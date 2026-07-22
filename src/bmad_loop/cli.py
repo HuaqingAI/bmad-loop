@@ -25,14 +25,19 @@ from . import policy as policy_mod
 from . import (
     resolve,
     runs,
+    runsetup,
     sprintstatus,
 )
 from . import stories as stories_mod
 from . import (
     verify,
 )
-from .adapters.base import CodingCLIAdapter
-from .checks import Finding, ValidationReport
+
+# Re-exported for the test suite, which stubs `_platform_preflight` with
+# `cli.Finding(...)`; no longer referenced within this module (the preflight body
+# moved to runsetup), so it needs the pin or ruff F401 autofix would drop it.
+from .checks import Finding  # noqa: F401 — re-export
+from .checks import ValidationReport
 
 # The --json document builders live in documents.py (the library-level projection
 # layer a non-CLI frontend imports). The schema constants are re-exported rather
@@ -61,6 +66,17 @@ from .model import RunState
 from .platform_util import MAX_SEGMENT
 from .process_host import ProcessHostError
 from .runs import RUNS_DIR
+
+# The run-composition helpers now live in runsetup.py (the library layer a non-CLI
+# frontend imports). They are re-exported under their historical private names —
+# used within this module (validate/mux/sweep/resume) and monkeypatched as
+# `cli.<name>` by the test suite — so the seams stay importable here. Each is
+# genuinely referenced below, so no noqa is needed (an unused-import pin would
+# itself trip RUF100); a future caller-less re-export would need `# noqa: F401`.
+from .runsetup import ROLES
+from .runsetup import make_adapters as _make_adapters
+from .runsetup import mux_reason_label as _mux_reason_label
+from .runsetup import platform_preflight as _platform_preflight
 from .stories_engine import StoriesEngine
 from .sweep import SweepEngine
 
@@ -151,223 +167,7 @@ def _reconcile_stale(project: Path, paths: bmadconfig.ProjectPaths, pol) -> None
         print(f"reclaimed {len(freed)} stale worktree(s) from prior runs")
 
 
-ROLES = ("dev", "review", "triage")
-
-
-def _make_adapters(project: Path, run_dir: Path, policy) -> dict[str, CodingCLIAdapter]:
-    from .adapters.generic import GenericAdapter, GenericDevAdapter
-    from .adapters.multiplexer import get_multiplexer, mux_usable
-    from .adapters.profile import ProfileError, get_profile
-
-    # The dev skill (bmad-dev-auto) writes no result.json: its adapter
-    # synthesizes the result from the spec, and so needs the project paths to
-    # find that spec — rebasing onto the active worktree's implementation-
-    # artifacts dir under isolation, not just the main checkout's.
-    paths = bmadconfig.load_paths(project)
-    mux = None
-    adapters: dict[str, CodingCLIAdapter] = {}
-    by_cfg: dict = {}
-    for role in ROLES:
-        cfg = policy.adapter.resolved(role)
-        # Both the dev and review sessions are now bmad-dev-auto runs (the review
-        # session re-invokes the dev skill on the done spec for a follow-up pass),
-        # and the skill writes no result.json — its adapter synthesizes the result
-        # from the spec it leaves on disk, so it needs the project paths to find
-        # that spec and cannot be shared with the triage role even on identical config.
-        synthesizes = role in ("dev", "review") and policy.dev.skill == "bmad-dev-auto"
-        key = (cfg, synthesizes)
-        if key not in by_cfg:
-            try:
-                profile = get_profile(cfg.name, project)
-            except ProfileError as e:
-                raise SystemExit(f"error: {e}") from e
-            if profile.hookless:
-                # Hookless profiles (opencode-http) are driven over HTTP/SSE —
-                # the tmux adapters below cannot host them.
-                from .adapters.opencode_http import (
-                    OpencodeDevAdapter,
-                    OpencodeHttpAdapter,
-                    OpencodeServerError,
-                )
-
-                common = dict(
-                    run_dir=run_dir,
-                    policy=policy,
-                    profile=profile,
-                    extra_args=cfg.extra_args,
-                    usage_grace_s=cfg.usage_grace_s,
-                    stop_without_result_nudges=cfg.stop_without_result_nudges,
-                )
-                try:
-                    by_cfg[key] = (
-                        OpencodeDevAdapter(**common, paths=paths)
-                        if synthesizes
-                        else OpencodeHttpAdapter(**common)
-                    )
-                except OpencodeServerError as e:
-                    raise SystemExit(f"error: {e}") from e
-            else:
-                # Resolve and probe the shared multiplexer only when a profile
-                # actually uses it; hookless HTTP/SSE runs need no transport.
-                if mux is None:
-                    mux = get_multiplexer()
-                    if not mux_usable(mux):
-                        try:
-                            version = mux.version()
-                        except Exception:  # noqa: BLE001 — diagnosing must not mask the refusal
-                            version = None
-                        raise SystemExit(
-                            f"error: multiplexer backend {type(mux).__name__} is not usable on "
-                            f"this host (reported version: {version}); its transport binary is "
-                            "missing, the version is unsupported, or a required helper is "
-                            "absent (psmux needs `pwsh` on PATH); see `bmad-loop diagnose`"
-                        )
-                common = dict(
-                    run_dir=run_dir,
-                    policy=policy,
-                    profile=profile,
-                    extra_args=cfg.extra_args,
-                    usage_grace_s=cfg.usage_grace_s,
-                    stop_without_result_nudges=cfg.stop_without_result_nudges,
-                    mux=mux,
-                )
-                by_cfg[key] = (
-                    GenericDevAdapter(**common, paths=paths)
-                    if synthesizes
-                    else GenericAdapter(**common)
-                )
-        adapters[role] = by_cfg[key]
-    return adapters
-
-
 # ----------------------------------------------------------------- commands
-
-
-def _platform_preflight() -> list[Finding]:
-    """Probe the platform-selected seams — the terminal multiplexer and the process
-    host — for `cmd_validate`, returning the findings in emission order.
-
-    A backend reports its own readiness through ``available()`` / ``version()``, so
-    a new OS or transport surfaces here by *registering* rather than by adding a
-    ``sys.platform`` branch to validate. The process host is named so a
-    misselection (e.g. the Windows host picked on Linux) is visible at a glance.
-    """
-    from .adapters.multiplexer import (
-        detect_multiplexers,
-        external_backend_errors,
-        get_multiplexer,
-    )
-    from .process_host import get_process_host
-
-    found: list[Finding] = []
-
-    try:
-        backend = get_multiplexer()
-        label = type(backend).__name__
-        version = backend.version()
-        if backend.available():
-            found.append(
-                Finding(
-                    "mux.backend",
-                    "ok",
-                    f"multiplexer {label} available" + (f" ({version})" if version else ""),
-                    {"backend": label, "available": True, "version": version},
-                )
-            )
-        else:
-            found.append(
-                Finding(
-                    "mux.backend",
-                    "problem",
-                    f"multiplexer {label} unavailable"
-                    + (f" (reports {version})" if version else "")
-                    + " — its transport binary is missing, the version is unsupported, or a "
-                    "required helper is absent (psmux needs `pwsh` on PATH); "
-                    "see `bmad-loop diagnose`",
-                    {"backend": label, "available": False, "version": version},
-                )
-            )
-    except Exception as e:  # noqa: BLE001 — selection or readiness must not abort validate
-        found.append(Finding("mux.preflight", "problem", f"multiplexer preflight failed: {e}"))
-
-    try:
-        infos = detect_multiplexers()
-    except Exception:  # noqa: BLE001 — detection is advisory; never break validate
-        infos = []
-    if len(infos) > 1:  # a lone tmux needs no listing; keep single-backend output stable
-        listed = ", ".join(
-            i.name
-            + ("*" if i.selected else "")
-            + (
-                " (available" + (f", {i.version}" if i.version else "") + ")"
-                if i.available
-                else " (unavailable)"
-            )
-            for i in infos
-        )
-        # The text flattens each row into a suffix soup ("tmux*, psmux
-        # (unavailable)") whose trailing `*` a consumer would have to parse to
-        # learn which backend is selected. The detail keeps the rows themselves.
-        found.append(
-            Finding(
-                "mux.backends-detected",
-                "ok",
-                f"mux backends: {listed} — `bmad-loop mux` for details",
-                {
-                    "backends": [
-                        {
-                            "name": i.name,
-                            "matches_platform": i.matches_platform,
-                            "available": i.available,
-                            "version": i.version,
-                            "selected": i.selected,
-                            "reason": i.reason,
-                        }
-                        for i in infos
-                    ]
-                },
-            )
-        )
-    chosen = next((i for i in infos if i.selected), None)
-    if chosen and chosen.reason in ("env", "policy"):
-        # detail keeps the raw enum, not _mux_reason_label's prose: the label is
-        # wording ("set by [mux] backend in .bmad-loop/policy.toml"), the enum is
-        # the value MuxBackendInfo.reason actually carries.
-        found.append(
-            Finding(
-                "mux.selection",
-                "ok",
-                f"multiplexer selection {_mux_reason_label(chosen.reason)}",
-                {"backend": chosen.name, "reason": chosen.reason},
-            )
-        )
-
-    # A warning, not a problem and not a note: an installed package the operator
-    # asked for did not load, which is a real failure — but selection already
-    # degraded past it (a failed external can never be the selected backend), so
-    # the preflight outcome above is authoritative and the verdict must not flip.
-    # `cmd_mux` has always printed this same condition as `warning:`; validate was
-    # the outlier, pinned to "ok" because promoting inserts "  warning: " into the
-    # text (render() keeps the double prefix by design) and the TUI rendered that
-    # text verbatim. Since #210 the TUI reads `validate --json` and styles from the
-    # severity field, so the severity is free to say what the message already does.
-    for ep_name, reason in sorted(external_backend_errors().items()):
-        found.append(
-            Finding(
-                "mux.external-backend",
-                "warning",
-                f"external mux backend '{ep_name}' failed to load: {reason}",
-                {"entry_point": ep_name, "error": reason},
-            )
-        )
-
-    try:
-        host = type(get_process_host()).__name__
-        found.append(Finding("host.process", "ok", f"process host: {host}", {"host": host}))
-    except Exception as e:  # noqa: BLE001 — a bad BMAD_LOOP_PROCESS_HOST must report, not crash
-        found.append(Finding("host.process", "problem", f"process host preflight failed: {e}"))
-
-    return found
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
@@ -540,17 +340,6 @@ def cmd_validate(args: argparse.Namespace) -> int:
     else:
         report.render()
     return 0 if report.passed else 1
-
-
-def _mux_reason_label(reason: str) -> str:
-    """Human wording for a MuxBackendInfo.reason, shared by `mux` and validate."""
-    return {
-        "env": "forced by BMAD_LOOP_MUX_BACKEND",
-        "policy": f"set by [mux] backend in {POLICY_FILE}",
-        "platform-default": f"platform default for {sys.platform}",
-        "first-match": "first available platform match",
-        "fallback": "fallback (no registered backend is available)",
-    }.get(reason, reason)
 
 
 def cmd_mux(args: argparse.Namespace) -> int:
@@ -830,49 +619,27 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     _reconcile_stale(project, paths, pol)
 
-    run_id = args.run_id or runs.new_run_id()
-    run_dir = project / RUNS_DIR / run_id
-    journal = Journal(run_dir)
-    state = RunState(
-        run_id=run_id,
-        project=str(project),
-        started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
-        policy_snapshot=pol.to_dict(),
-        epic_filter=args.epic,
-        story_filter=args.story,
-        max_stories=args.max_stories,
-        source="stories" if stories_on else "sprint-status",
-        spec_folder=spec_folder if stories_on else "",
-    )
-    save_state(run_dir, state)
-    runs.write_pid(run_dir)
-    adapters = _make_adapters(project, run_dir, pol)
-    journal.append(
-        "run-start",
-        run_id=run_id,
-        source=state.source,
-        adapter_dev=pol.adapter.resolved("dev").name,
-        adapter_review=pol.adapter.resolved("review").name,
-    )
-    print(f"run {run_id} starting (attach: bmad-loop attach)")
-
-    common = dict(
+    # The composition (run dir + state + pid + adapters + engine) lives in
+    # runsetup; cmd_run stays parse -> compose -> render. Engine/StoriesEngine and
+    # _make_adapters are handed in from this module's namespace so the test suite's
+    # `monkeypatch.setattr(cli, "Engine"/"_make_adapters", ...)` still applies.
+    composed = runsetup.compose_run(
+        project=project,
         paths=paths,
         policy=pol,
-        adapter=adapters["dev"],
-        review_adapter=adapters["review"],
-        run_dir=run_dir,
-        journal=journal,
-        state=state,
-        max_stories=args.max_stories,
+        run_id=args.run_id,
         epic_filter=args.epic,
         story_filter=args.story,
+        max_stories=args.max_stories,
+        stories_on=stories_on,
+        spec_folder=spec_folder,
         sweep_factory=_sweep_factory(project, paths),
+        make_adapters=_make_adapters,
+        engine_cls=Engine,
+        stories_engine_cls=StoriesEngine,
     )
-    engine: Engine = (
-        StoriesEngine(**common, spec_folder=spec_folder) if stories_on else Engine(**common)
-    )
-    summary = engine.run()
+    print(f"run {composed.run_id} starting (attach: bmad-loop attach)")
+    summary = composed.engine.run()
     print(summary.render())
     return 0
 
