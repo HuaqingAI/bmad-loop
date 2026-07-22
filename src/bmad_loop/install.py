@@ -480,160 +480,6 @@ def _remove_legacy_skills(project: Path, trees: Sequence[str]) -> None:
                 print(f"  removed legacy skill: {tree}/{skill}")
 
 
-def provision_worktree(
-    worktree: Path,
-    profiles: Sequence[CLIProfile],
-    repo_root: Path,
-    seed_files: Sequence[str] = (),
-    seed_globs: Sequence[str] = (),
-) -> list[str]:
-    """Make a freshly-created git worktree a self-sufficient bmad-loop project.
-
-    A worktree checks out tracked files only, but the skill trees (.claude/skills,
-    .agents/skills), the hook config, and the project's gitignored MCP/CLI configs
-    are absent from the checkout. Without them the bundled bmad-loop-* skills are missing,
-    the Stop-signal hook never fires, and isolated sessions can't reach their MCP
-    server. Lay the bundled skills + signal hook into the worktree for the active
-    CLI profiles, and copy the `seed_files` configs in from the main repo. The
-    upstream skills the orchestrator drives (BASE_SKILLS: bmad-dev-auto + the review
-    hunters) are not bundled in the wheel, so they are copied from the MAIN REPO's
-    installed tree instead. Quiet (no stdout) — unlike `install_into` this runs
-    inside the engine loop under a TUI. No-op when there's nothing to do.
-
-    seed_globs are project-relative glob patterns (e.g. ".claude/skills/*") expanded
-    against the main repo; every match is copied into the worktree under the same
-    relative path, copy-when-absent like seed_files. A game-engine plugin uses these
-    to pull its MCP-generated skill tree (gitignored, so absent from the checkout)
-    into a per_worktree Editor's checkout.
-
-    Kept safe against the unit's eventual `git add -A` commit:
-    - skills + seed files are copied only when ABSENT, so a project that commits its
-      own skill tree (e.g. .agents/) or config keeps it untouched (no diff merged back);
-    - the hook points at the MAIN repo's already-installed relay via an absolute
-      path (the relay locates the run dir from $BMAD_LOOP_RUN_DIR, not its own
-      location), so nothing is written into the worktree's .bmad-loop/;
-    - everything we wrote is added to the worktree's local git exclude.
-    Skill trees, the per-CLI hook config, and the seeded configs all live in dirs
-    projects gitignore — but the exclude shields them even when a project doesn't.
-
-    seed_files are copied BEFORE the hook step so a seeded settings file that is
-    also a hook config_path (.claude/settings.json, .gemini/settings.json) keeps its
-    real content and just gets the Stop hook merged in, rather than being created empty.
-
-    Returns the `seed_files` entries that existed in the repo but were skipped
-    because the destination already existed — copy-when-absent turned them into
-    no-ops. The caller journals them: a user-authored `worktree_seed` entry that
-    silently copies nothing reads as applied configuration and is not.
-    """
-    if not profiles and not seed_files and not seed_globs:
-        return []
-    worktree = worktree.resolve()
-    repo_root = repo_root.resolve()
-    relay = repo_root / HOOK_SCRIPT_REL
-    skills_root = resources.files("bmad_loop.data").joinpath("skills")
-
-    # project gitignored MCP/CLI configs: copy from the main repo when absent.
-    # Resolve-and-contain guards against an `..`/absolute entry escaping either tree.
-    seeded: list[str] = []
-    # Entries that named a real source but whose destination already exists, so
-    # copy-when-absent made them a no-op. Reported to the caller (this function is
-    # quiet by contract — it runs under a TUI) because for a DIRECTORY entry the
-    # no-op is silent and total: a worktree checks out tracked files, so a seed dir
-    # with any tracked child always exists and the whole entry is skipped, including
-    # the children that are absent and would clobber nothing. Glob-expanded matches
-    # are deliberately not reported: a plugin's glob is expected to hit paths the
-    # checkout already carries, so that skip is routine rather than a misconfiguration.
-    skipped: list[str] = []
-    for rel in seed_files:
-        src = (repo_root / rel).resolve()
-        dst = (worktree / rel).resolve()
-        if not src.is_relative_to(repo_root) or not dst.is_relative_to(worktree):
-            continue
-        if not src.exists():
-            continue
-        if dst.exists():
-            skipped.append(str(rel))
-            continue
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        _copy_traversable(src, dst)
-        seeded.append(rel)
-
-    # glob-seeded trees (e.g. an engine plugin's MCP skill dirs): expand each
-    # pattern against the main repo and copy matches in, same contain guard +
-    # copy-when-absent semantics. rel is taken from the unresolved match so the
-    # worktree path mirrors the repo layout; resolve only guards containment.
-    for pattern in seed_globs:
-        for match in sorted(repo_root.glob(pattern)):
-            rel = match.relative_to(repo_root)
-            src = match.resolve()
-            dst = (worktree / rel).resolve()
-            if not src.is_relative_to(repo_root) or not dst.is_relative_to(worktree):
-                continue
-            if not src.exists() or dst.exists():
-                continue
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            _copy_traversable(src, dst)
-            # as_posix so the exclude pattern anchors on Windows too (os.sep would not)
-            seeded.append(rel.as_posix())
-
-    # bundled skills into each CLI's skill tree (deduped: codex+gemini share one);
-    # never clobber a skill the checkout already carries (tracked or pre-existing).
-    for tree in dict.fromkeys(p.skill_tree for p in profiles):
-        tree_dir = worktree / tree
-        for skill in MODULE_SKILLS:
-            dst = tree_dir / skill
-            if dst.exists():
-                continue
-            _copy_traversable(skills_root.joinpath(skill), dst)
-        # The orchestrator-driven upstream skills (BASE_SKILLS) are not in the
-        # wheel; copy them from the MAIN REPO's installed tree (same tree path) so
-        # an isolated worktree can still resolve /bmad-dev-auto and the review
-        # hunters. Skip silently when the main repo lacks them — the run-start
-        # preflight reports it.
-        for skill in BASE_SKILLS:
-            dst = tree_dir / skill
-            if dst.exists():
-                continue
-            src = (repo_root / tree / skill).resolve()
-            if not src.is_relative_to(repo_root) or not src.is_dir():
-                continue
-            _copy_traversable(src, dst)
-
-    # per-CLI signal-hook registration, baked to the main repo's relay (absolute).
-    # Hookless profiles (HTTP/SSE transport) have no config to merge.
-    for profile in profiles:
-        if profile.hookless:
-            continue
-        config_path = worktree / profile.hooks.config_path
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        config: dict = {}
-        if config_path.is_file():
-            try:
-                config = json.loads(config_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                config = {}
-        host = get_process_host()
-        interp = host.hook_interpreter()
-        registrations = {
-            native: f"{interp} {host.shell_quote(str(relay))} {canonical}"
-            for native, canonical in profile.hooks.events.items()
-        }
-        config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
-        if changed:
-            config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
-
-    # Shield exactly the paths we wrote (skill trees + hook configs + seeded
-    # configs) from the unit's `git add -A`, in case a project doesn't gitignore
-    # its tool dirs.
-    patterns = {f"/{p.skill_tree}" for p in profiles}
-    # hookless profiles have no config_path — and their empty string would render
-    # as the pattern "/", git-excluding the entire worktree.
-    patterns |= {f"/{p.hooks.config_path}" for p in profiles if not p.hookless}
-    patterns |= {f"/{rel}" for rel in seeded}
-    _worktree_local_exclude(worktree, sorted(patterns))
-    return skipped
-
-
 def _warn_if_policy_tracked(project: Path) -> None:
     """One-time migration hint: a .gitignore entry does not untrack an
     already-committed policy.toml, so repos initialized before the file was
@@ -761,3 +607,16 @@ def install_into(
         if profile.first_run_note:
             print(f"  {profile.name}: {profile.first_run_note}")
     return 0
+
+
+def __getattr__(name: str):
+    # `provision_worktree` now lives in `worktree_flow` (issue #244 F-9a): the
+    # runtime control loop must not import the installer. It is re-exported here
+    # lazily — a module-level `from .worktree_flow import provision_worktree` would
+    # form an import cycle (worktree_flow imports installer helpers from this
+    # module), so resolve it on first attribute access, once both modules exist.
+    if name == "provision_worktree":
+        from .worktree_flow import provision_worktree
+
+        return provision_worktree
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
