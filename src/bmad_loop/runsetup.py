@@ -9,7 +9,13 @@ frontend (or a test) can compose a run directly:
 * :func:`make_adapters` — the per-role adapter factory.
 * :func:`platform_preflight` — the multiplexer/process-host readiness probe
   ``cmd_validate`` reports.
-* :func:`build_run_state` / :func:`compose_run` — the RunState + Engine wiring.
+* :func:`build_run_state` / :func:`compose_run` — the RunState + Engine wiring
+  for ``cmd_run``.
+* :func:`compose_sweep` — the same wiring for a ``sweep`` run (``cmd_sweep`` and
+  the auto-triggered child-sweep factory).
+* :func:`compose_resume` — rebuilds the engine for a paused/interrupted run
+  (``cmd_resume`` and ``resolve``'s re-arm), selecting the sweep/stories/plain
+  variant from persisted run state.
 
 The engine class and the adapter factory are *injected* into :func:`compose_run`
 rather than referenced here directly: ``cli`` resolves ``Engine`` /
@@ -22,6 +28,7 @@ so those seams stay importable and monkeypatchable from ``cli``.
 
 from __future__ import annotations
 
+import json
 import sys
 import time
 from dataclasses import dataclass
@@ -305,11 +312,13 @@ def build_run_state(
 
 @dataclass
 class ComposedRun:
-    """The composed-but-not-yet-run artifacts ``cmd_run`` renders from.
+    """The composed-but-not-yet-run artifacts a ``compose_*`` returns for its
+    callback to render from — shared by :func:`compose_run`, :func:`compose_sweep`,
+    and :func:`compose_resume`.
 
     ``engine`` is ready to :meth:`run`; ``run_id`` names the run for the attach
-    hint. ``run_dir`` / ``state`` / ``journal`` are the persisted context (already
-    written to disk) a caller other than ``cmd_run`` can inspect."""
+    hint. ``run_dir`` / ``state`` / ``journal`` are the persisted context a caller
+    other than the CLI can inspect."""
 
     engine: Engine
     run_id: str
@@ -384,3 +393,145 @@ def compose_run(
         else engine_cls(**common)
     )
     return ComposedRun(engine=engine, run_id=run_id, run_dir=run_dir, state=state, journal=journal)
+
+
+def compose_sweep(
+    *,
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    policy: Policy,
+    run_id: str | None,
+    prompting: bool,
+    decisions_only: bool,
+    max_bundles: int | None,
+    repeat: bool | None,
+    max_cycles: int | None,
+    trigger: str,
+    make_adapters: Callable[[Path, Path, Policy], dict[str, CodingCLIAdapter]],
+    sweep_engine_cls: type[Engine],
+) -> ComposedRun:
+    """Stand up a sweep run: allocate the run dir, persist state + pid, record the
+    sweep options, build the adapters, and wire the ``SweepEngine`` — everything
+    ``cli._start_sweep`` did inline before ``engine.run()``.
+
+    ``sweep.json`` freezes the launch options so a resume rebuilds the same sweep
+    (see :func:`compose_resume`). ``make_adapters`` and ``sweep_engine_cls`` are
+    injected so ``cli`` supplies its own module-level names — keeping the test
+    suite's ``monkeypatch.setattr(cli, "SweepEngine"/"_make_adapters", ...)``
+    effective."""
+    run_id = run_id or runs.new_run_id()
+    run_dir = project / RUNS_DIR / run_id
+    journal = Journal(run_dir)
+    state = RunState(
+        run_id=run_id,
+        project=str(project),
+        started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+        policy_snapshot=policy.to_dict(),
+        run_type="sweep",
+    )
+    save_state(run_dir, state)
+    runs.write_pid(run_dir)
+    options = {
+        "prompting": prompting,
+        "decisions_only": decisions_only,
+        "max_bundles": max_bundles,
+        "repeat": repeat,
+        "max_cycles": max_cycles,
+        "trigger": trigger,
+    }
+    (run_dir / "sweep.json").write_text(json.dumps(options, indent=2), encoding="utf-8")
+    adapters = make_adapters(project, run_dir, policy)
+    journal.append("run-start", run_id=run_id, run_type="sweep", trigger=trigger)
+    engine: Engine = sweep_engine_cls(
+        paths=paths,
+        policy=policy,
+        adapter=adapters["dev"],
+        review_adapter=adapters["review"],
+        triage_adapter=adapters["triage"],
+        run_dir=run_dir,
+        journal=journal,
+        state=state,
+        prompting=prompting,
+        decisions_only=decisions_only,
+        max_bundles=max_bundles,
+        repeat=repeat,
+        max_cycles=max_cycles,
+    )
+    return ComposedRun(engine=engine, run_id=run_id, run_dir=run_dir, state=state, journal=journal)
+
+
+def compose_resume(
+    *,
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    run_dir: Path,
+    state: RunState,
+    policy: Policy,
+    journal: Journal,
+    sweep_factory: Callable[[str], None],
+    make_adapters: Callable[[Path, Path, Policy], dict[str, CodingCLIAdapter]],
+    engine_cls: type[Engine],
+    stories_engine_cls: type[Engine],
+    sweep_engine_cls: type[Engine],
+) -> ComposedRun:
+    """Rebuild the engine for a paused/interrupted run and return it ready to
+    :meth:`run` — the adapter build + engine selection ``cli._resume_paused_run``
+    did inline.
+
+    ``state`` arrives already re-stamped and persisted by the caller: the resume
+    policy-snapshot reconciliation and the pause/pid/graceful-stop bookkeeping stay
+    CLI-side (their ordering is load-bearing — see ``_resume_paused_run``), so this
+    lifts only the composition. The variant is selected from persisted run state:
+    ``run_type == "sweep"`` rebuilds a ``SweepEngine`` from ``sweep.json``;
+    otherwise ``source`` picks ``StoriesEngine`` vs ``Engine``, restoring the
+    launching scope + cap so a resumed ``--epic N`` run keeps its filter. The engine
+    classes and ``make_adapters`` are injected so ``cli``'s ``monkeypatch.setattr``
+    seams bite."""
+    # drop any stale agent session so the run spins up a fresh one (a stopped or
+    # interrupted run can leave a lingering bmad-loop-<id> session behind).
+    runs.kill_session(run_dir.name)
+    adapters = make_adapters(project, run_dir, policy)
+    if state.run_type == "sweep":
+        opts_path = run_dir / "sweep.json"
+        opts = json.loads(opts_path.read_text(encoding="utf-8")) if opts_path.is_file() else {}
+        engine: Engine = sweep_engine_cls(
+            paths=paths,
+            policy=policy,
+            adapter=adapters["dev"],
+            review_adapter=adapters["review"],
+            triage_adapter=adapters["triage"],
+            run_dir=run_dir,
+            journal=journal,
+            state=state,
+            prompting=bool(opts.get("prompting", False)),
+            decisions_only=bool(opts.get("decisions_only", False)),
+            max_bundles=opts.get("max_bundles"),
+            repeat=opts.get("repeat"),
+            max_cycles=opts.get("max_cycles"),
+        )
+    else:
+        story_common = dict(
+            paths=paths,
+            policy=policy,
+            adapter=adapters["dev"],
+            review_adapter=adapters["review"],
+            run_dir=run_dir,
+            journal=journal,
+            state=state,
+            # restore the launching scope + cap so a resumed `--epic N` run keeps
+            # picking within N instead of silently widening to every epic.
+            epic_filter=state.epic_filter,
+            story_filter=state.story_filter,
+            max_stories=state.max_stories,
+            sweep_factory=sweep_factory,
+        )
+        # stories mode is pinned in run state at launch, so resume rebuilds the
+        # same picker (StoriesEngine) without any flag.
+        engine = (
+            stories_engine_cls(**story_common, spec_folder=state.spec_folder)
+            if state.source == "stories"
+            else engine_cls(**story_common)
+        )
+    return ComposedRun(
+        engine=engine, run_id=run_dir.name, run_dir=run_dir, state=state, journal=journal
+    )
