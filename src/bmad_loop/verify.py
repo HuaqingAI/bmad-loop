@@ -641,7 +641,17 @@ def worktree_add(
     another worktree — git refuses that.
     """
     if create:
-        rc, out = _git(repo, "worktree", "add", "-b", branch, str(path), base)
+        # base is the caller-supplied start-point when create=True; None would fail
+        # in git, so callers pass a real ref — not narrowed by the signature here.
+        rc, out = _git(
+            repo,
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            str(path),
+            base,  # pyright: ignore[reportArgumentType]
+        )
     else:
         rc, out = _git(repo, "worktree", "add", str(path), branch)
     if rc != 0:

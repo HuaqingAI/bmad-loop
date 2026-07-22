@@ -12,6 +12,7 @@ import sys
 import time
 from enum import IntEnum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from . import (
     __version__,
@@ -78,6 +79,11 @@ from .runsetup import mux_reason_label as _mux_reason_label
 from .runsetup import platform_preflight as _platform_preflight
 from .stories_engine import StoriesEngine
 from .sweep import SweepEngine
+
+if TYPE_CHECKING:
+    # Type-only: annotate the profile-lookup map without a module-level adapter
+    # import (cli.py imports the adapter package lazily inside functions).
+    from .adapters.profile import CLIProfile
 
 POLICY_FILE = policy_mod.POLICY_FILE
 
@@ -193,7 +199,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
     from .adapters.profile import ProfileError, get_profile
 
     profiles = []
-    profile_by_name: dict[str, object] = {}
+    profile_by_name: dict[str, CLIProfile] = {}
     pol = None
     try:
         pol = policy_mod.load(_policy_path(project))
