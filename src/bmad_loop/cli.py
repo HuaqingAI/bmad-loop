@@ -89,7 +89,7 @@ class ExitCode(IntEnum):
       interrupt converts to a clean ``RunStopped`` (``engine.py``) and never reaches
       here — a Ctrl+C during a run stays rc 0.
 
-    Codes ``3``–``129`` and ``131+`` are intentionally absent until a consumer needs one.
+    Codes ``3``-``129`` and ``131+`` are intentionally absent until a consumer needs one.
     """
 
     OK = 0

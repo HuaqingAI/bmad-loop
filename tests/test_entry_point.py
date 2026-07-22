@@ -130,10 +130,13 @@ def test_exit_keyboard_interrupt_is_130(tmp_path, capsys, monkeypatch):
         raise KeyboardInterrupt
 
     monkeypatch.setattr(cli, "cmd_validate", boom)
-    assert cli.main(["validate", "--project", str(tmp_path)]) == 130
+    # --json is the strictest stdout contract: a --json command must emit *no* partial
+    # document on interrupt, only the whole document or nothing (machine.py). The raise
+    # lands before any output, so stdout stays empty and stderr carries just the notice.
+    assert cli.main(["validate", "--json", "--project", str(tmp_path)]) == 130
     captured = capsys.readouterr()
-    assert captured.out == ""  # empty stdout: nothing half-emitted, --json-safe
-    assert captured.err.strip() == "interrupted"
+    assert captured.out == ""  # empty stdout: nothing half-emitted under --json rules
+    assert captured.err == "interrupted\n"  # exactly one line, no stray whitespace
     assert "Traceback" not in captured.err
 
 
@@ -150,7 +153,7 @@ def test_exit_code_enum_values():
 
 
 def test_exit_code_enum_has_only_contracted_codes():
-    """OK/FAILURE/USAGE/INTERRUPTED are the whole contract — codes 3–129 and 131+ are
+    """OK/FAILURE/USAGE/INTERRUPTED are the whole contract — codes 3-129 and 131+ are
     deferred until a consumer needs them, so guard against one sneaking in early."""
     assert {c.value for c in cli.ExitCode} == {0, 1, 2, 130}
 
