@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import time
+from enum import IntEnum
 from pathlib import Path
 
 from . import (
@@ -64,6 +65,30 @@ from .stories_engine import StoriesEngine
 from .sweep import SweepEngine
 
 POLICY_FILE = policy_mod.POLICY_FILE
+
+
+class ExitCode(IntEnum):
+    """The process exit codes ``main()`` contracts — names for the released numbers.
+
+    ``rc`` is a released contract, so these values do not move; the enum just gives
+    the existing numbers a name at their use sites. Being an ``IntEnum`` it returns
+    from ``main()`` (``-> int``) and reaches ``sys.exit`` transparently.
+
+    - ``OK`` — a command handler returned success (``args.func`` returns it, not
+      ``main`` directly).
+    - ``FAILURE`` — a typed error surfaced to the dispatch tail, or the broad
+      backstop caught an unexpected exception; both print ``error: …`` to stderr.
+    - ``USAGE`` — an argparse usage error (unknown subcommand, bad flag). argparse
+      raises ``SystemExit(2)`` before dispatch, so this names its number rather than
+      being returned here.
+
+    Codes ``3+`` are intentionally absent until a consumer needs one. ``INTERRUPTED``
+    (Ctrl+C → 130) is deferred to its own change; today that path is unchanged.
+    """
+
+    OK = 0
+    FAILURE = 1
+    USAGE = 2
 
 
 def _project(args: argparse.Namespace) -> Path:
@@ -2575,13 +2600,13 @@ def main(argv: list[str] | None = None) -> int:
         verify.GitError,
     ) as e:
         print(f"error: {e}", file=sys.stderr)
-        return 1
+        return ExitCode.FAILURE
     except Exception as e:
         # backstop for the residual surface outside engine.run() (config load,
         # engine construction, render/notify): never let an unexpected exception
         # die to the parked control pane with a bare traceback.
         print(f"error: {e}", file=sys.stderr)
-        return 1
+        return ExitCode.FAILURE
 
 
 if __name__ == "__main__":

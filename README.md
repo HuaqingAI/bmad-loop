@@ -519,6 +519,20 @@ Each run drives its agents inside a dedicated tmux session, `bmad-loop-<run-id>`
 
 Two things to know when matching. `message` is **not** contracted — several problems are the raw text of an underlying config/policy/profile exception, so the wording moves with those modules; `check` is the matchable identity. And a check id's _absence_ is not a pass: the gates are chained, so a policy that fails to load leaves the binary, hook and skill gates with nothing to check, and they contribute no finding at all. Read `ok` for the verdict.
 
+### Exit codes
+
+Normal command dispatch and argparse usage errors resolve to one of three released codes — safe to branch on in CI:
+
+| Code | Name      | Meaning                                                                                                                                                   |
+| ---- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `0`  | `OK`      | the command did its job                                                                                                                                   |
+| `1`  | `FAILURE` | the command could not do its job — a known error (bad config, git failure, unready project) or an unexpected one; the reason goes to stderr as `error: …` |
+| `2`  | `USAGE`   | the invocation was malformed — an unknown subcommand or bad flag, caught by argument parsing before the command runs                                      |
+
+No `ExitCode` values `≥3` are assigned yet. The one path outside this table is **interruption**: Ctrl+C (SIGINT) terminates the process with **130** — today as a bare traceback; a follow-up ([#241](https://github.com/bmad-code-org/bmad-loop/issues/241) PR 2) replaces that with a clean one-line message, but the code stays 130. The names come from the `ExitCode` enum in `bmad_loop.cli`.
+
+One caveat repeated from above: a `--json` command reporting a **verdict** exits `1` to _carry_ that verdict, not because the command broke — `validate --json` on an unready project exits `1` but still prints its whole document. So for those commands read the document's own field (`ok`), not the exit status; `1` conflates "the checks failed" with "the command failed". For everything else, `0` vs non-zero is the answer.
+
 ## Other coding CLIs
 
 One generic driver (`adapters/generic.py`) runs any coding CLI that fits the injection + hook-signal transport; everything CLI-specific lives in a declarative **profile** (`adapters/profile.py`), and the terminal transport itself sits behind a pluggable `TerminalMultiplexer` seam (tmux bundled; external backends like the herdr adapter install as packages — see [Terminal multiplexer backends](docs/multiplexer-backends.md)). Built-in profiles ship as TOML in `bmad_loop/data/profiles/`:
