@@ -65,7 +65,6 @@ from .journal import Journal, load_state, save_state
 from .model import RunState
 from .platform_util import MAX_SEGMENT
 from .process_host import ProcessHostError
-from .runs import RUNS_DIR
 
 # The run-composition helpers now live in runsetup.py (the library layer a non-CLI
 # frontend imports). They are re-exported under their historical private names —
@@ -789,46 +788,26 @@ def _start_sweep(
     trigger: str,
     run_id: str | None = None,
 ) -> int:
-    run_id = run_id or runs.new_run_id()
-    run_dir = project / RUNS_DIR / run_id
-    journal = Journal(run_dir)
-    state = RunState(
-        run_id=run_id,
-        project=str(project),
-        started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
-        policy_snapshot=pol.to_dict(),
-        run_type="sweep",
-    )
-    save_state(run_dir, state)
-    runs.write_pid(run_dir)
-    options = {
-        "prompting": prompting,
-        "decisions_only": decisions_only,
-        "max_bundles": max_bundles,
-        "repeat": repeat,
-        "max_cycles": max_cycles,
-        "trigger": trigger,
-    }
-    (run_dir / "sweep.json").write_text(json.dumps(options, indent=2), encoding="utf-8")
-    adapters = _make_adapters(project, run_dir, pol)
-    journal.append("run-start", run_id=run_id, run_type="sweep", trigger=trigger)
-    print(f"sweep {run_id} starting (attach: bmad-loop attach)")
-    engine = SweepEngine(
+    # The composition (run dir + state + pid + sweep.json + adapters + engine)
+    # lives in runsetup; this stays compose -> render. SweepEngine and
+    # _make_adapters are handed in from this module's namespace so the test suite's
+    # `monkeypatch.setattr(cli, "SweepEngine"/"_make_adapters", ...)` still applies.
+    composed = runsetup.compose_sweep(
+        project=project,
         paths=paths,
         policy=pol,
-        adapter=adapters["dev"],
-        review_adapter=adapters["review"],
-        triage_adapter=adapters["triage"],
-        run_dir=run_dir,
-        journal=journal,
-        state=state,
+        run_id=run_id,
         prompting=prompting,
         decisions_only=decisions_only,
         max_bundles=max_bundles,
         repeat=repeat,
         max_cycles=max_cycles,
+        trigger=trigger,
+        make_adapters=_make_adapters,
+        sweep_engine_cls=SweepEngine,
     )
-    summary = engine.run()
+    print(f"sweep {composed.run_id} starting (attach: bmad-loop attach)")
+    summary = composed.engine.run()
     print(summary.render())
     return 0
 
@@ -975,52 +954,26 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     # runs FIRST so no observer catches a window of "not paused + dead pid",
     # which tui.data classifies as INTERRUPTED.
     save_state(run_dir, state)
-    # drop any stale agent session so the run spins up a fresh one (a stopped or
-    # interrupted run can leave a lingering bmad-loop-<id> session behind).
-    runs.kill_session(run_dir.name)
-    adapters = _make_adapters(project, run_dir, pol)
-    if state.run_type == "sweep":
-        opts_path = run_dir / "sweep.json"
-        opts = json.loads(opts_path.read_text(encoding="utf-8")) if opts_path.is_file() else {}
-        engine: Engine = SweepEngine(
-            paths=paths,
-            policy=pol,
-            adapter=adapters["dev"],
-            review_adapter=adapters["review"],
-            triage_adapter=adapters["triage"],
-            run_dir=run_dir,
-            journal=journal,
-            state=state,
-            prompting=bool(opts.get("prompting", False)),
-            decisions_only=bool(opts.get("decisions_only", False)),
-            max_bundles=opts.get("max_bundles"),
-            repeat=opts.get("repeat"),
-            max_cycles=opts.get("max_cycles"),
-        )
-    else:
-        story_common = dict(
-            paths=paths,
-            policy=pol,
-            adapter=adapters["dev"],
-            review_adapter=adapters["review"],
-            run_dir=run_dir,
-            journal=journal,
-            state=state,
-            # restore the launching scope + cap so a resumed `--epic N` run keeps
-            # picking within N instead of silently widening to every epic.
-            epic_filter=state.epic_filter,
-            story_filter=state.story_filter,
-            max_stories=state.max_stories,
-            sweep_factory=_sweep_factory(project, paths),
-        )
-        # stories mode is pinned in run state at launch, so resume rebuilds the
-        # same picker (StoriesEngine) without any flag.
-        engine = (
-            StoriesEngine(**story_common, spec_folder=state.spec_folder)
-            if state.source == "stories"
-            else Engine(**story_common)
-        )
-    summary = engine.run()
+    # The adapter build + engine selection (sweep vs stories vs plain, from
+    # persisted state) lives in runsetup; the re-stamp/pid/save bookkeeping above
+    # stays here because its ordering is load-bearing. Engine/StoriesEngine/
+    # SweepEngine and _make_adapters are handed in from this module's namespace so
+    # the test suite's `monkeypatch.setattr(cli, "SweepEngine"/"Engine"/..., ...)`
+    # still applies.
+    composed = runsetup.compose_resume(
+        project=project,
+        paths=paths,
+        run_dir=run_dir,
+        state=state,
+        policy=pol,
+        journal=journal,
+        sweep_factory=_sweep_factory(project, paths),
+        make_adapters=_make_adapters,
+        engine_cls=Engine,
+        stories_engine_cls=StoriesEngine,
+        sweep_engine_cls=SweepEngine,
+    )
+    summary = composed.engine.run()
     print(summary.render())
     return 0
 
