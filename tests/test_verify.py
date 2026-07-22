@@ -1485,6 +1485,18 @@ def test_read_frontmatter_oserror_still_raises(project, monkeypatch):
         verify.read_frontmatter(p)
 
 
+def test_read_frontmatter_ignores_triple_dash_in_value(project):
+    """A `---` inside a scalar value must NOT be read as the closing delimiter.
+    A plain `split("---", 2)` truncates the block at the first substring match →
+    YAMLError → {}, silently zeroing status; the closing boundary is a standalone
+    `---` line only."""
+    p = project.project / "x.md"
+    p.write_text("---\ntitle: 'restore --- review'\nstatus: done\n---\nbody\n")
+    fm = verify.read_frontmatter(p)
+    assert fm["status"] == "done"
+    assert fm["title"] == "restore --- review"
+
+
 def test_artifact_relpaths_returns_in_repo_folders(project):
     """The orchestrator-owned artifact folders, repo-relative posix."""
     rels = verify.artifact_relpaths(project)

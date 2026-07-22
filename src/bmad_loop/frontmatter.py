@@ -16,6 +16,28 @@ from typing import Any
 import yaml
 
 
+def _split_frontmatter(text: str) -> tuple[str, str, str] | None:
+    """Split a document into ``(before, block, after)`` around its YAML
+    frontmatter, where ``before + block + after == text`` exactly.
+
+    The opening and closing ``---`` are recognized ONLY as standalone delimiter
+    lines (``line.rstrip() == "---"``), so a ``---`` substring inside a scalar
+    value (e.g. ``title: 'restore --- review'``) is never mistaken for the
+    closing boundary — the flaw a plain ``text.split("---", 2)`` has. ``before``
+    is the opening delimiter line, ``block`` is the YAML content between the
+    delimiters, and ``after`` begins with the closing delimiter line; callers
+    rewrite ``block`` and reconstruct the file byte-for-byte. Returns ``None``
+    when the text has no opening delimiter line or no closing delimiter line.
+    """
+    lines = text.splitlines(keepends=True)  # "".join(lines) == text
+    if not lines or lines[0].rstrip() != "---":
+        return None
+    for i in range(1, len(lines)):
+        if lines[i].rstrip() == "---":
+            return lines[0], "".join(lines[1:i]), "".join(lines[i:])
+    return None
+
+
 def read_frontmatter(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return {}
@@ -28,13 +50,11 @@ def read_frontmatter(path: Path) -> dict[str, Any]:
         # (UnicodeDecodeError is a ValueError, so it slipped past callers'
         # except-OSError guards).
         return {}
-    if not text.startswith("---"):
-        return {}
-    parts = text.split("---", 2)
-    if len(parts) < 3:
+    split = _split_frontmatter(text)
+    if split is None:
         return {}
     try:
-        doc = yaml.safe_load(parts[1])
+        doc = yaml.safe_load(split[1])
     except yaml.YAMLError:
         return {}
     return doc if isinstance(doc, dict) else {}
@@ -63,12 +83,11 @@ def set_frontmatter_status(path: Path, status: str) -> bool:
     if not path.is_file():
         return False
     text = path.read_text(encoding="utf-8")
-    if not text.startswith("---"):
+    split = _split_frontmatter(text)
+    if split is None:
         return False
-    parts = text.split("---", 2)
-    if len(parts) < 3:
-        return False
-    block_lines = parts[1].splitlines(keepends=True)
+    before, block, after = split
+    block_lines = block.splitlines(keepends=True)
     replaced = False
     for i, line in enumerate(block_lines):
         stripped = line.lstrip()
@@ -80,7 +99,7 @@ def set_frontmatter_status(path: Path, status: str) -> bool:
             break
     if not replaced:
         return False
-    rebuilt = parts[0] + "---" + "".join(block_lines) + "---" + parts[2]
+    rebuilt = before + "".join(block_lines) + after
     if rebuilt == text:  # already at the target value — idempotent no-op
         return False
     path.write_text(rebuilt, encoding="utf-8")

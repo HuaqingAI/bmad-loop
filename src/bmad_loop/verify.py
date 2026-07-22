@@ -18,7 +18,7 @@ from typing import Any
 from . import deferredwork
 from .bmadconfig import ProjectPaths
 from .frontmatter import set_frontmatter_status  # noqa: F401 — re-export
-from .frontmatter import read_frontmatter, status_of
+from .frontmatter import _split_frontmatter, read_frontmatter, status_of
 from .model import StoryTask, VerifyOutcome
 from .policy import POLICY_FILE, Policy
 from .sprintstatus import story_status
@@ -918,12 +918,11 @@ def set_frontmatter_field(path: Path, key: str, value: str) -> bool:
     if not path.is_file():
         return False
     text = path.read_text(encoding="utf-8")
-    if not text.startswith("---"):
+    split = _split_frontmatter(text)
+    if split is None:
         return False
-    parts = text.split("---", 2)
-    if len(parts) < 3:
-        return False
-    block_lines = parts[1].splitlines(keepends=True)
+    before, block, after = split
+    block_lines = block.splitlines(keepends=True)
     replaced = False
     for i, line in enumerate(block_lines):
         stripped = line.lstrip()
@@ -935,7 +934,7 @@ def set_frontmatter_field(path: Path, key: str, value: str) -> bool:
             break
     if not replaced:
         block_lines.append(f"{key}: {value}\n")
-    rebuilt = parts[0] + "---" + "".join(block_lines) + "---" + parts[2]
+    rebuilt = before + "".join(block_lines) + after
     if rebuilt == text:  # already at the target value — idempotent no-op
         return False
     path.write_text(rebuilt, encoding="utf-8")
