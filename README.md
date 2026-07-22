@@ -521,15 +521,16 @@ Two things to know when matching. `message` is **not** contracted — several pr
 
 ### Exit codes
 
-Normal command dispatch and argparse usage errors resolve to one of three released codes — safe to branch on in CI:
+Normal command dispatch, argparse usage errors, and interruption resolve to one of four released codes — safe to branch on in CI:
 
-| Code | Name      | Meaning                                                                                                                                                   |
-| ---- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `0`  | `OK`      | the command did its job                                                                                                                                   |
-| `1`  | `FAILURE` | the command could not do its job — a known error (bad config, git failure, unready project) or an unexpected one; the reason goes to stderr as `error: …` |
-| `2`  | `USAGE`   | the invocation was malformed — an unknown subcommand or bad flag, caught by argument parsing before the command runs                                      |
+| Code  | Name          | Meaning                                                                                                                                                      |
+| ----- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `0`   | `OK`          | the command did its job                                                                                                                                      |
+| `1`   | `FAILURE`     | the command could not do its job — a known error (bad config, git failure, unready project) or an unexpected one; the reason goes to stderr as `error: …`    |
+| `2`   | `USAGE`       | the invocation was malformed — an unknown subcommand or bad flag, caught by argument parsing before the command runs                                         |
+| `130` | `INTERRUPTED` | Ctrl+C (SIGINT) interrupted the process outside a run — 128 + signal 2, the shell's convention; a one-line `interrupted` notice goes to stderr, no traceback |
 
-No `ExitCode` values `≥3` are assigned yet. The one path outside this table is **interruption**: Ctrl+C (SIGINT) terminates the process with **130** — today as a bare traceback; a follow-up ([#241](https://github.com/bmad-code-org/bmad-loop/issues/241) PR 2) replaces that with a clean one-line message, but the code stays 130. The names come from the `ExitCode` enum in `bmad_loop.cli`.
+No `ExitCode` values `3`–`129` or `≥131` are assigned yet. `INTERRUPTED` (`130`) covers only a Ctrl+C that lands **outside** a run — during config load or engine construction; a Ctrl+C **during** a run is caught by the engine and finalized as a clean, resumable `stopped` run, which exits `0`. The names come from the `ExitCode` enum in `bmad_loop.cli`.
 
 One caveat repeated from above: a `--json` command reporting a **verdict** exits `1` to _carry_ that verdict, not because the command broke — `validate --json` on an unready project exits `1` but still prints its whole document. So for those commands read the document's own field (`ok`), not the exit status; `1` conflates "the checks failed" with "the command failed". For everything else, `0` vs non-zero is the answer.
 

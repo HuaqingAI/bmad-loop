@@ -81,14 +81,21 @@ class ExitCode(IntEnum):
     - ``USAGE`` — an argparse usage error (unknown subcommand, bad flag). argparse
       raises ``SystemExit(2)`` before dispatch, so this names its number rather than
       being returned here.
+    - ``INTERRUPTED`` — Ctrl+C (SIGINT) escaped ``main()`` outside ``engine.run()``
+      (config load, engine construction, a handler with no run loop). 130 = 128 +
+      SIGINT(2), the shell's conventional code for an interrupt; uncaught this path
+      already reached 130 (CPython re-raises SIGINT) but as a bare traceback, so
+      ``main()`` catches it for a clean one-line exit at the same code. The in-run
+      interrupt converts to a clean ``RunStopped`` (``engine.py``) and never reaches
+      here — a Ctrl+C during a run stays rc 0.
 
-    Codes ``3+`` are intentionally absent until a consumer needs one. ``INTERRUPTED``
-    (Ctrl+C → 130) is deferred to its own change; today that path is unchanged.
+    Codes ``3``–``129`` and ``131+`` are intentionally absent until a consumer needs one.
     """
 
     OK = 0
     FAILURE = 1
     USAGE = 2
+    INTERRUPTED = 130
 
 
 def _project(args: argparse.Namespace) -> Path:
@@ -2601,6 +2608,17 @@ def main(argv: list[str] | None = None) -> int:
     ) as e:
         print(f"error: {e}", file=sys.stderr)
         return ExitCode.FAILURE
+    except KeyboardInterrupt:
+        # Ctrl+C on the residual surface outside engine.run() (config load, engine
+        # construction, a handler with no run loop). A KeyboardInterrupt is a
+        # BaseException, so the broad `except Exception` below never caught it.
+        # Uncaught it already ends at 130 — CPython re-raises SIGINT (128+2) — but as
+        # death-by-signal with a bare traceback dumped after any partial --json stdout.
+        # Catch it for a clean, intentional exit(130): one line on stderr, nothing on
+        # stdout. The in-run interrupt is engine.run()'s own clean RunStopped (see
+        # engine.py) and never reaches here.
+        print("interrupted", file=sys.stderr)
+        return ExitCode.INTERRUPTED
     except Exception as e:
         # backstop for the residual surface outside engine.run() (config load,
         # engine construction, render/notify): never let an unexpected exception
