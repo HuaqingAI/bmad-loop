@@ -67,7 +67,11 @@ def _instantiate(manifest: PluginManifest, settings: dict) -> Plugin:
     cls_name = manifest.python.cls  # type: ignore[union-attr]
     cls = getattr(module, cls_name, None)
     if cls is None:
-        raise AttributeError(f"plugin module {manifest.python.module!r} has no {cls_name!r}")
+        # manifest.python is validated non-None before this loader runs (mirrors
+        # the manifest.python.cls access above).
+        raise AttributeError(
+            f"plugin module {manifest.python.module!r} has no {cls_name!r}"  # pyright: ignore[reportOptionalMemberAccess]
+        )
     if not (isinstance(cls, type) and issubclass(cls, Plugin)):
         raise TypeError(f"{cls_name!r} must subclass plugins.Plugin")
     return cls(manifest, settings)

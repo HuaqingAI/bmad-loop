@@ -50,6 +50,8 @@ if TYPE_CHECKING:
     from .adapters.base import CodingCLIAdapter
     from .engine import Engine
     from .policy import Policy
+    from .stories_engine import StoriesEngine
+    from .sweep import SweepEngine
 
 
 # The three adapter roles a run wires. Defined here (the composition layer that
@@ -103,10 +105,11 @@ def make_adapters(project: Path, run_dir: Path, policy) -> dict[str, CodingCLIAd
                     stop_without_result_nudges=cfg.stop_without_result_nudges,
                 )
                 try:
+                    # heterogeneous **kwargs: pyright unions the dict values; per-arg error is spurious
                     by_cfg[key] = (
                         OpencodeDevAdapter(**common, paths=paths)
                         if synthesizes
-                        else OpencodeHttpAdapter(**common)
+                        else OpencodeHttpAdapter(**common)  # pyright: ignore[reportArgumentType]
                     )
                 except OpencodeServerError as e:
                     raise SystemExit(f"error: {e}") from e
@@ -135,10 +138,11 @@ def make_adapters(project: Path, run_dir: Path, policy) -> dict[str, CodingCLIAd
                     stop_without_result_nudges=cfg.stop_without_result_nudges,
                     mux=mux,
                 )
+                # heterogeneous **kwargs: pyright unions the dict values; per-arg error is spurious
                 by_cfg[key] = (
                     GenericDevAdapter(**common, paths=paths)
                     if synthesizes
-                    else GenericAdapter(**common)
+                    else GenericAdapter(**common)  # pyright: ignore[reportArgumentType]
                 )
         adapters[role] = by_cfg[key]
     return adapters
@@ -342,7 +346,7 @@ def compose_run(
     sweep_factory: Callable[[str], None],
     make_adapters: Callable[[Path, Path, Policy], dict[str, CodingCLIAdapter]],
     engine_cls: type[Engine],
-    stories_engine_cls: type[Engine],
+    stories_engine_cls: type[StoriesEngine],
 ) -> ComposedRun:
     """Stand up a run: allocate the run dir, persist state + pid, build the
     adapters, and wire the engine — everything ``cmd_run`` did inline between its
@@ -388,10 +392,11 @@ def compose_run(
         story_filter=story_filter,
         sweep_factory=sweep_factory,
     )
+    # heterogeneous **kwargs: pyright unions the dict values; per-arg error is spurious
     engine: Engine = (
         stories_engine_cls(**common, spec_folder=spec_folder)
         if stories_on
-        else engine_cls(**common)
+        else engine_cls(**common)  # pyright: ignore[reportArgumentType]
     )
     return ComposedRun(engine=engine, run_id=run_id, run_dir=run_dir, state=state, journal=journal)
 
@@ -409,7 +414,7 @@ def compose_sweep(
     max_cycles: int | None,
     trigger: str,
     make_adapters: Callable[[Path, Path, Policy], dict[str, CodingCLIAdapter]],
-    sweep_engine_cls: type[Engine],
+    sweep_engine_cls: type[SweepEngine],
 ) -> ComposedRun:
     """Stand up a sweep run: allocate the run dir, persist state + pid, record the
     sweep options, build the adapters, and wire the ``SweepEngine`` — everything
@@ -478,8 +483,8 @@ def compose_resume(
     sweep_factory: Callable[[str], None],
     make_adapters: Callable[[Path, Path, Policy], dict[str, CodingCLIAdapter]],
     engine_cls: type[Engine],
-    stories_engine_cls: type[Engine],
-    sweep_engine_cls: type[Engine],
+    stories_engine_cls: type[StoriesEngine],
+    sweep_engine_cls: type[SweepEngine],
 ) -> ComposedRun:
     """Rebuild the engine for a paused/interrupted run and return it ready to
     :meth:`run` — the adapter build + engine selection ``cli._resume_paused_run``
@@ -540,10 +545,11 @@ def compose_resume(
         )
         # stories mode is pinned in run state at launch, so resume rebuilds the
         # same picker (StoriesEngine) without any flag.
+        # heterogeneous **kwargs: pyright unions the dict values; per-arg error is spurious
         engine = (
             stories_engine_cls(**story_common, spec_folder=state.spec_folder)
             if state.source == "stories"
-            else engine_cls(**story_common)
+            else engine_cls(**story_common)  # pyright: ignore[reportArgumentType]
         )
     return ComposedRun(
         engine=engine, run_id=run_dir.name, run_dir=run_dir, state=state, journal=journal

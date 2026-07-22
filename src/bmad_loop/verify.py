@@ -635,13 +635,19 @@ def worktree_add(
 ) -> None:
     """Check `branch` out in a new worktree at `path` (which must not exist).
 
-    create=True (default) cuts a fresh `branch` at `base`. create=False mounts an
+    create=True (default) cuts a fresh `branch` at `base`, or from HEAD when
+    `base` is None (git's own default start-point). create=False mounts an
     existing `branch` (used to re-mount a shared run branch across serial units);
     `base` is ignored. Either way the branch must not already be checked out in
     another worktree — git refuses that.
     """
     if create:
-        rc, out = _git(repo, "worktree", "add", "-b", branch, str(path), base)
+        # `git worktree add -b <branch> <path> [<base>]`: cut the new branch at the
+        # caller's start-point, or from HEAD when none is given (git's own default).
+        cmd = ["worktree", "add", "-b", branch, str(path)]
+        if base is not None:
+            cmd.append(base)
+        rc, out = _git(repo, *cmd)
     else:
         rc, out = _git(repo, "worktree", "add", str(path), branch)
     if rc != 0:

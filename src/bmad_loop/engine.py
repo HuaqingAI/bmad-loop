@@ -18,7 +18,7 @@ import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from . import deferredwork, devcontract, gates, verify
 from .adapters.base import CodingCLIAdapter, SessionResult, SessionSpec
@@ -58,6 +58,10 @@ from .workspace import (
     open_unit_workspace,
     unit_worktrees_dir,
 )
+
+if TYPE_CHECKING:
+    # Type-only: the worktree-provisioning helpers speak in CLI profiles.
+    from .adapters.profile import CLIProfile
 
 
 class RunPaused(Exception):
@@ -461,7 +465,9 @@ class Engine:
     def _restore_stop_signals(self) -> None:
         for sig, prev in self._prev_handlers.items():
             try:
-                signal.signal(sig, prev)
+                # prev is a prior OS handler from signal.signal(); the dict is
+                # object-typed to avoid importing the private stdlib _HANDLER alias.
+                signal.signal(sig, prev)  # pyright: ignore[reportArgumentType]
             except (ValueError, TypeError):
                 pass
         self._prev_handlers.clear()
@@ -527,11 +533,11 @@ class Engine:
         self.journal.append("target-branch", branch=self.state.target_branch)
         self._save()
 
-    def _worktree_profiles(self):
+    def _worktree_profiles(self) -> list[CLIProfile]:
         """The distinct CLI profiles of the dev + review adapters, for provisioning
         their skills/hooks into a worktree. Adapters without a `profile` (e.g. test
         fakes) contribute nothing, so provisioning is a no-op for them."""
-        seen: dict[str, object] = {}
+        seen: dict[str, CLIProfile] = {}
         for adapter in (self.adapters["dev"], self.adapters["review"]):
             profile = getattr(adapter, "profile", None)
             if profile is not None and profile.name not in seen:
@@ -2712,10 +2718,13 @@ class Engine:
             "post_session",
             task,
             role=role,
-            session_status=result.status,
-            result_json=result.result_json,
+            # Reaching here means `adapter.run` returned (a non-None SessionResult)
+            # rather than raising past the finally, but pyright can't prove that
+            # through the try/finally, so it keeps `result` widened to | None.
+            session_status=result.status,  # pyright: ignore[reportOptionalMemberAccess]
+            result_json=result.result_json,  # pyright: ignore[reportOptionalMemberAccess]
         )
-        return result
+        return result  # pyright: ignore[reportReturnType]
 
     def _dev_prompt(self, task: StoryTask, feedback: Path | None) -> str:
         return self._generic_dev_prompt(task, feedback)

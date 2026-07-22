@@ -67,3 +67,18 @@ target-version = ["py311"]
 [tool.isort]
 profile = "black"
 line_length = 100
+
+[tool.pyright]
+# Stage 1 of #245 (assessment F-4): a basic-mode type-check gate so annotation
+# drift stops being invisible. Verified against pyright 1.1.411 docs.
+include = ["src/bmad_loop"]
+# data/ ships skill assets + hook scripts that are templates / stand-alone (not
+# part of the package's import graph); type-checking them is noise.
+exclude = ["src/bmad_loop/data"]
+typeCheckingMode = "basic"
+# Check against the floor of requires-python so we never lean on 3.12+ typing.
+pythonVersion = "3.11"
+# Resolve third-party imports from the uv-managed project venv (created by
+# `uv sync` locally and in CI), so optional-extra imports aren't false misses.
+venvPath = "."
+venv = ".venv"

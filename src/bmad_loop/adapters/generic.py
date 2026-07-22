@@ -88,6 +88,10 @@ class _ResultFileMixin:
     any adapter whose skill writes ``tasks/<task_id>/result.json``; needs
     only ``self.tasks_dir``."""
 
+    # Set by the concrete adapter's __init__; bare annotation (no runtime effect)
+    # tells the type checker the host attribute this mixin reads.
+    tasks_dir: Path
+
     def _result_json(self, handle: SessionHandle, spec: SessionSpec, *, wait: bool) -> dict | None:
         """Acquire this session's result dict. Base behavior: read the
         skill-written ``result.json`` (briefly awaiting it on the Stop event,
@@ -875,6 +879,11 @@ class _DevSynthesisMixin(_ResultFileMixin):
     synthesizes the legacy result dict via :mod:`devcontract`. Hosts provide
     ``self.paths`` (a :class:`ProjectPaths`), the ``self.policy`` knobs read
     by ``_configure_dev_knobs``, and the ``_probe_alive`` liveness seam."""
+
+    # Set by the concrete adapter's __init__ (see docstring); bare annotations
+    # (no runtime effect) tell the type checker the host attributes this reads.
+    paths: ProjectPaths
+    policy: Policy
 
     def _configure_dev_knobs(self) -> None:
         """Override the base result-file knobs for the bmad-dev-auto contract;

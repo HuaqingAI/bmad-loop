@@ -403,7 +403,11 @@ class SettingsScreen(Screen[None]):
                 return False
             return True
         if isinstance(desired, list):
-            return [str(item) for item in current] != desired
+            # `current` pairs with a list `desired` here; its static type is the
+            # heterogeneous `object` setting supertype, but at runtime it is a list.
+            return [
+                str(item) for item in current  # pyright: ignore[reportGeneralTypeIssues]
+            ] != desired
         return current != desired
 
     def _save_enabled(self) -> None:
