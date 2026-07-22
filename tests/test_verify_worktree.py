@@ -63,6 +63,18 @@ def test_worktree_add_list_remove(project, tmp_path):
     assert wt.resolve() not in [p.resolve() for p in verify.worktree_list(repo)]
 
 
+def test_worktree_add_create_defaults_to_head(project, tmp_path):
+    """create=True with no `base` cuts the branch from HEAD (git's own default)
+    instead of passing None into git and crashing."""
+    repo = project.project
+    head = verify.rev_parse_head(repo)
+    wt = tmp_path / "wt-head"
+
+    verify.worktree_add(repo, wt, "feat", create=True)
+    assert verify.branch_exists(repo, "feat")
+    assert verify.rev_parse_head(wt) == head
+
+
 def test_worktree_add_existing_path_raises(project, tmp_path):
     wt = tmp_path / "wt"
     wt.mkdir()
