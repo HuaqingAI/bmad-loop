@@ -107,6 +107,37 @@ def test_set_frontmatter_field_replaces_inserts_idempotent(tmp_path):
     assert verify.set_frontmatter_field(bare, "baseline_revision", "abc123") is False
 
 
+def test_set_frontmatter_status_preserves_triple_dash_in_value(tmp_path):
+    """A `---` inside a scalar is not the closing delimiter: status flips and the
+    ---bearing title + body survive (a plain split("---", 2) corrupted this)."""
+    spec = tmp_path / "spec.md"
+    spec.write_text(
+        "---\ntitle: 'restore --- review'\nstatus: in-review\n---\nbody text\n",
+        encoding="utf-8",
+    )
+    assert verify.set_frontmatter_status(spec, "done") is True
+    fm = verify.read_frontmatter(spec)
+    assert fm["status"] == "done"
+    assert fm["title"] == "restore --- review"  # scalar with --- intact
+    assert "body text" in spec.read_text(encoding="utf-8")
+
+
+def test_set_frontmatter_field_preserves_triple_dash_in_value(tmp_path):
+    """Inserting a field appends before the real standalone closing `---`, not
+    inside a scalar that merely contains `---` (which the old split corrupted)."""
+    spec = tmp_path / "spec.md"
+    spec.write_text(
+        "---\ntitle: 'restore --- review'\nstatus: done\n---\nbody text\n",
+        encoding="utf-8",
+    )
+    assert verify.set_frontmatter_field(spec, "baseline_revision", "abc123") is True
+    fm = verify.read_frontmatter(spec)
+    assert fm["baseline_revision"] == "abc123"
+    assert fm["title"] == "restore --- review"
+    assert fm["status"] == "done"
+    assert "body text" in spec.read_text(encoding="utf-8")
+
+
 # ----------------------------------------------------------- build_context
 
 
