@@ -2765,6 +2765,28 @@ def test_resume_restamps_policy_snapshot_for_sweep_runs(project, monkeypatch):
     assert load_state(run_dir).cache_read_weight() == 0.5
 
 
+def test_resume_tolerates_a_corrupt_sweep_json(project, monkeypatch):
+    """A torn/corrupt sweep.json (a crash mid-write on an older run) must not abort
+    resume — the recovery path. compose_resume guards the read and falls back to the
+    same launch defaults as the missing-file arm instead of letting json.loads raise."""
+    run_dir = _paused_run_for_resume(project, monkeypatch, run_type="sweep")
+    (run_dir / "sweep.json").write_text("{ not json", encoding="utf-8")
+
+    captured: dict = {}
+
+    class _CapturingSweep(_StubEngine):
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(cli, "SweepEngine", _CapturingSweep)
+
+    # resume does not raise, and the sweep is rebuilt with default options
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+    assert captured["prompting"] is False
+    assert captured["decisions_only"] is False
+    assert captured["max_bundles"] is None
+
+
 def test_resume_stamps_a_legacy_run_with_no_snapshot(project, monkeypatch):
     """A run persisted before policy_snapshot existed carries `{}` and displays at
     the hardcoded 0.1 default. Its first resume stamps it — and must not report

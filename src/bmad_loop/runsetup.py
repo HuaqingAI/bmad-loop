@@ -41,6 +41,7 @@ from . import runs
 from .checks import Finding
 from .journal import Journal, save_state
 from .model import RunState
+from .platform_util import atomic_replace
 from .runs import RUNS_DIR
 
 if TYPE_CHECKING:
@@ -439,7 +440,13 @@ def compose_sweep(
         "max_cycles": max_cycles,
         "trigger": trigger,
     }
-    (run_dir / "sweep.json").write_text(json.dumps(options, indent=2), encoding="utf-8")
+    # Persist the sweep options atomically (tmp + os.replace), the way save_state
+    # writes state.json: a resume reads this back to rebuild the SweepEngine, so a
+    # crash mid-write must not leave a torn file the recovery path then chokes on.
+    sweep_path = run_dir / "sweep.json"
+    sweep_tmp = sweep_path.with_suffix(".json.tmp")
+    sweep_tmp.write_text(json.dumps(options, indent=2), encoding="utf-8")
+    atomic_replace(sweep_tmp, sweep_path)
     adapters = make_adapters(project, run_dir, policy)
     journal.append("run-start", run_id=run_id, run_type="sweep", trigger=trigger)
     engine: Engine = sweep_engine_cls(
@@ -493,7 +500,13 @@ def compose_resume(
     adapters = make_adapters(project, run_dir, policy)
     if state.run_type == "sweep":
         opts_path = run_dir / "sweep.json"
-        opts = json.loads(opts_path.read_text(encoding="utf-8")) if opts_path.is_file() else {}
+        try:
+            opts = json.loads(opts_path.read_text(encoding="utf-8")) if opts_path.is_file() else {}
+        except (OSError, json.JSONDecodeError):
+            # A torn/corrupt sweep.json (crash mid-write on an older run) must not
+            # abort the recovery path — fall back to the same launch defaults as
+            # the missing-file arm, mirroring tui.data's tolerant run-dir reads.
+            opts = {}
         engine: Engine = sweep_engine_cls(
             paths=paths,
             policy=policy,
