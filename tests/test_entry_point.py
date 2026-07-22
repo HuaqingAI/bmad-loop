@@ -117,3 +117,27 @@ def test_exit_argparse_usage_error_is_2(capsys):
         cli.main(["definitely-not-a-command"])
     assert excinfo.value.code == 2
     assert "invalid choice" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------- ExitCode enum
+
+
+def test_exit_code_enum_values():
+    """``ExitCode`` names the released rc numbers — the values are the contract, so
+    pin them literally (a rename is fine; a renumber is a breaking change)."""
+    assert cli.ExitCode.OK == 0
+    assert cli.ExitCode.FAILURE == 1
+    assert cli.ExitCode.USAGE == 2
+
+
+def test_exit_code_enum_has_no_codes_3_plus():
+    """Only OK/FAILURE/USAGE exist yet — codes 3+ (and INTERRUPTED=130) are deferred
+    until a consumer needs them, so guard against one sneaking in early."""
+    assert {c.value for c in cli.ExitCode} == {0, 1, 2}
+
+
+def test_exit_code_enum_is_int_returnable():
+    """``main() -> int`` and ``sys.exit`` both consume the members transparently:
+    an ``IntEnum`` member *is* its int, so the failure paths can return it as-is."""
+    assert isinstance(cli.ExitCode.FAILURE, int)
+    assert cli.ExitCode.FAILURE == 1
