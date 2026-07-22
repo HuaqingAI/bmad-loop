@@ -15,11 +15,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 from . import deferredwork
 from .bmadconfig import ProjectPaths
-from .model import StoryTask
+from .frontmatter import set_frontmatter_status  # noqa: F401 — re-export
+from .frontmatter import read_frontmatter, status_of
+from .model import StoryTask, VerifyOutcome
 from .policy import POLICY_FILE, Policy
 from .sprintstatus import story_status
 
@@ -64,38 +64,6 @@ AUTOMATOR_DIR_REL = POLICY_FILE.parent.as_posix()
 
 class GitError(Exception):
     pass
-
-
-@dataclass(frozen=True)
-class VerifyOutcome:
-    ok: bool
-    reason: str = ""
-    severity: str = ""  # "" | "CRITICAL" | "PREFERENCE" — set when not retryable
-    # fixable failures carry concrete evidence (failing command output) that a
-    # feedback-driven repair session can act on; non-fixable retries start over
-    fixable: bool = False
-    # the failure is the run environment's, not the story's (verify command
-    # not found / not executable): no repair session can fix it and every
-    # story shares the same commands, so it must never charge attempt budgets
-    env_fault: bool = False
-
-    @classmethod
-    def passed(cls) -> "VerifyOutcome":
-        return cls(ok=True)
-
-    @classmethod
-    def retry(cls, reason: str, fixable: bool = False) -> "VerifyOutcome":
-        return cls(ok=False, reason=reason, fixable=fixable)
-
-    @classmethod
-    def escalate(
-        cls, reason: str, severity: str = "CRITICAL", env_fault: bool = False
-    ) -> "VerifyOutcome":
-        return cls(ok=False, reason=reason, severity=severity, env_fault=env_fault)
-
-    @property
-    def retryable(self) -> bool:
-        return not self.ok and not self.severity
 
 
 def _run_git(
@@ -933,77 +901,6 @@ def capture_diff(repo: Path, baseline: str, *, max_file_bytes: int | None = None
             )
         parts.append(u.stdout)
     return "".join(parts)
-
-
-def read_frontmatter(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        return {}
-    try:
-        text = path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        # A non-UTF-8 file carries no readable frontmatter — degrade exactly like
-        # unparseable YAML below. Every status gate then reads status "" and
-        # returns a clean retry/repair outcome instead of crashing mid-verify
-        # (UnicodeDecodeError is a ValueError, so it slipped past callers'
-        # except-OSError guards).
-        return {}
-    if not text.startswith("---"):
-        return {}
-    parts = text.split("---", 2)
-    if len(parts) < 3:
-        return {}
-    try:
-        doc = yaml.safe_load(parts[1])
-    except yaml.YAMLError:
-        return {}
-    return doc if isinstance(doc, dict) else {}
-
-
-def status_of(fm: dict[str, Any]) -> str:
-    """Normalized spec status from a frontmatter dict: stripped + lowercased.
-
-    The single point all spec-frontmatter status gates read through, so casing
-    never decides a gate — the spec template and sprint-status tokens are
-    lowercase, so a stray ``Done``/``In-Review`` from a hand-edited spec still
-    matches. (``devcontract`` keeps its own lowercasing; it parses skill-written
-    prose where casing genuinely varies.)
-    """
-    return str(fm.get("status", "")).strip().lower()
-
-
-def set_frontmatter_status(path: Path, status: str) -> bool:
-    """Rewrite the `status:` field in a spec's `---`…`---` frontmatter block.
-
-    A minimal in-place line replacement (not a YAML round-trip) so the spec's
-    formatting, comments, and field order survive — only the status value
-    changes. Returns True when the file was rewritten, False when it has no
-    frontmatter or already carries `status`. Idempotent.
-    """
-    if not path.is_file():
-        return False
-    text = path.read_text(encoding="utf-8")
-    if not text.startswith("---"):
-        return False
-    parts = text.split("---", 2)
-    if len(parts) < 3:
-        return False
-    block_lines = parts[1].splitlines(keepends=True)
-    replaced = False
-    for i, line in enumerate(block_lines):
-        stripped = line.lstrip()
-        if stripped.startswith("status:") and not stripped.startswith("status_"):
-            indent = line[: len(line) - len(stripped)]
-            newline = "\n" if line.endswith("\n") else ""
-            block_lines[i] = f"{indent}status: {status}{newline}"
-            replaced = True
-            break
-    if not replaced:
-        return False
-    rebuilt = parts[0] + "---" + "".join(block_lines) + "---" + parts[2]
-    if rebuilt == text:  # already at the target value — idempotent no-op
-        return False
-    path.write_text(rebuilt, encoding="utf-8")
-    return True
 
 
 def set_frontmatter_field(path: Path, key: str, value: str) -> bool:

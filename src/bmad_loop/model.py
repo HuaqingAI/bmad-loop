@@ -458,3 +458,35 @@ class RunState:
             plugin_shared=dict(d.get("plugin_shared", {})),
             tasks={k: StoryTask.from_dict(t) for k, t in d.get("tasks", {}).items()},
         )
+
+
+@dataclass(frozen=True)
+class VerifyOutcome:
+    ok: bool
+    reason: str = ""
+    severity: str = ""  # "" | "CRITICAL" | "PREFERENCE" — set when not retryable
+    # fixable failures carry concrete evidence (failing command output) that a
+    # feedback-driven repair session can act on; non-fixable retries start over
+    fixable: bool = False
+    # the failure is the run environment's, not the story's (verify command
+    # not found / not executable): no repair session can fix it and every
+    # story shares the same commands, so it must never charge attempt budgets
+    env_fault: bool = False
+
+    @classmethod
+    def passed(cls) -> "VerifyOutcome":
+        return cls(ok=True)
+
+    @classmethod
+    def retry(cls, reason: str, fixable: bool = False) -> "VerifyOutcome":
+        return cls(ok=False, reason=reason, fixable=fixable)
+
+    @classmethod
+    def escalate(
+        cls, reason: str, severity: str = "CRITICAL", env_fault: bool = False
+    ) -> "VerifyOutcome":
+        return cls(ok=False, reason=reason, severity=severity, env_fault=env_fault)
+
+    @property
+    def retryable(self) -> bool:
+        return not self.ok and not self.severity
