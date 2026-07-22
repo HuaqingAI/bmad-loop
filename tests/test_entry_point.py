@@ -10,10 +10,10 @@ Two things every other CLI test leaves uncovered:
   Do not convert these to in-process ``cli.main()`` calls; the subprocess *is* the test.
 
 - **Exit-code semantics.** ``main()`` maps the typed error surface and the broad
-  backstop both to rc 1, and argparse usage errors to rc 2 (``cli.py`` dispatch tail).
-  The ``test_exit_*`` cases pin today's rc for each path. They are characterization
-  tests — a guard rail for the later exit-code-taxonomy work (#241) and the cli.py
-  composition extraction (#243), not an endorsement of the current mapping.
+  backstop both to rc 1, argparse usage errors to rc 2, and a Ctrl+C escaping
+  ``engine.run()`` to rc 130 — each named by the ``ExitCode`` enum (#241). The
+  ``test_exit_*`` cases pin the rc for each path, a guard rail for the exit-code
+  taxonomy and the later cli.py composition extraction (#243).
 """
 
 import json
@@ -119,6 +119,27 @@ def test_exit_argparse_usage_error_is_2(capsys):
     assert "invalid choice" in capsys.readouterr().err
 
 
+def test_exit_keyboard_interrupt_is_130(tmp_path, capsys, monkeypatch):
+    """Ctrl+C escaping ``main()`` outside ``engine.run()`` → rc 130 (128+SIGINT), a
+    one-line stderr notice, no traceback. Patched onto the dispatched handler so the
+    raise lands inside the dispatch try — the same escape route a config-load or
+    engine-construction interrupt takes. (The in-run interrupt is ``engine.run()``'s
+    own clean RunStopped, which this PR must not touch — see engine.py.)"""
+
+    def boom(_args):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "cmd_validate", boom)
+    # --json is the strictest stdout contract: a --json command must emit *no* partial
+    # document on interrupt, only the whole document or nothing (machine.py). The raise
+    # lands before any output, so stdout stays empty and stderr carries just the notice.
+    assert cli.main(["validate", "--json", "--project", str(tmp_path)]) == 130
+    captured = capsys.readouterr()
+    assert captured.out == ""  # empty stdout: nothing half-emitted under --json rules
+    assert captured.err == "interrupted\n"  # exactly one line, no stray whitespace
+    assert "Traceback" not in captured.err
+
+
 # --------------------------------------------------------------------- ExitCode enum
 
 
@@ -128,12 +149,13 @@ def test_exit_code_enum_values():
     assert cli.ExitCode.OK == 0
     assert cli.ExitCode.FAILURE == 1
     assert cli.ExitCode.USAGE == 2
+    assert cli.ExitCode.INTERRUPTED == 130
 
 
-def test_exit_code_enum_has_no_codes_3_plus():
-    """Only OK/FAILURE/USAGE exist yet — codes 3+ (and INTERRUPTED=130) are deferred
-    until a consumer needs them, so guard against one sneaking in early."""
-    assert {c.value for c in cli.ExitCode} == {0, 1, 2}
+def test_exit_code_enum_has_only_contracted_codes():
+    """OK/FAILURE/USAGE/INTERRUPTED are the whole contract — codes 3-129 and 131+ are
+    deferred until a consumer needs them, so guard against one sneaking in early."""
+    assert {c.value for c in cli.ExitCode} == {0, 1, 2, 130}
 
 
 def test_exit_code_enum_is_int_returnable():
