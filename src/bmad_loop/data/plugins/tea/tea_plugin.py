@@ -94,7 +94,7 @@ def _review_token(line: str) -> str | None:
     return None
 
 
-def _scan_markdown(text: str, labels: tuple[str, ...], normalize) -> str | None:  # noqa: ANN001
+def _scan_markdown(text: str, labels: tuple[str, ...], normalize) -> str | None:
     """First *concrete* labeled line that yields a verdict. Lines carrying ``{}``
     placeholders or ``|`` table syntax are skipped — they are template scaffolding,
     not a generated decision — so a real artifact's value line is what's read."""
@@ -237,7 +237,7 @@ class TeaPlugin(Plugin):
                 continue
             try:
                 verdict = self._parse_artifact(kind, path)
-            except Exception:  # noqa: BLE001  # nosec B112 - fail-open: a parse error never blocks
+            except Exception:  # nosec B112 - fail-open: a parse error never blocks
                 continue
             if verdict is not None:
                 return verdict

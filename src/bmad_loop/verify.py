@@ -346,7 +346,7 @@ def _prune_refs(
     for name in refs[keep:]:
         try:
             delete(name)
-        except Exception as exc:  # noqa: BLE001 - a git timeout/OSError on one ref
+        except Exception as exc:  # a git timeout/OSError on one ref
             # must not wedge the tail behind it any more than a GitError does; the
             # per-ref best-effort contract holds for the whole subprocess surface
             failed.append(f"{name} ({exc})")

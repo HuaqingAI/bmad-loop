@@ -134,7 +134,7 @@ def _require_httpx():
     """Import httpx lazily — it ships as the ``opencode`` extra, so the
     dep-free core never pays for it (the ``_psutil()`` pattern)."""
     try:
-        import httpx  # noqa: PLC0415  (intentional lazy import — optional extra)
+        import httpx  # intentional lazy import — optional extra
     except ImportError as exc:
         raise OpencodeServerError(
             "the opencode-http adapter needs httpx; "
@@ -340,7 +340,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
         try:
             for _ in range(SPAWN_ATTEMPTS):
                 port = _free_port()
-                process = subprocess.Popen(  # noqa: S603 - argv built from profile
+                process = subprocess.Popen(  # argv built from profile
                     self._serve_argv(resolved, port),
                     cwd=str(spec.cwd),
                     env=env,
@@ -387,7 +387,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
                 try:
                     resp = client.get("/global/health")
                     healthy = resp.status_code == 200 and resp.json().get("healthy") is True
-                except Exception:  # noqa: BLE001 - not up yet (conn refused, junk)
+                except Exception:  # not up yet (conn refused, junk)
                     healthy = False
                 if sess.process.poll() is not None:
                     return False
@@ -461,7 +461,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
             return
         try:
             self._prompt(sess, text)
-        except Exception:  # noqa: BLE001  # nosec B110 - next tick's poll() settles liveness
+        except Exception:  # nosec B110 - next tick's poll() settles liveness
             pass
 
     def _start_sse_reader(self, sess: _ServerSession) -> None:
@@ -500,7 +500,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
                             if sess.sse_stop.is_set():
                                 return
                             self._dispatch_sse(sess, event)
-            except Exception:  # noqa: BLE001  # nosec B110 - reader must never die silently
+            except Exception:  # nosec B110 - reader must never die silently
                 pass
             if sess.sse_stop.is_set():
                 return
@@ -684,7 +684,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
                                 )
                             try:
                                 self.send_text(handle, BUDGET_NUDGE_TEXT)
-                            except Exception:  # noqa: BLE001  # nosec B110 - best-effort nudge
+                            except Exception:  # nosec B110 - best-effort nudge
                                 # a dead/hung server can't take the nudge; the
                                 # grace still arms — the next tick's process
                                 # poll scores a dead server crashed.
@@ -881,7 +881,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
                 return None
             status = resp.json().get(sess.session_id) or {}
             return status.get("type") in ("busy", "retry")
-        except Exception:  # noqa: BLE001 - probe is advisory
+        except Exception:  # probe is advisory
             return None
 
     def _probe_completion(self, sess: _ServerSession) -> bool:
@@ -904,7 +904,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
                     continue
                 done_ms = (info.get("time") or {}).get("completed") or 0
                 completed = max(completed, int(done_ms))
-        except Exception:  # noqa: BLE001 - probe is advisory
+        except Exception:  # probe is advisory
             return False
         if completed > sess.floor_ms:
             sess.floor_ms = completed
@@ -916,7 +916,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
             return
         try:
             sess.client.post(f"/session/{sess.session_id}/abort")
-        except Exception:  # noqa: BLE001  # nosec B110 - abort is best-effort
+        except Exception:  # nosec B110 - abort is best-effort
             pass
 
     # ----------------------------------------------------------------- usage
@@ -933,7 +933,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
             if resp.status_code != 200:
                 return None
             usage = _sum_usage(resp.json())
-        except Exception:  # noqa: BLE001 - sampling is advisory
+        except Exception:  # sampling is advisory
             return None
         return usage.weighted_total(spec.cache_read_weight)
 
@@ -953,7 +953,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
             path.write_text(json.dumps(messages, ensure_ascii=False, indent=2), encoding="utf-8")
             self._usage[sess.session_id] = _sum_usage(messages)
             return str(path)
-        except Exception:  # noqa: BLE001 - usage is metadata, never a gate
+        except Exception:  # usage is metadata, never a gate
             return None
 
     def read_usage(self, result: SessionResult) -> TokenUsage | None:
@@ -980,7 +980,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
         if sess.client is not None:
             try:
                 sess.client.close()
-            except Exception:  # noqa: BLE001  # nosec B110 - closing is best-effort
+            except Exception:  # nosec B110 - closing is best-effort
                 pass
         try:
             sess.log_fh.close()
@@ -1029,7 +1029,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
             # wrapper is gone `/T` can never enumerate the child again.
             try:
                 host.force_kill(process.pid)
-            except Exception:  # noqa: BLE001  # nosec B110 - already-gone races are fine
+            except Exception:  # nosec B110 - already-gone races are fine
                 pass
         else:
             try:
@@ -1041,7 +1041,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
         except subprocess.TimeoutExpired:
             try:
                 host.force_kill(process.pid)
-            except Exception:  # noqa: BLE001  # nosec B110 - already-gone races are fine
+            except Exception:  # nosec B110 - already-gone races are fine
                 pass
             try:
                 process.wait(timeout=self.kill_wait_s)
@@ -1082,7 +1082,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
         for pid in survivors:
             try:
                 host.force_kill(pid)
-            except Exception:  # noqa: BLE001  # nosec B110 - already-gone races are fine
+            except Exception:  # nosec B110 - already-gone races are fine
                 pass
 
     def _atexit_sweep(self) -> None:

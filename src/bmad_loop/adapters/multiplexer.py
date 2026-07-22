@@ -354,13 +354,13 @@ def _load_external_backends() -> None:
     _EXTERNALS_LOADED = True
     try:
         eps = importlib.metadata.entry_points(group=MUX_BACKENDS_GROUP)
-    except Exception as exc:  # noqa: BLE001 — diagnostics path, never crash selection
+    except Exception as exc:  # diagnostics path, never crash selection
         _EXTERNAL_ERRORS["<entry-point scan>"] = f"{type(exc).__name__}: {exc}"
         return
     for ep in eps:
         try:
             ep.load()  # module import runs register_multiplexer(...)
-        except Exception as exc:  # noqa: BLE001 — one bad package must not hide the rest
+        except Exception as exc:  # one bad package must not hide the rest
             _EXTERNAL_ERRORS[ep.name] = f"{type(exc).__name__}: {exc}"
 
 
@@ -442,7 +442,7 @@ def mux_usable(backend: TerminalMultiplexer | None = None) -> bool:
         _FORCED_UNUSABLE_WARNED = True
         try:
             version = backend.version()
-        except Exception:  # noqa: BLE001 — a broken probe must not break the warning
+        except Exception:  # a broken probe must not break the warning
             version = None
         print(
             f"warning: forced multiplexer backend {type(backend).__name__} reports "

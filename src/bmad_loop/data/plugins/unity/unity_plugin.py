@@ -332,7 +332,7 @@ class UnityPlugin(Plugin):
         path = self._probe_pid_path(ctx)
         if path is None:
             return
-        from bmad_loop import runs  # noqa: PLC0415 - lazy: keep import cost off the hot path
+        from bmad_loop import runs  # lazy: keep import cost off the hot path
 
         pid, identity = runs.read_named_pid_identity(path)
         if pid is not None:

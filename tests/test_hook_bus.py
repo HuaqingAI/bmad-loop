@@ -72,7 +72,7 @@ def test_zero_plugin_fast_path():
 
 def test_active_only_for_bound_stages():
     class P(Plugin):
-        def on_pre_commit(self, c):  # noqa: ANN001
+        def on_pre_commit(self, c):
             pass
 
     bus = HookBus(registry_of(py_plugin(P)))
@@ -84,7 +84,7 @@ def test_observe_sees_readonly_context():
     seen = {}
 
     class P(Plugin):
-        def on_pre_story(self, c):  # noqa: ANN001
+        def on_pre_story(self, c):
             seen["story"] = c.story_key
             seen["stage"] = c.stage
 
@@ -95,11 +95,11 @@ def test_observe_sees_readonly_context():
 def test_mutations_pipeline_last_writer_wins():
     # lower priority runs first; the later plugin sees the earlier edit and wins
     class First(Plugin):
-        def on_pre_commit(self, c):  # noqa: ANN001
+        def on_pre_commit(self, c):
             c.proposed_commit_message = "first"
 
     class Second(Plugin):
-        def on_pre_commit(self, c):  # noqa: ANN001
+        def on_pre_commit(self, c):
             assert c.proposed_commit_message == "first"  # sees the earlier edit
             c.proposed_commit_message = "second"
 
@@ -113,11 +113,11 @@ def test_mutations_pipeline_last_writer_wins():
 
 def test_veto_resolves_most_conservative():
     class Skip(Plugin):
-        def on_pre_story(self, c):  # noqa: ANN001
+        def on_pre_story(self, c):
             c.veto("skip", "skip me")
 
     class Pause(Plugin):
-        def on_pre_story(self, c):  # noqa: ANN001
+        def on_pre_story(self, c):
             c.veto("pause", "stop everything")
 
     # registered skip-first; resolution must still pick pause (no short-circuit)
@@ -133,7 +133,7 @@ def test_python_exception_is_isolated_and_disables_instance():
     calls = {"n": 0}
 
     class Boom(Plugin):
-        def on_pre_story(self, c):  # noqa: ANN001
+        def on_pre_story(self, c):
             calls["n"] += 1
             raise RuntimeError("kaboom")
 
@@ -147,7 +147,7 @@ def test_python_exception_is_isolated_and_disables_instance():
 
 def test_baseexception_propagates():
     class Sig(Plugin):
-        def on_pre_story(self, c):  # noqa: ANN001
+        def on_pre_story(self, c):
             raise KeyboardInterrupt("sigint-like")
 
     with pytest.raises(KeyboardInterrupt):
@@ -158,7 +158,7 @@ def test_fail_closed_python_vetoes_on_raise():
     class Strict(Plugin):
         fail_closed = True
 
-        def on_pre_story(self, c):  # noqa: ANN001
+        def on_pre_story(self, c):
             raise RuntimeError("nope")
 
     c = ctx()
@@ -179,7 +179,7 @@ def declarative(stage: str, *, blocking=False, fail_closed=False, name="d") -> L
 def test_declarative_nonzero_exit_vetoes_blocking():
     runs = {}
 
-    def runner(cmd, *, cwd, env, timeout):  # noqa: ANN001
+    def runner(cmd, *, cwd, env, timeout):
         runs["env_stage"] = env["BMAD_LOOP_STAGE"]
         return 3, "build failed"
 
@@ -248,7 +248,7 @@ def test_real_subprocess_runner_reports_exit_code(tmp_path):
 
 def test_shared_persists_across_stages():
     class P(Plugin):
-        def on_pre_dev_phase(self, c):  # noqa: ANN001
+        def on_pre_dev_phase(self, c):
             c.shared["count"] = c.shared.get("count", 0) + 1
 
     bus = HookBus(registry_of(py_plugin(P)))
@@ -265,7 +265,7 @@ class _FakeJournal:
     def __init__(self):
         self.entries: list[dict] = []
 
-    def append(self, kind, **fields):  # noqa: ANN001
+    def append(self, kind, **fields):
         self.entries.append({"kind": kind, **fields})
 
     def kinds(self):
@@ -308,7 +308,7 @@ def test_zero_plugin_run_is_byte_identical(project):
 
 def test_prompt_mutation_reaches_the_session(project):
     class P(Plugin):
-        def on_pre_session(self, c):  # noqa: ANN001
+        def on_pre_session(self, c):
             if c.role == "dev":
                 c.proposed_prompt = "/custom-dev-prompt"
 
@@ -324,7 +324,7 @@ def test_commit_message_mutation_reaches_git(project):
     from conftest import git
 
     class P(Plugin):
-        def on_pre_commit(self, c):  # noqa: ANN001
+        def on_pre_commit(self, c):
             c.proposed_commit_message = f"plugin-authored: {c.story_key}"
 
     engine, _ = make_engine(project, one_story(project), registry_of(py_plugin(P, "msgmut")))
@@ -356,7 +356,7 @@ def test_pre_commit_hook_fires_on_commit_resume(project):
     a plugin's rewrite has to reach the squashed commit."""
 
     class P(Plugin):
-        def on_pre_commit(self, c):  # noqa: ANN001
+        def on_pre_commit(self, c):
             c.proposed_commit_message = f"plugin-authored: {c.story_key}"
 
     reg = registry_of(py_plugin(P, "msgmut"))
@@ -378,7 +378,7 @@ def test_pre_commit_pause_veto_on_commit_resume_escalates(project):
     is the legal move) with the attempt's commits left intact above baseline."""
 
     class P(Plugin):
-        def on_pre_commit(self, c):  # noqa: ANN001
+        def on_pre_commit(self, c):
             c.veto("pause", "halt")
 
     reg = registry_of(py_plugin(P, "vpcommit"))
@@ -398,7 +398,7 @@ def test_pre_commit_pause_veto_on_commit_resume_escalates(project):
 
 def test_veto_defer_routes_to_defer(project):
     class P(Plugin):
-        def on_pre_story(self, c):  # noqa: ANN001
+        def on_pre_story(self, c):
             c.veto("defer", "not now")
 
     engine, _ = make_engine(project, one_story(project), registry_of(py_plugin(P, "vd")))
@@ -410,7 +410,7 @@ def test_veto_defer_routes_to_defer(project):
 
 def test_veto_pause_routes_to_escalation(project):
     class P(Plugin):
-        def on_pre_story(self, c):  # noqa: ANN001
+        def on_pre_story(self, c):
             c.veto("pause", "halt the line")
 
     engine, _ = make_engine(project, one_story(project), registry_of(py_plugin(P, "vp")))
@@ -422,7 +422,7 @@ def test_session_veto_retries_then_defers(project):
     # a vetoed dev session synthesizes status="vetoed"; decide_dev retries within
     # budget, then defers — never silently proceeds.
     class P(Plugin):
-        def on_pre_dev_session(self, c):  # noqa: ANN001
+        def on_pre_dev_session(self, c):
             c.veto("defer", "dev not allowed")
 
     policy = Policy(
@@ -441,7 +441,7 @@ def test_session_veto_retries_then_defers(project):
 
 def test_plugin_exception_does_not_crash_the_run(project):
     class P(Plugin):
-        def on_pre_story(self, c):  # noqa: ANN001
+        def on_pre_story(self, c):
             raise RuntimeError("plugin bug")
 
     engine, _ = make_engine(project, one_story(project), registry_of(py_plugin(P, "buggy")))
@@ -452,10 +452,10 @@ def test_plugin_exception_does_not_crash_the_run(project):
 
 def test_shared_state_persists_into_run_state(project):
     class P(Plugin):
-        def on_pre_story(self, c):  # noqa: ANN001
+        def on_pre_story(self, c):
             c.shared["seen_story"] = c.story_key
 
-        def on_post_commit(self, c):  # noqa: ANN001, E301
+        def on_post_commit(self, c):
             c.shared["committed"] = True
 
     engine, _ = make_engine(project, one_story(project), registry_of(py_plugin(P, "sh")))

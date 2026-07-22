@@ -271,7 +271,7 @@ class RecoveryFlow:
         ):
             try:
                 deleted = prune(workspace.root, keep)
-            except Exception as exc:  # noqa: BLE001 - housekeeping must never crash the
+            except Exception as exc:  # housekeeping must never crash the
                 # run: a git timeout/OSError here would otherwise escape to the crash
                 # handler, so anything beyond the expected GitError is journalled too
                 # A partial prune (PrunePreserveError) already deleted refs before one

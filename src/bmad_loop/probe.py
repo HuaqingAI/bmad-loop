@@ -611,7 +611,7 @@ def probe(
     mux = get_multiplexer()
     try:
         mux_ready = bool(mux.available())
-    except Exception:  # noqa: BLE001 — a raising host probe means "cannot probe", not a crash
+    except Exception:  # a raising host probe means "cannot probe", not a crash
         mux_ready = False
     if not mux_ready or not shutil.which(binary):
         # finding.binary, not the raw local — see the identical note in scan()

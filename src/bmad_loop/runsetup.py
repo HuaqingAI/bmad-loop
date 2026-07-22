@@ -121,7 +121,7 @@ def make_adapters(project: Path, run_dir: Path, policy) -> dict[str, CodingCLIAd
                     if not mux_usable(mux):
                         try:
                             version = mux.version()
-                        except Exception:  # noqa: BLE001 — diagnosing must not mask the refusal
+                        except Exception:  # diagnosing must not mask the refusal
                             version = None
                         raise SystemExit(
                             f"error: multiplexer backend {type(mux).__name__} is not usable on "
@@ -203,12 +203,12 @@ def platform_preflight() -> list[Finding]:
                     {"backend": label, "available": False, "version": version},
                 )
             )
-    except Exception as e:  # noqa: BLE001 — selection or readiness must not abort validate
+    except Exception as e:  # selection or readiness must not abort validate
         found.append(Finding("mux.preflight", "problem", f"multiplexer preflight failed: {e}"))
 
     try:
         infos = detect_multiplexers()
-    except Exception:  # noqa: BLE001 — detection is advisory; never break validate
+    except Exception:  # detection is advisory; never break validate
         infos = []
     if len(infos) > 1:  # a lone tmux needs no listing; keep single-backend output stable
         listed = ", ".join(
@@ -280,7 +280,7 @@ def platform_preflight() -> list[Finding]:
     try:
         host = type(get_process_host()).__name__
         found.append(Finding("host.process", "ok", f"process host: {host}", {"host": host}))
-    except Exception as e:  # noqa: BLE001 — a bad BMAD_LOOP_PROCESS_HOST must report, not crash
+    except Exception as e:  # a bad BMAD_LOOP_PROCESS_HOST must report, not crash
         found.append(Finding("host.process", "problem", f"process host preflight failed: {e}"))
 
     return found

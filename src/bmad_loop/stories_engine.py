@@ -682,5 +682,5 @@ class StoriesEngine(Engine):
                     break  # a blocked story stops the scan; the rest is unreachable
                 remaining += 1  # actionable
             return remaining
-        except Exception:  # noqa: BLE001 - a hint must never break the stop
+        except Exception:  # a hint must never break the stop
             return None
