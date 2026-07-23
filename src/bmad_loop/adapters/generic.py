@@ -27,6 +27,7 @@ import json
 import re
 import shlex
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -123,6 +124,25 @@ BUDGET_NUDGE_TEXT = (
     "and end your turn. Note: a prose reply cannot end this session — only the "
     "completion artifact does; if you cannot finish, mark the work blocked in it "
     "and end your turn."
+)
+# Targeted contract-repair nudge (#276 M4): a Stop found the spec at
+# {spec_path} finalized to terminal frontmatter status {status} but WITHOUT the
+# `## Auto Run Result` section bmad-loop's harvest scan keys on. Ask the skill to
+# append that section itself so the omission is fixed at the source (a compliant
+# append is then harvested by the normal scan; harness-side frontmatter synthesis
+# stays the backstop). Sent at most once per session and never re-armed, so it is
+# safe to be specific and directive. Guarded ("if this spec is not yours or the
+# work is unfinished") so a session legitimately mid-workflow is not derailed.
+CONTRACT_NUDGE_TEXT = (
+    "You are running in bmad-loop automation mode. The spec at {spec_path} now "
+    "carries a terminal frontmatter `status: {status}`, but it is missing the "
+    "`## Auto Run Result` section your contract requires — bmad-loop harvests "
+    "that section, not the frontmatter, so without it this finished story looks "
+    "unfinished. If this spec is yours and the work is done, append the section "
+    "to the spec now — the `## Auto Run Result` heading, a `Status: {status}` "
+    "line matching the frontmatter, and a brief summary — then end your turn. If "
+    "this spec is not yours, or the work is not actually finished, ignore this "
+    "and continue your workflow instead."
 )
 
 
@@ -1001,6 +1021,12 @@ class _DevSynthesisMixin(_ResultFileMixin):
     # (no runtime effect) tell the type checker the host attributes this reads.
     paths: ProjectPaths
     policy: Policy
+    # The concrete adapter's real transport (GenericDevAdapter/OpencodeDevAdapter
+    # both define `def send_text`). Declared here as a BARE annotation, never a
+    # `def`: the mixin precedes the concrete adapter in MRO, so a stub method
+    # would shadow the real one on both adapters. The contract nudge (#276 M4)
+    # sends through it.
+    send_text: Callable[[SessionHandle, str], None]
 
     def _configure_dev_knobs(self) -> None:
         """Override the base result-file knobs for the bmad-dev-auto contract;
@@ -1025,6 +1051,13 @@ class _DevSynthesisMixin(_ResultFileMixin):
         # session wrote it. Same lifetime doctrine as `_fm_fallback_obs` — task_ids
         # are unique per session, so entries are recorded once and never cleared.
         self._fm_transition_obs: dict[str, str] = {}
+        # Targeted contract-nudge budget (#276 M4): task_ids that have already been
+        # sent the one CONTRACT_NUDGE_TEXT nudge. A set, never cleared, so the nudge
+        # fires at most once per session even though an mtime bump resets the
+        # `_fm_fallback_obs` observation counter to 1 (#149's refill hazard cannot
+        # apply — this budget is not a counter and touches no stall counters).
+        self._contract_nudge_sent: set[str] = set()
+        self._contract_nudge_enabled = self.policy.limits.dev_contract_nudge
 
     def _probe_alive(self, handle: SessionHandle) -> bool | None:
         """Liveness of the session's native surface (tmux window, server
@@ -1172,6 +1205,17 @@ class _DevSynthesisMixin(_ResultFileMixin):
         an already-stable fingerprint but never records observations or
         breadcrumbs; the hash gate is the one wait=False path that leaves a crumb,
         and only under a dead window (``frontmatter-unmodified-refused``).
+
+        On the FIRST ``terminal-frontmatter-pending`` observation (wait=True, one
+        candidate, not the hash-gate refusal, transition not yet proven) it also
+        fires the #276 M4 contract nudge when ``limits.dev_contract_nudge`` is on:
+        one ``CONTRACT_NUDGE_TEXT`` send asking the skill to append the marker it
+        owed, then repair at the source rather than only synthesizing here. It is
+        bounded by the never-cleared ``_contract_nudge_sent`` set (marked before
+        the send, ``MultiplexerError`` swallowed) — exactly once per session,
+        touching no stall counters, so an mtime bump that resets ``observations``
+        to 1 never re-nudges. A compliant append is harvested by the ordinary
+        marker scan on a later Stop, leaving synthesis as the backstop.
         """
         task_id = handle.task_id
         candidates: list[Path] = []
@@ -1282,6 +1326,31 @@ class _DevSynthesisMixin(_ResultFileMixin):
                 f"{path} frontmatter status={fm_status!r} with no '## Auto Run Result'"
                 f" marker; observation {observations}/{FM_FALLBACK_MIN_OBS} before synthesis",
             )
+            # Contract nudge (#276 M4): at the FIRST pending observation, ask the
+            # skill to append the `## Auto Run Result` section it owed so the
+            # omission is repaired at the source (a compliant append is then
+            # harvested by the normal marker scan on a later Stop; synthesis stays
+            # the backstop). Exactly once per session: the task_id is marked BEFORE
+            # the send so a raising transport still satisfies exactly-once, and the
+            # never-cleared set — not the mtime-resettable observation counter — is
+            # the budget, so the #149 refill hazard cannot apply. Touches no stall
+            # counters.
+            if (
+                self._contract_nudge_enabled
+                and observations == 1
+                and task_id not in self._contract_nudge_sent
+            ):
+                self._contract_nudge_sent.add(task_id)
+                self._note_lifecycle(
+                    task_id, "contract-nudge-sent", spec=str(path), status=fm_status
+                )
+                try:
+                    self.send_text(
+                        handle,
+                        CONTRACT_NUDGE_TEXT.format(spec_path=path, status=fm_status),
+                    )
+                except MultiplexerError:
+                    pass
         return None
 
     def _stories_synth_result(

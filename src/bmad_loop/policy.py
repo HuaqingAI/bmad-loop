@@ -130,6 +130,16 @@ class LimitsPolicy:
     # after this many total nudges (non-blocking workflows then advance the
     # phase).
     workflow_stall_nudges_cap: int = 3
+    # One targeted nudge per session (#276 M4) when a Stop finds a marker-less
+    # terminal-frontmatter spec (a review that finalized `status: done`/`blocked`
+    # without appending its required `## Auto Run Result` section): ask the skill
+    # to append that section now, then end its turn — repairing the omission at
+    # the source so the normal marker scan harvests it. Sent exactly once per
+    # session (a never-cleared set), never refilled, and touching no stall
+    # counters; the harness-side frontmatter synthesis (#224) stays the backstop
+    # for a session that never complies. True enables it; False keeps the pre-M4
+    # behavior (synthesis only).
+    dev_contract_nudge: bool = True
     max_tokens_per_story: int = 2_000_000
     # weight of cache-read tokens in the budget check (1.0 = count raw)
     cache_read_weight: float = 0.1
@@ -707,6 +717,9 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         workflow_stall_nudges_cap=int(
             limits_d.get("workflow_stall_nudges_cap", LimitsPolicy.workflow_stall_nudges_cap)
         ),
+        dev_contract_nudge=bool(
+            limits_d.get("dev_contract_nudge", LimitsPolicy.dev_contract_nudge)
+        ),
         max_tokens_per_story=int(
             limits_d.get("max_tokens_per_story", LimitsPolicy.max_tokens_per_story)
         ),
@@ -999,6 +1012,7 @@ dev_stall_grace_s = 600      # grace for a dev session that ended its turn await
 dev_stall_nudges = 2         # times an idle dev session is nudged awake on grace expiry before it is called stalled (bmad-loop has no background-completion re-invocation); pane output re-arms the grace window and a fresh Stop restores the budget. 0 = stall on grace expiry
 dev_stall_nudges_cap = 6     # total (never-restored) stall nudges for a dev/review session before it is called stalled; bounds a session whose reply to the wake nudge is itself a result-less Stop that would refill the budget forever (#149). 0 = stall on first grace expiry
 workflow_stall_nudges_cap = 3 # total (never-restored) stall nudges for an injected plugin-workflow session before it is called stalled; bounds a session that finished its work but never wrote its completion marker. 0 = stall on first grace expiry
+dev_contract_nudge = true    # true: one targeted nudge per session (#276) when a Stop finds a spec finalized to a terminal frontmatter status but missing its `## Auto Run Result` marker, asking the skill to append it and end its turn; sent exactly once, never refilled, touches no stall counters. false: rely only on harness-side frontmatter synthesis
 max_tokens_per_story = 2000000
 cache_read_weight = 0.1      # cache reads bill at ~0.1x input on all vendors; 1.0 = count raw
 session_budget_mode = "warn"  # off | warn | enforce — weighted per-SESSION cap sampled every ~30s mid-session; warn = one ATTENTION + breadcrumb; enforce = wrap-up nudge (best-effort courtesy; the kill is the guarantee) then over_budget termination (retry→defer). Live-verified on claude; other transcript parsers sample best-effort (mid-turn flush unverified); inert where no mid-session usage signal exists (usage_parser "none", copilot's shutdown-only flush)

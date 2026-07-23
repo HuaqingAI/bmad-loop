@@ -476,7 +476,7 @@ def test_kill_grace_zero_is_the_legacy_single_strike(tmp_path):
 # Stop event, via devcontract. These exercise that override in isolation.
 
 
-def make_dev_adapter(tmp_path, profile_name="claude"):
+def make_dev_adapter(tmp_path, profile_name="claude", policy=None):
     impl = tmp_path / "impl"
     impl.mkdir()
     # project root == tmp_path so rebased(spec.cwd=tmp_path) is a no-op: these
@@ -488,7 +488,7 @@ def make_dev_adapter(tmp_path, profile_name="claude"):
     )
     adapter = GenericDevAdapter(
         run_dir=tmp_path / "run",
-        policy=Policy(limits=LimitsPolicy()),
+        policy=policy or Policy(limits=LimitsPolicy()),
         profile=get_profile(profile_name),
         paths=paths,
     )
@@ -3460,3 +3460,216 @@ def test_wait_loop_heartbeat_drives_observe_tick(tmp_path, monkeypatch):
     assert result.status == "stalled"
     # the first tick plus at least one later heartbeat crossing fired the hook
     assert len(observed) >= 2 and all(tid == "3-1-dev-1" for tid in observed)
+
+
+# ------------------------------ contract nudge (#276 M4)
+#
+# On the FIRST `terminal-frontmatter-pending` observation (a Stop that found the
+# spec finalized to a terminal frontmatter status but missing its `## Auto Run
+# Result` marker), the dev adapter sends ONE targeted nudge asking the skill to
+# append the section it owed — repairing the omission at the source. Sent exactly
+# once per session via a never-cleared set (marked before the send), gated by
+# `limits.dev_contract_nudge`, and touching no stall counters. Frontmatter
+# synthesis stays the backstop for a session that never complies.
+
+
+def _nudge_crumbs(adapter, task_id="3-1-dev-1"):
+    return [ln for ln in _lifecycle_lines(adapter, task_id) if ln["event"] == "contract-nudge-sent"]
+
+
+def _record_sent(adapter):
+    sent: list[str] = []
+    adapter.send_text = lambda handle, text: sent.append(text)
+    return sent
+
+
+def test_contract_nudge_sent_on_first_pending_observation(tmp_path, monkeypatch):
+    """The first pending observation sends exactly the formatted nudge, journals a
+    `contract-nudge-sent` crumb, and still records the `terminal-frontmatter-
+    pending` verdict — the nudge is additive, not a replacement for the fallback."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    sent = _record_sent(adapter)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+
+    assert sent == [generic.CONTRACT_NUDGE_TEXT.format(spec_path=spec_file, status="done")]
+    (crumb,) = _nudge_crumbs(adapter)
+    assert crumb["spec"] == str(spec_file) and crumb["status"] == "done"
+    (verdict,) = _breadcrumbs(adapter)
+    assert verdict["verdict"] == "terminal-frontmatter-pending"
+    assert adapter._contract_nudge_sent == {"3-1-dev-1"}
+
+
+def test_contract_nudge_exactly_once_across_mtime_reset(tmp_path, monkeypatch):
+    """#149's refill hazard cannot apply: an mtime bump resets the observation
+    counter to 1, but the nudge budget is the never-cleared set, so a second
+    first-observation Stop over the same session sends nothing more."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    sent = _record_sent(adapter)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+    os.utime(spec_file, ns=(1_000_000_000, 1_000_000_000))
+
+    # first pending observation -> one nudge
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+    assert len(sent) == 1
+    # the session wrote again: fingerprint changes, observation count resets to 1
+    os.utime(spec_file, ns=(2_000_000_000, 2_000_000_000))
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+
+    assert len(sent) == 1  # not re-nudged despite observations back at 1
+    assert len(_nudge_crumbs(adapter)) == 1
+
+
+def test_contract_nudge_not_sent_when_transition_proven(tmp_path, monkeypatch):
+    """A recorded mid-session transition (#276 M2) harvests on the first sighting,
+    so the record-obs branch — and its nudge — is never reached."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    sent = _record_sent(adapter)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n# Story\n\nLaunch.\n"
+    )
+    spec = _snapshotted_spec(tmp_path, spec_file)
+    spec_file.write_text(_MARKERLESS_DONE)  # bytes differ from the launch snapshot
+    adapter._fm_transition_obs["3-1-dev-1"] = "in-review"
+
+    rj = adapter._result_json(_dev_handle(), spec, wait=True)
+
+    assert rj is not None and rj["synthesized_from_frontmatter"] is True
+    assert sent == []
+    assert _nudge_crumbs(adapter) == []
+
+
+def test_contract_nudge_not_sent_on_ambiguous(tmp_path, monkeypatch):
+    """Several marker-less candidates refuse to guess before the fingerprint/nudge
+    branch, so no nudge is sent."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    sent = _record_sent(adapter)
+    (impl / "spec-3-1-foo.md").write_text(_MARKERLESS_DONE)
+    (impl / "spec-3-2-bar.md").write_text(_MARKERLESS_DONE)
+
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+
+    (crumb,) = _breadcrumbs(adapter)
+    assert crumb["verdict"] == "ambiguous-frontmatter"
+    assert sent == []
+    assert _nudge_crumbs(adapter) == []
+
+
+def test_contract_nudge_not_sent_on_dead_window(tmp_path):
+    """A dead-window post-kill reconcile synthesizes on a single sighting via the
+    wait=False path, which never reaches the nudge (wait=True only)."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    adapter._window_alive = lambda handle: False
+    sent = _record_sent(adapter)
+    (impl / "spec-3-1-foo.md").write_text(_MARKERLESS_DONE)
+
+    result = adapter._post_kill_reconcile(_dev_handle(), _dev_spec(tmp_path), _unvouched())
+
+    assert result.status == "completed"  # synthesized on the dead window
+    assert sent == []
+    assert _nudge_crumbs(adapter) == []
+
+
+def test_contract_nudge_not_sent_on_unmodified_refusal(tmp_path, monkeypatch):
+    """The M1 hash gate refuses a byte-identical spec before the fingerprint/nudge
+    branch: a spec provably untouched by this session is not this session's to
+    repair, so no nudge fires."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    sent = _record_sent(adapter)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+    spec = _snapshotted_spec(tmp_path, spec_file)  # snapshot == current bytes
+
+    assert adapter._result_json(_dev_handle(), spec, wait=True) is None
+
+    (crumb,) = _breadcrumbs(adapter)
+    assert crumb["verdict"] == "unmodified-since-launch"
+    assert sent == []
+    assert _nudge_crumbs(adapter) == []
+
+
+def test_contract_nudge_send_failure_marks_sent(tmp_path, monkeypatch):
+    """A raising transport still satisfies exactly-once: the task is marked (and
+    the crumb journaled) BEFORE the send, so a `MultiplexerError` is swallowed and
+    the next Stop attempts no retry."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    calls = {"n": 0}
+
+    def boom(handle, text):
+        calls["n"] += 1
+        raise generic.MultiplexerError("transport down")
+
+    adapter.send_text = boom
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+
+    # first observation: nudge attempted, raises, swallowed (no crash)
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+    assert calls["n"] == 1
+    assert adapter._contract_nudge_sent == {"3-1-dev-1"}
+    assert len(_nudge_crumbs(adapter)) == 1  # marked before the send
+
+    # second stable Stop: task already marked -> no retry, and it harvests
+    rj = adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True)
+    assert rj["synthesized_from_frontmatter"] is True
+    assert calls["n"] == 1  # never re-sent
+
+
+def test_contract_nudge_disabled_by_policy(tmp_path, monkeypatch):
+    """Knob off: no send, no `contract-nudge-sent` crumb, and the fallback behaves
+    exactly as it did pre-M4 (pending crumb recorded, harvest on the second Stop)."""
+    adapter, impl = make_dev_adapter(
+        tmp_path, policy=Policy(limits=LimitsPolicy(dev_contract_nudge=False))
+    )
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    sent = _record_sent(adapter)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+    assert sent == []
+    assert _nudge_crumbs(adapter) == []
+    assert adapter._contract_nudge_sent == set()
+    (crumb,) = _breadcrumbs(adapter)
+    assert crumb["verdict"] == "terminal-frontmatter-pending"
+    # pre-M4 behavior intact: harvest on the second stable Stop
+    rj = adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True)
+    assert rj["synthesized_from_frontmatter"] is True
+
+
+def test_wait_loop_contract_nudge_then_skill_appends_marker(tmp_path, monkeypatch):
+    """End to end: Stop 1 finds a marker-less terminal spec and nudges; the skill
+    complies by appending its `## Auto Run Result` section before Stop 2; Stop 2
+    then completes via the NORMAL marker scan — no synthesis, no
+    `synthesized_from_frontmatter` flag, and no second nudge."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    sent = _record_sent(adapter)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+
+    # Stop 1: marker-less -> pending + one nudge
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+    assert sent == [generic.CONTRACT_NUDGE_TEXT.format(spec_path=spec_file, status="done")]
+
+    # the skill heeds the nudge and appends its required marker section
+    spec_file.write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n# Story\n\nAll done.\n\n"
+        "## Auto Run Result\n\nStatus: done\nImplemented the thing.\n"
+    )
+
+    # Stop 2: harvested by the ordinary scan, not the fallback
+    rj = adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True)
+    assert rj["status"] == "done"
+    assert "synthesized_from_frontmatter" not in rj
+    assert len(sent) == 1  # no second nudge

@@ -115,6 +115,20 @@ breaking changes may land in a minor release.
     with the synthesized status (journal `spec-marker-repaired` / `spec-marker-repair-failed` /
     `spec-marker-repair-skipped`), so it can never author a marker that disagrees with the
     frontmatter.
+  - _Targeted contract nudge_ (`limits.dev_contract_nudge`, default `true`). On the first
+    `terminal-frontmatter-pending` Stop — a marker-less terminal spec that is not the hash-gate
+    refusal and whose transition is not yet proven — the dev adapter sends one tmux nudge asking
+    the skill to append the `## Auto Run Result` section it owed and end its turn, repairing the
+    omission at its source; a compliant append is then harvested by the ordinary marker scan (no
+    synthesis, no `synthesized_from_frontmatter` flag). It fires exactly once per session — marked
+    before the send (a raising transport still counts), never refilled, and touching no stall
+    counters, so an mtime bump that resets the observation counter can never re-nudge (the #149
+    refill hazard structurally cannot apply). `contract-nudge-sent` lifecycle crumb; set
+    `dev_contract_nudge = false` to rely on harness-side synthesis alone.
+
+  Together these hold one HARD CONSTRAINT: the spec's `status:` at review launch is load-bearing
+  routing input to the upstream skill, so the frontmatter is **never** mutated at review launch —
+  every mechanism is observation or a prose-append, never a status write.
 
 ## [0.9.0] — 2026-07-21
 

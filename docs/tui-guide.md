@@ -219,10 +219,15 @@ One row per story (or sweep bundle/triage task) in the selected run:
   (the guard's mid-session sample at trip time). The
   matching `tasks/<id>/` dir holds the forensic breadcrumbs the adapter wrote
   while the session ran: `session-lifecycle.jsonl` (timeout-fire,
-  budget-guard `budget-tripped` / `over-budget-fired`, and kill-escalation
-  lines), `heartbeat.json` (the wait loop's proof-of-life —
+  budget-guard `budget-tripped` / `over-budget-fired`, kill-escalation, and the
+  #276 missing-marker forensics `spec-status-transition-observed` /
+  `frontmatter-unmodified-refused` / `contract-nudge-sent`),
+  `heartbeat.json` (the wait loop's proof-of-life —
   stale under a live session means the orchestrator itself was frozen), and
-  `resultless-stops.jsonl`.
+  `resultless-stops.jsonl` (each give-up Stop with its verdict: `no-artifact`,
+  `ambiguous-frontmatter`, `unmodified-since-launch` — the spec's bytes were
+  unchanged since review launch, so it is a prior `done` re-opened, not this
+  session's output (#276) — or `terminal-frontmatter-pending`).
 - **Log** — the active agent session's pane output (`logs/<task-id>.log`),
   ANSI colors preserved, starting with a dim `— <task-id>.log —` header. The
   active task is the last `session-start` without a matching `session-end`
