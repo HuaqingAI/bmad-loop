@@ -27,6 +27,7 @@ from .escalation import (
     critical_escalations,
     decide_dev,
     decide_review_session,
+    env_fault_detail,
     preference_escalations,
 )
 from .journal import Journal, save_state
@@ -1027,14 +1028,29 @@ class Engine:
                 session_stage="pre_workflow_session",
                 label=f"{lp.name}.{wf.name}",
             )
+            wf_extras: dict = {"env_fault": result.env_fault}
+            if result.env_fault_evidence:
+                wf_extras["env_fault_evidence"] = result.env_fault_evidence
             self.journal.append(
                 "workflow-end",
                 plugin=lp.name,
                 workflow=wf.name,
                 status=result.status,
                 story_key=task.story_key,
+                **wf_extras,
             )
             if wf.blocking and result.status != "completed":
+                if result.env_fault:
+                    # A blocking workflow session that lost its API connection (#194)
+                    # never ran — escalate (re-arm restores the budget) instead of
+                    # deferring the story on a transport failure. Non-blocking
+                    # workflows keep continuing (journaled only): the next story
+                    # session will classify and pause if the outage persists.
+                    self._escalate(
+                        task,
+                        f"environment fault: blocking workflow {wf.name!r} ({lp.name}) "
+                        f"session {result.status} ({env_fault_detail(result)})",
+                    )
                 self._defer(
                     task,
                     f"blocking workflow {wf.name!r} ({lp.name}) did not complete: {result.status}",
@@ -1165,7 +1181,10 @@ class Engine:
                 session_status=result.status,
                 action=str(decision.action),
                 reason=decision.reason,
-                env_fault=bool(outcome is not None and outcome.env_fault),
+                # env_fault from EITHER the verify path (rc 126/127) or the
+                # session-transport classification (#194); decide_dev PAUSEs on
+                # the latter, so the fall-through below preserves the worktree.
+                env_fault=bool((outcome is not None and outcome.env_fault) or result.env_fault),
             )
             self._save()
             if decision.action == Action.PROCEED:
@@ -1866,6 +1885,12 @@ class Engine:
                 budget=self.policy.limits.max_tokens_per_session,
                 budget_mode=self.policy.limits.session_budget_mode,
             )
+        # transport-failure classification (#194): rides both session-end emit
+        # sites so the evidence line is on the record wherever the session ended.
+        if result.env_fault:
+            extras["env_fault"] = True
+            if result.env_fault_evidence:
+                extras["env_fault_evidence"] = result.env_fault_evidence
         return extras
 
     @staticmethod
@@ -2211,8 +2236,18 @@ class Engine:
                 attempt=task.attempt,
                 session_status=result.status,
                 ok=ok,
-                env_fault=bool(outcome is not None and outcome.env_fault),
+                env_fault=bool((outcome is not None and outcome.env_fault) or result.env_fault),
             )
+            if result.status != "completed" and result.env_fault:
+                # A fix session whose CLI lost its API connection (#194) did no
+                # repair work — another attempt cannot fix the run environment, so
+                # pause (re-arm restores the budget) instead of burning the dev
+                # budget. A completed-but-env-fault-grade verify failure is handled
+                # by the retryable check just below (its own escalate path).
+                self._escalate(
+                    task,
+                    f"environment fault: fix session {result.status} ({env_fault_detail(result)})",
+                )
             if outcome is not None and not outcome.ok and not outcome.retryable:
                 # escalate-grade failure (environment fault): another repair
                 # session cannot fix the run environment — stop spending the

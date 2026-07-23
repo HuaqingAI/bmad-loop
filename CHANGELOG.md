@@ -9,16 +9,26 @@ breaking changes may land in a minor release.
 
 ### Added
 
-- **Post-mortem transport-failure classification — plumbing (part 1/3 of #194).** Adapters can now
-  classify a non-completed (`timeout`/`stalled`/`crashed`) session as an _environment fault_ by
-  matching per-profile `env_fault_patterns` regexes against the ANSI-stripped tail of the session's
-  pane log — the signature of a coding CLI that lost its API connection and idled out the session
-  clock without doing real work. `SessionResult` gains `env_fault` / `env_fault_evidence`, the
-  generic tmux adapter reads the log tail once after the verdict and reconcile settle (last match
-  wins, `over_budget`/`completed` excluded), and the `claude` profile ships a seed pattern that
-  requires an `API Error` line _and_ a connection-level cause on the same line. This part is
-  plumbing only — nothing consumes the flag yet; the story pipeline, workflow, and sweep sessions
-  pause on it (without burning attempts) in later parts.
+- **Transport failures pause instead of burning attempts (#194).** A session whose coding CLI
+  lost its API connection stays alive but idle, printing `API Error: Unable to connect …` while it
+  idles out the session clock — indistinguishable from a real wall-clock timeout, so two such
+  outages exhausted `max_dev_attempts` and deferred the story with zero real work attempted.
+  bmad-loop now classifies these post-mortem and pauses for a human (re-arm restores the budget),
+  exactly as verify environment faults (`rc 126/127`) already do:
+  - Adapters classify a non-completed (`timeout`/`stalled`/`crashed`) session as an _environment
+    fault_ by matching per-profile `env_fault_patterns` regexes against the ANSI-stripped tail of
+    the pane log. `SessionResult` gains `env_fault` / `env_fault_evidence`; the generic tmux
+    adapter reads the log tail once after the verdict and reconcile settle (last match wins,
+    `over_budget`/`completed` excluded), drops an `env-fault-classified` breadcrumb, and the
+    `claude` profile ships a seed pattern requiring an `API Error` line _and_ a connection-level
+    cause on the same line (so prose "API Error" test output does not trip it).
+  - The dev, review, and fix phases PAUSE on a classified session (evidence in the reason, worktree
+    preserved) instead of charging the attempt/cycle; the `dev-decision` / `fix-decision` /
+    `session-end` journal entries carry the flag and evidence.
+  - Blocking plugin workflows escalate rather than defer the story on a classified session
+    (non-blocking workflows keep continuing, journaled only); the sweep migration and triage loops
+    escalate before charging a retry, and the sweep's existing escalation-resume restores their
+    budget.
 
 - **Documented the `BMAD_LOOP_*` environment variables (#246).** The three runtime override
   vars — `BMAD_LOOP_MUX_BACKEND`, `BMAD_LOOP_PROCESS_HOST`, `BMAD_LOOP_SESSION_TIMEOUT_S` — now

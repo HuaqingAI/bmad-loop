@@ -650,6 +650,82 @@ def test_triage_validation_failure_retries_with_feedback_then_escalates(project)
     assert "not triaged: DW-1" in open(feedback_path).read()
 
 
+def test_triage_session_env_fault_escalates_then_resume_restores_budget(project):
+    """A triage session whose CLI lost its API connection (#194) escalates on the
+    first attempt instead of retrying up to max_triage_attempts; the decision
+    carries env_fault, and the ESCALATED-resume restores the budget (attempt -> 0)
+    so a resume after the outage re-drives triage cleanly."""
+    write_ledger(project, {"DW-1": "open"})
+    evidence = "API Error: Unable to connect (ECONNREFUSED)"
+    engine, adapter = make_sweep(
+        project,
+        [SessionResult(status="timeout", env_fault=True, env_fault_evidence=evidence)],
+    )
+    summary = engine.run()
+
+    assert summary.paused
+    task = engine.state.tasks["sweep-triage"]
+    assert task.phase == Phase.ESCALATED
+    assert task.attempt == 1  # only the one session — no retry budget spent
+    assert "environment fault: triage session timeout" in engine.state.paused_reason
+    assert evidence in engine.state.paused_reason
+    assert len(adapter.sessions) == 1  # no feedback-retry session
+    dec = [e for e in engine.journal.entries() if e["kind"] == "triage-decision"][-1]
+    assert dec["env_fault"] is True
+
+    # resume once the outage clears: the ESCALATED-resume resets attempt to 0
+    # (fresh budget) and re-drives triage to completion
+    good = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "moot"}])
+    resumed, radapter = resume_sweep(project, engine, [triage_effect(good)])
+    assert not resumed.run().paused
+    assert resumed.state.tasks["sweep-triage"].phase == Phase.DONE
+    assert len(radapter.sessions) == 1
+
+
+def test_triage_plain_timeout_still_retries_to_cap(project):
+    """Guard: a NON-env-fault triage timeout keeps today's behavior — retries up to
+    max_triage_attempts (2) then escalates. The env-fault branch must not swallow
+    ordinary transient failures on the first attempt."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, adapter = make_sweep(
+        project,
+        [SessionResult(status="timeout"), SessionResult(status="timeout")],
+    )
+    summary = engine.run()
+
+    assert summary.paused
+    assert engine.state.tasks["sweep-triage"].phase == Phase.ESCALATED
+    assert len(adapter.sessions) == 2  # both attempts spent, not escalated on the first
+    dec = [e for e in engine.journal.entries() if e["kind"] == "triage-decision"]
+    assert all(d["env_fault"] is False for d in dec)
+
+
+def test_migration_session_env_fault_escalates_without_consuming_attempts(project):
+    """A migration session whose CLI lost its API connection (#194) escalates on the
+    first attempt instead of charging a migration retry; migrate-decision carries
+    env_fault, and the legacy ledger is left untouched (no half-rewrite lands)."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    evidence = "API Error: Unable to connect (ECONNREFUSED)"
+    engine, adapter = make_sweep(
+        project,
+        [SessionResult(status="timeout", env_fault=True, env_fault_evidence=evidence)],
+    )
+    summary = engine.run()
+
+    assert summary.paused
+    task = engine.state.tasks["sweep-migrate"]
+    assert task.phase == Phase.ESCALATED
+    assert task.attempt == 1  # only the one session — no migration retry spent
+    assert "environment fault: migration session timeout" in engine.state.paused_reason
+    assert evidence in engine.state.paused_reason
+    assert len(adapter.sessions) == 1
+    dec = [e for e in engine.journal.entries() if e["kind"] == "migrate-decision"][-1]
+    assert dec["env_fault"] is True
+    # the legacy ledger is intact and the tree clean: no half-rewrite escaped
+    assert project.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
+    assert worktree_clean(project.project)
+
+
 def test_triage_escalation_resume_retries_triage(project):
     write_ledger(project, {"DW-1": "open"})
     bad = triage_result(["DW-1"])

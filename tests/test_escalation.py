@@ -56,6 +56,59 @@ def test_env_fault_outcome_pauses_even_with_budget_left():
     assert "rc=127" in decision.reason
 
 
+def test_dev_env_fault_session_pauses_even_with_budget_left():
+    """A dev session classified as a transport/API environment fault (#194) PAUSEs
+    immediately — like the verify env-fault above, the attempt budget is never
+    consulted, and the reason carries the evidence line."""
+    task = _task(attempt=1)  # 1 < 2 -> budget remains
+    env_fault = SessionResult(
+        status="timeout", env_fault=True, env_fault_evidence="API Error: Connection refused"
+    )
+    decision = decide_dev(task, env_fault, None, POLICY)
+    assert decision.action == Action.PAUSE
+    assert "environment fault: dev session timeout" in decision.reason
+    assert "API Error: Connection refused" in decision.reason
+
+
+def test_dev_env_fault_session_pauses_even_when_budget_exhausted():
+    """The env-fault pause outranks budget exhaustion too — a spent budget must not
+    downgrade it to a defer (that would file a transport failure as deferred work)."""
+    task = _task(attempt=2)  # 2 == max_dev_attempts -> budget spent
+    env_fault = SessionResult(status="crashed", env_fault=True)
+    decision = decide_dev(task, env_fault, None, POLICY)
+    assert decision.action == Action.PAUSE
+    assert "environment fault" in decision.reason
+
+
+def test_dev_plain_noncompleted_still_retries_with_budget():
+    """Guard pin: a NON-env-fault timeout with budget left still RETRYs — the
+    env-fault branch must not swallow ordinary transient failures."""
+    task = _task(attempt=1)
+    plain = SessionResult(status="timeout")  # env_fault defaults False
+    decision = decide_dev(task, plain, None, POLICY)
+    assert decision.action == Action.RETRY
+    assert "environment fault" not in decision.reason
+
+
+def test_review_env_fault_session_pauses():
+    """The same classification pauses a review session (evidence in the reason),
+    where a plain non-completed review would RETRY/DEFER."""
+    task = _task(review_cycle=1)  # budget remains
+    env_fault = SessionResult(
+        status="stalled", env_fault=True, env_fault_evidence="API Error: ETIMEDOUT"
+    )
+    decision = decide_review_session(task, env_fault, POLICY)
+    assert decision.action == Action.PAUSE
+    assert "environment fault: review session stalled" in decision.reason
+    assert "ETIMEDOUT" in decision.reason
+
+
+def test_review_plain_noncompleted_still_retries_with_budget():
+    task = _task(review_cycle=1)
+    plain = SessionResult(status="crashed")
+    assert decide_review_session(task, plain, POLICY).action == Action.RETRY
+
+
 def test_review_exhausted_defers_normal_story():
     task = _task(review_cycle=2)  # 2 == max_review_cycles
     crashed = SessionResult(status="crashed")

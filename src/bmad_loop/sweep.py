@@ -20,7 +20,7 @@ from typing import Any, Callable
 
 from . import deferredwork, gates, verify
 from .engine import Engine
-from .escalation import critical_escalations
+from .escalation import critical_escalations, env_fault_detail
 from .model import Phase, StoryTask
 from .platform_util import atomic_replace
 from .statemachine import advance
@@ -755,7 +755,19 @@ class SweepEngine(Engine):
                 session_status=result.status,
                 ok=not errors,
                 errors=errors,
+                env_fault=result.env_fault,
             )
+            if result.status != "completed" and result.env_fault:
+                # The migration session's CLI lost its API connection (#194): it did
+                # no rewrite work, so pause (the ESCALATED-resume above resets
+                # task.attempt to 0 — fresh budget) instead of charging a migration
+                # attempt. Escalate BEFORE the _safe_reset/attempt-cap path; that
+                # resume also restores the ledger if the worktree is dirty.
+                self._escalate(
+                    task,
+                    f"environment fault: migration session {result.status} "
+                    f"({env_fault_detail(result)})",
+                )
             if not errors:
                 advance(task, Phase.DONE)
                 self._save()
@@ -858,7 +870,17 @@ class SweepEngine(Engine):
                 session_status=result.status,
                 ok=plan is not None,
                 errors=errors,
+                env_fault=result.env_fault,
             )
+            if result.status != "completed" and result.env_fault:
+                # transport/API failure (#194): pause rather than charge a triage
+                # attempt for a session that never reached the API. The
+                # ESCALATED-resume above resets task.attempt to 0 (fresh budget).
+                self._escalate(
+                    task,
+                    f"environment fault: triage session {result.status} "
+                    f"({env_fault_detail(result)})",
+                )
             if plan is not None:
                 advance(task, Phase.DONE)
                 self._save()
