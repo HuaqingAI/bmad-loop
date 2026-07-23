@@ -1,6 +1,7 @@
 """Engine scenario tests against the mock adapter — no tmux, no LLM."""
 
 import dataclasses
+import hashlib
 import os
 import re
 import signal
@@ -1990,6 +1991,53 @@ def test_reset_spec_for_repair_strips_stale_terminal_section(project):
     assert "status: in-progress\n" in text  # re-opened
     assert "Auto Run Result" not in text  # stale terminal section gone
     assert "## Intent\n\nbody\n" in text  # frozen intent untouched
+
+
+def test_review_launch_snapshot_threaded_into_session_spec(project):
+    """The engine captures a launch-state SpecSnapshot right after the review
+    marker strip and threads it onto the review SessionSpec; the dev session that
+    precedes it carries none (#276 M1)."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    captured: dict[str, str] = {}
+
+    def capturing_review(spec):
+        # The engine captured the snapshot just before launching this session; the
+        # spec on disk is still the dev pass's bytes until this effect rewrites it,
+        # so hashing it here recomputes exactly what the snapshot recorded.
+        sp = spec_path(project, "1-1-a")
+        captured["digest"] = hashlib.sha256(sp.read_bytes()).hexdigest()
+        return review_effect(project, "1-1-a", clean=True)(spec)
+
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a"), capturing_review])
+    summary = engine.run()
+
+    assert summary.done == 1
+    dev_spec, review_spec = adapter.sessions
+    assert dev_spec.role == "dev" and dev_spec.spec_snapshot is None
+    snap = review_spec.spec_snapshot
+    assert snap is not None
+    assert snap.path == str(spec_path(project, "1-1-a"))
+    assert snap.fm_status == "done"
+    assert snap.sha256 == captured["digest"]
+
+
+def test_review_launch_snapshot_degrades_on_unreadable_spec(project):
+    """A spec path that cannot be read degrades the snapshot capture to None and
+    journals `spec-read-failed` at site `review-launch-snapshot`. A directory where
+    a file is expected is the trigger: it slips past the strip's `is_file()` guard
+    (the strip's raise-on-unreadable doctrine is untouched), then `read_bytes` raises
+    IsADirectoryError, which the capture catches."""
+    engine, _ = make_engine(project, [])
+    bad = project.implementation_artifacts / "spec-1-1-a.md"
+    bad.mkdir(parents=True, exist_ok=True)
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(bad))
+
+    snap = engine._reset_spec_for_review(task)
+
+    assert snap is None
+    events = [e for e in engine.journal.entries() if e["kind"] == "spec-read-failed"]
+    assert events and events[-1]["site"] == "review-launch-snapshot"
+    assert events[-1]["story_key"] == "1-1-a"
 
 
 def test_generic_reconcile_skips_blocked_prose(project):
@@ -5767,3 +5815,173 @@ def test_session_synthesized_from_frontmatter_journaled(project):
         e for e in engine.journal.entries() if e["kind"] == "session-synthesized-from-frontmatter"
     ]
     assert crumb["role"] == "dev"
+
+
+def test_synthesized_result_repairs_spec_marker(project):
+    """#276 M3: when the fallback synthesizes a dev result the engine appends the
+    marker the skill owed onto the on-disk spec — with provenance — and journals
+    `spec-marker-repaired`. The story still completes; verify/commit are unaffected
+    (the marker is prose; the frontmatter status the gates read is unchanged)."""
+    from bmad_loop import devcontract
+
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    # No follow-up review, so nothing rewrites the spec after the repair lands.
+    inner = dev_effect(project, "1-1-a", followup_review=False)
+
+    def synthesized_dev(spec):
+        result = inner(spec)
+        result.result_json["synthesized_from_frontmatter"] = True
+        result.result_json["status"] = "done"  # what synthesize_result would carry
+        return result
+
+    engine, _ = make_engine(project, [synthesized_dev])
+    summary = engine.run()
+
+    assert summary.done == 1
+    text = spec_path(project, "1-1-a").read_text()
+    arr = devcontract.parse_auto_run_result(text)
+    assert arr.present and arr.status == "done"
+    assert devcontract.ORCHESTRATOR_SYNTH_NOTE in text
+    (repaired,) = [e for e in engine.journal.entries() if e["kind"] == "spec-marker-repaired"]
+    assert repaired["status"] == "done"
+    assert not [e for e in engine.journal.entries() if e["kind"] == "spec-marker-repair-skipped"]
+
+
+def test_marker_repair_failure_is_best_effort(project, monkeypatch):
+    """An OSError out of the append is swallowed (journaled `spec-marker-repair-
+    failed`): the result was already synthesized, so the story still completes —
+    only the on-disk spec is left non-compliant."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    inner = dev_effect(project, "1-1-a", followup_review=False)
+
+    def synthesized_dev(spec):
+        result = inner(spec)
+        result.result_json["synthesized_from_frontmatter"] = True
+        result.result_json["status"] = "done"
+        return result
+
+    def boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("bmad_loop.devcontract.append_auto_run_result", boom)
+    engine, _ = make_engine(project, [synthesized_dev])
+    summary = engine.run()
+
+    assert summary.done == 1
+    (failed,) = [e for e in engine.journal.entries() if e["kind"] == "spec-marker-repair-failed"]
+    assert "OSError" in failed["error"]
+
+
+def test_synthesized_review_result_repairs_marker_and_story_completes(project):
+    """#276 M3, review path: when the fallback synthesizes a REVIEW result the engine
+    appends the marker onto the on-disk spec (with provenance) and the story still
+    completes. Prior engine coverage only exercised a synthesized DEV result with no
+    follow-up review — this covers the primary review-repair path."""
+    from bmad_loop import devcontract
+
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    dev = dev_effect(project, "1-1-a", followup_review=True)
+    review = review_effect(project, "1-1-a", clean=True)
+
+    def synthesized_review(spec):
+        result = review(spec)
+        result.result_json["synthesized_from_frontmatter"] = True
+        result.result_json["status"] = "done"
+        return result
+
+    engine, _ = make_engine(project, [dev, synthesized_review])
+    summary = engine.run()
+
+    assert summary.done == 1
+    text = spec_path(project, "1-1-a").read_text()
+    arr = devcontract.parse_auto_run_result(text)
+    assert arr.present and arr.status == "done"
+    assert devcontract.ORCHESTRATOR_SYNTH_NOTE in text
+    (repaired,) = [e for e in engine.journal.entries() if e["kind"] == "spec-marker-repaired"]
+    assert repaired["status"] == "done"
+    synth = [
+        e for e in engine.journal.entries() if e["kind"] == "session-synthesized-from-frontmatter"
+    ]
+    assert [e["role"] for e in synth] == ["review"]  # the REVIEW session synthesized
+
+
+def test_synthesized_review_repair_survives_followup_rewrite(project):
+    """The finding's core case: a synthesized review cycle repairs the marker, then a
+    subsequent clean review cycle rewrites the whole spec (dropping the marker). The
+    story still converges to done, the run does not livelock, and exactly one repair
+    fired (the synthesized cycle) — the repair never fights the follow-up rewrite."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    dev = dev_effect(project, "1-1-a", followup_review=True)
+    review1 = review_effect(project, "1-1-a", clean=False)  # recommends another review
+
+    def synthesized_review1(spec):
+        result = review1(spec)
+        result.result_json["synthesized_from_frontmatter"] = True
+        result.result_json["status"] = "done"
+        return result
+
+    review2 = review_effect(project, "1-1-a", clean=True)  # converges; rewrites the spec
+    engine, _ = make_engine(project, [dev, synthesized_review1, review2])
+    summary = engine.run()
+
+    assert summary.done == 1
+    repaired = [e for e in engine.journal.entries() if e["kind"] == "spec-marker-repaired"]
+    assert len(repaired) == 1  # only the synthesized cycle repaired
+
+
+def test_marker_repair_undecodable_spec_is_best_effort(project, monkeypatch):
+    """`append_auto_run_result` reads raw bytes and raises `UnicodeDecodeError`
+    (a `ValueError`, not an `OSError`) on an undecodable spec — a spec torn mid-
+    write through a multi-byte UTF-8 sequence between the frontmatter read and the
+    append. The best-effort repair must swallow it too (journaled
+    `spec-marker-repair-failed`) so the run still completes rather than crashing."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    inner = dev_effect(project, "1-1-a", followup_review=False)
+
+    def synthesized_dev(spec):
+        result = inner(spec)
+        result.result_json["synthesized_from_frontmatter"] = True
+        result.result_json["status"] = "done"
+        return result
+
+    def boom(*args, **kwargs):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr("bmad_loop.devcontract.append_auto_run_result", boom)
+    engine, _ = make_engine(project, [synthesized_dev])
+    summary = engine.run()
+
+    assert summary.done == 1
+    (failed,) = [e for e in engine.journal.entries() if e["kind"] == "spec-marker-repair-failed"]
+    assert "UnicodeDecodeError" in failed["error"]
+
+
+def test_marker_repair_skips_out_of_tree_spec(project, tmp_path):
+    """A session-reported spec_file outside the orchestrator-owned roots is never
+    written — the repair skips with reason `out-of-tree`, like the reconcile."""
+    engine, _ = make_engine(project, [])
+    outside = tmp_path / "outside-spec.md"  # sibling of the sandbox root, not under it
+    outside.write_text("---\nstatus: done\n---\n\nbody\n", encoding="utf-8")
+    task = StoryTask(story_key="1-1-a", epic=1)
+
+    engine._repair_spec_marker(task, {"spec_file": str(outside), "status": "done"})
+
+    (skipped,) = [e for e in engine.journal.entries() if e["kind"] == "spec-marker-repair-skipped"]
+    assert skipped["reason"] == "out-of-tree"
+    assert "## Auto Run Result" not in outside.read_text()
+
+
+def test_marker_repair_skips_on_fm_mismatch(project):
+    """A fresh frontmatter read that no longer agrees with the synthesized status
+    (here still `in-progress` while `rj` claims `done`) is refused with reason
+    `fm-mismatch` and no marker is appended — never author an inconsistent one."""
+    engine, _ = make_engine(project, [])
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-progress", "abc123")
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(sp))
+
+    engine._repair_spec_marker(task, {"spec_file": str(sp), "status": "done"})
+
+    (skipped,) = [e for e in engine.journal.entries() if e["kind"] == "spec-marker-repair-skipped"]
+    assert skipped["reason"] == "fm-mismatch"
+    assert "## Auto Run Result" not in sp.read_text()

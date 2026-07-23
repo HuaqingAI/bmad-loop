@@ -80,6 +80,64 @@ breaking changes may land in a minor release.
   new resultless-stop breadcrumb verdicts `terminal-frontmatter-pending` and
   `ambiguous-frontmatter` record the fingerprint's progress.
 
+- **Deterministic missing-marker catch + repair (#276).** Hardens the #224 missing-marker
+  fallback, whose attribution was heuristic (a 2-stable-Stops fingerprint, or a single sighting
+  post-kill) and left the spec non-compliant on disk:
+  - _Launch-state snapshot + content-hash gate._ Before every review launch the engine now
+    captures a `SpecSnapshot` (content hash, mtime, frontmatter status) of the spec immediately
+    after the #160 marker strip and threads it onto the review `SessionSpec`. The fallback
+    deterministically refuses to synthesize from a candidate whose bytes still hash equal to that
+    snapshot — the spec is provably untouched by this session (a `done` spec re-opened for review,
+    never re-written) — in **every** mode, including the dead-window post-kill reconcile. This kills
+    the documented dead-window false positive (a review killed after an mtime-only bump but before
+    the `in-review` flip, previously scored `done` without having run). New resultless-stop verdict
+    `unmodified-since-launch` and dead-window lifecycle crumb `frontmatter-unmodified-refused`
+    record each refusal. The snapshot is process-transient (a crash-resume degrades to the
+    conservative 2-observation path), and the review-launch frontmatter `status` is never
+    mutated — it remains load-bearing skill routing. The same launch-snapshot decision (M1 hash +
+    M2 transition, a single shared `_snapshot_verdict`) also guards the stories-mode folder+id
+    read-back, closing the identical false completion on that path; snapshot/candidate identity is
+    by resolved filesystem path, not raw string spelling.
+  - _Mid-session status-transition observation._ On each heartbeat tick the generic (and
+    OpenCode) dev adapter now samples the snapshotted spec's frontmatter and records the first
+    status it observes this session drive off its launch state to a live, non-terminal value
+    (in practice `in-review`), with a `spec-status-transition-observed` lifecycle crumb. A
+    recorded transition is deterministic proof the terminal frontmatter the spec later carries
+    is this session's own write, so the fallback synthesizes on a single terminal sighting —
+    live or dead window — instead of the 2-observation fingerprint (the synthesized crumb gains
+    a `transition` flag). A recorded transition now **outranks** the content-hash gate: a clean
+    review can round-trip `done → in-review → done` back to the launch bytes while still omitting
+    its marker, and the observed `in-review` proves it ran, so the hash gate refuses only when no
+    transition was seen. A transition that flips entirely between two ticks is missed and falls
+    back to the conservative fingerprint path.
+  - _Artifact repair._ When the fallback synthesizes a result the engine now appends the
+    `## Auto Run Result` marker the skill owed onto the on-disk spec (new
+    `devcontract.append_auto_run_result`, the inverse of the #160 strip), so the once-invisible
+    spec re-enters the normal marker scan and the next review launch strips it exactly like a
+    skill-written marker. Best-effort at the `session-synthesized-from-frontmatter` site (covers
+    live-Stop, crash-path, and post-kill synthesis): guarded to the generic path, refused for a
+    spec resolved outside the orchestrator-owned roots or whose fresh frontmatter no longer agrees
+    with the synthesized status (journal `spec-marker-repaired` / `spec-marker-repair-failed` /
+    `spec-marker-repair-skipped`), so it can never author a marker that disagrees with the
+    frontmatter. The append and the #160 strip/reset now rewrite the spec atomically (temp +
+    `atomic_replace`), so an interrupted or disk-full repair leaves the original spec intact rather
+    than truncated, and a spec ending in a bare `\r` no longer receives an invisible (unparsed)
+    heading.
+  - _Targeted contract nudge_ (`limits.dev_contract_nudge`, default `true`). On the first
+    `terminal-frontmatter-pending` Stop — a marker-less terminal spec that is not the hash-gate
+    refusal and whose transition is not yet proven — the dev adapter sends one tmux nudge asking
+    the skill to append the `## Auto Run Result` section it owed and end its turn, repairing the
+    omission at its source; a compliant append is then harvested by the ordinary marker scan (no
+    synthesis, no `synthesized_from_frontmatter` flag). It fires exactly once per session — marked
+    before the send (a raising transport still counts), never refilled, and touching no stall
+    counters, so an mtime bump that resets the observation counter can never re-nudge (the #149
+    refill hazard structurally cannot apply). `contract-nudge-sent` lifecycle crumb; set
+    `dev_contract_nudge = false` to rely on harness-side synthesis alone.
+
+  Together these hold one HARD CONSTRAINT: the spec's `status:` at review launch is load-bearing
+  routing input to the upstream skill, so the frontmatter is **never** mutated at review launch —
+  every mechanism is observation or a prose-append, never a status write.
+
 ## [0.9.0] — 2026-07-21
 
 ### Added

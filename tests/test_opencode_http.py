@@ -1499,3 +1499,25 @@ def test_e2e_dev_post_kill_rescue(tmp_path, fake_opencode):
     assert result.result_json["status"] == "done"
     assert result.result_json["post_kill_reconciled"] is True
     assert_server_gone(rec)
+
+
+def test_e2e_dev_wait_loop_drives_observe_tick(tmp_path, fake_opencode, monkeypatch):
+    """Cross-adapter parity (#276 M2): the OpenCode wait loop invokes _observe_tick
+    from its heartbeat-throttled block, exactly as the generic adapter does. The
+    first tick always fires (last_heartbeat is None), so any run drives the hook —
+    with this session's handle and the very spec that was dispatched. OpencodeDev-
+    Adapter shares _DevSynthesisMixin, so the observation seam is live over HTTP."""
+    launcher, rec = fake_opencode
+    adapter, impl = make_dev_adapter(tmp_path, binary=str(launcher))
+    spec = make_dev_spec(tmp_path, rec, "completed", impl / "spec-3-1-foo.md")
+
+    seen: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        adapter, "_observe_tick", lambda handle, s: seen.append((handle.task_id, s is spec))
+    )
+
+    result = adapter.run(spec)
+
+    assert result.status == "completed"
+    assert seen and all(tid == "3-1-dev-1" and same for tid, same in seen)
+    assert_server_gone(rec)

@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .platform_util import atomic_replace
 from .verify import DEV_WORKFLOW, read_frontmatter
 
 # The section the skill appends on EVERY terminal path (success and blocked),
@@ -369,6 +370,29 @@ def find_frontmatter_candidates(impl_artifacts: Path, *, since_ns: int) -> list[
     return [p for _, p in found]
 
 
+def _atomic_write_spec(spec_path: Path, text: str) -> None:
+    """Rewrite ``spec_path`` with ``text`` via a same-directory temp file + atomic
+    rename, so an interrupted / short / disk-full write can never truncate the
+    canonical spec — a failed repair must lose no work (fault injection on the old
+    truncating ``write_text`` reduced a 46-byte spec to 12). Bytes are written
+    verbatim (``write_bytes``, not ``write_text``): every caller here has already
+    captured and preserved the file's own line endings, and ``write_text``'s
+    ``newline=None`` default would re-translate ``\\n``→``\\r\\n`` on Windows. The
+    ``.tmp`` sibling ends in ``.tmp`` (not ``.md``), so the ``*.md`` artifact scans
+    never see it. On any failure the temp file is removed and the error re-raised —
+    the callers impose best-effort, the writer never swallows."""
+    tmp = spec_path.with_suffix(spec_path.suffix + ".tmp")
+    try:
+        tmp.write_bytes(text.encode("utf-8"))
+        atomic_replace(tmp, spec_path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def reset_spec_status(spec_path: Path, new_status: str) -> bool:
     """Rewrite the frontmatter ``status:`` value of a spec in place.
 
@@ -421,7 +445,7 @@ def reset_spec_status(spec_path: Path, new_status: str) -> bool:
         changed = True
     if not changed:
         return False
-    spec_path.write_text(head + new_body + tail + text[fm.end() :], encoding="utf-8")
+    _atomic_write_spec(spec_path, head + new_body + tail + text[fm.end() :])
     return True
 
 
@@ -457,5 +481,79 @@ def strip_auto_run_result(spec_path: Path) -> bool:
         kept.append(text[pos : m.start()])
         pos = _next_heading_start(text, m.end())
     kept.append(text[pos:])
-    spec_path.write_text("".join(kept), encoding="utf-8")
+    _atomic_write_spec(spec_path, "".join(kept))
+    return True
+
+
+# Provenance stamped into a synthesized `## Auto Run Result` section so a human
+# (or a later re-derivation) can tell an orchestrator-repaired marker from one
+# the skill wrote itself. Single line (no internal newlines) so the writer's
+# line-ending detection governs every break in the appended block.
+ORCHESTRATOR_SYNTH_NOTE = (
+    "_Appended by the bmad-loop orchestrator (missing-marker repair, #224): the "
+    "session finalized this spec's frontmatter without its `## Auto Run Result` "
+    "marker, so the orchestrator synthesized the result from the frontmatter and "
+    "appended this section._"
+)
+
+
+def append_auto_run_result(spec_path: Path, status: str, *, detail: str = "") -> bool:
+    """Append a synthesized ``## Auto Run Result`` marker section — the inverse of
+    `strip_auto_run_result`.
+
+    The missing-marker fallback (#224) synthesizes a session's result from a spec
+    that carries a terminal frontmatter ``status:`` but never got the marker the
+    skill owed; this writer brings that spec back into contract. Before the append
+    a marker-less terminal spec sits in `find_frontmatter_candidates`' territory
+    (it requires ZERO real headings); after it the spec carries exactly one real
+    ``## Auto Run Result`` heading and moves into `find_result_artifact`'s
+    (requires >= 1), so a later re-read is harvested on the normal marker path
+    instead of the fallback scan, and the next review launch strips it exactly
+    like a skill-written marker (#160).
+
+    Returns False when the spec is absent, or when a REAL (non-fenced)
+    ``## Auto Run Result`` heading is already present — idempotence, and the same
+    #52 symmetry the strip honors: a fence-quoted heading (a frozen intent's
+    example) is documentation, not a marker, so it does NOT block the append. A
+    present-but-unreadable spec RAISES rather than no-ops (the repair-write
+    doctrine `strip_auto_run_result` and `reset_spec_status` share — the CALLER
+    imposes best-effort); silently skipping would leave the spec in a state the
+    caller believes it repaired.
+
+    Newline handling follows `reset_spec_status`'s intent: the file's line ending
+    is detected (CRLF vs LF) and reused for the appended block, and a missing
+    trailing newline is added so the heading can never glue onto the last body line
+    (``...body## Auto Run Result``). The spec is read as raw bytes rather than via
+    `read_text`, whose universal-newline translation would both hide a CRLF file's
+    ending and silently rewrite its whole body to LF — an in-place repair must not
+    mutate line endings it did not author. The section is ``## Auto Run Result`` /
+    blank / ``Status: <status>`` / blank / the provenance note (plus an optional
+    detail paragraph). ``status`` is normalized lowercase and MUST be the spec's
+    own frontmatter ``status`` — the caller passes exactly that — so
+    `synthesize_result`'s ``consistent`` cross-check holds on every later re-read."""
+    if not spec_path.is_file():
+        return False
+    # Raw read (not read_text): preserve the file's exact line endings, and let an
+    # undecodable spec raise UnicodeDecodeError like the strip's read (repair-write
+    # doctrine — the caller imposes best-effort, never the writer).
+    text = spec_path.read_bytes().decode("utf-8")
+    if _section_headings(text):
+        return False  # a real marker is already present — idempotent
+    status = status.strip().lower()
+    nl = "\r\n" if "\r\n" in text else "\n"
+    # Ensure the heading lands after a newline the scan can recognize. A file
+    # already ending in "\n" (LF, or the "\n" of a CRLF) is left byte-for-byte
+    # intact, so a strip of this exact append round-trips. A file ending in a BARE
+    # "\r" is the trap: it reads as "already terminated", but AUTO_RUN_HEADING_RE's
+    # "^" (MULTILINE) only matches after "\n" — a heading glued directly after "\r"
+    # is invisible to the scan. Complete such a bare CR to CRLF (preserving the
+    # authored CR) so the heading begins on a recognized line boundary.
+    if text.endswith("\r"):
+        text += "\n"
+    elif text and not text.endswith("\n"):
+        text += nl
+    section = f"## Auto Run Result{nl}{nl}Status: {status}{nl}{nl}{ORCHESTRATOR_SYNTH_NOTE}{nl}"
+    if detail:
+        section += f"{nl}{detail.strip()}{nl}"
+    _atomic_write_spec(spec_path, text + section)
     return True

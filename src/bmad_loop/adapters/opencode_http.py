@@ -616,6 +616,11 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
                         "stall_nudges_sent": stall_nudges_sent,
                     },
                 )
+                # Mid-session spec-status transition sampling (#276 M2) rides the
+                # same heartbeat cadence — a no-op on the plain HTTP adapter; the
+                # OpencodeDevAdapter shares _DevSynthesisMixin, so the hook records
+                # transitions there exactly as on the generic dev adapter.
+                self._observe_tick(handle, spec)
                 # Budget sampling rides the heartbeat cadence — no extra knob.
                 # Usage comes over HTTP (server state is sqlite, not a file).
                 if (

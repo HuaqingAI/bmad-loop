@@ -8,6 +8,7 @@ propagation / hook-signal waiting / kill end-to-end for any profile.
 """
 
 import dataclasses
+import hashlib
 import json
 import os
 import shutil
@@ -21,7 +22,7 @@ import pytest
 import regex
 
 from bmad_loop.adapters import generic, tmux_base
-from bmad_loop.adapters.base import SessionHandle, SessionResult, SessionSpec
+from bmad_loop.adapters.base import SessionHandle, SessionResult, SessionSpec, SpecSnapshot
 from bmad_loop.adapters.generic import GenericDevAdapter, GenericTmuxAdapter
 from bmad_loop.adapters.multiplexer import MultiplexerError
 from bmad_loop.adapters.profile import get_profile
@@ -475,7 +476,7 @@ def test_kill_grace_zero_is_the_legacy_single_strike(tmp_path):
 # Stop event, via devcontract. These exercise that override in isolation.
 
 
-def make_dev_adapter(tmp_path, profile_name="claude"):
+def make_dev_adapter(tmp_path, profile_name="claude", policy=None):
     impl = tmp_path / "impl"
     impl.mkdir()
     # project root == tmp_path so rebased(spec.cwd=tmp_path) is a no-op: these
@@ -487,7 +488,7 @@ def make_dev_adapter(tmp_path, profile_name="claude"):
     )
     adapter = GenericDevAdapter(
         run_dir=tmp_path / "run",
-        policy=Policy(limits=LimitsPolicy()),
+        policy=policy or Policy(limits=LimitsPolicy()),
         profile=get_profile(profile_name),
         paths=paths,
     )
@@ -2954,6 +2955,119 @@ _MARKERLESS_DONE = "---\nstatus: done\nbaseline_revision: abc123\n---\n\n# Story
 _MARKERLESS_BLOCKED = "---\nstatus: blocked\n---\n\n# Story\n\nStuck.\n"
 
 
+def _snap(spec_file: Path) -> SpecSnapshot:
+    """A review-launch snapshot of an on-disk spec, exactly as
+    ``_reset_spec_for_review`` captures it: hash + mtime + normalized fm status."""
+    raw = spec_file.read_bytes()
+    return SpecSnapshot(
+        path=str(spec_file),
+        mtime_ns=spec_file.stat().st_mtime_ns,
+        sha256=hashlib.sha256(raw).hexdigest(),
+        fm_status="done",
+    )
+
+
+def _snapshotted_spec(tmp_path, spec_file: Path, story_key="3-1") -> SessionSpec:
+    """A review SessionSpec carrying the launch snapshot of ``spec_file`` (#276 M1)."""
+    return dataclasses.replace(
+        _dev_spec(tmp_path, story_key), role="review", spec_snapshot=_snap(spec_file)
+    )
+
+
+def _snapshotted_stories_spec(tmp_path, story_spec: Path, story_key="1") -> SessionSpec:
+    """A review-role stories SessionSpec carrying the launch snapshot of its story
+    spec (#276 M1/M2), as the engine threads for a stories-mode review leg."""
+    return dataclasses.replace(
+        _stories_spec(tmp_path, story_key), role="review", spec_snapshot=_snap(story_spec)
+    )
+
+
+def test_stories_readback_refuses_unmodified_snapshot_no_transition(tmp_path, monkeypatch):
+    """#276 M1 on the stories read-back: a `done` story spec byte-identical to its
+    review-launch snapshot with no transition observed is the dead-window false
+    positive (a review that only bumped the mtime). The gate REFUSES synthesis
+    (`unmodified-since-launch`) instead of accepting on the mtime floor alone."""
+    adapter, _ = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    story = _write_story_spec(tmp_path, "1", "foo", _MARKERLESS_DONE)
+    spec = _snapshotted_stories_spec(tmp_path, story)  # snapshot == current bytes
+    assert adapter._result_json(_dev_handle(), spec, wait=True) is None
+    (crumb,) = _breadcrumbs(adapter)  # keyed by handle.task_id (3-1-dev-1)
+    assert crumb["verdict"] == "unmodified-since-launch"
+
+
+def test_stories_readback_transition_beats_snapshot(tmp_path, monkeypatch):
+    """M2 outranks M1 on the stories path too: with a recorded transition the same
+    byte-identical `done` spec synthesizes (the review provably ran)."""
+    adapter, _ = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    story = _write_story_spec(tmp_path, "1", "foo", _MARKERLESS_DONE)
+    spec = _snapshotted_stories_spec(tmp_path, story)
+    adapter._fm_transition_obs["3-1-dev-1"] = "in-review"  # keyed by handle.task_id
+    rj = adapter._result_json(_dev_handle(), spec, wait=True)
+    assert rj is not None and rj["status"] == "done"
+    assert _breadcrumbs(adapter) == []
+
+
+def test_stories_readback_changed_bytes_synthesizes(tmp_path, monkeypatch):
+    """Over-refusal guard: when the spec's bytes differ from the launch snapshot the
+    gate is NEUTRAL and the read-back synthesizes as before."""
+    adapter, _ = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    story = _write_story_spec(tmp_path, "1", "foo", _MARKERLESS_DONE)
+    spec = _snapshotted_stories_spec(tmp_path, story)  # snapshot of the original bytes
+    story.write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n# Story\n\nReviewed and done.\n",
+        encoding="utf-8",
+    )  # this session actually rewrote the spec
+    rj = adapter._result_json(_dev_handle(), spec, wait=True)
+    assert rj is not None and rj["status"] == "done"
+
+
+def test_stories_readback_dev_leg_no_snapshot_accepts(tmp_path, monkeypatch):
+    """Inert on a dev leg: no launch snapshot → NEUTRAL → the unchanged mtime-floor
+    accept, even for a spec that would be byte-identical to some snapshot."""
+    adapter, _ = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    _write_story_spec(tmp_path, "1", "foo", _MARKERLESS_DONE)
+    rj = adapter._result_json(_dev_handle(), _stories_spec(tmp_path), wait=True)  # snap None
+    assert rj is not None and rj["status"] == "done"
+
+
+def test_stories_readback_snapshot_other_path_inert(tmp_path, monkeypatch):
+    """The gate only bites when the resolved story spec IS the snapshotted file. A
+    snapshot for a different path leaves the read-back on its normal accept."""
+    adapter, _ = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    story = _write_story_spec(tmp_path, "1", "foo", _MARKERLESS_DONE)
+    other = tmp_path / "epic" / "stories" / "9-other.md"
+    snap = dataclasses.replace(_snap(story), path=str(other))
+    spec = dataclasses.replace(_stories_spec(tmp_path), role="review", spec_snapshot=snap)
+    rj = adapter._result_json(_dev_handle(), spec, wait=True)
+    assert rj is not None and rj["status"] == "done"
+
+
+def test_snapshot_verdict_truth_table(tmp_path):
+    """Direct unit test of the shared M1/M2 decision — the anti-drift guard both the
+    scan fallback and the stories read-back route through."""
+    adapter, _ = make_dev_adapter(tmp_path)
+    snap = SpecSnapshot(path="/x/spec.md", mtime_ns=1, sha256="deadbeef", fm_status="done")
+    decide = adapter._snapshot_verdict
+    V = generic._SnapVerdict
+    # no snapshot / different file → NEUTRAL regardless of digest
+    assert decide(same_file=False, snap=None, task_id="t", digest="deadbeef") is V.NEUTRAL
+    assert decide(same_file=False, snap=snap, task_id="t", digest="deadbeef") is V.NEUTRAL
+    # matching digest, no transition → REFUSE
+    assert decide(same_file=True, snap=snap, task_id="t", digest="deadbeef") is V.REFUSE
+    # transition observed → PROVEN, even with a matching digest
+    adapter._fm_transition_obs["t"] = "in-review"
+    assert decide(same_file=True, snap=snap, task_id="t", digest="deadbeef") is V.PROVEN
+    # mismatched digest, no transition → NEUTRAL
+    assert decide(same_file=True, snap=snap, task_id="u", digest="feed") is V.NEUTRAL
+    # digest None (unreadable) → NEUTRAL
+    assert decide(same_file=True, snap=snap, task_id="u", digest=None) is V.NEUTRAL
+
+
 def test_frontmatter_fallback_synthesizes_on_second_stable_stop(tmp_path, monkeypatch):
     adapter, impl = make_dev_adapter(tmp_path)
     monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
@@ -3132,3 +3246,539 @@ def test_wait_loop_completes_markerless_spec_on_second_stop(tmp_path, monkeypatc
     assert result.status == "completed"
     assert result.result_json["status"] == "done"
     assert result.result_json["synthesized_from_frontmatter"] is True
+
+
+# ---------------------------- launch-state snapshot + content-hash gate (#276 M1)
+#
+# A review session inherits the dev pass's `done` spec. When the review is killed
+# after an mtime-only bump but before it flips the frontmatter to `in-review`, the
+# #224 fallback would score `done` without the review ever running. The engine now
+# threads a SpecSnapshot (hash + mtime + fm status) captured at review launch; the
+# fallback refuses to synthesize from a candidate still byte-identical to it — in
+# every mode, live or dead-window.
+
+
+def test_frontmatter_fallback_refuses_unmodified_snapshot_live(tmp_path, monkeypatch):
+    """A byte-identical spec is provably untouched by this session: no wait=True
+    pass ever harvests, every verdict is `unmodified-since-launch`, and the
+    fingerprint dict stays empty (no observation recorded or popped)."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+    spec = _snapshotted_spec(tmp_path, spec_file)
+    for _ in range(3):
+        assert adapter._result_json(_dev_handle(), spec, wait=True) is None
+    verdicts = {c["verdict"] for c in _breadcrumbs(adapter)}
+    assert verdicts == {"unmodified-since-launch"}
+    assert "byte-identical to review-launch snapshot" in _breadcrumbs(adapter)[0]["detail"]
+    assert adapter._fm_fallback_obs == {}
+
+
+def test_frontmatter_fallback_refuses_unmodified_snapshot_dead_window(tmp_path):
+    """The kill shot: a dead window over a markerless `done` spec whose only change
+    since launch is an mtime bump. The single-sighting post-kill rescue must refuse
+    — returning the ORIGINAL result — and leave the dead-window lifecycle crumb."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    adapter._window_alive = lambda handle: False
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+    spec = _snapshotted_spec(tmp_path, spec_file)
+    # mtime-only bump: bytes unchanged, so the hash still matches the snapshot.
+    os.utime(spec_file, ns=(spec.spec_snapshot.mtime_ns + 10**9,) * 2)
+    original = _unvouched()
+    assert adapter._post_kill_reconcile(_dev_handle(), spec, original) is original
+    events = [ln["event"] for ln in _lifecycle_lines(adapter)]
+    assert "frontmatter-unmodified-refused" in events
+    # a refusal is not a resultless-Stop breadcrumb (that channel is wait=True only)
+    assert _breadcrumbs(adapter) == []
+
+
+def test_frontmatter_fallback_hash_mismatch_still_two_obs(tmp_path, monkeypatch):
+    """Content edited since the snapshot (the review actually wrote): the hash gate
+    is inert and today's fingerprint behavior stands — pending on the first stable
+    Stop, harvested on the second."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n# Story\n\nLaunch.\n"
+    )
+    spec = _snapshotted_spec(tmp_path, spec_file)
+    # the review rewrote the spec's body: bytes differ from the launch snapshot.
+    spec_file.write_text(_MARKERLESS_DONE)
+    assert adapter._result_json(_dev_handle(), spec, wait=True) is None
+    (crumb,) = _breadcrumbs(adapter)
+    assert crumb["verdict"] == "terminal-frontmatter-pending"
+    rj = adapter._result_json(_dev_handle(), spec, wait=True)
+    assert rj["synthesized_from_frontmatter"] is True
+
+
+def test_frontmatter_fallback_snapshot_other_path_inert(tmp_path, monkeypatch):
+    """The gate only fires when the candidate IS the snapshotted spec. A snapshot
+    for a different path leaves the fallback on its normal fingerprint path even
+    when the candidate happens to be byte-identical to that snapshot's content."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+    snap = dataclasses.replace(_snap(spec_file), path=str(impl / "spec-9-9-other.md"))
+    spec = dataclasses.replace(_dev_spec(tmp_path), role="review", spec_snapshot=snap)
+    # not the snapshotted path -> no hash comparison -> ordinary 2-obs harvest
+    assert adapter._result_json(_dev_handle(), spec, wait=True) is None
+    (crumb,) = _breadcrumbs(adapter)
+    assert crumb["verdict"] == "terminal-frontmatter-pending"
+    rj = adapter._result_json(_dev_handle(), spec, wait=True)
+    assert rj["synthesized_from_frontmatter"] is True
+
+
+def test_frontmatter_fallback_unmodified_wait_false_silent(tmp_path, monkeypatch):
+    """The plain crash path (wait=False, live window) is compare-only over an
+    unmodified spec: it refuses to synthesize and leaves zero crumbs of either
+    kind."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+    spec = _snapshotted_spec(tmp_path, spec_file)
+    assert adapter._result_json(_dev_handle(), spec, wait=False) is None
+    assert _breadcrumbs(adapter) == []
+    assert _lifecycle_lines(adapter) == []
+    assert adapter._fm_fallback_obs == {}
+
+
+# ------------------------- mid-session status-transition observation (#276 M2)
+#
+# The engine threads a launch snapshot whose fm_status is the review's `done`
+# (re-opened). On each heartbeat tick the dev adapter samples the snapshotted
+# spec and records the FIRST non-terminal status it observes this session drive
+# it to (in practice `in-review`). That single sighting makes a later terminal
+# frontmatter deterministic proof THIS session wrote it, so the fallback
+# harvests on one sighting — but the M1 hash gate still outranks it.
+
+
+def _transitioned_spec(tmp_path, spec_file: Path, live_status: str = "in-review") -> SessionSpec:
+    """A review spec whose launch snapshot carries `done` but whose on-disk file
+    now sits at `live_status` — the state a mid-session tick observes."""
+    spec_file.write_text(_MARKERLESS_DONE)  # launch state: terminal `done`
+    spec = _snapshotted_spec(tmp_path, spec_file)
+    spec_file.write_text(f"---\nstatus: {live_status}\n---\n\n# Story\n\nReviewing.\n")
+    return spec
+
+
+def _lifecycle_events(adapter, event, task_id="3-1-dev-1"):
+    """Lifecycle breadcrumbs of one `event` kind — the shared filter behind the
+    per-event helpers (`spec-status-transition-observed`, `contract-nudge-sent`)."""
+    return [ln for ln in _lifecycle_lines(adapter, task_id) if ln["event"] == event]
+
+
+def test_observe_tick_records_first_transition(tmp_path):
+    """The first observed non-terminal, non-launch status is recorded once with a
+    single `spec-status-transition-observed` crumb; a second tick — even a
+    different non-terminal status — neither overwrites the record nor re-crumbs."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec = _transitioned_spec(tmp_path, spec_file)  # on disk: in-review
+
+    adapter._observe_tick(_dev_handle(), spec)
+    assert adapter._fm_transition_obs == {"3-1-dev-1": "in-review"}
+    (crumb,) = _lifecycle_events(adapter, "spec-status-transition-observed")
+    assert crumb["status"] == "in-review"
+    assert crumb["spec"] == str(spec_file)
+
+    # a later tick at a different non-terminal status must not overwrite or re-crumb
+    spec_file.write_text("---\nstatus: in-progress\n---\n\n# Story\n\nStill.\n")
+    adapter._observe_tick(_dev_handle(), spec)
+    assert adapter._fm_transition_obs == {"3-1-dev-1": "in-review"}
+    assert len(_lifecycle_events(adapter, "spec-status-transition-observed")) == 1
+
+
+@pytest.mark.parametrize(
+    "on_disk, launch_status",
+    [
+        ("done", "done"),  # terminal — and this review's own launch status
+        ("blocked", "done"),  # terminal — belongs to the Stop harvest
+        ("", "done"),  # blank/torn parse — not evidence of anything
+        ("in-review", "in-review"),  # equals the launch status — not a transition
+    ],
+)
+def test_observe_tick_ignores_terminal_blank_and_launch_status(tmp_path, on_disk, launch_status):
+    """A tick records nothing when the on-disk status is terminal (`done`/
+    `blocked`), a blank/torn parse, or unchanged from the snapshot's launch
+    status — only a live, non-terminal transition off the launch state counts."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    spec_file = impl / "spec-3-1-foo.md"
+    if on_disk == "":
+        spec_file.write_text("# Story\n\nno frontmatter\n")  # parses to status ""
+    else:
+        spec_file.write_text(f"---\nstatus: {on_disk}\n---\n\n# Story\n\nbody\n")
+    snap = dataclasses.replace(_snap(spec_file), fm_status=launch_status)
+    spec = dataclasses.replace(_dev_spec(tmp_path), role="review", spec_snapshot=snap)
+
+    adapter._observe_tick(_dev_handle(), spec)
+
+    assert adapter._fm_transition_obs == {}
+    assert _lifecycle_events(adapter, "spec-status-transition-observed") == []
+
+
+def test_observe_tick_without_snapshot_or_unreadable_is_noop(tmp_path, monkeypatch):
+    """No snapshot (every non-review session) is a pure no-op, and a torn/
+    unreadable snapshot read (OSError) is a skipped sample — never a verdict —
+    so neither records a transition or a crumb."""
+    adapter, impl = make_dev_adapter(tmp_path)
+
+    # (a) no snapshot at all: returns before reading anything
+    adapter._observe_tick(_dev_handle(), _dev_spec(tmp_path))
+    assert adapter._fm_transition_obs == {}
+
+    # (b) a snapshot whose path raises on read: the sampling path swallows OSError
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text("---\nstatus: in-review\n---\n\n# Story\n\nx\n")
+    spec = _snapshotted_spec(tmp_path, spec_file)
+
+    def boom(_path):
+        raise OSError("torn read")
+
+    monkeypatch.setattr(generic, "read_frontmatter", boom)
+    adapter._observe_tick(_dev_handle(), spec)
+    assert adapter._fm_transition_obs == {}
+    assert _lifecycle_lines(adapter) == []
+
+
+def test_frontmatter_fallback_transition_single_sighting_harvest(tmp_path, monkeypatch):
+    """A recorded transition + a terminal frontmatter whose bytes differ from the
+    snapshot: the FIRST wait=True pass harvests (no 2-obs wait), the result is
+    marked synthesized, the synth crumb carries transition=True, and no
+    `terminal-frontmatter-pending` breadcrumb is left."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n# Story\n\nLaunch.\n"
+    )
+    spec = _snapshotted_spec(tmp_path, spec_file)  # snapshot of the launch bytes
+    # the review actually ran: terminal spec written, bytes differ from launch
+    spec_file.write_text(_MARKERLESS_DONE)
+    adapter._fm_transition_obs["3-1-dev-1"] = "in-review"
+
+    rj = adapter._result_json(_dev_handle(), spec, wait=True)
+
+    assert rj is not None and rj["synthesized_from_frontmatter"] is True
+    assert _breadcrumbs(adapter) == []  # single-sighting: no pending crumb
+    synth = [ln for ln in _lifecycle_lines(adapter) if ln["event"] == "frontmatter-synthesized"]
+    assert len(synth) == 1 and synth[0]["transition"] is True
+
+
+def test_frontmatter_fallback_missed_transition_stays_conservative(tmp_path, monkeypatch):
+    """Snapshot present, bytes differ, but NO transition was recorded (the flip
+    happened between ticks): the fallback keeps the conservative 2-observation
+    fingerprint — pending on the first stable Stop, harvested on the second with
+    transition=False."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n# Story\n\nLaunch.\n"
+    )
+    spec = _snapshotted_spec(tmp_path, spec_file)
+    spec_file.write_text(_MARKERLESS_DONE)  # bytes differ; transition unrecorded
+    assert adapter._fm_transition_obs == {}
+
+    assert adapter._result_json(_dev_handle(), spec, wait=True) is None
+    (crumb,) = _breadcrumbs(adapter)
+    assert crumb["verdict"] == "terminal-frontmatter-pending"
+
+    rj = adapter._result_json(_dev_handle(), spec, wait=True)
+    assert rj["synthesized_from_frontmatter"] is True
+    synth = [ln for ln in _lifecycle_lines(adapter) if ln["event"] == "frontmatter-synthesized"]
+    assert len(synth) == 1 and synth[0]["transition"] is False
+
+
+def test_transition_beats_hash_gate(tmp_path, monkeypatch):
+    """A recorded transition (#276 M2) OUTRANKS the M1 hash gate: a clean review that
+    round-tripped `done -> in-review -> done` back to byte-identical launch bytes
+    while omitting its marker still harvests — the observed transition proves it ran.
+    No `unmodified-since-launch` refusal; one `frontmatter-synthesized` crumb marked
+    transition=True."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+    spec = _snapshotted_spec(tmp_path, spec_file)  # snapshot == current bytes
+    adapter._fm_transition_obs["3-1-dev-1"] = "in-review"  # a transition WAS seen
+
+    rj = adapter._result_json(_dev_handle(), spec, wait=True)
+    assert rj["synthesized_from_frontmatter"] is True
+    assert _breadcrumbs(adapter) == []  # a harvest leaves no give-up breadcrumb
+    synth = [ln for ln in _lifecycle_lines(adapter) if ln["event"] == "frontmatter-synthesized"]
+    assert len(synth) == 1 and synth[0]["transition"] is True
+
+
+def test_frontmatter_fallback_alias_path_recognized_as_same_spec(tmp_path, monkeypatch):
+    """#5: snapshot/candidate identity is filesystem-based, not lexical. A snapshot
+    recorded under a non-normalized alias of the candidate (a `..` detour to the same
+    file) is still recognized as the same spec, so the M1 hash gate fires on a
+    byte-identical unmodified spec instead of wrongly harvesting (a raw string compare
+    would miss the alias)."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+    alias = impl / ".." / impl.name / "spec-3-1-foo.md"  # same file, different spelling
+    assert alias.resolve() == spec_file.resolve()
+    snap = dataclasses.replace(_snap(spec_file), path=str(alias))
+    spec = dataclasses.replace(_dev_spec(tmp_path), role="review", spec_snapshot=snap)
+
+    assert adapter._result_json(_dev_handle(), spec, wait=True) is None
+    (crumb,) = _breadcrumbs(adapter)
+    assert crumb["verdict"] == "unmodified-since-launch"
+
+
+def test_wait_loop_heartbeat_drives_observe_tick(tmp_path, monkeypatch):
+    """The wait loop invokes _observe_tick inside the heartbeat-throttled block:
+    the first tick always fires (last_heartbeat is None) and each later tick a
+    HEARTBEAT_INTERVAL_S apart fires again, always with the session's handle."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    adapter, _ = make_dev_adapter(tmp_path)
+    adapter._stall_grace_s = 100.0  # let several idle ticks pass before the stall
+    adapter._stall_nudges = 0
+    adapter._window_alive = lambda handle: True
+
+    observed: list[str] = []
+    monkeypatch.setattr(
+        adapter, "_observe_tick", lambda handle, spec: observed.append(handle.task_id)
+    )
+
+    clock = {"t": 1000.0}
+
+    class _Clock:
+        monotonic = staticmethod(lambda: clock["t"])
+        time = staticmethod(lambda: 0.0)  # frozen wall clock: the co-bound never fires
+        sleep = staticmethod(lambda *_: None)
+        time_ns = staticmethod(lambda: 0)
+
+    monkeypatch.setattr(generic, "time", _Clock)
+
+    def advance(call_n):
+        if call_n >= 2:  # each idle tick crosses one HEARTBEAT_INTERVAL_S (30s)
+            clock["t"] += 31.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_stop_event("3-1-dev-1", "sess", "/run/events.jsonl")],  # then None forever
+        on_call=advance,
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "stalled"
+    # the first tick plus at least one later heartbeat crossing fired the hook
+    assert len(observed) >= 2 and all(tid == "3-1-dev-1" for tid in observed)
+
+
+# ------------------------------ contract nudge (#276 M4)
+#
+# On the FIRST `terminal-frontmatter-pending` observation (a Stop that found the
+# spec finalized to a terminal frontmatter status but missing its `## Auto Run
+# Result` marker), the dev adapter sends ONE targeted nudge asking the skill to
+# append the section it owed — repairing the omission at the source. Sent exactly
+# once per session via a never-cleared set (marked before the send), gated by
+# `limits.dev_contract_nudge`, and touching no stall counters. Frontmatter
+# synthesis stays the backstop for a session that never complies.
+
+
+def _record_sent(adapter):
+    sent: list[str] = []
+    adapter.send_text = lambda handle, text: sent.append(text)
+    return sent
+
+
+def test_contract_nudge_sent_on_first_pending_observation(tmp_path, monkeypatch):
+    """The first pending observation sends exactly the formatted nudge, journals a
+    `contract-nudge-sent` crumb, and still records the `terminal-frontmatter-
+    pending` verdict — the nudge is additive, not a replacement for the fallback."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    sent = _record_sent(adapter)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+
+    assert sent == [generic.CONTRACT_NUDGE_TEXT.format(spec_path=spec_file, status="done")]
+    (crumb,) = _lifecycle_events(adapter, "contract-nudge-sent")
+    assert crumb["spec"] == str(spec_file) and crumb["status"] == "done"
+    (verdict,) = _breadcrumbs(adapter)
+    assert verdict["verdict"] == "terminal-frontmatter-pending"
+    assert adapter._contract_nudge_sent == {"3-1-dev-1"}
+
+
+def test_contract_nudge_exactly_once_across_mtime_reset(tmp_path, monkeypatch):
+    """#149's refill hazard cannot apply: an mtime bump resets the observation
+    counter to 1, but the nudge budget is the never-cleared set, so a second
+    first-observation Stop over the same session sends nothing more."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    sent = _record_sent(adapter)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+    os.utime(spec_file, ns=(1_000_000_000, 1_000_000_000))
+
+    # first pending observation -> one nudge
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+    assert len(sent) == 1
+    # the session wrote again: fingerprint changes, observation count resets to 1
+    os.utime(spec_file, ns=(2_000_000_000, 2_000_000_000))
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+
+    assert len(sent) == 1  # not re-nudged despite observations back at 1
+    assert len(_lifecycle_events(adapter, "contract-nudge-sent")) == 1
+
+
+def test_contract_nudge_not_sent_when_transition_proven(tmp_path, monkeypatch):
+    """A recorded mid-session transition (#276 M2) harvests on the first sighting,
+    so the record-obs branch — and its nudge — is never reached."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    sent = _record_sent(adapter)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n# Story\n\nLaunch.\n"
+    )
+    spec = _snapshotted_spec(tmp_path, spec_file)
+    spec_file.write_text(_MARKERLESS_DONE)  # bytes differ from the launch snapshot
+    adapter._fm_transition_obs["3-1-dev-1"] = "in-review"
+
+    rj = adapter._result_json(_dev_handle(), spec, wait=True)
+
+    assert rj is not None and rj["synthesized_from_frontmatter"] is True
+    assert sent == []
+    assert _lifecycle_events(adapter, "contract-nudge-sent") == []
+
+
+def test_contract_nudge_not_sent_on_ambiguous(tmp_path, monkeypatch):
+    """Several marker-less candidates refuse to guess before the fingerprint/nudge
+    branch, so no nudge is sent."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    sent = _record_sent(adapter)
+    (impl / "spec-3-1-foo.md").write_text(_MARKERLESS_DONE)
+    (impl / "spec-3-2-bar.md").write_text(_MARKERLESS_DONE)
+
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+
+    (crumb,) = _breadcrumbs(adapter)
+    assert crumb["verdict"] == "ambiguous-frontmatter"
+    assert sent == []
+    assert _lifecycle_events(adapter, "contract-nudge-sent") == []
+
+
+def test_contract_nudge_not_sent_on_dead_window(tmp_path):
+    """A dead-window post-kill reconcile synthesizes on a single sighting via the
+    wait=False path, which never reaches the nudge (wait=True only)."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    adapter._window_alive = lambda handle: False
+    sent = _record_sent(adapter)
+    (impl / "spec-3-1-foo.md").write_text(_MARKERLESS_DONE)
+
+    result = adapter._post_kill_reconcile(_dev_handle(), _dev_spec(tmp_path), _unvouched())
+
+    assert result.status == "completed"  # synthesized on the dead window
+    assert sent == []
+    assert _lifecycle_events(adapter, "contract-nudge-sent") == []
+
+
+def test_contract_nudge_not_sent_on_unmodified_refusal(tmp_path, monkeypatch):
+    """The M1 hash gate refuses a byte-identical spec before the fingerprint/nudge
+    branch: a spec provably untouched by this session is not this session's to
+    repair, so no nudge fires."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    sent = _record_sent(adapter)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+    spec = _snapshotted_spec(tmp_path, spec_file)  # snapshot == current bytes
+
+    assert adapter._result_json(_dev_handle(), spec, wait=True) is None
+
+    (crumb,) = _breadcrumbs(adapter)
+    assert crumb["verdict"] == "unmodified-since-launch"
+    assert sent == []
+    assert _lifecycle_events(adapter, "contract-nudge-sent") == []
+
+
+def test_contract_nudge_send_failure_marks_sent(tmp_path, monkeypatch):
+    """A raising transport still satisfies exactly-once: the task is marked (and
+    the crumb journaled) BEFORE the send, so a `MultiplexerError` is swallowed and
+    the next Stop attempts no retry."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    calls = {"n": 0}
+
+    def boom(handle, text):
+        calls["n"] += 1
+        raise generic.MultiplexerError("transport down")
+
+    adapter.send_text = boom
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+
+    # first observation: nudge attempted, raises, swallowed (no crash)
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+    assert calls["n"] == 1
+    assert adapter._contract_nudge_sent == {"3-1-dev-1"}
+    assert len(_lifecycle_events(adapter, "contract-nudge-sent")) == 1  # marked before the send
+
+    # second stable Stop: task already marked -> no retry, and it harvests
+    rj = adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True)
+    assert rj["synthesized_from_frontmatter"] is True
+    assert calls["n"] == 1  # never re-sent
+
+
+def test_contract_nudge_disabled_by_policy(tmp_path, monkeypatch):
+    """Knob off: no send, no `contract-nudge-sent` crumb, and the fallback behaves
+    exactly as it did pre-M4 (pending crumb recorded, harvest on the second Stop)."""
+    adapter, impl = make_dev_adapter(
+        tmp_path, policy=Policy(limits=LimitsPolicy(dev_contract_nudge=False))
+    )
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    sent = _record_sent(adapter)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+    assert sent == []
+    assert _lifecycle_events(adapter, "contract-nudge-sent") == []
+    assert adapter._contract_nudge_sent == set()
+    (crumb,) = _breadcrumbs(adapter)
+    assert crumb["verdict"] == "terminal-frontmatter-pending"
+    # pre-M4 behavior intact: harvest on the second stable Stop
+    rj = adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True)
+    assert rj["synthesized_from_frontmatter"] is True
+
+
+def test_wait_loop_contract_nudge_then_skill_appends_marker(tmp_path, monkeypatch):
+    """End to end: Stop 1 finds a marker-less terminal spec and nudges; the skill
+    complies by appending its `## Auto Run Result` section before Stop 2; Stop 2
+    then completes via the NORMAL marker scan — no synthesis, no
+    `synthesized_from_frontmatter` flag, and no second nudge."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    sent = _record_sent(adapter)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+
+    # Stop 1: marker-less -> pending + one nudge
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+    assert sent == [generic.CONTRACT_NUDGE_TEXT.format(spec_path=spec_file, status="done")]
+
+    # the skill heeds the nudge and appends its required marker section
+    spec_file.write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n# Story\n\nAll done.\n\n"
+        "## Auto Run Result\n\nStatus: done\nImplemented the thing.\n"
+    )
+
+    # Stop 2: harvested by the ordinary scan, not the fallback
+    rj = adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True)
+    assert rj["status"] == "done"
+    assert "synthesized_from_frontmatter" not in rj
+    assert len(sent) == 1  # no second nudge

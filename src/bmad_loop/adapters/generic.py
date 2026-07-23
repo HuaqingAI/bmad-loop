@@ -22,10 +22,13 @@ fallback.
 from __future__ import annotations
 
 import dataclasses
+import enum
+import hashlib
 import json
 import re
 import shlex
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -40,7 +43,7 @@ from ..process_host import ProcessHostError, get_process_host
 from ..signals import SignalWatcher
 from ..tokens import read_usage as tally_usage
 from ..verify import read_frontmatter
-from .base import CodingCLIAdapter, SessionHandle, SessionResult, SessionSpec
+from .base import CodingCLIAdapter, SessionHandle, SessionResult, SessionSpec, SpecSnapshot
 from .multiplexer import MultiplexerError, TerminalMultiplexer, get_multiplexer
 from .profile import CLIProfile
 
@@ -64,6 +67,27 @@ KILL_POLL_S = 0.5
 # a session mid-edit cannot produce. A dead window skips the counter entirely:
 # the kill settled liveness, so the frontmatter is as final as it will ever get.
 FM_FALLBACK_MIN_OBS = 2
+
+
+class _SnapVerdict(enum.Enum):
+    """Launch-snapshot (#276 M1/M2) decision, shared by the mtime-scan fallback and
+    the stories read-back so the two completion paths can never drift.
+
+    NEUTRAL — no snapshot, a different file, or bytes changed since launch: fall
+    through to the path's normal accept logic.
+    PROVEN  — a mid-session status transition (M2) was observed for this spec:
+    single-sighting harvest, and it OUTRANKS a byte-identical hash (a clean review
+    can round-trip back to the launch bytes yet provably ran).
+    REFUSE  — bytes still byte-identical to the review-launch snapshot AND no
+    transition was observed (M1): the documented dead-window false positive
+    (a `done` spec re-opened for review, mtime-bumped but never re-driven).
+    """
+
+    NEUTRAL = "neutral"
+    PROVEN = "proven"
+    REFUSE = "refuse"
+
+
 # Post-mortem transport-failure classification (#194): how much of the tee'd
 # pane log's tail to scan, how long an evidence excerpt to keep, and which
 # non-completed statuses are eligible. over_budget is excluded — a budget
@@ -122,6 +146,25 @@ BUDGET_NUDGE_TEXT = (
     "and end your turn. Note: a prose reply cannot end this session — only the "
     "completion artifact does; if you cannot finish, mark the work blocked in it "
     "and end your turn."
+)
+# Targeted contract-repair nudge (#276 M4): a Stop found the spec at
+# {spec_path} finalized to terminal frontmatter status {status} but WITHOUT the
+# `## Auto Run Result` section bmad-loop's harvest scan keys on. Ask the skill to
+# append that section itself so the omission is fixed at the source (a compliant
+# append is then harvested by the normal scan; harness-side frontmatter synthesis
+# stays the backstop). Sent at most once per session and never re-armed, so it is
+# safe to be specific and directive. Guarded ("if this spec is not yours or the
+# work is unfinished") so a session legitimately mid-workflow is not derailed.
+CONTRACT_NUDGE_TEXT = (
+    "You are running in bmad-loop automation mode. The spec at {spec_path} now "
+    "carries a terminal frontmatter `status: {status}`, but it is missing the "
+    "`## Auto Run Result` section your contract requires — bmad-loop harvests "
+    "that section, not the frontmatter, so without it this finished story looks "
+    "unfinished. If this spec is yours and the work is done, append the section "
+    "to the spec now — the `## Auto Run Result` heading, a `Status: {status}` "
+    "line matching the frontmatter, and a brief summary — then end your turn. If "
+    "this spec is not yours, or the work is not actually finished, ignore this "
+    "and continue your workflow instead."
 )
 
 
@@ -458,6 +501,10 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
                         "stall_nudges_sent": stall_nudges_sent,
                     },
                 )
+                # Mid-session spec-status transition sampling (#276 M2) rides the
+                # same heartbeat cadence — a no-op unless this adapter drives the
+                # generic skill and the engine threaded a launch snapshot.
+                self._observe_tick(handle, spec)
                 # Budget sampling rides the heartbeat cadence — no extra knob.
                 # transcript_path is unknown until the first hook event carries
                 # it (SessionStart for claude); until then the guard is inert.
@@ -996,6 +1043,12 @@ class _DevSynthesisMixin(_ResultFileMixin):
     # (no runtime effect) tell the type checker the host attributes this reads.
     paths: ProjectPaths
     policy: Policy
+    # The concrete adapter's real transport (GenericDevAdapter/OpencodeDevAdapter
+    # both define `def send_text`). Declared here as a BARE annotation, never a
+    # `def`: the mixin precedes the concrete adapter in MRO, so a stub method
+    # would shadow the real one on both adapters. The contract nudge (#276 M4)
+    # sends through it.
+    send_text: Callable[[SessionHandle, str], None]
 
     def _configure_dev_knobs(self) -> None:
         """Override the base result-file knobs for the bmad-dev-auto contract;
@@ -1013,6 +1066,20 @@ class _DevSynthesisMixin(_ResultFileMixin):
         # Task ids are unique per session, so entries never need resetting
         # between sessions; the dict lives for the adapter's lifetime.
         self._fm_fallback_obs: dict[str, tuple[str, int, str, int]] = {}
+        # First mid-session spec-status transition observed per session (#276 M2):
+        # task_id -> normalized status. Recorded by `_observe_tick` when the spec's
+        # frontmatter first moves off its launch status to a non-terminal state (in
+        # practice `in-review`), which makes a later terminal frontmatter proof THIS
+        # session wrote it. Same lifetime doctrine as `_fm_fallback_obs` — task_ids
+        # are unique per session, so entries are recorded once and never cleared.
+        self._fm_transition_obs: dict[str, str] = {}
+        # Targeted contract-nudge budget (#276 M4): task_ids that have already been
+        # sent the one CONTRACT_NUDGE_TEXT nudge. A set, never cleared, so the nudge
+        # fires at most once per session even though an mtime bump resets the
+        # `_fm_fallback_obs` observation counter to 1 (#149's refill hazard cannot
+        # apply — this budget is not a counter and touches no stall counters).
+        self._contract_nudge_sent: set[str] = set()
+        self._contract_nudge_enabled = self.policy.limits.dev_contract_nudge
 
     def _probe_alive(self, handle: SessionHandle) -> bool | None:
         """Liveness of the session's native surface (tmux window, server
@@ -1076,6 +1143,77 @@ class _DevSynthesisMixin(_ResultFileMixin):
         dw_ids = [tok for tok in (i.strip() for i in raw_dw_ids) if tok]
         return devcontract.synthesize_result(spec_path, story_key=story_key, dw_ids=dw_ids or None)
 
+    def _observe_tick(self, handle: SessionHandle, spec: SessionSpec) -> None:
+        """Mid-session status-transition observation (#276 M2), called each
+        heartbeat tick (~every HEARTBEAT_INTERVAL_S; the first tick fires too).
+        Records the FIRST spec frontmatter status this session drives off its
+        launch state to a live, non-terminal value (in practice ``in-review``)
+        into ``_fm_transition_obs``. That single sighting is what lets
+        ``_frontmatter_fallback`` treat a later terminal frontmatter as
+        deterministic proof THIS session wrote it (``transition_proven``), so it
+        can synthesize on ONE terminal sighting instead of the 2-observation
+        fingerprint.
+
+        A pure sampling path, never a verdict path: it needs a launch snapshot to
+        observe against, fires at most once per session (task_ids are unique;
+        entries are never cleared), and any unreadable/torn read is a skipped
+        sample (silent OSError return), never evidence. Blank/torn parses (``s ==
+        ""``) and terminal states (``done``/``blocked``) are NOT recorded — a
+        terminal frontmatter is the Stop harvest's business, and the launch status
+        itself (the ``done`` a review re-opens) is not a transition. A transition
+        that flips entirely between two ticks is simply missed, and the fallback
+        keeps its conservative 2-observation path."""
+        task_id = handle.task_id
+        snap = spec.spec_snapshot
+        if snap is None or task_id in self._fm_transition_obs:
+            return
+        try:
+            s = str(read_frontmatter(Path(snap.path)).get("status", "")).strip().lower()
+        except OSError:
+            return
+        if s != "" and s not in (devcontract.DONE, devcontract.BLOCKED) and s != snap.fm_status:
+            self._fm_transition_obs[task_id] = s
+            self._note_lifecycle(
+                task_id, "spec-status-transition-observed", spec=snap.path, status=s
+            )
+
+    @staticmethod
+    def _same_spec(candidate: Path, snap_path: str) -> bool:
+        """Whether ``candidate`` and the snapshot's recorded path are the SAME file
+        by filesystem identity (#276 M1), not raw string spelling. ``snap_path`` is
+        the engine's ``str(task.spec_file)``; a ``..`` segment, a symlinked artifacts
+        dir, or a case-variant alias makes an equivalent path compare unequal
+        lexically and would silently disable the hash/transition gate. ``resolve()``
+        (the repo's identity convention, non-strict) collapses those; an unresolvable
+        path degrades to "not the same file" — conservative, the gate stays inert
+        rather than ever falsely refusing."""
+        try:
+            return candidate.resolve() == Path(snap_path).resolve()
+        except OSError:
+            return False
+
+    def _snapshot_verdict(
+        self,
+        *,
+        same_file: bool,
+        snap: SpecSnapshot | None,
+        task_id: str,
+        digest: str | None,
+    ) -> _SnapVerdict:
+        """Shared M1/M2 launch-snapshot decision (see ``_SnapVerdict``). Pure logic,
+        no I/O: each caller precomputes ``same_file`` (via ``_same_spec``) and, only
+        when it holds, ``digest`` (so an unrelated spec is never hashed), preserving
+        each path's own read-error semantics. A recorded transition (M2) outranks the
+        content hash (M1); the hash gate refuses only when no transition was observed
+        and the bytes are still identical to the launch snapshot."""
+        if snap is None or not same_file:
+            return _SnapVerdict.NEUTRAL
+        if task_id in self._fm_transition_obs:
+            return _SnapVerdict.PROVEN
+        if digest is not None and digest == snap.sha256:
+            return _SnapVerdict.REFUSE
+        return _SnapVerdict.NEUTRAL
+
     def _frontmatter_fallback(
         self,
         handle: SessionHandle,
@@ -1097,9 +1235,26 @@ class _DevSynthesisMixin(_ResultFileMixin):
         evidence than the marker, so the live path harvests only a fingerprint
         (path, mtime, status) that held stable across ``FM_FALLBACK_MIN_OBS``
         resultless Stops; a dead window (post-kill reconcile) harvests on one
-        sighting, liveness having been settled by the kill. Several candidates
-        mean the scan cannot know which spec is this session's — refuse to
-        guess. Every synthesized result still runs the engine's full
+        sighting, liveness having been settled by the kill. A recorded mid-session
+        transition (#276 M2) is a third single-sighting route, live or dead: having
+        observed this session drive the spec off its launch ``status:`` to a live
+        non-terminal state (``in-review``) proves the terminal frontmatter it now
+        carries is this session's own write, not a stale prior ``done``, so one
+        terminal sighting suffices — the ``transition=`` flag on the synthesized
+        crumb marks it. A transition that flips entirely between two ticks is simply
+        missed, and this stays on the conservative 2-observation fingerprint.
+        Several candidates mean the scan cannot know which spec is this session's —
+        refuse to guess. The launch-snapshot hash (#276 M1) and the transition (M2)
+        interact via ``_snapshot_verdict``: when the engine threaded a
+        ``spec_snapshot`` (review sessions) and the candidate's bytes still hash
+        equal to it, synthesis is deterministically REFUSED in every mode, including
+        the dead window (the ``unmodified-since-launch`` verdict /
+        ``frontmatter-unmodified-refused`` crumb) — the ``done`` spec re-opened for
+        review, mtime-bumped but never re-driven. A recorded transition OUTRANKS the
+        hash, though: a clean review can round-trip ``done -> in-review -> done`` back
+        to the launch bytes while still omitting its marker, and the observed
+        ``in-review`` proves it ran — so REFUSE fires only when NO transition was
+        seen. Every synthesized result still runs the engine's full
         deterministic verify downstream, the same #61 trust model as the
         post-kill rescue. With this in place a marker-less ``done`` spec
         completes here and never reaches the review-timeout path, so the
@@ -1107,10 +1262,23 @@ class _DevSynthesisMixin(_ResultFileMixin):
         case: a review that died with a NON-terminal frontmatter.
 
         Owns the give-up breadcrumb: exactly one of ``no-artifact``,
-        ``ambiguous-frontmatter``, or ``terminal-frontmatter-pending`` per
-        wait=True pass (none on a harvest). A plain wait=False read (the crash
-        path) is compare-only — it may harvest an already-stable fingerprint but
-        never records observations or breadcrumbs.
+        ``ambiguous-frontmatter``, ``unmodified-since-launch``, or
+        ``terminal-frontmatter-pending`` per wait=True pass (none on a harvest).
+        A plain wait=False read (the crash path) is compare-only — it may harvest
+        an already-stable fingerprint but never records observations or
+        breadcrumbs; the hash gate is the one wait=False path that leaves a crumb,
+        and only under a dead window (``frontmatter-unmodified-refused``).
+
+        On the FIRST ``terminal-frontmatter-pending`` observation (wait=True, one
+        candidate, not the hash-gate refusal, transition not yet proven) it also
+        fires the #276 M4 contract nudge when ``limits.dev_contract_nudge`` is on:
+        one ``CONTRACT_NUDGE_TEXT`` send asking the skill to append the marker it
+        owed, then repair at the source rather than only synthesizing here. It is
+        bounded by the never-cleared ``_contract_nudge_sent`` set (marked before
+        the send, ``MultiplexerError`` swallowed) — exactly once per session,
+        touching no stall counters, so an mtime bump that resets ``observations``
+        to 1 never re-nudges. A compliant append is harvested by the ordinary
+        marker scan on a later Stop, leaving synthesis as the backstop.
         """
         task_id = handle.task_id
         candidates: list[Path] = []
@@ -1141,9 +1309,15 @@ class _DevSynthesisMixin(_ResultFileMixin):
                 )
             return None
         path = candidates[0]
+        snap = spec.spec_snapshot
+        same_file = snap is not None and self._same_spec(path, snap.path)
         try:
             mtime_ns = path.stat().st_mtime_ns
             fm_status = str(read_frontmatter(path).get("status", "")).strip().lower()
+            # Content hash only when the candidate IS the snapshotted spec (compared
+            # by filesystem identity) — an unrelated marker-less spec under the same
+            # artifacts dir shares no launch state, so hashing it is meaningless work.
+            digest = hashlib.sha256(path.read_bytes()).hexdigest() if same_file else None
         except OSError:
             # Torn mid-write read: not evidence of anything — same degrade as
             # the read-back doctrine everywhere else on this path.
@@ -1152,11 +1326,44 @@ class _DevSynthesisMixin(_ResultFileMixin):
                     task_id, "no-artifact", f"unreadable marker-less candidate {path}"
                 )
             return None
+        # Launch-snapshot verdict (#276 M1/M2), shared with the stories read-back.
+        # REFUSE (M1) — bytes byte-identical to the review-launch snapshot with NO
+        # transition observed — is the documented dead-window false positive (a
+        # `done` spec re-opened for review, mtime-bumped but never re-driven);
+        # refuse in EVERY mode, including `dead_window`. A PROVEN transition (M2)
+        # outranks it and falls through to synthesis below. No observation is
+        # recorded or popped on REFUSE — an unchanged spec is neither progress nor a
+        # stall.
+        verdict = self._snapshot_verdict(
+            same_file=same_file, snap=snap, task_id=task_id, digest=digest
+        )
+        if verdict is _SnapVerdict.REFUSE:
+            assert snap is not None  # REFUSE is returned only for a matched snapshot
+            if wait:
+                self._note_resultless_stop(
+                    task_id,
+                    "unmodified-since-launch",
+                    f"{path} byte-identical to review-launch snapshot "
+                    f"(snapshot mtime_ns={snap.mtime_ns}, candidate mtime_ns={mtime_ns}); "
+                    "refusing frontmatter synthesis",
+                )
+            elif dead_window:
+                self._note_lifecycle(
+                    task_id,
+                    "frontmatter-unmodified-refused",
+                    spec=str(path),
+                    status=fm_status,
+                    dead_window=True,
+                )
+            return None
         fingerprint = (str(path), mtime_ns, fm_status)
         prev = self._fm_fallback_obs.get(task_id)
         stable = prev is not None and prev[:3] == fingerprint
         observations = (prev[3] + 1) if (stable and prev is not None) else 1
-        if dead_window or (stable and observations >= FM_FALLBACK_MIN_OBS):
+        # A recorded mid-session transition (#276 M2) proves the terminal frontmatter
+        # is this session's write → single-sighting harvest, like a dead window.
+        transition_proven = verdict is _SnapVerdict.PROVEN
+        if dead_window or transition_proven or (stable and observations >= FM_FALLBACK_MIN_OBS):
             sr = self._synthesize_from(path, spec)
             if sr.result_json is not None:
                 sr.result_json["synthesized_from_frontmatter"] = True
@@ -1166,6 +1373,7 @@ class _DevSynthesisMixin(_ResultFileMixin):
                     spec=str(path),
                     status=fm_status,
                     dead_window=dead_window,
+                    transition=transition_proven,
                 )
             return sr
         if wait:
@@ -1176,6 +1384,31 @@ class _DevSynthesisMixin(_ResultFileMixin):
                 f"{path} frontmatter status={fm_status!r} with no '## Auto Run Result'"
                 f" marker; observation {observations}/{FM_FALLBACK_MIN_OBS} before synthesis",
             )
+            # Contract nudge (#276 M4): at the FIRST pending observation, ask the
+            # skill to append the `## Auto Run Result` section it owed so the
+            # omission is repaired at the source (a compliant append is then
+            # harvested by the normal marker scan on a later Stop; synthesis stays
+            # the backstop). Exactly once per session: the task_id is marked BEFORE
+            # the send so a raising transport still satisfies exactly-once, and the
+            # never-cleared set — not the mtime-resettable observation counter — is
+            # the budget, so the #149 refill hazard cannot apply. Touches no stall
+            # counters.
+            if (
+                self._contract_nudge_enabled
+                and observations == 1
+                and task_id not in self._contract_nudge_sent
+            ):
+                self._contract_nudge_sent.add(task_id)
+                self._note_lifecycle(
+                    task_id, "contract-nudge-sent", spec=str(path), status=fm_status
+                )
+                try:
+                    self.send_text(
+                        handle,
+                        CONTRACT_NUDGE_TEXT.format(spec_path=path, status=fm_status),
+                    )
+                except MultiplexerError:
+                    pass
         return None
 
     def _stories_synth_result(
@@ -1200,7 +1433,19 @@ class _DevSynthesisMixin(_ResultFileMixin):
         On a plan-halt leg (``BMAD_LOOP_PLAN_HALT`` set by the engine for a
         spec_checkpoint story's first dispatch) the skill HALTs at
         ``ready-for-dev``; pass ``plan_halt=True`` so synthesize treats that as a
-        successful terminal (marked ``plan_halt``) rather than died-mid-flight."""
+        successful terminal (marked ``plan_halt``) rather than died-mid-flight.
+
+        A review session also carries a launch ``spec_snapshot``, so before
+        synthesizing this applies the shared ``_snapshot_verdict`` gate (#276 M1/M2):
+        an unmodified-since-launch ``done`` spec with no observed transition is
+        REFUSED (the ``unmodified-since-launch`` verdict), closing the same
+        false-positive completion the mtime-scan fallback closes — a review that only
+        bumped the mtime of the stripped launch spec no longer reads as done. A dev
+        leg carries no snapshot → the gate is inert (mtime-floor accept). Identity is
+        filesystem-based (``_same_spec``): under worktree isolation, if ``base``
+        resolves into the worktree but the snapshot path is the main checkout the two
+        differ and the gate stays inert — conservative (no false accept, just no
+        extra protection)."""
         from .. import stories
 
         story_key = spec.env.get("BMAD_LOOP_STORY_KEY") or ""
@@ -1230,23 +1475,54 @@ class _DevSynthesisMixin(_ResultFileMixin):
                     verdict = "stale-mtime"
                     detail = f"{state.path} predates session launch"
                 else:
-                    try:
-                        sr = devcontract.synthesize_result(
-                            state.path, story_key=story_key or None, plan_halt=plan_halt
+                    # Launch-snapshot gate (#276 M1/M2), shared with the mtime-scan
+                    # fallback so the stories read-back can't false-complete on an
+                    # unmodified `done` spec. Only bites on a review session (the
+                    # engine threads `spec_snapshot` there); a dev leg leaves it None
+                    # → NEUTRAL → the mtime-floor accept below.
+                    snap = spec.spec_snapshot
+                    same_file = snap is not None and self._same_spec(state.path, snap.path)
+                    digest = None
+                    if same_file:
+                        try:
+                            digest = hashlib.sha256(state.path.read_bytes()).hexdigest()
+                        except OSError:
+                            digest = None  # torn read → NEUTRAL; synthesize keeps its degrade
+                    snap_verdict = self._snapshot_verdict(
+                        same_file=same_file, snap=snap, task_id=handle.task_id, digest=digest
+                    )
+                    if snap_verdict is _SnapVerdict.REFUSE:
+                        assert snap is not None  # REFUSE implies a matched snapshot
+                        # Byte-identical to the review-launch snapshot with no
+                        # transition observed — the same dead-window false positive
+                        # the scan path refuses. Fall through to keep polling the
+                        # grace (a real mid-grace write flips the verdict), then
+                        # breadcrumb + None on the deadline, like `stale-mtime`.
+                        verdict = "unmodified-since-launch"
+                        detail = (
+                            f"{state.path} byte-identical to review-launch snapshot "
+                            f"(snapshot mtime_ns={snap.mtime_ns}); refusing stories synthesis"
                         )
-                    except UnicodeDecodeError:
-                        # A non-UTF-8 read is either a torn glimpse of a spec still
-                        # being written (keep polling — a later pass sees the finished
-                        # write) or a genuinely corrupt file: then the grace expires
-                        # result-less and the next _pick_next re-classifies it as a
-                        # wedge (resolve_story_spec degrades an undecodable PRESENT
-                        # spec to status "" → pause for resolve), never a crash of
-                        # the read-back poll.
-                        sr = None
-                    if sr is not None and sr.result_json is not None:
-                        return sr
-                    verdict = "not-terminal"
-                    detail = f"{state.path} has no terminal status (frontmatter {state.status!r})"
+                    else:
+                        try:
+                            sr = devcontract.synthesize_result(
+                                state.path, story_key=story_key or None, plan_halt=plan_halt
+                            )
+                        except UnicodeDecodeError:
+                            # A non-UTF-8 read is either a torn glimpse of a spec still
+                            # being written (keep polling — a later pass sees the finished
+                            # write) or a genuinely corrupt file: then the grace expires
+                            # result-less and the next _pick_next re-classifies it as a
+                            # wedge (resolve_story_spec degrades an undecodable PRESENT
+                            # spec to status "" → pause for resolve), never a crash of
+                            # the read-back poll.
+                            sr = None
+                        if sr is not None and sr.result_json is not None:
+                            return sr
+                        verdict = "not-terminal"
+                        detail = (
+                            f"{state.path} has no terminal status (frontmatter {state.status!r})"
+                        )
             if not wait or time.monotonic() >= deadline:
                 if wait:
                     self._note_resultless_stop(handle.task_id, verdict, detail)

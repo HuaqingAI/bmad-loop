@@ -136,6 +136,12 @@ minimum = 0
 default_ref = "LimitsPolicy.workflow_stall_nudges_cap"
 description = "total (never-restored) stall nudges for an injected plugin-workflow session before it is called stalled; bounds a session that finished its work but never wrote its completion marker · 0 = stall on first grace expiry"
 [[section.field]]
+key = "dev_contract_nudge"
+kind = "switch"
+default_ref = "LimitsPolicy.dev_contract_nudge"
+label = "dev contract nudge"
+description = "ON: one targeted nudge per session when a Stop finds a spec finalized to a terminal frontmatter status but missing its `## Auto Run Result` marker, asking the skill to append it and end its turn (sent exactly once, never refilled, touches no stall counters) · OFF: rely only on harness-side frontmatter synthesis"
+[[section.field]]
 key = "max_tokens_per_story"
 kind = "int"
 minimum = 1
