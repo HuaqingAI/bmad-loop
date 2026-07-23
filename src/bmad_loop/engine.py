@@ -1880,6 +1880,88 @@ class Engine:
             to=success_status,
         )
 
+    def _repair_spec_marker(self, task: StoryTask, rj: dict) -> None:
+        """Append the ``## Auto Run Result`` marker a missing-marker synthesis
+        (#224) proved the session owed but never wrote — #276 Mechanism 3, the
+        artifact-repair leg. Called at the ``session-synthesized-from-frontmatter``
+        journal site, which fires for live-Stop, crash-path, and post-kill
+        dead-window synthesis alike (all carry the ``synthesized_from_frontmatter``
+        flag), so this ONE call site covers every synthesis path. After the append
+        the spec leaves `find_frontmatter_candidates`' territory (zero real
+        markers) and enters `find_result_artifact`'s (>= 1), so a later re-read is
+        harvested on the normal marker path and the next review launch strips it
+        exactly like a skill-written marker.
+
+        Best-effort by doctrine: the result was already synthesized, so a failed
+        or skipped repair only leaves the spec non-compliant — it never loses work.
+        Guards mirror `_reconcile_generic_terminal_status`, the sibling
+        session-path spec writer: the generic path only; the session-supplied
+        ``spec_file`` must resolve to a real file inside the orchestrator-owned
+        roots (else `spec-marker-repair-skipped`, reason ``out-of-tree`` — this is
+        a write keyed off a session-reported path); and a FRESH frontmatter re-read
+        must be terminal (``done``/``blocked``) AND agree with the synthesized
+        ``rj["status"]`` (else reason ``fm-mismatch``). Never author a marker whose
+        ``Status:`` disagrees with the frontmatter the synthesis trusted — that
+        would trip `synthesize_result`'s consistency cross-check on the next read.
+
+        Non-interference: `_reconcile_generic_terminal_status` only acts when the
+        frontmatter LAGS the prose, so once this append lands (frontmatter already
+        terminal) reconcile hits its idempotent / refusal branches;
+        `_salvage_review_timeout` reads the frontmatter fresh and stays disjoint.
+        The append is engine-side ONLY — an adapter-side write would perturb the
+        adapter's own mtime/hash observation state (#276 M1/M2)."""
+        if not self._generic_dev():
+            return
+        spec_file = (rj or {}).get("spec_file")
+        if not spec_file:
+            return
+        spec_path = verify.resolve_spec_path(str(spec_file), self.workspace.paths)
+        if not spec_path.is_file():
+            return
+        if not verify.spec_within_roots(spec_path, self.workspace.paths):
+            self.journal.append(
+                "spec-marker-repair-skipped",
+                story_key=task.story_key,
+                spec=str(spec_path),
+                reason="out-of-tree",
+            )
+            return
+        fm = self._observed_frontmatter(spec_path, task.story_key, "marker-repair")
+        if fm is None:
+            return
+        fm_status = str(fm.get("status", "")).strip().lower()
+        rj_status = str(rj.get("status", "")).strip().lower()
+        if fm_status not in (devcontract.DONE, devcontract.BLOCKED) or fm_status != rj_status:
+            self.journal.append(
+                "spec-marker-repair-skipped",
+                story_key=task.story_key,
+                spec=str(spec_path),
+                reason="fm-mismatch",
+            )
+            return
+        detail = (
+            f"Synthesized by the bmad-loop orchestrator from frontmatter status "
+            f"`{fm_status}` for story `{task.story_key}` (session finalized the spec "
+            f"without appending its marker)."
+        )
+        try:
+            repaired = devcontract.append_auto_run_result(spec_path, fm_status, detail=detail)
+        except OSError as e:
+            self.journal.append(
+                "spec-marker-repair-failed",
+                story_key=task.story_key,
+                spec=str(spec_path),
+                error=f"{e.__class__.__name__}: {e}",
+            )
+            return
+        if repaired:
+            self.journal.append(
+                "spec-marker-repaired",
+                story_key=task.story_key,
+                spec=str(spec_path),
+                status=fm_status,
+            )
+
     def _post_dev_state_sync(self, task: StoryTask, result_json: dict | None) -> None:
         """Single-writer for the on-disk bookkeeping the generic skill never touches.
 
@@ -2155,6 +2237,11 @@ class Engine:
                 self.journal.append(
                     "session-synthesized-from-frontmatter", task_id=task_id, role=role
                 )
+                # #276 M3: the marker the skill owed was never appended. Repair the
+                # on-disk spec (best-effort) so the next re-read is harvested on the
+                # normal marker path. Covers live-Stop, crash-path, and post-kill
+                # dead-window synthesis — every path that sets this flag.
+                self._repair_spec_marker(task, result.result_json)
             # Only dev/review sessions are resumable — `_resumable_session` matches
             # exactly those task ids under DEV_RUNNING/REVIEW_RUNNING. For everything
             # else (triage/sweep, labeled plugin-workflow sessions) the payload is

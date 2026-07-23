@@ -5815,3 +5815,89 @@ def test_session_synthesized_from_frontmatter_journaled(project):
         e for e in engine.journal.entries() if e["kind"] == "session-synthesized-from-frontmatter"
     ]
     assert crumb["role"] == "dev"
+
+
+def test_synthesized_result_repairs_spec_marker(project):
+    """#276 M3: when the fallback synthesizes a dev result the engine appends the
+    marker the skill owed onto the on-disk spec — with provenance — and journals
+    `spec-marker-repaired`. The story still completes; verify/commit are unaffected
+    (the marker is prose; the frontmatter status the gates read is unchanged)."""
+    from bmad_loop import devcontract
+
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    # No follow-up review, so nothing rewrites the spec after the repair lands.
+    inner = dev_effect(project, "1-1-a", followup_review=False)
+
+    def synthesized_dev(spec):
+        result = inner(spec)
+        result.result_json["synthesized_from_frontmatter"] = True
+        result.result_json["status"] = "done"  # what synthesize_result would carry
+        return result
+
+    engine, _ = make_engine(project, [synthesized_dev])
+    summary = engine.run()
+
+    assert summary.done == 1
+    text = spec_path(project, "1-1-a").read_text()
+    arr = devcontract.parse_auto_run_result(text)
+    assert arr.present and arr.status == "done"
+    assert devcontract.ORCHESTRATOR_SYNTH_NOTE in text
+    (repaired,) = [e for e in engine.journal.entries() if e["kind"] == "spec-marker-repaired"]
+    assert repaired["status"] == "done"
+    assert not [e for e in engine.journal.entries() if e["kind"] == "spec-marker-repair-skipped"]
+
+
+def test_marker_repair_failure_is_best_effort(project, monkeypatch):
+    """An OSError out of the append is swallowed (journaled `spec-marker-repair-
+    failed`): the result was already synthesized, so the story still completes —
+    only the on-disk spec is left non-compliant."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    inner = dev_effect(project, "1-1-a", followup_review=False)
+
+    def synthesized_dev(spec):
+        result = inner(spec)
+        result.result_json["synthesized_from_frontmatter"] = True
+        result.result_json["status"] = "done"
+        return result
+
+    def boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("bmad_loop.devcontract.append_auto_run_result", boom)
+    engine, _ = make_engine(project, [synthesized_dev])
+    summary = engine.run()
+
+    assert summary.done == 1
+    (failed,) = [e for e in engine.journal.entries() if e["kind"] == "spec-marker-repair-failed"]
+    assert "OSError" in failed["error"]
+
+
+def test_marker_repair_skips_out_of_tree_spec(project, tmp_path):
+    """A session-reported spec_file outside the orchestrator-owned roots is never
+    written — the repair skips with reason `out-of-tree`, like the reconcile."""
+    engine, _ = make_engine(project, [])
+    outside = tmp_path / "outside-spec.md"  # sibling of the sandbox root, not under it
+    outside.write_text("---\nstatus: done\n---\n\nbody\n", encoding="utf-8")
+    task = StoryTask(story_key="1-1-a", epic=1)
+
+    engine._repair_spec_marker(task, {"spec_file": str(outside), "status": "done"})
+
+    (skipped,) = [e for e in engine.journal.entries() if e["kind"] == "spec-marker-repair-skipped"]
+    assert skipped["reason"] == "out-of-tree"
+    assert "## Auto Run Result" not in outside.read_text()
+
+
+def test_marker_repair_skips_on_fm_mismatch(project):
+    """A fresh frontmatter read that no longer agrees with the synthesized status
+    (here still `in-progress` while `rj` claims `done`) is refused with reason
+    `fm-mismatch` and no marker is appended — never author an inconsistent one."""
+    engine, _ = make_engine(project, [])
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-progress", "abc123")
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(sp))
+
+    engine._repair_spec_marker(task, {"spec_file": str(sp), "status": "done"})
+
+    (skipped,) = [e for e in engine.journal.entries() if e["kind"] == "spec-marker-repair-skipped"]
+    assert skipped["reason"] == "fm-mismatch"
+    assert "## Auto Run Result" not in sp.read_text()

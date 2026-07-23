@@ -105,6 +105,16 @@ breaking changes may land in a minor release.
     a `transition` flag). The content-hash gate still outranks it: bytes reverted exactly to the
     launch snapshot refuse even with a transition recorded. A transition that flips entirely
     between two ticks is missed and falls back to the conservative fingerprint path.
+  - _Artifact repair._ When the fallback synthesizes a result the engine now appends the
+    `## Auto Run Result` marker the skill owed onto the on-disk spec (new
+    `devcontract.append_auto_run_result`, the inverse of the #160 strip), so the once-invisible
+    spec re-enters the normal marker scan and the next review launch strips it exactly like a
+    skill-written marker. Best-effort at the `session-synthesized-from-frontmatter` site (covers
+    live-Stop, crash-path, and post-kill synthesis): guarded to the generic path, refused for a
+    spec resolved outside the orchestrator-owned roots or whose fresh frontmatter no longer agrees
+    with the synthesized status (journal `spec-marker-repaired` / `spec-marker-repair-failed` /
+    `spec-marker-repair-skipped`), so it can never author a marker that disagrees with the
+    frontmatter.
 
 ## [0.9.0] — 2026-07-21
 

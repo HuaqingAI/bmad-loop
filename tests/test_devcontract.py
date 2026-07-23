@@ -784,3 +784,108 @@ def test_frontmatter_candidates_skips_unreadable_file(tmp_path):
 
 def test_frontmatter_candidates_missing_dir_is_empty(tmp_path):
     assert devcontract.find_frontmatter_candidates(tmp_path / "nope", since_ns=0) == []
+
+
+# ------------------------------- append_auto_run_result (#276 M3)
+#
+# The artifact-repair writer: the inverse of `strip_auto_run_result`. Appends the
+# `## Auto Run Result` marker a missing-marker synthesis proved the session owed,
+# bringing a marker-less terminal spec back into contract.
+
+
+def test_append_auto_run_result_minimal_shape(tmp_path):
+    """The appended section carries a parseable Status + the provenance note, and
+    leaves the spec `synthesize_result`-consistent with its unchanged frontmatter."""
+    sp = _write(
+        tmp_path,
+        "spec-a.md",
+        "---\nstatus: done\nbaseline_revision: 'abc123'\n---\n\n## Intent\n\nbody\n",
+    )
+    assert devcontract.append_auto_run_result(sp, "done") is True
+    text = sp.read_text()
+    arr = devcontract.parse_auto_run_result(text)
+    assert arr.present and arr.status == "done"
+    assert devcontract.ORCHESTRATOR_SYNTH_NOTE in arr.detail
+    # frontmatter is untouched, so the prose Status must equal it → consistent
+    assert "status: done\n" in text
+    sr = devcontract.synthesize_result(sp, story_key="1-1-a")
+    assert sr.status_consistent is True
+    assert sr.result_json is not None and sr.result_json["status"] == "done"
+
+
+def test_append_moves_spec_to_marker_scan_territory(tmp_path):
+    """Before: a missing-marker candidate, invisible to the marker scan. After:
+    gone from the fallback scan, found by the normal `find_result_artifact`."""
+    sp = _write(tmp_path, "spec-a.md", "---\nstatus: done\n---\n\nbody\n")
+    assert devcontract.find_frontmatter_candidates(tmp_path, since_ns=0) == [sp]
+    assert devcontract.find_result_artifact(tmp_path, since_ns=0) is None
+
+    assert devcontract.append_auto_run_result(sp, "done") is True
+
+    assert devcontract.find_frontmatter_candidates(tmp_path, since_ns=0) == []
+    assert devcontract.find_result_artifact(tmp_path, since_ns=0) == sp
+
+
+def test_append_refuses_existing_real_heading(tmp_path):
+    """Idempotence: a real (non-fenced) marker already present blocks the append,
+    and the bytes are left identical."""
+    original = "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    sp = _write(tmp_path, "spec-a.md", original)
+    before = sp.read_bytes()
+    assert devcontract.append_auto_run_result(sp, "done") is False
+    assert sp.read_bytes() == before
+
+
+def test_append_missing_file_false(tmp_path):
+    assert devcontract.append_auto_run_result(tmp_path / "ghost.md", "done") is False
+
+
+def test_append_raises_on_undecodable_spec(tmp_path):
+    """Repair-write doctrine (shared with the strip): a present-but-unreadable spec
+    RAISES, never no-ops — the caller imposes best-effort, not the writer."""
+    sp = tmp_path / "spec-a.md"
+    sp.write_bytes(b"---\nstatus: done\n---\n\n\xff\xfebody\n")
+    with pytest.raises(UnicodeDecodeError):
+        devcontract.append_auto_run_result(sp, "done")
+
+
+def test_append_over_fence_quoted_heading_appends(tmp_path):
+    """#52 symmetry with the strip: a heading quoted inside a fence is
+    documentation, not a real marker, so it does NOT block the append. Exactly one
+    REAL heading exists afterward — the appended one — and it parses."""
+    sp = _write(
+        tmp_path,
+        "spec-a.md",
+        "---\nstatus: done\n---\n\n## Intent\n\n```md\n## Auto Run Result\n\nStatus: done\n```\n",
+    )
+    assert devcontract.append_auto_run_result(sp, "done") is True
+    text = sp.read_text()
+    assert len(devcontract._section_headings(text)) == 1
+    arr = devcontract.parse_auto_run_result(text)
+    assert arr.present and arr.status == "done"
+
+
+def test_append_handles_missing_trailing_newline_and_crlf(tmp_path):
+    """A CRLF spec with no trailing newline: the heading lands on its own line
+    (never glued to the last body line) and the file's CRLF ending is preserved —
+    no bare LF is introduced into the appended block."""
+    sp = tmp_path / "spec-a.md"
+    sp.write_bytes(b"---\r\nstatus: done\r\n---\r\n\r\n## Intent\r\n\r\nbody")
+    assert devcontract.append_auto_run_result(sp, "done") is True
+    text = sp.read_bytes().decode("utf-8")
+    assert "body## Auto Run Result" not in text  # never glued
+    assert "body\r\n## Auto Run Result\r\n" in text  # own line, trailing newline ensured
+    assert "\r\nStatus: done\r\n" in text  # CRLF preserved in the block
+    assert "\n" not in text.replace("\r\n", "")  # no bare LF introduced
+
+
+def test_append_then_strip_roundtrip(tmp_path):
+    """The strip removes exactly the appended section: a spec that ended in a
+    newline round-trips byte-for-byte through append → strip, detail paragraph and
+    all."""
+    original = "---\nstatus: done\n---\n\n## Intent\n\nbody\n"
+    sp = _write(tmp_path, "spec-a.md", original)
+    assert devcontract.append_auto_run_result(sp, "done", detail="extra context") is True
+    assert "## Auto Run Result" in sp.read_text() and "extra context" in sp.read_text()
+    assert devcontract.strip_auto_run_result(sp) is True
+    assert sp.read_text() == original
