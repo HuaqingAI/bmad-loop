@@ -384,23 +384,49 @@ def _register_hooks(project: Path, profile: CLIProfile) -> int:
     return 0
 
 
-def _copy_traversable(src, dst: Path) -> None:
+def _copy_traversable(src, dst: Path, *, skip_existing: bool = False) -> bool:
     """Recursively copy a packaged resource tree to a filesystem path.
 
     Walks via the Traversable API (.iterdir/.read_bytes) rather than resolving a
     filesystem path, so it works even when the package is zip-imported.
+
+    ``skip_existing`` makes the copy no-clobber at FILE granularity: an existing
+    destination file is left untouched and its siblings are still copied — even
+    when it stands where the source has a directory (that subtree is skipped
+    whole rather than mkdir'd over the file). It is
+    opt-in because the `--force-skills` path (`install_into`) rmtree's the
+    destination precisely to overwrite it, and a guard baked into this helper
+    would silently regress that. Only the worktree-seed caller passes it.
+
+    Returns whether anything was actually written, so a caller seeding into an
+    existing directory can tell a partial seed (something landed) from a total
+    no-op (every child was already present). Every other call site ignores it.
     """
     if src.is_dir():
+        if skip_existing and dst.exists() and not dst.is_dir():
+            # a FILE sits where the source has a directory: mkdir would raise
+            # FileExistsError. Under the no-clobber contract the file wins and
+            # the whole subtree is skipped, like any existing destination.
+            return False
+        # creating a missing directory IS a write: an empty dir seeded into an
+        # existing tree must count, or the entry is misreported as a total no-op.
+        copied = not dst.exists()
         dst.mkdir(parents=True, exist_ok=True)
+        # `any(...)` would short-circuit and skip the remaining children.
         for child in src.iterdir():
-            _copy_traversable(child, dst / child.name)
-    elif isinstance(src, Path):
+            if _copy_traversable(child, dst / child.name, skip_existing=skip_existing):
+                copied = True
+        return copied
+    if skip_existing and dst.exists():
+        return False
+    if isinstance(src, Path):
         # real filesystem source (worktree seeds, non-zip package data): copy2
         # preserves the mode so a seeded vendor/bin/* keeps +x (issue #126)
         shutil.copy2(src, dst)
     else:
         # zip-imported Traversable exposes no stat: content-only copy
         dst.write_bytes(src.read_bytes())
+    return True
 
 
 def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> None:

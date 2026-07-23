@@ -91,9 +91,15 @@ def provision_worktree(
     to pull its MCP-generated skill tree (gitignored, so absent from the checkout)
     into a per_worktree Editor's checkout.
 
+    A `seed_files` entry naming a DIRECTORY whose destination already exists is
+    seeded child by child: the children the checkout lacks are copied in, the ones
+    it carries are left untouched. A worktree checks out tracked files, so such a
+    dir always exists and the entry would otherwise be a total no-op (issue #230).
+
     Kept safe against the unit's eventual `git add -A` commit:
-    - skills + seed files are copied only when ABSENT, so a project that commits its
-      own skill tree (e.g. .agents/) or config keeps it untouched (no diff merged back);
+    - skills + seed files are copied only when ABSENT — at FILE granularity, so a
+      project that commits its own skill tree (e.g. .agents/) or config keeps it
+      untouched (no diff merged back);
     - the hook points at the MAIN repo's already-installed relay via an absolute
       path (the relay locates the run dir from $BMAD_LOOP_RUN_DIR, not its own
       location), so nothing is written into the worktree's .bmad-loop/;
@@ -105,10 +111,11 @@ def provision_worktree(
     also a hook config_path (.claude/settings.json, .gemini/settings.json) keeps its
     real content and just gets the Stop hook merged in, rather than being created empty.
 
-    Returns the `seed_files` entries that existed in the repo but were skipped
-    because the destination already existed — copy-when-absent turned them into
-    no-ops. The caller journals them: a user-authored `worktree_seed` entry that
-    silently copies nothing reads as applied configuration and is not.
+    Returns the `seed_files` entries that copied NOTHING because everything they
+    name was already present — copy-when-absent turned them into no-ops. The caller
+    journals them: a user-authored `worktree_seed` entry that silently copies
+    nothing reads as applied configuration and is not. A directory entry that
+    seeded even one child is not reported: it is applied configuration.
     """
     if not profiles and not seed_files and not seed_globs:
         return []
@@ -120,14 +127,13 @@ def provision_worktree(
     # project gitignored MCP/CLI configs: copy from the main repo when absent.
     # Resolve-and-contain guards against an `..`/absolute entry escaping either tree.
     seeded: list[str] = []
-    # Entries that named a real source but whose destination already exists, so
-    # copy-when-absent made them a no-op. Reported to the caller (this function is
-    # quiet by contract — it runs under a TUI) because for a DIRECTORY entry the
-    # no-op is silent and total: a worktree checks out tracked files, so a seed dir
-    # with any tracked child always exists and the whole entry is skipped, including
-    # the children that are absent and would clobber nothing. Glob-expanded matches
-    # are deliberately not reported: a plugin's glob is expected to hit paths the
-    # checkout already carries, so that skip is routine rather than a misconfiguration.
+    # Entries that named a real source but copied nothing, because every path they
+    # name already exists. Reported to the caller (this function is quiet by
+    # contract — it runs under a TUI) because the no-op is otherwise silent: an
+    # entry that reads as applied configuration is not. Per-CHILD skips inside a
+    # directory entry are deliberately not reported — the checkout is expected to
+    # carry its tracked children, so that is routine rather than a
+    # misconfiguration, exactly like the glob-expanded matches below.
     skipped: list[str] = []
     for rel in seed_files:
         src = (repo_root / rel).resolve()
@@ -137,7 +143,27 @@ def provision_worktree(
         if not src.exists():
             continue
         if dst.exists():
-            skipped.append(str(rel))
+            # File entries keep the classic copy-when-absent skip. A destination
+            # that is not a directory while the source is (the checkout carries a
+            # FILE where the seed names a dir) is a type mismatch: recursing would
+            # try to mkdir over the file, so the entry is skipped whole instead.
+            if not src.is_dir() or not dst.is_dir():
+                skipped.append(str(rel))
+                continue
+            # A DIRECTORY whose destination exists is the case #230 reported: the
+            # checkout carries some tracked child, so the whole entry used to be a
+            # no-op — including the gitignored children that are absent and would
+            # clobber nothing. Recurse instead, copying only what is missing.
+            if not _copy_traversable(src, dst, skip_existing=True):
+                # every child was already present: still a total no-op, still
+                # reported. Only a PARTIAL seed stops being reported.
+                skipped.append(str(rel))
+                continue
+            # Partially seeded, so the entry must still reach `patterns` below:
+            # the children we just wrote have to stay out of the unit's
+            # `git add -A`. Excluding the whole dir is safe — an exclude does not
+            # untrack the tracked children that were already there.
+            seeded.append(rel)
             continue
         dst.parent.mkdir(parents=True, exist_ok=True)
         _copy_traversable(src, dst)
