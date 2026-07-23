@@ -20,7 +20,7 @@ from typing import Any, Callable
 
 from . import deferredwork, gates, verify
 from .engine import Engine
-from .escalation import critical_escalations, env_fault_detail
+from .escalation import critical_escalations, env_fault_pause_reason
 from .model import Phase, StoryTask
 from .platform_util import atomic_replace
 from .statemachine import advance
@@ -765,8 +765,7 @@ class SweepEngine(Engine):
                 # resume also restores the ledger if the worktree is dirty.
                 self._escalate(
                     task,
-                    f"environment fault: migration session {result.status} "
-                    f"({env_fault_detail(result)})",
+                    env_fault_pause_reason("migration", result),
                 )
             if not errors:
                 advance(task, Phase.DONE)
@@ -878,8 +877,7 @@ class SweepEngine(Engine):
                 # ESCALATED-resume above resets task.attempt to 0 (fresh budget).
                 self._escalate(
                     task,
-                    f"environment fault: triage session {result.status} "
-                    f"({env_fault_detail(result)})",
+                    env_fault_pause_reason("triage", result),
                 )
             if plan is not None:
                 advance(task, Phase.DONE)

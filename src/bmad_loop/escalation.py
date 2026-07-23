@@ -61,6 +61,14 @@ def env_fault_detail(result: SessionResult) -> str:
     return result.env_fault_evidence or "transport-failure pattern in session log"
 
 
+def env_fault_pause_reason(role: str, result: SessionResult) -> str:
+    """The uniform pause/escalation reason for a transport-failed session (#194).
+    `role` is the descriptor placed before "session" — e.g. "dev", "review",
+    "fix", "migration", "triage", or a richer "blocking workflow 'x' (y)". Keeps
+    the wording identical across escalation/engine/sweep (see env_fault_detail)."""
+    return f"environment fault: {role} session {result.status} ({env_fault_detail(result)})"
+
+
 def decide_dev(
     task: StoryTask,
     result: SessionResult,
@@ -85,7 +93,7 @@ def decide_dev(
             # result_json=None, so it found nothing).
             return Decision(
                 Action.PAUSE,
-                f"environment fault: dev session {result.status} ({env_fault_detail(result)})",
+                env_fault_pause_reason("dev", result),
             )
         reason = f"dev session {result.status}"
         if budget_left:
@@ -116,7 +124,7 @@ def decide_review_session(task: StoryTask, result: SessionResult, policy: Policy
             # cycle for a session that never reached the API (see decide_dev).
             return Decision(
                 Action.PAUSE,
-                f"environment fault: review session {result.status} ({env_fault_detail(result)})",
+                env_fault_pause_reason("review", result),
             )
         reason = f"review session {result.status}"
         if budget_left:

@@ -27,7 +27,7 @@ from .escalation import (
     critical_escalations,
     decide_dev,
     decide_review_session,
-    env_fault_detail,
+    env_fault_pause_reason,
     preference_escalations,
 )
 from .journal import Journal, save_state
@@ -1048,8 +1048,9 @@ class Engine:
                     # session will classify and pause if the outage persists.
                     self._escalate(
                         task,
-                        f"environment fault: blocking workflow {wf.name!r} ({lp.name}) "
-                        f"session {result.status} ({env_fault_detail(result)})",
+                        env_fault_pause_reason(
+                            f"blocking workflow {wf.name!r} ({lp.name})", result
+                        ),
                     )
                 self._defer(
                     task,
@@ -2246,7 +2247,7 @@ class Engine:
                 # by the retryable check just below (its own escalate path).
                 self._escalate(
                     task,
-                    f"environment fault: fix session {result.status} ({env_fault_detail(result)})",
+                    env_fault_pause_reason("fix", result),
                 )
             if outcome is not None and not outcome.ok and not outcome.retryable:
                 # escalate-grade failure (environment fault): another repair
