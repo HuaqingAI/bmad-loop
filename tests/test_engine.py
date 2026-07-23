@@ -5872,6 +5872,63 @@ def test_marker_repair_failure_is_best_effort(project, monkeypatch):
     assert "OSError" in failed["error"]
 
 
+def test_synthesized_review_result_repairs_marker_and_story_completes(project):
+    """#276 M3, review path: when the fallback synthesizes a REVIEW result the engine
+    appends the marker onto the on-disk spec (with provenance) and the story still
+    completes. Prior engine coverage only exercised a synthesized DEV result with no
+    follow-up review — this covers the primary review-repair path."""
+    from bmad_loop import devcontract
+
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    dev = dev_effect(project, "1-1-a", followup_review=True)
+    review = review_effect(project, "1-1-a", clean=True)
+
+    def synthesized_review(spec):
+        result = review(spec)
+        result.result_json["synthesized_from_frontmatter"] = True
+        result.result_json["status"] = "done"
+        return result
+
+    engine, _ = make_engine(project, [dev, synthesized_review])
+    summary = engine.run()
+
+    assert summary.done == 1
+    text = spec_path(project, "1-1-a").read_text()
+    arr = devcontract.parse_auto_run_result(text)
+    assert arr.present and arr.status == "done"
+    assert devcontract.ORCHESTRATOR_SYNTH_NOTE in text
+    (repaired,) = [e for e in engine.journal.entries() if e["kind"] == "spec-marker-repaired"]
+    assert repaired["status"] == "done"
+    synth = [
+        e for e in engine.journal.entries() if e["kind"] == "session-synthesized-from-frontmatter"
+    ]
+    assert [e["role"] for e in synth] == ["review"]  # the REVIEW session synthesized
+
+
+def test_synthesized_review_repair_survives_followup_rewrite(project):
+    """The finding's core case: a synthesized review cycle repairs the marker, then a
+    subsequent clean review cycle rewrites the whole spec (dropping the marker). The
+    story still converges to done, the run does not livelock, and exactly one repair
+    fired (the synthesized cycle) — the repair never fights the follow-up rewrite."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    dev = dev_effect(project, "1-1-a", followup_review=True)
+    review1 = review_effect(project, "1-1-a", clean=False)  # recommends another review
+
+    def synthesized_review1(spec):
+        result = review1(spec)
+        result.result_json["synthesized_from_frontmatter"] = True
+        result.result_json["status"] = "done"
+        return result
+
+    review2 = review_effect(project, "1-1-a", clean=True)  # converges; rewrites the spec
+    engine, _ = make_engine(project, [dev, synthesized_review1, review2])
+    summary = engine.run()
+
+    assert summary.done == 1
+    repaired = [e for e in engine.journal.entries() if e["kind"] == "spec-marker-repaired"]
+    assert len(repaired) == 1  # only the synthesized cycle repaired
+
+
 def test_marker_repair_undecodable_spec_is_best_effort(project, monkeypatch):
     """`append_auto_run_result` reads raw bytes and raises `UnicodeDecodeError`
     (a `ValueError`, not an `OSError`) on an undecodable spec — a spec torn mid-

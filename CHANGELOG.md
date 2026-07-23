@@ -94,7 +94,10 @@ breaking changes may land in a minor release.
     `unmodified-since-launch` and dead-window lifecycle crumb `frontmatter-unmodified-refused`
     record each refusal. The snapshot is process-transient (a crash-resume degrades to the
     conservative 2-observation path), and the review-launch frontmatter `status` is never
-    mutated — it remains load-bearing skill routing.
+    mutated — it remains load-bearing skill routing. The same launch-snapshot decision (M1 hash +
+    M2 transition, a single shared `_snapshot_verdict`) also guards the stories-mode folder+id
+    read-back, closing the identical false completion on that path; snapshot/candidate identity is
+    by resolved filesystem path, not raw string spelling.
   - _Mid-session status-transition observation._ On each heartbeat tick the generic (and
     OpenCode) dev adapter now samples the snapshotted spec's frontmatter and records the first
     status it observes this session drive off its launch state to a live, non-terminal value
@@ -102,9 +105,11 @@ breaking changes may land in a minor release.
     recorded transition is deterministic proof the terminal frontmatter the spec later carries
     is this session's own write, so the fallback synthesizes on a single terminal sighting —
     live or dead window — instead of the 2-observation fingerprint (the synthesized crumb gains
-    a `transition` flag). The content-hash gate still outranks it: bytes reverted exactly to the
-    launch snapshot refuse even with a transition recorded. A transition that flips entirely
-    between two ticks is missed and falls back to the conservative fingerprint path.
+    a `transition` flag). A recorded transition now **outranks** the content-hash gate: a clean
+    review can round-trip `done → in-review → done` back to the launch bytes while still omitting
+    its marker, and the observed `in-review` proves it ran, so the hash gate refuses only when no
+    transition was seen. A transition that flips entirely between two ticks is missed and falls
+    back to the conservative fingerprint path.
   - _Artifact repair._ When the fallback synthesizes a result the engine now appends the
     `## Auto Run Result` marker the skill owed onto the on-disk spec (new
     `devcontract.append_auto_run_result`, the inverse of the #160 strip), so the once-invisible
@@ -114,7 +119,10 @@ breaking changes may land in a minor release.
     spec resolved outside the orchestrator-owned roots or whose fresh frontmatter no longer agrees
     with the synthesized status (journal `spec-marker-repaired` / `spec-marker-repair-failed` /
     `spec-marker-repair-skipped`), so it can never author a marker that disagrees with the
-    frontmatter.
+    frontmatter. The append and the #160 strip/reset now rewrite the spec atomically (temp +
+    `atomic_replace`), so an interrupted or disk-full repair leaves the original spec intact rather
+    than truncated, and a spec ending in a bare `\r` no longer receives an invisible (unparsed)
+    heading.
   - _Targeted contract nudge_ (`limits.dev_contract_nudge`, default `true`). On the first
     `terminal-frontmatter-pending` Stop — a marker-less terminal spec that is not the hash-gate
     refusal and whose transition is not yet proven — the dev adapter sends one tmux nudge asking

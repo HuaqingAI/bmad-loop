@@ -2974,6 +2974,100 @@ def _snapshotted_spec(tmp_path, spec_file: Path, story_key="3-1") -> SessionSpec
     )
 
 
+def _snapshotted_stories_spec(tmp_path, story_spec: Path, story_key="1") -> SessionSpec:
+    """A review-role stories SessionSpec carrying the launch snapshot of its story
+    spec (#276 M1/M2), as the engine threads for a stories-mode review leg."""
+    return dataclasses.replace(
+        _stories_spec(tmp_path, story_key), role="review", spec_snapshot=_snap(story_spec)
+    )
+
+
+def test_stories_readback_refuses_unmodified_snapshot_no_transition(tmp_path, monkeypatch):
+    """#276 M1 on the stories read-back: a `done` story spec byte-identical to its
+    review-launch snapshot with no transition observed is the dead-window false
+    positive (a review that only bumped the mtime). The gate REFUSES synthesis
+    (`unmodified-since-launch`) instead of accepting on the mtime floor alone."""
+    adapter, _ = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    story = _write_story_spec(tmp_path, "1", "foo", _MARKERLESS_DONE)
+    spec = _snapshotted_stories_spec(tmp_path, story)  # snapshot == current bytes
+    assert adapter._result_json(_dev_handle(), spec, wait=True) is None
+    (crumb,) = _breadcrumbs(adapter)  # keyed by handle.task_id (3-1-dev-1)
+    assert crumb["verdict"] == "unmodified-since-launch"
+
+
+def test_stories_readback_transition_beats_snapshot(tmp_path, monkeypatch):
+    """M2 outranks M1 on the stories path too: with a recorded transition the same
+    byte-identical `done` spec synthesizes (the review provably ran)."""
+    adapter, _ = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    story = _write_story_spec(tmp_path, "1", "foo", _MARKERLESS_DONE)
+    spec = _snapshotted_stories_spec(tmp_path, story)
+    adapter._fm_transition_obs["3-1-dev-1"] = "in-review"  # keyed by handle.task_id
+    rj = adapter._result_json(_dev_handle(), spec, wait=True)
+    assert rj is not None and rj["status"] == "done"
+    assert _breadcrumbs(adapter) == []
+
+
+def test_stories_readback_changed_bytes_synthesizes(tmp_path, monkeypatch):
+    """Over-refusal guard: when the spec's bytes differ from the launch snapshot the
+    gate is NEUTRAL and the read-back synthesizes as before."""
+    adapter, _ = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    story = _write_story_spec(tmp_path, "1", "foo", _MARKERLESS_DONE)
+    spec = _snapshotted_stories_spec(tmp_path, story)  # snapshot of the original bytes
+    story.write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n# Story\n\nReviewed and done.\n",
+        encoding="utf-8",
+    )  # this session actually rewrote the spec
+    rj = adapter._result_json(_dev_handle(), spec, wait=True)
+    assert rj is not None and rj["status"] == "done"
+
+
+def test_stories_readback_dev_leg_no_snapshot_accepts(tmp_path, monkeypatch):
+    """Inert on a dev leg: no launch snapshot → NEUTRAL → the unchanged mtime-floor
+    accept, even for a spec that would be byte-identical to some snapshot."""
+    adapter, _ = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    _write_story_spec(tmp_path, "1", "foo", _MARKERLESS_DONE)
+    rj = adapter._result_json(_dev_handle(), _stories_spec(tmp_path), wait=True)  # snap None
+    assert rj is not None and rj["status"] == "done"
+
+
+def test_stories_readback_snapshot_other_path_inert(tmp_path, monkeypatch):
+    """The gate only bites when the resolved story spec IS the snapshotted file. A
+    snapshot for a different path leaves the read-back on its normal accept."""
+    adapter, _ = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    story = _write_story_spec(tmp_path, "1", "foo", _MARKERLESS_DONE)
+    other = tmp_path / "epic" / "stories" / "9-other.md"
+    snap = dataclasses.replace(_snap(story), path=str(other))
+    spec = dataclasses.replace(_stories_spec(tmp_path), role="review", spec_snapshot=snap)
+    rj = adapter._result_json(_dev_handle(), spec, wait=True)
+    assert rj is not None and rj["status"] == "done"
+
+
+def test_snapshot_verdict_truth_table(tmp_path):
+    """Direct unit test of the shared M1/M2 decision — the anti-drift guard both the
+    scan fallback and the stories read-back route through."""
+    adapter, _ = make_dev_adapter(tmp_path)
+    snap = SpecSnapshot(path="/x/spec.md", mtime_ns=1, sha256="deadbeef", fm_status="done")
+    decide = adapter._snapshot_verdict
+    V = generic._SnapVerdict
+    # no snapshot / different file → NEUTRAL regardless of digest
+    assert decide(same_file=False, snap=None, task_id="t", digest="deadbeef") is V.NEUTRAL
+    assert decide(same_file=False, snap=snap, task_id="t", digest="deadbeef") is V.NEUTRAL
+    # matching digest, no transition → REFUSE
+    assert decide(same_file=True, snap=snap, task_id="t", digest="deadbeef") is V.REFUSE
+    # transition observed → PROVEN, even with a matching digest
+    adapter._fm_transition_obs["t"] = "in-review"
+    assert decide(same_file=True, snap=snap, task_id="t", digest="deadbeef") is V.PROVEN
+    # mismatched digest, no transition → NEUTRAL
+    assert decide(same_file=True, snap=snap, task_id="u", digest="feed") is V.NEUTRAL
+    # digest None (unreadable) → NEUTRAL
+    assert decide(same_file=True, snap=snap, task_id="u", digest=None) is V.NEUTRAL
+
+
 def test_frontmatter_fallback_synthesizes_on_second_stable_stop(tmp_path, monkeypatch):
     adapter, impl = make_dev_adapter(tmp_path)
     monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
@@ -3400,10 +3494,12 @@ def test_frontmatter_fallback_missed_transition_stays_conservative(tmp_path, mon
     assert len(synth) == 1 and synth[0]["transition"] is False
 
 
-def test_hash_gate_beats_transition_evidence(tmp_path, monkeypatch):
-    """The M1 hash gate outranks a recorded transition: bytes reverted exactly to
-    the launch snapshot refuse with `unmodified-since-launch` and never harvest,
-    even though a mid-session transition was observed."""
+def test_transition_beats_hash_gate(tmp_path, monkeypatch):
+    """A recorded transition (#276 M2) OUTRANKS the M1 hash gate: a clean review that
+    round-tripped `done -> in-review -> done` back to byte-identical launch bytes
+    while omitting its marker still harvests — the observed transition proves it ran.
+    No `unmodified-since-launch` refusal; one `frontmatter-synthesized` crumb marked
+    transition=True."""
     adapter, impl = make_dev_adapter(tmp_path)
     monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
     spec_file = impl / "spec-3-1-foo.md"
@@ -3411,12 +3507,31 @@ def test_hash_gate_beats_transition_evidence(tmp_path, monkeypatch):
     spec = _snapshotted_spec(tmp_path, spec_file)  # snapshot == current bytes
     adapter._fm_transition_obs["3-1-dev-1"] = "in-review"  # a transition WAS seen
 
+    rj = adapter._result_json(_dev_handle(), spec, wait=True)
+    assert rj["synthesized_from_frontmatter"] is True
+    assert _breadcrumbs(adapter) == []  # a harvest leaves no give-up breadcrumb
+    synth = [ln for ln in _lifecycle_lines(adapter) if ln["event"] == "frontmatter-synthesized"]
+    assert len(synth) == 1 and synth[0]["transition"] is True
+
+
+def test_frontmatter_fallback_alias_path_recognized_as_same_spec(tmp_path, monkeypatch):
+    """#5: snapshot/candidate identity is filesystem-based, not lexical. A snapshot
+    recorded under a non-normalized alias of the candidate (a `..` detour to the same
+    file) is still recognized as the same spec, so the M1 hash gate fires on a
+    byte-identical unmodified spec instead of wrongly harvesting (a raw string compare
+    would miss the alias)."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+    alias = impl / ".." / impl.name / "spec-3-1-foo.md"  # same file, different spelling
+    assert alias.resolve() == spec_file.resolve()
+    snap = dataclasses.replace(_snap(spec_file), path=str(alias))
+    spec = dataclasses.replace(_dev_spec(tmp_path), role="review", spec_snapshot=snap)
+
     assert adapter._result_json(_dev_handle(), spec, wait=True) is None
     (crumb,) = _breadcrumbs(adapter)
     assert crumb["verdict"] == "unmodified-since-launch"
-    assert [
-        ln for ln in _lifecycle_lines(adapter) if ln["event"] == "frontmatter-synthesized"
-    ] == []
 
 
 def test_wait_loop_heartbeat_drives_observe_tick(tmp_path, monkeypatch):

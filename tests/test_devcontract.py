@@ -889,3 +889,55 @@ def test_append_then_strip_roundtrip(tmp_path):
     assert "## Auto Run Result" in sp.read_text() and "extra context" in sp.read_text()
     assert devcontract.strip_auto_run_result(sp) is True
     assert sp.read_text() == original
+
+
+def test_append_bare_cr_terminated_spec_makes_heading_visible(tmp_path):
+    """#276: a spec ending in a BARE ``\\r`` (no ``\\n``) must not glue an invisible
+    heading. The append completes the CR to CRLF so ``## Auto Run Result`` lands on a
+    line the scan's ``^``-anchored regex recognizes: the heading parses, exactly one
+    real heading exists, and a second append is idempotent (proving the heading is
+    visible to the scan — under the old logic it was glued after ``\\r`` and unseen)."""
+    sp = tmp_path / "spec-a.md"
+    sp.write_bytes(b"---\nstatus: done\n---\n\nbody\r")
+    assert devcontract.append_auto_run_result(sp, "done") is True
+    text = sp.read_bytes().decode("utf-8")
+    assert len(devcontract._section_headings(text)) == 1
+    arr = devcontract.parse_auto_run_result(text)
+    assert arr.present and arr.status == "done"
+    assert devcontract.append_auto_run_result(sp, "done") is False  # idempotent → visible
+
+
+@pytest.mark.parametrize(
+    "writer, original",
+    [
+        (
+            lambda sp: devcontract.append_auto_run_result(sp, "done"),
+            "---\nstatus: done\n---\n\n# Story\n\nbody\n",  # no marker → append writes
+        ),
+        (
+            lambda sp: devcontract.strip_auto_run_result(sp),
+            "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n",  # marker → strip writes
+        ),
+        (
+            lambda sp: devcontract.reset_spec_status(sp, "in-progress"),
+            "---\nstatus: done\n---\n\nbody\n",  # status differs → reset writes
+        ),
+    ],
+    ids=["append", "strip", "reset"],
+)
+def test_repair_write_failure_never_truncates_spec(tmp_path, monkeypatch, writer, original):
+    """#276: the three in-place spec rewriters are atomic (tmp + ``atomic_replace``).
+    A failed rename (disk-full, interruption, short write) leaves the original spec
+    byte-for-byte intact with no ``.tmp`` litter — the "a failed repair never loses
+    work" invariant (fault injection on the old truncating write reduced a 46-byte
+    spec to 12)."""
+    sp = _write(tmp_path, "spec-a.md", original)
+
+    def boom(tmp, target):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(devcontract, "atomic_replace", boom)
+    with pytest.raises(OSError, match="no space left"):
+        writer(sp)
+    assert sp.read_text(encoding="utf-8") == original  # original untouched
+    assert list(tmp_path.glob("*.tmp")) == []  # temp file cleaned up, no litter

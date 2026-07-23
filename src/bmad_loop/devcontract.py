@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .platform_util import atomic_replace
 from .verify import DEV_WORKFLOW, read_frontmatter
 
 # The section the skill appends on EVERY terminal path (success and blocked),
@@ -369,6 +370,29 @@ def find_frontmatter_candidates(impl_artifacts: Path, *, since_ns: int) -> list[
     return [p for _, p in found]
 
 
+def _atomic_write_spec(spec_path: Path, text: str) -> None:
+    """Rewrite ``spec_path`` with ``text`` via a same-directory temp file + atomic
+    rename, so an interrupted / short / disk-full write can never truncate the
+    canonical spec — a failed repair must lose no work (fault injection on the old
+    truncating ``write_text`` reduced a 46-byte spec to 12). Bytes are written
+    verbatim (``write_bytes``, not ``write_text``): every caller here has already
+    captured and preserved the file's own line endings, and ``write_text``'s
+    ``newline=None`` default would re-translate ``\\n``→``\\r\\n`` on Windows. The
+    ``.tmp`` sibling ends in ``.tmp`` (not ``.md``), so the ``*.md`` artifact scans
+    never see it. On any failure the temp file is removed and the error re-raised —
+    the callers impose best-effort, the writer never swallows."""
+    tmp = spec_path.with_suffix(spec_path.suffix + ".tmp")
+    try:
+        tmp.write_bytes(text.encode("utf-8"))
+        atomic_replace(tmp, spec_path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def reset_spec_status(spec_path: Path, new_status: str) -> bool:
     """Rewrite the frontmatter ``status:`` value of a spec in place.
 
@@ -421,7 +445,7 @@ def reset_spec_status(spec_path: Path, new_status: str) -> bool:
         changed = True
     if not changed:
         return False
-    spec_path.write_text(head + new_body + tail + text[fm.end() :], encoding="utf-8")
+    _atomic_write_spec(spec_path, head + new_body + tail + text[fm.end() :])
     return True
 
 
@@ -457,7 +481,7 @@ def strip_auto_run_result(spec_path: Path) -> bool:
         kept.append(text[pos : m.start()])
         pos = _next_heading_start(text, m.end())
     kept.append(text[pos:])
-    spec_path.write_text("".join(kept), encoding="utf-8")
+    _atomic_write_spec(spec_path, "".join(kept))
     return True
 
 
@@ -517,13 +541,19 @@ def append_auto_run_result(spec_path: Path, status: str, *, detail: str = "") ->
         return False  # a real marker is already present — idempotent
     status = status.strip().lower()
     nl = "\r\n" if "\r\n" in text else "\n"
-    # Ensure a trailing newline so the heading lands on its own line. A file
-    # already ending in a newline is left byte-for-byte intact, so a strip of this
-    # exact append round-trips.
-    if text and not text.endswith(("\n", "\r")):
+    # Ensure the heading lands after a newline the scan can recognize. A file
+    # already ending in "\n" (LF, or the "\n" of a CRLF) is left byte-for-byte
+    # intact, so a strip of this exact append round-trips. A file ending in a BARE
+    # "\r" is the trap: it reads as "already terminated", but AUTO_RUN_HEADING_RE's
+    # "^" (MULTILINE) only matches after "\n" — a heading glued directly after "\r"
+    # is invisible to the scan. Complete such a bare CR to CRLF (preserving the
+    # authored CR) so the heading begins on a recognized line boundary.
+    if text.endswith("\r"):
+        text += "\n"
+    elif text and not text.endswith("\n"):
         text += nl
     section = f"## Auto Run Result{nl}{nl}Status: {status}{nl}{nl}{ORCHESTRATOR_SYNTH_NOTE}{nl}"
     if detail:
         section += f"{nl}{detail.strip()}{nl}"
-    spec_path.write_text(text + section, encoding="utf-8", newline="")
+    _atomic_write_spec(spec_path, text + section)
     return True
