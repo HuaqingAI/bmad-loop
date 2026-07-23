@@ -66,7 +66,7 @@ dev = [
     { name = "pytest-asyncio", specifier = ">=1.0" },
     { name = "pytest-rerunfailures", specifier = ">=16.0" },
     { name = "pytest-xdist", specifier = ">=3.6" },
-    { name = "ruff", specifier = ">=0.4" },
+    { name = "ruff", specifier = ">=0.15.17" },
 ]
 
 [[package]]

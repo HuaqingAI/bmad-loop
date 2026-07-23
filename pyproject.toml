@@ -34,7 +34,7 @@ opencode = ["httpx>=0.28"]
 # dev gets tui via `uv sync --all-extras` (groups can't self-reference an extra).
 dev = [
   "pytest>=8.0",
-  "ruff>=0.4",
+  "ruff>=0.15.17",
   "pytest-asyncio>=1.0",
   "pytest-rerunfailures>=16.0",
   "pytest-xdist>=3.6",
@@ -61,11 +61,15 @@ target-version = "py311"
 extend-exclude = [".agents", ".claude", "src/bmad_loop/data/skills"]
 
 [tool.ruff.lint]
-# CI lints with trunk's ruff (pinned, currently 0.15.17), which injects no
-# `--select` and so runs ruff's own default rule set. Pin that same set here so
-# a local `ruff` of any version enforces exactly what CI enforces — no drift,
-# no stricter local gate. This is ruff's default (`E4`, `E7`, `E9`, `F`) spelled
-# out explicitly (#246). Do NOT ratchet stricter than CI without moving CI first.
+# CI lints with trunk's ruff (pinned 0.15.17), whose plugin injects no `--select`
+# and so runs ruff's own default rule set. With no lint table that default is
+# resolved per ruff version and can drift, so pin the families explicitly. The
+# repo's ruff is pinned to 0.15.17 via trunk (`trunk check` = what CI runs and
+# the documented local lint, see CONTRIBUTING) and floored at >=0.15.17 in the
+# dev deps (uv.lock resolves 0.15.17), so those paths match CI; a bare, newer
+# ruff gets rule-family parity only — new rules can land under these prefixes.
+# This spells out ruff 0.15.17's default set (`E4`, `E7`, `E9`, `F`) (#246). Do
+# NOT ratchet stricter than CI without moving CI first.
 select = ["E4", "E7", "E9", "F"]
 
 [tool.black]
