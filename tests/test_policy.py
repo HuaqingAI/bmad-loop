@@ -39,6 +39,17 @@ def test_review_trigger_invalid():
         policy.loads('[review]\ntrigger = "sometimes"\n')
 
 
+def test_review_on_timeout_default_and_parse():
+    assert policy.loads("").review.on_timeout == "retry"
+    for mode in ("salvage-if-done", "defer"):
+        assert policy.loads(f'[review]\non_timeout = "{mode}"\n').review.on_timeout == mode
+
+
+def test_review_on_timeout_invalid():
+    with pytest.raises(policy.PolicyError, match="review.on_timeout"):
+        policy.loads('[review]\non_timeout = "salvage"\n')
+
+
 def test_stories_defaults():
     pol = policy.loads("")
     assert pol.stories.source == "sprint-status"

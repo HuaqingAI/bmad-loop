@@ -9,6 +9,17 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **`review.on_timeout` policy knob (#271).** A timeout-like review verdict (`timeout` /
+  `stalled` / `over_budget`) previously always burned a review cycle (RETRY) until
+  `max_review_cycles`, then deferred — even when the dev product was already finalized and
+  verify-green. New modes: `"retry"` (default, unchanged), `"salvage-if-done"` (commit the
+  verified dev product, reset a mid-review `in-review` interrupt forward, refile the outstanding
+  follow-up recommendation to deferred work — origin `review-timeout-salvage` — and journal
+  `review-timeout-salvage` instead of burning another pass), and `"defer"` (give up on the first
+  timeout-like verdict). A salvaged timeout never re-arms `followup_review_recommended` nor
+  spends a damping grant; env-fault (#194) and `crashed` verdicts keep their own routing in
+  every mode.
+
 - **Transport failures pause instead of burning attempts (#194).** A session whose coding CLI
   lost its API connection stays alive but idle, printing `API Error: Unable to connect …` while it
   idles out the session clock — indistinguishable from a real wall-clock timeout, so two such
@@ -53,6 +64,21 @@ breaking changes may land in a minor release.
   stdout. It is now a clean `exit(130)` with empty stdout (a Python caller reading
   `subprocess.returncode` sees `130` rather than `-2`). A Ctrl+C _during_ a run is unchanged:
   the engine still finalizes it as a resumable `stopped` run (rc `0`).
+
+### Fixed
+
+- **A finished story whose session omitted `## Auto Run Result` no longer livelocks and
+  DEFER-drops (#224).** The review HALT intermittently finalizes the spec's frontmatter to
+  `status: done` without appending the terminal marker the harvest scan keys on; every Stop
+  then read `no-artifact`, stall nudges re-invoked an already-exited workflow (#149), and after
+  `max_review_cycles` the finished, verify-passing work was rolled back. The scan path now
+  synthesizes the result from the authoritative terminal frontmatter (exactly as stories mode
+  already did) once the spec's (path, mtime, status) fingerprint holds stable across two
+  resultless Stops — several candidates refuse to guess — and the post-kill reconcile applies
+  the same fallback on a single sighting once the window is provably dead. Synthesized results
+  carry `synthesized_from_frontmatter` and journal `session-synthesized-from-frontmatter`;
+  new resultless-stop breadcrumb verdicts `terminal-frontmatter-pending` and
+  `ambiguous-frontmatter` record the fingerprint's progress.
 
 ## [0.9.0] — 2026-07-21
 

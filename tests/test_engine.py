@@ -45,6 +45,7 @@ from bmad_loop.policy import (
     LimitsPolicy,
     NotifyPolicy,
     Policy,
+    ReviewPolicy,
     ScmPolicy,
     StageAdapterPolicy,
     SweepPolicy,
@@ -5603,3 +5604,166 @@ def test_graceful_stop_on_resume_finishes_inflight_then_stops(project, monkeypat
     assert [s.role for s in adapter.sessions] == ["review"]  # only the in-flight review ran
     stops = [e for e in resumed.journal.entries() if e["kind"] == "run-stop"]
     assert stops and stops[-1]["graceful"] is True
+
+
+# ------------------------------- review.on_timeout = "salvage-if-done" (#271)
+
+
+def _salvage_policy(**limits_kw) -> Policy:
+    return Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=True),
+        limits=LimitsPolicy(**limits_kw),
+        review=ReviewPolicy(on_timeout="salvage-if-done"),
+    )
+
+
+def test_review_timeout_salvage_commits_and_refiles(project):
+    """A review timeout over an already-finalized, verify-green dev product
+    converges: the work commits, the outstanding follow-up refiles to deferred
+    work, and no further review cycle burns."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), SessionResult(status="timeout")],
+        policy=_salvage_policy(),
+    )
+    summary = engine.run()
+
+    assert summary.done == 1 and summary.deferred == 0
+    task = engine.state.tasks["1-1-a"]
+    (salvage,) = [e for e in engine.journal.entries() if e["kind"] == "review-timeout-salvage"]
+    assert salvage["session_status"] == "timeout"
+    assert salvage["cycle"] == 1
+    assert salvage["reset_from"] is None  # the review never touched the done spec
+    assert salvage["refiled"] and salvage["refiled"].startswith("DW-")
+    ledger = project.deferred_work.read_text(encoding="utf-8")
+    assert "origin: review-timeout-salvage" in ledger
+    assert "1-1-a" in ledger
+    # the timeout neither re-arms the recommendation nor spends a damping grant
+    assert task.followup_review_recommended is False
+    assert task.followup_reviews_spent == 0
+    assert not [e for e in engine.journal.entries() if e["kind"] == "review-retry"]
+
+
+def test_review_timeout_salvage_resets_in_review_spec(project):
+    """The mid-review interrupt: the dying pass flipped the transient in-review
+    marker. Salvage resets it forward to done and commits."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+
+    def timeout_mid_review(spec):
+        sp = spec_path(project, "1-1-a")
+        write_spec(sp, "in-review", _spec_baseline(sp))
+        return SessionResult(status="timeout")
+
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), timeout_mid_review],
+        policy=_salvage_policy(),
+    )
+    summary = engine.run()
+
+    assert summary.done == 1
+    (salvage,) = [e for e in engine.journal.entries() if e["kind"] == "review-timeout-salvage"]
+    assert salvage["reset_from"] == "in-review"
+    fm = read_frontmatter(spec_path(project, "1-1-a"))
+    assert str(fm.get("status")) == "done"
+
+
+def test_review_timeout_salvage_verify_fail_falls_back(project):
+    """A failing verify gate refuses the salvage (journaled) and falls back to
+    the default retry/exhaust routing — never ships unverified work."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    # green at dev-verify time; the dying review breaks it, so only the salvage
+    # gate (not the dev gate) sees the failure
+    marker = project.project / "verify-marker.txt"
+    marker.write_text("ok", encoding="utf-8")
+    policy = dataclasses.replace(
+        _salvage_policy(max_review_cycles=1),
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker),)),
+    )
+
+    def timeout_and_break_verify(spec):
+        marker.unlink()
+        return SessionResult(status="timeout")
+
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), timeout_and_break_verify],
+        policy=policy,
+    )
+    summary = engine.run()
+
+    assert summary.deferred == 1 and summary.done == 0
+    (failed,) = [
+        e for e in engine.journal.entries() if e["kind"] == "review-timeout-salvage-failed"
+    ]
+    assert failed["cycle"] == 1
+    task = engine.state.tasks["1-1-a"]
+    assert "salvage not applicable" in task.defer_reason
+    assert not [e for e in engine.journal.entries() if e["kind"] == "review-timeout-salvage"]
+
+
+def test_review_timeout_salvage_nonterminal_spec_falls_back(project):
+    """A spec at a non-terminal status (unfinished dev work) is never salvaged
+    over — no salvage event at all, straight to the fallback routing."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+
+    def timeout_mid_work(spec):
+        sp = spec_path(project, "1-1-a")
+        write_spec(sp, "in-progress", _spec_baseline(sp))
+        return SessionResult(status="timeout")
+
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), timeout_mid_work],
+        policy=_salvage_policy(max_review_cycles=1),
+    )
+    summary = engine.run()
+
+    assert summary.deferred == 1
+    kinds = {e["kind"] for e in engine.journal.entries()}
+    assert "review-timeout-salvage" not in kinds
+    assert "review-timeout-salvage-failed" not in kinds
+    assert "salvage not applicable" in engine.state.tasks["1-1-a"].defer_reason
+
+
+def test_review_timeout_salvage_skipped_under_isolation(project):
+    """Worktree isolation: a defer already preserves the unit's worktree + diff,
+    and committing into the main repo would be wrong — salvage never applies."""
+    policy = dataclasses.replace(
+        _salvage_policy(), scm=ScmPolicy(rollback_on_failure=True, isolation="worktree")
+    )
+    engine, _ = make_engine(project, [], policy=policy)
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(spec_path(project, "1-1-a")))
+    assert engine._salvage_review_timeout(task, SessionResult(status="timeout")) is False
+
+
+def test_review_timeout_salvage_requires_spec_file(project):
+    engine, _ = make_engine(project, [], policy=_salvage_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)  # no spec recorded yet
+    assert engine._salvage_review_timeout(task, SessionResult(status="timeout")) is False
+
+
+def test_session_synthesized_from_frontmatter_journaled(project):
+    """The adapter's missing-marker synthesis flag (#224) leaves the same style
+    of forensic breadcrumb as a post-kill rescue."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    inner = dev_effect(project, "1-1-a")
+
+    def synthesized_dev(spec):
+        result = inner(spec)
+        result.result_json["synthesized_from_frontmatter"] = True
+        return result
+
+    engine, _ = make_engine(
+        project,
+        [synthesized_dev, review_effect(project, "1-1-a", clean=True)],
+    )
+    summary = engine.run()
+    assert summary.done == 1
+    (crumb,) = [
+        e for e in engine.journal.entries() if e["kind"] == "session-synthesized-from-frontmatter"
+    ]
+    assert crumb["role"] == "dev"

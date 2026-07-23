@@ -24,6 +24,18 @@ class Action(StrEnum):
     RETRY = "retry"
     DEFER = "defer"
     PAUSE = "pause"
+    # review.on_timeout = "salvage-if-done" only (#271): the engine attempts to
+    # commit the already-finalized dev product instead of burning another review
+    # cycle; when salvage is not applicable it falls back through
+    # `review_retry_or_exhaust`. Produced only by `decide_review_session`.
+    SALVAGE = "salvage"
+
+
+# Timeout-like review verdicts review.on_timeout governs (#271): deliberately the
+# same set `_post_kill_reconcile` treats as rescue-eligible. `crashed` is excluded
+# — a hard window death is cheap to retry and already honors on-disk artifacts via
+# the crash-path read-back — and env-fault (#194) short-circuits before this.
+REVIEW_TIMEOUT_STATUSES = frozenset({"timeout", "stalled", "over_budget"})
 
 
 @dataclass(frozen=True)
@@ -117,7 +129,6 @@ def decide_review_session(task: StoryTask, result: SessionResult, policy: Policy
         details = "; ".join(str(e.get("detail", e.get("type", "?"))) for e in crits)
         return Decision(Action.PAUSE, f"CRITICAL escalation from review session: {details}")
 
-    budget_left = task.review_cycle < policy.limits.max_review_cycles
     if result.status != "completed":
         if result.env_fault:
             # transport/API failure (#194): pause rather than charge a review
@@ -127,10 +138,27 @@ def decide_review_session(task: StoryTask, result: SessionResult, policy: Policy
                 env_fault_pause_reason("review", result),
             )
         reason = f"review session {result.status}"
-        if budget_left:
-            return Decision(Action.RETRY, reason)
-        return Decision(_exhausted_action(task), _exhaust_reason(task, reason))
+        if result.status in REVIEW_TIMEOUT_STATUSES:
+            mode = policy.review.on_timeout
+            if mode == "defer":
+                return Decision(
+                    _exhausted_action(task),
+                    _exhaust_reason(task, f"{reason} (review.on_timeout=defer)"),
+                )
+            if mode == "salvage-if-done":
+                return Decision(Action.SALVAGE, reason)
+        return review_retry_or_exhaust(task, policy, reason)
     return Decision(Action.PROCEED)
+
+
+def review_retry_or_exhaust(task: StoryTask, policy: Policy, reason: str) -> Decision:
+    """The default routing for a failed review session: RETRY while the outer
+    cycle budget lasts, then plateau-defer (or re-escalate mid re-drive). Module-
+    level so the engine can fall back through it when a SALVAGE attempt turns out
+    not to be applicable (#271)."""
+    if task.review_cycle < policy.limits.max_review_cycles:
+        return Decision(Action.RETRY, reason)
+    return Decision(_exhausted_action(task), _exhaust_reason(task, reason))
 
 
 def _exhausted_action(task: StoryTask) -> Action:

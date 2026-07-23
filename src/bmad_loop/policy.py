@@ -28,6 +28,7 @@ RETRO_MODES = {"never", "notify", "auto"}
 SESSION_BUDGET_MODES = {"off", "warn", "enforce"}
 SWEEP_AUTO_MODES = {"never", "per-epic", "run-end"}
 REVIEW_TRIGGER_MODES = {"always", "recommended"}
+REVIEW_ON_TIMEOUT_MODES = {"retry", "salvage-if-done", "defer"}
 # Where the run gets its story queue. "sprint-status" (default) is the classic
 # flow — bmad-sprint-planning writes sprint-status.yaml from prose epics.
 # "stories" is the opt-in folder+id dispatch flow (BMAD-METHOD #2549): a typed,
@@ -181,6 +182,18 @@ class ReviewPolicy:
     # recommending an independent follow-up — by converging + refiling once the
     # damping grant is spent instead of looping to the outer cap.
     trigger: str = "recommended"
+    # What a timeout-like review verdict (timeout / stalled / over_budget — the
+    # same set the post-kill reconcile treats as rescue-eligible) costs (#271):
+    #   "retry" (default) — today's behavior: burn a review cycle per timeout
+    #       until limits.max_review_cycles, then defer.
+    #   "salvage-if-done" — when the spec's frontmatter shows the dev product
+    #       already finalized (`done`, or the `in-review` mid-review interrupt,
+    #       reset forward) and the deterministic verify gate passes, commit the
+    #       work and refile any outstanding follow-up review to deferred work
+    #       instead of burning another full review pass on an empty delta.
+    #   "defer" — give up on the first timeout-like verdict (no retries).
+    # `crashed` and env-fault (#194) verdicts keep their own routing in every mode.
+    on_timeout: str = "retry"
 
 
 @dataclass(frozen=True)
@@ -752,10 +765,16 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     review = ReviewPolicy(
         enabled=bool(review_d.get("enabled", ReviewPolicy.enabled)),
         trigger=str(review_d.get("trigger", ReviewPolicy.trigger)).strip(),
+        on_timeout=str(review_d.get("on_timeout", ReviewPolicy.on_timeout)).strip(),
     )
     if review.trigger not in REVIEW_TRIGGER_MODES:
         raise PolicyError(
             f"review.trigger must be one of {sorted(REVIEW_TRIGGER_MODES)}: got {review.trigger!r}"
+        )
+    if review.on_timeout not in REVIEW_ON_TIMEOUT_MODES:
+        raise PolicyError(
+            f"review.on_timeout must be one of {sorted(REVIEW_ON_TIMEOUT_MODES)}:"
+            f" got {review.on_timeout!r}"
         )
     stories = StoriesPolicy(
         source=str(stories_d.get("source", StoriesPolicy.source)).strip(),
@@ -1009,6 +1028,12 @@ enabled = true
 # limits.max_followup_reviews (a round that finalizes the story yet keeps
 # recommending a follow-up converges + refiles once the grant is spent) either way.
 trigger = "recommended"
+# What a timeout-like review verdict (timeout/stalled/over_budget) costs:
+#   "retry"           -> burn a review cycle per timeout until max_review_cycles (default).
+#   "salvage-if-done" -> if the dev product is already finalized and verify passes,
+#                        commit it and refile the outstanding follow-up to deferred work.
+#   "defer"           -> give up on the first timeout-like verdict.
+on_timeout = "retry"
 
 [stories]
 # Story-queue source. "sprint-status" (default) walks sprint-status.yaml written

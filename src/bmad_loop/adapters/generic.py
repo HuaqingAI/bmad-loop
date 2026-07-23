@@ -39,6 +39,7 @@ from ..policy import Policy
 from ..process_host import ProcessHostError, get_process_host
 from ..signals import SignalWatcher
 from ..tokens import read_usage as tally_usage
+from ..verify import read_frontmatter
 from .base import CodingCLIAdapter, SessionHandle, SessionResult, SessionSpec
 from .multiplexer import MultiplexerError, TerminalMultiplexer, get_multiplexer
 from .profile import CLIProfile
@@ -52,6 +53,17 @@ PANE_LINES = 50
 RESULT_GRACE_S = 15.0
 RESULT_POLL_S = 0.5
 KILL_POLL_S = 0.5
+# Missing-marker fallback (#224): how many consecutive resultless-Stop
+# observations of an IDENTICAL (path, mtime, status) fingerprint a marker-less
+# terminal spec must survive before it is synthesized as this session's result.
+# One observation is not enough: right after a review launch the spec still
+# carries the dev pass's `done` frontmatter, and the review's first write can
+# bump its mtime past the launch floor before the status flips to `in-review` —
+# harvesting on that single sighting would score a review that never ran (#261).
+# Two stable sightings bracket a full stall-grace + nudge with zero writes, which
+# a session mid-edit cannot produce. A dead window skips the counter entirely:
+# the kill settled liveness, so the frontmatter is as final as it will ever get.
+FM_FALLBACK_MIN_OBS = 2
 # Post-mortem transport-failure classification (#194): how much of the tee'd
 # pane log's tail to scan, how long an evidence excerpt to keep, and which
 # non-completed statuses are eligible. over_budget is excluded — a budget
@@ -996,6 +1008,11 @@ class _DevSynthesisMixin(_ResultFileMixin):
         self._stop_nudges = 0
         self._stall_grace_s = float(self.policy.limits.dev_stall_grace_s)
         self._stall_nudges = int(self.policy.limits.dev_stall_nudges)
+        # Missing-marker fingerprint observations (#224):
+        # task_id -> (path, mtime_ns, frontmatter status, observation count).
+        # Task ids are unique per session, so entries never need resetting
+        # between sessions; the dict lives for the adapter's lifetime.
+        self._fm_fallback_obs: dict[str, tuple[str, int, str, int]] = {}
 
     def _probe_alive(self, handle: SessionHandle) -> bool | None:
         """Liveness of the session's native surface (tmux window, server
@@ -1022,12 +1039,14 @@ class _DevSynthesisMixin(_ResultFileMixin):
         return sr.result_json if sr is not None else None
 
     def _synth_result(
-        self, handle: SessionHandle, spec: SessionSpec, *, wait: bool
+        self, handle: SessionHandle, spec: SessionSpec, *, wait: bool, dead_window: bool = False
     ) -> devcontract.SynthResult | None:
         # Stories mode (folder+id dispatch): the story spec lives at a
         # deterministic id-keyed path, so resolve it directly instead of the
         # mtime-floor scan. The engine exports BMAD_LOOP_SPEC_FOLDER only for
         # stories runs, so sprint/sweep runs keep the scan path below unchanged.
+        # (dead_window is a scan-path refinement — stories read-back is already
+        # frontmatter-authoritative, so it needs no missing-marker fallback.)
         if spec.env.get("BMAD_LOOP_SPEC_FOLDER"):
             return self._stories_synth_result(handle, spec, wait=wait)
         # Mirror the base _await_result poll: the skill's terminal spec may not be
@@ -1039,25 +1058,125 @@ class _DevSynthesisMixin(_ResultFileMixin):
             for artifacts in search_dirs:
                 spec_path = devcontract.find_result_artifact(artifacts, since_ns=handle.launched_ns)
                 if spec_path is not None:
-                    story_key = spec.env.get("BMAD_LOOP_STORY_KEY") or None
-                    # Bundle dev sessions: the orchestrator exports the bundle's
-                    # owned dw ids (the generic skill never authors them). Stamp
-                    # them onto the result so verify_dev_bundle's cross-check passes.
-                    raw_dw_ids = (spec.env.get("BMAD_LOOP_DW_IDS") or "").split(",")
-                    dw_ids = [tok for tok in (i.strip() for i in raw_dw_ids) if tok]
-                    return devcontract.synthesize_result(
-                        spec_path, story_key=story_key, dw_ids=dw_ids or None
-                    )
+                    return self._synthesize_from(spec_path, spec)
             if not wait or time.monotonic() >= deadline:
-                if wait:
-                    self._note_resultless_stop(
-                        handle.task_id,
-                        "no-artifact",
-                        "no result artifact newer than session launch under: "
-                        + ", ".join(str(d) for d in search_dirs),
-                    )
-                return None
+                return self._frontmatter_fallback(
+                    handle, spec, search_dirs, wait=wait, dead_window=dead_window
+                )
             time.sleep(RESULT_POLL_S)
+
+    def _synthesize_from(self, spec_path: Path, spec: SessionSpec) -> devcontract.SynthResult:
+        """Shared synthesis call for the marker scan and the missing-marker
+        fallback, so both stamp the session's story key and — for bundle dev
+        sessions, where the orchestrator exports the bundle's owned dw ids (the
+        generic skill never authors them) — the dw_ids verify_dev_bundle
+        cross-checks."""
+        story_key = spec.env.get("BMAD_LOOP_STORY_KEY") or None
+        raw_dw_ids = (spec.env.get("BMAD_LOOP_DW_IDS") or "").split(",")
+        dw_ids = [tok for tok in (i.strip() for i in raw_dw_ids) if tok]
+        return devcontract.synthesize_result(spec_path, story_key=story_key, dw_ids=dw_ids or None)
+
+    def _frontmatter_fallback(
+        self,
+        handle: SessionHandle,
+        spec: SessionSpec,
+        search_dirs: list[Path],
+        *,
+        wait: bool,
+        dead_window: bool,
+    ) -> devcontract.SynthResult | None:
+        """Missing-marker rescue (#224): synthesize from a spec this session
+        finalized to a terminal frontmatter ``status:`` without appending the
+        ``## Auto Run Result`` marker the scan keys on. Without this, such a
+        spec is invisible to the harvest: every Stop reads ``no-artifact``, the
+        stall nudges re-invoke a skill that has already exited its workflow, and
+        a finished story rides to timeout — where the engine's review RETRY
+        strips the spec and reproduces the omission until the story defers.
+
+        Trust model: a terminal frontmatter under a live window is weaker
+        evidence than the marker, so the live path harvests only a fingerprint
+        (path, mtime, status) that held stable across ``FM_FALLBACK_MIN_OBS``
+        resultless Stops; a dead window (post-kill reconcile) harvests on one
+        sighting, liveness having been settled by the kill. Several candidates
+        mean the scan cannot know which spec is this session's — refuse to
+        guess. Every synthesized result still runs the engine's full
+        deterministic verify downstream, the same #61 trust model as the
+        post-kill rescue. With this in place a marker-less ``done`` spec
+        completes here and never reaches the review-timeout path, so the
+        ``review.on_timeout`` salvage (#271) only ever sees the complementary
+        case: a review that died with a NON-terminal frontmatter.
+
+        Owns the give-up breadcrumb: exactly one of ``no-artifact``,
+        ``ambiguous-frontmatter``, or ``terminal-frontmatter-pending`` per
+        wait=True pass (none on a harvest). A plain wait=False read (the crash
+        path) is compare-only — it may harvest an already-stable fingerprint but
+        never records observations or breadcrumbs.
+        """
+        task_id = handle.task_id
+        candidates: list[Path] = []
+        for artifacts in search_dirs:
+            candidates.extend(
+                devcontract.find_frontmatter_candidates(artifacts, since_ns=handle.launched_ns)
+            )
+        if not candidates:
+            # No marker-less terminal spec either (the common resultless Stop —
+            # e.g. a review that flipped to `in-review` and is mid-work): clear
+            # any stale fingerprint so a later terminal state starts over.
+            self._fm_fallback_obs.pop(task_id, None)
+            if wait:
+                self._note_resultless_stop(
+                    task_id,
+                    "no-artifact",
+                    "no result artifact newer than session launch under: "
+                    + ", ".join(str(d) for d in search_dirs),
+                )
+            return None
+        if len(candidates) > 1:
+            if wait:
+                self._note_resultless_stop(
+                    task_id,
+                    "ambiguous-frontmatter",
+                    f"{len(candidates)} terminal marker-less candidates: "
+                    + ", ".join(str(p) for p in candidates),
+                )
+            return None
+        path = candidates[0]
+        try:
+            mtime_ns = path.stat().st_mtime_ns
+            fm_status = str(read_frontmatter(path).get("status", "")).strip().lower()
+        except OSError:
+            # Torn mid-write read: not evidence of anything — same degrade as
+            # the read-back doctrine everywhere else on this path.
+            if wait:
+                self._note_resultless_stop(
+                    task_id, "no-artifact", f"unreadable marker-less candidate {path}"
+                )
+            return None
+        fingerprint = (str(path), mtime_ns, fm_status)
+        prev = self._fm_fallback_obs.get(task_id)
+        stable = prev is not None and prev[:3] == fingerprint
+        observations = (prev[3] + 1) if (stable and prev is not None) else 1
+        if dead_window or (stable and observations >= FM_FALLBACK_MIN_OBS):
+            sr = self._synthesize_from(path, spec)
+            if sr.result_json is not None:
+                sr.result_json["synthesized_from_frontmatter"] = True
+                self._note_lifecycle(
+                    task_id,
+                    "frontmatter-synthesized",
+                    spec=str(path),
+                    status=fm_status,
+                    dead_window=dead_window,
+                )
+            return sr
+        if wait:
+            self._fm_fallback_obs[task_id] = (*fingerprint, observations)
+            self._note_resultless_stop(
+                task_id,
+                "terminal-frontmatter-pending",
+                f"{path} frontmatter status={fm_status!r} with no '## Auto Run Result'"
+                f" marker; observation {observations}/{FM_FALLBACK_MIN_OBS} before synthesis",
+            )
+        return None
 
     def _stories_synth_result(
         self, handle: SessionHandle, spec: SessionSpec, *, wait: bool
@@ -1189,7 +1308,11 @@ class _DevSynthesisMixin(_ResultFileMixin):
         if alive is None:
             return result  # liveness unknowable: unknown is not dead
         try:
-            sr = self._synth_result(handle, spec, wait=False)
+            # dead_window: the probe above settled liveness, so the missing-
+            # marker fallback (#224) may synthesize from a terminal frontmatter
+            # on a single sighting — the gates below still refuse anything but
+            # a self-consistent, escalation-free successful terminal.
+            sr = self._synth_result(handle, spec, wait=False, dead_window=True)
         except (OSError, UnicodeDecodeError):
             # An unreadable artifact is not evidence a session finished. This
             # hook runs right after run()'s finally-kill — the moment a spec the

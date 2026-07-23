@@ -29,6 +29,7 @@ from .escalation import (
     decide_review_session,
     env_fault_pause_reason,
     preference_escalations,
+    review_retry_or_exhaust,
 )
 from .journal import Journal, save_state
 from .model import (
@@ -1328,6 +1329,27 @@ class Engine:
                     "review-retry", story_key=task.story_key, reason=decision.reason
                 )
                 continue
+            if decision.action == Action.SALVAGE:
+                # review.on_timeout = "salvage-if-done" (#271): the session hit a
+                # timeout-like verdict, but the dev product may already be
+                # finalized and verify-green — converge (commit + refile the
+                # outstanding follow-up) instead of burning another review cycle
+                # on an empty delta. When salvage is not applicable, fall back
+                # through the default retry/exhaust routing.
+                if self._salvage_review_timeout(task, result):
+                    return
+                fallback = review_retry_or_exhaust(
+                    task, self.policy, f"{decision.reason}; salvage not applicable"
+                )
+                if fallback.action == Action.PAUSE:
+                    self._escalate(task, fallback.reason)
+                if fallback.action == Action.DEFER:
+                    self._defer(task, fallback.reason)
+                    return
+                self.journal.append(
+                    "review-retry", story_key=task.story_key, reason=fallback.reason
+                )
+                continue
 
             rj = result.result_json or {}
             for pref in preference_escalations(rj):
@@ -1467,6 +1489,105 @@ class Engine:
             return
 
         self._commit(task)
+
+    def _salvage_review_timeout(self, task: StoryTask, result: SessionResult) -> bool:
+        """``review.on_timeout = "salvage-if-done"`` (#271): try to converge a
+        timed-out review by committing the already-finalized dev product instead
+        of burning another review cycle. Returns True when the story committed;
+        False means salvage was not applicable and the caller falls back to the
+        default retry/exhaust routing. The cycle the timed-out session charged is
+        deliberately not refunded — salvage changes what the *next* cycle costs,
+        not what this one did.
+
+        Applicability, all deterministic: not worktree-isolated (a defer there
+        already keeps the unit's worktree + diff, and committing into the main
+        repo would be wrong — same scoping as the budget-exhaustion rescue); a
+        spec is recorded and its frontmatter reads ``done`` (the review never got
+        far enough to touch it — rare once the adapter's missing-marker fallback
+        (#224) completes those sessions, but a review that never wrote the spec
+        at all still lands here) or ``in-review`` (the mid-review interrupt: the
+        dying pass flipped the transient marker and died — reset it forward,
+        stripping any partial terminal section so the next launch's mtime-floor
+        scan can't misread it). Anything else — ``blocked``, ``in-progress``, a
+        custom token — was set deliberately or means unfinished dev work: never
+        salvage over it. The commit is gated on the same authoritative
+        ``_verify_review`` as every other converge path, so salvage can never
+        ship unverified work; a timeout that produced no review result neither
+        re-arms ``followup_review_recommended`` nor spends a damping grant — the
+        outstanding recommendation is refiled to deferred work instead."""
+        if self._isolated or not task.spec_file:
+            return False
+        spec_path = Path(task.spec_file)
+        fm = self._observed_frontmatter(spec_path, task.story_key, "review-timeout-salvage")
+        if fm is None:
+            return False
+        fm_status = str(fm.get("status", "")).strip().lower()
+        if fm_status not in ("done", "in-review"):
+            return False
+        reset_from: str | None = None
+        if fm_status == "in-review":
+            # Repair-write doctrine: these raise on an unreadable spec rather
+            # than silently proceeding stale (see _reset_spec_for_repair).
+            reset_from = fm_status
+            devcontract.reset_spec_status(spec_path, "done")
+            devcontract.strip_auto_run_result(spec_path)
+        outcome = self._verify_review(task)
+        if not outcome.ok:
+            self.journal.append(
+                "review-timeout-salvage-failed",
+                story_key=task.story_key,
+                cycle=task.review_cycle,
+                reason=outcome.reason,
+                env_fault=outcome.env_fault,
+            )
+            if not outcome.retryable:
+                # escalate-grade failure (environment fault, git error): another
+                # review cycle would replay it — pause the run (mirrors the
+                # review loop's own verify-failed routing).
+                self._escalate(task, outcome.reason)
+            return False
+        refiled: str | None = None
+        if task.followup_review_recommended:
+            # Refile BEFORE _commit so the ledger edit squashes into the story
+            # commit (mirrors _record_review_budget_followup's ordering). A new
+            # origin string: the review-budget-followup origin's wording and
+            # re-review cap are load-bearing for that path and must not blur.
+            refiled = deferredwork.append_entry(
+                self.workspace.paths.deferred_work,
+                title=(
+                    f"Follow-up review still outstanding for {task.story_key}"
+                    " after a review timeout"
+                ),
+                origin="review-timeout-salvage",
+                source_spec=spec_path.name if task.spec_file else task.story_key,
+                reason=(
+                    f"The review session ended {result.status} with the story already "
+                    f"finalized (status: done, verify green). Per review.on_timeout = "
+                    f"'salvage-if-done' the work was committed by bmad-loop run "
+                    f"{self.state.run_id} without another review pass; this entry "
+                    f"preserves the outstanding follow-up recommendation for a "
+                    f"deliberate later review."
+                ),
+                severity="low",
+            )
+            task.followup_review_recommended = False
+        self.journal.append(
+            "review-timeout-salvage",
+            story_key=task.story_key,
+            cycle=task.review_cycle,
+            session_status=result.status,
+            reset_from=reset_from,
+            refiled=refiled,
+        )
+        gates.notify(
+            self.policy,
+            self.run_dir,
+            f"review timeout salvaged, work committed: {task.story_key}",
+            f"review session {result.status}; the finalized, verify-green dev product "
+            f"was committed and any outstanding follow-up refiled to deferred work.",
+        )
+        self._commit(task)
+        return True
 
     def _skip_review_and_commit(self, task: StoryTask) -> None:
         """review.enabled = false: no separate review session runs. The
@@ -2020,6 +2141,14 @@ class Engine:
             # completion in the journal; leave a breadcrumb for forensics.
             if result.result_json is not None and result.result_json.get("post_kill_reconciled"):
                 self.journal.append("session-rescued-post-kill", task_id=task_id, role=role)
+            # Same forensics need for a missing-marker synthesis (#224): the
+            # result is real, but the marker-append the skill owes was skipped.
+            if result.result_json is not None and result.result_json.get(
+                "synthesized_from_frontmatter"
+            ):
+                self.journal.append(
+                    "session-synthesized-from-frontmatter", task_id=task_id, role=role
+                )
             # Only dev/review sessions are resumable — `_resumable_session` matches
             # exactly those task ids under DEV_RUNNING/REVIEW_RUNNING. For everything
             # else (triage/sweep, labeled plugin-workflow sessions) the payload is
