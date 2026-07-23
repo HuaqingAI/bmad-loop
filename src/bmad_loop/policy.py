@@ -1,5 +1,15 @@
 """Policy-as-data: .bmad-loop/policy.toml -> immutable Policy dataclasses."""
 
+# Strict-checked under #245 Stage 2, with the three "expression fully known"
+# rules below relaxed for this file only: the snapshot/TOML readers rebuild typed
+# Policy objects from loosely-typed persisted data — `tomllib.load` and a run's
+# json-round-tripped `asdict(Policy)` both hand back `dict[str, Any]`, and
+# isinstance-narrowing an `Any` yields `dict[Unknown, Unknown]` — so `.get(...)`
+# chains off those dicts read as Unknown. Clearing them would take a TypedDict
+# per persisted shape or runtime coercions (out of scope for a no-runtime-change
+# gate); every other strict rule stays on and still catches annotation drift.
+# pyright: reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
 import re

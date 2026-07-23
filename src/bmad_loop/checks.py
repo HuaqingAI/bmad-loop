@@ -21,9 +21,17 @@ itself here. The assert only ever fires on a literal an author just wrote, never
 on runtime data, so it is a lint with a stack trace rather than a validation.
 """
 
+# Strict-checked under #245 Stage 2, with one rule relaxed for this file only:
+# `ValidationReport.findings` uses the idiomatic `field(default_factory=list)`,
+# which pyright can only infer as `list[Unknown]` (it does not fold the declared
+# `list[Finding]` annotation back into the bare `list` factory) though the field
+# is correctly typed. Every other strict rule stays on.
+# pyright: reportUnknownVariableType=false
+
 from __future__ import annotations
 
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -80,7 +88,7 @@ class Finding:
     check: str
     severity: Severity
     message: str
-    detail: dict | None = None
+    detail: Mapping[str, object] | None = None
 
 
 @dataclass
@@ -95,17 +103,23 @@ class ValidationReport:
 
     findings: list[Finding] = field(default_factory=list)
 
-    def add(self, check: str, severity: Severity, message: str, detail: dict | None = None) -> None:
+    def add(
+        self,
+        check: str,
+        severity: Severity,
+        message: str,
+        detail: Mapping[str, object] | None = None,
+    ) -> None:
         assert check in VALIDATE_CHECKS, f"unregistered check id: {check!r}"
         self.findings.append(Finding(check, severity, message, detail))
 
-    def ok(self, check: str, message: str, detail: dict | None = None) -> None:
+    def ok(self, check: str, message: str, detail: Mapping[str, object] | None = None) -> None:
         self.add(check, "ok", message, detail)
 
-    def warn(self, check: str, message: str, detail: dict | None = None) -> None:
+    def warn(self, check: str, message: str, detail: Mapping[str, object] | None = None) -> None:
         self.add(check, "warning", message, detail)
 
-    def fail(self, check: str, message: str, detail: dict | None = None) -> None:
+    def fail(self, check: str, message: str, detail: Mapping[str, object] | None = None) -> None:
         self.add(check, "problem", message, detail)
 
     def extend(self, findings: list[Finding]) -> None:

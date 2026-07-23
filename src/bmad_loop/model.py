@@ -1,5 +1,16 @@
 """Core data model: story lifecycle phases, per-task records, run state."""
 
+# Strict-checked under #245 Stage 2, with the two rules below relaxed for this
+# file only. `reportUnknownVariableType`: the dataclass collection fields use the
+# idiomatic `field(default_factory=list|dict)`, which pyright can only infer as
+# `list[Unknown]` / `dict[Unknown, Unknown]` (it does not fold the declared
+# annotation back into the factory) though the fields are correctly typed.
+# `reportUnknownArgumentType`: `from_dict` / snapshot readers pull values out of
+# run-persisted `dict[str, Any]`, so isinstance-narrowing an `Any` value yields
+# Unknown at that boundary. Both are inherent to the persistence edge, not
+# annotation drift; every other strict rule stays on.
+# pyright: reportUnknownArgumentType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
