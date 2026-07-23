@@ -9,6 +9,17 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **Post-mortem transport-failure classification — plumbing (part 1/3 of #194).** Adapters can now
+  classify a non-completed (`timeout`/`stalled`/`crashed`) session as an _environment fault_ by
+  matching per-profile `env_fault_patterns` regexes against the ANSI-stripped tail of the session's
+  pane log — the signature of a coding CLI that lost its API connection and idled out the session
+  clock without doing real work. `SessionResult` gains `env_fault` / `env_fault_evidence`, the
+  generic tmux adapter reads the log tail once after the verdict and reconcile settle (last match
+  wins, `over_budget`/`completed` excluded), and the `claude` profile ships a seed pattern that
+  requires an `API Error` line _and_ a connection-level cause on the same line. This part is
+  plumbing only — nothing consumes the flag yet; the story pipeline, workflow, and sweep sessions
+  pause on it (without burning attempts) in later parts.
+
 - **Documented the `BMAD_LOOP_*` environment variables (#246).** The three runtime override
   vars — `BMAD_LOOP_MUX_BACKEND`, `BMAD_LOOP_PROCESS_HOST`, `BMAD_LOOP_SESSION_TIMEOUT_S` — now
   have a reference table in the README. Behavior is unchanged; they are read through a single

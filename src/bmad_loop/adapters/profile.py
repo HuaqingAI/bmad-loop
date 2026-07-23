@@ -13,6 +13,7 @@ existing hook dialect needs no Python.
 
 from __future__ import annotations
 
+import re
 import tomllib
 from dataclasses import dataclass, field
 from importlib import resources
@@ -87,6 +88,13 @@ class CLIProfile:
     # that a `git worktree add` checkout omits; provision_worktree copies them in
     # from the main repo so isolated dev/review sessions can reach the MCP server.
     seed_files: tuple[str, ...] = ()
+    # Python `re` patterns matched line-by-line against the ANSI-stripped tail of
+    # a non-completed session's pane log to classify a transport/API *environment
+    # fault* (#194) — e.g. an "API Error … Connection refused" the CLI printed
+    # while idling out the session clock. Compiled and validated at parse time
+    # (an invalid regex is a profile error). Seeded only for `claude`; empty =
+    # inert. Override/extend via a project profile in .bmad-loop/profiles/.
+    env_fault_patterns: tuple[str, ...] = ()
 
     @property
     def hookless(self) -> bool:
@@ -166,6 +174,13 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         if not seed or is_absolute_path(seed) or has_parent_ref(seed):
             raise fail(f"seed_files entries must be project-relative paths: got {seed!r}")
 
+    env_fault_patterns = tuple(str(p) for p in doc.get("env_fault_patterns", ()))
+    for pattern in env_fault_patterns:
+        try:
+            re.compile(pattern)
+        except re.error as e:
+            raise fail(f"env_fault_patterns entry is not a valid regex: {pattern!r} ({e})") from e
+
     return CLIProfile(
         name=name,
         binary=binary,
@@ -182,6 +197,7 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         subagent_stop_without_transcript=bool(doc.get("subagent_stop_without_transcript", False)),
         first_run_note=str(doc.get("first_run_note", "")),
         seed_files=seed_files,
+        env_fault_patterns=env_fault_patterns,
     )
 
 

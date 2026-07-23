@@ -3,10 +3,13 @@
 Each pipeline step gets a fresh tmux window running the full interactive CLI
 with the skill invocation as the initial prompt. Completion is detected
 exclusively through hook-written event files (Stop/SessionEnd) plus the
-presence of the skill-written result.json — the pane log's *contents* are
-never parsed for control flow (only tee'd for human debugging), though its
-*growth* (mtime/size, never the bytes — see ``_log_activity_key``) is read as
-a liveness signal to re-arm the dev-stall grace window.
+presence of the skill-written result.json — the pane log's *contents* never
+drive the wait loop (only tee'd for human debugging), though its *growth*
+(mtime/size, never the bytes — see ``_log_activity_key``) is read as a liveness
+signal to re-arm the dev-stall grace window. The one exception is post-mortem:
+after the verdict and reconcile have settled, a single tail read of the log
+classifies a transport-failure environment fault (#194, see
+``_classify_env_fault``) — it labels the result, it never drives the wait loop.
 
 Everything CLI-specific (binary, prompt rendering, bypass flags, usage
 parser) comes from a declarative CLIProfile; each CLI's hook config registers
@@ -18,7 +21,9 @@ fallback.
 
 from __future__ import annotations
 
+import dataclasses
 import json
+import re
 import shlex
 import time
 from pathlib import Path
@@ -45,6 +50,26 @@ PANE_LINES = 50
 RESULT_GRACE_S = 15.0
 RESULT_POLL_S = 0.5
 KILL_POLL_S = 0.5
+# Post-mortem transport-failure classification (#194): how much of the tee'd
+# pane log's tail to scan, how long an evidence excerpt to keep, and which
+# non-completed statuses are eligible. over_budget is excluded — a budget
+# crossing proves real API traffic — and completed never reaches the scan.
+ENV_FAULT_TAIL_BYTES = 64 * 1024
+ENV_FAULT_EVIDENCE_MAX = 240
+ENV_FAULT_STATUSES = frozenset({"timeout", "stalled", "crashed"})
+# Self-contained ANSI/terminal-control stripper for the log tail: CSI, OSC (BEL-
+# or ST-terminated), other two-char ESC sequences, and raw C1 bytes. Deliberately
+# NOT the TUI/pyte machinery — the classifier reads raw pane bytes best-effort and
+# must not pull a terminal emulator into the adapter.
+_ANSI_RE = re.compile(
+    r"""
+    \x1b\[ [0-?]* [ -/]* [@-~]        # CSI ... final byte
+    | \x1b\] .*? (?: \x07 | \x1b\\ )   # OSC ... BEL or ST
+    | \x1b [@-Z\\-_]                   # 2-char ESC sequences (incl. C1 via ESC)
+    | [\x80-\x9f]                      # raw C1 control bytes
+    """,
+    re.VERBOSE,
+)
 # min spacing between heartbeat.json overwrites in wait_for_completion; the
 # heartbeat's staleness is what makes a frozen orchestrator (#157) diagnosable.
 HEARTBEAT_INTERVAL_S = 30.0
@@ -221,6 +246,9 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
         self.run_dir = run_dir
         self.policy = policy
         self.profile = profile
+        # Precompiled once per adapter (the profile validated each at parse time,
+        # so re.compile cannot raise here); empty tuple = classification inert.
+        self._env_fault_patterns = tuple(re.compile(p) for p in profile.env_fault_patterns)
         self.mux = mux or get_multiplexer()
         # None = use the profile's default bypass flags; a tuple replaces them
         self.extra_args = extra_args
@@ -690,6 +718,59 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
         except OSError:
             return None
         return (st.st_mtime_ns, st.st_size)
+
+    def _classify_env_fault(
+        self, handle: SessionHandle, spec: SessionSpec, result: SessionResult
+    ) -> SessionResult:
+        """Post-mortem transport-failure classification (#194).
+
+        Runs last in ``run()`` (after ``_post_kill_reconcile``): only a
+        non-completed verdict (``result.status`` in ``ENV_FAULT_STATUSES``,
+        ``result_json is None``) with configured patterns is inspected, so a
+        reconcile upgrade to ``completed`` is never re-classified and adapters
+        without patterns stay inert. On a matching log-tail line, stamp
+        ``env_fault`` / ``env_fault_evidence`` and drop an ``env-fault-classified``
+        lifecycle breadcrumb. No match, no patterns, or an unreadable log leaves
+        the verdict untouched — best-effort, like ``_write_heartbeat``."""
+        if (
+            not self._env_fault_patterns
+            or result.status not in ENV_FAULT_STATUSES
+            or result.result_json is not None
+        ):
+            return result
+        evidence = self._env_fault_evidence(handle.task_id)
+        if evidence is None:
+            return result
+        self._note_lifecycle(
+            handle.task_id, "env-fault-classified", status=result.status, evidence=evidence
+        )
+        return dataclasses.replace(result, env_fault=True, env_fault_evidence=evidence)
+
+    def _env_fault_evidence(self, task_id: str) -> str | None:
+        """Scan the tail of the tee'd pane log for a transport-failure pattern.
+
+        Reads the last ``ENV_FAULT_TAIL_BYTES`` (binary, decoded with
+        ``errors="replace"``, ``\\r``→``\\n``), strips ANSI, and matches each
+        line against the precompiled patterns. Returns the ANSI-stripped matching
+        line (last match winning, truncated to ``ENV_FAULT_EVIDENCE_MAX``), or
+        None when nothing matches or the log can't be read (any ``OSError`` → no
+        classification, the best-effort doctrine)."""
+        try:
+            with (self.logs_dir / f"{task_id}.log").open("rb") as fh:
+                fh.seek(0, 2)  # SEEK_END
+                size = fh.tell()
+                fh.seek(max(0, size - ENV_FAULT_TAIL_BYTES))
+                raw = fh.read()
+        except OSError:
+            return None
+        text = _ANSI_RE.sub("", raw.decode("utf-8", errors="replace").replace("\r", "\n"))
+        match_line: str | None = None
+        for line in text.split("\n"):
+            if any(pat.search(line) for pat in self._env_fault_patterns):
+                match_line = line  # last match wins
+        if match_line is None:
+            return None
+        return match_line.strip()[:ENV_FAULT_EVIDENCE_MAX]
 
     def _window_alive(self, handle: SessionHandle) -> bool:
         return handle.native_id in self.mux.list_window_ids(self.session_name)

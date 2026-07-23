@@ -2388,6 +2388,178 @@ def test_run_exception_kills_without_reconcile(tmp_path):
     assert calls == ["kill"]
 
 
+# ----------------------------------- env-fault classification (#194, part 1/3)
+#
+# A coding CLI that loses its API connection idles out the session clock and is
+# stamped `timeout` (or `stalled`/`crashed`), indistinguishable from a real
+# wall-clock timeout. _classify_env_fault reads the tee'd pane log's tail ONCE
+# after the verdict and reconcile settle, matches the profile's env_fault_patterns
+# against the ANSI-stripped lines, and stamps env_fault/env_fault_evidence so a
+# later phase can PAUSE instead of charging a dev attempt. These pin the classifier
+# in isolation plus its ordering through run(). Downstream consumption is phase 2+.
+
+_ENV_FAULT_TASK = "1-1-a-dev-1"
+
+
+def _write_task_log(adapter, data: bytes, task_id=_ENV_FAULT_TASK) -> None:
+    (adapter.logs_dir / f"{task_id}.log").write_bytes(data)
+
+
+def _classify(adapter, status, *, result_json=None, task_id=_ENV_FAULT_TASK) -> SessionResult:
+    handle = SessionHandle(task_id=task_id, native_id="@1")
+    result = SessionResult(status=status, result_json=result_json)
+    spec = make_spec(adapter.run_dir, task_id=task_id)
+    return adapter._classify_env_fault(handle, spec, result)
+
+
+def test_classify_env_fault_flags_timeout_from_ansi_log(tmp_path):
+    """The headline case: a timeout whose pane log holds an ANSI-colored
+    `API Error … (ConnectionRefused)` line is stamped env_fault, the evidence is
+    the ANSI-stripped line, and an `env-fault-classified` breadcrumb is written."""
+    adapter = make_adapter(tmp_path)  # claude profile ships the seed pattern
+    _write_task_log(
+        adapter,
+        b"building the diff...\n"
+        b"\x1b[31mAPI Error: Unable to connect (ConnectionRefused)\x1b[0m\n"
+        b"idle...\n",
+    )
+    result = _classify(adapter, "timeout")
+    assert result.env_fault is True
+    assert result.status == "timeout"  # the status string is unchanged
+    assert result.env_fault_evidence == "API Error: Unable to connect (ConnectionRefused)"
+    assert "\x1b" not in result.env_fault_evidence  # ANSI stripped
+    events = _lifecycle_lines(adapter, _ENV_FAULT_TASK)
+    assert [e["event"] for e in events] == ["env-fault-classified"]
+    assert events[0]["status"] == "timeout"
+    assert "ConnectionRefused" in events[0]["evidence"]
+
+
+@pytest.mark.parametrize("status", ["stalled", "crashed"])
+def test_classify_env_fault_flags_stalled_and_crashed(tmp_path, status):
+    """stalled and crashed join timeout in the eligible set — all three can be a
+    lost-connection session dressed up as a non-completed verdict."""
+    adapter = make_adapter(tmp_path)
+    _write_task_log(adapter, b"API Error: Connection refused\n")
+    result = _classify(adapter, status)
+    assert result.env_fault is True
+    assert result.env_fault_evidence == "API Error: Connection refused"
+
+
+def test_classify_env_fault_ignores_completed_and_over_budget(tmp_path):
+    """completed never reaches the scan (it carries result_json), and over_budget is
+    excluded outright — a budget crossing proves real API traffic. Both pass through
+    unchanged (same object), with no breadcrumb."""
+    adapter = make_adapter(tmp_path)
+    _write_task_log(adapter, b"API Error: Connection refused\n")
+    completed = _classify(adapter, "completed", result_json={"ok": True})
+    assert completed.env_fault is False and completed.env_fault_evidence is None
+    over = _classify(adapter, "over_budget")
+    assert over.env_fault is False and over.env_fault_evidence is None
+    assert _lifecycle_lines(adapter, _ENV_FAULT_TASK) == []
+
+
+def test_classify_env_fault_ignores_result_json_present(tmp_path):
+    """The guard is `result_json is None`: an eligible status that somehow carries a
+    result dict is trusted work, never re-classified."""
+    adapter = make_adapter(tmp_path)
+    _write_task_log(adapter, b"API Error: Connection refused\n")
+    result = _classify(adapter, "timeout", result_json={"salvaged": True})
+    assert result.env_fault is False
+    assert _lifecycle_lines(adapter, _ENV_FAULT_TASK) == []
+
+
+def test_classify_env_fault_inert_without_patterns(tmp_path):
+    """A profile with no env_fault_patterns (codex) never classifies, even with a
+    matching line in the log."""
+    adapter = make_adapter(tmp_path, profile_name="codex")
+    assert adapter._env_fault_patterns == ()
+    _write_task_log(adapter, b"API Error: Connection refused\n")
+    result = _classify(adapter, "timeout")
+    assert result.env_fault is False
+    assert _lifecycle_lines(adapter, _ENV_FAULT_TASK) == []
+
+
+def test_classify_env_fault_no_match_leaves_verdict(tmp_path):
+    """A log with no transport-failure line (only benign output that mentions
+    `API Error` in prose, the false-positive control) leaves the verdict alone."""
+    adapter = make_adapter(tmp_path)
+    _write_task_log(adapter, b"the story tests how we surface an API Error to users\n")
+    result = _classify(adapter, "timeout")
+    assert result.env_fault is False
+    assert _lifecycle_lines(adapter, _ENV_FAULT_TASK) == []
+
+
+def test_classify_env_fault_missing_log_degrades_silently(tmp_path):
+    """No pane log at all (an OSError on read) → no classification, no crash,
+    no breadcrumb — the best-effort doctrine."""
+    adapter = make_adapter(tmp_path)  # no log file written
+    result = _classify(adapter, "timeout")
+    assert result.env_fault is False
+    assert result.env_fault_evidence is None
+    assert _lifecycle_lines(adapter, _ENV_FAULT_TASK) == []
+
+
+def test_classify_env_fault_last_match_wins_and_truncates(tmp_path):
+    """Multiple matching lines → the LAST one is the evidence (the most recent
+    failure), and a long line is truncated to ENV_FAULT_EVIDENCE_MAX."""
+    adapter = make_adapter(tmp_path)
+    filler = "x" * 400
+    _write_task_log(
+        adapter,
+        (
+            f"API Error: Connection refused FIRST {filler}\n"
+            f"unrelated line\n"
+            f"API Error: Connection refused LAST {filler}\n"
+        ).encode(),
+    )
+    result = _classify(adapter, "crashed")
+    assert result.env_fault is True
+    assert len(result.env_fault_evidence) == generic.ENV_FAULT_EVIDENCE_MAX
+    assert "LAST" in result.env_fault_evidence  # last match won
+    assert "FIRST" not in result.env_fault_evidence
+
+
+def test_run_classifies_env_fault_after_reconcile(tmp_path):
+    """Through run(): a non-rescued timeout (window still alive at the post-kill
+    probe) whose log tail matches is stamped env_fault — classification runs on the
+    reconcile-settled result."""
+    adapter, _impl = make_dev_adapter(tmp_path)
+    _write_task_log(
+        adapter,
+        b"\x1b[31mAPI Error: Unable to connect (ECONNREFUSED)\x1b[0m\n",
+        task_id="3-1-dev-1",
+    )
+    adapter.start_session = lambda spec: _dev_handle()
+    adapter.wait_for_completion = lambda handle, spec: _unvouched("timeout")
+    adapter.kill = lambda handle: None
+    adapter._window_alive = lambda handle: True  # alive → reconcile keeps the timeout
+    result = adapter.run(_dev_spec(tmp_path))
+    assert result.status == "timeout"
+    assert result.env_fault is True
+    assert "ECONNREFUSED" in result.env_fault_evidence
+
+
+def test_run_reconcile_upgrade_is_not_reclassified(tmp_path):
+    """The ordering invariant: a session reconcile upgrades to completed is NOT
+    re-classified, even though the same log tail would match — env_fault runs after
+    the reconcile and only ever inspects a non-completed, result-less verdict."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    (impl / "spec-3-1-foo.md").write_text(_DONE_SPEC)  # a done artifact to rescue
+    _write_task_log(
+        adapter,
+        b"API Error: Unable to connect (ECONNREFUSED)\n",  # would match if scanned
+        task_id="3-1-dev-1",
+    )
+    adapter.start_session = lambda spec: _dev_handle()
+    adapter.wait_for_completion = lambda handle, spec: _unvouched("timeout")
+    adapter.kill = lambda handle: None
+    adapter._window_alive = lambda handle: False  # dead → reconcile rescues to completed
+    result = adapter.run(_dev_spec(tmp_path))
+    assert result.status == "completed"
+    assert result.env_fault is False
+    assert result.env_fault_evidence is None
+
+
 def test_wait_for_completion_tolerates_transient_liveness_probe_failure(tmp_path, monkeypatch):
     """A transient transport hang (the liveness probe raising MultiplexerError, e.g.
     a 30s tmux hang) must never be read as a dead window -> crash. The tick is

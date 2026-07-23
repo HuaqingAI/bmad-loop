@@ -78,6 +78,14 @@ class SessionResult:
     # unless the guard tripped. Set on every post-trip exit — warn-mode sessions
     # that run to completion carry it too — so the engine can journal it.
     budget_weighted: int | None = None
+    # transport-failure classification (#194): True when a non-completed session
+    # was post-mortem-matched as an *environment fault* (the coding CLI lost its
+    # API connection and idled out the session clock instead of doing real work).
+    # Set by the _classify_env_fault hook; env_fault_evidence carries the matched,
+    # ANSI-stripped log line. These two MUST stay the LAST fields so every
+    # positional SessionResult construction in the codebase stays valid.
+    env_fault: bool = False
+    env_fault_evidence: str | None = None
 
 
 class CodingCLIAdapter(ABC):
@@ -118,7 +126,8 @@ class CodingCLIAdapter(ABC):
             result = self.wait_for_completion(handle, spec)
         finally:
             self.kill(handle)
-        return self._post_kill_reconcile(handle, spec, result)
+        result = self._post_kill_reconcile(handle, spec, result)
+        return self._classify_env_fault(handle, spec, result)
 
     def _post_kill_reconcile(
         self, handle: SessionHandle, spec: SessionSpec, result: SessionResult
@@ -131,4 +140,20 @@ class CodingCLIAdapter(ABC):
         window death (see GenericDevAdapter) may re-inspect on-disk state here,
         now that the kill has settled the liveness question a live-window
         verdict had to leave open."""
+        return result
+
+    def _classify_env_fault(
+        self, handle: SessionHandle, spec: SessionSpec, result: SessionResult
+    ) -> SessionResult:
+        """Last-chance post-mortem: label a non-completed session an environment
+        fault (#194) when the CLI lost its API connection and idled out the
+        session clock rather than doing real work.
+
+        Runs LAST in ``run()`` — after ``_post_kill_reconcile`` — so a reconcile
+        upgrade to ``completed`` is never re-classified, and only a genuinely
+        non-completed verdict (``result_json is None``) is ever inspected. Base
+        behavior: identity, like ``_post_kill_reconcile``, so adapters with no
+        post-mortem signal (HTTP/mock) stay inert. Adapters that tee the pane
+        (see GenericAdapter) may match profile patterns against the log tail here
+        and stamp ``env_fault`` / ``env_fault_evidence`` onto the result."""
         return result

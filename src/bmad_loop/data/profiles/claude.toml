@@ -16,6 +16,18 @@ seed_files = [
   ".claude/settings.local.json",
 ]
 
+# Transport-failure classification (#194): regexes matched line-by-line against
+# the ANSI-stripped tail of a non-completed (timeout/stalled/crashed) session's
+# pane log. A match reclassifies the session as an environment fault so the
+# orchestrator can PAUSE (and re-arm with a fresh budget) instead of charging a
+# dev attempt for a session that never reached the API. The pattern requires an
+# "API Error" line AND a connection-level cause on the SAME line, so ordinary
+# story test output that merely mentions "API Error" in prose does not trip it.
+# To disable or extend, copy this profile into .bmad-loop/profiles/ and edit.
+env_fault_patterns = [
+  "API Error.*(Unable to connect|Connection ?(error|refused|reset|timed ?out)|ConnectionRefused|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN)",
+]
+
 # Force Claude Code's classic (inline/scrollback) renderer. The fullscreen TUI
 # (research preview, alt-screen ?1049h like vim/htop) repaints in place, so the
 # tmux pane capture only ever holds the final frame and the Log tab shows a single

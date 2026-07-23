@@ -75,6 +75,12 @@ def test_builtin_profiles_load():
     for name in sorted(set(profiles) - {"claude"}):
         assert "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN" not in profiles[name].env
         assert "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS" not in profiles[name].env
+    # transport-failure classification (#194): only claude seeds env_fault_patterns
+    # (the "API Error … connection cause" signature); every other built-in ships
+    # none, so classification stays inert until a project overlay adds patterns
+    assert profiles["claude"].env_fault_patterns  # non-empty
+    for name in ("codex", "gemini", "copilot", "antigravity", "opencode-http"):
+        assert profiles[name].env_fault_patterns == ()
     # opencode-http is hookless (HTTP/SSE transport): no hook dialect surfaces,
     # skills read from the claude tree, usage comes over HTTP (no transcript parser)
     opencode = profiles["opencode-http"]
@@ -107,6 +113,29 @@ def test_seed_files_default_empty_when_unset(tmp_path):
     profiles_dir.mkdir(parents=True)
     (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE)
     assert load_profiles(tmp_path)["mycli"].seed_files == ()
+
+
+def test_env_fault_patterns_default_empty_when_unset(tmp_path):
+    # MINIMAL_PROFILE omits env_fault_patterns -> defaults to () (classification inert)
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE)
+    assert load_profiles(tmp_path)["mycli"].env_fault_patterns == ()
+
+
+def test_env_fault_patterns_parse_from_overlay(tmp_path):
+    # a project overlay may add/extend the transport-failure patterns; they parse
+    # into a tuple verbatim (compilation validated, see the invalid-regex case)
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(
+        MINIMAL_PROFILE.replace(
+            "[hooks]",
+            'env_fault_patterns = ["API Error.*refused", "socket hang up"]\n[hooks]',
+        )
+    )
+    prof = load_profiles(tmp_path)["mycli"]
+    assert prof.env_fault_patterns == ("API Error.*refused", "socket hang up")
 
 
 def test_skill_tree_defaults_when_unset():
@@ -201,6 +230,14 @@ def test_user_profile_overlay(tmp_path):
                 'seed_files = ["/etc/passwd"]\n[hooks]',
             ),
             "seed_files",
+        ),
+        # an env_fault_patterns entry that is not a valid regex fails fast at parse
+        (
+            MINIMAL_PROFILE.replace(
+                "[hooks]",
+                'env_fault_patterns = ["API Error(unbalanced"]\n[hooks]',
+            ),
+            "env_fault_patterns",
         ),
         (
             MINIMAL_PROFILE.replace("[hooks]", "usage_grace_s = -1\n[hooks]"),
