@@ -19,6 +19,7 @@ from . import (
     bmadconfig,
     decisions,
     deferredwork,
+    envvars,
     install,
     machine,
 )
@@ -444,7 +445,7 @@ def _mux_set(project: Path, args: argparse.Namespace) -> int:
             "`bmad-loop validate` will report it",
             file=sys.stderr,
         )
-    if os.environ.get("BMAD_LOOP_MUX_BACKEND"):
+    if envvars.mux_backend():
         print(
             "note: BMAD_LOOP_MUX_BACKEND is set in this shell and outranks the persisted choice",
             file=sys.stderr,

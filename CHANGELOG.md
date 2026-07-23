@@ -9,6 +9,11 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **Documented the `BMAD_LOOP_*` environment variables (#246).** The three runtime override
+  vars — `BMAD_LOOP_MUX_BACKEND`, `BMAD_LOOP_PROCESS_HOST`, `BMAD_LOOP_SESSION_TIMEOUT_S` — now
+  have a reference table in the README. Behavior is unchanged; they are read through a single
+  `bmad_loop.envvars` registry so the supported knobs are discoverable in one place.
+
 - **`python -m bmad_loop` (#240).** The package is now runnable as a module
   (`python -m bmad_loop …`), mirroring the installed `bmad-loop` console script via a thin
   `__main__.py`. Subprocess smoke tests exercise the module entry, and characterization tests
