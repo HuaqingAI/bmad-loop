@@ -172,6 +172,18 @@ class CodingCLIAdapter(ABC):
         verdict had to leave open."""
         return result
 
+    def _observe_tick(self, handle: SessionHandle, spec: SessionSpec) -> None:
+        """Heartbeat-cadence hook for mid-session on-disk observation, called from
+        the wait loop's heartbeat-throttled block (~every HEARTBEAT_INTERVAL_S; the
+        first tick always fires). Base behavior: nothing. Adapters that drive a
+        skill whose terminal on-disk state is heuristic to attribute may sample it
+        here (see GenericDevAdapter's `_DevSynthesisMixin`, which records the spec's
+        first non-terminal status transition to make a later terminal frontmatter
+        deterministic proof this session wrote it, #276 M2). An observation seam
+        only — it MUST NOT mutate session state or the spec, and any read failure is
+        a sample it silently skips, never a verdict."""
+        return None
+
     def _classify_env_fault(
         self, handle: SessionHandle, spec: SessionSpec, result: SessionResult
     ) -> SessionResult:

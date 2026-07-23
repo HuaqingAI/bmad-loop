@@ -95,6 +95,16 @@ breaking changes may land in a minor release.
     record each refusal. The snapshot is process-transient (a crash-resume degrades to the
     conservative 2-observation path), and the review-launch frontmatter `status` is never
     mutated — it remains load-bearing skill routing.
+  - _Mid-session status-transition observation._ On each heartbeat tick the generic (and
+    OpenCode) dev adapter now samples the snapshotted spec's frontmatter and records the first
+    status it observes this session drive off its launch state to a live, non-terminal value
+    (in practice `in-review`), with a `spec-status-transition-observed` lifecycle crumb. A
+    recorded transition is deterministic proof the terminal frontmatter the spec later carries
+    is this session's own write, so the fallback synthesizes on a single terminal sighting —
+    live or dead window — instead of the 2-observation fingerprint (the synthesized crumb gains
+    a `transition` flag). The content-hash gate still outranks it: bytes reverted exactly to the
+    launch snapshot refuse even with a transition recorded. A transition that flips entirely
+    between two ticks is missed and falls back to the conservative fingerprint path.
 
 ## [0.9.0] — 2026-07-21
 

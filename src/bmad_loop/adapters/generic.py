@@ -459,6 +459,10 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
                         "stall_nudges_sent": stall_nudges_sent,
                     },
                 )
+                # Mid-session spec-status transition sampling (#276 M2) rides the
+                # same heartbeat cadence — a no-op unless this adapter drives the
+                # generic skill and the engine threaded a launch snapshot.
+                self._observe_tick(handle, spec)
                 # Budget sampling rides the heartbeat cadence — no extra knob.
                 # transcript_path is unknown until the first hook event carries
                 # it (SessionStart for claude); until then the guard is inert.
@@ -1014,6 +1018,13 @@ class _DevSynthesisMixin(_ResultFileMixin):
         # Task ids are unique per session, so entries never need resetting
         # between sessions; the dict lives for the adapter's lifetime.
         self._fm_fallback_obs: dict[str, tuple[str, int, str, int]] = {}
+        # First mid-session spec-status transition observed per session (#276 M2):
+        # task_id -> normalized status. Recorded by `_observe_tick` when the spec's
+        # frontmatter first moves off its launch status to a non-terminal state (in
+        # practice `in-review`), which makes a later terminal frontmatter proof THIS
+        # session wrote it. Same lifetime doctrine as `_fm_fallback_obs` — task_ids
+        # are unique per session, so entries are recorded once and never cleared.
+        self._fm_transition_obs: dict[str, str] = {}
 
     def _probe_alive(self, handle: SessionHandle) -> bool | None:
         """Liveness of the session's native surface (tmux window, server
@@ -1077,6 +1088,40 @@ class _DevSynthesisMixin(_ResultFileMixin):
         dw_ids = [tok for tok in (i.strip() for i in raw_dw_ids) if tok]
         return devcontract.synthesize_result(spec_path, story_key=story_key, dw_ids=dw_ids or None)
 
+    def _observe_tick(self, handle: SessionHandle, spec: SessionSpec) -> None:
+        """Mid-session status-transition observation (#276 M2), called each
+        heartbeat tick (~every HEARTBEAT_INTERVAL_S; the first tick fires too).
+        Records the FIRST spec frontmatter status this session drives off its
+        launch state to a live, non-terminal value (in practice ``in-review``)
+        into ``_fm_transition_obs``. That single sighting is what lets
+        ``_frontmatter_fallback`` treat a later terminal frontmatter as
+        deterministic proof THIS session wrote it (``transition_proven``), so it
+        can synthesize on ONE terminal sighting instead of the 2-observation
+        fingerprint.
+
+        A pure sampling path, never a verdict path: it needs a launch snapshot to
+        observe against, fires at most once per session (task_ids are unique;
+        entries are never cleared), and any unreadable/torn read is a skipped
+        sample (silent OSError return), never evidence. Blank/torn parses (``s ==
+        ""``) and terminal states (``done``/``blocked``) are NOT recorded — a
+        terminal frontmatter is the Stop harvest's business, and the launch status
+        itself (the ``done`` a review re-opens) is not a transition. A transition
+        that flips entirely between two ticks is simply missed, and the fallback
+        keeps its conservative 2-observation path."""
+        task_id = handle.task_id
+        snap = spec.spec_snapshot
+        if snap is None or task_id in self._fm_transition_obs:
+            return
+        try:
+            s = str(read_frontmatter(Path(snap.path)).get("status", "")).strip().lower()
+        except OSError:
+            return
+        if s != "" and s not in (devcontract.DONE, devcontract.BLOCKED) and s != snap.fm_status:
+            self._fm_transition_obs[task_id] = s
+            self._note_lifecycle(
+                task_id, "spec-status-transition-observed", spec=snap.path, status=s
+            )
+
     def _frontmatter_fallback(
         self,
         handle: SessionHandle,
@@ -1098,9 +1143,16 @@ class _DevSynthesisMixin(_ResultFileMixin):
         evidence than the marker, so the live path harvests only a fingerprint
         (path, mtime, status) that held stable across ``FM_FALLBACK_MIN_OBS``
         resultless Stops; a dead window (post-kill reconcile) harvests on one
-        sighting, liveness having been settled by the kill. Several candidates
-        mean the scan cannot know which spec is this session's — refuse to
-        guess. Outranking all of that (#276 M1): when the engine threaded a
+        sighting, liveness having been settled by the kill. A recorded mid-session
+        transition (#276 M2) is a third single-sighting route, live or dead: having
+        observed this session drive the spec off its launch ``status:`` to a live
+        non-terminal state (``in-review``) proves the terminal frontmatter it now
+        carries is this session's own write, not a stale prior ``done``, so one
+        terminal sighting suffices — the ``transition=`` flag on the synthesized
+        crumb marks it. A transition that flips entirely between two ticks is simply
+        missed, and this stays on the conservative 2-observation fingerprint.
+        Several candidates mean the scan cannot know which spec is this session's —
+        refuse to guess. Outranking all of that (#276 M1): when the engine threaded a
         ``spec_snapshot`` (review sessions) and the candidate's bytes still hash
         equal to it, the spec is provably untouched by this session — a ``done``
         spec re-opened for review, not this session's output — and synthesis is
@@ -1201,7 +1253,15 @@ class _DevSynthesisMixin(_ResultFileMixin):
         prev = self._fm_fallback_obs.get(task_id)
         stable = prev is not None and prev[:3] == fingerprint
         observations = (prev[3] + 1) if (stable and prev is not None) else 1
-        if dead_window or (stable and observations >= FM_FALLBACK_MIN_OBS):
+        # A mid-session transition recorded for THIS spec (#276 M2) proves the
+        # terminal frontmatter is this session's write → single-sighting harvest,
+        # like a dead window. Strictly weaker than the M1 hash gate above: bytes
+        # reverted exactly to the launch snapshot already returned, so a recorded
+        # transition can never resurrect an unmodified spec.
+        transition_proven = (
+            snap is not None and str(path) == snap.path and task_id in self._fm_transition_obs
+        )
+        if dead_window or transition_proven or (stable and observations >= FM_FALLBACK_MIN_OBS):
             sr = self._synthesize_from(path, spec)
             if sr.result_json is not None:
                 sr.result_json["synthesized_from_frontmatter"] = True
@@ -1211,6 +1271,7 @@ class _DevSynthesisMixin(_ResultFileMixin):
                     spec=str(path),
                     status=fm_status,
                     dead_window=dead_window,
+                    transition=transition_proven,
                 )
             return sr
         if wait:
