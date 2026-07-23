@@ -4498,6 +4498,112 @@ def test_fix_phase_env_fault_escalates_instead_of_looping(project):
     assert fix["env_fault"] is True
 
 
+# ---------------------------- session-transport environment faults (#194) ----
+#
+# A dev/review/fix session whose coding CLI lost its API connection is classified
+# env_fault by the adapter (part 1) and stamped on the SessionResult. These pin
+# the story-pipeline consumption (part 2): the run PAUSEs — evidence journaled,
+# worktree preserved — instead of charging the attempt, and re-arm restores the
+# budget. Guard pins confirm plain (non-classified) failures still retry/defer.
+
+
+def test_session_env_fault_pauses_dev_without_burning_budget(project):
+    """A dev session classified an environment fault (#194) pauses the run at the
+    first story rather than charging the attempt; the decision + session-end carry
+    the evidence, and re-arm restores the budget (attempt -> 0)."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    evidence = "API Error: Unable to connect (ECONNREFUSED)"
+    engine, adapter = make_engine(
+        project,
+        [SessionResult(status="timeout", env_fault=True, env_fault_evidence=evidence)],
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev"]  # no retry session burned
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED
+    assert task.attempt == 1  # the one real session, not a spent budget
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    assert "environment fault: dev session timeout" in engine.state.paused_reason
+    assert evidence in engine.state.paused_reason
+
+    dec = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"][-1]
+    assert dec["action"] == "pause"
+    assert dec["env_fault"] is True
+    end = [e for e in engine.journal.entries() if e["kind"] == "session-end"][-1]
+    assert end["env_fault"] is True
+    assert end["env_fault_evidence"] == evidence
+
+    # the resolve workflow's re-arm step restores the attempt budget
+    rearm_escalation(engine.run_dir)
+    assert load_state(engine.run_dir).tasks["1-1-a"].attempt == 0
+
+
+def test_two_plain_timeouts_still_defer(project):
+    """Guard: NON-env-fault timeouts keep today's flow — two of them exhaust the
+    dev budget and defer the story (the env-fault pause must not intercept them)."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        limits=LimitsPolicy(max_dev_attempts=2),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, adapter = make_engine(
+        project,
+        [SessionResult(status="timeout"), SessionResult(status="timeout")],
+        policy=policy,
+    )
+    summary = engine.run()
+
+    assert summary.deferred == 1 and summary.escalated == 0 and not summary.paused
+    assert [s.role for s in adapter.sessions] == ["dev", "dev"]  # both attempts spent
+    assert engine.state.tasks["1-1-a"].phase == Phase.DEFERRED
+    dec = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert all(d["env_fault"] is False for d in dec)
+
+
+def test_fix_phase_session_env_fault_escalates(project):
+    """A fix session whose CLI lost its API connection (#194) escalates instead of
+    burning the remaining dev budget on repair sessions that never ran."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    marker = project.project / "fixed.marker"
+    script = project.project / "check.sh"
+    script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    script.chmod(0o755)
+
+    def dev_with_marker(spec):
+        marker.write_text("ok\n")
+        return dev_effect(project, "1-1-a")(spec)
+
+    def breaking_review(spec):
+        marker.unlink()  # ordinary fixable failure -> routes to a fix session
+        return review_effect(project, "1-1-a", clean=True)(spec)
+
+    evidence = "API Error: Connection reset by peer"
+    env_fault_fix = SessionResult(status="timeout", env_fault=True, env_fault_evidence=evidence)
+
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker), f'"{script}"')),
+        limits=LimitsPolicy(max_dev_attempts=3),  # budget left -> must not be spent
+    )
+    engine, adapter = make_engine(
+        project, [dev_with_marker, breaking_review, env_fault_fix], policy=policy
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "dev"]  # one fix, then stop
+    assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
+    assert "environment fault: fix session timeout" in engine.state.paused_reason
+    assert evidence in engine.state.paused_reason
+    fix = [e for e in engine.journal.entries() if e["kind"] == "fix-decision"][-1]
+    assert fix["env_fault"] is True
+
+
 def test_max_stories_limit(project):
     write_sprint(project, {"1-1-a": "ready-for-dev", "1-2-b": "ready-for-dev"})
     engine, _ = make_engine(

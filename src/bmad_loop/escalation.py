@@ -52,6 +52,23 @@ def preference_escalations(result_json: dict[str, Any] | None) -> list[dict[str,
     ]
 
 
+def env_fault_detail(result: SessionResult) -> str:
+    """The evidence excerpt for an environment-fault pause reason, or a generic
+    fallback when the adapter classified a fault but kept no line (#194). Shared
+    by every site that pauses a transport-failed session — dev/review here, plus
+    fix/workflow/sweep in the engine — so the reason wording stays uniform:
+    ``environment fault: <role> session <status> (<detail>)``."""
+    return result.env_fault_evidence or "transport-failure pattern in session log"
+
+
+def env_fault_pause_reason(role: str, result: SessionResult) -> str:
+    """The uniform pause/escalation reason for a transport-failed session (#194).
+    `role` is the descriptor placed before "session" — e.g. "dev", "review",
+    "fix", "migration", "triage", or a richer "blocking workflow 'x' (y)". Keeps
+    the wording identical across escalation/engine/sweep (see env_fault_detail)."""
+    return f"environment fault: {role} session {result.status} ({env_fault_detail(result)})"
+
+
 def decide_dev(
     task: StoryTask,
     result: SessionResult,
@@ -68,6 +85,16 @@ def decide_dev(
     exhausted = _exhausted_action(task)
 
     if result.status != "completed":
+        if result.env_fault:
+            # A transport/API failure (the CLI never reached the API, #194): the
+            # attempt did no real work, so pause for a human instead of charging
+            # it — re-arm resets the budget, exactly like a verify env-fault (rc
+            # 126/127). The crits check above already ran (env-fault results carry
+            # result_json=None, so it found nothing).
+            return Decision(
+                Action.PAUSE,
+                env_fault_pause_reason("dev", result),
+            )
         reason = f"dev session {result.status}"
         if budget_left:
             return Decision(Action.RETRY, reason)
@@ -92,6 +119,13 @@ def decide_review_session(task: StoryTask, result: SessionResult, policy: Policy
 
     budget_left = task.review_cycle < policy.limits.max_review_cycles
     if result.status != "completed":
+        if result.env_fault:
+            # transport/API failure (#194): pause rather than charge a review
+            # cycle for a session that never reached the API (see decide_dev).
+            return Decision(
+                Action.PAUSE,
+                env_fault_pause_reason("review", result),
+            )
         reason = f"review session {result.status}"
         if budget_left:
             return Decision(Action.RETRY, reason)

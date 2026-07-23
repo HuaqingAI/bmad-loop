@@ -268,6 +268,31 @@ def test_blocking_workflow_failure_defers_the_unit(project):
     assert "story-deferred" in kinds
 
 
+def test_blocking_workflow_env_fault_escalates_instead_of_deferring(project):
+    """A blocking workflow session classified an environment fault (#194) escalates
+    the run (re-arm restores the budget) instead of deferring the story as if its
+    code were broken; the workflow-end entry carries env_fault + evidence."""
+    setup_story(project)
+    reg = PluginRegistry([LoadedPlugin(manifest=wf_manifest("wf", blocking=True))])
+    evidence = "API Error: Unable to connect (ECONNREFUSED)"
+    script = [
+        dev_effect(project, "1-1-a"),
+        SessionResult(status="timeout", env_fault=True, env_fault_evidence=evidence),
+    ]
+    engine, _ = make_engine(project, script, reg)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
+    assert "environment fault: blocking workflow" in engine.state.paused_reason
+    assert evidence in engine.state.paused_reason
+    end = [e for e in engine.journal.entries() if e["kind"] == "workflow-end"][-1]
+    assert end["env_fault"] is True
+    assert end["env_fault_evidence"] == evidence
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "story-deferred" not in kinds  # escalated, not deferred
+
+
 def test_nonblocking_workflow_failure_is_advisory(project):
     captured: list = []
     setup_story(project)

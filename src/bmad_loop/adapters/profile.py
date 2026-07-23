@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
 
+import regex
+
 from ..platform_util import has_parent_ref, is_absolute_path
 
 USAGE_PARSERS = {"claude-jsonl", "codex-rollout", "gemini-chat", "copilot-events", "none"}
@@ -87,6 +89,13 @@ class CLIProfile:
     # that a `git worktree add` checkout omits; provision_worktree copies them in
     # from the main repo so isolated dev/review sessions can reach the MCP server.
     seed_files: tuple[str, ...] = ()
+    # Python `re` patterns matched line-by-line against the ANSI-stripped tail of
+    # a non-completed session's pane log to classify a transport/API *environment
+    # fault* (#194) — e.g. an "API Error … Connection refused" the CLI printed
+    # while idling out the session clock. Compiled and validated at parse time
+    # (an invalid regex is a profile error). Seeded only for `claude`; empty =
+    # inert. Override/extend via a project profile in .bmad-loop/profiles/.
+    env_fault_patterns: tuple[str, ...] = ()
 
     @property
     def hookless(self) -> bool:
@@ -111,6 +120,14 @@ class CLIProfile:
 def _parse_profile(doc: dict, source: str) -> CLIProfile:
     def fail(msg: str) -> ProfileError:
         return ProfileError(f"profile {source}: {msg}")
+
+    def str_list(key: str) -> tuple[str, ...]:
+        # TOML arrays parse as list; reject a bare string (which would iterate to
+        # per-character entries) or a scalar (a raw TypeError) with a friendly error.
+        raw = doc.get(key, [])
+        if not isinstance(raw, list) or not all(isinstance(x, str) for x in raw):
+            raise fail(f"{key} must be a list of strings")
+        return tuple(raw)
 
     name = str(doc.get("name", "")).strip()
     binary = str(doc.get("binary", "")).strip()
@@ -161,10 +178,17 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
     if not skill_tree or is_absolute_path(skill_tree) or has_parent_ref(skill_tree):
         raise fail("skill_tree must be a project-relative path")
 
-    seed_files = tuple(str(s) for s in doc.get("seed_files", ()))
+    seed_files = str_list("seed_files")
     for seed in seed_files:
         if not seed or is_absolute_path(seed) or has_parent_ref(seed):
             raise fail(f"seed_files entries must be project-relative paths: got {seed!r}")
+
+    env_fault_patterns = str_list("env_fault_patterns")
+    for pattern in env_fault_patterns:
+        try:
+            regex.compile(pattern)  # same engine the adapter matches with (timeout-guarded)
+        except regex.error as e:
+            raise fail(f"env_fault_patterns entry is not a valid regex: {pattern!r} ({e})") from e
 
     return CLIProfile(
         name=name,
@@ -172,8 +196,8 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         hooks=HookSpec(dialect=dialect, config_path=config_path, events=events),
         skill_tree=skill_tree,
         prompt_template=str(doc.get("prompt_template", "{prompt}")),
-        launch_args=tuple(str(a) for a in doc.get("launch_args", ())),
-        bypass_args=tuple(str(a) for a in doc.get("bypass_args", ())),
+        launch_args=str_list("launch_args"),
+        bypass_args=str_list("bypass_args"),
         model_flag=str(doc.get("model_flag", "--model")),
         env={str(k): str(v) for k, v in doc.get("env", {}).items()},
         usage_parser=usage_parser,
@@ -182,6 +206,7 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         subagent_stop_without_transcript=bool(doc.get("subagent_stop_without_transcript", False)),
         first_run_note=str(doc.get("first_run_note", "")),
         seed_files=seed_files,
+        env_fault_patterns=env_fault_patterns,
     )
 
 
