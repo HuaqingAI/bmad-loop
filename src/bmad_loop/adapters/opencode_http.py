@@ -178,6 +178,46 @@ def _parse_sse_lines(lines) -> Any:
             data.append(line[5:].lstrip())
 
 
+def _sum_args(arguments: Any) -> str:
+    """Compact one-line summary of a ``command.executed`` event's ``arguments``
+    for the inline run log. Truncates long dicts/strings so a single line never
+    explodes the tail view."""
+    if not arguments:
+        return ""
+    try:
+        if isinstance(arguments, (dict, list)):
+            text = json.dumps(arguments, ensure_ascii=False)
+        else:
+            text = str(arguments)
+    except (TypeError, ValueError):
+        text = str(arguments)
+    if len(text) > 120:
+        text = text[:119] + "\u2026"
+    return text
+
+
+# ANSI colors for inline-log marker lines, keyed by message role. The bmad-loop
+# TUI renders <task>.log through a pyte terminal emulator (tui/data.py LogView),
+# which dispatches SGR to per-Char styles and maps pyte named colors via
+# _rich_color straight through to Rich — so every [bmad] marker shows colored in
+# the LogView. A plain `cat`/editor shows the escape bytes; the structured trace
+# stays uncoloured in <task>.events.jsonl. Keys are opencode message.info.role
+# values; an unseen role falls back to _ROLE_COLOR_DEFAULT so it still renders
+# distinctly — add it to the map to pin its hue.
+_ROLE_COLORS = {
+    "user": "\x1b[33m",  # SGR 33 = yellow
+    "assistant": "\x1b[36m",  # SGR 36 = cyan
+}
+_ROLE_COLOR_DEFAULT = "\x1b[35m"  # SGR 35 = magenta — unseen roles
+_TOOL_COLOR = "\x1b[32m"  # SGR 32 = green — cmd/file/permission (role-less)
+_RESET = "\x1b[0m"
+
+
+def _role_color(role: str) -> str:
+    """ANSI color for a message role; unseen roles fall back to magenta."""
+    return _ROLE_COLORS.get(role, _ROLE_COLOR_DEFAULT)
+
+
 @dataclass
 class _ServerSession:
     """Everything the adapter tracks for one live ``opencode serve``."""
@@ -187,6 +227,23 @@ class _ServerSession:
     base_url: str
     password: str
     log_fh: Any
+    # The spawned server's own stdout/stderr sink (``<task_id>.server.out``),
+    # kept separate from ``log_fh`` so the readable transcript stays clean. The
+    # server's INFO/diagnostic lines land here; ``log_fh`` carries only the
+    # curated ``[bmad]`` lines written from the SSE reader thread.
+    server_fh: Any = None
+    # Structured-event JSONL sink (``<task_id>.events.jsonl``); None when
+    # structured logging is off. Written from the SSE reader thread only.
+    event_fh: Any = None
+    # Monotonic per-session line number written into the JSONL sink.
+    event_seq: int = 0
+    # Role keyed by opencode message id (``msg_*``), refreshed from
+    # ``message.updated.info.{id,role}``. The per-part / delta events carry a
+    # ``messageID`` but no role of their own, and ``message.updated`` frames
+    # arrive out of order (re-emits for an earlier message land mid-turn), so a
+    # "last role seen" would mislabel the assistant's reply as ``user:``. Keying
+    # by message id makes the lookup ordering-independent.
+    msg_roles: dict = field(default_factory=dict)
     client: Any = None  # control httpx.Client — main thread only
     session_id: str = ""
     events: queue.Queue = field(default_factory=queue.Queue)
@@ -336,6 +393,12 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
         env = self._session_env(spec, password)
         log_path = self.logs_dir / f"{spec.task_id}.log"
         log_fh = log_path.open("ab")  # append: retries share one log
+        event_path = self.logs_dir / f"{spec.task_id}.events.jsonl"
+        event_fh = event_path.open("a", encoding="utf-8")  # one structured event per line
+        # The server's own stdout/stderr (INFO/diagnostic lines) is kept in a
+        # separate file so the readable transcript in <task_id>.log stays clean.
+        server_path = self.logs_dir / f"{spec.task_id}.server.out"
+        server_fh = server_path.open("ab")  # append: retries share one server log
         last_error = "server did not become healthy"
         try:
             for _ in range(SPAWN_ATTEMPTS):
@@ -344,7 +407,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
                     self._serve_argv(resolved, port),
                     cwd=str(spec.cwd),
                     env=env,
-                    stdout=log_fh,
+                    stdout=server_fh,
                     stderr=subprocess.STDOUT,
                     stdin=subprocess.DEVNULL,
                 )
@@ -354,6 +417,8 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
                     base_url=f"http://127.0.0.1:{port}",
                     password=password,
                     log_fh=log_fh,
+                    server_fh=server_fh,
+                    event_fh=event_fh,
                 )
                 if self._await_healthy(sess):
                     sess.client = self._make_client(sess)
@@ -367,8 +432,12 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
                     last_error = f"server exited rc={process.returncode} during startup"
         except BaseException:
             log_fh.close()
+            server_fh.close()
+            event_fh.close()
             raise
         log_fh.close()
+        server_fh.close()
+        event_fh.close()
         raise OpencodeServerError(
             f"could not start `{self.binary} serve` after {SPAWN_ATTEMPTS} attempts "
             f"({last_error}); log: {log_path}"
@@ -521,10 +590,135 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
         props = event.get("properties") or {}
         if props.get("sessionID") != sess.session_id:
             return
+        # Before the control queue: render one human-readable line into the run
+        # log and emit a structured JSONL record. Both helpers no-op on unknown
+        # types, so unhandled frames leave both sinks byte-identical to today,
+        # and idle/error still queue below — control flow is unchanged.
+        self._render_inline(sess, etype, props)
+        self._emit_event(sess, etype, props)
         if etype == "session.idle":
             sess.events.put("idle")
         elif etype == "session.error":
             sess.events.put("error")
+
+    def _render_inline(self, sess: _ServerSession, etype: str, props: dict) -> None:
+        """Append one human-readable progress line to the run log for the event
+        types worth watching live. No-ops on anything else, so an unhandled
+        frame writes nothing.
+
+        ``log_fh`` is the readable transcript sink (``<task_id>.log``): it
+        carries ONLY these curated ``[bmad]`` lines. The server's own INFO /
+        diagnostic stdout is kept apart in ``<task_id>.server.out`` (see
+        ``server_fh``) so the transcript stays a clean, line-wrapped
+        conversation rather than a jumble of server logging. Only this SSE
+        reader thread writes ``log_fh``, and each line is a single ``write()``
+        plus ``flush()`` — so it always lands as a whole line at EOF.
+
+        Event-type strings pinned live against the 1.18.2 ``/event`` SSE stream
+        (probe 2026-07-23; the generated SDK ``Event`` union is the contract).
+        There is no ``tool.call`` / ``tool.response`` on this surface — tool
+        execution surfaces as ``command.executed`` + ``file.edited``, and the
+        permission flow as ``permission.updated`` + ``permission.replied``.
+
+        ``message.updated`` carries only turn metadata (notably ``info.role``
+        keyed by ``info.id``) and renders no inline line of its own — it just
+        records the role under the message id so the following
+        ``message.part.*`` lines resolve the right speaker. Keying by message
+        id (not "last role seen") is required because ``message.updated``
+        frames arrive out of order: a re-emit for the user message lands mid-
+        assistant-turn and would otherwise flip the prefix to ``user:`` on the
+        assistant's own reply text. That also avoids a flood of role-only
+        announce lines like ``[bmad] assistant: assistant``."""
+        if etype == "message.updated":
+            info = props.get("info") or {}
+            mid = info.get("id")
+            role = info.get("role")
+            if mid and role:
+                sess.msg_roles[mid] = role
+            return
+        role = "assistant"
+        if etype == "message.part.updated":
+            mid = (props.get("part") or {}).get("messageID")
+            if mid and mid in sess.msg_roles:
+                role = sess.msg_roles[mid]
+        line = self._inline_line(etype, props, role)
+        if line is None:
+            return
+        if sess.log_fh is None:  # bare-sess unit tests / disabled inline log
+            return
+        try:
+            # CRLF line endings: the bmad-loop TUI renders this log through a
+            # pyte terminal emulator, where a bare LF moves the cursor down
+            # without returning to column 0 (a real PTY's ONLCR does that, but
+            # pyte is a pure VT100 emulator). LF-only lines staircase right,
+            # so emit CRLF like real terminal output (the claude/tmux captures
+            # carry it via cursor-addressing; our plain text must carry it raw).
+            sess.log_fh.write(line.replace("\n", "\r\n").encode("utf-8"))
+            sess.log_fh.flush()
+        except OSError:
+            pass
+
+    def _inline_line(self, etype: str, props: dict, role: str) -> str | None:
+        # ``message.updated`` is consumed in ``_render_inline`` (role refresh
+        # only); it renders no line here.
+        # assistant / user assembled text. Per-token ``message.part.delta``
+        # frames are NOT rendered inline: they concatenate to exactly the text
+        # ``message.part.updated`` already carries complete, so emitting both
+        # duplicates every statement as a one-word-per-line flood. Deltas stay
+        # in the JSONL trace for per-token granularity; the inline log keeps one
+        # clean line per statement.
+        if etype == "message.part.updated":
+            part = props.get("part") or {}
+            text = part.get("text") or ""
+            body = text.strip()  # drop surrounding blanks; keep internal structure
+            if not body:  # empty/non-text part — no value live
+                return None
+            role = role or "assistant"
+            # A blank line separates each turn from the previous one (the
+            # separator sits ABOVE the header, body follows directly beneath),
+            # and the role-colored marker line anchors the turn boundary.
+            # Internal newlines in the body are preserved so multi-paragraph
+            # reasoning reads as prose under the one header.
+            return f"\n{_role_color(role)}[bmad] {role}:{_RESET}\n{body}\n"
+        # tool/command surface (no tool.call exists on this SSE stream)
+        if etype == "command.executed":
+            args = _sum_args(props.get("arguments"))
+            return f"{_TOOL_COLOR}[bmad] cmd: {props.get('name') or '?'}{(' ' + args) if args else ''}{_RESET}\n"
+        if etype == "file.edited":
+            return f"{_TOOL_COLOR}[bmad] file: {props.get('file') or '?'}{_RESET}\n"
+        # permission surface
+        if etype == "permission.updated":
+            perm = props.get("permission") or props
+            return (
+                f"{_TOOL_COLOR}[bmad] perm: {perm.get('type') or '?'} {perm.get('pattern') or ''}{_RESET}".rstrip()
+                + "\n"
+            )
+        if etype == "permission.replied":
+            return f"{_TOOL_COLOR}[bmad] perm: {props.get('response') or '?'}{_RESET}\n"
+        return None
+
+    def _emit_event(self, sess: _ServerSession, etype: str, props: dict) -> None:
+        """Append one structured JSON object to the session's
+        ``<task_id>.events.jsonl`` sink — one record per session-matching event,
+        for post-hoc replay/debugging. No-ops when the sink is off
+        (``event_fh is None``). A post-filter event of any type is recorded, so
+        the JSONL is a complete trace of what the adapter acted on (per-token
+        ``message.part.delta`` frames included — gate in one line if a run is
+        too chatty)."""
+        if sess.event_fh is None:
+            return
+        sess.event_seq += 1
+        record = {
+            "seq": sess.event_seq,
+            "type": etype,
+            "properties": props,
+            "ts": int(time.time() * 1000),
+        }
+        try:
+            sess.event_fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            sess.event_fh.flush()
+        except (OSError, TypeError, ValueError):
+            pass
 
     # ------------------------------------------------------ completion loop
 
@@ -986,6 +1180,16 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
             sess.log_fh.close()
         except OSError:
             pass
+        if sess.server_fh is not None:
+            try:
+                sess.server_fh.close()
+            except OSError:
+                pass
+        if sess.event_fh is not None:
+            try:
+                sess.event_fh.close()
+            except OSError:
+                pass
 
     def _kill_process(self, sess: _ServerSession) -> None:
         process = sess.process

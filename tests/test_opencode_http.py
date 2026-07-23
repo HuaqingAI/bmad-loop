@@ -14,6 +14,7 @@ import importlib.util
 import json
 import os
 import queue
+import re
 import signal
 import subprocess
 import sys
@@ -27,13 +28,17 @@ from bmad_loop.adapters import generic, opencode_http
 from bmad_loop.adapters.base import SessionHandle, SessionSpec
 from bmad_loop.adapters.generic import BUDGET_NUDGE_TEXT, NUDGE_TEXT, STALL_NUDGE_TEXT
 from bmad_loop.adapters.opencode_http import (
+    _RESET,
+    _TOOL_COLOR,
     OpencodeDevAdapter,
     OpencodeHttpAdapter,
     OpencodeServerError,
     _free_port,
     _now_ms,
     _parse_sse_lines,
+    _role_color,
     _ServerSession,
+    _sum_args,
     _sum_usage,
 )
 from bmad_loop.adapters.profile import get_profile
@@ -91,6 +96,7 @@ argv = sys.argv[1:]
 assert argv and argv[0] == "serve", argv
 PORT = int(argv[argv.index("--port") + 1])
 HOST = argv[argv.index("--hostname") + 1]
+print(f"FAKE_STDOUT_CANARY listening on {HOST}:{PORT}", flush=True)
 
 if START_FAILURES:
     counter = os.path.join(REC_DIR, "start-count")
@@ -478,6 +484,355 @@ def test_sse_dispatch_filters_child_sessions(tmp_path):
     assert sess.events.get_nowait() == "error"
 
 
+# ------------------------------- readable run logs + structured event JSONL
+#
+# The opencode-http adapter keeps three on-disk sinks per session:
+#   <task_id>.log              — the readable transcript: curated one-line human
+#                                progress via _render_inline ([bmad] lines only).
+#   <task_id>.server.out       — the spawned server's own stdout/stderr (INFO /
+#                                diagnostic lines), kept apart so <task_id>.log
+#                                reads as a clean conversation, not a jumble.
+#   <task_id>.events.jsonl     — one JSON record per session-matching event, the
+#                                complete trace for post-hoc replay (_emit_event).
+# The two text sinks (transcript + server stdout) are written from disjoint
+# sources (SSE reader thread vs the server process); the JSONL is written from
+# the SSE reader thread. These are pure unit tests: canned event dicts straight
+# through _dispatch_sse, no real or fake opencode binary (the zero-token
+# invariant from PR #167).
+
+
+def _sess_with_sinks(tmp_path: Path, task_id: str = "t-log"):
+    """A _ServerSession wired to real .log (binary append) and .events.jsonl
+    text sinks under tmp_path, so dispatch behaviour is assertable file-to-file.
+    Mirrors how _spawn_server wires the real sinks (O_APPEND log + append jsonl)."""
+    adapter = make_adapter(tmp_path)
+    log_path = tmp_path / f"{task_id}.log"
+    event_path = tmp_path / f"{task_id}.events.jsonl"
+    sess = _ServerSession(
+        process=None,
+        port=0,
+        base_url="",
+        password="",
+        log_fh=log_path.open("ab"),
+        event_fh=event_path.open("a", encoding="utf-8"),
+    )
+    sess.session_id = "ses_test"
+    return adapter, sess, log_path, event_path
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _log_text(path: Path) -> str:
+    # The transcript log now carries CRLF line endings (the TUI renders it
+    # through a pyte terminal emulator); normalize to LF so assertions check
+    # logical content, not the wire encoding. ANSI color escapes (the cyan
+    # [bmad] marker) are stripped too so content assertions stay color-agnostic.
+    if not path.is_file():
+        return ""
+    return _ANSI_RE.sub("", path.read_bytes().decode("utf-8").replace("\r\n", "\n"))
+
+
+def test_inline_line_returns_none_for_unhandled_types():
+    """_inline_line is the curate/no-op switch: None for anything not worth a
+    live line, so those frames leave the run log byte-identical to today."""
+    adapter = make_adapter(Path("/tmp"))  # no session built; _inline_line is pure
+    assert adapter._inline_line("server.heartbeat", {}, "assistant") is None
+    assert adapter._inline_line("server.connected", {}, "assistant") is None
+    assert adapter._inline_line("session.created", {"sessionID": "x"}, "assistant") is None
+    assert adapter._inline_line("session.idle", {"sessionID": "x"}, "assistant") is None
+    assert adapter._inline_line("session.error", {"sessionID": "x"}, "assistant") is None
+    assert adapter._inline_line("catalog.updated", {}, "assistant") is None
+    assert adapter._inline_line("totally.unknown", {"sessionID": "x"}, "assistant") is None
+    # message.updated renders no line (role refresh lives in _render_inline)
+    assert (
+        adapter._inline_line("message.updated", {"info": {"role": "assistant"}}, "assistant")
+        is None
+    )
+    # empty/whitespace text carries no live value → None
+    assert (
+        adapter._inline_line("message.part.updated", {"part": {"text": "  "}}, "assistant") is None
+    )
+    assert adapter._inline_line("message.part.updated", {"part": {}}, "assistant") is None
+    # message.part.delta never renders inline — it duplicates the complete
+    # text message.part.updated already carries (deltas stay in the JSONL only)
+    assert adapter._inline_line("message.part.delta", {"delta": "wor"}, "assistant") is None
+    assert adapter._inline_line("message.part.delta", {"delta": ""}, "assistant") is None
+
+
+def test_inline_line_renders_each_curated_type():
+    """Every event type worth a live line renders deterministically. These are
+    the pinned 1.18.2 strings (probe 2026-07-23): note there is no tool.call /
+    tool.response on this SSE surface — tool exec is command.executed/file.edited
+    and the permission flow is permission.updated/permission.replied. The
+    message.part.* prefix is the session's last-seen role (tracked in
+    _render_inline from message.updated.info.role)."""
+    adapter = make_adapter(Path("/tmp"))
+    assert adapter._inline_line("message.part.updated", {"part": {"text": "hi"}}, "assistant") == (
+        f"\n{_role_color('assistant')}[bmad] assistant:{_RESET}\nhi\n"
+    )
+    assert adapter._inline_line("message.part.updated", {"part": {"text": "hi"}}, "user") == (
+        f"\n{_role_color('user')}[bmad] user:{_RESET}\nhi\n"
+    )
+    # roles are distinct hues — the map pins them, so assistant != user colour
+    assert _role_color("assistant") != _role_color("user")
+    # an unseen role still renders, falling back to the default hue (no crash)
+    assert adapter._inline_line("message.part.updated", {"part": {"text": "hi"}}, "system") == (
+        f"\n{_role_color('system')}[bmad] system:{_RESET}\nhi\n"
+    )
+    # multi-line part.text: blank line above the role-colored header, then the
+    # full body (internal newlines preserved) directly beneath — reads as a
+    # contiguous block, not a prefix on every line.
+    assert (
+        adapter._inline_line(
+            "message.part.updated",
+            {"part": {"text": "para one\n\npara two\npara three"}},
+            "assistant",
+        )
+        == f"\n{_role_color('assistant')}[bmad] assistant:{_RESET}\npara one\n\npara two\npara three\n"
+    )
+    assert adapter._inline_line(
+        "command.executed", {"name": "Read", "arguments": None}, "assistant"
+    ) == (f"{_TOOL_COLOR}[bmad] cmd: Read{_RESET}\n")
+    assert adapter._inline_line("file.edited", {"file": "src/app.py"}, "assistant") == (
+        f"{_TOOL_COLOR}[bmad] file: src/app.py{_RESET}\n"
+    )
+    assert (
+        adapter._inline_line(
+            "permission.updated", {"permission": {"type": "edit", "pattern": "src/**"}}, "assistant"
+        )
+        == f"{_TOOL_COLOR}[bmad] perm: edit src/**{_RESET}\n"
+    )
+    assert adapter._inline_line("permission.replied", {"response": "allow"}, "assistant") == (
+        f"{_TOOL_COLOR}[bmad] perm: allow{_RESET}\n"
+    )
+
+
+def test_dispatch_writes_assistant_text_to_log_and_jsonl(tmp_path):
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    adapter._dispatch_sse(
+        sess,
+        {
+            "type": "message.part.updated",
+            "properties": {"sessionID": "ses_test", "part": {"text": "hello"}},
+        },
+    )
+    assert "\n[bmad] assistant:\nhello\n" in _log_text(log_path)
+    # raw bytes still carry the assistant-role SGR (the write path does not strip it)
+    assert _role_color("assistant") in log_path.read_bytes().decode("utf-8")
+    records = read_jsonl(event_path)
+    assert len(records) == 1
+    assert records[0]["type"] == "message.part.updated"
+    assert records[0]["properties"]["part"]["text"] == "hello"
+
+
+def test_message_updated_keys_role_by_message_id(tmp_path):
+    """``message.updated`` carries ``info.role`` under ``info.id`` but renders no
+    line of its own; it records the role keyed by opencode message id so the
+    following ``message.part.updated`` line prefixes with the right speaker
+    (user vs assistant)."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    # a user turn: message.updated(role=user, id=u1) then the user's prompt text
+    adapter._dispatch_sse(
+        sess,
+        {
+            "type": "message.updated",
+            "properties": {"sessionID": "ses_test", "info": {"id": "msg_u1", "role": "user"}},
+        },
+    )
+    adapter._dispatch_sse(
+        sess,
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "ses_test",
+                "part": {"text": "do the thing", "messageID": "msg_u1"},
+            },
+        },
+    )
+    assert sess.msg_roles["msg_u1"] == "user"
+    log = _log_text(log_path)
+    assert "\n[bmad] user:\ndo the thing\n" in log
+    assert "assistant: do the thing" not in log
+    # message.updated itself renders no inline line, but IS in the JSONL trace
+    types = [r["type"] for r in read_jsonl(event_path)]
+    assert types == ["message.updated", "message.part.updated"]
+
+
+def test_role_lookup_survives_out_of_order_message_updated(tmp_path):
+    """``message.updated`` frames re-emit out of order: a stale user re-emit can
+    land mid-assistant-turn. Keying role by message id (not "last seen") keeps
+    the assistant's reply labeled ``assistant:`` even when a user re-emit
+    arrives between the assistant's announcement and its reply text."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    # assistant announced
+    adapter._dispatch_sse(
+        sess,
+        {
+            "type": "message.updated",
+            "properties": {"sessionID": "ses_test", "info": {"id": "msg_a1", "role": "assistant"}},
+        },
+    )
+    # stale re-emit for the earlier user message (must NOT clobber the assistant)
+    adapter._dispatch_sse(
+        sess,
+        {
+            "type": "message.updated",
+            "properties": {"sessionID": "ses_test", "info": {"id": "msg_u1", "role": "user"}},
+        },
+    )
+    # assistant's reply part arrives — must still be labeled assistant:
+    adapter._dispatch_sse(
+        sess,
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "ses_test",
+                "part": {"text": "done", "messageID": "msg_a1"},
+            },
+        },
+    )
+    log = _log_text(log_path)
+    assert "\n[bmad] assistant:\ndone\n" in log
+    assert "user: done" not in log
+
+
+def test_part_without_known_message_id_falls_back_to_assistant(tmp_path):
+    """A part whose message id has no recorded role falls back to ``assistant``
+    so the line still renders rather than dropping."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    adapter._dispatch_sse(
+        sess,
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "ses_test",
+                "part": {"text": "hi", "messageID": "msg_unseen"},
+            },
+        },
+    )
+    assert "\n[bmad] assistant:\nhi\n" in _log_text(log_path)
+
+
+def test_dispatch_skips_empty_text_and_never_renders_deltas(tmp_path):
+    """Empty/whitespace part text carries no live value, and message.part.delta is
+    never rendered inline — it duplicates the complete text message.part.updated
+    already carries. Both leave the readable log untouched while still recorded in
+    the JSONL (deltas stay there for per-token granularity)."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    for evt in (
+        {
+            "type": "message.part.updated",
+            "properties": {"sessionID": "ses_test", "part": {"text": ""}},
+        },
+        {
+            "type": "message.part.updated",
+            "properties": {"sessionID": "ses_test", "part": {"text": "   "}},
+        },
+        {
+            "type": "message.part.delta",
+            "properties": {"sessionID": "ses_test", "delta": "streaming token"},
+        },
+    ):
+        adapter._dispatch_sse(sess, evt)
+    assert _log_text(log_path) == ""
+    types = [r["type"] for r in read_jsonl(event_path)]
+    assert types == ["message.part.updated", "message.part.updated", "message.part.delta"]
+
+
+def test_dispatch_writes_command_file_permission_lines(tmp_path):
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    for evt in (
+        {
+            "type": "command.executed",
+            "properties": {"sessionID": "ses_test", "name": "Edit", "arguments": {"x": 1}},
+        },
+        {"type": "file.edited", "properties": {"sessionID": "ses_test", "file": "a.py"}},
+        {"type": "permission.replied", "properties": {"sessionID": "ses_test", "response": "deny"}},
+    ):
+        adapter._dispatch_sse(sess, evt)
+    log = _log_text(log_path)
+    assert "[bmad] cmd: Edit " in log
+    assert "[bmad] file: a.py\n" in log
+    assert "[bmad] perm: deny\n" in log
+    types = [r["type"] for r in read_jsonl(event_path)]
+    assert types == ["command.executed", "file.edited", "permission.replied"]
+
+
+def test_jsonl_seq_is_monotonic_with_ts_and_shape(tmp_path):
+    """Each session-matching event gets one JSONL record with a monotonic seq,
+    the raw type, the raw properties, and an epoch-ms ts that never goes
+    backwards across the batch."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    for n in range(4):
+        adapter._dispatch_sse(
+            sess,
+            {
+                "type": "message.part.delta",
+                "properties": {"sessionID": "ses_test", "delta": str(n)},
+            },
+        )
+    records = read_jsonl(event_path)
+    assert [r["seq"] for r in records] == [1, 2, 3, 4]
+    assert all(set(r) == {"seq", "type", "properties", "ts"} for r in records)
+    ts = [r["ts"] for r in records]
+    assert ts == sorted(ts)  # epoch ms, non-decreasing within the batch
+    assert all(r["properties"]["delta"] == str(i) for i, r in enumerate(records))
+
+
+def test_unhandled_session_event_recorded_in_jsonl_not_log(tmp_path):
+    """A session-scoped event _render_inline does not curate (e.g. session.diff)
+    still passes the sessionID filter, so it lands in the complete-trace JSONL —
+    but writes no human-readable line. The two sinks split by design: curated
+    human log vs complete machine trace."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    adapter._dispatch_sse(
+        sess, {"type": "session.diff", "properties": {"sessionID": "ses_test", "diff": []}}
+    )
+    assert _log_text(log_path) == ""
+    records = read_jsonl(event_path)
+    assert len(records) == 1 and records[0]["type"] == "session.diff"
+
+
+def test_no_session_id_event_filtered_from_both_sinks(tmp_path):
+    """An event with no matching sessionID (noise like catalog.updated) is
+    filtered before either sink fires — neither a log line nor a JSONL record."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    adapter._dispatch_sse(sess, {"type": "catalog.updated", "properties": {}})
+    assert _log_text(log_path) == ""
+    assert read_jsonl(event_path) == []
+    assert sess.event_seq == 0
+
+
+def test_render_inline_noops_when_log_fh_is_none(tmp_path):
+    """A bare _ServerSession (log_fh=None, as built by the older unit tests)
+    must not raise when a curated event is dispatched — inline rendering is
+    best-effort, never a crash path."""
+    adapter = make_adapter(tmp_path)
+    sess = _ServerSession(process=None, port=0, base_url="", password="", log_fh=None)
+    sess.session_id = "ses_test"
+    adapter._dispatch_sse(
+        sess,
+        {
+            "type": "message.part.updated",
+            "properties": {"sessionID": "ses_test", "part": {"text": "x"}},
+        },
+    )
+    # event_fh defaults to None too: no jsonl written, no seq bumped
+    assert sess.event_seq == 0
+
+
+def test_sum_args_truncates_and_handles_shapes():
+    """_sum_args keeps a command's arguments on one log line: short passthrough,
+    dict→json, long→truncated with an ellipsis, falsy→empty."""
+    assert _sum_args(None) == ""
+    assert _sum_args("") == ""
+    assert _sum_args({"a": 1}) == '{"a": 1}'
+    assert _sum_args([1, 2]) == "[1, 2]"
+    long = _sum_args("x" * 500)
+    assert len(long) == 120 and long.endswith("\u2026")
+
+
 def test_sum_usage_maps_opencode_tokens():
     messages = [
         {"info": {"role": "user", "tokens": {"input": 999}}},  # not assistant: ignored
@@ -744,6 +1099,11 @@ def test_e2e_completed(tmp_path, fake_opencode):
     assert adapter._sessions == {}
     assert_server_gone(rec)
     assert (tmp_path / "run" / "logs" / "t-1.log").exists()
+    # the server's own stdout is redirected to its own file, keeping the
+    # readable transcript in <task>.log clean of server INFO noise
+    server_log = (tmp_path / "run" / "logs" / "t-1.server.out").read_text()
+    assert "FAKE_STDOUT_CANARY" in server_log
+    assert "FAKE_STDOUT_CANARY" not in (tmp_path / "run" / "logs" / "t-1.log").read_text()
 
 
 def test_e2e_result_less_stop_nudges_then_completes(tmp_path, fake_opencode):
