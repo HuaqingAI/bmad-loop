@@ -217,7 +217,7 @@ def collect_env() -> EnvInfo:
         mux = type(backend).__name__
         raw = backend.version()
         tmux_v = sanitize.scrub_text(raw, max_lines=1) if raw else None
-    except Exception:  # noqa: BLE001  # nosec B110 - env probe is best-effort; absent mux is fine
+    except Exception:  # nosec B110 - env probe is best-effort; absent mux is fine
         pass
     return EnvInfo(
         os=platform.system(),
@@ -475,7 +475,7 @@ def collect(
     for run_dir in run_dirs:
         try:
             runs.append(collect_run(run_dir, pseudo=pseudo, cap=cap))
-        except Exception as e:  # noqa: BLE001 — one bad run never sinks the dump
+        except Exception as e:  # one bad run never sinks the dump
             runs.append(_unreadable_run(run_dir, e))
     return Diagnostics(
         schema_version=SCHEMA_VERSION,

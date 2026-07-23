@@ -348,7 +348,7 @@ class Engine:
                         # rather than let it mask the stop.
                         self._gc_run_worktrees()
                         self._emit("post_run")
-                    except Exception as finalize_exc:  # noqa: BLE001 - see comment above
+                    except Exception as finalize_exc:  # see comment above
                         self.journal.append("run-stop-finalize-error", error=str(finalize_exc))
                     remaining = self._remaining_estimate()
                     self._graceful_remaining = remaining
@@ -379,7 +379,7 @@ class Engine:
                     kill_session(self.state.run_id)
                 except (
                     BaseException
-                ):  # noqa: BLE001  # nosec B110 - best-effort teardown; the stop must still record
+                ):  # nosec B110 - best-effort teardown; the stop must still record
                     pass
                 if self._is_nested:
                     raise
@@ -405,7 +405,7 @@ class Engine:
                     kill_session(self.state.run_id)
                 except (
                     Exception
-                ):  # noqa: BLE001  # nosec B110 - best-effort teardown; a crashing run must still record
+                ):  # nosec B110 - best-effort teardown; a crashing run must still record
                     pass
                 if self._is_nested:
                     raise  # nested auto-sweep: let the owner record the failure
@@ -424,7 +424,7 @@ class Engine:
                     )
                 except (
                     Exception
-                ):  # noqa: BLE001  # nosec B110 - journal write is best-effort; crash.txt + state flag already persisted
+                ):  # nosec B110 - journal write is best-effort; crash.txt + state flag already persisted
                     pass
             finally:
                 # Any pending stop-request control file that outlived this run
@@ -473,7 +473,7 @@ class Engine:
         if sigbreak is not None:
             windows_ctrl_signals.add(sigbreak)
 
-        def handler(signum, frame):  # noqa: ANN001 - stdlib signal signature
+        def handler(signum, frame):  # stdlib signal signature
             if sys.platform == "win32" and signum in windows_ctrl_signals:
                 # best-effort: a journal error must never escape a signal handler.
                 with contextlib.suppress(Exception):
@@ -601,7 +601,7 @@ class Engine:
                 for s in ss.stories
                 if s.status in ACTIONABLE_STATUSES and s.key not in self.state.tasks
             )
-        except Exception:  # noqa: BLE001 - a hint must never break the stop
+        except Exception:  # a hint must never break the stop
             return None
 
     def _check_graceful_stop(self) -> None:
@@ -2083,7 +2083,7 @@ class Engine:
                             status="aborted",
                             error=type(exc).__name__ if exc is not None else None,
                         )
-                except Exception:  # noqa: BLE001  # nosec B110
+                except Exception:  # nosec B110
                     pass
         self._save()
         self._emit(
@@ -2460,7 +2460,7 @@ class Engine:
         try:
             self.sweep_factory(trigger)
             self.journal.append("sweep-auto-finished", trigger=trigger)
-        except Exception as e:  # noqa: BLE001 — child must never break the parent
+        except Exception as e:  # child must never break the parent
             self.journal.append("sweep-auto-failed", trigger=trigger, error=str(e))
             gates.notify(self.policy, self.run_dir, "auto sweep failed", f"{trigger}: {e}")
 

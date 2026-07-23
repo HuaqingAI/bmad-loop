@@ -322,9 +322,9 @@ def _psutil_descendants(pid: int) -> dict[int, float | None]:
                 if not child.is_running():  # generation changed under us — don't stamp it
                     continue
                 out[child.pid] = identity
-            except Exception:  # noqa: BLE001  # nosec B112 - gone/reused mid-walk: omit it
+            except Exception:  # nosec B112 - gone/reused mid-walk: omit it
                 continue
-    except Exception:  # noqa: BLE001 - the kill-path seam must never raise
+    except Exception:  # the kill-path seam must never raise
         return {}
     return out
 
@@ -335,7 +335,7 @@ def _psutil():
     probes. The dep-free core never imports it on Linux; raise a clear, actionable
     error if it's missing where it's needed."""
     try:
-        import psutil  # noqa: PLC0415  (intentional lazy import — keeps the core dep-free)
+        import psutil  # intentional lazy import — keeps the core dep-free
     except ImportError as exc:  # pragma: no cover - exercised only off Linux
         raise ProcessHostError(
             f"process_host: pid operations on {sys.platform!r} need psutil; "

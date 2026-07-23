@@ -488,7 +488,7 @@ def _warn_if_policy_tracked(project: Path) -> None:
     means nothing to warn about."""
     try:
         tracked = (
-            subprocess.run(  # noqa: S603, S607 — fixed argv, no shell
+            subprocess.run(  # fixed argv, no shell
                 ["git", "ls-files", "--error-unmatch", ".bmad-loop/policy.toml"],
                 cwd=project,
                 capture_output=True,

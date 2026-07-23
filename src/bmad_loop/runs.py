@@ -542,7 +542,7 @@ def _state_or_none(run_dir: Path):
     never reclaim) what you cannot positively read."""
     try:
         return load_state(run_dir)
-    except Exception:  # noqa: BLE001 - unreadable/corrupt state ⇒ leave it alone
+    except Exception:  # unreadable/corrupt state ⇒ leave it alone
         return None
 
 
@@ -890,7 +890,7 @@ def rearm_escalation(
         untracked = sorted(verify.untracked_files(repo) - stale_residue)
         task.baseline_commit = head
         task.baseline_untracked = untracked
-    except Exception:  # noqa: BLE001  # nosec B110 - best-effort git read, must not fail re-arm
+    except Exception:  # nosec B110 - best-effort git read, must not fail re-arm
         pass
 
     # Patch-restore only: re-stamp the spec's own baseline to the advanced one.
@@ -979,7 +979,7 @@ def _stale_restore_residue(
     if old_baseline:
         try:
             shas = verify.commits_above(repo, old_baseline)
-        except Exception:  # noqa: BLE001  # nosec B110 - warn-only, must not fail re-arm
+        except Exception:  # nosec B110 - warn-only, must not fail re-arm
             shas = []
         if shas:
             journal.append(

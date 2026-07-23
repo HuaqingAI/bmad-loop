@@ -1070,7 +1070,7 @@ class BmadLoopApp(App[None]):
         try:
             _rc, out, _err = launch.run_captured_streams([*tail, "--json"])
             doc = widgets.validate_document(out)
-        except Exception:  # noqa: BLE001 — a JSON-leg failure degrades, never kills the app
+        except Exception:  # a JSON-leg failure degrades, never kills the app
             doc = None
         if doc is None:
             rc, merged = self._run_captured_guarded(tail)
@@ -1094,7 +1094,7 @@ class BmadLoopApp(App[None]):
         """
         try:
             return launch.run_captured(tail)
-        except Exception as exc:  # noqa: BLE001 — a failed spawn is a modal, not a crash
+        except Exception as exc:  # a failed spawn is a modal, not a crash
             return 1, f"could not run: {exc}"
 
     @work(thread=True, exclusive=True, group="captured")

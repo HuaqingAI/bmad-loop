@@ -766,13 +766,13 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
         for pid in repane:
             try:
                 host.force_kill(pid)
-            except Exception:  # noqa: BLE001  # nosec B110 - already-gone races are fine
+            except Exception:  # nosec B110 - already-gone races are fine
                 pass
         for pid, identity in tree.items():
             if pid not in repane and identity is not None and host.alive_and_ours(pid, identity):
                 try:
                     host.force_kill(pid)
-                except Exception:  # noqa: BLE001  # nosec B110 - already-gone races are fine
+                except Exception:  # nosec B110 - already-gone races are fine
                     pass
         self.mux.kill_window(handle.native_id)
         try:
@@ -830,7 +830,7 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
                 try:
                     host.force_kill(pid)
                     forced.append(pid)
-                except Exception:  # noqa: BLE001  # nosec B110 - already-gone races are fine
+                except Exception:  # nosec B110 - already-gone races are fine
                     pass
         unreaped = [pid for pid, identity in tree.items() if host.alive_and_ours(pid, identity)]
         # Distinct field name (`unreaped`, a pid list) from the wedged branch's

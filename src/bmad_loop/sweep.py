@@ -416,7 +416,7 @@ class SweepEngine(Engine):
             ledger = self.workspace.paths.deferred_work
             text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
             return len(deferredwork.open_ids(text))
-        except Exception:  # noqa: BLE001 - a hint must never break the stop
+        except Exception:  # a hint must never break the stop
             return None
 
     # ------------------------------------------------------------ main loop

@@ -95,7 +95,7 @@ def _resolve(manifest: PluginManifest, policy, journal) -> LoadedPlugin:
 
     try:
         instance = _instantiate(manifest, settings)
-    except Exception as e:  # noqa: BLE001 - isolate plugin failures; never BaseException
+    except Exception as e:  # isolate plugin failures; never BaseException
         if journal is not None:
             journal.append("plugin-error", plugin=manifest.name, error=f"{type(e).__name__}: {e}")
         return LoadedPlugin(manifest=manifest, disabled=True, error=str(e), settings=settings)
