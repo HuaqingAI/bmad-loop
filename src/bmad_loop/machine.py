@@ -117,7 +117,10 @@ def emit_document(rendered: str) -> None:
     # a TextIOWrapper at all. Falling through leaves the pre-#200 behaviour, which
     # is a crash with stdout still empty — permitted by the contract above.
     if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")
+        # hasattr-guarded: reconfigure exists on TextIOWrapper, not the TextIO base.
+        sys.stdout.reconfigure(  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
+            encoding="utf-8"
+        )
     print(document)
 
 

@@ -236,7 +236,7 @@ class HookBus:
         ctx._current_plugin = lp.name
         try:
             instance.hook(stage, ctx)  # type: ignore[union-attr]
-        except Exception as e:  # noqa: BLE001 - isolate plugin failures; never BaseException
+        except Exception as e:  # isolate plugin failures; never BaseException
             self._log("plugin-error", plugin=lp.name, stage=stage, error=f"{type(e).__name__}: {e}")
             # disable the misbehaving instance for the rest of the run; its
             # declarative hooks (if any) keep working — they are out-of-process.

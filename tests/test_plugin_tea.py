@@ -132,7 +132,7 @@ def workflow_effect(captured: list, status: str = "completed"):
     status (mirrors test_plugin_workflows)."""
     from bmad_loop.adapters.base import SessionResult
 
-    def effect(spec):  # noqa: ANN001
+    def effect(spec):
         captured.append(spec)
         return SessionResult(status=status, result_json={})
 

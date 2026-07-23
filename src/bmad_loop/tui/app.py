@@ -328,12 +328,20 @@ class BmadLoopApp(App[None]):
         self.push_screen(DecisionModal(decision), on_choice)
 
     def _record_decision(self, decision: object, option: object) -> bool:
+        # decision/option cross the widget boundary as `object`; their runtime types
+        # are the Decision/DecisionOption that apply_pre_answer and `.id` expect.
         try:
             decisions.apply_pre_answer(
-                self.project, decision, option, date=time.strftime("%Y-%m-%d")
+                self.project,
+                decision,  # pyright: ignore[reportArgumentType]
+                option,  # pyright: ignore[reportArgumentType]
+                date=time.strftime("%Y-%m-%d"),
             )
         except (OSError, bmadconfig.BmadConfigError) as e:
-            self.notify(f"failed to record {decision.id}: {e}", severity="error")
+            self.notify(
+                f"failed to record {decision.id}: {e}",  # pyright: ignore[reportAttributeAccessIssue]
+                severity="error",
+            )
             return False
         return True
 
@@ -406,6 +414,9 @@ class BmadLoopApp(App[None]):
         ok, argv = self._mux_guarded(lambda: runs.attach_target_argv(target))
         if not ok:
             return
+        # argv is None only when `ok` is False (they are a pair); past this guard it
+        # is a real argv, but pyright can't correlate the two — hence the
+        # reportArgumentType ignores on the subprocess.call/shlex.join uses below.
         # Backend-honest inside-the-multiplexer probe (current_return_target()
         # is None outside): inside, attach_target_argv returned the
         # fire-and-forget switch/focus form, so no suspend is needed.
@@ -417,7 +428,7 @@ class BmadLoopApp(App[None]):
             # session.
             if return_window is not None:
                 launch.set_return_pane(return_window, ret)
-            subprocess.call(argv)
+            subprocess.call(argv)  # pyright: ignore[reportArgumentType]
             return
         # Outside tmux we attach a throwaway client (under suspend). The ctl
         # session keeps its own shell window, so a closed run window would leave
@@ -428,10 +439,10 @@ class BmadLoopApp(App[None]):
             launch.set_return_pane(return_window, launch.RETURN_DETACH)
         try:
             with self.suspend():
-                subprocess.call(argv)
+                subprocess.call(argv)  # pyright: ignore[reportArgumentType]
         except SuspendNotSupported:
             self.notify(
-                f"cannot suspend here — run manually: {shlex.join(argv)}",
+                f"cannot suspend here — run manually: {shlex.join(argv)}",  # pyright: ignore[reportArgumentType]
                 severity="warning",
                 timeout=10,
             )
@@ -556,7 +567,8 @@ class BmadLoopApp(App[None]):
         }
         spec_path, spec_text = self._paused_spec(state)
         modal = SpecReviewModal(
-            title=f"{labels.get(state.paused_stage, 'gate')} — review the finalized spec",
+            # paused_stage may be None; dict.get tolerates a None key (returns the default).
+            title=f"{labels.get(state.paused_stage, 'gate')} — review the finalized spec",  # pyright: ignore[reportArgumentType, reportCallIssue]
             subtitle=self._story_subtitle(state),
             spec_path=spec_path,
             spec_text=spec_text,
@@ -1058,7 +1070,7 @@ class BmadLoopApp(App[None]):
         try:
             _rc, out, _err = launch.run_captured_streams([*tail, "--json"])
             doc = widgets.validate_document(out)
-        except Exception:  # noqa: BLE001 — a JSON-leg failure degrades, never kills the app
+        except Exception:  # a JSON-leg failure degrades, never kills the app
             doc = None
         if doc is None:
             rc, merged = self._run_captured_guarded(tail)
@@ -1082,7 +1094,7 @@ class BmadLoopApp(App[None]):
         """
         try:
             return launch.run_captured(tail)
-        except Exception as exc:  # noqa: BLE001 — a failed spawn is a modal, not a crash
+        except Exception as exc:  # a failed spawn is a modal, not a crash
             return 1, f"could not run: {exc}"
 
     @work(thread=True, exclusive=True, group="captured")

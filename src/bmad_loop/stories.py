@@ -28,7 +28,7 @@ from pathlib import Path
 
 import yaml
 
-from .verify import read_frontmatter, status_of
+from .frontmatter import read_frontmatter, status_of
 
 # Fixed-name discovery, like SPEC.md / .memlog.md — never listed in companions.
 STORIES_FILENAME = "stories.yaml"

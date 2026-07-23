@@ -9,10 +9,26 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **Documented the `BMAD_LOOP_*` environment variables (#246).** The three runtime override
+  vars — `BMAD_LOOP_MUX_BACKEND`, `BMAD_LOOP_PROCESS_HOST`, `BMAD_LOOP_SESSION_TIMEOUT_S` — now
+  have a reference table in the README. Behavior is unchanged; they are read through a single
+  `bmad_loop.envvars` registry so the supported knobs are discoverable in one place.
+
 - **`python -m bmad_loop` (#240).** The package is now runnable as a module
   (`python -m bmad_loop …`), mirroring the installed `bmad-loop` console script via a thin
   `__main__.py`. Subprocess smoke tests exercise the module entry, and characterization tests
   pin the current CLI exit codes (typed errors and the broad backstop → 1, argparse usage → 2).
+
+### Changed
+
+- **Ctrl+C outside a run now exits `130` cleanly (#241).** A `KeyboardInterrupt` escaping
+  `main()` outside `engine.run()` (config load, engine construction) now prints a one-line
+  `interrupted` to stderr and returns the new `ExitCode.INTERRUPTED` (`130` = 128 + SIGINT).
+  The exit code is **unchanged** — uncaught, CPython already ended the process at `130` by
+  re-raising SIGINT — but previously as a **bare traceback**, dumped after any partial `--json`
+  stdout. It is now a clean `exit(130)` with empty stdout (a Python caller reading
+  `subprocess.returncode` sees `130` rather than `-2`). A Ctrl+C _during_ a run is unchanged:
+  the engine still finalizes it as a resumable `stopped` run (rc `0`).
 
 ## [0.9.0] — 2026-07-21
 

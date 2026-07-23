@@ -2765,6 +2765,28 @@ def test_resume_restamps_policy_snapshot_for_sweep_runs(project, monkeypatch):
     assert load_state(run_dir).cache_read_weight() == 0.5
 
 
+def test_resume_tolerates_a_corrupt_sweep_json(project, monkeypatch):
+    """A torn/corrupt sweep.json (a crash mid-write on an older run) must not abort
+    resume — the recovery path. compose_resume guards the read and falls back to the
+    same launch defaults as the missing-file arm instead of letting json.loads raise."""
+    run_dir = _paused_run_for_resume(project, monkeypatch, run_type="sweep")
+    (run_dir / "sweep.json").write_text("{ not json", encoding="utf-8")
+
+    captured: dict = {}
+
+    class _CapturingSweep(_StubEngine):
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(cli, "SweepEngine", _CapturingSweep)
+
+    # resume does not raise, and the sweep is rebuilt with default options
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+    assert captured["prompting"] is False
+    assert captured["decisions_only"] is False
+    assert captured["max_bundles"] is None
+
+
 def test_resume_stamps_a_legacy_run_with_no_snapshot(project, monkeypatch):
     """A run persisted before policy_snapshot existed carries `{}` and displays at
     the hardcoded 0.1 default. Its first resume stamps it — and must not report
@@ -3459,6 +3481,50 @@ def test_validate_json_warning_message_carries_no_severity_prefix(project, capsy
     for finding in warned:
         assert "warning:" not in finding["message"]
         assert not finding["message"].startswith(" ")
+
+
+def test_validate_json_detail_round_trips_for_every_real_shape(capsys):
+    """Every `detail` shape the real gates attach must survive `validate --json`'s
+    `json.dumps` boundary.
+
+    #268 widened `Finding.detail` to `Mapping[str, object]` for strict-mode
+    covariance — so `install.py`'s `dict[str, str]` stays assignable — which leaves
+    implicit the invariant this pins: the production path
+    `machine.emit(validate_document(...))` still emits one whole, parseable document
+    for every detail a caller actually builds. Each case below mirrors a real call
+    site (str values, the nested `dict(role_names)` dict, str+int, install.py's
+    `{**detail, "marker": ...}`, and the `detail=None` leg). A future caller that
+    attaches a non-JSON-serializable detail fails here, by name, rather than at
+    runtime on stdout.
+    """
+    from bmad_loop import machine
+
+    report = cli.ValidationReport()
+    report.ok("adapter.binary", "codex found", {"binary": "codex"})  # str values (cli.py)
+    report.ok(  # nested plain dict — the `dict(role_names)` shape (cli.py)
+        "policy",
+        "policy OK",
+        {"gates_mode": "warn", "adapters": {"dev": "claude", "review": "claude"}},
+    )
+    report.ok(  # str + int (cli.py)
+        "queue.stories-manifest", "stories OK", {"spec_folder": "docs", "stories": 3}
+    )
+    report.fail(  # install.py's `{**detail, "marker": ...}` shape
+        "skills.stories-dispatch-stale",
+        "stale",
+        {"tree": ".claude", "skill": "s", "file": "f", "marker": "m"},
+    )
+    report.ok("git.worktree-clean", "clean")  # the detail=None leg
+
+    # the exact production path: cli.py does `machine.emit(validate_document(...))`.
+    machine.emit(cli.validate_document(report, stories_on=False, spec_folder=""))
+    parsed = json.loads(capsys.readouterr().out)  # whole stdout parses => a pure document
+
+    by_check = {f["check"]: f for f in parsed["findings"]}
+    assert by_check["policy"]["detail"]["adapters"]["dev"] == "claude"  # nested dict survives
+    assert by_check["queue.stories-manifest"]["detail"]["stories"] == 3  # int, not "3"
+    assert by_check["skills.stories-dispatch-stale"]["detail"]["marker"] == "m"
+    assert by_check["git.worktree-clean"]["detail"] is None  # None -> null round-trips
 
 
 @pytest.mark.parametrize(

@@ -52,7 +52,9 @@ if TYPE_CHECKING:
 VALIDATE_SCHEMA_VERSION = 1
 
 
-def validate_document(report: ValidationReport, stories_on: bool, spec_folder: str) -> dict:
+def validate_document(
+    report: ValidationReport, stories_on: bool, spec_folder: str
+) -> dict[str, object]:
     """The `validate --json` document: the verdict plus every check that produced it.
 
     Obeys the pure-document contract in machine.py (additive-only evolution;
@@ -211,7 +213,7 @@ def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> 
         status = "stopped"
     else:
         status = "in-progress"
-    tasks = []
+    tasks: list[dict[str, object]] = []
     for key, task in state.tasks.items():
         tokens = task.tokens.to_dict()
         tokens["raw"] = task.tokens.total

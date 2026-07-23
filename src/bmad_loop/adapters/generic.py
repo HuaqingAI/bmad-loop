@@ -88,6 +88,10 @@ class _ResultFileMixin:
     any adapter whose skill writes ``tasks/<task_id>/result.json``; needs
     only ``self.tasks_dir``."""
 
+    # Set by the concrete adapter's __init__; bare annotation (no runtime effect)
+    # tells the type checker the host attribute this mixin reads.
+    tasks_dir: Path
+
     def _result_json(self, handle: SessionHandle, spec: SessionSpec, *, wait: bool) -> dict | None:
         """Acquire this session's result dict. Base behavior: read the
         skill-written ``result.json`` (briefly awaiting it on the Stop event,
@@ -762,13 +766,13 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
         for pid in repane:
             try:
                 host.force_kill(pid)
-            except Exception:  # noqa: BLE001  # nosec B110 - already-gone races are fine
+            except Exception:  # nosec B110 - already-gone races are fine
                 pass
         for pid, identity in tree.items():
             if pid not in repane and identity is not None and host.alive_and_ours(pid, identity):
                 try:
                     host.force_kill(pid)
-                except Exception:  # noqa: BLE001  # nosec B110 - already-gone races are fine
+                except Exception:  # nosec B110 - already-gone races are fine
                     pass
         self.mux.kill_window(handle.native_id)
         try:
@@ -826,7 +830,7 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
                 try:
                     host.force_kill(pid)
                     forced.append(pid)
-                except Exception:  # noqa: BLE001  # nosec B110 - already-gone races are fine
+                except Exception:  # nosec B110 - already-gone races are fine
                     pass
         unreaped = [pid for pid, identity in tree.items() if host.alive_and_ours(pid, identity)]
         # Distinct field name (`unreaped`, a pid list) from the wedged branch's
@@ -875,6 +879,11 @@ class _DevSynthesisMixin(_ResultFileMixin):
     synthesizes the legacy result dict via :mod:`devcontract`. Hosts provide
     ``self.paths`` (a :class:`ProjectPaths`), the ``self.policy`` knobs read
     by ``_configure_dev_knobs``, and the ``_probe_alive`` liveness seam."""
+
+    # Set by the concrete adapter's __init__ (see docstring); bare annotations
+    # (no runtime effect) tell the type checker the host attributes this reads.
+    paths: ProjectPaths
+    policy: Policy
 
     def _configure_dev_knobs(self) -> None:
         """Override the base result-file knobs for the bmad-dev-auto contract;

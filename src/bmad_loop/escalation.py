@@ -12,9 +12,8 @@ from enum import StrEnum
 from typing import Any
 
 from .adapters.base import SessionResult
-from .model import StoryTask
+from .model import StoryTask, VerifyOutcome
 from .policy import Policy
-from .verify import VerifyOutcome
 
 SEVERITY_CRITICAL = "CRITICAL"
 SEVERITY_PREFERENCE = "PREFERENCE"

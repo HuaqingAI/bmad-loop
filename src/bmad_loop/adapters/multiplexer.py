@@ -30,12 +30,13 @@ from __future__ import annotations
 
 import functools
 import importlib.metadata
-import os
 import sys
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+
+from .. import envvars
 
 
 class MultiplexerError(Exception):
@@ -354,13 +355,13 @@ def _load_external_backends() -> None:
     _EXTERNALS_LOADED = True
     try:
         eps = importlib.metadata.entry_points(group=MUX_BACKENDS_GROUP)
-    except Exception as exc:  # noqa: BLE001 — diagnostics path, never crash selection
+    except Exception as exc:  # diagnostics path, never crash selection
         _EXTERNAL_ERRORS["<entry-point scan>"] = f"{type(exc).__name__}: {exc}"
         return
     for ep in eps:
         try:
             ep.load()  # module import runs register_multiplexer(...)
-        except Exception as exc:  # noqa: BLE001 — one bad package must not hide the rest
+        except Exception as exc:  # one bad package must not hide the rest
             _EXTERNAL_ERRORS[ep.name] = f"{type(exc).__name__}: {exc}"
 
 
@@ -414,7 +415,7 @@ def backend_forced() -> bool:
     trusted; the backend fails loudly if it can't run), so launch preflights
     that refuse an unusable backend must stand down for it too — via
     :func:`mux_usable`, which stands down loudly."""
-    return bool(os.environ.get("BMAD_LOOP_MUX_BACKEND")) or _CONFIGURED is not None
+    return bool(envvars.mux_backend()) or _CONFIGURED is not None
 
 
 _FORCED_UNUSABLE_WARNED = False
@@ -442,7 +443,7 @@ def mux_usable(backend: TerminalMultiplexer | None = None) -> bool:
         _FORCED_UNUSABLE_WARNED = True
         try:
             version = backend.version()
-        except Exception:  # noqa: BLE001 — a broken probe must not break the warning
+        except Exception:  # a broken probe must not break the warning
             version = None
         print(
             f"warning: forced multiplexer backend {type(backend).__name__} reports "
@@ -473,7 +474,7 @@ def _select() -> tuple[TerminalMultiplexer, str, str]:
     silently fall back to tmux (wrong/unsafe on a non-POSIX host)."""
     _load_builtin_backends()
     _load_external_backends()
-    forced = os.environ.get("BMAD_LOOP_MUX_BACKEND")
+    forced = envvars.mux_backend()
     if forced:
         factory = _factory_by_name(forced)
         if factory is None:

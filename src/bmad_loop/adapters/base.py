@@ -106,7 +106,7 @@ class CodingCLIAdapter(ABC):
         """Env vars to layer onto the caller's environment for interactive_argv."""
         return dict(spec.env)
 
-    def kill(self, handle: SessionHandle) -> None:  # noqa: B027 - optional cleanup
+    def kill(self, handle: SessionHandle) -> None:  # optional cleanup
         pass
 
     def read_usage(self, result: SessionResult) -> TokenUsage | None:

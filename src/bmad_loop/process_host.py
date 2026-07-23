@@ -26,6 +26,8 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Callable
 
+from . import envvars
+
 # SIGKILL is absent on Windows; fall back to SIGTERM so attribute access never
 # raises. The POSIX host references this rather than ``signal.SIGKILL`` directly.
 SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)  # portability: SIGKILL absent on Windows
@@ -322,9 +324,9 @@ def _psutil_descendants(pid: int) -> dict[int, float | None]:
                 if not child.is_running():  # generation changed under us — don't stamp it
                     continue
                 out[child.pid] = identity
-            except Exception:  # noqa: BLE001  # nosec B112 - gone/reused mid-walk: omit it
+            except Exception:  # nosec B112 - gone/reused mid-walk: omit it
                 continue
-    except Exception:  # noqa: BLE001 - the kill-path seam must never raise
+    except Exception:  # the kill-path seam must never raise
         return {}
     return out
 
@@ -335,7 +337,7 @@ def _psutil():
     probes. The dep-free core never imports it on Linux; raise a clear, actionable
     error if it's missing where it's needed."""
     try:
-        import psutil  # noqa: PLC0415  (intentional lazy import — keeps the core dep-free)
+        import psutil  # intentional lazy import — keeps the core dep-free
     except ImportError as exc:  # pragma: no cover - exercised only off Linux
         raise ProcessHostError(
             f"process_host: pid operations on {sys.platform!r} need psutil; "
@@ -391,7 +393,7 @@ def get_process_host() -> ProcessHost:
     otherwise the first host whose ``matches(sys.platform)`` is true wins. POSIX is
     the default fallback, so behavior on Linux/macOS is unchanged. Cached — tests
     that flip the env var must call ``get_process_host.cache_clear()``."""
-    forced = os.environ.get("BMAD_LOOP_PROCESS_HOST")
+    forced = envvars.process_host()
     _load_builtin_hosts()
     for name, matches, factory in _HOSTS:
         if name == forced or (not forced and matches(sys.platform)):

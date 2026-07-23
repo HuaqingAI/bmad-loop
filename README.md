@@ -495,6 +495,18 @@ The readiness gate runs the plugin's `ready_cmd` (`unity_ready.py`), which for `
 
 For `per_worktree`, set `editor_mode = "per_worktree"` with `[scm] isolation = "worktree"`. The bundled Unity plugin wires the worktree-Editor lifecycle against the **IvanMurzak** CLI (`open` / `setup-mcp` / `close`, which key off the project path with auto port detection — verified against v0.81.1). A fresh worktree has no `Library` (it's gitignored), and opening Unity on an empty `Library` forces a cold full reimport that crashes the import workers on a real project — so the setup hook **primes** the worktree's `Library` with a reflink/CoW copy of your warm main `Library` (`<repo>/Library`), near-instant on btrfs/xfs, making the import incremental; it falls back to a deep copy, then to a symlinked empty cache under the gitignored `.bmad-loop/cache/`, off-CoW or when no warm `Library` exists. Tune this with `BMAD_LOOP_UNITY_LIBRARY_SEED` / `…_SEED_MODE` (and `BMAD_LOOP_UNITY_LIBRARY_CACHE` for the fallback cache root — see the [Game Engine MCP guide](docs/game-engine-mcp-guide.md) for the full env reference); a [Unity Accelerator](https://docs.unity3d.com/Manual/UnityAccelerator.html) helps further, and `unity_path` pins the Editor binary. A cold worktree Editor takes time to launch and import — bump `ready_grace_sec`/`ready_timeout_sec` if your project's first import runs long. CoplayDev's single shared-server model isn't wired for a managed per-worktree launch — point `worktree_setup_cmd`/`worktree_teardown_cmd` at your own scripts under `.bmad-loop/plugins/unity/`, or use shared mode.
 
+## Environment variables
+
+A handful of `BMAD_LOOP_*` variables override behavior at runtime, taking precedence over the policy file. Most operators only ever touch `BMAD_LOOP_MUX_BACKEND`; the other two are override/test hooks.
+
+| Variable                      | Value                                          | Effect                                                                                                                                                                                                               |
+| ----------------------------- | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BMAD_LOOP_MUX_BACKEND`       | registered backend name (e.g. `tmux`, `psmux`) | Forces the terminal-multiplexer backend, outranking the `[mux] backend` policy key and auto-selection. A name matching no registered backend is an error — it never silently falls back. Unset ⇒ auto-select.        |
+| `BMAD_LOOP_PROCESS_HOST`      | registered host name (e.g. `posix`, `windows`) | Forces the process-lifecycle host (an override/test hook). A name matching no registered host raises rather than silently using POSIX. Unset ⇒ this platform's default.                                              |
+| `BMAD_LOOP_SESSION_TIMEOUT_S` | seconds (float)                                | Overrides the per-session wall-clock budget (normally `limits.session_timeout_min × 60`) — mainly a test/E2E hook for sub-minute timeouts. A non-positive or unparseable value is ignored. Unset ⇒ the policy value. |
+
+Game-engine (Unity) runs read a wider `BMAD_LOOP_UNITY_*` / `BMAD_LOOP_ENGINE_*` set documented in the [Game Engine MCP guide](docs/game-engine-mcp-guide.md).
+
 ## Run state
 
 Everything about a run lives in `.bmad-loop/runs/<run-id>/` (gitignored): `state.json` (resumable engine state), `journal.jsonl` (every decision), `events/` (hook signals), `tasks/<id>/` (per-session prompt + result + escalations, plus diagnostic breadcrumbs — `session-lifecycle.jsonl` records when a timeout fired, `heartbeat.json` is the wait loop's proof-of-life, `resultless-stops.jsonl` records give-up Stops), `logs/` (raw pane output, debugging only), `deferred/` (stashed specs from deferred stories), `resolve/<story>/` (escalation `context.json` + the resolve agent's `resolution.json`), `ATTENTION` (human-readable alerts), and — only while a graceful stop is pending — `stop-request.json` (the control file the engine consumes at the next item boundary).
@@ -518,6 +530,21 @@ Each run drives its agents inside a dedicated tmux session, `bmad-loop-<run-id>`
 **A failing check still emits the whole document, at exit 1.** That is the verdict being reported, not a failure to produce one — so branch on `.ok`, not on the exit status: `bmad-loop validate --json | jq -e '.ok'`, or `jq '.findings[] | select(.severity == "problem") | .check'` to see what to fix. The exit code is unchanged from the text mode, so an existing `bmad-loop validate || exit 1` in CI keeps working.
 
 Two things to know when matching. `message` is **not** contracted — several problems are the raw text of an underlying config/policy/profile exception, so the wording moves with those modules; `check` is the matchable identity. And a check id's _absence_ is not a pass: the gates are chained, so a policy that fails to load leaves the binary, hook and skill gates with nothing to check, and they contribute no finding at all. Read `ok` for the verdict.
+
+### Exit codes
+
+Normal command dispatch, argparse usage errors, and interruption resolve to one of four released codes — safe to branch on in CI:
+
+| Code  | Name          | Meaning                                                                                                                                                      |
+| ----- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `0`   | `OK`          | the command did its job                                                                                                                                      |
+| `1`   | `FAILURE`     | the command could not do its job — a known error (bad config, git failure, unready project) or an unexpected one; the reason goes to stderr as `error: …`    |
+| `2`   | `USAGE`       | the invocation was malformed — an unknown subcommand or bad flag, caught by argument parsing before the command runs                                         |
+| `130` | `INTERRUPTED` | Ctrl+C (SIGINT) interrupted the process outside a run — 128 + signal 2, the shell's convention; a one-line `interrupted` notice goes to stderr, no traceback |
+
+No `ExitCode` values `3`–`129` or `≥131` are assigned yet. `INTERRUPTED` (`130`) covers only a Ctrl+C that lands **outside** a run — during config load or engine construction; a Ctrl+C **during** a run is caught by the engine and finalized as a clean, resumable `stopped` run, which exits `0`. The names come from the `ExitCode` enum in `bmad_loop.cli`.
+
+One caveat repeated from above: a `--json` command reporting a **verdict** exits `1` to _carry_ that verdict, not because the command broke — `validate --json` on an unready project exits `1` but still prints its whole document. So for those commands read the document's own field (`ok`), not the exit status; `1` conflates "the checks failed" with "the command failed". For everything else, `0` vs non-zero is the answer.
 
 ## Other coding CLIs
 

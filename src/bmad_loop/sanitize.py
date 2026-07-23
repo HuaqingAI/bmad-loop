@@ -35,6 +35,14 @@ word-boundary semantics, re-verified, and disclosed to the caller). A routing
 bug or a future field can therefore never silently ship a secret/PII/path.
 """
 
+# Strict-checked under #245 Stage 2, with the two "expression fully known" rules
+# below relaxed for this file only: `_scrub` walks arbitrary, foreign JSON whose
+# leaves are `Any` by design (it exists to redact unknown/future fields), so
+# isinstance-narrowing that `Any` yields dict/list `[Unknown, ...]` and every
+# key/value it iterates is Unknown. Typing it away would defeat the point of a
+# catch-all scrubber. Every other strict rule stays on.
+# pyright: reportUnknownArgumentType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
 import getpass

@@ -364,7 +364,8 @@ def _render_row(row: dict) -> Text:
         ch = row[x]
         key = (ch.fg, ch.bg, ch.bold, ch.italics, ch.underscore, ch.strikethrough, ch.reverse)
         if key != prev_key and run:
-            text.append("".join(run), _char_style(prev_key))
+            # prev_key is non-None whenever `run` is non-empty (a prior cell was buffered).
+            text.append("".join(run), _char_style(prev_key))  # pyright: ignore[reportArgumentType]
             run.clear()
         prev_key = key
         run.append(ch.data)
@@ -622,7 +623,13 @@ class LogView:
             # marker bytes; the log_pos->line mapping is already approximate)
             end = start + len(piece)
             self._offset = base + (consumed if end >= total else round(end / total * consumed))
-            line = top.dropped + len(top) + self._screen.cursor.y
+            # pyte types history.top as base deque; bmad-loop installs a _CountingDeque
+            # (see class below) that adds `.dropped`.
+            line = (
+                top.dropped  # pyright: ignore[reportAttributeAccessIssue]
+                + len(top)
+                + self._screen.cursor.y
+            )
             self._checkpoints.append((self._offset, line))
         self._offset = base + consumed
         # When a chunk is entirely an unterminated trailing CSI, consumed == 0 and
@@ -633,7 +640,12 @@ class LogView:
         # only risk eating a legitimately split sequence by forcing it through).
         # drop checkpoints whose lines evicted past the history horizon;
         # their offsets would clamp to line 0 anyway
-        while len(self._checkpoints) > 1 and self._checkpoints[1][1] <= top.dropped:
+        # `.dropped` is on the _CountingDeque bmad-loop installs as history.top.
+        while (
+            len(self._checkpoints) > 1
+            and self._checkpoints[1][1]
+            <= top.dropped  # pyright: ignore[reportAttributeAccessIssue]
+        ):
             self._checkpoints.pop(0)
         return consumed > 0
 
@@ -663,7 +675,10 @@ class LogView:
             rows.pop()
         front_drop = max(0, len(rows) - self._history)
         del rows[:front_drop]
-        self._render_base = screen.history.top.dropped + front_drop
+        # `.dropped` is on the _CountingDeque bmad-loop installs as history.top.
+        self._render_base = (
+            screen.history.top.dropped + front_drop  # pyright: ignore[reportAttributeAccessIssue]
+        )
         self._render_len = len(rows)
         return Text("\n").join(rows)
 

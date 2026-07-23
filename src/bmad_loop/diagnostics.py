@@ -217,7 +217,7 @@ def collect_env() -> EnvInfo:
         mux = type(backend).__name__
         raw = backend.version()
         tmux_v = sanitize.scrub_text(raw, max_lines=1) if raw else None
-    except Exception:  # noqa: BLE001  # nosec B110 - env probe is best-effort; absent mux is fine
+    except Exception:  # nosec B110 - env probe is best-effort; absent mux is fine
         pass
     return EnvInfo(
         os=platform.system(),
@@ -397,7 +397,13 @@ def summarize_journal(
         kind_histogram=dict(kinds),
         first_ts=first_ts,
         last_ts=last_ts,
-        duration_s=(round(last_ts - first_ts, 3) if first_ts is not None else None),
+        # first_ts/last_ts are set together (both None iff no timestamps), so the
+        # first_ts guard also proves last_ts is not None here.
+        duration_s=(
+            round(last_ts - first_ts, 3)  # pyright: ignore[reportOptionalOperand]
+            if first_ts is not None
+            else None
+        ),
         escalation_count=kinds.get("story-escalated", 0) + kinds.get("preference-escalation", 0),
         defer_count=kinds.get("story-deferred", 0),
         plugin_error_count=kinds.get("plugin-error", 0),
@@ -469,7 +475,7 @@ def collect(
     for run_dir in run_dirs:
         try:
             runs.append(collect_run(run_dir, pseudo=pseudo, cap=cap))
-        except Exception as e:  # noqa: BLE001 — one bad run never sinks the dump
+        except Exception as e:  # one bad run never sinks the dump
             runs.append(_unreadable_run(run_dir, e))
     return Diagnostics(
         schema_version=SCHEMA_VERSION,

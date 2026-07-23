@@ -59,7 +59,7 @@ def _psutil():
     dep-free core never imports it; raise a clear, actionable error if it's missing
     on a platform that needs it."""
     try:
-        import psutil  # noqa: PLC0415  (intentional lazy import — keeps the core dep-free)
+        import psutil  # intentional lazy import — keeps the core dep-free
     except ImportError as exc:  # pragma: no cover - exercised only off Linux
         raise RuntimeError(
             f"unity_teardown: process discovery on {sys.platform!r} needs psutil; "
@@ -251,7 +251,7 @@ def _probe_pidfile_pids(run_dir: Path | None) -> list[int]:
     still alive AND still our probe (identity-checked). The primary reap handle."""
     if run_dir is None:
         return []
-    from bmad_loop.runs import read_named_pid_identity  # noqa: PLC0415 - lazy import
+    from bmad_loop.runs import read_named_pid_identity  # lazy import
 
     pid, identity = read_named_pid_identity(run_dir / _DIALOG_PROBE_PID_FILE)
     if pid is None:

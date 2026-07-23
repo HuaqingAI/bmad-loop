@@ -67,7 +67,9 @@ class PolicyDoc:
             if stage and table is not None and len(table) == 0:
                 del self._doc[parent][stage]
             return
-        self._table(section, create=True)[key] = value
+        # _table(create=True) never returns None (it creates missing tables), but
+        # its return type is Any | None.
+        self._table(section, create=True)[key] = value  # pyright: ignore[reportOptionalSubscript]
 
     def validate(
         self,

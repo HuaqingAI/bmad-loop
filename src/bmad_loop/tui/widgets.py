@@ -527,7 +527,7 @@ def validate_findings(doc: dict, *, details: bool) -> Table:
     for finding in findings:
         try:
             rows = _finding_rows(finding, details=details)
-        except Exception:  # noqa: BLE001 — a bad finding costs its row, never the modal
+        except Exception:  # a bad finding costs its row, never the modal
             rows = [
                 (
                     Text("?", style="dim"),

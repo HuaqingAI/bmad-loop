@@ -201,5 +201,5 @@ def run_session(adapter, project: Path, run_dir: Path, story_key: str, *, model:
     marker.unlink(missing_ok=True)
     argv = adapter.interactive_argv(spec)
     env = {**os.environ, **adapter.interactive_env(spec)}
-    subprocess.run(argv, cwd=str(project), env=env)  # noqa: S603 - attached, inherited stdio
+    subprocess.run(argv, cwd=str(project), env=env)  # attached, inherited stdio
     return marker.is_file()

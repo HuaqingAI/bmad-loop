@@ -93,7 +93,7 @@ def workflow_effect(captured: list, status: str = "completed"):
     """A scripted session standing in for an injected workflow session: record the
     spec (to assert prompt substitution + task_id) and return ``status``."""
 
-    def effect(spec):  # noqa: ANN001
+    def effect(spec):
         captured.append(spec)
         return SessionResult(status=status, result_json={})
 

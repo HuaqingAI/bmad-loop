@@ -34,7 +34,7 @@ opencode = ["httpx>=0.28"]
 # dev gets tui via `uv sync --all-extras` (groups can't self-reference an extra).
 dev = [
   "pytest>=8.0",
-  "ruff>=0.4",
+  "ruff>=0.15.17",
   "pytest-asyncio>=1.0",
   "pytest-rerunfailures>=16.0",
   "pytest-xdist>=3.6",
@@ -60,6 +60,18 @@ target-version = "py311"
 # skill assets contain template placeholders that are not valid Python
 extend-exclude = [".agents", ".claude", "src/bmad_loop/data/skills"]
 
+[tool.ruff.lint]
+# CI lints with trunk's ruff (pinned 0.15.17), whose plugin injects no `--select`
+# and so runs ruff's own default rule set. With no lint table that default is
+# resolved per ruff version and can drift, so pin the families explicitly. The
+# repo's ruff is pinned to 0.15.17 via trunk (`trunk check` = what CI runs and
+# the documented local lint, see CONTRIBUTING) and floored at >=0.15.17 in the
+# dev deps (uv.lock resolves 0.15.17), so those paths match CI; a bare, newer
+# ruff gets rule-family parity only — new rules can land under these prefixes.
+# This spells out ruff 0.15.17's default set (`E4`, `E7`, `E9`, `F`) (#246). Do
+# NOT ratchet stricter than CI without moving CI first.
+select = ["E4", "E7", "E9", "F"]
+
 [tool.black]
 line-length = 100
 target-version = ["py311"]
@@ -67,3 +79,32 @@ target-version = ["py311"]
 [tool.isort]
 profile = "black"
 line_length = 100
+
+[tool.pyright]
+# Stage 1 of #245 (assessment F-4): a basic-mode type-check gate so annotation
+# drift stops being invisible. Verified against pyright 1.1.411 docs.
+include = ["src/bmad_loop"]
+# data/ ships skill assets + hook scripts that are templates / stand-alone (not
+# part of the package's import graph); type-checking them is noise.
+exclude = ["src/bmad_loop/data"]
+typeCheckingMode = "basic"
+# Stage 2 of #245: the pure/leaf modules (no live process, git, or mux I/O) are
+# held to strict analysis while the rest stays basic. `strict` overrides
+# typeCheckingMode for these paths only — the same effect as a per-file
+# `# pyright: strict` comment — so annotation drift in the domain core is caught
+# without forcing the I/O-heavy modules over the strict bar. No runtime changes.
+strict = [
+  "src/bmad_loop/model.py",
+  "src/bmad_loop/statemachine.py",
+  "src/bmad_loop/policy.py",
+  "src/bmad_loop/documents.py",
+  "src/bmad_loop/machine.py",
+  "src/bmad_loop/checks.py",
+  "src/bmad_loop/sanitize.py",
+]
+# Check against the floor of requires-python so we never lean on 3.12+ typing.
+pythonVersion = "3.11"
+# Resolve third-party imports from the uv-managed project venv (created by
+# `uv sync` locally and in CI), so optional-extra imports aren't false misses.
+venvPath = "."
+venv = ".venv"
