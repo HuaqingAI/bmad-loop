@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import contextlib
 import functools
-import os
 import shutil
 import signal
 import sys
@@ -20,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, NoReturn
 
-from . import deferredwork, devcontract, gates, verify
+from . import deferredwork, devcontract, envvars, gates, verify
 from .adapters.base import CodingCLIAdapter, SessionResult, SessionSpec
 from .bmadconfig import ProjectPaths
 from .escalation import (
@@ -1879,15 +1878,8 @@ class Engine:
         binary run can't be monkeypatched. A non-positive or unparseable
         override is ignored, so a fat-fingered value can never silently shorten
         a real run's budget."""
-        raw = os.environ.get("BMAD_LOOP_SESSION_TIMEOUT_S")
-        if raw is not None:
-            try:
-                override = float(raw)
-            except ValueError:
-                override = 0.0
-            if override > 0:
-                return override
-        return default_s
+        override = envvars.session_timeout_s()
+        return override if override is not None else default_s
 
     def _run_session(
         self,

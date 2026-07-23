@@ -30,12 +30,13 @@ from __future__ import annotations
 
 import functools
 import importlib.metadata
-import os
 import sys
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+
+from .. import envvars
 
 
 class MultiplexerError(Exception):
@@ -414,7 +415,7 @@ def backend_forced() -> bool:
     trusted; the backend fails loudly if it can't run), so launch preflights
     that refuse an unusable backend must stand down for it too — via
     :func:`mux_usable`, which stands down loudly."""
-    return bool(os.environ.get("BMAD_LOOP_MUX_BACKEND")) or _CONFIGURED is not None
+    return bool(envvars.mux_backend()) or _CONFIGURED is not None
 
 
 _FORCED_UNUSABLE_WARNED = False
@@ -473,7 +474,7 @@ def _select() -> tuple[TerminalMultiplexer, str, str]:
     silently fall back to tmux (wrong/unsafe on a non-POSIX host)."""
     _load_builtin_backends()
     _load_external_backends()
-    forced = os.environ.get("BMAD_LOOP_MUX_BACKEND")
+    forced = envvars.mux_backend()
     if forced:
         factory = _factory_by_name(forced)
         if factory is None:

@@ -26,6 +26,8 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Callable
 
+from . import envvars
+
 # SIGKILL is absent on Windows; fall back to SIGTERM so attribute access never
 # raises. The POSIX host references this rather than ``signal.SIGKILL`` directly.
 SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)  # portability: SIGKILL absent on Windows
@@ -391,7 +393,7 @@ def get_process_host() -> ProcessHost:
     otherwise the first host whose ``matches(sys.platform)`` is true wins. POSIX is
     the default fallback, so behavior on Linux/macOS is unchanged. Cached — tests
     that flip the env var must call ``get_process_host.cache_clear()``."""
-    forced = os.environ.get("BMAD_LOOP_PROCESS_HOST")
+    forced = envvars.process_host()
     _load_builtin_hosts()
     for name, matches, factory in _HOSTS:
         if name == forced or (not forced and matches(sys.platform)):
