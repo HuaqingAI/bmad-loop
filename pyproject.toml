@@ -88,6 +88,20 @@ include = ["src/bmad_loop"]
 # part of the package's import graph); type-checking them is noise.
 exclude = ["src/bmad_loop/data"]
 typeCheckingMode = "basic"
+# Stage 2 of #245: the pure/leaf modules (no live process, git, or mux I/O) are
+# held to strict analysis while the rest stays basic. `strict` overrides
+# typeCheckingMode for these paths only — the same effect as a per-file
+# `# pyright: strict` comment — so annotation drift in the domain core is caught
+# without forcing the I/O-heavy modules over the strict bar. No runtime changes.
+strict = [
+  "src/bmad_loop/model.py",
+  "src/bmad_loop/statemachine.py",
+  "src/bmad_loop/policy.py",
+  "src/bmad_loop/documents.py",
+  "src/bmad_loop/machine.py",
+  "src/bmad_loop/checks.py",
+  "src/bmad_loop/sanitize.py",
+]
 # Check against the floor of requires-python so we never lean on 3.12+ typing.
 pythonVersion = "3.11"
 # Resolve third-party imports from the uv-managed project venv (created by
