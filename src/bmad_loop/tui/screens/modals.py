@@ -210,18 +210,26 @@ class StartSweepModal(BaseDialog):
     """Options for `bmad-loop sweep` → {no_prompt, decisions_only,
     max_bundles, dry_run}."""
 
+    DEFAULT_CSS = """
+    StartSweepModal #body {
+        height: auto;
+        max-height: 70%;
+    }
+    """
+
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
             yield Label("start sweep", classes="title")
-            yield Checkbox("unattended (--no-prompt): skip decisions", id="no-prompt")
-            yield Checkbox("decisions only: triage + answer, no bundles", id="decisions-only")
-            yield Input(
-                placeholder="max bundles — blank for policy default",
-                type="integer",
-                valid_empty=True,
-                id="max-bundles",
-            )
-            yield Checkbox("dry run (list open entries, spawn nothing)", id="dry-run")
+            with VerticalScroll(id="body"):
+                yield Checkbox("unattended (--no-prompt): skip decisions", id="no-prompt")
+                yield Checkbox("decisions only: triage + answer, no bundles", id="decisions-only")
+                yield Input(
+                    placeholder="max bundles — blank for policy default",
+                    type="integer",
+                    valid_empty=True,
+                    id="max-bundles",
+                )
+                yield Checkbox("dry run (list open entries, spawn nothing)", id="dry-run")
             with Horizontal(classes="buttons"):
                 yield Button("start", variant="primary", id="ok")
                 yield Button("cancel", id="cancel")
@@ -243,6 +251,13 @@ class StartSweepModal(BaseDialog):
 class ConfirmModal(BaseDialog):
     """Generic confirmation → dismiss(True) on confirm, None otherwise."""
 
+    DEFAULT_CSS = """
+    ConfirmModal #body {
+        height: auto;
+        max-height: 60%;
+    }
+    """
+
     def __init__(
         self,
         title: str,
@@ -260,9 +275,10 @@ class ConfirmModal(BaseDialog):
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
             yield Label(self._title, classes="title")
-            yield Static(self._body)
-            if self._warning:
-                yield Static(Text(f"⚠ {self._warning}", style="bold red"))
+            with VerticalScroll(id="body"):
+                yield Static(self._body)
+                if self._warning:
+                    yield Static(Text(f"⚠ {self._warning}", style="bold red"))
             with Horizontal(classes="buttons"):
                 yield Button(self._confirm_label, variant="warning", id="ok")
                 yield Button("cancel", id="cancel")
@@ -343,12 +359,12 @@ class DecisionModal(BaseDialog):
     DEFAULT_CSS = """
     DecisionModal #dialog {
         width: 86;
-        height: auto;
-        max-height: 90%;
+        height: 90%;
     }
-    DecisionModal #context {
-        height: auto;
-        max-height: 40%;
+    DecisionModal #body {
+        height: 1fr;
+    }
+    DecisionModal .context {
         margin-bottom: 1;
     }
     DecisionModal .opt {
@@ -369,22 +385,22 @@ class DecisionModal(BaseDialog):
         title.append(f"{d.id} — answer this decision", style="bold")
         with Vertical(id="dialog"):
             yield Static(title, classes="title")
-            yield Static(Text(d.question))
-            if d.context:
-                with VerticalScroll(id="context"):
-                    yield Static(Text(d.context, style="dim"))
-            for opt in d.options:
-                head = Text()
-                head.append(f"[{opt.key}] ", style="bold")
-                head.append(opt.label)
-                head.append(f"  · {opt.effect}", style="cyan")
-                if opt.key == d.recommendation:
-                    head.append("  (recommended)", style="green")
-                yield Static(head, classes="opt")
-                detail = opt.intent or opt.resolution
-                if detail:
-                    yield Static(Text(f"    {detail}", style="dim"), classes="opt-detail")
-                yield Button(f"choose {opt.key}", id=f"opt-{opt.key}")
+            with VerticalScroll(id="body"):
+                yield Static(Text(d.question))
+                if d.context:
+                    yield Static(Text(d.context, style="dim"), classes="context")
+                for opt in d.options:
+                    head = Text()
+                    head.append(f"[{opt.key}] ", style="bold")
+                    head.append(opt.label)
+                    head.append(f"  · {opt.effect}", style="cyan")
+                    if opt.key == d.recommendation:
+                        head.append("  (recommended)", style="green")
+                    yield Static(head, classes="opt")
+                    detail = opt.intent or opt.resolution
+                    if detail:
+                        yield Static(Text(f"    {detail}", style="dim"), classes="opt-detail")
+                    yield Button(f"choose {opt.key}", id=f"opt-{opt.key}")
             with Horizontal(classes="buttons"):
                 yield Button("skip", id="cancel")
 
@@ -477,6 +493,13 @@ class StoryCheckpointModal(BaseDialog):
     count) and token totals. Dismisses with 'continue' (resume the schedule) or
     'stop' (mark the run stopped), None on close/escape."""
 
+    DEFAULT_CSS = """
+    StoryCheckpointModal #body {
+        height: auto;
+        max-height: 70%;
+    }
+    """
+
     def __init__(
         self,
         *,
@@ -498,16 +521,17 @@ class StoryCheckpointModal(BaseDialog):
         head.append(f"story checkpoint — {self._story_key}", style="bold")
         with Vertical(id="dialog"):
             yield Label(head, classes="title")
-            if self._title:
-                yield Static(Text(self._title))
-            card = Text()
-            card.append("\ncommit  ", style="dim")
-            card.append(self._commit or "(none)", style="green")
-            card.append("\nverify  ", style="dim")
-            card.append(self._verify_line)
-            card.append("\ntokens  ", style="dim")
-            card.append(self._tokens, style="dim")
-            yield Static(card)
+            with VerticalScroll(id="body"):
+                if self._title:
+                    yield Static(Text(self._title))
+                card = Text()
+                card.append("\ncommit  ", style="dim")
+                card.append(self._commit or "(none)", style="green")
+                card.append("\nverify  ", style="dim")
+                card.append(self._verify_line)
+                card.append("\ntokens  ", style="dim")
+                card.append(self._tokens, style="dim")
+                yield Static(card)
             with Horizontal(classes="buttons"):
                 yield Button("Continue run", variant="primary", id="act-continue")
                 yield Button("Stop run", variant="warning", id="act-stop")
@@ -529,12 +553,13 @@ class EscalationModal(BaseDialog):
     DEFAULT_CSS = """
     EscalationModal #dialog {
         width: 90;
-        height: auto;
-        max-height: 90%;
+        height: 90%;
+    }
+    EscalationModal #body {
+        height: 1fr;
     }
     EscalationModal #blocking {
         height: auto;
-        max-height: 40%;
         margin-top: 1;
         border: solid $primary-darken-2;
         padding: 0 1;
@@ -568,47 +593,50 @@ class EscalationModal(BaseDialog):
         head.append(f"escalation — {self._story_key}", style="bold red")
         with Vertical(id="dialog"):
             yield Label(head, classes="title")
-            if self._title:
-                yield Static(Text(self._title, style="bold"))
-            if self._description:
-                yield Static(Text(self._description, style="dim"))
-            if self._sentinel_kind:
-                yield Static(
-                    Text(
-                        f"⚠ pre-planning-halt sentinel ({self._sentinel_kind}) — "
-                        "re-arm deletes it (a copy is preserved) for a clean re-dispatch",
+            with VerticalScroll(id="body"):
+                if self._title:
+                    yield Static(Text(self._title, style="bold"))
+                if self._description:
+                    yield Static(Text(self._description, style="dim"))
+                if self._sentinel_kind:
+                    yield Static(
+                        Text(
+                            f"⚠ pre-planning-halt sentinel ({self._sentinel_kind}) — "
+                            "re-arm deletes it (a copy is preserved) for a clean re-dispatch",
+                            style="yellow",
+                        )
+                    )
+                with Vertical(id="blocking"):
+                    body = self._blocking.strip()
+                    yield Static(
+                        Text(body)
+                        if body
+                        else Text("(no blocking condition recorded)", style="dim")
+                    )
+                if self._engine_live:
+                    yield Static(
+                        Text("engine may still be live — stop it before resolving", style="yellow")
+                    )
+                hint = Text()
+                if self._restore_recorded:
+                    # honoring the latch from here would be unsafe (a stale marker is
+                    # indistinguishable from a fresh one), so Re-arm stays a plain
+                    # from-scratch re-drive — but never a silent drop of the decision.
+                    hint.append(
+                        "⚠ the resolution records a restore patch — Re-arm here re-drives "
+                        "from scratch and drops it; run `bmad-loop resolve` to honor the "
+                        "restore",
                         style="yellow",
                     )
-                )
-            with VerticalScroll(id="blocking"):
-                body = self._blocking.strip()
-                yield Static(
-                    Text(body) if body else Text("(no blocking condition recorded)", style="dim")
-                )
-            if self._engine_live:
-                yield Static(
-                    Text("engine may still be live — stop it before resolving", style="yellow")
-                )
-            hint = Text()
-            if self._restore_recorded:
-                # honoring the latch from here would be unsafe (a stale marker is
-                # indistinguishable from a fresh one), so Re-arm stays a plain
-                # from-scratch re-drive — but never a silent drop of the decision.
-                hint.append(
-                    "⚠ the resolution records a restore patch — Re-arm here re-drives "
-                    "from scratch and drops it; run `bmad-loop resolve` to honor the "
-                    "restore",
-                    style="yellow",
-                )
-            elif self._resolution_ready:
-                hint.append("resolution recorded — re-arm & resume when ready", style="green")
-            else:
-                hint.append(
-                    "resolve opens an interactive agent to fix the frozen spec; "
-                    "re-arm unlocks once it records a resolution",
-                    style="dim",
-                )
-            yield Static(hint)
+                elif self._resolution_ready:
+                    hint.append("resolution recorded — re-arm & resume when ready", style="green")
+                else:
+                    hint.append(
+                        "resolve opens an interactive agent to fix the frozen spec; "
+                        "re-arm unlocks once it records a resolution",
+                        style="dim",
+                    )
+                yield Static(hint)
             with Horizontal(classes="buttons"):
                 yield Button(
                     "Resolve", variant="primary", id="act-resolve", disabled=self._engine_live

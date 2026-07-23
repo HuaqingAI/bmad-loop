@@ -1232,6 +1232,122 @@ async def test_answer_decisions_none_notifies(project):
         await until(pilot, lambda: any("no unanswered decisions" in m for m in notifications(app)))
 
 
+# ------------------------------------- #275 modal bodies scroll, buttons stay
+
+
+def _on_screen(app, w) -> bool:
+    """A widget's laid-out region is non-empty and fully inside the screen —
+    i.e. the button is reachable, not clipped off the visible area (#275)."""
+    r = w.region
+    return r.width > 0 and r.height > 0 and app.screen.region.contains_region(r)
+
+
+def _long_decision():
+    from bmad_loop.sweep import Decision, DecisionOption
+
+    options = tuple(
+        DecisionOption(
+            key=str(i),
+            label=f"option {i} — " + "a wordy option label that keeps going " * 3,
+            effect="build",
+            intent="a long intent describing what building this bundle would do " * 2,
+        )
+        for i in range(1, 9)
+    )
+    return Decision(
+        id="DW-1",
+        question="a decision question that is itself fairly wordy " * 3,
+        context="\n".join(f"context line {i} with some detail" for i in range(60)),
+        options=options,
+        recommendation="1",
+    )
+
+
+async def test_decision_modal_scrolls_when_content_long(project):
+    """A long question + 60-line context + 8 options overflow the dialog, but the
+    body scrolls so the docked skip button stays reachable and every per-option
+    choose button is present."""
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(90, 16)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app.push_screen(DecisionModal(_long_decision()))
+        await until(pilot, lambda: isinstance(app.screen, DecisionModal))
+        body = await ready(pilot, "#body")
+        assert body.max_scroll_y > 0  # content overflows yet scrolls
+        assert _on_screen(app, app.screen.query_one("#cancel", Button))  # skip reachable
+        assert app.screen.query_one("#opt-8", Button)  # last option present in the DOM
+
+
+async def test_escalation_modal_scrolls_when_description_long(project):
+    """A long escalation description overflows; the body scrolls and both the
+    Resolve and close buttons stay on-screen."""
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(90, 16)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app.push_screen(
+            EscalationModal(
+                story_key="e-1-s",
+                title="t",
+                description="X\n" * 80,
+                blocking="b",
+                sentinel_kind="",
+                resolution_ready=False,
+                engine_live=False,
+            )
+        )
+        await until(pilot, lambda: isinstance(app.screen, EscalationModal))
+        body = await ready(pilot, "#body")
+        assert body.max_scroll_y > 0
+        assert _on_screen(app, app.screen.query_one("#act-resolve", Button))
+        assert _on_screen(app, app.screen.query_one("#cancel", Button))
+
+
+async def test_confirm_modal_scrolls_long_body(project):
+    """A ConfirmModal (covers ConfirmResumeModal by inheritance) with a long body
+    scrolls it so the confirm/cancel buttons stay reachable."""
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(64, 12)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app.push_screen(ConfirmModal("t", "line\n" * 80, warning="w"))
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        body = await ready(pilot, "#body")
+        assert body.max_scroll_y > 0
+        assert _on_screen(app, app.screen.query_one("#ok", Button))
+        assert _on_screen(app, app.screen.query_one("#cancel", Button))
+
+
+async def test_start_sweep_and_checkpoint_buttons_reachable(project):
+    """On a short terminal the bounded modals keep their docked action buttons
+    on-screen: the body scrolls to absorb the overflow instead of pushing the
+    button row off the bottom. The height (14) sits just above the frame floor —
+    a thick-bordered dialog with a title and a 3-row button row needs ~13 rows
+    before any body content — so the assertion isolates the body-scroll fix."""
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(64, 14)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app.push_screen(StartSweepModal())
+        await until(pilot, lambda: isinstance(app.screen, StartSweepModal))
+        body = await ready(pilot, "#body")
+        assert body.max_scroll_y > 0  # options overflow the shrunk body, so it scrolls
+        assert _on_screen(app, app.screen.query_one("#ok", Button))
+        assert _on_screen(app, app.screen.query_one("#cancel", Button))
+        app.pop_screen()
+
+        app.push_screen(
+            StoryCheckpointModal(
+                story_key="e-1-s",
+                title="t",
+                commit="abc123",
+                verify_line="v",
+                tokens="0",
+            )
+        )
+        await until(pilot, lambda: isinstance(app.screen, StoryCheckpointModal))
+        await ready(pilot, "#body")
+        assert _on_screen(app, app.screen.query_one("#act-continue", Button))
+        assert _on_screen(app, app.screen.query_one("#cancel", Button))
+
+
 def test_cli_tui_hint_without_textual(project, monkeypatch, capsys):
     """`bmad-loop tui` prints the install hint when the extra is missing."""
     import builtins
