@@ -715,3 +715,72 @@ def test_strip_auto_run_result_ignores_heading_in_mismatched_fence_char(tmp_path
     sp.write_text(original, encoding="utf-8")
     assert devcontract.strip_auto_run_result(sp) is False
     assert sp.read_text() == original
+
+
+# ------------------------------- find_frontmatter_candidates (#224)
+#
+# The missing-marker fallback scan: terminal-frontmatter specs with NO real
+# `## Auto Run Result` heading, written at/after the session-launch floor.
+
+
+def _write(dirpath: Path, name: str, text: str, mtime_ns: int | None = None) -> Path:
+    path = dirpath / name
+    path.write_text(text, encoding="utf-8")
+    if mtime_ns is not None:
+        os.utime(path, ns=(mtime_ns, mtime_ns))
+    return path
+
+
+def test_frontmatter_candidates_finds_done_and_blocked(tmp_path):
+    _write(tmp_path, "spec-a.md", "---\nstatus: done\n---\n\nbody\n", 2_000)
+    _write(tmp_path, "spec-b.md", "---\nstatus: blocked\n---\n\nbody\n", 3_000)
+    found = devcontract.find_frontmatter_candidates(tmp_path, since_ns=0)
+    # most-recent first
+    assert [p.name for p in found] == ["spec-b.md", "spec-a.md"]
+
+
+def test_frontmatter_candidates_excludes_marker_bearing_spec(tmp_path):
+    _write(
+        tmp_path,
+        "spec-a.md",
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n",
+    )
+    assert devcontract.find_frontmatter_candidates(tmp_path, since_ns=0) == []
+
+
+def test_frontmatter_candidates_includes_fence_quoted_heading_only(tmp_path):
+    """A heading quoted inside a fence is documentation (#52) — the spec has no
+    REAL marker, so it IS a missing-marker candidate."""
+    p = _write(
+        tmp_path,
+        "spec-a.md",
+        "---\nstatus: done\n---\n\n```\n## Auto Run Result\n\nStatus: done\n```\n",
+    )
+    assert devcontract.find_frontmatter_candidates(tmp_path, since_ns=0) == [p]
+
+
+def test_frontmatter_candidates_excludes_no_spec_fallback_file(tmp_path):
+    """bmad-dev-auto-result-*.md is the skill's no-spec fallback — matched by
+    name on the normal scan, so the fallback scan must not double-claim it."""
+    _write(tmp_path, "bmad-dev-auto-result-x.md", "---\nstatus: done\n---\n\nbody\n")
+    assert devcontract.find_frontmatter_candidates(tmp_path, since_ns=0) == []
+
+
+def test_frontmatter_candidates_enforces_mtime_floor(tmp_path):
+    _write(tmp_path, "spec-a.md", "---\nstatus: done\n---\n\nbody\n", 1_000)
+    assert devcontract.find_frontmatter_candidates(tmp_path, since_ns=2_000) == []
+
+
+def test_frontmatter_candidates_excludes_non_terminal_status(tmp_path):
+    for status in ("draft", "in-progress", "in-review", "ready-for-dev", ""):
+        _write(tmp_path, "spec-a.md", f"---\nstatus: {status}\n---\n\nbody\n")
+        assert devcontract.find_frontmatter_candidates(tmp_path, since_ns=0) == []
+
+
+def test_frontmatter_candidates_skips_unreadable_file(tmp_path):
+    (tmp_path / "spec-a.md").write_bytes(b"\xff\xfe\x00\x01 not utf-8 \x80\x81")
+    assert devcontract.find_frontmatter_candidates(tmp_path, since_ns=0) == []
+
+
+def test_frontmatter_candidates_missing_dir_is_empty(tmp_path):
+    assert devcontract.find_frontmatter_candidates(tmp_path / "nope", since_ns=0) == []

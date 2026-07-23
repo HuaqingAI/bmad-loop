@@ -9,6 +9,7 @@ propagation / hook-signal waiting / kill end-to-end for any profile.
 
 import dataclasses
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -2245,7 +2246,7 @@ def test_post_kill_reconcile_synth_read_error_keeps_stall(tmp_path, monkeypatch)
     (impl / "spec-3-1-foo.md").write_text(_DONE_SPEC)
     for exc in (OSError("I/O error"), UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid")):
 
-        def raising(handle, spec, *, wait, _exc=exc):
+        def raising(handle, spec, *, wait, dead_window=False, _exc=exc):
             raise _exc
 
         monkeypatch.setattr(adapter, "_synth_result", raising)
@@ -2938,3 +2939,196 @@ def test_tmux_timeout_with_flushed_spec_rescued_post_kill(tmp_path):
     assert result.status == "completed"
     assert result.result_json["status"] == "done"
     assert result.result_json["post_kill_reconciled"] is True
+
+
+# ------------------------------- missing-marker fallback (#224)
+#
+# A session (in practice: the follow-up review leg) can finalize the spec's
+# frontmatter to a terminal status while omitting the `## Auto Run Result`
+# marker find_result_artifact keys on. The scan-path fallback synthesizes from
+# the frontmatter once the fingerprint holds stable across FM_FALLBACK_MIN_OBS
+# resultless Stops (live), or on a single sighting under a dead window
+# (post-kill reconcile).
+
+_MARKERLESS_DONE = "---\nstatus: done\nbaseline_revision: abc123\n---\n\n# Story\n\nAll done.\n"
+_MARKERLESS_BLOCKED = "---\nstatus: blocked\n---\n\n# Story\n\nStuck.\n"
+
+
+def test_frontmatter_fallback_synthesizes_on_second_stable_stop(tmp_path, monkeypatch):
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    (impl / "spec-3-1-foo.md").write_text(_MARKERLESS_DONE)
+    # first resultless Stop: observation recorded, no harvest yet
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+    (crumb,) = _breadcrumbs(adapter)
+    assert crumb["verdict"] == "terminal-frontmatter-pending"
+    assert "spec-3-1-foo.md" in crumb["detail"]
+    # second Stop over the identical (path, mtime, status) fingerprint: harvest
+    rj = adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True)
+    assert rj["status"] == "done"
+    assert rj["workflow"] == "auto-dev"
+    assert rj["baseline_commit"] == "abc123"
+    assert rj["synthesized_from_frontmatter"] is True
+    assert rj["escalations"] == []
+    # the harvest pass writes no breadcrumb
+    assert len(_breadcrumbs(adapter)) == 1
+
+
+def test_frontmatter_fallback_stamps_story_key_and_dw_ids(tmp_path, monkeypatch):
+    """The fallback shares _synthesize_from with the marker path, so bundle dev
+    sessions get their exported dw ids stamped for verify_dev_bundle."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    (impl / "spec-3-1-foo.md").write_text(_MARKERLESS_DONE)
+    spec = dataclasses.replace(
+        _dev_spec(tmp_path),
+        env={"BMAD_LOOP_STORY_KEY": "3-1", "BMAD_LOOP_DW_IDS": "DW-7, DW-9"},
+    )
+    assert adapter._result_json(_dev_handle(), spec, wait=True) is None
+    rj = adapter._result_json(_dev_handle(), spec, wait=True)
+    assert rj["story_key"] == "3-1"
+    assert rj["dw_ids"] == ["DW-7", "DW-9"]
+
+
+def test_frontmatter_fallback_mtime_bump_resets_counter(tmp_path, monkeypatch):
+    """A spec still being written (the premature-harvest hazard: review launched
+    on a done spec, first edit bumped mtime before the in-review flip) must not
+    be harvested — any fingerprint change restarts the count."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+    os.utime(spec_file, ns=(1_000_000_000, 1_000_000_000))
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+    os.utime(spec_file, ns=(2_000_000_000, 2_000_000_000))  # the session wrote again
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+    # now stable across two Stops -> harvest on the third call
+    rj = adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True)
+    assert rj["synthesized_from_frontmatter"] is True
+    verdicts = [c["verdict"] for c in _breadcrumbs(adapter)]
+    assert verdicts == ["terminal-frontmatter-pending", "terminal-frontmatter-pending"]
+
+
+def test_frontmatter_fallback_status_flip_clears_observations(tmp_path, monkeypatch):
+    """done -> in-review (a review actually running) drops the candidate AND the
+    recorded fingerprint, so a later terminal state starts the count over."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+    os.utime(spec_file, ns=(1_000_000_000, 1_000_000_000))
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+    spec_file.write_text("---\nstatus: in-review\n---\n\n# Story\n")
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+    assert adapter._fm_fallback_obs == {}
+    spec_file.write_text(_MARKERLESS_DONE)
+    os.utime(spec_file, ns=(3_000_000_000, 3_000_000_000))
+    # back at one observation: not harvested yet
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+    rj = adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True)
+    assert rj["synthesized_from_frontmatter"] is True
+
+
+def test_frontmatter_fallback_blocked_synthesizes_critical(tmp_path, monkeypatch):
+    """A marker-less blocked terminal synthesizes the same CRITICAL escalation
+    stories mode produces, routing decide_dev/decide_review_session to PAUSE."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    (impl / "spec-3-1-foo.md").write_text(_MARKERLESS_BLOCKED)
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+    rj = adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True)
+    assert rj["status"] == "blocked"
+    assert rj["synthesized_from_frontmatter"] is True
+    (esc,) = rj["escalations"]
+    assert esc["severity"] == "CRITICAL"
+
+
+def test_frontmatter_fallback_ambiguous_never_harvests(tmp_path, monkeypatch):
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    (impl / "spec-3-1-foo.md").write_text(_MARKERLESS_DONE)
+    (impl / "spec-3-2-bar.md").write_text(_MARKERLESS_DONE)
+    for _ in range(3):
+        assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+    verdicts = {c["verdict"] for c in _breadcrumbs(adapter)}
+    assert verdicts == {"ambiguous-frontmatter"}
+    assert "2 terminal marker-less candidates" in _breadcrumbs(adapter)[0]["detail"]
+
+
+def test_frontmatter_fallback_pre_launch_spec_is_no_artifact(tmp_path, monkeypatch):
+    """A marker-less terminal spec older than the session launch is prior state,
+    not this session's output — the plain no-artifact verdict stands."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    (impl / "spec-3-1-foo.md").write_text(_MARKERLESS_DONE)
+    handle = _dev_handle(launched_ns=time.time_ns() + 10**12)
+    assert adapter._result_json(handle, _dev_spec(tmp_path), wait=True) is None
+    (crumb,) = _breadcrumbs(adapter)
+    assert crumb["verdict"] == "no-artifact"
+
+
+def test_frontmatter_fallback_wait_false_is_compare_only(tmp_path, monkeypatch):
+    """The crash path's read-once (wait=False, live window) neither records
+    observations nor writes breadcrumbs; it may only harvest a fingerprint the
+    live loop already saw and that still matches."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+    os.utime(spec_file, ns=(1_000_000_000, 1_000_000_000))
+    # no prior observation: nothing harvested, nothing recorded, no crumb
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=False) is None
+    assert adapter._fm_fallback_obs == {}
+    assert _breadcrumbs(adapter) == []
+    # one live observation, then the crash read over the unchanged state harvests
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+    rj = adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=False)
+    assert rj["synthesized_from_frontmatter"] is True
+
+
+def test_post_kill_reconcile_rescues_markerless_done_spec(tmp_path):
+    """The #224 backstop: dead window + terminal marker-less frontmatter rescues
+    on a single sighting — no live observations required."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    adapter._window_alive = lambda handle: False
+    (impl / "spec-3-1-foo.md").write_text(_MARKERLESS_DONE)
+    result = adapter._post_kill_reconcile(_dev_handle(), _dev_spec(tmp_path), _unvouched())
+    assert result.status == "completed"
+    assert result.result_json["status"] == "done"
+    assert result.result_json["post_kill_reconciled"] is True
+    assert result.result_json["synthesized_from_frontmatter"] is True
+
+
+def test_post_kill_reconcile_markerless_blocked_keeps_verdict(tmp_path):
+    """The post-kill done-only gate still refuses a blocked synthesis: blocked
+    carries no finished work, marker or no marker."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    adapter._window_alive = lambda handle: False
+    (impl / "spec-3-1-foo.md").write_text(_MARKERLESS_BLOCKED)
+    original = _unvouched()
+    assert adapter._post_kill_reconcile(_dev_handle(), _dev_spec(tmp_path), original) is original
+
+
+def test_post_kill_reconcile_markerless_ambiguous_keeps_verdict(tmp_path):
+    adapter, impl = make_dev_adapter(tmp_path)
+    adapter._window_alive = lambda handle: False
+    (impl / "spec-3-1-foo.md").write_text(_MARKERLESS_DONE)
+    (impl / "spec-3-2-bar.md").write_text(_MARKERLESS_DONE)
+    original = _unvouched()
+    assert adapter._post_kill_reconcile(_dev_handle(), _dev_spec(tmp_path), original) is original
+
+
+def test_wait_loop_completes_markerless_spec_on_second_stop(tmp_path, monkeypatch):
+    """End-to-end through wait_for_completion: two Stops over a stable
+    marker-less done spec complete the session instead of arming the stall
+    grace toward the #149 livelock."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    adapter, impl = make_dev_adapter(tmp_path)
+    (impl / "spec-3-1-foo.md").write_text(_MARKERLESS_DONE)
+    stop = _stop_event("3-1-dev-1", "sess-1", "/t.jsonl")
+    adapter.watcher = _ScriptedWatcher([stop, stop])
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert result.status == "completed"
+    assert result.result_json["status"] == "done"
+    assert result.result_json["synthesized_from_frontmatter"] is True

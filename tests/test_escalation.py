@@ -2,9 +2,14 @@
 resolved-escalation guard that re-escalates instead of silently deferring."""
 
 from bmad_loop.adapters.base import SessionResult
-from bmad_loop.escalation import Action, decide_dev, decide_review_session
+from bmad_loop.escalation import (
+    Action,
+    decide_dev,
+    decide_review_session,
+    review_retry_or_exhaust,
+)
 from bmad_loop.model import StoryTask
-from bmad_loop.policy import LimitsPolicy, NotifyPolicy, Policy
+from bmad_loop.policy import LimitsPolicy, NotifyPolicy, Policy, ReviewPolicy
 from bmad_loop.verify import VerifyOutcome
 
 POLICY = Policy(
@@ -121,3 +126,92 @@ def test_review_exhausted_reescalates_resolved_redrive():
     decision = decide_review_session(task, crashed, POLICY)
     assert decision.action == Action.PAUSE
     assert "re-escalating instead of deferring" in decision.reason
+
+
+# ------------------------------- review.on_timeout routing (#271)
+
+
+def _policy(on_timeout: str) -> Policy:
+    return Policy(
+        limits=LimitsPolicy(max_dev_attempts=2, max_review_cycles=2),
+        notify=NotifyPolicy(desktop=False, file=True),
+        review=ReviewPolicy(on_timeout=on_timeout),
+    )
+
+
+def test_review_timeout_default_retry_matches_legacy_decisions():
+    """on_timeout="retry" (the default) is byte-compatible with the pre-knob
+    routing for every timeout-like status."""
+    for status in ("timeout", "stalled", "over_budget"):
+        result = SessionResult(status=status)
+        with_budget = decide_review_session(_task(review_cycle=1), result, _policy("retry"))
+        assert with_budget.action == Action.RETRY
+        assert with_budget.reason == f"review session {status}"
+        spent = decide_review_session(_task(review_cycle=2), result, _policy("retry"))
+        assert spent.action == Action.DEFER
+
+
+def test_review_timeout_salvage_mode_routes_to_salvage():
+    for status in ("timeout", "stalled", "over_budget"):
+        result = SessionResult(status=status)
+        # budget state is irrelevant: the engine owns the fallback routing
+        for cycle in (1, 2):
+            decision = decide_review_session(
+                _task(review_cycle=cycle), result, _policy("salvage-if-done")
+            )
+            assert decision.action == Action.SALVAGE
+            assert decision.reason == f"review session {status}"
+
+
+def test_review_timeout_defer_mode_gives_up_immediately():
+    decision = decide_review_session(
+        _task(review_cycle=1), SessionResult(status="timeout"), _policy("defer")
+    )
+    assert decision.action == Action.DEFER
+    assert "review.on_timeout=defer" in decision.reason
+
+
+def test_review_timeout_defer_mode_reescalates_resolved_redrive():
+    """The resolved_redrive latch outranks the defer mode — same contract as
+    budget exhaustion (never silently downgrade a human's correction)."""
+    decision = decide_review_session(
+        _task(review_cycle=1, resolved_redrive=True),
+        SessionResult(status="timeout"),
+        _policy("defer"),
+    )
+    assert decision.action == Action.PAUSE
+    assert "re-escalating instead of deferring" in decision.reason
+
+
+def test_review_crashed_unaffected_by_on_timeout_modes():
+    """crashed is not a timeout-like verdict: every mode keeps the default
+    retry/exhaust routing for it."""
+    crashed = SessionResult(status="crashed")
+    for mode in ("retry", "salvage-if-done", "defer"):
+        assert decide_review_session(_task(review_cycle=1), crashed, _policy(mode)).action == (
+            Action.RETRY
+        )
+        assert decide_review_session(_task(review_cycle=2), crashed, _policy(mode)).action == (
+            Action.DEFER
+        )
+
+
+def test_review_env_fault_pauses_under_every_on_timeout_mode():
+    """env-fault (#194) short-circuits before the on_timeout branch."""
+    env_fault = SessionResult(status="timeout", env_fault=True)
+    for mode in ("retry", "salvage-if-done", "defer"):
+        decision = decide_review_session(_task(review_cycle=1), env_fault, _policy(mode))
+        assert decision.action == Action.PAUSE
+        assert "environment fault" in decision.reason
+
+
+def test_review_completed_proceeds_under_every_on_timeout_mode():
+    for mode in ("retry", "salvage-if-done", "defer"):
+        assert decide_review_session(_task(), COMPLETED, _policy(mode)).action == Action.PROCEED
+
+
+def test_review_retry_or_exhaust_helper_matches_budget_semantics():
+    assert review_retry_or_exhaust(_task(review_cycle=1), POLICY, "r").action == Action.RETRY
+    assert review_retry_or_exhaust(_task(review_cycle=2), POLICY, "r").action == Action.DEFER
+    latched = review_retry_or_exhaust(_task(review_cycle=2, resolved_redrive=True), POLICY, "r")
+    assert latched.action == Action.PAUSE

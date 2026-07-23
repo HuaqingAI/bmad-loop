@@ -324,6 +324,51 @@ def find_result_artifact(impl_artifacts: Path, *, since_ns: int) -> Path | None:
     return best[1] if best else None
 
 
+def find_frontmatter_candidates(impl_artifacts: Path, *, since_ns: int) -> list[Path]:
+    """Missing-marker fallback scan (#224): specs this session finalized to a
+    terminal frontmatter ``status:`` WITHOUT appending the ``## Auto Run Result``
+    marker `find_result_artifact` keys on. The skill's HALT instructions make the
+    append unconditional, but compliance is intermittent — without this scan such
+    a spec is invisible to the harvest and a finished story rides stall-nudges to
+    timeout, then loses its work to a retry/DEFER cycle.
+
+    A candidate must be modified at/after `since_ns` (same session-launch floor
+    as the marker scan), carry ZERO real (non-fenced) marker headings, not be the
+    no-spec fallback file (that one is already matched by name on the normal
+    path), and have frontmatter ``status:`` of ``done`` or ``blocked``. Returns
+    ALL matches, most-recent first — the caller refuses to guess between several
+    and must apply its own stability fingerprint before synthesizing, because a
+    terminal frontmatter under a live window is weaker evidence than the marker.
+    """
+    if not impl_artifacts.is_dir():
+        return []
+    found: list[tuple[int, Path]] = []
+    for path in impl_artifacts.glob("*.md"):
+        if path.name.startswith(FALLBACK_RESULT_PREFIX):
+            continue
+        try:
+            mtime_ns = path.stat().st_mtime_ns
+        except OSError:
+            continue
+        if mtime_ns < since_ns:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if _section_headings(text):
+            continue  # carries a real marker — the normal scan's territory
+        try:
+            fm = read_frontmatter(path)
+        except OSError:
+            continue
+        if str(fm.get("status", "")).strip().lower() not in (DONE, BLOCKED):
+            continue
+        found.append((mtime_ns, path))
+    found.sort(key=lambda t: t[0], reverse=True)
+    return [p for _, p in found]
+
+
 def reset_spec_status(spec_path: Path, new_status: str) -> bool:
     """Rewrite the frontmatter ``status:`` value of a spec in place.
 
