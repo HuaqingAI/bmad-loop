@@ -861,6 +861,50 @@ def test_provision_worktree_reports_seed_dir_with_nothing_to_copy(tmp_path):
     assert (wt / "cfg" / "tracked.yaml").read_text() == "IN_WORKTREE"
 
 
+def test_provision_worktree_seed_dir_over_existing_file_is_skipped(tmp_path):
+    """A directory entry whose destination is a FILE is a type mismatch: recursing
+    would mkdir over the file. The file wins (no-clobber) and the entry is reported
+    skipped like any other whose destination already exists."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    (repo / "cfg").mkdir(parents=True)
+    (repo / "cfg" / "ignored.yaml").write_text("SEED ME", encoding="utf-8")
+    wt.mkdir()
+    (wt / "cfg").write_text("A FILE, NOT A DIR", encoding="utf-8")
+
+    assert provision_worktree(wt, [], repo, seed_files=["cfg"]) == ["cfg"]
+    assert (wt / "cfg").read_text() == "A FILE, NOT A DIR"  # untouched
+
+
+def test_provision_worktree_seed_skips_nested_file_typed_as_dir(tmp_path):
+    """The same type mismatch one level down: a child that is a dir in the repo but
+    a FILE in the checkout is skipped whole (never mkdir'd over), while its absent
+    siblings still seed — so the entry counts as applied."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    (repo / "cfg" / "sub").mkdir(parents=True)
+    (repo / "cfg" / "sub" / "deep.yaml").write_text("SEED ME", encoding="utf-8")
+    (repo / "cfg" / "ignored.yaml").write_text("SEED ME TOO", encoding="utf-8")
+    (wt / "cfg").mkdir(parents=True)
+    (wt / "cfg" / "sub").write_text("A FILE, NOT A DIR", encoding="utf-8")
+
+    assert provision_worktree(wt, [], repo, seed_files=["cfg"]) == []
+    assert (wt / "cfg" / "sub").read_text() == "A FILE, NOT A DIR"  # untouched
+    assert (wt / "cfg" / "ignored.yaml").read_text() == "SEED ME TOO"
+
+
+def test_provision_worktree_seeds_absent_empty_child_dir(tmp_path):
+    """Creating a missing EMPTY child directory is a write: the entry modified the
+    worktree, so it is treated as applied rather than reported as a no-op."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    (repo / "cfg" / "empty").mkdir(parents=True)
+    (repo / "cfg" / "tracked.yaml").write_text("FROM_REPO", encoding="utf-8")
+    (wt / "cfg").mkdir(parents=True)
+    (wt / "cfg" / "tracked.yaml").write_text("IN_WORKTREE", encoding="utf-8")
+
+    assert provision_worktree(wt, [], repo, seed_files=["cfg"]) == []
+    assert (wt / "cfg" / "empty").is_dir()
+    assert (wt / "cfg" / "tracked.yaml").read_text() == "IN_WORKTREE"  # untouched
+
+
 def test_provision_worktree_reports_nothing_when_seeding_succeeds(tmp_path):
     """A seed that actually copies is not reported — the signal stays specific to
     entries that silently did nothing. A missing source is also not a no-op report:
@@ -1109,3 +1153,16 @@ def test_copy_traversable_skip_existing_reports_total_noop(tmp_path):
 
     assert _copy_traversable(src, dst, skip_existing=True) is False
     assert (dst / "d" / "f.txt").read_text() == "ON_DISK"
+
+
+def test_copy_traversable_skip_existing_never_mkdirs_over_file(tmp_path):
+    """A destination FILE standing where the source has a directory is left alone:
+    without the guard, mkdir(exist_ok=True) on the file raises FileExistsError."""
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    (src / "d").mkdir(parents=True)
+    (src / "d" / "f.txt").write_text("FROM_SRC", encoding="utf-8")
+    dst.mkdir()
+    (dst / "d").write_text("A FILE, NOT A DIR", encoding="utf-8")
+
+    assert _copy_traversable(src, dst, skip_existing=True) is False
+    assert (dst / "d").read_text() == "A FILE, NOT A DIR"

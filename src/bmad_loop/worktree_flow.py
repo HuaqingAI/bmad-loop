@@ -143,7 +143,11 @@ def provision_worktree(
         if not src.exists():
             continue
         if dst.exists():
-            if not src.is_dir():
+            # File entries keep the classic copy-when-absent skip. A destination
+            # that is not a directory while the source is (the checkout carries a
+            # FILE where the seed names a dir) is a type mismatch: recursing would
+            # try to mkdir over the file, so the entry is skipped whole instead.
+            if not src.is_dir() or not dst.is_dir():
                 skipped.append(str(rel))
                 continue
             # A DIRECTORY whose destination exists is the case #230 reported: the

@@ -391,7 +391,9 @@ def _copy_traversable(src, dst: Path, *, skip_existing: bool = False) -> bool:
     filesystem path, so it works even when the package is zip-imported.
 
     ``skip_existing`` makes the copy no-clobber at FILE granularity: an existing
-    destination file is left untouched and its siblings are still copied. It is
+    destination file is left untouched and its siblings are still copied — even
+    when it stands where the source has a directory (that subtree is skipped
+    whole rather than mkdir'd over the file). It is
     opt-in because the `--force-skills` path (`install_into`) rmtree's the
     destination precisely to overwrite it, and a guard baked into this helper
     would silently regress that. Only the worktree-seed caller passes it.
@@ -401,9 +403,16 @@ def _copy_traversable(src, dst: Path, *, skip_existing: bool = False) -> bool:
     no-op (every child was already present). Every other call site ignores it.
     """
     if src.is_dir():
+        if skip_existing and dst.exists() and not dst.is_dir():
+            # a FILE sits where the source has a directory: mkdir would raise
+            # FileExistsError. Under the no-clobber contract the file wins and
+            # the whole subtree is skipped, like any existing destination.
+            return False
+        # creating a missing directory IS a write: an empty dir seeded into an
+        # existing tree must count, or the entry is misreported as a total no-op.
+        copied = not dst.exists()
         dst.mkdir(parents=True, exist_ok=True)
         # `any(...)` would short-circuit and skip the remaining children.
-        copied = False
         for child in src.iterdir():
             if _copy_traversable(child, dst / child.name, skip_existing=skip_existing):
                 copied = True
