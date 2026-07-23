@@ -3272,12 +3272,10 @@ def _transitioned_spec(tmp_path, spec_file: Path, live_status: str = "in-review"
     return spec
 
 
-def _transition_crumbs(adapter, task_id="3-1-dev-1"):
-    return [
-        ln
-        for ln in _lifecycle_lines(adapter, task_id)
-        if ln["event"] == "spec-status-transition-observed"
-    ]
+def _lifecycle_events(adapter, event, task_id="3-1-dev-1"):
+    """Lifecycle breadcrumbs of one `event` kind — the shared filter behind the
+    per-event helpers (`spec-status-transition-observed`, `contract-nudge-sent`)."""
+    return [ln for ln in _lifecycle_lines(adapter, task_id) if ln["event"] == event]
 
 
 def test_observe_tick_records_first_transition(tmp_path):
@@ -3290,7 +3288,7 @@ def test_observe_tick_records_first_transition(tmp_path):
 
     adapter._observe_tick(_dev_handle(), spec)
     assert adapter._fm_transition_obs == {"3-1-dev-1": "in-review"}
-    (crumb,) = _transition_crumbs(adapter)
+    (crumb,) = _lifecycle_events(adapter, "spec-status-transition-observed")
     assert crumb["status"] == "in-review"
     assert crumb["spec"] == str(spec_file)
 
@@ -3298,7 +3296,7 @@ def test_observe_tick_records_first_transition(tmp_path):
     spec_file.write_text("---\nstatus: in-progress\n---\n\n# Story\n\nStill.\n")
     adapter._observe_tick(_dev_handle(), spec)
     assert adapter._fm_transition_obs == {"3-1-dev-1": "in-review"}
-    assert len(_transition_crumbs(adapter)) == 1
+    assert len(_lifecycle_events(adapter, "spec-status-transition-observed")) == 1
 
 
 @pytest.mark.parametrize(
@@ -3326,7 +3324,7 @@ def test_observe_tick_ignores_terminal_blank_and_launch_status(tmp_path, on_disk
     adapter._observe_tick(_dev_handle(), spec)
 
     assert adapter._fm_transition_obs == {}
-    assert _transition_crumbs(adapter) == []
+    assert _lifecycle_events(adapter, "spec-status-transition-observed") == []
 
 
 def test_observe_tick_without_snapshot_or_unreadable_is_noop(tmp_path, monkeypatch):
@@ -3473,10 +3471,6 @@ def test_wait_loop_heartbeat_drives_observe_tick(tmp_path, monkeypatch):
 # synthesis stays the backstop for a session that never complies.
 
 
-def _nudge_crumbs(adapter, task_id="3-1-dev-1"):
-    return [ln for ln in _lifecycle_lines(adapter, task_id) if ln["event"] == "contract-nudge-sent"]
-
-
 def _record_sent(adapter):
     sent: list[str] = []
     adapter.send_text = lambda handle, text: sent.append(text)
@@ -3496,7 +3490,7 @@ def test_contract_nudge_sent_on_first_pending_observation(tmp_path, monkeypatch)
     assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
 
     assert sent == [generic.CONTRACT_NUDGE_TEXT.format(spec_path=spec_file, status="done")]
-    (crumb,) = _nudge_crumbs(adapter)
+    (crumb,) = _lifecycle_events(adapter, "contract-nudge-sent")
     assert crumb["spec"] == str(spec_file) and crumb["status"] == "done"
     (verdict,) = _breadcrumbs(adapter)
     assert verdict["verdict"] == "terminal-frontmatter-pending"
@@ -3522,7 +3516,7 @@ def test_contract_nudge_exactly_once_across_mtime_reset(tmp_path, monkeypatch):
     assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
 
     assert len(sent) == 1  # not re-nudged despite observations back at 1
-    assert len(_nudge_crumbs(adapter)) == 1
+    assert len(_lifecycle_events(adapter, "contract-nudge-sent")) == 1
 
 
 def test_contract_nudge_not_sent_when_transition_proven(tmp_path, monkeypatch):
@@ -3543,7 +3537,7 @@ def test_contract_nudge_not_sent_when_transition_proven(tmp_path, monkeypatch):
 
     assert rj is not None and rj["synthesized_from_frontmatter"] is True
     assert sent == []
-    assert _nudge_crumbs(adapter) == []
+    assert _lifecycle_events(adapter, "contract-nudge-sent") == []
 
 
 def test_contract_nudge_not_sent_on_ambiguous(tmp_path, monkeypatch):
@@ -3560,7 +3554,7 @@ def test_contract_nudge_not_sent_on_ambiguous(tmp_path, monkeypatch):
     (crumb,) = _breadcrumbs(adapter)
     assert crumb["verdict"] == "ambiguous-frontmatter"
     assert sent == []
-    assert _nudge_crumbs(adapter) == []
+    assert _lifecycle_events(adapter, "contract-nudge-sent") == []
 
 
 def test_contract_nudge_not_sent_on_dead_window(tmp_path):
@@ -3575,7 +3569,7 @@ def test_contract_nudge_not_sent_on_dead_window(tmp_path):
 
     assert result.status == "completed"  # synthesized on the dead window
     assert sent == []
-    assert _nudge_crumbs(adapter) == []
+    assert _lifecycle_events(adapter, "contract-nudge-sent") == []
 
 
 def test_contract_nudge_not_sent_on_unmodified_refusal(tmp_path, monkeypatch):
@@ -3594,7 +3588,7 @@ def test_contract_nudge_not_sent_on_unmodified_refusal(tmp_path, monkeypatch):
     (crumb,) = _breadcrumbs(adapter)
     assert crumb["verdict"] == "unmodified-since-launch"
     assert sent == []
-    assert _nudge_crumbs(adapter) == []
+    assert _lifecycle_events(adapter, "contract-nudge-sent") == []
 
 
 def test_contract_nudge_send_failure_marks_sent(tmp_path, monkeypatch):
@@ -3617,7 +3611,7 @@ def test_contract_nudge_send_failure_marks_sent(tmp_path, monkeypatch):
     assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
     assert calls["n"] == 1
     assert adapter._contract_nudge_sent == {"3-1-dev-1"}
-    assert len(_nudge_crumbs(adapter)) == 1  # marked before the send
+    assert len(_lifecycle_events(adapter, "contract-nudge-sent")) == 1  # marked before the send
 
     # second stable Stop: task already marked -> no retry, and it harvests
     rj = adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True)
@@ -3638,7 +3632,7 @@ def test_contract_nudge_disabled_by_policy(tmp_path, monkeypatch):
 
     assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
     assert sent == []
-    assert _nudge_crumbs(adapter) == []
+    assert _lifecycle_events(adapter, "contract-nudge-sent") == []
     assert adapter._contract_nudge_sent == set()
     (crumb,) = _breadcrumbs(adapter)
     assert crumb["verdict"] == "terminal-frontmatter-pending"

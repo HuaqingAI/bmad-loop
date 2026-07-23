@@ -1946,7 +1946,13 @@ class Engine:
         )
         try:
             repaired = devcontract.append_auto_run_result(spec_path, fm_status, detail=detail)
-        except OSError as e:
+        except (OSError, UnicodeDecodeError) as e:
+            # UnicodeDecodeError as well as OSError: the writer reads the spec's raw
+            # bytes and, by contract, raises on an undecodable spec (the same
+            # torn-mid-write hazard `_post_kill_reconcile` guards — a spec truncated
+            # through a multi-byte UTF-8 sequence between `_observed_frontmatter`'s
+            # read and this one). This repair is pure best-effort forensics; it must
+            # never turn a synthesized-and-recorded result into a run crash.
             self.journal.append(
                 "spec-marker-repair-failed",
                 story_key=task.story_key,

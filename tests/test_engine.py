@@ -5872,6 +5872,33 @@ def test_marker_repair_failure_is_best_effort(project, monkeypatch):
     assert "OSError" in failed["error"]
 
 
+def test_marker_repair_undecodable_spec_is_best_effort(project, monkeypatch):
+    """`append_auto_run_result` reads raw bytes and raises `UnicodeDecodeError`
+    (a `ValueError`, not an `OSError`) on an undecodable spec — a spec torn mid-
+    write through a multi-byte UTF-8 sequence between the frontmatter read and the
+    append. The best-effort repair must swallow it too (journaled
+    `spec-marker-repair-failed`) so the run still completes rather than crashing."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    inner = dev_effect(project, "1-1-a", followup_review=False)
+
+    def synthesized_dev(spec):
+        result = inner(spec)
+        result.result_json["synthesized_from_frontmatter"] = True
+        result.result_json["status"] = "done"
+        return result
+
+    def boom(*args, **kwargs):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr("bmad_loop.devcontract.append_auto_run_result", boom)
+    engine, _ = make_engine(project, [synthesized_dev])
+    summary = engine.run()
+
+    assert summary.done == 1
+    (failed,) = [e for e in engine.journal.entries() if e["kind"] == "spec-marker-repair-failed"]
+    assert "UnicodeDecodeError" in failed["error"]
+
+
 def test_marker_repair_skips_out_of_tree_spec(project, tmp_path):
     """A session-reported spec_file outside the orchestrator-owned roots is never
     written — the repair skips with reason `out-of-tree`, like the reconcile."""
