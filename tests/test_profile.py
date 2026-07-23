@@ -239,6 +239,33 @@ def test_user_profile_overlay(tmp_path):
             ),
             "env_fault_patterns",
         ),
+        # list fields must be a TOML array of strings: a bare string would iterate to
+        # per-character entries (regexes, in env_fault_patterns' case) and a scalar
+        # would leak a raw TypeError — both are rejected with a friendly ProfileError.
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'env_fault_patterns = "API"\n[hooks]'),
+            "env_fault_patterns must be a list of strings",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", "env_fault_patterns = 5\n[hooks]"),
+            "env_fault_patterns must be a list of strings",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", "env_fault_patterns = [1]\n[hooks]"),
+            "env_fault_patterns must be a list of strings",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", "launch_args = [1]\n[hooks]"),
+            "launch_args must be a list of strings",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", "seed_files = 3\n[hooks]"),
+            "seed_files must be a list of strings",
+        ),
+        (
+            MINIMAL_PROFILE.replace('bypass_args = ["--yes"]', 'bypass_args = "x"'),
+            "bypass_args must be a list of strings",
+        ),
         (
             MINIMAL_PROFILE.replace("[hooks]", "usage_grace_s = -1\n[hooks]"),
             "usage_grace_s",

@@ -29,6 +29,8 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import regex
+
 from .. import devcontract, gates, runs
 from ..bmadconfig import ProjectPaths
 from ..journal import LOGS_DIR
@@ -57,6 +59,11 @@ KILL_POLL_S = 0.5
 ENV_FAULT_TAIL_BYTES = 64 * 1024
 ENV_FAULT_EVIDENCE_MAX = 240
 ENV_FAULT_STATUSES = frozenset({"timeout", "stalled", "crashed"})
+# Wall-clock bound on each operator-supplied pattern match (run via the `regex`
+# module, not stdlib `re`, whose `search` has no timeout): a pathological profile
+# regex can't hang run() teardown. Huge headroom — a sane pattern over the ≤64 KiB
+# tail matches in microseconds; a runaway is capped at ~this and declines to classify.
+ENV_FAULT_MATCH_TIMEOUT_S = 2.0
 # Self-contained ANSI/terminal-control stripper for the log tail: CSI, OSC (BEL-
 # or ST-terminated), other two-char ESC sequences, and raw C1 bytes. Deliberately
 # NOT the TUI/pyte machinery — the classifier reads raw pane bytes best-effort and
@@ -246,9 +253,10 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
         self.run_dir = run_dir
         self.policy = policy
         self.profile = profile
-        # Precompiled once per adapter (the profile validated each at parse time,
-        # so re.compile cannot raise here); empty tuple = classification inert.
-        self._env_fault_patterns = tuple(re.compile(p) for p in profile.env_fault_patterns)
+        # Precompiled once per adapter (the profile validated each at parse time with
+        # the same regex engine, so regex.compile cannot raise here); matched under a
+        # per-pattern timeout in _env_fault_evidence. Empty tuple = classification inert.
+        self._env_fault_patterns = tuple(regex.compile(p) for p in profile.env_fault_patterns)
         self.mux = mux or get_multiplexer()
         # None = use the profile's default bypass flags; a tuple replaces them
         self.extra_args = extra_args
@@ -336,6 +344,10 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
             self.build_command(spec),
         )
         log_file = self.logs_dir / f"{spec.task_id}.log"
+        # A re-armed run reuses task_ids and both mux backends append; drop the prior
+        # cycle's tee so the #194 tail scan can't match a stale transport error (mirrors
+        # the result.json unlink above; journal.py already assumes "next session replaces it").
+        log_file.unlink(missing_ok=True)
         # pipe_pane tolerates the window having already died (a CLI that crashes on
         # launch can take it down before the tee attaches); the dead window is then
         # reported as a crash in wait_for_completion.
@@ -750,11 +762,12 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
         """Scan the tail of the tee'd pane log for a transport-failure pattern.
 
         Reads the last ``ENV_FAULT_TAIL_BYTES`` (binary, decoded with
-        ``errors="replace"``, ``\\r``→``\\n``), strips ANSI, and matches each
-        line against the precompiled patterns. Returns the ANSI-stripped matching
-        line (last match winning, truncated to ``ENV_FAULT_EVIDENCE_MAX``), or
-        None when nothing matches or the log can't be read (any ``OSError`` → no
-        classification, the best-effort doctrine)."""
+        ``errors="replace"``, ``\\r``→``\\n``), strips ANSI, and matches each line
+        against the precompiled patterns under a per-match ``ENV_FAULT_MATCH_TIMEOUT_S``
+        bound. Returns the ANSI-stripped matching line (last match winning, truncated
+        to ``ENV_FAULT_EVIDENCE_MAX``), or None when nothing matches, the log can't be
+        read (any ``OSError``), or a pattern exceeds the match timeout
+        (``TimeoutError``) — no classification, the best-effort doctrine."""
         try:
             with (self.logs_dir / f"{task_id}.log").open("rb") as fh:
                 fh.seek(0, 2)  # SEEK_END
@@ -765,9 +778,15 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
             return None
         text = _ANSI_RE.sub("", raw.decode("utf-8", errors="replace").replace("\r", "\n"))
         match_line: str | None = None
-        for line in text.split("\n"):
-            if any(pat.search(line) for pat in self._env_fault_patterns):
-                match_line = line  # last match wins
+        try:
+            for line in text.split("\n"):
+                if any(
+                    pat.search(line, timeout=ENV_FAULT_MATCH_TIMEOUT_S)
+                    for pat in self._env_fault_patterns
+                ):
+                    match_line = line  # last match wins
+        except TimeoutError:
+            return None  # runaway pattern → decline to classify (best-effort, like OSError)
         if match_line is None:
             return None
         return match_line.strip()[:ENV_FAULT_EVIDENCE_MAX]

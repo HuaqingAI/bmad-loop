@@ -17,6 +17,7 @@ import uuid
 from pathlib import Path
 
 import pytest
+import regex
 
 from bmad_loop.adapters import generic, tmux_base
 from bmad_loop.adapters.base import SessionHandle, SessionResult, SessionSpec
@@ -2558,6 +2559,57 @@ def test_run_reconcile_upgrade_is_not_reclassified(tmp_path):
     assert result.status == "completed"
     assert result.env_fault is False
     assert result.env_fault_evidence is None
+
+
+class _StartSessionMux:
+    """Minimal mux to drive the real start_session: new_window returns a stable id
+    and pipe_pane records the log path it was handed (it writes nothing itself)."""
+
+    def __init__(self):
+        self.piped: list[tuple[str, Path]] = []
+
+    def new_window(self, session_name, window_name, cwd, env, cmd):
+        return "@1"
+
+    def pipe_pane(self, window_id, log_file):
+        self.piped.append((window_id, Path(log_file)))
+
+
+def test_start_session_resets_reused_task_log(tmp_path):
+    """A re-armed run reuses task_ids and both mux backends APPEND to
+    logs/<task_id>.log, so a prior cycle's transport-failure line would linger in the
+    64 KiB tail and mis-flag a later unrelated timeout. start_session drops the stale
+    tee before re-piping (mirroring the result.json unlink), so the reused path holds
+    only the current session's output."""
+    mux = _StartSessionMux()
+    adapter = make_adapter(tmp_path, mux=mux)
+    adapter._ensure_session = lambda cwd: None  # skip the tmux server plumbing
+    task_id = _ENV_FAULT_TASK
+    _write_task_log(adapter, b"API Error: Unable to connect (ECONNREFUSED)\n", task_id=task_id)
+    log_path = adapter.logs_dir / f"{task_id}.log"
+    assert log_path.exists()  # the prior cycle's tee is present...
+
+    adapter.start_session(make_spec(tmp_path, task_id=task_id))
+
+    assert not log_path.exists()  # ...and start_session unlinked it before re-piping
+    assert mux.piped == [("@1", log_path)]  # the fresh tee attaches to the same path
+    # a re-driven session that times out with no NEW matching output is not misclassified
+    assert _classify(adapter, "timeout", task_id=task_id).env_fault is False
+
+
+def test_classify_env_fault_bounds_pathological_pattern(tmp_path, monkeypatch):
+    """A pathological operator regex can't hang run() teardown: each match is bounded
+    by ENV_FAULT_MATCH_TIMEOUT_S, and exceeding it declines to classify (best-effort,
+    like an unreadable log) rather than backtracking forever on a long tail line."""
+    adapter = make_adapter(tmp_path)
+    adapter._env_fault_patterns = (regex.compile(r"(a+)+$"),)  # catastrophic backtracker
+    monkeypatch.setattr(generic, "ENV_FAULT_MATCH_TIMEOUT_S", 0.1)
+    _write_task_log(adapter, b"a" * 1000 + b"!\n")  # long non-matching line -> deep backtrack
+    start = time.monotonic()
+    result = _classify(adapter, "timeout")
+    assert time.monotonic() - start < 5  # bounded; did not hang on the runaway match
+    assert result.env_fault is False and result.env_fault_evidence is None
+    assert _lifecycle_lines(adapter, _ENV_FAULT_TASK) == []
 
 
 def test_wait_for_completion_tolerates_transient_liveness_probe_failure(tmp_path, monkeypatch):

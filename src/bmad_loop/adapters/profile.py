@@ -13,11 +13,12 @@ existing hook dialect needs no Python.
 
 from __future__ import annotations
 
-import re
 import tomllib
 from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
+
+import regex
 
 from ..platform_util import has_parent_ref, is_absolute_path
 
@@ -120,6 +121,14 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
     def fail(msg: str) -> ProfileError:
         return ProfileError(f"profile {source}: {msg}")
 
+    def str_list(key: str) -> tuple[str, ...]:
+        # TOML arrays parse as list; reject a bare string (which would iterate to
+        # per-character entries) or a scalar (a raw TypeError) with a friendly error.
+        raw = doc.get(key, [])
+        if not isinstance(raw, list) or not all(isinstance(x, str) for x in raw):
+            raise fail(f"{key} must be a list of strings")
+        return tuple(raw)
+
     name = str(doc.get("name", "")).strip()
     binary = str(doc.get("binary", "")).strip()
     if not name or not binary:
@@ -169,16 +178,16 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
     if not skill_tree or is_absolute_path(skill_tree) or has_parent_ref(skill_tree):
         raise fail("skill_tree must be a project-relative path")
 
-    seed_files = tuple(str(s) for s in doc.get("seed_files", ()))
+    seed_files = str_list("seed_files")
     for seed in seed_files:
         if not seed or is_absolute_path(seed) or has_parent_ref(seed):
             raise fail(f"seed_files entries must be project-relative paths: got {seed!r}")
 
-    env_fault_patterns = tuple(str(p) for p in doc.get("env_fault_patterns", ()))
+    env_fault_patterns = str_list("env_fault_patterns")
     for pattern in env_fault_patterns:
         try:
-            re.compile(pattern)
-        except re.error as e:
+            regex.compile(pattern)  # same engine the adapter matches with (timeout-guarded)
+        except regex.error as e:
             raise fail(f"env_fault_patterns entry is not a valid regex: {pattern!r} ({e})") from e
 
     return CLIProfile(
@@ -187,8 +196,8 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         hooks=HookSpec(dialect=dialect, config_path=config_path, events=events),
         skill_tree=skill_tree,
         prompt_template=str(doc.get("prompt_template", "{prompt}")),
-        launch_args=tuple(str(a) for a in doc.get("launch_args", ())),
-        bypass_args=tuple(str(a) for a in doc.get("bypass_args", ())),
+        launch_args=str_list("launch_args"),
+        bypass_args=str_list("bypass_args"),
         model_flag=str(doc.get("model_flag", "--model")),
         env={str(k): str(v) for k, v in doc.get("env", {}).items()},
         usage_parser=usage_parser,

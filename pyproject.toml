@@ -13,6 +13,12 @@ authors = [{ name = "BMad Code, LLC" }]
 requires-python = ">=3.11"
 dependencies = [
   "pyyaml>=6.0",
+  # stdlib `re` has no match timeout; the #194 env-fault classifier runs
+  # operator-supplied profile regexes over pane logs, so it matches with the
+  # `regex` module's per-call timeout= to keep a pathological pattern from
+  # hanging a session teardown. Core (all-platform) — classification is on the
+  # main pipeline path.
+  "regex>=2024.11.6",
   # win32 liveness needs psutil (no /proc; os.kill(pid,0) is destructive there);
   # without it the TUI shows every run as `?`. Hard dep so no install path misses it.
   "psutil>=7.2.2; sys_platform == 'win32'",

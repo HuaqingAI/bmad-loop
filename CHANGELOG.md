@@ -21,7 +21,10 @@ breaking changes may land in a minor release.
     adapter reads the log tail once after the verdict and reconcile settle (last match wins,
     `over_budget`/`completed` excluded), drops an `env-fault-classified` breadcrumb, and the
     `claude` profile ships a seed pattern requiring an `API Error` line _and_ a connection-level
-    cause on the same line (so prose "API Error" test output does not trip it).
+    cause on the same line (so prose "API Error" test output does not trip it). Patterns must be a
+    list of strings and are matched with the `regex` module under a per-pattern timeout (a
+    pathological pattern can't hang a teardown), and the pane log is reset when a re-armed run reuses
+    a task id so a prior cycle's line can't misclassify a later session.
   - The dev, review, and fix phases PAUSE on a classified session (evidence in the reason, worktree
     preserved) instead of charging the attempt/cycle; the `dev-decision` / `fix-decision` /
     `session-end` journal entries carry the flag and evidence.
