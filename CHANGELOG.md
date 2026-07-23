@@ -80,6 +80,22 @@ breaking changes may land in a minor release.
   new resultless-stop breadcrumb verdicts `terminal-frontmatter-pending` and
   `ambiguous-frontmatter` record the fingerprint's progress.
 
+- **Deterministic missing-marker catch + repair (#276).** Hardens the #224 missing-marker
+  fallback, whose attribution was heuristic (a 2-stable-Stops fingerprint, or a single sighting
+  post-kill) and left the spec non-compliant on disk:
+  - _Launch-state snapshot + content-hash gate._ Before every review launch the engine now
+    captures a `SpecSnapshot` (content hash, mtime, frontmatter status) of the spec immediately
+    after the #160 marker strip and threads it onto the review `SessionSpec`. The fallback
+    deterministically refuses to synthesize from a candidate whose bytes still hash equal to that
+    snapshot — the spec is provably untouched by this session (a `done` spec re-opened for review,
+    never re-written) — in **every** mode, including the dead-window post-kill reconcile. This kills
+    the documented dead-window false positive (a review killed after an mtime-only bump but before
+    the `in-review` flip, previously scored `done` without having run). New resultless-stop verdict
+    `unmodified-since-launch` and dead-window lifecycle crumb `frontmatter-unmodified-refused`
+    record each refusal. The snapshot is process-transient (a crash-resume degrades to the
+    conservative 2-observation path), and the review-launch frontmatter `status` is never
+    mutated — it remains load-bearing skill routing.
+
 ## [0.9.0] — 2026-07-21
 
 ### Added

@@ -1,6 +1,7 @@
 """Engine scenario tests against the mock adapter — no tmux, no LLM."""
 
 import dataclasses
+import hashlib
 import os
 import re
 import signal
@@ -1990,6 +1991,53 @@ def test_reset_spec_for_repair_strips_stale_terminal_section(project):
     assert "status: in-progress\n" in text  # re-opened
     assert "Auto Run Result" not in text  # stale terminal section gone
     assert "## Intent\n\nbody\n" in text  # frozen intent untouched
+
+
+def test_review_launch_snapshot_threaded_into_session_spec(project):
+    """The engine captures a launch-state SpecSnapshot right after the review
+    marker strip and threads it onto the review SessionSpec; the dev session that
+    precedes it carries none (#276 M1)."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    captured: dict[str, str] = {}
+
+    def capturing_review(spec):
+        # The engine captured the snapshot just before launching this session; the
+        # spec on disk is still the dev pass's bytes until this effect rewrites it,
+        # so hashing it here recomputes exactly what the snapshot recorded.
+        sp = spec_path(project, "1-1-a")
+        captured["digest"] = hashlib.sha256(sp.read_bytes()).hexdigest()
+        return review_effect(project, "1-1-a", clean=True)(spec)
+
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a"), capturing_review])
+    summary = engine.run()
+
+    assert summary.done == 1
+    dev_spec, review_spec = adapter.sessions
+    assert dev_spec.role == "dev" and dev_spec.spec_snapshot is None
+    snap = review_spec.spec_snapshot
+    assert snap is not None
+    assert snap.path == str(spec_path(project, "1-1-a"))
+    assert snap.fm_status == "done"
+    assert snap.sha256 == captured["digest"]
+
+
+def test_review_launch_snapshot_degrades_on_unreadable_spec(project):
+    """A spec path that cannot be read degrades the snapshot capture to None and
+    journals `spec-read-failed` at site `review-launch-snapshot`. A directory where
+    a file is expected is the trigger: it slips past the strip's `is_file()` guard
+    (the strip's raise-on-unreadable doctrine is untouched), then `read_bytes` raises
+    IsADirectoryError, which the capture catches."""
+    engine, _ = make_engine(project, [])
+    bad = project.implementation_artifacts / "spec-1-1-a.md"
+    bad.mkdir(parents=True, exist_ok=True)
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(bad))
+
+    snap = engine._reset_spec_for_review(task)
+
+    assert snap is None
+    events = [e for e in engine.journal.entries() if e["kind"] == "spec-read-failed"]
+    assert events and events[-1]["site"] == "review-launch-snapshot"
+    assert events[-1]["story_key"] == "1-1-a"
 
 
 def test_generic_reconcile_skips_blocked_prose(project):

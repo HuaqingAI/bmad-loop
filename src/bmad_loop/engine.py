@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import hashlib
 import shutil
 import signal
 import sys
@@ -20,7 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, NoReturn
 
 from . import deferredwork, devcontract, envvars, gates, verify
-from .adapters.base import CodingCLIAdapter, SessionResult, SessionSpec
+from .adapters.base import CodingCLIAdapter, SessionResult, SessionSpec, SpecSnapshot
 from .bmadconfig import ProjectPaths
 from .escalation import (
     Action,
@@ -1302,12 +1303,13 @@ class Engine:
                 # marker past the adapter's launch-mtime floor and end the review
                 # on its first result-less Stop (issue #160). Non-replay branch
                 # only — the replay path above launches no session.
-                self._reset_spec_for_review(task)
+                snapshot = self._reset_spec_for_review(task)
                 result = self._run_session(
                     task,
                     role="review",
                     prompt=self._review_prompt(task),
                     seq=task.review_cycle,
+                    spec_snapshot=snapshot,
                 )
             advance(task, Phase.REVIEW_VERIFY)
             self._save()
@@ -2036,6 +2038,7 @@ class Engine:
         seq: int,
         session_stage: str | None = None,
         label: str | None = None,
+        spec_snapshot: SpecSnapshot | None = None,
     ) -> SessionResult:
         # ``label`` names a non-standard session (a plugin-provided workflow) so
         # its task_id stays distinct from the role's own dev/review attempts.
@@ -2117,6 +2120,9 @@ class Engine:
             token_budget_mode=self.policy.limits.session_budget_mode,
             token_budget_grace_s=float(self.policy.limits.session_budget_grace_s),
             cache_read_weight=self.policy.limits.cache_read_weight,
+            # Launch-state snapshot of a review session's spec (#276 M1); None for
+            # every other session and on a crash-resume (process-transient).
+            spec_snapshot=spec_snapshot,
         )
         self.journal.set_active_log(task_id)
         self.journal.append(
@@ -2295,8 +2301,9 @@ class Engine:
         devcontract.reset_spec_status(spec_path, "in-progress")
         devcontract.strip_auto_run_result(spec_path)
 
-    def _reset_spec_for_review(self, task: StoryTask) -> None:
-        """Strip the prior pass's stale `## Auto Run Result` before a review launch.
+    def _reset_spec_for_review(self, task: StoryTask) -> SpecSnapshot | None:
+        """Strip the prior pass's stale `## Auto Run Result` before a review launch,
+        then capture a launch-state snapshot of the spec (#276 M1).
 
         A follow-up review session re-invokes bmad-dev-auto on the FINALIZED spec,
         which still carries the dev pass's terminal `## Auto Run Result` section.
@@ -2308,15 +2315,40 @@ class Engine:
         PREVIOUS review pass's own marker, so this runs before every review launch,
         never on the crash-resume replay branch (no session launches there). Unlike
         `_reset_spec_for_repair` the frontmatter is left untouched: `status: done` is
-        what routes the re-invocation's step-01 to a fresh step-04 review pass.
+        what routes the re-invocation's step-01 to a fresh step-04 review pass — the
+        HARD CONSTRAINT that the review-launch frontmatter status is NEVER mutated
+        (it is load-bearing skill routing), so every #276 mechanism observes only.
 
-        No-op when the dev skill is not the generic one or no spec is recorded yet.
-        Repair-write doctrine (see `devcontract.strip_auto_run_result`): a present-
-        but-unreadable spec raises rather than silently proceeding stale — skipping
-        the strip recreates the exact bug state, so it must surface."""
+        Returns a `SpecSnapshot` of the on-disk spec as it stood at launch — its
+        content hash, mtime, and normalized frontmatter status — so the generic
+        adapter's missing-marker fallback can refuse to synthesize from a candidate
+        whose bytes never changed this session (a `done` spec re-opened for review,
+        never re-written). Snapshot capture is best-effort: a torn/unreadable read
+        degrades to `None` (journaled, `review-launch-snapshot`), and the fallback
+        then keeps its conservative 2-observation fingerprint path. Only the capture
+        is guarded — the strip keeps its raise-on-unreadable repair doctrine (see
+        `devcontract.strip_auto_run_result`): skipping the strip recreates the exact
+        #160 bug state, so it must surface.
+
+        No-op (returns `None`) when the dev skill is not the generic one or no spec
+        is recorded yet."""
         if not self._generic_dev() or not task.spec_file:
-            return
-        devcontract.strip_auto_run_result(Path(task.spec_file))
+            return None
+        spec_path = Path(task.spec_file)
+        devcontract.strip_auto_run_result(spec_path)
+        try:
+            raw = spec_path.read_bytes()
+            mtime_ns = spec_path.stat().st_mtime_ns
+            fm_status = str(verify.read_frontmatter(spec_path).get("status", "")).strip().lower()
+        except OSError as e:
+            self._journal_spec_read_failed(spec_path, task.story_key, "review-launch-snapshot", e)
+            return None
+        return SpecSnapshot(
+            path=str(spec_path),
+            mtime_ns=mtime_ns,
+            sha256=hashlib.sha256(raw).hexdigest(),
+            fm_status=fm_status,
+        )
 
     def _write_feedback(self, task: StoryTask, reason: str) -> Path:
         """Persist a verification failure where the next session can read it —

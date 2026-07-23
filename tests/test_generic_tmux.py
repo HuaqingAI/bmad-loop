@@ -8,6 +8,7 @@ propagation / hook-signal waiting / kill end-to-end for any profile.
 """
 
 import dataclasses
+import hashlib
 import json
 import os
 import shutil
@@ -21,7 +22,7 @@ import pytest
 import regex
 
 from bmad_loop.adapters import generic, tmux_base
-from bmad_loop.adapters.base import SessionHandle, SessionResult, SessionSpec
+from bmad_loop.adapters.base import SessionHandle, SessionResult, SessionSpec, SpecSnapshot
 from bmad_loop.adapters.generic import GenericDevAdapter, GenericTmuxAdapter
 from bmad_loop.adapters.multiplexer import MultiplexerError
 from bmad_loop.adapters.profile import get_profile
@@ -2954,6 +2955,25 @@ _MARKERLESS_DONE = "---\nstatus: done\nbaseline_revision: abc123\n---\n\n# Story
 _MARKERLESS_BLOCKED = "---\nstatus: blocked\n---\n\n# Story\n\nStuck.\n"
 
 
+def _snap(spec_file: Path) -> SpecSnapshot:
+    """A review-launch snapshot of an on-disk spec, exactly as
+    ``_reset_spec_for_review`` captures it: hash + mtime + normalized fm status."""
+    raw = spec_file.read_bytes()
+    return SpecSnapshot(
+        path=str(spec_file),
+        mtime_ns=spec_file.stat().st_mtime_ns,
+        sha256=hashlib.sha256(raw).hexdigest(),
+        fm_status="done",
+    )
+
+
+def _snapshotted_spec(tmp_path, spec_file: Path, story_key="3-1") -> SessionSpec:
+    """A review SessionSpec carrying the launch snapshot of ``spec_file`` (#276 M1)."""
+    return dataclasses.replace(
+        _dev_spec(tmp_path, story_key), role="review", spec_snapshot=_snap(spec_file)
+    )
+
+
 def test_frontmatter_fallback_synthesizes_on_second_stable_stop(tmp_path, monkeypatch):
     adapter, impl = make_dev_adapter(tmp_path)
     monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
@@ -3132,3 +3152,102 @@ def test_wait_loop_completes_markerless_spec_on_second_stop(tmp_path, monkeypatc
     assert result.status == "completed"
     assert result.result_json["status"] == "done"
     assert result.result_json["synthesized_from_frontmatter"] is True
+
+
+# ---------------------------- launch-state snapshot + content-hash gate (#276 M1)
+#
+# A review session inherits the dev pass's `done` spec. When the review is killed
+# after an mtime-only bump but before it flips the frontmatter to `in-review`, the
+# #224 fallback would score `done` without the review ever running. The engine now
+# threads a SpecSnapshot (hash + mtime + fm status) captured at review launch; the
+# fallback refuses to synthesize from a candidate still byte-identical to it — in
+# every mode, live or dead-window.
+
+
+def test_frontmatter_fallback_refuses_unmodified_snapshot_live(tmp_path, monkeypatch):
+    """A byte-identical spec is provably untouched by this session: no wait=True
+    pass ever harvests, every verdict is `unmodified-since-launch`, and the
+    fingerprint dict stays empty (no observation recorded or popped)."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+    spec = _snapshotted_spec(tmp_path, spec_file)
+    for _ in range(3):
+        assert adapter._result_json(_dev_handle(), spec, wait=True) is None
+    verdicts = {c["verdict"] for c in _breadcrumbs(adapter)}
+    assert verdicts == {"unmodified-since-launch"}
+    assert "byte-identical to review-launch snapshot" in _breadcrumbs(adapter)[0]["detail"]
+    assert adapter._fm_fallback_obs == {}
+
+
+def test_frontmatter_fallback_refuses_unmodified_snapshot_dead_window(tmp_path):
+    """The kill shot: a dead window over a markerless `done` spec whose only change
+    since launch is an mtime bump. The single-sighting post-kill rescue must refuse
+    — returning the ORIGINAL result — and leave the dead-window lifecycle crumb."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    adapter._window_alive = lambda handle: False
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+    spec = _snapshotted_spec(tmp_path, spec_file)
+    # mtime-only bump: bytes unchanged, so the hash still matches the snapshot.
+    os.utime(spec_file, ns=(spec.spec_snapshot.mtime_ns + 10**9,) * 2)
+    original = _unvouched()
+    assert adapter._post_kill_reconcile(_dev_handle(), spec, original) is original
+    events = [ln["event"] for ln in _lifecycle_lines(adapter)]
+    assert "frontmatter-unmodified-refused" in events
+    # a refusal is not a resultless-Stop breadcrumb (that channel is wait=True only)
+    assert _breadcrumbs(adapter) == []
+
+
+def test_frontmatter_fallback_hash_mismatch_still_two_obs(tmp_path, monkeypatch):
+    """Content edited since the snapshot (the review actually wrote): the hash gate
+    is inert and today's fingerprint behavior stands — pending on the first stable
+    Stop, harvested on the second."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n# Story\n\nLaunch.\n"
+    )
+    spec = _snapshotted_spec(tmp_path, spec_file)
+    # the review rewrote the spec's body: bytes differ from the launch snapshot.
+    spec_file.write_text(_MARKERLESS_DONE)
+    assert adapter._result_json(_dev_handle(), spec, wait=True) is None
+    (crumb,) = _breadcrumbs(adapter)
+    assert crumb["verdict"] == "terminal-frontmatter-pending"
+    rj = adapter._result_json(_dev_handle(), spec, wait=True)
+    assert rj["synthesized_from_frontmatter"] is True
+
+
+def test_frontmatter_fallback_snapshot_other_path_inert(tmp_path, monkeypatch):
+    """The gate only fires when the candidate IS the snapshotted spec. A snapshot
+    for a different path leaves the fallback on its normal fingerprint path even
+    when the candidate happens to be byte-identical to that snapshot's content."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+    snap = dataclasses.replace(_snap(spec_file), path=str(impl / "spec-9-9-other.md"))
+    spec = dataclasses.replace(_dev_spec(tmp_path), role="review", spec_snapshot=snap)
+    # not the snapshotted path -> no hash comparison -> ordinary 2-obs harvest
+    assert adapter._result_json(_dev_handle(), spec, wait=True) is None
+    (crumb,) = _breadcrumbs(adapter)
+    assert crumb["verdict"] == "terminal-frontmatter-pending"
+    rj = adapter._result_json(_dev_handle(), spec, wait=True)
+    assert rj["synthesized_from_frontmatter"] is True
+
+
+def test_frontmatter_fallback_unmodified_wait_false_silent(tmp_path, monkeypatch):
+    """The plain crash path (wait=False, live window) is compare-only over an
+    unmodified spec: it refuses to synthesize and leaves zero crumbs of either
+    kind."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+    spec = _snapshotted_spec(tmp_path, spec_file)
+    assert adapter._result_json(_dev_handle(), spec, wait=False) is None
+    assert _breadcrumbs(adapter) == []
+    assert _lifecycle_lines(adapter) == []
+    assert adapter._fm_fallback_obs == {}

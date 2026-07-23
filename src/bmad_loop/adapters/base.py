@@ -23,6 +23,29 @@ from ..model import TokenUsage
 
 
 @dataclass(frozen=True)
+class SpecSnapshot:
+    """Launch-state fingerprint of a review session's spec, captured by the
+    engine immediately after the pre-review-launch marker strip
+    (``_reset_spec_for_review``) and threaded onto its ``SessionSpec``.
+
+    Lets the generic adapter's missing-marker fallback deterministically refuse
+    to synthesize from a candidate whose bytes are byte-identical to the spec's
+    launch state: such a spec is provably untouched by this session, so the
+    terminal ``status:`` it carries is the PRIOR pass's ``done`` (re-opened for
+    review), not proof this session finished (#276 M1).
+
+    Process-transient: it rides the live ``SessionSpec`` only and is deliberately
+    NOT persisted (no ``StoryTask.to_dict`` entry). A crash-resume that
+    reconstructs the ``SessionSpec`` therefore carries no snapshot, and the
+    fallback degrades to its conservative 2-observation fingerprint path."""
+
+    path: str
+    mtime_ns: int
+    sha256: str
+    fm_status: str
+
+
+@dataclass(frozen=True)
 class SessionSpec:
     task_id: str
     role: str  # "dev" | "review" | "retro"
@@ -53,6 +76,13 @@ class SessionSpec:
     token_budget_mode: str = "off"  # "off" | "warn" | "enforce"
     token_budget_grace_s: float = 240.0
     cache_read_weight: float = 0.1
+    # Launch-state snapshot of a review session's spec (#276 M1): captured by the
+    # engine right after the pre-review-launch marker strip and threaded here so
+    # the generic adapter's missing-marker fallback can deterministically refuse
+    # to synthesize from a spec still byte-identical to its launch state. None for
+    # every non-review session and on a crash-resume (process-transient — see
+    # SpecSnapshot). Kept LAST so positional SessionSpec constructions stay valid.
+    spec_snapshot: SpecSnapshot | None = None
 
 
 @dataclass(frozen=True)

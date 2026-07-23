@@ -22,6 +22,7 @@ fallback.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import re
 import shlex
@@ -1099,7 +1100,13 @@ class _DevSynthesisMixin(_ResultFileMixin):
         resultless Stops; a dead window (post-kill reconcile) harvests on one
         sighting, liveness having been settled by the kill. Several candidates
         mean the scan cannot know which spec is this session's — refuse to
-        guess. Every synthesized result still runs the engine's full
+        guess. Outranking all of that (#276 M1): when the engine threaded a
+        ``spec_snapshot`` (review sessions) and the candidate's bytes still hash
+        equal to it, the spec is provably untouched by this session — a ``done``
+        spec re-opened for review, not this session's output — and synthesis is
+        deterministically refused in every mode, including the dead window (the
+        ``unmodified-since-launch`` verdict / ``frontmatter-unmodified-refused``
+        crumb). Every synthesized result still runs the engine's full
         deterministic verify downstream, the same #61 trust model as the
         post-kill rescue. With this in place a marker-less ``done`` spec
         completes here and never reaches the review-timeout path, so the
@@ -1107,10 +1114,12 @@ class _DevSynthesisMixin(_ResultFileMixin):
         case: a review that died with a NON-terminal frontmatter.
 
         Owns the give-up breadcrumb: exactly one of ``no-artifact``,
-        ``ambiguous-frontmatter``, or ``terminal-frontmatter-pending`` per
-        wait=True pass (none on a harvest). A plain wait=False read (the crash
-        path) is compare-only — it may harvest an already-stable fingerprint but
-        never records observations or breadcrumbs.
+        ``ambiguous-frontmatter``, ``unmodified-since-launch``, or
+        ``terminal-frontmatter-pending`` per wait=True pass (none on a harvest).
+        A plain wait=False read (the crash path) is compare-only — it may harvest
+        an already-stable fingerprint but never records observations or
+        breadcrumbs; the hash gate is the one wait=False path that leaves a crumb,
+        and only under a dead window (``frontmatter-unmodified-refused``).
         """
         task_id = handle.task_id
         candidates: list[Path] = []
@@ -1141,15 +1150,51 @@ class _DevSynthesisMixin(_ResultFileMixin):
                 )
             return None
         path = candidates[0]
+        snap = spec.spec_snapshot
         try:
             mtime_ns = path.stat().st_mtime_ns
             fm_status = str(read_frontmatter(path).get("status", "")).strip().lower()
+            # Content hash only when the candidate IS the snapshotted spec — an
+            # unrelated marker-less spec under the same artifacts dir shares no
+            # launch state, so hashing it would be meaningless work.
+            digest = (
+                hashlib.sha256(path.read_bytes()).hexdigest()
+                if snap is not None and str(path) == snap.path
+                else None
+            )
         except OSError:
             # Torn mid-write read: not evidence of anything — same degrade as
             # the read-back doctrine everywhere else on this path.
             if wait:
                 self._note_resultless_stop(
                     task_id, "no-artifact", f"unreadable marker-less candidate {path}"
+                )
+            return None
+        # Hash gate (#276 M1): a candidate byte-identical to the spec's review-launch
+        # snapshot is provably untouched by this session — its terminal frontmatter
+        # is the PRIOR pass's `done`, re-opened for review and never re-written, not
+        # proof this session finished. Refuse to synthesize in EVERY mode, including
+        # `dead_window`: this is precisely the documented dead-window false positive
+        # (a review killed after an mtime-only bump but before the `in-review` flip,
+        # scored `done` without running). The snapshot is stronger evidence than
+        # window death, so it outranks the single-sighting rescue. No observation is
+        # recorded or popped — an unchanged spec is neither progress nor a stall.
+        if digest is not None and snap is not None and digest == snap.sha256:
+            if wait:
+                self._note_resultless_stop(
+                    task_id,
+                    "unmodified-since-launch",
+                    f"{path} byte-identical to review-launch snapshot "
+                    f"(snapshot mtime_ns={snap.mtime_ns}, candidate mtime_ns={mtime_ns}); "
+                    "refusing frontmatter synthesis",
+                )
+            elif dead_window:
+                self._note_lifecycle(
+                    task_id,
+                    "frontmatter-unmodified-refused",
+                    spec=str(path),
+                    status=fm_status,
+                    dead_window=True,
                 )
             return None
         fingerprint = (str(path), mtime_ns, fm_status)
