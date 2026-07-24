@@ -123,27 +123,54 @@ DEV_PRIMITIVE_SKILL = "bmad-dev-auto"
 # customize.toml review layer) and "Invoke the `bmad-review-edge-case-hunter`
 # skill on this diff" (pre-consolidation step-04). Deliberately narrow —
 # backticked, `bmad-` prefixed — because a false match here is a false FAIL,
-# the exact failure mode #260 was. A reference we don't recognize simply isn't
-# preflighted, which is no worse than the static catalog.
+# the exact failure mode #260 was.
 _INVOKE_SKILL_RE = re.compile(r"[Ii]nvoke the `(bmad-[a-z0-9-]+)` skill")
-# Project-level overrides of the skill's shipped customize.toml, in precedence
-# order (later wins), per customize.toml's own header.
+# Any backticked bmad-* token in a layer's instruction. What this matches and
+# _INVOKE_SKILL_RE does not is a skill reference we cannot confirm is an
+# invocation — upstream itself writes "use the `bmad-code-review` skill"
+# elsewhere, so the narrow phrasing is a convention, not a contract. Such a
+# reference is reported as a WARNING and never hard-required: an override may
+# legitimately mention a skill it does not invoke, and blocking on that would
+# rebuild #260's false FAIL. Lens names (`adversarial`) lack the prefix, so the
+# shipped layers add nothing here.
+_SKILL_REF_RE = re.compile(r"`(bmad-[a-z0-9-]+)`")
+# Where project-level customization of an upstream skill lives. Both the
+# preflight (which reads the overrides) and worktree provisioning (which seeds
+# them, so an isolated run resolves the same layers) derive their paths from
+# this one constant, or they drift.
+CUSTOMIZE_DIR = Path("_bmad") / "custom"
+# Overrides of the skill's shipped customize.toml, in precedence order (later
+# wins), per customize.toml's own header. The `.user.toml` layer is personal and
+# gitignored by the upstream installer.
 _CUSTOMIZE_OVERRIDES = (
-    Path("_bmad") / "custom" / "bmad-dev-auto.toml",
-    Path("_bmad") / "custom" / "bmad-dev-auto.user.toml",
+    CUSTOMIZE_DIR / f"{DEV_PRIMITIVE_SKILL}.toml",
+    CUSTOMIZE_DIR / f"{DEV_PRIMITIVE_SKILL}.user.toml",
 )
 
 
-class _ReviewConfig(NamedTuple):
+class ReviewResolution(NamedTuple):
     """Which skills the installed bmad-dev-auto's review step actually invokes.
 
-    ``source`` is the file it was read from (for the finding's detail), ``skills``
-    maps each invoked skill to the review-layer ids that invoke it — empty for the
-    pre-consolidation shape, which has no layers.
+    ``source`` is the file it was read from (for the finding's detail).
+    ``required`` maps each invoked skill to the review-layer ids invoking it —
+    empty ids for the pre-consolidation shape, which has no layers. ``advisory``
+    is the same shape for references we cannot confirm will run (see
+    :data:`_SKILL_REF_RE` and ``when``-gated layers): missing ones warn, never
+    fail. ``active_layers`` names every layer with a non-empty ``instruction`` —
+    all of them disabled is a run that HALTs. ``unreadable`` names override files
+    that failed to parse.
     """
 
     source: str
-    skills: dict[str, tuple[str, ...]]
+    required: dict[str, tuple[str, ...]]
+    advisory: dict[str, tuple[str, ...]]
+    layer_driven: bool
+    active_layers: tuple[str, ...]
+    unreadable: tuple[str, ...]
+
+    def skills(self) -> tuple[str, ...]:
+        """Every skill this review step may invoke, required or advisory."""
+        return tuple(dict.fromkeys((*self.required, *self.advisory)))
 
 
 def _read_toml(path: Path) -> dict[str, Any] | None:
@@ -154,43 +181,109 @@ def _read_toml(path: Path) -> dict[str, Any] | None:
         return None
 
 
-def _layers_of(data: dict[str, Any]) -> list[Any]:
-    layers = data.get("workflow", {}).get("review_layers") if isinstance(data, dict) else None
-    return layers if isinstance(layers, list) else []
+def _layers_of(data: Any) -> list[Any]:
+    """The ``[[workflow.review_layers]]`` array, or [] for any other shape.
+
+    Every hop is type-guarded independently: `workflow` is only a table by
+    convention, and a syntactically valid `workflow = "..."` would otherwise
+    raise AttributeError straight out of the preflight — crashing validate, run,
+    resume and sweep on a file whose only sin is being misconfigured.
+    """
+    workflow = data.get("workflow") if isinstance(data, dict) else None
+    layers = workflow.get("review_layers") if isinstance(workflow, dict) else None
+    return list(layers) if isinstance(layers, list) else []
 
 
-def _merged_review_layers(project: Path, tree: str) -> list[Any] | None:
-    """The skill's shipped review layers with any project override applied.
+# BMAD's own merge keys for arrays of tables, in detection precedence order.
+_KEYED_MERGE_FIELDS = ("code", "id")
 
-    Arrays of tables merge by ``id``: a matching id replaces the default, new ids
-    append. Returns None when any input is unreadable — the caller must then fall
-    back rather than conclude anything from a half-read config.
+
+def _keyed_merge_field(items: list[Any]) -> str | None:
+    """The key an array of tables merges on, or None to append.
+
+    Port of `_detect_keyed_merge_field` in BMAD-METHOD
+    `src/scripts/resolve_customization.py`. EVERY item — base and override
+    combined — must be a table carrying the same key, and `code` is checked
+    before `id`; a mixed or key-less array falls through to append. Guessing
+    differently here means the preflight requires a different skill set than the
+    resolver the run actually uses.
+    """
+    if not items or not all(isinstance(item, dict) for item in items):
+        return None
+    for candidate in _KEYED_MERGE_FIELDS:
+        if all(item.get(candidate) is not None for item in items):
+            return candidate
+    return None
+
+
+def _merge_layer_arrays(base: list[Any], override: list[Any]) -> list[Any]:
+    """Merge two arrays of tables the way BMAD's resolver does.
+
+    Port of `_merge_arrays`/`_merge_by_key` in BMAD-METHOD
+    `src/scripts/resolve_customization.py`: keyed merge when the combined array
+    opts into one (matching keys replace in place, new keys append), plain
+    concatenation otherwise.
+    """
+    key = _keyed_merge_field(base + override)
+    if key is None:
+        return base + override
+    result: list[Any] = []
+    index_by_key: dict[Any, int] = {}
+    for item in base:
+        if not isinstance(item, dict):
+            continue
+        if item.get(key) is not None:
+            index_by_key[item[key]] = len(result)
+        result.append(dict(item))
+    for item in override:
+        if not isinstance(item, dict):
+            result.append(item)
+            continue
+        item_key = item.get(key)
+        if item_key is not None and item_key in index_by_key:
+            result[index_by_key[item_key]] = dict(item)
+        else:
+            if item_key is not None:
+                index_by_key[item_key] = len(result)
+            result.append(dict(item))
+    return result
+
+
+def _merged_review_layers(project: Path, tree: str) -> tuple[list[Any], tuple[str, ...]] | None:
+    """The skill's shipped review layers with project overrides applied.
+
+    Returns ``(layers, unreadable_override_paths)``, or None when the skill's OWN
+    customize.toml is absent or unparseable — the one case that genuinely means
+    "shape unknown", so the caller falls back to the static catalog.
+
+    An unparseable OVERRIDE is not that case: BMAD's resolver warns and treats it
+    as empty, still resolving every other layer. Matching that keeps the preflight
+    agreeing with the run; the broken file is reported separately as a warning.
     """
     data = _read_toml(project / tree / DEV_PRIMITIVE_SKILL / "customize.toml")
     if data is None:
         return None
     layers = _layers_of(data)
+    unreadable: list[str] = []
     for rel in _CUSTOMIZE_OVERRIDES:
         override = project / rel
         if not override.is_file():
             continue
         extra = _read_toml(override)
         if extra is None:
-            return None
-        for layer in _layers_of(extra):
-            if not isinstance(layer, dict):
-                continue
-            lid = layer.get("id")
-            for i, existing in enumerate(layers):
-                if isinstance(existing, dict) and lid is not None and existing.get("id") == lid:
-                    layers[i] = layer
-                    break
-            else:
-                layers.append(layer)
-    return layers
+            unreadable.append(rel.as_posix())
+            continue
+        layers = _merge_layer_arrays(layers, _layers_of(extra))
+    return layers, tuple(unreadable)
 
 
-def _configured_review_skills(project: Path, tree: str) -> _ReviewConfig | None:
+def _layer_id(layer: dict[str, Any], index: int) -> str:
+    """A layer's id for reporting — positional when it declares none."""
+    lid = layer.get("id")
+    return lid if isinstance(lid, str) and lid else f"#{index + 1}"
+
+
+def resolve_review_layers(project: Path, tree: str) -> ReviewResolution | None:
     """Read the review skills this project will really invoke, or None if unknown.
 
     Post-consolidation bmad-dev-auto is layer-driven: each
@@ -204,32 +297,62 @@ def _configured_review_skills(project: Path, tree: str) -> _ReviewConfig | None:
     a project whose configured layers invoke a skill it does not have is otherwise
     green here and broken on every dev run (#260). None means the shape could not
     be determined, so the caller falls back to the static catalog.
+
+    A ``when``-gated layer contributes ADVISORY requirements only: step-04 skips
+    every layer whose condition does not hold, and that condition is evaluated by
+    the model in run context — undecidable here, so hard-requiring its skill would
+    be a false FAIL.
     """
-    layers = _merged_review_layers(project, tree)
-    if layers is None:
+    merged = _merged_review_layers(project, tree)
+    if merged is None:
         return None
+    layers, unreadable = merged
     if layers:
-        found: dict[str, list[str]] = {}
-        for layer in layers:
+        required: dict[str, list[str]] = {}
+        advisory: dict[str, list[str]] = {}
+        active: list[str] = []
+        for index, layer in enumerate(layers):
             if not isinstance(layer, dict):
                 continue
             instruction = layer.get("instruction")
             if not isinstance(instruction, str) or not instruction.strip():
                 continue
-            layer_id = layer.get("id")
-            for skill in _INVOKE_SKILL_RE.findall(instruction):
-                ids = found.setdefault(skill, [])
-                if isinstance(layer_id, str) and layer_id not in ids:
-                    ids.append(layer_id)
-        return _ReviewConfig("customize.toml", {s: tuple(i) for s, i in found.items()})
+            layer_id = _layer_id(layer, index)
+            active.append(layer_id)
+            when = layer.get("when")
+            gated = isinstance(when, str) and bool(when.strip())
+            invoked = _INVOKE_SKILL_RE.findall(instruction)
+            # A gated layer's invocations are advisory; so is any bmad-* token we
+            # can't tie to an invocation phrasing, in either kind of layer.
+            hard = [] if gated else invoked
+            soft = [s for s in _SKILL_REF_RE.findall(instruction) if gated or s not in invoked]
+            for bucket, skills in ((required, hard), (advisory, soft)):
+                for skill in skills:
+                    ids = bucket.setdefault(skill, [])
+                    if layer_id not in ids:
+                        ids.append(layer_id)
+        return ReviewResolution(
+            "customize.toml",
+            {s: tuple(i) for s, i in required.items()},
+            # never warn about a skill another layer already hard-requires
+            {s: tuple(i) for s, i in advisory.items() if s not in required},
+            True,
+            tuple(active),
+            unreadable,
+        )
     try:
         step04 = (project / tree / DEV_PRIMITIVE_SKILL / "step-04-review.md").read_text(
             encoding="utf-8"
         )
     except (OSError, UnicodeDecodeError):
         return None
+    # step-04 is a whole prose document rather than a self-contained execution
+    # recipe, so only the invocation phrasing counts here — a backticked mention
+    # anywhere in it is not evidence of a handoff.
     named = dict.fromkeys(_INVOKE_SKILL_RE.findall(step04), ())
-    return _ReviewConfig("step-04-review.md", named) if named else None
+    if not named:
+        return None
+    return ReviewResolution("step-04-review.md", dict(named), {}, False, (), unreadable)
 
 
 # Stories mode (folder+id dispatch, BMAD-METHOD #2549) needs a *newer* bmad-dev-auto
@@ -296,9 +419,14 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
     The dev primitive (bmad-dev-auto) and the review layers its step-04 invokes
     inline are installed by the BMad Method module, not by `bmad-loop init`. Each
     must exist in every active CLI skill tree and carry its marker files. Returns
-    one problem :class:`Finding` per missing/incomplete skill; empty list means OK.
-    Run as a preflight so a missing skill fails loudly with remediation instead of
+    one :class:`Finding` per missing/incomplete skill; empty list means OK. Run as
+    a preflight so a missing skill fails loudly with remediation instead of
     stalling as an `Unknown command` until the run times out.
+
+    Not every finding is fatal: review layers that are conditional, ambiguously
+    phrased, or configured by an unparseable override come back as ``warning``
+    (see :func:`_review_findings`). **Callers must branch on severity** — treating
+    a non-empty return as failure turns every advisory into a blocked run.
 
     The review skills are read from the installed bmad-dev-auto itself
     (:func:`_configured_review_skills`) so the preflight requires what this project
@@ -341,14 +469,30 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
                         {"tree": tree, "skill": DEV_PRIMITIVE_SKILL, "missing_markers": absent},
                     )
                 )
-        problems.extend(_missing_review_skills(project, tree))
+        problems.extend(_review_findings(project, tree))
     return problems
 
 
-def _missing_review_skills(project: Path, tree: str) -> list[Finding]:
-    """Problems for the review skills this tree's bmad-dev-auto invokes."""
-    configured = _configured_review_skills(project, tree)
-    if configured is None:
+def _where_clause(layer_ids: Sequence[str]) -> str:
+    """How a finding's message names the layers that reach for a skill."""
+    if len(layer_ids) > 1:
+        return f"review layers {', '.join(layer_ids)} invoke"
+    if layer_ids:
+        return f"review layer {layer_ids[0]} invokes"
+    return "review step invokes"
+
+
+def _review_findings(project: Path, tree: str) -> list[Finding]:
+    """Findings for the review skills this tree's bmad-dev-auto invokes.
+
+    Problems block; warnings never do. A skill is only a problem when the
+    installed config says this run WILL invoke it — anything conditional or
+    ambiguous warns instead, because a false FAIL here is #260 all over again.
+    Callers must therefore honour severity rather than treating any finding as
+    fatal.
+    """
+    resolved = resolve_review_layers(project, tree)
+    if resolved is None:
         # Unknown shape: keep the long-standing static requirement, which both real
         # topologies satisfy — the two hunters, or the merged reviewer instead.
         if (project / tree / MERGED_REVIEW_SKILL / "SKILL.md").is_file():
@@ -366,32 +510,69 @@ def _missing_review_skills(project: Path, tree: str) -> list[Finding]:
             for skill in sorted(_REVIEW_LAYER_SKILLS)
             if not (project / tree / skill / "SKILL.md").is_file()
         ]
-    problems: list[Finding] = []
-    for skill, layer_ids in sorted(configured.skills.items()):
+    findings: list[Finding] = []
+    for rel in resolved.unreadable:
+        findings.append(
+            Finding(
+                "skills.customize-unreadable",
+                "warning",
+                f"{rel} could not be parsed as TOML — the run's resolver skips a broken "
+                f"override layer, so this project's review layers resolve without it; "
+                f"fix the file or remove it",
+                {"tree": tree, "file": rel},
+            )
+        )
+    if resolved.layer_driven and not resolved.active_layers:
+        findings.append(
+            Finding(
+                "skills.review-layers-empty",
+                "problem",
+                f"{tree}/{DEV_PRIMITIVE_SKILL} has no enabled review layer (every "
+                f"`instruction` is empty) — every dev run would HALT blocked with "
+                f"'no active review layers'; re-enable a layer in "
+                f"{_CUSTOMIZE_OVERRIDES[0].as_posix()}",
+                {"tree": tree, "source": resolved.source},
+            )
+        )
+    for skill, layer_ids in sorted(resolved.required.items()):
         if (project / tree / skill / "SKILL.md").is_file():
             continue
-        if len(layer_ids) > 1:
-            where = f"review layers {', '.join(layer_ids)} invoke"
-        elif layer_ids:
-            where = f"review layer {layer_ids[0]} invokes"
-        else:
-            where = "review step invokes"
-        problems.append(
+        findings.append(
             Finding(
                 "skills.review-layer-missing",
                 "problem",
-                f"{tree}/{skill} not found — {tree}/{DEV_PRIMITIVE_SKILL}'s {where} it "
-                f"({configured.source}), so every dev run's review would fail; "
-                f"install or update the bmm module so this project's review layers resolve",
+                f"{tree}/{skill} not found — {tree}/{DEV_PRIMITIVE_SKILL}'s "
+                f"{_where_clause(layer_ids)} it ({resolved.source}), so every dev run's "
+                f"review would fail; install or update the bmm module so this project's "
+                f"review layers resolve",
                 {
                     "tree": tree,
                     "skill": skill,
                     "layers": list(layer_ids),
-                    "source": configured.source,
+                    "source": resolved.source,
                 },
             )
         )
-    return problems
+    for skill, layer_ids in sorted(resolved.advisory.items()):
+        if (project / tree / skill / "SKILL.md").is_file():
+            continue
+        findings.append(
+            Finding(
+                "skills.review-layer-unresolved",
+                "warning",
+                f"{tree}/{skill} not found — {tree}/{DEV_PRIMITIVE_SKILL}'s "
+                f"{_where_clause(layer_ids)} it conditionally, or names it in prose this "
+                f"check cannot confirm is a handoff ({resolved.source}); install it if "
+                f"that layer is meant to run",
+                {
+                    "tree": tree,
+                    "skill": skill,
+                    "layers": list(layer_ids),
+                    "source": resolved.source,
+                },
+            )
+        )
+    return findings
 
 
 def _hook_command(project: Path, profile: CLIProfile, canonical_event: str) -> str:

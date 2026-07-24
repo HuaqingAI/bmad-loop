@@ -80,6 +80,28 @@ breaking changes may land in a minor release.
   now caught by a new `skills.review-layer-missing` problem instead of passing and then failing
   on every dev run. Unreadable configs fall back to the previous static requirement, and all
   messages name the real remedy (install/update bmm, BMAD-METHOD >= 6.10.0).
+
+  Derivation is held to what the run really resolves:
+  - Override merging matches BMAD's own resolver (`resolve_customization.py`) exactly — arrays of
+    tables opt into keyed merge only when _every_ combined item carries the same identifier, and
+    `code` is checked before `id`; anything mixed or key-less appends. Keying on `id` alone
+    silently dropped base layers in one direction and kept superseded ones in the other.
+  - An override that is not valid TOML no longer abandons derivation: the resolver skips a broken
+    layer and carries on, so the preflight does too, reporting the file as a
+    `skills.customize-unreadable` warning.
+  - A `customize.toml` whose `workflow` key is valid TOML of the wrong _shape_ (a string, list or
+    number) no longer raises `AttributeError` out of `validate`/`run`/`resume`/`sweep`.
+  - Disabling every review layer is reported as `skills.review-layers-empty` rather than passing:
+    `step-04-review.md` HALTs blocked with `no active review layers`.
+  - Layers that cannot be resolved statically — gated by a `when` condition the model evaluates at
+    run time, or naming a skill in a phrasing this check cannot confirm is a handoff — are reported
+    as `skills.review-layer-unresolved` **warnings** and never block. `validate` and the run
+    preflight now branch on severity, so an advisory can no longer abort a run.
+  - Isolated worktrees get what was validated: `provision_worktree` copies the review skills the
+    project's own layers name (not just the fixed base catalog) and seeds `_bmad/custom/`, whose
+    `*.user.toml` layer the upstream installer gitignores — without it the preflight resolved one
+    layer set from the main checkout while the worktree run resolved another.
+
 - **`notify.desktop` works on macOS/Windows, and warns when it can't (#231).** The desktop
   notification channel was `notify-send`-only, so on macOS and Windows `notify.desktop` (default
   `true`) was silently inert — every "a human is needed" path (escalations, deferrals,

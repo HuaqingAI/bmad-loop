@@ -125,6 +125,32 @@ v6.10.0 hunters — which a tree carrying `bmad-review` satisfies.
 release ships it as a standalone skill, and on current sources it is only a thin
 forwarder to `bmad-review`. It is required exactly when your installed layers name it.
 
+### Customizing the review layers
+
+Your project overrides in `_bmad/custom/bmad-dev-auto.toml` (team) and
+`_bmad/custom/bmad-dev-auto.user.toml` (personal, gitignored by the bmm installer) are
+applied before the requirement is computed, using the same merge rules BMAD's own
+resolver uses: an array of tables merges by key only when _every_ entry — default and
+override alike — carries the same `code` or `id`; otherwise the override appends. So
+adding a layer with a new `id` adds a requirement, and replacing one by `id` moves it.
+
+Two things `validate` reports but never blocks on, because neither can be decided
+without running the review:
+
+- a layer gated by a `when` condition, which the model evaluates against the diff;
+- a layer naming a skill in a phrasing that is not recognizably a handoff (the
+  convention is ``Invoke the `skill-name` skill``).
+
+Both come back as `skills.review-layer-unresolved` warnings, so a customized layer can
+never block a run the way the old fixed catalog did. What _is_ a problem: every layer
+disabled at once (`skills.review-layers-empty`), which makes `bmad-dev-auto` HALT
+blocked with `no active review layers`.
+
+Under `isolation = "worktree"` the skills your layers name are copied into each unit's
+worktree along with `_bmad/custom/`, so an isolated run resolves the same layers
+`validate` checked — including from the gitignored `*.user.toml`, which a fresh checkout
+would not carry.
+
 ## Choosing which CLIs to drive
 
 The supported adapters are `claude` (the default), `codex`, `gemini`, `copilot`,
