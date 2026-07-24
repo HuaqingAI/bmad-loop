@@ -139,13 +139,48 @@ def test_notify_linux_runs_notify_send(monkeypatch, tmp_path):
     )
     calls = _capture_run(monkeypatch)
 
+    # option-shaped title/message must not be parsed as notify-send options: the `--`
+    # terminator forces GLib to treat them as positional SUMMARY/BODY text.
+    gates.notify(_policy(desktop=True, file=False), tmp_path, "--title", "--help")
+
+    assert len(calls) == 1
+    argv, kwargs = calls[0]
+    # `--` sits before the untrusted text, so a leading-dash payload stays positional
+    assert argv == ["notify-send", "--app-name=bmad-loop", "--", "--title", "--help"]
+    assert kwargs["env"] is None  # no env override for the notify-send path
+
+
+def test_notify_desktop_swallows_value_error(monkeypatch, tmp_path):
+    """An embedded NUL in the untrusted text makes subprocess.run raise ValueError
+    (not a SubprocessError, which is not a ValueError subclass); the best-effort
+    boundary must still swallow it rather than crash the run."""
+    monkeypatch.setattr(gates.sys, "platform", "linux")
+    monkeypatch.setattr(gates.shutil, "which", lambda _cmd: "/usr/bin/notify-send")
+
+    def boom(*_a, **_k):
+        raise ValueError("embedded null byte")
+
+    monkeypatch.setattr(gates.subprocess, "run", boom)
+    # must not propagate
+    gates.notify(_policy(desktop=True, file=False), tmp_path, "title", "mid\x00nul")
+
+
+def test_notify_windows_dispatches_via_pwsh_only(monkeypatch, tmp_path):
+    """PowerShell Core alone (no powershell.exe) still dispatches the toast — the
+    dispatch path must select whichever of pwsh/powershell shutil.which resolves."""
+    monkeypatch.setattr(gates.sys, "platform", "win32")
+    monkeypatch.setattr(
+        gates.shutil, "which", lambda cmd: "/usr/bin/pwsh" if cmd == "pwsh" else None
+    )
+    calls = _capture_run(monkeypatch)
+
     gates.notify(_policy(desktop=True, file=False), tmp_path, "title", "message")
 
     assert len(calls) == 1
     argv, kwargs = calls[0]
-    assert argv[:1] == ["notify-send"]
-    assert "title" in argv and "message" in argv  # notify-send takes text as argv (already safe)
-    assert kwargs["env"] is None  # no env override for the notify-send path
+    assert argv[0].endswith("pwsh")  # not powershell.exe
+    assert "-Command" in argv
+    assert kwargs["env"][gates._TITLE_ENV] == "title"
 
 
 def test_notify_desktop_noop_when_no_notifier(monkeypatch, tmp_path):

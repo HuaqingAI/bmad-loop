@@ -77,6 +77,10 @@ breaking changes may land in a minor release.
   string. When `notify.desktop` is set but no
   notifier exists on the platform, `validate` emits a `notify.desktop-unavailable` warning and the
   run start prints a one-time stderr warning plus a `notify-desktop-unavailable` journal event.
+  Note: headless CI cannot observe a real toast/notification (there is no macOS job), so the
+  unit tests assert command construction only. To verify visual delivery, set
+  `notify.desktop = true` and trigger a notify path on each OS (macOS/Windows/Linux) — or call
+  `gates.notify` directly — and confirm a notification appears.
 
 - **Scrollable modal dialogs (#275).** The decision, escalation, confirm, sweep-options and
   story-checkpoint TUI dialogs now scroll their bodies and dock their action buttons, so the

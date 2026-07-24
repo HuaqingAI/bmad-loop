@@ -28,7 +28,7 @@ from conftest import (
 from bmad_loop import platform_util, verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
-from bmad_loop.engine import Engine, RunPaused, RunStopped
+from bmad_loop.engine import Engine, RunPaused, RunStopped, _run_depth
 from bmad_loop.journal import Journal, load_state
 from bmad_loop.model import (
     PAUSE_EPIC_BOUNDARY,
@@ -137,6 +137,91 @@ def test_warn_desktop_notifier_inert_noop_when_available(project, monkeypatch, c
 
     engine._warn_desktop_notifier_inert()
 
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "notify-desktop-unavailable" not in kinds
+    assert capsys.readouterr().err == ""
+
+
+def test_warn_desktop_notifier_inert_noop_when_desktop_off(project, monkeypatch, capsys):
+    """notify.desktop off → nothing to warn about, even with no platform notifier."""
+    engine = make_engine(
+        project,
+        [],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"), notify=NotifyPolicy(desktop=False, file=True)
+        ),
+    )[0]
+    monkeypatch.setattr("bmad_loop.gates.desktop_notifier_kind", lambda: None)
+
+    engine._warn_desktop_notifier_inert()
+
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "notify-desktop-unavailable" not in kinds
+    assert capsys.readouterr().err == ""
+
+
+def test_warn_desktop_notifier_inert_no_file_channel_guidance(project, monkeypatch, capsys):
+    """desktop requested + no notifier + notify.file off → the warning says no alert
+    channel is configured rather than pointing at an ATTENTION file never written."""
+    engine = make_engine(
+        project,
+        [],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"), notify=NotifyPolicy(desktop=True, file=False)
+        ),
+    )[0]
+    monkeypatch.setattr("bmad_loop.gates.desktop_notifier_kind", lambda: None)
+
+    engine._warn_desktop_notifier_inert()
+
+    err = capsys.readouterr().err
+    assert "no alert channel is configured" in err
+    assert "ATTENTION file" not in err
+
+
+def _stub_run_side_effects(engine, monkeypatch):
+    """No-op the git/loop/session side effects of Engine.run() so a test can drive
+    the pre_run -> warn -> post_run path in isolation."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    for name in ("_loop", "_ensure_target_branch", "_prune_preserve_refs", "_gc_run_worktrees"):
+        monkeypatch.setattr(engine, name, lambda *a, **k: None)
+
+
+def test_run_warns_when_toplevel_owns_no_signals(project, monkeypatch, capsys):
+    """#231/finding-4: a top-level run that owns no signals (e.g. off the main
+    thread, where signal handlers cannot install) is still depth-0 / non-nested, so
+    the inert-notifier warning fires. Guards the fix that keys the gate on _run_depth
+    rather than signal ownership (which was wrongly silencing off-main-thread runs)."""
+    engine = _notify_engine(project)
+    monkeypatch.setattr("bmad_loop.gates.desktop_notifier_kind", lambda: None)
+    _stub_run_side_effects(engine, monkeypatch)
+    monkeypatch.setattr(engine, "_install_stop_signals", lambda: None)  # owns no signals
+
+    engine.run()
+
+    assert engine._owns_signals is False
+    assert engine._is_nested is False
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "notify-desktop-unavailable" in kinds
+    assert "warning: notify.desktop is set" in capsys.readouterr().err
+
+
+def test_run_suppresses_warning_when_nested(project, monkeypatch, capsys):
+    """A nested run (call-stack depth > 0) suppresses the once-per-run warning even
+    with no notifier — it belongs to the owning top-level run, not the child sweep.
+    Nesting is depth-based, so it holds even when the child owns no signals."""
+    engine = _notify_engine(project)
+    monkeypatch.setattr("bmad_loop.gates.desktop_notifier_kind", lambda: None)
+    _stub_run_side_effects(engine, monkeypatch)
+    monkeypatch.setattr(engine, "_install_stop_signals", lambda: None)
+
+    token = _run_depth.set(1)  # simulate an outer engine's run() frame
+    try:
+        engine.run()
+    finally:
+        _run_depth.reset(token)
+
+    assert engine._is_nested is True
     kinds = [e["kind"] for e in engine.journal.entries()]
     assert "notify-desktop-unavailable" not in kinds
     assert capsys.readouterr().err == ""
@@ -365,11 +450,13 @@ def test_nested_engine_reraises_keyboard_interrupt(project, monkeypatch):
 
     monkeypatch.setattr(engine, "_loop", boom)
     sentinel = object()
-    Engine._stop_signals_owner = sentinel  # pretend an outer engine owns signals
+    Engine._stop_signals_owner = sentinel  # outer engine owns signals (child won't install)
+    token = _run_depth.set(1)  # ...and this run is nested inside the outer run() frame
     try:
         with pytest.raises(KeyboardInterrupt):
             engine.run()
     finally:
+        _run_depth.reset(token)
         Engine._stop_signals_owner = None
 
     assert load_state(engine.run_dir).stopped is False  # owner records it, not us
@@ -5072,11 +5159,13 @@ def test_nested_engine_reraises_runstopped(project, monkeypatch):
 
     monkeypatch.setattr(engine, "_loop", boom)
     sentinel = object()
-    Engine._stop_signals_owner = sentinel  # pretend an outer engine owns signals
+    Engine._stop_signals_owner = sentinel  # outer engine owns signals (child won't install)
+    token = _run_depth.set(1)  # ...and this run is nested inside the outer run() frame
     try:
         with pytest.raises(RunStopped):
             engine.run()
     finally:
+        _run_depth.reset(token)
         Engine._stop_signals_owner = None
 
     assert load_state(engine.run_dir).stopped is False  # owner records it, not us
@@ -5131,11 +5220,13 @@ def test_nested_engine_reraises_crash(project, monkeypatch):
 
     monkeypatch.setattr(engine, "_loop", boom)
     sentinel = object()
-    Engine._stop_signals_owner = sentinel  # pretend an outer engine owns signals
+    Engine._stop_signals_owner = sentinel  # outer engine owns signals (child won't install)
+    token = _run_depth.set(1)  # ...and this run is nested inside the outer run() frame
     try:
         with pytest.raises(RuntimeError):
             engine.run()
     finally:
+        _run_depth.reset(token)
         Engine._stop_signals_owner = None
 
     assert load_state(engine.run_dir).crashed is False  # owner records it, not us

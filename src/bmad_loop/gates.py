@@ -77,10 +77,18 @@ def _notifier_argv(kind: str, title: str, message: str) -> tuple[list[str], dict
             [pwsh, "-NoProfile", "-NonInteractive", "-Command", _WIN_TOAST_PS],
             {_TITLE_ENV: title, _MESSAGE_ENV: message},
         )
-    return (["notify-send", "--app-name=bmad-loop", title, message], {})
+    # `--` ends GLib option parsing: an untrusted title/message beginning with
+    # `-`/`--` (e.g. a plugin veto reason of `--help`) is then taken as positional
+    # SUMMARY/BODY text, not parsed as a notify-send option.
+    return (["notify-send", "--app-name=bmad-loop", "--", title, message], {})
 
 
 def notify(policy: Policy, run_dir: Path, title: str, message: str) -> None:
+    """Best-effort human notification: append the ATTENTION file (if notify.file)
+    and fire a native desktop notification (if notify.desktop). Never raises — a
+    failing notifier must not crash the run. Headless CI cannot observe a real
+    notification (no macOS job), so the native macOS/Windows paths are unit-tested
+    at the command-construction level; verify visual delivery manually per OS."""
     if policy.notify.file:
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
         with (run_dir / ATTENTION_FILE).open("a", encoding="utf-8") as f:
@@ -99,8 +107,12 @@ def notify(policy: Policy, run_dir: Path, title: str, message: str) -> None:
                     capture_output=True,
                     env={**os.environ, **env} if env else None,
                 )
-            except (subprocess.SubprocessError, OSError):
-                pass  # desktop notification is best-effort
+            except (subprocess.SubprocessError, OSError, ValueError):
+                # best-effort: a failing notifier must never crash the run. ValueError
+                # covers an embedded NUL in the untrusted title/message, which reaches
+                # argv (notify-send) or an env value (osascript/PowerShell) and makes
+                # subprocess.run raise `ValueError: embedded null byte`.
+                pass
 
 
 def pause_at_epic_boundary(policy: Policy) -> bool:

@@ -9,6 +9,7 @@ verify. All creative work happens inside disposable adapter sessions.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import functools
 import hashlib
 import shutil
@@ -173,9 +174,17 @@ def _session_task_id(story_key: str, part: str, seq: int) -> str:
     return safe_segment(f"{story_key}-{part}-{seq}")
 
 
+# Call-stack nesting depth for engine runs. A nested auto-sweep runs synchronously
+# in the same thread as its parent (see _maybe_auto_sweep), so a ContextVar carries
+# the parent's depth into the child. Tracked independently of signal ownership so an
+# off-main-thread top-level run (which cannot own signals) is still seen as depth-0.
+_run_depth: contextvars.ContextVar[int] = contextvars.ContextVar("bmad_loop_run_depth", default=0)
+
+
 class Engine:
-    # The engine that installed the process-wide stop handlers; nested
-    # auto-sweep runs (same process) see it set and let RunStopped propagate up.
+    # The engine that installed the process-wide stop handlers. Signal handling is
+    # single-owner per process; only this engine reinstalls/restores them. Run
+    # nesting is tracked separately via _run_depth (see run()).
     _stop_signals_owner: "Engine | None" = None
 
     def __init__(
@@ -238,10 +247,10 @@ class Engine:
             self.journal.append("plugins-active", plugins=self._bus.active_plugins())
         # stop-signal bookkeeping (see run())
         self._owns_signals = False
-        # True iff an outer engine already owned the stop handlers when this one
-        # started — i.e. this is a nested auto-sweep run. Distinct from
-        # _owns_signals, which is also False for a top-level engine that simply
-        # could not install handlers (e.g. off the main thread).
+        # Set authoritatively at run() entry from the _run_depth call-stack counter:
+        # True iff this engine runs nested inside another engine's run() (a nested
+        # auto-sweep). Independent of _owns_signals — a top-level run off the main
+        # thread owns no signals yet is still non-nested. Defaults False pre-run.
         self._is_nested = False
         self._stopping = False
         self._prev_handlers: dict[int, object] = {}
@@ -327,18 +336,32 @@ class Engine:
         )
 
     def run(self) -> RunSummary:
+        # Establish call-stack nesting depth before anything else: _is_nested is read
+        # by the warning gate and the stop/crash re-raise arms below. Reset in the
+        # outermost finally so a nested child's re-raise still decrements the depth.
+        depth = _run_depth.get()
+        self._is_nested = depth > 0
+        token = _run_depth.set(depth + 1)
+        try:
+            return self._run_inner()
+        finally:
+            _run_depth.reset(token)
+
+    def _run_inner(self) -> RunSummary:
         self._install_stop_signals()
         try:
             try:
+                # Warn once per top-level run before pre_run: a plugin `pause` veto in
+                # _emit_run_boundary("pre_run") raises RunPaused, which would otherwise
+                # skip the promised inert-notifier warning + journal event. Gated on
+                # `not _is_nested` (call-stack depth), not `_owns_signals`: a top-level
+                # run that could not install signal handlers (off the main thread) owns
+                # no signals yet is not nested, and must still surface the warning.
+                if not self._is_nested:
+                    self._warn_desktop_notifier_inert()
                 # target-branch setup can raise RunPaused (detached HEAD, unborn
                 # repo), so it must sit inside the pause handler, not before it.
                 self._emit_run_boundary("pre_run")
-                # Warn once per top-level run. Gate on `not _is_nested`, not
-                # `_owns_signals`: a top-level run that could not install signal
-                # handlers (off the main thread) still owns no signals yet is not
-                # nested, and must still surface the inert-notifier warning.
-                if not self._is_nested:
-                    self._warn_desktop_notifier_inert()
                 self._ensure_target_branch()
                 self._prune_preserve_refs()
                 self._loop()
@@ -492,9 +515,9 @@ class Engine:
         outermost engine in the process owns the handlers (nested auto-sweep
         runs let the exception propagate up to it); install is best-effort and
         silently skipped off the main thread (signal.signal raises there)."""
-        # capture nesting before the early return: a non-None owner here means an
-        # outer engine already installed the handlers, so we are nested.
-        self._is_nested = Engine._stop_signals_owner is not None
+        # Signal ownership is process-global and independent of run nesting (tracked
+        # via _run_depth in run()): a non-None owner means an outer engine already
+        # installed the handlers, so this engine must not reinstall them.
         if Engine._stop_signals_owner is not None:
             return
 
