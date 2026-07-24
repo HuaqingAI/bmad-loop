@@ -113,15 +113,23 @@ def test_notify_windows_runs_powershell(monkeypatch, tmp_path):
     )
     calls = _capture_run(monkeypatch)
 
-    gates.notify(_policy(desktop=True, file=False), tmp_path, "escalation", "toast body")
+    # both title and message carry PowerShell/shell-sensitive text that must never
+    # reach argv — they travel through env, and the -Command script reads $env:.
+    title = 'escalation `$(rm)`;"& evil'
+    message = 'toast $(bad) "body"'
+    gates.notify(_policy(desktop=True, file=False), tmp_path, title, message)
 
     assert len(calls) == 1
     argv, kwargs = calls[0]
     assert argv[0].lower().endswith(("powershell.exe", "pwsh"))
     assert "-Command" in argv
-    assert kwargs["env"][gates._TITLE_ENV] == "escalation"
-    assert kwargs["env"][gates._MESSAGE_ENV] == "toast body"
-    assert not any("toast body" in part for part in argv)
+    assert kwargs["env"][gates._TITLE_ENV] == title
+    assert kwargs["env"][gates._MESSAGE_ENV] == message
+    # neither the title nor the message is interpolated into the command string
+    assert not any(title in part for part in argv)
+    assert not any(message in part for part in argv)
+    # the toast is delivered under a registered AUMID (Windows drops unregistered ids)
+    assert any("WindowsPowerShell" in part for part in argv)
 
 
 def test_notify_linux_runs_notify_send(monkeypatch, tmp_path):

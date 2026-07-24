@@ -312,10 +312,17 @@ class Engine:
         if not (self.policy.notify.desktop and gates.desktop_notifier_kind() is None):
             return
         self.journal.append("notify-desktop-unavailable", platform=sys.platform)
+        # The ATTENTION file only exists as a fallback when notify.file is on; with
+        # it off there is no human channel left, so point at that rather than a file
+        # that is never written.
+        channel = (
+            f"watch the ATTENTION file in {self.run_dir}"
+            if self.policy.notify.file
+            else "notify.file is also off, so no alert channel is configured"
+        )
         print(
             f"warning: notify.desktop is set but no desktop notifier is available "
-            f"on {sys.platform}; desktop alerts are silently skipped — watch the "
-            f"ATTENTION file in {self.run_dir}.",
+            f"on {sys.platform}; desktop alerts are silently skipped — {channel}.",
             file=sys.stderr,
         )
 
@@ -326,7 +333,11 @@ class Engine:
                 # target-branch setup can raise RunPaused (detached HEAD, unborn
                 # repo), so it must sit inside the pause handler, not before it.
                 self._emit_run_boundary("pre_run")
-                if self._owns_signals:
+                # Warn once per top-level run. Gate on `not _is_nested`, not
+                # `_owns_signals`: a top-level run that could not install signal
+                # handlers (off the main thread) still owns no signals yet is not
+                # nested, and must still surface the inert-notifier warning.
+                if not self._is_nested:
                     self._warn_desktop_notifier_inert()
                 self._ensure_target_branch()
                 self._prune_preserve_refs()

@@ -34,7 +34,14 @@ _WIN_TOAST_PS = (
     "$x.Item(0).AppendChild($t.CreateTextNode($env:BMAD_LOOP_NOTIFY_TITLE))|Out-Null;"
     "$x.Item(1).AppendChild($t.CreateTextNode($env:BMAD_LOOP_NOTIFY_MESSAGE))|Out-Null;"
     "$n=[Windows.UI.Notifications.ToastNotification]::new($t);"
-    "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('bmad-loop').Show($n)"
+    # Windows only shows a toast for a *registered* AppUserModelID; 'bmad-loop' has
+    # no Start-menu shortcut carrying it, so that toast would be silently dropped.
+    # Reuse Windows PowerShell's own default-registered AUMID instead (the toast is
+    # attributed to "Windows PowerShell"). Raw strings: the AUMID's backslashes must
+    # stay literal — `\v1.0` would otherwise be parsed as a vertical tab.
+    r"[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("
+    r"'{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe')"
+    r".Show($n)"
 )
 
 

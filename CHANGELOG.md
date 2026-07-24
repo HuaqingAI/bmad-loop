@@ -72,8 +72,9 @@ breaking changes may land in a minor release.
   `true`) was silently inert — every "a human is needed" path (escalations, deferrals,
   worktree-open failures) reached no one, leaving only the untailed `ATTENTION` file. `gates.notify`
   now dispatches natively per platform: `osascript` (macOS), a best-effort WinRT PowerShell toast
-  (Windows), `notify-send` (Linux); the untrusted title/message are passed via environment
-  variables, never interpolated into the command string. When `notify.desktop` is set but no
+  (Windows), `notify-send` (Linux); the untrusted title/message are handed to `osascript`/PowerShell
+  through environment variables and to `notify-send` as argv — never interpolated into the command
+  string. When `notify.desktop` is set but no
   notifier exists on the platform, `validate` emits a `notify.desktop-unavailable` warning and the
   run start prints a one-time stderr warning plus a `notify-desktop-unavailable` journal event.
 
