@@ -343,7 +343,7 @@ session_budget_grace_s = 240     # enforce mode: seconds to wrap up after the nu
 commands = ["pytest -q", "ruff check ."]
 
 [notify]
-desktop = true             # desktop notification on gate pauses / escalations
+desktop = true             # desktop notification on gate pauses / escalations — notify-send (Linux) / osascript (macOS) / PowerShell toast (Windows), best-effort
 file = true                # append the same alerts to the run's ATTENTION file
 
 [review]

@@ -382,8 +382,13 @@ _FINDING_WIDTH = 96
 
 
 def render(renderable, width: int = _FINDING_WIDTH) -> str:
-    """Rich renderable -> plain text, as journal_rows does for the journal."""
-    console = Console(width=width)
+    """Rich renderable -> plain text, as journal_rows does for the journal.
+
+    ``no_color=True`` so the capture is deterministic regardless of the ambient
+    ``FORCE_COLOR``/``CLICOLOR_FORCE``: Rich otherwise honors a forced color mode
+    even into a non-tty capture buffer, and the column-alignment assertions here
+    slice raw strings that embedded ANSI escapes would shift out of position."""
+    console = Console(width=width, no_color=True)
     with console.capture() as capture:
         console.print(renderable)
     return capture.get()
