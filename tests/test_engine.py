@@ -108,6 +108,40 @@ def resume_engine(project, engine, script, policy=None) -> tuple[Engine, MockAda
     return new_engine, adapter
 
 
+def _notify_engine(project):
+    return make_engine(
+        project,
+        [],
+        policy=Policy(gates=GatesPolicy(mode="none"), notify=NotifyPolicy(desktop=True, file=True)),
+    )[0]
+
+
+def test_warn_desktop_notifier_inert_journals_and_prints(project, monkeypatch, capsys):
+    """#231: at run start, notify.desktop requested + no platform notifier ->
+    one journal event and a stderr warning, so an unattended launch that skipped
+    `validate` still learns the desktop channel is dead."""
+    engine = _notify_engine(project)
+    monkeypatch.setattr("bmad_loop.gates.desktop_notifier_kind", lambda: None)
+
+    engine._warn_desktop_notifier_inert()
+
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "notify-desktop-unavailable" in kinds
+    assert "warning: notify.desktop is set" in capsys.readouterr().err
+
+
+def test_warn_desktop_notifier_inert_noop_when_available(project, monkeypatch, capsys):
+    """A resolvable notifier means notify.desktop works here — no warning, no event."""
+    engine = _notify_engine(project)
+    monkeypatch.setattr("bmad_loop.gates.desktop_notifier_kind", lambda: "osascript")
+
+    engine._warn_desktop_notifier_inert()
+
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "notify-desktop-unavailable" not in kinds
+    assert capsys.readouterr().err == ""
+
+
 def test_run_session_saves_completed_session_checkpoint(project):
     """The completed session must already be on disk when post_session fires:
     a host kill inside the hooks cannot lose it."""

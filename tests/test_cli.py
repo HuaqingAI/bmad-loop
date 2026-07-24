@@ -3278,6 +3278,35 @@ def test_validate_hookless_profile_flags_missing_httpx(project, capsys, monkeypa
     assert "bmad-loop[opencode]" in text
 
 
+def test_validate_warns_when_no_desktop_notifier(project, monkeypatch, capsys):
+    """#231: notify.desktop defaults on, but when this platform resolves no
+    notifier the setting is silently inert — validate must surface it as a
+    warning finding (not a FAIL — desktop notification is best-effort)."""
+    install_bmad_config(project)
+    _write_policy(project.project)  # default notify.desktop = true
+    monkeypatch.setattr(cli.gates, "desktop_notifier_kind", lambda: None)
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)  # rc varies by host (binary/skills) — parse the document instead
+    doc = json.loads(capsys.readouterr().out)
+    finding = next(f for f in doc["findings"] if f["check"] == "notify.desktop-unavailable")
+    assert finding["severity"] == "warning"
+    assert "notify.desktop is set" in finding["message"]
+
+
+def test_validate_silent_when_desktop_notifier_available(project, monkeypatch, capsys):
+    """The mirror case: a resolvable notifier means notify.desktop works, so no
+    notify.desktop-unavailable finding is emitted at all."""
+    install_bmad_config(project)
+    _write_policy(project.project)
+    monkeypatch.setattr(cli.gates, "desktop_notifier_kind", lambda: "osascript")
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)
+    doc = json.loads(capsys.readouterr().out)
+    assert all(f["check"] != "notify.desktop-unavailable" for f in doc["findings"])
+
+
 OPENCODE_QUALIFIED_POLICY = '[adapter]\nname = "opencode"\nmodel = "anthropic/claude-haiku-4-5"\n'
 
 

@@ -20,6 +20,7 @@ from . import (
     decisions,
     deferredwork,
     envvars,
+    gates,
     install,
     machine,
 )
@@ -257,6 +258,20 @@ def cmd_validate(args: argparse.Namespace) -> int:
         report.fail("git.probe", f"git check failed: {e}")
 
     report.extend(_platform_preflight())
+
+    # #231: notify.desktop defaults to true but only fires when a platform notifier
+    # exists (osascript/PowerShell/notify-send). When none does, the setting is
+    # silently inert — warn so it stops being a no-op nobody can see.
+    if pol is not None and pol.notify.desktop and gates.desktop_notifier_kind() is None:
+        report.warn(
+            "notify.desktop-unavailable",
+            f"notify.desktop is set but no desktop notifier is available on "
+            f"{sys.platform} — desktop notifications are silently skipped; the "
+            f"ATTENTION file in the run directory is the only alert channel "
+            f"(macOS ships osascript; Linux needs notify-send; Windows needs "
+            f"PowerShell). Install one or set notify.desktop = false.",
+            {"platform": sys.platform},
+        )
 
     for tool in dict.fromkeys(p.binary for p in profiles):
         if shutil.which(tool):

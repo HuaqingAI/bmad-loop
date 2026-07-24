@@ -1024,7 +1024,7 @@ session_budget_grace_s = 240 # enforce mode: seconds a tripped session gets to w
 commands = []                # e.g. ["pytest -q", "ruff check ."]
 
 [notify]
-desktop = true               # notify-send, best-effort
+desktop = true               # notify-send (Linux) / osascript (macOS) / PowerShell toast (Windows), best-effort
 file = true                  # ATTENTION file in the run dir
 
 [review]

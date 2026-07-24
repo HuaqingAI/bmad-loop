@@ -67,6 +67,16 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **`notify.desktop` works on macOS/Windows, and warns when it can't (#231).** The desktop
+  notification channel was `notify-send`-only, so on macOS and Windows `notify.desktop` (default
+  `true`) was silently inert — every "a human is needed" path (escalations, deferrals,
+  worktree-open failures) reached no one, leaving only the untailed `ATTENTION` file. `gates.notify`
+  now dispatches natively per platform: `osascript` (macOS), a best-effort WinRT PowerShell toast
+  (Windows), `notify-send` (Linux); the untrusted title/message are passed via environment
+  variables, never interpolated into the command string. When `notify.desktop` is set but no
+  notifier exists on the platform, `validate` emits a `notify.desktop-unavailable` warning and the
+  run start prints a one-time stderr warning plus a `notify-desktop-unavailable` journal event.
+
 - **Scrollable modal dialogs (#275).** The decision, escalation, confirm, sweep-options and
   story-checkpoint TUI dialogs now scroll their bodies and dock their action buttons, so the
   choose/action buttons stay reachable with long content down to the dialog's minimum frame

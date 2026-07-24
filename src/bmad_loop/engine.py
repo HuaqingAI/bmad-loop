@@ -304,6 +304,21 @@ class Engine:
 
     # ------------------------------------------------------------- top level
 
+    def _warn_desktop_notifier_inert(self) -> None:
+        """One-time run-start alert for #231: ``notify.desktop`` is requested but
+        this platform has no notifier, so every ``gates.notify`` desktop sink is a
+        silent no-op. Journalled + stderr so an unattended launch that skips
+        ``validate`` still surfaces it."""
+        if not (self.policy.notify.desktop and gates.desktop_notifier_kind() is None):
+            return
+        self.journal.append("notify-desktop-unavailable", platform=sys.platform)
+        print(
+            f"warning: notify.desktop is set but no desktop notifier is available "
+            f"on {sys.platform}; desktop alerts are silently skipped — watch the "
+            f"ATTENTION file in {self.run_dir}.",
+            file=sys.stderr,
+        )
+
     def run(self) -> RunSummary:
         self._install_stop_signals()
         try:
@@ -311,6 +326,8 @@ class Engine:
                 # target-branch setup can raise RunPaused (detached HEAD, unborn
                 # repo), so it must sit inside the pause handler, not before it.
                 self._emit_run_boundary("pre_run")
+                if self._owns_signals:
+                    self._warn_desktop_notifier_inert()
                 self._ensure_target_branch()
                 self._prune_preserve_refs()
                 self._loop()
