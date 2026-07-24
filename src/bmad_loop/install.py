@@ -86,7 +86,7 @@ LEGACY_MODULE_SKILLS = (
 #   - the two review hunters v6.10.0 ships. These are only the FALLBACK review
 #     requirement, used when the installed skill's shape can't be read: normally the
 #     reviewers are derived per tree from bmad-dev-auto itself
-#     (_configured_review_skills), because which skills the review step invokes is a
+#     (resolve_review_layers), because which skills the review step invokes is a
 #     property of that skill version, not of a catalog pinned in here (#260).
 # bmad-review-verification-gap is not in the fallback set: no tagged BMAD-METHOD
 # release ships it standalone (on current sources it is a thin forwarder to the
@@ -429,7 +429,7 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
     a non-empty return as failure turns every advisory into a blocked run.
 
     The review skills are read from the installed bmad-dev-auto itself
-    (:func:`_configured_review_skills`) so the preflight requires what this project
+    (:func:`resolve_review_layers`) so the preflight requires what this project
     will really invoke: a tree whose configured layers call the merged
     ``bmad-review`` needs that skill and not the standalone hunters, and a tree on
     the pre-consolidation step-04 needs the two hunters it names. When the shape
