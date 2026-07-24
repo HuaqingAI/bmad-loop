@@ -357,7 +357,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
     if profiles and not base_problems:
         report.ok(
             "skills.base",
-            "upstream skills present (bmad-dev-auto + review hunters)",
+            "upstream skills present (bmad-dev-auto + review layers)",
             {"trees": list(dict.fromkeys(p.skill_tree for p in profiles))},
         )
     report.extend(base_problems)
@@ -480,7 +480,7 @@ def _mux_set(project: Path, args: argparse.Namespace) -> int:
 
 def _require_base_skills(project: Path, pol, *, require_stories: bool = False) -> bool:
     """Preflight the upstream skills the orchestrator drives (bmad-dev-auto + the
-    three review hunters it invokes inline).
+    review layers it invokes inline).
 
     Returns True when everything is in place; otherwise prints the problems and
     returns False so the caller can abort before spawning any session (a missing

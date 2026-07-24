@@ -67,6 +67,14 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **`validate` no longer requires a skill no release ships (#260).** The preflight demanded
+  `bmad-review-verification-gap`, which no tagged BMAD-METHOD release ships (absent from
+  v6.10.0; post-6.10.0 it exists only as a forwarder to the merged `bmad-review`), and
+  misdiagnosed it as "install the BMad Method (bmm) module" on projects where bmm _was_
+  installed — so `validate`/`run`/`resume`/`sweep` could not pass on a stock install. It is no
+  longer preflighted (still copied into a worktree when present), a tree carrying the merged
+  `bmad-review` skill now satisfies the review layers on its own, and the remaining messages
+  name the actual remedy (install/update bmm, BMAD-METHOD >= 6.10.0).
 - **`notify.desktop` works on macOS/Windows, and warns when it can't (#231).** The desktop
   notification channel was `notify-send`-only, so on macOS and Windows `notify.desktop` (default
   `true`) was silently inert — every "a human is needed" path (escalations, deferrals,

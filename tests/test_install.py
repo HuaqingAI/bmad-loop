@@ -9,6 +9,7 @@ from bmad_loop import verify
 from bmad_loop.adapters.profile import get_profile
 from bmad_loop.install import (
     BASE_SKILLS,
+    DEV_BASE_SKILLS,
     LEGACY_MODULE_SKILLS,
     MODULE_SKILLS,
     _copy_traversable,
@@ -20,14 +21,23 @@ from bmad_loop.install import (
 )
 
 
-def _install_base_skills(root, tree=".claude/skills"):
-    """Lay down stubs of the non-bundled upstream skills the orchestrator drives."""
-    for skill, markers in BASE_SKILLS.items():
+def _install_skills(root, tree, catalog):
+    """Lay down stubs of exactly ``catalog`` ({skill: (marker, ...)}) under root/tree.
+
+    Takes the catalog explicitly so a test can build one precise upstream topology
+    (e.g. the v6.10.0 shape: no `bmad-review`, no verification-gap) rather than the
+    everything-installed superset."""
+    for skill, markers in catalog.items():
         d = root / tree / skill
         d.mkdir(parents=True, exist_ok=True)
         (d / "SKILL.md").write_text(f"# {skill}\n", encoding="utf-8")
         for marker in markers:
             (d / marker).write_text("x\n", encoding="utf-8")
+
+
+def _install_base_skills(root, tree=".claude/skills"):
+    """Lay down stubs of the non-bundled upstream skills the orchestrator drives."""
+    _install_skills(root, tree, BASE_SKILLS)
 
 
 def _registrations(profile, command="python3 /x/.bmad-loop/bmad_loop_hook.py {event}"):
@@ -601,12 +611,12 @@ def test_provision_worktree_copies_base_skills_from_repo(tmp_path):
 
 def test_missing_base_skills_reports_absent_and_incomplete(tmp_path):
     claude = get_profile("claude")
-    # nothing installed → dev primitive + all three inline review hunters reported
-    # missing (the hunters are always required — bmad-dev-auto's step-04 invokes
-    # them on every run, regardless of the orchestrator's follow-up review)
+    # nothing installed → dev primitive + the two inline review layers reported
+    # missing (the hunters are required whenever the merged reviewer is absent —
+    # bmad-dev-auto's step-04 invokes them on every run)
     problems = missing_base_skills(tmp_path, [claude.skill_tree])
-    assert len(problems) == 4
-    assert all("install the BMad Method" in p.message for p in problems)
+    assert len(problems) == 3
+    assert all("BMAD-METHOD >= 6.10.0" in p.message for p in problems)
 
     # install everything → no problems
     _install_base_skills(tmp_path, claude.skill_tree)
@@ -628,15 +638,13 @@ def test_missing_base_skills_reports_absent_and_incomplete(tmp_path):
     assert "incomplete" in problems[0].message
     assert "customize.toml" in problems[0].message
 
-    # the newest review layer (verification-gap) reported by name when absent
+    # #260: verification-gap is NOT a requirement — no tagged BMAD-METHOD release
+    # ships it, so removing it from an otherwise complete tree must still pass
     _install_base_skills(tmp_path, claude.skill_tree)  # re-complete everything
     import shutil as _shutil
 
     _shutil.rmtree(tmp_path / claude.skill_tree / "bmad-review-verification-gap")
-    problems = missing_base_skills(tmp_path, [claude.skill_tree])
-    assert len(problems) == 1
-    assert "bmad-review-verification-gap" in problems[0].message
-    assert "install the BMad Method" in problems[0].message
+    assert missing_base_skills(tmp_path, [claude.skill_tree]) == []
 
 
 def test_missing_stories_support_probes_step01_content(tmp_path):
@@ -681,7 +689,6 @@ def test_missing_base_skills_findings_carry_ids_and_detail(tmp_path):
         "bmad-dev-auto",
         "bmad-review-adversarial-general",
         "bmad-review-edge-case-hunter",
-        "bmad-review-verification-gap",
     }
     assert all(f.detail["tree"] == claude.skill_tree for f in absent)
 
@@ -695,6 +702,66 @@ def test_missing_base_skills_findings_carry_ids_and_detail(tmp_path):
     assert incomplete[0].detail["missing_markers"] == ["step-04-review.md", "customize.toml"]
     for marker in incomplete[0].detail["missing_markers"]:
         assert marker in incomplete[0].message
+
+
+def test_merged_bmad_review_satisfies_review_layers(tmp_path):
+    """#260: post-consolidation bmm installs ship the merged `bmad-review` skill, with
+    the standalone hunter IDs as thin forwarders to it. The merged reviewer provides
+    every lens itself, so a tree carrying it needs none of the hunters."""
+    claude = get_profile("claude")
+    _install_skills(
+        tmp_path,
+        claude.skill_tree,
+        {"bmad-dev-auto": DEV_BASE_SKILLS["bmad-dev-auto"], "bmad-review": ()},
+    )
+    assert missing_base_skills(tmp_path, [claude.skill_tree]) == []
+
+    # ...but it never substitutes for the dev primitive
+    import shutil as _shutil
+
+    _shutil.rmtree(tmp_path / claude.skill_tree / "bmad-dev-auto")
+    problems = missing_base_skills(tmp_path, [claude.skill_tree])
+    assert len(problems) == 1
+    assert problems[0].detail["skill"] == "bmad-dev-auto"
+
+
+def test_verification_gap_never_required(tmp_path):
+    """#260: the latest-release (v6.10.0) shape — dev primitive + the two review
+    layers that release actually ships, no `bmad-review-verification-gap` (no tagged
+    release has ever shipped it) and no merged reviewer — must validate. Requiring it
+    made `validate` (and the run/resume/sweep preflight) unsatisfiable everywhere."""
+    claude = get_profile("claude")
+    _install_skills(tmp_path, claude.skill_tree, DEV_BASE_SKILLS)
+    # guard the topology: neither escape hatch is present, so [] below is earned by
+    # verification-gap not being required, not by the merged-reviewer bypass
+    assert not (tmp_path / claude.skill_tree / "bmad-review-verification-gap").exists()
+    assert not (tmp_path / claude.skill_tree / "bmad-review").exists()
+
+    assert missing_base_skills(tmp_path, [claude.skill_tree]) == []
+
+
+def test_review_hunter_missing_without_merged_review_reported(tmp_path):
+    """A genuinely broken pre-consolidation install still fails — and its message must
+    not misdiagnose the cause as "bmm is not installed" (#260): bmm is exactly what
+    ships the layer, so a user whose bmm is installed could not act on the old line."""
+    claude = get_profile("claude")
+    _install_skills(
+        tmp_path,
+        claude.skill_tree,
+        {k: v for k, v in DEV_BASE_SKILLS.items() if k != "bmad-review-edge-case-hunter"},
+    )
+
+    problems = missing_base_skills(tmp_path, [claude.skill_tree])
+    assert len(problems) == 1
+    assert problems[0].check == "skills.base-missing"
+    assert problems[0].severity == "problem"
+    assert problems[0].detail == {
+        "tree": claude.skill_tree,
+        "skill": "bmad-review-edge-case-hunter",
+    }
+    assert "bmad-review-edge-case-hunter" in problems[0].message
+    assert "install the BMad Method" not in problems[0].message
+    assert "update bmm" in problems[0].message
 
 
 def test_missing_stories_support_findings_split_absent_from_stale(tmp_path):

@@ -75,29 +75,39 @@ LEGACY_MODULE_SKILLS = (
 # BMad Method (bmm) module installs them. Each must exist in every active CLI skill
 # tree and carry its marker files (a half-installed or pre-automation skill is
 # caught by the `bmad-loop validate` preflight). `{skill: (marker-rel-path, ...)}`.
-#   - bmad-dev-auto: the inner dev primitive — always required. Markers pin BOTH a
-#     step file (catches a truncated copy) AND customize.toml, the layer/handoff
-#     config step-04 resolves review_layers from (BMAD-METHOD #2535/#2550): a
-#     pre-July bmm install predating it would let every dev run's step-04 fail.
-#   - the three review hunters bmad-dev-auto's step-04 invokes inline on EVERY dev
-#     run (and on each follow-up review re-invocation) — also always required, no
-#     longer gated on a separate review session. bmad-review-verification-gap is
-#     the newest layer (BMAD-METHOD #2550): a target project missing it makes the
-#     verification-gap review layer fail on every run.
+#   - bmad-dev-auto: the inner dev primitive — always required, and never
+#     substitutable. Markers pin BOTH a step file (catches a truncated copy) AND
+#     customize.toml, the layer/handoff config step-04 resolves review_layers from
+#     (BMAD-METHOD #2535/#2550): a pre-July bmm install predating it would let
+#     every dev run's step-04 fail.
+#   - the two standalone review hunters step-04 invokes inline by name on EVERY dev
+#     run (and on each follow-up review re-invocation). These are the review layers
+#     the latest BMAD-METHOD release (v6.10.0) actually ships; they are required
+#     only when the merged reviewer below is absent.
+# bmad-review-verification-gap is deliberately NOT preflighted (#260): no tagged
+# BMAD-METHOD release ships it — post-6.10.0 it exists only as a thin forwarder to
+# the merged bmad-review — and v6.10.0's step-04 never invokes it, so its absence
+# fails no run. Requiring it made `validate` unsatisfiable on every real install.
 DEV_BASE_SKILLS = {
     "bmad-dev-auto": ("step-04-review.md", "customize.toml"),
     "bmad-review-adversarial-general": (),
     "bmad-review-edge-case-hunter": (),
-    "bmad-review-verification-gap": (),
 }
-# Every non-bundled skill that might need copying into an isolated worktree.
-# bmad-review is the merged lens-based reviewer (BMAD-METHOD core-streamline):
-# on new bmm installs the three hunter IDs above are thin forwarders to it, so a
-# worktree must carry the real skill for those forwards to resolve. It is NOT in
-# DEV_BASE_SKILLS (preflight) so pre-merge bmm installs — which have the three
-# real hunters and no bmad-review — keep validating; provision_worktree skips
-# skills the main repo lacks, so copy-if-present is safe in both directions.
-BASE_SKILLS = {**DEV_BASE_SKILLS, "bmad-review": ()}
+# The merged lens-based reviewer (BMAD-METHOD core-streamline). Where it is present
+# it provides every review lens itself and step-04 is layer-driven (the standalone
+# hunter IDs are thin forwarders to it), so none of the hunters are required.
+MERGED_REVIEW_SKILL = "bmad-review"
+# The DEV_BASE_SKILLS entries MERGED_REVIEW_SKILL subsumes. bmad-dev-auto (the dev
+# primitive) is NOT here — the merged reviewer never substitutes for it.
+_REVIEW_LAYER_SKILLS = frozenset(
+    {"bmad-review-adversarial-general", "bmad-review-edge-case-hunter"}
+)
+# Every non-bundled skill that might need copying into an isolated worktree: the
+# preflight set above plus the merged reviewer and the pre-consolidation standalone
+# verification-gap forwarder (carried so a hand-installed forwarder still resolves,
+# never validated). provision_worktree skips skills the main repo lacks, so this
+# copy-if-present superset is safe in both directions.
+BASE_SKILLS = {**DEV_BASE_SKILLS, "bmad-review-verification-gap": (), MERGED_REVIEW_SKILL: ()}
 
 # Stories mode (folder+id dispatch, BMAD-METHOD #2549) needs a *newer* bmad-dev-auto
 # than sprint mode: one whose step-01 routes a spec-folder + story-id invocation.
@@ -160,30 +170,48 @@ def missing_stories_support(project: Path, trees: Sequence[str]) -> list[Finding
 def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
     """Problems for the upstream skills the orchestrator drives but doesn't bundle.
 
-    The dev primitive (bmad-dev-auto) and the three review hunters it invokes
-    inline — adversarial-general, edge-case-hunter, and verification-gap — are
-    installed by the BMad Method module, not by `bmad-loop init`. Each must exist
-    in every active CLI skill tree and carry its marker files. Returns one problem
-    :class:`Finding` per missing/incomplete skill; empty list means OK. Run as a
-    preflight so a missing skill fails loudly with remediation instead of stalling
-    as an `Unknown command` until the run times out.
+    The dev primitive (bmad-dev-auto) and the review layers its step-04 invokes
+    inline are installed by the BMad Method module, not by `bmad-loop init`. Each
+    must exist in every active CLI skill tree and carry its marker files. Returns
+    one problem :class:`Finding` per missing/incomplete skill; empty list means OK.
+    Run as a preflight so a missing skill fails loudly with remediation instead of
+    stalling as an `Unknown command` until the run times out.
+
+    A tree carrying the merged ``bmad-review`` skill satisfies the review layers on
+    its own, so only bmad-dev-auto is required there (#260) — the check is per tree,
+    since a project can have a post-consolidation `.claude` tree and a pre-merge
+    `.agents` one side by side.
 
     ``skills.base-incomplete`` carries ``missing_markers`` as a list — the message
     joins it with ", " for the human line, which a consumer would otherwise have to
     split back apart on a separator the message is free to change.
     """
-    required = dict(DEV_BASE_SKILLS)
     problems: list[Finding] = []
     for tree in dict.fromkeys(trees):
-        for skill, markers in required.items():
+        merged_present = (project / tree / MERGED_REVIEW_SKILL / "SKILL.md").is_file()
+        for skill, markers in DEV_BASE_SKILLS.items():
+            if merged_present and skill in _REVIEW_LAYER_SKILLS:
+                continue
             skill_dir = project / tree / skill
             if not (skill_dir / "SKILL.md").is_file():
+                if skill in _REVIEW_LAYER_SKILLS:
+                    remedy = (
+                        f"this review layer ships with the bmm module "
+                        f"(BMAD-METHOD >= 6.10.0), as does the consolidated "
+                        f"{MERGED_REVIEW_SKILL} skill that supersedes it in newer releases; "
+                        f"install or update bmm in this project"
+                    )
+                else:
+                    remedy = (
+                        "the orchestrator drives this upstream dev primitive directly; it "
+                        "ships with the bmm module (BMAD-METHOD >= 6.10.0); "
+                        "install or update bmm in this project"
+                    )
                 problems.append(
                     Finding(
                         "skills.base-missing",
                         "problem",
-                        f"{tree}/{skill} not found — install the BMad Method (bmm) module "
-                        f"(the orchestrator drives this upstream skill directly)",
+                        f"{tree}/{skill} not found — {remedy}",
                         {"tree": tree, "skill": skill},
                     )
                 )

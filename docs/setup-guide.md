@@ -97,8 +97,16 @@ installs all the bundled skills together (`bmad-loop-resolve`, `bmad-loop-sweep`
 the orchestrator normalizes the ledger to. The dev primitive `bmad-dev-auto` is
 **not** bundled: it is the upstream skill the orchestrator drives (for both
 implementation and the follow-up review), installed by the BMad Method (bmm)
-module. `bmad-loop validate` checks it — plus the three review hunters it
-invokes inline — are present before a run starts.
+module. `bmad-loop validate` checks it — plus the review layers it invokes
+inline — are present before a run starts.
+
+**Minimum BMAD-METHOD: v6.10.0** for sprint mode. That release ships `bmad-dev-auto`
+(with its `customize.toml`) plus the `bmad-review-adversarial-general` and
+`bmad-review-edge-case-hunter` layers, which is all `validate` requires. Newer,
+post-consolidation releases instead ship the merged `bmad-review` skill; where that is
+present it provides every review lens itself, so the standalone hunters are not
+required. The verification-gap review layer only runs on a release newer than 6.10.0
+(or with `bmad-review`) — on 6.10.0, dev runs use the other two layers.
 
 ## Choosing which CLIs to drive
 

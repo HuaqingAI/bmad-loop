@@ -175,7 +175,7 @@ See [README.md](../README.md) for the narrative overview and [setup-guide.md](se
 ### Setup & install
 
 - `bmad-loop init` installs the three `bmad-loop-*` skills (`bmad-loop-setup`, `bmad-loop-resolve`, `bmad-loop-sweep`, into `.claude/skills/` and/or `.agents/skills/`), the hook relay, `.bmad-loop/policy.toml`, and a gitignore covering the runs dir, plugin caches, and policy.toml itself (per-machine config). Flags: `--cli` (repeatable), `--no-skills`, `--force-skills`.
-- `bmad-loop validate` preflights every prerequisite: BMAD config, sprint-status, git, the selected terminal-multiplexer backend (listing all detected when more than one is registered), CLI binary, hook registration, and the three inline review-hunter skills `bmad-dev-auto` invokes (`bmad-review-adversarial-general`, `bmad-review-edge-case-hunter`, `bmad-review-verification-gap`) plus its `customize.toml`.
+- `bmad-loop validate` preflights every prerequisite: BMAD config, sprint-status, git, the selected terminal-multiplexer backend (listing all detected when more than one is registered), CLI binary, hook registration, and the inline review-layer skills `bmad-dev-auto` invokes (`bmad-review-adversarial-general` + `bmad-review-edge-case-hunter`, or the merged `bmad-review` skill that supersedes them) plus its `customize.toml`.
 - Non-invasive: drives the upstream `bmad-dev-auto` skill unmodified — there is no fork to keep in sync — and review is just a re-invocation of it on the `done` spec. Your standard BMAD install is never modified.
 
 ### Command reference
