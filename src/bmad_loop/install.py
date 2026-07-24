@@ -93,9 +93,12 @@ DEV_BASE_SKILLS = {
     "bmad-review-adversarial-general": (),
     "bmad-review-edge-case-hunter": (),
 }
-# The merged lens-based reviewer (BMAD-METHOD core-streamline). Where it is present
-# it provides every review lens itself and step-04 is layer-driven (the standalone
-# hunter IDs are thin forwarders to it), so none of the hunters are required.
+# The merged lens-based reviewer (BMAD-METHOD core-streamline). Where it is present,
+# step-04 is layer-driven off customize.toml's [[workflow.review_layers]]: four layers
+# (blind-hunter, edge-case-hunter, verification-gap — each invoking bmad-review with
+# one lens — plus intent-alignment, an inline prompt invoking no skill at all). So
+# bmad-review alone satisfies every layer that needs a skill, and the standalone
+# hunter IDs (thin forwarders to it) are not required.
 MERGED_REVIEW_SKILL = "bmad-review"
 # The DEV_BASE_SKILLS entries MERGED_REVIEW_SKILL subsumes. bmad-dev-auto (the dev
 # primitive) is NOT here — the merged reviewer never substitutes for it.

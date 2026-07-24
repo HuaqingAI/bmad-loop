@@ -100,13 +100,22 @@ implementation and the follow-up review), installed by the BMad Method (bmm)
 module. `bmad-loop validate` checks it — plus the review layers it invokes
 inline — are present before a run starts.
 
-**Minimum BMAD-METHOD: v6.10.0** for sprint mode. That release ships `bmad-dev-auto`
-(with its `customize.toml`) plus the `bmad-review-adversarial-general` and
-`bmad-review-edge-case-hunter` layers, which is all `validate` requires. Newer,
-post-consolidation releases instead ship the merged `bmad-review` skill; where that is
-present it provides every review lens itself, so the standalone hunters are not
-required. The verification-gap review layer only runs on a release newer than 6.10.0
-(or with `bmad-review`) — on 6.10.0, dev runs use the other two layers.
+**Minimum BMAD-METHOD: v6.10.0** for sprint mode. On that release `bmad-dev-auto`'s
+`step-04-review.md` invokes exactly two review skills by name —
+`bmad-review-adversarial-general` and `bmad-review-edge-case-hunter` — and those,
+plus `bmad-dev-auto` itself (with its `customize.toml`), are all `validate` requires.
+
+Newer, post-consolidation releases restructure this: the review step becomes
+layer-driven off `customize.toml`'s `[[workflow.review_layers]]`, which defines four
+layers — `blind-hunter`, `edge-case-hunter`, and `verification-gap`, each invoking the
+merged `bmad-review` skill with one lens, plus `intent-alignment`, a self-contained
+prompt that invokes no skill at all. A tree carrying `bmad-review` therefore satisfies
+every layer that needs a skill, and the standalone hunters are not required there.
+
+`bmad-review-verification-gap` is never required, in either topology: no tagged release
+ships it as a standalone skill (on newer sources it is only a thin forwarder to
+`bmad-review`). The verification-gap lens runs via `bmad-review` on post-consolidation
+installs, and does not run at all on 6.10.0.
 
 ## Choosing which CLIs to drive
 
