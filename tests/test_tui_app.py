@@ -1366,6 +1366,22 @@ async def test_start_sweep_and_checkpoint_buttons_reachable(project):
         assert _on_screen(app, app.screen.query_one("#cancel", Button))
 
 
+async def test_short_confirm_modal_stays_compact(project):
+    """The bounded modals keep BaseDialog #dialog at height: auto on purpose, so a
+    short body sizes to content instead of filling the screen. Guards the compact
+    tier against the #280 CodeRabbit suggestion of a definite `#dialog` height: on
+    a tall terminal a one-line confirm must stay a handful of rows, not balloon to
+    the 90% cap (a definite height took this from 7 → 23 rows when measured)."""
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(64, 40)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app.push_screen(ConfirmModal("t", "Stop the run?"))
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        dialog = await ready(pilot, "#dialog")
+        # content-driven height, nowhere near the 90% cap (36 rows at this size)
+        assert dialog.region.height < 12
+
+
 async def test_escalation_rearm_warning_stays_on_screen(project):
     """When a restore patch is recorded the escalation warns that Re-arm re-drives
     from scratch and drops it. Re-arm is enabled, so that warning must stay docked

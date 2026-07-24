@@ -38,6 +38,13 @@ class BaseDialog(ModalScreen):
     }
     BaseDialog #dialog {
         width: 64;
+        /* height is intentionally auto (not a definite %). Two-tier by design:
+           list-heavy modals (Decision/Escalation/StartRun/...) override #dialog
+           with a definite height + a 1fr body; the bounded modals (Confirm/
+           StartSweep/StoryCheckpoint) keep this auto so short content stays
+           compact and only long bodies grow to the #body max-height cap. Giving
+           #dialog a definite % here would balloon a one-line confirm to ~90% of
+           the screen — see test_short_confirm_modal_stays_compact. */
         height: auto;
         max-height: 90%;
         padding: 1 2;
