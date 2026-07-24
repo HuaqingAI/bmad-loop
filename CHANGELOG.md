@@ -67,6 +67,13 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **Scrollable modal dialogs (#275).** The decision, escalation, confirm, sweep-options and
+  story-checkpoint TUI dialogs now scroll their bodies and dock their action buttons, so the
+  choose/action buttons stay reachable with long content down to the dialog's minimum frame
+  height (previously the lowest button could be clipped off-screen with no scrollbar). Safety
+  warnings that gate an enabled Resume/Re-arm are docked with the buttons so they cannot scroll
+  out of view, and the Resume confirm re-checks engine liveness at click time.
+
 - **A finished story whose session omitted `## Auto Run Result` no longer livelocks and
   DEFER-drops (#224).** The review HALT intermittently finalizes the spec's frontmatter to
   `status: done` without appending the terminal marker the harvest scan keys on; every Stop
