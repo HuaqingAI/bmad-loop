@@ -67,14 +67,19 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
-- **`validate` no longer requires a skill no release ships (#260).** The preflight demanded
-  `bmad-review-verification-gap`, which no tagged BMAD-METHOD release ships (absent from
-  v6.10.0; post-6.10.0 it exists only as a forwarder to the merged `bmad-review`), and
-  misdiagnosed it as "install the BMad Method (bmm) module" on projects where bmm _was_
-  installed — so `validate`/`run`/`resume`/`sweep` could not pass on a stock install. It is no
-  longer preflighted (still copied into a worktree when present), a tree carrying the merged
-  `bmad-review` skill now satisfies the review layers on its own, and the remaining messages
-  name the actual remedy (install/update bmm, BMAD-METHOD >= 6.10.0).
+- **`validate` requires the review skills your `bmad-dev-auto` actually invokes (#260).** The
+  preflight held every project to a fixed catalog that included `bmad-review-verification-gap`,
+  which no tagged BMAD-METHOD release ships (absent from v6.10.0; on current sources only a
+  forwarder to the merged `bmad-review`), and misdiagnosed it as "install the BMad Method (bmm)
+  module" on projects where bmm _was_ installed — so `validate`/`run`/`resume`/`sweep` could not
+  pass on a stock install. The required reviewers are now read from the installed skill itself:
+  its `customize.toml` `[[workflow.review_layers]]` when present (honoring disabled layers and
+  `_bmad/custom/bmad-dev-auto.toml` overrides), else the reviewers `step-04-review.md` names
+  inline. A merged-`bmad-review` install needs only `bmad-review`; a v6.10.0 install needs the
+  two hunters it names; and a tree whose configured layers reference a skill it does not have is
+  now caught by a new `skills.review-layer-missing` problem instead of passing and then failing
+  on every dev run. Unreadable configs fall back to the previous static requirement, and all
+  messages name the real remedy (install/update bmm, BMAD-METHOD >= 6.10.0).
 - **`notify.desktop` works on macOS/Windows, and warns when it can't (#231).** The desktop
   notification channel was `notify-send`-only, so on macOS and Windows `notify.desktop` (default
   `true`) was silently inert — every "a human is needed" path (escalations, deferrals,

@@ -255,7 +255,7 @@ The orchestrator drives the upstream `bmad-dev-auto` skill as its inner dev prim
 | `bmad-loop-sweep`                 | deferred-work ledger triage (automation-only)                                               |
 | `bmad-loop-setup`                 | registers the module in `_bmad/` config + help                                              |
 
-`bmad-loop validate` preflights the upstream skills: `bmad-dev-auto` (always) plus the two standalone review layers — which a tree carrying the merged `bmad-review` skill satisfies on its own. A target project missing one of them (or a `bmad-dev-auto` without its `customize.toml` review-layer config) is reported with bmm-module remediation before any run starts.
+`bmad-loop validate` preflights `bmad-dev-auto` (always) plus the review skills that copy of the skill will actually invoke — read from its `customize.toml` review layers, or from `step-04-review.md` on releases that name their reviewers inline. So a merged-`bmad-review` install needs only `bmad-review`, a v6.10.0 install needs the two hunters it names, and a tree whose configured layers reference a skill it does not have is reported instead of failing on every dev run. Missing skills (or a `bmad-dev-auto` without its `customize.toml`) are reported with bmm-module remediation before any run starts.
 
 **Via uv + `bmad-loop init` (self-sufficient).** Installing the tool and running `init` is all you need — `init` installs the `bmad-loop-*` skills into `.claude/skills/` (claude) and/or `.agents/skills/` (codex/gemini) for the CLIs you select, alongside the hooks and policy:
 

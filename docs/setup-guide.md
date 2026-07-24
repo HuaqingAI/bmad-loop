@@ -100,22 +100,30 @@ implementation and the follow-up review), installed by the BMad Method (bmm)
 module. `bmad-loop validate` checks it — plus the review layers it invokes
 inline — are present before a run starts.
 
-**Minimum BMAD-METHOD: v6.10.0** for sprint mode. On that release `bmad-dev-auto`'s
-`step-04-review.md` invokes exactly two review skills by name —
-`bmad-review-adversarial-general` and `bmad-review-edge-case-hunter` — and those,
-plus `bmad-dev-auto` itself (with its `customize.toml`), are all `validate` requires.
+**Minimum BMAD-METHOD: v6.10.0** for sprint mode. Beyond `bmad-dev-auto` itself (with
+its `customize.toml`), `bmad-loop validate` holds you to no fixed list of review
+skills: it reads the `bmad-dev-auto` you actually have installed and requires the
+reviewers that copy will actually invoke.
 
-Newer, post-consolidation releases restructure this: the review step becomes
-layer-driven off `customize.toml`'s `[[workflow.review_layers]]`, which defines four
-layers — `blind-hunter`, `edge-case-hunter`, and `verification-gap`, each invoking the
-merged `bmad-review` skill with one lens, plus `intent-alignment`, a self-contained
-prompt that invokes no skill at all. A tree carrying `bmad-review` therefore satisfies
-every layer that needs a skill, and the standalone hunters are not required there.
+- **Layer-driven (post-6.10.0)** — `customize.toml` defines
+  `[[workflow.review_layers]]`, and each layer's `instruction` names the skill it hands
+  off to. Current sources define four layers: `blind-hunter`, `edge-case-hunter`, and
+  `verification-gap`, each invoking the merged `bmad-review` skill with one lens, plus
+  `intent-alignment`, a self-contained prompt that invokes no skill at all. Such a tree
+  needs `bmad-review` and none of the standalone hunters. An intermediate release whose
+  layers name the standalone hunters needs exactly those instead.
+- **v6.10.0** — no `review_layers` section at all; `step-04-review.md` names
+  `bmad-review-adversarial-general` and `bmad-review-edge-case-hunter` inline, so those
+  two are what is required.
 
-`bmad-review-verification-gap` is never required, in either topology: no tagged release
-ships it as a standalone skill (on newer sources it is only a thin forwarder to
-`bmad-review`). The verification-gap lens runs via `bmad-review` on post-consolidation
-installs, and does not run at all on 6.10.0.
+A layer disabled with an empty `instruction`, or replaced in
+`_bmad/custom/bmad-dev-auto.toml` by a recipe that runs something else, requires
+nothing. If the shape cannot be read at all, `validate` falls back to requiring the two
+v6.10.0 hunters — which a tree carrying `bmad-review` satisfies.
+
+`bmad-review-verification-gap` is no longer required unconditionally (#260): no tagged
+release ships it as a standalone skill, and on current sources it is only a thin
+forwarder to `bmad-review`. It is required exactly when your installed layers name it.
 
 ## Choosing which CLIs to drive
 

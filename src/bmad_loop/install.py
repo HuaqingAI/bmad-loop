@@ -17,11 +17,14 @@ orchestrator's signal watcher is CLI-agnostic.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
+import tomllib
 from collections.abc import Iterable, Sequence
 from importlib import resources
 from pathlib import Path
+from typing import Any, NamedTuple
 
 from .adapters.profile import ALIASES, CLIProfile, ProfileError, load_profiles
 from .checks import Finding
@@ -80,25 +83,27 @@ LEGACY_MODULE_SKILLS = (
 #     customize.toml, the layer/handoff config step-04 resolves review_layers from
 #     (BMAD-METHOD #2535/#2550): a pre-July bmm install predating it would let
 #     every dev run's step-04 fail.
-#   - the two standalone review hunters step-04 invokes inline by name on EVERY dev
-#     run (and on each follow-up review re-invocation). These are the review layers
-#     the latest BMAD-METHOD release (v6.10.0) actually ships; they are required
-#     only when the merged reviewer below is absent.
-# bmad-review-verification-gap is deliberately NOT preflighted (#260): no tagged
-# BMAD-METHOD release ships it — post-6.10.0 it exists only as a thin forwarder to
-# the merged bmad-review — and v6.10.0's step-04 never invokes it, so its absence
-# fails no run. Requiring it made `validate` unsatisfiable on every real install.
+#   - the two review hunters v6.10.0 ships. These are only the FALLBACK review
+#     requirement, used when the installed skill's shape can't be read: normally the
+#     reviewers are derived per tree from bmad-dev-auto itself
+#     (_configured_review_skills), because which skills the review step invokes is a
+#     property of that skill version, not of a catalog pinned in here (#260).
+# bmad-review-verification-gap is not in the fallback set: no tagged BMAD-METHOD
+# release ships it standalone (on current sources it is a thin forwarder to the
+# merged bmad-review), so demanding it of every project made `validate`
+# unsatisfiable on real installs. A project whose review layers DO name it still has
+# it required — by derivation from its own config, not by this list.
 DEV_BASE_SKILLS = {
     "bmad-dev-auto": ("step-04-review.md", "customize.toml"),
     "bmad-review-adversarial-general": (),
     "bmad-review-edge-case-hunter": (),
 }
-# The merged lens-based reviewer (BMAD-METHOD core-streamline). Where it is present,
-# step-04 is layer-driven off customize.toml's [[workflow.review_layers]]: four layers
+# The merged lens-based reviewer (BMAD-METHOD core-streamline). Current sources make
+# step-04 layer-driven off customize.toml's [[workflow.review_layers]]: four layers
 # (blind-hunter, edge-case-hunter, verification-gap — each invoking bmad-review with
-# one lens — plus intent-alignment, an inline prompt invoking no skill at all). So
-# bmad-review alone satisfies every layer that needs a skill, and the standalone
-# hunter IDs (thin forwarders to it) are not required.
+# one lens — plus intent-alignment, an inline prompt invoking no skill at all), so
+# bmad-review alone satisfies every layer that needs a skill. Named here for the
+# fallback path only; the derived path sees it named in the layers themselves.
 MERGED_REVIEW_SKILL = "bmad-review"
 # The DEV_BASE_SKILLS entries MERGED_REVIEW_SKILL subsumes. bmad-dev-auto (the dev
 # primitive) is NOT here — the merged reviewer never substitutes for it.
@@ -111,6 +116,121 @@ _REVIEW_LAYER_SKILLS = frozenset(
 # never validated). provision_worktree skips skills the main repo lacks, so this
 # copy-if-present superset is safe in both directions.
 BASE_SKILLS = {**DEV_BASE_SKILLS, "bmad-review-verification-gap": (), MERGED_REVIEW_SKILL: ()}
+
+DEV_PRIMITIVE_SKILL = "bmad-dev-auto"
+# How bmad-dev-auto names a skill it hands a review off to, in both shapes:
+# "Invoke the `bmad-review` skill with only the `adversarial` lens" (a
+# customize.toml review layer) and "Invoke the `bmad-review-edge-case-hunter`
+# skill on this diff" (pre-consolidation step-04). Deliberately narrow —
+# backticked, `bmad-` prefixed — because a false match here is a false FAIL,
+# the exact failure mode #260 was. A reference we don't recognize simply isn't
+# preflighted, which is no worse than the static catalog.
+_INVOKE_SKILL_RE = re.compile(r"[Ii]nvoke the `(bmad-[a-z0-9-]+)` skill")
+# Project-level overrides of the skill's shipped customize.toml, in precedence
+# order (later wins), per customize.toml's own header.
+_CUSTOMIZE_OVERRIDES = (
+    Path("_bmad") / "custom" / "bmad-dev-auto.toml",
+    Path("_bmad") / "custom" / "bmad-dev-auto.user.toml",
+)
+
+
+class _ReviewConfig(NamedTuple):
+    """Which skills the installed bmad-dev-auto's review step actually invokes.
+
+    ``source`` is the file it was read from (for the finding's detail), ``skills``
+    maps each invoked skill to the review-layer ids that invoke it — empty for the
+    pre-consolidation shape, which has no layers.
+    """
+
+    source: str
+    skills: dict[str, tuple[str, ...]]
+
+
+def _read_toml(path: Path) -> dict[str, Any] | None:
+    """Parse a TOML file, or None if it is absent/unreadable/malformed."""
+    try:
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return None
+
+
+def _layers_of(data: dict[str, Any]) -> list[Any]:
+    layers = data.get("workflow", {}).get("review_layers") if isinstance(data, dict) else None
+    return layers if isinstance(layers, list) else []
+
+
+def _merged_review_layers(project: Path, tree: str) -> list[Any] | None:
+    """The skill's shipped review layers with any project override applied.
+
+    Arrays of tables merge by ``id``: a matching id replaces the default, new ids
+    append. Returns None when any input is unreadable — the caller must then fall
+    back rather than conclude anything from a half-read config.
+    """
+    data = _read_toml(project / tree / DEV_PRIMITIVE_SKILL / "customize.toml")
+    if data is None:
+        return None
+    layers = _layers_of(data)
+    for rel in _CUSTOMIZE_OVERRIDES:
+        override = project / rel
+        if not override.is_file():
+            continue
+        extra = _read_toml(override)
+        if extra is None:
+            return None
+        for layer in _layers_of(extra):
+            if not isinstance(layer, dict):
+                continue
+            lid = layer.get("id")
+            for i, existing in enumerate(layers):
+                if isinstance(existing, dict) and lid is not None and existing.get("id") == lid:
+                    layers[i] = layer
+                    break
+            else:
+                layers.append(layer)
+    return layers
+
+
+def _configured_review_skills(project: Path, tree: str) -> _ReviewConfig | None:
+    """Read the review skills this project will really invoke, or None if unknown.
+
+    Post-consolidation bmad-dev-auto is layer-driven: each
+    ``[[workflow.review_layers]]`` entry carries its whole execution recipe, and a
+    layer that runs a skill names it inline (an empty ``instruction`` disables the
+    layer, and a layer may legitimately name no skill at all — `intent-alignment`
+    is a self-contained prompt). Pre-consolidation, ``step-04-review.md`` names its
+    reviewers directly instead.
+
+    Reading whichever is installed keeps the preflight honest as upstream moves:
+    a project whose configured layers invoke a skill it does not have is otherwise
+    green here and broken on every dev run (#260). None means the shape could not
+    be determined, so the caller falls back to the static catalog.
+    """
+    layers = _merged_review_layers(project, tree)
+    if layers is None:
+        return None
+    if layers:
+        found: dict[str, list[str]] = {}
+        for layer in layers:
+            if not isinstance(layer, dict):
+                continue
+            instruction = layer.get("instruction")
+            if not isinstance(instruction, str) or not instruction.strip():
+                continue
+            layer_id = layer.get("id")
+            for skill in _INVOKE_SKILL_RE.findall(instruction):
+                ids = found.setdefault(skill, [])
+                if isinstance(layer_id, str) and layer_id not in ids:
+                    ids.append(layer_id)
+        return _ReviewConfig("customize.toml", {s: tuple(i) for s, i in found.items()})
+    try:
+        step04 = (project / tree / DEV_PRIMITIVE_SKILL / "step-04-review.md").read_text(
+            encoding="utf-8"
+        )
+    except (OSError, UnicodeDecodeError):
+        return None
+    named = dict.fromkeys(_INVOKE_SKILL_RE.findall(step04), ())
+    return _ReviewConfig("step-04-review.md", named) if named else None
+
 
 # Stories mode (folder+id dispatch, BMAD-METHOD #2549) needs a *newer* bmad-dev-auto
 # than sprint mode: one whose step-01 routes a spec-folder + story-id invocation.
@@ -180,10 +300,15 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
     Run as a preflight so a missing skill fails loudly with remediation instead of
     stalling as an `Unknown command` until the run times out.
 
-    A tree carrying the merged ``bmad-review`` skill satisfies the review layers on
-    its own, so only bmad-dev-auto is required there (#260) — the check is per tree,
-    since a project can have a post-consolidation `.claude` tree and a pre-merge
-    `.agents` one side by side.
+    The review skills are read from the installed bmad-dev-auto itself
+    (:func:`_configured_review_skills`) so the preflight requires what this project
+    will really invoke: a tree whose configured layers call the merged
+    ``bmad-review`` needs that skill and not the standalone hunters, and a tree on
+    the pre-consolidation step-04 needs the two hunters it names. When the shape
+    can't be read we fall back to the static catalog, with a present
+    ``bmad-review`` satisfying the hunters. Everything is per tree, since a project
+    can have a post-consolidation `.claude` tree and a pre-merge `.agents` one side
+    by side.
 
     ``skills.base-incomplete`` carries ``missing_markers`` as a list — the message
     joins it with ", " for the human line, which a consumer would otherwise have to
@@ -191,45 +316,81 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
     """
     problems: list[Finding] = []
     for tree in dict.fromkeys(trees):
-        merged_present = (project / tree / MERGED_REVIEW_SKILL / "SKILL.md").is_file()
-        for skill, markers in DEV_BASE_SKILLS.items():
-            if merged_present and skill in _REVIEW_LAYER_SKILLS:
-                continue
-            skill_dir = project / tree / skill
-            if not (skill_dir / "SKILL.md").is_file():
-                if skill in _REVIEW_LAYER_SKILLS:
-                    remedy = (
-                        f"this review layer ships with the bmm module "
-                        f"(BMAD-METHOD >= 6.10.0), as does the consolidated "
-                        f"{MERGED_REVIEW_SKILL} skill that supersedes it in newer releases; "
-                        f"install or update bmm in this project"
-                    )
-                else:
-                    remedy = (
-                        "the orchestrator drives this upstream dev primitive directly; it "
-                        "ships with the bmm module (BMAD-METHOD >= 6.10.0); "
-                        "install or update bmm in this project"
-                    )
-                problems.append(
-                    Finding(
-                        "skills.base-missing",
-                        "problem",
-                        f"{tree}/{skill} not found — {remedy}",
-                        {"tree": tree, "skill": skill},
-                    )
+        skill_dir = project / tree / DEV_PRIMITIVE_SKILL
+        markers = DEV_BASE_SKILLS[DEV_PRIMITIVE_SKILL]
+        if not (skill_dir / "SKILL.md").is_file():
+            problems.append(
+                Finding(
+                    "skills.base-missing",
+                    "problem",
+                    f"{tree}/{DEV_PRIMITIVE_SKILL} not found — the orchestrator drives this "
+                    f"upstream dev primitive directly; it ships with the bmm module "
+                    f"(BMAD-METHOD >= 6.10.0); install or update bmm in this project",
+                    {"tree": tree, "skill": DEV_PRIMITIVE_SKILL},
                 )
-                continue
+            )
+        else:
             absent = [m for m in markers if not (skill_dir / m).is_file()]
             if absent:
                 problems.append(
                     Finding(
                         "skills.base-incomplete",
                         "problem",
-                        f"{tree}/{skill} is incomplete (missing {', '.join(absent)}) — "
-                        f"reinstall it from the bmm module",
-                        {"tree": tree, "skill": skill, "missing_markers": absent},
+                        f"{tree}/{DEV_PRIMITIVE_SKILL} is incomplete (missing "
+                        f"{', '.join(absent)}) — reinstall it from the bmm module",
+                        {"tree": tree, "skill": DEV_PRIMITIVE_SKILL, "missing_markers": absent},
                     )
                 )
+        problems.extend(_missing_review_skills(project, tree))
+    return problems
+
+
+def _missing_review_skills(project: Path, tree: str) -> list[Finding]:
+    """Problems for the review skills this tree's bmad-dev-auto invokes."""
+    configured = _configured_review_skills(project, tree)
+    if configured is None:
+        # Unknown shape: keep the long-standing static requirement, which both real
+        # topologies satisfy — the two hunters, or the merged reviewer instead.
+        if (project / tree / MERGED_REVIEW_SKILL / "SKILL.md").is_file():
+            return []
+        return [
+            Finding(
+                "skills.base-missing",
+                "problem",
+                f"{tree}/{skill} not found — this review layer ships with the bmm module "
+                f"(BMAD-METHOD >= 6.10.0), as does the consolidated {MERGED_REVIEW_SKILL} "
+                f"skill that supersedes it in newer releases; install or update bmm in "
+                f"this project",
+                {"tree": tree, "skill": skill},
+            )
+            for skill in sorted(_REVIEW_LAYER_SKILLS)
+            if not (project / tree / skill / "SKILL.md").is_file()
+        ]
+    problems: list[Finding] = []
+    for skill, layer_ids in sorted(configured.skills.items()):
+        if (project / tree / skill / "SKILL.md").is_file():
+            continue
+        if len(layer_ids) > 1:
+            where = f"review layers {', '.join(layer_ids)} invoke"
+        elif layer_ids:
+            where = f"review layer {layer_ids[0]} invokes"
+        else:
+            where = "review step invokes"
+        problems.append(
+            Finding(
+                "skills.review-layer-missing",
+                "problem",
+                f"{tree}/{skill} not found — {tree}/{DEV_PRIMITIVE_SKILL}'s {where} it "
+                f"({configured.source}), so every dev run's review would fail; "
+                f"install or update the bmm module so this project's review layers resolve",
+                {
+                    "tree": tree,
+                    "skill": skill,
+                    "layers": list(layer_ids),
+                    "source": configured.source,
+                },
+            )
+        )
     return problems
 
 

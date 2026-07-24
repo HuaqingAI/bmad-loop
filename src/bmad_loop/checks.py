@@ -68,6 +68,7 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "skills.base",
         "skills.base-missing",
         "skills.base-incomplete",
+        "skills.review-layer-missing",
         "skills.stories-dispatch",
         "skills.stories-dispatch-missing",
         "skills.stories-dispatch-stale",

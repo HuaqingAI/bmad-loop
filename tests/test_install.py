@@ -764,6 +764,219 @@ def test_review_hunter_missing_without_merged_review_reported(tmp_path):
     assert "update bmm" in problems[0].message
 
 
+# Verbatim shape of BMAD-METHOD main's bmad-dev-auto/customize.toml: four review
+# layers, three invoking the merged `bmad-review` with one lens each, plus
+# intent-alignment — a self-contained prompt that invokes no skill at all.
+LAYER_CUSTOMIZE = """
+[workflow]
+implementation_handoff = "irrelevant here"
+
+[[workflow.review_layers]]
+id = "blind-hunter"
+name = "Blind Hunter"
+instruction = '''
+Launch a subagent with no prior conversation context, with this prompt:
+
+> Invoke the `bmad-review` skill with only the `adversarial` lens on this diff:
+>
+> {diff_output}
+'''
+
+[[workflow.review_layers]]
+id = "edge-case-hunter"
+name = "Edge Case Hunter"
+instruction = '''
+> Invoke the `bmad-review` skill with only the `edge-case-hunter` lens on this diff:
+>
+> {diff_output}
+'''
+
+[[workflow.review_layers]]
+id = "verification-gap"
+name = "Verification Gap Reviewer"
+instruction = '''
+> Invoke the `bmad-review` skill with only the `verification-gap` lens on this diff:
+>
+> {diff_output}
+'''
+
+[[workflow.review_layers]]
+id = "intent-alignment"
+name = "Intent Alignment Auditor"
+instruction = '''
+> You are an intent-alignment auditor. Here is the diff:
+>
+> {diff_output}
+'''
+"""
+
+# Pre-consolidation (v6.10.0) shape: a valid customize.toml that simply has no
+# review_layers section, and a step-04 that names the two reviewers it invokes.
+PRE_LAYER_CUSTOMIZE = """
+[workflow]
+activation_steps_prepend = []
+persistent_facts = ["file:{project-root}/**/project-context.md"]
+on_complete = ""
+"""
+
+STEP04_NAMED = """
+### Step 2: Review layers
+
+- Launch a subagent, with this prompt:
+  > Invoke the `bmad-review-adversarial-general` skill on this diff:
+  > {diff_output}
+- Launch a subagent, with this prompt:
+  > Invoke the `bmad-review-edge-case-hunter` skill on this diff:
+  > {diff_output}
+"""
+
+
+def _install_dev_auto(root, tree, *, customize="x\n", step04="x\n"):
+    """Install bmad-dev-auto with real customize.toml / step-04 content, so the
+    preflight reads the review shape it would read on a real install."""
+    d = root / tree / "bmad-dev-auto"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "SKILL.md").write_text("# bmad-dev-auto\n", encoding="utf-8")
+    (d / "customize.toml").write_text(customize, encoding="utf-8")
+    (d / "step-04-review.md").write_text(step04, encoding="utf-8")
+    return d
+
+
+def test_layer_driven_review_requires_the_merged_skill_it_names(tmp_path):
+    """Post-consolidation topology: the layers invoke `bmad-review` by name, so that
+    skill — and none of the standalone hunters — is what the tree must carry."""
+    claude = get_profile("claude")
+    _install_dev_auto(tmp_path, claude.skill_tree, customize=LAYER_CUSTOMIZE)
+    _install_skills(tmp_path, claude.skill_tree, {"bmad-review": ()})
+
+    assert missing_base_skills(tmp_path, [claude.skill_tree]) == []
+
+
+def test_layer_driven_review_reports_unresolvable_layer(tmp_path):
+    """The gap this closes: a project whose customize.toml is post-consolidation but
+    whose skills are the pre-consolidation standalone hunters. The old preflight was
+    green here while three of the four layers would fail on every dev run."""
+    claude = get_profile("claude")
+    _install_dev_auto(tmp_path, claude.skill_tree, customize=LAYER_CUSTOMIZE)
+    _install_skills(
+        tmp_path,
+        claude.skill_tree,
+        {
+            "bmad-review-adversarial-general": (),
+            "bmad-review-edge-case-hunter": (),
+            "bmad-review-verification-gap": (),
+        },
+    )
+
+    problems = missing_base_skills(tmp_path, [claude.skill_tree])
+    assert len(problems) == 1
+    assert problems[0].check == "skills.review-layer-missing"
+    assert problems[0].severity == "problem"
+    assert problems[0].detail["skill"] == "bmad-review"
+    # the three lens layers name it; intent-alignment invokes no skill at all
+    assert problems[0].detail["layers"] == [
+        "blind-hunter",
+        "edge-case-hunter",
+        "verification-gap",
+    ]
+    assert problems[0].detail["source"] == "customize.toml"
+    assert "bmad-review" in problems[0].message
+
+
+def test_review_layer_check_id_is_registered(tmp_path):
+    from bmad_loop.checks import VALIDATE_CHECKS
+
+    assert "skills.review-layer-missing" in VALIDATE_CHECKS
+
+
+def test_pre_consolidation_step04_requires_the_skills_it_names(tmp_path):
+    """v6.10.0 shape: no review_layers, so the requirement comes from the two skills
+    step-04 invokes by name — and a tree carrying only the merged reviewer does NOT
+    satisfy them, because that step-04 names the hunters, not `bmad-review`."""
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    _install_dev_auto(tmp_path, tree, customize=PRE_LAYER_CUSTOMIZE, step04=STEP04_NAMED)
+    _install_skills(
+        tmp_path,
+        tree,
+        {"bmad-review-adversarial-general": (), "bmad-review-edge-case-hunter": ()},
+    )
+    assert missing_base_skills(tmp_path, [tree]) == []
+
+    import shutil as _shutil
+
+    _shutil.rmtree(tmp_path / tree / "bmad-review-edge-case-hunter")
+    problems = missing_base_skills(tmp_path, [tree])
+    assert len(problems) == 1
+    assert problems[0].check == "skills.review-layer-missing"
+    assert problems[0].detail["skill"] == "bmad-review-edge-case-hunter"
+    assert problems[0].detail["layers"] == []
+    assert problems[0].detail["source"] == "step-04-review.md"
+
+
+def test_disabled_review_layer_is_not_required(tmp_path):
+    """An empty `instruction` disables a layer — its skill must not be required."""
+    claude = get_profile("claude")
+    disabled = LAYER_CUSTOMIZE.replace(
+        """instruction = '''
+> Invoke the `bmad-review` skill with only the `verification-gap` lens on this diff:
+>
+> {diff_output}
+'''""",
+        'instruction = ""',
+    )
+    _install_dev_auto(tmp_path, claude.skill_tree, customize=disabled)
+    _install_skills(tmp_path, claude.skill_tree, {"bmad-review": ()})
+
+    assert missing_base_skills(tmp_path, [claude.skill_tree]) == []
+
+
+def test_project_override_replaces_review_layer(tmp_path):
+    """`_bmad/custom/bmad-dev-auto.toml` merges arrays of tables by `id`. A layer
+    overridden to run an external reviewer no longer requires the default's skill —
+    requiring it anyway would be exactly the kind of false FAIL #260 was."""
+    claude = get_profile("claude")
+    only_one_layer = LAYER_CUSTOMIZE.split("[[workflow.review_layers]]")[0] + (
+        """[[workflow.review_layers]]
+id = "blind-hunter"
+instruction = '''
+> Invoke the `bmad-review` skill with only the `adversarial` lens on this diff:
+'''
+"""
+    )
+    _install_dev_auto(tmp_path, claude.skill_tree, customize=only_one_layer)
+    assert len(missing_base_skills(tmp_path, [claude.skill_tree])) == 1
+
+    override = tmp_path / "_bmad" / "custom" / "bmad-dev-auto.toml"
+    override.parent.mkdir(parents=True, exist_ok=True)
+    override.write_text(
+        """[[workflow.review_layers]]
+id = "blind-hunter"
+instruction = "Run `my-external-reviewer` via bash on the diff."
+""",
+        encoding="utf-8",
+    )
+    assert missing_base_skills(tmp_path, [claude.skill_tree]) == []
+
+
+def test_unreadable_customize_falls_back_to_static_catalog(tmp_path):
+    """A malformed customize.toml must not crash the preflight, and must not be read
+    as "no layers configured" either — fall back to the static catalog."""
+    claude = get_profile("claude")
+    _install_dev_auto(tmp_path, claude.skill_tree, customize="this is not = valid toml [[[")
+
+    problems = missing_base_skills(tmp_path, [claude.skill_tree])
+    assert {p.detail["skill"] for p in problems} == {
+        "bmad-review-adversarial-general",
+        "bmad-review-edge-case-hunter",
+    }
+    assert {p.check for p in problems} == {"skills.base-missing"}
+
+    # ...and the merged reviewer still satisfies that fallback
+    _install_skills(tmp_path, claude.skill_tree, {"bmad-review": ()})
+    assert missing_base_skills(tmp_path, [claude.skill_tree]) == []
+
+
 def test_missing_stories_support_findings_split_absent_from_stale(tmp_path):
     """#205: a half install and a too-old install are different conditions with
     different remediations, so they get different check ids — a script pinning a
