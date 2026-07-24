@@ -364,14 +364,12 @@ class BmadLoopApp(App[None]):
         engine_alive = _engine_possibly_live(run_dir)
 
         def done(ok: bool | None) -> None:
-            if not ok:
-                return
-            try:
-                launch.resume_detached(self.project, run_id)
-            except launch.LaunchError as e:
-                self.notify(str(e), severity="error")
-                return
-            self.notify(f"resume of {run_id} launched (control session {launch.CTL_SESSION})")
+            # Re-check liveness at confirm time via the shared guard — the modal's
+            # warning is display-only and sampled at open time, so route through
+            # _do_resume (like the e/viewer and re-arm paths) rather than launching
+            # blind; a newly-live engine is caught even if the user confirmed.
+            if ok:
+                self._do_resume(run_id)
 
         self.push_screen(ConfirmResumeModal(run_id, state, engine_alive), done)
 

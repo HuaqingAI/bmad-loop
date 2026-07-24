@@ -277,8 +277,10 @@ class ConfirmModal(BaseDialog):
             yield Label(self._title, classes="title")
             with VerticalScroll(id="body"):
                 yield Static(self._body)
-                if self._warning:
-                    yield Static(Text(f"⚠ {self._warning}", style="bold red"))
+            # The warning gates an enabled, destructive confirm, so it is docked
+            # outside #body (never scrolled off) — directly above the button row.
+            if self._warning:
+                yield Static(Text(f"⚠ {self._warning}", style="bold red"), id="warning")
             with Horizontal(classes="buttons"):
                 yield Button(self._confirm_label, variant="warning", id="ok")
                 yield Button("cancel", id="cancel")
@@ -617,26 +619,28 @@ class EscalationModal(BaseDialog):
                     yield Static(
                         Text("engine may still be live — stop it before resolving", style="yellow")
                     )
-                hint = Text()
-                if self._restore_recorded:
-                    # honoring the latch from here would be unsafe (a stale marker is
-                    # indistinguishable from a fresh one), so Re-arm stays a plain
-                    # from-scratch re-drive — but never a silent drop of the decision.
-                    hint.append(
-                        "⚠ the resolution records a restore patch — Re-arm here re-drives "
-                        "from scratch and drops it; run `bmad-loop resolve` to honor the "
-                        "restore",
-                        style="yellow",
-                    )
-                elif self._resolution_ready:
-                    hint.append("resolution recorded — re-arm & resume when ready", style="green")
-                else:
-                    hint.append(
-                        "resolve opens an interactive agent to fix the frozen spec; "
-                        "re-arm unlocks once it records a resolution",
-                        style="dim",
-                    )
-                yield Static(hint)
+            # The restore-discard branch below gates an enabled Re-arm, so the hint
+            # is docked outside #body (never scrolled off) — directly above the buttons.
+            hint = Text()
+            if self._restore_recorded:
+                # honoring the latch from here would be unsafe (a stale marker is
+                # indistinguishable from a fresh one), so Re-arm stays a plain
+                # from-scratch re-drive — but never a silent drop of the decision.
+                hint.append(
+                    "⚠ the resolution records a restore patch — Re-arm here re-drives "
+                    "from scratch and drops it; run `bmad-loop resolve` to honor the "
+                    "restore",
+                    style="yellow",
+                )
+            elif self._resolution_ready:
+                hint.append("resolution recorded — re-arm & resume when ready", style="green")
+            else:
+                hint.append(
+                    "resolve opens an interactive agent to fix the frozen spec; "
+                    "re-arm unlocks once it records a resolution",
+                    style="dim",
+                )
+            yield Static(hint, id="hint")
             with Horizontal(classes="buttons"):
                 yield Button(
                     "Resolve", variant="primary", id="act-resolve", disabled=self._engine_live
