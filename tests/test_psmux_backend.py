@@ -157,6 +157,69 @@ def test_new_window_env_values_stay_inert_literals(rec, tmp_path):
     assert source.replace("''", "").count("'") % 2 == 0
 
 
+# ------------------------------------------- session-qualified window ids (#254)
+# psmux mints window ids per server (one server per session), so a bare `@N`
+# replayed as a `-t` target routes by the caller's $TMUX — the wrong server
+# from a ctl pane. new_window and list_window_ids must therefore emit the
+# `session:@N` form symmetrically (psmux/psmux#483), or window_alive's
+# membership check reads every window as dead.
+
+
+def _window_fake(monkeypatch, new_window_id: str = "@2\n", listed: str = "@1\n@2\n"):
+    """Script new-window to print an id and list-windows to list ids."""
+
+    def fake(argv, **kwargs):
+        out = new_window_id if argv[1] == "new-window" else listed
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+
+
+def test_new_window_returns_session_qualified_id(monkeypatch, tmp_path):
+    _window_fake(monkeypatch)
+    assert PsmuxMultiplexer().new_window("s", "n", tmp_path, {}, "prog") == "s:@2"
+
+
+def test_list_window_ids_returns_session_qualified_ids(monkeypatch):
+    _window_fake(monkeypatch)
+    assert PsmuxMultiplexer().list_window_ids("s") == ["s:@1", "s:@2"]
+
+
+def test_qualification_degrades_to_bare_on_colon_session(monkeypatch, tmp_path):
+    # A `:` in the session name would split the target at the wrong colon on
+    # replay — both methods degrade to the bare id identically (the #221 rule).
+    _window_fake(monkeypatch)
+    mux = PsmuxMultiplexer()
+    assert mux.new_window("a:b", "n", tmp_path, {}, "prog") == "@2"
+    assert mux.list_window_ids("a:b") == ["@1", "@2"]
+
+
+def test_new_window_falsy_id_passes_through_unqualified(monkeypatch, tmp_path):
+    # An empty minted id is a failure sentinel, not a target — qualifying it
+    # would forge "s:" out of nothing.
+    _window_fake(monkeypatch, new_window_id="")
+    assert PsmuxMultiplexer().new_window("s", "n", tmp_path, {}, "prog") == ""
+
+
+def test_window_alive_accepts_new_window_id(monkeypatch, tmp_path):
+    # Symmetry is the whole contract: the id new_window mints must be found by
+    # list_window_ids, or the engine's liveness probe declares an instant crash.
+    _window_fake(monkeypatch)
+    mux = PsmuxMultiplexer()
+    assert mux.window_alive("s", mux.new_window("s", "n", tmp_path, {}, "prog")) is True
+
+
+def test_list_window_ids_transport_failure_still_raises(monkeypatch):
+    # Qualification must not soften the liveness contract: a transport failure
+    # raises rather than answering [] (which would read as "session crashed").
+    def timeout(*_a, **_k):
+        raise subprocess.TimeoutExpired(["psmux"], 30)
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", timeout)
+    with pytest.raises(MultiplexerError):
+        PsmuxMultiplexer().list_window_ids("s")
+
+
 # --------------------------------------------------------------- new_session
 
 

@@ -115,6 +115,19 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 ### Fixed
 
+- **psmux window ids are now session-qualified (#254).** psmux mints window ids per server (one
+  server per session), so the bare `@N` the backend returned from `new_window` routed by the
+  caller's `$TMUX` when replayed as a `-t` target — from a `bmad-loop-ctl` pane that is the ctl
+  server, not the agent's. The log sink then bound to the engine's own window (empty run logs,
+  dead activity signal), stop/stall nudges were typed into the engine's own pane, and session
+  teardown harvested and killed the engine's window instead of the agent's. `new_window` and
+  `list_window_ids` now emit the `session:@N` form symmetrically (endorsed in psmux/psmux#483 as
+  the permanent model boundary), so every target the engine replays — `pipe_pane`, `send_text`,
+  `kill_window`, `window_pane_pids` — routes to the owning server unambiguously, and the
+  `window_alive` membership check keeps matching the minted form. Degrades to the bare id when
+  the session name contains `:` (the #221 rule); the tmux backend is untouched (its ids are
+  server-global).
+
 - **A session's read-back could adopt another story's spec (#261).** The generic dev/review
   read-back located "the artifact this session produced" by scanning the implementation-artifacts
   dir for the most-recently-modified qualifying `*.md`, with nothing tying the match to the story
