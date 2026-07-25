@@ -75,7 +75,9 @@ from .process_host import ProcessHostError
 # used within this module (validate/mux/sweep/resume) and monkeypatched as
 # `cli.<name>` by the test suite — so the seams stay importable here. Each is
 # genuinely referenced below, so no noqa is needed (an unused-import pin would
-# itself trip RUF100); a future caller-less re-export would need `# noqa: F401`.
+# itself trip RUF100); a future caller-less re-export would need a `noqa: F401`
+# pin. Written without the leading hash on purpose: ruff scans comment TEXT for
+# directives, so spelling one out in prose is read as a real (and malformed) one.
 from .runsetup import ROLES
 from .runsetup import make_adapters as _make_adapters
 from .runsetup import mux_reason_label as _mux_reason_label
