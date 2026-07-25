@@ -2250,19 +2250,33 @@ class Engine:
         Advisory itself, twice over: a failed restore is journaled, never
         raised, and the journaling is suppressed rather than allowed to become
         the crash — this runs inside except arms whose exception must travel
-        unchanged."""
+        unchanged. Skipping the `raise` would replace a `RunStopped` with a
+        symlink complaint; skipping the `GitError` arm's `_escalate` would
+        strand the story in COMMITTING with no diagnosis on the record.
+
+        The guard is type-agnostic on purpose, and `OSError` is not wide enough
+        to hold it: `atomic_write_text` resolves the path before its own try,
+        and below 3.13 `Path.resolve` reports a symlink loop as `RuntimeError`
+        — the same non-OSError `_ledger_in_repo` already catches for this very
+        path. Catching `Exception` and not `BaseException` is the other half:
+        `RunStopped` is an `Exception`, so a second stop signal landing inside
+        the restore is absorbed while the first still travels, and a genuine
+        KeyboardInterrupt still gets out."""
         if not snapshot:
             return
         ledger, before = snapshot[-1]
         try:
             atomic_write_text(ledger, before)
-        except OSError as e:
+        except Exception as e:
             with contextlib.suppress(Exception):
                 self.journal.append(
                     "deferred-close-rollback-failed",
                     story_key=task.story_key,
                     ledger=str(ledger),
-                    error=str(e),
+                    # named, not bare `str(e)`: now that every type is admitted,
+                    # a message alone cannot say whether the disk or the path
+                    # was the fault. Matches `_journal_ledger_unavailable`.
+                    error=f"{e.__class__.__name__}: {e}",
                 )
             return
         with contextlib.suppress(Exception):

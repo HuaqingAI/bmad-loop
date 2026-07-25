@@ -2481,6 +2481,50 @@ def test_closes_deferred_rolls_back_when_a_signal_stops_the_close_itself(project
     assert "deferred-close-rolled-back" in kinds
 
 
+def test_failed_rollback_does_not_displace_the_commit_failure(project, monkeypatch):
+    """The restore runs INSIDE the commit window's except arms, so anything it
+    raises replaces the exception those arms exist to carry: the `GitError` arm
+    would skip `_escalate` and strand the story in COMMITTING with no diagnosis,
+    and the `BaseException` arm would skip its bare `raise` and swap a graceful
+    `RunStopped` for a write complaint.
+
+    `OSError` was too narrow to hold that. `atomic_write_text` resolves the path
+    before its own try, and below 3.13 `Path.resolve` reports a symlink loop as
+    `RuntimeError` — for a ledger the helper explicitly supports being a symlink,
+    and whose OTHER resolve (`_ledger_in_repo`) already catches that type.
+
+    The fault is injected rather than built from a real symlink loop on purpose:
+    3.13+ resolves loops without raising, so a loop-based version would pass on
+    the interpreter this suite usually runs and only ever fail on the 3.11/3.12
+    legs — green here, red in CI, for a guard that was never exercised."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+    _reject_commits(project)  # the commit fails, so the restore is reached
+
+    def unresolvable(*a, **kw):
+        raise RuntimeError("Symlink loop from '/w/deferred-work.md'")
+
+    # patched as bound in `engine` (its sole call site is the restore), NOT in
+    # `deferredwork` — the forward close must still publish, or there would be
+    # nothing for the rollback to fail at.
+    monkeypatch.setattr("bmad_loop.engine.atomic_write_text", unresolvable)
+
+    summary = engine.run()
+
+    # the disposition is the failed COMMIT's, not the failed rollback's
+    assert summary.paused and summary.escalated == 1 and not summary.crashed
+    assert load_state(engine.run_dir).tasks["1-1-a"].phase == Phase.ESCALATED
+    reasons = [e["reason"] for e in engine.journal.entries() if e["kind"] == "story-escalated"]
+    assert len(reasons) == 1 and reasons[0].startswith("commit failed:")
+    # and the rollback's own failure is on the record, naming the type — `str(e)`
+    # alone cannot say whether the disk or the path was at fault
+    failed = [e for e in engine.journal.entries() if e["kind"] == "deferred-close-rollback-failed"]
+    assert len(failed) == 1 and failed[0]["error"].startswith("RuntimeError: ")
+    # honest about what did NOT happen: the restore never landed, so the entry
+    # still reads `done` for a commit that does not exist. Advisory, journaled,
+    # human-attended — not silently papered over.
+    assert not _ledger_entries(project)["DW-1"].open
+
+
 def test_transient_spec_read_fault_does_not_crash_run(project, monkeypatch):
     """Integration capstone for #97. A single transient OSError on the spec — a
     TOCTOU truncation while the dev skill rewrites the file the orchestrator is
