@@ -21,11 +21,12 @@ from conftest import (
     review_effect,
     set_sprint,
     spec_path,
+    write_ledger,
     write_spec,
     write_sprint,
 )
 
-from bmad_loop import platform_util, verify
+from bmad_loop import deferredwork, platform_util, verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import Engine, RunPaused, RunStopped, _run_depth
@@ -90,6 +91,10 @@ def make_engine(project, script, policy=None, **kwargs) -> tuple[Engine, MockAda
 
 def resume_engine(project, engine, script, policy=None) -> tuple[Engine, MockAdapter]:
     state = load_state(engine.run_dir)
+    # `cli._resume_paused_run` refuses a finished run outright. Without the same
+    # refusal here a test can "resume" what the CLI never would, and prove a
+    # recovery path that does not exist (#284 round-6 review, finding 1).
+    assert not state.finished, "cli._resume_paused_run refuses a finished run"
     state.clear_pause()
     adapter = MockAdapter(script)
     new_engine = Engine(
@@ -1939,6 +1944,585 @@ def test_post_dev_state_sync_skips_on_unreadable_spec(project, monkeypatch):
     events = [e for e in engine.journal.entries() if e["kind"] == "spec-read-failed"]
     assert len(events) == 1 and events[0]["site"] == "post-dev-sync"
     assert events[0]["story_key"] == "1-1-a"
+
+
+# ------------------------------------------- closes_deferred auto-resolve (#234)
+
+
+def _ledger_entries(project) -> dict:
+    return {
+        e.id: e
+        for e in deferredwork.parse_ledger(project.deferred_work.read_text(encoding="utf-8"))
+    }
+
+
+def _vetoing_emit(engine, stage: str, action: str):
+    """Wrap `engine._emit` so `stage` resolves to a plugin veto of `action`,
+    without a real plugin on disk — `_emit` returns None on the zero-plugin fast
+    path, so the context is built the same way the bus would."""
+    from bmad_loop.plugins.context import Veto
+
+    original = engine._emit
+
+    def emit(s, task=None, **fields):
+        ctx = original(s, task, **fields)
+        if s != stage:
+            return ctx
+        ctx = ctx or engine._make_context(s, task, **fields)
+        ctx.add_veto(Veto(action, "test veto", "test-plugin"))
+        return ctx
+
+    return emit
+
+
+def _closes_deferred_run(project, dw_ids, *, ledger=None, **dev_kwargs):
+    """A whole sprint-mode story run whose dev session declares `closes_deferred:
+    dw_ids`, over a committed ledger. `followup_review=False` so the story takes
+    the skip-review path straight to commit — these assert the *lifecycle*
+    placement of the close, not the review loop.
+
+    Everything is committed up front and the run is driven end to end, because
+    the defect this covers (#234 review) only appears downstream of the dev
+    session: the close used to land at dev-sync time, before verification, review
+    and commit could still reject the story."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_ledger(project, ledger or {"DW-1": "open"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False, closes_deferred=dw_ids, **dev_kwargs)],
+    )
+    return engine
+
+
+def test_closes_deferred_marks_declared_entries_done(project):
+    """A story spec declaring `closes_deferred:` flips each referenced ledger
+    entry to `status: done <date>` + a `resolution:` note when the story commits —
+    the write the loop never made, forcing retros to reconstruct closure by hand
+    (#234). Closure is declared, never inferred from the diff."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    entry = _ledger_entries(project)["DW-1"]
+    assert entry.status.startswith("done") and not entry.open
+    assert "resolution: resolved by story 1-1-a" in entry.body
+    closed = [e for e in engine.journal.entries() if e["kind"] == "story-deferred-closed"]
+    assert len(closed) == 1
+    assert closed[0]["dw_ids"] == ["DW-1"] and closed[0]["story_key"] == "1-1-a"
+
+
+def test_closes_deferred_annotation_rides_the_story_commit(project):
+    """The annotation must be IN the story's own commit, not left dirty behind it:
+    the loop has to end each story on a clean tree (story N+1's step-01 HALTs on a
+    dirty one), which is why closure happens just before `finalize_commit`'s
+    `git add -A` rather than after the commit."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+
+    engine.run()
+
+    committed = git(project.project, "show", "HEAD", "--", str(project.deferred_work))
+    assert "+status: done" in committed
+    assert "+resolution: resolved by story 1-1-a" in committed
+    assert worktree_clean(project.project)
+
+
+def test_closes_deferred_stays_open_when_verify_defers_the_story(project):
+    """The reviewer's repro (#234 review, finding 1). The dev session finalizes
+    its spec — declaration and all — but the story then fails deterministic
+    verification and defers. Closing at dev-sync time made that permanent: the
+    in-place defer path snapshots the ledger AFTER the mutation and restores it
+    over the rollback, so a rejected story left the ledger claiming its work
+    resolved. At the commit boundary there is nothing to undo."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_ledger(project, {"DW-1": "open"})
+    # write_src=False: no diff since baseline, so the proof-of-work gate fails and
+    # every attempt defers — the spec still reaches `done` with its declaration.
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", write_src=False, closes_deferred=["DW-1"])] * 3,
+    )
+
+    summary = engine.run()
+
+    assert summary.deferred == 1 and summary.done == 0
+    assert _ledger_entries(project)["DW-1"].open  # never claimed resolved
+    kinds = {e["kind"] for e in engine.journal.entries()}
+    assert "story-deferred-closed" not in kinds
+    assert "story-deferred" in kinds  # the story really did defer
+
+
+def test_closes_deferred_stays_open_when_the_story_escalates(project):
+    """`_escalate` rolls nothing back — it advances to ESCALATED and pauses. A
+    close written before that point survives into the operator's checkout, where
+    the NEXT story's `git add -A` sweeps it into an unrelated commit."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_engine(
+        project, [dev_effect(project, "1-1-a", followup_review=False, closes_deferred=["DW-1"])]
+    )
+    engine._emit = _vetoing_emit(engine, "pre_commit", "pause")
+
+    summary = engine.run()
+
+    assert summary.paused and summary.done == 0
+    assert _ledger_entries(project)["DW-1"].open
+    assert "story-deferred-closed" not in {e["kind"] for e in engine.journal.entries()}
+
+
+def test_closes_deferred_idempotent_on_resume(project):
+    """A host death in the commit window re-drives `_finalize_commit_phase` on
+    resume, so the close runs twice. The second pass must write nothing and stay
+    *silent*: an id that is present-but-already-done is a satisfied declaration,
+    not an unmatched one."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+    engine.run()
+    task = load_state(engine.run_dir).tasks["1-1-a"]
+
+    # re-drive the exact commit-phase step a resume performs
+    engine._close_declared_deferred(task)
+
+    body = _ledger_entries(project)["DW-1"].body
+    assert body.count("resolution: resolved by story 1-1-a") == 1  # not doubled
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert kinds.count("story-deferred-closed") == 1  # only the first pass wrote
+    assert "deferred-close-unmatched" not in kinds  # already-done is NOT unknown
+
+
+def test_closes_deferred_warns_on_unknown_id(project):
+    """An id absent from the ledger (a typo, or an entry since reworded) is
+    journaled and dropped — never a story failure, and never a ledger write."""
+    engine = _closes_deferred_run(project, ["DW-99"])
+    before = project.deferred_work.read_bytes()
+
+    summary = engine.run()
+
+    assert summary.done == 1  # the annotation is traceability, not a gate
+    assert project.deferred_work.read_bytes() == before  # ledger untouched
+    events = [e for e in engine.journal.entries() if e["kind"] == "deferred-close-unmatched"]
+    assert len(events) == 1
+    assert events[0]["dw_ids"] == ["DW-99"] and events[0]["story_key"] == "1-1-a"
+    assert "story-deferred-closed" not in [e["kind"] for e in engine.journal.entries()]
+
+
+def test_closes_deferred_reports_a_malformed_ledger_entry(project):
+    """An entry that exists but carries neither an `open` nor a `done` status
+    cannot be marked. Reporting only present-vs-absent left that case in silence,
+    which reads to the operator exactly like a successful close (#234 review)."""
+    engine = _closes_deferred_run(project, ["DW-1"], ledger={"DW-1": "in-progress"})
+
+    engine.run()
+
+    assert not _ledger_entries(project)["DW-1"].status.startswith("done")
+    events = [e for e in engine.journal.entries() if e["kind"] == "deferred-close-malformed"]
+    assert len(events) == 1 and events[0]["dw_ids"] == ["DW-1"]
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "closed"),
+    [("open", "done 2026-06-01", True), ("done 2026-06-01", "open", False)],
+    ids=["open-first", "done-first"],
+)
+def test_closes_deferred_reports_a_duplicated_ledger_id(project, first, second, closed):
+    """One id, two entries: only the first is read and only the first can be
+    written, so the second is neither. Both orders used to pass in total silence —
+    `classify` indexed the LAST entry while the mutation took the first, so a
+    done-first ledger classified the id open and then marked nothing at all
+    (#284 round-6 review, finding 4).
+
+    The close itself still behaves as the first entry dictates. What changes is
+    that the operator is told the ledger names one id twice (#286)."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        f"### DW-1: the first copy\nstatus: {first}\n\n"
+        f"### DW-1: the second copy\nstatus: {second}\n",
+        encoding="utf-8",
+    )
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "duplicate id")
+
+    summary = engine.run()
+
+    assert summary.done == 1  # never a gate
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    events = [e for e in engine.journal.entries() if e["kind"] == "deferred-close-duplicate-id"]
+    assert len(events) == 1 and events[0]["dw_ids"] == ["DW-1"]
+    # the first entry decides, and the close is reported only when it happened
+    assert ("story-deferred-closed" in kinds) is closed
+    parsed = deferredwork.parse_ledger(project.deferred_work.read_text(encoding="utf-8"))
+    assert [e.status.split()[0] for e in parsed] == (
+        ["done", "done"] if closed else ["done", "open"]
+    )
+
+
+def test_closes_deferred_reports_a_wrong_container_declaration(project):
+    """`closes_deferred: DW-1` (a scalar, not a list) is a real declaration of
+    intent. Reading it as an empty list closed nothing and said nothing, while
+    the same mistake in `stories.yaml` was a hard schema error — the two channels
+    now agree that it is a mistake worth surfacing."""
+    engine = _closes_deferred_run(project, "DW-1")  # bare scalar
+    before = project.deferred_work.read_bytes()
+
+    summary = engine.run()
+
+    assert summary.done == 1  # still never a gate
+    assert project.deferred_work.read_bytes() == before
+    events = [e for e in engine.journal.entries() if e["kind"] == "deferred-close-malformed"]
+    assert len(events) == 1  # the one live read, at the commit boundary
+    assert "must be a list" in events[0]["error"]
+
+
+def test_closes_deferred_noop_when_field_absent(project):
+    """The default spec declares nothing: no ledger write and no journal noise on
+    the close path every ordinary story takes."""
+    engine = _closes_deferred_run(project, None)
+    before = project.deferred_work.read_bytes()
+
+    engine.run()
+
+    assert project.deferred_work.read_bytes() == before
+    kinds = {e["kind"] for e in engine.journal.entries()}
+    assert not kinds & {
+        "story-deferred-closed",
+        "deferred-close-unmatched",
+        "deferred-close-malformed",
+    }
+
+
+def test_closes_deferred_refuses_an_out_of_tree_spec(project, tmp_path):
+    """The sprint-mode spec path comes from the session's own result.json. A
+    stale or hostile absolute path carrying `status: done` + `closes_deferred`
+    must not be able to steer a ledger write — the same root-containment rule the
+    frontmatter-status reconcile already applies to its one session-supplied
+    path (#234 review, finding 4)."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_engine(project, [])
+    outside = tmp_path / "elsewhere" / "spec.md"
+    outside.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(outside, "done", "abc123", closes_deferred=["DW-1"])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.spec_file = str(outside)
+
+    engine._close_declared_deferred(task)
+
+    assert _ledger_entries(project)["DW-1"].open
+    events = [
+        e for e in engine.journal.entries() if e["kind"] == "deferred-close-skipped-out-of-tree"
+    ]
+    assert len(events) == 1 and events[0]["story_key"] == "1-1-a"
+
+
+def _reject_commits(project):
+    """Install a native `pre-commit` hook that rejects every commit — the
+    real-world shape of a `finalize_commit` failure (a lint/secret hook saying no)
+    that no amount of orchestrator correctness prevents."""
+    hooks = project.project / ".git" / "hooks"
+    hooks.mkdir(parents=True, exist_ok=True)
+    hook = hooks / "pre-commit"
+    hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    hook.chmod(0o755)
+    return hook
+
+
+def test_closes_deferred_rolls_back_when_the_commit_fails(project):
+    """The close is written just BEFORE `finalize_commit` so an in-repo annotation
+    rides the story's own commit — but that commit can still fail, and `_escalate`
+    unwinds nothing. Left alone the entry claims work that is in no commit, and
+    the usual recovery makes it permanent: a resolved re-drive preserves the
+    artifact folders' tracked content through `safe_reset` (#284 review, finding 1).
+    """
+    engine = _closes_deferred_run(project, ["DW-1"])
+    before = project.deferred_work.read_bytes()
+    _reject_commits(project)
+
+    summary = engine.run()
+
+    assert summary.done == 0 and summary.paused  # the commit really did fail
+    assert _ledger_entries(project)["DW-1"].open
+    assert project.deferred_work.read_bytes() == before  # byte-identical, not just re-opened
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    # the write happened and was undone: both are on the record, in that order
+    assert kinds.index("story-deferred-closed") < kinds.index("deferred-close-rolled-back")
+
+
+def test_closes_deferred_lands_once_when_a_failed_commit_is_re_driven(project):
+    """The rollback must leave the story re-drivable: once the hook is gone, the
+    resumed commit phase re-applies the close exactly once (no doubled
+    `resolution:` line) and carries it in the commit it belongs to."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+    hook = _reject_commits(project)
+    engine.run()
+    hook.unlink()
+    # the resolve workflow's re-arm: a resolved re-drive, which is precisely the
+    # recovery that PRESERVES the artifact folders' tracked content through
+    # `safe_reset` — so a close left standing here would never be reverted.
+    rearm_escalation(engine.run_dir)
+
+    resumed, _ = resume_engine(
+        project,
+        engine,
+        [dev_effect(project, "1-1-a", followup_review=False, closes_deferred=["DW-1"])],
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1
+    entry = _ledger_entries(project)["DW-1"]
+    assert not entry.open
+    assert entry.body.count("resolution: resolved by story 1-1-a") == 1
+    committed = git(project.project, "show", "HEAD", "--", str(project.deferred_work))
+    assert "status: done" in committed
+
+
+def _external_ledger_paths(project, tmp_path):
+    """`project` with its artifact dir configured OUTSIDE the repo — the shared,
+    uncommittable ledger configuration `ProjectPaths.rebased` leaves in place."""
+    external = tmp_path / "shared-artifacts"
+    external.mkdir(exist_ok=True)
+    return dataclasses.replace(project, implementation_artifacts=external)
+
+
+def test_closes_deferred_external_ledger_is_written_and_journaled(project, tmp_path):
+    """A ledger outside the repo can ride no commit (`ProjectPaths.rebased`
+    deliberately shares an external artifact dir between worktrees, and
+    `git add -A` can never stage it). The advisory contract writes it at the
+    same commit-boundary moment anyway, and tells the operator the annotation
+    is part of no commit (`deferred-close-external-ledger`)."""
+    paths = _external_ledger_paths(project, tmp_path)
+    write_sprint(paths, {"1-1-a": "ready-for-dev"})
+    write_ledger(paths, {"DW-1": "open"}, commit=False)
+    engine, _ = make_engine(
+        paths,
+        [dev_effect(paths, "1-1-a", followup_review=False, closes_deferred=["DW-1"])],
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    entry = next(
+        e
+        for e in deferredwork.parse_ledger(paths.deferred_work.read_text(encoding="utf-8"))
+        if e.id == "DW-1"
+    )
+    assert not entry.open and "resolution: resolved by story 1-1-a" in entry.body
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "deferred-close-external-ledger" in kinds  # told it rides no commit
+    assert "story-deferred-closed" in kinds
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("shape", ["dangling", "looping"])
+def test_closes_deferred_in_repo_broken_ledger_link_is_an_outage_not_a_typo(project, shape):
+    """A broken ledger link must read as an outage, not as an empty ledger: an
+    empty read classifies every declared id `unknown`, and the story then
+    reports a typo (`unmatched`) for a mount that went away.
+
+    Both shapes land in the same answer by different routes: the loop is
+    refused at the read (ELOOP), the dangling link by the symlink check behind
+    `FileNotFoundError` — the link existing at all is the evidence a ledger is
+    expected there."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+    ledger = project.deferred_work
+    ledger.unlink()
+    if shape == "dangling":
+        ledger.symlink_to(project.project / "gone-mount" / "deferred-work.md")
+    else:
+        other = project.project / "ledger-loop"
+        ledger.symlink_to(other)
+        other.symlink_to(ledger)
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed  # the story still lands
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "deferred-close-ledger-unavailable" in kinds
+    assert "deferred-close-unmatched" not in kinds
+    assert "story-deferred-closed" not in kinds
+
+
+def test_closes_deferred_re_reads_the_declaration_at_the_commit_boundary(project, monkeypatch):
+    """The spec on disk at the commit is what the story declares. Closing against
+    any earlier snapshot instead lets an id the author has since withdrawn be
+    marked resolved — a false close, the one outcome this whole path exists to
+    prevent — and drops one added in the same edit (#284 follow-up review,
+    finding 3). Both directions must follow the final spec."""
+    engine = _closes_deferred_run(project, ["DW-1"], ledger={"DW-1": "open", "DW-3": "open"})
+    sp = spec_path(project, "1-1-a")
+    finalize = engine._finalize_commit_phase
+
+    def edited_after_verification(task):
+        # the shape of a review session rewriting the frontmatter, or a human
+        # editing the spec while the review loop runs: DW-1 withdrawn, DW-3 added
+        write_spec(sp, "done", task.baseline_commit, closes_deferred=["DW-3"])
+        return finalize(task)
+
+    monkeypatch.setattr(engine, "_finalize_commit_phase", edited_after_verification)
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    entries = _ledger_entries(project)
+    assert entries["DW-1"].open  # withdrawn before the commit: never closed
+    assert not entries["DW-3"].open  # named by the final spec: closed
+    closed = [e for e in engine.journal.entries() if e["kind"] == "story-deferred-closed"]
+    assert [e["dw_ids"] for e in closed] == [["DW-3"]]
+
+
+def test_closes_deferred_rolls_back_when_a_signal_stops_the_commit(project, monkeypatch):
+    """A failed commit is not the only way out of the close→commit window. The
+    handler `run()` installs raises RunStopped from wherever the main thread is
+    standing, and `run()` catches it to finalize a *stopped* run — not to repair
+    bookkeeping. Left alone the ledger claims work that is in no commit, exactly
+    as a rejecting pre-commit hook did, but past `except verify.GitError`
+    (#284 follow-up review, finding 2)."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    engine = _closes_deferred_run(project, ["DW-1"])
+    before = project.deferred_work.read_bytes()
+    real_finalize = verify.finalize_commit
+
+    def sigterm_mid_commit(*a, **kw):
+        # in-process, catchable, and routed through the REAL installed handler —
+        # this is the mechanism, not a stand-in for it
+        signal.raise_signal(signal.SIGTERM)
+        return real_finalize(*a, **kw)  # unreachable: the handler raises first
+
+    monkeypatch.setattr(verify, "finalize_commit", sigterm_mid_commit)
+
+    summary = engine.run()
+
+    assert summary.done == 0
+    assert load_state(engine.run_dir).stopped is True  # the stop really landed
+    assert _ledger_entries(project)["DW-1"].open
+    assert project.deferred_work.read_bytes() == before  # byte-identical
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert kinds.index("story-deferred-closed") < kinds.index("deferred-close-rolled-back")
+
+
+def test_closes_deferred_rolls_back_when_the_commit_raises_a_non_git_error(project, monkeypatch):
+    """`_run_git` translates only TimeoutExpired, so a raw OSError from the spawn
+    itself (a fork failure, git gone from PATH) reaches the commit boundary as
+    itself and slips past the GitError arm."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+    before = project.deferred_work.read_bytes()
+
+    def cannot_spawn(*a, **kw):
+        raise OSError("cannot allocate memory")
+
+    monkeypatch.setattr(verify, "finalize_commit", cannot_spawn)
+
+    summary = engine.run()
+
+    assert summary.crashed  # re-raised untouched: the disposition is not ours
+    assert _ledger_entries(project)["DW-1"].open
+    assert project.deferred_work.read_bytes() == before
+
+
+def test_closes_deferred_rolls_back_when_the_journal_fails_after_the_ledger_write(
+    project, monkeypatch
+):
+    """The ledger publishes atomically and the journal line recording it is
+    written *after*. A full disk between the two used to leave the entry reading
+    `done` with the rollback un-armed: the snapshot was bound from the close's
+    RETURN value, which a raise inside it never produces, so the restore had
+    nothing to work from and `finalize_commit` never ran either — a resolution
+    claimed for a commit that does not exist (#284 round-5 review, finding 1).
+
+    The snapshot is armed before the write now, so the failure unwinds whether it
+    lands in the commit or inside the close itself."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+    before = project.deferred_work.read_bytes()
+    real_append = engine.journal.append
+
+    def full_disk_recording_the_close(kind, **fields):
+        # fault ONLY the close record: the rollback's own journal line has to
+        # survive, or the test could not tell a restore from a crash
+        if kind == "story-deferred-closed":
+            raise OSError("No space left on device")
+        return real_append(kind, **fields)
+
+    monkeypatch.setattr(engine.journal, "append", full_disk_recording_the_close)
+
+    summary = engine.run()
+
+    assert summary.crashed
+    assert _ledger_entries(project)["DW-1"].open
+    assert project.deferred_work.read_bytes() == before  # byte-identical
+    rolled = [e for e in engine.journal.entries() if e["kind"] == "deferred-close-rolled-back"]
+    assert len(rolled) == 1
+
+
+def test_closes_deferred_rolls_back_when_a_signal_stops_the_close_itself(project, monkeypatch):
+    """The stop signal can land INSIDE the close, not only inside the commit: the
+    handler raises from wherever the main thread stands, and the ledger is already
+    published by the time `mark_done_many` returns. Nothing downstream runs — no
+    close record, no commit — so without an early-armed snapshot the entry stayed
+    `done` for work that never landed (#284 round-5 review, finding 1)."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    engine = _closes_deferred_run(project, ["DW-1"])
+    before = project.deferred_work.read_bytes()
+    real_mark = deferredwork.mark_done_many
+
+    def sigterm_after_publication(*a, **kw):
+        marked = real_mark(*a, **kw)  # the flip is on disk now
+        signal.raise_signal(signal.SIGTERM)
+        return marked  # unreachable: the handler raises first
+
+    monkeypatch.setattr(deferredwork, "mark_done_many", sigterm_after_publication)
+
+    summary = engine.run()
+
+    assert summary.done == 0
+    assert load_state(engine.run_dir).stopped is True  # the stop really landed
+    assert _ledger_entries(project)["DW-1"].open
+    assert project.deferred_work.read_bytes() == before
+    kinds = {e["kind"] for e in engine.journal.entries()}
+    # the close never got to report itself, and the restore still happened
+    assert "story-deferred-closed" not in kinds
+    assert "deferred-close-rolled-back" in kinds
+
+
+def test_failed_rollback_does_not_displace_the_commit_failure(project, monkeypatch):
+    """The restore runs INSIDE the commit window's except arms, so anything it
+    raises replaces the exception those arms exist to carry: the `GitError` arm
+    would skip `_escalate` and strand the story in COMMITTING with no diagnosis,
+    and the `BaseException` arm would skip its bare `raise` and swap a graceful
+    `RunStopped` for a write complaint.
+
+    `OSError` was too narrow to hold that. `atomic_write_text` resolves the path
+    before its own try, and below 3.13 `Path.resolve` reports a symlink loop as
+    `RuntimeError` — for a ledger the helper explicitly supports being a symlink,
+    and whose OTHER resolve (`_ledger_in_repo`) already catches that type.
+
+    The fault is injected rather than built from a real symlink loop on purpose:
+    3.13+ resolves loops without raising, so a loop-based version would pass on
+    the interpreter this suite usually runs and only ever fail on the 3.11/3.12
+    legs — green here, red in CI, for a guard that was never exercised."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+    _reject_commits(project)  # the commit fails, so the restore is reached
+
+    def unresolvable(*a, **kw):
+        raise RuntimeError("Symlink loop from '/w/deferred-work.md'")
+
+    # patched as bound in `engine` (its sole call site is the restore), NOT in
+    # `deferredwork` — the forward close must still publish, or there would be
+    # nothing for the rollback to fail at.
+    monkeypatch.setattr("bmad_loop.engine.atomic_write_text", unresolvable)
+
+    summary = engine.run()
+
+    # the disposition is the failed COMMIT's, not the failed rollback's
+    assert summary.paused and summary.escalated == 1 and not summary.crashed
+    assert load_state(engine.run_dir).tasks["1-1-a"].phase == Phase.ESCALATED
+    reasons = [e["reason"] for e in engine.journal.entries() if e["kind"] == "story-escalated"]
+    assert len(reasons) == 1 and reasons[0].startswith("commit failed:")
+    # and the rollback's own failure is on the record, naming the type — `str(e)`
+    # alone cannot say whether the disk or the path was at fault
+    failed = [e for e in engine.journal.entries() if e["kind"] == "deferred-close-rollback-failed"]
+    assert len(failed) == 1 and failed[0]["error"].startswith("RuntimeError: ")
+    # honest about what did NOT happen: the restore never landed, so the entry
+    # still reads `done` for a commit that does not exist. Advisory, journaled,
+    # human-attended — not silently papered over.
+    assert not _ledger_entries(project)["DW-1"].open
 
 
 def test_transient_spec_read_fault_does_not_crash_run(project, monkeypatch):

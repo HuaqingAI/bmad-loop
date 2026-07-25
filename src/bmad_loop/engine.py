@@ -19,7 +19,7 @@ import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, NoReturn
+from typing import TYPE_CHECKING, Callable, NoReturn, Sequence
 
 from . import deferredwork, devcontract, envvars, gates, verify
 from .adapters.base import CodingCLIAdapter, SessionResult, SessionSpec, SpecSnapshot
@@ -43,7 +43,7 @@ from .model import (
     SessionRecord,
     StoryTask,
 )
-from .platform_util import atomic_replace, retrying_unlink, safe_segment
+from .platform_util import atomic_replace, atomic_write_text, retrying_unlink, safe_segment
 from .plugins import HookBus, HookContext, PluginRegistry
 from .policy import Policy
 from .recovery_flow import RecoveryFlow
@@ -1729,7 +1729,15 @@ class Engine:
                 self._escalate(task, f"plugin {veto.plugin_id!r} vetoed pre_commit: {veto.reason}")
             if ctx.proposed_commit_message:
                 message = ctx.proposed_commit_message
+        # The success boundary for story-declared ledger closure (#234): every
+        # verify gate, checkpoint, review cycle and pre-commit workflow is behind
+        # us, and finalize_commit's `git add -A` is still ahead, so an in-repo
+        # annotation rides this story's own commit. `snapshot` is armed inside
+        # the close, before its write, so both failure arms below hold the
+        # pre-close text no matter where in the window a raise lands.
+        snapshot: list[tuple[Path, str]] = []
         try:
+            self._close_declared_deferred(task, snapshot)
             # bmad-dev-auto commits its own work each iteration; the orchestrator
             # squashes that chain plus its uncommitted bookkeeping back onto the
             # pre-dev baseline as one commit carrying `message`. None means there
@@ -1743,7 +1751,16 @@ class Engine:
             task.resolved_redrive = False
             task.restore_patch = None
         except verify.GitError as e:
+            self._restore_deferred_closes(task, snapshot)
             self._escalate(task, f"commit failed: {e}")
+        except BaseException:
+            # A failed commit is not the only way out of this window: the signal
+            # handler `_run` installed raises RunStopped from wherever the main
+            # thread is standing, and a raw OSError on spawn escapes `_run_git`
+            # as itself. Either leaves the ledger flipped for a commit that does
+            # not exist. Restore, then re-raise untouched.
+            self._restore_deferred_closes(task, snapshot)
+            raise
         advance(task, Phase.DONE)
         self.journal.append("story-done", story_key=task.story_key, commit=task.commit_sha)
         self._emit("post_commit", task)
@@ -1778,6 +1795,10 @@ class Engine:
             return False
         return self.policy.review.enabled
 
+    # the date stamped into ledger edits; isolated for tests
+    def _today(self) -> str:
+        return time.strftime("%Y-%m-%d")
+
     def _observed_frontmatter(self, spec_path: Path, story_key: str, site: str) -> dict | None:
         """Read a spec's frontmatter on a *bookkeeping* path, degrading an
         unreadable spec to ``None`` (journaled) instead of a whole-run crash.
@@ -1795,8 +1816,7 @@ class Engine:
         Repair writes (``reset_spec_status``, ``mark_done``) deliberately do the
         opposite and let OSError raise: silently skipping a rewrite would leave the
         spec in a state the caller believes it fixed. Observation degrades, repair
-        raises.
-        """
+        raises."""
         try:
             return verify.read_frontmatter(spec_path)
         except OSError as e:
@@ -2058,6 +2078,264 @@ class Engine:
             return
         target = "review" if review_enabled else "done"
         sprint_advance(self.workspace.paths.sprint_status, task.story_key, target)
+
+    def _manifest_closes_deferred(self, task: StoryTask) -> tuple[str, ...]:
+        """Deferred-work ids declared for this story by a *manifest* the
+        orchestrator reads, as opposed to the story spec's own frontmatter.
+
+        Empty here: sprint mode has no manifest, so frontmatter is its only
+        channel. ``StoriesEngine`` overrides this with its ``stories.yaml``
+        entry — the channel that matters for an unattended run, since the spec is
+        generated later by a dev skill that knows nothing of the ledger."""
+        return ()
+
+    def _declared_deferred_ids(self, task: StoryTask) -> tuple[str, ...]:
+        """The ids this story declares it closes, unioned across both channels
+        and order-preserving (a story that names the same id in the manifest and
+        in its spec must be marked once and reported once).
+
+        Both halves are read live here, at the commit boundary: what the spec
+        and the manifest say at the moment of the close is what the story
+        declares — a declaration edited after the dev artifacts verified must
+        not be closed against a stale snapshot, because the stale half of that
+        can close an entry the final spec no longer names.
+
+        Every degraded reading declares nothing, which is the safe direction
+        for an advisory annotation: the entries stay ``open`` — a miss the next
+        sweep or retro re-verifies — rather than closed on evidence nobody
+        could read. An unreadable spec is journaled by
+        ``_observed_frontmatter``; an unparseable one flattens to ``{}`` there
+        like every other status gate; and a session-supplied path outside the
+        orchestrator's roots is refused under the same containment rule the
+        frontmatter-status reconcile applies, so a surprising absolute path can
+        never steer a ledger write."""
+        ids: list[str] = list(self._manifest_closes_deferred(task))
+        spec_path = Path(task.spec_file) if task.spec_file else None
+        if spec_path is not None:
+            try:
+                within = verify.spec_within_roots(spec_path, self.workspace.paths)
+            except (OSError, RuntimeError):
+                # resolve() faulted (a symlink loop, an unreadable component):
+                # containment can vouch for nothing, so refuse the same way.
+                within = False
+            if not within:
+                self.journal.append(
+                    "deferred-close-skipped-out-of-tree",
+                    story_key=task.story_key,
+                    spec=str(spec_path),
+                )
+            else:
+                fm = self._observed_frontmatter(spec_path, task.story_key, "deferred-close")
+                declared, error = deferredwork.parse_declaration((fm or {}).get("closes_deferred"))
+                if error:
+                    self.journal.append(
+                        "deferred-close-malformed",
+                        story_key=task.story_key,
+                        spec=str(spec_path),
+                        error=f"closes_deferred {error}",
+                    )
+                ids += declared
+        return tuple(dict.fromkeys(ids))
+
+    def _close_declared_deferred(
+        self, task: StoryTask, snapshot: list[tuple[Path, str]] | None = None
+    ) -> None:
+        """At the commit boundary, flip every ledger entry the story declares
+        via ``closes_deferred:`` to ``status: done <date>`` + a ``resolution:``
+        note (#234) — the regular-story counterpart of the sweep bundle close
+        at ``SweepEngine._close_bundle_ledger_when_spec_status``.
+
+        Declaration is the only signal: closure is never inferred from a diff.
+
+        **Advisory by contract.** The annotation is traceability for the next
+        sweep or retro, never a gate: no reading of the spec, the manifest or
+        the ledger can fail the story, and every degraded reading leaves the
+        entries ``open`` — the direction a sweep re-verifies and a retro can
+        repair. That contract is the design: closure needs no transactional
+        coupling to git, because the ledger's consumers re-verify entries
+        against the codebase anyway.
+
+        **Placement.** Runs from ``_finalize_commit_phase`` — after artifact
+        verification, the verify commands, every checkpoint, the review loop,
+        the ``pre_commit_gate`` workflows and the ``pre_commit`` veto — and
+        still before ``finalize_commit``, whose ``git add -A`` stages an
+        in-repo annotation into the story's own commit (worktree isolation
+        included: the unit's ledger rides the unit commit and reaches the
+        target branch with the ordinary merge). Marking at dev-sync time
+        instead let a story that later failed verification or review leave the
+        ledger permanently claiming its work resolved.
+
+        A ledger outside the repo (``ProjectPaths.rebased`` deliberately
+        shares an external artifact dir between worktrees) is written at the
+        same moment; the annotation is simply part of no commit, which is
+        journaled (``deferred-close-external-ledger``). A merge that later
+        fails leaves that annotation standing — visible, journaled and
+        human-attended, the accepted advisory trade-off.
+
+        ``snapshot``, when given, receives ``(ledger, pre-close text)`` the
+        statement before the write, so the caller's failure arms can undo the
+        edit no matter where inside the window a raise lands — including a
+        journal append failing after the write published. Cleared again when
+        nothing was flipped: an empty close needs no restore.
+
+        Idempotent, so the COMMITTING resume arm may re-drive the commit phase
+        freely — ids are classified against the ledger text, and an entry
+        already ``done`` is a satisfied declaration, not an unmatched one."""
+        ids = self._declared_deferred_ids(task)
+        if not ids:
+            return
+        ledger = self.workspace.paths.deferred_work
+        try:
+            text = ledger.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            # Nothing at the path — but a dangling link IS something: the link
+            # names a ledger on a mount that is not answering, and blaming a
+            # typo (`unmatched`) would misreport an outage.
+            try:
+                dangling = ledger.is_symlink()
+            except OSError:
+                dangling = True
+            if dangling:
+                self._journal_ledger_unavailable(task, ids, ledger, "dangling symlink")
+                return
+            text = ""  # no ledger: classify reports every id unmatched; nothing is written
+        except (OSError, UnicodeDecodeError) as e:
+            # An unavailable or undecodable location is not an answer about the
+            # entries: close nothing and say so, rather than read an outage as
+            # "no such entries".
+            self._journal_ledger_unavailable(task, ids, ledger, f"{e.__class__.__name__}: {e}")
+            return
+        if snapshot is not None:
+            snapshot.append((ledger, text))
+        marked = self._apply_deferred_closes(task, ids, ledger, text)
+        if snapshot is not None and not marked:
+            # `mark_done_many` writes only when it marks: the ledger is
+            # byte-identical, so a restore would record a rollback of nothing.
+            snapshot.clear()
+        if marked and not self._ledger_in_repo(ledger):
+            self.journal.append(
+                "deferred-close-external-ledger",
+                story_key=task.story_key,
+                dw_ids=list(marked),
+                ledger=str(ledger),
+                note="ledger is outside the repo; the annotation is not part of any commit",
+            )
+
+    def _journal_ledger_unavailable(
+        self, task: StoryTask, ids: Sequence[str], ledger: Path, error: str
+    ) -> None:
+        self.journal.append(
+            "deferred-close-ledger-unavailable",
+            story_key=task.story_key,
+            dw_ids=list(ids),
+            ledger=str(ledger),
+            error=error,
+        )
+
+    def _ledger_in_repo(self, ledger: Path) -> bool:
+        """Whether the ledger's annotation rides the story's commit. Decided on
+        RESOLVED paths: an in-repo symlink to a shared external ledger must
+        count as external. A path that cannot be resolved reports as external —
+        the write has already happened either way, and "part of no commit" is
+        the claim that stays true when nothing else is known."""
+        try:
+            return ledger.resolve().is_relative_to(self.workspace.root.resolve())
+        except (OSError, RuntimeError):
+            return False
+
+    def _restore_deferred_closes(self, task: StoryTask, snapshot: list[tuple[Path, str]]) -> None:
+        """Put the ledger back the way ``_close_declared_deferred`` found it,
+        after the commit its closures were written for failed (#234): left
+        alone the entries read ``done`` for work that is in no commit, and the
+        likeliest recovery makes that permanent — a human-resolved re-drive
+        sets ``resolved_redrive``, which has ``safe_reset`` preserve the
+        artifact folders' tracked content through the rollback.
+
+        Whole-document, from the pre-close text. Within the commit window the
+        engine is the only writer this restore can know about; anything else
+        that edited the ledger inside it (a native pre-commit hook, say) is
+        restored away with the close — an accepted advisory trade-off, and the
+        escalation hands the tree to a human either way.
+
+        Advisory itself, twice over: a failed restore is journaled, never
+        raised, and the journaling is suppressed rather than allowed to become
+        the crash — this runs inside except arms whose exception must travel
+        unchanged. Skipping the `raise` would replace a `RunStopped` with a
+        symlink complaint; skipping the `GitError` arm's `_escalate` would
+        strand the story in COMMITTING with no diagnosis on the record.
+
+        The guard is type-agnostic on purpose, and `OSError` is not wide enough
+        to hold it: `atomic_write_text` resolves the path before its own try,
+        and below 3.13 `Path.resolve` reports a symlink loop as `RuntimeError`
+        — the same non-OSError `_ledger_in_repo` already catches for this very
+        path. Catching `Exception` and not `BaseException` is the other half:
+        `RunStopped` is an `Exception`, so a second stop signal landing inside
+        the restore is absorbed while the first still travels, and a genuine
+        KeyboardInterrupt still gets out."""
+        if not snapshot:
+            return
+        ledger, before = snapshot[-1]
+        try:
+            atomic_write_text(ledger, before)
+        except Exception as e:
+            with contextlib.suppress(Exception):
+                self.journal.append(
+                    "deferred-close-rollback-failed",
+                    story_key=task.story_key,
+                    ledger=str(ledger),
+                    # named, not bare `str(e)`: now that every type is admitted,
+                    # a message alone cannot say whether the disk or the path
+                    # was the fault. Matches `_journal_ledger_unavailable`.
+                    error=f"{e.__class__.__name__}: {e}",
+                )
+            return
+        with contextlib.suppress(Exception):
+            self.journal.append(
+                "deferred-close-rolled-back", story_key=task.story_key, ledger=str(ledger)
+            )
+
+    def _apply_deferred_closes(
+        self, task: StoryTask, ids: Sequence[str], ledger: Path, text: str
+    ) -> list[str]:
+        """Write the closure for `ids`, journal exactly what landed, and return
+        the ids actually flipped.
+
+        ``text`` is the ledger snapshot the caller already read, never re-read
+        here: classification and the write have to describe the same document, and
+        a second read is a second chance for the location to have gone away
+        underneath them."""
+        declared = deferredwork.classify(text, ids)
+        marked = deferredwork.mark_done_many(
+            ledger, declared.open_ids, self._today(), f"resolved by story {task.story_key}"
+        )
+        if marked:
+            self.journal.append("story-deferred-closed", story_key=task.story_key, dw_ids=marked)
+        if declared.unknown:
+            self.journal.append(
+                "deferred-close-unmatched", story_key=task.story_key, dw_ids=list(declared.unknown)
+            )
+        if declared.malformed:
+            # Present in the ledger but carrying neither an `open` nor a `done`
+            # status: nothing was marked, and staying quiet would read to the
+            # operator exactly like a successful close.
+            self.journal.append(
+                "deferred-close-malformed",
+                story_key=task.story_key,
+                dw_ids=list(declared.malformed),
+                error="ledger entry status is neither open nor done",
+            )
+        if declared.duplicates:
+            # One id, two entries: only the first was classified and only the
+            # first can be marked, so whatever the second says about this work is
+            # neither read nor written. A corrupt ledger (#286) must not close
+            # quietly — the operator has to know which id to go look at.
+            self.journal.append(
+                "deferred-close-duplicate-id",
+                story_key=task.story_key,
+                dw_ids=list(declared.duplicates),
+                error="the ledger carries more than one entry for this id; only the first was read",
+            )
+        return marked
 
     def _extra_session_env(
         self, task: StoryTask, role: str, label: str | None = None

@@ -173,7 +173,20 @@ Turn it on per project with `[stories] source = "stories"` + `spec_folder = "<ep
 - **`spec_checkpoint`** — pause _before_ code, to review the plan. The dev session halts right after planning (`Halt after planning.`) with the spec at `ready-for-dev`; the run pauses at a **plan checkpoint**. Approve to resume straight to implementation, or request a replan (resets the spec to `draft` so the next dispatch re-plans).
 - **`done_checkpoint`** — pause _after_ the story commits, to review the result before the loop moves on (skipped automatically when it is the last story).
 
-A story may set both (it pauses twice); `gates.mode` pauses stack on top. A blocked story escalates exactly as in sprint mode — `bmad-loop resolve`, then re-arm + resume — now with the story's title/description and the blocking condition surfaced; a pre-planning-halt **sentinel** spec is auto-deleted (a copy preserved under the run dir) on re-arm for a clean re-dispatch.
+An entry may also carry **`closes_deferred`** — the `DW-<n>` ledger ids that story's work closes (see [Deferred-work sweeps](#deferred-work-sweeps)):
+
+```yaml
+- id: '3-2'
+  title: Export digests
+  description: …
+  closes_deferred: [DW-5, DW-6]
+```
+
+Declaring it here rather than in the story spec is what lets the annotation happen without touching each generated spec: `bmad-dev-auto` generates the spec and knows nothing of the ledger, whereas the breakdown is authored while the ledger is in view. A spec that _does_ carry the field in frontmatter is honored too — the two are unioned.
+
+Like `spec_checkpoint` and `done_checkpoint`, this is a **human-authored, caller-only field**. Breakdown time, with the ledger open, is where it belongs — but it is not a deadline: the declaration is read when the story commits, so adding one to a story spec's frontmatter mid-run is honored, and withdrawing one before the commit means it is not closed. Upstream Story Breakdown does not emit it yet ([BMAD-METHOD#2619](https://github.com/bmad-code-org/BMAD-METHOD/issues/2619)), and re-deriving `stories.yaml` rewrites the file — so record the intent in `.memlog.md` alongside the story, or the declaration is lost on the next re-derive.
+
+A story may set both checkpoints (it pauses twice); `gates.mode` pauses stack on top. A blocked story escalates exactly as in sprint mode — `bmad-loop resolve`, then re-arm + resume — now with the story's title/description and the blocking condition surfaced; a pre-planning-halt **sentinel** spec is auto-deleted (a copy preserved under the run dir) on re-arm for a clean re-dispatch.
 
 `bmad-loop run --dry-run --spec <folder>` prints the linear schedule (list order, checkpoint markers, live on-disk state); `bmad-loop status` shows the same stories board.
 
@@ -234,6 +247,22 @@ bmad-loop sweep [--no-prompt] [--decisions-only] [--max-bundles N] [--repeat] [-
               → commit. The review gate also checks every bundle entry is
               `status: done` in the ledger.
 ```
+
+**Closing entries from a story.** Sweeps are not the only way an entry gets closed. A story spec can declare the entries its work closes, in frontmatter:
+
+```yaml
+closes_deferred: [DW-5, DW-6] # DW-<n> ids this story closes
+```
+
+In stories mode the same declaration can live on the `stories.yaml` entry instead (`closes_deferred: [DW-5, DW-6]`), which is where it belongs for an unattended run — the breakdown is authored while the ledger is in view, whereas the story spec is generated later by a dev skill that knows nothing of the ledger. Both channels are unioned. Either way the field is human-authored — like `spec_checkpoint` / `done_checkpoint`, no upstream skill emits it yet, and re-deriving `stories.yaml` drops it unless the intent is logged in `.memlog.md`.
+
+The orchestrator writes the same annotation a bundle close writes — `status: done <date>` and `resolution: resolved by story <id>` — into each declared entry. Without it the ledger is one-way: entries are filed automatically but only ever marked resolved by hand, so a multi-epic run ends with entries that were satisfied epics ago still reading `open`.
+
+**Closure happens at the commit boundary**, after artifact verification, the verify commands, every checkpoint, the review loop and the pre-commit workflows — and just before the story's commit is squashed, so an in-repo ledger carries the annotation in that same commit. A story that fails, blocks, is rejected by review, or escalates closes nothing, and there is nothing to undo. Closure is declared, never inferred from the diff; a resume re-driving the same close is a no-op; and an id that matches no entry is journaled rather than failing the story. The declaration is re-read at that boundary, so an edit made after the story was implemented is the one that counts.
+
+A declaration in a shape nothing can read — a bare `closes_deferred: DW-5` where a list belongs — depends on which channel it is in. In a **story spec** it is journaled and dropped, like an unknown id: the spec is generated mid-run by a dev skill, and a malformed field there must not be able to fail a story that succeeded. In **`stories.yaml`** it is a schema error, exactly like every other manifest field of the wrong type, and the manifest fails to load — the breakdown is hand-authored before the run, where `bmad-loop validate` reports it up front and a typo is still cheap to fix. `validate` warns about unknown ids in both queue modes and about a malformed spec declaration; a malformed manifest is the manifest's own `queue.stories-manifest` failure.
+
+> **Ledger outside the repo.** If `implementation_artifacts` is configured outside the project tree, the ledger is shared between worktrees and cannot be part of any commit. The annotation is written all the same, at the same moment, and the run journals `deferred-close-external-ledger` so its absence from git history is not a surprise. A location that cannot be read or written when the write comes due (a shared mount that has gone away) closes nothing and is journaled — those entries stay `open` for a sweep to re-verify, and an outage is never read as "no such entries".
 
 **Answering missed decisions later.** An unattended sweep (`--no-prompt`) skips decisions, and an interactive one can be abandoned before you answer them all — those answers would otherwise be lost, since triage re-derives the decision set from the ledger every run. `bmad-loop decisions` (or press `d` in the TUI) surfaces every decision past sweeps left unanswered, reconstructed from their triage output, and lets you answer them out of band. A `close` is applied immediately; a `build`/`keep-open` is saved to `.bmad-loop/decisions.json` and consumed by the next sweep (build → bundle, keep-open → recorded) with no re-prompt. `--list` shows them without answering; `bmad-loop status` reports the outstanding count.
 

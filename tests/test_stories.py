@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 
 import pytest
+from conftest import fault_read_text
 
 from bmad_loop import stories
 
@@ -64,6 +65,19 @@ def test_load_non_utf8_raises_stories_error(tmp_path):
     tmp_path.mkdir(parents=True, exist_ok=True)
     (tmp_path / stories.STORIES_FILENAME).write_bytes(_BAD_UTF8)
     with pytest.raises(stories.StoriesError, match="not valid UTF-8"):
+        stories.load_stories(tmp_path)
+
+
+def test_load_unreadable_raises_stories_error(tmp_path, monkeypatch):
+    """A manifest that is present but unreadable — permissions, an I/O error, a
+    dead mount — must be a StoriesError like every other manifest fault. `is_file`
+    only rules out absence, so the OSError escaped raw and crashed the run from
+    whichever caller reached it first, including the commit-boundary read of
+    `closes_deferred`, whose contract is to journal and carry on
+    (#284 round-5 review, finding 5)."""
+    write_stories(tmp_path, "- id: 1\n  title: t\n  description: d\n")
+    fault_read_text(monkeypatch, tmp_path / stories.STORIES_FILENAME)
+    with pytest.raises(stories.StoriesError, match="could not be read"):
         stories.load_stories(tmp_path)
 
 
@@ -214,6 +228,41 @@ def test_invoke_dev_with_defaults_empty(tmp_path):
 def test_invoke_dev_with_non_string_rejected(tmp_path):
     write_stories(tmp_path, '- id: "1"\n  title: t\n  description: d\n  invoke_dev_with: [a, b]\n')
     with pytest.raises(stories.StoriesError, match="must be a string"):
+        stories.load_stories(tmp_path)
+
+
+def test_closes_deferred_defaults_empty(tmp_path):
+    """The overwhelmingly common entry declares nothing — and an older manifest,
+    written before the field existed, must keep parsing unchanged (#234)."""
+    write_stories(tmp_path, '- id: "1"\n  title: t\n  description: d\n')
+    assert stories.load_stories(tmp_path).entries[0].closes_deferred == ()
+
+
+def test_closes_deferred_parses_ledger_ids(tmp_path):
+    write_stories(
+        tmp_path,
+        '- id: "1"\n  title: t\n  description: d\n  closes_deferred: [DW-5, DW-6]\n',
+    )
+    assert stories.load_stories(tmp_path).entries[0].closes_deferred == ("DW-5", "DW-6")
+
+
+def test_closes_deferred_normalizes_items(tmp_path):
+    """Items are str()-normalized, stripped, blank-dropped, and de-duplicated, the
+    same leniency ids get: an LLM-authored manifest may emit a bare `5` as an int
+    or repeat an id, and neither is a contradiction worth failing a run over."""
+    write_stories(
+        tmp_path,
+        '- id: "1"\n  title: t\n  description: d\n'
+        '  closes_deferred: ["  DW-5  ", 5, "DW-5", ""]\n',
+    )
+    assert stories.load_stories(tmp_path).entries[0].closes_deferred == ("DW-5", "5")
+
+
+def test_closes_deferred_non_list_rejected(tmp_path):
+    """Strict about the container: a bare string is a schema error, never silently
+    wrapped — a lenient reading would iterate it into single characters."""
+    write_stories(tmp_path, '- id: "1"\n  title: t\n  description: d\n  closes_deferred: DW-5\n')
+    with pytest.raises(stories.StoriesError, match="must be a list of deferred-work ids"):
         stories.load_stories(tmp_path)
 
 

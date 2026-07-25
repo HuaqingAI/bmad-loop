@@ -413,10 +413,46 @@ class StoriesEngine(Engine):
     # ---------------------------------------------------------- sync + verify
 
     def _post_dev_state_sync(self, task: StoryTask, result_json: dict | None) -> None:
-        """No-op: stories mode has no sprint board (and no deferred-work ledger to
-        flip). Honors the contract's "the orchestrator writes nothing" on the
-        happy path — the dev skill is the sole writer of each story spec's status."""
+        """No-op: stories mode has no sprint board. Honors the contract's "the
+        orchestrator writes nothing" on the happy path — the dev skill is the sole
+        writer of each story spec's status.
+
+        Deferred-work closure is deliberately NOT here. It is project-wide state
+        (a story's ``closes_deferred:`` declaration applies in this mode too), but
+        it belongs at the commit boundary rather than at dev-sync time, so a story
+        that later fails verification or review never leaves the ledger claiming
+        its work resolved — see ``Engine._close_declared_deferred`` (#234)."""
         return
+
+    def _manifest_closes_deferred(self, task: StoryTask) -> tuple[str, ...]:
+        """The ``stories.yaml`` entry's ``closes_deferred`` ids.
+
+        This is the channel that makes story-declared closure work unattended:
+        ``bmad-dev-auto`` writes the story spec and knows nothing of the ledger,
+        so with the spec frontmatter alone a human would have to hand-edit every
+        generated spec. The breakdown, by contrast, is authored while the ledger
+        is in view. Both channels compose — the base hook unions them.
+
+        Read here rather than through ``_entry_for`` because the two want opposite
+        things from an unreadable manifest. ``_entry_for`` is a dispatch helper: it
+        warns once per story and falls back to a bare folder+id dispatch that still
+        works. Here the fallback is silence — the ids are not persisted anywhere,
+        unlike the spec half's capture, so a parse failure at the commit boundary
+        drops a declared closure with no trace beyond a generic one-time warning
+        that may already have been spent earlier in the run. Say what was actually
+        lost, at the site that lost it."""
+        try:
+            entry = self._load_stories().get(task.story_key)
+        except stories.StoriesError as e:
+            self.journal.append(
+                "deferred-close-declaration-unreadable",
+                story_key=task.story_key,
+                source="stories.yaml",
+                error=str(e),
+                note="manifest-declared ids cannot be read; nothing is closed for them",
+            )
+            return ()
+        return entry.closes_deferred if entry else ()
 
     def _verify_dev_artifacts(self, task: StoryTask, result_json: dict | None):
         # The adapter marks a plan-halt leg's synthesized result `plan_halt`; latch

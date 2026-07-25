@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import re
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -402,10 +401,6 @@ class SweepEngine(Engine):
         # persistent decision item would notify once per repeat cycle
         self._skipped_decisions: set[str] = set()
         self.state.run_type = "sweep"
-
-    # the date stamped into ledger edits; isolated for tests
-    def _today(self) -> str:
-        return time.strftime("%Y-%m-%d")
 
     def _remaining_estimate(self) -> int | None:
         """Sweep override of the graceful-stop hint: how many deferred-work
@@ -1229,6 +1224,16 @@ class SweepEngine(Engine):
             return
         success_status = "in-review" if self._dev_review_enabled() else "done"
         self._close_bundle_ledger_when_spec_status(task, str(spec_file), success_status)
+
+    def _close_declared_deferred(
+        self, task: StoryTask, snapshot: list[tuple[Path, str]] | None = None
+    ) -> None:
+        """No-op: a bundle's ledger closure is owned by
+        ``_close_bundle_ledger_when_spec_status``, which runs at dev-sync time
+        because ``verify_review_bundle`` *requires* those entries closed before it
+        will pass. Letting the base class's commit-boundary hook (#234) also fire
+        here would re-derive closure for a task whose ids come from
+        ``task.dw_ids``, not from a ``closes_deferred:`` declaration."""
 
     def _close_bundle_ledger_when_spec_status(
         self,

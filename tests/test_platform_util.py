@@ -8,6 +8,7 @@ the legacy ``platform_util`` entry points still delegate, plus the real
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 import sys
 
@@ -129,6 +130,142 @@ def test_atomic_replace_no_retry_on_posix(tmp_path, monkeypatch):
     with pytest.raises(PermissionError):
         platform_util.atomic_replace(tmp_path / "s", tmp_path / "d")
     assert sleeps == []  # zero backoff — a real POSIX error surfaces at once
+
+
+# ------------------------------------------------------------- atomic_write_text
+
+
+def test_atomic_write_text_replaces_contents(tmp_path):
+    target = tmp_path / "ledger.md"
+    target.write_text("before", encoding="utf-8")
+
+    platform_util.atomic_write_text(target, "after")
+
+    assert target.read_text(encoding="utf-8") == "after"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+def test_atomic_write_text_preserves_the_target_mode(tmp_path):
+    """`os.replace` swaps in a NEW inode, so a naive tmp-write-and-replace resets
+    the file's permissions to the umask default — silently widening a 0600 ledger
+    to world-readable, or dropping group-write on a shared artifact dir."""
+    target = tmp_path / "ledger.md"
+    target.write_text("before", encoding="utf-8")
+    target.chmod(0o600)
+
+    platform_util.atomic_write_text(target, "after")
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_atomic_write_text_writes_through_a_symlink(tmp_path):
+    """Replacing the LINK would turn it into a regular file and orphan the real
+    ledger, so the link is resolved first and the target is what gets rewritten."""
+    real = tmp_path / "real-ledger.md"
+    real.write_text("before", encoding="utf-8")
+    link = tmp_path / "ledger.md"
+    link.symlink_to(real)
+
+    platform_util.atomic_write_text(link, "after")
+
+    assert link.is_symlink()
+    assert real.read_text(encoding="utf-8") == "after"
+
+
+def test_atomic_write_text_preserves_extended_attributes(tmp_path):
+    """`os.replace` swaps a fresh inode into place, so anything carried by the old
+    inode rather than by its name is silently reset — xattrs included, which on a
+    ledger is where an SELinux label or a backup tool's marker lives. Deleting
+    `_copy_xattrs` left every other test green (#284 follow-up review, finding 8).
+
+    Skipped where the platform or filesystem has no user xattrs (Windows, macOS's
+    different API, tmpfs mounted `nouser_xattr`) — the helper is best-effort by
+    design and must stay silent there, which the write below also proves."""
+    target = tmp_path / "ledger.md"
+    target.write_text("before", encoding="utf-8")
+    setxattr = getattr(os, "setxattr", None)
+    if setxattr is None:
+        pytest.skip("no os.setxattr on this platform")
+    try:
+        setxattr(target, "user.bmad-loop-test", b"kept")
+    except OSError as e:
+        pytest.skip(f"filesystem does not support user xattrs: {e}")
+
+    platform_util.atomic_write_text(target, "after")
+
+    assert target.read_text(encoding="utf-8") == "after"
+    assert os.getxattr(target, "user.bmad-loop-test") == b"kept"
+
+
+def test_atomic_write_text_fsyncs_before_it_publishes(tmp_path, monkeypatch):
+    """`os.replace` is atomic against concurrent readers, but that says nothing
+    about a machine losing power: closing the temp only hands its bytes to the
+    page cache, so the rename can be durable while the data is not, and the new
+    name comes back pointing at a zero-length file. An empty ledger *parses* — as
+    no entries — so the failure reads as every hand-written entry having vanished
+    rather than as corruption (CodeRabbit, review round 3)."""
+    order = []
+    real_fsync, real_replace = os.fsync, os.replace
+    monkeypatch.setattr(
+        platform_util.os, "fsync", lambda fd: (order.append("fsync"), real_fsync(fd))[1]
+    )
+    monkeypatch.setattr(
+        platform_util.os, "replace", lambda s, d: (order.append("replace"), real_replace(s, d))[1]
+    )
+    target = tmp_path / "ledger.md"
+    target.write_text("before", encoding="utf-8")
+
+    platform_util.atomic_write_text(target, "after")
+
+    assert order == ["fsync", "replace"]  # the sync must precede the publish
+    assert target.read_text(encoding="utf-8") == "after"
+
+
+def test_atomic_write_text_leaves_no_temp_behind(tmp_path):
+    target = tmp_path / "ledger.md"
+    target.write_text("before", encoding="utf-8")
+
+    platform_util.atomic_write_text(target, "after")
+
+    assert [p.name for p in tmp_path.iterdir()] == ["ledger.md"]
+
+
+def test_atomic_write_text_cleans_up_and_keeps_the_original_on_failure(tmp_path, monkeypatch):
+    target = tmp_path / "ledger.md"
+    target.write_text("before", encoding="utf-8")
+
+    def boom(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(platform_util.os, "replace", boom)
+
+    with pytest.raises(OSError):
+        platform_util.atomic_write_text(target, "after")
+
+    assert target.read_text(encoding="utf-8") == "before"
+    assert [p.name for p in tmp_path.iterdir()] == ["ledger.md"]  # no orphaned temp
+
+
+def test_atomic_write_text_temp_name_is_unique_per_call(tmp_path, monkeypatch):
+    """A fixed `<name>.tmp` sibling is a collision between two writers of the same
+    file — the second clobbers the first's staged content and one replace lands
+    a half-written mix."""
+    target = tmp_path / "ledger.md"
+    target.write_text("before", encoding="utf-8")
+    seen: list[str] = []
+    real_replace = os.replace
+
+    def record(src, dst):
+        seen.append(os.path.basename(src))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(platform_util.os, "replace", record)
+
+    platform_util.atomic_write_text(target, "a")
+    platform_util.atomic_write_text(target, "b")
+
+    assert len(set(seen)) == 2
 
 
 # --------------------------------------------------------------- retrying_unlink

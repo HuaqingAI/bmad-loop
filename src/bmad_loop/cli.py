@@ -20,6 +20,7 @@ from . import (
     decisions,
     deferredwork,
     envvars,
+    frontmatter,
     gates,
     install,
     machine,
@@ -229,7 +230,9 @@ def cmd_validate(args: argparse.Namespace) -> int:
             _validate_stories_queue(
                 project, paths, spec_folder, [p.skill_tree for p in profiles], report
             )
+            _validate_closes_deferred(paths, report, spec_folder=spec_folder)
         else:
+            _validate_closes_deferred(paths, report)
             try:
                 ss = sprintstatus.load(paths.sprint_status)
                 actionable = [s for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
@@ -601,6 +604,154 @@ def _validate_stories_queue(
             {"trees": list(dict.fromkeys(skill_trees))},
         )
     report.extend(stories_probs)
+
+
+def _spec_closes_deferred(path: Path) -> tuple[tuple[str, ...], str | None]:
+    """One story spec's ``closes_deferred:`` declaration, degrading an unreadable
+    spec to an empty one — other gates own spec readability, and an advisory
+    check must never be the thing that crashes the preflight it is advising."""
+    try:
+        raw = frontmatter.read_frontmatter(path).get("closes_deferred")
+    except (OSError, UnicodeDecodeError):
+        return (), None
+    return deferredwork.parse_declaration(raw)
+
+
+def _validate_closes_deferred(
+    paths: bmadconfig.ProjectPaths,
+    report: ValidationReport,
+    *,
+    spec_folder: str | None = None,
+) -> None:
+    """Warn when a story declares ``closes_deferred:`` ids the deferred-work
+    ledger does not carry, or declares them in a shape nothing can read (#234).
+
+    At clean close the orchestrator flips each declared id to ``status: done
+    <date>`` + a ``resolution:`` line. An id that names no entry — a typo, or an
+    entry reworded/renumbered since the spec was written — annotates nothing, and
+    the run says so only in the journal, where nobody looks until the retro that
+    the annotation exists to spare. Saying it at preflight is the whole point:
+    the declaration is fixable before the run, not after.
+
+    Runs in **both** queue modes, because the declaration exists in both. With
+    ``spec_folder`` (stories mode) each manifest entry is checked together with
+    its id-resolved spec, unioned — the manifest half is what makes this genuinely
+    a *pre*-flight, since those ids are readable before the story has ever been
+    dispatched. Without it (sprint mode) the story specs already sitting in the
+    artifacts dir are scanned instead; those are written by `create-story` ahead
+    of the run, which is exactly while a typo is still cheap to fix. Reporting
+    only in stories mode left sprint-mode operators with nothing but a journal
+    line after the fact.
+
+    An id present but already ``done`` is a declaration a prior run already
+    satisfied (a resume re-drives the same close), so it stays silent — the same
+    classification the engine's close hook makes, for the same reason. Everything
+    else it can journal is reported here: an absent id, an id whose ledger entry
+    carries neither an ``open`` nor a ``done`` status (nothing will be marked, and
+    the remedy is in the ledger rather than in the declaration), and a
+    wrong-container declaration, which names real intent that would otherwise
+    close nothing and say nothing. Covering only two of the three left the third
+    to be discovered in the journal after the run it should have preceded.
+
+    A ledger that cannot be read at all is reported as well. Staying quiet there
+    is not the same trade as staying quiet about an unparseable manifest: the
+    manifest is already reported by ``queue.stories-manifest``, while nothing
+    else in ``validate`` reads the ledger, so silence meant reporting success for
+    a preflight that checked nothing.
+
+    Never a failure. The annotation is traceability, not a gate, so a stale
+    reference must not be able to block a run that would otherwise start.
+    """
+    ledger = paths.deferred_work
+    try:
+        text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+    except (OSError, UnicodeDecodeError) as e:
+        # Split from the manifest read below, which is silent for a good reason
+        # that does not apply here: nothing else in `validate` reads the ledger, so
+        # returning quietly reported success for a preflight that checked nothing,
+        # against the very file the run's closure will fail on
+        # (#284 round-5 review, finding 6).
+        report.warn(
+            "deferred.ledger-unreadable",
+            f"{ledger} cannot be read ({e}) — closes_deferred declarations were not "
+            "checked against it, and the run's own closure will fail the same way",
+            {"ledger": str(ledger), "error": str(e)},
+        )
+        return
+    try:
+        sources = (
+            _stories_declarations(paths, spec_folder)
+            if spec_folder is not None
+            else _sprint_declarations(paths)
+        )
+    except (OSError, UnicodeDecodeError, stories_mod.StoriesError):
+        # An unparseable manifest is already a `queue.stories-manifest` failure from
+        # the gate above — don't double-report it.
+        return
+    for label, ids, error in sources:
+        if error:
+            report.warn(
+                "deferred.closes-malformed",
+                f"{label} declares closes_deferred in a shape that cannot be read: "
+                f"{error} — nothing will be marked resolved for it",
+                {"source": label, "error": error},
+            )
+        declared = deferredwork.classify(text, ids)
+        if declared.malformed:
+            malformed = list(declared.malformed)
+            report.warn(
+                "deferred.closes-entry-unreadable",
+                f"{label} declares closes_deferred ids whose {ledger.name} entries carry "
+                f"neither an `open` nor a `done` status: {', '.join(malformed)} — nothing "
+                "will be marked resolved for them until the entry status is repaired",
+                {"source": label, "dw_ids": malformed},
+            )
+        if declared.unknown:
+            unknown = list(declared.unknown)
+            report.warn(
+                "deferred.closes-unknown",
+                f"{label} declares closes_deferred ids that are not in "
+                f"{ledger.name}: {', '.join(unknown)} — nothing will be marked "
+                f"resolved for them (typo, or a renumbered/reworded entry?)",
+                {"source": label, "unknown_ids": unknown},
+            )
+
+
+def _stories_declarations(
+    paths: bmadconfig.ProjectPaths, spec_folder: str
+) -> list[tuple[str, tuple[str, ...], str | None]]:
+    """Per manifest entry: the union of its ``stories.yaml`` ids and its
+    id-resolved spec's, deduped across both channels."""
+    folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
+    out = []
+    for entry in stories_mod.load_stories(folder).entries:
+        ids = list(entry.closes_deferred)
+        error = None
+        state = stories_mod.resolve_story_spec(folder, entry.id)
+        if state.kind == stories_mod.KIND_PRESENT and state.path is not None:
+            spec_ids, error = _spec_closes_deferred(state.path)
+            ids += spec_ids
+        out.append((f"story {entry.id}", tuple(dict.fromkeys(ids)), error))
+    return out
+
+
+def _sprint_declarations(
+    paths: bmadconfig.ProjectPaths,
+) -> list[tuple[str, tuple[str, ...], str | None]]:
+    """Sprint mode has no manifest, so the declarations that exist yet are the
+    ones in story specs already on disk — the flat ``*.md`` layout the artifacts
+    dir holds."""
+    impl = paths.implementation_artifacts
+    if not impl.is_dir():
+        return []
+    out = []
+    for path in sorted(impl.glob("*.md")):
+        if path == paths.deferred_work:
+            continue
+        ids, error = _spec_closes_deferred(path)
+        if ids or error:
+            out.append((f"spec {path.name}", ids, error))
+    return out
 
 
 def _warn_unknown_keys(ss: sprintstatus.SprintStatus) -> None:
