@@ -542,7 +542,6 @@ def test_inline_line_returns_none_for_unhandled_types():
     assert adapter._inline_line("server.connected", {}, "assistant") is None
     assert adapter._inline_line("session.created", {"sessionID": "x"}, "assistant") is None
     assert adapter._inline_line("session.idle", {"sessionID": "x"}, "assistant") is None
-    assert adapter._inline_line("session.error", {"sessionID": "x"}, "assistant") is None
     assert adapter._inline_line("catalog.updated", {}, "assistant") is None
     assert adapter._inline_line("totally.unknown", {"sessionID": "x"}, "assistant") is None
     # message.updated renders no line (role refresh lives in _render_inline)
@@ -563,11 +562,11 @@ def test_inline_line_returns_none_for_unhandled_types():
 
 
 def test_inline_line_renders_each_curated_type():
-    """Every event type worth a live line renders deterministically. These are
-    the pinned 1.18.2 strings (probe 2026-07-23): note there is no tool.call /
-    tool.response on this SSE surface — tool exec is command.executed/file.edited
-    and the permission flow is permission.updated/permission.replied. The
-    message.part.* prefix is the session's last-seen role (tracked in
+    """Every event type worth a live line renders deterministically. The type
+    strings and which of them actually fire on 1.18.2 are pinned in the adapter's
+    module docstring (live probes 2026-07-16 / 2026-07-25) — notably there is no
+    tool.call / tool.response on this SSE surface at all. The message.part.*
+    prefix is the role recorded for that part's message id (tracked in
     _render_inline from message.updated.info.role)."""
     adapter = make_adapter(Path("/tmp"))
     assert adapter._inline_line("message.part.updated", {"part": {"text": "hi"}}, "assistant") == (
@@ -608,6 +607,41 @@ def test_inline_line_renders_each_curated_type():
     assert adapter._inline_line("permission.replied", {"response": "allow"}, "assistant") == (
         f"{_TOOL_COLOR}[bmad] perm: allow{_RESET}\n"
     )
+
+
+def test_inline_line_renders_session_error():
+    """session.error ends the session via the queue put in _dispatch_sse; without
+    a line here the transcript would simply stop mid-turn with no stated cause.
+    Role-less like the other tool-family markers, so it takes the same hue. The
+    error payload has no pinned shape on this surface, so any shape summarizes
+    rather than raising or printing a bare '?'."""
+    adapter = make_adapter(Path("/tmp"))
+    assert adapter._inline_line(
+        "session.error", {"sessionID": "x", "error": {"name": "ProviderAuthError"}}, "assistant"
+    ) == (f'{_TOOL_COLOR}[bmad] error: {{"name": "ProviderAuthError"}}{_RESET}\n')
+    # a bare string payload
+    assert adapter._inline_line("session.error", {"error": "boom"}, "assistant") == (
+        f"{_TOOL_COLOR}[bmad] error: boom{_RESET}\n"
+    )
+    # no detail at all still marks the failure — the line is the signal
+    assert adapter._inline_line("session.error", {"sessionID": "x"}, "assistant") == (
+        f"{_TOOL_COLOR}[bmad] error:{_RESET}\n"
+    )
+    # long payloads are truncated like any other one-line summary
+    long_line = adapter._inline_line("session.error", {"error": "x" * 500}, "assistant")
+    assert long_line is not None and "…" in long_line
+
+
+def test_dispatch_session_error_renders_line_and_still_queues_error(tmp_path):
+    """The inline line is additive: the control-path 'error' put still happens."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    adapter._dispatch_sse(
+        sess,
+        {"type": "session.error", "properties": {"sessionID": "ses_test", "error": "boom"}},
+    )
+    assert "[bmad] error: boom\n" in _log_text(log_path)
+    assert sess.events.get_nowait() == "error"
+    assert [r["type"] for r in read_jsonl(event_path)] == ["session.error"]
 
 
 def test_dispatch_writes_assistant_text_to_log_and_jsonl(tmp_path):

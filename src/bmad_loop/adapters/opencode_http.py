@@ -36,6 +36,44 @@ in git history, commit b85d8ca / PR #167). This list wins over memory:
 - All ``time.*`` fields are epoch **milliseconds**; ``POST /session/:id/abort``
   returns ``200 true`` even when nothing is running.
 
+``/event`` frame types the run-log renderer reads — pinned by a second live
+probe of 1.18.2 (2026-07-25, 388 frames over 5 turns across two servers; the
+full evidence table is posted on PR #279). Cross-checked against the server's
+own OpenAPI at ``GET /doc``, whose ``Event`` union has 89 variants and is the
+static contract — worth re-dumping on any version bump:
+
+- ``message.updated`` — turn metadata only, no text. Carries ``info.id`` +
+  ``info.role``; **re-emits out of order** (a stale re-emit for the user
+  message lands mid-assistant-turn), so role must be keyed by message id, never
+  tracked as "last role seen".
+- ``message.part.updated`` — **complete-once, NOT cumulative.** A part fires
+  exactly twice: once at creation with ``text: ""``, then once carrying the
+  full final text. Held at 4 / 711 / 5689 chars (2 fires each, 1 non-empty).
+  Rendering on this frame therefore yields one clean line per statement, with
+  no de-duplication needed. Tool execution also surfaces here, as
+  ``part.type == "tool"`` with ``part.tool`` and ``state.status`` stepping
+  pending → running → completed (``state.input`` / ``state.output``) — tool
+  parts carry no ``part.text``, so the current renderer emits nothing for them.
+- ``message.part.delta`` — the separate per-token stream. At 5689 chars its 50
+  deltas concatenate **byte-exactly** to the single ``part.updated`` text, so
+  it is pure redundancy: never rendered inline, and excluded from the SSE trace
+  (``logs/`` is never trimmed by retention).
+- ``command.executed`` — the **slash-command** surface. It does **not** fire for
+  agent tool use: 0 frames across live ``bash`` / ``write`` / ``read`` /
+  ``edit`` calls. Its payload is ``name`` / ``arguments`` / ``messageID``.
+- ``file.edited`` — live payload is exactly ``{"file": "/abs/path"}`` with **no
+  ``sessionID``**, so the ``properties.sessionID`` filter in ``_dispatch_sse``
+  drops it before any render. Same for ``file.watcher.updated``. Reaching it
+  needs an explicit session-less allowlist, sound here only because bmad-loop
+  runs one server per session.
+- ``permission.updated`` — **does not exist in 1.18.2.** The live ask frame is
+  ``permission.asked`` with ``permission`` / ``patterns`` / ``metadata`` /
+  ``always`` / ``tool`` (not ``type`` / ``pattern``), and ``permission.replied``
+  carries **``reply``**, not ``response``. ``permission.v2.asked`` /
+  ``permission.v2.replied`` also exist in the union.
+- There is **no ``tool.call`` / ``tool.response``** on this surface —
+  confirmed both statically in the 89-variant union and live.
+
 Transport shape (the settled design drivers):
 
 - **One ``opencode serve`` per session.** The API has no per-session env, and
@@ -186,9 +224,11 @@ def _parse_sse_lines(lines) -> Any:
 
 
 def _sum_args(arguments: Any) -> str:
-    """Compact one-line summary of a ``command.executed`` event's ``arguments``
-    for the inline run log. Truncates long dicts/strings so a single line never
-    explodes the tail view."""
+    """Compact one-line summary of an arbitrary event payload value (a
+    ``command.executed`` ``arguments``, a ``session.error`` ``error``) for the
+    inline run log. Truncates long dicts/strings so a single line never explodes
+    the tail view, and accepts any shape — these payloads are server-controlled
+    and not all of them have a pinned schema."""
     if not arguments:
         return ""
     try:
@@ -242,7 +282,10 @@ class _ServerSession:
     # Structured SSE-trace JSONL sink (``<task_id>.sse.jsonl``); None when the
     # ``sse_trace`` knob is off. Written from the SSE reader thread only.
     event_fh: Any = None
-    # Monotonic per-session line number written into the JSONL sink.
+    # Monotonic line number stamped into the trace. Per SESSION, while the file
+    # is per TASK and opened in append mode — so a retried task restarts the seq
+    # at 1 partway down the file. Read a run of seq back to 1 as "new session",
+    # not as corruption; the ``ts`` field orders records across the whole file.
     event_seq: int = 0
     # Role keyed by opencode message id (``msg_*``), refreshed from
     # ``message.updated.info.{id,role}``. The per-part / delta events carry a
@@ -659,11 +702,11 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
         reader thread writes ``log_fh``, and each line is a single ``write()``
         plus ``flush()`` — so it always lands as a whole line at EOF.
 
-        Event-type strings pinned live against the 1.18.2 ``/event`` SSE stream
-        (probe 2026-07-23; the generated SDK ``Event`` union is the contract).
-        There is no ``tool.call`` / ``tool.response`` on this surface — tool
-        execution surfaces as ``command.executed`` + ``file.edited``, and the
-        permission flow as ``permission.updated`` + ``permission.replied``.
+        Event-type strings and their semantics are pinned in the module
+        docstring's ``/event`` section — read that before adding a branch here.
+        It records which of these types actually fire on 1.18.2 and which the
+        renderer names but never sees (``command.executed`` for tool use,
+        ``file.edited``, ``permission.updated``).
 
         ``message.updated`` carries only turn metadata (notably ``info.role``
         keyed by ``info.id``) and renders no inline line of its own — it just
@@ -740,6 +783,15 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
             )
         if etype == "permission.replied":
             return f"{_TOOL_COLOR}[bmad] perm: {props.get('response') or '?'}{_RESET}\n"
+        # A failing turn is the one thing a reader most wants in the transcript:
+        # without this the log just stops mid-turn while the queue put below
+        # ends the session. Same green/tool hue as the other role-less markers —
+        # the color family is "not a speaker", not "severity". `error` has no
+        # pinned shape on this surface, so summarize whatever it carries rather
+        # than reaching into fields that may not exist.
+        if etype == "session.error":
+            detail = _sum_args(props.get("error"))
+            return f"{_TOOL_COLOR}[bmad] error:{(' ' + detail) if detail else ''}{_RESET}\n"
         return None
 
     def _emit_event(self, sess: _ServerSession, etype: str, props: dict) -> None:
@@ -763,7 +815,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
             "seq": sess.event_seq,
             "type": etype,
             "properties": props,
-            "ts": int(time.time() * 1000),
+            "ts": _now_ms(),  # epoch ms — the unit every opencode time.* uses
         }
         try:
             sess.event_fh.write(json.dumps(record, ensure_ascii=False) + "\n")
