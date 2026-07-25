@@ -14,6 +14,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -21,6 +22,7 @@ from pathlib import Path
 import pytest
 import regex
 
+from bmad_loop import devcontract
 from bmad_loop.adapters import generic, tmux_base
 from bmad_loop.adapters.base import SessionHandle, SessionResult, SessionSpec, SpecSnapshot
 from bmad_loop.adapters.generic import GenericDevAdapter, GenericTmuxAdapter
@@ -2999,16 +3001,32 @@ def test_tmux_timeout_silent_session_not_rescued(tmp_path):
         },
         timeout_s=6.0,
     )
-    # A FOREIGN story's finished spec lands mid-window (the concurrent merge-back).
-    (impl / "spec-9-9-someone-elses-story.md").write_text(
-        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n"
-        "## Auto Run Result\n\nStatus: done\nImplemented.\n"
-    )
+    # A FOREIGN story's finished spec lands MID-WINDOW, from a separate thread
+    # standing in for the concurrent run's merge-back. It must be written after
+    # `run()` stamps `launched_ns`, or its mtime sits below the `since_ns` floor,
+    # `find_result_artifact` discards it on that alone, and the read-back never
+    # produces a candidate for the gate to refuse — the test would then pass with
+    # the proof-of-work gate entirely removed (verified: it did).
+    foreign = impl / "spec-9-9-someone-elses-story.md"
+
+    def merge_back():
+        time.sleep(1.0)  # inside the 6s session window
+        foreign.write_text(
+            "---\nstatus: done\nbaseline_revision: abc123\n---\n\n"
+            "## Auto Run Result\n\nStatus: done\nImplemented.\n"
+        )
+
+    writer = threading.Thread(target=merge_back, daemon=True)
+    writer.start()
     try:
         result = adapter.run(spec)
     finally:
+        writer.join(timeout=10)
         subprocess.run(["tmux", "kill-session", "-t", adapter.session_name], capture_output=True)
 
+    # The foreign spec really is a candidate the read-back would otherwise adopt:
+    # it exists, qualifies, and post-dates launch. Only the gate rejects it.
+    assert devcontract.is_result_artifact(foreign, since_ns=0)
     assert result.status == "timeout"
     assert result.result_json is None
     # Below the floor is the invariant; exactly zero is merely what it happens to be.
