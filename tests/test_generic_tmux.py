@@ -2552,7 +2552,12 @@ def test_run_reconcile_upgrade_is_not_reclassified(tmp_path):
     (impl / "spec-3-1-foo.md").write_text(_DONE_SPEC)  # a done artifact to rescue
     _write_task_log(
         adapter,
-        b"API Error: Unable to connect (ECONNREFUSED)\n",  # would match if scanned
+        # Padded past PROOF_OF_WORK_MIN_LOG_BYTES: this fixture stands in for a
+        # session that implemented the story and then lost its Stop, and such a
+        # session renders. A log holding ONLY the error line would be a session that
+        # rendered ~44 bytes total, which the #261 gate correctly declines to rescue
+        # — it would make this ordering test depend on a scenario it is not about.
+        b"working...\n" * 32 + b"API Error: Unable to connect (ECONNREFUSED)\n",
         task_id="3-1-dev-1",
     )
     adapter.start_session = lambda spec: _dev_handle()
@@ -2584,18 +2589,25 @@ def test_start_session_resets_reused_task_log(tmp_path):
     logs/<task_id>.log, so a prior cycle's transport-failure line would linger in the
     64 KiB tail and mis-flag a later unrelated timeout. start_session drops the stale
     tee before re-piping (mirroring the result.json unlink), so the reused path holds
-    only the current session's output."""
+    only the current session's output.
+
+    It then re-creates the file EMPTY rather than leaving it absent, so a window that
+    dies before pipe_pane attaches still reports "rendered nothing" to the #261
+    proof-of-work gate instead of "no pane signal here" (#298 review). The invariant
+    this pins is that no stale BYTE survives — not that no file does."""
     mux = _StartSessionMux()
     adapter = make_adapter(tmp_path, mux=mux)
     adapter._ensure_session = lambda cwd: None  # skip the tmux server plumbing
     task_id = _ENV_FAULT_TASK
     _write_task_log(adapter, b"API Error: Unable to connect (ECONNREFUSED)\n", task_id=task_id)
     log_path = adapter.logs_dir / f"{task_id}.log"
-    assert log_path.exists()  # the prior cycle's tee is present...
+    assert log_path.stat().st_size > 0  # the prior cycle's tee is present...
 
     adapter.start_session(make_spec(tmp_path, task_id=task_id))
 
-    assert not log_path.exists()  # ...and start_session unlinked it before re-piping
+    # ...and start_session dropped every stale byte before re-piping, leaving the
+    # empty file the proof-of-work gate needs to read a dead-on-arrival window.
+    assert log_path.read_bytes() == b""
     assert mux.piped == [("@1", log_path)]  # the fresh tee attaches to the same path
     # a re-driven session that times out with no NEW matching output is not misclassified
     assert _classify(adapter, "timeout", task_id=task_id).env_fault is False
@@ -3007,10 +3019,29 @@ def test_tmux_timeout_silent_session_not_rescued(tmp_path):
     # `find_result_artifact` discards it on that alone, and the read-back never
     # produces a candidate for the gate to refuse — the test would then pass with
     # the proof-of-work gate entirely removed (verified: it did).
+    #
+    # So the writer waits on the ACTUAL launch rather than a fixed sleep: the gap
+    # from `run()` to `launched_ns` covers `_ensure_session`, a real `tmux
+    # new-session`, and a slow or loaded box can push that past any margin picked
+    # in advance — silently restoring the vacuous pass (#298 review). Capturing the
+    # handle also gives the assertion below the real floor to test against.
     foreign = impl / "spec-9-9-someone-elses-story.md"
+    launched: list[SessionHandle] = []
+    launch_stamped = threading.Event()
+    real_start_session = adapter.start_session
+
+    def spy_start_session(session_spec):
+        handle = real_start_session(session_spec)
+        launched.append(handle)
+        launch_stamped.set()
+        return handle
+
+    adapter.start_session = spy_start_session
 
     def merge_back():
-        time.sleep(1.0)  # inside the 6s session window
+        if not launch_stamped.wait(timeout=10):
+            return  # the run failed to launch; the assertions below will say so
+        time.sleep(0.5)  # comfortably inside the 6s session window
         foreign.write_text(
             "---\nstatus: done\nbaseline_revision: abc123\n---\n\n"
             "## Auto Run Result\n\nStatus: done\nImplemented.\n"
@@ -3024,9 +3055,11 @@ def test_tmux_timeout_silent_session_not_rescued(tmp_path):
         writer.join(timeout=10)
         subprocess.run(["tmux", "kill-session", "-t", adapter.session_name], capture_output=True)
 
-    # The foreign spec really is a candidate the read-back would otherwise adopt:
-    # it exists, qualifies, and post-dates launch. Only the gate rejects it.
-    assert devcontract.is_result_artifact(foreign, since_ns=0)
+    # The foreign spec really is a candidate the read-back would otherwise adopt: it
+    # exists, qualifies, and — tested against the launch floor this session actually
+    # recorded, not a permissive 0 — post-dates launch. Only the gate rejects it.
+    assert launched, "start_session never ran"
+    assert devcontract.is_result_artifact(foreign, since_ns=launched[0].launched_ns)
     assert result.status == "timeout"
     assert result.result_json is None
     # Below the floor is the invariant; exactly zero is merely what it happens to be.
@@ -4092,9 +4125,9 @@ def test_proof_of_work_pane_log_growth_is_evidence(tmp_path, monkeypatch):
     assert res.result_json["status"] == "done"
 
 
-def test_proof_of_work_hook_event_is_evidence_despite_empty_log(tmp_path, monkeypatch):
+def test_proof_of_work_ended_turn_is_evidence_despite_empty_log(tmp_path, monkeypatch):
     """The two signals are ORed for a reason: on a misbound pane sink (#254/#217) a
-    HEALTHY session logs zero bytes. A hook event having arrived carries it."""
+    HEALTHY session logs zero bytes. A turn having ENDED carries it."""
     adapter, impl = make_dev_adapter(tmp_path)
     monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
     (impl / "spec-3-1-foo.md").write_text(
@@ -4102,13 +4135,42 @@ def test_proof_of_work_hook_event_is_evidence_despite_empty_log(tmp_path, monkey
         "## Auto Run Result\n\nStatus: done\nImplemented.\n"
     )
     _pane_log(adapter, "3-1-dev-1", 0)
-    res = adapter._final(_dev_handle(), _dev_spec(tmp_path), "crashed", "sess-1", None)
+    res = adapter._final(
+        _dev_handle(), _dev_spec(tmp_path), "crashed", "sess-1", None, stop_seen=True
+    )
     assert res.status == "completed"
+
+
+def test_proof_of_work_session_id_alone_is_not_evidence(tmp_path, monkeypatch):
+    """`session_id`/`transcript_path` are populated by SessionStart and SessionEnd,
+    which a CLI that launched and wedged emits without doing anything. Reading them
+    as proof left the gate satisfied in exactly the case it exists to catch (#298
+    review): only `stop_seen` — a turn that ENDED — is the hook-side evidence."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    (impl / "spec-9-9-someone-elses-story.md").write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n"
+        "## Auto Run Result\n\nStatus: done\nImplemented.\n"
+    )
+    _pane_log(adapter, "3-1-dev-1", 0)
+    res = adapter._final(
+        _dev_handle(),
+        _dev_spec(tmp_path),
+        "crashed",
+        "sess-1",  # SessionStart handed us a session id...
+        "/t.jsonl",  # ...and a transcript path. Neither means work happened.
+        stop_seen=False,
+    )
+    assert res.status == "crashed"
+    assert res.result_json is None
 
 
 def test_proof_of_work_no_pane_log_is_inert(tmp_path, monkeypatch):
     """Unknown never blocks: with no pane log at all there is no signal, and the
-    gate preserves the previous behavior exactly."""
+    gate preserves the previous behavior exactly. Reachable only for a handle this
+    adapter never launched — `start_session` always leaves a log behind (see the
+    dead-on-arrival test below), which is what keeps this state from swallowing the
+    case the gate is for."""
     adapter, impl = make_dev_adapter(tmp_path)
     monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
     (impl / "spec-3-1-foo.md").write_text(
@@ -4118,6 +4180,56 @@ def test_proof_of_work_no_pane_log_is_inert(tmp_path, monkeypatch):
     assert not (adapter.logs_dir / "3-1-dev-1.log").exists()
     res = adapter._final(_dev_handle(), _dev_spec(tmp_path), "crashed", None, None)
     assert res.status == "completed"
+
+
+def test_proof_of_work_dead_on_arrival_window_is_refused(tmp_path, monkeypatch):
+    """A window that dies before `pipe_pane` attaches tees NOTHING, so before #298
+    it left no log file at all — the inert state above — and the gate failed open on
+    precisely the dead-on-arrival session it exists to refuse. `start_session` now
+    creates the log empty up front, so "no tee ever attached" reports as `False`
+    (rendered nothing) rather than `None` (no pane signal here).
+
+    Driven through the REAL `start_session` with a mux whose `pipe_pane` writes
+    nothing — the faithful stand-in for attaching a tee to a corpse."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    adapter._ensure_session = lambda cwd: None  # skip the tmux server plumbing
+    adapter.mux = _StartSessionMux()
+
+    handle = adapter.start_session(_dev_spec(tmp_path))
+    assert (adapter.logs_dir / "3-1-dev-1.log").stat().st_size == 0
+
+    # The foreign spec must land AFTER launch, or its mtime sits below the
+    # `since_ns` floor, the scan discards it there, and the gate is never reached —
+    # the test would pass with the gate removed (verified by ablation: it did).
+    foreign = impl / "spec-9-9-someone-elses-story.md"
+    foreign.write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n"
+        "## Auto Run Result\n\nStatus: done\nImplemented.\n"
+    )
+    assert devcontract.is_result_artifact(foreign, since_ns=handle.launched_ns)
+
+    res = adapter._final(handle, _dev_spec(tmp_path), "crashed", None, None)
+    assert res.status == "crashed"
+    assert res.result_json is None
+
+
+def test_proof_of_work_leaves_task_scoped_result_json_alone(tmp_path):
+    """The gate is scoped to the shared-directory read-back, not to `_final` at
+    large (#298 review). A base adapter's `tasks/<task_id>/result.json` is unique to
+    this task and unlinked at launch, so its presence already proves THIS session
+    wrote it — no foreign writer can reach it. Gating it could only ever discard an
+    authoritative completion, so `_ResultFileMixin` declines the gate outright."""
+    adapter = make_adapter(tmp_path)
+    task_dir = adapter.tasks_dir / "1-1-a-dev-1"
+    task_dir.mkdir(parents=True)
+    (task_dir / "result.json").write_text('{"status": "done", "workflow": "dev"}')
+    _pane_log(adapter, "1-1-a-dev-1", 0)  # no rendering, and no Stop below
+
+    handle = SessionHandle(task_id="1-1-a-dev-1", native_id="@1")
+    res = adapter._final(handle, make_spec(tmp_path), "crashed", None, None)
+    assert res.status == "completed"
+    assert res.result_json["status"] == "done"
 
 
 def test_proof_of_work_gates_post_kill_reconcile(tmp_path, monkeypatch):
@@ -4183,3 +4295,10 @@ def test_log_evidence_mro_is_not_shadowed_by_the_mixin():
 
     assert GenericDevAdapter._log_evidence is GenericAdapter._log_evidence
     assert OpencodeDevAdapter._log_evidence is _ResultFileMixin._log_evidence
+    # Same hazard, same reason: the gate applies to the shared-directory read-back
+    # the dev mixin owns and to nothing else. An MRO that let the base default win
+    # for a dev adapter would silently disarm it; one that let the dev value leak
+    # onto a base adapter would start discarding authoritative task-scoped results.
+    assert GenericDevAdapter._READBACK_NEEDS_PROOF_OF_WORK is True
+    assert OpencodeDevAdapter._READBACK_NEEDS_PROOF_OF_WORK is True
+    assert GenericTmuxAdapter._READBACK_NEEDS_PROOF_OF_WORK is False

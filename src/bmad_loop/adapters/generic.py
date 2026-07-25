@@ -191,6 +191,16 @@ class _ResultFileMixin:
     # tells the type checker the host attribute this mixin reads.
     tasks_dir: Path
 
+    # Whether `_final` applies the #261 proof-of-work gate to its read-back. False
+    # here, and that is not a conservative default — it is the correct answer for
+    # this mixin's own read-back. `tasks/<task_id>/result.json` is task-unique and
+    # `start_session` unlinks it before launch, so its presence is already proof
+    # THIS session wrote it; a foreign writer cannot reach it. Gating it could only
+    # ever downgrade an authoritative completion. Overridden True by
+    # `_DevSynthesisMixin`, whose read-back scans a directory shared with every
+    # concurrent run — the one place a result can belong to somebody else.
+    _READBACK_NEEDS_PROOF_OF_WORK = False
+
     def _result_json(self, handle: SessionHandle, spec: SessionSpec, *, wait: bool) -> dict | None:
         """Acquire this session's result dict. Base behavior: read the
         skill-written ``result.json`` (briefly awaiting it on the Stop event,
@@ -199,24 +209,28 @@ class _ResultFileMixin:
         on-disk artifact."""
         return self._await_result(handle.task_id) if wait else self._read_result(handle.task_id)
 
-    def _produced_work(
-        self, handle: SessionHandle, session_id: str | None, transcript: str | None
-    ) -> bool:
+    def _produced_work(self, handle: SessionHandle, stop_seen: bool) -> bool:
         """Whether this session shows ANY evidence it actually ran, for the #261
         proof-of-work gate. Deliberately a very low bar — it separates "the CLI
         wedged before it did anything" from "the CLI worked", not good work from bad.
 
-        Two independent signals, ORed, because each has a known blind spot:
-        a hook event having arrived (``session_id``/``transcript`` are populated only
-        from one) covers an adapter whose pane sink is misbound (#254/#217, where a
-        HEALTHY session still logs zero bytes), and pane-log growth covers a profile
-        whose hooks never fire. Requiring both to be absent is what makes the gate
-        safe to apply to a `completed` upgrade.
+        Two independent signals, ORed, because each has a known blind spot: a `Stop`
+        event having arrived covers an adapter whose pane sink is misbound (#254/#217,
+        where a HEALTHY session still logs zero bytes), and pane-log growth covers a
+        profile whose hooks never fire. Requiring both to be absent is what makes the
+        gate safe to apply to a `completed` upgrade.
+
+        The hook signal is `Stop` specifically — a turn that ENDED — not "a hook
+        event arrived". Of the three canonical events, `SessionStart` fires before
+        the session does anything and `SessionEnd` fires when it stops being one;
+        both are emitted by a CLI that launched and wedged, so accepting either
+        would leave the gate satisfied in exactly the case it exists to catch. The
+        #254/#217 rationale is unaffected: a healthy session ends its turn.
 
         Unknown never blocks: `_log_evidence` returns None when there is no signal at
         all (no pane log — the opencode-http transport, and every unit-test fixture),
         and that reads as evidence-present, preserving current behavior exactly."""
-        if session_id or transcript:
+        if stop_seen:
             return True
         evidence = self._log_evidence(handle)
         return True if evidence is None else evidence
@@ -238,21 +252,28 @@ class _ResultFileMixin:
         *,
         accept_result: bool = True,
         budget_weighted: int | None = None,
+        stop_seen: bool = False,
     ) -> SessionResult:
         """Session is gone or done responding: completed if the result file
         landed anyway, otherwise the fallback status. ``accept_result=False``
         (a stall verdict reached under a live window) pins the fallback: an
         artifact that appeared without a Stop or window death is not trusted.
         ``budget_weighted`` (a tripped session-budget guard's sample) rides
-        every exit so the engine can journal it whatever the verdict."""
+        every exit so the engine can journal it whatever the verdict.
+        ``stop_seen`` is the proof-of-work hook signal, threaded separately from
+        ``session_id``/``transcript`` because those are also set by a mere launch."""
         result_json = self._result_json(handle, spec, wait=False) if accept_result else None
-        if result_json is not None and not self._produced_work(handle, session_id, transcript):
+        if (
+            result_json is not None
+            and self._READBACK_NEEDS_PROOF_OF_WORK
+            and not self._produced_work(handle, stop_seen)
+        ):
             # Proof-of-work gate (#261): this session is gone and produced no
-            # observable output at all — no hook event ever arrived AND its pane log
-            # never grew. A read-back artifact is then not evidence THIS session
-            # finished; it is evidence that SOMETHING wrote a qualifying file in a
-            # directory we share. Keep the fallback verdict rather than upgrade a
-            # dead-on-arrival session to `completed`.
+            # observable output at all — no turn ever ended AND its pane log never
+            # grew. A read-back artifact is then not evidence THIS session finished;
+            # it is evidence that SOMETHING wrote a qualifying file in a directory we
+            # share. Keep the fallback verdict rather than upgrade a dead-on-arrival
+            # session to `completed`.
             self._note_lifecycle(
                 handle.task_id,
                 "readback-refused-no-proof-of-work",
@@ -268,6 +289,7 @@ class _ResultFileMixin:
             session_id=session_id,
             transcript_path=transcript,
             budget_weighted=budget_weighted,
+            stop_seen=stop_seen,
         )
 
     def _result_path(self, task_id: str) -> Path:
@@ -447,6 +469,22 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
         # wait_for_completion ignores anything older than this floor so a reused
         # task_id's earlier Stop event cannot replay.
         launched_ns = time.time_ns()
+        log_file = self.logs_dir / f"{spec.task_id}.log"
+        # A re-armed run reuses task_ids and both mux backends append; drop the prior
+        # cycle's tee so the #194 tail scan can't match a stale transport error (mirrors
+        # the result.json unlink above; journal.py already assumes "next session replaces it").
+        log_file.unlink(missing_ok=True)
+        # ...then create it EMPTY, before the window exists. `pipe_pane` below tolerates
+        # a window that already died and then attaches no tee, so without this a
+        # dead-on-arrival session leaves NO log at all — and an absent log is the
+        # `_log_evidence` "this transport has no pane signal" state, which the #261
+        # proof-of-work gate treats as inert. The gate would fail OPEN in exactly the
+        # case it exists to catch. A 0-byte file says something truer and stronger:
+        # this transport does tee a pane, and this session rendered nothing into it.
+        # (Both backends append, so pre-creating cannot truncate a live tee. Stall
+        # detection is unaffected: `_log_activity_key` reports (mtime, 0) instead of
+        # None, and every reader compares signatures rather than testing existence.)
+        log_file.touch()
         window_id = self.mux.new_window(
             self.session_name,
             spec.task_id[-40:],
@@ -454,11 +492,6 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
             {**self.profile.env, **spec.env},
             self.build_command(spec),
         )
-        log_file = self.logs_dir / f"{spec.task_id}.log"
-        # A re-armed run reuses task_ids and both mux backends append; drop the prior
-        # cycle's tee so the #194 tail scan can't match a stale transport error (mirrors
-        # the result.json unlink above; journal.py already assumes "next session replaces it").
-        log_file.unlink(missing_ok=True)
         # pipe_pane tolerates the window having already died (a CLI that crashes on
         # launch can take it down before the tee attaches); the dead window is then
         # reported as a crash in wait_for_completion.
@@ -497,6 +530,12 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
         # forever: after cap total nudges it is declared stalled. cap=None
         # (raw constructor default) skips the check.
         stall_nudges_sent = 0
+        # latched on the first accepted `Stop`: the hook half of the #261 proof-of-work
+        # gate. Tracked apart from session_id/transcript_path — those are populated by
+        # SessionStart and SessionEnd too, which a CLI that launched and wedged emits
+        # without doing any work. Rides out on every exit (see SessionResult.stop_seen)
+        # so `_post_kill_reconcile` reads the same signal after run() kills the window.
+        stop_seen = False
         # internal observability counter: counts ticks where the liveness probe
         # raised a transport error (e.g. a 30s tmux hang). It deliberately does
         # NOT escalate to "crashed" — a transient transport hiccup is not proof
@@ -544,6 +583,7 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
                     timeout_fired_at=time.time(),
                     timeout_expired_clock=expired,
                     budget_weighted=budget_weighted,
+                    stop_seen=stop_seen,
                 )
             now = time.monotonic()
             if last_heartbeat is None or now - last_heartbeat >= HEARTBEAT_INTERVAL_S:
@@ -613,6 +653,7 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
                                             session_id,
                                             transcript_path,
                                             budget_weighted=weighted,
+                                            stop_seen=stop_seen,
                                         )
                                 except MultiplexerError:
                                     pass
@@ -629,6 +670,7 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
                                     session_id=session_id,
                                     transcript_path=transcript_path,
                                     budget_weighted=weighted,
+                                    stop_seen=stop_seen,
                                 )
                             try:
                                 self.send_text(handle, BUDGET_NUDGE_TEXT)
@@ -660,6 +702,7 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
                             session_id,
                             transcript_path,
                             budget_weighted=budget_weighted,
+                            stop_seen=stop_seen,
                         )
                 except MultiplexerError:
                     pass
@@ -676,6 +719,7 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
                     session_id=session_id,
                     transcript_path=transcript_path,
                     budget_weighted=budget_weighted,
+                    stop_seen=stop_seen,
                 )
             event = self.watcher.wait_for(
                 handle.task_id,
@@ -704,6 +748,7 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
                         session_id,
                         transcript_path,
                         budget_weighted=budget_weighted,
+                        stop_seen=stop_seen,
                     )
                 if stall_deadline is not None:
                     # No artifact shortcut here: the window is alive on this tick
@@ -756,6 +801,7 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
                                 session_id,
                                 transcript_path,
                                 budget_weighted=budget_weighted,
+                                stop_seen=stop_seen,
                             )
                     except MultiplexerError:
                         pass
@@ -770,6 +816,7 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
                         transcript_path,
                         accept_result=False,
                         budget_weighted=budget_weighted,
+                        stop_seen=stop_seen,
                     )
                 continue
             if (
@@ -790,6 +837,11 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
             if event.event == "SessionStart":
                 continue
             if event.event == "Stop":
+                # A turn ENDED — the one canonical event that proves the CLI did
+                # something, and so the hook half of the #261 proof-of-work gate.
+                # Latched after the subagent filter above, which rejects a stop that
+                # is not the main session's turn-end. Never cleared.
+                stop_seen = True
                 result_json = self._result_json(handle, spec, wait=True)
                 if result_json is not None:
                     return SessionResult(
@@ -798,6 +850,7 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
                         session_id=session_id,
                         transcript_path=transcript_path,
                         budget_weighted=budget_weighted,
+                        stop_seen=stop_seen,
                     )
                 if nudges_left > 0:
                     nudges_left -= 1
@@ -811,6 +864,7 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
                         session_id,
                         transcript_path,
                         budget_weighted=budget_weighted,
+                        stop_seen=stop_seen,
                     )
                 # A result-less Stop, but the session may have ended its turn to
                 # await a background process (a Unity PlayMode run, a slow test)
@@ -833,6 +887,7 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
                     session_id,
                     transcript_path,
                     budget_weighted=budget_weighted,
+                    stop_seen=stop_seen,
                 )
 
     def _log_evidence(self, handle: SessionHandle) -> bool | None:
@@ -840,11 +895,17 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
         `_ResultFileMixin._produced_work`). The pane is tee'd to a stable inode, so
         its size is a direct measure of how much the session emitted.
 
-        None when the log does not exist — no signal, and the gate stays inert.
-        Otherwise True iff the log exceeded `PROOF_OF_WORK_MIN_LOG_BYTES` (see that
-        constant for why the floor is not zero, and for what it does and does not
-        prove). This measures rendering, not liveness, which is why `_produced_work`
-        ORs it with the hook-event signal rather than trusting it alone."""
+        True iff the log exceeded `PROOF_OF_WORK_MIN_LOG_BYTES` (see that constant for
+        why the floor is not zero, and for what it does and does not prove). This
+        measures rendering, not liveness, which is why `_produced_work` ORs it with
+        the turn-ended signal rather than trusting it alone.
+
+        None when the log does not exist — no signal, gate inert. `start_session`
+        creates it empty before the window exists, precisely so a session that died
+        on arrival reports False (rendered nothing) rather than None (no such signal):
+        the DOA case is the gate's whole purpose and must not read as unknown. What
+        is left in the None state is a handle this adapter never launched — unit
+        fixtures — for which "unknown never blocks" is the right and only answer."""
         try:
             size = (self.logs_dir / f"{handle.task_id}.log").stat().st_size
         except OSError:
@@ -1121,6 +1182,15 @@ class _DevSynthesisMixin(_ResultFileMixin):
     # would shadow the real one on both adapters. The contract nudge (#276 M4)
     # sends through it.
     send_text: Callable[[SessionHandle, str], None]
+
+    # This mixin's read-back is where #261 lives: the skill writes no task-scoped
+    # result.json, so a result is synthesized from a *.md in an implementation-
+    # artifacts dir shared with every concurrent run and with the human. A pinned
+    # `expected_spec` closes that for the sessions the orchestrator can name, but
+    # dev attempt 1 (no spec exists yet) and the labeled-workflow marker still scan.
+    # There a qualifying file can belong to someone else, so a dead session must
+    # show it ran before its "result" is honored. See `_produced_work`.
+    _READBACK_NEEDS_PROOF_OF_WORK = True
 
     def _configure_dev_knobs(self) -> None:
         """Override the base result-file knobs for the bmad-dev-auto contract;
@@ -1759,11 +1829,11 @@ class _DevSynthesisMixin(_ResultFileMixin):
             return result
         # Proof-of-work gate (#261), the same one the crash path applies in `_final`:
         # this rescue exists for a session that finished but lost its Stop, not for
-        # one that never ran. A session with no hook event and a pane log that never
+        # one that never ran. A session that ended no turn and whose pane log never
         # grew produced nothing, so a qualifying artifact is not its output — keep
         # the stall/timeout verdict. This is the call path the issue's second
         # occurrence (story i-11) took.
-        if not self._produced_work(handle, result.session_id, result.transcript_path):
+        if not self._produced_work(handle, result.stop_seen):
             self._note_lifecycle(
                 handle.task_id,
                 "readback-refused-no-proof-of-work",
@@ -1785,6 +1855,7 @@ class _DevSynthesisMixin(_ResultFileMixin):
             timeout_fired_at=result.timeout_fired_at,
             timeout_expired_clock=result.timeout_expired_clock,
             budget_weighted=result.budget_weighted,
+            stop_seen=result.stop_seen,
         )
 
 

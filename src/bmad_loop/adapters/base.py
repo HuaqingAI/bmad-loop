@@ -135,10 +135,16 @@ class SessionResult:
     # was post-mortem-matched as an *environment fault* (the coding CLI lost its
     # API connection and idled out the session clock instead of doing real work).
     # Set by the _classify_env_fault hook; env_fault_evidence carries the matched,
-    # ANSI-stripped log line. These two MUST stay the LAST fields so every
-    # positional SessionResult construction in the codebase stays valid.
+    # ANSI-stripped log line. New fields are APPENDED below these, never inserted
+    # among them, so every positional SessionResult construction stays valid.
     env_fault: bool = False
     env_fault_evidence: str | None = None
+    # Whether a `Stop` hook event arrived during this session — the hook half of the
+    # #261 proof-of-work gate (see `_ResultFileMixin._produced_work`). Deliberately
+    # NOT `session_id is not None`: SessionStart and SessionEnd populate that too,
+    # and both fire on a CLI that launched and wedged without doing anything. Stop
+    # is the only canonical event that means a turn actually ended.
+    stop_seen: bool = False
 
 
 class CodingCLIAdapter(ABC):
