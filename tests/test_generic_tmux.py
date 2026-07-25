@@ -2896,13 +2896,22 @@ def test_tmux_timeout_with_flushed_spec_rescued_post_kill(tmp_path):
     never emits any hook event, so the wait loop idles to `timeout` — a path that
     never arms the stall grace and checks no artifact. run()'s real kill then
     settles liveness, and the post-kill reconcile rescues the finished work
-    through a real tmux probe + scan."""
+    through a real tmux probe + scan.
+
+    The fake renders to its pane before writing the spec. That is not decoration:
+    the #261 proof-of-work gate refuses to upgrade a session that emitted NOTHING
+    (no hook event AND no pane-log growth), and a CLI that genuinely implemented a
+    story always renders — the run this test stands in for logged 1.4 MB. A silent
+    fake would be byte-identical to the wedge #261 is about (0-byte log, zero
+    events), which is precisely what must NOT be rescued; see the companion
+    test_tmux_timeout_silent_session_not_rescued."""
     impl = tmp_path / "impl"
     impl.mkdir()
     fake = tmp_path / "fake-cli"
     fake.write_text(
         "#!/bin/bash\n"
         "# finished work, but hooks are 'misconfigured': no event files at all\n"
+        'for i in $(seq 1 20); do echo "implementing story 3-1: step $i of 20 ..."; done\n'
         f"printf -- '---\\nstatus: done\\nbaseline_revision: abc123\\n---\\n\\n"
         f"## Auto Run Result\\n\\nStatus: done\\nImplemented.\\n' > {impl}/spec-3-1-foo.md\n"
         "sleep 60  # stay alive so the wait loop times out under a live window\n"
@@ -2940,6 +2949,64 @@ def test_tmux_timeout_with_flushed_spec_rescued_post_kill(tmp_path):
     assert result.status == "completed"
     assert result.result_json["status"] == "done"
     assert result.result_json["post_kill_reconciled"] is True
+
+
+@pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
+def test_tmux_timeout_silent_session_not_rescued(tmp_path):
+    """The #261 counterpart of the rescue above, same call path, one delta: the CLI
+    wedges instantly and renders NOTHING. A qualifying spec still appears in the
+    shared artifacts dir — here written by a concurrent process, exactly as a
+    parallel run's merge-back did in the report — and it is newer than launch, so
+    the mtime scan would adopt it and the post-kill reconcile would score a session
+    that never ran as `completed:done`.
+
+    Proof-of-work refuses it: no hook event ever arrived AND the pane log never
+    grew (0 bytes — measured, the same signature as the report's wedged review
+    windows). The verdict stays `timeout`, which is what the report's two control
+    stories correctly received."""
+    impl = tmp_path / "impl"
+    impl.mkdir()
+    fake = tmp_path / "fake-cli"
+    # Wedges immediately: no output, no events, no writes of its own.
+    fake.write_text("#!/bin/bash\nsleep 60\n")
+    fake.chmod(0o755)
+    adapter = GenericDevAdapter(
+        run_dir=tmp_path / f"run-{uuid.uuid4().hex[:8]}",
+        policy=Policy(limits=LimitsPolicy()),
+        profile=get_profile("claude"),
+        binary=str(fake),
+        extra_args=(),
+        paths=ProjectPaths(
+            project=tmp_path,
+            implementation_artifacts=impl,
+            planning_artifacts=tmp_path / "plan",
+        ),
+    )
+    spec = SessionSpec(
+        task_id="t-silent",
+        role="dev",
+        prompt="/bmad-dev-auto 3-1",
+        cwd=tmp_path,
+        env={
+            "BMAD_LOOP_RUN_DIR": str(adapter.run_dir),
+            "BMAD_LOOP_TASK_ID": "t-silent",
+            "BMAD_LOOP_STORY_KEY": "3-1",
+        },
+        timeout_s=6.0,
+    )
+    # A FOREIGN story's finished spec lands mid-window (the concurrent merge-back).
+    (impl / "spec-9-9-someone-elses-story.md").write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n"
+        "## Auto Run Result\n\nStatus: done\nImplemented.\n"
+    )
+    try:
+        result = adapter.run(spec)
+    finally:
+        subprocess.run(["tmux", "kill-session", "-t", adapter.session_name], capture_output=True)
+
+    assert result.status == "timeout"
+    assert result.result_json is None
+    assert (adapter.logs_dir / "t-silent.log").stat().st_size == 0
 
 
 # ------------------------------- missing-marker fallback (#224)
@@ -3782,3 +3849,279 @@ def test_wait_loop_contract_nudge_then_skill_appends_marker(tmp_path, monkeypatc
     assert rj["status"] == "done"
     assert "synthesized_from_frontmatter" not in rj
     assert len(sent) == 1  # no second nudge
+
+
+# ------------------------------- authoritative-path read-back (#261)
+#
+# The read-back located "the artifact this session produced" by scanning the
+# implementation-artifacts dir for the newest qualifying `*.md`. Under worktree
+# isolation that search also covers the MAIN checkout's dir, which every
+# concurrent run shares; with isolation="none" it IS that shared dir. So a
+# foreign story's spec landing there after launch (a parallel run's merge-back,
+# a human edit, a sweep) won on mtime and was adopted as this session's result:
+# a review that produced nothing was scored `completed:done` and unreviewed code
+# merged.
+#
+# Where the orchestrator already knows which spec the session owes — every review
+# leg and every dev retry, via StoryTask.spec_file, which it literally hands the
+# session in its own prompt — SessionSpec.expected_spec pins the read-back to
+# that one file and the scan is never reached.
+
+_FOREIGN_DONE = (
+    "---\nstatus: done\nbaseline_revision: deadbeef\n---\n\n"
+    "# Someone else's story\n\n## Auto Run Result\n\nStatus: done\nImplemented.\n"
+)
+
+
+def _expecting(tmp_path, spec_file: Path, story_key="3-1") -> SessionSpec:
+    """A review SessionSpec pinned to the spec the orchestrator recorded (#261),
+    carrying its launch snapshot too — exactly what the engine threads for a
+    review leg whose story already has a spec_file."""
+    return dataclasses.replace(
+        _snapshotted_spec(tmp_path, spec_file, story_key), expected_spec=str(spec_file)
+    )
+
+
+def test_expected_spec_ignores_foreign_marker_spec(tmp_path, monkeypatch):
+    """The #261 regression, marker path. Our own spec sits stripped of its marker
+    (the #160 pre-review-launch strip) and the session died without rewriting it; a
+    FOREIGN story's finished spec is newer. The scan would return the foreign spec
+    and score it as this story's `done`."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    ours.write_text("---\nstatus: done\nbaseline_revision: abc123\n---\n\n# Story\n")
+    foreign = impl / "spec-9-9-someone-elses-story.md"
+    foreign.write_text(_FOREIGN_DONE)
+    os.utime(foreign, ns=(2_000_000_000, 2_000_000_000))  # newest: the scan would win here
+
+    spec = _expecting(tmp_path, ours)
+    assert adapter._result_json(_dev_handle(), spec, wait=False) is None
+    # ...and the unpinned spec is exactly what the bug looked like.
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=False) is not None
+
+
+def test_expected_spec_never_reaches_the_scan(tmp_path, monkeypatch):
+    """Structural: with expected_spec set, the directory scan is not merely
+    out-voted, it is never called."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+
+    def boom(*a, **k):
+        raise AssertionError("find_result_artifact must not run with expected_spec set")
+
+    monkeypatch.setattr(generic.devcontract, "find_result_artifact", boom)
+    monkeypatch.setattr(generic.devcontract, "find_frontmatter_candidates", boom)
+    ours = impl / "spec-3-1-foo.md"
+    ours.write_text("---\nstatus: done\n---\n\n# Story\n")
+    (impl / "spec-9-9-someone-elses-story.md").write_text(_FOREIGN_DONE)
+    assert adapter._result_json(_dev_handle(), _expecting(tmp_path, ours), wait=False) is None
+
+
+def test_expected_spec_synthesizes_its_own_marker_spec(tmp_path, monkeypatch):
+    """Over-refusal guard: when THIS session wrote the spec it owed, the pinned
+    read-back synthesizes exactly as the scan did — and stamps the session's own
+    story key, not the foreign spec's."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    ours.write_text("---\nstatus: done\nbaseline_revision: abc123\n---\n\n# Story\n")
+    spec = _expecting(tmp_path, ours)  # snapshot taken of the stripped spec
+    (impl / "spec-9-9-someone-elses-story.md").write_text(_FOREIGN_DONE)
+    ours.write_text(  # the review then finishes and appends its marker
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n# Story\n\n"
+        "## Auto Run Result\n\nStatus: done\nReviewed.\n"
+    )
+    rj = adapter._result_json(_dev_handle(), spec, wait=False)
+    assert rj is not None and rj["status"] == "done"
+    assert rj["story_key"] == "3-1"
+    assert rj["spec_file"] == str(ours)
+
+
+def test_expected_spec_ignores_foreign_markerless_spec(tmp_path, monkeypatch):
+    """Same regression through the #224 missing-marker fallback, which #261 predates
+    but which added a second identical mtime-only scan of the shared dir. A foreign
+    marker-less `status: done` spec must not be a candidate at all — under a dead
+    window it would otherwise synthesize on a single sighting."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    ours.write_text("---\nstatus: in-review\n---\n\n# Story\n")  # non-terminal: still working
+    (impl / "spec-9-9-someone-elses-story.md").write_text(_MARKERLESS_DONE)
+
+    spec = _expecting(tmp_path, ours)
+    assert adapter._synth_result(_dev_handle(), spec, wait=False, dead_window=True) is None
+    # Unpinned, the foreign spec is adopted on the dead window's single sighting.
+    unpinned = dataclasses.replace(_dev_spec(tmp_path), role="review")
+    assert adapter._synth_result(_dev_handle(), unpinned, wait=False, dead_window=True) is not None
+
+
+def test_expected_spec_markerless_own_spec_still_synthesizes(tmp_path, monkeypatch):
+    """Over-refusal guard for the fallback: our OWN marker-less terminal spec is
+    still harvested under a dead window, and the M1/M2 gates still apply to it."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    ours.write_text("---\nstatus: in-review\n---\n\n# Story\n")
+    spec = _expecting(tmp_path, ours)  # snapshot of the in-review bytes
+    ours.write_text(_MARKERLESS_DONE)  # this session finalized it, marker omitted
+    sr = adapter._synth_result(_dev_handle(), spec, wait=False, dead_window=True)
+    assert sr is not None and sr.result_json["status"] == "done"
+    assert sr.result_json["synthesized_from_frontmatter"] is True
+
+
+def test_expected_spec_absent_file_is_no_result(tmp_path, monkeypatch):
+    """A session that never wrote the spec it owed produced no result — and the
+    pinned read-back deliberately does NOT fall back to the scan, so a foreign
+    artifact cannot stand in for it."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    (impl / "spec-9-9-someone-elses-story.md").write_text(_FOREIGN_DONE)
+    spec = dataclasses.replace(
+        _dev_spec(tmp_path), role="review", expected_spec=str(impl / "spec-3-1-foo.md")
+    )
+    assert adapter._result_json(_dev_handle(), spec, wait=False) is None
+
+
+def test_expected_spec_breadcrumb_names_the_pinned_path(tmp_path, monkeypatch):
+    """The give-up crumb points at the spec that was owed, not at a directory list —
+    the diagnostic that would have made #261 obvious in the journal."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    ours.write_text("---\nstatus: in-review\n---\n\n# Story\n")
+    (impl / "spec-9-9-someone-elses-story.md").write_text(_FOREIGN_DONE)
+    assert adapter._result_json(_dev_handle(), _expecting(tmp_path, ours), wait=True) is None
+    (crumb,) = _breadcrumbs(adapter)
+    assert crumb["verdict"] == "no-artifact"
+    assert str(ours) in crumb["detail"]
+    assert "someone-elses" not in crumb["detail"]
+
+
+def test_dev_attempt_one_keeps_the_scan(tmp_path, monkeypatch):
+    """Unchanged where it must be: a dev attempt 1 has no recorded spec yet (the
+    skill creates it), so expected_spec is None and the mtime scan still runs."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n"
+        "## Auto Run Result\n\nStatus: done\nImplemented.\n"
+    )
+    spec = _dev_spec(tmp_path)
+    assert spec.expected_spec is None
+    rj = adapter._result_json(_dev_handle(), spec, wait=False)
+    assert rj is not None and rj["status"] == "done"
+
+
+# ------------------------------- proof-of-work gate (#261)
+
+
+def _pane_log(adapter, task_id: str, size: int) -> Path:
+    adapter.logs_dir.mkdir(parents=True, exist_ok=True)
+    log = adapter.logs_dir / f"{task_id}.log"
+    log.write_bytes(b"x" * size)
+    return log
+
+
+def test_proof_of_work_refuses_silent_dead_session(tmp_path, monkeypatch):
+    """A dead session with no hook event and a pane log that never grew produced
+    nothing, so a read-back artifact is not its output. Keep the crash verdict."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n"
+        "## Auto Run Result\n\nStatus: done\nImplemented.\n"
+    )
+    _pane_log(adapter, "3-1-dev-1", 0)
+    res = adapter._final(_dev_handle(), _dev_spec(tmp_path), "crashed", None, None)
+    assert res.status == "crashed"
+    assert res.result_json is None
+
+
+def test_proof_of_work_two_byte_log_is_not_work(tmp_path, monkeypatch):
+    """The floor is not zero: the report's wedged windows left 0-byte AND 2-byte
+    logs, so `size > 0` would have cleared one of them."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    _pane_log(adapter, "3-1-dev-1", 2)
+    assert adapter._final(_dev_handle(), _dev_spec(tmp_path), "crashed", None, None).status == (
+        "crashed"
+    )
+
+
+def test_proof_of_work_pane_log_growth_is_evidence(tmp_path, monkeypatch):
+    """A session that rendered to its pane ran, so its artifact is honoured."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n"
+        "## Auto Run Result\n\nStatus: done\nImplemented.\n"
+    )
+    _pane_log(adapter, "3-1-dev-1", generic.PROOF_OF_WORK_MIN_LOG_BYTES + 1)
+    res = adapter._final(_dev_handle(), _dev_spec(tmp_path), "crashed", None, None)
+    assert res.status == "completed"
+    assert res.result_json["status"] == "done"
+
+
+def test_proof_of_work_hook_event_is_evidence_despite_empty_log(tmp_path, monkeypatch):
+    """The two signals are ORed for a reason: on a misbound pane sink (#254/#217) a
+    HEALTHY session logs zero bytes. A hook event having arrived carries it."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n"
+        "## Auto Run Result\n\nStatus: done\nImplemented.\n"
+    )
+    _pane_log(adapter, "3-1-dev-1", 0)
+    res = adapter._final(_dev_handle(), _dev_spec(tmp_path), "crashed", "sess-1", None)
+    assert res.status == "completed"
+
+
+def test_proof_of_work_no_pane_log_is_inert(tmp_path, monkeypatch):
+    """Unknown never blocks: with no pane log at all there is no signal, and the
+    gate preserves the previous behavior exactly."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n"
+        "## Auto Run Result\n\nStatus: done\nImplemented.\n"
+    )
+    assert not (adapter.logs_dir / "3-1-dev-1.log").exists()
+    res = adapter._final(_dev_handle(), _dev_spec(tmp_path), "crashed", None, None)
+    assert res.status == "completed"
+
+
+def test_proof_of_work_gates_post_kill_reconcile(tmp_path, monkeypatch):
+    """The i-11 call path: the rescue is for a session that finished and lost its
+    Stop, not for one that never ran."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    adapter._window_alive = lambda handle: False
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n"
+        "## Auto Run Result\n\nStatus: done\nImplemented.\n"
+    )
+    _pane_log(adapter, "3-1-dev-1", 0)
+    stalled = SessionResult(status="stalled")
+    assert adapter._post_kill_reconcile(_dev_handle(), _dev_spec(tmp_path), stalled) is stalled
+
+    _pane_log(adapter, "3-1-dev-1", generic.PROOF_OF_WORK_MIN_LOG_BYTES + 1)
+    rescued = adapter._post_kill_reconcile(_dev_handle(), _dev_spec(tmp_path), stalled)
+    assert rescued.status == "completed"
+    assert rescued.result_json["post_kill_reconciled"] is True
+
+
+def test_proof_of_work_journals_the_refusal(tmp_path, monkeypatch):
+    """The refusal is observable — a silent downgrade would be its own #261."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    _pane_log(adapter, "3-1-dev-1", 0)
+    adapter._final(_dev_handle(), _dev_spec(tmp_path), "crashed", None, None)
+    events = (adapter.tasks_dir / "3-1-dev-1" / "session-lifecycle.jsonl").read_text()
+    assert "readback-refused-no-proof-of-work" in events

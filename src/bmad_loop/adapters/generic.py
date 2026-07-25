@@ -67,6 +67,14 @@ KILL_POLL_S = 0.5
 # a session mid-edit cannot produce. A dead window skips the counter entirely:
 # the kill settled liveness, so the frontmatter is as final as it will ever get.
 FM_FALLBACK_MIN_OBS = 2
+# Proof-of-work gate (#261): pane-log size, in bytes, above which a session counts
+# as having produced SOMETHING — the floor a dead session must clear before a
+# read-back artifact may upgrade its verdict to `completed`. Not zero: the three
+# wedged sessions in #261 left logs of 0 and 2 bytes, so `size > 0` would have
+# cleared one of them. Any session that reached the agent loop echoes at least its
+# own prompt (hundreds of bytes) into the pane, and a real one logs megabytes, so
+# this sits far below a genuine session and far above a wedge.
+PROOF_OF_WORK_MIN_LOG_BYTES = 256
 
 
 class _SnapVerdict(enum.Enum):
@@ -187,6 +195,35 @@ class _ResultFileMixin:
         on-disk artifact."""
         return self._await_result(handle.task_id) if wait else self._read_result(handle.task_id)
 
+    def _produced_work(
+        self, handle: SessionHandle, session_id: str | None, transcript: str | None
+    ) -> bool:
+        """Whether this session shows ANY evidence it actually ran, for the #261
+        proof-of-work gate. Deliberately a very low bar — it separates "the CLI
+        wedged before it did anything" from "the CLI worked", not good work from bad.
+
+        Two independent signals, ORed, because each has a known blind spot:
+        a hook event having arrived (``session_id``/``transcript`` are populated only
+        from one) covers an adapter whose pane sink is misbound (#254/#217, where a
+        HEALTHY session still logs zero bytes), and pane-log growth covers a profile
+        whose hooks never fire. Requiring both to be absent is what makes the gate
+        safe to apply to a `completed` upgrade.
+
+        Unknown never blocks: `_log_evidence` returns None when there is no signal at
+        all (no pane log — the opencode-http transport, and every unit-test fixture),
+        and that reads as evidence-present, preserving current behavior exactly."""
+        if session_id or transcript:
+            return True
+        evidence = self._log_evidence(handle)
+        return True if evidence is None else evidence
+
+    def _log_evidence(self, handle: SessionHandle) -> bool | None:
+        """Tristate pane-log proof-of-work signal: True = the log grew past a
+        trivial floor, False = the log exists and did not, None = no such signal for
+        this transport. Base: None (inert). Overridden by `GenericAdapter`, which
+        tees a pane log."""
+        return None
+
     def _final(
         self,
         handle: SessionHandle,
@@ -205,6 +242,21 @@ class _ResultFileMixin:
         ``budget_weighted`` (a tripped session-budget guard's sample) rides
         every exit so the engine can journal it whatever the verdict."""
         result_json = self._result_json(handle, spec, wait=False) if accept_result else None
+        if result_json is not None and not self._produced_work(handle, session_id, transcript):
+            # Proof-of-work gate (#261): this session is gone and produced no
+            # observable output at all — no hook event ever arrived AND its pane log
+            # never grew. A read-back artifact is then not evidence THIS session
+            # finished; it is evidence that SOMETHING wrote a qualifying file in a
+            # directory we share. Keep the fallback verdict rather than upgrade a
+            # dead-on-arrival session to `completed`.
+            self._note_lifecycle(
+                handle.task_id,
+                "readback-refused-no-proof-of-work",
+                fallback=fallback,
+                spec=str(result_json.get("spec_file", "")),
+                status=str(result_json.get("status", "")),
+            )
+            result_json = None
         status = "completed" if result_json is not None else fallback
         return SessionResult(
             status=status,
@@ -779,6 +831,23 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
                     budget_weighted=budget_weighted,
                 )
 
+    def _log_evidence(self, handle: SessionHandle) -> bool | None:
+        """Pane-log half of the #261 proof-of-work gate (see
+        `_ResultFileMixin._produced_work`). The pane is tee'd to a stable inode, so
+        its size is a direct measure of how much the session emitted.
+
+        None when the log does not exist — no signal, and the gate stays inert.
+        Otherwise True iff the log exceeded `PROOF_OF_WORK_MIN_LOG_BYTES`. The floor
+        is not zero on purpose: the wedged sessions in #261 left 0-byte AND 2-byte
+        logs, so `size > 0` would have missed one of them. Any session that reached
+        the agent loop echoes at least its own (multi-hundred-byte) prompt into the
+        pane, so the floor sits far below a real session and far above a wedge."""
+        try:
+            size = (self.logs_dir / f"{handle.task_id}.log").stat().st_size
+        except OSError:
+            return None
+        return size > PROOF_OF_WORK_MIN_LOG_BYTES
+
     def _log_activity_key(self, task_id: str) -> tuple[int, int] | None:
         """Activity signature of the tee'd pane log: (mtime_ns, size), or None if
         it does not yet exist. The pane is piped via append to a stable inode, so
@@ -1116,6 +1185,18 @@ class _DevSynthesisMixin(_ResultFileMixin):
         # frontmatter-authoritative, so it needs no missing-marker fallback.)
         if spec.env.get("BMAD_LOOP_SPEC_FOLDER"):
             return self._stories_synth_result(handle, spec, wait=wait)
+        # Authoritative-path read-back (#261): when the orchestrator already knows
+        # which spec this session owes — every review leg and every dev retry, see
+        # SessionSpec.expected_spec — read THAT file and never the directory scan
+        # below. The scan asks "what is the newest qualifying *.md here" of a
+        # directory shared with every concurrent run; the question is "what did THIS
+        # session write for THIS story", and here we were told the answer at launch.
+        if spec.expected_spec:
+            return self._known_spec_synth_result(
+                handle, spec, Path(spec.expected_spec), wait=wait, dead_window=dead_window
+            )
+        # Dev attempt 1 only: no spec exists yet (the skill creates it), so the
+        # mtime-floor scan is the sole way to find it.
         # Mirror the base _await_result poll: the skill's terminal spec may not be
         # flushed to disk the instant the Stop event fires, so briefly await it when
         # wait=True instead of reading once and mis-reporting a stall.
@@ -1129,6 +1210,44 @@ class _DevSynthesisMixin(_ResultFileMixin):
             if not wait or time.monotonic() >= deadline:
                 return self._frontmatter_fallback(
                     handle, spec, search_dirs, wait=wait, dead_window=dead_window
+                )
+            time.sleep(RESULT_POLL_S)
+
+    def _known_spec_synth_result(
+        self,
+        handle: SessionHandle,
+        spec: SessionSpec,
+        path: Path,
+        *,
+        wait: bool,
+        dead_window: bool,
+    ) -> devcontract.SynthResult | None:
+        """Read back from the ONE spec the session was required to write (#261).
+
+        Structurally the scan path with the candidate source replaced: poll the
+        marker predicate on this single file over the same ``RESULT_GRACE_S`` flush
+        window, then hand the same file to the missing-marker fallback (#224) via
+        its ``only`` seam, so the stability fingerprint, the M2 transition
+        observation and the M1 launch-snapshot gate all still apply — scoped to the
+        one legitimate path instead of a shared directory.
+
+        No launch-snapshot gate is needed on the marker branch itself: the
+        pre-review-launch strip (`Engine._reset_spec_for_review`) REMOVES the
+        marker, so a spec carrying one again has necessarily changed bytes since the
+        snapshot and the gate would be a no-op (`_snapshot_verdict` → NEUTRAL).
+
+        Note this deliberately does NOT fall back to the scan when the expected spec
+        yields nothing: a session that did not write the spec it owed produced no
+        result, and any other qualifying file in that directory belongs to someone
+        else. Returning None routes to the dev-stall grace / crashed verdict — the
+        safe direction, and the verdict the two control stories in #261 received."""
+        deadline = time.monotonic() + RESULT_GRACE_S
+        while True:
+            if devcontract.is_result_artifact(path, since_ns=handle.launched_ns):
+                return self._synthesize_from(path, spec)
+            if not wait or time.monotonic() >= deadline:
+                return self._frontmatter_fallback(
+                    handle, spec, [], wait=wait, dead_window=dead_window, only=path
                 )
             time.sleep(RESULT_POLL_S)
 
@@ -1222,6 +1341,7 @@ class _DevSynthesisMixin(_ResultFileMixin):
         *,
         wait: bool,
         dead_window: bool,
+        only: Path | None = None,
     ) -> devcontract.SynthResult | None:
         """Missing-marker rescue (#224): synthesize from a spec this session
         finalized to a terminal frontmatter ``status:`` without appending the
@@ -1279,13 +1399,33 @@ class _DevSynthesisMixin(_ResultFileMixin):
         touching no stall counters, so an mtime bump that resets ``observations``
         to 1 never re-nudges. A compliant append is harvested by the ordinary
         marker scan on a later Stop, leaving synthesis as the backstop.
+
+        ``only`` (#261) replaces the directory scan with the single spec the
+        orchestrator knows this session owed: the candidate set becomes that file
+        if it qualifies, else empty, and ``search_dirs`` is unused. Every gate
+        below is unchanged — the point is purely that a foreign story's
+        marker-less terminal spec, sitting in the same shared artifacts dir, is no
+        longer a candidate at all, so the "refuse to guess between several" branch
+        becomes unreachable.
         """
         task_id = handle.task_id
         candidates: list[Path] = []
-        for artifacts in search_dirs:
-            candidates.extend(
-                devcontract.find_frontmatter_candidates(artifacts, since_ns=handle.launched_ns)
-            )
+        if only is not None:
+            # Authoritative-path mode (#261): the caller knows the ONE spec this
+            # session owed, so the candidate set is that file if it qualifies and
+            # nothing otherwise. `len(candidates) > 1` is unreachable here — the
+            # "refuse to guess" branch exists for the scan, which cannot know which
+            # of several specs is this session's; with a known path there is nothing
+            # to guess between.
+            if devcontract.is_frontmatter_candidate(only, since_ns=handle.launched_ns):
+                candidates.append(only)
+            where = str(only)
+        else:
+            for artifacts in search_dirs:
+                candidates.extend(
+                    devcontract.find_frontmatter_candidates(artifacts, since_ns=handle.launched_ns)
+                )
+            where = ", ".join(str(d) for d in search_dirs)
         if not candidates:
             # No marker-less terminal spec either (the common resultless Stop —
             # e.g. a review that flipped to `in-review` and is mid-work): clear
@@ -1295,8 +1435,7 @@ class _DevSynthesisMixin(_ResultFileMixin):
                 self._note_resultless_stop(
                     task_id,
                     "no-artifact",
-                    "no result artifact newer than session launch under: "
-                    + ", ".join(str(d) for d in search_dirs),
+                    "no result artifact newer than session launch under: " + where,
                 )
             return None
         if len(candidates) > 1:
@@ -1605,6 +1744,22 @@ class _DevSynthesisMixin(_ResultFileMixin):
         if rj.get("escalations") or not (
             rj.get("status") == devcontract.DONE or rj.get("plan_halt") is True
         ):
+            return result
+        # Proof-of-work gate (#261), the same one the crash path applies in `_final`:
+        # this rescue exists for a session that finished but lost its Stop, not for
+        # one that never ran. A session with no hook event and a pane log that never
+        # grew produced nothing, so a qualifying artifact is not its output — keep
+        # the stall/timeout verdict. This is the call path the issue's second
+        # occurrence (story i-11) took.
+        if not self._produced_work(handle, result.session_id, result.transcript_path):
+            self._note_lifecycle(
+                handle.task_id,
+                "readback-refused-no-proof-of-work",
+                fallback=result.status,
+                spec=str(rj.get("spec_file", "")),
+                status=str(rj.get("status", "")),
+                dead_window=True,
+            )
             return result
         rj["post_kill_reconciled"] = True
         return SessionResult(

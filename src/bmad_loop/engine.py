@@ -2262,6 +2262,23 @@ class Engine:
             # Launch-state snapshot of a review session's spec (#276 M1); None for
             # every other session and on a crash-resume (process-transient).
             spec_snapshot=spec_snapshot,
+            # The spec this session is required to write, when already known (#261),
+            # so the adapter reads THAT path back instead of mtime-scanning a
+            # directory shared with every concurrent run. Same `_generic_dev()` guard
+            # as the snapshot above, so the two can never disagree about whether the
+            # devcontract read-back is in play.
+            #
+            # Withheld from an injected plugin-workflow session (`label` set — e.g. a
+            # TEA pre_commit_gate): it runs the generic adapter but owes the
+            # WORKFLOW_COMPLETION_CONTRACT marker above, not the story spec, so
+            # pinning it to task.spec_file would point the read-back at the wrong
+            # file. Same doctrine as StoriesEngine withholding BMAD_LOOP_SPEC_FOLDER
+            # from labeled sessions.
+            expected_spec=(
+                task.spec_file
+                if (label is None and self._generic_dev() and task.spec_file)
+                else None
+            ),
         )
         self.journal.set_active_log(task_id)
         self.journal.append(

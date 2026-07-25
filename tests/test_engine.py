@@ -2142,6 +2142,27 @@ def test_review_launch_snapshot_threaded_into_session_spec(project):
     assert snap.sha256 == captured["digest"]
 
 
+def test_expected_spec_threaded_onto_review_session(project):
+    """#261: the engine pins the review session's read-back to the spec it recorded
+    on dev success — the same path it hands the session in its prompt — so the
+    adapter never mtime-scans the shared artifacts dir. The dev leg that precedes it
+    has no recorded spec yet and carries none."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+    )
+    summary = engine.run()
+
+    assert summary.done == 1
+    dev_spec, review_spec = adapter.sessions
+    assert dev_spec.role == "dev" and dev_spec.expected_spec is None
+    assert review_spec.expected_spec == str(spec_path(project, "1-1-a"))
+    # It must not silently ride on the snapshot, which degrades to None on a torn
+    # read — the two are captured independently.
+    assert review_spec.expected_spec == review_spec.spec_snapshot.path
+
+
 def test_review_launch_snapshot_degrades_on_unreadable_spec(project):
     """A spec path that cannot be read degrades the snapshot capture to None and
     journals `spec-read-failed` at site `review-launch-snapshot`. A directory where

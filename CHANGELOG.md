@@ -90,6 +90,33 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **A session's read-back could adopt another story's spec (#261).** The generic dev/review
+  read-back located "the artifact this session produced" by scanning the implementation-artifacts
+  dir for the most-recently-modified qualifying `*.md`, with nothing tying the match to the story
+  being driven. That dir is shared: under worktree isolation the search also covers the main
+  checkout's copy, and with `isolation="none"` it _is_ that copy. A foreign story's spec landing
+  there after launch — a concurrent run's merge-back, a human edit, a sweep — won on mtime and
+  became this session's result, so a review that produced nothing was scored `completed:done`
+  (merging unreviewed code) and, on the dev leg, its `followup_review_recommended: false` skipped
+  the review entirely. Unlike the rest of this family (#88/#127/#160/#224) it failed toward
+  _landing_ unverified work. Two fixes, both in the adapter:
+  - **Authoritative-path read-back.** Where the orchestrator already knows which spec the session
+    owes — every review leg and every dev retry, via `StoryTask.spec_file`, the path it hands the
+    session in its own prompt — `SessionSpec.expected_spec` pins the read-back to that one file and
+    the directory scan is never reached. This closes the asymmetry with stories mode, which already
+    resolved by id rather than by mtime, and covers the #224 missing-marker fallback (a second
+    mtime-only scan of the same shared dir) through the same seam. Deliberately not a filename
+    rule: spec names come from an LLM-derived slug, so a prefix check risks trading this unsafe
+    failure for a lossy one — and a pinned path needs no exemption for the `bmad-dev-auto-result-*`
+    fallback or for sweep bundles, which legitimately adopt a differently-named story spec (#161).
+    A dev attempt 1 has no recorded spec yet and keeps the scan.
+  - **Proof-of-work gate.** A read-back artifact may no longer upgrade a dead session to
+    `completed` when that session shows no evidence it ran at all — no hook event arrived _and_ its
+    pane log never grew past a small floor. The two signals are ORed because each has a blind spot
+    (a misbound pane sink still fires hooks; a hook-less profile still logs), and no signal at all
+    leaves the gate inert. Applies to both the crash path and `_post_kill_reconcile`, and journals
+    `readback-refused-no-proof-of-work`.
+
 - **`validate` requires the review skills your `bmad-dev-auto` actually invokes (#260).** The
   preflight held every project to a fixed catalog that included `bmad-review-verification-gap`,
   which no tagged BMAD-METHOD release ships (absent from v6.10.0; on current sources only a

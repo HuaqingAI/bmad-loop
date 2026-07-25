@@ -83,6 +83,25 @@ class SessionSpec:
     # every non-review session and on a crash-resume (process-transient — see
     # SpecSnapshot). Kept LAST so positional SessionSpec constructions stay valid.
     spec_snapshot: SpecSnapshot | None = None
+    # The spec path this session is REQUIRED to write, when the orchestrator
+    # already knows it (#261): `StoryTask.spec_file`, recorded by verify_dev /
+    # verify_dev_bundle on dev success and handed to the review session in its own
+    # prompt. Set for every leg with a recorded spec — always a review, and a dev
+    # retry — and None on a dev attempt 1, whose spec does not exist yet.
+    #
+    # When set, the generic adapter reads back from THIS path instead of scanning
+    # the implementation-artifacts dir for the newest qualifying `*.md`. That scan
+    # is shared with every concurrent run: a foreign story's spec landing there
+    # after launch (a merge-back into the main checkout, a human edit, a sweep)
+    # wins on mtime and is adopted as this session's result, so a review that
+    # produced nothing is scored `completed:done` and unreviewed code merges.
+    #
+    # Deliberately independent of `spec_snapshot`, which degrades to None on a torn
+    # read: the identity constraint must not silently disappear with it. Process-
+    # transient for the same reason as SpecSnapshot (not persisted); a crash-resume
+    # reconstructing the SessionSpec carries none and falls back to the scan. Kept
+    # LAST alongside spec_snapshot so positional constructions stay valid.
+    expected_spec: str | None = None
 
 
 @dataclass(frozen=True)

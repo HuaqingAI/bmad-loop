@@ -304,25 +304,39 @@ def find_result_artifact(impl_artifacts: Path, *, since_ns: int) -> Path | None:
             mtime_ns = path.stat().st_mtime_ns
         except OSError:
             continue
-        if mtime_ns < since_ns:
+        if not is_result_artifact(path, since_ns=since_ns):
             continue
-        # The no-spec fallback is recognized by name (it has no Auto Run Result
-        # heading); every other artifact must carry a real (non-fenced) terminal
-        # section — a fence-quoted example must not qualify the spec (#52).
-        if not path.name.startswith(FALLBACK_RESULT_PREFIX):
-            try:
-                text = path.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
-                # A binary/truncated candidate cannot be shown to carry a terminal
-                # section, so it does not qualify — skip it exactly like an
-                # unreadable one. UnicodeDecodeError is a ValueError, so a bare
-                # `except OSError` let a torn mid-write spec crash the scan.
-                continue
-            if not _section_headings(text):
-                continue
         if best is None or mtime_ns > best[0]:
             best = (mtime_ns, path)
     return best[1] if best else None
+
+
+def is_result_artifact(path: Path, *, since_ns: int) -> bool:
+    """Whether ONE file qualifies as a session's result artifact — the per-path
+    predicate `find_result_artifact` applies to each glob hit, factored out so a
+    caller that already KNOWS which spec the session owed (the orchestrator hands
+    the review session its path in the prompt) can test that one file instead of
+    scanning a directory shared with every concurrent run (#261).
+
+    Qualifies when the file was modified at/after ``since_ns`` (the session-launch
+    floor) AND either is the by-name no-spec fallback (`bmad-dev-auto-result-*`,
+    which carries no heading by design) or carries a real, non-fenced
+    ``## Auto Run Result`` heading — a fence-quoted example must not qualify the
+    spec (#52). An unreadable/undecodable candidate cannot be SHOWN to carry a
+    terminal section, so it does not qualify (UnicodeDecodeError is a ValueError,
+    so a bare ``except OSError`` let a torn mid-write spec crash the scan)."""
+    try:
+        if path.stat().st_mtime_ns < since_ns:
+            return False
+    except OSError:
+        return False
+    if path.name.startswith(FALLBACK_RESULT_PREFIX):
+        return True
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    return bool(_section_headings(text))
 
 
 def find_frontmatter_candidates(impl_artifacts: Path, *, since_ns: int) -> list[Path]:
@@ -345,29 +359,47 @@ def find_frontmatter_candidates(impl_artifacts: Path, *, since_ns: int) -> list[
         return []
     found: list[tuple[int, Path]] = []
     for path in impl_artifacts.glob("*.md"):
-        if path.name.startswith(FALLBACK_RESULT_PREFIX):
-            continue
         try:
             mtime_ns = path.stat().st_mtime_ns
         except OSError:
             continue
-        if mtime_ns < since_ns:
-            continue
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            continue
-        if _section_headings(text):
-            continue  # carries a real marker — the normal scan's territory
-        try:
-            fm = read_frontmatter(path)
-        except OSError:
-            continue
-        if str(fm.get("status", "")).strip().lower() not in (DONE, BLOCKED):
+        if not is_frontmatter_candidate(path, since_ns=since_ns):
             continue
         found.append((mtime_ns, path))
     found.sort(key=lambda t: t[0], reverse=True)
     return [p for _, p in found]
+
+
+def is_frontmatter_candidate(path: Path, *, since_ns: int) -> bool:
+    """Whether ONE file qualifies for the missing-marker fallback — the per-path
+    predicate `find_frontmatter_candidates` applies to each glob hit, factored out
+    for the same reason as `is_result_artifact`: a caller holding the spec path the
+    session actually owed can test that file alone instead of a shared directory
+    (#261).
+
+    Qualifies when the file is modified at/after ``since_ns``, is NOT the no-spec
+    fallback (already matched by name on the marker path), carries ZERO real
+    (non-fenced) marker headings — one would put it in `find_result_artifact`'s
+    territory — and has a frontmatter ``status:`` of ``done`` or ``blocked``. Any
+    unreadable/undecodable read degrades to False, never an exception."""
+    if path.name.startswith(FALLBACK_RESULT_PREFIX):
+        return False
+    try:
+        if path.stat().st_mtime_ns < since_ns:
+            return False
+    except OSError:
+        return False
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    if _section_headings(text):
+        return False  # carries a real marker — the normal scan's territory
+    try:
+        fm = read_frontmatter(path)
+    except OSError:
+        return False
+    return str(fm.get("status", "")).strip().lower() in (DONE, BLOCKED)
 
 
 def _atomic_write_spec(spec_path: Path, text: str) -> None:
