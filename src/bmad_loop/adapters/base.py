@@ -83,6 +83,29 @@ class SessionSpec:
     # every non-review session and on a crash-resume (process-transient — see
     # SpecSnapshot). Kept LAST so positional SessionSpec constructions stay valid.
     spec_snapshot: SpecSnapshot | None = None
+    # The spec path this session is REQUIRED to write, when the orchestrator
+    # already knows it (#261): `StoryTask.spec_file`, recorded by verify_dev /
+    # verify_dev_bundle on dev success and handed to the review session in its own
+    # prompt. Set for every leg with a recorded spec — always a review, and a dev
+    # retry — and None on a dev attempt 1, whose spec does not exist yet.
+    #
+    # When set, the generic adapter reads back from THIS path instead of scanning
+    # the implementation-artifacts dir for the newest qualifying `*.md`. That scan
+    # is shared with every concurrent run: a foreign story's spec landing there
+    # after launch (a merge-back into the main checkout, a human edit, a sweep)
+    # wins on mtime and is adopted as this session's result, so a review that
+    # produced nothing is scored `completed:done` and unreviewed code merges.
+    #
+    # Deliberately independent of `spec_snapshot`, which degrades to None on a torn
+    # read: the identity constraint must not silently disappear with it.
+    #
+    # Unlike SpecSnapshot this SURVIVES a crash-resume. The field itself is not
+    # persisted, but its source is: `StoryTask.spec_file` round-trips through
+    # state.json (stored relative to the worktree, re-absolutized by
+    # WorktreeFlow on resume), and the engine re-derives this on every launch. So a
+    # resumed run is protected too — always an absolute path by the time it lands
+    # here. Kept LAST alongside spec_snapshot so positional constructions stay valid.
+    expected_spec: str | None = None
 
 
 @dataclass(frozen=True)
@@ -112,10 +135,16 @@ class SessionResult:
     # was post-mortem-matched as an *environment fault* (the coding CLI lost its
     # API connection and idled out the session clock instead of doing real work).
     # Set by the _classify_env_fault hook; env_fault_evidence carries the matched,
-    # ANSI-stripped log line. These two MUST stay the LAST fields so every
-    # positional SessionResult construction in the codebase stays valid.
+    # ANSI-stripped log line. New fields are APPENDED below these, never inserted
+    # among them, so every positional SessionResult construction stays valid.
     env_fault: bool = False
     env_fault_evidence: str | None = None
+    # Whether a `Stop` hook event arrived during this session — the hook half of the
+    # #261 proof-of-work gate (see `_ResultFileMixin._produced_work`). Deliberately
+    # NOT `session_id is not None`: SessionStart and SessionEnd populate that too,
+    # and both fire on a CLI that launched and wedged without doing anything. Stop
+    # is the only canonical event that means a turn actually ended.
+    stop_seen: bool = False
 
 
 class CodingCLIAdapter(ABC):

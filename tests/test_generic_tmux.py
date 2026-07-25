@@ -14,6 +14,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -21,6 +22,7 @@ from pathlib import Path
 import pytest
 import regex
 
+from bmad_loop import devcontract
 from bmad_loop.adapters import generic, tmux_base
 from bmad_loop.adapters.base import SessionHandle, SessionResult, SessionSpec, SpecSnapshot
 from bmad_loop.adapters.generic import GenericDevAdapter, GenericTmuxAdapter
@@ -2550,7 +2552,12 @@ def test_run_reconcile_upgrade_is_not_reclassified(tmp_path):
     (impl / "spec-3-1-foo.md").write_text(_DONE_SPEC)  # a done artifact to rescue
     _write_task_log(
         adapter,
-        b"API Error: Unable to connect (ECONNREFUSED)\n",  # would match if scanned
+        # Padded past PROOF_OF_WORK_MIN_LOG_BYTES: this fixture stands in for a
+        # session that implemented the story and then lost its Stop, and such a
+        # session renders. A log holding ONLY the error line would be a session that
+        # rendered ~44 bytes total, which the #261 gate correctly declines to rescue
+        # — it would make this ordering test depend on a scenario it is not about.
+        b"working...\n" * 32 + b"API Error: Unable to connect (ECONNREFUSED)\n",
         task_id="3-1-dev-1",
     )
     adapter.start_session = lambda spec: _dev_handle()
@@ -2582,18 +2589,25 @@ def test_start_session_resets_reused_task_log(tmp_path):
     logs/<task_id>.log, so a prior cycle's transport-failure line would linger in the
     64 KiB tail and mis-flag a later unrelated timeout. start_session drops the stale
     tee before re-piping (mirroring the result.json unlink), so the reused path holds
-    only the current session's output."""
+    only the current session's output.
+
+    It then re-creates the file EMPTY rather than leaving it absent, so a window that
+    dies before pipe_pane attaches still reports "rendered nothing" to the #261
+    proof-of-work gate instead of "no pane signal here" (#298 review). The invariant
+    this pins is that no stale BYTE survives — not that no file does."""
     mux = _StartSessionMux()
     adapter = make_adapter(tmp_path, mux=mux)
     adapter._ensure_session = lambda cwd: None  # skip the tmux server plumbing
     task_id = _ENV_FAULT_TASK
     _write_task_log(adapter, b"API Error: Unable to connect (ECONNREFUSED)\n", task_id=task_id)
     log_path = adapter.logs_dir / f"{task_id}.log"
-    assert log_path.exists()  # the prior cycle's tee is present...
+    assert log_path.stat().st_size > 0  # the prior cycle's tee is present...
 
     adapter.start_session(make_spec(tmp_path, task_id=task_id))
 
-    assert not log_path.exists()  # ...and start_session unlinked it before re-piping
+    # ...and start_session dropped every stale byte before re-piping, leaving the
+    # empty file the proof-of-work gate needs to read a dead-on-arrival window.
+    assert log_path.read_bytes() == b""
     assert mux.piped == [("@1", log_path)]  # the fresh tee attaches to the same path
     # a re-driven session that times out with no NEW matching output is not misclassified
     assert _classify(adapter, "timeout", task_id=task_id).env_fault is False
@@ -2896,13 +2910,27 @@ def test_tmux_timeout_with_flushed_spec_rescued_post_kill(tmp_path):
     never emits any hook event, so the wait loop idles to `timeout` — a path that
     never arms the stall grace and checks no artifact. run()'s real kill then
     settles liveness, and the post-kill reconcile rescues the finished work
-    through a real tmux probe + scan."""
+    through a real tmux probe + scan.
+
+    The fake renders to its pane before writing the spec. That is not decoration:
+    the #261 proof-of-work gate refuses to upgrade a session that emitted NOTHING
+    (no hook event AND no pane-log growth), and a CLI that genuinely implemented a
+    story always renders — the run this test stands in for logged 1.4 MB. A silent
+    fake would be byte-identical to the wedge #261 is about (0-byte log, zero
+    events), which is precisely what must NOT be rescued; see the companion
+    test_tmux_timeout_silent_session_not_rescued."""
     impl = tmp_path / "impl"
     impl.mkdir()
     fake = tmp_path / "fake-cli"
     fake.write_text(
         "#!/bin/bash\n"
         "# finished work, but hooks are 'misconfigured': no event files at all\n"
+        # Emit OVER TIME, not in one burst at startup: pipe_pane attaches after the
+        # window is created, so a burst can finish before the sink exists and leave
+        # a 0-byte log on a fast runner (observed on CI py3.11/3.12 while 3.13/3.14
+        # passed). Spread across ~2s, well inside the 6s session timeout below.
+        'for i in $(seq 1 40); do echo "implementing story 3-1: step $i of 40 ..."; '
+        "sleep 0.05; done\n"
         f"printf -- '---\\nstatus: done\\nbaseline_revision: abc123\\n---\\n\\n"
         f"## Auto Run Result\\n\\nStatus: done\\nImplemented.\\n' > {impl}/spec-3-1-foo.md\n"
         "sleep 60  # stay alive so the wait loop times out under a live window\n"
@@ -2940,6 +2968,104 @@ def test_tmux_timeout_with_flushed_spec_rescued_post_kill(tmp_path):
     assert result.status == "completed"
     assert result.result_json["status"] == "done"
     assert result.result_json["post_kill_reconciled"] is True
+
+
+@pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
+def test_tmux_timeout_silent_session_not_rescued(tmp_path):
+    """The #261 counterpart of the rescue above, same call path, one delta: the CLI
+    wedges instantly and renders NOTHING. A qualifying spec still appears in the
+    shared artifacts dir — here written by a concurrent process, exactly as a
+    parallel run's merge-back did in the report — and it is newer than launch, so
+    the mtime scan would adopt it and the post-kill reconcile would score a session
+    that never ran as `completed:done`.
+
+    Proof-of-work refuses it: no hook event ever arrived AND the pane log never
+    grew (0 bytes — measured, the same signature as the report's wedged review
+    windows). The verdict stays `timeout`, which is what the report's two control
+    stories correctly received."""
+    impl = tmp_path / "impl"
+    impl.mkdir()
+    fake = tmp_path / "fake-cli"
+    # Wedges immediately: no output, no events, no writes of its own.
+    fake.write_text("#!/bin/bash\nsleep 60\n")
+    fake.chmod(0o755)
+    adapter = GenericDevAdapter(
+        run_dir=tmp_path / f"run-{uuid.uuid4().hex[:8]}",
+        policy=Policy(limits=LimitsPolicy()),
+        profile=get_profile("claude"),
+        binary=str(fake),
+        extra_args=(),
+        paths=ProjectPaths(
+            project=tmp_path,
+            implementation_artifacts=impl,
+            planning_artifacts=tmp_path / "plan",
+        ),
+    )
+    spec = SessionSpec(
+        task_id="t-silent",
+        role="dev",
+        prompt="/bmad-dev-auto 3-1",
+        cwd=tmp_path,
+        env={
+            "BMAD_LOOP_RUN_DIR": str(adapter.run_dir),
+            "BMAD_LOOP_TASK_ID": "t-silent",
+            "BMAD_LOOP_STORY_KEY": "3-1",
+        },
+        timeout_s=6.0,
+    )
+    # A FOREIGN story's finished spec lands MID-WINDOW, from a separate thread
+    # standing in for the concurrent run's merge-back. It must be written after
+    # `run()` stamps `launched_ns`, or its mtime sits below the `since_ns` floor,
+    # `find_result_artifact` discards it on that alone, and the read-back never
+    # produces a candidate for the gate to refuse — the test would then pass with
+    # the proof-of-work gate entirely removed (verified: it did).
+    #
+    # So the writer waits on the ACTUAL launch rather than a fixed sleep: the gap
+    # from `run()` to `launched_ns` covers `_ensure_session`, a real `tmux
+    # new-session`, and a slow or loaded box can push that past any margin picked
+    # in advance — silently restoring the vacuous pass (#298 review). Capturing the
+    # handle also gives the assertion below the real floor to test against.
+    foreign = impl / "spec-9-9-someone-elses-story.md"
+    launched: list[SessionHandle] = []
+    launch_stamped = threading.Event()
+    real_start_session = adapter.start_session
+
+    def spy_start_session(session_spec):
+        handle = real_start_session(session_spec)
+        launched.append(handle)
+        launch_stamped.set()
+        return handle
+
+    adapter.start_session = spy_start_session
+
+    def merge_back():
+        if not launch_stamped.wait(timeout=10):
+            return  # the run failed to launch; the assertions below will say so
+        time.sleep(0.5)  # comfortably inside the 6s session window
+        foreign.write_text(
+            "---\nstatus: done\nbaseline_revision: abc123\n---\n\n"
+            "## Auto Run Result\n\nStatus: done\nImplemented.\n"
+        )
+
+    writer = threading.Thread(target=merge_back, daemon=True)
+    writer.start()
+    try:
+        result = adapter.run(spec)
+    finally:
+        writer.join(timeout=10)
+        subprocess.run(["tmux", "kill-session", "-t", adapter.session_name], capture_output=True)
+
+    # The foreign spec really is a candidate the read-back would otherwise adopt: it
+    # exists, qualifies, and — tested against the launch floor this session actually
+    # recorded, not a permissive 0 — post-dates launch. Only the gate rejects it.
+    assert launched, "start_session never ran"
+    assert devcontract.is_result_artifact(foreign, since_ns=launched[0].launched_ns)
+    assert result.status == "timeout"
+    assert result.result_json is None
+    # Below the floor is the invariant; exactly zero is merely what it happens to be.
+    assert (adapter.logs_dir / "t-silent.log").stat().st_size <= (
+        generic.PROOF_OF_WORK_MIN_LOG_BYTES
+    )
 
 
 # ------------------------------- missing-marker fallback (#224)
@@ -3782,3 +3908,408 @@ def test_wait_loop_contract_nudge_then_skill_appends_marker(tmp_path, monkeypatc
     assert rj["status"] == "done"
     assert "synthesized_from_frontmatter" not in rj
     assert len(sent) == 1  # no second nudge
+
+
+# ------------------------------- authoritative-path read-back (#261)
+#
+# The read-back located "the artifact this session produced" by scanning the
+# implementation-artifacts dir for the newest qualifying `*.md`. Under worktree
+# isolation that search also covers the MAIN checkout's dir, which every
+# concurrent run shares; with isolation="none" it IS that shared dir. So a
+# foreign story's spec landing there after launch (a parallel run's merge-back,
+# a human edit, a sweep) won on mtime and was adopted as this session's result:
+# a review that produced nothing was scored `completed:done` and unreviewed code
+# merged.
+#
+# Where the orchestrator already knows which spec the session owes — every review
+# leg and every dev retry, via StoryTask.spec_file, which it literally hands the
+# session in its own prompt — SessionSpec.expected_spec pins the read-back to
+# that one file and the scan is never reached.
+
+_FOREIGN_DONE = (
+    "---\nstatus: done\nbaseline_revision: deadbeef\n---\n\n"
+    "# Someone else's story\n\n## Auto Run Result\n\nStatus: done\nImplemented.\n"
+)
+
+
+def _expecting(tmp_path, spec_file: Path, story_key="3-1") -> SessionSpec:
+    """A review SessionSpec pinned to the spec the orchestrator recorded (#261),
+    carrying its launch snapshot too — exactly what the engine threads for a
+    review leg whose story already has a spec_file."""
+    return dataclasses.replace(
+        _snapshotted_spec(tmp_path, spec_file, story_key), expected_spec=str(spec_file)
+    )
+
+
+def test_expected_spec_ignores_foreign_marker_spec(tmp_path, monkeypatch):
+    """The #261 regression, marker path. Our own spec sits stripped of its marker
+    (the #160 pre-review-launch strip) and the session died without rewriting it; a
+    FOREIGN story's finished spec is newer. The scan would return the foreign spec
+    and score it as this story's `done`."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    ours.write_text("---\nstatus: done\nbaseline_revision: abc123\n---\n\n# Story\n")
+    foreign = impl / "spec-9-9-someone-elses-story.md"
+    foreign.write_text(_FOREIGN_DONE)
+    os.utime(foreign, ns=(2_000_000_000, 2_000_000_000))  # newest: the scan would win here
+
+    spec = _expecting(tmp_path, ours)
+    assert adapter._result_json(_dev_handle(), spec, wait=False) is None
+    # ...and the unpinned spec is exactly what the bug looked like.
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=False) is not None
+
+
+def test_expected_spec_never_reaches_the_scan(tmp_path, monkeypatch):
+    """Structural: with expected_spec set, the directory scan is not merely
+    out-voted, it is never called."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+
+    def boom(*a, **k):
+        raise AssertionError("find_result_artifact must not run with expected_spec set")
+
+    monkeypatch.setattr(generic.devcontract, "find_result_artifact", boom)
+    monkeypatch.setattr(generic.devcontract, "find_frontmatter_candidates", boom)
+    ours = impl / "spec-3-1-foo.md"
+    ours.write_text("---\nstatus: done\n---\n\n# Story\n")
+    (impl / "spec-9-9-someone-elses-story.md").write_text(_FOREIGN_DONE)
+    assert adapter._result_json(_dev_handle(), _expecting(tmp_path, ours), wait=False) is None
+
+
+def test_expected_spec_synthesizes_its_own_marker_spec(tmp_path, monkeypatch):
+    """Over-refusal guard: when THIS session wrote the spec it owed, the pinned
+    read-back synthesizes exactly as the scan did — and stamps the session's own
+    story key, not the foreign spec's."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    ours.write_text("---\nstatus: done\nbaseline_revision: abc123\n---\n\n# Story\n")
+    spec = _expecting(tmp_path, ours)  # snapshot taken of the stripped spec
+    (impl / "spec-9-9-someone-elses-story.md").write_text(_FOREIGN_DONE)
+    ours.write_text(  # the review then finishes and appends its marker
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n# Story\n\n"
+        "## Auto Run Result\n\nStatus: done\nReviewed.\n"
+    )
+    rj = adapter._result_json(_dev_handle(), spec, wait=False)
+    assert rj is not None and rj["status"] == "done"
+    assert rj["story_key"] == "3-1"
+    assert rj["spec_file"] == str(ours)
+
+
+def test_expected_spec_ignores_foreign_markerless_spec(tmp_path, monkeypatch):
+    """Same regression through the #224 missing-marker fallback, which #261 predates
+    but which added a second identical mtime-only scan of the shared dir. A foreign
+    marker-less `status: done` spec must not be a candidate at all — under a dead
+    window it would otherwise synthesize on a single sighting."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    ours.write_text("---\nstatus: in-review\n---\n\n# Story\n")  # non-terminal: still working
+    (impl / "spec-9-9-someone-elses-story.md").write_text(_MARKERLESS_DONE)
+
+    spec = _expecting(tmp_path, ours)
+    assert adapter._synth_result(_dev_handle(), spec, wait=False, dead_window=True) is None
+    # Unpinned, the foreign spec is adopted on the dead window's single sighting.
+    unpinned = dataclasses.replace(_dev_spec(tmp_path), role="review")
+    assert adapter._synth_result(_dev_handle(), unpinned, wait=False, dead_window=True) is not None
+
+
+def test_expected_spec_markerless_own_spec_still_synthesizes(tmp_path, monkeypatch):
+    """Over-refusal guard for the fallback: our OWN marker-less terminal spec is
+    still harvested under a dead window, and the M1/M2 gates still apply to it."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    ours.write_text("---\nstatus: in-review\n---\n\n# Story\n")
+    spec = _expecting(tmp_path, ours)  # snapshot of the in-review bytes
+    ours.write_text(_MARKERLESS_DONE)  # this session finalized it, marker omitted
+    sr = adapter._synth_result(_dev_handle(), spec, wait=False, dead_window=True)
+    assert sr is not None and sr.result_json["status"] == "done"
+    assert sr.result_json["synthesized_from_frontmatter"] is True
+
+
+def test_expected_spec_absent_file_is_no_result(tmp_path, monkeypatch):
+    """A session that never wrote the spec it owed produced no result — and the
+    pinned read-back deliberately does NOT fall back to the scan, so a foreign
+    artifact cannot stand in for it."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    (impl / "spec-9-9-someone-elses-story.md").write_text(_FOREIGN_DONE)
+    spec = dataclasses.replace(
+        _dev_spec(tmp_path), role="review", expected_spec=str(impl / "spec-3-1-foo.md")
+    )
+    assert adapter._result_json(_dev_handle(), spec, wait=False) is None
+
+
+def test_expected_spec_breadcrumb_names_the_pinned_path(tmp_path, monkeypatch):
+    """The give-up crumb points at the spec that was owed, not at a directory list —
+    the diagnostic that would have made #261 obvious in the journal."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    ours.write_text("---\nstatus: in-review\n---\n\n# Story\n")
+    (impl / "spec-9-9-someone-elses-story.md").write_text(_FOREIGN_DONE)
+    assert adapter._result_json(_dev_handle(), _expecting(tmp_path, ours), wait=True) is None
+    (crumb,) = _breadcrumbs(adapter)
+    assert crumb["verdict"] == "no-artifact"
+    assert str(ours) in crumb["detail"]
+    assert "someone-elses" not in crumb["detail"]
+
+
+def test_dev_attempt_one_keeps_the_scan(tmp_path, monkeypatch):
+    """Unchanged where it must be: a dev attempt 1 has no recorded spec yet (the
+    skill creates it), so expected_spec is None and the mtime scan still runs."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n"
+        "## Auto Run Result\n\nStatus: done\nImplemented.\n"
+    )
+    spec = _dev_spec(tmp_path)
+    assert spec.expected_spec is None
+    rj = adapter._result_json(_dev_handle(), spec, wait=False)
+    assert rj is not None and rj["status"] == "done"
+
+
+# ------------------------------- proof-of-work gate (#261)
+
+
+def _pane_log(adapter, task_id: str, size: int) -> Path:
+    adapter.logs_dir.mkdir(parents=True, exist_ok=True)
+    log = adapter.logs_dir / f"{task_id}.log"
+    log.write_bytes(b"x" * size)
+    return log
+
+
+def test_proof_of_work_refuses_silent_dead_session(tmp_path, monkeypatch):
+    """A dead session with no hook event and a pane log that never grew produced
+    nothing, so a read-back artifact is not its output. Keep the crash verdict."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n"
+        "## Auto Run Result\n\nStatus: done\nImplemented.\n"
+    )
+    _pane_log(adapter, "3-1-dev-1", 0)
+    res = adapter._final(_dev_handle(), _dev_spec(tmp_path), "crashed", None, None)
+    assert res.status == "crashed"
+    assert res.result_json is None
+
+
+def test_proof_of_work_two_byte_log_is_not_work(tmp_path, monkeypatch):
+    """The floor is not zero: the report's wedged windows left 0-byte AND 2-byte
+    logs, so `size > 0` would have cleared one of them."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    _pane_log(adapter, "3-1-dev-1", 2)
+    assert adapter._final(_dev_handle(), _dev_spec(tmp_path), "crashed", None, None).status == (
+        "crashed"
+    )
+
+
+def test_proof_of_work_pane_log_growth_is_evidence(tmp_path, monkeypatch):
+    """A session that rendered to its pane ran, so its artifact is honoured."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n"
+        "## Auto Run Result\n\nStatus: done\nImplemented.\n"
+    )
+    _pane_log(adapter, "3-1-dev-1", generic.PROOF_OF_WORK_MIN_LOG_BYTES + 1)
+    res = adapter._final(_dev_handle(), _dev_spec(tmp_path), "crashed", None, None)
+    assert res.status == "completed"
+    assert res.result_json["status"] == "done"
+
+
+def test_proof_of_work_ended_turn_is_evidence_despite_empty_log(tmp_path, monkeypatch):
+    """The two signals are ORed for a reason: on a misbound pane sink (#254/#217) a
+    HEALTHY session logs zero bytes. A turn having ENDED carries it."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n"
+        "## Auto Run Result\n\nStatus: done\nImplemented.\n"
+    )
+    _pane_log(adapter, "3-1-dev-1", 0)
+    res = adapter._final(
+        _dev_handle(), _dev_spec(tmp_path), "crashed", "sess-1", None, stop_seen=True
+    )
+    assert res.status == "completed"
+
+
+def test_proof_of_work_session_id_alone_is_not_evidence(tmp_path, monkeypatch):
+    """`session_id`/`transcript_path` are populated by SessionStart and SessionEnd,
+    which a CLI that launched and wedged emits without doing anything. Reading them
+    as proof left the gate satisfied in exactly the case it exists to catch (#298
+    review): only `stop_seen` — a turn that ENDED — is the hook-side evidence."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    (impl / "spec-9-9-someone-elses-story.md").write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n"
+        "## Auto Run Result\n\nStatus: done\nImplemented.\n"
+    )
+    _pane_log(adapter, "3-1-dev-1", 0)
+    res = adapter._final(
+        _dev_handle(),
+        _dev_spec(tmp_path),
+        "crashed",
+        "sess-1",  # SessionStart handed us a session id...
+        "/t.jsonl",  # ...and a transcript path. Neither means work happened.
+        stop_seen=False,
+    )
+    assert res.status == "crashed"
+    assert res.result_json is None
+
+
+def test_proof_of_work_no_pane_log_is_inert(tmp_path, monkeypatch):
+    """Unknown never blocks: with no pane log at all there is no signal, and the
+    gate preserves the previous behavior exactly. Reachable only for a handle this
+    adapter never launched — `start_session` always leaves a log behind (see the
+    dead-on-arrival test below), which is what keeps this state from swallowing the
+    case the gate is for."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n"
+        "## Auto Run Result\n\nStatus: done\nImplemented.\n"
+    )
+    assert not (adapter.logs_dir / "3-1-dev-1.log").exists()
+    res = adapter._final(_dev_handle(), _dev_spec(tmp_path), "crashed", None, None)
+    assert res.status == "completed"
+
+
+def test_proof_of_work_dead_on_arrival_window_is_refused(tmp_path, monkeypatch):
+    """A window that dies before `pipe_pane` attaches tees NOTHING, so before #298
+    it left no log file at all — the inert state above — and the gate failed open on
+    precisely the dead-on-arrival session it exists to refuse. `start_session` now
+    creates the log empty up front, so "no tee ever attached" reports as `False`
+    (rendered nothing) rather than `None` (no pane signal here).
+
+    Driven through the REAL `start_session` with a mux whose `pipe_pane` writes
+    nothing — the faithful stand-in for attaching a tee to a corpse."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    adapter._ensure_session = lambda cwd: None  # skip the tmux server plumbing
+    adapter.mux = _StartSessionMux()
+
+    handle = adapter.start_session(_dev_spec(tmp_path))
+    assert (adapter.logs_dir / "3-1-dev-1.log").stat().st_size == 0
+
+    # The foreign spec must land AFTER launch, or its mtime sits below the
+    # `since_ns` floor, the scan discards it there, and the gate is never reached —
+    # the test would pass with the gate removed (verified by ablation: it did).
+    #
+    # Writing it "after start_session returned" is not enough to establish that on
+    # Windows: `launched_ns` comes from `time.time_ns()` (a precise clock) while an
+    # NTFS mtime is stamped from the coarse system-time tick (~15.6 ms), so a file
+    # written a millisecond later can carry an mtime BELOW the floor. Re-stamp until
+    # the precondition actually holds rather than assuming the two clocks agree.
+    foreign = impl / "spec-9-9-someone-elses-story.md"
+    deadline = time.monotonic() + 5.0
+    while True:
+        foreign.write_text(
+            "---\nstatus: done\nbaseline_revision: abc123\n---\n\n"
+            "## Auto Run Result\n\nStatus: done\nImplemented.\n"
+        )
+        if devcontract.is_result_artifact(foreign, since_ns=handle.launched_ns):
+            break
+        assert time.monotonic() < deadline, "foreign spec never cleared the launch floor"
+        time.sleep(0.02)
+
+    res = adapter._final(handle, _dev_spec(tmp_path), "crashed", None, None)
+    assert res.status == "crashed"
+    assert res.result_json is None
+
+
+def test_proof_of_work_leaves_task_scoped_result_json_alone(tmp_path):
+    """The gate is scoped to the shared-directory read-back, not to `_final` at
+    large (#298 review). A base adapter's `tasks/<task_id>/result.json` is unique to
+    this task and unlinked at launch, so its presence already proves THIS session
+    wrote it — no foreign writer can reach it. Gating it could only ever discard an
+    authoritative completion, so `_ResultFileMixin` declines the gate outright."""
+    adapter = make_adapter(tmp_path)
+    task_dir = adapter.tasks_dir / "1-1-a-dev-1"
+    task_dir.mkdir(parents=True)
+    (task_dir / "result.json").write_text('{"status": "done", "workflow": "dev"}')
+    _pane_log(adapter, "1-1-a-dev-1", 0)  # no rendering, and no Stop below
+
+    handle = SessionHandle(task_id="1-1-a-dev-1", native_id="@1")
+    res = adapter._final(handle, make_spec(tmp_path), "crashed", None, None)
+    assert res.status == "completed"
+    assert res.result_json["status"] == "done"
+
+
+def test_proof_of_work_gates_post_kill_reconcile(tmp_path, monkeypatch):
+    """The i-11 call path: the rescue is for a session that finished and lost its
+    Stop, not for one that never ran."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    adapter._window_alive = lambda handle: False
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n"
+        "## Auto Run Result\n\nStatus: done\nImplemented.\n"
+    )
+    _pane_log(adapter, "3-1-dev-1", 0)
+    stalled = SessionResult(status="stalled")
+    assert adapter._post_kill_reconcile(_dev_handle(), _dev_spec(tmp_path), stalled) is stalled
+
+    _pane_log(adapter, "3-1-dev-1", generic.PROOF_OF_WORK_MIN_LOG_BYTES + 1)
+    rescued = adapter._post_kill_reconcile(_dev_handle(), _dev_spec(tmp_path), stalled)
+    assert rescued.status == "completed"
+    assert rescued.result_json["post_kill_reconciled"] is True
+
+
+def test_proof_of_work_journals_the_refusal(tmp_path, monkeypatch):
+    """The refusal is observable — a silent downgrade would be its own #261."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    _pane_log(adapter, "3-1-dev-1", 0)
+    adapter._final(_dev_handle(), _dev_spec(tmp_path), "crashed", None, None)
+    events = (adapter.tasks_dir / "3-1-dev-1" / "session-lifecycle.jsonl").read_text()
+    assert "readback-refused-no-proof-of-work" in events
+
+
+def test_expected_spec_relative_path_is_rebased_on_cwd(tmp_path, monkeypatch):
+    """A relative expected_spec resolves against the session cwd, not the process
+    CWD. The engine always threads an absolute path, so this is a guard against a
+    future caller quietly turning the #261 fix into a work-losing false refusal."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    ours.write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n"
+        "## Auto Run Result\n\nStatus: done\nImplemented.\n"
+    )
+    spec = dataclasses.replace(
+        _dev_spec(tmp_path), role="review", expected_spec=str(ours.relative_to(tmp_path))
+    )
+    rj = adapter._result_json(_dev_handle(), spec, wait=False)
+    assert rj is not None and rj["spec_file"] == str(ours)
+
+
+def test_log_evidence_mro_is_not_shadowed_by_the_mixin():
+    """`_log_evidence` is declared inert on `_ResultFileMixin` and overridden on
+    `GenericAdapter`, which owns the pane log. Both mixins sit ahead of the concrete
+    adapter in the MRO, and this file already documents that hazard for `send_text` —
+    so pin the resolution: if a future base reshuffle let the inert stub win, the
+    proof-of-work gate would silently go dead everywhere instead of failing loudly.
+    OpencodeDevAdapter has no pane log and must keep the inert one."""
+    from bmad_loop.adapters.generic import GenericAdapter, _ResultFileMixin
+    from bmad_loop.adapters.opencode_http import OpencodeDevAdapter
+
+    assert GenericDevAdapter._log_evidence is GenericAdapter._log_evidence
+    assert OpencodeDevAdapter._log_evidence is _ResultFileMixin._log_evidence
+    # Same hazard, same reason: the gate applies to the shared-directory read-back
+    # the dev mixin owns and to nothing else. An MRO that let the base default win
+    # for a dev adapter would silently disarm it; one that let the dev value leak
+    # onto a base adapter would start discarding authoritative task-scoped results.
+    assert GenericDevAdapter._READBACK_NEEDS_PROOF_OF_WORK is True
+    assert OpencodeDevAdapter._READBACK_NEEDS_PROOF_OF_WORK is True
+    assert GenericTmuxAdapter._READBACK_NEEDS_PROOF_OF_WORK is False

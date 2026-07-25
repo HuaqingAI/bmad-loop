@@ -1271,13 +1271,23 @@ class Engine:
         have no spec path to act on, so the re-drive HALTs on the stale ``blocked``
         status. The synthesized result names the spec even on a HALT
         (``devcontract.synthesize_result``). No-op once set or when the claimed
-        spec is absent."""
+        spec is absent.
+
+        The skill's no-spec fallback artifact (``bmad-dev-auto-result-*``, written
+        when intent was too unclear to even CREATE a spec) is refused: it is not the
+        story's spec, so every consumer here misreads it. ``rearm_escalation`` would
+        flip frontmatter on a marker no re-drive reads, ``_reset_spec_for_repair``
+        would re-open it as if it were the frozen intent contract, and the repair
+        prompt would point the session at it — which the #261 read-back then pins to,
+        polling a stale marker while the re-drive's real spec goes unread."""
         if task.spec_file:
             return
         spec_file = (result_json or {}).get("spec_file")
         if not spec_file:
             return
         spec_path = verify.resolve_spec_path(str(spec_file), self.workspace.paths)
+        if spec_path.name.startswith(devcontract.FALLBACK_RESULT_PREFIX):
+            return
         if spec_path.is_file():
             task.spec_file = str(spec_path)
 
@@ -2262,6 +2272,42 @@ class Engine:
             # Launch-state snapshot of a review session's spec (#276 M1); None for
             # every other session and on a crash-resume (process-transient).
             spec_snapshot=spec_snapshot,
+            # The spec this session is required to write, when already known (#261),
+            # so the adapter reads THAT path back instead of mtime-scanning a
+            # directory shared with every concurrent run. Same `_generic_dev()` guard
+            # as the snapshot above, so the two can never disagree about whether the
+            # devcontract read-back is in play.
+            #
+            # Pinned ONLY when the dispatched prompt NAMES that path — the read-back
+            # may demand a file back solely because the session was told to write it.
+            # Knowing a spec exists is not the same as having pointed a session at it:
+            # a from-scratch re-drive after an escalation/deferral has `task.spec_file`
+            # recorded (`_record_dev_spec`) but dispatches a bare story key, a sweep
+            # bundle dispatches `intent.md`, and StoriesEngine dispatches folder+id.
+            # Pinning those would poll a path the session never promised to rewrite
+            # and score its real output as "wrote nothing" — trading #261's unsafe
+            # failure for a work-LOSING one, the exact trade this fix exists to avoid.
+            # Testing the prompt keeps the pin and the contract that justifies it in
+            # one place across all three engines (each builds its own prompt), and
+            # reads the post-gate text, so a plugin rewrite cannot desynchronize them.
+            # A miss simply falls back to the scan — the pre-#261 behavior.
+            #
+            # Withheld from an injected plugin-workflow session (`label` set — e.g. a
+            # TEA pre_commit_gate): it runs the generic adapter but owes the
+            # WORKFLOW_COMPLETION_CONTRACT marker above, not the story spec, so
+            # pinning it to task.spec_file would point the read-back at the wrong
+            # file. Same doctrine as StoriesEngine withholding BMAD_LOOP_SPEC_FOLDER
+            # from labeled sessions.
+            expected_spec=(
+                task.spec_file
+                if (
+                    label is None
+                    and self._generic_dev()
+                    and task.spec_file
+                    and str(task.spec_file) in prompt
+                )
+                else None
+            ),
         )
         self.journal.set_active_log(task_id)
         self.journal.append(

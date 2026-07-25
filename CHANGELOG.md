@@ -90,6 +90,42 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **A session's read-back could adopt another story's spec (#261).** The generic dev/review
+  read-back located "the artifact this session produced" by scanning the implementation-artifacts
+  dir for the most-recently-modified qualifying `*.md`, with nothing tying the match to the story
+  being driven. That dir is shared: under worktree isolation the search also covers the main
+  checkout's copy, and with `isolation="none"` it _is_ that copy. A foreign story's spec landing
+  there after launch — a concurrent run's merge-back, a human edit, a sweep — won on mtime and
+  became this session's result, so a review that produced nothing was scored `completed:done`
+  (merging unreviewed code) and, on the dev leg, its `followup_review_recommended: false` skipped
+  the review entirely. Unlike the rest of this family (#88/#127/#160/#224) it failed toward
+  _landing_ unverified work. Two fixes, both in the adapter:
+  - **Authoritative-path read-back.** Where the orchestrator has pointed the session at the spec it
+    owes — every review leg, every dev repair, every patch-restore re-drive — `SessionSpec.expected_spec`
+    pins the read-back to that one file and the directory scan is never reached. The pin is taken only
+    when the dispatched prompt names the path: a from-scratch re-drive after an escalation or deferral
+    has a recorded `StoryTask.spec_file` but dispatches a bare story key, and pinning there would poll a
+    stale path while the re-drive's real output went unread. This closes the asymmetry with stories mode,
+    which already resolved by id rather than by mtime, and covers the #224 missing-marker fallback (a
+    second mtime-only scan of the same shared dir) through the same seam. Deliberately not a filename
+    rule: spec names come from an LLM-derived slug, so a prefix check risks trading this unsafe
+    failure for a lossy one — and a pinned path needs no exemption for the `bmad-dev-auto-result-*`
+    fallback or for sweep bundles, which legitimately adopt a differently-named story spec (#161).
+    A dev attempt 1 has no recorded spec yet and keeps the scan. Relatedly, the skill's no-spec
+    fallback marker is no longer recorded as a story's spec at all — it is not one, and every
+    consumer of `task.spec_file` misroutes on it.
+  - **Proof-of-work gate.** A read-back artifact may no longer upgrade a dead session to
+    `completed` when that session shows no evidence it ran at all — no turn ever ended _and_ its
+    pane log never grew past a small floor. The two signals are ORed because each has a blind spot
+    (a misbound pane sink still ends turns; a hook-less profile still logs). The hook signal is a
+    `Stop` event specifically: `SessionStart` and `SessionEnd` are emitted by a CLI that launched
+    and wedged, so reading either as work would leave the gate satisfied in exactly the case it is
+    for. For the same reason the pane log is created empty at launch, so a window that dies before
+    the tee attaches reports "rendered nothing" rather than "no pane signal here". Scoped to the
+    shared-directory read-back: a task-scoped `result.json` is unique to its session and cleared at
+    launch, so it stays authoritative. Applies to both the crash path and `_post_kill_reconcile`,
+    and journals `readback-refused-no-proof-of-work`.
+
 - **`validate` requires the review skills your `bmad-dev-auto` actually invokes (#260).** The
   preflight held every project to a fixed catalog that included `bmad-review-verification-gap`,
   which no tagged BMAD-METHOD release ships (absent from v6.10.0; on current sources only a
