@@ -9,7 +9,9 @@ verify. All creative work happens inside disposable adapter sessions.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import functools
+import hashlib
 import shutil
 import signal
 import sys
@@ -17,10 +19,10 @@ import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, NoReturn
+from typing import TYPE_CHECKING, Callable, NoReturn, Sequence
 
 from . import deferredwork, devcontract, envvars, gates, verify
-from .adapters.base import CodingCLIAdapter, SessionResult, SessionSpec
+from .adapters.base import CodingCLIAdapter, SessionResult, SessionSpec, SpecSnapshot
 from .bmadconfig import ProjectPaths
 from .escalation import (
     Action,
@@ -41,7 +43,7 @@ from .model import (
     SessionRecord,
     StoryTask,
 )
-from .platform_util import atomic_replace, retrying_unlink, safe_segment
+from .platform_util import atomic_replace, atomic_write_text, retrying_unlink, safe_segment
 from .plugins import HookBus, HookContext, PluginRegistry
 from .policy import Policy
 from .recovery_flow import RecoveryFlow
@@ -172,9 +174,17 @@ def _session_task_id(story_key: str, part: str, seq: int) -> str:
     return safe_segment(f"{story_key}-{part}-{seq}")
 
 
+# Call-stack nesting depth for engine runs. A nested auto-sweep runs synchronously
+# in the same thread as its parent (see _maybe_auto_sweep), so a ContextVar carries
+# the parent's depth into the child. Tracked independently of signal ownership so an
+# off-main-thread top-level run (which cannot own signals) is still seen as depth-0.
+_run_depth: contextvars.ContextVar[int] = contextvars.ContextVar("bmad_loop_run_depth", default=0)
+
+
 class Engine:
-    # The engine that installed the process-wide stop handlers; nested
-    # auto-sweep runs (same process) see it set and let RunStopped propagate up.
+    # The engine that installed the process-wide stop handlers. Signal handling is
+    # single-owner per process; only this engine reinstalls/restores them. Run
+    # nesting is tracked separately via _run_depth (see run()).
     _stop_signals_owner: "Engine | None" = None
 
     def __init__(
@@ -237,10 +247,10 @@ class Engine:
             self.journal.append("plugins-active", plugins=self._bus.active_plugins())
         # stop-signal bookkeeping (see run())
         self._owns_signals = False
-        # True iff an outer engine already owned the stop handlers when this one
-        # started — i.e. this is a nested auto-sweep run. Distinct from
-        # _owns_signals, which is also False for a top-level engine that simply
-        # could not install handlers (e.g. off the main thread).
+        # Set authoritatively at run() entry from the _run_depth call-stack counter:
+        # True iff this engine runs nested inside another engine's run() (a nested
+        # auto-sweep). Independent of _owns_signals — a top-level run off the main
+        # thread owns no signals yet is still non-nested. Defaults False pre-run.
         self._is_nested = False
         self._stopping = False
         self._prev_handlers: dict[int, object] = {}
@@ -303,10 +313,52 @@ class Engine:
 
     # ------------------------------------------------------------- top level
 
+    def _warn_desktop_notifier_inert(self) -> None:
+        """One-time run-start alert for #231: ``notify.desktop`` is requested but
+        this platform has no notifier, so every ``gates.notify`` desktop sink is a
+        silent no-op. Journalled + stderr so an unattended launch that skips
+        ``validate`` still surfaces it."""
+        if not (self.policy.notify.desktop and gates.desktop_notifier_kind() is None):
+            return
+        self.journal.append("notify-desktop-unavailable", platform=sys.platform)
+        # The ATTENTION file only exists as a fallback when notify.file is on; with
+        # it off there is no human channel left, so point at that rather than a file
+        # that is never written.
+        channel = (
+            f"watch the ATTENTION file in {self.run_dir}"
+            if self.policy.notify.file
+            else "notify.file is also off, so no alert channel is configured"
+        )
+        print(
+            f"warning: notify.desktop is set but no desktop notifier is available "
+            f"on {sys.platform}; desktop alerts are silently skipped — {channel}.",
+            file=sys.stderr,
+        )
+
     def run(self) -> RunSummary:
+        # Establish call-stack nesting depth before anything else: _is_nested is read
+        # by the warning gate and the stop/crash re-raise arms below. Reset in the
+        # outermost finally so a nested child's re-raise still decrements the depth.
+        depth = _run_depth.get()
+        self._is_nested = depth > 0
+        token = _run_depth.set(depth + 1)
+        try:
+            return self._run_inner()
+        finally:
+            _run_depth.reset(token)
+
+    def _run_inner(self) -> RunSummary:
         self._install_stop_signals()
         try:
             try:
+                # Warn once per top-level run before pre_run: a plugin `pause` veto in
+                # _emit_run_boundary("pre_run") raises RunPaused, which would otherwise
+                # skip the promised inert-notifier warning + journal event. Gated on
+                # `not _is_nested` (call-stack depth), not `_owns_signals`: a top-level
+                # run that could not install signal handlers (off the main thread) owns
+                # no signals yet is not nested, and must still surface the warning.
+                if not self._is_nested:
+                    self._warn_desktop_notifier_inert()
                 # target-branch setup can raise RunPaused (detached HEAD, unborn
                 # repo), so it must sit inside the pause handler, not before it.
                 self._emit_run_boundary("pre_run")
@@ -463,9 +515,9 @@ class Engine:
         outermost engine in the process owns the handlers (nested auto-sweep
         runs let the exception propagate up to it); install is best-effort and
         silently skipped off the main thread (signal.signal raises there)."""
-        # capture nesting before the early return: a non-None owner here means an
-        # outer engine already installed the handlers, so we are nested.
-        self._is_nested = Engine._stop_signals_owner is not None
+        # Signal ownership is process-global and independent of run nesting (tracked
+        # via _run_depth in run()): a non-None owner means an outer engine already
+        # installed the handlers, so this engine must not reinstall them.
         if Engine._stop_signals_owner is not None:
             return
 
@@ -1219,13 +1271,23 @@ class Engine:
         have no spec path to act on, so the re-drive HALTs on the stale ``blocked``
         status. The synthesized result names the spec even on a HALT
         (``devcontract.synthesize_result``). No-op once set or when the claimed
-        spec is absent."""
+        spec is absent.
+
+        The skill's no-spec fallback artifact (``bmad-dev-auto-result-*``, written
+        when intent was too unclear to even CREATE a spec) is refused: it is not the
+        story's spec, so every consumer here misreads it. ``rearm_escalation`` would
+        flip frontmatter on a marker no re-drive reads, ``_reset_spec_for_repair``
+        would re-open it as if it were the frozen intent contract, and the repair
+        prompt would point the session at it — which the #261 read-back then pins to,
+        polling a stale marker while the re-drive's real spec goes unread."""
         if task.spec_file:
             return
         spec_file = (result_json or {}).get("spec_file")
         if not spec_file:
             return
         spec_path = verify.resolve_spec_path(str(spec_file), self.workspace.paths)
+        if spec_path.name.startswith(devcontract.FALLBACK_RESULT_PREFIX):
+            return
         if spec_path.is_file():
             task.spec_file = str(spec_path)
 
@@ -1302,12 +1364,13 @@ class Engine:
                 # marker past the adapter's launch-mtime floor and end the review
                 # on its first result-less Stop (issue #160). Non-replay branch
                 # only — the replay path above launches no session.
-                self._reset_spec_for_review(task)
+                snapshot = self._reset_spec_for_review(task)
                 result = self._run_session(
                     task,
                     role="review",
                     prompt=self._review_prompt(task),
                     seq=task.review_cycle,
+                    spec_snapshot=snapshot,
                 )
             advance(task, Phase.REVIEW_VERIFY)
             self._save()
@@ -1666,7 +1729,15 @@ class Engine:
                 self._escalate(task, f"plugin {veto.plugin_id!r} vetoed pre_commit: {veto.reason}")
             if ctx.proposed_commit_message:
                 message = ctx.proposed_commit_message
+        # The success boundary for story-declared ledger closure (#234): every
+        # verify gate, checkpoint, review cycle and pre-commit workflow is behind
+        # us, and finalize_commit's `git add -A` is still ahead, so an in-repo
+        # annotation rides this story's own commit. `snapshot` is armed inside
+        # the close, before its write, so both failure arms below hold the
+        # pre-close text no matter where in the window a raise lands.
+        snapshot: list[tuple[Path, str]] = []
         try:
+            self._close_declared_deferred(task, snapshot)
             # bmad-dev-auto commits its own work each iteration; the orchestrator
             # squashes that chain plus its uncommitted bookkeeping back onto the
             # pre-dev baseline as one commit carrying `message`. None means there
@@ -1680,7 +1751,16 @@ class Engine:
             task.resolved_redrive = False
             task.restore_patch = None
         except verify.GitError as e:
+            self._restore_deferred_closes(task, snapshot)
             self._escalate(task, f"commit failed: {e}")
+        except BaseException:
+            # A failed commit is not the only way out of this window: the signal
+            # handler `_run` installed raises RunStopped from wherever the main
+            # thread is standing, and a raw OSError on spawn escapes `_run_git`
+            # as itself. Either leaves the ledger flipped for a commit that does
+            # not exist. Restore, then re-raise untouched.
+            self._restore_deferred_closes(task, snapshot)
+            raise
         advance(task, Phase.DONE)
         self.journal.append("story-done", story_key=task.story_key, commit=task.commit_sha)
         self._emit("post_commit", task)
@@ -1715,6 +1795,10 @@ class Engine:
             return False
         return self.policy.review.enabled
 
+    # the date stamped into ledger edits; isolated for tests
+    def _today(self) -> str:
+        return time.strftime("%Y-%m-%d")
+
     def _observed_frontmatter(self, spec_path: Path, story_key: str, site: str) -> dict | None:
         """Read a spec's frontmatter on a *bookkeeping* path, degrading an
         unreadable spec to ``None`` (journaled) instead of a whole-run crash.
@@ -1732,8 +1816,7 @@ class Engine:
         Repair writes (``reset_spec_status``, ``mark_done``) deliberately do the
         opposite and let OSError raise: silently skipping a rewrite would leave the
         spec in a state the caller believes it fixed. Observation degrades, repair
-        raises.
-        """
+        raises."""
         try:
             return verify.read_frontmatter(spec_path)
         except OSError as e:
@@ -1878,6 +1961,94 @@ class Engine:
             to=success_status,
         )
 
+    def _repair_spec_marker(self, task: StoryTask, rj: dict) -> None:
+        """Append the ``## Auto Run Result`` marker a missing-marker synthesis
+        (#224) proved the session owed but never wrote — #276 Mechanism 3, the
+        artifact-repair leg. Called at the ``session-synthesized-from-frontmatter``
+        journal site, which fires for live-Stop, crash-path, and post-kill
+        dead-window synthesis alike (all carry the ``synthesized_from_frontmatter``
+        flag), so this ONE call site covers every synthesis path. After the append
+        the spec leaves `find_frontmatter_candidates`' territory (zero real
+        markers) and enters `find_result_artifact`'s (>= 1), so a later re-read is
+        harvested on the normal marker path and the next review launch strips it
+        exactly like a skill-written marker.
+
+        Best-effort by doctrine: the result was already synthesized, so a failed
+        or skipped repair only leaves the spec non-compliant — it never loses work.
+        Guards mirror `_reconcile_generic_terminal_status`, the sibling
+        session-path spec writer: the generic path only; the session-supplied
+        ``spec_file`` must resolve to a real file inside the orchestrator-owned
+        roots (else `spec-marker-repair-skipped`, reason ``out-of-tree`` — this is
+        a write keyed off a session-reported path); and a FRESH frontmatter re-read
+        must be terminal (``done``/``blocked``) AND agree with the synthesized
+        ``rj["status"]`` (else reason ``fm-mismatch``). Never author a marker whose
+        ``Status:`` disagrees with the frontmatter the synthesis trusted — that
+        would trip `synthesize_result`'s consistency cross-check on the next read.
+
+        Non-interference: `_reconcile_generic_terminal_status` only acts when the
+        frontmatter LAGS the prose, so once this append lands (frontmatter already
+        terminal) reconcile hits its idempotent / refusal branches;
+        `_salvage_review_timeout` reads the frontmatter fresh and stays disjoint.
+        The append is engine-side ONLY — an adapter-side write would perturb the
+        adapter's own mtime/hash observation state (#276 M1/M2)."""
+        if not self._generic_dev():
+            return
+        spec_file = (rj or {}).get("spec_file")
+        if not spec_file:
+            return
+        spec_path = verify.resolve_spec_path(str(spec_file), self.workspace.paths)
+        if not spec_path.is_file():
+            return
+        if not verify.spec_within_roots(spec_path, self.workspace.paths):
+            self.journal.append(
+                "spec-marker-repair-skipped",
+                story_key=task.story_key,
+                spec=str(spec_path),
+                reason="out-of-tree",
+            )
+            return
+        fm = self._observed_frontmatter(spec_path, task.story_key, "marker-repair")
+        if fm is None:
+            return
+        fm_status = str(fm.get("status", "")).strip().lower()
+        rj_status = str(rj.get("status", "")).strip().lower()
+        if fm_status not in (devcontract.DONE, devcontract.BLOCKED) or fm_status != rj_status:
+            self.journal.append(
+                "spec-marker-repair-skipped",
+                story_key=task.story_key,
+                spec=str(spec_path),
+                reason="fm-mismatch",
+            )
+            return
+        detail = (
+            f"Synthesized by the bmad-loop orchestrator from frontmatter status "
+            f"`{fm_status}` for story `{task.story_key}` (session finalized the spec "
+            f"without appending its marker)."
+        )
+        try:
+            repaired = devcontract.append_auto_run_result(spec_path, fm_status, detail=detail)
+        except (OSError, UnicodeDecodeError) as e:
+            # UnicodeDecodeError as well as OSError: the writer reads the spec's raw
+            # bytes and, by contract, raises on an undecodable spec (the same
+            # torn-mid-write hazard `_post_kill_reconcile` guards — a spec truncated
+            # through a multi-byte UTF-8 sequence between `_observed_frontmatter`'s
+            # read and this one). This repair is pure best-effort forensics; it must
+            # never turn a synthesized-and-recorded result into a run crash.
+            self.journal.append(
+                "spec-marker-repair-failed",
+                story_key=task.story_key,
+                spec=str(spec_path),
+                error=f"{e.__class__.__name__}: {e}",
+            )
+            return
+        if repaired:
+            self.journal.append(
+                "spec-marker-repaired",
+                story_key=task.story_key,
+                spec=str(spec_path),
+                status=fm_status,
+            )
+
     def _post_dev_state_sync(self, task: StoryTask, result_json: dict | None) -> None:
         """Single-writer for the on-disk bookkeeping the generic skill never touches.
 
@@ -1907,6 +2078,264 @@ class Engine:
             return
         target = "review" if review_enabled else "done"
         sprint_advance(self.workspace.paths.sprint_status, task.story_key, target)
+
+    def _manifest_closes_deferred(self, task: StoryTask) -> tuple[str, ...]:
+        """Deferred-work ids declared for this story by a *manifest* the
+        orchestrator reads, as opposed to the story spec's own frontmatter.
+
+        Empty here: sprint mode has no manifest, so frontmatter is its only
+        channel. ``StoriesEngine`` overrides this with its ``stories.yaml``
+        entry — the channel that matters for an unattended run, since the spec is
+        generated later by a dev skill that knows nothing of the ledger."""
+        return ()
+
+    def _declared_deferred_ids(self, task: StoryTask) -> tuple[str, ...]:
+        """The ids this story declares it closes, unioned across both channels
+        and order-preserving (a story that names the same id in the manifest and
+        in its spec must be marked once and reported once).
+
+        Both halves are read live here, at the commit boundary: what the spec
+        and the manifest say at the moment of the close is what the story
+        declares — a declaration edited after the dev artifacts verified must
+        not be closed against a stale snapshot, because the stale half of that
+        can close an entry the final spec no longer names.
+
+        Every degraded reading declares nothing, which is the safe direction
+        for an advisory annotation: the entries stay ``open`` — a miss the next
+        sweep or retro re-verifies — rather than closed on evidence nobody
+        could read. An unreadable spec is journaled by
+        ``_observed_frontmatter``; an unparseable one flattens to ``{}`` there
+        like every other status gate; and a session-supplied path outside the
+        orchestrator's roots is refused under the same containment rule the
+        frontmatter-status reconcile applies, so a surprising absolute path can
+        never steer a ledger write."""
+        ids: list[str] = list(self._manifest_closes_deferred(task))
+        spec_path = Path(task.spec_file) if task.spec_file else None
+        if spec_path is not None:
+            try:
+                within = verify.spec_within_roots(spec_path, self.workspace.paths)
+            except (OSError, RuntimeError):
+                # resolve() faulted (a symlink loop, an unreadable component):
+                # containment can vouch for nothing, so refuse the same way.
+                within = False
+            if not within:
+                self.journal.append(
+                    "deferred-close-skipped-out-of-tree",
+                    story_key=task.story_key,
+                    spec=str(spec_path),
+                )
+            else:
+                fm = self._observed_frontmatter(spec_path, task.story_key, "deferred-close")
+                declared, error = deferredwork.parse_declaration((fm or {}).get("closes_deferred"))
+                if error:
+                    self.journal.append(
+                        "deferred-close-malformed",
+                        story_key=task.story_key,
+                        spec=str(spec_path),
+                        error=f"closes_deferred {error}",
+                    )
+                ids += declared
+        return tuple(dict.fromkeys(ids))
+
+    def _close_declared_deferred(
+        self, task: StoryTask, snapshot: list[tuple[Path, str]] | None = None
+    ) -> None:
+        """At the commit boundary, flip every ledger entry the story declares
+        via ``closes_deferred:`` to ``status: done <date>`` + a ``resolution:``
+        note (#234) — the regular-story counterpart of the sweep bundle close
+        at ``SweepEngine._close_bundle_ledger_when_spec_status``.
+
+        Declaration is the only signal: closure is never inferred from a diff.
+
+        **Advisory by contract.** The annotation is traceability for the next
+        sweep or retro, never a gate: no reading of the spec, the manifest or
+        the ledger can fail the story, and every degraded reading leaves the
+        entries ``open`` — the direction a sweep re-verifies and a retro can
+        repair. That contract is the design: closure needs no transactional
+        coupling to git, because the ledger's consumers re-verify entries
+        against the codebase anyway.
+
+        **Placement.** Runs from ``_finalize_commit_phase`` — after artifact
+        verification, the verify commands, every checkpoint, the review loop,
+        the ``pre_commit_gate`` workflows and the ``pre_commit`` veto — and
+        still before ``finalize_commit``, whose ``git add -A`` stages an
+        in-repo annotation into the story's own commit (worktree isolation
+        included: the unit's ledger rides the unit commit and reaches the
+        target branch with the ordinary merge). Marking at dev-sync time
+        instead let a story that later failed verification or review leave the
+        ledger permanently claiming its work resolved.
+
+        A ledger outside the repo (``ProjectPaths.rebased`` deliberately
+        shares an external artifact dir between worktrees) is written at the
+        same moment; the annotation is simply part of no commit, which is
+        journaled (``deferred-close-external-ledger``). A merge that later
+        fails leaves that annotation standing — visible, journaled and
+        human-attended, the accepted advisory trade-off.
+
+        ``snapshot``, when given, receives ``(ledger, pre-close text)`` the
+        statement before the write, so the caller's failure arms can undo the
+        edit no matter where inside the window a raise lands — including a
+        journal append failing after the write published. Cleared again when
+        nothing was flipped: an empty close needs no restore.
+
+        Idempotent, so the COMMITTING resume arm may re-drive the commit phase
+        freely — ids are classified against the ledger text, and an entry
+        already ``done`` is a satisfied declaration, not an unmatched one."""
+        ids = self._declared_deferred_ids(task)
+        if not ids:
+            return
+        ledger = self.workspace.paths.deferred_work
+        try:
+            text = ledger.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            # Nothing at the path — but a dangling link IS something: the link
+            # names a ledger on a mount that is not answering, and blaming a
+            # typo (`unmatched`) would misreport an outage.
+            try:
+                dangling = ledger.is_symlink()
+            except OSError:
+                dangling = True
+            if dangling:
+                self._journal_ledger_unavailable(task, ids, ledger, "dangling symlink")
+                return
+            text = ""  # no ledger: classify reports every id unmatched; nothing is written
+        except (OSError, UnicodeDecodeError) as e:
+            # An unavailable or undecodable location is not an answer about the
+            # entries: close nothing and say so, rather than read an outage as
+            # "no such entries".
+            self._journal_ledger_unavailable(task, ids, ledger, f"{e.__class__.__name__}: {e}")
+            return
+        if snapshot is not None:
+            snapshot.append((ledger, text))
+        marked = self._apply_deferred_closes(task, ids, ledger, text)
+        if snapshot is not None and not marked:
+            # `mark_done_many` writes only when it marks: the ledger is
+            # byte-identical, so a restore would record a rollback of nothing.
+            snapshot.clear()
+        if marked and not self._ledger_in_repo(ledger):
+            self.journal.append(
+                "deferred-close-external-ledger",
+                story_key=task.story_key,
+                dw_ids=list(marked),
+                ledger=str(ledger),
+                note="ledger is outside the repo; the annotation is not part of any commit",
+            )
+
+    def _journal_ledger_unavailable(
+        self, task: StoryTask, ids: Sequence[str], ledger: Path, error: str
+    ) -> None:
+        self.journal.append(
+            "deferred-close-ledger-unavailable",
+            story_key=task.story_key,
+            dw_ids=list(ids),
+            ledger=str(ledger),
+            error=error,
+        )
+
+    def _ledger_in_repo(self, ledger: Path) -> bool:
+        """Whether the ledger's annotation rides the story's commit. Decided on
+        RESOLVED paths: an in-repo symlink to a shared external ledger must
+        count as external. A path that cannot be resolved reports as external —
+        the write has already happened either way, and "part of no commit" is
+        the claim that stays true when nothing else is known."""
+        try:
+            return ledger.resolve().is_relative_to(self.workspace.root.resolve())
+        except (OSError, RuntimeError):
+            return False
+
+    def _restore_deferred_closes(self, task: StoryTask, snapshot: list[tuple[Path, str]]) -> None:
+        """Put the ledger back the way ``_close_declared_deferred`` found it,
+        after the commit its closures were written for failed (#234): left
+        alone the entries read ``done`` for work that is in no commit, and the
+        likeliest recovery makes that permanent — a human-resolved re-drive
+        sets ``resolved_redrive``, which has ``safe_reset`` preserve the
+        artifact folders' tracked content through the rollback.
+
+        Whole-document, from the pre-close text. Within the commit window the
+        engine is the only writer this restore can know about; anything else
+        that edited the ledger inside it (a native pre-commit hook, say) is
+        restored away with the close — an accepted advisory trade-off, and the
+        escalation hands the tree to a human either way.
+
+        Advisory itself, twice over: a failed restore is journaled, never
+        raised, and the journaling is suppressed rather than allowed to become
+        the crash — this runs inside except arms whose exception must travel
+        unchanged. Skipping the `raise` would replace a `RunStopped` with a
+        symlink complaint; skipping the `GitError` arm's `_escalate` would
+        strand the story in COMMITTING with no diagnosis on the record.
+
+        The guard is type-agnostic on purpose, and `OSError` is not wide enough
+        to hold it: `atomic_write_text` resolves the path before its own try,
+        and below 3.13 `Path.resolve` reports a symlink loop as `RuntimeError`
+        — the same non-OSError `_ledger_in_repo` already catches for this very
+        path. Catching `Exception` and not `BaseException` is the other half:
+        `RunStopped` is an `Exception`, so a second stop signal landing inside
+        the restore is absorbed while the first still travels, and a genuine
+        KeyboardInterrupt still gets out."""
+        if not snapshot:
+            return
+        ledger, before = snapshot[-1]
+        try:
+            atomic_write_text(ledger, before)
+        except Exception as e:
+            with contextlib.suppress(Exception):
+                self.journal.append(
+                    "deferred-close-rollback-failed",
+                    story_key=task.story_key,
+                    ledger=str(ledger),
+                    # named, not bare `str(e)`: now that every type is admitted,
+                    # a message alone cannot say whether the disk or the path
+                    # was the fault. Matches `_journal_ledger_unavailable`.
+                    error=f"{e.__class__.__name__}: {e}",
+                )
+            return
+        with contextlib.suppress(Exception):
+            self.journal.append(
+                "deferred-close-rolled-back", story_key=task.story_key, ledger=str(ledger)
+            )
+
+    def _apply_deferred_closes(
+        self, task: StoryTask, ids: Sequence[str], ledger: Path, text: str
+    ) -> list[str]:
+        """Write the closure for `ids`, journal exactly what landed, and return
+        the ids actually flipped.
+
+        ``text`` is the ledger snapshot the caller already read, never re-read
+        here: classification and the write have to describe the same document, and
+        a second read is a second chance for the location to have gone away
+        underneath them."""
+        declared = deferredwork.classify(text, ids)
+        marked = deferredwork.mark_done_many(
+            ledger, declared.open_ids, self._today(), f"resolved by story {task.story_key}"
+        )
+        if marked:
+            self.journal.append("story-deferred-closed", story_key=task.story_key, dw_ids=marked)
+        if declared.unknown:
+            self.journal.append(
+                "deferred-close-unmatched", story_key=task.story_key, dw_ids=list(declared.unknown)
+            )
+        if declared.malformed:
+            # Present in the ledger but carrying neither an `open` nor a `done`
+            # status: nothing was marked, and staying quiet would read to the
+            # operator exactly like a successful close.
+            self.journal.append(
+                "deferred-close-malformed",
+                story_key=task.story_key,
+                dw_ids=list(declared.malformed),
+                error="ledger entry status is neither open nor done",
+            )
+        if declared.duplicates:
+            # One id, two entries: only the first was classified and only the
+            # first can be marked, so whatever the second says about this work is
+            # neither read nor written. A corrupt ledger (#286) must not close
+            # quietly — the operator has to know which id to go look at.
+            self.journal.append(
+                "deferred-close-duplicate-id",
+                story_key=task.story_key,
+                dw_ids=list(declared.duplicates),
+                error="the ledger carries more than one entry for this id; only the first was read",
+            )
+        return marked
 
     def _extra_session_env(
         self, task: StoryTask, role: str, label: str | None = None
@@ -2036,6 +2465,7 @@ class Engine:
         seq: int,
         session_stage: str | None = None,
         label: str | None = None,
+        spec_snapshot: SpecSnapshot | None = None,
     ) -> SessionResult:
         # ``label`` names a non-standard session (a plugin-provided workflow) so
         # its task_id stays distinct from the role's own dev/review attempts.
@@ -2117,6 +2547,45 @@ class Engine:
             token_budget_mode=self.policy.limits.session_budget_mode,
             token_budget_grace_s=float(self.policy.limits.session_budget_grace_s),
             cache_read_weight=self.policy.limits.cache_read_weight,
+            # Launch-state snapshot of a review session's spec (#276 M1); None for
+            # every other session and on a crash-resume (process-transient).
+            spec_snapshot=spec_snapshot,
+            # The spec this session is required to write, when already known (#261),
+            # so the adapter reads THAT path back instead of mtime-scanning a
+            # directory shared with every concurrent run. Same `_generic_dev()` guard
+            # as the snapshot above, so the two can never disagree about whether the
+            # devcontract read-back is in play.
+            #
+            # Pinned ONLY when the dispatched prompt NAMES that path — the read-back
+            # may demand a file back solely because the session was told to write it.
+            # Knowing a spec exists is not the same as having pointed a session at it:
+            # a from-scratch re-drive after an escalation/deferral has `task.spec_file`
+            # recorded (`_record_dev_spec`) but dispatches a bare story key, a sweep
+            # bundle dispatches `intent.md`, and StoriesEngine dispatches folder+id.
+            # Pinning those would poll a path the session never promised to rewrite
+            # and score its real output as "wrote nothing" — trading #261's unsafe
+            # failure for a work-LOSING one, the exact trade this fix exists to avoid.
+            # Testing the prompt keeps the pin and the contract that justifies it in
+            # one place across all three engines (each builds its own prompt), and
+            # reads the post-gate text, so a plugin rewrite cannot desynchronize them.
+            # A miss simply falls back to the scan — the pre-#261 behavior.
+            #
+            # Withheld from an injected plugin-workflow session (`label` set — e.g. a
+            # TEA pre_commit_gate): it runs the generic adapter but owes the
+            # WORKFLOW_COMPLETION_CONTRACT marker above, not the story spec, so
+            # pinning it to task.spec_file would point the read-back at the wrong
+            # file. Same doctrine as StoriesEngine withholding BMAD_LOOP_SPEC_FOLDER
+            # from labeled sessions.
+            expected_spec=(
+                task.spec_file
+                if (
+                    label is None
+                    and self._generic_dev()
+                    and task.spec_file
+                    and str(task.spec_file) in prompt
+                )
+                else None
+            ),
         )
         self.journal.set_active_log(task_id)
         self.journal.append(
@@ -2149,6 +2618,11 @@ class Engine:
                 self.journal.append(
                     "session-synthesized-from-frontmatter", task_id=task_id, role=role
                 )
+                # #276 M3: the marker the skill owed was never appended. Repair the
+                # on-disk spec (best-effort) so the next re-read is harvested on the
+                # normal marker path. Covers live-Stop, crash-path, and post-kill
+                # dead-window synthesis — every path that sets this flag.
+                self._repair_spec_marker(task, result.result_json)
             # Only dev/review sessions are resumable — `_resumable_session` matches
             # exactly those task ids under DEV_RUNNING/REVIEW_RUNNING. For everything
             # else (triage/sweep, labeled plugin-workflow sessions) the payload is
@@ -2295,8 +2769,9 @@ class Engine:
         devcontract.reset_spec_status(spec_path, "in-progress")
         devcontract.strip_auto_run_result(spec_path)
 
-    def _reset_spec_for_review(self, task: StoryTask) -> None:
-        """Strip the prior pass's stale `## Auto Run Result` before a review launch.
+    def _reset_spec_for_review(self, task: StoryTask) -> SpecSnapshot | None:
+        """Strip the prior pass's stale `## Auto Run Result` before a review launch,
+        then capture a launch-state snapshot of the spec (#276 M1).
 
         A follow-up review session re-invokes bmad-dev-auto on the FINALIZED spec,
         which still carries the dev pass's terminal `## Auto Run Result` section.
@@ -2308,15 +2783,40 @@ class Engine:
         PREVIOUS review pass's own marker, so this runs before every review launch,
         never on the crash-resume replay branch (no session launches there). Unlike
         `_reset_spec_for_repair` the frontmatter is left untouched: `status: done` is
-        what routes the re-invocation's step-01 to a fresh step-04 review pass.
+        what routes the re-invocation's step-01 to a fresh step-04 review pass — the
+        HARD CONSTRAINT that the review-launch frontmatter status is NEVER mutated
+        (it is load-bearing skill routing), so every #276 mechanism observes only.
 
-        No-op when the dev skill is not the generic one or no spec is recorded yet.
-        Repair-write doctrine (see `devcontract.strip_auto_run_result`): a present-
-        but-unreadable spec raises rather than silently proceeding stale — skipping
-        the strip recreates the exact bug state, so it must surface."""
+        Returns a `SpecSnapshot` of the on-disk spec as it stood at launch — its
+        content hash, mtime, and normalized frontmatter status — so the generic
+        adapter's missing-marker fallback can refuse to synthesize from a candidate
+        whose bytes never changed this session (a `done` spec re-opened for review,
+        never re-written). Snapshot capture is best-effort: a torn/unreadable read
+        degrades to `None` (journaled, `review-launch-snapshot`), and the fallback
+        then keeps its conservative 2-observation fingerprint path. Only the capture
+        is guarded — the strip keeps its raise-on-unreadable repair doctrine (see
+        `devcontract.strip_auto_run_result`): skipping the strip recreates the exact
+        #160 bug state, so it must surface.
+
+        No-op (returns `None`) when the dev skill is not the generic one or no spec
+        is recorded yet."""
         if not self._generic_dev() or not task.spec_file:
-            return
-        devcontract.strip_auto_run_result(Path(task.spec_file))
+            return None
+        spec_path = Path(task.spec_file)
+        devcontract.strip_auto_run_result(spec_path)
+        try:
+            raw = spec_path.read_bytes()
+            mtime_ns = spec_path.stat().st_mtime_ns
+            fm_status = str(verify.read_frontmatter(spec_path).get("status", "")).strip().lower()
+        except OSError as e:
+            self._journal_spec_read_failed(spec_path, task.story_key, "review-launch-snapshot", e)
+            return None
+        return SpecSnapshot(
+            path=str(spec_path),
+            mtime_ns=mtime_ns,
+            sha256=hashlib.sha256(raw).hexdigest(),
+            fm_status=fm_status,
+        )
 
     def _write_feedback(self, task: StoryTask, reason: str) -> Path:
         """Persist a verification failure where the next session can read it —

@@ -9,6 +9,31 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **Stories can close deferred-work entries (#234).** The ledger was one-way: entries are filed
+  automatically but were only ever marked resolved by hand. A story can now declare the entries
+  its work closes — `closes_deferred: [DW-5, DW-6]`, on its `stories.yaml` entry (stories mode)
+  or in the story spec's frontmatter, the two unioned — and when the story commits, the
+  orchestrator flips each declared entry to `status: done <date>` + `resolution: resolved by
+story <id>`, the same annotation a sweep bundle writes. Both sprint and stories mode.
+
+  Advisory by contract: the annotation is written at the commit boundary — behind every verify
+  gate, checkpoint and review cycle, just before the squash — so an in-repo ledger carries it in
+  the story's own commit (worktree isolation included) and a story that fails, is rejected by
+  review, or escalates closes nothing; a commit that then fails takes the annotation back with
+  it. The declaration is re-read at that boundary, so a late edit counts in both directions, and
+  an id already `done` is a silent no-op across a resume. Nothing about it can fail a story:
+  unknown ids, duplicate ids, unreadable entry statuses, an unreadable ledger location and a
+  non-list spec declaration are journaled warnings (a non-list `closes_deferred` in `stories.yaml`
+  is a manifest schema error like any other). A ledger outside the repo is written at the same
+  moment; its annotation is part of no commit, which is journaled
+  (`deferred-close-external-ledger`).
+
+  `bmad-loop validate` warns up front in both queue modes (`deferred.closes-unknown`,
+  `deferred.closes-malformed`, `deferred.closes-entry-unreadable`, `deferred.ledger-unreadable`);
+  warnings never change the exit code. The field is human-authored, like `spec_checkpoint` — no
+  upstream skill emits it yet (BMAD-METHOD#2619 proposes it at breakdown), and re-deriving
+  `stories.yaml` drops it unless the intent is logged in `.memlog.md`.
+
 - **Readable run logs for `opencode-http` (#306).** Contributed by
   [@jackmcintyre](https://github.com/jackmcintyre). The HTTP adapter has no tmux pane to replay,
   so a finished opencode run left `logs/<task-id>.log` holding nothing but the server's own INFO
@@ -66,6 +91,21 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- **`bmad-loop-setup` stops registering BMAD config; the installer owns it (#258).** The skill
+  wrote `_bmad/config.yaml`, `_bmad/config.user.yaml` and a root `_bmad/module-help.csv` — the
+  pre-v6.10 layout, which BMAD's own resolver never reads (it merges four TOML layers, and
+  `/bmad-help` reads a catalog assembled from per-module `_bmad/<module>/module-help.csv`). Since
+  v6.10.0 bmad-loop is an installer-installed module, so the BMAD installer already stages
+  `_bmad/bmad-loop/`, writes the manifests, and rebuilds the help catalog on every run — and
+  regenerates the central `config.toml` wholesale, discarding anything written there from outside.
+  The three PEP 723 scripts (`merge-config.py`, `merge-help-csv.py`, `cleanup-legacy.py`) are
+  **removed**; setup now writes exactly one file under `_bmad/`, the per-module
+  `_bmad/bmad-loop/module-help.csv`, and otherwise does only what the installer cannot: install
+  or upgrade the orchestrator tool, run `bmad-loop init`, and preflight with `validate`. It reads
+  the user's name and language through BMAD's own `resolve_config.py` instead of collecting them.
+  Dropping the scripts also closes the PEP 723 invocation bug (#259) — no inline-dependency script
+  is invoked with bare `python3` any more, because none ships.
+
 - **Ctrl+C outside a run now exits `130` cleanly (#241).** A `KeyboardInterrupt` escaping
   `main()` outside `engine.run()` (config load, engine construction) now prints a one-line
   `interrupted` to stderr and returns the new `ExitCode.INTERRUPTED` (`130` = 128 + SIGINT).
@@ -75,7 +115,108 @@ breaking changes may land in a minor release.
   `subprocess.returncode` sees `130` rather than `-2`). A Ctrl+C _during_ a run is unchanged:
   the engine still finalizes it as a resumable `stopped` run (rc `0`).
 
+### Removed
+
+- **The `bmad-auto` → `bmad-loop` rename compatibility is gone.** The rename shipped in 0.8.0 and
+  no pre-rename installs remain in the wild, so `init` no longer strips `bmad_auto`-marked hooks,
+  deletes `bmad-auto-*` skill dirs, carries `.automator/policy.toml` over to `.bmad-loop/`, or
+  prints the leftover-`.automator/` note. `bmad-loop-setup` drops its migration section with them.
+  A project still on `bmad-auto` should migrate on 0.9.0 before upgrading past it.
+
 ### Fixed
+
+- **A session's read-back could adopt another story's spec (#261).** The generic dev/review
+  read-back located "the artifact this session produced" by scanning the implementation-artifacts
+  dir for the most-recently-modified qualifying `*.md`, with nothing tying the match to the story
+  being driven. That dir is shared: under worktree isolation the search also covers the main
+  checkout's copy, and with `isolation="none"` it _is_ that copy. A foreign story's spec landing
+  there after launch — a concurrent run's merge-back, a human edit, a sweep — won on mtime and
+  became this session's result, so a review that produced nothing was scored `completed:done`
+  (merging unreviewed code) and, on the dev leg, its `followup_review_recommended: false` skipped
+  the review entirely. Unlike the rest of this family (#88/#127/#160/#224) it failed toward
+  _landing_ unverified work. Two fixes, both in the adapter:
+  - **Authoritative-path read-back.** Where the orchestrator has pointed the session at the spec it
+    owes — every review leg, every dev repair, every patch-restore re-drive — `SessionSpec.expected_spec`
+    pins the read-back to that one file and the directory scan is never reached. The pin is taken only
+    when the dispatched prompt names the path: a from-scratch re-drive after an escalation or deferral
+    has a recorded `StoryTask.spec_file` but dispatches a bare story key, and pinning there would poll a
+    stale path while the re-drive's real output went unread. This closes the asymmetry with stories mode,
+    which already resolved by id rather than by mtime, and covers the #224 missing-marker fallback (a
+    second mtime-only scan of the same shared dir) through the same seam. Deliberately not a filename
+    rule: spec names come from an LLM-derived slug, so a prefix check risks trading this unsafe
+    failure for a lossy one — and a pinned path needs no exemption for the `bmad-dev-auto-result-*`
+    fallback or for sweep bundles, which legitimately adopt a differently-named story spec (#161).
+    A dev attempt 1 has no recorded spec yet and keeps the scan. Relatedly, the skill's no-spec
+    fallback marker is no longer recorded as a story's spec at all — it is not one, and every
+    consumer of `task.spec_file` misroutes on it.
+  - **Proof-of-work gate.** A read-back artifact may no longer upgrade a dead session to
+    `completed` when that session shows no evidence it ran at all — no turn ever ended _and_ its
+    pane log never grew past a small floor. The two signals are ORed because each has a blind spot
+    (a misbound pane sink still ends turns; a hook-less profile still logs). The hook signal is a
+    `Stop` event specifically: `SessionStart` and `SessionEnd` are emitted by a CLI that launched
+    and wedged, so reading either as work would leave the gate satisfied in exactly the case it is
+    for. For the same reason the pane log is created empty at launch, so a window that dies before
+    the tee attaches reports "rendered nothing" rather than "no pane signal here". Scoped to the
+    shared-directory read-back: a task-scoped `result.json` is unique to its session and cleared at
+    launch, so it stays authoritative. Applies to both the crash path and `_post_kill_reconcile`,
+    and journals `readback-refused-no-proof-of-work`.
+
+- **`validate` requires the review skills your `bmad-dev-auto` actually invokes (#260).** The
+  preflight held every project to a fixed catalog that included `bmad-review-verification-gap`,
+  which no tagged BMAD-METHOD release ships (absent from v6.10.0; on current sources only a
+  forwarder to the merged `bmad-review`), and misdiagnosed it as "install the BMad Method (bmm)
+  module" on projects where bmm _was_ installed — so `validate`/`run`/`resume`/`sweep` could not
+  pass on a stock install. The required reviewers are now read from the installed skill itself:
+  its `customize.toml` `[[workflow.review_layers]]` when present (honoring disabled layers and
+  `_bmad/custom/bmad-dev-auto.toml` overrides), else the reviewers `step-04-review.md` names
+  inline. A merged-`bmad-review` install needs only `bmad-review`; a v6.10.0 install needs the
+  two hunters it names; and a tree whose configured layers reference a skill it does not have is
+  now caught by a new `skills.review-layer-missing` problem instead of passing and then failing
+  on every dev run. Unreadable configs fall back to the previous static requirement, and all
+  messages name the real remedy (install/update bmm, BMAD-METHOD >= 6.10.0).
+
+  Derivation is held to what the run really resolves:
+  - Override merging matches BMAD's own resolver (`resolve_customization.py`) exactly — arrays of
+    tables opt into keyed merge only when _every_ combined item carries the same identifier, and
+    `code` is checked before `id`; anything mixed or key-less appends. Keying on `id` alone
+    silently dropped base layers in one direction and kept superseded ones in the other.
+  - An override that is not valid TOML no longer abandons derivation: the resolver skips a broken
+    layer and carries on, so the preflight does too, reporting the file as a
+    `skills.customize-unreadable` warning.
+  - A `customize.toml` whose `workflow` key is valid TOML of the wrong _shape_ (a string, list or
+    number) no longer raises `AttributeError` out of `validate`/`run`/`resume`/`sweep`.
+  - Disabling every review layer is reported as `skills.review-layers-empty` rather than passing:
+    `step-04-review.md` HALTs blocked with `no active review layers`.
+  - Layers that cannot be resolved statically — gated by a `when` condition the model evaluates at
+    run time, or naming a skill in a phrasing this check cannot confirm is a handoff — are reported
+    as `skills.review-layer-unresolved` **warnings** and never block. `validate` and the run
+    preflight now branch on severity, so an advisory can no longer abort a run.
+  - Isolated worktrees get what was validated: `provision_worktree` copies the review skills the
+    project's own layers name (not just the fixed base catalog) and seeds `_bmad/custom/`, whose
+    `*.user.toml` layer the upstream installer gitignores — without it the preflight resolved one
+    layer set from the main checkout while the worktree run resolved another.
+
+- **`notify.desktop` works on macOS/Windows, and warns when it can't (#231).** The desktop
+  notification channel was `notify-send`-only, so on macOS and Windows `notify.desktop` (default
+  `true`) was silently inert — every "a human is needed" path (escalations, deferrals,
+  worktree-open failures) reached no one, leaving only the untailed `ATTENTION` file. `gates.notify`
+  now dispatches natively per platform: `osascript` (macOS), a best-effort WinRT PowerShell toast
+  (Windows), `notify-send` (Linux); the untrusted title/message are handed to `osascript`/PowerShell
+  through environment variables and to `notify-send` as argv — never interpolated into the command
+  string. When `notify.desktop` is set but no
+  notifier exists on the platform, `validate` emits a `notify.desktop-unavailable` warning and the
+  run start prints a one-time stderr warning plus a `notify-desktop-unavailable` journal event.
+  Note: headless CI cannot observe a real toast/notification (there is no macOS job), so the
+  unit tests assert command construction only. To verify visual delivery, set
+  `notify.desktop = true` and trigger a notify path on each OS (macOS/Windows/Linux) — or call
+  `gates.notify` directly — and confirm a notification appears.
+
+- **Scrollable modal dialogs (#275).** The decision, escalation, confirm, sweep-options and
+  story-checkpoint TUI dialogs now scroll their bodies and dock their action buttons, so the
+  choose/action buttons stay reachable with long content down to the dialog's minimum frame
+  height (previously the lowest button could be clipped off-screen with no scrollbar). Safety
+  warnings that gate an enabled Resume/Re-arm are docked with the buttons so they cannot scroll
+  out of view, and the Resume confirm re-checks engine liveness at click time.
 
 - **A finished story whose session omitted `## Auto Run Result` no longer livelocks and
   DEFER-drops (#224).** The review HALT intermittently finalizes the spec's frontmatter to
@@ -89,6 +230,64 @@ breaking changes may land in a minor release.
   carry `synthesized_from_frontmatter` and journal `session-synthesized-from-frontmatter`;
   new resultless-stop breadcrumb verdicts `terminal-frontmatter-pending` and
   `ambiguous-frontmatter` record the fingerprint's progress.
+
+- **Deterministic missing-marker catch + repair (#276).** Hardens the #224 missing-marker
+  fallback, whose attribution was heuristic (a 2-stable-Stops fingerprint, or a single sighting
+  post-kill) and left the spec non-compliant on disk:
+  - _Launch-state snapshot + content-hash gate._ Before every review launch the engine now
+    captures a `SpecSnapshot` (content hash, mtime, frontmatter status) of the spec immediately
+    after the #160 marker strip and threads it onto the review `SessionSpec`. The fallback
+    deterministically refuses to synthesize from a candidate whose bytes still hash equal to that
+    snapshot — the spec is provably untouched by this session (a `done` spec re-opened for review,
+    never re-written) — in **every** mode, including the dead-window post-kill reconcile. This kills
+    the documented dead-window false positive (a review killed after an mtime-only bump but before
+    the `in-review` flip, previously scored `done` without having run). New resultless-stop verdict
+    `unmodified-since-launch` and dead-window lifecycle crumb `frontmatter-unmodified-refused`
+    record each refusal. The snapshot is process-transient (a crash-resume degrades to the
+    conservative 2-observation path), and the review-launch frontmatter `status` is never
+    mutated — it remains load-bearing skill routing. The same launch-snapshot decision (M1 hash +
+    M2 transition, a single shared `_snapshot_verdict`) also guards the stories-mode folder+id
+    read-back, closing the identical false completion on that path; snapshot/candidate identity is
+    by resolved filesystem path, not raw string spelling.
+  - _Mid-session status-transition observation._ On each heartbeat tick the generic (and
+    OpenCode) dev adapter now samples the snapshotted spec's frontmatter and records the first
+    status it observes this session drive off its launch state to a live, non-terminal value
+    (in practice `in-review`), with a `spec-status-transition-observed` lifecycle crumb. A
+    recorded transition is deterministic proof the terminal frontmatter the spec later carries
+    is this session's own write, so the fallback synthesizes on a single terminal sighting —
+    live or dead window — instead of the 2-observation fingerprint (the synthesized crumb gains
+    a `transition` flag). A recorded transition now **outranks** the content-hash gate: a clean
+    review can round-trip `done → in-review → done` back to the launch bytes while still omitting
+    its marker, and the observed `in-review` proves it ran, so the hash gate refuses only when no
+    transition was seen. A transition that flips entirely between two ticks is missed and falls
+    back to the conservative fingerprint path.
+  - _Artifact repair._ When the fallback synthesizes a result the engine now appends the
+    `## Auto Run Result` marker the skill owed onto the on-disk spec (new
+    `devcontract.append_auto_run_result`, the inverse of the #160 strip), so the once-invisible
+    spec re-enters the normal marker scan and the next review launch strips it exactly like a
+    skill-written marker. Best-effort at the `session-synthesized-from-frontmatter` site (covers
+    live-Stop, crash-path, and post-kill synthesis): guarded to the generic path, refused for a
+    spec resolved outside the orchestrator-owned roots or whose fresh frontmatter no longer agrees
+    with the synthesized status (journal `spec-marker-repaired` / `spec-marker-repair-failed` /
+    `spec-marker-repair-skipped`), so it can never author a marker that disagrees with the
+    frontmatter. The append and the #160 strip/reset now rewrite the spec atomically (temp +
+    `atomic_replace`), so an interrupted or disk-full repair leaves the original spec intact rather
+    than truncated, and a spec ending in a bare `\r` no longer receives an invisible (unparsed)
+    heading.
+  - _Targeted contract nudge_ (`limits.dev_contract_nudge`, default `true`). On the first
+    `terminal-frontmatter-pending` Stop — a marker-less terminal spec that is not the hash-gate
+    refusal and whose transition is not yet proven — the dev adapter sends one tmux nudge asking
+    the skill to append the `## Auto Run Result` section it owed and end its turn, repairing the
+    omission at its source; a compliant append is then harvested by the ordinary marker scan (no
+    synthesis, no `synthesized_from_frontmatter` flag). It fires exactly once per session — marked
+    before the send (a raising transport still counts), never refilled, and touching no stall
+    counters, so an mtime bump that resets the observation counter can never re-nudge (the #149
+    refill hazard structurally cannot apply). `contract-nudge-sent` lifecycle crumb; set
+    `dev_contract_nudge = false` to rely on harness-side synthesis alone.
+
+  Together these hold one HARD CONSTRAINT: the spec's `status:` at review launch is load-bearing
+  routing input to the upstream skill, so the frontmatter is **never** mutated at review launch —
+  every mechanism is observation or a prose-append, never a status write.
 
 ## [0.9.0] — 2026-07-21
 

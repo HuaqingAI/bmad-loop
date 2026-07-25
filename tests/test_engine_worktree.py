@@ -57,7 +57,9 @@ def commit_sprint(project, statuses: dict[str, str]) -> None:
     git(project.project, "commit", "-q", "-m", "sprint")
 
 
-def wt_dev_effect(project, story_key, *, final_status="done", followup_review=True):
+def wt_dev_effect(
+    project, story_key, *, final_status="done", followup_review=True, closes_deferred=None
+):
     """Dev session running inside the unit worktree (spec.cwd). Mirrors the
     bmad-dev-auto skill: self-finalizes the spec to done, never writes the sprint
     board (the orchestrator advances it via the B2 seam, inside the worktree).
@@ -71,7 +73,7 @@ def wt_dev_effect(project, story_key, *, final_status="done", followup_review=Tr
         src = cwd / "src.txt"
         src.write_text(src.read_text() + f"change for {story_key}\n")
         sp = wt.implementation_artifacts / f"spec-{story_key}.md"
-        write_spec(sp, final_status, baseline)
+        write_spec(sp, final_status, baseline, closes_deferred=closes_deferred)
         # NO set_sprint: the orchestrator is the single sprint-status writer
         return SessionResult(
             status="completed",
@@ -1429,4 +1431,35 @@ def test_dev_retry_in_worktree_auto_recovers_instead_of_pausing(project):
     # only the successful attempt's work merged to the target branch
     src = (project.project / "src.txt").read_text()
     assert "change for 1-1-a" in src and "bad attempt" not in src
+    assert worktree_clean(project.project)
+
+
+# ------------------------------------ story-declared deferred-work closure (#234)
+
+
+def _ledger_entry(paths, dw_id: str):
+    from bmad_loop import deferredwork
+
+    text = paths.deferred_work.read_text(encoding="utf-8")
+    return next(e for e in deferredwork.parse_ledger(text) if e.id == dw_id)
+
+
+def test_worktree_in_repo_ledger_closure_reaches_the_target_branch(project):
+    """An in-repo ledger is rebased into the unit worktree, so the closure rides
+    the unit's own commit and arrives on the target branch with the merge (#234)."""
+    from conftest import write_ledger
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a", followup_review=False, closes_deferred=["DW-1"])],
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    entry = _ledger_entry(project, "DW-1")
+    assert entry.status.startswith("done") and not entry.open
+    assert "resolution: resolved by story 1-1-a" in entry.body
     assert worktree_clean(project.project)

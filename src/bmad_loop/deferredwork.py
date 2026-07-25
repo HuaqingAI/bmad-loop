@@ -13,8 +13,11 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+
+from .platform_util import atomic_write_text
 
 HEADING_RE = re.compile(r"^### (DW-\d+): (.+?)\s*$", re.MULTILINE)
 ANY_HEADING_RE = re.compile(r"^#{1,6} ", re.MULTILINE)
@@ -64,6 +67,102 @@ def open_ids(text: str) -> set[str]:
     return {e.id for e in parse_ledger(text) if e.open}
 
 
+def parse_declaration(raw: object) -> tuple[tuple[str, ...], str | None]:
+    """The single reading of a ``closes_deferred:`` declaration (#234), shared by
+    the ``stories.yaml`` parser, the engine's close hook, and ``validate``.
+
+    Returns the normalized ids plus an error describing a wrong *container*.
+    Missing / YAML-null is an empty declaration, not an error.
+
+    Strict about the container, lenient about each item. A bare
+    ``closes_deferred: DW-1`` is a schema error rather than a silently-wrapped
+    single id — a string is iterable, so a lenient reading would quietly turn one
+    id into a list of characters — while items are ``str()``-normalized and
+    stripped, because an LLM-authored manifest may emit an unquoted ``DW-1`` as a
+    string but a bare ``5`` as an int. Blanks drop and duplicates collapse
+    (order-preserving): both are noise, not a contradiction.
+
+    Callers decide the severity: the manifest parser raises, the engine journals,
+    ``validate`` warns. What they must NOT do is disagree — before this, a wrong
+    container was a hard schema error in ``stories.yaml`` and a silent empty
+    declaration in frontmatter, so the same mistake either failed the parse or
+    vanished depending on which file it was made in.
+
+    Whether an id names a real entry is not decided here; that needs the ledger
+    (:func:`classify`).
+    """
+    if raw is None:
+        return (), None
+    if not isinstance(raw, list):
+        return (), f"must be a list of deferred-work ids (got {type(raw).__name__})"
+    return tuple(dict.fromkeys(item for item in (str(x).strip() for x in raw) if item)), None
+
+
+@dataclass(frozen=True)
+class Declared:
+    """How declared ids line up against one ledger snapshot (#234).
+
+    Four outcomes, not two, because "not open" hides two very different cases.
+    ``already_done`` is a satisfied declaration — a resume re-driving a close that
+    already landed — and must stay silent. ``malformed`` is an entry that exists
+    but carries neither an ``open`` nor a ``done`` status: nothing can be marked,
+    and saying nothing would leave the operator believing it was.
+
+    ``duplicates`` cross-cuts the other four: it names the declared ids the ledger
+    carries more than once, whichever bucket they landed in. A duplicate id is a
+    corrupt ledger (#286), and the entry this classification describes is only one
+    of them — so the close is reported, never silent.
+    """
+
+    open_ids: tuple[str, ...] = ()
+    already_done: tuple[str, ...] = ()
+    unknown: tuple[str, ...] = ()
+    malformed: tuple[str, ...] = ()
+    duplicates: tuple[str, ...] = ()
+
+
+def classify(text: str, ids: Sequence[str]) -> Declared:
+    """Partition `ids` against a single ledger snapshot, preserving order.
+
+    Classifying from a snapshot rather than from :func:`mark_done`'s return value
+    is deliberate: that return conflates "already done" with "absent from the
+    ledger", and those need opposite treatment (silence vs. a warning).
+
+    **The FIRST entry of a duplicated id wins**, because that is the one
+    :func:`_find_entry` — and so every mutation in this module — acts on. Indexing
+    last-wins instead made the two disagree, and a ledger carrying one `DW-1` open
+    and another done then closed nothing while saying nothing, in either order: a
+    done-first ledger classified the id `open`, sent it to
+    :func:`mark_done_many`, and had :func:`_apply_done` refuse the done copy it
+    found first (marked nothing, so not even an unmatched warning); an open-first
+    ledger classified it `already_done` and never attempted the write at all
+    (#284 round-6 review, finding 4). The duplicate itself is reported through
+    ``duplicates`` rather than swallowed — one id naming two entries is a fault
+    about the ledger, not an answer about the work."""
+    by_id: dict[str, DWEntry] = {}
+    duplicated: set[str] = set()
+    for e in parse_ledger(text):
+        if e.id in by_id:
+            duplicated.add(e.id)
+            continue  # first wins: `_find_entry` mutates that one
+        by_id[e.id] = e
+    buckets: dict[str, list[str]] = {"open": [], "done": [], "unknown": [], "malformed": []}
+    for dw_id in ids:
+        entry = by_id.get(dw_id)
+        if entry is None:
+            buckets["unknown"].append(dw_id)
+            continue
+        word = entry.status.split()[0] if entry.status else ""
+        buckets[word if word in ("open", "done") else "malformed"].append(dw_id)
+    return Declared(
+        open_ids=tuple(buckets["open"]),
+        already_done=tuple(buckets["done"]),
+        unknown=tuple(buckets["unknown"]),
+        malformed=tuple(buckets["malformed"]),
+        duplicates=tuple(dw_id for dw_id in dict.fromkeys(ids) if dw_id in duplicated),
+    )
+
+
 def _find_entry(text: str, dw_id: str) -> DWEntry | None:
     for entry in parse_ledger(text):
         if entry.id == dw_id:
@@ -82,15 +181,13 @@ def _insert_after_status(text: str, entry: DWEntry, line: str) -> str:
     return text[:insert_at] + "\n" + line + text[insert_at:]
 
 
-def mark_done(path: Path, dw_id: str, date: str, note: str) -> bool:
-    """Flip one entry to `status: done <date>` and record a resolution note.
-    Returns False (no write) when the entry is missing or already done."""
-    if not path.is_file():
-        return False
-    text = path.read_text(encoding="utf-8")
+def _apply_done(text: str, dw_id: str, date: str, note: str) -> str | None:
+    """Flip one entry to `status: done <date>` + a resolution note *within* `text`.
+    None when the entry is missing or not open. The entry is re-located after the
+    status rewrite because that edit shifts every later span offset."""
     entry = _find_entry(text, dw_id)
     if entry is None or not entry.open:
-        return False
+        return None
     status_m = STATUS_RE.search(entry.body)
     assert status_m is not None  # open implies a status line
     start = entry.span[0] + status_m.start()
@@ -98,9 +195,44 @@ def mark_done(path: Path, dw_id: str, date: str, note: str) -> bool:
     text = text[:start] + f"status: done {date}" + text[end:]
     entry = _find_entry(text, dw_id)
     assert entry is not None
-    text = _insert_after_status(text, entry, f"resolution: {note}")
-    path.write_text(text, encoding="utf-8")
-    return True
+    return _insert_after_status(text, entry, f"resolution: {note}")
+
+
+def mark_done_many(path: Path, dw_ids: Sequence[str], date: str, note: str) -> list[str]:
+    """Flip every entry in `dw_ids` to `status: done <date>` + a resolution note,
+    in ONE read and ONE atomic write. Returns the ids actually flipped (missing
+    and already-done ids are skipped), in the order given.
+
+    All-or-nothing on purpose. A per-id read-modify-write loop leaves marks on
+    disk when it raises partway through several ids — a half-applied closure the
+    caller never gets to journal, so the ledger claims resolutions the run has no
+    record of. Here a failure writes nothing, and the returned list is exactly
+    what landed.
+
+    The write goes through :func:`~bmad_loop.platform_util.atomic_write_text`
+    rather than a bare tmp+replace: swapping a fresh inode over the ledger
+    otherwise resets its mode (a ``0600`` ledger silently becoming world-readable)
+    and turns a symlinked ledger into a regular file."""
+    if not path.is_file():
+        return []
+    text = path.read_text(encoding="utf-8")
+    marked: list[str] = []
+    for dw_id in dw_ids:
+        updated = _apply_done(text, dw_id, date, note)
+        if updated is None:
+            continue
+        text = updated
+        marked.append(dw_id)
+    if not marked:
+        return []
+    atomic_write_text(path, text)
+    return marked
+
+
+def mark_done(path: Path, dw_id: str, date: str, note: str) -> bool:
+    """Flip one entry to `status: done <date>` and record a resolution note.
+    Returns False (no write) when the entry is missing or already done."""
+    return bool(mark_done_many(path, [dw_id], date, note))
 
 
 def append_decision(path: Path, dw_id: str, date: str, label: str, detail: str) -> bool:

@@ -40,7 +40,7 @@ Inspired by the original [bmad-automator](https://github.com/bmad-code-org/bmad-
 
 - **Python 3.11+**, a **terminal multiplexer** (tmux is the bundled default), and a supported coding CLI — `claude` by default; `codex`, `gemini`, `copilot`, and `antigravity` (`agy`) via [profiles](#other-coding-clis).
 - **Linux or macOS** (or **Windows via WSL**, which _is_ Linux — it runs as-is). tmux is the bundled terminal-multiplexer backend (externals like the [herdr adapter](https://github.com/pbean/bmad-loop-adapter-herdr) co-install as packages and self-register — see [Terminal multiplexer backends](docs/multiplexer-backends.md)), and all of it sits behind a pluggable **registry** of OS seams (transport, process lifecycle, hook interpreter) with availability-aware selection — env var → persisted `[mux] backend` choice (`bmad-loop mux set <name>`) → platform default (`psmux` on Windows, `tmux` elsewhere) → first available platform match — so a native-Windows backend slots in as new files + a registration line each, with no engine edits — see [Porting bmad-loop to a new OS](docs/porting-to-a-new-os.md). Native Windows is not yet shipped.
-- A **BMAD v6 project** (`_bmad/bmm/config.yaml`, a `sprint-status.yaml` from `bmad-sprint-planning`) with the upstream `bmad-dev-auto` skill (and the three review-hunter skills its step-04 invokes inline: `bmad-review-adversarial-general`, `bmad-review-edge-case-hunter`, `bmad-review-verification-gap`) and the bmad-loop skill module from this repo installed (`bmad-loop-resolve`, `bmad-loop-sweep` — see [Installing the skill module](#installing-the-skill-module)). Standard BMAD skills stay untouched.
+- A **BMAD v6 project** (`_bmad/bmm/config.yaml`, a `sprint-status.yaml` from `bmad-sprint-planning`) on **BMAD-METHOD ≥ 6.10.0**, with the upstream `bmad-dev-auto` skill (and the review-layer skills its step-04 invokes inline: `bmad-review-adversarial-general` + `bmad-review-edge-case-hunter`, or the merged `bmad-review` skill that supersedes them in newer releases) and the bmad-loop skill module from this repo installed (`bmad-loop-resolve`, `bmad-loop-sweep` — see [Installing the skill module](#installing-the-skill-module)). Standard BMAD skills stay untouched.
 
 ## Quick start
 
@@ -173,7 +173,20 @@ Turn it on per project with `[stories] source = "stories"` + `spec_folder = "<ep
 - **`spec_checkpoint`** — pause _before_ code, to review the plan. The dev session halts right after planning (`Halt after planning.`) with the spec at `ready-for-dev`; the run pauses at a **plan checkpoint**. Approve to resume straight to implementation, or request a replan (resets the spec to `draft` so the next dispatch re-plans).
 - **`done_checkpoint`** — pause _after_ the story commits, to review the result before the loop moves on (skipped automatically when it is the last story).
 
-A story may set both (it pauses twice); `gates.mode` pauses stack on top. A blocked story escalates exactly as in sprint mode — `bmad-loop resolve`, then re-arm + resume — now with the story's title/description and the blocking condition surfaced; a pre-planning-halt **sentinel** spec is auto-deleted (a copy preserved under the run dir) on re-arm for a clean re-dispatch.
+An entry may also carry **`closes_deferred`** — the `DW-<n>` ledger ids that story's work closes (see [Deferred-work sweeps](#deferred-work-sweeps)):
+
+```yaml
+- id: '3-2'
+  title: Export digests
+  description: …
+  closes_deferred: [DW-5, DW-6]
+```
+
+Declaring it here rather than in the story spec is what lets the annotation happen without touching each generated spec: `bmad-dev-auto` generates the spec and knows nothing of the ledger, whereas the breakdown is authored while the ledger is in view. A spec that _does_ carry the field in frontmatter is honored too — the two are unioned.
+
+Like `spec_checkpoint` and `done_checkpoint`, this is a **human-authored, caller-only field**. Breakdown time, with the ledger open, is where it belongs — but it is not a deadline: the declaration is read when the story commits, so adding one to a story spec's frontmatter mid-run is honored, and withdrawing one before the commit means it is not closed. Upstream Story Breakdown does not emit it yet ([BMAD-METHOD#2619](https://github.com/bmad-code-org/BMAD-METHOD/issues/2619)), and re-deriving `stories.yaml` rewrites the file — so record the intent in `.memlog.md` alongside the story, or the declaration is lost on the next re-derive.
+
+A story may set both checkpoints (it pauses twice); `gates.mode` pauses stack on top. A blocked story escalates exactly as in sprint mode — `bmad-loop resolve`, then re-arm + resume — now with the story's title/description and the blocking condition surfaced; a pre-planning-halt **sentinel** spec is auto-deleted (a copy preserved under the run dir) on re-arm for a clean re-dispatch.
 
 `bmad-loop run --dry-run --spec <folder>` prints the linear schedule (list order, checkpoint markers, live on-disk state); `bmad-loop status` shows the same stories board.
 
@@ -235,6 +248,22 @@ bmad-loop sweep [--no-prompt] [--decisions-only] [--max-bundles N] [--repeat] [-
               `status: done` in the ledger.
 ```
 
+**Closing entries from a story.** Sweeps are not the only way an entry gets closed. A story spec can declare the entries its work closes, in frontmatter:
+
+```yaml
+closes_deferred: [DW-5, DW-6] # DW-<n> ids this story closes
+```
+
+In stories mode the same declaration can live on the `stories.yaml` entry instead (`closes_deferred: [DW-5, DW-6]`), which is where it belongs for an unattended run — the breakdown is authored while the ledger is in view, whereas the story spec is generated later by a dev skill that knows nothing of the ledger. Both channels are unioned. Either way the field is human-authored — like `spec_checkpoint` / `done_checkpoint`, no upstream skill emits it yet, and re-deriving `stories.yaml` drops it unless the intent is logged in `.memlog.md`.
+
+The orchestrator writes the same annotation a bundle close writes — `status: done <date>` and `resolution: resolved by story <id>` — into each declared entry. Without it the ledger is one-way: entries are filed automatically but only ever marked resolved by hand, so a multi-epic run ends with entries that were satisfied epics ago still reading `open`.
+
+**Closure happens at the commit boundary**, after artifact verification, the verify commands, every checkpoint, the review loop and the pre-commit workflows — and just before the story's commit is squashed, so an in-repo ledger carries the annotation in that same commit. A story that fails, blocks, is rejected by review, or escalates closes nothing, and there is nothing to undo. Closure is declared, never inferred from the diff; a resume re-driving the same close is a no-op; and an id that matches no entry is journaled rather than failing the story. The declaration is re-read at that boundary, so an edit made after the story was implemented is the one that counts.
+
+A declaration in a shape nothing can read — a bare `closes_deferred: DW-5` where a list belongs — depends on which channel it is in. In a **story spec** it is journaled and dropped, like an unknown id: the spec is generated mid-run by a dev skill, and a malformed field there must not be able to fail a story that succeeded. In **`stories.yaml`** it is a schema error, exactly like every other manifest field of the wrong type, and the manifest fails to load — the breakdown is hand-authored before the run, where `bmad-loop validate` reports it up front and a typo is still cheap to fix. `validate` warns about unknown ids in both queue modes and about a malformed spec declaration; a malformed manifest is the manifest's own `queue.stories-manifest` failure.
+
+> **Ledger outside the repo.** If `implementation_artifacts` is configured outside the project tree, the ledger is shared between worktrees and cannot be part of any commit. The annotation is written all the same, at the same moment, and the run journals `deferred-close-external-ledger` so its absence from git history is not a surprise. A location that cannot be read or written when the write comes due (a shared mount that has gone away) closes nothing and is journaled — those entries stay `open` for a sweep to re-verify, and an outage is never read as "no such entries".
+
 **Answering missed decisions later.** An unattended sweep (`--no-prompt`) skips decisions, and an interactive one can be abandoned before you answer them all — those answers would otherwise be lost, since triage re-derives the decision set from the ledger every run. `bmad-loop decisions` (or press `d` in the TUI) surfaces every decision past sweeps left unanswered, reconstructed from their triage output, and lets you answer them out of band. A `close` is applied immediately; a `build`/`keep-open` is saved to `.bmad-loop/decisions.json` and consumed by the next sweep (build → bundle, keep-open → recorded) with no re-prompt. `--list` shows them without answering; `bmad-loop status` reports the outstanding count.
 
 Sweeps are their own resumable runs (`bmad-loop resume <id>`). `[sweep] auto` in the policy fires an unattended sweep automatically at epic boundaries or run end; a failed/paused child sweep never interrupts the parent run.
@@ -243,19 +272,19 @@ Bundle dev sessions can themselves append new deferred entries (split-off goals,
 
 ## Installing the skill module
 
-The orchestrator drives the upstream `bmad-dev-auto` skill as its inner dev primitive — unmodified, so there is no fork to keep in sync; it both implements and (re-invoked on the done spec) runs the follow-up review — plus its own bundled `bmad-loop-*` skills for escalation, sweep, and setup. Your standard BMAD install is never modified. The three bundled skills ship in the `bmad-loop` wheel (canonical source: `src/bmad_loop/data/skills/`, BMAD module code `bmad-loop`) so `bmad-loop init` lays them down for you; `bmad-dev-auto` and the three review-hunter skills its step-04 invokes inline are prerequisites installed by the BMad Method (bmm) module:
+The orchestrator drives the upstream `bmad-dev-auto` skill as its inner dev primitive — unmodified, so there is no fork to keep in sync; it both implements and (re-invoked on the done spec) runs the follow-up review — plus its own bundled `bmad-loop-*` skills for escalation, sweep, and setup. Your standard BMAD install is never modified. The three bundled skills ship in the `bmad-loop` wheel (canonical source: `src/bmad_loop/data/skills/`, BMAD module code `bmad-loop`) so `bmad-loop init` lays them down for you; `bmad-dev-auto` and the review-layer skills its step-04 invokes inline are prerequisites installed by the BMad Method (bmm) module:
 
-| Skill                             | Role                                                                                            |
-| --------------------------------- | ----------------------------------------------------------------------------------------------- |
-| `bmad-dev-auto`                   | unattended implementation + follow-up review (**upstream** — bmm prerequisite, not bundled)     |
-| `bmad-review-adversarial-general` | inline step-04 review layer (**upstream** — bmm prerequisite, not bundled)                      |
-| `bmad-review-edge-case-hunter`    | inline step-04 review layer (**upstream** — bmm prerequisite, not bundled)                      |
-| `bmad-review-verification-gap`    | inline step-04 review layer, newest (BMAD-METHOD#2550) (**upstream** — bmm prereq, not bundled) |
-| `bmad-loop-resolve`               | interactive CRITICAL-escalation resolution (`/bmad-loop-resolve <story>`)                       |
-| `bmad-loop-sweep`                 | deferred-work ledger triage (automation-only)                                                   |
-| `bmad-loop-setup`                 | registers the module in `_bmad/` config + help                                                  |
+| Skill                             | Role                                                                                        |
+| --------------------------------- | ------------------------------------------------------------------------------------------- |
+| `bmad-dev-auto`                   | unattended implementation + follow-up review (**upstream** — bmm prerequisite, not bundled) |
+| `bmad-review-adversarial-general` | inline step-04 review layer (**upstream** — bmm prerequisite, not bundled)                  |
+| `bmad-review-edge-case-hunter`    | inline step-04 review layer (**upstream** — bmm prerequisite, not bundled)                  |
+| `bmad-review`                     | merged lens-based reviewer, supersedes the hunters (**upstream** — bmm prereq, not bundled) |
+| `bmad-loop-resolve`               | interactive CRITICAL-escalation resolution (`/bmad-loop-resolve <story>`)                   |
+| `bmad-loop-sweep`                 | deferred-work ledger triage (automation-only)                                               |
+| `bmad-loop-setup`                 | installs the orchestrator tool from Git, then runs `bmad-loop init` + `validate`            |
 
-`bmad-loop validate` preflights all four upstream skills; a target project on a pre-July bmm install missing `bmad-review-verification-gap` (or a `bmad-dev-auto` without its `customize.toml` review-layer config) is reported with bmm-module remediation before any run starts.
+`bmad-loop validate` preflights `bmad-dev-auto` (always) plus the review skills that copy of the skill will actually invoke — read from its `customize.toml` review layers, or from `step-04-review.md` on releases that name their reviewers inline. So a merged-`bmad-review` install needs only `bmad-review`, a v6.10.0 install needs the two hunters it names, and a tree whose configured layers reference a skill it does not have is reported instead of failing on every dev run. Missing skills (or a `bmad-dev-auto` without its `customize.toml`) are reported with bmm-module remediation before any run starts.
 
 **Via uv + `bmad-loop init` (self-sufficient).** Installing the tool and running `init` is all you need — `init` installs the `bmad-loop-*` skills into `.claude/skills/` (claude) and/or `.agents/skills/` (codex/gemini) for the CLIs you select, alongside the hooks and policy:
 
@@ -267,14 +296,14 @@ uv tool install "bmad-loop[tui] @ git+https://github.com/bmad-code-org/bmad-loop
 uv tool install "bmad-loop[tui] @ git+https://github.com/bmad-code-org/bmad-loop.git@v0.8.1"
 
 bmad-loop init --project /path/to/project --cli claude   # add --cli codex/gemini as needed
-claude "/bmad-loop-setup accept all defaults"            # registers _bmad/ config + help
+claude "/bmad-loop-setup accept all defaults"            # installs the tool + wires the project
 ```
 
 The `[tui]` extra pulls in the dashboard/settings UI (textual); drop it for a headless install. `bmad-loop --version` confirms what you've got. Existing skill dirs are left untouched (`--force-skills` to overwrite a stale copy, `--no-skills` to manage skills yourself).
 
 ### Upgrading
 
-**Easiest — let the setup skill do it.** Re-running `/bmad-loop-setup` (or `/bmad-loop-setup upgrade`) on an already-installed project performs the two-step ritual for you: it detects the existing install, upgrades the tool with `--reinstall`, re-lays the per-project skills with `--force-skills`, and re-stamps config — then reports the before → after version.
+**Easiest — let the setup skill do it.** Re-running `/bmad-loop-setup` (or `/bmad-loop-setup upgrade`) on an already-installed project performs the two-step ritual for you: it detects the existing install, upgrades the tool with `--reinstall`, and re-lays the per-project skills with `--force-skills` — then reports the before → after version.
 
 ```bash
 claude "/bmad-loop-setup upgrade"
@@ -343,7 +372,7 @@ session_budget_grace_s = 240     # enforce mode: seconds to wrap up after the nu
 commands = ["pytest -q", "ruff check ."]
 
 [notify]
-desktop = true             # desktop notification on gate pauses / escalations
+desktop = true             # desktop notification on gate pauses / escalations — notify-send (Linux) / osascript (macOS) / PowerShell toast (Windows), best-effort
 file = true                # append the same alerts to the run's ATTENTION file
 
 [review]

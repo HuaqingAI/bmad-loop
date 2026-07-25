@@ -382,8 +382,13 @@ _FINDING_WIDTH = 96
 
 
 def render(renderable, width: int = _FINDING_WIDTH) -> str:
-    """Rich renderable -> plain text, as journal_rows does for the journal."""
-    console = Console(width=width)
+    """Rich renderable -> plain text, as journal_rows does for the journal.
+
+    ``no_color=True`` so the capture is deterministic regardless of the ambient
+    ``FORCE_COLOR``/``CLICOLOR_FORCE``: Rich otherwise honors a forced color mode
+    even into a non-tty capture buffer, and the column-alignment assertions here
+    slice raw strings that embedded ANSI escapes would shift out of position."""
+    console = Console(width=width, no_color=True)
     with console.capture() as capture:
         console.print(renderable)
     return capture.get()
@@ -1230,6 +1235,213 @@ async def test_answer_decisions_none_notifies(project):
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("d")
         await until(pilot, lambda: any("no unanswered decisions" in m for m in notifications(app)))
+
+
+# ------------------------------------- #275 modal bodies scroll, buttons stay
+
+
+def _on_screen(app, w) -> bool:
+    """A widget's laid-out region is non-empty and fully inside the screen —
+    i.e. the button is reachable, not clipped off the visible area (#275)."""
+    r = w.region
+    return r.width > 0 and r.height > 0 and app.screen.region.contains_region(r)
+
+
+def _long_decision():
+    from bmad_loop.sweep import Decision, DecisionOption
+
+    options = tuple(
+        DecisionOption(
+            key=str(i),
+            label=f"option {i} — " + "a wordy option label that keeps going " * 3,
+            effect="build",
+            intent="a long intent describing what building this bundle would do " * 2,
+        )
+        for i in range(1, 9)
+    )
+    return Decision(
+        id="DW-1",
+        question="a decision question that is itself fairly wordy " * 3,
+        context="\n".join(f"context line {i} with some detail" for i in range(60)),
+        options=options,
+        recommendation="1",
+    )
+
+
+async def test_decision_modal_scrolls_when_content_long(project):
+    """A long question + 60-line context + 8 options overflow the dialog, but the
+    body scrolls so the docked skip button stays reachable AND the last option can
+    be scrolled into view and activated — proving real access, not just overflow."""
+    app = BmadLoopApp(project.project)
+    chosen: list = []
+    async with app.run_test(size=(90, 16)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app.push_screen(DecisionModal(_long_decision()), chosen.append)
+        await until(pilot, lambda: isinstance(app.screen, DecisionModal))
+        body = await ready(pilot, "#body")
+        assert body.max_scroll_y > 0  # content overflows yet scrolls
+        assert _on_screen(app, app.screen.query_one("#cancel", Button))  # skip reachable
+        # the last option starts below the fold; scroll it in, confirm it is on
+        # screen, then click it — the whole point of the scroll fix.
+        opt8 = app.screen.query_one("#opt-8", Button)
+        opt8.scroll_visible(animate=False)
+        await pilot.pause()
+        assert _on_screen(app, opt8)
+        await pilot.click("#opt-8")
+        await until(pilot, lambda: bool(chosen))
+        assert chosen[0].key == "8"  # the eighth option was actually returned
+
+
+async def test_escalation_modal_scrolls_when_description_long(project):
+    """A long escalation description overflows; the body scrolls and both the
+    Resolve and close buttons stay on-screen."""
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(90, 16)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app.push_screen(
+            EscalationModal(
+                story_key="e-1-s",
+                title="t",
+                description="X\n" * 80,
+                blocking="b",
+                sentinel_kind="",
+                resolution_ready=False,
+                engine_live=False,
+            )
+        )
+        await until(pilot, lambda: isinstance(app.screen, EscalationModal))
+        body = await ready(pilot, "#body")
+        assert body.max_scroll_y > 0
+        assert _on_screen(app, app.screen.query_one("#act-resolve", Button))
+        assert _on_screen(app, app.screen.query_one("#cancel", Button))
+
+
+async def test_confirm_modal_scrolls_long_body(project):
+    """A ConfirmModal (covers ConfirmResumeModal by inheritance) with a long body
+    scrolls it so the confirm/cancel buttons stay reachable, and the ⚠ warning is
+    docked outside the scroll region so it stays on-screen with the buttons — a
+    warning that gates the enabled confirm must never scroll off (#280 review)."""
+    app = BmadLoopApp(project.project)
+    # height 16 clears the frame floor now that the warning is a docked row (a
+    # sibling of #body); the 80-line body still overflows the 60%-capped #body.
+    async with app.run_test(size=(64, 16)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app.push_screen(ConfirmModal("t", "line\n" * 80, warning="w"))
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        body = await ready(pilot, "#body")
+        assert body.max_scroll_y > 0  # the long body still overflows and scrolls
+        assert _on_screen(app, app.screen.query_one("#ok", Button))
+        assert _on_screen(app, app.screen.query_one("#cancel", Button))
+        # the warning is a sibling of #body, not a child — visible whenever #ok is
+        assert _on_screen(app, app.screen.query_one("#warning", Static))
+
+
+async def test_start_sweep_and_checkpoint_buttons_reachable(project):
+    """On a short terminal the bounded modals keep their docked action buttons
+    on-screen: the body scrolls to absorb the overflow instead of pushing the
+    button row off the bottom. The height (14) sits just above the frame floor —
+    a thick-bordered dialog with a title and a 3-row button row needs ~13 rows
+    before any body content — so the assertion isolates the body-scroll fix."""
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(64, 14)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app.push_screen(StartSweepModal())
+        await until(pilot, lambda: isinstance(app.screen, StartSweepModal))
+        body = await ready(pilot, "#body")
+        assert body.max_scroll_y > 0  # options overflow the shrunk body, so it scrolls
+        assert _on_screen(app, app.screen.query_one("#ok", Button))
+        assert _on_screen(app, app.screen.query_one("#cancel", Button))
+        app.pop_screen()
+
+        # genuinely long checkpoint content (not just a tiny terminal): the body
+        # must scroll to absorb it while the action buttons stay docked on-screen.
+        app.push_screen(
+            StoryCheckpointModal(
+                story_key="e-1-s",
+                title="t\n" * 80,
+                commit="abc123",
+                verify_line="v",
+                tokens="0",
+            )
+        )
+        await until(pilot, lambda: isinstance(app.screen, StoryCheckpointModal))
+        body = await ready(pilot, "#body")
+        assert body.max_scroll_y > 0  # the long title overflows and the body scrolls
+        assert _on_screen(app, app.screen.query_one("#act-continue", Button))
+        assert _on_screen(app, app.screen.query_one("#cancel", Button))
+
+
+async def test_short_confirm_modal_stays_compact(project):
+    """The bounded modals keep BaseDialog #dialog at height: auto on purpose, so a
+    short body sizes to content instead of filling the screen. Guards the compact
+    tier against the #280 CodeRabbit suggestion of a definite `#dialog` height: on
+    a tall terminal a one-line confirm must stay a handful of rows, not balloon to
+    the 90% cap (a definite height took this from 7 → 23 rows when measured)."""
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(64, 40)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app.push_screen(ConfirmModal("t", "Stop the run?"))
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        dialog = await ready(pilot, "#dialog")
+        # content-driven height, nowhere near the 90% cap (36 rows at this size)
+        assert dialog.region.height < 12
+
+
+async def test_escalation_rearm_warning_stays_on_screen(project):
+    """When a restore patch is recorded the escalation warns that Re-arm re-drives
+    from scratch and drops it. Re-arm is enabled, so that warning must stay docked
+    on-screen (a sibling of #body) even when a long description scrolls the body
+    (#280 review — the warning must not be reachable-only by scrolling)."""
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(90, 16)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app.push_screen(
+            EscalationModal(
+                story_key="e-1-s",
+                title="t",
+                description="X\n" * 80,
+                blocking="b",
+                sentinel_kind="",
+                resolution_ready=True,
+                engine_live=False,
+                restore_recorded=True,
+            )
+        )
+        await until(pilot, lambda: isinstance(app.screen, EscalationModal))
+        body = await ready(pilot, "#body")
+        assert body.max_scroll_y > 0  # the long description overflows and scrolls
+        rearm = app.screen.query_one("#act-rearm", Button)
+        assert not rearm.disabled  # the destructive action is clickable...
+        assert _on_screen(app, rearm)
+        assert _on_screen(
+            app, app.screen.query_one("#hint", Static)
+        )  # ...so its warning is visible
+
+
+async def test_resume_confirm_rechecks_liveness(project, monkeypatch):
+    """The resume confirm callback re-checks engine liveness at click time rather
+    than launching blind: with a possibly-live engine (unknown liveness + a pid),
+    confirming resume is refused and never calls resume_detached (#280 review)."""
+    calls: list = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "unknown")
+    run_dir = make_run(
+        project.project,
+        "20260611-100000-aaaa",
+        paused_stage="DEV_VERIFY",
+        paused_reason="verify failed",
+    )
+    (run_dir / "engine.pid").write_text("4242 123.0", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: dashboard(app).selected_run_id is not None)
+        await pilot.press("e")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmResumeModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: any("may still be live" in m for m in notifications(app)))
+        assert calls == []  # the callback re-checked and refused; nothing launched
 
 
 def test_cli_tui_hint_without_textual(project, monkeypatch, capsys):

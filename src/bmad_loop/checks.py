@@ -64,12 +64,21 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "mux.selection",
         "mux.external-backend",
         "host.process",
+        "notify.desktop-unavailable",
         "skills.base",
         "skills.base-missing",
         "skills.base-incomplete",
+        "skills.review-layer-missing",
+        "skills.review-layer-unresolved",
+        "skills.review-layers-empty",
+        "skills.customize-unreadable",
         "skills.stories-dispatch",
         "skills.stories-dispatch-missing",
         "skills.stories-dispatch-stale",
+        "deferred.closes-unknown",
+        "deferred.closes-malformed",
+        "deferred.closes-entry-unreadable",
+        "deferred.ledger-unreadable",
     }
 )
 

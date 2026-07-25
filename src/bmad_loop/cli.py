@@ -20,6 +20,8 @@ from . import (
     decisions,
     deferredwork,
     envvars,
+    frontmatter,
+    gates,
     install,
     machine,
 )
@@ -73,7 +75,9 @@ from .process_host import ProcessHostError
 # used within this module (validate/mux/sweep/resume) and monkeypatched as
 # `cli.<name>` by the test suite — so the seams stay importable here. Each is
 # genuinely referenced below, so no noqa is needed (an unused-import pin would
-# itself trip RUF100); a future caller-less re-export would need `# noqa: F401`.
+# itself trip RUF100); a future caller-less re-export would need a `noqa: F401`
+# pin. Written without the leading hash on purpose: ruff scans comment TEXT for
+# directives, so spelling one out in prose is read as a real (and malformed) one.
 from .runsetup import ROLES
 from .runsetup import make_adapters as _make_adapters
 from .runsetup import mux_reason_label as _mux_reason_label
@@ -228,7 +232,9 @@ def cmd_validate(args: argparse.Namespace) -> int:
             _validate_stories_queue(
                 project, paths, spec_folder, [p.skill_tree for p in profiles], report
             )
+            _validate_closes_deferred(paths, report, spec_folder=spec_folder)
         else:
+            _validate_closes_deferred(paths, report)
             try:
                 ss = sprintstatus.load(paths.sprint_status)
                 actionable = [s for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
@@ -257,6 +263,28 @@ def cmd_validate(args: argparse.Namespace) -> int:
         report.fail("git.probe", f"git check failed: {e}")
 
     report.extend(_platform_preflight())
+
+    # #231: notify.desktop defaults to true but only fires when a platform notifier
+    # exists (osascript/PowerShell/notify-send). When none does, the setting is
+    # silently inert — warn so it stops being a no-op nobody can see.
+    if pol is not None and pol.notify.desktop and gates.desktop_notifier_kind() is None:
+        # The ATTENTION file is only a fallback when notify.file is also on; with it
+        # off there is no alert channel left at all, so say so rather than pointing
+        # at a file that is never written.
+        channel = (
+            "the ATTENTION file in the run directory is the only alert channel left"
+            if pol.notify.file
+            else "notify.file is also off, so no alert channel is configured — "
+            "enable notify.file"
+        )
+        report.warn(
+            "notify.desktop-unavailable",
+            f"notify.desktop is set but no desktop notifier is available on "
+            f"{sys.platform} — desktop notifications are silently skipped; "
+            f"{channel} (macOS ships osascript; Linux needs notify-send; Windows "
+            f"needs PowerShell). Install one or set notify.desktop = false.",
+            {"platform": sys.platform},
+        )
 
     for tool in dict.fromkeys(p.binary for p in profiles):
         if shutil.which(tool):
@@ -330,14 +358,17 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     {"role": role, "model": cfg.model, "profile": prof.name},
                 )
 
-    base_problems = install.missing_base_skills(project, [p.skill_tree for p in profiles])
-    if profiles and not base_problems:
+    base_findings = install.missing_base_skills(project, [p.skill_tree for p in profiles])
+    # gated on PROBLEMS, not on any finding: an advisory review layer (a `when`
+    # gate, a phrasing this check can't confirm, a broken override) is a warning
+    # that must ride alongside the ok line rather than suppress it.
+    if profiles and not any(f.severity == "problem" for f in base_findings):
         report.ok(
             "skills.base",
-            "upstream skills present (bmad-dev-auto + review hunters)",
+            "upstream skills present (bmad-dev-auto + review layers)",
             {"trees": list(dict.fromkeys(p.skill_tree for p in profiles))},
         )
-    report.extend(base_problems)
+    report.extend(base_findings)
 
     if getattr(args, "json", False):
         # getattr, not args.json: cmd_validate is called directly by tests (and by
@@ -457,11 +488,12 @@ def _mux_set(project: Path, args: argparse.Namespace) -> int:
 
 def _require_base_skills(project: Path, pol, *, require_stories: bool = False) -> bool:
     """Preflight the upstream skills the orchestrator drives (bmad-dev-auto + the
-    three review hunters it invokes inline).
+    review layers it invokes inline).
 
     Returns True when everything is in place; otherwise prints the problems and
     returns False so the caller can abort before spawning any session (a missing
     skill would otherwise stall as an `Unknown command` until the run times out).
+    Warnings are printed but never abort — only ``problem`` findings block.
 
     ``require_stories`` additionally content-probes bmad-dev-auto for folder+id
     dispatch — stories mode needs a newer skill than sprint mode, so an older
@@ -475,9 +507,16 @@ def _require_base_skills(project: Path, pol, *, require_stories: bool = False) -
             skill_trees.append(get_profile(name, project).skill_tree)
         except ProfileError:
             continue
-    problems = install.missing_base_skills(project, skill_trees)
+    findings = install.missing_base_skills(project, skill_trees)
     if require_stories:
-        problems += install.missing_stories_support(project, skill_trees)
+        findings += install.missing_stories_support(project, skill_trees)
+    # Severity decides. A review layer we can't statically resolve (a `when` gate,
+    # an unrecognized handoff phrasing, an unparseable override) is reported and
+    # then stepped over: aborting on it would be the false FAIL of #260, only now
+    # on every run rather than only on validate.
+    problems = [f for f in findings if f.severity == "problem"]
+    for warning in (f for f in findings if f.severity != "problem"):
+        print(f"warning: {warning.message}", file=sys.stderr)
     if problems:
         for problem in problems:
             print(f"FAIL: {problem.message}", file=sys.stderr)
@@ -567,6 +606,154 @@ def _validate_stories_queue(
             {"trees": list(dict.fromkeys(skill_trees))},
         )
     report.extend(stories_probs)
+
+
+def _spec_closes_deferred(path: Path) -> tuple[tuple[str, ...], str | None]:
+    """One story spec's ``closes_deferred:`` declaration, degrading an unreadable
+    spec to an empty one — other gates own spec readability, and an advisory
+    check must never be the thing that crashes the preflight it is advising."""
+    try:
+        raw = frontmatter.read_frontmatter(path).get("closes_deferred")
+    except (OSError, UnicodeDecodeError):
+        return (), None
+    return deferredwork.parse_declaration(raw)
+
+
+def _validate_closes_deferred(
+    paths: bmadconfig.ProjectPaths,
+    report: ValidationReport,
+    *,
+    spec_folder: str | None = None,
+) -> None:
+    """Warn when a story declares ``closes_deferred:`` ids the deferred-work
+    ledger does not carry, or declares them in a shape nothing can read (#234).
+
+    At clean close the orchestrator flips each declared id to ``status: done
+    <date>`` + a ``resolution:`` line. An id that names no entry — a typo, or an
+    entry reworded/renumbered since the spec was written — annotates nothing, and
+    the run says so only in the journal, where nobody looks until the retro that
+    the annotation exists to spare. Saying it at preflight is the whole point:
+    the declaration is fixable before the run, not after.
+
+    Runs in **both** queue modes, because the declaration exists in both. With
+    ``spec_folder`` (stories mode) each manifest entry is checked together with
+    its id-resolved spec, unioned — the manifest half is what makes this genuinely
+    a *pre*-flight, since those ids are readable before the story has ever been
+    dispatched. Without it (sprint mode) the story specs already sitting in the
+    artifacts dir are scanned instead; those are written by `create-story` ahead
+    of the run, which is exactly while a typo is still cheap to fix. Reporting
+    only in stories mode left sprint-mode operators with nothing but a journal
+    line after the fact.
+
+    An id present but already ``done`` is a declaration a prior run already
+    satisfied (a resume re-drives the same close), so it stays silent — the same
+    classification the engine's close hook makes, for the same reason. Everything
+    else it can journal is reported here: an absent id, an id whose ledger entry
+    carries neither an ``open`` nor a ``done`` status (nothing will be marked, and
+    the remedy is in the ledger rather than in the declaration), and a
+    wrong-container declaration, which names real intent that would otherwise
+    close nothing and say nothing. Covering only two of the three left the third
+    to be discovered in the journal after the run it should have preceded.
+
+    A ledger that cannot be read at all is reported as well. Staying quiet there
+    is not the same trade as staying quiet about an unparseable manifest: the
+    manifest is already reported by ``queue.stories-manifest``, while nothing
+    else in ``validate`` reads the ledger, so silence meant reporting success for
+    a preflight that checked nothing.
+
+    Never a failure. The annotation is traceability, not a gate, so a stale
+    reference must not be able to block a run that would otherwise start.
+    """
+    ledger = paths.deferred_work
+    try:
+        text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+    except (OSError, UnicodeDecodeError) as e:
+        # Split from the manifest read below, which is silent for a good reason
+        # that does not apply here: nothing else in `validate` reads the ledger, so
+        # returning quietly reported success for a preflight that checked nothing,
+        # against the very file the run's closure will fail on
+        # (#284 round-5 review, finding 6).
+        report.warn(
+            "deferred.ledger-unreadable",
+            f"{ledger} cannot be read ({e}) — closes_deferred declarations were not "
+            "checked against it, and the run's own closure will fail the same way",
+            {"ledger": str(ledger), "error": str(e)},
+        )
+        return
+    try:
+        sources = (
+            _stories_declarations(paths, spec_folder)
+            if spec_folder is not None
+            else _sprint_declarations(paths)
+        )
+    except (OSError, UnicodeDecodeError, stories_mod.StoriesError):
+        # An unparseable manifest is already a `queue.stories-manifest` failure from
+        # the gate above — don't double-report it.
+        return
+    for label, ids, error in sources:
+        if error:
+            report.warn(
+                "deferred.closes-malformed",
+                f"{label} declares closes_deferred in a shape that cannot be read: "
+                f"{error} — nothing will be marked resolved for it",
+                {"source": label, "error": error},
+            )
+        declared = deferredwork.classify(text, ids)
+        if declared.malformed:
+            malformed = list(declared.malformed)
+            report.warn(
+                "deferred.closes-entry-unreadable",
+                f"{label} declares closes_deferred ids whose {ledger.name} entries carry "
+                f"neither an `open` nor a `done` status: {', '.join(malformed)} — nothing "
+                "will be marked resolved for them until the entry status is repaired",
+                {"source": label, "dw_ids": malformed},
+            )
+        if declared.unknown:
+            unknown = list(declared.unknown)
+            report.warn(
+                "deferred.closes-unknown",
+                f"{label} declares closes_deferred ids that are not in "
+                f"{ledger.name}: {', '.join(unknown)} — nothing will be marked "
+                f"resolved for them (typo, or a renumbered/reworded entry?)",
+                {"source": label, "unknown_ids": unknown},
+            )
+
+
+def _stories_declarations(
+    paths: bmadconfig.ProjectPaths, spec_folder: str
+) -> list[tuple[str, tuple[str, ...], str | None]]:
+    """Per manifest entry: the union of its ``stories.yaml`` ids and its
+    id-resolved spec's, deduped across both channels."""
+    folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
+    out = []
+    for entry in stories_mod.load_stories(folder).entries:
+        ids = list(entry.closes_deferred)
+        error = None
+        state = stories_mod.resolve_story_spec(folder, entry.id)
+        if state.kind == stories_mod.KIND_PRESENT and state.path is not None:
+            spec_ids, error = _spec_closes_deferred(state.path)
+            ids += spec_ids
+        out.append((f"story {entry.id}", tuple(dict.fromkeys(ids)), error))
+    return out
+
+
+def _sprint_declarations(
+    paths: bmadconfig.ProjectPaths,
+) -> list[tuple[str, tuple[str, ...], str | None]]:
+    """Sprint mode has no manifest, so the declarations that exist yet are the
+    ones in story specs already on disk — the flat ``*.md`` layout the artifacts
+    dir holds."""
+    impl = paths.implementation_artifacts
+    if not impl.is_dir():
+        return []
+    out = []
+    for path in sorted(impl.glob("*.md")):
+        if path == paths.deferred_work:
+            continue
+        ids, error = _spec_closes_deferred(path)
+        if ids or error:
+            out.append((f"spec {path.name}", ids, error))
+    return out
 
 
 def _warn_unknown_keys(ss: sprintstatus.SprintStatus) -> None:

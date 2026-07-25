@@ -389,6 +389,18 @@ def test_dev_stall_nudges_cap_default_parse_and_template():
         policy.loads("[limits]\ndev_stall_nudges_cap = -1\n")
 
 
+def test_dev_contract_nudge_default_parse_and_template():
+    import tomllib
+
+    # defaults on; overridable to false (no range validation — it is a bool)
+    assert policy.loads("").limits.dev_contract_nudge is True
+    loaded = policy.loads("[limits]\ndev_contract_nudge = false\n")
+    assert loaded.limits.dev_contract_nudge is False
+    # the emitted template documents the knob at its dataclass default
+    doc = tomllib.loads(policy.POLICY_TEMPLATE)
+    assert doc["limits"]["dev_contract_nudge"] == policy.LimitsPolicy.dev_contract_nudge
+
+
 def test_session_budget_mode_default_parse_and_template():
     import tomllib
 

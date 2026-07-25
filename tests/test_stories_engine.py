@@ -33,7 +33,7 @@ from bmad_loop.policy import (
 )
 from bmad_loop.runs import STOP_REQUEST_FILE, graceful_stop_requested
 from bmad_loop.stories_engine import StoriesEngine
-from bmad_loop.verify import read_frontmatter, rev_parse_head, status_of
+from bmad_loop.verify import read_frontmatter, rev_parse_head, status_of, worktree_clean
 
 QUIET = NotifyPolicy(desktop=False, file=True)
 SPEC_FOLDER = "_bmad-output/epic-1"  # under output_folder -> excluded from proof-of-work
@@ -63,11 +63,20 @@ def setup_stories(paths, entries: list[dict], *, spec_folder: str = SPEC_FOLDER)
 
 
 def stories_dev_effect(
-    *, final_status: str = "done", followup_review: bool = False, prose_status: str | None = None
+    *,
+    final_status: str = "done",
+    followup_review: bool = False,
+    prose_status: str | None = None,
+    closes_deferred: object = None,
+    write_src: bool = True,
 ):
     """Simulate a bmad-dev-auto folder+id dispatch: read the story id + spec
     folder from the session env (as the real adapter does), write the id-keyed
-    story spec, and touch real code so proof-of-work passes."""
+    story spec, and touch real code so proof-of-work passes.
+
+    ``write_src=False`` skips the code change, so the proof-of-work gate fails and
+    the story defers with its spec still finalized — the shape a story-declared
+    ledger closure must survive without claiming anything resolved."""
 
     def effect(spec) -> SessionResult:
         story_id = spec.env["BMAD_LOOP_STORY_KEY"]
@@ -77,8 +86,11 @@ def stories_dev_effect(
         stories_dir.mkdir(parents=True, exist_ok=True)
         sp = stories_dir / f"{story_id}-slug.md"
         src = Path(spec.cwd) / "src.txt"
-        src.write_text(src.read_text() + f"work for {story_id}\n")
-        write_spec(sp, final_status, baseline, prose_status=prose_status)
+        if write_src:
+            src.write_text(src.read_text() + f"work for {story_id}\n")
+        write_spec(
+            sp, final_status, baseline, prose_status=prose_status, closes_deferred=closes_deferred
+        )
         return SessionResult(
             status="completed",
             result_json={
@@ -1220,3 +1232,227 @@ def test_entry_for_unreadable_manifest_journals_warning_once(project):
     # a second call for the same story does not re-journal (dedup per story key)
     assert engine._entry_for(task) is None
     assert len(_kinds(engine.journal, "stories-manifest-unreadable")) == 1
+
+
+# ------------------- closes_deferred auto-resolve in stories mode (#234) ------
+
+
+def _entries(project) -> dict:
+    from bmad_loop import deferredwork
+
+    text = project.deferred_work.read_text(encoding="utf-8")
+    return {e.id: e for e in deferredwork.parse_ledger(text)}
+
+
+def _closing_run(project, *, manifest=None, spec=None, ledger=None, attempts=1, **effect_kwargs):
+    """A whole stories-mode run of one story, declaring `manifest` ids on its
+    stories.yaml entry and `spec` ids in the generated story spec, over a
+    committed ledger. Driven end to end: the close lives at the commit boundary,
+    so only a real run exercises where it actually lands. `attempts` scripts the
+    same session repeatedly for a story expected to retry before deferring."""
+    from conftest import write_ledger
+
+    setup_stories(project, [entry("1", **({"closes_deferred": manifest} if manifest else {}))])
+    write_ledger(project, ledger or {"DW-1": "open"})
+    effect = stories_dev_effect(closes_deferred=spec, **effect_kwargs)
+    return make_engine(project, [effect] * attempts)[0]
+
+
+def test_stories_mode_closes_declared_deferred_entries(project):
+    """#234: stories mode has no sprint board, but it shares the project's
+    deferred-work ledger — so a story declaring `closes_deferred:` must still get
+    those entries annotated. Without this the field is inert in exactly the mode
+    whose declarations `validate` preflights."""
+    engine = _closing_run(project, spec=["DW-1"])
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    dw1 = _entries(project)["DW-1"]
+    assert dw1.status.startswith("done") and not dw1.open
+    assert "resolution: resolved by story 1" in dw1.body
+    closed = _kinds(engine.journal, "story-deferred-closed")
+    assert len(closed) == 1 and closed[0]["dw_ids"] == ["DW-1"]
+
+
+def test_stories_mode_annotation_rides_the_story_commit(project):
+    """An in-repo ledger annotation is part of the story's own commit, so the run
+    ends on the clean tree the next story's step-01 requires."""
+    engine = _closing_run(project, spec=["DW-1"])
+
+    engine.run()
+
+    committed = git(project.project, "show", "HEAD", "--", str(project.deferred_work))
+    assert "+resolution: resolved by story 1" in committed
+    assert worktree_clean(project.project)
+
+
+def test_stories_mode_closes_nothing_when_the_story_defers(project):
+    """The story finalizes its spec — declaration and all — then fails the
+    proof-of-work gate and defers. Closing at dev-sync time made that permanent
+    (#234 review, finding 1); at the commit boundary the entry is never touched."""
+    engine = _closing_run(project, manifest=["DW-1"], spec=["DW-1"], write_src=False, attempts=3)
+
+    summary = engine.run()
+
+    assert summary.deferred == 1 and summary.done == 0
+    assert _entries(project)["DW-1"].open
+    assert not _kinds(engine.journal, "story-deferred-closed")
+
+
+def test_stories_mode_close_is_silent_without_declaration(project):
+    """The ordinary story declares nothing: no ledger write, no journal noise —
+    and the sprint board stays untouched in a mode that has none."""
+    engine = _closing_run(project)
+    before = project.deferred_work.read_bytes()
+
+    engine.run()
+
+    assert project.deferred_work.read_bytes() == before
+    assert not _kinds(engine.journal, "story-deferred-closed")
+    assert not _kinds(engine.journal, "deferred-close-unmatched")
+
+
+def test_stories_mode_dev_sync_writes_nothing(project):
+    """Stories mode keeps the contract's "the orchestrator writes nothing" at dev
+    time: the post-dev sync is a pure no-op, and in particular does NOT close
+    declared entries — that belongs after verification, at commit."""
+    engine = _closing_run(project, manifest=["DW-1"], spec=["DW-1"])
+    before = project.deferred_work.read_bytes()
+
+    engine._post_dev_state_sync(StoryTask(story_key="1", epic=0), {})
+
+    assert project.deferred_work.read_bytes() == before
+    assert not _kinds(engine.journal, "story-deferred-closed")
+
+
+def test_stories_mode_closes_ids_declared_in_the_manifest(project):
+    """The channel that makes this work unattended (#234): `bmad-dev-auto` writes
+    the story spec and knows nothing of the ledger, so a frontmatter-only
+    declaration would have to be hand-edited into every generated spec. Declaring
+    on the stories.yaml entry — authored while the ledger is in view — closes the
+    loop with no upstream change."""
+    engine = _closing_run(project, manifest=["DW-1"])  # spec declares nothing
+
+    engine.run()
+
+    dw1 = _entries(project)["DW-1"]
+    assert dw1.status.startswith("done") and "resolution: resolved by story 1" in dw1.body
+    assert _kinds(engine.journal, "story-deferred-closed")[0]["dw_ids"] == ["DW-1"]
+
+
+def test_stories_mode_unreadable_manifest_at_commit_does_not_crash_the_run(project, monkeypatch):
+    """`_manifest_closes_deferred` advertises a fallback — journal the unreadable
+    manifest, carry on with the spec channel — but it catches only StoriesError,
+    and `load_stories` let an OSError from the read escape raw. A commit-time
+    permission fault therefore crashed the whole run instead of costing one
+    channel (#284 round-5 review, finding 5).
+
+    The fault is transient and scoped to the close, which is the shape that
+    matters: a manifest unreadable for the whole run is a preflight failure, not
+    this."""
+    engine = _closing_run(project, spec=["DW-1"])
+    manifest = project.project / SPEC_FOLDER / "stories.yaml"
+    real_read = Path.read_text
+    faulted = {"on": False}
+
+    def maybe_fault(self, *a, **kw):
+        if faulted["on"] and self == manifest:
+            raise PermissionError(13, "Permission denied")
+        return real_read(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_text", maybe_fault)
+    finalize = engine._finalize_commit_phase
+
+    def unreadable_across_the_close(task):
+        faulted["on"] = True
+        try:
+            return finalize(task)
+        finally:
+            faulted["on"] = False
+
+    monkeypatch.setattr(engine, "_finalize_commit_phase", unreadable_across_the_close)
+
+    summary = engine.run()
+
+    assert summary.done == 1  # the run survives; only the manifest channel is lost
+    assert not _entries(project)["DW-1"].open  # the spec channel still closed it
+    lost = _kinds(engine.journal, "deferred-close-declaration-unreadable")
+    assert lost and lost[-1]["source"] == "stories.yaml"
+
+
+def test_stories_mode_unions_manifest_and_frontmatter_declarations(project):
+    """Both channels are honored, and an id named in both is marked and reported
+    once — the natural case once a planner declares it and the spec echoes it."""
+    engine = _closing_run(
+        project,
+        manifest=["DW-1", "DW-2"],
+        spec=["DW-2", "DW-3"],  # DW-2 in both
+        ledger={"DW-1": "open", "DW-2": "open", "DW-3": "open"},
+    )
+
+    engine.run()
+
+    entries = _entries(project)
+    assert all(not entries[dw].open for dw in ("DW-1", "DW-2", "DW-3"))
+    assert entries["DW-2"].body.count("resolution: resolved by story 1") == 1  # not doubled
+    closed = _kinds(engine.journal, "story-deferred-closed")
+    assert closed[0]["dw_ids"] == ["DW-1", "DW-2", "DW-3"]  # manifest first, deduped
+
+
+def test_stories_mode_reports_a_manifest_unreadable_at_the_commit_boundary(project, monkeypatch):
+    """The manifest half is re-read at the commit and, unlike the spec half, is
+    persisted nowhere — so a parse failure there drops a declared closure with
+    nothing to fall back on. Routing it through `_entry_for` reported that as a
+    generic `stories-manifest-unreadable` warning that is emitted at most ONCE per
+    story, so an earlier dispatch-time failure spent the one line and the lost
+    closure passed in silence (#284 follow-up review, finding 4).
+
+    The spec half is unaffected: one unreadable channel must not take the other
+    down with it."""
+    from bmad_loop import stories as stories_mod
+
+    engine = _closing_run(
+        project,
+        manifest=["DW-1"],
+        spec=["DW-2"],
+        ledger={"DW-1": "open", "DW-2": "open"},
+    )
+    finalize = engine._finalize_commit_phase
+    real_load = engine._load_stories
+
+    def unreadable(*_a, **_kw):
+        raise stories_mod.StoriesError("stories.yaml is not valid YAML")
+
+    def unreadable_from_the_commit_phase_on(task):
+        monkeypatch.setattr(engine, "_load_stories", unreadable)
+        try:
+            return finalize(task)
+        finally:
+            monkeypatch.setattr(engine, "_load_stories", real_load)
+
+    monkeypatch.setattr(engine, "_finalize_commit_phase", unreadable_from_the_commit_phase_on)
+
+    summary = engine.run()
+
+    assert summary.done == 1  # never a gate
+    entries = _entries(project)
+    assert entries["DW-1"].open  # the manifest-declared id is lost...
+    events = _kinds(engine.journal, "deferred-close-declaration-unreadable")
+    assert len(events) == 1 and events[0]["source"] == "stories.yaml"  # ...but not silently
+    assert not entries["DW-2"].open  # the spec half still closed
+
+
+def test_stories_mode_unknown_id_is_journaled_not_fatal(project):
+    """An id naming no ledger entry — a typo, or an entry renumbered since the
+    breakdown was written — is journaled and dropped. The annotation is
+    traceability, so a stale reference must never fail a story that succeeded."""
+    engine = _closing_run(project, manifest=["DW-99"])
+    before = project.deferred_work.read_bytes()
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert project.deferred_work.read_bytes() == before
+    unmatched = _kinds(engine.journal, "deferred-close-unmatched")
+    assert len(unmatched) == 1 and unmatched[0]["dw_ids"] == ["DW-99"]
