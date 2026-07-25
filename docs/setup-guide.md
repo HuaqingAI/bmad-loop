@@ -223,7 +223,10 @@ them to whoever owns the machine:
   workspace-trust dialog to answer). Requires OpenCode ≥ 1.18. Set the model as
   `provider/model` (e.g. `[adapter] model = "anthropic/claude-haiku-4-5"`). No hooks are
   registered — the adapter drives a headless `opencode serve` over HTTP/SSE, so there is no
-  tmux window to attach to; watch a session via its `logs/<task-id>.log` or the TUI Log tab.
+  tmux window to attach to; watch a session via its `logs/<task-id>.log` — a curated
+  transcript of the agent's prose, tool calls, file edits and permission decisions — or the
+  TUI Log tab. The server's own stdout lands beside it in `<task-id>.server.out`, and a
+  structured trace of the raw SSE frames in `<task-id>.sse.jsonl`.
 
 ### Skill location
 

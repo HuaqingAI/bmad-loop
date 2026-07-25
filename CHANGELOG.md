@@ -9,6 +9,16 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **Readable run logs for `opencode-http` (#306).** Contributed by
+  [@jackmcintyre](https://github.com/jackmcintyre). The HTTP adapter has no tmux pane to replay,
+  so a finished opencode run left `logs/<task-id>.log` holding nothing but the server's own INFO
+  stdout. Per-session logs now split three ways, rendered off the SSE stream the adapter already
+  reads for completion:
+  - `<task-id>.log` — curated transcript: role-prefixed agent/user prose plus `[bmad]` marker
+    lines for tool calls, slash commands, file edits, permission asks/replies and session errors.
+  - `<task-id>.server.out` — the server's own stdout, no longer mixed into the transcript.
+  - `<task-id>.sse.jsonl` — structured trace of the raw SSE frames for post-hoc debugging.
+
 - **`review.on_timeout` policy knob (#271).** A timeout-like review verdict (`timeout` /
   `stalled` / `over_budget`) previously always burned a review cycle (RETRY) until
   `max_review_cycles`, then deferred — even when the dev product was already finalized and
