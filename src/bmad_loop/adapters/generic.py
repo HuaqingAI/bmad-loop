@@ -71,9 +71,13 @@ FM_FALLBACK_MIN_OBS = 2
 # as having produced SOMETHING — the floor a dead session must clear before a
 # read-back artifact may upgrade its verdict to `completed`. Not zero: the three
 # wedged sessions in #261 left logs of 0 and 2 bytes, so `size > 0` would have
-# cleared one of them. Any session that reached the agent loop echoes at least its
-# own prompt (hundreds of bytes) into the pane, and a real one logs megabytes, so
-# this sits far below a genuine session and far above a wedge.
+# cleared one of them. The separation is wide in the observed data — that run's
+# working dev session logged 1.4 MB against the wedged reviews' 0 and 2 — so the
+# exact value is not load-bearing; it only has to sit above the noise a pane can
+# accumulate without the CLI rendering anything. Note the floor measures the CLI's
+# OWN output: the orchestrator's prompt is delivered by send-keys and a program
+# that never echoes it leaves the log empty (measured), so this is not a proxy for
+# "the session was launched" — only for "the CLI rendered something".
 PROOF_OF_WORK_MIN_LOG_BYTES = 256
 
 
@@ -837,11 +841,10 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
         its size is a direct measure of how much the session emitted.
 
         None when the log does not exist — no signal, and the gate stays inert.
-        Otherwise True iff the log exceeded `PROOF_OF_WORK_MIN_LOG_BYTES`. The floor
-        is not zero on purpose: the wedged sessions in #261 left 0-byte AND 2-byte
-        logs, so `size > 0` would have missed one of them. Any session that reached
-        the agent loop echoes at least its own (multi-hundred-byte) prompt into the
-        pane, so the floor sits far below a real session and far above a wedge."""
+        Otherwise True iff the log exceeded `PROOF_OF_WORK_MIN_LOG_BYTES` (see that
+        constant for why the floor is not zero, and for what it does and does not
+        prove). This measures rendering, not liveness, which is why `_produced_work`
+        ORs it with the hook-event signal rather than trusting it alone."""
         try:
             size = (self.logs_dir / f"{handle.task_id}.log").stat().st_size
         except OSError:
