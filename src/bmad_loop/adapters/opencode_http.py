@@ -73,11 +73,20 @@ static contract — worth re-dumping on any version bump:
   drops it before any render. Same for ``file.watcher.updated``. Reaching it
   needs an explicit session-less allowlist, sound here only because bmad-loop
   runs one server per session.
-- ``permission.updated`` — **does not exist in 1.18.2.** The live ask frame is
-  ``permission.asked`` with ``permission`` / ``patterns`` / ``metadata`` /
-  ``always`` / ``tool`` (not ``type`` / ``pattern``), and ``permission.replied``
-  carries **``reply``**, not ``response``. ``permission.v2.asked`` /
-  ``permission.v2.replied`` also exist in the union.
+- ``permission.asked`` — the ask frame. There is **no ``permission.updated``** in
+  1.18.2. Payload is a ``permission`` **string** plus ``patterns`` /
+  ``metadata`` / ``always`` / ``tool`` / ``id`` / ``sessionID`` — not a nested
+  object with ``type`` / ``pattern``.
+- ``permission.replied`` — carries **``reply``**, not ``response`` (plus
+  ``sessionID`` / ``requestID``).
+- ``permission.v2.asked`` / ``permission.v2.replied`` exist in the union and are
+  **deliberately not consumed**: neither was seen live, and the v2 ask is a
+  different payload (``action`` / ``resources`` / ``save`` / ``metadata`` /
+  ``source``), so a branch for it would be written from the schema alone —
+  exactly the guess that made the three corrections above necessary. The v2
+  reply is shape-identical to the v1 one, but consuming it without the ask would
+  log a decision with no request. Add both together once a live sighting pins
+  what ``action`` / ``resources`` actually hold.
 - There is **no ``tool.call`` / ``tool.response``** on this surface —
   confirmed both statically in the 89-variant union and live.
 
@@ -232,8 +241,8 @@ def _parse_sse_lines(lines) -> Any:
 
 def _sum_args(arguments: Any) -> str:
     """Compact one-line summary of an arbitrary event payload value (a tool
-    part's ``state.input``, a ``command.executed`` ``arguments``, a
-    ``session.error`` ``error``) for the
+    part's ``state.input``, a ``permission.asked`` ``patterns``, a
+    ``command.executed`` ``arguments``, a ``session.error`` ``error``) for the
     inline run log. Truncates long dicts/strings so a single line never explodes
     the tail view, and accepts any shape — these payloads are server-controlled
     and not all of them have a pinned schema."""
@@ -723,8 +732,10 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
         docstring's ``/event`` section — read that before adding a branch here.
         It records which of these types actually fire on 1.18.2, notably that
         agent tool use arrives as a ``tool``-typed ``message.part.updated`` part
-        (never as ``command.executed``), and which types the renderer names but
-        never sees (``file.edited``, ``permission.updated``).
+        (never as ``command.executed``), that the permission frames are
+        ``permission.asked`` / ``permission.replied`` with ``permission`` /
+        ``patterns`` / ``reply`` fields, and which types the renderer names but
+        never sees (``file.edited``).
 
         ``message.updated`` carries only turn metadata (notably ``info.role``
         keyed by ``info.id``) and renders no inline line of its own — it just
@@ -806,15 +817,20 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
             return f"{_TOOL_COLOR}[bmad] cmd: {props.get('name') or '?'}{(' ' + args) if args else ''}{_RESET}\n"
         if etype == "file.edited":
             return f"{_TOOL_COLOR}[bmad] file: {props.get('file') or '?'}{_RESET}\n"
-        # permission surface
-        if etype == "permission.updated":
-            perm = props.get("permission") or props
+        # Permission surface. Field names are the live 1.18.2 ones: the ask frame
+        # is `permission.asked` (there is no `permission.updated`) carrying a
+        # `permission` STRING plus a `patterns` list — not a nested object with
+        # `type`/`pattern` — and the reply carries `reply`, not `response`.
+        # `metadata` (the concrete command) and `always` are left to the trace;
+        # `patterns` is what the permission actually matched on.
+        if etype == "permission.asked":
+            pats = _sum_args(props.get("patterns"))
             return (
-                f"{_TOOL_COLOR}[bmad] perm: {perm.get('type') or '?'} {perm.get('pattern') or ''}{_RESET}".rstrip()
-                + "\n"
+                f"{_TOOL_COLOR}[bmad] perm ask: {props.get('permission') or '?'}"
+                f"{(' ' + pats) if pats else ''}{_RESET}\n"
             )
         if etype == "permission.replied":
-            return f"{_TOOL_COLOR}[bmad] perm: {props.get('response') or '?'}{_RESET}\n"
+            return f"{_TOOL_COLOR}[bmad] perm reply: {props.get('reply') or '?'}{_RESET}\n"
         # A failing turn is the one thing a reader most wants in the transcript:
         # without this the log just stops mid-turn while the queue put below
         # ends the session. Same green/tool hue as the other role-less markers —

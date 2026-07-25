@@ -559,6 +559,14 @@ def test_inline_line_returns_none_for_unhandled_types():
     # for the same reason)
     assert adapter._inline_line("message.part.delta", {"delta": "wor"}, "assistant") is None
     assert adapter._inline_line("message.part.delta", {"delta": ""}, "assistant") is None
+    # permission.updated does not exist on this surface at all (the live ask
+    # frame is permission.asked) — nothing may be keyed to the dead name.
+    assert (
+        adapter._inline_line(
+            "permission.updated", {"permission": {"type": "edit", "pattern": "src/**"}}, "assistant"
+        )
+        is None
+    )
 
 
 def test_inline_line_renders_each_curated_type():
@@ -598,15 +606,30 @@ def test_inline_line_renders_each_curated_type():
     assert adapter._inline_line("file.edited", {"file": "src/app.py"}, "assistant") == (
         f"{_TOOL_COLOR}[bmad] file: src/app.py{_RESET}\n"
     )
+    # Permission fields are the live 1.18.2 ones: the ask frame is
+    # permission.asked (permission.updated does not exist) carrying a
+    # `permission` STRING plus a `patterns` list, and the reply carries `reply`.
     assert (
         adapter._inline_line(
-            "permission.updated", {"permission": {"type": "edit", "pattern": "src/**"}}, "assistant"
+            "permission.asked",
+            {
+                "id": "per_1",
+                "permission": "bash",
+                "patterns": ["echo permcheck"],
+                "metadata": {"command": "echo permcheck"},
+                "always": ["echo *"],
+            },
+            "assistant",
         )
-        == f"{_TOOL_COLOR}[bmad] perm: edit src/**{_RESET}\n"
+        == f'{_TOOL_COLOR}[bmad] perm ask: bash ["echo permcheck"]{_RESET}\n'
     )
-    assert adapter._inline_line("permission.replied", {"response": "allow"}, "assistant") == (
-        f"{_TOOL_COLOR}[bmad] perm: allow{_RESET}\n"
+    # no patterns at all still names the permission rather than printing '?'
+    assert adapter._inline_line("permission.asked", {"permission": "edit"}, "assistant") == (
+        f"{_TOOL_COLOR}[bmad] perm ask: edit{_RESET}\n"
     )
+    assert adapter._inline_line(
+        "permission.replied", {"requestID": "per_1", "reply": "once"}, "assistant"
+    ) == (f"{_TOOL_COLOR}[bmad] perm reply: once{_RESET}\n")
 
 
 def test_inline_line_renders_session_error():
@@ -789,15 +812,23 @@ def test_dispatch_writes_command_file_permission_lines(tmp_path):
             "properties": {"sessionID": "ses_test", "name": "Edit", "arguments": {"x": 1}},
         },
         {"type": "file.edited", "properties": {"sessionID": "ses_test", "file": "a.py"}},
-        {"type": "permission.replied", "properties": {"sessionID": "ses_test", "response": "deny"}},
+        {
+            "type": "permission.asked",
+            "properties": {"sessionID": "ses_test", "permission": "bash", "patterns": ["rm *"]},
+        },
+        {
+            "type": "permission.replied",
+            "properties": {"sessionID": "ses_test", "requestID": "per_1", "reply": "deny"},
+        },
     ):
         adapter._dispatch_sse(sess, evt)
     log = _log_text(log_path)
     assert "[bmad] cmd: Edit " in log
     assert "[bmad] file: a.py\n" in log
-    assert "[bmad] perm: deny\n" in log
+    assert '[bmad] perm ask: bash ["rm *"]\n' in log
+    assert "[bmad] perm reply: deny\n" in log
     types = [r["type"] for r in read_jsonl(event_path)]
-    assert types == ["command.executed", "file.edited", "permission.replied"]
+    assert types == ["command.executed", "file.edited", "permission.asked", "permission.replied"]
 
 
 # ------------------------------------------------------------ tool-part render
@@ -1041,9 +1072,11 @@ MALFORMED_FRAMES = [
     {"type": "message.part.updated", "properties": {"part": ["text"]}},
     # info is a string → _render_inline's info.get("id") on the role refresh
     {"type": "message.updated", "properties": {"info": "not-a-dict"}},
-    # permission is a truthy non-dict → `props.get("permission") or props`
-    # keeps it, then perm.get("type") blows up
-    {"type": "permission.updated", "properties": {"permission": "bash"}},
+    # a tool part whose state is a truthy non-dict → `part.get("state") or {}`
+    # keeps it, then state.get("status") blows up. (The permission frames no
+    # longer offer this shape: post-correction they read `permission` /
+    # `patterns` / `reply` straight off props, which is always a dict here.)
+    {"type": "message.part.updated", "properties": {"part": {"type": "tool", "state": "running"}}},
 ]
 
 
