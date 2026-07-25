@@ -50,17 +50,24 @@ static contract — worth re-dumping on any version bump:
   exactly twice: once at creation with ``text: ""``, then once carrying the
   full final text. Held at 4 / 711 / 5689 chars (2 fires each, 1 non-empty).
   Rendering on this frame therefore yields one clean line per statement, with
-  no de-duplication needed. Tool execution also surfaces here, as
-  ``part.type == "tool"`` with ``part.tool`` and ``state.status`` stepping
-  pending → running → completed (``state.input`` / ``state.output``) — tool
-  parts carry no ``part.text``, so the current renderer emits nothing for them.
+  no de-duplication needed. **Tool execution also surfaces here** — and only
+  here — as ``part.type == "tool"`` with ``part.tool`` and a ``state`` whose
+  ``status`` steps pending → running → terminal (``state.input`` throughout,
+  ``state.output`` on ``completed``, ``state.error`` on ``error``). Tool parts
+  carry no ``part.text``, so the tool branch must sit ABOVE the empty-text
+  bail-out in ``_inline_line`` to be reachable at all. ``ToolState`` is a
+  4-variant union (pending / running / completed / error), so rendering on the
+  terminal pair is exhaustively once-per-tool-call; ``error`` is included from
+  the static contract (no tool failed during the live probe) so a failed call
+  cannot vanish from the transcript.
 - ``message.part.delta`` — the separate per-token stream. At 5689 chars its 50
   deltas concatenate **byte-exactly** to the single ``part.updated`` text, so
   it is pure redundancy: never rendered inline, and excluded from the SSE trace
   (``logs/`` is never trimmed by retention).
-- ``command.executed`` — the **slash-command** surface. It does **not** fire for
-  agent tool use: 0 frames across live ``bash`` / ``write`` / ``read`` /
-  ``edit`` calls. Its payload is ``name`` / ``arguments`` / ``messageID``.
+- ``command.executed`` — the **slash-command** surface, kept as that and nothing
+  more. It does **not** fire for agent tool use: 0 frames across live ``bash`` /
+  ``write`` / ``read`` / ``edit`` calls. Payload is ``name`` / ``arguments`` /
+  ``messageID`` / ``sessionID`` (all required, so it needs no allowlist).
 - ``file.edited`` — live payload is exactly ``{"file": "/abs/path"}`` with **no
   ``sessionID``**, so the ``properties.sessionID`` filter in ``_dispatch_sse``
   drops it before any render. Same for ``file.watcher.updated``. Reaching it
@@ -224,8 +231,9 @@ def _parse_sse_lines(lines) -> Any:
 
 
 def _sum_args(arguments: Any) -> str:
-    """Compact one-line summary of an arbitrary event payload value (a
-    ``command.executed`` ``arguments``, a ``session.error`` ``error``) for the
+    """Compact one-line summary of an arbitrary event payload value (a tool
+    part's ``state.input``, a ``command.executed`` ``arguments``, a
+    ``session.error`` ``error``) for the
     inline run log. Truncates long dicts/strings so a single line never explodes
     the tail view, and accepts any shape — these payloads are server-controlled
     and not all of them have a pinned schema."""
@@ -256,8 +264,17 @@ _ROLE_COLORS = {
     "assistant": "\x1b[36m",  # SGR 36 = cyan
 }
 _ROLE_COLOR_DEFAULT = "\x1b[35m"  # SGR 35 = magenta — unseen roles
-_TOOL_COLOR = "\x1b[32m"  # SGR 32 = green — cmd/file/permission (role-less)
+_TOOL_COLOR = "\x1b[32m"  # SGR 32 = green — tool/cmd/file/permission (role-less)
 _RESET = "\x1b[0m"
+
+# Tool-part statuses that end a tool call. `ToolState` is a 4-variant union in
+# the 1.18.2 OpenAPI (`pending`, `running`, `completed`, `error`), so these two
+# are exhaustively the terminal ones — a tool call reaches exactly one of them,
+# which is what makes "render on terminal" equal to "one line per tool". The
+# live probe only ever saw pending → running → completed (nothing failed during
+# it); `error` comes from the static contract, and including it is what keeps a
+# FAILED tool call from vanishing from the transcript entirely.
+_TOOL_TERMINAL_STATES = frozenset({"completed", "error"})
 
 
 def _role_color(role: str) -> str:
@@ -704,9 +721,10 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
 
         Event-type strings and their semantics are pinned in the module
         docstring's ``/event`` section — read that before adding a branch here.
-        It records which of these types actually fire on 1.18.2 and which the
-        renderer names but never sees (``command.executed`` for tool use,
-        ``file.edited``, ``permission.updated``).
+        It records which of these types actually fire on 1.18.2, notably that
+        agent tool use arrives as a ``tool``-typed ``message.part.updated`` part
+        (never as ``command.executed``), and which types the renderer names but
+        never sees (``file.edited``, ``permission.updated``).
 
         ``message.updated`` carries only turn metadata (notably ``info.role``
         keyed by ``info.id``) and renders no inline line of its own — it just
@@ -757,6 +775,15 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
         # nothing consumes deltas anywhere in this adapter.
         if etype == "message.part.updated":
             part = props.get("part") or {}
+            # Tool execution rides this same frame as a `tool`-typed part —
+            # there is no tool.call/tool.response event on this surface, and
+            # `command.executed` never fires for it (both pinned live). Tool
+            # parts carry no `text`, so this branch MUST sit above the
+            # empty-text `return None` below or it can never be reached: that
+            # exact ordering is the difference between rendering the agent's
+            # actions and rendering nothing but its prose.
+            if part.get("type") == "tool":
+                return self._tool_line(part)
             text = part.get("text") or ""
             body = text.strip()  # drop surrounding blanks; keep internal structure
             if not body:  # empty/non-text part — no value live
@@ -768,7 +795,12 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
             # Internal newlines in the body are preserved so multi-paragraph
             # reasoning reads as prose under the one header.
             return f"\n{_role_color(role)}[bmad] {role}:{_RESET}\n{body}\n"
-        # tool/command surface (no tool.call exists on this SSE stream)
+        # The SLASH-COMMAND surface — NOT the tool surface. Agent tool use never
+        # reaches here (0 `command.executed` frames across live bash/write/read/
+        # edit calls); it renders from the `tool`-typed part above. Kept because
+        # a slash command invoked through this server is still worth a line and
+        # its payload is pinned (`name`/`arguments`/`messageID`, all required),
+        # but do not "fix" tool rendering back into this branch.
         if etype == "command.executed":
             args = _sum_args(props.get("arguments"))
             return f"{_TOOL_COLOR}[bmad] cmd: {props.get('name') or '?'}{(' ' + args) if args else ''}{_RESET}\n"
@@ -793,6 +825,40 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
             detail = _sum_args(props.get("error"))
             return f"{_TOOL_COLOR}[bmad] error:{(' ' + detail) if detail else ''}{_RESET}\n"
         return None
+
+    @staticmethod
+    def _tool_line(part: dict) -> str | None:
+        """One line for a finished tool call, or None while it is still running.
+
+        A `tool`-typed ``message.part.updated`` part fires once per state
+        transition — ``pending`` → ``running`` → terminal — carrying the SAME
+        part id each time. Rendering every fire would print each tool call three
+        times, so the line is emitted only on a terminal status
+        (``_TOOL_TERMINAL_STATES``): a tool call reaches exactly one terminal
+        state, which makes that gate exactly "once per tool call". The gate is
+        the whole correctness argument here — a test that only asserts a tool
+        renders at all passes with it removed.
+
+        Same green/tool hue as the other role-less markers: a tool call is an
+        action, not a speaker. ``state.input`` is summarized inline (that is the
+        "what did the agent just do" the reader wants); ``state.output`` is
+        deliberately NOT — it is a full command's stdout or a whole file's text
+        on this surface, and the complete payload is in the SSE trace for anyone
+        who needs it. A failure appends the error, because a tool that failed
+        silently is exactly what a reader would go looking for."""
+        state = part.get("state") or {}
+        status = state.get("status")
+        if status not in _TOOL_TERMINAL_STATES:
+            return None
+        args = _sum_args(state.get("input"))
+        suffix = ""
+        if status == "error":
+            detail = _sum_args(state.get("error"))
+            suffix = f" -> error{(': ' + detail) if detail else ''}"
+        return (
+            f"{_TOOL_COLOR}[bmad] tool: {part.get('tool') or '?'}"
+            f"{(' ' + args) if args else ''}{suffix}{_RESET}\n"
+        )
 
     def _emit_event(self, sess: _ServerSession, etype: str, props: dict) -> None:
         """Append one structured JSON object to the session's

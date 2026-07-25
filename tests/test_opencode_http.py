@@ -800,6 +800,156 @@ def test_dispatch_writes_command_file_permission_lines(tmp_path):
     assert types == ["command.executed", "file.edited", "permission.replied"]
 
 
+# ------------------------------------------------------------ tool-part render
+#
+# Agent tool use has no event of its own on this SSE surface: no tool.call, no
+# tool.response, and command.executed never fires for it (0 frames across live
+# bash/write/read/edit). It arrives as message.part.updated with a `tool`-typed
+# part — which carries NO `part.text`, so the tool branch has to sit above
+# _inline_line's empty-text bail-out to be reachable at all.
+#
+# A tool part re-fires on every state transition with the same part id
+# (pending → running → terminal), so the render is gated on a TERMINAL status.
+# That gate, not the rendering, is the correctness claim here — see the ABLATION
+# note above test_tool_part_renders_once_per_call.
+
+
+def _tool_part(status: str, **state) -> dict:
+    """A `tool`-typed message part in the given state, shaped like 1.18.2's
+    ToolPart (same part id across every transition of one call)."""
+    return {
+        "id": "prt_tool1",
+        "sessionID": "ses_test",
+        "messageID": "msg_a1",
+        "type": "tool",
+        "callID": "toolu_1",
+        "tool": "bash",
+        "state": {"status": status, **state},
+    }
+
+
+def _dispatch_tool(adapter, sess, part: dict) -> None:
+    adapter._dispatch_sse(
+        sess,
+        {"type": "message.part.updated", "properties": {"sessionID": "ses_test", "part": part}},
+    )
+
+
+def test_tool_line_renders_name_and_input_summary():
+    """The terminal fire renders the tool name plus a one-line input summary —
+    the "what did the agent just do" the transcript exists for. state.output is
+    deliberately absent from the line (it is a whole command's stdout or a whole
+    file on this surface); the complete payload stays in the SSE trace."""
+    adapter = make_adapter(Path("/tmp"))  # _inline_line is pure
+    line = adapter._inline_line(
+        "message.part.updated",
+        {"part": _tool_part("completed", input={"command": "echo hi"}, output="OUTPUT_MARKER")},
+        "assistant",
+    )
+    assert line == f'{_TOOL_COLOR}[bmad] tool: bash {{"command": "echo hi"}}{_RESET}\n'
+    assert "OUTPUT_MARKER" not in line  # output is traced, never rendered inline
+    # a tool with no input still names itself rather than dropping
+    assert adapter._inline_line(
+        "message.part.updated", {"part": _tool_part("completed", input={}, output="")}, "assistant"
+    ) == (f"{_TOOL_COLOR}[bmad] tool: bash{_RESET}\n")
+    # long inputs truncate like any other one-line summary
+    long_line = adapter._inline_line(
+        "message.part.updated",
+        {"part": _tool_part("completed", input={"command": "x" * 500})},
+        "assistant",
+    )
+    assert long_line is not None and "…" in long_line
+
+
+def test_tool_line_marks_a_failed_call():
+    """`error` is the other terminal status (ToolState is a 4-variant union), and
+    a tool that failed is precisely what a reader goes to the transcript for —
+    so it renders, with the error appended to the same line shape."""
+    adapter = make_adapter(Path("/tmp"))
+    assert adapter._inline_line(
+        "message.part.updated",
+        {"part": _tool_part("error", input={"command": "false"}, error="exit status 1")},
+        "assistant",
+    ) == (
+        f'{_TOOL_COLOR}[bmad] tool: bash {{"command": "false"}} -> error: exit status 1{_RESET}\n'
+    )
+    # an error with no detail still marks the failure — the marker is the signal
+    assert adapter._inline_line(
+        "message.part.updated", {"part": _tool_part("error", input={})}, "assistant"
+    ) == (f"{_TOOL_COLOR}[bmad] tool: bash -> error{_RESET}\n")
+
+
+def test_tool_part_renders_to_the_log(tmp_path):
+    """End to end through _dispatch_sse: a completed tool call lands in the
+    readable transcript (this is the half of the feature that rendered nothing
+    at all before — tool parts have no part.text)."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    _dispatch_tool(adapter, sess, _tool_part("completed", input={"file": "a.py"}, output="ok"))
+    assert '[bmad] tool: bash {"file": "a.py"}\n' in _log_text(log_path)
+    # role-less: no "[bmad] assistant:" header is emitted for a tool part
+    assert "[bmad] assistant:" not in _log_text(log_path)
+    assert _TOOL_COLOR in log_path.read_bytes().decode("utf-8")
+
+
+# ABLATION (both directions run 2026-07-25). "One line per tool" is a PLACEMENT
+# claim, and it is also what a renderer that emits NOTHING satisfies — so the
+# presence ablation alone would not test the gate:
+#   (a) delete the `part.get("type") == "tool"` branch from _inline_line → all
+#       five tool tests fail; this one at `assert 0 == 1` on the count.
+#   (b) INVERSE: drop the `status not in _TOOL_TERMINAL_STATES` gate from
+#       _tool_line so it renders on every transition → this test fails on the
+#       FIRST intermediate assert (pending rendered '[bmad] tool: bash'), which
+#       is the proof the mutation actually fires: the pending and running frames
+#       really do reach the branch, so the count assertion is not passing
+#       vacuously. Left to run to completion the count is 3 != 1, with running
+#       and completed rendering byte-identical lines.
+# The intermediate "nothing yet" asserts are the placement claim stated directly;
+# the count is the backstop.
+
+
+def test_tool_part_renders_once_per_call(tmp_path):
+    """One tool call = one transcript line, even though the part re-fires on
+    pending, running and the terminal status with the same part id. The trace
+    keeps all three fires: the sinks split curated-vs-complete by design."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    # the live progression: pending (no input yet) → running → completed
+    _dispatch_tool(adapter, sess, _tool_part("pending", input={}, raw=""))
+    assert _log_text(log_path) == ""  # nothing rendered while it is queued
+    _dispatch_tool(adapter, sess, _tool_part("running", input={"command": "echo hi"}))
+    assert _log_text(log_path) == ""  # nor while it runs
+    _dispatch_tool(
+        adapter, sess, _tool_part("completed", input={"command": "echo hi"}, output="hi\n")
+    )
+
+    log = _log_text(log_path)  # ANSI-stripped, CRLF normalized
+    assert log.count("[bmad] tool: bash") == 1
+    assert log == '[bmad] tool: bash {"command": "echo hi"}\n'
+    # all three fires are in the trace — only the transcript is deduplicated
+    records = read_jsonl(event_path)
+    assert [r["properties"]["part"]["state"]["status"] for r in records] == [
+        "pending",
+        "running",
+        "completed",
+    ]
+
+
+def test_tool_part_never_shadows_assistant_text(tmp_path):
+    """The tool branch sits inside the message.part.updated arm, above the
+    empty-text bail-out — it must not swallow ordinary text parts on the way."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    for part in (
+        {"type": "text", "text": "thinking about it", "messageID": "msg_a1"},
+        _tool_part("completed", input={"command": "ls"}, output="a.py"),
+        {"type": "text", "text": "done", "messageID": "msg_a1"},
+    ):
+        _dispatch_tool(adapter, sess, part)
+    log = _log_text(log_path)
+    assert "\n[bmad] assistant:\nthinking about it\n" in log
+    assert '[bmad] tool: bash {"command": "ls"}\n' in log
+    assert "\n[bmad] assistant:\ndone\n" in log
+    assert log.index("thinking about it") < log.index("tool: bash") < log.index("done")
+
+
 def test_jsonl_seq_is_monotonic_with_ts_and_shape(tmp_path):
     """Each traced event gets one JSONL record with a monotonic seq, the raw
     type, the raw properties, and an epoch-ms ts that never goes backwards
