@@ -129,6 +129,15 @@ class TerminalMultiplexer(ABC):
         """Create a window running ``command`` (with ``env`` layered on) in
         ``session``, rooted at ``cwd``. Returns the backend-native window id.
 
+        That id is **opaque to core**: it is replayed verbatim as the ``-t``
+        target of :meth:`pipe_pane`, :meth:`send_text`, :meth:`kill_window` and
+        :meth:`window_pane_pids`, and membership-tested against
+        :meth:`list_window_ids` — never parsed, and never re-composed through
+        :meth:`target`. So a backend MAY return an already-qualified target
+        instead of a bare id (psmux returns ``session:@N``), provided
+        :meth:`list_window_ids` emits the identical form — see its symmetry
+        rule.
+
         ``command`` is a POSIX shlex-joined argv string, not a shell line:
         shell-operator behavior (``&&``, ``|``, ...) is backend-defined —
         one backend may hand the string to a shell, another may shlex
@@ -146,6 +155,15 @@ class TerminalMultiplexer(ABC):
     @abstractmethod
     def list_window_ids(self, session: str) -> list[str]:
         """Native ids of every window in ``session`` (empty if it is gone).
+
+        SYMMETRY RULE: these must be the *same id form* :meth:`new_window` and
+        :meth:`new_parked_window` return, because :meth:`window_alive` is a
+        membership test over this list. A backend that qualifies one side and
+        not the other reads every live window as instantly dead. The form
+        itself is the backend's own — psmux emits ``session:@N`` because its
+        ids are minted per server (one server per session), so a bare ``@N``
+        replayed as a ``-t`` target routes by the *caller's* server instead of
+        the owning one.
 
         Raises :class:`MultiplexerError` if the transport itself fails (timeout /
         missing binary): an empty list means "no windows" and must not be

@@ -209,6 +209,16 @@ def test_window_alive_accepts_new_window_id(monkeypatch, tmp_path):
     assert mux.window_alive("s", mux.new_window("s", "n", tmp_path, {}, "prog")) is True
 
 
+def test_qualified_id_reaches_the_pipe_pane_target(rec, tmp_path):
+    # #254 is about the `-t` argv, not the return value: the consumer must replay
+    # the minted id verbatim, and this backend's pipe_pane override (the one verb
+    # it reimplements) must not re-derive a bare target of its own.
+    rec.stdout = "@2\n"
+    mux = PsmuxMultiplexer()
+    mux.pipe_pane(mux.new_window("s", "n", tmp_path, {}, "prog"), tmp_path / "run.log")
+    assert rec.argv[1:4] == ["pipe-pane", "-t", "s:@2"]
+
+
 def test_list_window_ids_transport_failure_still_raises(monkeypatch):
     # Qualification must not soften the liveness contract: a transport failure
     # raises rather than answering [] (which would read as "session crashed").

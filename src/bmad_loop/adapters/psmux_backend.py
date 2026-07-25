@@ -14,7 +14,10 @@ dash-flag token from the piped command (so the log sink travels as a
 positional sidecar ``.ps1``). Window ids are minted per server (one
 server per session), so ``new_window``/``list_window_ids`` hand back
 session-qualified ``session:@N`` ids that route to the owning server from
-any caller (psmux/psmux#483). ``available()`` additionally gates on
+any caller (psmux/psmux#483) — the TUI-side mint/list surfaces
+(``new_parked_window``, ``list_windows`` field ids) deliberately still hand
+back bare ids, a different process context tracked in #291.
+``available()`` additionally gates on
 the reported version: psmux releases up to 3.3.6 kill recycled PIDs during
 pane/session teardown without a process-identity check, which can take down
 an unrelated long-lived process mid-run. See :mod:`.multiplexer` for the
@@ -184,6 +187,12 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # boundary). Degrade to the bare id when the session name contains `:`
         # (it would split at the wrong colon) — the #221 rule — or when the id
         # is falsy (a failure sentinel must pass through unchanged).
+        #
+        # Composed here rather than via self.target() — which would emit
+        # `=session:@N`, and does parse (psmux strips the `=`) — because the
+        # seam requires target() to stay a stable *by-name* token and `@N` is
+        # an id. Do not "unify" the two grammars: current_return_target's
+        # `=session:%N` is a target(), this is not.
         if not window_id or ":" in session:
             return window_id
         return f"{session}:{window_id}"

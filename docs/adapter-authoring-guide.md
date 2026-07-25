@@ -82,7 +82,10 @@ seams of a full OS port are in
   (run a command, then _park_ on a keypress so the exit status stays inspectable,
   then return any attached client to its origin — the POSIX `sh -c` recipe is
   composed from the base's overridable shell-dialect hooks, so a non-POSIX
-  backend swaps the dialect fragments, not the method body), `list_window_ids`, `list_windows` (selected fields per window),
+  backend swaps the dialect fragments, not the method body), `list_window_ids`
+  (which MUST emit the same id form your `new_window` returns — `window_alive` is
+  a membership test over it, so qualifying one side and not the other reads every
+  live window as dead), `list_windows` (selected fields per window),
   `window_alive`, `kill_window`, `select_window`, `set_window_option`,
   `unset_window_option`, `show_window_option`, `pipe_pane` (tee a pane to a log),
   `send_text`.
@@ -102,11 +105,13 @@ families: the **seam-canonical target token** `=session[:window]` — formatted 
 the concrete `TerminalMultiplexer.target(session, window=None)`, decoded by the
 module-level `parse_target()` — or the backend's own **native id** (whatever your
 `new_window` returned). Core never hand-assembles the grammar; it calls
-`target()`. (The parked-window return target is the one value composed by the
-backend itself — `current_return_target`, above — precisely so this grammar
-never has to carry a pane id.) tmux consumes the token natively (it coincides
-with tmux exact-match syntax), so `BaseTmuxBackend` passes it straight
-through. A native-id backend
+`target()`. (Two values are composed by the backend itself rather than by
+`target()`, precisely so the seam grammar never has to carry a pane or window
+id: the parked-window return target — `current_return_target`, above — and the
+native window id, which psmux qualifies to `session:@N` at both minting seams
+because its ids are per-server. Both are replayed opaquely; neither is parsed by
+core.) tmux consumes the token natively (it coincides with tmux exact-match
+syntax), so `BaseTmuxBackend` passes it straight through. A native-id backend
 calls `parse_target()` first — `None` means "already a native id, use as-is",
 otherwise resolve `(session, window)` yourself; the herdr adapter's
 `_parse_target`
