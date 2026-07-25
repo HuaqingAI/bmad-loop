@@ -805,13 +805,17 @@ def test_dispatch_skips_empty_text_and_drops_deltas_from_both_sinks(tmp_path):
 
 
 def test_dispatch_writes_command_file_permission_lines(tmp_path):
+    """The role-less marker family, dispatched with the payload shapes 1.18.2
+    actually sends: command.executed carries a sessionID, file.edited carries
+    none (it rides the session-less allowlist), and the permission pair uses
+    permission/patterns + reply."""
     adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
     for evt in (
         {
             "type": "command.executed",
             "properties": {"sessionID": "ses_test", "name": "Edit", "arguments": {"x": 1}},
         },
-        {"type": "file.edited", "properties": {"sessionID": "ses_test", "file": "a.py"}},
+        {"type": "file.edited", "properties": {"file": "a.py"}},
         {
             "type": "permission.asked",
             "properties": {"sessionID": "ses_test", "permission": "bash", "patterns": ["rm *"]},
@@ -1024,6 +1028,84 @@ def test_no_session_id_event_filtered_from_both_sinks(tmp_path):
     assert _log_text(log_path) == ""
     assert read_jsonl(event_path) == []
     assert sess.event_seq == 0
+
+
+# ----------------------------------------------- session-less type allowlist
+#
+# Some frames worth logging carry no sessionID at all: file.edited is exactly
+# {"file": "/abs/path"} live, and 1.18.2 pins it additionalProperties:false over
+# that one key — so the sessionID filter in _dispatch_sse drops it above both
+# sinks and its render branch is unreachable without an explicit exemption.
+# _SESSIONLESS_TYPES is that exemption, and it is sound ONLY because bmad-loop
+# spawns one opencode serve per session, which makes a server-global frame
+# unambiguously this session's.
+#
+# It is an allowlist rather than "allow anything session-less" because the
+# session-less traffic is mostly noise that says nothing about the run:
+# plugin.added alone was 90 of 388 frames in the live probe.
+#
+# ABLATION (verified 2026-07-25): revert _dispatch_sse's filter to the plain
+# `props.get("sessionID") != sess.session_id` and the two tests that assert a
+# session-less frame REACHES a sink fail. The two negative tests below
+# (non-allowlisted, control-queue) keep passing under that ablation — they
+# assert absence, which holds however the frame was dropped, so they document
+# scope rather than prove reachability. The positive test carries that claim.
+
+
+def test_sessionless_allowlisted_type_renders_and_traces(tmp_path):
+    """file.edited has no sessionID at all, yet reaches BOTH sinks — the
+    allowlist exempts it from the filter, and the trace stays consistent with the
+    transcript (it is the file you read to explain a rendered line)."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    adapter._dispatch_sse(sess, {"type": "file.edited", "properties": {"file": "/abs/src/app.py"}})
+    assert "[bmad] file: /abs/src/app.py\n" in _log_text(log_path)
+    records = read_jsonl(event_path)
+    assert [r["type"] for r in records] == ["file.edited"]
+    assert records[0]["properties"] == {"file": "/abs/src/app.py"}
+
+
+def test_sessionless_non_allowlisted_type_writes_nothing(tmp_path):
+    """The allowlist is not a blanket exemption. plugin.added is session-less
+    too and was 90 of 388 live frames; it must still be dropped above both
+    sinks, burning no seq. Same for the file watcher, which fires for any change
+    under the project (not just the agent's) and double-reports file.edited."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    for etype in ("plugin.added", "file.watcher.updated", "server.instance.disposed"):
+        adapter._dispatch_sse(sess, {"type": etype, "properties": {"plugin": "x", "file": "y"}})
+    assert _log_text(log_path) == ""
+    assert read_jsonl(event_path) == []
+    assert sess.event_seq == 0
+    # liveness is unaffected: these frames still counted as activity, exactly as
+    # before the allowlist existed (that counter sits above the filter)
+    assert sess.activity == 3
+
+
+def test_sessionless_allowlist_does_not_touch_the_control_queue(tmp_path):
+    """The allowlist is a logging exemption only. A session-less frame must never
+    reach the idle/error puts — those stay keyed to this session's id, or a
+    foreign server-global frame could end the turn."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    for etype in ("session.idle", "session.error"):
+        adapter._dispatch_sse(sess, {"type": etype, "properties": {}})
+    assert sess.events.empty()
+    # and an allowlisted one does not either
+    adapter._dispatch_sse(sess, {"type": "file.edited", "properties": {"file": "a.py"}})
+    assert sess.events.empty()
+
+
+def test_unhashable_event_type_never_raises_in_the_filter(tmp_path):
+    """The allowlist membership test sits OUTSIDE the try/except that guards the
+    two sinks, so it must not raise on a server-controlled `type`: `in` on a
+    frozenset raises TypeError for an unhashable value, hence the isinstance
+    narrowing ahead of it."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    for etype in ({"a": 1}, ["file.edited"], {"file.edited"}):
+        adapter._dispatch_sse(sess, {"type": etype, "properties": {}})  # must not raise
+    assert _log_text(log_path) == ""
+    assert read_jsonl(event_path) == []
+    # the control path still works after them
+    adapter._dispatch_sse(sess, {"type": "session.idle", "properties": {"sessionID": "ses_test"}})
+    assert sess.events.get_nowait() == "idle"
 
 
 def test_render_inline_noops_when_log_fh_is_none(tmp_path):

@@ -68,11 +68,13 @@ static contract — worth re-dumping on any version bump:
   more. It does **not** fire for agent tool use: 0 frames across live ``bash`` /
   ``write`` / ``read`` / ``edit`` calls. Payload is ``name`` / ``arguments`` /
   ``messageID`` / ``sessionID`` (all required, so it needs no allowlist).
-- ``file.edited`` — live payload is exactly ``{"file": "/abs/path"}`` with **no
-  ``sessionID``**, so the ``properties.sessionID`` filter in ``_dispatch_sse``
-  drops it before any render. Same for ``file.watcher.updated``. Reaching it
-  needs an explicit session-less allowlist, sound here only because bmad-loop
-  runs one server per session.
+- ``file.edited`` — payload is exactly ``{"file": "/abs/path"}``, schema-pinned
+  ``additionalProperties: false`` over that one key, so it carries **no
+  ``sessionID``** and the ``properties.sessionID`` filter would drop it before
+  either sink. It is reachable only through the explicit ``_SESSIONLESS_TYPES``
+  allowlist, sound here only because bmad-loop runs one server per session.
+  ``file.watcher.updated`` is session-less too and deliberately NOT allowlisted
+  (see that constant).
 - ``permission.asked`` — the ask frame. There is **no ``permission.updated``** in
   1.18.2. Payload is a ``permission`` **string** plus ``patterns`` /
   ``metadata`` / ``always`` / ``tool`` / ``id`` / ``sessionID`` — not a nested
@@ -182,6 +184,24 @@ POLL_TICK_S = 5.0  # max event-queue wait per loop tick (generic's cadence)
 # an operator flips in a REPL or a subclass, not in the run contract every
 # settings file has to carry. Off means the sink is never opened.
 SSE_TRACE = True
+
+# ``/event`` frame types that carry NO ``properties.sessionID`` but are still
+# attributed to this session, exempting them from the sessionID filter in
+# `_dispatch_sse`. Sound ONLY because bmad-loop spawns one `opencode serve` per
+# session (see the transport notes in the module docstring): the server is
+# single-tenant, so a server-global frame is unambiguously this session's. Any
+# design that ever shares a server across sessions must empty this set.
+#
+# Deliberately an allowlist and not "allow every session-less frame": the live
+# probe's session-less traffic was overwhelmingly noise that says nothing about
+# the run — `plugin.added` alone was 90 of 388 frames, plus `server.heartbeat`,
+# `catalog.updated`, `server.connected`, `reference.updated` and
+# `integration.updated`. `file.watcher.updated` is excluded on purpose too: it
+# is the editor-integration watcher firing for any change under the project
+# (our own git operations, a build, an editor save), so it is not evidence the
+# agent did anything, and for the changes the agent DID make it just
+# double-reports what `file.edited` already carries.
+_SESSIONLESS_TYPES = frozenset({"file.edited"})
 
 # Fixed basic-auth username in OPENCODE_SERVER_PASSWORD mode (Bearer is rejected).
 AUTH_USER = "opencode"
@@ -679,7 +699,28 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
         # streams, exactly like subagent output in a tmux pane log).
         sess.activity += 1
         props = event.get("properties") or {}
-        if props.get("sessionID") != sess.session_id:
+        # Session-scoped frames must name this session (child/subagent sessions
+        # share the stream). A short allowlist of SESSION-LESS types passes
+        # anyway: some frames worth logging carry no sessionID at all — live
+        # `file.edited` is exactly `{"file": "/abs/path"}`, and the 1.18.2 schema
+        # pins it as `additionalProperties: false` over that one key, so there is
+        # no id to match and this filter would drop it before either sink. See
+        # `_SESSIONLESS_TYPES` for why it is an allowlist and what stays out.
+        #
+        # Both sinks sit below this gate, so an allowlisted frame is traced as
+        # well as rendered. That is intended: the trace's contract is one record
+        # per frame the adapter acted on, and it is the file you read to explain
+        # a line in the transcript — a rendered line with no matching record
+        # would make the two sinks disagree. It costs nothing here because the
+        # allowlist admits one low-rate type, not the noisy session-less bulk.
+        if props.get("sessionID") != sess.session_id and not (
+            # `in` on a frozenset raises TypeError for an unhashable value, and
+            # `type` is server-controlled, so narrow before the membership test
+            # (the isinstance check below this filter is deliberately kept there
+            # — moving it up would change the activity counter above).
+            isinstance(etype, str)
+            and etype in _SESSIONLESS_TYPES
+        ):
             return
         if not isinstance(etype, str):
             # Every branch below compares `type` against a string literal, so a
@@ -734,8 +775,8 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
         agent tool use arrives as a ``tool``-typed ``message.part.updated`` part
         (never as ``command.executed``), that the permission frames are
         ``permission.asked`` / ``permission.replied`` with ``permission`` /
-        ``patterns`` / ``reply`` fields, and which types the renderer names but
-        never sees (``file.edited``).
+        ``patterns`` / ``reply`` fields, and that ``file.edited`` reaches this
+        renderer only via the ``_SESSIONLESS_TYPES`` allowlist.
 
         ``message.updated`` carries only turn metadata (notably ``info.role``
         keyed by ``info.id``) and renders no inline line of its own — it just
@@ -816,6 +857,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
             args = _sum_args(props.get("arguments"))
             return f"{_TOOL_COLOR}[bmad] cmd: {props.get('name') or '?'}{(' ' + args) if args else ''}{_RESET}\n"
         if etype == "file.edited":
+            # Session-less: reachable only via `_SESSIONLESS_TYPES`.
             return f"{_TOOL_COLOR}[bmad] file: {props.get('file') or '?'}{_RESET}\n"
         # Permission surface. Field names are the live 1.18.2 ones: the ask frame
         # is `permission.asked` (there is no `permission.updated`) carrying a
