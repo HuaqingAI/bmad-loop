@@ -12,8 +12,8 @@ an optional extra.
 There are two ways the skills land in a project. The orchestrator's wheel **bundles**
 the three skills, so the simplest path is **pip + `bmad-loop init`**, which installs them
 itself. Alternatively the **BMAD-method installer** copies them. Either way the
-`/bmad-loop-setup` skill registers the `_bmad/` config, ensures the tool is installed,
-picks which coding CLIs to drive, and bootstraps the project. For the one-page summary,
+`/bmad-loop-setup` skill installs the orchestrator tool, picks which coding CLIs to
+drive, and bootstraps the project. For the one-page summary,
 see the [Installing the skill module](../README.md#installing-the-skill-module) section
 of the README.
 
@@ -62,19 +62,19 @@ claude "/bmad-loop-setup accept all defaults"
 
 `/bmad-loop-setup` handles both first-time setup and later upgrades — re-run it any time. It:
 
-1. Merges the module's config into `_bmad/config.yaml` (+ personal settings into the
-   gitignored `_bmad/config.user.yaml`) and registers its help entries in
-   `_bmad/module-help.csv`.
-2. Installs **or upgrades** the `bmad-loop` tool from Git (see
+1. Installs **or upgrades** the `bmad-loop` tool from Git (see
    [Installing the tool and TUI](#installing-the-tool-and-tui)). On an upgrade it runs
    `uv tool upgrade bmad-loop --reinstall`.
-3. Asks **which coding CLI(s)** the orchestrator should drive, then runs `bmad-loop init`
+2. Asks **which coding CLI(s)** the orchestrator should drive, then runs `bmad-loop init`
    to install the `bmad-loop-*` skills + register hooks + write the `.bmad-loop/policy.toml`
    template + add gitignore entries (including policy.toml itself — policy is per-machine; repos initialized before this run `git rm --cached .bmad-loop/policy.toml` once if theirs is already committed) (see [Choosing which CLIs to drive](#choosing-which-clis-to-drive)
    and [Initializing CLIs other than claude](#initializing-clis-other-than-claude)). On an
    upgrade it passes `--force-skills` so the per-project skill copies are refreshed.
-4. Runs `bmad-loop validate` as a preflight (see [Verify](#verify)).
-5. Cleans up the legacy installer package directories under `_bmad/`, leaving only config.
+3. Runs `bmad-loop validate` as a preflight (see [Verify](#verify)).
+4. Refreshes `_bmad/bmad-loop/module-help.csv`, the module's help entries. That is the
+   only file it writes under `_bmad/` — module registration, the central `config.toml`,
+   and the `/bmad-help` catalog are owned by the BMAD installer, which regenerates them
+   on every run.
 
 Run `/bmad-loop-setup` with plain prompts if you want to choose interactively — e.g.
 `claude "/bmad-loop-setup cli: claude, codex"` to preselect the CLIs.
@@ -88,7 +88,7 @@ If you are working from a clone of this repo, sync the project env and let
 ```bash
 uv sync --extra tui                                             # the orchestrator tool + TUI
 uv run bmad-loop init --project /path/to/project --cli claude   # installs skills + hooks + policy
-claude "/bmad-loop-setup accept all defaults"                   # register _bmad/ config + help
+claude "/bmad-loop-setup accept all defaults"                   # install the tool + wire the project
 ```
 
 Add `--cli codex --cli gemini` to also populate `.agents/skills/`. `init` always
@@ -307,8 +307,8 @@ lines), then uninstall the tool. There is no `bmad-loop uninstall` command — t
 are the documented manual procedure. Work **inside the project root**, and reclaim disk
 **before** deleting state so no worktrees or archives are orphaned.
 
-Two paths overlap: every project does steps 1–5 and 7; only projects set up through the
-**BMAD-method installer** (i.e. that ran `/bmad-loop-setup`) also need step 6.
+Two paths overlap: every project does steps 1–5 and 7; only projects with a `_bmad/` tree
+also need step 6.
 
 ### 1. Reclaim run disk first
 
@@ -370,15 +370,16 @@ entries to strip; leave every other hook in place.
 you had run `git rm --cached .bmad-loop/policy.toml` to stop sharing the per-machine policy, the
 file is untracked — re-add it (`git add .bmad-loop/policy.toml`) only if you want it back in version control.
 
-### 6. Unregister from `_bmad/` (BMAD-installer projects only)
+### 6. Remove the BMAD module (BMAD-installer projects only)
 
-If you ran `/bmad-loop-setup`, it registered the module in your BMAD config. Remove the
-bmad-loop (`bmad-loop`) entries from:
+There is nothing to hand-unregister: bmad-loop writes no BMAD config. If you installed the
+module through the BMAD installer, remove it there — the installer owns `_bmad/bmad-loop/`,
+the central `config.toml`, and the `/bmad-help` catalog, and regenerates all three on its
+next run.
 
-- `_bmad/config.yaml` and `_bmad/config.user.yaml` — drop the bmad-loop module config block
-- `_bmad/module-help.csv` — drop the bmad-loop help rows
-
-uv + `init`-only projects never write to `_bmad/` and can skip this step.
+If you only ever ran `/bmad-loop-setup`, delete `_bmad/bmad-loop/module-help.csv` (the one
+file it refreshes) — or the whole `_bmad/bmad-loop/` directory if the installer never
+created it. uv + `init`-only projects that have no `_bmad/` can skip this step.
 
 ### 7. Uninstall the tool
 

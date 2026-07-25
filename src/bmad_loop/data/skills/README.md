@@ -15,7 +15,7 @@ the table below).
 | `bmad-loop`         | — (this repo, Git)   | the orchestrator: ralph-loop, hooks, tmux adapters, TUI. CLI `bmad-loop`. Installed by `bmad-loop-setup` from Git.                                |
 | `bmad-loop-resolve` | — (bmad-loop-native) | interactive CRITICAL-escalation resolution: a human disambiguates a frozen spec so a paused story can be re-driven (`/bmad-loop-resolve <story>`) |
 | `bmad-loop-sweep`   | — (bmad-loop-native) | read-only deferred-work ledger triage; owns the canonical `deferred-work-format.md`                                                               |
-| `bmad-loop-setup`   | — (scaffolded)       | registers the module in `_bmad/config.yaml` + `module-help.csv`, **installs the orchestrator tool from Git**, runs `bmad-loop init` + `validate`  |
+| `bmad-loop-setup`   | — (scaffolded)       | **installs the orchestrator tool from Git**, runs `bmad-loop init` + `validate`, refreshes `_bmad/bmad-loop/module-help.csv`                      |
 
 The **inner dev primitive is the upstream `bmad-dev-auto` skill** (BMAD-METHOD's
 generic unattended dev session). It is **not** owned or bundled here — the
@@ -35,16 +35,19 @@ down for you:
 ```bash
 uv tool install "bmad-loop[tui] @ git+https://github.com/bmad-code-org/bmad-loop.git"
 bmad-loop init --project /path/to/project --cli claude   # add --cli codex/gemini as needed
-claude "/bmad-loop-setup accept all defaults"            # registers _bmad/ config + help
+claude "/bmad-loop-setup accept all defaults"            # installs the tool + wires the project
 ```
 
 `bmad-loop init` installs the `bmad-loop-*` skills into `.claude/skills/`
 (claude) and/or `.agents/skills/` (codex/gemini), registers hooks, writes
 `.bmad-loop/policy.toml`, and gitignores the runs dir. Existing skill dirs are
 left untouched (`--force-skills` to overwrite, `--no-skills` to skip).
-`bmad-loop-setup` is one-shot for the BMAD-side wiring: it merges config + help
-entries, ensures the tool is installed, then runs `bmad-loop init` and
-`bmad-loop validate` (preflight).
+`bmad-loop-setup` is one-shot for the bootstrap the BMAD installer cannot do: it
+ensures the orchestrator tool is installed, then runs `bmad-loop init` and
+`bmad-loop validate` (preflight). Module registration — `_bmad/bmad-loop/`, the
+central `config.toml`, the `/bmad-help` catalog — belongs to the BMAD installer,
+which regenerates it on every run; the only file the skill writes there is
+`_bmad/bmad-loop/module-help.csv`.
 
 The skills must be installed **together**: `bmad-loop-sweep` owns the canonical
 `deferred-work-format.md` that the ledger normalizes to, and the upstream

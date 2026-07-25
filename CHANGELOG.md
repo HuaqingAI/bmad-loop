@@ -56,6 +56,21 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- **`bmad-loop-setup` stops registering BMAD config; the installer owns it (#258).** The skill
+  wrote `_bmad/config.yaml`, `_bmad/config.user.yaml` and a root `_bmad/module-help.csv` — the
+  pre-v6.10 layout, which BMAD's own resolver never reads (it merges four TOML layers, and
+  `/bmad-help` reads a catalog assembled from per-module `_bmad/<module>/module-help.csv`). Since
+  v6.10.0 bmad-loop is an installer-installed module, so the BMAD installer already stages
+  `_bmad/bmad-loop/`, writes the manifests, and rebuilds the help catalog on every run — and
+  regenerates the central `config.toml` wholesale, discarding anything written there from outside.
+  The three PEP 723 scripts (`merge-config.py`, `merge-help-csv.py`, `cleanup-legacy.py`) are
+  **removed**; setup now writes exactly one file under `_bmad/`, the per-module
+  `_bmad/bmad-loop/module-help.csv`, and otherwise does only what the installer cannot: install
+  or upgrade the orchestrator tool, run `bmad-loop init`, and preflight with `validate`. It reads
+  the user's name and language through BMAD's own `resolve_config.py` instead of collecting them.
+  Dropping the scripts also closes the PEP 723 invocation bug (#259) — no inline-dependency script
+  is invoked with bare `python3` any more, because none ships.
+
 - **Ctrl+C outside a run now exits `130` cleanly (#241).** A `KeyboardInterrupt` escaping
   `main()` outside `engine.run()` (config load, engine construction) now prints a one-line
   `interrupted` to stderr and returns the new `ExitCode.INTERRUPTED` (`130` = 128 + SIGINT).
@@ -64,6 +79,14 @@ breaking changes may land in a minor release.
   stdout. It is now a clean `exit(130)` with empty stdout (a Python caller reading
   `subprocess.returncode` sees `130` rather than `-2`). A Ctrl+C _during_ a run is unchanged:
   the engine still finalizes it as a resumable `stopped` run (rc `0`).
+
+### Removed
+
+- **The `bmad-auto` → `bmad-loop` rename compatibility is gone.** The rename shipped in 0.8.0 and
+  no pre-rename installs remain in the wild, so `init` no longer strips `bmad_auto`-marked hooks,
+  deletes `bmad-auto-*` skill dirs, carries `.automator/policy.toml` over to `.bmad-loop/`, or
+  prints the leftover-`.automator/` note. `bmad-loop-setup` drops its migration section with them.
+  A project still on `bmad-auto` should migrate on 0.9.0 before upgrading past it.
 
 ### Fixed
 

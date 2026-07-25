@@ -253,7 +253,7 @@ The orchestrator drives the upstream `bmad-dev-auto` skill as its inner dev prim
 | `bmad-review`                     | merged lens-based reviewer, supersedes the hunters (**upstream** — bmm prereq, not bundled) |
 | `bmad-loop-resolve`               | interactive CRITICAL-escalation resolution (`/bmad-loop-resolve <story>`)                   |
 | `bmad-loop-sweep`                 | deferred-work ledger triage (automation-only)                                               |
-| `bmad-loop-setup`                 | registers the module in `_bmad/` config + help                                              |
+| `bmad-loop-setup`                 | installs the orchestrator tool from Git, then runs `bmad-loop init` + `validate`            |
 
 `bmad-loop validate` preflights `bmad-dev-auto` (always) plus the review skills that copy of the skill will actually invoke — read from its `customize.toml` review layers, or from `step-04-review.md` on releases that name their reviewers inline. So a merged-`bmad-review` install needs only `bmad-review`, a v6.10.0 install needs the two hunters it names, and a tree whose configured layers reference a skill it does not have is reported instead of failing on every dev run. Missing skills (or a `bmad-dev-auto` without its `customize.toml`) are reported with bmm-module remediation before any run starts.
 
@@ -267,14 +267,14 @@ uv tool install "bmad-loop[tui] @ git+https://github.com/bmad-code-org/bmad-loop
 uv tool install "bmad-loop[tui] @ git+https://github.com/bmad-code-org/bmad-loop.git@v0.8.1"
 
 bmad-loop init --project /path/to/project --cli claude   # add --cli codex/gemini as needed
-claude "/bmad-loop-setup accept all defaults"            # registers _bmad/ config + help
+claude "/bmad-loop-setup accept all defaults"            # installs the tool + wires the project
 ```
 
 The `[tui]` extra pulls in the dashboard/settings UI (textual); drop it for a headless install. `bmad-loop --version` confirms what you've got. Existing skill dirs are left untouched (`--force-skills` to overwrite a stale copy, `--no-skills` to manage skills yourself).
 
 ### Upgrading
 
-**Easiest — let the setup skill do it.** Re-running `/bmad-loop-setup` (or `/bmad-loop-setup upgrade`) on an already-installed project performs the two-step ritual for you: it detects the existing install, upgrades the tool with `--reinstall`, re-lays the per-project skills with `--force-skills`, and re-stamps config — then reports the before → after version.
+**Easiest — let the setup skill do it.** Re-running `/bmad-loop-setup` (or `/bmad-loop-setup upgrade`) on an already-installed project performs the two-step ritual for you: it detects the existing install, upgrades the tool with `--reinstall`, and re-lays the per-project skills with `--force-skills` — then reports the before → after version.
 
 ```bash
 claude "/bmad-loop-setup upgrade"
