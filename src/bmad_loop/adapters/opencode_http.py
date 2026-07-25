@@ -397,6 +397,8 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
         event_fh = event_path.open("a", encoding="utf-8")  # one structured event per line
         # The server's own stdout/stderr (INFO/diagnostic lines) is kept in a
         # separate file so the readable transcript in <task_id>.log stays clean.
+        # This is also where a failed spawn's diagnostics land — the give-up
+        # error below names this path, not log_path.
         server_path = self.logs_dir / f"{spec.task_id}.server.out"
         server_fh = server_path.open("ab")  # append: retries share one server log
         last_error = "server did not become healthy"
@@ -440,7 +442,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
         event_fh.close()
         raise OpencodeServerError(
             f"could not start `{self.binary} serve` after {SPAWN_ATTEMPTS} attempts "
-            f"({last_error}); log: {log_path}"
+            f"({last_error}); server log: {server_path}"
         )
 
     def _await_healthy(self, sess: _ServerSession) -> bool:

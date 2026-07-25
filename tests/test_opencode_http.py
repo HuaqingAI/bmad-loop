@@ -1660,15 +1660,29 @@ def test_e2e_spawn_retry_survives_one_early_death(tmp_path, fake_opencode):
 
 
 def test_e2e_spawn_gives_up_after_attempts(tmp_path, fake_opencode):
+    """The give-up error has to point at the file that actually holds the
+    diagnostics. Server stdout is redirected to <task>.server.out, so naming
+    <task>.log — which now carries only the SSE-rendered transcript, and is
+    EMPTY when the server never got far enough to stream anything — would send
+    an operator to a blank file on every failed spawn."""
     launcher, rec = fake_opencode
     adapter = make_adapter(tmp_path, binary=str(launcher))
     spec = make_spec(tmp_path, rec, "completed", extra_env={"FAKE_OPENCODE_START_FAILURES": "99"})
+    logs = tmp_path / "run" / "logs"
 
-    with pytest.raises(OpencodeServerError, match="after 3 attempts"):
+    with pytest.raises(OpencodeServerError, match="after 3 attempts") as excinfo:
         adapter.run(spec)
+
     assert adapter._sessions == {}
-    # every attempt appended to one log for the task
-    assert (tmp_path / "run" / "logs" / "t-1.log").exists()
+    message = str(excinfo.value)
+    assert str(logs / "t-1.server.out") in message
+    assert str(logs / "t-1.log") not in message
+    # and the path it names holds the goods: every attempt appended to one
+    # server log, so all 3 spawns' stdout is there to read
+    server_out = (logs / "t-1.server.out").read_text(encoding="utf-8")
+    assert server_out.count("FAKE_STDOUT_CANARY") == 3
+    # the transcript is the file that would have been useless here
+    assert (logs / "t-1.log").read_bytes() == b""
 
 
 # --------------------------------------------- OpencodeDevAdapter (Phase 4)
