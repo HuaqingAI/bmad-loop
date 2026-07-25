@@ -4202,12 +4202,23 @@ def test_proof_of_work_dead_on_arrival_window_is_refused(tmp_path, monkeypatch):
     # The foreign spec must land AFTER launch, or its mtime sits below the
     # `since_ns` floor, the scan discards it there, and the gate is never reached —
     # the test would pass with the gate removed (verified by ablation: it did).
+    #
+    # Writing it "after start_session returned" is not enough to establish that on
+    # Windows: `launched_ns` comes from `time.time_ns()` (a precise clock) while an
+    # NTFS mtime is stamped from the coarse system-time tick (~15.6 ms), so a file
+    # written a millisecond later can carry an mtime BELOW the floor. Re-stamp until
+    # the precondition actually holds rather than assuming the two clocks agree.
     foreign = impl / "spec-9-9-someone-elses-story.md"
-    foreign.write_text(
-        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n"
-        "## Auto Run Result\n\nStatus: done\nImplemented.\n"
-    )
-    assert devcontract.is_result_artifact(foreign, since_ns=handle.launched_ns)
+    deadline = time.monotonic() + 5.0
+    while True:
+        foreign.write_text(
+            "---\nstatus: done\nbaseline_revision: abc123\n---\n\n"
+            "## Auto Run Result\n\nStatus: done\nImplemented.\n"
+        )
+        if devcontract.is_result_artifact(foreign, since_ns=handle.launched_ns):
+            break
+        assert time.monotonic() < deadline, "foreign spec never cleared the launch floor"
+        time.sleep(0.02)
 
     res = adapter._final(handle, _dev_spec(tmp_path), "crashed", None, None)
     assert res.status == "crashed"
