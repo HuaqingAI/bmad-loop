@@ -592,12 +592,35 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
         props = event.get("properties") or {}
         if props.get("sessionID") != sess.session_id:
             return
-        # Before the control queue: render one human-readable line into the run
-        # log and emit a structured JSONL record. Both helpers no-op on unknown
-        # types, so unhandled frames leave both sinks byte-identical to today,
-        # and idle/error still queue below — control flow is unchanged.
-        self._render_inline(sess, etype, props)
-        self._emit_event(sess, etype, props)
+        if not isinstance(etype, str):
+            # Every branch below compares `type` against a string literal, so a
+            # frame carrying a non-string (or absent) type can match none of
+            # them. Dropping it here narrows the value for the typed helpers and
+            # keeps a malformed frame out of the trace — it is not a frame the
+            # adapter acted on. Liveness/activity above already counted it.
+            return
+        # Before the control queue: emit a structured trace record and render
+        # one human-readable line into the run log. Both helpers no-op on
+        # unknown types, so unhandled frames leave both sinks byte-identical to
+        # today, and idle/error still queue below — control flow is unchanged.
+        #
+        # Guarded as a block because these two sinks sit UPSTREAM of the
+        # idle/error queue puts on a frame-shaped payload we do not control:
+        # both helpers walk nested `.get` chains (props["part"], ["info"],
+        # ["permission"]), so a server that ships a string where a dict is
+        # expected raises AttributeError here. Unguarded that unwinds all the
+        # way to the reader's connection-level catch in `_sse_loop`, which tears
+        # the stream down, reconnects, and drops whatever the server had already
+        # buffered — a logging bug silently degrading completion signaling. Same
+        # never-die doctrine as the reader itself: logging is advisory, the
+        # queue puts below are not. `_emit_event` runs first (it is the simpler
+        # of the two) so a render bug still leaves the offending frame recorded
+        # in the trace that would be used to diagnose it.
+        try:
+            self._emit_event(sess, etype, props)
+            self._render_inline(sess, etype, props)
+        except Exception:  # nosec B110 - logging must never disturb the queue puts below
+            pass
         if etype == "session.idle":
             sess.events.put("idle")
         elif etype == "session.error":

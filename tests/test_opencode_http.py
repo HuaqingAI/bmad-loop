@@ -822,6 +822,102 @@ def test_render_inline_noops_when_log_fh_is_none(tmp_path):
     assert sess.event_seq == 0
 
 
+# --------------------------------------------- logging never breaks the stream
+#
+# Both sinks are written from _dispatch_sse ABOVE the idle/error queue puts, and
+# both walk nested .get chains into server-controlled payloads. A frame that
+# ships a string (or a list, or null) where the renderer expects a dict raises
+# AttributeError. Unguarded, that propagates out of _dispatch_sse into the SSE
+# reader's connection-level `except Exception` in _sse_loop, which treats it as
+# a dead connection: it tears the stream down, puts a `gap`, sleeps, and
+# reconnects — losing whatever the server had already buffered on that
+# connection. That is a logging bug degrading completion signaling, so these
+# tests assert the two properties that matter: the malformed frame does not
+# raise, and a following session.idle still reaches the control queue.
+#
+# ABLATION (verified 2026-07-25): delete the try/except around the two helper
+# calls in _dispatch_sse and the five tests below that feed a wrong-shaped
+# payload through the RENDER path fail with AttributeError. The sixth
+# (test_unserializable_properties_...) still passes ablated — its protection is
+# _emit_event's own narrow `except (OSError, TypeError, ValueError)` around
+# json.dumps, not this guard. It is kept as a regression test for that inner
+# catch; do not read it as evidence for the outer one.
+
+MALFORMED_FRAMES = [
+    # part is a string, not a dict → _render_inline's part.get("messageID")
+    {"type": "message.part.updated", "properties": {"part": "not-a-dict"}},
+    # part is a list → same chain, different wrong shape
+    {"type": "message.part.updated", "properties": {"part": ["text"]}},
+    # info is a string → _render_inline's info.get("id") on the role refresh
+    {"type": "message.updated", "properties": {"info": "not-a-dict"}},
+    # permission is a truthy non-dict → `props.get("permission") or props`
+    # keeps it, then perm.get("type") blows up
+    {"type": "permission.updated", "properties": {"permission": "bash"}},
+]
+
+
+@pytest.mark.parametrize("frame", MALFORMED_FRAMES, ids=lambda f: f["type"])
+def test_malformed_frame_never_breaks_dispatch(tmp_path, frame):
+    """A server-shaped payload the renderer can't walk must not escape dispatch."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    event = {**frame, "properties": {**frame["properties"], "sessionID": "ses_test"}}
+
+    adapter._dispatch_sse(sess, event)  # must not raise
+
+    # and the control path is untouched: the next idle still queues
+    adapter._dispatch_sse(sess, {"type": "session.idle", "properties": {"sessionID": "ses_test"}})
+    assert sess.events.get_nowait() == "idle"
+
+
+def test_malformed_frame_does_not_lose_the_trace_record(tmp_path):
+    """_emit_event runs before _render_inline inside the guard, so the frame that
+    broke rendering is still in the trace — which is the file you would read to
+    diagnose it."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    adapter._dispatch_sse(
+        sess,
+        {
+            "type": "message.part.updated",
+            "properties": {"sessionID": "ses_test", "part": "not-a-dict"},
+        },
+    )
+    records = read_jsonl(event_path)
+    assert [r["type"] for r in records] == ["message.part.updated"]
+    assert records[0]["properties"]["part"] == "not-a-dict"
+    assert _log_text(log_path) == ""  # rendering aborted, nothing half-written
+
+
+def test_unserializable_properties_never_break_dispatch(tmp_path):
+    """The trace's own failure mode: json.dumps raising on a payload it can't
+    encode must not take the stream down either. Held by _emit_event's own
+    catch rather than the outer guard (see the ABLATION note above)."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    adapter._dispatch_sse(
+        sess,
+        {
+            "type": "message.part.updated",
+            "properties": {"sessionID": "ses_test", "part": {"text": "hi"}, "blob": {1, 2}},
+        },
+    )
+    adapter._dispatch_sse(sess, {"type": "session.idle", "properties": {"sessionID": "ses_test"}})
+    assert sess.events.get_nowait() == "idle"
+    # the unserializable record is dropped, but the readable line still landed
+    # and the trace keeps working for the frames that follow
+    assert [r["type"] for r in read_jsonl(event_path)] == ["session.idle"]
+    assert "\n[bmad] assistant:\nhi\n" in _log_text(log_path)
+
+
+def test_non_string_event_type_is_dropped(tmp_path):
+    """`type` absent or non-string can match no branch below, so the frame is
+    dropped rather than traced — it is not something the adapter acted on."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    adapter._dispatch_sse(sess, {"properties": {"sessionID": "ses_test"}})
+    adapter._dispatch_sse(sess, {"type": 7, "properties": {"sessionID": "ses_test"}})
+    assert read_jsonl(event_path) == []
+    assert _log_text(log_path) == ""
+    assert sess.events.empty()
+
+
 def test_sum_args_truncates_and_handles_shapes():
     """_sum_args keeps a command's arguments on one log line: short passthrough,
     dict→json, long→truncated with an ellipsis, falsy→empty."""
