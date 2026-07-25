@@ -5,7 +5,16 @@ import sys
 from pathlib import Path
 
 import pytest
-from conftest import fault_read_text, git, spec_path, write_spec, write_sprint
+from conftest import (
+    _FAIL,
+    _OK,
+    MISSING_TOOL_CMD,
+    fault_read_text,
+    git,
+    spec_path,
+    write_spec,
+    write_sprint,
+)
 
 from bmad_loop import verify
 from bmad_loop.model import StoryTask
@@ -323,10 +332,12 @@ def test_verify_review_happy_and_commands(project):
     write_spec(sp, "done", task.baseline_commit)
     task.spec_file = str(sp)
 
-    ok_policy = Policy(verify=VerifyPolicy(commands=("true",)))
+    # The host-shell verbs, not POSIX `true`/`false`: cmd has neither, so those
+    # read as a broken environment on Windows rather than pass/fail (#302).
+    ok_policy = Policy(verify=VerifyPolicy(commands=(_OK,)))
     assert verify.verify_review(task, project, ok_policy).ok
 
-    fail_policy = Policy(verify=VerifyPolicy(commands=("true", "false")))
+    fail_policy = Policy(verify=VerifyPolicy(commands=(_OK, _FAIL)))
     out = verify.verify_review(task, project, fail_policy)
     assert not out.ok and "verify command failed" in out.reason
 
@@ -358,7 +369,11 @@ def test_verify_review_sprint_not_done(project):
 def test_verify_commands_env_fault_rc_escalates(tmp_path, rc):
     """The shell's environment faults (126 = not executable, 127 = not found)
     escalate instead of retrying: a repair session cannot fix the environment,
-    so they must never charge the story's attempt budget."""
+    so they must never charge the story's attempt budget.
+
+    Runs on both platforms: 126/127 are sh's *convention*, but the rc arm is
+    checked ahead of the per-shell branch, so `cmd /c "exit 126"` classifies
+    the same way — nothing about the win32 arm narrows it (issue #302)."""
     policy = Policy(verify=VerifyPolicy(commands=(f"exit {rc}",)))
     out = verify.verify_commands_outcome(policy, tmp_path)
     assert not out.ok
@@ -368,19 +383,185 @@ def test_verify_commands_env_fault_rc_escalates(tmp_path, rc):
     assert f"rc={rc}" in out.reason
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="cmd reports 9009, not 127")
 def test_verify_commands_missing_binary_is_env_fault(tmp_path):
-    """Realism check: an actual missing command yields sh's 127 → env fault."""
-    policy = Policy(verify=VerifyPolicy(commands=("definitely-not-a-real-cmd-126126",)))
+    """Realism check on the host shell: a command no host has is an env fault on
+    both — sh exits 127, cmd exits 1 and says "is not recognized" (issue #302)."""
+    policy = Policy(verify=VerifyPolicy(commands=(MISSING_TOOL_CMD,)))
     out = verify.verify_commands_outcome(policy, tmp_path)
-    assert out.env_fault and "rc=127" in out.reason
+    assert out.env_fault and not out.fixable
+    assert MISSING_TOOL_CMD in out.reason
+
+
+# --------------------------------------------------- cmd env-fault signals (issue #302)
+#
+# cmd has no 126/127 convention, so the win32 arm classifies on three other
+# signals. These drive verify.env_fault_reason directly with synthetic results:
+# actually executing an unrunnable path on Windows would hand it to the file
+# association (see #292) — an interactive picker mid-suite, not a test.
+
+WIN32_ONLY = pytest.mark.skipif(sys.platform != "win32", reason="cmd-specific classification")
+NOT_RECOGNIZED = (
+    "'ruff' is not recognized as an internal or external command,\noperable program or batch file."
+)
+
+
+@WIN32_ONLY
+@pytest.mark.parametrize(
+    "rc, tail",
+    [
+        (9009, ""),  # a .cmd/.bat wrapper propagating %ERRORLEVEL%
+        (1, NOT_RECOGNIZED),  # cmd's own message, alone in the tail
+        # The shape production actually builds: run_verify_commands concatenates
+        # stdout + stderr, and cmd's message is on stderr — so a compound command
+        # whose earlier half printed to stdout still puts the message last.
+        (1, f"1 failed, 3 passed\n{NOT_RECOGNIZED}"),
+    ],
+)
+def test_win32_shell_signals_are_env_faults(tmp_path, rc, tail):
+    result = verify.CommandResult("ruff check", rc, tail)
+    assert verify.env_fault_reason(result, tmp_path) is not None
+
+
+@WIN32_ONLY
+def test_win32_unresolvable_token_is_env_fault_without_the_message(tmp_path):
+    """The localized-Windows path: cmd's message is not English, so the leading
+    token is probed against PATH instead."""
+    result = verify.CommandResult(f"{MISSING_TOOL_CMD} -q", 1, "nije prepoznat kao naredba")
+    assert "not found on PATH" in (verify.env_fault_reason(result, tmp_path) or "")
+
+
+@WIN32_ONLY
+def test_win32_unexecutable_file_is_env_fault_despite_rc_zero(tmp_path):
+    """cmd hands a file whose extension is not in PATHEXT to the file association
+    and returns 0 without running it — a silent false pass, not a green verify."""
+    script = tmp_path / "check.sh"
+    script.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    result = verify.CommandResult(f'"{script}"', 0, "")
+    assert "not executable by cmd" in (verify.env_fault_reason(result, tmp_path) or "")
+
+
+@WIN32_ONLY
+def test_win32_file_named_after_a_builtin_is_not_a_false_fault(tmp_path):
+    """cmd answers an unqualified internal name internally, before searching any
+    directory, so a file that merely shares the name is never what runs. Without
+    the builtin guard on the file probe this escalates at rc 0 — verify could
+    then never pass in a repo that happens to carry such a file."""
+    (tmp_path / "echo").write_text("not a program\n", encoding="utf-8")
+    passing = verify.CommandResult("echo verifying", 0, "")
+    assert verify.env_fault_reason(passing, tmp_path) is None
+    failing = verify.CommandResult("echo verifying", 1, "checks failed")
+    assert verify.env_fault_reason(failing, tmp_path) is None
+    # The exemption is the bare name only: a qualified reference to that same file
+    # is something cmd does try to run, so it must still classify.
+    qualified = verify.CommandResult(str(tmp_path / "echo"), 0, "")
+    assert "not executable by cmd" in (verify.env_fault_reason(qualified, tmp_path) or "")
+
+
+@WIN32_ONLY
+@pytest.mark.parametrize(
+    "command, rc, tail",
+    [
+        ('if exist "x" (exit 1)', 1, ""),  # a cmd builtin: which cannot resolve it
+        ("pytest -q", 1, "1 failed, 3 passed"),  # the tool exists; the tests failed
+        ('pytest "unbalanced', 1, ""),  # untokenizable: probe skipped, not raised
+        # Pins the window, not a production shape: cmd's message rides on stderr,
+        # which is appended last, so it cannot be pushed out of the closing lines
+        # by a real run — only by a command echoing the phrase itself.
+        ("ruff check", 1, f"{NOT_RECOGNIZED}\n1 file reformatted"),
+        ("pytest -q", 1, "Access is denied\n1 test failed"),
+        ("2>nul pytest -q", 1, ""),
+        ("(pytest)", 1, "1 failed"),  # grouping parens on both ends, no argument
+        ("(pytest -q) && (ruff check)", 1, "1 failed"),
+        ("pytest|findstr FAIL", 1, "1 failed"),  # shlex leaves the pipe attached
+        ("pytest -q&&ruff check", 1, "1 failed"),
+        ("& pytest -q", 1, "1 failed"),  # a leading operator is not a tool name
+    ],
+)
+def test_win32_ordinary_failures_are_not_env_faults(tmp_path, command, rc, tail, monkeypatch):
+    # Pin PATH resolution to a host that has exactly pytest and ruff: otherwise
+    # every row here silently asserts this interpreter's PATH layout (a
+    # `python -m pytest` from an env whose Scripts\ dir is not on PATH reports
+    # "pytest not found on PATH" and fails for the wrong reason). Resolving only
+    # those two keeps each row load-bearing — `(pytest)` still proves the parens
+    # are stripped, `if exist` still proves the builtin allowlist.
+    monkeypatch.setattr(
+        verify.shutil,
+        "which",
+        lambda name: rf"C:\tools\{name}.exe" if name in {"pytest", "ruff"} else None,
+    )
+    assert verify.env_fault_reason(verify.CommandResult(command, rc, tail), tmp_path) is None
+
+
+@WIN32_ONLY
+def test_win32_passing_command_is_never_an_env_fault(tmp_path):
+    """rc 0 classifies only via the file probe — a token that is not a file on
+    disk must never escalate a green run."""
+    assert verify.env_fault_reason(verify.CommandResult("pytest -q", 0, ""), tmp_path) is None
+
+
+@WIN32_ONLY
+@pytest.mark.parametrize(
+    "command",
+    [
+        "%TOOLCHAIN%\\pytest.exe -q",  # cmd expands it; the literal never resolves
+        "!DELAYED!\\pytest.exe -q",
+    ],
+)
+def test_win32_expandable_token_skips_the_probe(tmp_path, command):
+    """A token cmd expands before running is unprobeable: resolving the literal
+    would report "not found" for a tool that is right there."""
+    assert verify.env_fault_reason(verify.CommandResult(command, 1, ""), tmp_path) is None
+
+
+@WIN32_ONLY
+def test_win32_failing_script_in_the_run_dir_is_not_a_false_fault(tmp_path, monkeypatch):
+    """cmd searches the run's own directory before PATH, so a runnable check that
+    simply *fails* there keeps the fixable-retry classification — `which` would
+    miss it, since it searches this process's directory instead."""
+    (tmp_path / "check.cmd").write_text("@exit /b 1\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path.parent)
+    failing = verify.CommandResult("check.cmd", 1, "checks failed")
+    assert verify.env_fault_reason(failing, tmp_path) is None
+    assert (
+        verify.env_fault_reason(verify.CommandResult("check", 1, "checks failed"), tmp_path) is None
+    )
+
+
+@WIN32_ONLY
+def test_win32_relative_script_under_a_foreign_cwd_is_not_a_false_fault(tmp_path, monkeypatch):
+    """The run's cwd is not the process cwd under worktree isolation, so
+    executability is decided by PATHEXT rather than by resolving the relative
+    path against whatever directory this process happens to sit in."""
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "check.cmd").write_text("@exit /b 0\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path.parent)
+    passing = verify.CommandResult("scripts\\check.cmd", 0, "")
+    assert verify.env_fault_reason(passing, tmp_path) is None
+
+
+@WIN32_ONLY
+def test_win32_timeout_is_never_an_env_fault(tmp_path):
+    """A timed-out command (rc sentinel -1) ran and hung, so it was found and
+    runnable — it keeps the charged fixable-retry classification even when its
+    tool happens to be unresolvable from this process."""
+    timed_out = verify.CommandResult(f"{MISSING_TOOL_CMD} -q", -1, "timed out")
+    assert verify.env_fault_reason(timed_out, tmp_path) is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="win32 has its own classifier")
+def test_posix_ignores_the_cmd_signals(tmp_path):
+    """The cmd signals stay win32-only: on sh, 9009 is an ordinary exit code."""
+    assert verify.env_fault_reason(verify.CommandResult("ruff", 9009, ""), tmp_path) is None
+    assert (
+        verify.env_fault_reason(verify.CommandResult("ruff", 1, NOT_RECOGNIZED), tmp_path) is None
+    )
 
 
 def test_env_fault_takes_precedence_over_earlier_ordinary_failure(tmp_path):
     """A mixed run must not classify by the first failure it sees: an env
     fault later in the command list still escalates — a repair session
     dispatched for the earlier rc=1 would run in the broken environment."""
-    policy = Policy(verify=VerifyPolicy(commands=("exit 1", "exit 127")))
+    policy = Policy(verify=VerifyPolicy(commands=(_FAIL, "exit 127")))
     out = verify.verify_commands_outcome(policy, tmp_path)
     assert not out.ok
     assert out.env_fault
@@ -390,7 +571,7 @@ def test_env_fault_takes_precedence_over_earlier_ordinary_failure(tmp_path):
 
 def test_verify_commands_rc1_stays_fixable_retry(tmp_path):
     """Ordinary failures (tests failing) keep the fixable-retry classification."""
-    policy = Policy(verify=VerifyPolicy(commands=("exit 1",)))
+    policy = Policy(verify=VerifyPolicy(commands=(_FAIL,)))
     out = verify.verify_commands_outcome(policy, tmp_path)
     assert not out.ok and out.fixable and out.retryable and not out.env_fault
 

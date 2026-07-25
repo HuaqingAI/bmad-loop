@@ -11,9 +11,13 @@ from pathlib import Path
 
 import pytest
 from conftest import (
+    _FAIL,
     _OK,
+    _disarm_check_script,
     _file_exists_cmd,
+    _self_disarming_cmd,
     _spec_baseline,
+    _write_check_script,
     committing_crash_state,
     dev_effect,
     fault_read_text,
@@ -5209,7 +5213,7 @@ def test_verify_commands_never_pass_defers_at_dev(project):
     policy = Policy(
         gates=GatesPolicy(mode="none"),
         notify=QUIET,
-        verify=VerifyPolicy(commands=("false",)),
+        verify=VerifyPolicy(commands=(_FAIL,)),  # host-shell fail verb, not `false` (#302)
     )
     engine, adapter = make_engine(
         project,
@@ -5251,25 +5255,15 @@ def test_verify_env_fault_pauses_dev_without_burning_budget(project):
     assert decision["env_fault"] is True
 
 
-def _self_disarming_script(project, name="check.sh"):
-    """A verify script that passes once, then strips its own exec bit — the
-    next invocation dies rc=126 (the issue's seeded-worktree fault, exactly)."""
-    script = project.project / name
-    script.write_text(f'#!/bin/sh\nchmod 644 "{script}"\nexit 0\n', encoding="utf-8")
-    script.chmod(0o755)
-    return script
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="sh env-fault exit codes (cmd reports 9009)")
 def test_review_verify_env_fault_escalates_instead_of_fix_session(project):
     """An env fault at the review gate pauses the run — no fix session is
     dispatched and no review cycles are burned re-verifying a broken environment."""
     write_sprint(project, {"1-1-a": "ready-for-dev"})
-    script = _self_disarming_script(project)
+    check = _self_disarming_cmd(project.project)
     policy = Policy(
         gates=GatesPolicy(mode="none"),
         notify=QUIET,
-        verify=VerifyPolicy(commands=(f'"{script}"',)),
+        verify=VerifyPolicy(commands=(check,)),
     )
     engine, adapter = make_engine(
         project,
@@ -5281,24 +5275,23 @@ def test_review_verify_env_fault_escalates_instead_of_fix_session(project):
     assert summary.paused and summary.escalated == 1 and summary.deferred == 0
     assert [s.role for s in adapter.sessions] == ["dev", "review"]  # no fix session
     assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
-    assert "rc=126" in engine.state.paused_reason
+    assert "verify environment fault" in engine.state.paused_reason
     failed = [e for e in engine.journal.entries() if e["kind"] == "review-verify-failed"][-1]
     assert failed["env_fault"] is True
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="sh env-fault exit codes (cmd reports 9009)")
 def test_skip_review_env_fault_escalates_not_defers(project):
     """review.enabled = false: an env fault at the commit gates pauses the run
     instead of deferring the story as if its code were broken."""
     from bmad_loop.policy import ReviewPolicy
 
     write_sprint(project, {"1-1-a": "ready-for-dev"})
-    script = _self_disarming_script(project)
+    check = _self_disarming_cmd(project.project)
     policy = Policy(
         gates=GatesPolicy(mode="none"),
         notify=QUIET,
         review=ReviewPolicy(enabled=False),
-        verify=VerifyPolicy(commands=(f'"{script}"',)),
+        verify=VerifyPolicy(commands=(check,)),
     )
     engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")], policy=policy)
     summary = engine.run()
@@ -5306,20 +5299,17 @@ def test_skip_review_env_fault_escalates_not_defers(project):
     assert summary.paused and summary.escalated == 1 and summary.deferred == 0
     assert [s.role for s in adapter.sessions] == ["dev"]  # no fix session either
     assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
-    assert "rc=126" in engine.state.paused_reason
+    assert "verify environment fault" in engine.state.paused_reason
     failed = [e for e in engine.journal.entries() if e["kind"] == "review-verify-failed"][-1]
     assert failed["env_fault"] is True
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="sh env-fault exit codes (cmd reports 9009)")
 def test_fix_phase_env_fault_escalates_instead_of_looping(project):
     """An env fault surfacing mid-fix-loop stops the loop — the remaining dev
     budget is not spent on repair sessions against an unfixable environment."""
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     marker = project.project / "fixed.marker"
-    script = project.project / "check.sh"
-    script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    script.chmod(0o755)
+    script, check = _write_check_script(project.project)
 
     def dev_with_marker(spec):
         marker.write_text("ok\n")
@@ -5331,7 +5321,7 @@ def test_fix_phase_env_fault_escalates_instead_of_looping(project):
 
     def env_breaking_fix(spec):
         marker.write_text("ok\n")
-        script.chmod(0o644)  # the re-verify now dies rc=126 — env fault
+        _disarm_check_script(script)  # the re-verify now hits an env fault
         return SessionResult(
             status="completed", result_json={"workflow": "auto-dev", "escalations": []}
         )
@@ -5339,7 +5329,7 @@ def test_fix_phase_env_fault_escalates_instead_of_looping(project):
     policy = Policy(
         gates=GatesPolicy(mode="none"),
         notify=QUIET,
-        verify=VerifyPolicy(commands=(_file_exists_cmd(marker), f'"{script}"')),
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker), check)),
         limits=LimitsPolicy(max_dev_attempts=3),  # budget left — must not be spent
     )
     engine, adapter = make_engine(
@@ -5350,7 +5340,7 @@ def test_fix_phase_env_fault_escalates_instead_of_looping(project):
     assert summary.paused and summary.escalated == 1 and summary.deferred == 0
     assert [s.role for s in adapter.sessions] == ["dev", "review", "dev"]  # one fix, then stop
     assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
-    assert "rc=126" in engine.state.paused_reason
+    assert "verify environment fault" in engine.state.paused_reason
     fix = [e for e in engine.journal.entries() if e["kind"] == "fix-decision"][-1]
     assert fix["env_fault"] is True
 

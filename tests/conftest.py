@@ -83,6 +83,10 @@ def write_script_launcher(directory: Path, name: str, body: str) -> Path:
 # re-deriving the win32 branch.
 
 _OK = "exit 0"  # cross-platform always-success verb (both `cmd /c` and `sh -c` honor it)
+# Its counterpart. `false`, the POSIX reflex, is *not* the same thing on Windows:
+# cmd has no such verb, so it reads as a broken environment rather than a failing
+# check (issue #302) — an ordinary-failure test written with it asserts nothing.
+_FAIL = "exit 1"
 _RUN = "%BMAD_LOOP_RUN_DIR%" if sys.platform == "win32" else "$BMAD_LOOP_RUN_DIR"
 
 
@@ -94,6 +98,54 @@ def _file_exists_cmd(path) -> str:
     if sys.platform == "win32":
         return f'if exist "{path}\\NUL" (exit 1) else if exist "{path}" (exit 0) else (exit 1)'
     return f'test -f "{path}"'
+
+
+# A tool no host has: sh exits 127, cmd exits 1 with "is not recognized" (#302).
+# Both classify as verify environment faults — the point of the tests using it.
+MISSING_TOOL_CMD = "definitely-not-a-real-cmd-302"
+
+
+def _self_disarming_cmd(project_dir: Path, stem: str = "check") -> str:
+    """A verify command that passes once, then breaks its own environment — the
+    seeded-worktree fault of issue #126.
+
+    POSIX: a script that drops its own exec bit, so the next run dies rc=126.
+    win32: cmd has no exec bit, and a batch file cannot disarm itself at all
+    (cmd re-reads it per line, so deleting or renaming it kills the *current*
+    run with "The batch file cannot be found."). The win32 twin therefore burns
+    a flag file and reaches for a tool that is not there on the second run —
+    cmd's own "is not recognized", the env fault of #302. A `.sh` command would
+    be worse than useless here: cmd hands it to the file association, which pops
+    an interactive picker mid-suite (#292)."""
+    if sys.platform == "win32":
+        armed = project_dir / f"{stem}.armed"
+        armed.write_text("", encoding="utf-8")
+        return f'if exist "{armed}" (del "{armed}") else ({MISSING_TOOL_CMD})'
+    script = project_dir / f"{stem}.sh"
+    script.write_text(f'#!/bin/sh\nchmod 644 "{script}"\nexit 0\n', encoding="utf-8")
+    script.chmod(0o755)
+    return f'"{script}"'
+
+
+def _write_check_script(project_dir: Path, stem: str = "check") -> tuple[Path, str]:
+    """An always-passing verify script for the host shell. Returns (script, command)."""
+    if sys.platform == "win32":
+        script = project_dir / f"{stem}.cmd"
+        script.write_text("@exit /b 0\n", encoding="utf-8")
+    else:
+        script = project_dir / f"{stem}.sh"
+        script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        script.chmod(0o755)
+    return script, f'"{script}"'
+
+
+def _disarm_check_script(script: Path) -> None:
+    """Break the script the way the host shell notices: POSIX drops the exec bit
+    (rc=126); cmd has no exec bit, so the file goes away (#302)."""
+    if sys.platform == "win32":
+        script.unlink()
+    else:
+        script.chmod(0o644)
 
 
 def _touch_run(marker: str) -> str:
