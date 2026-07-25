@@ -64,7 +64,9 @@ def write_script_launcher(directory: Path, name: str, body: str) -> Path:
     sidecar.write_text(body, encoding="utf-8")
     if sys.platform == "win32":
         launcher = directory / f"{name}.cmd"
-        launcher.write_text(f'@"{sys.executable}" "{sidecar}" %*\r\n', encoding="utf-8")
+        # `\n`, not `\r\n`: write_text translates it to the CRLF cmd wants, so an
+        # explicit `\r` would land on disk doubled (`\r\r\n`).
+        launcher.write_text(f'@"{sys.executable}" "{sidecar}" %*\n', encoding="utf-8")
     else:
         launcher = directory / name
         launcher.write_text(
