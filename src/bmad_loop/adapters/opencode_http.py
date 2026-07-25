@@ -701,11 +701,10 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
         props = event.get("properties") or {}
         # Session-scoped frames must name this session (child/subagent sessions
         # share the stream). A short allowlist of SESSION-LESS types passes
-        # anyway: some frames worth logging carry no sessionID at all — live
-        # `file.edited` is exactly `{"file": "/abs/path"}`, and the 1.18.2 schema
-        # pins it as `additionalProperties: false` over that one key, so there is
-        # no id to match and this filter would drop it before either sink. See
-        # `_SESSIONLESS_TYPES` for why it is an allowlist and what stays out.
+        # anyway: some frames worth logging carry no sessionID at all, so there
+        # is no id to match and this filter would drop them before either sink.
+        # See `_SESSIONLESS_TYPES` for which ones, why it is an allowlist, and
+        # what deliberately stays out.
         #
         # Both sinks sit below this gate, so an allowlisted frame is traced as
         # well as rendered. That is intended: the trace's contract is one record
@@ -769,14 +768,12 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
         reader thread writes ``log_fh``, and each line is a single ``write()``
         plus ``flush()`` — so it always lands as a whole line at EOF.
 
-        Event-type strings and their semantics are pinned in the module
-        docstring's ``/event`` section — read that before adding a branch here.
-        It records which of these types actually fire on 1.18.2, notably that
-        agent tool use arrives as a ``tool``-typed ``message.part.updated`` part
-        (never as ``command.executed``), that the permission frames are
-        ``permission.asked`` / ``permission.replied`` with ``permission`` /
-        ``patterns`` / ``reply`` fields, and that ``file.edited`` reaches this
-        renderer only via the ``_SESSIONLESS_TYPES`` allowlist.
+        Every event-type string below, and the payload shape each branch reads,
+        is pinned in the module docstring's ``/event`` section against a live
+        1.18.2 probe — read that before adding or changing a branch here. That
+        is deliberately the only copy of those facts: three of this renderer's
+        original branches named frames the server does not send, and a second
+        copy is a second thing to get wrong on the next version bump.
 
         ``message.updated`` carries only turn metadata (notably ``info.role``
         keyed by ``info.id``) and renders no inline line of its own — it just
