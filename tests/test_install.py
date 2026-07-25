@@ -11,14 +11,12 @@ from bmad_loop.adapters.profile import get_profile
 from bmad_loop.install import (
     BASE_SKILLS,
     DEV_BASE_SKILLS,
-    LEGACY_MODULE_SKILLS,
     MODULE_SKILLS,
     _copy_traversable,
     install_into,
     merge_hooks,
     missing_base_skills,
     provision_worktree,
-    strip_legacy_hooks,
 )
 
 
@@ -223,170 +221,15 @@ def test_merge_hooks_antigravity_preserves_other_groups():
     assert settings["bmad-loop"]["Stop"][0]["command"].endswith("bmad_loop_hook.py Stop")
 
 
-# ----------------------------------------------------------------- legacy migration (rename)
-
-LEGACY_CMD = "python3 /x/.automator/bmad_auto_hook.py Stop"
-
-
-def test_strip_legacy_hooks_claude_shape():
-    # claude/codex nest handlers under "hooks"; an emptied event is dropped entirely
-    config = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": LEGACY_CMD}]}]}}
-    config, removed = strip_legacy_hooks(config)
-    assert removed == 1
-    assert "Stop" not in config["hooks"]
-
-
-def test_strip_legacy_hooks_gemini_shape():
-    config = {"hooks": {"AfterAgent": [{"matcher": "", "hooks": [{"command": LEGACY_CMD}]}]}}
-    config, removed = strip_legacy_hooks(config)
-    assert removed == 1
-    assert "AfterAgent" not in config["hooks"]
-
-
-def test_strip_legacy_hooks_copilot_bare_shape():
-    # copilot stores the handler directly in the event list (no "hooks" wrapper)
-    config = {"version": 1, "hooks": {"agentStop": [{"type": "command", "command": LEGACY_CMD}]}}
-    config, removed = strip_legacy_hooks(config)
-    assert removed == 1
-    assert "agentStop" not in config["hooks"]
-    assert config["version"] == 1  # untouched
-
-
-def test_strip_legacy_hooks_preserves_foreign_and_new():
-    # a foreign user hook and a current bmad_loop hook survive; only bmad_auto goes
-    config = {
-        "hooks": {
-            "Stop": [
-                {"hooks": [{"type": "command", "command": LEGACY_CMD}]},
-                {"hooks": [{"type": "command", "command": "echo hi"}]},
-                {
-                    "hooks": [
-                        {"type": "command", "command": "python3 .bmad-loop/bmad_loop_hook.py Stop"}
-                    ]
-                },
-            ]
-        }
-    }
-    config, removed = strip_legacy_hooks(config)
-    assert removed == 1
-    commands = [h["command"] for m in config["hooks"]["Stop"] for h in m["hooks"]]
-    assert commands == ["echo hi", "python3 .bmad-loop/bmad_loop_hook.py Stop"]
-
-
-def test_strip_legacy_hooks_prunes_within_matcher():
-    # legacy + new share one matcher's nested list -> prune just the legacy handler
-    config = {
-        "hooks": {
-            "Stop": [
-                {
-                    "hooks": [
-                        {"type": "command", "command": LEGACY_CMD},
-                        {"type": "command", "command": "python3 .bmad-loop/bmad_loop_hook.py Stop"},
-                    ]
-                }
-            ]
-        }
-    }
-    config, removed = strip_legacy_hooks(config)
-    assert removed == 1
-    handlers = config["hooks"]["Stop"][0]["hooks"]
-    assert [h["command"] for h in handlers] == ["python3 .bmad-loop/bmad_loop_hook.py Stop"]
-
-
-def test_strip_legacy_hooks_tolerates_non_string_command():
-    # a pre-existing handler whose "command" is a non-string (e.g. null) must not
-    # crash the legacy strip — it just isn't a bmad_auto hook, so it's kept.
-    # Guarded at both walks: the flat (copilot) entry and the nested handler.
-    flat = {"hooks": {"agentStop": [{"type": "command", "command": None}]}}
-    config, removed = strip_legacy_hooks(flat)
-    assert removed == 0
-    assert config["hooks"]["agentStop"] == [{"type": "command", "command": None}]
-
-    nested = {
-        "hooks": {
-            "Stop": [
-                {
-                    "hooks": [
-                        {"type": "command", "command": None},
-                        {"type": "command", "command": LEGACY_CMD},
-                    ]
-                }
-            ]
-        }
-    }
-    config, removed = strip_legacy_hooks(nested)
-    assert removed == 1  # only the legacy handler is pruned; the null one survives
-    handlers = config["hooks"]["Stop"][0]["hooks"]
-    assert handlers == [{"type": "command", "command": None}]
-
-
-def test_strip_legacy_hooks_noop_without_hooks():
-    assert strip_legacy_hooks({}) == ({}, 0)
-    assert strip_legacy_hooks({"hooks": {}})[1] == 0
-    # the hyphenated upstream skill must never be mistaken for the legacy relay
-    config = {"hooks": {"Stop": [{"hooks": [{"command": "/bmad-dev-auto 1-2-a"}]}]}}
-    assert strip_legacy_hooks(config)[1] == 0
-
-
-def test_install_migrates_from_legacy_bmad_auto(tmp_path):
-    """A project that was `bmad-auto init`-ed: init strips the old hook, removes the
-    old skill dirs, and carries the old policy over — leaving .automator/ in place."""
-    # pre-seed a legacy claude install
-    settings = tmp_path / ".claude" / "settings.json"
-    settings.parent.mkdir(parents=True)
-    settings.write_text(
-        json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": LEGACY_CMD}]}]}}),
-        encoding="utf-8",
-    )
-    legacy_skill = tmp_path / ".claude" / "skills" / "bmad-auto-sweep"
-    legacy_skill.mkdir(parents=True)
-    (legacy_skill / "SKILL.md").write_text("# old\n", encoding="utf-8")
-    legacy_policy = tmp_path / ".automator" / "policy.toml"
-    legacy_policy.parent.mkdir(parents=True)
-    legacy_policy.write_text('[scm]\nisolation = "worktree"\n', encoding="utf-8")
-
-    assert install_into(tmp_path) == 0
-
-    # legacy hook stripped, current bmad_loop hook registered in its place
-    result = json.loads(settings.read_text())
-    cmds = [h["command"] for m in result["hooks"]["Stop"] for h in m["hooks"]]
-    assert not any("bmad_auto" in c for c in cmds)
-    assert any("bmad_loop_hook" in c for c in cmds)
-    # legacy skill dir removed; new forks installed
-    assert not legacy_skill.exists()
-    for skill in MODULE_SKILLS:
-        assert (tmp_path / ".claude" / "skills" / skill / "SKILL.md").is_file()
-    # old policy carried over verbatim; .automator/ left in place
-    migrated = (tmp_path / ".bmad-loop" / "policy.toml").read_text()
-    assert migrated == '[scm]\nisolation = "worktree"\n'
-    assert (tmp_path / ".automator").is_dir()
-
-    # idempotent: re-run doesn't duplicate hooks or re-create the legacy skill
-    assert install_into(tmp_path) == 0
-    result = json.loads(settings.read_text())
-    assert len(result["hooks"]["Stop"]) == 1
-    assert not legacy_skill.exists()
-
-
-def test_install_does_not_clobber_existing_policy_over_legacy(tmp_path):
-    """When .bmad-loop/policy.toml already exists, a legacy .automator/policy.toml
-    must not overwrite it."""
+def test_install_does_not_clobber_existing_policy(tmp_path):
+    """An existing .bmad-loop/policy.toml is per-machine state: init must leave it
+    alone rather than resetting it to the template."""
     current = tmp_path / ".bmad-loop" / "policy.toml"
     current.parent.mkdir(parents=True)
     current.write_text("CURRENT", encoding="utf-8")
-    legacy = tmp_path / ".automator" / "policy.toml"
-    legacy.parent.mkdir(parents=True)
-    legacy.write_text("LEGACY", encoding="utf-8")
 
     assert install_into(tmp_path) == 0
     assert current.read_text() == "CURRENT"
-
-
-def test_install_legacy_skills_constant_matches_module_skills():
-    # the legacy names are exactly the current ones with the old prefix
-    assert LEGACY_MODULE_SKILLS == tuple(
-        s.replace("bmad-loop-", "bmad-auto-") for s in MODULE_SKILLS
-    )
 
 
 def test_copilot_profile_render_prompt():
