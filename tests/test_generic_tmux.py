@@ -2911,7 +2911,12 @@ def test_tmux_timeout_with_flushed_spec_rescued_post_kill(tmp_path):
     fake.write_text(
         "#!/bin/bash\n"
         "# finished work, but hooks are 'misconfigured': no event files at all\n"
-        'for i in $(seq 1 20); do echo "implementing story 3-1: step $i of 20 ..."; done\n'
+        # Emit OVER TIME, not in one burst at startup: pipe_pane attaches after the
+        # window is created, so a burst can finish before the sink exists and leave
+        # a 0-byte log on a fast runner (observed on CI py3.11/3.12 while 3.13/3.14
+        # passed). Spread across ~2s, well inside the 6s session timeout below.
+        'for i in $(seq 1 40); do echo "implementing story 3-1: step $i of 40 ..."; '
+        "sleep 0.05; done\n"
         f"printf -- '---\\nstatus: done\\nbaseline_revision: abc123\\n---\\n\\n"
         f"## Auto Run Result\\n\\nStatus: done\\nImplemented.\\n' > {impl}/spec-3-1-foo.md\n"
         "sleep 60  # stay alive so the wait loop times out under a live window\n"
@@ -3006,7 +3011,10 @@ def test_tmux_timeout_silent_session_not_rescued(tmp_path):
 
     assert result.status == "timeout"
     assert result.result_json is None
-    assert (adapter.logs_dir / "t-silent.log").stat().st_size == 0
+    # Below the floor is the invariant; exactly zero is merely what it happens to be.
+    assert (adapter.logs_dir / "t-silent.log").stat().st_size <= (
+        generic.PROOF_OF_WORK_MIN_LOG_BYTES
+    )
 
 
 # ------------------------------- missing-marker fallback (#224)
@@ -4125,3 +4133,21 @@ def test_proof_of_work_journals_the_refusal(tmp_path, monkeypatch):
     adapter._final(_dev_handle(), _dev_spec(tmp_path), "crashed", None, None)
     events = (adapter.tasks_dir / "3-1-dev-1" / "session-lifecycle.jsonl").read_text()
     assert "readback-refused-no-proof-of-work" in events
+
+
+def test_expected_spec_relative_path_is_rebased_on_cwd(tmp_path, monkeypatch):
+    """A relative expected_spec resolves against the session cwd, not the process
+    CWD. The engine always threads an absolute path, so this is a guard against a
+    future caller quietly turning the #261 fix into a work-losing false refusal."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    ours.write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n"
+        "## Auto Run Result\n\nStatus: done\nImplemented.\n"
+    )
+    spec = dataclasses.replace(
+        _dev_spec(tmp_path), role="review", expected_spec=str(ours.relative_to(tmp_path))
+    )
+    rj = adapter._result_json(_dev_handle(), spec, wait=False)
+    assert rj is not None and rj["spec_file"] == str(ours)

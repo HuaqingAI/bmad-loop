@@ -97,10 +97,14 @@ class SessionSpec:
     # produced nothing is scored `completed:done` and unreviewed code merges.
     #
     # Deliberately independent of `spec_snapshot`, which degrades to None on a torn
-    # read: the identity constraint must not silently disappear with it. Process-
-    # transient for the same reason as SpecSnapshot (not persisted); a crash-resume
-    # reconstructing the SessionSpec carries none and falls back to the scan. Kept
-    # LAST alongside spec_snapshot so positional constructions stay valid.
+    # read: the identity constraint must not silently disappear with it.
+    #
+    # Unlike SpecSnapshot this SURVIVES a crash-resume. The field itself is not
+    # persisted, but its source is: `StoryTask.spec_file` round-trips through
+    # state.json (stored relative to the worktree, re-absolutized by
+    # WorktreeFlow on resume), and the engine re-derives this on every launch. So a
+    # resumed run is protected too — always an absolute path by the time it lands
+    # here. Kept LAST alongside spec_snapshot so positional constructions stay valid.
     expected_spec: str | None = None
 
 

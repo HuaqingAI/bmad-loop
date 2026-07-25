@@ -1192,8 +1192,17 @@ class _DevSynthesisMixin(_ResultFileMixin):
         # directory shared with every concurrent run; the question is "what did THIS
         # session write for THIS story", and here we were told the answer at launch.
         if spec.expected_spec:
+            # The engine always threads an absolute path (StoryTask.spec_file is
+            # re-absolutized against the worktree on resume). Rebase a relative one
+            # against spec.cwd anyway, the same way the stories read-back handles
+            # BMAD_LOOP_SPEC_FOLDER: a path resolved against the process CWD would
+            # simply miss and read as "the session wrote nothing", turning this
+            # guard into the silent work-losing failure it exists to avoid.
+            owed = Path(spec.expected_spec)
+            if not owed.is_absolute():
+                owed = Path(spec.cwd) / owed
             return self._known_spec_synth_result(
-                handle, spec, Path(spec.expected_spec), wait=wait, dead_window=dead_window
+                handle, spec, owed, wait=wait, dead_window=dead_window
             )
         # Dev attempt 1 only: no spec exists yet (the skill creates it), so the
         # mtime-floor scan is the sole way to find it.
