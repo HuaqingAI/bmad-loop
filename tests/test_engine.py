@@ -2163,6 +2163,87 @@ def test_expected_spec_threaded_onto_review_session(project):
     assert review_spec.expected_spec == review_spec.spec_snapshot.path
 
 
+def _pin_probe(project, prompt: str, *, spec_file: str | None, role="dev", label=None):
+    """The `expected_spec` a session dispatched with ``prompt`` would carry, for a
+    task whose recorded spec is ``spec_file``. Drives the real `_run_session` seam
+    and reads what actually reached the adapter."""
+    engine, adapter = make_engine(project, [SessionResult(status="crashed")])
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=spec_file)
+    engine._run_session(task, role=role, prompt=prompt, seq=1, label=label)
+    return adapter.sessions[-1].expected_spec
+
+
+def test_expected_spec_pinned_only_when_the_prompt_names_the_spec(project):
+    """#261 pins the read-back to the spec the session owes — and the ONLY thing
+    that makes a session owe one is having been pointed at it. Knowing a spec exists
+    is not the same: `_record_dev_spec` sets `task.spec_file` when a story escalates
+    or defers, but the re-drive that follows dispatches a bare story key. Pinning
+    there would poll a stale path while the re-drive's real output went unread —
+    trading #261's unsafe failure for a work-losing one (#298 review).
+
+    Both directions are asserted against the REAL prompt builders, so the rule and
+    the contract it reads cannot drift apart."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    owed_path = spec_path(project, "1-1-a")
+    write_spec(owed_path, "done", "abc123")  # the repair leg re-opens it in place
+    owed = str(owed_path)
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=owed)
+    feedback = project.project / "feedback.md"
+
+    # Pinned: every dispatch that hands the session the path.
+    assert _pin_probe(project, engine._review_prompt(task), spec_file=owed) == owed
+    assert _pin_probe(project, engine._dev_prompt(task, feedback), spec_file=owed) == owed
+    restoring = dataclasses.replace(task, restore_patch="/tmp/attempt.patch")
+    assert _pin_probe(project, engine._dev_prompt(restoring, None), spec_file=owed) == owed
+
+    # NOT pinned: the from-scratch re-drive after an escalation/deferral. The task
+    # carries a recorded spec, but the dispatch is a bare story key — the session is
+    # free to write a different spec, and the scan is the only way to find it.
+    fresh = engine._dev_prompt(task, None)
+    assert fresh == "/bmad-dev-auto 1-1-a"
+    assert _pin_probe(project, fresh, spec_file=owed) is None
+
+
+def test_expected_spec_withheld_from_labeled_workflow_session(project):
+    """An injected plugin-workflow session (a TEA pre_commit_gate) runs the generic
+    adapter but owes the completion MARKER, not the story spec — and its prompt gets
+    the spec path appended to it by nothing, so the naming rule alone would already
+    withhold the pin. The explicit `label is None` guard is what keeps that true if a
+    plugin's workflow prompt ever quotes the spec path as context."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    owed = str(spec_path(project, "1-1-a"))
+    pinned = _pin_probe(
+        project,
+        f"Run the pre-commit gate against `{owed}`.",
+        spec_file=owed,
+        label="tea.pre_commit_gate",
+    )
+    assert pinned is None
+
+
+def test_record_dev_spec_refuses_the_no_spec_fallback_marker(project):
+    """`bmad-dev-auto-result-*` is the skill's "intent too unclear to even create a
+    spec" artifact. Recording it as the story's spec misroutes every consumer: the
+    escalation re-arm flips frontmatter on a marker nothing reads, the repair leg
+    re-opens it as the frozen intent contract, and the #261 read-back then pins to
+    it — polling a stale marker while the re-drive's real spec goes unread."""
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    marker = project.implementation_artifacts / "bmad-dev-auto-result-1-1-a-dev-1.md"
+    marker.write_text("---\nstatus: blocked\n---\n\nIntent unclear.\n")
+
+    engine._record_dev_spec(task, {"spec_file": str(marker)})
+    assert task.spec_file is None
+
+    # A real spec on the same call path is still recorded — this is a filter, not
+    # a disabling of the capture escalation resolution depends on.
+    real = spec_path(project, "1-1-a")
+    write_spec(real, "blocked", "abc123")
+    engine._record_dev_spec(task, {"spec_file": str(real)})
+    assert task.spec_file == str(real)
+
+
 def test_review_launch_snapshot_degrades_on_unreadable_spec(project):
     """A spec path that cannot be read degrades the snapshot capture to None and
     journals `spec-read-failed` at site `review-launch-snapshot`. A directory where

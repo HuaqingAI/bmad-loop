@@ -2379,3 +2379,29 @@ def test_graceful_stop_between_cycles_skips_next_triage(project):
     entries = ledger_entries(project)
     assert entries["DW-1"].status.startswith("done") and entries["DW-2"].open
     assert stops[-1]["remaining"] == 1  # DW-2, generated in cycle 1, still open
+
+
+def test_bundle_dispatch_does_not_pin_expected_spec(project, tmp_path):
+    """A sweep bundle's fresh dispatch points at `intent.md`, never at a spec — the
+    session is free to CREATE one, and #161 has it legitimately adopting a
+    pre-existing story spec under a different name. So the #261 read-back must stay
+    on the scan here even when a prior attempt recorded `task.spec_file`; pinning
+    would poll a path this dispatch never promised to rewrite.
+
+    Falls out of the naming rule rather than a sweep-specific carve-out, which is
+    exactly why it needs pinning down: nothing in sweep.py mentions expected_spec."""
+    engine, adapter = make_sweep(project, [SessionResult(status="crashed")])
+    intent = tmp_path / "bundles" / "fix" / "intent.md"
+    intent.parent.mkdir(parents=True)
+    intent.write_text("# bundle intent\n")
+    task = StoryTask(
+        story_key="dw-fix",
+        epic=0,
+        bundle_file=str(intent),
+        spec_file=str(project.implementation_artifacts / "spec-adopted-elsewhere.md"),
+    )
+
+    prompt = engine._dev_prompt(task, None)
+    assert str(intent) in prompt and task.spec_file not in prompt
+    engine._run_session(task, role="dev", prompt=prompt, seq=1)
+    assert adapter.sessions[-1].expected_spec is None
