@@ -4151,3 +4151,17 @@ def test_expected_spec_relative_path_is_rebased_on_cwd(tmp_path, monkeypatch):
     )
     rj = adapter._result_json(_dev_handle(), spec, wait=False)
     assert rj is not None and rj["spec_file"] == str(ours)
+
+
+def test_log_evidence_mro_is_not_shadowed_by_the_mixin():
+    """`_log_evidence` is declared inert on `_ResultFileMixin` and overridden on
+    `GenericAdapter`, which owns the pane log. Both mixins sit ahead of the concrete
+    adapter in the MRO, and this file already documents that hazard for `send_text` —
+    so pin the resolution: if a future base reshuffle let the inert stub win, the
+    proof-of-work gate would silently go dead everywhere instead of failing loudly.
+    OpencodeDevAdapter has no pane log and must keep the inert one."""
+    from bmad_loop.adapters.generic import GenericAdapter, _ResultFileMixin
+    from bmad_loop.adapters.opencode_http import OpencodeDevAdapter
+
+    assert GenericDevAdapter._log_evidence is GenericAdapter._log_evidence
+    assert OpencodeDevAdapter._log_evidence is _ResultFileMixin._log_evidence
