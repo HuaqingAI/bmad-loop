@@ -2107,6 +2107,72 @@ def test_e2e_spawn_gives_up_after_attempts(tmp_path, fake_opencode):
     assert (logs / "t-1.log").read_bytes() == b""
 
 
+def test_spawn_open_failure_closes_the_sinks_already_open(tmp_path, fake_opencode, monkeypatch):
+    """A failing sink `open()` must not strand the sinks opened before it.
+
+    All three sinks open ABOVE the retry loop's try/except, so an `open()` that
+    fails partway — ENOSPC, EMFILE, a permission race — propagates straight out
+    of `_spawn_server` without ever reaching the loop's handler. Only the guard
+    around the opens themselves can close what was already handed out; without
+    it those handles stay open for as long as the propagating traceback keeps
+    this frame alive. One sink had nothing to leak here; three do.
+    """
+    launcher, rec = fake_opencode
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    spec = make_spec(tmp_path, rec, "completed")
+    opened: dict = {}
+    real_open = Path.open
+
+    def flaky_open(self, *args, **kwargs):
+        # the LAST of the three sinks to open — so .log and .sse.jsonl are both
+        # already live when it blows up
+        if self.name.endswith(".server.out"):
+            raise OSError(28, "No space left on device")
+        fh = real_open(self, *args, **kwargs)
+        opened[self.name] = fh
+        return fh
+
+    monkeypatch.setattr(Path, "open", flaky_open)
+
+    with pytest.raises(OSError, match="No space left"):
+        adapter._spawn_server(spec)
+
+    # both earlier sinks were opened, and both were closed on the way out
+    assert set(opened) >= {"t-1.log", "t-1.sse.jsonl"}, sorted(opened)
+    still_open = [name for name, fh in opened.items() if not fh.closed]
+    assert still_open == [], f"leaked sink handles: {still_open}"
+
+
+def test_close_spawn_sinks_survives_a_failing_close(tmp_path):
+    """A close that raises must not displace the failure being reported.
+
+    Both callers are already reporting something worse — one is mid-`raise`, the
+    other is about to raise `OpencodeServerError` — so an OSError from a
+    flush-on-close would replace the real diagnosis. It must also not strand the
+    sinks after it in the loop.
+    """
+    adapter = make_adapter(tmp_path)
+    closed = []
+
+    class _Fh:
+        def __init__(self, name, boom=False):
+            self.name, self._boom = name, boom
+
+        def close(self):
+            closed.append(self.name)
+            if self._boom:
+                raise OSError(5, "Input/output error")
+
+    # the FIRST sink fails to close: an unguarded loop would propagate here and
+    # never reach the other two
+    adapter._close_spawn_sinks(_Fh("log", boom=True), _Fh("server"), _Fh("event"))
+
+    assert closed == ["log", "server", "event"]
+    # and None (sse_trace off, or the sink whose open was the failure) is skipped
+    adapter._close_spawn_sinks(_Fh("log2"), None, None)
+    assert closed[-1] == "log2"
+
+
 # --------------------------------------------- OpencodeDevAdapter (Phase 4)
 #
 # Dev/review sessions run the generic bmad-dev-auto skill, which writes NO

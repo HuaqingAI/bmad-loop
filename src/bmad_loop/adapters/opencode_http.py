@@ -490,21 +490,33 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
         env = self._session_env(spec, password)
         log_path = self.logs_dir / f"{spec.task_id}.log"
         log_fh = log_path.open("ab")  # append: retries share one log
-        # Structured SSE trace, off entirely when the knob is down. Append like
-        # the other two sinks: the file is per TASK and every retry of that task
-        # writes into it, while `event_seq` is per SESSION and restarts at 1 for
-        # each one — so a seq dropping back to 1 mid-file marks a new session,
-        # not a truncation. `ts` (epoch ms) is the cross-session ordering key.
         event_fh = None
-        if self.sse_trace:
-            event_path = self.logs_dir / f"{spec.task_id}.sse.jsonl"
-            event_fh = event_path.open("a", encoding="utf-8")  # one record per line
-        # The server's own stdout/stderr (INFO/diagnostic lines) is kept in a
-        # separate file so the readable transcript in <task_id>.log stays clean.
-        # This is also where a failed spawn's diagnostics land — the give-up
-        # error below names this path, not log_path.
-        server_path = self.logs_dir / f"{spec.task_id}.server.out"
-        server_fh = server_path.open("ab")  # append: retries share one server log
+        server_fh = None
+        # The remaining sinks open under their own guard: each `open()` can fail
+        # on its own (ENOSPC, EMFILE, a permission race) with the earlier ones
+        # already open, and that happens ABOVE the retry loop's try/except — so
+        # without this the handles opened so far never reach `_close_spawn_sinks`
+        # and stay open for as long as the propagating traceback keeps this frame
+        # alive. One sink had nothing to leak here; three do.
+        try:
+            # Structured SSE trace, off entirely when the knob is down. Append
+            # like the other two sinks: the file is per TASK and every retry of
+            # that task writes into it, while `event_seq` is per SESSION and
+            # restarts at 1 for each one — so a seq dropping back to 1 mid-file
+            # marks a new session, not a truncation. `ts` (epoch ms) is the
+            # cross-session ordering key.
+            if self.sse_trace:
+                event_path = self.logs_dir / f"{spec.task_id}.sse.jsonl"
+                event_fh = event_path.open("a", encoding="utf-8")  # one record per line
+            # The server's own stdout/stderr (INFO/diagnostic lines) is kept in a
+            # separate file so the readable transcript in <task_id>.log stays
+            # clean. This is also where a failed spawn's diagnostics land — the
+            # give-up error below names this path, not log_path.
+            server_path = self.logs_dir / f"{spec.task_id}.server.out"
+            server_fh = server_path.open("ab")  # append: retries share one server log
+        except BaseException:
+            self._close_spawn_sinks(log_fh, server_fh, event_fh)
+            raise
         last_error = "server did not become healthy"
         try:
             for _ in range(SPAWN_ATTEMPTS):
@@ -547,12 +559,23 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
 
     @staticmethod
     def _close_spawn_sinks(log_fh: Any, server_fh: Any, event_fh: Any) -> None:
-        """Close the three per-task sinks on the spawn failure paths. `event_fh`
-        is None when the sse_trace knob is off."""
-        log_fh.close()
-        server_fh.close()
-        if event_fh is not None:
-            event_fh.close()
+        """Close whichever of the three per-task sinks are open, on the spawn
+        failure paths. Any of them can be None: `event_fh` when the sse_trace
+        knob is off, and either of the last two when the failure WAS the open
+        that would have created it.
+
+        Every close is guarded, matching `_teardown`. Both callers are already
+        reporting a failure — one is mid-`raise`, the other is about to raise
+        `OpencodeServerError` — so an OSError from a flush-on-close would
+        replace the failure actually worth reporting, and would strand the sinks
+        after it in this loop."""
+        for fh in (log_fh, server_fh, event_fh):
+            if fh is None:
+                continue
+            try:
+                fh.close()
+            except OSError:
+                pass
 
     def _await_healthy(self, sess: _ServerSession) -> bool:
         """Poll /global/health (authenticated) until it answers healthy. The
