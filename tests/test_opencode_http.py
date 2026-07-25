@@ -492,8 +492,9 @@ def test_sse_dispatch_filters_child_sessions(tmp_path):
 #   <task_id>.server.out       — the spawned server's own stdout/stderr (INFO /
 #                                diagnostic lines), kept apart so <task_id>.log
 #                                reads as a clean conversation, not a jumble.
-#   <task_id>.events.jsonl     — one JSON record per session-matching event, the
-#                                complete trace for post-hoc replay (_emit_event).
+#   <task_id>.sse.jsonl        — one JSON record per acted-on frame except the
+#                                per-token deltas: the trace for post-hoc replay
+#                                (_emit_event), gated by the sse_trace knob.
 # The two text sinks (transcript + server stdout) are written from disjoint
 # sources (SSE reader thread vs the server process); the JSONL is written from
 # the SSE reader thread. These are pure unit tests: canned event dicts straight
@@ -502,12 +503,12 @@ def test_sse_dispatch_filters_child_sessions(tmp_path):
 
 
 def _sess_with_sinks(tmp_path: Path, task_id: str = "t-log"):
-    """A _ServerSession wired to real .log (binary append) and .events.jsonl
+    """A _ServerSession wired to real .log (binary append) and .sse.jsonl
     text sinks under tmp_path, so dispatch behaviour is assertable file-to-file.
     Mirrors how _spawn_server wires the real sinks (O_APPEND log + append jsonl)."""
     adapter = make_adapter(tmp_path)
     log_path = tmp_path / f"{task_id}.log"
-    event_path = tmp_path / f"{task_id}.events.jsonl"
+    event_path = tmp_path / f"{task_id}.sse.jsonl"
     sess = _ServerSession(
         process=None,
         port=0,
@@ -555,7 +556,8 @@ def test_inline_line_returns_none_for_unhandled_types():
     )
     assert adapter._inline_line("message.part.updated", {"part": {}}, "assistant") is None
     # message.part.delta never renders inline — it duplicates the complete
-    # text message.part.updated already carries (deltas stay in the JSONL only)
+    # text message.part.updated already carries (and is kept out of the trace
+    # for the same reason)
     assert adapter._inline_line("message.part.delta", {"delta": "wor"}, "assistant") is None
     assert adapter._inline_line("message.part.delta", {"delta": ""}, "assistant") is None
 
@@ -714,11 +716,14 @@ def test_part_without_known_message_id_falls_back_to_assistant(tmp_path):
     assert "\n[bmad] assistant:\nhi\n" in _log_text(log_path)
 
 
-def test_dispatch_skips_empty_text_and_never_renders_deltas(tmp_path):
-    """Empty/whitespace part text carries no live value, and message.part.delta is
-    never rendered inline — it duplicates the complete text message.part.updated
-    already carries. Both leave the readable log untouched while still recorded in
-    the JSONL (deltas stay there for per-token granularity)."""
+def test_dispatch_skips_empty_text_and_drops_deltas_from_both_sinks(tmp_path):
+    """Empty/whitespace part text carries no live value, so it renders nothing
+    while still being traced. message.part.delta is dropped from BOTH sinks: its
+    tokens concatenate byte-exactly to the text message.part.updated already
+    carries complete (pinned live), so tracing them re-stores text the file
+    already holds — and logs/ is never trimmed by retention, so those bytes are
+    permanent. Deltas also must not consume a seq: the trace's seq numbering has
+    to match the lines actually in the file."""
     adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
     for evt in (
         {
@@ -736,8 +741,10 @@ def test_dispatch_skips_empty_text_and_never_renders_deltas(tmp_path):
     ):
         adapter._dispatch_sse(sess, evt)
     assert _log_text(log_path) == ""
-    types = [r["type"] for r in read_jsonl(event_path)]
-    assert types == ["message.part.updated", "message.part.updated", "message.part.delta"]
+    records = read_jsonl(event_path)
+    assert [r["type"] for r in records] == ["message.part.updated", "message.part.updated"]
+    assert [r["seq"] for r in records] == [1, 2]
+    assert sess.event_seq == 2  # the delta burned no sequence number
 
 
 def test_dispatch_writes_command_file_permission_lines(tmp_path):
@@ -760,24 +767,24 @@ def test_dispatch_writes_command_file_permission_lines(tmp_path):
 
 
 def test_jsonl_seq_is_monotonic_with_ts_and_shape(tmp_path):
-    """Each session-matching event gets one JSONL record with a monotonic seq,
-    the raw type, the raw properties, and an epoch-ms ts that never goes
-    backwards across the batch."""
+    """Each traced event gets one JSONL record with a monotonic seq, the raw
+    type, the raw properties, and an epoch-ms ts that never goes backwards
+    across the batch."""
     adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
     for n in range(4):
         adapter._dispatch_sse(
             sess,
-            {
-                "type": "message.part.delta",
-                "properties": {"sessionID": "ses_test", "delta": str(n)},
-            },
+            {"type": "session.diff", "properties": {"sessionID": "ses_test", "diff": [str(n)]}},
         )
     records = read_jsonl(event_path)
     assert [r["seq"] for r in records] == [1, 2, 3, 4]
     assert all(set(r) == {"seq", "type", "properties", "ts"} for r in records)
     ts = [r["ts"] for r in records]
     assert ts == sorted(ts)  # epoch ms, non-decreasing within the batch
-    assert all(r["properties"]["delta"] == str(i) for i, r in enumerate(records))
+    # epoch ms, not ns and not seconds — the unit every opencode time.* field
+    # uses, and the unit the poll fallback's floor comparison assumes
+    assert all(abs(r["ts"] - _now_ms()) < 60_000 for r in records)
+    assert all(r["properties"]["diff"] == [str(i)] for i, r in enumerate(records))
 
 
 def test_unhandled_session_event_recorded_in_jsonl_not_log(tmp_path):
@@ -1200,6 +1207,26 @@ def test_e2e_completed(tmp_path, fake_opencode):
     server_log = (tmp_path / "run" / "logs" / "t-1.server.out").read_text()
     assert "FAKE_STDOUT_CANARY" in server_log
     assert "FAKE_STDOUT_CANARY" not in (tmp_path / "run" / "logs" / "t-1.log").read_text()
+    # the SSE trace is on by default and named .sse.jsonl
+    trace = read_jsonl(tmp_path / "run" / "logs" / "t-1.sse.jsonl")
+    assert trace and "session.idle" in {r["type"] for r in trace}
+
+
+def test_e2e_sse_trace_knob_off_never_opens_the_sink(tmp_path, fake_opencode):
+    """sse_trace is a tier-1 instance knob, not a policy field: flipping it off
+    means the file is never created at all (not created-then-empty), while the
+    run itself and the readable transcript are unaffected."""
+    launcher, rec = fake_opencode
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    adapter.sse_trace = False
+    spec = make_spec(tmp_path, rec, "completed")
+
+    result = adapter.run(spec)
+
+    assert result.status == "completed"
+    assert not (tmp_path / "run" / "logs" / "t-1.sse.jsonl").exists()
+    assert (tmp_path / "run" / "logs" / "t-1.log").exists()
+    assert_server_gone(rec)
 
 
 def test_e2e_result_less_stop_nudges_then_completes(tmp_path, fake_opencode):

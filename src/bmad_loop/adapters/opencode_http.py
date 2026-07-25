@@ -121,6 +121,13 @@ KILL_WAIT_S = 5.0
 REAP_POLL_S = 0.1
 SPAWN_ATTEMPTS = 3
 POLL_TICK_S = 5.0  # max event-queue wait per loop tick (generic's cadence)
+# Structured SSE trace (``logs/<task_id>.sse.jsonl``). Tier-1 knob deliberately:
+# a module default plus the ``sse_trace`` instance attribute, NOT a policy field
+# in core.toml. It changes nothing about how a run behaves — it only decides
+# whether a debugging artifact is written — so it belongs with the timing knobs
+# an operator flips in a REPL or a subclass, not in the run contract every
+# settings file has to carry. Off means the sink is never opened.
+SSE_TRACE = True
 
 # Fixed basic-auth username in OPENCODE_SERVER_PASSWORD mode (Bearer is rejected).
 AUTH_USER = "opencode"
@@ -201,7 +208,7 @@ def _sum_args(arguments: Any) -> str:
 # which dispatches SGR to per-Char styles and maps pyte named colors via
 # _rich_color straight through to Rich — so every [bmad] marker shows colored in
 # the LogView. A plain `cat`/editor shows the escape bytes; the structured trace
-# stays uncoloured in <task>.events.jsonl. Keys are opencode message.info.role
+# stays uncoloured in <task>.sse.jsonl. Keys are opencode message.info.role
 # values; an unseen role falls back to _ROLE_COLOR_DEFAULT so it still renders
 # distinctly — add it to the map to pin its hue.
 _ROLE_COLORS = {
@@ -232,8 +239,8 @@ class _ServerSession:
     # server's INFO/diagnostic lines land here; ``log_fh`` carries only the
     # curated ``[bmad]`` lines written from the SSE reader thread.
     server_fh: Any = None
-    # Structured-event JSONL sink (``<task_id>.events.jsonl``); None when
-    # structured logging is off. Written from the SSE reader thread only.
+    # Structured SSE-trace JSONL sink (``<task_id>.sse.jsonl``); None when the
+    # ``sse_trace`` knob is off. Written from the SSE reader thread only.
     event_fh: Any = None
     # Monotonic per-session line number written into the JSONL sink.
     event_seq: int = 0
@@ -316,6 +323,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
         self.reconnect_sleep_s = RECONNECT_SLEEP_S
         self.kill_wait_s = KILL_WAIT_S
         self.poll_tick_s = POLL_TICK_S
+        self.sse_trace = SSE_TRACE  # False = never open the .sse.jsonl sink
         self.result_grace_s: float | None = None  # None = the mixin default
         self.tasks_dir = run_dir / "tasks"
         self.logs_dir = run_dir / LOGS_DIR
@@ -393,8 +401,15 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
         env = self._session_env(spec, password)
         log_path = self.logs_dir / f"{spec.task_id}.log"
         log_fh = log_path.open("ab")  # append: retries share one log
-        event_path = self.logs_dir / f"{spec.task_id}.events.jsonl"
-        event_fh = event_path.open("a", encoding="utf-8")  # one structured event per line
+        # Structured SSE trace, off entirely when the knob is down. Append like
+        # the other two sinks: the file is per TASK and every retry of that task
+        # writes into it, while `event_seq` is per SESSION and restarts at 1 for
+        # each one — so a seq dropping back to 1 mid-file marks a new session,
+        # not a truncation. `ts` (epoch ms) is the cross-session ordering key.
+        event_fh = None
+        if self.sse_trace:
+            event_path = self.logs_dir / f"{spec.task_id}.sse.jsonl"
+            event_fh = event_path.open("a", encoding="utf-8")  # one record per line
         # The server's own stdout/stderr (INFO/diagnostic lines) is kept in a
         # separate file so the readable transcript in <task_id>.log stays clean.
         # This is also where a failed spawn's diagnostics land — the give-up
@@ -433,17 +448,22 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
                 else:
                     last_error = f"server exited rc={process.returncode} during startup"
         except BaseException:
-            log_fh.close()
-            server_fh.close()
-            event_fh.close()
+            self._close_spawn_sinks(log_fh, server_fh, event_fh)
             raise
-        log_fh.close()
-        server_fh.close()
-        event_fh.close()
+        self._close_spawn_sinks(log_fh, server_fh, event_fh)
         raise OpencodeServerError(
             f"could not start `{self.binary} serve` after {SPAWN_ATTEMPTS} attempts "
             f"({last_error}); server log: {server_path}"
         )
+
+    @staticmethod
+    def _close_spawn_sinks(log_fh: Any, server_fh: Any, event_fh: Any) -> None:
+        """Close the three per-task sinks on the spawn failure paths. `event_fh`
+        is None when the sse_trace knob is off."""
+        log_fh.close()
+        server_fh.close()
+        if event_fh is not None:
+            event_fh.close()
 
     def _await_healthy(self, sess: _ServerSession) -> bool:
         """Poll /global/health (authenticated) until it answers healthy. The
@@ -689,9 +709,9 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
         # assistant / user assembled text. Per-token ``message.part.delta``
         # frames are NOT rendered inline: they concatenate to exactly the text
         # ``message.part.updated`` already carries complete, so emitting both
-        # duplicates every statement as a one-word-per-line flood. Deltas stay
-        # in the JSONL trace for per-token granularity; the inline log keeps one
-        # clean line per statement.
+        # duplicates every statement as a one-word-per-line flood. For the same
+        # reason they are excluded from the SSE trace too (see ``_emit_event``);
+        # nothing consumes deltas anywhere in this adapter.
         if etype == "message.part.updated":
             part = props.get("part") or {}
             text = part.get("text") or ""
@@ -724,13 +744,19 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
 
     def _emit_event(self, sess: _ServerSession, etype: str, props: dict) -> None:
         """Append one structured JSON object to the session's
-        ``<task_id>.events.jsonl`` sink — one record per session-matching event,
-        for post-hoc replay/debugging. No-ops when the sink is off
-        (``event_fh is None``). A post-filter event of any type is recorded, so
-        the JSONL is a complete trace of what the adapter acted on (per-token
-        ``message.part.delta`` frames included — gate in one line if a run is
-        too chatty)."""
+        ``<task_id>.sse.jsonl`` sink — a record for every acted-on frame except
+        the per-token deltas, for post-hoc replay/debugging. No-ops when the
+        sink is off (``event_fh is None``, i.e. the ``sse_trace`` knob is down).
+
+        ``message.part.delta`` is the one exclusion. Its text concatenates
+        byte-exactly to the ``message.part.updated`` record already in the file
+        (pinned live — see the module docstring), so every delta is bytes spent
+        re-storing text the trace already holds, and they dominate the frame
+        count on any real turn. ``logs/`` is never trimmed by retention, so that
+        cost is permanent. Drop the branch to get them back."""
         if sess.event_fh is None:
+            return
+        if etype == "message.part.delta":
             return
         sess.event_seq += 1
         record = {
