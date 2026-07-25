@@ -9,6 +9,31 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **Stories can close deferred-work entries (#234).** The ledger was one-way: entries are filed
+  automatically but were only ever marked resolved by hand. A story can now declare the entries
+  its work closes — `closes_deferred: [DW-5, DW-6]`, on its `stories.yaml` entry (stories mode)
+  or in the story spec's frontmatter, the two unioned — and when the story commits, the
+  orchestrator flips each declared entry to `status: done <date>` + `resolution: resolved by
+story <id>`, the same annotation a sweep bundle writes. Both sprint and stories mode.
+
+  Advisory by contract: the annotation is written at the commit boundary — behind every verify
+  gate, checkpoint and review cycle, just before the squash — so an in-repo ledger carries it in
+  the story's own commit (worktree isolation included) and a story that fails, is rejected by
+  review, or escalates closes nothing; a commit that then fails takes the annotation back with
+  it. The declaration is re-read at that boundary, so a late edit counts in both directions, and
+  an id already `done` is a silent no-op across a resume. Nothing about it can fail a story:
+  unknown ids, duplicate ids, unreadable entry statuses, an unreadable ledger location and a
+  non-list spec declaration are journaled warnings (a non-list `closes_deferred` in `stories.yaml`
+  is a manifest schema error like any other). A ledger outside the repo is written at the same
+  moment; its annotation is part of no commit, which is journaled
+  (`deferred-close-external-ledger`).
+
+  `bmad-loop validate` warns up front in both queue modes (`deferred.closes-unknown`,
+  `deferred.closes-malformed`, `deferred.closes-entry-unreadable`, `deferred.ledger-unreadable`);
+  warnings never change the exit code. The field is human-authored, like `spec_checkpoint` — no
+  upstream skill emits it yet (BMAD-METHOD#2619 proposes it at breakdown), and re-deriving
+  `stories.yaml` drops it unless the intent is logged in `.memlog.md`.
+
 - **`review.on_timeout` policy knob (#271).** A timeout-like review verdict (`timeout` /
   `stalled` / `over_budget`) previously always burned a review cycle (RETRY) until
   `max_review_cycles`, then deferred — even when the dev product was already finalized and
