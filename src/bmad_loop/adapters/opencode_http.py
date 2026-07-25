@@ -36,6 +36,62 @@ in git history, commit b85d8ca / PR #167). This list wins over memory:
 - All ``time.*`` fields are epoch **milliseconds**; ``POST /session/:id/abort``
   returns ``200 true`` even when nothing is running.
 
+``/event`` frame types the run-log renderer reads — pinned by a second live
+probe of 1.18.2 (2026-07-25, 388 frames over 5 turns across two servers; the
+full evidence table is posted on PR #279). Cross-checked against the server's
+own OpenAPI at ``GET /doc``, whose ``Event`` union has 89 variants and is the
+static contract — worth re-dumping on any version bump:
+
+- ``message.updated`` — turn metadata only, no text. Carries ``info.id`` +
+  ``info.role``; **re-emits out of order** (a stale re-emit for the user
+  message lands mid-assistant-turn), so role must be keyed by message id, never
+  tracked as "last role seen".
+- ``message.part.updated`` — **complete-once, NOT cumulative.** A part fires
+  exactly twice: once at creation with ``text: ""``, then once carrying the
+  full final text. Held at 4 / 711 / 5689 chars (2 fires each, 1 non-empty).
+  Rendering on this frame therefore yields one clean line per statement, with
+  no de-duplication needed. **Tool execution also surfaces here** — and only
+  here — as ``part.type == "tool"`` with ``part.tool`` and a ``state`` whose
+  ``status`` steps pending → running → terminal (``state.input`` throughout,
+  ``state.output`` on ``completed``, ``state.error`` on ``error``). Tool parts
+  carry no ``part.text``, so the tool branch must sit ABOVE the empty-text
+  bail-out in ``_inline_line`` to be reachable at all. ``ToolState`` is a
+  4-variant union (pending / running / completed / error), so rendering on the
+  terminal pair is exhaustively once-per-tool-call; ``error`` is included from
+  the static contract (no tool failed during the live probe) so a failed call
+  cannot vanish from the transcript.
+- ``message.part.delta`` — the separate per-token stream. At 5689 chars its 50
+  deltas concatenate **byte-exactly** to the single ``part.updated`` text, so
+  it is pure redundancy: never rendered inline, and excluded from the SSE trace
+  (``logs/`` is never trimmed by retention).
+- ``command.executed`` — the **slash-command** surface, kept as that and nothing
+  more. It does **not** fire for agent tool use: 0 frames across live ``bash`` /
+  ``write`` / ``read`` / ``edit`` calls. Payload is ``name`` / ``arguments`` /
+  ``messageID`` / ``sessionID`` (all required, so it needs no allowlist).
+- ``file.edited`` — payload is exactly ``{"file": "/abs/path"}``, schema-pinned
+  ``additionalProperties: false`` over that one key, so it carries **no
+  ``sessionID``** and the ``properties.sessionID`` filter would drop it before
+  either sink. It is reachable only through the explicit ``_SESSIONLESS_TYPES``
+  allowlist, sound here only because bmad-loop runs one server per session.
+  ``file.watcher.updated`` is session-less too and deliberately NOT allowlisted
+  (see that constant).
+- ``permission.asked`` — the ask frame. There is **no ``permission.updated``** in
+  1.18.2. Payload is a ``permission`` **string** plus ``patterns`` /
+  ``metadata`` / ``always`` / ``tool`` / ``id`` / ``sessionID`` — not a nested
+  object with ``type`` / ``pattern``.
+- ``permission.replied`` — carries **``reply``**, not ``response`` (plus
+  ``sessionID`` / ``requestID``).
+- ``permission.v2.asked`` / ``permission.v2.replied`` exist in the union and are
+  **deliberately not consumed**: neither was seen live, and the v2 ask is a
+  different payload (``action`` / ``resources`` / ``save`` / ``metadata`` /
+  ``source``), so a branch for it would be written from the schema alone —
+  exactly the guess that made the three corrections above necessary. The v2
+  reply is shape-identical to the v1 one, but consuming it without the ask would
+  log a decision with no request. Add both together once a live sighting pins
+  what ``action`` / ``resources`` actually hold.
+- There is **no ``tool.call`` / ``tool.response``** on this surface —
+  confirmed both statically in the 89-variant union and live.
+
 Transport shape (the settled design drivers):
 
 - **One ``opencode serve`` per session.** The API has no per-session env, and
@@ -121,6 +177,31 @@ KILL_WAIT_S = 5.0
 REAP_POLL_S = 0.1
 SPAWN_ATTEMPTS = 3
 POLL_TICK_S = 5.0  # max event-queue wait per loop tick (generic's cadence)
+# Structured SSE trace (``logs/<task_id>.sse.jsonl``). Tier-1 knob deliberately:
+# a module default plus the ``sse_trace`` instance attribute, NOT a policy field
+# in core.toml. It changes nothing about how a run behaves — it only decides
+# whether a debugging artifact is written — so it belongs with the timing knobs
+# an operator flips in a REPL or a subclass, not in the run contract every
+# settings file has to carry. Off means the sink is never opened.
+SSE_TRACE = True
+
+# ``/event`` frame types that carry NO ``properties.sessionID`` but are still
+# attributed to this session, exempting them from the sessionID filter in
+# `_dispatch_sse`. Sound ONLY because bmad-loop spawns one `opencode serve` per
+# session (see the transport notes in the module docstring): the server is
+# single-tenant, so a server-global frame is unambiguously this session's. Any
+# design that ever shares a server across sessions must empty this set.
+#
+# Deliberately an allowlist and not "allow every session-less frame": the live
+# probe's session-less traffic was overwhelmingly noise that says nothing about
+# the run — `plugin.added` alone was 90 of 388 frames, plus `server.heartbeat`,
+# `catalog.updated`, `server.connected`, `reference.updated` and
+# `integration.updated`. `file.watcher.updated` is excluded on purpose too: it
+# is the editor-integration watcher firing for any change under the project
+# (our own git operations, a build, an editor save), so it is not evidence the
+# agent did anything, and for the changes the agent DID make it just
+# double-reports what `file.edited` already carries.
+_SESSIONLESS_TYPES = frozenset({"file.edited"})
 
 # Fixed basic-auth username in OPENCODE_SERVER_PASSWORD mode (Bearer is rejected).
 AUTH_USER = "opencode"
@@ -178,6 +259,58 @@ def _parse_sse_lines(lines) -> Any:
             data.append(line[5:].lstrip())
 
 
+def _sum_args(arguments: Any) -> str:
+    """Compact one-line summary of an arbitrary event payload value (a tool
+    part's ``state.input``, a ``permission.asked`` ``patterns``, a
+    ``command.executed`` ``arguments``, a ``session.error`` ``error``) for the
+    inline run log. Truncates long dicts/strings so a single line never explodes
+    the tail view, and accepts any shape — these payloads are server-controlled
+    and not all of them have a pinned schema."""
+    if not arguments:
+        return ""
+    try:
+        if isinstance(arguments, (dict, list)):
+            text = json.dumps(arguments, ensure_ascii=False)
+        else:
+            text = str(arguments)
+    except (TypeError, ValueError):
+        text = str(arguments)
+    if len(text) > 120:
+        text = text[:119] + "\u2026"
+    return text
+
+
+# ANSI colors for inline-log marker lines, keyed by message role. The bmad-loop
+# TUI renders <task>.log through a pyte terminal emulator (tui/data.py LogView),
+# which dispatches SGR to per-Char styles and maps pyte named colors via
+# _rich_color straight through to Rich — so every [bmad] marker shows colored in
+# the LogView. A plain `cat`/editor shows the escape bytes; the structured trace
+# stays uncoloured in <task>.sse.jsonl. Keys are opencode message.info.role
+# values; an unseen role falls back to _ROLE_COLOR_DEFAULT so it still renders
+# distinctly — add it to the map to pin its hue.
+_ROLE_COLORS = {
+    "user": "\x1b[33m",  # SGR 33 = yellow
+    "assistant": "\x1b[36m",  # SGR 36 = cyan
+}
+_ROLE_COLOR_DEFAULT = "\x1b[35m"  # SGR 35 = magenta — unseen roles
+_TOOL_COLOR = "\x1b[32m"  # SGR 32 = green — tool/cmd/file/permission (role-less)
+_RESET = "\x1b[0m"
+
+# Tool-part statuses that end a tool call. `ToolState` is a 4-variant union in
+# the 1.18.2 OpenAPI (`pending`, `running`, `completed`, `error`), so these two
+# are exhaustively the terminal ones — a tool call reaches exactly one of them,
+# which is what makes "render on terminal" equal to "one line per tool". The
+# live probe only ever saw pending → running → completed (nothing failed during
+# it); `error` comes from the static contract, and including it is what keeps a
+# FAILED tool call from vanishing from the transcript entirely.
+_TOOL_TERMINAL_STATES = frozenset({"completed", "error"})
+
+
+def _role_color(role: str) -> str:
+    """ANSI color for a message role; unseen roles fall back to magenta."""
+    return _ROLE_COLORS.get(role, _ROLE_COLOR_DEFAULT)
+
+
 @dataclass
 class _ServerSession:
     """Everything the adapter tracks for one live ``opencode serve``."""
@@ -187,6 +320,26 @@ class _ServerSession:
     base_url: str
     password: str
     log_fh: Any
+    # The spawned server's own stdout/stderr sink (``<task_id>.server.out``),
+    # kept separate from ``log_fh`` so the readable transcript stays clean. The
+    # server's INFO/diagnostic lines land here; ``log_fh`` carries only the
+    # curated ``[bmad]`` lines written from the SSE reader thread.
+    server_fh: Any = None
+    # Structured SSE-trace JSONL sink (``<task_id>.sse.jsonl``); None when the
+    # ``sse_trace`` knob is off. Written from the SSE reader thread only.
+    event_fh: Any = None
+    # Monotonic line number stamped into the trace. Per SESSION, while the file
+    # is per TASK and opened in append mode — so a retried task restarts the seq
+    # at 1 partway down the file. Read a run of seq back to 1 as "new session",
+    # not as corruption; the ``ts`` field orders records across the whole file.
+    event_seq: int = 0
+    # Role keyed by opencode message id (``msg_*``), refreshed from
+    # ``message.updated.info.{id,role}``. The per-part / delta events carry a
+    # ``messageID`` but no role of their own, and ``message.updated`` frames
+    # arrive out of order (re-emits for an earlier message land mid-turn), so a
+    # "last role seen" would mislabel the assistant's reply as ``user:``. Keying
+    # by message id makes the lookup ordering-independent.
+    msg_roles: dict = field(default_factory=dict)
     client: Any = None  # control httpx.Client — main thread only
     session_id: str = ""
     events: queue.Queue = field(default_factory=queue.Queue)
@@ -259,6 +412,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
         self.reconnect_sleep_s = RECONNECT_SLEEP_S
         self.kill_wait_s = KILL_WAIT_S
         self.poll_tick_s = POLL_TICK_S
+        self.sse_trace = SSE_TRACE  # False = never open the .sse.jsonl sink
         self.result_grace_s: float | None = None  # None = the mixin default
         self.tasks_dir = run_dir / "tasks"
         self.logs_dir = run_dir / LOGS_DIR
@@ -336,6 +490,33 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
         env = self._session_env(spec, password)
         log_path = self.logs_dir / f"{spec.task_id}.log"
         log_fh = log_path.open("ab")  # append: retries share one log
+        event_fh = None
+        server_fh = None
+        # The remaining sinks open under their own guard: each `open()` can fail
+        # on its own (ENOSPC, EMFILE, a permission race) with the earlier ones
+        # already open, and that happens ABOVE the retry loop's try/except — so
+        # without this the handles opened so far never reach `_close_spawn_sinks`
+        # and stay open for as long as the propagating traceback keeps this frame
+        # alive. One sink had nothing to leak here; three do.
+        try:
+            # Structured SSE trace, off entirely when the knob is down. Append
+            # like the other two sinks: the file is per TASK and every retry of
+            # that task writes into it, while `event_seq` is per SESSION and
+            # restarts at 1 for each one — so a seq dropping back to 1 mid-file
+            # marks a new session, not a truncation. `ts` (epoch ms) is the
+            # cross-session ordering key.
+            if self.sse_trace:
+                event_path = self.logs_dir / f"{spec.task_id}.sse.jsonl"
+                event_fh = event_path.open("a", encoding="utf-8")  # one record per line
+            # The server's own stdout/stderr (INFO/diagnostic lines) is kept in a
+            # separate file so the readable transcript in <task_id>.log stays
+            # clean. This is also where a failed spawn's diagnostics land — the
+            # give-up error below names this path, not log_path.
+            server_path = self.logs_dir / f"{spec.task_id}.server.out"
+            server_fh = server_path.open("ab")  # append: retries share one server log
+        except BaseException:
+            self._close_spawn_sinks(log_fh, server_fh, event_fh)
+            raise
         last_error = "server did not become healthy"
         try:
             for _ in range(SPAWN_ATTEMPTS):
@@ -344,7 +525,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
                     self._serve_argv(resolved, port),
                     cwd=str(spec.cwd),
                     env=env,
-                    stdout=log_fh,
+                    stdout=server_fh,
                     stderr=subprocess.STDOUT,
                     stdin=subprocess.DEVNULL,
                 )
@@ -354,6 +535,8 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
                     base_url=f"http://127.0.0.1:{port}",
                     password=password,
                     log_fh=log_fh,
+                    server_fh=server_fh,
+                    event_fh=event_fh,
                 )
                 if self._await_healthy(sess):
                     sess.client = self._make_client(sess)
@@ -366,13 +549,33 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
                 else:
                     last_error = f"server exited rc={process.returncode} during startup"
         except BaseException:
-            log_fh.close()
+            self._close_spawn_sinks(log_fh, server_fh, event_fh)
             raise
-        log_fh.close()
+        self._close_spawn_sinks(log_fh, server_fh, event_fh)
         raise OpencodeServerError(
             f"could not start `{self.binary} serve` after {SPAWN_ATTEMPTS} attempts "
-            f"({last_error}); log: {log_path}"
+            f"({last_error}); server log: {server_path}"
         )
+
+    @staticmethod
+    def _close_spawn_sinks(log_fh: Any, server_fh: Any, event_fh: Any) -> None:
+        """Close whichever of the three per-task sinks are open, on the spawn
+        failure paths. Any of them can be None: `event_fh` when the sse_trace
+        knob is off, and either of the last two when the failure WAS the open
+        that would have created it.
+
+        Every close is guarded, matching `_teardown`. Both callers are already
+        reporting a failure — one is mid-`raise`, the other is about to raise
+        `OpencodeServerError` — so an OSError from a flush-on-close would
+        replace the failure actually worth reporting, and would strand the sinks
+        after it in this loop."""
+        for fh in (log_fh, server_fh, event_fh):
+            if fh is None:
+                continue
+            try:
+                fh.close()
+            except OSError:
+                pass
 
     def _await_healthy(self, sess: _ServerSession) -> bool:
         """Poll /global/health (authenticated) until it answers healthy. The
@@ -519,12 +722,250 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
         # streams, exactly like subagent output in a tmux pane log).
         sess.activity += 1
         props = event.get("properties") or {}
-        if props.get("sessionID") != sess.session_id:
+        # Session-scoped frames must name this session (child/subagent sessions
+        # share the stream). A short allowlist of SESSION-LESS types passes
+        # anyway: some frames worth logging carry no sessionID at all, so there
+        # is no id to match and this filter would drop them before either sink.
+        # See `_SESSIONLESS_TYPES` for which ones, why it is an allowlist, and
+        # what deliberately stays out.
+        #
+        # Both sinks sit below this gate, so an allowlisted frame is traced as
+        # well as rendered. That is intended: the trace's contract is one record
+        # per frame the adapter acted on, and it is the file you read to explain
+        # a line in the transcript — a rendered line with no matching record
+        # would make the two sinks disagree. It costs nothing here because the
+        # allowlist admits one low-rate type, not the noisy session-less bulk.
+        if props.get("sessionID") != sess.session_id and not (
+            # `in` on a frozenset raises TypeError for an unhashable value, and
+            # `type` is server-controlled, so narrow before the membership test
+            # (the isinstance check below this filter is deliberately kept there
+            # — moving it up would change the activity counter above).
+            isinstance(etype, str)
+            and etype in _SESSIONLESS_TYPES
+        ):
             return
+        if not isinstance(etype, str):
+            # Every branch below compares `type` against a string literal, so a
+            # frame carrying a non-string (or absent) type can match none of
+            # them. Dropping it here narrows the value for the typed helpers and
+            # keeps a malformed frame out of the trace — it is not a frame the
+            # adapter acted on. Liveness/activity above already counted it.
+            return
+        # Before the control queue: emit a structured trace record and render
+        # one human-readable line into the run log. Both helpers no-op on
+        # unknown types, so unhandled frames leave both sinks byte-identical to
+        # today, and idle/error still queue below — control flow is unchanged.
+        #
+        # Guarded as a block because these two sinks sit UPSTREAM of the
+        # idle/error queue puts on a frame-shaped payload we do not control:
+        # both helpers walk nested `.get` chains (props["part"], ["info"],
+        # ["permission"]), so a server that ships a string where a dict is
+        # expected raises AttributeError here. Unguarded that unwinds all the
+        # way to the reader's connection-level catch in `_sse_loop`, which tears
+        # the stream down, reconnects, and drops whatever the server had already
+        # buffered — a logging bug silently degrading completion signaling. Same
+        # never-die doctrine as the reader itself: logging is advisory, the
+        # queue puts below are not. `_emit_event` runs first (it is the simpler
+        # of the two) so a render bug still leaves the offending frame recorded
+        # in the trace that would be used to diagnose it.
+        try:
+            self._emit_event(sess, etype, props)
+            self._render_inline(sess, etype, props)
+        except Exception:  # nosec B110 - logging must never disturb the queue puts below
+            pass
         if etype == "session.idle":
             sess.events.put("idle")
         elif etype == "session.error":
             sess.events.put("error")
+
+    def _render_inline(self, sess: _ServerSession, etype: str, props: dict) -> None:
+        """Append one human-readable progress line to the run log for the event
+        types worth watching live. No-ops on anything else, so an unhandled
+        frame writes nothing.
+
+        ``log_fh`` is the readable transcript sink (``<task_id>.log``): it
+        carries ONLY these curated ``[bmad]`` lines. The server's own INFO /
+        diagnostic stdout is kept apart in ``<task_id>.server.out`` (see
+        ``server_fh``) so the transcript stays a clean, line-wrapped
+        conversation rather than a jumble of server logging. Only this SSE
+        reader thread writes ``log_fh``, and each line is a single ``write()``
+        plus ``flush()`` — so it always lands as a whole line at EOF.
+
+        Every event-type string below, and the payload shape each branch reads,
+        is pinned in the module docstring's ``/event`` section against a live
+        1.18.2 probe — read that before adding or changing a branch here. That
+        is deliberately the only copy of those facts: three of this renderer's
+        original branches named frames the server does not send, and a second
+        copy is a second thing to get wrong on the next version bump.
+
+        ``message.updated`` carries only turn metadata (notably ``info.role``
+        keyed by ``info.id``) and renders no inline line of its own — it just
+        records the role under the message id so the following
+        ``message.part.*`` lines resolve the right speaker. Keying by message
+        id (not "last role seen") is required because ``message.updated``
+        frames arrive out of order: a re-emit for the user message lands mid-
+        assistant-turn and would otherwise flip the prefix to ``user:`` on the
+        assistant's own reply text. That also avoids a flood of role-only
+        announce lines like ``[bmad] assistant: assistant``."""
+        if etype == "message.updated":
+            info = props.get("info") or {}
+            mid = info.get("id")
+            role = info.get("role")
+            if mid and role:
+                sess.msg_roles[mid] = role
+            return
+        role = "assistant"
+        if etype == "message.part.updated":
+            mid = (props.get("part") or {}).get("messageID")
+            if mid and mid in sess.msg_roles:
+                role = sess.msg_roles[mid]
+        line = self._inline_line(etype, props, role)
+        if line is None:
+            return
+        if sess.log_fh is None:  # bare-sess unit tests / disabled inline log
+            return
+        try:
+            # CRLF line endings: the bmad-loop TUI renders this log through a
+            # pyte terminal emulator, where a bare LF moves the cursor down
+            # without returning to column 0 (a real PTY's ONLCR does that, but
+            # pyte is a pure VT100 emulator). LF-only lines staircase right,
+            # so emit CRLF like real terminal output (the claude/tmux captures
+            # carry it via cursor-addressing; our plain text must carry it raw).
+            sess.log_fh.write(line.replace("\n", "\r\n").encode("utf-8"))
+            sess.log_fh.flush()
+        except OSError:
+            pass
+
+    def _inline_line(self, etype: str, props: dict, role: str) -> str | None:
+        # ``message.updated`` is consumed in ``_render_inline`` (role refresh
+        # only); it renders no line here.
+        # assistant / user assembled text. Per-token ``message.part.delta``
+        # frames are NOT rendered inline: they concatenate to exactly the text
+        # ``message.part.updated`` already carries complete, so emitting both
+        # duplicates every statement as a one-word-per-line flood. For the same
+        # reason they are excluded from the SSE trace too (see ``_emit_event``);
+        # nothing consumes deltas anywhere in this adapter.
+        if etype == "message.part.updated":
+            part = props.get("part") or {}
+            # Tool execution rides this same frame as a `tool`-typed part —
+            # there is no tool.call/tool.response event on this surface, and
+            # `command.executed` never fires for it (both pinned live). Tool
+            # parts carry no `text`, so this branch MUST sit above the
+            # empty-text `return None` below or it can never be reached: that
+            # exact ordering is the difference between rendering the agent's
+            # actions and rendering nothing but its prose.
+            if part.get("type") == "tool":
+                return self._tool_line(part)
+            text = part.get("text") or ""
+            body = text.strip()  # drop surrounding blanks; keep internal structure
+            if not body:  # empty/non-text part — no value live
+                return None
+            role = role or "assistant"
+            # A blank line separates each turn from the previous one (the
+            # separator sits ABOVE the header, body follows directly beneath),
+            # and the role-colored marker line anchors the turn boundary.
+            # Internal newlines in the body are preserved so multi-paragraph
+            # reasoning reads as prose under the one header.
+            return f"\n{_role_color(role)}[bmad] {role}:{_RESET}\n{body}\n"
+        # The SLASH-COMMAND surface — NOT the tool surface. Agent tool use never
+        # reaches here (0 `command.executed` frames across live bash/write/read/
+        # edit calls); it renders from the `tool`-typed part above. Kept because
+        # a slash command invoked through this server is still worth a line and
+        # its payload is pinned (`name`/`arguments`/`messageID`, all required),
+        # but do not "fix" tool rendering back into this branch.
+        if etype == "command.executed":
+            args = _sum_args(props.get("arguments"))
+            return f"{_TOOL_COLOR}[bmad] cmd: {props.get('name') or '?'}{(' ' + args) if args else ''}{_RESET}\n"
+        if etype == "file.edited":
+            # Session-less: reachable only via `_SESSIONLESS_TYPES`.
+            return f"{_TOOL_COLOR}[bmad] file: {props.get('file') or '?'}{_RESET}\n"
+        # Permission surface. Field names are the live 1.18.2 ones: the ask frame
+        # is `permission.asked` (there is no `permission.updated`) carrying a
+        # `permission` STRING plus a `patterns` list — not a nested object with
+        # `type`/`pattern` — and the reply carries `reply`, not `response`.
+        # `metadata` (the concrete command) and `always` are left to the trace;
+        # `patterns` is what the permission actually matched on.
+        if etype == "permission.asked":
+            pats = _sum_args(props.get("patterns"))
+            return (
+                f"{_TOOL_COLOR}[bmad] perm ask: {props.get('permission') or '?'}"
+                f"{(' ' + pats) if pats else ''}{_RESET}\n"
+            )
+        if etype == "permission.replied":
+            return f"{_TOOL_COLOR}[bmad] perm reply: {props.get('reply') or '?'}{_RESET}\n"
+        # A failing turn is the one thing a reader most wants in the transcript:
+        # without this the log just stops mid-turn while the queue put below
+        # ends the session. Same green/tool hue as the other role-less markers —
+        # the color family is "not a speaker", not "severity". `error` has no
+        # pinned shape on this surface, so summarize whatever it carries rather
+        # than reaching into fields that may not exist.
+        if etype == "session.error":
+            detail = _sum_args(props.get("error"))
+            return f"{_TOOL_COLOR}[bmad] error:{(' ' + detail) if detail else ''}{_RESET}\n"
+        return None
+
+    @staticmethod
+    def _tool_line(part: dict) -> str | None:
+        """One line for a finished tool call, or None while it is still running.
+
+        A `tool`-typed ``message.part.updated`` part fires once per state
+        transition — ``pending`` → ``running`` → terminal — carrying the SAME
+        part id each time. Rendering every fire would print each tool call three
+        times, so the line is emitted only on a terminal status
+        (``_TOOL_TERMINAL_STATES``): a tool call reaches exactly one terminal
+        state, which makes that gate exactly "once per tool call". The gate is
+        the whole correctness argument here — a test that only asserts a tool
+        renders at all passes with it removed.
+
+        Same green/tool hue as the other role-less markers: a tool call is an
+        action, not a speaker. ``state.input`` is summarized inline (that is the
+        "what did the agent just do" the reader wants); ``state.output`` is
+        deliberately NOT — it is a full command's stdout or a whole file's text
+        on this surface, and the complete payload is in the SSE trace for anyone
+        who needs it. A failure appends the error, because a tool that failed
+        silently is exactly what a reader would go looking for."""
+        state = part.get("state") or {}
+        status = state.get("status")
+        if status not in _TOOL_TERMINAL_STATES:
+            return None
+        args = _sum_args(state.get("input"))
+        suffix = ""
+        if status == "error":
+            detail = _sum_args(state.get("error"))
+            suffix = f" -> error{(': ' + detail) if detail else ''}"
+        return (
+            f"{_TOOL_COLOR}[bmad] tool: {part.get('tool') or '?'}"
+            f"{(' ' + args) if args else ''}{suffix}{_RESET}\n"
+        )
+
+    def _emit_event(self, sess: _ServerSession, etype: str, props: dict) -> None:
+        """Append one structured JSON object to the session's
+        ``<task_id>.sse.jsonl`` sink — a record for every acted-on frame except
+        the per-token deltas, for post-hoc replay/debugging. No-ops when the
+        sink is off (``event_fh is None``, i.e. the ``sse_trace`` knob is down).
+
+        ``message.part.delta`` is the one exclusion. Its text concatenates
+        byte-exactly to the ``message.part.updated`` record already in the file
+        (pinned live — see the module docstring), so every delta is bytes spent
+        re-storing text the trace already holds, and they dominate the frame
+        count on any real turn. ``logs/`` is never trimmed by retention, so that
+        cost is permanent. Drop the branch to get them back."""
+        if sess.event_fh is None:
+            return
+        if etype == "message.part.delta":
+            return
+        sess.event_seq += 1
+        record = {
+            "seq": sess.event_seq,
+            "type": etype,
+            "properties": props,
+            "ts": _now_ms(),  # epoch ms — the unit every opencode time.* uses
+        }
+        try:
+            sess.event_fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            sess.event_fh.flush()
+        except (OSError, TypeError, ValueError):
+            pass
 
     # ------------------------------------------------------ completion loop
 
@@ -991,6 +1432,16 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
             sess.log_fh.close()
         except OSError:
             pass
+        if sess.server_fh is not None:
+            try:
+                sess.server_fh.close()
+            except OSError:
+                pass
+        if sess.event_fh is not None:
+            try:
+                sess.event_fh.close()
+            except OSError:
+                pass
 
     def _kill_process(self, sess: _ServerSession) -> None:
         process = sess.process

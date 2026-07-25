@@ -14,6 +14,7 @@ import importlib.util
 import json
 import os
 import queue
+import re
 import signal
 import subprocess
 import sys
@@ -27,13 +28,17 @@ from bmad_loop.adapters import generic, opencode_http
 from bmad_loop.adapters.base import SessionHandle, SessionSpec
 from bmad_loop.adapters.generic import BUDGET_NUDGE_TEXT, NUDGE_TEXT, STALL_NUDGE_TEXT
 from bmad_loop.adapters.opencode_http import (
+    _RESET,
+    _TOOL_COLOR,
     OpencodeDevAdapter,
     OpencodeHttpAdapter,
     OpencodeServerError,
     _free_port,
     _now_ms,
     _parse_sse_lines,
+    _role_color,
     _ServerSession,
+    _sum_args,
     _sum_usage,
 )
 from bmad_loop.adapters.profile import get_profile
@@ -91,6 +96,7 @@ argv = sys.argv[1:]
 assert argv and argv[0] == "serve", argv
 PORT = int(argv[argv.index("--port") + 1])
 HOST = argv[argv.index("--hostname") + 1]
+print(f"FAKE_STDOUT_CANARY listening on {HOST}:{PORT}", flush=True)
 
 if START_FAILURES:
     counter = os.path.join(REC_DIR, "start-count")
@@ -478,6 +484,757 @@ def test_sse_dispatch_filters_child_sessions(tmp_path):
     assert sess.events.get_nowait() == "error"
 
 
+# ------------------------------- readable run logs + structured event JSONL
+#
+# The opencode-http adapter keeps three on-disk sinks per session:
+#   <task_id>.log              — the readable transcript: curated one-line human
+#                                progress via _render_inline ([bmad] lines only).
+#   <task_id>.server.out       — the spawned server's own stdout/stderr (INFO /
+#                                diagnostic lines), kept apart so <task_id>.log
+#                                reads as a clean conversation, not a jumble.
+#   <task_id>.sse.jsonl        — one JSON record per acted-on frame except the
+#                                per-token deltas: the trace for post-hoc replay
+#                                (_emit_event), gated by the sse_trace knob.
+# The two text sinks (transcript + server stdout) are written from disjoint
+# sources (SSE reader thread vs the server process); the JSONL is written from
+# the SSE reader thread. These are pure unit tests: canned event dicts straight
+# through _dispatch_sse, no real or fake opencode binary (the zero-token
+# invariant from PR #167).
+
+
+def _sess_with_sinks(tmp_path: Path, task_id: str = "t-log"):
+    """A _ServerSession wired to real .log (binary append) and .sse.jsonl
+    text sinks under tmp_path, so dispatch behaviour is assertable file-to-file.
+    Mirrors how _spawn_server wires the real sinks (O_APPEND log + append jsonl)."""
+    adapter = make_adapter(tmp_path)
+    log_path = tmp_path / f"{task_id}.log"
+    event_path = tmp_path / f"{task_id}.sse.jsonl"
+    sess = _ServerSession(
+        process=None,
+        port=0,
+        base_url="",
+        password="",
+        log_fh=log_path.open("ab"),
+        event_fh=event_path.open("a", encoding="utf-8"),
+    )
+    sess.session_id = "ses_test"
+    return adapter, sess, log_path, event_path
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _log_text(path: Path) -> str:
+    # The transcript log now carries CRLF line endings (the TUI renders it
+    # through a pyte terminal emulator); normalize to LF so assertions check
+    # logical content, not the wire encoding. ANSI color escapes (the cyan
+    # [bmad] marker) are stripped too so content assertions stay color-agnostic.
+    if not path.is_file():
+        return ""
+    return _ANSI_RE.sub("", path.read_bytes().decode("utf-8").replace("\r\n", "\n"))
+
+
+def test_inline_line_returns_none_for_unhandled_types():
+    """_inline_line is the curate/no-op switch: None for anything not worth a
+    live line, so those frames leave the run log byte-identical to today."""
+    adapter = make_adapter(Path("/tmp"))  # no session built; _inline_line is pure
+    assert adapter._inline_line("server.heartbeat", {}, "assistant") is None
+    assert adapter._inline_line("server.connected", {}, "assistant") is None
+    assert adapter._inline_line("session.created", {"sessionID": "x"}, "assistant") is None
+    assert adapter._inline_line("session.idle", {"sessionID": "x"}, "assistant") is None
+    assert adapter._inline_line("catalog.updated", {}, "assistant") is None
+    assert adapter._inline_line("totally.unknown", {"sessionID": "x"}, "assistant") is None
+    # message.updated renders no line (role refresh lives in _render_inline)
+    assert (
+        adapter._inline_line("message.updated", {"info": {"role": "assistant"}}, "assistant")
+        is None
+    )
+    # empty/whitespace text carries no live value → None
+    assert (
+        adapter._inline_line("message.part.updated", {"part": {"text": "  "}}, "assistant") is None
+    )
+    assert adapter._inline_line("message.part.updated", {"part": {}}, "assistant") is None
+    # message.part.delta never renders inline — it duplicates the complete
+    # text message.part.updated already carries (and is kept out of the trace
+    # for the same reason)
+    assert adapter._inline_line("message.part.delta", {"delta": "wor"}, "assistant") is None
+    assert adapter._inline_line("message.part.delta", {"delta": ""}, "assistant") is None
+    # permission.updated does not exist on this surface at all (the live ask
+    # frame is permission.asked) — nothing may be keyed to the dead name.
+    assert (
+        adapter._inline_line(
+            "permission.updated", {"permission": {"type": "edit", "pattern": "src/**"}}, "assistant"
+        )
+        is None
+    )
+
+
+def test_inline_line_renders_each_curated_type():
+    """Every event type worth a live line renders deterministically. The type
+    strings and which of them actually fire on 1.18.2 are pinned in the adapter's
+    module docstring (live probes 2026-07-16 / 2026-07-25) — notably there is no
+    tool.call / tool.response on this SSE surface at all. The message.part.*
+    prefix is the role recorded for that part's message id (tracked in
+    _render_inline from message.updated.info.role)."""
+    adapter = make_adapter(Path("/tmp"))
+    assert adapter._inline_line("message.part.updated", {"part": {"text": "hi"}}, "assistant") == (
+        f"\n{_role_color('assistant')}[bmad] assistant:{_RESET}\nhi\n"
+    )
+    assert adapter._inline_line("message.part.updated", {"part": {"text": "hi"}}, "user") == (
+        f"\n{_role_color('user')}[bmad] user:{_RESET}\nhi\n"
+    )
+    # roles are distinct hues — the map pins them, so assistant != user colour
+    assert _role_color("assistant") != _role_color("user")
+    # an unseen role still renders, falling back to the default hue (no crash)
+    assert adapter._inline_line("message.part.updated", {"part": {"text": "hi"}}, "system") == (
+        f"\n{_role_color('system')}[bmad] system:{_RESET}\nhi\n"
+    )
+    # multi-line part.text: blank line above the role-colored header, then the
+    # full body (internal newlines preserved) directly beneath — reads as a
+    # contiguous block, not a prefix on every line.
+    assert (
+        adapter._inline_line(
+            "message.part.updated",
+            {"part": {"text": "para one\n\npara two\npara three"}},
+            "assistant",
+        )
+        == f"\n{_role_color('assistant')}[bmad] assistant:{_RESET}\npara one\n\npara two\npara three\n"
+    )
+    assert adapter._inline_line(
+        "command.executed", {"name": "Read", "arguments": None}, "assistant"
+    ) == (f"{_TOOL_COLOR}[bmad] cmd: Read{_RESET}\n")
+    assert adapter._inline_line("file.edited", {"file": "src/app.py"}, "assistant") == (
+        f"{_TOOL_COLOR}[bmad] file: src/app.py{_RESET}\n"
+    )
+    # Permission fields are the live 1.18.2 ones: the ask frame is
+    # permission.asked (permission.updated does not exist) carrying a
+    # `permission` STRING plus a `patterns` list, and the reply carries `reply`.
+    assert (
+        adapter._inline_line(
+            "permission.asked",
+            {
+                "id": "per_1",
+                "permission": "bash",
+                "patterns": ["echo permcheck"],
+                "metadata": {"command": "echo permcheck"},
+                "always": ["echo *"],
+            },
+            "assistant",
+        )
+        == f'{_TOOL_COLOR}[bmad] perm ask: bash ["echo permcheck"]{_RESET}\n'
+    )
+    # no patterns at all still names the permission rather than printing '?'
+    assert adapter._inline_line("permission.asked", {"permission": "edit"}, "assistant") == (
+        f"{_TOOL_COLOR}[bmad] perm ask: edit{_RESET}\n"
+    )
+    assert adapter._inline_line(
+        "permission.replied", {"requestID": "per_1", "reply": "once"}, "assistant"
+    ) == (f"{_TOOL_COLOR}[bmad] perm reply: once{_RESET}\n")
+
+
+def test_inline_line_renders_session_error():
+    """session.error ends the session via the queue put in _dispatch_sse; without
+    a line here the transcript would simply stop mid-turn with no stated cause.
+    Role-less like the other tool-family markers, so it takes the same hue. The
+    error payload has no pinned shape on this surface, so any shape summarizes
+    rather than raising or printing a bare '?'."""
+    adapter = make_adapter(Path("/tmp"))
+    assert adapter._inline_line(
+        "session.error", {"sessionID": "x", "error": {"name": "ProviderAuthError"}}, "assistant"
+    ) == (f'{_TOOL_COLOR}[bmad] error: {{"name": "ProviderAuthError"}}{_RESET}\n')
+    # a bare string payload
+    assert adapter._inline_line("session.error", {"error": "boom"}, "assistant") == (
+        f"{_TOOL_COLOR}[bmad] error: boom{_RESET}\n"
+    )
+    # no detail at all still marks the failure — the line is the signal
+    assert adapter._inline_line("session.error", {"sessionID": "x"}, "assistant") == (
+        f"{_TOOL_COLOR}[bmad] error:{_RESET}\n"
+    )
+    # long payloads are truncated like any other one-line summary
+    long_line = adapter._inline_line("session.error", {"error": "x" * 500}, "assistant")
+    assert long_line is not None and "…" in long_line
+
+
+def test_dispatch_session_error_renders_line_and_still_queues_error(tmp_path):
+    """The inline line is additive: the control-path 'error' put still happens."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    adapter._dispatch_sse(
+        sess,
+        {"type": "session.error", "properties": {"sessionID": "ses_test", "error": "boom"}},
+    )
+    assert "[bmad] error: boom\n" in _log_text(log_path)
+    assert sess.events.get_nowait() == "error"
+    assert [r["type"] for r in read_jsonl(event_path)] == ["session.error"]
+
+
+def test_dispatch_writes_assistant_text_to_log_and_jsonl(tmp_path):
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    adapter._dispatch_sse(
+        sess,
+        {
+            "type": "message.part.updated",
+            "properties": {"sessionID": "ses_test", "part": {"text": "hello"}},
+        },
+    )
+    assert "\n[bmad] assistant:\nhello\n" in _log_text(log_path)
+    # raw bytes still carry the assistant-role SGR (the write path does not strip it)
+    assert _role_color("assistant") in log_path.read_bytes().decode("utf-8")
+    records = read_jsonl(event_path)
+    assert len(records) == 1
+    assert records[0]["type"] == "message.part.updated"
+    assert records[0]["properties"]["part"]["text"] == "hello"
+
+
+def test_message_updated_keys_role_by_message_id(tmp_path):
+    """``message.updated`` carries ``info.role`` under ``info.id`` but renders no
+    line of its own; it records the role keyed by opencode message id so the
+    following ``message.part.updated`` line prefixes with the right speaker
+    (user vs assistant)."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    # a user turn: message.updated(role=user, id=u1) then the user's prompt text
+    adapter._dispatch_sse(
+        sess,
+        {
+            "type": "message.updated",
+            "properties": {"sessionID": "ses_test", "info": {"id": "msg_u1", "role": "user"}},
+        },
+    )
+    adapter._dispatch_sse(
+        sess,
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "ses_test",
+                "part": {"text": "do the thing", "messageID": "msg_u1"},
+            },
+        },
+    )
+    assert sess.msg_roles["msg_u1"] == "user"
+    log = _log_text(log_path)
+    assert "\n[bmad] user:\ndo the thing\n" in log
+    assert "assistant: do the thing" not in log
+    # message.updated itself renders no inline line, but IS in the JSONL trace
+    types = [r["type"] for r in read_jsonl(event_path)]
+    assert types == ["message.updated", "message.part.updated"]
+
+
+def test_role_lookup_survives_out_of_order_message_updated(tmp_path):
+    """``message.updated`` frames re-emit out of order: a stale user re-emit can
+    land mid-assistant-turn. Keying role by message id (not "last seen") keeps
+    the assistant's reply labeled ``assistant:`` even when a user re-emit
+    arrives between the assistant's announcement and its reply text."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    # assistant announced
+    adapter._dispatch_sse(
+        sess,
+        {
+            "type": "message.updated",
+            "properties": {"sessionID": "ses_test", "info": {"id": "msg_a1", "role": "assistant"}},
+        },
+    )
+    # stale re-emit for the earlier user message (must NOT clobber the assistant)
+    adapter._dispatch_sse(
+        sess,
+        {
+            "type": "message.updated",
+            "properties": {"sessionID": "ses_test", "info": {"id": "msg_u1", "role": "user"}},
+        },
+    )
+    # assistant's reply part arrives — must still be labeled assistant:
+    adapter._dispatch_sse(
+        sess,
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "ses_test",
+                "part": {"text": "done", "messageID": "msg_a1"},
+            },
+        },
+    )
+    log = _log_text(log_path)
+    assert "\n[bmad] assistant:\ndone\n" in log
+    assert "user: done" not in log
+
+
+def test_part_without_known_message_id_falls_back_to_assistant(tmp_path):
+    """A part whose message id has no recorded role falls back to ``assistant``
+    so the line still renders rather than dropping."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    adapter._dispatch_sse(
+        sess,
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "ses_test",
+                "part": {"text": "hi", "messageID": "msg_unseen"},
+            },
+        },
+    )
+    assert "\n[bmad] assistant:\nhi\n" in _log_text(log_path)
+
+
+def test_dispatch_skips_empty_text_and_drops_deltas_from_both_sinks(tmp_path):
+    """Empty/whitespace part text carries no live value, so it renders nothing
+    while still being traced. message.part.delta is dropped from BOTH sinks: its
+    tokens concatenate byte-exactly to the text message.part.updated already
+    carries complete (pinned live), so tracing them re-stores text the file
+    already holds — and logs/ is never trimmed by retention, so those bytes are
+    permanent. Deltas also must not consume a seq: the trace's seq numbering has
+    to match the lines actually in the file."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    for evt in (
+        {
+            "type": "message.part.updated",
+            "properties": {"sessionID": "ses_test", "part": {"text": ""}},
+        },
+        {
+            "type": "message.part.updated",
+            "properties": {"sessionID": "ses_test", "part": {"text": "   "}},
+        },
+        {
+            "type": "message.part.delta",
+            "properties": {"sessionID": "ses_test", "delta": "streaming token"},
+        },
+    ):
+        adapter._dispatch_sse(sess, evt)
+    assert _log_text(log_path) == ""
+    records = read_jsonl(event_path)
+    assert [r["type"] for r in records] == ["message.part.updated", "message.part.updated"]
+    assert [r["seq"] for r in records] == [1, 2]
+    assert sess.event_seq == 2  # the delta burned no sequence number
+
+
+def test_dispatch_writes_command_file_permission_lines(tmp_path):
+    """The role-less marker family, dispatched with the payload shapes 1.18.2
+    actually sends: command.executed carries a sessionID, file.edited carries
+    none (it rides the session-less allowlist), and the permission pair uses
+    permission/patterns + reply."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    for evt in (
+        {
+            "type": "command.executed",
+            "properties": {"sessionID": "ses_test", "name": "Edit", "arguments": {"x": 1}},
+        },
+        {"type": "file.edited", "properties": {"file": "a.py"}},
+        {
+            "type": "permission.asked",
+            "properties": {"sessionID": "ses_test", "permission": "bash", "patterns": ["rm *"]},
+        },
+        {
+            "type": "permission.replied",
+            "properties": {"sessionID": "ses_test", "requestID": "per_1", "reply": "deny"},
+        },
+    ):
+        adapter._dispatch_sse(sess, evt)
+    log = _log_text(log_path)
+    assert "[bmad] cmd: Edit " in log
+    assert "[bmad] file: a.py\n" in log
+    assert '[bmad] perm ask: bash ["rm *"]\n' in log
+    assert "[bmad] perm reply: deny\n" in log
+    types = [r["type"] for r in read_jsonl(event_path)]
+    assert types == ["command.executed", "file.edited", "permission.asked", "permission.replied"]
+
+
+# ------------------------------------------------------------ tool-part render
+#
+# Agent tool use has no event of its own on this SSE surface: no tool.call, no
+# tool.response, and command.executed never fires for it (0 frames across live
+# bash/write/read/edit). It arrives as message.part.updated with a `tool`-typed
+# part — which carries NO `part.text`, so the tool branch has to sit above
+# _inline_line's empty-text bail-out to be reachable at all.
+#
+# A tool part re-fires on every state transition with the same part id
+# (pending → running → terminal), so the render is gated on a TERMINAL status.
+# That gate, not the rendering, is the correctness claim here — see the ABLATION
+# note above test_tool_part_renders_once_per_call.
+
+
+def _tool_part(status: str, **state) -> dict:
+    """A `tool`-typed message part in the given state, shaped like 1.18.2's
+    ToolPart (same part id across every transition of one call)."""
+    return {
+        "id": "prt_tool1",
+        "sessionID": "ses_test",
+        "messageID": "msg_a1",
+        "type": "tool",
+        "callID": "toolu_1",
+        "tool": "bash",
+        "state": {"status": status, **state},
+    }
+
+
+def _dispatch_tool(adapter, sess, part: dict) -> None:
+    adapter._dispatch_sse(
+        sess,
+        {"type": "message.part.updated", "properties": {"sessionID": "ses_test", "part": part}},
+    )
+
+
+def test_tool_line_renders_name_and_input_summary():
+    """The terminal fire renders the tool name plus a one-line input summary —
+    the "what did the agent just do" the transcript exists for. state.output is
+    deliberately absent from the line (it is a whole command's stdout or a whole
+    file on this surface); the complete payload stays in the SSE trace."""
+    adapter = make_adapter(Path("/tmp"))  # _inline_line is pure
+    line = adapter._inline_line(
+        "message.part.updated",
+        {"part": _tool_part("completed", input={"command": "echo hi"}, output="OUTPUT_MARKER")},
+        "assistant",
+    )
+    assert line == f'{_TOOL_COLOR}[bmad] tool: bash {{"command": "echo hi"}}{_RESET}\n'
+    assert "OUTPUT_MARKER" not in line  # output is traced, never rendered inline
+    # a tool with no input still names itself rather than dropping
+    assert adapter._inline_line(
+        "message.part.updated", {"part": _tool_part("completed", input={}, output="")}, "assistant"
+    ) == (f"{_TOOL_COLOR}[bmad] tool: bash{_RESET}\n")
+    # long inputs truncate like any other one-line summary
+    long_line = adapter._inline_line(
+        "message.part.updated",
+        {"part": _tool_part("completed", input={"command": "x" * 500})},
+        "assistant",
+    )
+    assert long_line is not None and "…" in long_line
+
+
+def test_tool_line_marks_a_failed_call():
+    """`error` is the other terminal status (ToolState is a 4-variant union), and
+    a tool that failed is precisely what a reader goes to the transcript for —
+    so it renders, with the error appended to the same line shape."""
+    adapter = make_adapter(Path("/tmp"))
+    assert adapter._inline_line(
+        "message.part.updated",
+        {"part": _tool_part("error", input={"command": "false"}, error="exit status 1")},
+        "assistant",
+    ) == (
+        f'{_TOOL_COLOR}[bmad] tool: bash {{"command": "false"}} -> error: exit status 1{_RESET}\n'
+    )
+    # an error with no detail still marks the failure — the marker is the signal
+    assert adapter._inline_line(
+        "message.part.updated", {"part": _tool_part("error", input={})}, "assistant"
+    ) == (f"{_TOOL_COLOR}[bmad] tool: bash -> error{_RESET}\n")
+
+
+def test_tool_part_renders_to_the_log(tmp_path):
+    """End to end through _dispatch_sse: a completed tool call lands in the
+    readable transcript (this is the half of the feature that rendered nothing
+    at all before — tool parts have no part.text)."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    _dispatch_tool(adapter, sess, _tool_part("completed", input={"file": "a.py"}, output="ok"))
+    assert '[bmad] tool: bash {"file": "a.py"}\n' in _log_text(log_path)
+    # role-less: no "[bmad] assistant:" header is emitted for a tool part
+    assert "[bmad] assistant:" not in _log_text(log_path)
+    assert _TOOL_COLOR in log_path.read_bytes().decode("utf-8")
+
+
+# ABLATION (both directions run 2026-07-25). "One line per tool" is a PLACEMENT
+# claim, and it is also what a renderer that emits NOTHING satisfies — so the
+# presence ablation alone would not test the gate:
+#   (a) delete the `part.get("type") == "tool"` branch from _inline_line → all
+#       five tool tests fail; this one at `assert 0 == 1` on the count.
+#   (b) INVERSE: drop the `status not in _TOOL_TERMINAL_STATES` gate from
+#       _tool_line so it renders on every transition → this test fails on the
+#       FIRST intermediate assert (pending rendered '[bmad] tool: bash'), which
+#       is the proof the mutation actually fires: the pending and running frames
+#       really do reach the branch, so the count assertion is not passing
+#       vacuously. Left to run to completion the count is 3 != 1, with running
+#       and completed rendering byte-identical lines.
+# The intermediate "nothing yet" asserts are the placement claim stated directly;
+# the count is the backstop.
+
+
+def test_tool_part_renders_once_per_call(tmp_path):
+    """One tool call = one transcript line, even though the part re-fires on
+    pending, running and the terminal status with the same part id. The trace
+    keeps all three fires: the sinks split curated-vs-complete by design."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    # the live progression: pending (no input yet) → running → completed
+    _dispatch_tool(adapter, sess, _tool_part("pending", input={}, raw=""))
+    assert _log_text(log_path) == ""  # nothing rendered while it is queued
+    _dispatch_tool(adapter, sess, _tool_part("running", input={"command": "echo hi"}))
+    assert _log_text(log_path) == ""  # nor while it runs
+    _dispatch_tool(
+        adapter, sess, _tool_part("completed", input={"command": "echo hi"}, output="hi\n")
+    )
+
+    log = _log_text(log_path)  # ANSI-stripped, CRLF normalized
+    assert log.count("[bmad] tool: bash") == 1
+    assert log == '[bmad] tool: bash {"command": "echo hi"}\n'
+    # all three fires are in the trace — only the transcript is deduplicated
+    records = read_jsonl(event_path)
+    assert [r["properties"]["part"]["state"]["status"] for r in records] == [
+        "pending",
+        "running",
+        "completed",
+    ]
+
+
+def test_tool_part_never_shadows_assistant_text(tmp_path):
+    """The tool branch sits inside the message.part.updated arm, above the
+    empty-text bail-out — it must not swallow ordinary text parts on the way."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    for part in (
+        {"type": "text", "text": "thinking about it", "messageID": "msg_a1"},
+        _tool_part("completed", input={"command": "ls"}, output="a.py"),
+        {"type": "text", "text": "done", "messageID": "msg_a1"},
+    ):
+        _dispatch_tool(adapter, sess, part)
+    log = _log_text(log_path)
+    assert "\n[bmad] assistant:\nthinking about it\n" in log
+    assert '[bmad] tool: bash {"command": "ls"}\n' in log
+    assert "\n[bmad] assistant:\ndone\n" in log
+    assert log.index("thinking about it") < log.index("tool: bash") < log.index("done")
+
+
+def test_jsonl_seq_is_monotonic_with_ts_and_shape(tmp_path):
+    """Each traced event gets one JSONL record with a monotonic seq, the raw
+    type, the raw properties, and an epoch-ms ts that never goes backwards
+    across the batch."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    for n in range(4):
+        adapter._dispatch_sse(
+            sess,
+            {"type": "session.diff", "properties": {"sessionID": "ses_test", "diff": [str(n)]}},
+        )
+    records = read_jsonl(event_path)
+    assert [r["seq"] for r in records] == [1, 2, 3, 4]
+    assert all(set(r) == {"seq", "type", "properties", "ts"} for r in records)
+    ts = [r["ts"] for r in records]
+    assert ts == sorted(ts)  # epoch ms, non-decreasing within the batch
+    # epoch ms, not ns and not seconds — the unit every opencode time.* field
+    # uses, and the unit the poll fallback's floor comparison assumes
+    assert all(abs(r["ts"] - _now_ms()) < 60_000 for r in records)
+    assert all(r["properties"]["diff"] == [str(i)] for i, r in enumerate(records))
+
+
+def test_unhandled_session_event_recorded_in_jsonl_not_log(tmp_path):
+    """A session-scoped event _render_inline does not curate (e.g. session.diff)
+    still passes the sessionID filter, so it lands in the complete-trace JSONL —
+    but writes no human-readable line. The two sinks split by design: curated
+    human log vs complete machine trace."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    adapter._dispatch_sse(
+        sess, {"type": "session.diff", "properties": {"sessionID": "ses_test", "diff": []}}
+    )
+    assert _log_text(log_path) == ""
+    records = read_jsonl(event_path)
+    assert len(records) == 1 and records[0]["type"] == "session.diff"
+
+
+def test_no_session_id_event_filtered_from_both_sinks(tmp_path):
+    """An event with no matching sessionID (noise like catalog.updated) is
+    filtered before either sink fires — neither a log line nor a JSONL record."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    adapter._dispatch_sse(sess, {"type": "catalog.updated", "properties": {}})
+    assert _log_text(log_path) == ""
+    assert read_jsonl(event_path) == []
+    assert sess.event_seq == 0
+
+
+# ----------------------------------------------- session-less type allowlist
+#
+# Some frames worth logging carry no sessionID at all: file.edited is exactly
+# {"file": "/abs/path"} live, and 1.18.2 pins it additionalProperties:false over
+# that one key — so the sessionID filter in _dispatch_sse drops it above both
+# sinks and its render branch is unreachable without an explicit exemption.
+# _SESSIONLESS_TYPES is that exemption, and it is sound ONLY because bmad-loop
+# spawns one opencode serve per session, which makes a server-global frame
+# unambiguously this session's.
+#
+# It is an allowlist rather than "allow anything session-less" because the
+# session-less traffic is mostly noise that says nothing about the run:
+# plugin.added alone was 90 of 388 frames in the live probe.
+#
+# ABLATION (verified 2026-07-25): revert _dispatch_sse's filter to the plain
+# `props.get("sessionID") != sess.session_id` and the two tests that assert a
+# session-less frame REACHES a sink fail. The two negative tests below
+# (non-allowlisted, control-queue) keep passing under that ablation — they
+# assert absence, which holds however the frame was dropped, so they document
+# scope rather than prove reachability. The positive test carries that claim.
+
+
+def test_sessionless_allowlisted_type_renders_and_traces(tmp_path):
+    """file.edited has no sessionID at all, yet reaches BOTH sinks — the
+    allowlist exempts it from the filter, and the trace stays consistent with the
+    transcript (it is the file you read to explain a rendered line)."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    adapter._dispatch_sse(sess, {"type": "file.edited", "properties": {"file": "/abs/src/app.py"}})
+    assert "[bmad] file: /abs/src/app.py\n" in _log_text(log_path)
+    records = read_jsonl(event_path)
+    assert [r["type"] for r in records] == ["file.edited"]
+    assert records[0]["properties"] == {"file": "/abs/src/app.py"}
+
+
+def test_sessionless_non_allowlisted_type_writes_nothing(tmp_path):
+    """The allowlist is not a blanket exemption. plugin.added is session-less
+    too and was 90 of 388 live frames; it must still be dropped above both
+    sinks, burning no seq. Same for the file watcher, which fires for any change
+    under the project (not just the agent's) and double-reports file.edited."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    for etype in ("plugin.added", "file.watcher.updated", "server.instance.disposed"):
+        adapter._dispatch_sse(sess, {"type": etype, "properties": {"plugin": "x", "file": "y"}})
+    assert _log_text(log_path) == ""
+    assert read_jsonl(event_path) == []
+    assert sess.event_seq == 0
+    # liveness is unaffected: these frames still counted as activity, exactly as
+    # before the allowlist existed (that counter sits above the filter)
+    assert sess.activity == 3
+
+
+def test_sessionless_allowlist_does_not_touch_the_control_queue(tmp_path):
+    """The allowlist is a logging exemption only. A session-less frame must never
+    reach the idle/error puts — those stay keyed to this session's id, or a
+    foreign server-global frame could end the turn."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    for etype in ("session.idle", "session.error"):
+        adapter._dispatch_sse(sess, {"type": etype, "properties": {}})
+    assert sess.events.empty()
+    # and an allowlisted one does not either
+    adapter._dispatch_sse(sess, {"type": "file.edited", "properties": {"file": "a.py"}})
+    assert sess.events.empty()
+
+
+def test_unhashable_event_type_never_raises_in_the_filter(tmp_path):
+    """The allowlist membership test sits OUTSIDE the try/except that guards the
+    two sinks, so it must not raise on a server-controlled `type`: `in` on a
+    frozenset raises TypeError for an unhashable value, hence the isinstance
+    narrowing ahead of it."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    for etype in ({"a": 1}, ["file.edited"], {"file.edited"}):
+        adapter._dispatch_sse(sess, {"type": etype, "properties": {}})  # must not raise
+    assert _log_text(log_path) == ""
+    assert read_jsonl(event_path) == []
+    # the control path still works after them
+    adapter._dispatch_sse(sess, {"type": "session.idle", "properties": {"sessionID": "ses_test"}})
+    assert sess.events.get_nowait() == "idle"
+
+
+def test_render_inline_noops_when_log_fh_is_none(tmp_path):
+    """A bare _ServerSession (log_fh=None, as built by the older unit tests)
+    must not raise when a curated event is dispatched — inline rendering is
+    best-effort, never a crash path."""
+    adapter = make_adapter(tmp_path)
+    sess = _ServerSession(process=None, port=0, base_url="", password="", log_fh=None)
+    sess.session_id = "ses_test"
+    adapter._dispatch_sse(
+        sess,
+        {
+            "type": "message.part.updated",
+            "properties": {"sessionID": "ses_test", "part": {"text": "x"}},
+        },
+    )
+    # event_fh defaults to None too: no jsonl written, no seq bumped
+    assert sess.event_seq == 0
+
+
+# --------------------------------------------- logging never breaks the stream
+#
+# Both sinks are written from _dispatch_sse ABOVE the idle/error queue puts, and
+# both walk nested .get chains into server-controlled payloads. A frame that
+# ships a string (or a list, or null) where the renderer expects a dict raises
+# AttributeError. Unguarded, that propagates out of _dispatch_sse into the SSE
+# reader's connection-level `except Exception` in _sse_loop, which treats it as
+# a dead connection: it tears the stream down, puts a `gap`, sleeps, and
+# reconnects — losing whatever the server had already buffered on that
+# connection. That is a logging bug degrading completion signaling, so these
+# tests assert the two properties that matter: the malformed frame does not
+# raise, and a following session.idle still reaches the control queue.
+#
+# ABLATION (verified 2026-07-25): delete the try/except around the two helper
+# calls in _dispatch_sse and the five tests below that feed a wrong-shaped
+# payload through the RENDER path fail with AttributeError. The sixth
+# (test_unserializable_properties_...) still passes ablated — its protection is
+# _emit_event's own narrow `except (OSError, TypeError, ValueError)` around
+# json.dumps, not this guard. It is kept as a regression test for that inner
+# catch; do not read it as evidence for the outer one.
+
+MALFORMED_FRAMES = [
+    # part is a string, not a dict → _render_inline's part.get("messageID")
+    {"type": "message.part.updated", "properties": {"part": "not-a-dict"}},
+    # part is a list → same chain, different wrong shape
+    {"type": "message.part.updated", "properties": {"part": ["text"]}},
+    # info is a string → _render_inline's info.get("id") on the role refresh
+    {"type": "message.updated", "properties": {"info": "not-a-dict"}},
+    # a tool part whose state is a truthy non-dict → `part.get("state") or {}`
+    # keeps it, then state.get("status") blows up. (The permission frames no
+    # longer offer this shape: post-correction they read `permission` /
+    # `patterns` / `reply` straight off props, which is always a dict here.)
+    {"type": "message.part.updated", "properties": {"part": {"type": "tool", "state": "running"}}},
+]
+
+
+@pytest.mark.parametrize("frame", MALFORMED_FRAMES, ids=lambda f: f["type"])
+def test_malformed_frame_never_breaks_dispatch(tmp_path, frame):
+    """A server-shaped payload the renderer can't walk must not escape dispatch."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    event = {**frame, "properties": {**frame["properties"], "sessionID": "ses_test"}}
+
+    adapter._dispatch_sse(sess, event)  # must not raise
+
+    # and the control path is untouched: the next idle still queues
+    adapter._dispatch_sse(sess, {"type": "session.idle", "properties": {"sessionID": "ses_test"}})
+    assert sess.events.get_nowait() == "idle"
+
+
+def test_malformed_frame_does_not_lose_the_trace_record(tmp_path):
+    """_emit_event runs before _render_inline inside the guard, so the frame that
+    broke rendering is still in the trace — which is the file you would read to
+    diagnose it."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    adapter._dispatch_sse(
+        sess,
+        {
+            "type": "message.part.updated",
+            "properties": {"sessionID": "ses_test", "part": "not-a-dict"},
+        },
+    )
+    records = read_jsonl(event_path)
+    assert [r["type"] for r in records] == ["message.part.updated"]
+    assert records[0]["properties"]["part"] == "not-a-dict"
+    assert _log_text(log_path) == ""  # rendering aborted, nothing half-written
+
+
+def test_unserializable_properties_never_break_dispatch(tmp_path):
+    """The trace's own failure mode: json.dumps raising on a payload it can't
+    encode must not take the stream down either. Held by _emit_event's own
+    catch rather than the outer guard (see the ABLATION note above)."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    adapter._dispatch_sse(
+        sess,
+        {
+            "type": "message.part.updated",
+            "properties": {"sessionID": "ses_test", "part": {"text": "hi"}, "blob": {1, 2}},
+        },
+    )
+    adapter._dispatch_sse(sess, {"type": "session.idle", "properties": {"sessionID": "ses_test"}})
+    assert sess.events.get_nowait() == "idle"
+    # the unserializable record is dropped, but the readable line still landed
+    # and the trace keeps working for the frames that follow
+    assert [r["type"] for r in read_jsonl(event_path)] == ["session.idle"]
+    assert "\n[bmad] assistant:\nhi\n" in _log_text(log_path)
+
+
+def test_non_string_event_type_is_dropped(tmp_path):
+    """`type` absent or non-string can match no branch below, so the frame is
+    dropped rather than traced — it is not something the adapter acted on."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    adapter._dispatch_sse(sess, {"properties": {"sessionID": "ses_test"}})
+    adapter._dispatch_sse(sess, {"type": 7, "properties": {"sessionID": "ses_test"}})
+    assert read_jsonl(event_path) == []
+    assert _log_text(log_path) == ""
+    assert sess.events.empty()
+
+
+def test_sum_args_truncates_and_handles_shapes():
+    """_sum_args keeps a command's arguments on one log line: short passthrough,
+    dict→json, long→truncated with an ellipsis, falsy→empty."""
+    assert _sum_args(None) == ""
+    assert _sum_args("") == ""
+    assert _sum_args({"a": 1}) == '{"a": 1}'
+    assert _sum_args([1, 2]) == "[1, 2]"
+    long = _sum_args("x" * 500)
+    assert len(long) == 120 and long.endswith("\u2026")
+
+
 def test_sum_usage_maps_opencode_tokens():
     messages = [
         {"info": {"role": "user", "tokens": {"input": 999}}},  # not assistant: ignored
@@ -744,6 +1501,31 @@ def test_e2e_completed(tmp_path, fake_opencode):
     assert adapter._sessions == {}
     assert_server_gone(rec)
     assert (tmp_path / "run" / "logs" / "t-1.log").exists()
+    # the server's own stdout is redirected to its own file, keeping the
+    # readable transcript in <task>.log clean of server INFO noise
+    server_log = (tmp_path / "run" / "logs" / "t-1.server.out").read_text()
+    assert "FAKE_STDOUT_CANARY" in server_log
+    assert "FAKE_STDOUT_CANARY" not in (tmp_path / "run" / "logs" / "t-1.log").read_text()
+    # the SSE trace is on by default and named .sse.jsonl
+    trace = read_jsonl(tmp_path / "run" / "logs" / "t-1.sse.jsonl")
+    assert trace and "session.idle" in {r["type"] for r in trace}
+
+
+def test_e2e_sse_trace_knob_off_never_opens_the_sink(tmp_path, fake_opencode):
+    """sse_trace is a tier-1 instance knob, not a policy field: flipping it off
+    means the file is never created at all (not created-then-empty), while the
+    run itself and the readable transcript are unaffected."""
+    launcher, rec = fake_opencode
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    adapter.sse_trace = False
+    spec = make_spec(tmp_path, rec, "completed")
+
+    result = adapter.run(spec)
+
+    assert result.status == "completed"
+    assert not (tmp_path / "run" / "logs" / "t-1.sse.jsonl").exists()
+    assert (tmp_path / "run" / "logs" / "t-1.log").exists()
+    assert_server_gone(rec)
 
 
 def test_e2e_result_less_stop_nudges_then_completes(tmp_path, fake_opencode):
@@ -1300,15 +2082,95 @@ def test_e2e_spawn_retry_survives_one_early_death(tmp_path, fake_opencode):
 
 
 def test_e2e_spawn_gives_up_after_attempts(tmp_path, fake_opencode):
+    """The give-up error has to point at the file that actually holds the
+    diagnostics. Server stdout is redirected to <task>.server.out, so naming
+    <task>.log — which now carries only the SSE-rendered transcript, and is
+    EMPTY when the server never got far enough to stream anything — would send
+    an operator to a blank file on every failed spawn."""
     launcher, rec = fake_opencode
     adapter = make_adapter(tmp_path, binary=str(launcher))
     spec = make_spec(tmp_path, rec, "completed", extra_env={"FAKE_OPENCODE_START_FAILURES": "99"})
+    logs = tmp_path / "run" / "logs"
 
-    with pytest.raises(OpencodeServerError, match="after 3 attempts"):
+    with pytest.raises(OpencodeServerError, match="after 3 attempts") as excinfo:
         adapter.run(spec)
+
     assert adapter._sessions == {}
-    # every attempt appended to one log for the task
-    assert (tmp_path / "run" / "logs" / "t-1.log").exists()
+    message = str(excinfo.value)
+    assert str(logs / "t-1.server.out") in message
+    assert str(logs / "t-1.log") not in message
+    # and the path it names holds the goods: every attempt appended to one
+    # server log, so all 3 spawns' stdout is there to read
+    server_out = (logs / "t-1.server.out").read_text(encoding="utf-8")
+    assert server_out.count("FAKE_STDOUT_CANARY") == 3
+    # the transcript is the file that would have been useless here
+    assert (logs / "t-1.log").read_bytes() == b""
+
+
+def test_spawn_open_failure_closes_the_sinks_already_open(tmp_path, fake_opencode, monkeypatch):
+    """A failing sink `open()` must not strand the sinks opened before it.
+
+    All three sinks open ABOVE the retry loop's try/except, so an `open()` that
+    fails partway — ENOSPC, EMFILE, a permission race — propagates straight out
+    of `_spawn_server` without ever reaching the loop's handler. Only the guard
+    around the opens themselves can close what was already handed out; without
+    it those handles stay open for as long as the propagating traceback keeps
+    this frame alive. One sink had nothing to leak here; three do.
+    """
+    launcher, rec = fake_opencode
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    spec = make_spec(tmp_path, rec, "completed")
+    opened: dict = {}
+    real_open = Path.open
+
+    def flaky_open(self, *args, **kwargs):
+        # the LAST of the three sinks to open — so .log and .sse.jsonl are both
+        # already live when it blows up
+        if self.name.endswith(".server.out"):
+            raise OSError(28, "No space left on device")
+        fh = real_open(self, *args, **kwargs)
+        opened[self.name] = fh
+        return fh
+
+    monkeypatch.setattr(Path, "open", flaky_open)
+
+    with pytest.raises(OSError, match="No space left"):
+        adapter._spawn_server(spec)
+
+    # both earlier sinks were opened, and both were closed on the way out
+    assert set(opened) >= {"t-1.log", "t-1.sse.jsonl"}, sorted(opened)
+    still_open = [name for name, fh in opened.items() if not fh.closed]
+    assert still_open == [], f"leaked sink handles: {still_open}"
+
+
+def test_close_spawn_sinks_survives_a_failing_close(tmp_path):
+    """A close that raises must not displace the failure being reported.
+
+    Both callers are already reporting something worse — one is mid-`raise`, the
+    other is about to raise `OpencodeServerError` — so an OSError from a
+    flush-on-close would replace the real diagnosis. It must also not strand the
+    sinks after it in the loop.
+    """
+    adapter = make_adapter(tmp_path)
+    closed = []
+
+    class _Fh:
+        def __init__(self, name, boom=False):
+            self.name, self._boom = name, boom
+
+        def close(self):
+            closed.append(self.name)
+            if self._boom:
+                raise OSError(5, "Input/output error")
+
+    # the FIRST sink fails to close: an unguarded loop would propagate here and
+    # never reach the other two
+    adapter._close_spawn_sinks(_Fh("log", boom=True), _Fh("server"), _Fh("event"))
+
+    assert closed == ["log", "server", "event"]
+    # and None (sse_trace off, or the sink whose open was the failure) is skipped
+    adapter._close_spawn_sinks(_Fh("log2"), None, None)
+    assert closed[-1] == "log2"
 
 
 # --------------------------------------------- OpencodeDevAdapter (Phase 4)

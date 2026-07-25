@@ -514,6 +514,20 @@ decisions worth stealing:
   loss. Completion evidence is gated by a forward-advancing floor so an idle
   event without proof of new work never completes a session — the same
   artifact-distrust invariant the tmux adapters enforce.
+- **A transport with no pane still owes the operator a transcript.** The tmux
+  adapters get `logs/<task-id>.log` for free by replaying the pane; over HTTP that
+  file would hold nothing but `opencode serve`'s own INFO stdout, leaving finished
+  runs unreadable. So the transcript is _curated_ off the SSE stream the adapter
+  already consumes for control — a second consumer on the same
+  `sessionID`-filtered dispatch, costing one `write()` per interesting frame.
+  Three sinks, one per audience: `<task-id>.log` is the readable transcript
+  (role-prefixed prose plus `[bmad]`-marked `tool:` / `cmd:` / `file:` /
+  `perm ask:` / `perm reply:` / `error:` lines), `<task-id>.server.out` takes the
+  server's own stdout so it cannot drown that transcript, and
+  `<task-id>.sse.jsonl` keeps the raw frames for post-hoc debugging (behind the
+  `sse_trace` module knob, per-token deltas excluded). The catch of curating:
+  what you render is only as good as the event names you pinned — check every
+  branch against the running binary, not against the names that read plausibly.
 - **Hookless profile.** The profile sets `[hooks] dialect = "none"`: no hook
   registration, no hook-config merge into worktrees; `init`, `validate` and
   worktree provisioning all understand `profile.hookless`. Skills still install
