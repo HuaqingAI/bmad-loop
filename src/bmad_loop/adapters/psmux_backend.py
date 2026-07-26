@@ -11,7 +11,13 @@ pane, ``kill-session`` ignores the ``=name`` exact-match form, a quoted
 command string does not survive psmux's outer re-parse (so shell source
 travels as ``pwsh -EncodedCommand``), and ``pipe-pane`` strips every
 dash-flag token from the piped command (so the log sink travels as a
-positional sidecar ``.ps1``). ``available()`` additionally gates on
+positional sidecar ``.ps1``). Window ids are minted per server (one
+server per session), so ``new_window``/``list_window_ids`` hand back
+session-qualified ``session:@N`` ids that route to the owning server from
+any caller (psmux/psmux#483) — the TUI-side mint/list surfaces
+(``new_parked_window``, ``list_windows`` field ids) deliberately still hand
+back bare ids, a different process context tracked in #291.
+``available()`` additionally gates on
 the reported version: psmux releases up to 3.3.6 kill recycled PIDs during
 pane/session teardown without a process-identity check, which can take down
 an unrelated long-lived process mid-run. See :mod:`.multiplexer` for the
@@ -170,6 +176,45 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             self._run(["kill-session", "-t", name], check=False)
         except (subprocess.SubprocessError, OSError):
             pass
+
+    @staticmethod
+    def _qualified_window_id(session: str, window_id: str) -> str:
+        # psmux mints window ids per server (one server per session), so a bare
+        # `@N` replayed as a `-t` target routes by the caller's $TMUX — from a
+        # ctl pane that is the wrong server entirely (#254). A `session:@N`
+        # target routes by the session's port file instead (psmux/psmux#483:
+        # qualified targets are at full parity; bare ids are a permanent model
+        # boundary). Degrade to the bare id when the session name contains `:`
+        # (it would split at the wrong colon) — the #221 rule — or when the id
+        # is falsy (a failure sentinel must pass through unchanged).
+        #
+        # Composed here rather than via self.target() — which would emit
+        # `=session:@N`, and does parse (psmux strips the `=`) — because the
+        # seam requires target() to stay a stable *by-name* token and `@N` is
+        # an id. Do not "unify" the two grammars: current_return_target's
+        # `=session:%N` is a target(), this is not.
+        if not window_id or ":" in session:
+            return window_id
+        return f"{session}:{window_id}"
+
+    def new_window(
+        self, session: str, name: str, cwd: Path, env: dict[str, str], command: str
+    ) -> str:
+        # Session-qualify the minted id (see _qualified_window_id) so every
+        # downstream `-t` consumer inherits an unambiguous target. Post-process
+        # the base's return rather than reformatting `-F` so the argv stays
+        # byte-identical to the base's.
+        window_id = super().new_window(session, name, cwd, env, command)
+        return self._qualified_window_id(session, window_id)
+
+    def list_window_ids(self, session: str) -> list[str]:
+        # psmux's list-windows emits bare `@N` lines; qualify them identically
+        # to new_window or window_alive's membership check (native_id in
+        # list_window_ids) would read every window as dead.
+        return [
+            self._qualified_window_id(session, window_id)
+            for window_id in super().list_window_ids(session)
+        ]
 
     def current_return_target(self) -> str | None:
         # psmux runs one server per session, so a bare pane id recorded on a
