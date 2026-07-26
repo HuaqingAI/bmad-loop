@@ -291,9 +291,18 @@ class PsmuxMultiplexer(BaseTmuxBackend):
                 # The unresolved id sent below is exactly the form that CLI-side
                 # check rejects, and its exit 1 lands in a pipe the base
                 # discards — so the send is known-futile and the caller's later
-                # attach shows whichever window happens to be current. Warn
-                # (the pipe-pane sidecar precedent), or that is untraceable;
-                # guessing an index instead could focus an unrelated window.
+                # attach shows whichever window happens to be current. Guessing
+                # an index instead could focus an unrelated window, so warn and
+                # send: the pipe-pane sidecar precedent, but a weaker one, and
+                # deliberately not load-bearing. Today's only caller of the
+                # qualified-id path (select_ctl_window_id, from the TUI's resolve
+                # launch) runs inside the Textual app, which captures stderr for
+                # the app's whole run — see the run_tui note in tui/app.py, which
+                # pre-trips the forced-backend warning for exactly this reason —
+                # so this emission is invisible there. It is kept for the CLI-side
+                # callers tui/launch.py is textual-free to allow; a TUI-visible
+                # miss would need a return value, which is more seam than a
+                # best-effort focus change is worth.
                 print(
                     f"warning: select-window could not resolve {target} to a "
                     "window index; the window will not be focused",
