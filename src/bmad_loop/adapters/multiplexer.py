@@ -156,14 +156,19 @@ class TerminalMultiplexer(ABC):
     def list_window_ids(self, session: str) -> list[str]:
         """Native ids of every window in ``session`` (empty if it is gone).
 
-        SYMMETRY RULE: these must be the *same id form* :meth:`new_window` and
-        :meth:`new_parked_window` return, because :meth:`window_alive` is a
-        membership test over this list. A backend that qualifies one side and
-        not the other reads every live window as instantly dead. The form
-        itself is the backend's own — psmux emits ``session:@N`` because its
-        ids are minted per server (one server per session), so a bare ``@N``
-        replayed as a ``-t`` target routes by the *caller's* server instead of
-        the owning one.
+        SYMMETRY RULE: these must be the *same id form* :meth:`new_window`
+        returns, because :meth:`window_alive` is a membership test over this
+        list. A backend that qualifies one side and not the other reads every
+        live window as instantly dead. The form itself is the backend's own —
+        psmux emits ``session:@N`` because its ids are minted per server (one
+        server per session), so a bare ``@N`` replayed as a ``-t`` target
+        routes by the *caller's* server instead of the owning one.
+
+        :meth:`new_parked_window` is deliberately *outside* the rule: nothing
+        membership-tests a parked id — it is only replayed as a ``-t`` target,
+        by the TUI — so a backend MAY mint it in a form this list never
+        carries. psmux keeps it bare, because the qualified grammar is not
+        accepted by the verbs the parked path uses (#291).
 
         Raises :class:`MultiplexerError` if the transport itself fails (timeout /
         missing binary): an empty list means "no windows" and must not be
