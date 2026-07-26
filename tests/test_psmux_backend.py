@@ -1010,6 +1010,9 @@ def test_kill_window_unroutable_target_skips_cleanup_but_kills(monkeypatch):
         "a \\; b",  # standalone `\;` token splits the same way
         " C:\\p x",  # leading space survives the wire but this backend's reads strip
         "C:\\p x ",  # trailing space, same round-trip loss
+        "C:\\Users\\O'Brien\\dev",  # SPACELESS `'` — unquoted, so the server tokenizer
+        # opens a quote on it. The spaced sibling below is accepted; the docs call
+        # out the inversion because an apostrophe in a Windows home is common.
     ],
 )
 def test_set_window_option_refuses_untransportable_values(monkeypatch, capsys, value):

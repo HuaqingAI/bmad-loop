@@ -21,12 +21,11 @@ and routes to the owning server from any caller (psmux/psmux#483).
 ``select_window`` is the one verb that
 cannot take that form: psmux validates a scoped target's window part
 CLI-side against window index/name only, so the override resolves the id
-back to an index first. Per-window user options do not exist at all —
-psmux keeps one user-option scope per server and every ``-w`` read of an
-``@``-prefixed name is empty — so the window-option verbs, the
-``@``-prefixed columns of ``list_windows`` and the parked trailer route
-through a session-scoped option whose key carries the window id (#310).
-``available()`` additionally gates on
+back to an index first. Per-window user options do not exist at all, so
+the window-option verbs, the ``@``-prefixed columns of ``list_windows``
+and the parked trailer route through a substitute channel — see the
+``per-window option channel (#310)`` block below for the model and its
+rules. ``available()`` additionally gates on
 the reported version: psmux releases up to 3.3.6 kill recycled PIDs during
 pane/session teardown without a process-identity check, which can take down
 an unrelated long-lived process mid-run. The psmux behaviors cited in this
@@ -603,7 +602,7 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # kill itself is best-effort, so a kill that then fails leaves a live
         # window without its keys — the prune's untagged run-dir fallback still
         # scopes the retry, and a lost return key just parks the window as-is.
-        # ponytail: one listing round-trip per kill, two for a name target
+        # Cost, accepted: one listing round-trip per kill, two for a name target
         # (name-resolve, then keys; agent-window kills pay it too, for
         # nothing); skip-by-session-name if that ever measures.
         scope = self._option_scope(target)

@@ -57,9 +57,13 @@ by a session-scoped option whose key carries the window id (`@bmad_project_@3` f
 Both are properties of psmux's model, not gaps awaiting an upstream release. Practical
 consequence: such a value is **not** readable via `psmux show-options -w` by hand — read it with
 `psmux show-options -qv -t <session> "@bmad_project_@N"` instead. One visible limit: a value
-that cannot survive psmux's control-line transport verbatim (e.g. a project path that is both
-UNC and spaced) is refused with a stderr warning at every launch, and that project's windows
-stay untagged — the prune then scopes them through the run-dir fallback instead of the tag.
+that cannot survive psmux's control-line transport verbatim is refused with a stderr warning at
+every launch, and that project's windows stay untagged — the prune then scopes them through the
+run-dir fallback instead of the tag. Which paths those are is counter-intuitive, because the
+psmux client quotes a value only when it contains an ASCII space and `'` is literal inside those
+quotes: `C:\Users\O'Brien\dev` is **refused** while `C:\Users\O'Brien Files\dev` is accepted, and
+a spaced UNC path (`\\server\share\My Proj`) is refused while the spaceless `\\server\share\proj`
+is accepted.
 
 ## External backends
 
