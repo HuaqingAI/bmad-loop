@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 from conftest import (
+    _OK,
     _file_exists_cmd,
     _spec_baseline,
     committing_crash_state,
@@ -5425,9 +5426,6 @@ def test_fix_phase_session_env_fault_escalates(project):
     burning the remaining dev budget on repair sessions that never ran."""
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     marker = project.project / "fixed.marker"
-    script = project.project / "check.sh"
-    script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    script.chmod(0o755)
 
     def dev_with_marker(spec):
         marker.write_text("ok\n")
@@ -5443,7 +5441,10 @@ def test_fix_phase_session_env_fault_escalates(project):
     policy = Policy(
         gates=GatesPolicy(mode="none"),
         notify=QUIET,
-        verify=VerifyPolicy(commands=(_file_exists_cmd(marker), f'"{script}"')),
+        # `_OK`, not a script file (#292): verify commands run through the host shell,
+        # and cmd hands a `.sh` path to ShellExecute instead of running it. Only the
+        # marker command carries signal here — the escalation is the session's.
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker), _OK)),
         limits=LimitsPolicy(max_dev_attempts=3),  # budget left -> must not be spent
     )
     engine, adapter = make_engine(
