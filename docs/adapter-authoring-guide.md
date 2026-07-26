@@ -108,11 +108,14 @@ module-level `parse_target()` — or the backend's own **native id** (whatever y
 `target()`. (Two values are composed by the backend itself rather than by
 `target()`, precisely so the seam grammar never has to carry a pane or window
 id: the parked-window return target — `current_return_target`, above — and the
-native window id, which psmux qualifies to `session:@N` across the
-`new_window`/`list_window_ids` pair because its ids are per-server (falling back
-to the bare id where that grammar would not survive — the backend owns those
-conditions, and applies them to both halves of the pair so the symmetry rule
-still holds). Both are replayed opaquely; neither is parsed by core.) tmux consumes the token natively (it coincides with tmux exact-match
+native window id, which psmux qualifies to `session:@N` because its ids are
+per-server (falling back to the bare id where that grammar would not survive —
+the backend owns those conditions, and applies them uniformly, so the
+`new_window`/`list_window_ids` symmetry rule holds under the fallback too).
+Both are replayed opaquely; neither is parsed by core. psmux applies the same
+qualification to `new_parked_window`, the `window_id` columns of `list_windows`
+and `current_window_id`; the latter two must agree, since the ctl-window prune
+compares them to skip its own window.) tmux consumes the token natively (it coincides with tmux exact-match
 syntax), so `BaseTmuxBackend` passes it straight through. A native-id backend
 calls `parse_target()` first — `None` means "already a native id, use as-is",
 otherwise resolve `(session, window)` yourself; the herdr adapter's

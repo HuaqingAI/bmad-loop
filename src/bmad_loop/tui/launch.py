@@ -67,8 +67,9 @@ def select_ctl_window(window: str) -> None:
 
 
 def select_ctl_window_id(window_id: str) -> None:
-    """Like select_ctl_window but by stable tmux window id (@N). Immune to the
-    by-name first-match ambiguity in ctl_window and to tmux auto-rename."""
+    """Like select_ctl_window but by the backend's stable window id (bare `@N` on
+    tmux, session-qualified on psmux), as returned by start_detached. Immune to
+    the by-name first-match ambiguity in ctl_window and to tmux auto-rename."""
     get_multiplexer().select_window(window_id)
 
 
@@ -101,7 +102,8 @@ def set_return_pane(window_target: str, target: str) -> None:
     """Record `target` (a current_return_target value or RETURN_DETACH) as the
     return move on a control-session window, so its trailing shell sends the
     client back there when the window's command exits. `window_target` is any
-    tmux window spec (e.g. `=bmad-loop-ctl:run-…` or a stable `@N` id)."""
+    window spec the backend accepts (e.g. `=bmad-loop-ctl:run-…`, or a stable id
+    from start_detached — bare `@N` on tmux, session-qualified on psmux)."""
     get_multiplexer().set_window_option(window_target, RETURN_OPTION, target)
 
 
@@ -281,8 +283,9 @@ def start_detached(project: Path, argv_tail: list[str], run_id: str, kind: str) 
     handled by the multiplexer's parked-window primitive, keyed by the
     RETURN_OPTION recorded on the window by set_return_pane.
 
-    Returns the new window's stable tmux id (@N) so callers can target it
-    unambiguously (window names collide when several kinds share a run_id).
+    Returns the new window's stable backend id (bare `@N` on tmux,
+    session-qualified on psmux) so callers can target it unambiguously (window
+    names collide when several kinds share a run_id).
     """
     mux = get_multiplexer()
     if not mux_usable(mux):
