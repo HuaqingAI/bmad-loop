@@ -182,13 +182,7 @@ class TerminalMultiplexer(ABC):
         probe, so a sentinel is safe).
 
         A ``window_id`` column carries the same id form :meth:`current_window_id`
-        returns; core compares the two directly.
-
-        An ``@``-prefixed option column may carry a backend-private opaque
-        marker meaning "the read FAILED" (distinct from ``""`` = unset).
-        Callers must only ever compare such a column against their own known
-        values — a non-matching value means "not mine", never a displayable
-        tag."""
+        returns; core compares the two directly."""
 
     @abstractmethod
     def window_alive(self, session: str, window_id: str) -> bool:

@@ -1038,12 +1038,12 @@ def test_set_window_option_write_failure_warns(monkeypatch, capsys):
     assert "failed" in capsys.readouterr().err
 
 
-def test_list_windows_option_read_failure_poisons_not_unset(monkeypatch, capsys):
-    # error ≠ unset: "" would drop a tagged window into the prune's untagged
-    # run-dir fallback (kill-eligible); the poison tag reads as some other
-    # project's window and is skipped — the safe direction for a kill scan.
-    # The failure also warns: without it a prune --dry-run reports "nothing
-    # prunable" with no trace of why.
+def test_list_windows_option_read_failure_degrades_to_unset_with_a_warning(monkeypatch, capsys):
+    # A failed listing reads as "untagged", the same answer a genuinely untagged
+    # window gives — safe because _ctl_window_candidates only claims an untagged
+    # window whose run dir exists under THIS project, and run ids are unique. The
+    # failure still warns: without it a prune --dry-run reports "nothing
+    # prunable" with no trace of why. The other columns must survive intact.
     def fake(argv, **kwargs):
         if argv[1] == "show-options":
             raise subprocess.TimeoutExpired(argv, 1)
@@ -1051,18 +1051,16 @@ def test_list_windows_option_read_failure_poisons_not_unset(monkeypatch, capsys)
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     rows = PsmuxMultiplexer().list_windows("ctl", ["window_id", "window_name", "@bmad_project"])
-    assert rows == [("ctl:@1", "shell", PsmuxMultiplexer._OPT_READ_FAILED)]
-    assert PsmuxMultiplexer._OPT_READ_FAILED  # non-empty, or the fallback fires
+    assert rows == [("ctl:@1", "shell", "")]  # id column still qualified
     assert "listing failed" in capsys.readouterr().err
 
 
-def test_list_windows_malformed_id_probe_poisons_not_unset(monkeypatch):
-    # A probe value that is not a bare `@N` is a malfunction, the same failure
-    # class as a dead listing — it must poison (skip), not read as "untagged"
-    # (kill-eligible via the run-dir fallback).
+def test_list_windows_malformed_id_probe_degrades_to_unset(monkeypatch):
+    # A probe value that is not a bare `@N` yields no key to look up, so the
+    # column reads unset — same degrade as a dead listing.
     rec_ = _option_fake(monkeypatch, rows="weird\tshell\tweird\n", value="")
     rows = PsmuxMultiplexer().list_windows("ctl", ["window_id", "window_name", "@bmad_project"])
-    assert rows[0][2] == PsmuxMultiplexer._OPT_READ_FAILED
+    assert rows[0][2] == ""
     assert rec_.calls  # the listing was still attempted
 
 

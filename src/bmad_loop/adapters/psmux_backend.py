@@ -295,11 +295,14 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         degraded = not session or ":" in session
         options = self._scoped_options(session) if opt_columns and not degraded else None
         if opt_columns and not degraded and options is None:
-            # Without this line the failure is invisible: every fill poisons,
-            # so a prune dry-run would report nothing prunable with no trace.
+            # Say it: every column degrades to "unset" at once, so a prune reads
+            # as if nothing were ever tagged. Visible on the CLI prune (cli.py,
+            # incl. the --dry-run this most affects); NOT under the TUI, which
+            # captures stderr for the app's whole run (tui/app.py's run_tui
+            # note) — the select_window precedent below, same deliberate ceiling.
             print(
                 f"warning: show-options listing failed on {session}; "
-                "option columns filled with a read-failure marker",
+                "option columns read as unset",
                 file=sys.stderr,
             )
         out: list[tuple[str, ...]] = []
@@ -308,12 +311,15 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             for i, option in opt_columns.items():
                 # values[i] is the bare `@N` probed in the option column's place.
                 digits = self._id_digits(values[i])
-                if degraded:
+                if degraded or not digits or options is None:
+                    # Unreadable degrades to "" ("unset") rather than to a
+                    # "read failed" sentinel: the caller's untagged fallback
+                    # proves ownership on its own (the ctl prune claims an
+                    # untagged window only when the run dir exists under THIS
+                    # project, and run ids are unique — runs.new_run_id), so a
+                    # third state in the column would buy only the skip of our
+                    # own dead window.
                     values[i] = ""
-                elif not digits or options is None:
-                    # A failed id probe or failed listing (≠ every key unset) —
-                    # see _OPT_READ_FAILED.
-                    values[i] = self._OPT_READ_FAILED
                 else:
                     values[i] = options.get(self._scoped_option_key(option, digits), "")
             for i in id_columns:
@@ -395,16 +401,10 @@ class PsmuxMultiplexer(BaseTmuxBackend):
     # matches (see the namespace note in the channel comment above).
     _KEY_SUFFIX = re.compile(r"_@(\d+)$")
 
-    # Fill value for an option column whose read FAILED (≠ unset). Non-empty on
-    # purpose: "" would drop a genuinely-tagged window into the prune's
-    # untagged run-dir fallback, while an impossible tag reads as "some other
-    # project" and the window is skipped — the safe direction for a kill scan.
-    _OPT_READ_FAILED = "\x00option-read-failed"
-
     def _read_scoped(self, session: str, option: str, digits: str) -> str | None:
         # No `-w`: the session-scoped read is the one that reaches the map.
-        # None = transport failure, "" = unset; only list_windows' fill keeps
-        # the distinction, the ABC read below collapses both to "".
+        # None = transport failure, "" = unset. The ABC read admits only "", so
+        # the caller collapses them — the distinction survives as a warning.
         try:
             proc = self._run(
                 ["show-options", "-qv", "-t", session, self._scoped_option_key(option, digits)],
