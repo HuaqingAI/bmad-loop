@@ -182,7 +182,13 @@ class TerminalMultiplexer(ABC):
         probe, so a sentinel is safe).
 
         A ``window_id`` column carries the same id form :meth:`current_window_id`
-        returns; core compares the two directly."""
+        returns; core compares the two directly.
+
+        An ``@``-prefixed option column may carry a backend-private opaque
+        marker meaning "the read FAILED" (distinct from ``""`` = unset).
+        Callers must only ever compare such a column against their own known
+        values — a non-matching value means "not mine", never a displayable
+        tag."""
 
     @abstractmethod
     def window_alive(self, session: str, window_id: str) -> bool:
@@ -209,7 +215,13 @@ class TerminalMultiplexer(ABC):
     def set_window_option(self, target: str, option: str, value: str) -> None:
         """Set a user option on the targeted window (best-effort: a no-op on a
         transport failure). ``target`` is a :meth:`target` token or a
-        backend-native window id."""
+        backend-native window id.
+
+        The contract is the (window, option) keying, not the storage: a backend
+        without per-window option scope may key the value however it likes
+        (psmux does), so read it back only through :meth:`show_window_option`
+        or :meth:`list_windows`, never by running the multiplexer's own option
+        verbs by hand."""
 
     @abstractmethod
     def unset_window_option(self, target: str, option: str) -> None:

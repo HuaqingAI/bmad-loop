@@ -49,6 +49,18 @@ selection falls through). Native Windows is still experimental — see the
 [roadmap](ROADMAP.md#native-windows-multiplexer-backend) for the remaining work. WSL is
 unaffected: it _is_ Linux and uses tmux.
 
+Two model differences matter if you port a backend or read psmux argv. psmux runs one server
+per session, so window ids are minted per server and the backend session-qualifies every id it
+hands out (`session:@N`). And psmux has no per-window user options — one scope exists per
+server — so the window-option verbs and the `@`-prefixed columns of `list_windows` are served
+by a session-scoped option whose key carries the window id (`@bmad_project_@3` for window `@3`).
+Both are properties of psmux's model, not gaps awaiting an upstream release. Practical
+consequence: such a value is **not** readable via `psmux show-options -w` by hand — read it with
+`psmux show-options -qv -t <session> "@bmad_project_@N"` instead. One visible limit: a value
+that cannot survive psmux's control-line transport verbatim (e.g. a project path that is both
+UNC and spaced) is refused with a stderr warning at every launch, and that project's windows
+stay untagged — the prune then scopes them through the run-dir fallback instead of the tag.
+
 ## External backends
 
 Every backend beyond the two bundled ones is a separate package that you co-install with bmad-loop; it
