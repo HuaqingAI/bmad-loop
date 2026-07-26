@@ -95,9 +95,11 @@ seams of a full OS port are in
   parked-window return hop, replayed opaquely by `switch_client` and the parked
   trailer; concrete default = the native pane id, so most backends inherit it —
   override only when your ids do not resolve from another session's context,
-  as psmux does to emit `=session:%N`), `detach_client`, `switch_client` (with
-  an optional last-client fallback), `available` (is this backend usable on
-  the current host).
+  as psmux does to emit `=session:%N`), `detach_client` / `switch_client` (with
+  an optional last-client fallback — both answer a bool the parked-window
+  return path trusts: True iff the backend reported the move happened, so a
+  backend with no real detach returns `False`, never a vacuous `True`),
+  `available` (is this backend usable on the current host).
 
 **Window targets.** The target-taking methods (`kill_window`, `select_window`,
 the window-option trio, `attach_target_argv`, `switch_client`) receive one of two
@@ -156,7 +158,8 @@ tee — runs a per-window **poller** thread that snapshots `pane read` into the 
 whenever the content changes, which is exactly enough to drive the two log consumers
 a tmux tee would (`generic._log_activity_key`'s stall re-arm and `probe`'s marker
 discovery). Its module docstring is a **degradation ledger** of every such
-divergence (sidecar options, poller `pipe_pane`, no-op `detach_client`, the attach
+divergence (sidecar options, poller `pipe_pane`, the no-op `detach_client` —
+which the widened seam now requires to answer `False`, not `None` — the attach
 argv, the advisory geometry, the protocol-version policy) — the reference for what
 "implement fresh" costs when the host has no tmux-shaped CLI. The operator-facing
 view — what a herdr _user_ notices and does — is

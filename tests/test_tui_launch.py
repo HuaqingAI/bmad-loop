@@ -475,9 +475,12 @@ def test_detach_client_argv(fake_run):
     assert fake_run.calls == [["tmux", "detach-client"]]
 
 
-def _return_fake(monkeypatch, *, win="@5", option="=main:%9", switch_rc=0):
+def _return_fake(
+    monkeypatch, *, win="@5", option="=main:%9", switch_rc=0, fallback_rc=0, detach_rc=0
+):
     """Script tmux for return_attached_client: display-message -> window id,
-    show-options -> the recorded RETURN_OPTION, switch-client -> switch_rc.
+    show-options -> the recorded RETURN_OPTION, switch-client -t -> switch_rc,
+    switch-client -l -> fallback_rc, detach-client -> detach_rc.
     return_attached_client runs inside a ctl window, so TMUX is set (the
     backend's current_window_id answers None otherwise)."""
     monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,123,0")
@@ -492,6 +495,10 @@ def _return_fake(monkeypatch, *, win="@5", option="=main:%9", switch_rc=0):
             out, rc = (f"{option}\n" if option else "", 0)
         elif verb == "switch-client" and argv[2] == "-t":
             out, rc = "", switch_rc
+        elif verb == "switch-client" and argv[2] == "-l":
+            out, rc = "", fallback_rc
+        elif verb == "detach-client":
+            out, rc = "", detach_rc
         else:
             out, rc = "", 0
         return subprocess.CompletedProcess(argv, rc, stdout=out, stderr="")
@@ -514,6 +521,27 @@ def test_return_attached_client_switch_fallback(monkeypatch):
     calls = _return_fake(monkeypatch, option="=main:%9", switch_rc=1)
     assert launch.return_attached_client() is True
     assert ["tmux", "switch-client", "-l"] in calls
+    # the fallback returned a client too, so the option is consumed — without
+    # this the unset could regress to primary-success-only and stay green
+    assert ["tmux", "set-option", "-wu", "-t", "@5", "@bmad_return_pane"] in calls
+
+
+def test_return_attached_client_switch_fails_keeps_return_option(monkeypatch):
+    """Stale target plus no last client: nothing was returned, so say so — and
+    leave RETURN_OPTION set, or the post-exit trailer loses its retry."""
+    calls = _return_fake(monkeypatch, option="=main:%9", switch_rc=1, fallback_rc=1)
+    assert launch.return_attached_client() is False
+    assert ["tmux", "switch-client", "-l"] in calls  # fallback was attempted
+    assert not any(c[1] == "set-option" for c in calls)  # option survives
+
+
+def test_return_attached_client_detach_fails_keeps_return_option(monkeypatch):
+    """Nothing was attached to detach — same non-return as a failed switch, so
+    the option must survive here too."""
+    calls = _return_fake(monkeypatch, option="detach", detach_rc=1)
+    assert launch.return_attached_client() is False
+    assert ["tmux", "detach-client"] in calls
+    assert not any(c[1] == "set-option" for c in calls)
 
 
 def test_return_attached_client_detaches(monkeypatch):

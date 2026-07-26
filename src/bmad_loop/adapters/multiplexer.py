@@ -277,9 +277,16 @@ class TerminalMultiplexer(ABC):
         return self.current_pane_id() or None
 
     @abstractmethod
-    def detach_client(self) -> None:
-        """Detach the client viewing the current session (best-effort: a no-op on
-        a transport failure)."""
+    def detach_client(self) -> bool:
+        """Detach the client viewing the current session. Returns True iff the
+        backend reported a successful detach; a transport failure answers
+        False. On tmux that is "a client was actually detached" — the command
+        fails when nothing is attached — but a backend whose transport cannot
+        distinguish "detached nothing" from success answers True vacuously
+        (psmux does; see its module docstring). Callers that only want the
+        terminal handed back may ignore it; the parked-window return path
+        cannot, because clearing its return option on a detach that never
+        happened strands the human (see tui.launch.return_attached_client)."""
 
     @abstractmethod
     def switch_client(self, target: str, last_fallback: bool = False) -> bool:

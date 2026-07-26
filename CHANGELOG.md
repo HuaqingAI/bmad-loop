@@ -125,6 +125,17 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 ### Fixed
 
+- **`return_attached_client` no longer claims a return that never happened (#227).** It discarded
+  `switch_client`'s result and answered `True` unconditionally, so a failed switch plus a failed
+  `-l` fallback still journaled the return and sent the sweep unattended while the human sat in
+  the sweep window with their terminal never handed back. The result is now the return value, and
+  `RETURN_OPTION` is cleared only on a real return — a failed one is left for the parked window's
+  trailer, which is a second chance if someone dismisses the park prompt, not a rescue for an
+  unattended window. `TerminalMultiplexer.detach_client` widens from `None` to `bool` for the same
+  reason: it had the return code in hand and dropped it, so the detach branch carried the identical
+  false positive. Out-of-tree backends still returning `None` read as "nothing detached", which
+  keeps the option set — degraded, not broken.
+
 - **Give psmux a working per-window option channel (#310).** psmux keeps one user-option scope
   per server and returns `''` for every `-w` read of an `@`-prefixed name, so both mechanisms
   riding per-window options were broken. The ctl-window project tag read the same bled value for

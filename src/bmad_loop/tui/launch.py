@@ -121,10 +121,12 @@ def in_ctl_session() -> bool:
     return current_session() == CTL_SESSION
 
 
-def detach_client() -> None:
+def detach_client() -> bool:
     """Detach the tmux client viewing the current session, handing the terminal
-    back to the user. Processes in the session keep running."""
-    get_multiplexer().detach_client()
+    back to the user. Processes in the session keep running. Returns True iff
+    the backend reported a successful detach (see
+    TerminalMultiplexer.detach_client for what each backend can promise)."""
+    return get_multiplexer().detach_client()
 
 
 def return_attached_client() -> bool:
@@ -137,8 +139,17 @@ def return_attached_client() -> bool:
         psmux): switch that client back there (`-l` fallback if it's gone);
       - RETURN_DETACH: detach the client so a blocking `tmux attach` returns;
       - unset/empty: nobody attached with a return target — do nothing.
-    The option is then cleared so the post-exit return trailer doesn't fire a
-    second time. Returns True iff a client was actually returned."""
+    Returns True iff a client was actually returned. The option is cleared only
+    then: a real return must not make the parked window's trailer fire a second
+    one, a failed return is left for the trailer to retry. That retry is a
+    second chance, not a rescue — new_parked_window parks on a blocking read
+    *before* the trailer, so it runs only once a human dismisses the park
+    prompt, never in the unattended case. On tmux both branches are equally
+    honest: a detach that found no client to detach fails the command, the
+    same non-return as a failed switch. psmux can report neither failure
+    (its detach/switch verbs report execution, not effect — see its module
+    docstring), but its inert option channel answers empty above before
+    either verb is reached."""
     mux = get_multiplexer()
     if not mux_usable(mux):
         return False
@@ -149,11 +160,12 @@ def return_attached_client() -> bool:
     if not ret:
         return False
     if ret == RETURN_DETACH:
-        mux.detach_client()
+        returned = mux.detach_client()
     else:
-        mux.switch_client(ret, last_fallback=True)
-    mux.unset_window_option(win, RETURN_OPTION)
-    return True
+        returned = mux.switch_client(ret, last_fallback=True)
+    if returned:
+        mux.unset_window_option(win, RETURN_OPTION)
+    return returned
 
 
 def decision_pending(run_dir: Path) -> bool:

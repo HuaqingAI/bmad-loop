@@ -239,11 +239,11 @@ def test_seam_methods_never_leak_raw_subprocess_error(boom_run, tmp_path):
     assert mux.show_window_option("@1", "opt") == ""
     assert mux.switch_client("s") is False
     assert mux.switch_client("s", last_fallback=True) is False
+    assert mux.detach_client() is False
     assert mux.kill_window("@1") is None
     assert mux.select_window("@1") is None
     assert mux.set_window_option("@1", "opt", "val") is None
     assert mux.unset_window_option("@1", "opt") is None
-    assert mux.detach_client() is None
     assert mux.pipe_pane("@1", tmp_path / "log") is None
     assert mux.window_pane_pids("@1") == []
 
