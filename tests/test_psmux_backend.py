@@ -1009,10 +1009,12 @@ def test_set_window_option_refuses_untransportable_values(monkeypatch, capsys, v
     # client re-quoting, chain splitter and server tokenizer at v3.3.7; the
     # `;`-token corruption reproduced on a live 3.3.7: `a ; b` stores as `a`).
     # A corrupted stored tag never equals project_tag again — the window turns
-    # silently unprunable — so refuse loudly instead of storing garbage.
+    # silently unprunable — so refuse loudly instead of storing garbage. The
+    # refusal also frees any prior value: a refused REwrite must read as unset,
+    # not replay the stale value (e.g. an old parked return target).
     rec_ = _option_fake(monkeypatch)
     PsmuxMultiplexer().set_window_option("ctl:@3", "@bmad_project", value)
-    assert rec_.calls == []
+    assert [c[0][1:4] for c in rec_.calls] == [["set-option", "-u", "-t"]]
     assert "transport" in capsys.readouterr().err
 
 
@@ -1112,7 +1114,7 @@ def test_set_window_option_refuses_non_ascii_whitespace(monkeypatch, capsys, val
     # on Unicode whitespace — an NBSP/tab in an unquoted value splits the token.
     rec_ = _option_fake(monkeypatch)
     PsmuxMultiplexer().set_window_option("ctl:@3", "@bmad_project", value)
-    assert rec_.calls == []
+    assert [c[0][1:4] for c in rec_.calls] == [["set-option", "-u", "-t"]]
     assert "transport" in capsys.readouterr().err
 
 
@@ -1151,7 +1153,7 @@ def test_sweep_treats_empty_live_list_as_failed_probe(monkeypatch, tmp_path):
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     PsmuxMultiplexer().new_parked_window("ctl", "run-x", tmp_path, ["prog"], "@ret")
-    assert [c[1] for c in calls if c[1] == "set-option"] == []
+    assert not [c for c in calls if c[1] == "set-option"]
 
 
 def test_sweep_transport_exception_never_fails_the_mint(monkeypatch, tmp_path, capsys):
@@ -1170,7 +1172,10 @@ def test_sweep_transport_exception_never_fails_the_mint(monkeypatch, tmp_path, c
     assert "sweep failed" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("value", ["a; b", "C:\\Users\\O'Brien Files\\proj", "two  spaces", "C:/p"])
+@pytest.mark.parametrize(
+    "value",
+    ["a; b", "C:\\Users\\O'Brien Files\\proj", "two  spaces", "C:/p", "\\\\srv\\share"],
+)
 def test_accepted_values_round_trip_through_the_listing_parse(monkeypatch, value):
     # The write gate and the read parser are two halves of one invariant:
     # every accepted value must read back IDENTICAL from the `@key "value"`

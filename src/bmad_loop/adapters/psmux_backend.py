@@ -443,7 +443,11 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # (live-verified on 3.3.7; psmux/psmux#499). `\\` collapses and a `"` can close the
         # wrapper early (client-escaped `\"` after a backslash reads back as
         # `\\` + closing quote). So the spaced branch refuses `"`, `\\`, a
-        # trailing `\`, and standalone `;`/`\;` tokens.
+        # trailing `\`, and standalone `;`/`\;` tokens. Outside double quotes
+        # the tokenizer's escape branch never fires (commands.rs:690 requires
+        # in_double_quotes) — an unquoted backslash is pushed literally, psmux
+        # being Windows-native — so the unspaced branch does not ban `\\` and a
+        # spaceless UNC path (`\\srv\share`) rides verbatim.
         # Non-ASCII-space whitespace (NBSP, tab, …) is refused outright: the
         # client quotes only on ASCII `' '` (main.rs `s.contains(' ')`) while
         # the server tokenizer splits on Unicode `is_whitespace()` — an NBSP in
@@ -467,9 +471,13 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         if not self._transportable(value):
             print(
                 f"warning: set-option {option} skipped — value does not survive "
-                "psmux's control-line transport verbatim; the option stays unset",
+                "psmux's control-line transport verbatim; the key is freed and "
+                "the option reads as unset",
                 file=sys.stderr,
             )
+            # Free any prior value: a refused REwrite must not leave the stale
+            # one to be replayed later (e.g. a parked return target).
+            self.unset_window_option(target, option)
             return
         scope = self._option_scope(target)
         if scope is None:
