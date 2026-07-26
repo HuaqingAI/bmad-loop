@@ -125,6 +125,21 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 ### Fixed
 
+- **Verify environment faults are classified per shell, so Windows stops burning dev attempts on a
+  broken tree (#302).** `ENV_FAULT_RCS = {126, 127}` is `sh`'s launcher convention, but verify
+  commands run through the host shell — and `cmd` has no equivalent: a missing tool exits `1`,
+  indistinguishable by exit code from the ordinary "tests failed" that _should_ route to a repair
+  session (9009 exists only as `%ERRORLEVEL%` inside a batch file, so it reaches the orchestrator
+  only through a `.cmd`/`.bat` wrapper). The env-fault arm therefore never fired on win32 and the
+  charged-attempt regression #130 fixed on POSIX was still live there. The win32 arm now classifies
+  on three independent signals: `rc 9009`, `cmd`'s own `is not recognized` / `access is denied`
+  closing the command's output, and a resolvability probe of the command's leading token
+  (`shutil.which`, skipping `cmd`'s internal commands). The probe also closes a second hole: a
+  verify command naming a file `cmd` cannot execute — a `.sh`, anything outside `PATHEXT` — is
+  handed to the file association and exits `0` without running, so verify reported **passed** for a
+  check that never happened; that now escalates too. POSIX classification is unchanged, and the
+  three engine tests that were `skipif(win32)` for exactly this gap now run on both platforms.
+
 - **psmux window ids are now session-qualified (#254).** psmux mints window ids per server (one
   server per session), so the bare `@N` the backend returned from `new_window` routed by the
   caller's `$TMUX` when replayed as a `-t` target — from a `bmad-loop-ctl` pane that is the ctl

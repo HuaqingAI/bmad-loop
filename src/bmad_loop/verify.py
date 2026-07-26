@@ -8,7 +8,10 @@ policy's test/lint gates with the orchestrator's own subprocess calls.
 from __future__ import annotations
 
 import os
+import shlex
+import shutil
 import subprocess
+import sys
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -1371,9 +1374,140 @@ class CommandResult:
 # sh launcher convention (verify commands run shell=True): 126 = command found
 # but not executable, 127 = command not found. Both are environment faults —
 # deterministic for a given tree, unfixable by a repair session (issue #126:
-# seeded worktrees that lost +x burned dev attempts on no-op repairs). Windows
-# cmd signals these as 9009/1 instead, so it keeps the charged behavior.
+# seeded worktrees that lost +x burned dev attempts on no-op repairs).
 ENV_FAULT_RCS = frozenset({126, 127})
+
+# cmd has no such convention (issue #302, measured on Windows 11): `cmd /c
+# <missing tool>` exits 1 — the same code an ordinary test failure uses — and
+# 9009 surfaces only as %ERRORLEVEL% *inside* a batch file, so it reaches us
+# only when the verify command is itself a .cmd/.bat propagating it. Worse,
+# handing cmd a file it cannot execute (extension not in PATHEXT: a .sh, a
+# .txt) exits 0 without running it, so the check silently "passes". The win32
+# arm therefore classifies on three independent signals instead of the rc.
+_CMD_ENV_FAULT_RC = 9009
+
+# Matched against the tail's last two non-empty lines only, because cmd writes its
+# message to stderr and ``run_verify_commands`` builds the tail as stdout + stderr —
+# so the message lands at the end, and it wraps ("… is not recognized as an internal
+# or external command,\noperable program or batch file."). Note what that ordering
+# does *not* buy: stderr is appended wholesale, not interleaved, so a command whose
+# own stderr ends with the phrase is read as a fault too. That is the accepted edge —
+# a verify command whose last stderr line is "X is not recognized" has a missing X
+# either way. Localized Windows prints neither phrase; the token probe covers those.
+_CMD_NOT_RECOGNIZED = "is not recognized as an internal or external command"
+_CMD_ACCESS_DENIED = "access is denied"
+_CMD_MESSAGE_LINES = 2
+
+# cmd's *internal* commands: shutil.which cannot resolve them, so without this
+# allowlist every failing `if exist …` / `exit 1` would classify as an env
+# fault. External tools (findstr, robocopy, …) resolve through which as usual.
+_CMD_BUILTINS = frozenset(
+    "assoc break call cd chdir cls color copy date del dir echo endlocal erase exit for"
+    " ftype goto if md mkdir mklink move path pause popd prompt pushd rd rem ren rename"
+    " rmdir set setlocal shift start time title type ver verify vol".split()
+)
+
+
+_CMD_METACHARS = ("%", "!", "<", ">", "&", "|", ";", "^")
+
+
+def _leading_token(command: str) -> str | None:
+    """The executable part of a shell command string, or None when nothing about
+    it can be probed. ``posix=False`` keeps Windows backslashes intact (posix mode
+    eats them), at the cost of leaving quotes on the token — hence the strip.
+
+    Returning None is the safe answer: it drops the probe, which can only ever
+    *add* an env fault. A token cmd would expand before running (``%VAR%``,
+    delayed ``!VAR!``) is unprobeable for that reason — resolving the literal
+    would report "not found" for a tool that is right there."""
+    try:
+        parts = shlex.split(command, posix=False)
+    except ValueError:  # unbalanced quotes — no reliable token to probe
+        return None
+    if not parts:
+        return None
+    # `(pytest -q)` tokenizes to `(pytest`, `(pytest)` to `(pytest)` — cmd's
+    # grouping parens and echo-suppressing `@` are shell syntax, not the name.
+    token = parts[0].strip('"').strip("()@")
+    # Anything the shell would still act on is not a name to probe: expansion
+    # (%VAR%, delayed !VAR!), redirection, or an operator shlex left attached
+    # (`pytest|findstr x` splits to one token). Probing those reports "not found"
+    # for a tool that is right there, so drop the probe instead.
+    if not token or any(char in token for char in _CMD_METACHARS):
+        return None
+    return token
+
+
+def _cmd_executable(path: Path) -> bool:
+    """Whether cmd resolves this path directly or by appending PATHEXT."""
+    pathext = os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+    extensions = tuple(ext.strip().lower() for ext in pathext.split(";") if ext.strip())
+    return (path.is_file() and path.suffix.lower() in extensions) or any(
+        Path(f"{path}{ext}").is_file() for ext in extensions
+    )
+
+
+def _win32_env_fault_reason(result: CommandResult, cwd: Path) -> str | None:
+    """Windows env-fault evidence, cheapest signal first, or None. Each signal is
+    independently sufficient; see the _CMD_* constants for why the rc alone isn't."""
+    if result.returncode < 0:
+        # the timeout sentinel: the command ran and hung, so it was found and it
+        # was runnable — none of the signals below can apply to it.
+        return None
+    if result.returncode == _CMD_ENV_FAULT_RC:
+        return f"rc={_CMD_ENV_FAULT_RC} — cmd reported the command as not found"
+    lines = [line.strip() for line in result.output_tail.splitlines() if line.strip()]
+    if result.returncode != 0 and lines:
+        closing = " ".join(lines[-_CMD_MESSAGE_LINES:])
+        if _CMD_NOT_RECOGNIZED in closing.lower():
+            return f"cmd: {closing}"
+        if _CMD_ACCESS_DENIED in lines[-1].lower():
+            return f"cmd: {lines[-1]}"
+    token = _leading_token(result.command)
+    if token is None:
+        return None
+    token_path = cwd / token
+    try:
+        names_a_file = token_path.is_file()
+        local_executable = _cmd_executable(token_path)
+    except OSError:  # a token no filesystem call can even ask about
+        return None
+    if names_a_file and not local_executable and token.lower() not in _CMD_BUILTINS:
+        # The builtin guard is the same one the PATH branch carries, for the other
+        # half of cmd's resolution order: an *unqualified* internal name is answered
+        # internally, before any directory is searched, so a file that happens to be
+        # named `echo` / `set` / `start` is never what runs and must not be read as a
+        # broken one. Only the bare name is exempt — `.\echo`, `C:\…\echo` are file
+        # references cmd does try to run, and they still classify below.
+        #
+        # PATHEXT is cmd's contract for what it *runs*; anything else it hands to
+        # the file association. For the extensions this is about (.sh, .txt) that
+        # association executes nothing and returns 0, so a green rc means nothing
+        # was verified. An extension with a console association outside PATHEXT
+        # (.rb, .pl on a host that registered them) does run — and is escalated
+        # here anyway, deliberately: what an association returns is the *app's*
+        # convention, not the script's, so it is not an exit code to gate on.
+        # The message names the token, so the fix ("ruby check.rb") is obvious.
+        return f"{token} is not executable by cmd (extension not in PATHEXT)"
+    if (
+        result.returncode != 0
+        and not local_executable  # cmd searches the run's own directory before PATH
+        and token.lower() not in _CMD_BUILTINS
+        and shutil.which(token) is None
+    ):
+        return f"{token} not found on PATH"
+    return None
+
+
+def env_fault_reason(result: CommandResult, cwd: Path) -> str | None:
+    """Why this verify command is an environment fault rather than a story
+    failure, or None if it is not one. Per-shell: verify commands run through
+    the host shell, and sh and cmd signal a broken environment differently."""
+    if result.returncode in ENV_FAULT_RCS:
+        return f"rc={result.returncode}"
+    if sys.platform != "win32":
+        return None
+    return _win32_env_fault_reason(result, cwd)
 
 
 def run_verify_commands(policy: Policy, cwd: Path) -> list[CommandResult]:
@@ -1400,16 +1534,18 @@ def run_verify_commands(policy: Policy, cwd: Path) -> list[CommandResult]:
 def verify_commands_outcome(policy: Policy, cwd: Path) -> VerifyOutcome:
     """Run the policy's deterministic verify commands. Failures are fixable:
     the captured output is concrete feedback a repair session can act on —
-    except environment faults (ENV_FAULT_RCS), which escalate so the run
+    except environment faults (see env_fault_reason), which escalate so the run
     pauses for an environment fix instead of burning story budgets. An env
     fault anywhere in the run wins over earlier ordinary failures: a repair
     session dispatched for the ordinary failure would still run in the
-    broken environment."""
+    broken environment. Note the first loop inspects rc=0 results too — on
+    Windows an unrunnable command is a silent pass, not a failure (#302)."""
     results = run_verify_commands(policy, cwd)
     for result in results:
-        if result.returncode in ENV_FAULT_RCS:
+        reason = env_fault_reason(result, cwd)
+        if reason is not None:
             return VerifyOutcome.escalate(
-                f"verify environment fault (rc={result.returncode}): {result.command}\n"
+                f"verify environment fault ({reason}): {result.command}\n"
                 "command not found / not executable — this is the run environment, "
                 "not the story; fix the environment, then re-arm the escalation "
                 "(the attempt budget resets on re-arm)\n"
