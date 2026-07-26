@@ -464,10 +464,34 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             return all(tok not in (";", "\\;") for tok in value.split())
         return not any(c in value for c in ";'\"")
 
+    def _write_scoped(self, verb: list[str], key: str) -> None:
+        # Both mutating verbs, one body. A write that silently failed re-opens
+        # the mis-scoped prune this channel exists to close, and a silently
+        # failed `-u` leaves a live return key that replays the return move when
+        # the window's command exits — so failures are said out loud either way
+        # (the verbs stay best-effort: warn, never raise).
+        label = " ".join(verb[: verb.index("-t")])  # `set-option` / `set-option -u`
+        try:
+            proc = self._run(verb, check=False)
+            if proc.returncode != 0:
+                print(f"warning: {label} {key} failed: {proc.stderr.strip()}", file=sys.stderr)
+        except (subprocess.SubprocessError, OSError) as exc:
+            print(f"warning: {label} {key} failed: {exc}", file=sys.stderr)
+
     def set_window_option(self, target: str, option: str, value: str) -> None:
         if not option.startswith("@"):
             super().set_window_option(target, option, value)
             return
+        # Scope first, transport second: an unroutable target has nothing to
+        # write AND nothing to free, and resolving here keeps the refusal path
+        # from re-entering unset_window_option and warning twice about a verb
+        # the caller never issued.
+        scope = self._option_scope(target)
+        if scope is None:
+            self._warn_unroutable("set-option", target, option)
+            return
+        session, digits = scope
+        key = self._scoped_option_key(option, digits)
         if not self._transportable(value):
             print(
                 f"warning: set-option {option} skipped — value does not survive "
@@ -477,26 +501,9 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             )
             # Free any prior value: a refused REwrite must not leave the stale
             # one to be replayed later (e.g. a parked return target).
-            self.unset_window_option(target, option)
+            self._write_scoped(["set-option", "-u", "-t", session, key], key)
             return
-        scope = self._option_scope(target)
-        if scope is None:
-            self._warn_unroutable("set-option", target, option)
-            return
-        session, digits = scope
-        # A write that silently failed re-opens the mis-scoped prune this
-        # channel exists to close, so failures are said out loud (the verbs
-        # stay best-effort — warn, never raise).
-        key = self._scoped_option_key(option, digits)
-        try:
-            proc = self._run(["set-option", "-t", session, key, value], check=False)
-            if proc.returncode != 0:
-                print(
-                    f"warning: set-option {key} failed: {proc.stderr.strip()}",
-                    file=sys.stderr,
-                )
-        except (subprocess.SubprocessError, OSError) as exc:
-            print(f"warning: set-option {key} failed: {exc}", file=sys.stderr)
+        self._write_scoped(["set-option", "-t", session, key, value], key)
 
     def unset_window_option(self, target: str, option: str) -> None:
         if not option.startswith("@"):
@@ -508,20 +515,9 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             return
         session, digits = scope
         # `-u` genuinely frees the key: the server's SetOptionUnset handler
-        # removes `@`-prefixed names from the map (verified at v3.3.7). `-u` is
-        # a write like set — a silently failed unset leaves a live return key
-        # that replays the return move when the window's command exits, so
-        # failures are said out loud here too (warn, never raise).
+        # removes `@`-prefixed names from the map (verified at v3.3.7).
         key = self._scoped_option_key(option, digits)
-        try:
-            proc = self._run(["set-option", "-u", "-t", session, key], check=False)
-            if proc.returncode != 0:
-                print(
-                    f"warning: set-option -u {key} failed: {proc.stderr.strip()}",
-                    file=sys.stderr,
-                )
-        except (subprocess.SubprocessError, OSError) as exc:
-            print(f"warning: set-option -u {key} failed: {exc}", file=sys.stderr)
+        self._write_scoped(["set-option", "-u", "-t", session, key], key)
 
     def show_window_option(self, target: str, option: str) -> str:
         if not option.startswith("@"):

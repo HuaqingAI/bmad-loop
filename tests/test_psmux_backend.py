@@ -861,6 +861,14 @@ def test_option_verbs_refuse_an_unroutable_target(monkeypatch, capsys, target):
     mux.unset_window_option(target, "@bmad_project")
     assert rec_.calls == []
     assert capsys.readouterr().err.count("does not resolve") == 2
+    # An unroutable target with an untransportable value warns ONCE: the scope
+    # gate runs first, so the refusal never re-enters the unset verb and
+    # reports a `set-option -u` the caller never issued.
+    mux.set_window_option(target, "@bmad_project", "a ; b")
+    err = capsys.readouterr().err
+    assert err.count("does not resolve") == 1
+    assert "transport" not in err
+    assert rec_.calls == []
 
 
 def test_set_window_option_unresolvable_name_token_warns(monkeypatch, capsys):
