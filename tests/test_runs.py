@@ -405,12 +405,17 @@ def test_stop_run_dead_pid_falls_back(tmp_path, monkeypatch):
 def test_stop_run_signals_live_process(tmp_path, monkeypatch):
     monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
     run_dir = _make_state_run(tmp_path, "r1")
-    proc = subprocess.Popen(["sleep", "30"])
-    (run_dir / "engine.pid").write_text(str(proc.pid))
-    assert runs.stop_run(run_dir) is True
-    # the process received SIGTERM and is gone
-    assert proc.poll() is not None or proc.wait(timeout=5) is not None
-    assert load_state(run_dir).stopped is True
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        (run_dir / "engine.pid").write_text(str(proc.pid))
+        assert runs.stop_run(run_dir) is True
+        # the process received SIGTERM and is gone
+        assert proc.poll() is not None or proc.wait(timeout=5) is not None
+        assert load_state(run_dir).stopped is True
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
 
 
 def test_stop_run_respects_engine_written_stopped(tmp_path, monkeypatch):
