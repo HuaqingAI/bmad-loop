@@ -97,8 +97,13 @@ seams of a full OS port are in
   override only when your ids do not resolve from another session's context,
   as psmux does to emit `=session:%N`), `detach_client` / `switch_client` (with
   an optional last-client fallback — both answer a bool the parked-window
-  return path trusts: True iff the backend reported the move happened, so a
-  backend with no real detach returns `False`, never a vacuous `True`),
+  return path trusts: report **effect**, not that the command was dispatched,
+  so a backend with no real detach returns `False`. Report the closest thing
+  your transport can actually observe, and if it cannot observe effect at all,
+  say so in your degradation ledger rather than leaving the caller to assume:
+  psmux is the worked example — its CLI exits 0 whether or not a client moved,
+  so its booleans are vacuously `True` and the seam's honesty guarantee does
+  not hold there),
   `available` (is this backend usable on the current host).
 
 **Window targets.** The target-taking methods (`kill_window`, `select_window`,
