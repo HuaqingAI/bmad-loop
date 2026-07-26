@@ -164,11 +164,10 @@ class TerminalMultiplexer(ABC):
         server per session), so a bare ``@N`` replayed as a ``-t`` target
         routes by the *caller's* server instead of the owning one.
 
-        :meth:`new_parked_window` is deliberately *outside* the rule: nothing
-        membership-tests a parked id — it is only replayed as a ``-t`` target,
-        by the TUI — so a backend MAY mint it in a form this list never
-        carries. psmux keeps it bare, because the qualified grammar is not
-        accepted by the verbs the parked path uses (#291).
+        :meth:`new_parked_window` is *outside* the rule — nothing
+        membership-tests a parked id, it is only replayed as a ``-t`` target by
+        the TUI — so a backend MAY mint it in a form this list never carries
+        (psmux happens to qualify it too, #291).
 
         Raises :class:`MultiplexerError` if the transport itself fails (timeout /
         missing binary): an empty list means "no windows" and must not be
@@ -180,7 +179,10 @@ class TerminalMultiplexer(ABC):
         """One tuple per window in ``session``, each holding the requested
         backend fields in order. Best-effort: returns ``[]`` on a transport
         failure (unlike :meth:`list_window_ids`, this is metadata, not a liveness
-        probe, so a sentinel is safe)."""
+        probe, so a sentinel is safe).
+
+        A ``window_id`` column carries the same id form :meth:`current_window_id`
+        returns; core compares the two directly."""
 
     @abstractmethod
     def window_alive(self, session: str, window_id: str) -> bool:
@@ -247,7 +249,9 @@ class TerminalMultiplexer(ABC):
     @abstractmethod
     def current_window_id(self) -> str | None:
         """Native id of the window this process runs in, or None when not inside
-        the multiplexer."""
+        the multiplexer. Must match the form :meth:`list_windows` puts in a
+        ``window_id`` column — the ctl-window prune skips its own window by
+        comparing them."""
 
     @abstractmethod
     def current_session(self) -> str | None:

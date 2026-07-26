@@ -125,6 +125,16 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 ### Fixed
 
+- **Session-qualify the psmux TUI-side window ids (#291).** #254 covered the engine seam but left
+  the launcher's surfaces bare, and that process usually runs _outside_ any pane — where a bare
+  `@N` resolves through psmux's most-recent-session fallback, not the session that minted it. The
+  ctl-window prune replayed such ids as `kill-window` targets and could close another server's
+  identically-numbered window with rc 0. `new_parked_window`, the `window_id` columns of
+  `list_windows`, and `current_window_id` now emit `session:@N`; the prune compares the last two,
+  so they qualify together or a prune kills the window it runs in. `select_window` resolves the id
+  to an index first — psmux validates a scoped target's window part CLI-side against window
+  index/name only. tmux is untouched (its ids are server-global).
+
 - **Verify environment faults are classified per shell, so Windows stops burning dev attempts on a
   broken tree (#302).** `ENV_FAULT_RCS = {126, 127}` is `sh`'s launcher convention, but verify
   commands run through the host shell — and `cmd` has no equivalent: a missing tool exits `1`,

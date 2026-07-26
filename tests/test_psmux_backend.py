@@ -14,6 +14,7 @@ import pytest
 from bmad_loop.adapters import psmux_backend, tmux_base
 from bmad_loop.adapters.multiplexer import MultiplexerError, get_multiplexer
 from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
+from bmad_loop.adapters.tmux_backend import TmuxMultiplexer
 
 
 class _RecordRun:
@@ -545,3 +546,213 @@ def test_registry_selects_psmux_when_forced(monkeypatch):
         assert isinstance(get_multiplexer(), PsmuxMultiplexer)
     finally:
         get_multiplexer.cache_clear()  # don't leak the forced pick to other tests
+
+
+# ------------------------------------------ TUI-side qualified window ids (#291)
+# The launcher/prune surfaces hand ids around from a process that is usually
+# OUTSIDE any pane, where a bare `@N` resolves through the most-recent-session
+# fallback instead of the session that minted it. kill-window on such an id is
+# destructive against the wrong server, so new_parked_window, the `window_id`
+# columns of list_windows, and current_window_id all carry `session:@N` — and
+# select_window, whose CLI-side check matches only window index/name, resolves
+# that form back to an index before sending.
+
+
+def _rows_fake(monkeypatch, rows: str, *, new_window_id: str = "@2\n"):
+    """Script list-windows to emit tab-separated -F rows (and new-window an id)."""
+
+    def fake(argv, **kwargs):
+        out = new_window_id if argv[1] == "new-window" else rows
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+
+
+def test_new_parked_window_returns_session_qualified_id(monkeypatch, tmp_path):
+    _window_fake(monkeypatch)
+    win = PsmuxMultiplexer().new_parked_window("ctl", "run-x", tmp_path, ["prog"], "@ret")
+    assert win == "ctl:@2"
+
+
+def test_new_parked_window_degrades_on_colon_session(monkeypatch, tmp_path):
+    # Same #221 rule the engine-side mint follows: `a:b:@2` would split at the
+    # wrong colon, so the id stays bare rather than becoming a wrong target.
+    _window_fake(monkeypatch)
+    win = PsmuxMultiplexer().new_parked_window("a:b", "run-x", tmp_path, ["prog"], "@ret")
+    assert win == "@2"
+
+
+def test_qualified_window_id_degrades_on_empty_session():
+    # An empty session name would compose ":@2", which current_window_id parses
+    # back to the bare "@2" — the two sides of the prune comparison must degrade
+    # together, so the compose side degrades too.
+    assert PsmuxMultiplexer()._qualified_window_id("", "@2") == "@2"
+
+
+def test_new_parked_window_falsy_id_passes_through(monkeypatch, tmp_path):
+    # An empty id is start_detached's "window id not captured" sentinel; forging
+    # "ctl:" out of it would turn a detected failure into a plausible target.
+    _window_fake(monkeypatch, new_window_id="")
+    assert PsmuxMultiplexer().new_parked_window("ctl", "r", tmp_path, ["p"], "@ret") == ""
+
+
+def test_list_windows_qualifies_only_the_window_id_column(monkeypatch):
+    _rows_fake(monkeypatch, "@1\tshell\t\n@2\trun-x\tproj-tag\n")
+    rows = PsmuxMultiplexer().list_windows("ctl", ["window_id", "window_name", "@bmad_project"])
+    assert rows == [("ctl:@1", "shell", ""), ("ctl:@2", "run-x", "proj-tag")]
+
+
+def test_list_windows_without_id_column_is_untouched(monkeypatch):
+    # ctl_window() asks for names only; nothing there may be rewritten.
+    _rows_fake(monkeypatch, "shell\nrun-x\n")
+    assert PsmuxMultiplexer().list_windows("ctl", ["window_name"]) == [("shell",), ("run-x",)]
+
+
+def test_list_windows_degrades_on_colon_session(monkeypatch):
+    _rows_fake(monkeypatch, "@1\tshell\n")
+    assert PsmuxMultiplexer().list_windows("a:b", ["window_id", "window_name"]) == [("@1", "shell")]
+
+
+_CURRENT_FMT = "#{session_name}:#{window_id}"
+
+
+def test_current_window_id_is_session_qualified(monkeypatch):
+    _probe_fake(monkeypatch, {_CURRENT_FMT: (0, "ctl:@2\n")})
+    assert PsmuxMultiplexer().current_window_id() == "ctl:@2"
+
+
+def test_current_window_id_matches_list_windows_form(monkeypatch):
+    # The load-bearing symmetry: the prune candidate scan skips its own window by
+    # comparing these two values. Qualify one side only and the scan stops
+    # recognizing itself — a prune from inside a ctl window kills that window.
+    _probe_fake(monkeypatch, {_CURRENT_FMT: (0, "ctl:@2\n")})
+    mux = PsmuxMultiplexer()
+    current = mux.current_window_id()
+    _rows_fake(monkeypatch, "@1\tshell\n@2\trun-x\n")
+    assert current in [row[0] for row in mux.list_windows("ctl", ["window_id", "window_name"])]
+
+
+def test_current_window_id_resolves_session_and_id_in_one_probe(monkeypatch):
+    # Two probes would open a gap where the id resolves and the session does not.
+    # There is no safe answer in that gap — list_windows qualifies its rows from
+    # the session it was PASSED, so they stay qualified whatever a probe here
+    # says, and a bare id can never equal one: the prune would stop excluding its
+    # own window and kill it. One expansion yields both parts or neither.
+    recorder = _RecordRun(stdout="ctl:@2\n")
+    monkeypatch.setenv("TMUX", "/tmp/psmux-1000/default,123,0")
+    monkeypatch.setattr(tmux_base.subprocess, "run", recorder)
+    assert PsmuxMultiplexer().current_window_id() == "ctl:@2"
+    assert len(recorder.calls) == 1
+    assert recorder.argv[1:] == ["display-message", "-p", _CURRENT_FMT]
+
+
+def test_current_window_id_none_outside_mux(monkeypatch):
+    # Not inside psmux: the probe is skipped entirely rather than answering for
+    # some other client's session.
+    monkeypatch.delenv("TMUX", raising=False)
+    rec = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", rec)
+    assert PsmuxMultiplexer().current_window_id() is None
+    assert rec.calls == []
+
+
+def test_current_window_id_bare_on_colon_session(monkeypatch):
+    # `a:b:@2` cannot be split back at the right colon, so it degrades to the
+    # bare id — and list_windows("a:b", ...) degrades its rows identically, so
+    # the prune comparison still lines up.
+    _probe_fake(monkeypatch, {_CURRENT_FMT: (0, "a:b:@2\n")})
+    mux = PsmuxMultiplexer()
+    assert mux.current_window_id() == "@2"
+    _rows_fake(monkeypatch, "@2\trun-x\n")
+    assert mux.list_windows("a:b", ["window_id", "window_name"]) == [("@2", "run-x")]
+
+
+def test_current_window_id_none_on_unparseable_probe(monkeypatch):
+    # A probe that did not answer a window id is not a target; composing one from
+    # the fragment would aim a later kill somewhere unintended.
+    for answer in ("ctl:\n", "ctl:notanid\n", ":\n", "ctl:@\n"):
+        _probe_fake(monkeypatch, {_CURRENT_FMT: (0, answer)})
+        assert PsmuxMultiplexer().current_window_id() is None, answer
+
+
+def test_select_window_resolves_qualified_id_to_index(monkeypatch):
+    # psmux exits 1 with "can't find window: @3" for the id form, because the
+    # CLI-side existence check compares only against #{window_index}/#{window_name}.
+    recorder = _RecordRun(stdout="@1\t0\n@3\t2\n")
+    monkeypatch.setattr(tmux_base.subprocess, "run", recorder)
+    PsmuxMultiplexer().select_window("ctl:@3")
+    assert recorder.calls[0][0][1:] == [
+        "list-windows",
+        "-t",
+        "=ctl",
+        "-F",
+        "#{window_id}\t#{window_index}",
+    ]
+    assert recorder.argv[1:] == ["select-window", "-t", "ctl:2"]
+
+
+def test_select_window_resolve_scopes_the_lookup_to_the_session(monkeypatch):
+    # The lookup must carry -t =<session>: psmux routes by the explicit session,
+    # and an unscoped list-windows would read whichever server the fallback picks.
+    recorder = _RecordRun(stdout="@3\t2\n")
+    monkeypatch.setattr(tmux_base.subprocess, "run", recorder)
+    PsmuxMultiplexer().select_window("ctl:@3")
+    assert "-t" in recorder.calls[0][0] and "=ctl" in recorder.calls[0][0]
+
+
+def test_select_window_unresolved_id_sends_original_target(monkeypatch, capsys):
+    # No matching row: send the id anyway (guessing an index would focus an
+    # unrelated window) — but warn, because psmux's "can't find window" exit 1
+    # lands in a discarded pipe and the miss would otherwise be untraceable.
+    recorder = _RecordRun(stdout="@1\t0\n")
+    monkeypatch.setattr(tmux_base.subprocess, "run", recorder)
+    PsmuxMultiplexer().select_window("ctl:@9")
+    assert recorder.argv[1:] == ["select-window", "-t", "ctl:@9"]
+    assert "could not resolve ctl:@9" in capsys.readouterr().err
+
+
+def test_select_window_resolve_failure_sends_original_target(monkeypatch, capsys):
+    # A transport failure during the resolve must not escalate: select_window is
+    # best-effort, so it degrades to the unresolved target (with the same
+    # warning as a resolve miss), never raises — and it must still SEND, not
+    # swallow the verb along with the failure.
+    sent = []
+
+    def fake(argv, **kwargs):
+        if argv[1] == "list-windows":
+            raise subprocess.TimeoutExpired(argv, 1)
+        sent.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    PsmuxMultiplexer().select_window("ctl:@3")  # must not raise
+    assert sent and sent[-1][1:] == ["select-window", "-t", "ctl:@3"]
+    assert "could not resolve ctl:@3" in capsys.readouterr().err
+
+
+def test_select_window_resolves_equals_prefixed_qualified_id(monkeypatch):
+    # target(session, "@3") composes `=ctl:@3`, which the seam documents as a
+    # legal argument here. Matching without stripping the `=` would capture the
+    # session as "=ctl" and look up `-t ==ctl`; psmux strips only one `=`, so the
+    # resolve would miss and the select would quietly focus nothing.
+    recorder = _RecordRun(stdout="@3\t2\n")
+    monkeypatch.setattr(tmux_base.subprocess, "run", recorder)
+    PsmuxMultiplexer().select_window("=ctl:@3")
+    assert recorder.calls[0][0][3] == "=ctl"
+    assert recorder.argv[1:] == ["select-window", "-t", "ctl:2"]
+
+
+def test_select_window_name_token_passes_through(rec):
+    # A target() name token already resolves CLI-side; it must not be rewritten.
+    PsmuxMultiplexer().select_window("=ctl:run-abc")
+    assert rec.argv[1:] == ["select-window", "-t", "=ctl:run-abc"]
+    assert len(rec.calls) == 1  # no resolve lookup spawned
+
+
+def test_tmux_backend_keeps_bare_tui_ids(monkeypatch, tmp_path):
+    # The divergence is psmux-only: tmux ids are server-global, so qualifying
+    # them would produce targets its own verbs do not accept.
+    _rows_fake(monkeypatch, "@1\tshell\n")
+    mux = TmuxMultiplexer()
+    assert mux.new_parked_window("ctl", "run-x", tmp_path, ["prog"], "@ret") == "@2"
+    assert mux.list_windows("ctl", ["window_id", "window_name"]) == [("@1", "shell")]
