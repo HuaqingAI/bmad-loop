@@ -21,9 +21,11 @@ and routes to the owning server from any caller (psmux/psmux#483).
 ``select_window`` is the one verb that
 cannot take that form: psmux validates a scoped target's window part
 CLI-side against window index/name only, so the override resolves the id
-back to an index first. The window-option verbs need no override: psmux
-drops the window slot of a ``-w`` target either way (#310).
-``available()`` additionally gates on
+back to an index first. Per-window user options do not exist at all, so
+the window-option verbs, the ``@``-prefixed columns of ``list_windows``
+and the parked trailer route through a substitute channel — see the
+``per-window option channel (#310)`` block below for the model and its
+rules. ``available()`` additionally gates on
 the reported version: psmux releases up to 3.3.6 kill recycled PIDs during
 pane/session teardown without a process-identity check, which can take down
 an unrelated long-lived process mid-run. The psmux behaviors cited in this
@@ -109,12 +111,43 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # The base's trailer re-expressed in pwsh — the tmux verbs are protocol-
         # identical across the family. Errors go to $null: a client or pane that
         # is already gone means the window just parks as-is.
+        #
+        # The base reads the return target with `show-options -wqv`, which is
+        # dead on psmux (#310), so this reads the session-scoped id-keyed option
+        # instead. Unlike every other caller of that channel, the trailer cannot
+        # be handed its own window id — it is built before the window exists —
+        # so it probes for it in-pane. `-t $env:TMUX_PANE` pins the probe to the
+        # pane's own window (psmux sets TMUX_PANE in every pane, and a bare `%N`
+        # target resolves globally via DisplayMessageById); a target-less probe
+        # would resolve the server's *active* window, which is another window's
+        # key the moment focus moves after Enter. No `-t <session>`: running
+        # inside the pane, $TMUX already routes to this window's own server.
+        #
+        # Both captures go through "$(...)".Trim(): a bare capture yields an
+        # array when psmux emits more than one line, and `-eq` on an array
+        # filters instead of comparing — silently taking neither branch.
         mux = self._BINARY
+        probe = (
+            '"$(' + mux + " display-message -p -t $env:TMUX_PANE '#{window_id}' 2>$null)\".Trim()"
+        )
+        read_key = '"$(' + mux + ' show-options -qv $key 2>$null)".Trim()'
         return (
-            f"$ret = {mux} show-options -wqv {_pwsh_quote(return_opt)} 2>$null; "
+            f"$wid = {probe}; "
+            # A failed probe skips the return AND the key free; the orphan
+            # sweep at a later parked-window launch reclaims the key once the
+            # window is gone.
+            f"if ($wid) {{ $key = {_pwsh_quote(return_opt + '_')} + $wid; "
+            f"$ret = {read_key}; "
             f"if ($ret -eq '{PARKED_RETURN_DETACH}') {{ {mux} detach-client 2>$null }} "
+            # The switch leg is still inert at 3.3.7 (psmux/psmux#483: the
+            # server splits the target without parse_target); only the detach
+            # return actually moves a client today. Kept: it is the correct
+            # verb the moment upstream lands the fix.
             f"elseif ($ret) {{ {mux} switch-client -t $ret 2>$null; "
-            f"if ($LASTEXITCODE -ne 0) {{ {mux} switch-client -l 2>$null }} }}"
+            f"if ($LASTEXITCODE -ne 0) {{ {mux} switch-client -l 2>$null }} }} "
+            # Free the key on the way out: the ctl session outlives every run,
+            # so a key left behind is one this server carries for its whole life.
+            f"{mux} set-option -u $key 2>$null }}"
         )
 
     def _window_launch(self, env: dict[str, str], command: str) -> list[str]:
@@ -232,23 +265,357 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # falls through to the most-recent-session fallback rather than the
         # session that just minted it.
         window_id = super().new_parked_window(session, name, cwd, argv, return_opt)
+        # Launch time is the reconcile point for keys whose window is gone —
+        # Enter-dismissing a parked window closes it without kill_window ever
+        # running, so its keys would otherwise outlive it (#310).
+        self._sweep_orphan_keys(session)
         return self._qualified_window_id(session, window_id)
 
     def list_windows(self, session: str, fields: list[str]) -> list[tuple[str, ...]]:
-        # Qualify only the `window_id` columns — the prune replays exactly those
-        # values as kill-window targets, and a bare one can take down another
-        # server's identically-numbered window.
-        rows = super().list_windows(session, fields)
-        id_columns = [i for i, field in enumerate(fields) if field == "window_id"]
-        if not id_columns:
-            return rows
-        return [
-            tuple(
-                self._qualified_window_id(session, value) if i in id_columns else value
-                for i, value in enumerate(row)
-            )
-            for row in rows
+        # Two corrections on the columns the prune reads. `window_id` is
+        # qualified — the prune replays those values as kill-window targets, and
+        # a bare one can hit another server's identically-numbered window. An
+        # `@` field never reaches psmux: `#{@name}` expands from the one
+        # per-server map, so every row would carry the same value. Probe the
+        # window id in its place and fill from the id-keyed options, fetched as
+        # ONE full listing — a flat extra call per list_windows, regardless of
+        # row or column count (#310).
+        opt_columns = {i: field for i, field in enumerate(fields) if field.startswith("@")}
+        probe_fields = [
+            "window_id" if i in opt_columns else field for i, field in enumerate(fields)
         ]
+        rows = super().list_windows(session, probe_fields)
+        id_columns = {i for i, field in enumerate(fields) if field == "window_id"}
+        if not opt_columns and not id_columns:
+            return rows
+        # The #221 degrade: an empty or `:`-bearing session cannot be routed
+        # with `-t`, and an unrouted read would answer from whichever server
+        # the fallback picks — fill "" without issuing reads at all.
+        degraded = not session or ":" in session
+        options = self._scoped_options(session) if opt_columns and not degraded else None
+        if opt_columns and not degraded and options is None:
+            # Say it: every column degrades to "unset" at once, so a prune reads
+            # as if nothing were ever tagged. Visible on the CLI prune (cli.py,
+            # incl. the --dry-run this most affects); NOT under the TUI, which
+            # captures stderr for the app's whole run (tui/app.py's run_tui
+            # note) — the select_window precedent below, same deliberate ceiling.
+            print(
+                f"warning: show-options listing failed on {session}; "
+                "option columns read as unset",
+                file=sys.stderr,
+            )
+        out: list[tuple[str, ...]] = []
+        for row in rows:
+            values = list(row)
+            for i, option in opt_columns.items():
+                # values[i] is the bare `@N` probed in the option column's place.
+                digits = self._id_digits(values[i])
+                if degraded or not digits or options is None:
+                    # Unreadable degrades to "" ("unset") rather than to a
+                    # "read failed" sentinel: the caller's untagged fallback
+                    # proves ownership on its own (the ctl prune claims an
+                    # untagged window only when the run dir exists under THIS
+                    # project, and run ids are unique — runs.new_run_id), so a
+                    # third state in the column would buy only the skip of our
+                    # own dead window.
+                    values[i] = ""
+                else:
+                    values[i] = options.get(self._scoped_option_key(option, digits), "")
+            for i in id_columns:
+                values[i] = self._qualified_window_id(session, values[i])
+            out.append(tuple(values))
+        return out
+
+    # ------------------------------------ per-window option channel (#310)
+    #
+    # Per-window user options do not exist on psmux: there is one scope per
+    # server, and every `-w` read of an `@` name returns '' before the map is
+    # consulted (a 14-name builtin allowlist gates it). Deliberate, per
+    # psmux/psmux#321 — a boundary to route around, not a bug to wait out.
+    #
+    # Substitute: a SESSION-scoped option whose key carries the window id
+    # (`@bmad_project_@3` for `@3`). Two rules keep it correct —
+    #   - `-t <session>` on every out-of-pane write and read (the parked
+    #     trailer runs in-pane and rides `$TMUX` instead — see
+    #     `_parked_trailer`). psmux picks the server from the target, and
+    #     without an explicit session it falls back to $TMUX / most-recent —
+    #     i.e. some other server. The session comes from the qualified ids
+    #     this backend already mints, which is why #310 lands after #291.
+    #   - the key ends with the full id (`_@3`, never bare digits): the ctl
+    #     server loads the user's psmux config, so the map is shared, and the
+    #     `_@` shape is what keeps foreign config options out of the generic
+    #     cleanup sweeps. Not airtight — psmux accepts any `@` name, so a
+    #     hand-written `@theme_@3` WOULD match — but no naming convention in
+    #     the tmux/psmux ecosystem puts `@` mid-name, and a bmad-owned prefix
+    #     guard would hardcode caller names into the backend. The session
+    #     stays out of the key; routing already carries it.
+    #
+    # Builtin window options keep the base's `-w` argv — psmux accepts those
+    # allowlisted names (only `automatic-rename` has true per-window storage;
+    # the rest read the global value), and rerouting them into this channel
+    # would break reads that work today.
+
+    # A window target as the seam composes it: `session:@N`, `=session:@N`, or
+    # `=session:<window-name>`. Deliberately looser than _QUALIFIED_ID, which
+    # only admits the id form — set_return_pane passes a name token.
+    _SESSION_WINDOW = re.compile(r"^(?P<session>[^:]+):(?P<window>.+)$")
+
+    @staticmethod
+    def _id_digits(window_id: str) -> str:
+        """`@3` -> `3`; `""` for anything that is not a bare window id."""
+        return window_id[1:] if PsmuxMultiplexer._BARE_ID.fullmatch(window_id) else ""
+
+    def _option_scope(self, target: str) -> tuple[str, str] | None:
+        """``(session, id-digits)`` for a window target, or None when it carries
+        no session and so cannot be routed to a specific server.
+
+        A sessionless target reaches here only where `_qualified_window_id`
+        degraded. Guessing a server for it is the misrouting qualification
+        exists to prevent, so it returns None and the caller declines to act.
+        """
+        match = self._SESSION_WINDOW.fullmatch(target.removeprefix("="))
+        if match is None:
+            return None
+        session, window = match["session"], match["window"]
+        digits = self._id_digits(window)
+        if not digits:
+            # A name token; same one-round-trip renumber race as _window_index.
+            digits = self._id_digits(self._window_id_for_name(session, window) or "")
+        return (session, digits) if digits else None
+
+    def _window_id_for_name(self, session: str, name: str) -> str | None:
+        """Bare window id of the window called ``name`` in ``session``, or None."""
+        # super(): the base emits unqualified ids, the form the key needs.
+        for win_id, win_name in super().list_windows(session, ["window_id", "window_name"]):
+            if win_name == name:
+                return win_id
+        return None
+
+    @staticmethod
+    def _scoped_option_key(option: str, digits: str) -> str:
+        return f"{option}_@{digits}"
+
+    # The channel's key suffix. Anchored: `@bmad_project_@13` must not read as
+    # a key of window `@3`, and a foreign `@color_3` (no `_@` shape) never
+    # matches (see the namespace note in the channel comment above).
+    _KEY_SUFFIX = re.compile(r"_@(\d+)$")
+
+    def _read_scoped(self, session: str, option: str, digits: str) -> str | None:
+        # No `-w`: the session-scoped read is the one that reaches the map.
+        # None = transport failure, "" = unset. The ABC read admits only "", so
+        # the caller collapses them — the distinction survives as a warning.
+        try:
+            proc = self._run(
+                ["show-options", "-qv", "-t", session, self._scoped_option_key(option, digits)],
+                check=False,
+            )
+        except (subprocess.SubprocessError, OSError):
+            return None
+        return proc.stdout.strip() if proc.returncode == 0 else None
+
+    def _warn_unroutable(self, verb: str, target: str, option: str) -> None:
+        # Silence would leave a write that looks like it landed but did not.
+        print(
+            f"warning: {verb} {option} skipped — {target} does not resolve to a "
+            "window id on a routable session (unqualified target, unknown window "
+            "name, or the name-resolve listing failed), so the per-window option "
+            "channel is unavailable",
+            file=sys.stderr,
+        )
+
+    @staticmethod
+    def _transportable(value: str) -> bool:
+        # The value crosses psmux's CLI→server control line: the client wraps a
+        # spaced value in double quotes escaping only `"`, and the server
+        # tokenizer treats a bare `'` as a quote opener, drops `-`-leading
+        # tokens, and collapses `\\` inside double quotes. A value that cannot
+        # survive that hop verbatim is refused loudly instead of stored
+        # corrupted — a tag that reads back different from what the prune
+        # compares against makes the window silently unprunable.
+        #
+        # The two branches deliberately ban DIFFERENT shapes. Inside the
+        # client's double quotes `'` is literal and a mid-token `;` survives,
+        # so a spaced `O'Brien Files` or `a; b` path passes. But the one-shot
+        # chain splitter (config.rs `split_chained_commands`) is NOT
+        # quote-aware: it cuts on whitespace-delimited `;`/`\;` TOKENS, so
+        # `a ; b` stores as `a` and hands the rest to the server as a command
+        # (live-verified on 3.3.7; psmux/psmux#499). `\\` collapses and a `"` can close the
+        # wrapper early (client-escaped `\"` after a backslash reads back as
+        # `\\` + closing quote). So the spaced branch refuses `"`, `\\`, a
+        # trailing `\`, and standalone `;`/`\;` tokens. Outside double quotes
+        # the tokenizer's escape branch never fires (commands.rs:690 requires
+        # in_double_quotes) — an unquoted backslash is pushed literally, psmux
+        # being Windows-native — so the unspaced branch does not ban `\\` and a
+        # spaceless UNC path (`\\srv\share`) rides verbatim.
+        # Non-ASCII-space whitespace (NBSP, tab, …) is refused outright: the
+        # client quotes only on ASCII `' '` (main.rs `s.contains(' ')`) while
+        # the server tokenizer splits on Unicode `is_whitespace()` — an NBSP in
+        # an unquoted value splits the token server-side. Leading/trailing
+        # ASCII space is refused too: it survives the wire, but this backend's
+        # own reads strip/Trim, so the value could never read back equal.
+        if not value or value.startswith("-") or any(c.isspace() and c != " " for c in value):
+            return False
+        if value != value.strip():
+            return False
+        if " " in value:  # will be double-quoted by the psmux client
+            if '"' in value or "\\\\" in value or value.endswith("\\"):
+                return False
+            return all(tok not in (";", "\\;") for tok in value.split())
+        return not any(c in value for c in ";'\"")
+
+    def _write_scoped(self, verb: list[str], key: str) -> None:
+        # Both mutating verbs, one body. A write that silently failed re-opens
+        # the mis-scoped prune this channel exists to close, and a silently
+        # failed `-u` leaves a live return key that replays the return move when
+        # the window's command exits — so failures are said out loud either way
+        # (the verbs stay best-effort: warn, never raise).
+        label = " ".join(verb[: verb.index("-t")])  # `set-option` / `set-option -u`
+        try:
+            proc = self._run(verb, check=False)
+            if proc.returncode != 0:
+                print(f"warning: {label} {key} failed: {proc.stderr.strip()}", file=sys.stderr)
+        except (subprocess.SubprocessError, OSError) as exc:
+            print(f"warning: {label} {key} failed: {exc}", file=sys.stderr)
+
+    def set_window_option(self, target: str, option: str, value: str) -> None:
+        if not option.startswith("@"):
+            super().set_window_option(target, option, value)
+            return
+        # Scope first, transport second: an unroutable target has nothing to
+        # write AND nothing to free, and resolving here keeps the refusal path
+        # from re-entering unset_window_option and warning twice about a verb
+        # the caller never issued.
+        scope = self._option_scope(target)
+        if scope is None:
+            self._warn_unroutable("set-option", target, option)
+            return
+        session, digits = scope
+        key = self._scoped_option_key(option, digits)
+        if not self._transportable(value):
+            print(
+                f"warning: set-option {option} skipped — value does not survive "
+                "psmux's control-line transport verbatim; the key is freed and "
+                "the option reads as unset",
+                file=sys.stderr,
+            )
+            # Free any prior value: a refused REwrite must not leave the stale
+            # one to be replayed later (e.g. a parked return target).
+            self._write_scoped(["set-option", "-u", "-t", session, key], key)
+            return
+        self._write_scoped(["set-option", "-t", session, key, value], key)
+
+    def unset_window_option(self, target: str, option: str) -> None:
+        if not option.startswith("@"):
+            super().unset_window_option(target, option)
+            return
+        scope = self._option_scope(target)
+        if scope is None:
+            self._warn_unroutable("set-option -u", target, option)
+            return
+        session, digits = scope
+        # `-u` genuinely frees the key: the server's SetOptionUnset handler
+        # removes `@`-prefixed names from the map (verified at v3.3.7).
+        key = self._scoped_option_key(option, digits)
+        self._write_scoped(["set-option", "-u", "-t", session, key], key)
+
+    def show_window_option(self, target: str, option: str) -> str:
+        if not option.startswith("@"):
+            return super().show_window_option(target, option)
+        scope = self._option_scope(target)
+        if scope is None:
+            # An unroutable target warns for reads the same as for writes —
+            # no verb is sent; "" already means "unset" to every caller.
+            self._warn_unroutable("show-options", target, option)
+            return ""
+        value = self._read_scoped(scope[0], option, scope[1])
+        if value is None:
+            # Transport failure, not a miss. The return value still degrades
+            # to "" ("unset") — that is all the ABC read admits — but say so.
+            print(
+                f"warning: show-options {option} failed on {target}; treating as unset",
+                file=sys.stderr,
+            )
+            return ""
+        return value
+
+    def _scoped_options(self, session: str) -> dict[str, str] | None:
+        """All `@`-prefixed options on ``session`` as ``{key: value}``, or None
+        on any failure (distinct from {} — an empty map is a real answer).
+        Live-verified on 3.3.7: `show-options -q -t <session>` lists user
+        options as `@key "value"` lines; accepted channel values can contain
+        neither `"` nor newlines (see _transportable), so the quote strip is
+        lossless for every value this backend wrote. Known hole: one server
+        request handler (the plugin-drain copy, server/mod.rs:465 at v3.3.7)
+        answers this listing empty-with-success while keys exist, so a
+        surprising {} is possible and is not proof that no keys are set."""
+        try:
+            proc = self._run(["show-options", "-q", "-t", session], check=False)
+        except (subprocess.SubprocessError, OSError):
+            return None
+        if proc.returncode != 0:
+            return None
+        options: dict[str, str] = {}
+        for line in proc.stdout.splitlines():
+            name, _, rest = line.partition(" ")
+            if not name.startswith("@"):
+                continue
+            if len(rest) >= 2 and rest.startswith('"') and rest.endswith('"'):
+                rest = rest[1:-1]
+            options[name] = rest
+        return options
+
+    def _sweep_orphan_keys(self, session: str) -> None:
+        # Free `_@N` keys whose window no longer exists (Enter-dismissed parked
+        # windows never pass through kill_window). The `_@` shape keeps foreign
+        # config options out of the sweep; window ids are never recycled within
+        # a server, so a swept key cannot belong to a future window.
+        #
+        # Order matters: keys are snapshotted BEFORE the live-window listing, so
+        # a window minted-and-tagged between the two calls has its key outside
+        # the snapshot and cannot be swept as a false orphan.
+        try:
+            options = self._scoped_options(session)
+            if options is None:
+                return
+            live = set(super().list_window_ids(session))  # base = bare ids
+            if not live:
+                # A session being swept just minted a window, so an empty live
+                # list is a failed probe, not an empty session — treating it as
+                # truth would sweep every key, live windows included.
+                return
+            for name in options:
+                match = self._KEY_SUFFIX.search(name)
+                if match and f"@{match.group(1)}" not in live:
+                    self._run(["set-option", "-u", "-t", session, name], check=False)
+        except (subprocess.SubprocessError, OSError, TmuxError) as exc:
+            # Reconcile is opportunistic; the mint must never fail on it. But a
+            # sweep that fails every launch leaks keys for the server's whole
+            # life, so the failure is at least visible.
+            print(f"warning: orphan-key sweep failed on {session}: {exc}", file=sys.stderr)
+
+    def kill_window(self, target: str) -> None:
+        # Free the window's id-keyed session options before the kill: the ctl
+        # session outlives every run, so a leaked key lives as long as the
+        # server. Discovery is generic by the `_@<digits>` suffix — the backend
+        # must not know which option names callers use. Best-effort throughout:
+        # cleanup failure never blocks the kill. Known ceiling, accepted: the
+        # kill itself is best-effort, so a kill that then fails leaves a live
+        # window without its keys — the prune's untagged run-dir fallback still
+        # scopes the retry, and a lost return key just parks the window as-is.
+        # Cost, accepted: one listing round-trip per kill, two for a name target
+        # (name-resolve, then keys; agent-window kills pay it too, for
+        # nothing); skip-by-session-name if that ever measures.
+        scope = self._option_scope(target)
+        if scope is not None:
+            session, digits = scope
+            suffix = f"_@{digits}"
+            try:
+                for name in self._scoped_options(session) or ():
+                    if name.endswith(suffix):
+                        self._run(["set-option", "-u", "-t", session, name], check=False)
+            except (subprocess.SubprocessError, OSError):
+                pass
+        super().kill_window(target)
 
     # What _qualified_window_id composes: `<session>:@<n>`. The session part
     # excludes `:` because that is exactly when qualification degrades to a bare

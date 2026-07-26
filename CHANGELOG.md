@@ -125,6 +125,21 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 ### Fixed
 
+- **Give psmux a working per-window option channel (#310).** psmux keeps one user-option scope
+  per server and returns `''` for every `-w` read of an `@`-prefixed name, so both mechanisms
+  riding per-window options were broken. The ctl-window project tag read the same bled value for
+  every `list-windows` row, letting a prune in one project `kill-window` another project's
+  window; the parked-return option always read empty, so an attached client was never handed
+  back to its origin. The window-option verbs, the `@`-prefixed columns of `list_windows` and the
+  parked trailer now use a session-scoped option whose key carries the window id
+  (`@bmad_project_@3` for window `@3` — the `_@` shape keeps foreign config options out of the
+  cleanup sweeps), routed with an explicit `-t <session>` (the in-pane parked trailer rides
+  `$TMUX` instead). Values that cannot survive psmux's
+  control-line transport verbatim are refused with a warning instead of stored corrupted. Keys are
+  freed on `kill_window` and reconciled at parked-window launch; the return move itself is restored
+  for the detach leg, while the `switch-client` leg stays inert until psmux/psmux#483 lands
+  upstream. Builtin window options keep the `-w` path; tmux is untouched.
+
 - **Session-qualify the psmux TUI-side window ids (#291).** #254 covered the engine seam but left
   the launcher's surfaces bare, and that process usually runs _outside_ any pane — where a bare
   `@N` resolves through psmux's most-recent-session fallback, not the session that minted it. The
