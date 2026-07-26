@@ -415,7 +415,7 @@ def test_stop_run_signals_live_process(tmp_path, monkeypatch):
     finally:
         if proc.poll() is None:
             proc.kill()
-            proc.wait()
+            proc.wait(timeout=10)
 
 
 def test_stop_run_respects_engine_written_stopped(tmp_path, monkeypatch):

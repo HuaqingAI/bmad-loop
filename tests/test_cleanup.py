@@ -2,8 +2,6 @@
 artifact trim, and the `clean` CLI command."""
 
 import argparse
-import subprocess
-import sys
 
 from conftest import install_bmad_config, machine_json
 
@@ -20,12 +18,6 @@ def _state_run(project, run_id, **kw):
         RunState(run_id=run_id, project=str(project), started_at="2026-06-11T10:00:00", **kw),
     )
     return run_dir
-
-
-def _dead_pid() -> int:
-    p = subprocess.Popen([sys.executable, "-c", ""])
-    p.wait()
-    return p.pid
 
 
 # --------------------------------------------------------------- predicates
