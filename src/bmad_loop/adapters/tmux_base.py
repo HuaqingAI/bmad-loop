@@ -429,11 +429,14 @@ class BaseTmuxBackend(TerminalMultiplexer):
             return None
         return proc.stdout.strip() if proc.returncode == 0 else None
 
-    def detach_client(self) -> None:
+    def detach_client(self) -> bool:
+        # Returns True iff a client was detached; a transport failure didn't
+        # detach anything, so False is the honest answer.
         try:
-            self._run(["detach-client"], check=False)
+            proc = self._run(["detach-client"], check=False)
         except (subprocess.SubprocessError, OSError):
-            pass
+            return False
+        return proc.returncode == 0
 
     def switch_client(self, target: str, last_fallback: bool = False) -> bool:
         # Returns True iff a switch happened; a transport failure didn't switch, so

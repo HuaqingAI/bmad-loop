@@ -36,6 +36,7 @@ from bmad_loop.policy import (
     SweepPolicy,
 )
 from bmad_loop.sweep import DecisionPrompter, SweepEngine, validate_migration, validate_triage
+from bmad_loop.tui import launch
 from bmad_loop.verify import worktree_clean
 
 QUIET = NotifyPolicy(desktop=False, file=True)
@@ -831,16 +832,17 @@ def _close_decision_plan():
     )
 
 
-def test_interactive_decisions_return_client_goes_unattended(project, monkeypatch):
-    """When a client was attached to answer, the sweep hands the terminal back
-    after the decisions and goes unattended so later cycles don't block on a
-    detached window."""
-    returned: list[bool] = []
+def _stub_return(monkeypatch, outcome):
+    """Pin return_attached_client's answer and record how often it was asked."""
+    asked: list[object] = []
     monkeypatch.setattr(
         "bmad_loop.tui.launch.return_attached_client",
-        lambda: bool(returned.append(True)) or True,
+        lambda: (asked.append(outcome), outcome)[1],
     )
-    write_ledger(project, {"DW-1": "open"})
+    return asked
+
+
+def _run_one_decision_sweep(project):
     engine, _adapter = make_sweep(
         project,
         [triage_effect(_close_decision_plan())],
@@ -849,7 +851,17 @@ def test_interactive_decisions_return_client_goes_unattended(project, monkeypatc
     )
     summary = engine.run()
     assert not summary.paused
-    assert returned == [True]  # asked exactly once, after the decisions phase
+    return engine
+
+
+def test_interactive_decisions_return_client_goes_unattended(project, monkeypatch):
+    """When a client was attached to answer, the sweep hands the terminal back
+    after the decisions and goes unattended so later cycles don't block on a
+    detached window."""
+    asked = _stub_return(monkeypatch, launch.ReturnOutcome.RETURNED)
+    write_ledger(project, {"DW-1": "open"})
+    engine = _run_one_decision_sweep(project)
+    assert len(asked) == 1  # asked exactly once, after the decisions phase
     assert engine.prompting is False
     assert '"sweep-returned-after-decisions"' in journal_text(engine)
 
@@ -857,17 +869,24 @@ def test_interactive_decisions_return_client_goes_unattended(project, monkeypatc
 def test_interactive_decisions_no_attach_stays_attended(project, monkeypatch):
     """A plain foreground sweep (nobody attached, no return target) keeps
     prompting and never emits the return event."""
-    monkeypatch.setattr("bmad_loop.tui.launch.return_attached_client", lambda: False)
+    _stub_return(monkeypatch, launch.ReturnOutcome.ATTENDED)
     write_ledger(project, {"DW-1": "open"})
-    engine, _adapter = make_sweep(
-        project,
-        [triage_effect(_close_decision_plan())],
-        answers=["1"],
-        prompting=True,
-    )
-    summary = engine.run()
-    assert not summary.paused
+    engine = _run_one_decision_sweep(project)
     assert engine.prompting is True
+    assert '"sweep-returned-after-decisions"' not in journal_text(engine)
+
+
+def test_interactive_decisions_unreachable_goes_unattended(project, monkeypatch):
+    """A failed detach is not the same non-return as a failed switch: it means
+    there was no client to hand back, so nobody can answer here any more. The
+    sweep must go unattended anyway — keeping `prompting` would leave a
+    --repeat cycle blocked on input() in a window no one is viewing — but it
+    must not claim a hand-back that did not happen."""
+    _stub_return(monkeypatch, launch.ReturnOutcome.UNREACHABLE)
+    write_ledger(project, {"DW-1": "open"})
+    engine = _run_one_decision_sweep(project)
+    assert engine.prompting is False
+    assert '"sweep-return-no-client"' in journal_text(engine)
     assert '"sweep-returned-after-decisions"' not in journal_text(engine)
 
 
