@@ -128,13 +128,24 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 - **`return_attached_client` no longer claims a return that never happened (#227).** It discarded
   `switch_client`'s result and answered `True` unconditionally, so a failed switch plus a failed
   `-l` fallback still journaled the return and sent the sweep unattended while the human sat in
-  the sweep window with their terminal never handed back. The result is now the return value, and
-  `RETURN_OPTION` is cleared only on a real return — a failed one is left for the parked window's
-  trailer, which is a second chance if someone dismisses the park prompt, not a rescue for an
-  unattended window. `TerminalMultiplexer.detach_client` widens from `None` to `bool` for the same
-  reason: it had the return code in hand and dropped it, so the detach branch carried the identical
-  false positive. Out-of-tree backends still returning `None` read as "nothing detached", which
-  keeps the option set — degraded, not broken.
+  the sweep window with their terminal never handed back. `RETURN_OPTION` is now cleared only on a
+  real return — a failed one is left for the parked window's trailer, which is a second chance if
+  someone dismisses the park prompt, not a rescue for an unattended window.
+
+  The two failures are reported apart, because they point opposite ways: a failed switch leaves
+  the client in this window with a human in front of it (`ATTENDED` — an attended sweep keeps
+  prompting, which is the fix), while a failed detach means there was no client to detach at all
+  (`UNREACHABLE` — the sweep goes unattended, or a `--repeat` cycle blocks forever on a prompt no
+  one can see). Announcing it stays tied to a real return; `UNREACHABLE` journals
+  `sweep-return-no-client` and prints nothing.
+
+  `TerminalMultiplexer.detach_client` widens from `None` to `bool` to carry that, and both client
+  verbs now owe **effect, not dispatch**. tmux reads it off the exit code. psmux cannot — every arm
+  of its `detach-client` / `switch-client` exits 0 whether or not a client moved — so it measures
+  the session's attached-client count across the call and answers on the drop; unobservable
+  degrades to `False`, never a vacuous `True` (#317). That path went live with the option channel
+  in #310, so on Windows the return was reachable and dishonest at the same time. Out-of-tree
+  backends still returning `None` read as "nothing detached" — degraded, not broken.
 
 - **Give psmux a working per-window option channel (#310).** psmux keeps one user-option scope
   per server and returns `''` for every `-w` read of an `@`-prefixed name, so both mechanisms

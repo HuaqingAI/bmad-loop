@@ -25,7 +25,11 @@ back to an index first. Per-window user options do not exist at all, so
 the window-option verbs, the ``@``-prefixed columns of ``list_windows``
 and the parked trailer route through a substitute channel — see the
 ``per-window option channel (#310)`` block below for the model and its
-rules. ``available()`` additionally gates on
+rules. ``detach-client`` and ``switch-client`` report dispatch rather than
+effect — every arm exits 0 whether or not a client moved — so both seam
+booleans are measured against the session's attached-client count instead of
+read off the exit code; see the ``client verbs: observed effect (#317)``
+block. ``available()`` additionally gates on
 the reported version: psmux releases up to 3.3.6 kill recycled PIDs during
 pane/session teardown without a process-identity check, which can take down
 an unrelated long-lived process mid-run. The psmux behaviors cited in this
@@ -720,6 +724,85 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         if not session or ":" in session:
             return pane
         return self.target(session, pane)
+
+    # ------------------------------- client verbs: observed effect (#317)
+    #
+    # psmux's client verbs report *dispatch*, not effect. At ``v3.3.7`` both CLI
+    # arms end in ``send_control(cmd)?; return Ok(())``, so the only nonzero exit
+    # is an unreachable session server: ``detach-client`` succeeds with zero
+    # clients attached (and a flag-less detach is promoted server-side to
+    # detach-all), and *no* form of ``switch-client`` — ``-t`` included —
+    # carries a server reply. Later builds narrow this but do not close it: a
+    # response path landed after the tag and only for ``-t``, leaving ``-l``
+    # exit-0 regardless. Taking those exit codes as the seam's booleans is the
+    # rc-0 no-op (#228) reached through Python instead of a shell fallback, and
+    # it is what ``tui.launch.return_attached_client`` would consume to decide a
+    # human has been handed their terminal back.
+    #
+    # So the exit code is discarded and the effect is measured: count the
+    # clients attached to this session before and after the verb, and answer on
+    # the DELTA. Never on an absolute count — a ``-t`` read against a session
+    # whose server is gone answers from whichever server the fallback picks, so
+    # "zero attached" on its own proves nothing (#315). A drop cannot be
+    # manufactured that way: it needs two successful reads of the same session,
+    # the first of them nonzero.
+    #
+    # Unobservable answers False, never a vacuous True. For the detach that is
+    # safe in both directions — the caller's UNREACHABLE and RETURNED agree that
+    # nobody is left at this terminal, and the only cost is the parked trailer
+    # re-issuing a detach that no-ops. For the switch it is also the truth
+    # today: the switch leg is inert at 3.3.7 (psmux/psmux#483), so no client
+    # ever moves. When upstream lands that fix the probe reports it without a
+    # code change here — which is why this measures rather than hardcoding.
+    #
+    # Residue: a switch whose target pane lives in THIS session moves the client
+    # between windows without changing the session's attached count, so it reads
+    # as no effect. Reachable only when the return target was recorded from
+    # inside a control-session window; the caller then keeps prompting, which is
+    # the safe direction.
+
+    def _attached_clients(self, session: str) -> int | None:
+        """Clients attached to ``session``, or None when psmux cannot say.
+
+        Self-detecting on purpose: an unsupported format field cannot answer a
+        plausible integer, so a psmux build that does not carry
+        ``#{session_attached}`` degrades to None instead of a wrong count.
+        """
+        try:
+            proc = self._run(
+                ["display-message", "-p", "-t", session, "#{session_attached}"], check=False
+            )
+        except (subprocess.SubprocessError, OSError):
+            return None
+        if proc.returncode != 0:
+            return None
+        text = proc.stdout.strip()
+        return int(text) if text.isdigit() else None
+
+    def _client_left(self, verb: list[str]) -> bool:
+        """Run a client verb and answer whether a client left this session."""
+        session = self.current_session()
+        if not session:
+            # Not inside a pane (or the probe failed): there is no "this
+            # session" to measure against, and no client of ours to move.
+            return False
+        before = self._attached_clients(session)
+        try:
+            self._run(verb, check=False)
+        except (subprocess.SubprocessError, OSError):
+            return False
+        after = self._attached_clients(session)
+        if before is None or after is None:
+            return False
+        return before > 0 and after < before
+
+    def detach_client(self) -> bool:
+        return self._client_left(["detach-client"])
+
+    def switch_client(self, target: str, last_fallback: bool = False) -> bool:
+        if self._client_left(["switch-client", "-t", target]):
+            return True
+        return last_fallback and self._client_left(["switch-client", "-l"])
 
     def pipe_pane(self, window_id: str, log_file: Path) -> None:
         # The base's POSIX `cat >>` sink assumes a POSIX host shell, and psmux

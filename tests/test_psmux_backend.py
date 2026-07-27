@@ -1227,3 +1227,93 @@ def test_ctl_prune_scan_discriminates_projects_end_to_end(monkeypatch, tmp_path)
 
     candidates = launch._ctl_window_candidates(tmp_path)
     assert candidates == [("bmad-loop-ctl:@2", "run-20260726-1")]
+
+
+# ---------------------------------------- client verbs: observed effect (#317)
+
+
+def _client_fake(monkeypatch, *, attached, session="ctl", verb_rc=0):
+    """Script the two probes the client verbs measure with.
+
+    ``attached`` is the successive answers to ``#{session_attached}``, consumed
+    in call order — so a detach that worked is ["1", "0"] and psmux's rc-0 no-op
+    is ["1", "1"]. Every verb exits ``verb_rc`` (0 by default: on psmux the exit
+    code says nothing, which is the whole point).
+    """
+    monkeypatch.setenv("TMUX", "/tmp/psmux-1000/default,123,0")  # inside a pane
+    counts = list(attached)
+    calls: list[list] = []
+
+    def fake(argv, **kwargs):
+        calls.append(list(argv))
+        if argv[1] == "display-message" and argv[-1] == "#{session_name}":
+            return subprocess.CompletedProcess(argv, 0, stdout=f"{session}\n", stderr="")
+        if argv[1] == "display-message" and argv[-1] == "#{session_attached}":
+            return subprocess.CompletedProcess(argv, 0, stdout=f"{counts.pop(0)}\n", stderr="")
+        return subprocess.CompletedProcess(argv, verb_rc, stdout="", stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    return calls
+
+
+def test_psmux_detach_reports_the_observed_drop(monkeypatch):
+    calls = _client_fake(monkeypatch, attached=["1", "0"])
+    assert PsmuxMultiplexer().detach_client() is True
+    assert ["psmux", "detach-client"] in calls
+    # both probes routed to the session, never left to the most-recent fallback
+    assert calls.count(["psmux", "display-message", "-p", "-t", "ctl", "#{session_attached}"]) == 2
+
+
+def test_psmux_detach_with_nothing_attached_is_false(monkeypatch):
+    """psmux's detach-client exits 0 with zero clients attached, so the exit
+    code cannot answer this — the count has to. Reading rc here is exactly the
+    vacuous True that strands the human (#317)."""
+    calls = _client_fake(monkeypatch, attached=["0", "0"])
+    assert PsmuxMultiplexer().detach_client() is False
+    assert ["psmux", "detach-client"] in calls  # attempted, just not effective
+
+
+def test_psmux_client_verbs_never_claim_an_unobservable_effect(monkeypatch):
+    """A psmux build that does not carry #{session_attached} echoes something
+    non-numeric; that degrades to False, never to a vacuous True."""
+    _client_fake(monkeypatch, attached=["#{session_attached}", "#{session_attached}"])
+    assert PsmuxMultiplexer().detach_client() is False
+
+
+def test_psmux_detach_outside_a_pane_is_false(monkeypatch):
+    """No TMUX, so current_session answers None: there is no session to measure
+    and no client of ours to move. Answer False without issuing a flag-less
+    detach, which psmux promotes server-side to detach-all."""
+    calls = _client_fake(monkeypatch, attached=[])
+    monkeypatch.delenv("TMUX", raising=False)
+    assert PsmuxMultiplexer().detach_client() is False
+    assert not any(c[1] == "detach-client" for c in calls)
+
+
+def test_psmux_switch_reports_the_drop(monkeypatch):
+    calls = _client_fake(monkeypatch, attached=["1", "0"])
+    assert PsmuxMultiplexer().switch_client("ctl:%9") is True
+    assert ["psmux", "switch-client", "-t", "ctl:%9"] in calls
+    assert not any(c[2:] == ["-l"] for c in calls)  # no fallback when -t moved it
+
+
+def test_psmux_switch_falls_back_then_reports_the_drop(monkeypatch):
+    calls = _client_fake(monkeypatch, attached=["1", "1", "1", "0"])
+    assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is True
+    assert ["psmux", "switch-client", "-l"] in calls
+
+
+def test_psmux_switch_is_false_while_the_leg_is_inert(monkeypatch):
+    """psmux/psmux#483: the switch moves no client, and every arm still exits 0.
+    Both legs are attempted and both read as no effect, so the caller keeps
+    prompting instead of being told the human was handed their terminal back."""
+    calls = _client_fake(monkeypatch, attached=["1", "1", "1", "1"])
+    assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is False
+    assert ["psmux", "switch-client", "-t", "ctl:%9"] in calls
+    assert ["psmux", "switch-client", "-l"] in calls
+
+
+def test_psmux_switch_without_fallback_does_not_attempt_it(monkeypatch):
+    calls = _client_fake(monkeypatch, attached=["1", "1"])
+    assert PsmuxMultiplexer().switch_client("ctl:%9") is False
+    assert not any(c[1:3] == ["switch-client", "-l"] for c in calls)

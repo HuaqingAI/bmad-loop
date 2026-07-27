@@ -278,22 +278,26 @@ class TerminalMultiplexer(ABC):
 
     @abstractmethod
     def detach_client(self) -> bool:
-        """Detach the client viewing the current session. Returns True iff the
-        backend reported a successful detach; a transport failure answers
-        False. On tmux that is "a client was actually detached" — the command
-        fails when nothing is attached — but a backend whose transport cannot
-        distinguish "detached nothing" from success answers True vacuously
-        (psmux does; see its module docstring). Callers that only want the
-        terminal handed back may ignore it; the parked-window return path
-        cannot, because clearing its return option on a detach that never
-        happened strands the human (see tui.launch.return_attached_client)."""
+        """Detach the client viewing the current session. Returns True iff a
+        client was actually detached — **effect, not dispatch**: a transport
+        failure answers False, and so does a backend with no real detach.
+        tmux gets this from the exit code (`detach-client` fails with "no
+        current client"); a backend whose CLI exits 0 either way measures it
+        instead (psmux counts the session's attached clients across the call).
+        Callers that only want the terminal handed back may ignore the answer;
+        the parked-window return path cannot — it clears its return option on a
+        True, and a vacuous one strands the human, while a False is positive
+        evidence that nobody is watching this window any more (see
+        tui.launch.return_attached_client)."""
 
     @abstractmethod
     def switch_client(self, target: str, last_fallback: bool = False) -> bool:
         """Switch the current client to ``target`` (optionally falling back to
-        the last client on failure). Returns True iff a switch happened — so a
-        transport failure returns False. ``target`` is a :meth:`target` token
-        or a backend-native id."""
+        the last client on failure). Returns True iff a switch happened — the
+        same effect-not-dispatch rule as :meth:`detach_client`, so a transport
+        failure returns False and a backend whose CLI cannot report the move
+        measures it or answers False. ``target`` is a :meth:`target` token or a
+        backend-native id."""
 
     @abstractmethod
     def available(self) -> bool:

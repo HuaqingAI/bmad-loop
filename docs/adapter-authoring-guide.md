@@ -98,13 +98,23 @@ seams of a full OS port are in
   as psmux does to emit `=session:%N`), `detach_client` / `switch_client` (with
   an optional last-client fallback — both answer a bool the parked-window
   return path trusts: report **effect**, not that the command was dispatched,
-  so a backend with no real detach returns `False`. Report the closest thing
-  your transport can actually observe, and if it cannot observe effect at all,
-  say so in your degradation ledger rather than leaving the caller to assume:
-  psmux is the worked example — its CLI exits 0 whether or not a client moved,
-  so its booleans are vacuously `True` and the seam's honesty guarantee does
-  not hold there),
+  so a backend with no real detach returns `False`. If your CLI's exit code
+  already means "a client moved" you are done (tmux: `detach-client` fails with
+  _no current client_). If it does not, **measure** — psmux is the worked
+  example: every arm of its `detach-client` / `switch-client` exits 0 whether or
+  not a client moved, so the backend counts the session's attached clients
+  across the call and answers on the drop. Where even that is unavailable,
+  answer `False` and record the gap in your degradation ledger; a vacuous `True`
+  is the one answer that strands a human),
   `available` (is this backend usable on the current host).
+
+  The caller's two failures are not symmetric, which is what makes the rule
+  worth the round-trip: a failed `switch_client` leaves the client in the window
+  it was already in, while a failed `detach_client` means there was no client
+  there at all. `tui.launch.return_attached_client` reports those as `ATTENDED`
+  and `UNREACHABLE`, and an attended sweep keeps prompting on the first but goes
+  unattended on the second. Answering `True` when nothing happened collapses
+  both into "the human has their terminal back", which is #227.
 
 **Window targets.** The target-taking methods (`kill_window`, `select_window`,
 the window-option trio, `attach_target_argv`, `switch_client`) receive one of two
@@ -164,7 +174,9 @@ whenever the content changes, which is exactly enough to drive the two log consu
 a tmux tee would (`generic._log_activity_key`'s stall re-arm and `probe`'s marker
 discovery). Its module docstring is a **degradation ledger** of every such
 divergence (sidecar options, poller `pipe_pane`, the no-op `detach_client` —
-which the widened seam now requires to answer `False`, not `None` — the attach
+which the widened seam now requires to answer `False`, not `None`, so the
+parked-return path reads it as `UNREACHABLE` and an attended sweep stops
+prompting into a window whose client only a manual chord can release — the attach
 argv, the advisory geometry, the protocol-version policy) — the reference for what
 "implement fresh" costs when the host has no tmux-shaped CLI. The operator-facing
 view — what a herdr _user_ notices and does — is
