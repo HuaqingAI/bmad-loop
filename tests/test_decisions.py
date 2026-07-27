@@ -2,6 +2,7 @@
 
 import json
 
+import pytest
 from conftest import install_bmad_config, write_ledger
 
 from bmad_loop import decisions, deferredwork
@@ -131,6 +132,58 @@ def test_apply_pre_answer_build_records_store_and_ledger(project):
     assert entries["DW-1"].open  # build stays open until a sweep builds it
     assert decisions.load_pre_answers(project.project)["DW-1"]["effect"] == "build"
     assert "chore(decisions): pre-answer DW-1" in _git_log(project)
+
+
+def test_apply_pre_answer_sanitizes_a_multiline_detail(project):
+    """The human-decision writer path (`decisions.py:146-150`), called bare: it
+    must sanitize rather than raise. Pins `detail = option.resolution or
+    option.intent` on its fallback branch — the resolution is empty here, so an
+    option `intent` is what reaches the ledger."""
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    from bmad_loop.sweep import Decision
+
+    opt = DecisionOption(
+        key="1", label="Build\ncap", effect="build", intent="widen the field.\nThen backfill."
+    )
+    d = Decision(id="DW-1", question="build it?", context="", options=(opt,), recommendation="1")
+
+    decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13")
+
+    text = project.deferred_work.read_text(encoding="utf-8")
+    entries = {e.id: e for e in deferredwork.parse_ledger(text)}
+    assert set(entries) == {"DW-1"}  # no phantom entry minted
+    assert (
+        "decision: 2026-06-13 Build cap — widen the field. Then backfill." in entries["DW-1"].body
+    )
+    assert len([line for line in text.splitlines() if line.startswith("decision:")]) == 1
+    assert entries["DW-1"].open  # build stays open until a sweep builds it
+
+
+def test_apply_pre_answer_raises_on_a_bad_date_leaving_nothing_written(project):
+    """The documented precondition, and that it fires before *any* of the four
+    side effects `apply_pre_answer` chains: `append_decision`, `mark_done`,
+    `record_pre_answer` and `commit_paths`. A raise partway through would leave a
+    ledger annotation with no store entry, or either with no commit.
+
+    Both callers catch it — the TUI degrades to a per-decision notification and
+    `bmad-loop decisions` to an error line — so the failure a human sees must
+    correspond to nothing having happened."""
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    from bmad_loop.sweep import Decision
+
+    opt = DecisionOption(key="1", label="Build", effect="build", intent="do it")
+    d = Decision(id="DW-1", question="?", context="", options=(opt,), recommendation="1")
+    ledger_before = project.deferred_work.read_text(encoding="utf-8")
+    store_before = decisions.load_pre_answers(project.project)
+
+    with pytest.raises(ValueError, match="date must be YYYY-MM-DD"):
+        decisions.apply_pre_answer(project.project, d, opt, date="13/06/2026")
+
+    assert project.deferred_work.read_text(encoding="utf-8") == ledger_before
+    assert decisions.load_pre_answers(project.project) == store_before
+    assert not decisions.store_path(project.project).exists()
 
 
 def test_apply_pre_answer_close_marks_done_no_store(project):

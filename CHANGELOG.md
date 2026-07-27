@@ -125,6 +125,32 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 ### Fixed
 
+- **The orchestrator's ledger writers no longer inject lines from a multiline value (#305).** Found
+  by [@Haven2026](https://github.com/Haven2026) in #274. The deferred-work ledger is line-oriented,
+  but `deferredwork`'s mutators interpolated their arguments verbatim: a resolution note of
+  `fixed\n### DW-99: fake\nstatus: open` minted a phantom entry, a note containing `\n- source_spec:`
+  truncated the entry's span and re-surfaced its tail as a phantom legacy item, and a mid-note break
+  left one entry carrying two `status:` lines. The writers now collapse line breaks in free text to a
+  space. They sanitize rather than raise — the sweep's close paths call them bare, so a `ValueError`
+  would end the run as crashed — and nothing upstream rejects on a break either: a formatting defect
+  must not cost a triage attempt. The break set is `str.splitlines()`'s, not `\n` alone, since
+  `parse_legacy` scans with it. A value that never carried a break is written byte-for-byte as
+  before, and a title that sanitizes away is named rather than left blank.
+
+  **New exception paths.** The orchestrator-owned fields are now validated where they never were:
+  `mark_done`, `mark_done_many`, `append_decision` and `append_entry` raise `ValueError` on a `date`
+  that is not ISO `YYYY-MM-DD`, and `append_entry` on a `status` outside `open`/`done <date>` or a
+  `severity` outside `critical|high|medium|low`. All four previously accepted anything and wrote it.
+  A bad value there is a programmer bug, not model output.
+
+  This covers the orchestrator's writers only. Two producers still write ledger markdown directly and
+  bypass them: the inner dev session's flat appends, and the sweep's migration session, which rewrites
+  the whole file (its validation checks legacy leftovers, duplicate ids, statuses and numbering — not
+  breaks inside a field value). Sanitizing also makes a break inert, not the text around it: a
+  `DW-<n>` token surviving as prose still counts toward `next_seq`. The sweep skill now states the
+  single-line expectation as guidance; an existing install picks it up on
+  `bmad-loop init --force-skills` (a plain `init` keeps skills that already exist).
+
 - **A deferred finding appended after the last ledger entry is no longer lost (#304).** Found and
   first fixed by [@Haven2026](https://github.com/Haven2026) in #274. The inner dev session appends
   each review defer as a flat `- source_spec:` / `summary:` / `evidence:` block; landing after the

@@ -35,6 +35,22 @@ reason: <why this was deferred rather than done now, one or two sentences>
 status: open
 ```
 
+**Every field line is exactly one line, and so is the title.** The format is
+line-oriented: readers find each field by scanning for `<name>:` at the start of
+a line, and an entry ends at whichever comes first — the next `### DW-<n>`
+entry, any other `#` .. `######` heading, or a `- source_spec:` flat-append
+bullet. A value carrying a line break therefore does not wrap; it becomes new
+ledger content, and three things can follow:
+
+- a break followed by `### ` mints an entry nobody filed;
+- a break before a `status:` line leaves one entry carrying two, so the ledger
+  no longer says one thing about it;
+- a break followed by `- source_spec:` cuts the entry short at that bullet, and
+  everything after it re-surfaces as a phantom _legacy_ item.
+
+Keep breaks out of field values, along with `### ` and a leading
+`- source_spec:`. If a reason needs two sentences, write them on one line.
+
 `severity:` is optional — entries written before this field existed have none
 and that is fine; readers must treat a missing or unrecognized value as
 "unspecified". Use `critical` for correctness/security issues, `high` for

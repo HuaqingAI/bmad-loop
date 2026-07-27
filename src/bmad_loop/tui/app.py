@@ -337,7 +337,12 @@ class BmadLoopApp(App[None]):
                 option,  # pyright: ignore[reportArgumentType]
                 date=time.strftime("%Y-%m-%d"),
             )
-        except (OSError, bmadconfig.BmadConfigError) as e:
+        except (OSError, bmadconfig.BmadConfigError, ValueError) as e:
+            # ValueError is the ledger writers' date precondition. It cannot fire
+            # from the strftime above, but an uncaught one here escapes into the
+            # Textual event loop and takes the dashboard down mid-walk — the
+            # per-decision notification is the right degradation for a modal the
+            # human is still stepping through.
             self.notify(
                 f"failed to record {decision.id}: {e}",  # pyright: ignore[reportAttributeAccessIssue]
                 severity="error",

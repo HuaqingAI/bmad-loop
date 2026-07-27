@@ -35,7 +35,16 @@ from bmad_loop.policy import (
     StageAdapterPolicy,
     SweepPolicy,
 )
-from bmad_loop.sweep import DecisionPrompter, SweepEngine, validate_migration, validate_triage
+from bmad_loop.sweep import (
+    Decision,
+    DecisionOption,
+    DecisionPrompter,
+    ResolvedEntry,
+    SweepEngine,
+    TriagePlan,
+    validate_migration,
+    validate_triage,
+)
 from bmad_loop.tui import launch
 from bmad_loop.verify import worktree_clean
 
@@ -187,6 +196,118 @@ def test_validate_triage_bad_fields():
     assert "needs intent" in joined
     assert "at least 2 options" in joined
     assert "recommendation" in joined
+
+
+# --------------------------------- line breaks in ledger-bound text (#305)
+#
+# validate_triage deliberately does NOT gate on line breaks. The sanitizer in
+# deferredwork already neutralizes them losslessly, so a rejection here would buy
+# no integrity — it would only spend a triage attempt, and the second failure
+# escalates the run to a human who has nothing to resolve. Acceptance is the
+# behavior under test; the two live writer paths below are where it lands.
+
+
+@pytest.mark.parametrize("field", ["evidence", "label", "resolution"])
+def test_validate_triage_accepts_multiline_free_text(field):
+    """A formatting-only defect must never cost a triage attempt or pause a run.
+    Deleting the plan over one line break trains nothing — the feedback file dies
+    with the session — and the escalation pages a human whose only remedy is to
+    re-roll the same dice."""
+    injected = "fixed in abc123\n### DW-99: fake\nstatus: open"
+    if field == "evidence":
+        rj = triage_result(["DW-1"], already_resolved=[{"id": "DW-1", "evidence": injected}])
+    else:
+        option = {"key": "1", "label": "build it", "effect": "build", "intent": "do x"}
+        option[field] = injected
+        rj = triage_result(
+            ["DW-1"],
+            decisions=[
+                {
+                    "id": "DW-1",
+                    "question": "renegotiate?",
+                    "context": "ctx",
+                    "options": [option, {"key": "2", "label": "keep", "effect": "keep-open"}],
+                    "recommendation": "1",
+                }
+            ],
+        )
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert errors == []
+    assert plan is not None
+
+
+def test_close_resolved_sanitizes_an_injected_evidence(project):
+    """First live writer path (`evidence` -> the `resolution:` note). The run
+    completes and the ledger keeps its shape — no raise into `_cycle`'s bare
+    call, which would end the sweep as crashed."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    engine, _adapter = make_sweep(project, [])
+    before = len(ledger_entries(project))
+    plan = TriagePlan(
+        open_ids=frozenset({"DW-1", "DW-2"}),
+        already_resolved=(ResolvedEntry("DW-1", "fixed\n### DW-99: fake\nstatus: open"),),
+    )
+
+    assert engine._close_resolved(plan) == 1
+
+    entries = ledger_entries(project)
+    assert len(entries) == before  # no phantom entry minted
+    assert set(entries) == {"DW-1", "DW-2"}
+    assert entries["DW-1"].status.startswith("done ")
+    assert entries["DW-2"].open
+    assert "already resolved: fixed ### DW-99: fake status: open" in entries["DW-1"].body
+
+
+@pytest.mark.parametrize(
+    ("resolution", "intent", "expected_detail"),
+    [
+        ("close it\n### DW-99: fake", "unused\nintent", "close it ### DW-99: fake"),
+        ("", "widen the field.\nThen backfill.", "widen the field. Then backfill."),
+    ],
+    ids=["resolution-wins", "intent-when-no-resolution"],
+)
+def test_apply_decision_effect_sanitizes_the_ledger_detail(
+    project, resolution, intent, expected_detail
+):
+    """Second live writer path, and the one that carries an option's `intent` to
+    the ledger. Pins `detail = option.resolution or option.intent`: the
+    resolution wins when present, the intent is the fallback, and either way
+    `append_decision` flattens it — which is why gating `intent` upstream would
+    prevent nothing while flattening the brief that drives a dev bundle."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, _adapter = make_sweep(project, [])
+    option = DecisionOption(
+        key="1", label="Keep\ncap", effect="keep-open", intent=intent, resolution=resolution
+    )
+    decision = Decision(id="DW-1", question="?", context="", options=(option,), recommendation="1")
+
+    engine._apply_decision_effect(decision, option)
+
+    text = project.deferred_work.read_text(encoding="utf-8")
+    decision_lines = [line for line in text.splitlines() if line.startswith("decision:")]
+    assert len(decision_lines) == 1
+    assert decision_lines[0].endswith(f"Keep cap — {expected_detail}")
+    assert ledger_entries(project)["DW-1"].open  # keep-open does not close
+
+
+def test_apply_decision_effect_close_sanitizes_the_close_note(project):
+    write_ledger(project, {"DW-1": "open"})
+    engine, _adapter = make_sweep(project, [])
+    option = DecisionOption(
+        key="1", label="Close", effect="close", resolution="superseded\n### DW-99: fake"
+    )
+    decision = Decision(id="DW-1", question="?", context="", options=(option,), recommendation="1")
+
+    engine._apply_decision_effect(decision, option)
+
+    entries = ledger_entries(project)
+    assert set(entries) == {"DW-1"}  # no phantom entry from the close note
+    assert entries["DW-1"].status.startswith("done ")
+    assert (
+        "resolution: closed by human decision: superseded ### DW-99: fake" in entries["DW-1"].body
+    )
 
 
 def test_validate_triage_unknown_id():

@@ -5,6 +5,9 @@ from pathlib import Path
 import pytest
 
 from bmad_loop.deferredwork import (
+    _ISO_DATE_RE,
+    LINE_BREAK_RE,
+    SEVERITY_ALIASES,
     append_decision,
     append_entry,
     classify,
@@ -139,6 +142,211 @@ def test_append_decision_then_mark_done(tmp_path):
 def test_append_decision_missing_file(tmp_path):
     assert not append_decision(tmp_path / "nope.md", "DW-1", "2026-06-11", "x", "y")
     assert not mark_done(tmp_path / "nope.md", "DW-1", "2026-06-11", "x")
+
+
+# ------------------------------------------------- line-break injection (#305)
+#
+# The ledger is line-oriented and every mutator interpolates its arguments, so a
+# value carrying a break injects ledger lines. Free text is SANITIZED, never
+# refused, and nothing upstream rejects it either: the close paths call these
+# writers bare (sweep._close_resolved, decisions.apply_pre_answer), so a raise
+# ends the sweep run as crashed. Only the orchestrator-owned enumerables (date,
+# status, severity) raise.
+
+# Derived from the oracle, never typed. A literal U+2028 in a source file is
+# trivially normalized to a plain space by an editor or a tool, and the two are
+# then indistinguishable by inspection — which silently turns a line-break case
+# into a whitespace case that passes for the wrong reason. The bound is safe:
+# the exhaustive test below proves the whole split set lives under it.
+BREAK_CHARS = tuple(chr(c) for c in range(0x2030) if len(("a" + chr(c) + "b").splitlines()) > 1)
+# Multi-character runs, which `BREAK_CHARS` cannot reach: every entry there is
+# one character, and the break-only cases collapse to "" before the quantifier
+# matters. Without these, deleting `+` from LINE_BREAK_RE leaves the suite
+# green while every CRLF value silently gains a second space — and CRLF is the
+# common real-world break, being what a Windows-authored result.json carries.
+BREAK_RUNS = ("\r\n", "\n\n")
+
+
+def test_line_break_set_is_exactly_what_str_splitlines_splits_on():
+    """`LINE_BREAK_RE` must cover every character `str.splitlines()` splits on,
+    because `parse_legacy` scans the ledger with it while `parse_ledger` matches
+    with `re.MULTILINE` — a member missed here splits an entry for one reader and
+    is invisible to the other.
+
+    Checked by enumeration rather than by listing the members: written as source
+    escapes these are easy to get wrong, and a `\\u2028` silently normalized to a
+    plain space would widen the class to collapse ordinary spaces — quietly
+    breaking the byte-identity guarantee instead of the injection guard."""
+    splits = {chr(c) for c in range(0x110000) if len(("a" + chr(c) + "b").splitlines()) > 1}
+    matches = {chr(c) for c in range(0x110000) if LINE_BREAK_RE.fullmatch(chr(c))}
+    assert matches == splits
+    assert " " not in matches and "\t" not in matches  # ordinary whitespace is not a break
+
+
+@pytest.mark.parametrize("brk", [*BREAK_CHARS, *BREAK_RUNS])
+def test_mark_done_many_sanitizes_an_injected_note(tmp_path, brk):
+    """Driven through `mark_done_many`, not the `mark_done` wrapper: that is the
+    entry point `Engine._apply_deferred_closes` uses, so a guard placed on the
+    wrapper would be inert for every story close."""
+    path = write_ledger(tmp_path)
+    before = len(parse_ledger(path.read_text(encoding="utf-8")))
+
+    note = f"fixed{brk}### DW-99: injected{brk}status: open"
+
+    assert mark_done_many(path, ["DW-1"], "2026-06-11", note) == ["DW-1"]
+
+    text = path.read_text(encoding="utf-8")
+    entries = {e.id: e for e in parse_ledger(text)}
+    assert len(entries) == before  # no phantom DW-99 minted
+    assert set(entries) == {"DW-1", "DW-2", "DW-3"}
+    assert entries["DW-1"].status == "done 2026-06-11"
+    # the injected text survives as prose on one line — sanitized, not dropped
+    assert "resolution: fixed ### DW-99: injected status: open" in entries["DW-1"].body
+
+
+@pytest.mark.parametrize("brk", [*BREAK_CHARS, *BREAK_RUNS])
+def test_mark_done_sanitizes_a_note_that_would_double_the_status_line(tmp_path, brk):
+    """The quiet half of the bug, and the half a status assertion cannot see:
+    `STATUS_RE` takes the FIRST match, so an injected `status:` line leaves both
+    `entry.status` and `entry.open` reporting exactly what they should. The damage
+    is structural — the entry ends up carrying two status lines, so the ledger no
+    longer says one thing about it, and which line wins depends on which reader
+    looks. Asserted by counting lines the way `str.splitlines()` does, which is
+    why the U+2028 case belongs here too."""
+    path = write_ledger(tmp_path)
+
+    assert mark_done(path, "DW-1", "2026-06-11", f"fixed{brk}status: open")
+
+    (entry,) = [e for e in parse_ledger(path.read_text(encoding="utf-8")) if e.id == "DW-1"]
+    assert entry.status == "done 2026-06-11"
+    assert [line for line in entry.body.splitlines() if line.startswith("status:")] == [
+        "status: done 2026-06-11"
+    ]
+
+
+@pytest.mark.parametrize("run", BREAK_RUNS)
+def test_a_multi_character_break_run_collapses_to_exactly_one_space(tmp_path, run):
+    """`LINE_BREAK_RE`'s `+` quantifier, which nothing else pins: a run of breaks
+    must become ONE space, not one per character. CRLF is the case that matters —
+    it is what a Windows-authored `result.json` carries, so it is the most likely
+    break to reach these writers at all."""
+    path = write_ledger(tmp_path)
+
+    assert mark_done(path, "DW-1", "2026-06-11", f"fixed{run}in src/foo.py")
+
+    (entry,) = [e for e in parse_ledger(path.read_text(encoding="utf-8")) if e.id == "DW-1"]
+    assert "resolution: fixed in src/foo.py" in entry.body
+
+
+def test_mark_done_sanitizes_a_note_that_would_truncate_the_entry(tmp_path):
+    """The sharpest shape: a break followed by the flat appender's opening line.
+    `FLAT_ENTRY_RE` bounds a canonical entry on exactly that line (#304), so an
+    unsanitized note cuts DW-1's span short there and the tail re-surfaces as a
+    phantom *legacy* item — visible to the sweep's migration trigger, `--dry-run`
+    leftovers and the TUI as work nobody filed."""
+    path = write_ledger(tmp_path)
+
+    assert mark_done(path, "DW-1", "2026-06-11", "fixed\n- source_spec: `x.md`")
+
+    text = path.read_text(encoding="utf-8")
+    (entry,) = [e for e in parse_ledger(text) if e.id == "DW-1"]
+    assert "resolution: fixed - source_spec: `x.md`" in entry.body
+    assert parse_legacy(text) == []
+
+
+@pytest.mark.parametrize(
+    "date",
+    [
+        "nope",
+        "2026-6-11",
+        "20260611",
+        "2026-02-30",
+        "2026-06-11\nx",
+        "\u0662\u0660\u0662\u0666-\u0660\u0666-\u0660\u0669",
+    ],
+    ids=["prose", "unpadded", "compact", "impossible-day", "with-break", "arabic-indic-digits"],
+)
+def test_mark_done_many_raises_on_a_bad_date_without_writing(tmp_path, date):
+    """`date` is orchestrator-owned (`Engine._today()`), so a bad value is a
+    programmer bug — the one place in these writers that raises. The digits are
+    pinned to ASCII by the pattern itself (`[0-9]`, not `\\d`), so the shape
+    check refuses an Arabic-Indic date rather than leaning on `fromisoformat`."""
+    path = write_ledger(tmp_path)
+    snapshot = path.read_text(encoding="utf-8")
+
+    with pytest.raises(ValueError, match="date must be YYYY-MM-DD"):
+        mark_done_many(path, ["DW-1"], date, "fixed")
+
+    assert path.read_text(encoding="utf-8") == snapshot
+
+
+def test_the_date_pattern_itself_refuses_non_ascii_digits():
+    """`\\d` matches Arabic-Indic, fullwidth and mathematical digit forms; `[0-9]`
+    does not. `date.fromisoformat` refuses them a moment later either way, so this
+    pins the *pattern* rather than the outcome — the docstring's claim is about
+    the regex, and only a direct assertion can hold it to that."""
+    assert _ISO_DATE_RE.fullmatch("2026-06-09")
+    for foreign in (
+        "\u0662\u0660\u0662\u0666-\u0660\u0666-\u0660\u0669",
+        "\uff12\uff10\uff12\uff16-\uff10\uff16-\uff10\uff19",
+    ):
+        assert not _ISO_DATE_RE.fullmatch(foreign)
+
+
+def test_bad_date_raises_even_with_no_ledger_on_disk(tmp_path):
+    """Validated at function entry, ahead of the `is_file()` short-circuit: a
+    guard that only fires when the ledger happens to exist is one an absent
+    fixture hides."""
+    missing = tmp_path / "nope.md"
+
+    with pytest.raises(ValueError, match="date must be YYYY-MM-DD"):
+        mark_done_many(missing, ["DW-1"], "nope", "fixed")
+    with pytest.raises(ValueError, match="date must be YYYY-MM-DD"):
+        append_decision(missing, "DW-1", "nope", "Keep", "detail")
+
+
+def test_append_decision_sanitizes_label_and_detail(tmp_path):
+    path = write_ledger(tmp_path)
+
+    assert append_decision(
+        path, "DW-3", "2026-06-11", "Keep\ncap", f"Keep{BREAK_CHARS[-1]}status: done 2026-01-01"
+    )
+
+    text = path.read_text(encoding="utf-8")
+    entries = {e.id: e for e in parse_ledger(text)}
+    assert "decision: 2026-06-11 Keep cap — Keep status: done 2026-01-01" in entries["DW-3"].body
+    assert len([line for line in text.splitlines() if line.startswith("decision:")]) == 1
+    assert entries["DW-3"].open  # the injected `status:` did not close it
+
+
+@pytest.mark.parametrize("detail", [*BREAK_CHARS, " \n ", "\r\n\t"])
+def test_append_decision_drops_the_separator_for_a_break_only_detail(tmp_path, detail):
+    """A detail that sanitizes to nothing must take the ` — ` with it. The
+    ordering is the guard: sanitizing after the emptiness test would leave the
+    entry carrying a dangling separator promising a detail that is not there."""
+    path = write_ledger(tmp_path)
+
+    assert append_decision(path, "DW-3", "2026-06-11", "Keep cap", detail)
+
+    (line,) = [
+        ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.startswith("decision:")
+    ]
+    assert line == "decision: 2026-06-11 Keep cap"
+    assert "—" not in line
+
+
+def test_writers_leave_a_clean_value_byte_identical(tmp_path):
+    """No reformatting of values that never carried a break — the sanitizer must
+    not become an incidental whitespace normalizer for existing ledgers."""
+    path = write_ledger(tmp_path)
+    padded = "  fixed  in  src/foo.py\t"
+
+    assert mark_done(path, "DW-1", "2026-06-11", padded)
+    assert append_decision(path, "DW-3", "2026-06-11", " Keep ", padded)
+
+    text = path.read_text(encoding="utf-8")
+    assert f"resolution: {padded}" in text
+    assert f"decision: 2026-06-11  Keep  — {padded}" in text
 
 
 # ------------------------------------------------------------------- legacy
@@ -667,6 +875,160 @@ def test_append_entry_idempotency_ignores_incidental_substring(tmp_path):
         p, title="t", origin="review-budget-followup", source_spec="spec-foo.md", reason="r"
     )
     assert new_id == "DW-2"  # not suppressed by the incidental mentions
+
+
+@pytest.mark.parametrize("field", ["title", "origin", "source_spec", "reason", "location"])
+@pytest.mark.parametrize("brk", [*BREAK_CHARS, *BREAK_RUNS])
+def test_append_entry_sanitizes_free_text_into_one_line(tmp_path, field, brk):
+    """One canonical entry, every field on its own line — no injected heading and
+    no second `status:` line, whichever field carried the break."""
+    p = tmp_path / "deferred-work.md"
+    values = {
+        "title": "follow-up",
+        "origin": "code-review",
+        "source_spec": "spec-foo.md",
+        "reason": "still open",
+        "location": "src/foo.py:12",
+    }
+    values[field] += f"{brk}### DW-99: injected{brk}status: done 2026-01-01"
+
+    assert append_entry(p, **values) == "DW-1"
+
+    text = p.read_text(encoding="utf-8")
+    (entry,) = parse_ledger(text)  # one entry: no phantom DW-99 heading
+    assert entry.id == "DW-1" and entry.open  # not closed by the injected status
+    lines = text.splitlines()
+    assert len(lines) == 6  # heading + origin/location/source_spec/reason/status
+    assert sum(line.startswith("### ") for line in lines) == 1
+    assert sum(line.startswith("status:") for line in lines) == 1
+
+
+@pytest.mark.parametrize("title", [*BREAK_CHARS, *BREAK_RUNS, " \n ", "\r\n\t", "  ", "\t", "\xa0"])
+def test_append_entry_names_an_entry_with_no_usable_title(tmp_path, title):
+    """Two routes to the same unusable heading. A break-only title collapses to
+    nothing, and `### DW-1: ` is a heading `HEADING_RE`'s `(.+?)` does not match:
+    the caller is handed an id no reader can find, with `next_seq` already past
+    it. A whitespace-only title never reaches the sanitizer at all — no break, so
+    the byte-identity fast path returns it unchanged and still truthy — and
+    parses to a heading that renders blank in `status`, `--json` and the TUI.
+    Both get a name; neither gets a space."""
+    p = tmp_path / "deferred-work.md"
+
+    assert append_entry(p, title=title, origin="o", source_spec="s.md", reason="r") == "DW-1"
+
+    text = p.read_text(encoding="utf-8")
+    (entry,) = parse_ledger(text)  # findable, and the id was not burned
+    assert entry.id == "DW-1"
+    assert entry.title == "(untitled DW-1)"  # identifiable, not blank
+    assert next_seq(text) == 2
+    assert len(text.splitlines()) == 6
+
+
+def test_append_entry_leaves_an_already_empty_title_as_it_was(tmp_path):
+    """The substitution is scoped to a title that *had* content and lost it to
+    sanitizing. An empty title in, empty title out — that hole predates this
+    guard, and widening the fix to cover it would change bytes for a value that
+    never carried a break."""
+    p = tmp_path / "deferred-work.md"
+
+    assert append_entry(p, title="", origin="o", source_spec="s.md", reason="r") == "DW-1"
+
+    assert p.read_text(encoding="utf-8").startswith("### DW-1: \n")
+
+
+def test_append_entry_idempotence_survives_sanitizing(tmp_path):
+    """Sanitizing must happen BEFORE the idempotence scan: that scan compares the
+    caller's value against the stored line via `field_line_present`, so
+    sanitizing afterwards would compare raw against sanitized and append a fresh
+    entry on every replay of the same defer."""
+    p = tmp_path / "deferred-work.md"
+    dirty = "spec-foo.md\nstatus: open"
+
+    first = append_entry(
+        p, title="t", origin="review-budget-followup", source_spec=dirty, reason="r"
+    )
+    again = append_entry(
+        p, title="t2", origin="review-budget-followup", source_spec=dirty, reason="r2"
+    )
+
+    assert first == "DW-1"
+    assert again is None
+    assert len(parse_ledger(p.read_text(encoding="utf-8"))) == 1
+
+
+@pytest.mark.parametrize("status", ["", "done", "closed", "open\n### DW-99: injected", "OPEN"])
+def test_append_entry_raises_on_a_noncanonical_status_without_writing(tmp_path, status):
+    p = tmp_path / "deferred-work.md"
+
+    with pytest.raises(ValueError, match="status must be"):
+        append_entry(p, title="t", origin="o", source_spec="s.md", reason="r", status=status)
+
+    assert not p.exists()
+
+
+def test_append_entry_raises_on_an_impossible_done_date_without_writing(tmp_path):
+    p = tmp_path / "deferred-work.md"
+
+    with pytest.raises(ValueError, match="date must be YYYY-MM-DD"):
+        append_entry(
+            p, title="t", origin="o", source_spec="s.md", reason="r", status="done 2026-02-30"
+        )
+
+    assert not p.exists()
+
+
+@pytest.mark.parametrize("severity", ["urgent", "blocker", "low\nseverity: high"])
+def test_append_entry_raises_on_a_noncanonical_severity_without_writing(tmp_path, severity):
+    """The whitelist is `SEVERITY_ALIASES`'s normalization targets. `blocker` is
+    an inbound alias the *parser* accepts from LLM-written ledgers, not a value
+    this writer may emit — so it raises like any other programmer bug."""
+    p = tmp_path / "deferred-work.md"
+
+    with pytest.raises(ValueError, match="severity must be one of"):
+        append_entry(p, title="t", origin="o", source_spec="s.md", reason="r", severity=severity)
+
+    assert not p.exists()
+
+
+def test_append_entry_accepts_every_canonical_severity(tmp_path):
+    """Pins the whitelist against its source: a `SEVERITY_ALIASES` value that the
+    writer refuses would mean the two have drifted."""
+    for i, severity in enumerate(sorted(set(SEVERITY_ALIASES.values())), start=1):
+        p = tmp_path / f"ledger-{i}.md"
+        assert (
+            append_entry(
+                p, title="t", origin="o", source_spec="s.md", reason="r", severity=severity
+            )
+            == "DW-1"
+        )
+        assert f"severity: {severity}" in p.read_text(encoding="utf-8")
+
+
+def test_append_entry_leaves_a_clean_value_byte_identical(tmp_path):
+    p = tmp_path / "deferred-work.md"
+
+    assert (
+        append_entry(
+            p,
+            title="follow-up  for  dw-x",
+            origin="review-budget-followup",
+            source_spec="spec-foo.md",
+            reason="review budget exhausted, work committed",
+            location="src/foo.py:12",
+            severity="low",
+        )
+        == "DW-1"
+    )
+
+    assert p.read_text(encoding="utf-8") == (
+        "### DW-1: follow-up  for  dw-x\n"
+        "origin: review-budget-followup\n"
+        "location: src/foo.py:12\n"
+        "source_spec: `spec-foo.md`\n"
+        "severity: low\n"
+        "reason: review budget exhausted, work committed\n"
+        "status: open\n"
+    )
 
 
 def test_field_line_present_matches_field_not_substring():
