@@ -1284,7 +1284,9 @@ def test_psmux_detach_outside_a_pane_is_false(monkeypatch):
     """No TMUX, so current_session answers None: there is no session to measure
     and no client of ours to move. Answer False without issuing a flag-less
     detach, which psmux promotes server-side to detach-all."""
-    calls = _client_fake(monkeypatch, attached=[])
+    # Scripted counts a probe COULD read, so removing the guard fails this on
+    # its assertions rather than on the fixture running dry.
+    calls = _client_fake(monkeypatch, attached=["1", "0"])
     monkeypatch.delenv("TMUX", raising=False)
     assert PsmuxMultiplexer().detach_client() is False
     assert not any(c[1] == "detach-client" for c in calls)
