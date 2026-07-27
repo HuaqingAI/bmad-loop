@@ -510,7 +510,7 @@ def _return_fake(
 
 def test_return_attached_client_switches_to_pane(monkeypatch):
     calls = _return_fake(monkeypatch, option="=main:%9")
-    assert launch.return_attached_client() is True
+    assert launch.return_attached_client() is launch.ReturnOutcome.RETURNED
     assert ["tmux", "switch-client", "-t", "=main:%9"] in calls
     assert ["tmux", "set-option", "-wu", "-t", "@5", "@bmad_return_pane"] in calls
     assert ["tmux", "switch-client", "-l"] not in calls  # no fallback when -t works
@@ -519,42 +519,47 @@ def test_return_attached_client_switches_to_pane(monkeypatch):
 
 def test_return_attached_client_switch_fallback(monkeypatch):
     calls = _return_fake(monkeypatch, option="=main:%9", switch_rc=1)
-    assert launch.return_attached_client() is True
+    assert launch.return_attached_client() is launch.ReturnOutcome.RETURNED
     assert ["tmux", "switch-client", "-l"] in calls
     # the fallback returned a client too, so the option is consumed — without
     # this the unset could regress to primary-success-only and stay green
     assert ["tmux", "set-option", "-wu", "-t", "@5", "@bmad_return_pane"] in calls
 
 
-def test_return_attached_client_switch_fails_keeps_return_option(monkeypatch):
-    """Stale target plus no last client: nothing was returned, so say so — and
-    leave RETURN_OPTION set, or the post-exit trailer loses its retry."""
+def test_return_attached_client_switch_fails_stays_attended(monkeypatch):
+    """Stale target plus no last client: the client never left this window, so
+    the human is still in front of it — ATTENDED, and RETURN_OPTION stays set
+    or the post-exit trailer loses its retry."""
     calls = _return_fake(monkeypatch, option="=main:%9", switch_rc=1, fallback_rc=1)
-    assert launch.return_attached_client() is False
+    assert launch.return_attached_client() is launch.ReturnOutcome.ATTENDED
     assert ["tmux", "switch-client", "-l"] in calls  # fallback was attempted
     assert not any(c[1] == "set-option" for c in calls)  # option survives
 
 
-def test_return_attached_client_detach_fails_keeps_return_option(monkeypatch):
-    """Nothing was attached to detach — same non-return as a failed switch, so
-    the option must survive here too."""
+def test_return_attached_client_detach_fails_is_unreachable(monkeypatch):
+    """`detach-client` fails only when there is no current client, so a failed
+    detach is positive evidence that nobody is watching — the opposite of a
+    failed switch, and NOT the same answer. RETURN_OPTION still survives."""
     calls = _return_fake(monkeypatch, option="detach", detach_rc=1)
-    assert launch.return_attached_client() is False
+    assert launch.return_attached_client() is launch.ReturnOutcome.UNREACHABLE
     assert ["tmux", "detach-client"] in calls
     assert not any(c[1] == "set-option" for c in calls)
 
 
 def test_return_attached_client_detaches(monkeypatch):
     calls = _return_fake(monkeypatch, option="detach")
-    assert launch.return_attached_client() is True
+    assert launch.return_attached_client() is launch.ReturnOutcome.RETURNED
     assert ["tmux", "detach-client"] in calls
     assert ["tmux", "set-option", "-wu", "-t", "@5", "@bmad_return_pane"] in calls
     assert not any(c[1] == "switch-client" for c in calls)
 
 
 def test_return_attached_client_noop_when_unset(monkeypatch):
+    """No return target recorded — a plain foreground sweep. Nothing was
+    attempted, so nothing can be concluded about who is at the terminal: the
+    conservative ATTENDED, never UNREACHABLE."""
     calls = _return_fake(monkeypatch, option="")
-    assert launch.return_attached_client() is False
+    assert launch.return_attached_client() is launch.ReturnOutcome.ATTENDED
     assert not any(c[1] in ("switch-client", "detach-client", "set-option") for c in calls)
 
 
@@ -568,7 +573,7 @@ def test_return_attached_client_noop_without_tmux(monkeypatch):
     ran: list = []
     monkeypatch.setattr(tmux_base.shutil, "which", lambda name: None)
     monkeypatch.setattr(tmux_base.subprocess, "run", lambda *a, **k: ran.append(a))
-    assert launch.return_attached_client() is False
+    assert launch.return_attached_client() is launch.ReturnOutcome.ATTENDED
     assert ran == []  # never shells out when tmux is missing
 
 

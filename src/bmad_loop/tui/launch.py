@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+from enum import StrEnum
 from pathlib import Path
 
 from .. import runs
@@ -123,13 +124,35 @@ def in_ctl_session() -> bool:
 
 def detach_client() -> bool:
     """Detach the tmux client viewing the current session, handing the terminal
-    back to the user. Processes in the session keep running. Returns True iff
-    the backend reported a successful detach (see
-    TerminalMultiplexer.detach_client for what each backend can promise)."""
+    back to the user. Processes in the session keep running. Returns True iff a
+    client was actually detached — False both when the transport failed and when
+    there was nothing attached (see TerminalMultiplexer.detach_client for how
+    each backend establishes that)."""
     return get_multiplexer().detach_client()
 
 
-def return_attached_client() -> bool:
+class ReturnOutcome(StrEnum):
+    """What return_attached_client managed to do — and, for a caller that goes
+    unattended on the strength of it, whether a human can still answer here.
+
+    A plain boolean cannot carry that: "the hand-back succeeded" and "there is
+    still someone at this terminal" are independent, and the two failures point
+    opposite ways. A failed *switch* leaves the client sitting in this very
+    window; a failed *detach* means there was no client to detach at all."""
+
+    RETURNED = "returned"
+    #: No hand-back, but a human may still be here: nothing was recorded to
+    #: return to (a plain foreground sweep), the backend is unusable, or the
+    #: switch failed with the client still in this window. The conservative
+    #: answer — a caller must keep talking to the terminal.
+    ATTENDED = "attended"
+    #: A hand-back was attempted and there was no client to hand back: the
+    #: detach found nothing attached, or the backend has no detach verb at all
+    #: (herdr). Nobody can answer a prompt in this window.
+    UNREACHABLE = "unreachable"
+
+
+def return_attached_client() -> ReturnOutcome:
     """Hand an attached client back to its origin *now*, mid-process — the
     parked-window return move (see start_detached) executed while the window's
     command keeps running in the background, instead of after it exits.
@@ -139,33 +162,36 @@ def return_attached_client() -> bool:
         psmux): switch that client back there (`-l` fallback if it's gone);
       - RETURN_DETACH: detach the client so a blocking `tmux attach` returns;
       - unset/empty: nobody attached with a return target — do nothing.
-    Returns True iff a client was actually returned. The option is cleared only
-    then: a real return must not make the parked window's trailer fire a second
-    one, a failed return is left for the trailer to retry. That retry is a
-    second chance, not a rescue — new_parked_window parks on a blocking read
-    *before* the trailer, so it runs only once a human dismisses the park
-    prompt, never in the unattended case. On tmux both branches are equally
-    honest: a detach that found no client to detach fails the command, the
-    same non-return as a failed switch. psmux can report neither failure
-    (its detach/switch verbs report execution, not effect — see its module
-    docstring), but its inert option channel answers empty above before
-    either verb is reached."""
+    The option is cleared only on RETURNED: a real return must not make the
+    parked window's trailer fire a second one, a failed return is left for the
+    trailer to retry. That retry is a second chance, not a rescue —
+    new_parked_window parks on a blocking read *before* the trailer, so it runs
+    only once a human dismisses the park prompt, never in the unattended case.
+
+    The two failures are not interchangeable, which is why this answers a
+    ReturnOutcome and not a bool. On tmux `detach-client` fails with "no
+    current client", so a failed detach is positive evidence that nobody is
+    watching (UNREACHABLE) — reporting it as the same non-return as a failed
+    switch would leave a --repeat sweep prompting into a window no one can
+    answer. A backend whose detach is a no-op (herdr) lands in the same place
+    for the same reason, which is what the seam's False-not-None rule buys it."""
     mux = get_multiplexer()
     if not mux_usable(mux):
-        return False
+        return ReturnOutcome.ATTENDED
     win = mux.current_window_id()
     if win is None:
-        return False
+        return ReturnOutcome.ATTENDED
     ret = mux.show_window_option(win, RETURN_OPTION)
     if not ret:
-        return False
+        return ReturnOutcome.ATTENDED
     if ret == RETURN_DETACH:
-        returned = mux.detach_client()
+        outcome = ReturnOutcome.RETURNED if mux.detach_client() else ReturnOutcome.UNREACHABLE
     else:
-        returned = mux.switch_client(ret, last_fallback=True)
-    if returned:
+        switched = mux.switch_client(ret, last_fallback=True)
+        outcome = ReturnOutcome.RETURNED if switched else ReturnOutcome.ATTENDED
+    if outcome is ReturnOutcome.RETURNED:
         mux.unset_window_option(win, RETURN_OPTION)
-    return returned
+    return outcome
 
 
 def decision_pending(run_dir: Path) -> bool:

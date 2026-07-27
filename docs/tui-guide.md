@@ -481,7 +481,9 @@ toast. Then:
 3. Detach with `ctrl-b d`. (On tmux this step is belt-and-suspenders — answering
    already hands your terminal back. On backends without a detach verb — e.g.
    the herdr adapter — the hand-back cannot be automatic: press its detach
-   chord, `ctrl+b q` on herdr.)
+   chord, `ctrl+b q` on herdr. Either way the sweep knows it can no longer reach
+   you and goes unattended for the rest of the run, so detaching first never
+   leaves it waiting on a prompt you can't see.)
 
 The banner clears on the next poll after the sweep journals anything further
 (the answer is recorded as a `decision:` line in `deferred-work.md`). Sweeps

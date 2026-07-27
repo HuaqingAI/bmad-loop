@@ -1006,16 +1006,31 @@ class SweepEngine(Engine):
         detach a plain-shell client, switch a tmux client back to its origin. A
         plain foreground sweep (nobody attached, no return target) is untouched.
 
-        After a successful return we go unattended for the rest of the run: a
-        later --repeat cycle's input() would otherwise block forever in a window
-        no one is viewing. New decisions then defer via the unattended path,
-        recorded for `bmad-loop decisions` or the next attended sweep."""
+        We then go unattended for the rest of the run: a later --repeat cycle's
+        input() would otherwise block forever in a window no one is viewing. New
+        decisions defer via the unattended path instead, recorded for
+        `bmad-loop decisions` or the next attended sweep.
+
+        The trigger for that is "nobody can answer here any more", NOT "the
+        hand-back succeeded" — the two come apart on a failed return, in
+        opposite directions. A failed switch leaves the client in this window
+        with a human in front of it (ATTENDED: keep prompting, which is the
+        whole point of #227). A failed detach means there was no client to
+        detach — nobody is watching, so going unattended is the only outcome
+        that does not strand a --repeat cycle on input(); the same holds for a
+        backend with no detach verb at all. Only a real return is announced:
+        UNREACHABLE prints nothing because there is no one to read it."""
         from .tui import launch  # import-light: launch.py has no textual imports
 
-        if launch.return_attached_client():
+        outcome = launch.return_attached_client()
+        if outcome is launch.ReturnOutcome.ATTENDED:
+            return
+        self.prompting = False
+        if outcome is launch.ReturnOutcome.RETURNED:
             self.journal.append("sweep-returned-after-decisions")
             self.prompter.print_fn("✓ decisions recorded — sweep continues in the background")
-            self.prompting = False
+        else:
+            self.journal.append("sweep-return-no-client")
 
     def _apply_decision_effect(self, decision: Decision, option: DecisionOption) -> None:
         ledger = self.workspace.paths.deferred_work
