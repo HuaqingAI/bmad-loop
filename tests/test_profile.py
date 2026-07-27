@@ -75,11 +75,17 @@ def test_builtin_profiles_load():
     for name in sorted(set(profiles) - {"claude"}):
         assert "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN" not in profiles[name].env
         assert "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS" not in profiles[name].env
-    # transport-failure classification (#194): only claude seeds env_fault_patterns
-    # (the "API Error … connection cause" signature); every other built-in ships
-    # none, so classification stays inert until a project overlay adds patterns
-    assert profiles["claude"].env_fault_patterns  # non-empty
-    for name in ("codex", "gemini", "copilot", "antigravity", "opencode-http"):
+    # transport/provider fault classification (#194): only the two profiles with
+    # captured real-world error output seed patterns — claude (the "API Error …
+    # connection cause" signature) and opencode-http (the serve process's
+    # `error.error="AI_APICallError: …"` field). The other four stay inert on
+    # purpose: patterns for them could only be written from strings scraped off
+    # public issue trackers, and an unverified pattern that fires on a healthy
+    # session pauses the whole run. Precision is asserted in
+    # tests/test_env_fault_patterns.py; here we only pin which profiles are seeded.
+    for name in ("claude", "opencode-http"):
+        assert profiles[name].env_fault_patterns, f"{name} ships no env_fault_patterns"
+    for name in ("codex", "gemini", "copilot", "antigravity"):
         assert profiles[name].env_fault_patterns == ()
     # opencode-http is hookless (HTTP/SSE transport): no hook dialect surfaces,
     # skills read from the claude tree, usage comes over HTTP (no transcript parser)

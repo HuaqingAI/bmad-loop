@@ -21,18 +21,14 @@ fallback.
 
 from __future__ import annotations
 
-import dataclasses
 import enum
 import hashlib
 import json
-import re
 import shlex
 import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
-
-import regex
 
 from .. import devcontract, gates, runs
 from ..bmadconfig import ProjectPaths
@@ -44,6 +40,19 @@ from ..signals import SignalWatcher
 from ..tokens import read_usage as tally_usage
 from ..verify import read_frontmatter
 from .base import CodingCLIAdapter, SessionHandle, SessionResult, SessionSpec, SpecSnapshot
+
+# Re-exported for importers that predate the env_fault module split (#194 landed
+# these names on this module); the definitions now live in .env_fault. The
+# redundant `X as X` form is the explicit-re-export spelling — it tells the linter
+# these are deliberate pass-throughs, without an `__all__` that would read as a
+# statement of this module's public API and understate it (callers also import
+# GenericTmuxAdapter, the *_NUDGE_TEXT constants and HEARTBEAT_INTERVAL_S).
+from .env_fault import _ANSI_RE as _ANSI_RE
+from .env_fault import ENV_FAULT_EVIDENCE_MAX as ENV_FAULT_EVIDENCE_MAX
+from .env_fault import ENV_FAULT_MATCH_TIMEOUT_S as ENV_FAULT_MATCH_TIMEOUT_S
+from .env_fault import ENV_FAULT_STATUSES as ENV_FAULT_STATUSES
+from .env_fault import ENV_FAULT_TAIL_BYTES as ENV_FAULT_TAIL_BYTES
+from .env_fault import EnvFaultMixin
 from .multiplexer import MultiplexerError, TerminalMultiplexer, get_multiplexer
 from .profile import CLIProfile
 
@@ -100,31 +109,6 @@ class _SnapVerdict(enum.Enum):
     REFUSE = "refuse"
 
 
-# Post-mortem transport-failure classification (#194): how much of the tee'd
-# pane log's tail to scan, how long an evidence excerpt to keep, and which
-# non-completed statuses are eligible. over_budget is excluded — a budget
-# crossing proves real API traffic — and completed never reaches the scan.
-ENV_FAULT_TAIL_BYTES = 64 * 1024
-ENV_FAULT_EVIDENCE_MAX = 240
-ENV_FAULT_STATUSES = frozenset({"timeout", "stalled", "crashed"})
-# Wall-clock bound on each operator-supplied pattern match (run via the `regex`
-# module, not stdlib `re`, whose `search` has no timeout): a pathological profile
-# regex can't hang run() teardown. Huge headroom — a sane pattern over the ≤64 KiB
-# tail matches in microseconds; a runaway is capped at ~this and declines to classify.
-ENV_FAULT_MATCH_TIMEOUT_S = 2.0
-# Self-contained ANSI/terminal-control stripper for the log tail: CSI, OSC (BEL-
-# or ST-terminated), other two-char ESC sequences, and raw C1 bytes. Deliberately
-# NOT the TUI/pyte machinery — the classifier reads raw pane bytes best-effort and
-# must not pull a terminal emulator into the adapter.
-_ANSI_RE = re.compile(
-    r"""
-    \x1b\[ [0-?]* [ -/]* [@-~]        # CSI ... final byte
-    | \x1b\] .*? (?: \x07 | \x1b\\ )   # OSC ... BEL or ST
-    | \x1b [@-Z\\-_]                   # 2-char ESC sequences (incl. C1 via ESC)
-    | [\x80-\x9f]                      # raw C1 control bytes
-    """,
-    re.VERBOSE,
-)
 # min spacing between heartbeat.json overwrites in wait_for_completion; the
 # heartbeat's staleness is what makes a frozen orchestrator (#157) diagnosable.
 HEARTBEAT_INTERVAL_S = 30.0
@@ -367,7 +351,7 @@ class _ResultFileMixin:
             time.sleep(RESULT_POLL_S)
 
 
-class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
+class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
     injection = "tmux-initial-prompt"
     observation = "hook-signal"
     state = "local-jsonl"
@@ -386,10 +370,7 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
         self.run_dir = run_dir
         self.policy = policy
         self.profile = profile
-        # Precompiled once per adapter (the profile validated each at parse time with
-        # the same regex engine, so regex.compile cannot raise here); matched under a
-        # per-pattern timeout in _env_fault_evidence. Empty tuple = classification inert.
-        self._env_fault_patterns = tuple(regex.compile(p) for p in profile.env_fault_patterns)
+        # env-fault patterns compile lazily off self.profile — see EnvFaultMixin.
         self.mux = mux or get_multiplexer()
         # None = use the profile's default bypass flags; a tuple replaces them
         self.extra_args = extra_args
@@ -922,66 +903,6 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
         except OSError:
             return None
         return (st.st_mtime_ns, st.st_size)
-
-    def _classify_env_fault(
-        self, handle: SessionHandle, spec: SessionSpec, result: SessionResult
-    ) -> SessionResult:
-        """Post-mortem transport-failure classification (#194).
-
-        Runs last in ``run()`` (after ``_post_kill_reconcile``): only a
-        non-completed verdict (``result.status`` in ``ENV_FAULT_STATUSES``,
-        ``result_json is None``) with configured patterns is inspected, so a
-        reconcile upgrade to ``completed`` is never re-classified and adapters
-        without patterns stay inert. On a matching log-tail line, stamp
-        ``env_fault`` / ``env_fault_evidence`` and drop an ``env-fault-classified``
-        lifecycle breadcrumb. No match, no patterns, or an unreadable log leaves
-        the verdict untouched — best-effort, like ``_write_heartbeat``."""
-        if (
-            not self._env_fault_patterns
-            or result.status not in ENV_FAULT_STATUSES
-            or result.result_json is not None
-        ):
-            return result
-        evidence = self._env_fault_evidence(handle.task_id)
-        if evidence is None:
-            return result
-        self._note_lifecycle(
-            handle.task_id, "env-fault-classified", status=result.status, evidence=evidence
-        )
-        return dataclasses.replace(result, env_fault=True, env_fault_evidence=evidence)
-
-    def _env_fault_evidence(self, task_id: str) -> str | None:
-        """Scan the tail of the tee'd pane log for a transport-failure pattern.
-
-        Reads the last ``ENV_FAULT_TAIL_BYTES`` (binary, decoded with
-        ``errors="replace"``, ``\\r``→``\\n``), strips ANSI, and matches each line
-        against the precompiled patterns under a per-match ``ENV_FAULT_MATCH_TIMEOUT_S``
-        bound. Returns the ANSI-stripped matching line (last match winning, truncated
-        to ``ENV_FAULT_EVIDENCE_MAX``), or None when nothing matches, the log can't be
-        read (any ``OSError``), or a pattern exceeds the match timeout
-        (``TimeoutError``) — no classification, the best-effort doctrine."""
-        try:
-            with (self.logs_dir / f"{task_id}.log").open("rb") as fh:
-                fh.seek(0, 2)  # SEEK_END
-                size = fh.tell()
-                fh.seek(max(0, size - ENV_FAULT_TAIL_BYTES))
-                raw = fh.read()
-        except OSError:
-            return None
-        text = _ANSI_RE.sub("", raw.decode("utf-8", errors="replace").replace("\r", "\n"))
-        match_line: str | None = None
-        try:
-            for line in text.split("\n"):
-                if any(
-                    pat.search(line, timeout=ENV_FAULT_MATCH_TIMEOUT_S)
-                    for pat in self._env_fault_patterns
-                ):
-                    match_line = line  # last match wins
-        except TimeoutError:
-            return None  # runaway pattern → decline to classify (best-effort, like OSError)
-        if match_line is None:
-            return None
-        return match_line.strip()[:ENV_FAULT_EVIDENCE_MAX]
 
     def _window_alive(self, handle: SessionHandle) -> bool:
         return handle.native_id in self.mux.list_window_ids(self.session_name)
