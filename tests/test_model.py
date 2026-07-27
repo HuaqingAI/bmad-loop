@@ -172,14 +172,25 @@ def test_restore_patch_defaults_none_for_legacy_state():
 
 
 def test_preserve_ref_round_trips():
-    task = StoryTask(story_key="1-1-a", epic=1, preserve_ref="attempt-preserve/run-1-abcd1234")
-    assert StoryTask.from_dict(task.to_dict()).preserve_ref == "attempt-preserve/run-1-abcd1234"
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        preserve_ref="attempt-preserve/run-1-abcd1234",
+        preserve_partial=True,
+    )
+    restored = StoryTask.from_dict(task.to_dict())
+    assert restored.preserve_ref == "attempt-preserve/run-1-abcd1234"
+    # the partial marker must survive resume too, or a resumed run's defer notice
+    # silently re-acquires the whole-attempt promise for a commits-only ref
+    assert restored.preserve_partial is True
 
 
 def test_preserve_ref_defaults_none_for_legacy_state():
     doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
     del doc["preserve_ref"]  # state.json from before the field existed
-    assert StoryTask.from_dict(doc).preserve_ref is None
+    del doc["preserve_partial"]
+    restored = StoryTask.from_dict(doc)
+    assert restored.preserve_ref is None and restored.preserve_partial is False
 
 
 def test_stopped_round_trips():

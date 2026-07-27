@@ -178,14 +178,28 @@ class StoryTask:
     # — an `attempt-preserve/*` branch (commits above baseline) or, when the tree
     # was also dirty, the `refs/attempt-preserve-dirty/*` snapshot, which is
     # parented at the attempt's HEAD and therefore subsumes the branch (last
-    # writer wins, so one `git merge --ff-only <ref>` recovers the whole attempt).
-    # Set by RecoveryFlow, cleared at the top of every auto-rollback so it can
-    # never name a *previous* attempt's ref; read by `_defer` (notification) and
-    # projected into `status`. None = nothing was parked (clean tree, preserve
-    # failure, or an isolated unit, whose branch stays mounted instead). Not
-    # cleared on success — a mid-retry rollback's breadcrumb stays readable.
-    # Survives the resume serialization round-trip.
+    # writer wins, so one `git merge --ff-only <ref>` recovers the whole attempt
+    # — unless `preserve_partial` is set). Set by RecoveryFlow, cleared at the top
+    # of every auto-rollback so it can never name a *previous* attempt's ref; read
+    # by `_defer` (notification) and projected into `status`. None = the last
+    # auto-rollback parked nothing (no commits above baseline and a clean or
+    # uncapturable tree, or the ref failed to take). Isolation-INDEPENDENT: a unit
+    # worktree's own dev-retry rollback parks on the same shared refs, so a
+    # deferred isolated unit can carry BOTH a kept-failed branch (the final
+    # attempt) and a preserve_ref (an earlier, rolled-back one) — `_defer` names
+    # both. The unit branch itself is never written here: a live branch is not a
+    # parked snapshot. Not cleared on success — a mid-retry rollback's breadcrumb
+    # stays readable. Survives the resume serialization round-trip.
     preserve_ref: str | None = None
+    # set when the auto-rollback's *worktree* snapshot was attempted and raised
+    # (journalled `attempt-worktree-preserve-failed`), so `preserve_ref` names an
+    # `attempt-preserve/*` commits branch ALONE and the reset that followed
+    # discarded the uncommitted half. False both when the snapshot succeeded (the
+    # dirty ref subsumes the branch) and when the tree was clean (nothing to
+    # capture, so the commits branch IS the whole attempt) — the ref name alone
+    # cannot tell those apart, which is why this is recorded rather than derived.
+    # Cleared with `preserve_ref`. Survives the resume serialization round-trip.
+    preserve_partial: bool = False
     # set by runs.rearm_escalation: this task was re-armed out of ESCALATED for a
     # clean rebuild against the corrected spec (not a failed attempt). Lets the
     # resume-time manual-recovery notice describe the real cause; cleared once the
@@ -279,6 +293,7 @@ class StoryTask:
             "commit_sha": self.commit_sha,
             "defer_reason": self.defer_reason,
             "preserve_ref": self.preserve_ref,
+            "preserve_partial": self.preserve_partial,
             "rearmed": self.rearmed,
             "resolved_redrive": self.resolved_redrive,
             "plan_checkpoint_pending": self.plan_checkpoint_pending,
@@ -327,6 +342,7 @@ class StoryTask:
             commit_sha=d.get("commit_sha"),
             defer_reason=d.get("defer_reason"),
             preserve_ref=d.get("preserve_ref"),
+            preserve_partial=bool(d.get("preserve_partial", False)),
             rearmed=bool(d.get("rearmed", False)),
             resolved_redrive=bool(d.get("resolved_redrive", False)),
             plan_checkpoint_pending=bool(d.get("plan_checkpoint_pending", False)),

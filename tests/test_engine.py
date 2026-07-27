@@ -3284,6 +3284,30 @@ def test_defer_recovery_note_is_uniform_across_ref_families(project):
         assert f'git -C "{project.project}" merge --ff-only {ref}' in note
 
 
+def test_defer_recovery_note_flags_a_commits_only_park(project):
+    """When the dirty snapshot failed, `preserve_ref` names the commits branch
+    alone and the reset discarded the rest — the notice must say so. It still
+    prints the merge command: the committed half IS recoverable, and scaring the
+    operator off a valid recovery would be its own defect.
+
+    Ablation targets: delete the `if task.preserve_partial:` branch and the first
+    half fails; make it unconditional and the second half fails."""
+    engine, _ = make_engine(project, [])
+    ref = "attempt-preserve/test-run-0badc0de"
+    task = StoryTask(story_key="1-1-a", epic=1, preserve_ref=ref, preserve_partial=True)
+
+    note = engine._defer_recovery_note(task)
+    assert f"attempt COMMITS parked at `{ref}`" in note
+    assert "did not survive the rollback" in note
+    assert "attempt-worktree-preserve-failed" in note  # names the breadcrumb
+    assert f'git -C "{project.project}" merge --ff-only {ref}' in note
+
+    task.preserve_partial = False  # a complete park keeps the unqualified wording
+    note = engine._defer_recovery_note(task)
+    assert f" — attempt work parked at `{ref}`" in note
+    assert "did not survive" not in note and "COMMITS" not in note
+
+
 def test_budget_exhausted_defer_reason_names_last_status(project):
     """The exhaustion defer reason reflects the last completed pass's real status
     (issue #160). Every review pass leaves the spec non-terminal (in-progress), so

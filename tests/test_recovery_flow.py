@@ -377,6 +377,47 @@ def test_dirty_preserve_ref_wins_and_subsumes_the_commits_branch(project):
     assert task.preserve_ref == dirty != branch
     # subsumption: the branch tip is an ancestor of the dirty snapshot
     git(repo, "merge-base", "--is-ancestor", branch, dirty)
+    # Ablation target for the partial marker: hoist `preserve_partial = True` out of
+    # preserve_attempt_worktree's `except` and this fails. A park that captured
+    # everything must never be libelled as commits-only.
+    assert task.preserve_partial is False
+
+
+def test_snapshot_failure_leaves_a_commits_only_ref_flagged_partial(project, monkeypatch):
+    """The snapshot raises *after* the commits branch was already parked, and the
+    reset runs anyway (best-effort contract). `preserve_ref` then names the commits
+    branch alone, so the whole-attempt promise no longer holds — `preserve_partial`
+    records that, and the defer notice downgrades its claim instead of telling the
+    operator a `merge --ff-only` restores work the reset just destroyed.
+
+    Ablation target: delete `task.preserve_partial = True` from
+    preserve_attempt_worktree's `except verify.GitError` block and this fails."""
+    repo = project.project
+    ws = Workspace.default(project)
+    flow = _make_flow(workspace=ws, policy=_policy(rollback_on_failure=True))
+    task = _task(repo)
+    (repo / "src.txt").write_text("committed\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "attempt commit")
+    (repo / "src.txt").write_text("committed then edited\n")  # the half that will be lost
+
+    def _fail(*_a, **_k):
+        raise verify.GitError("simulated commit-tree failure")
+
+    monkeypatch.setattr(verify, "snapshot_worktree", _fail)
+
+    flow.rollback_or_pause(task)
+
+    assert "attempt-worktree-preserve-failed" in flow.journal.events()
+    assert task.preserve_ref == flow.journal.fields("attempt-commits-preserved")["ref"]
+    assert task.preserve_ref.startswith("attempt-preserve/")
+    assert task.preserve_partial is True
+    # why it matters: the reset ran regardless, so the tree is back at baseline and
+    # the ref the notice names carries the committed half ONLY — the uncommitted
+    # edit survives nowhere, which is exactly what the un-downgraded notice's
+    # `merge --ff-only` would have implied it could restore
+    assert "committed" not in (repo / "src.txt").read_text()
+    assert git(repo, "show", f"{task.preserve_ref}:src.txt") == "committed"
 
 
 def test_rollback_clears_a_previous_attempts_preserve_ref(project, monkeypatch):

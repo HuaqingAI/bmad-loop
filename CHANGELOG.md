@@ -13,8 +13,9 @@ breaking changes may land in a minor release.
   the attempt on an `attempt-preserve/*` branch (or a `refs/attempt-preserve-dirty/*` snapshot),
   but the ref only ever reached `journal.jsonl` — the notification carried a bare reason, leaving
   the operator to find their work with `git log --all`. The notice now names the ref and the
-  `git merge --ff-only` command that restores it; an isolated unit's notice names its kept-failed
-  branch instead. New `preserve_ref` on each task, projected into `bmad-loop status` and
+  `git merge --ff-only` command that restores it — downgraded to commits-only when the dirty
+  snapshot could not be captured; an isolated unit's notice names its kept-failed branch and any
+  earlier rolled-back attempt's ref. New `preserve_ref` on each task, projected into `bmad-loop status` and
   `--json` (additive; schema stays 1). Reported verbatim from run state — `status` never runs
   git, so a ref since pruned by `scm.preserve_keep` is still named.
 
