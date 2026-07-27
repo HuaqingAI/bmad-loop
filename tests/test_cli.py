@@ -1093,6 +1093,37 @@ def test_status_json_defer_and_commit_are_separate_fields(project, capsys):
     assert entry_done["defer_reason"] is None
 
 
+def test_status_json_carries_the_preserve_ref(project, capsys):
+    """#333: the recovery ref a rolled-back attempt was parked on is reported
+    verbatim from state.json — status never runs git, so a ref a later run's
+    `preserve_keep` pruning deleted is still named rather than silently dropped."""
+    from bmad_loop.model import Phase, StoryTask
+
+    deferred = StoryTask(story_key="1-1-login", epic=1, phase=Phase.DEFERRED)
+    deferred.defer_reason = "review did not converge within budget"
+    deferred.preserve_ref = "refs/attempt-preserve-dirty/run-1-abcd1234-2"
+    done = StoryTask(story_key="1-2-logout", epic=1, phase=Phase.DONE)
+    _make_run_with_tokens(project, {"1-1-login": deferred, "1-2-logout": done}, weight=0.1)
+
+    doc = _status_json(project, capsys)
+    entry_deferred, entry_done = doc["tasks"]
+    assert entry_deferred["preserve_ref"] == "refs/attempt-preserve-dirty/run-1-abcd1234-2"
+    assert entry_done["preserve_ref"] is None
+
+
+def test_status_text_names_the_preserve_ref_beside_the_reason(project, capsys):
+    from bmad_loop.model import Phase, StoryTask
+
+    deferred = StoryTask(story_key="1-1-login", epic=1, phase=Phase.DEFERRED)
+    deferred.defer_reason = "review did not converge within budget"
+    deferred.preserve_ref = "attempt-preserve/run-1-abcd1234"
+    _make_run_with_tokens(project, {"1-1-login": deferred}, weight=0.1)
+
+    assert cli.main(["status", "--project", str(project.project)]) == 0
+    out = capsys.readouterr().out
+    assert "review did not converge within budget [attempt-preserve/run-1-abcd1234]" in out
+
+
 def test_status_json_stories_mode_is_pure_json(project, capsys):
     """--json must skip every text trailer (stories board, backlog, decisions
     nudge) — the stories-mode board would otherwise corrupt the document."""

@@ -1579,6 +1579,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         # to `if weighted` now that weighted is the displayed value.
         tokens = f"{task.tokens.weighted_total(weight):,}t ({raw:,} raw)" if raw else "-"
         extra = task.defer_reason or task.commit_sha or ""
+        if task.preserve_ref:
+            extra = f"{extra} [{task.preserve_ref}]".lstrip()
         print(
             f"  {key:40s} {task.phase:16s} dev×{task.attempt} review×{task.review_cycle} "
             f"{tokens} {extra}"

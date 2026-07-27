@@ -2991,6 +2991,31 @@ class Engine:
                 note,
             )
 
+    def _defer_recovery_note(self, task: StoryTask) -> str:
+        """Message tail naming where the deferred attempt's work survives (#333).
+
+        A bare reason leaves the operator to find the rolled-back work themselves
+        (the reporter used `git log --all`). In-place, the auto-rollback parked the
+        attempt on `task.preserve_ref`, which fast-forwards straight back. Isolated,
+        nothing is rolled back: a kept-failed unit's branch stays mounted.
+
+        Empty when there is nothing to point at — a clean-tree defer, a preservation
+        failure, rollback off, or `keep_failed` off — so the notice can never
+        advertise a ref that was not created. The pointer is a name, not a promise:
+        `scm.preserve_keep` prunes the oldest refs at a later run's start, and
+        nothing here re-validates it (this must stay git-free — `status` reads
+        `state.json` only)."""
+        if self._isolated:
+            if self.policy.scm.keep_failed and task.branch:
+                return f" — failed work kept on branch `{task.branch}`"
+            return ""
+        if not task.preserve_ref:
+            return ""
+        return (
+            f" — attempt work parked at `{task.preserve_ref}`; recover with "
+            f'`git -C "{self.workspace.root}" merge --ff-only {task.preserve_ref}`'
+        )
+
     def _defer(self, task: StoryTask, reason: str) -> None:
         task.defer_reason = reason
         advance(task, Phase.DEFERRED)
@@ -2999,7 +3024,12 @@ class Engine:
             # and the worktree kept/dropped by _integrate_unit. Don't touch the
             # tree here (no reset into the main repo — there's nothing to undo).
             self.journal.append("story-deferred", story_key=task.story_key, reason=reason)
-            gates.notify(self.policy, self.run_dir, f"story deferred: {task.story_key}", reason)
+            gates.notify(
+                self.policy,
+                self.run_dir,
+                f"story deferred: {task.story_key}",
+                reason + self._defer_recovery_note(task),
+            )
             self._save()
             return
         if task.baseline_commit:
@@ -3018,12 +3048,17 @@ class Engine:
                 if current != snapshot:
                     deferred_work.parent.mkdir(parents=True, exist_ok=True)
                     deferred_work.write_text(snapshot, encoding="utf-8")
-        self.journal.append("story-deferred", story_key=task.story_key, reason=reason)
+        self.journal.append(
+            "story-deferred",
+            story_key=task.story_key,
+            reason=reason,
+            preserve_ref=task.preserve_ref or "",
+        )
         gates.notify(
             self.policy,
             self.run_dir,
             f"story deferred: {task.story_key}",
-            reason,
+            reason + self._defer_recovery_note(task),
         )
         self._save()
 

@@ -315,6 +315,13 @@ def test_worktree_defer_keeps_failed_unit(project):
     # the main repo is untouched by the failed unit
     assert "change for 1-1-a" not in (project.project / "src.txt").read_text()
     assert worktree_clean(project.project)
+    # #333: nothing was rolled back here, so the notification points at the kept
+    # branch rather than a recovery ref — and `preserve_ref` stays unset, because
+    # a live unit branch is not a parked snapshot of a discarded attempt.
+    assert task.preserve_ref is None
+    attention = (engine.run_dir / "ATTENTION").read_text()
+    assert "story deferred: 1-1-a" in attention
+    assert "failed work kept on branch `bmad-loop/test-run/1-1-a`" in attention
 
 
 def test_worktree_defer_without_keep_drops_worktree_but_saves_patch(project):
@@ -332,6 +339,10 @@ def test_worktree_defer_without_keep_drops_worktree_but_saves_patch(project):
     # not kept → worktree removed, branch deleted
     assert not branch_exists(project.project, "bmad-loop/test-run/1-1-a")
     assert [p.resolve() for p in worktree_list(project.project)] == [project.project.resolve()]
+    # #333: the branch is gone, so the notification must not name it — the patch
+    # in the run dir is the only surviving artifact.
+    attention = (engine.run_dir / "ATTENTION").read_text()
+    assert "story deferred: 1-1-a" in attention and "kept on branch" not in attention
 
 
 def test_worktree_defer_then_next_story_succeeds(project):

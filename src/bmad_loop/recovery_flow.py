@@ -163,6 +163,12 @@ class RecoveryFlow:
         # worktree recorded) still targets the main checkout and must pause.
         in_unit_worktree = workspace.root != self.paths.repo_root
         if resolved or in_unit_worktree or self.policy.scm.rollback_on_failure:
+            # `preserve_ref` names where *this* rollback parked the attempt. Clear
+            # it first: a later attempt that parks nothing (clean tree, no commits
+            # above baseline, or a preserve failure) must not inherit the previous
+            # attempt's ref — the defer notice would then send the operator to work
+            # that is not the deferred attempt's.
+            task.preserve_ref = None
             self.journal.append(
                 "rollback-auto",
                 story_key=task.story_key,
@@ -332,6 +338,7 @@ class RecoveryFlow:
                 # the operator to blindly `reset --hard` (that would discard them).
                 self.pause_for_manual_recovery(task, baseline, preserve_failed=True)
             return  # re-drive: never pause — proceed to the (human-directed) reset
+        task.preserve_ref = ref
         self.journal.append(
             "attempt-commits-preserved", story_key=task.story_key, ref=ref, count=len(commits)
         )
@@ -371,6 +378,11 @@ class RecoveryFlow:
             )
             return
         if parked:
+            # Last writer wins over preserve_attempt_commits' branch on purpose:
+            # the snapshot is commit-tree'd parented at the attempt's HEAD
+            # (verify.snapshot_worktree), so it already contains the commits that
+            # branch points at — one ref recovers the whole attempt.
+            task.preserve_ref = parked
             self.journal.append("attempt-worktree-preserved", story_key=task.story_key, ref=parked)
 
     def pause_for_manual_recovery(

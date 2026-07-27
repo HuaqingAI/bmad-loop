@@ -281,6 +281,7 @@ def test_preserve_attempt_commits_parks_committed_work(project):
     ref = flow.journal.fields("attempt-commits-preserved")["ref"]
     assert ref.startswith("attempt-preserve/")
     git(repo, "rev-parse", "--verify", ref)  # the recovery branch exists
+    assert task.preserve_ref == ref  # #333: the ref reaches run state, not just the journal
 
 
 def test_preserve_attempt_commits_noop_without_commits(project):
@@ -292,6 +293,7 @@ def test_preserve_attempt_commits_noop_without_commits(project):
 
     assert "attempt-commits-preserved" not in flow.journal.events()
     assert flow.calls.pauses == []
+    assert task.preserve_ref is None  # nothing parked → nothing to point the operator at
 
 
 def test_preserve_attempt_commits_pauses_when_ref_fails_and_allowed(project, monkeypatch):
@@ -314,6 +316,8 @@ def test_preserve_attempt_commits_pauses_when_ref_fails_and_allowed(project, mon
     assert "attempt-preserve-failed" in flow.journal.events()
     # preserve_failed=True routes through the committed-work notice
     assert "could not be auto-preserved" in flow.calls.pauses[-1][0]
+    # the ref never took — run state must not name one (#333)
+    assert task.preserve_ref is None
 
 
 def test_preserve_attempt_commits_no_pause_on_redrive(project, monkeypatch):
@@ -347,6 +351,62 @@ def test_preserve_attempt_worktree_snapshots_dirty_tree(project):
     ref = flow.journal.fields("attempt-worktree-preserved")["ref"]
     assert ref.startswith("refs/attempt-preserve-dirty/")
     git(repo, "rev-parse", "--verify", ref)  # the snapshot ref exists
+    assert task.preserve_ref == ref  # #333
+
+
+def test_dirty_preserve_ref_wins_and_subsumes_the_commits_branch(project):
+    """Both families fire on one rollback: commits above baseline are parked on an
+    `attempt-preserve/*` branch and the still-dirty tree on a dirty snapshot. The
+    dirty ref is the one `preserve_ref` keeps, because it is committed parented at
+    the attempt's HEAD and therefore already contains the branch — so the single
+    `git merge --ff-only <preserve_ref>` the defer notice prints recovers the
+    whole attempt, not half of it."""
+    repo = project.project
+    ws = Workspace.default(project)
+    flow = _make_flow(workspace=ws, policy=_policy(rollback_on_failure=True))
+    task = _task(repo)
+    (repo / "src.txt").write_text("committed\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "attempt commit")
+    (repo / "src.txt").write_text("committed then edited\n")  # uncommitted on top
+
+    flow.rollback_or_pause(task)
+
+    branch = flow.journal.fields("attempt-commits-preserved")["ref"]
+    dirty = flow.journal.fields("attempt-worktree-preserved")["ref"]
+    assert task.preserve_ref == dirty != branch
+    # subsumption: the branch tip is an ancestor of the dirty snapshot
+    git(repo, "merge-base", "--is-ancestor", branch, dirty)
+
+
+def test_rollback_clears_a_previous_attempts_preserve_ref(project, monkeypatch):
+    """Ablation target: delete the `task.preserve_ref = None` at the top of
+    RecoveryFlow's auto-recover arm and this fails. A later rollback that parks
+    nothing — here the ref simply fails to take on a pause-free re-drive — must not
+    leave the *earlier* attempt's ref standing, or the defer notice sends the
+    operator to work that is not the deferred attempt's."""
+    repo = project.project
+    ws = Workspace.default(project)
+    flow = _make_flow(workspace=ws, policy=_policy(rollback_on_failure=True))
+    task = _task(repo)
+    (repo / "src.txt").write_text("attempt 1\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "attempt 1")
+
+    flow.rollback_or_pause(task)
+    stale = task.preserve_ref
+    assert stale and stale.startswith("attempt-preserve/")
+
+    task.attempt = 1
+    (repo / "src.txt").write_text("attempt 2\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "attempt 2")
+    monkeypatch.setattr(verify, "preserve_commits", lambda *a, **k: None)  # ref did not take
+
+    flow.rollback_or_pause(task, cause="resolved")  # re-drive: never pauses
+
+    assert "attempt-preserve-failed" in flow.journal.events()
+    assert task.preserve_ref is None
 
 
 # --------------------------------------------------------------- safe_reset

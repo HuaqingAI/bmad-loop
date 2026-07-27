@@ -174,6 +174,18 @@ class StoryTask:
     spec_file: str | None = None
     commit_sha: str | None = None
     defer_reason: str | None = None
+    # the recovery ref this attempt's work was parked on by the last auto-rollback
+    # — an `attempt-preserve/*` branch (commits above baseline) or, when the tree
+    # was also dirty, the `refs/attempt-preserve-dirty/*` snapshot, which is
+    # parented at the attempt's HEAD and therefore subsumes the branch (last
+    # writer wins, so one `git merge --ff-only <ref>` recovers the whole attempt).
+    # Set by RecoveryFlow, cleared at the top of every auto-rollback so it can
+    # never name a *previous* attempt's ref; read by `_defer` (notification) and
+    # projected into `status`. None = nothing was parked (clean tree, preserve
+    # failure, or an isolated unit, whose branch stays mounted instead). Not
+    # cleared on success — a mid-retry rollback's breadcrumb stays readable.
+    # Survives the resume serialization round-trip.
+    preserve_ref: str | None = None
     # set by runs.rearm_escalation: this task was re-armed out of ESCALATED for a
     # clean rebuild against the corrected spec (not a failed attempt). Lets the
     # resume-time manual-recovery notice describe the real cause; cleared once the
@@ -266,6 +278,7 @@ class StoryTask:
             "spec_file": self._serialized_spec_file(),
             "commit_sha": self.commit_sha,
             "defer_reason": self.defer_reason,
+            "preserve_ref": self.preserve_ref,
             "rearmed": self.rearmed,
             "resolved_redrive": self.resolved_redrive,
             "plan_checkpoint_pending": self.plan_checkpoint_pending,
@@ -313,6 +326,7 @@ class StoryTask:
             spec_file=d.get("spec_file"),
             commit_sha=d.get("commit_sha"),
             defer_reason=d.get("defer_reason"),
+            preserve_ref=d.get("preserve_ref"),
             rearmed=bool(d.get("rearmed", False)),
             resolved_redrive=bool(d.get("resolved_redrive", False)),
             plan_checkpoint_pending=bool(d.get("plan_checkpoint_pending", False)),
