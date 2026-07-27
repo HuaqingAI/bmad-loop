@@ -50,6 +50,25 @@ def test_review_on_timeout_invalid():
         policy.loads('[review]\non_timeout = "salvage"\n')
 
 
+def test_review_on_status_contradiction_default_parse_and_template():
+    import tomllib
+
+    # default is the new behavior: the released retry-until-budget loop is the
+    # defect (#334), "retry" is the compatibility opt-out.
+    assert policy.loads("").review.on_status_contradiction == "escalate"
+    for mode in sorted(policy.REVIEW_ON_STATUS_CONTRADICTION_MODES):
+        loaded = policy.loads(f'[review]\non_status_contradiction = "{mode}"\n')
+        assert loaded.review.on_status_contradiction == mode
+    # the emitted template documents the knob at its dataclass default
+    doc = tomllib.loads(policy.POLICY_TEMPLATE)
+    assert doc["review"]["on_status_contradiction"] == policy.ReviewPolicy.on_status_contradiction
+
+
+def test_review_on_status_contradiction_invalid():
+    with pytest.raises(policy.PolicyError, match=r"review\.on_status_contradiction"):
+        policy.loads('[review]\non_status_contradiction = "defer"\n')
+
+
 def test_stories_defaults():
     pol = policy.loads("")
     assert pol.stories.source == "sprint-status"

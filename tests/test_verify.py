@@ -18,7 +18,7 @@ from conftest import (
 
 from bmad_loop import verify
 from bmad_loop.model import StoryTask
-from bmad_loop.policy import Policy, VerifyPolicy
+from bmad_loop.policy import Policy, ReviewPolicy, VerifyPolicy
 
 
 def make_task(paths, story_key="1-1-a"):
@@ -360,6 +360,79 @@ def test_verify_review_sprint_not_done(project):
     task.spec_file = str(sp)
     out = verify.verify_review(task, project, Policy())
     assert not out.ok and "sprint-status" in out.reason
+
+
+# ------------------------------------- review revokes the sprint sign-off (#334)
+
+
+def _signoff_regression_task(project, sprint_status="in-progress"):
+    """A story the orchestrator advanced to `done` whose board a review then
+    wrote back, leaving the spec frontmatter at `done`."""
+    write_sprint(project, {"1-1-a": sprint_status})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "done", task.baseline_commit)
+    task.spec_file = str(sp)
+    return task
+
+
+def test_verify_review_signoff_regression_escalates(project):
+    """The default knob turns a review's board regression into a CRITICAL pause
+    that names both sides, instead of a retry no later cycle can satisfy."""
+    task = _signoff_regression_task(project)
+    out = verify.verify_review(task, project, Policy(), sprint_reached_done=True)
+
+    assert not out.ok and not out.retryable
+    assert out.severity == "CRITICAL" and out.contradiction is True
+    assert not out.fixable  # no repair session can reconcile a disagreement
+    # both sides are named, plus the two ways out and the opt-out knob
+    assert "'in-progress'" in out.reason and "'done'" in out.reason
+    assert "1-1-a" in out.reason
+    assert 'review.on_status_contradiction = "retry"' in out.reason
+
+
+def test_verify_review_signoff_regression_retry_mode_is_legacy(project):
+    """`retry` restores the pre-#334 routing verbatim: an ordinary retryable
+    sprint-status failure that burns review cycles and ends in a defer."""
+    task = _signoff_regression_task(project)
+    pol = Policy(review=ReviewPolicy(on_status_contradiction="retry"))
+    out = verify.verify_review(task, project, pol, sprint_reached_done=True)
+
+    assert not out.ok and out.retryable and out.contradiction is False
+    assert out.reason == "sprint-status for 1-1-a is 'in-progress', expected 'done'"
+
+
+def test_verify_review_signoff_regression_needs_the_launch_flag(project):
+    """Without the caller's guarantee that the board actually reached `done`, an
+    earlier status is a stage never reached — the gate must not escalate. Sweep
+    and stories callers never pass the flag."""
+    task = _signoff_regression_task(project)
+    out = verify.verify_review(task, project, Policy())  # sprint_reached_done defaults False
+
+    assert not out.ok and out.retryable and out.contradiction is False
+    assert "sprint-status" in out.reason
+
+
+@pytest.mark.parametrize(
+    "board, why",
+    [
+        ({"1-2-b": "done"}, "story absent from the board -> story_status returns None"),
+        ({"1-1-a": "awaiting-operator"}, "token outside STATUS_ORDER (hand-edited/future board)"),
+    ],
+)
+def test_verify_review_unrecognized_sprint_status_retries(project, board, why):
+    """Conservative on every uncertainty: a status the lifecycle does not know
+    cannot be *ordered* against `done`, so it is never called a regression — a
+    wrong escalation halts an otherwise healthy run."""
+    write_sprint(project, board)
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "done", task.baseline_commit)
+    task.spec_file = str(sp)
+
+    out = verify.verify_review(task, project, Policy(), sprint_reached_done=True)
+
+    assert not out.ok and out.retryable and out.contradiction is False, why
 
 
 # --------------------------------------------------- verify command exit codes (issue #126)

@@ -1475,11 +1475,13 @@ class Engine:
                     story_key=task.story_key,
                     reason=outcome.reason,
                     env_fault=outcome.env_fault,
+                    contradiction=outcome.contradiction,
                 )
                 if not outcome.retryable:
-                    # escalate-grade failure (environment fault, git error): a
-                    # repair session cannot fix it and another review cycle
-                    # would replay it — pause the run instead of burning budget
+                    # escalate-grade failure (environment fault, git error, a
+                    # review revoking the sprint sign-off): a repair session
+                    # cannot fix it and another review cycle would replay it —
+                    # pause the run instead of burning budget
                     self._escalate(task, outcome.reason)
                 if outcome.fixable and task.review_cycle < self.policy.limits.max_review_cycles:
                     # failing verify commands are dev work, not review work: a
@@ -1525,10 +1527,19 @@ class Engine:
             # the non-isolated path: in worktree isolation a defer already keeps the
             # unit's worktree + patch (no work is lost), so there is nothing to
             # rescue and committing into the main repo would be wrong.
-            if refileable_followup and not self._isolated and self._verify_review(task).ok:
-                self._record_review_budget_followup(task)
-                self._commit(task)
-                return
+            if refileable_followup and not self._isolated:
+                rescue = self._verify_review(task)
+                if rescue.ok:
+                    self._record_review_budget_followup(task)
+                    self._commit(task)
+                    return
+                if rescue.contradiction:
+                    # The rescue gate is the first place this story's sprint
+                    # sign-off was re-read (every in-loop cycle recommended its own
+                    # follow-up, so none of them verified). A defer here would roll
+                    # the work back under a "did not converge" reason that names
+                    # neither side of the disagreement — pause with both instead.
+                    self._escalate(task, rescue.reason)
             # Name the last completed pass's real outcome (issue #160): the fixed
             # follow-up wording is only correct when a finalized pass actually left
             # a refileable recommendation. "did not converge" stays in every variant
@@ -1669,10 +1680,12 @@ class Engine:
                 story_key=task.story_key,
                 reason=outcome.reason,
                 env_fault=outcome.env_fault,
+                contradiction=outcome.contradiction,
             )
             if not outcome.retryable:
-                # escalate-grade failure (environment fault, git error): a
-                # defer would just replay it on the next story — pause the run
+                # escalate-grade failure (environment fault, git error, a review
+                # revoking the sprint sign-off): a defer would just replay it on
+                # the next story — pause the run
                 self._escalate(task, outcome.reason)
             self._defer(task, f"verify failed with review disabled: {outcome.reason}")
             return
@@ -2376,7 +2389,16 @@ class Engine:
         )
 
     def _verify_review(self, task: StoryTask):
-        return verify.verify_review(task, self.workspace.paths, self.policy)
+        # `not _dev_review_enabled()` is exactly the case where _post_dev_state_sync
+        # targeted "done" and verify_dev asserted the board got there, so a board
+        # now short of done is a review revoking that sign-off, not a stage never
+        # reached (#334).
+        return verify.verify_review(
+            task,
+            self.workspace.paths,
+            self.policy,
+            sprint_reached_done=not self._dev_review_enabled(),
+        )
 
     def _review_prompt(self, task: StoryTask) -> str:
         # Re-invoking bmad-dev-auto on a `done` spec resets review_loop_iteration

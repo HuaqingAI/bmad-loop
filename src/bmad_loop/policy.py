@@ -29,6 +29,7 @@ SESSION_BUDGET_MODES = {"off", "warn", "enforce"}
 SWEEP_AUTO_MODES = {"never", "per-epic", "run-end"}
 REVIEW_TRIGGER_MODES = {"always", "recommended"}
 REVIEW_ON_TIMEOUT_MODES = {"retry", "salvage-if-done", "defer"}
+REVIEW_ON_STATUS_CONTRADICTION_MODES = {"escalate", "retry"}
 # Where the run gets its story queue. "sprint-status" (default) is the classic
 # flow — bmad-sprint-planning writes sprint-status.yaml from prose epics.
 # "stories" is the opt-in folder+id dispatch flow (BMAD-METHOD #2549): a typed,
@@ -204,6 +205,21 @@ class ReviewPolicy:
     #   "defer" — give up on the first timeout-like verdict (no retries).
     # `crashed` and env-fault (#194) verdicts keep their own routing in every mode.
     on_timeout: str = "retry"
+    # What a review that revokes the story's sprint sign-off costs (#334). The
+    # orchestrator advances sprint-status to `done` at dev time; a review session
+    # that judges the story unfinished and writes the board back to an earlier
+    # stage contradicts that — and nothing in the review loop re-advances the
+    # board, so every remaining cycle re-reads the same failure and the story
+    # ends deferred + rolled back.
+    #   "escalate" (default) — pause the run naming both sides of the
+    #       disagreement, so a human resolves it instead of the budget burning
+    #       down onto a rollback.
+    #   "retry" — legacy behavior: treat it as an ordinary verify failure, burn
+    #       review cycles to limits.max_review_cycles, then defer.
+    # Keys on sprint-status only: the spec's own frontmatter status legitimately
+    # cycles (in-review/in-progress) while a review patches, and `status: blocked`
+    # remains the sanctioned way for a review to hand a story back to a human.
+    on_status_contradiction: str = "escalate"
 
 
 @dataclass(frozen=True)
@@ -779,6 +795,9 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         enabled=bool(review_d.get("enabled", ReviewPolicy.enabled)),
         trigger=str(review_d.get("trigger", ReviewPolicy.trigger)).strip(),
         on_timeout=str(review_d.get("on_timeout", ReviewPolicy.on_timeout)).strip(),
+        on_status_contradiction=str(
+            review_d.get("on_status_contradiction", ReviewPolicy.on_status_contradiction)
+        ).strip(),
     )
     if review.trigger not in REVIEW_TRIGGER_MODES:
         raise PolicyError(
@@ -788,6 +807,12 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         raise PolicyError(
             f"review.on_timeout must be one of {sorted(REVIEW_ON_TIMEOUT_MODES)}:"
             f" got {review.on_timeout!r}"
+        )
+    if review.on_status_contradiction not in REVIEW_ON_STATUS_CONTRADICTION_MODES:
+        raise PolicyError(
+            "review.on_status_contradiction must be one of "
+            f"{sorted(REVIEW_ON_STATUS_CONTRADICTION_MODES)}:"
+            f" got {review.on_status_contradiction!r}"
         )
     stories = StoriesPolicy(
         source=str(stories_d.get("source", StoriesPolicy.source)).strip(),
@@ -1048,6 +1073,12 @@ trigger = "recommended"
 #                        commit it and refile the outstanding follow-up to deferred work.
 #   "defer"           -> give up on the first timeout-like verdict.
 on_timeout = "retry"
+# What a review that writes sprint-status back off `done` (the sign-off the
+# orchestrator recorded at dev time) costs. Nothing in the review loop
+# re-advances the board, so every remaining cycle re-reads the same failure:
+#   "escalate" -> pause the run naming both sides of the disagreement (default).
+#   "retry"    -> legacy: burn review cycles to max_review_cycles, then defer.
+on_status_contradiction = "escalate"
 
 [stories]
 # Story-queue source. "sprint-status" (default) walks sprint-status.yaml written
