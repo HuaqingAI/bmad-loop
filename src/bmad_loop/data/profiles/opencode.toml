@@ -9,5 +9,41 @@ usage_parser = "none"
 skill_tree = ".claude/skills"
 first_run_note = "run `opencode auth login` once on this machine; headless servers reuse the stored credentials"
 
+# Transport/provider environment-fault classification (#194). Unlike the tmux
+# adapters, the file scanned for this adapter is logs/<task_id>.server.out — the
+# `opencode serve` process's own stdout/stderr, structured logfmt, which the model
+# never writes to. So the anchor can be the ai-sdk error class opencode reports in
+# the `error.error=` field of a `level=ERROR message="stream error"` line, which is
+# both precise and incapable of colliding with story output.
+#
+# NOT logs/<task_id>.log: that is the curated `[bmad]` conversation transcript and
+# it carries the model's own words. These patterns are only safe against a
+# model-free log, so the file the classifier reads is part of their contract —
+# see EnvFaultMixin.ENV_FAULT_LOG_SUFFIX.
+#
+# Verified against a real 5-hour provider quota outage: 22 matching lines across
+# one run, in two forms — a clean refusal, and the socket drop providers fall
+# back to once they stop answering at all:
+#   ... message="stream error" ... error.error="AI_APICallError: Usage limit reached for 5 hour. Your limit will reset at 2026-07-26 22:49:46"
+#   ... message="stream error" ... error.error="AI_APICallError: Cannot connect to API: The socket connection was closed unexpectedly."
+# To disable or extend, copy this profile into .bmad-loop/profiles/ and edit.
+# Anchored on the structured field name, not on the error class alone: the server
+# reports the failure as `error.error="AI_APICallError: …"` inside a logfmt line.
+# The bare class name would also match `const MSG = "AI_APICallError: Usage limit
+# reached";` — unreachable in THIS log, but a pattern is copied into project
+# overlays and read as an example, so it should not model a weaker rule than it
+# means. Deliberately content-anchored rather than position-anchored: this file is
+# a byte stream, and the tmux profiles' equivalent is a raw pipe-pane capture full
+# of cursor-addressed repaints, so no column or line offset in it is meaningful.
+# The gap is [^"], not `.`: it must stay INSIDE the quoted error value. With `.`
+# the lazy gap walks past the closing quote and finds a cause word in a later
+# logfmt field, so an unrelated `AI_APICallError: Invalid API key` on a line whose
+# trailing fields mention a quota path classifies as a quota outage. In every
+# captured line the cause is inside the quotes, so nothing real is lost.
+env_fault_patterns = [
+  'error[.]error="AI_APICallError: [^"]{0,400}?(?i:usage limit reached|429|too many requests|rate[ _-]?limit|quota|overloaded)',
+  'error[.]error="AI_APICallError: [^"]{0,400}?(?i:cannot connect to api|socket connection was closed|connection ?(error|refused|reset|timed ?out)|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN)',
+]
+
 [hooks]
 dialect = "none"
