@@ -248,8 +248,15 @@ def _one_line(value: str) -> str:
 
     A break-only value therefore sanitizes to `""`. Keeping it non-empty *here*
     could only yield bare whitespace, which trades an unfindable entry for an
-    unidentifiable one; the callers that need a non-empty result supply something
-    identifiable instead (see :func:`append_entry`, :func:`append_decision`)."""
+    unidentifiable one, so each caller handles its own empties — and by two
+    different strategies, which is why neither belongs in this helper.
+    :func:`append_entry` **substitutes**, naming a vanished title
+    `(untitled DW-<n>)` so the id it just burned stays findable.
+    :func:`append_decision` **drops**, shedding the ` — ` separator along with an
+    empty detail rather than promising one that is not there. Its `label` needs
+    neither: every member of :data:`LINE_BREAK_RE` is `str.isspace()`, and
+    `validate_triage` builds each `DecisionOption` with `.strip() or key`, so a
+    break-only label has already become the option key before it arrives."""
     if not LINE_BREAK_RE.search(value):
         return value
     return LINE_BREAK_RE.sub(" ", value).strip()

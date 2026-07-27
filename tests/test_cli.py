@@ -553,11 +553,15 @@ def test_decisions_answer_records_and_carries_forward(project, capsys, monkeypat
     assert decisions.pending_missed_decisions(project.project) == []
 
 
-def test_decisions_reports_a_bad_date_instead_of_a_traceback(project, capsys, monkeypatch):
-    """`apply_pre_answer`'s `date` precondition raises `ValueError`. The TUI's copy
-    of this call degrades to a per-decision notification; this path must degrade
-    too, rather than letting the same programmer bug reach argparse as a
-    traceback in the UI a human is more likely answering from."""
+def test_decisions_names_the_decision_a_bad_date_failed(project, capsys, monkeypatch):
+    """`apply_pre_answer`'s `date` precondition raises `ValueError`, and the loop's
+    handler must attribute it to the decision that did not land.
+
+    Only the `could not record DW-1` assertion bites. `main`'s tail catches every
+    exception this handler does — BmadConfigError by name, the rest through a bare
+    `except Exception` — so deleting the handler still exits 1 and still prints the
+    `date must be YYYY-MM-DD` text. Those two assertions are the message's shape,
+    not the guard; the id prefix is the whole observable."""
     from conftest import write_ledger
 
     from bmad_loop import decisions
@@ -578,6 +582,44 @@ def test_decisions_reports_a_bad_date_instead_of_a_traceback(project, capsys, mo
     captured = capsys.readouterr()
     assert "could not record DW-1" in captured.err
     assert "date must be YYYY-MM-DD" in captured.err
+    assert decisions.load_pre_answers(project.project) == {}  # nothing recorded
+
+
+def test_decisions_names_the_decision_a_broken_config_failed(project, capsys, monkeypatch):
+    """The reachable half of the same handler, and the reason `BmadConfigError`
+    belongs in its tuple beside the unreachable `ValueError`.
+
+    `apply_pre_answer` re-reads the BMAD config on every call while `prompter.ask`
+    blocks on the human, so the config can break *after* the read at the top of
+    this command succeeded — reproduced here by removing it from inside `ask`
+    rather than by patching `apply_pre_answer` to raise, so the live `load_paths`
+    call is what fails.
+
+    Asserted on the `DW-1` prefix, not on the exit code: `main` catches
+    `BmadConfigError` by name, so without this tuple entry the command still exits
+    1 and still prints the config message — just bare, after a run of per-decision
+    outcome lines that then do not say which decision it belongs to."""
+    from conftest import write_ledger
+
+    from bmad_loop import decisions
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _make_run_with_decision(project)
+    config = project.project / "_bmad" / "bmm" / "config.yaml"
+
+    class _StubPrompter:
+        def ask(self, decision):
+            config.unlink()  # the human broke it while this prompt was blocking
+            return decision.option("1")
+
+    monkeypatch.setattr("bmad_loop.sweep.DecisionPrompter", lambda *a, **k: _StubPrompter())
+
+    assert cli.main(["decisions", "--project", str(project.project)]) == 1
+
+    captured = capsys.readouterr()
+    assert "could not record DW-1" in captured.err
+    assert "BMAD config not found" in captured.err
     assert decisions.load_pre_answers(project.project) == {}  # nothing recorded
 
 
