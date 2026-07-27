@@ -3556,6 +3556,10 @@ def test_review_signoff_regression_at_rescue_gate_escalates(project):
     assert task.phase == Phase.ESCALATED and task.followup_reviews_spent == 3
     assert [s.role for s in adapter.sessions] == ["dev", "review", "review", "review"]
     assert "revoked the sprint sign-off" in load_state(engine.run_dir).paused_reason
+    # journaled under the same kind as the in-loop gates: a consumer keying on
+    # `contradiction` must see this path too, not just `story-escalated`
+    failed = [e for e in engine.journal.entries() if e["kind"] == "review-verify-failed"]
+    assert len(failed) == 1 and failed[0]["contradiction"] is True
     kinds = [e["kind"] for e in engine.journal.entries()]
     # neither the rescue commit nor the exhaustion defer
     assert "review-budget-committed" not in kinds and "story-deferred" not in kinds

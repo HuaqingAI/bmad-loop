@@ -1539,6 +1539,17 @@ class Engine:
                     # follow-up, so none of them verified). A defer here would roll
                     # the work back under a "did not converge" reason that names
                     # neither side of the disagreement — pause with both instead.
+                    # Journaled under the same kind as the two in-loop gates so a
+                    # consumer keying on `contradiction` sees all three escalating
+                    # paths. The non-contradiction arm keeps its existing silence:
+                    # its story is told by the defer reason below.
+                    self.journal.append(
+                        "review-verify-failed",
+                        story_key=task.story_key,
+                        reason=rescue.reason,
+                        env_fault=rescue.env_fault,
+                        contradiction=rescue.contradiction,
+                    )
                     self._escalate(task, rescue.reason)
             # Name the last completed pass's real outcome (issue #160): the fixed
             # follow-up wording is only correct when a finalized pass actually left
