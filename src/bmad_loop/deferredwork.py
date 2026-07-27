@@ -21,6 +21,16 @@ from .platform_util import atomic_write_text
 
 HEADING_RE = re.compile(r"^### (DW-\d+): (.+?)\s*$", re.MULTILINE)
 ANY_HEADING_RE = re.compile(r"^#{1,6} ", re.MULTILINE)
+# The flat appender's opening line, in the two forms this module needs it: as a
+# bullet in the raw ledger (FLAT_ENTRY_RE, the canonical-span boundary in
+# parse_ledger) and as bullet *content* after `_BULLET_RE` has stripped the
+# marker (`_FLAT_SOURCE_RE`, legacy section). One shape, two anchors — they have
+# to agree, or a block the legacy parser recognizes stays invisible to it (#304).
+# Keyed on the opening line alone, deliberately: also requiring the block's
+# `summary:`/`evidence:` lines would narrow the boundary below the parser's own
+# recognition, leaving the bug in place for every partial shape it accepts.
+_FLAT_SOURCE_BODY = r"source_spec:[ \t]"
+FLAT_ENTRY_RE = re.compile(rf"^[-*][ \t]+{_FLAT_SOURCE_BODY}", re.IGNORECASE | re.MULTILINE)
 STATUS_RE = re.compile(r"^status:[ \t]*(.*)$", re.MULTILINE)
 
 
@@ -49,6 +59,18 @@ def parse_ledger(text: str) -> list[DWEntry]:
         other = ANY_HEADING_RE.search(text, m.end(), end)
         if other:
             end = other.start()
+        # ...and at a flat appender block, which belongs to no canonical entry
+        # (#304). This span is what parse_legacy() masks out before scanning, so
+        # absorbing the block hides the finding from every reader of the ledger.
+        # Searched from the entry's own `status:` line, never from above it:
+        # truncating over the status leaves the entry reading as neither open nor
+        # done (open_ids() drops it, classify() calls it malformed), which trades
+        # one lost flat block for one lost tracked entry. An entry with no status
+        # line has nothing to protect, so the whole span is fair game.
+        status_m = STATUS_RE.search(text, m.end(), end)
+        flat = FLAT_ENTRY_RE.search(text, status_m.end() if status_m else m.end(), end)
+        if flat:
+            end = flat.start()
         body = text[m.start() : end]
         status_m = STATUS_RE.search(body)
         entries.append(
@@ -276,6 +298,7 @@ def append_entry(
     origin: str,
     source_spec: str,
     reason: str,
+    location: str = "n/a",
     status: str = "open",
     severity: str | None = None,
 ) -> str | None:
@@ -295,7 +318,12 @@ def append_entry(
         ):
             return None
     dw_id = f"DW-{next_seq(text)}"
-    lines = [f"### {dw_id}: {title}", f"origin: {origin}", f"source_spec: `{source_spec}`"]
+    lines = [
+        f"### {dw_id}: {title}",
+        f"origin: {origin}",
+        f"location: {location}",
+        f"source_spec: `{source_spec}`",
+    ]
     if severity:
         lines.append(f"severity: {severity}")
     lines.append(f"reason: {reason}")
@@ -386,8 +414,10 @@ _LEAD_DONE_STRIP_RE = re.compile(
 #     summary: <one sentence>
 #     evidence: <why this is real>
 # We recognize it so the `summary` becomes the title (not the source_spec path)
-# and the entry migrates cleanly into the canonical `### DW-<seq>` shape.
-_FLAT_SOURCE_RE = re.compile(r"^source_spec:[ \t]", re.IGNORECASE)
+# and the entry migrates cleanly into the canonical `### DW-<seq>` shape. The
+# opening line comes from the same `_FLAT_SOURCE_BODY` as FLAT_ENTRY_RE, which
+# bounds canonical spans on it — see that constant for why they must not drift.
+_FLAT_SOURCE_RE = re.compile(rf"^{_FLAT_SOURCE_BODY}", re.IGNORECASE)
 _FLAT_SUMMARY_RE = re.compile(r"^[ \t]*summary:[ \t]*(.*)$", re.IGNORECASE | re.MULTILINE)
 _BULLET_RE = re.compile(r"^[-*][ \t]+(.*)$")
 _ITEM_ID_RE = re.compile(

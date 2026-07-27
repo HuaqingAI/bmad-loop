@@ -304,6 +304,178 @@ def test_mixed_ledger_keeps_both_views_separate():
     assert all("DW-" not in e.body for e in entries)
 
 
+def test_flat_append_after_canonical_stays_visible_to_legacy_parser():
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: canonical\n\n"
+        "origin: test\nlocation: n/a\nreason: test\nstatus: open\n\n"
+        "- source_spec: `spec-next.md`\n"
+        "  summary: later flat finding\n"
+        "  evidence: must not be swallowed by DW-1\n"
+    )
+
+    (canonical,) = parse_ledger(text)
+    (legacy,) = parse_legacy(text)
+
+    assert "later flat finding" not in canonical.body
+    assert legacy.title == "later flat finding"
+
+
+# The canonical-span boundary has to recognize every flat shape parse_legacy
+# does (#304): a boundary keyed on the full three-line block leaves the bug in
+# place for the partial ones — and those are not hypothetical, they are the
+# shapes test_flat_appender_missing_summary_falls_back and
+# test_flat_appender_in_done_section_is_done already pin. Each case asserts both
+# halves of the fix: the block reaches parse_legacy AND DW-1 keeps its status.
+FLAT_TAIL_SHAPES = {
+    "full-block": "- source_spec: `s.md`\n  summary: finding\n  evidence: e\n",
+    "no-summary": "- source_spec: `s.md`\n  evidence: orphaned note\n",
+    "no-evidence": "- source_spec: `s.md`\n  summary: finding\n",
+    "swapped-order": "- source_spec: `s.md`\n  evidence: e\n  summary: finding\n",
+    "field-interleaved": "- source_spec: `s.md`\n  severity: high\n  summary: finding\n",
+    "star-bullet": "* source_spec: `s.md`\n  summary: finding\n  evidence: e\n",
+    "tab-after-marker": "-\tsource_spec: `s.md`\n  summary: finding\n  evidence: e\n",
+    "padded-marker": "-   source_spec: `s.md`\n  summary: finding\n  evidence: e\n",
+    "uppercase-field": "- SOURCE_SPEC: `s.md`\n  summary: finding\n  evidence: e\n",
+}
+
+
+@pytest.mark.parametrize("shape", sorted(FLAT_TAIL_SHAPES), ids=sorted(FLAT_TAIL_SHAPES))
+def test_flat_append_visible_for_every_shape_parse_legacy_accepts(shape):
+    text = (
+        "# Deferred Work\n\n### DW-1: canonical\n\n"
+        "origin: test\nlocation: n/a\nreason: test\nstatus: open\n\n" + FLAT_TAIL_SHAPES[shape]
+    )
+
+    (canonical,) = parse_ledger(text)
+    (legacy,) = parse_legacy(text)
+
+    assert canonical.open, "the boundary must not cost DW-1 its status"
+    assert "source_spec" not in canonical.body
+    assert legacy.body.lstrip().startswith(("- ", "* ", "-\t"))
+
+
+def test_flat_boundary_never_truncates_above_the_entry_status_line():
+    """A flat-shaped bullet *inside* an entry, ahead of its `status:`, must not
+    move the span end above that status: an entry parsing as neither open nor
+    done is a lost tracked entry, the same failure class in the other direction
+    (open_ids() drops it, classify() reports it malformed)."""
+    text = (
+        "### DW-1: canonical\n\norigin: test\nlocation: n/a\n"
+        "reason: the appender writes this shape, quoted here as evidence\n"
+        "- source_spec: `quoted-example.md`\n"
+        "  summary: quoted, not a real finding\n"
+        "  evidence: prose inside DW-1, not an appended block\n"
+        "status: open\n"
+    )
+
+    (canonical,) = parse_ledger(text)
+
+    assert canonical.status == "open" and canonical.open
+    assert "quoted-example.md" in canonical.body
+    assert open_ids(text) == {"DW-1"}
+    assert parse_legacy(text) == []
+
+
+def test_flat_boundary_still_applies_after_a_quoted_block_inside_the_entry():
+    """The in-entry bullet does not grant immunity to what follows it: a real
+    appended block after the entry's `status:` is still bounded out."""
+    text = (
+        "### DW-1: canonical\n\norigin: test\nreason: prose\n"
+        "- source_spec: `quoted-example.md`\n  summary: quoted\n  evidence: e\n"
+        "status: open\n\n"
+        "- source_spec: `real.md`\n  summary: real finding\n  evidence: e\n"
+    )
+
+    (canonical,) = parse_ledger(text)
+    (legacy,) = parse_legacy(text)
+
+    assert canonical.open
+    assert "quoted-example.md" in canonical.body and "real finding" not in canonical.body
+    assert legacy.title == "real finding"
+
+
+def test_flat_boundary_exposes_the_block_when_the_entry_has_no_status_line():
+    """No status line means nothing to protect — the entry is already malformed,
+    so bounding the block out of it costs nothing and rescues the finding."""
+    text = "# Deferred Work\n\n### DW-1: malformed\n\norigin: test\nreason: test\n\n" + (
+        "- source_spec: `s.md`\n  summary: rescued finding\n  evidence: e\n"
+    )
+
+    (canonical,) = parse_ledger(text)
+    (legacy,) = parse_legacy(text)
+
+    assert canonical.status == "" and not canonical.open
+    assert legacy.title == "rescued finding"
+
+
+def test_flat_append_boundary_accepts_crlf():
+    text = "\r\n".join(
+        [
+            "# Deferred Work",
+            "",
+            "### DW-1: canonical",
+            "",
+            "origin: test",
+            "location: n/a",
+            "reason: test",
+            "status: open",
+            "",
+            "- source_spec: `spec-next.md`",
+            "  summary: later flat finding",
+            "  evidence: must not be swallowed by DW-1",
+            "",
+        ]
+    )
+
+    (canonical,) = parse_ledger(text)
+    (legacy,) = parse_legacy(text)
+
+    assert canonical.open
+    assert "later flat finding" not in canonical.body
+    assert legacy.title == "later flat finding"
+
+
+@pytest.mark.parametrize("gap", ["\n", ""], ids=["blank-line", "no-blank-line"])
+def test_flat_append_between_two_canonical_entries(gap):
+    """The realistic sequence: the inner session defers (flat) and the
+    orchestrator then refiles a canonical entry at EOF, sandwiching the block."""
+    text = (
+        "# Deferred Work\n\n### DW-1: a\n\norigin: t\nreason: t\nstatus: open\n"
+        + gap
+        + "- source_spec: `s.md`\n  summary: sandwiched finding\n  evidence: e\n"
+        + "\n### DW-2: b\n\norigin: t\nreason: t\nstatus: open\n"
+    )
+
+    assert open_ids(text) == {"DW-1", "DW-2"}
+    (legacy,) = parse_legacy(text)
+    assert legacy.title == "sandwiched finding"
+
+
+def test_two_flat_blocks_after_the_last_entry_are_both_visible():
+    block = "- source_spec: `s.md`\n  summary: %s\n  evidence: e\n"
+    text = (
+        "# Deferred Work\n\n### DW-1: a\n\norigin: t\nreason: t\nstatus: open\n\n"
+        + (block % "first")
+        + (block % "second")
+    )
+
+    assert open_ids(text) == {"DW-1"}
+    assert [e.title for e in parse_legacy(text)] == ["first", "second"]
+
+
+def test_flat_append_followed_by_a_legacy_section_keeps_both():
+    text = (
+        "# Deferred Work\n\n### DW-1: a\n\norigin: t\nreason: t\nstatus: open\n\n"
+        "- source_spec: `s.md`\n  summary: flat finding\n  evidence: e\n"
+        "\n## Deferred from: an older review (2026-06-01)\n\n"
+        "- W1 — a freeform legacy item\n"
+    )
+
+    assert open_ids(text) == {"DW-1"}
+    assert [e.title for e in parse_legacy(text)] == ["flat finding", "a freeform legacy item"]
+
+
 def test_legacy_item_does_not_swallow_masked_canonical_neighbor():
     text = (
         "## Deferred from: somewhere (2026-06-01)\n\n"
@@ -419,9 +591,29 @@ def test_append_entry_numbers_and_writes(tmp_path):
     assert "DW-5" in entries and entries["DW-5"].open
     body = entries["DW-5"].body
     assert "origin: review-budget-followup" in body
+    assert "location: n/a" in body
     assert "source_spec: `spec-foo.md`" in body
     assert "severity: low" in body
     assert "follow-up still recommended for dw-x" in body
+
+
+def test_append_entry_preserves_a_supplied_location(tmp_path):
+    """`n/a` is only the default the orchestrator's own refiles take — the field
+    is documented as `<file:line or component>` and must round-trip verbatim."""
+    p = tmp_path / "deferred-work.md"
+    assert (
+        append_entry(
+            p,
+            title="follow-up",
+            origin="code-review",
+            source_spec="spec-foo.md",
+            reason="still open",
+            location="src/foo.py:12",
+        )
+        == "DW-1"
+    )
+    (entry,) = parse_ledger(p.read_text())
+    assert "location: src/foo.py:12" in entry.body
 
 
 def test_append_entry_idempotent_for_open_origin_and_spec(tmp_path):
