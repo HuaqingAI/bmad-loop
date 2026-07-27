@@ -1496,7 +1496,16 @@ def cmd_decisions(args: argparse.Namespace) -> int:
     today = time.strftime("%Y-%m-%d")
     for decision in pending:
         option = prompter.ask(decision)
-        decisions.apply_pre_answer(project, decision, option, date=today)
+        try:
+            decisions.apply_pre_answer(project, decision, option, date=today)
+        except (OSError, ValueError) as e:
+            # ValueError is the ledger writers' `date` precondition. It cannot
+            # fire from the strftime above, but the TUI's copy of this call
+            # degrades to a per-decision notification, and the same programmer
+            # bug must not instead surface here as an argparse traceback — this
+            # is the UI a human is more likely answering from.
+            print(f"error: could not record {decision.id}: {e}", file=sys.stderr)
+            return 1
         if option.effect == "close":
             outcome = "closed now"
         elif option.effect == "build":

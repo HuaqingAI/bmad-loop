@@ -553,6 +553,34 @@ def test_decisions_answer_records_and_carries_forward(project, capsys, monkeypat
     assert decisions.pending_missed_decisions(project.project) == []
 
 
+def test_decisions_reports_a_bad_date_instead_of_a_traceback(project, capsys, monkeypatch):
+    """`apply_pre_answer`'s `date` precondition raises `ValueError`. The TUI's copy
+    of this call degrades to a per-decision notification; this path must degrade
+    too, rather than letting the same programmer bug reach argparse as a
+    traceback in the UI a human is more likely answering from."""
+    from conftest import write_ledger
+
+    from bmad_loop import decisions
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _make_run_with_decision(project)
+
+    class _StubPrompter:
+        def ask(self, decision):
+            return decision.option("1")
+
+    monkeypatch.setattr("bmad_loop.sweep.DecisionPrompter", lambda *a, **k: _StubPrompter())
+    monkeypatch.setattr("bmad_loop.cli.time.strftime", lambda *_a: "13/06/2026")
+
+    assert cli.main(["decisions", "--project", str(project.project)]) == 1
+
+    captured = capsys.readouterr()
+    assert "could not record DW-1" in captured.err
+    assert "date must be YYYY-MM-DD" in captured.err
+    assert decisions.load_pre_answers(project.project) == {}  # nothing recorded
+
+
 def test_status_surfaces_missed_decision_count(project, capsys):
     from conftest import write_ledger, write_sprint
 

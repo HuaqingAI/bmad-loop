@@ -140,7 +140,13 @@ def apply_pre_answer(
     the open set now), while `build`/`keep-open` are saved to the pre-answer
     store for the next sweep to consume. When `commit`, the ledger and store are
     committed on their own (only those paths) — best effort, so a non-git or
-    dirty tree never blocks the on-disk record."""
+    dirty tree never blocks the on-disk record.
+
+    Precondition: `date` is ISO `YYYY-MM-DD`. The ledger writers raise
+    `ValueError` on anything else (it would otherwise land a `status:` line that
+    reads as neither open nor done), so a caller building the date itself must
+    either guarantee the format or catch it. The option's own free text carries
+    no such precondition — it is sanitized, never refused."""
     paths = bmadconfig.load_paths(project)
     ledger = paths.deferred_work
     detail = option.resolution or option.intent
