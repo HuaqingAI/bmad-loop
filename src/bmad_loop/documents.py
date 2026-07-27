@@ -234,6 +234,10 @@ def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> 
                 "tokens": tokens,
                 "commit_sha": task.commit_sha,
                 "defer_reason": task.defer_reason,
+                # the recovery ref a rolled-back attempt's work was parked on, or
+                # null. Reported verbatim from state.json — never re-validated
+                # against git here (retention may since have pruned it).
+                "preserve_ref": task.preserve_ref,
                 "adapters_used": adapters_used,
             }
         )

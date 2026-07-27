@@ -2991,6 +2991,53 @@ class Engine:
                 note,
             )
 
+    def _defer_recovery_note(self, task: StoryTask) -> str:
+        """Message tail naming where the deferred attempt's work survives (#333).
+
+        A bare reason leaves the operator to find the rolled-back work themselves
+        (the reporter used `git log --all`). In-place, the auto-rollback parked the
+        attempt on `task.preserve_ref`, which fast-forwards straight back. Isolated,
+        *this* defer rolls nothing back — a kept-failed unit's branch stays mounted —
+        but an EARLIER attempt's in-worktree dev-retry rollback parks on the same
+        shared refs, so `preserve_ref` can be set here too. Both are named; the
+        isolated arm deliberately prints no `merge --ff-only` line, because that ref
+        is not fast-forwardable from either tree (the unit branch has since moved on
+        with the deferred attempt's commits, and fast-forwarding it into the
+        operator's checkout would land a *discarded* attempt on their branch).
+
+        Empty when there is nothing to point at — a clean-tree defer that parked
+        nothing, a commits-preserve failure, rollback off, or `keep_failed` off with
+        no earlier ref — so the notice can never advertise a ref that was not
+        created. A *worktree*-snapshot failure is the one case that still points
+        somewhere: `preserve_partial` then downgrades the claim to the committed
+        half instead of hiding a ref that does exist. The pointer is a name, not a
+        promise: `scm.preserve_keep` prunes the oldest refs at a later run's start,
+        and nothing here re-validates it (this must stay git-free — `status` reads
+        `state.json` only)."""
+        if self._isolated:
+            note = ""
+            if self.policy.scm.keep_failed and task.branch:
+                note = f" — failed work kept on branch `{task.branch}`"
+            if task.preserve_ref:
+                half = " (commits only)" if task.preserve_partial else ""
+                note += (
+                    f" — an earlier rolled-back attempt is parked at `{task.preserve_ref}`{half}"
+                )
+            return note
+        if not task.preserve_ref:
+            return ""
+        recover = (
+            f'; recover with `git -C "{self.workspace.root}" '
+            f"merge --ff-only {task.preserve_ref}`"
+        )
+        if task.preserve_partial:
+            return (
+                f" — attempt COMMITS parked at `{task.preserve_ref}`{recover}; the "
+                f"uncommitted changes could not be captured (journal: "
+                f"attempt-worktree-preserve-failed) and did not survive the rollback"
+            )
+        return f" — attempt work parked at `{task.preserve_ref}`{recover}"
+
     def _defer(self, task: StoryTask, reason: str) -> None:
         task.defer_reason = reason
         advance(task, Phase.DEFERRED)
@@ -2998,8 +3045,18 @@ class Engine:
             # the failed work lives in the unit's worktree; the diff is captured
             # and the worktree kept/dropped by _integrate_unit. Don't touch the
             # tree here (no reset into the main repo — there's nothing to undo).
-            self.journal.append("story-deferred", story_key=task.story_key, reason=reason)
-            gates.notify(self.policy, self.run_dir, f"story deferred: {task.story_key}", reason)
+            self.journal.append(
+                "story-deferred",
+                story_key=task.story_key,
+                reason=reason,
+                preserve_ref=task.preserve_ref or "",
+            )
+            gates.notify(
+                self.policy,
+                self.run_dir,
+                f"story deferred: {task.story_key}",
+                reason + self._defer_recovery_note(task),
+            )
             self._save()
             return
         if task.baseline_commit:
@@ -3018,12 +3075,17 @@ class Engine:
                 if current != snapshot:
                     deferred_work.parent.mkdir(parents=True, exist_ok=True)
                     deferred_work.write_text(snapshot, encoding="utf-8")
-        self.journal.append("story-deferred", story_key=task.story_key, reason=reason)
+        self.journal.append(
+            "story-deferred",
+            story_key=task.story_key,
+            reason=reason,
+            preserve_ref=task.preserve_ref or "",
+        )
         gates.notify(
             self.policy,
             self.run_dir,
             f"story deferred: {task.story_key}",
-            reason,
+            reason + self._defer_recovery_note(task),
         )
         self._save()
 

@@ -3231,6 +3231,81 @@ def test_budget_exhausted_unfinalized_defers(project):
     assert not spec_path(project, "1-1-a").exists()
     stashed = engine.run_dir / "deferred" / "1-1-a" / "spec-1-1-a.md"
     assert stashed.is_file() and "status: 'in-progress'" in stashed.read_text()
+    # #333: the rollback parked the attempt on a recovery ref — run state names it
+    # and the notification hands the operator the one command that restores it,
+    # instead of leaving them to hunt through `git log --all`.
+    ref = task.preserve_ref
+    assert ref and ref.startswith("refs/attempt-preserve-dirty/")
+    git(project.project, "rev-parse", "--verify", ref)
+    attention = (engine.run_dir / "ATTENTION").read_text()
+    assert "story deferred: 1-1-a" in attention
+    assert f"attempt work parked at `{ref}`" in attention
+    assert f'git -C "{project.project}" merge --ff-only {ref}' in attention
+    deferred_entry = [e for e in engine.journal.entries() if e["kind"] == "story-deferred"][-1]
+    assert deferred_entry["preserve_ref"] == ref
+
+
+def test_defer_notification_stays_bare_when_nothing_was_parked(project):
+    """Ablation target: make `_defer_recovery_note`'s tail unconditional and this
+    fails. Over-budget sessions touch no files, so the exhaustion defer's rollback
+    finds a clean tree and parks nothing — there is no ref to name, and the notice
+    must not advertise one (a `merge --ff-only` onto a ref that was never created
+    is worse than silence)."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            SessionResult(status="over_budget", budget_weighted=5_000_000),
+            SessionResult(status="over_budget", budget_weighted=6_000_000),
+        ],
+    )
+    summary = engine.run()
+
+    assert summary.deferred == 1
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DEFERRED and task.preserve_ref is None
+    assert "rollback-skipped-clean" in [e["kind"] for e in engine.journal.entries()]
+    attention = (engine.run_dir / "ATTENTION").read_text()
+    assert "story deferred: 1-1-a" in attention
+    assert "attempt work parked" not in attention and "merge --ff-only" not in attention
+
+
+def test_defer_recovery_note_is_uniform_across_ref_families(project):
+    """A commits branch and a dirty snapshot both fast-forward, so the recovery
+    line is the same command either way — the caller never has to know which
+    family parked the attempt."""
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    assert engine._defer_recovery_note(task) == ""
+    for ref in ("attempt-preserve/test-run-0badc0de", "refs/attempt-preserve-dirty/test-run-de-1"):
+        task.preserve_ref = ref
+        note = engine._defer_recovery_note(task)
+        assert f"parked at `{ref}`" in note
+        assert f'git -C "{project.project}" merge --ff-only {ref}' in note
+
+
+def test_defer_recovery_note_flags_a_commits_only_park(project):
+    """When the dirty snapshot failed, `preserve_ref` names the commits branch
+    alone and the reset discarded the rest — the notice must say so. It still
+    prints the merge command: the committed half IS recoverable, and scaring the
+    operator off a valid recovery would be its own defect.
+
+    Ablation targets: delete the `if task.preserve_partial:` branch and the first
+    half fails; make it unconditional and the second half fails."""
+    engine, _ = make_engine(project, [])
+    ref = "attempt-preserve/test-run-0badc0de"
+    task = StoryTask(story_key="1-1-a", epic=1, preserve_ref=ref, preserve_partial=True)
+
+    note = engine._defer_recovery_note(task)
+    assert f"attempt COMMITS parked at `{ref}`" in note
+    assert "did not survive the rollback" in note
+    assert "attempt-worktree-preserve-failed" in note  # names the breadcrumb
+    assert f'git -C "{project.project}" merge --ff-only {ref}' in note
+
+    task.preserve_partial = False  # a complete park keeps the unqualified wording
+    note = engine._defer_recovery_note(task)
+    assert f" — attempt work parked at `{ref}`" in note
+    assert "did not survive" not in note and "COMMITS" not in note
 
 
 def test_budget_exhausted_defer_reason_names_last_status(project):

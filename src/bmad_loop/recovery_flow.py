@@ -163,6 +163,16 @@ class RecoveryFlow:
         # worktree recorded) still targets the main checkout and must pause.
         in_unit_worktree = workspace.root != self.paths.repo_root
         if resolved or in_unit_worktree or self.policy.scm.rollback_on_failure:
+            # `preserve_ref` names where *this* rollback parked the attempt. Clear
+            # it first: a later attempt that parks nothing (no commits above
+            # baseline, or a preserve failure) must not inherit the previous
+            # attempt's ref — the defer notice would then send the operator to work
+            # that is not the deferred attempt's. A *clean*-tree rollback never gets
+            # here (the `rollback-skipped-clean` return above fires first), so it
+            # deliberately keeps the earlier ref: nothing new was parked, and that
+            # ref is then the only place the story's work survives.
+            task.preserve_ref = None
+            task.preserve_partial = False
             self.journal.append(
                 "rollback-auto",
                 story_key=task.story_key,
@@ -332,6 +342,7 @@ class RecoveryFlow:
                 # the operator to blindly `reset --hard` (that would discard them).
                 self.pause_for_manual_recovery(task, baseline, preserve_failed=True)
             return  # re-drive: never pause — proceed to the (human-directed) reset
+        task.preserve_ref = ref
         self.journal.append(
             "attempt-commits-preserved", story_key=task.story_key, ref=ref, count=len(commits)
         )
@@ -369,8 +380,23 @@ class RecoveryFlow:
             self.journal.append(
                 "attempt-worktree-preserve-failed", story_key=task.story_key, error=str(exc)
             )
+            # The reset below runs regardless (best-effort contract), so whatever was
+            # uncommitted is now gone. Latch that: `preserve_ref` may still name the
+            # commits branch parked just above, and the defer notice must offer it as
+            # the committed half rather than as the whole attempt. Set unconditionally
+            # — snapshot_worktree can raise before it can tell whether the tree was
+            # even dirty, so "could not capture" is the only honest state. Harmless
+            # when nothing was parked: the notice short-circuits on the ref first.
+            task.preserve_partial = True
             return
         if parked:
+            # Last writer wins over preserve_attempt_commits' branch on purpose:
+            # the snapshot is commit-tree'd parented at the attempt's HEAD
+            # (verify.snapshot_worktree), so it already contains the commits that
+            # branch points at — one ref recovers the whole attempt. That holds on
+            # this success path only; the `except` above records the case where the
+            # snapshot failed and the commits branch is all that survived.
+            task.preserve_ref = parked
             self.journal.append("attempt-worktree-preserved", story_key=task.story_key, ref=parked)
 
     def pause_for_manual_recovery(

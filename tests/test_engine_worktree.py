@@ -93,6 +93,35 @@ def wt_dev_effect(
     return effect
 
 
+def wt_bad_dev(project, story_key):
+    """Dev session that commits inside the unit worktree and then claims a foreign
+    baseline. `verify_dev` rejects that NON-fixably, so the retry routes through
+    `_rollback_or_pause` — which, inside a mounted worktree, auto-recovers and parks
+    the attempt on an `attempt-preserve/*` ref (#161). The one composable way to
+    reach an in-worktree rollback; `wt_dev_effect` never does."""
+
+    def effect(spec):
+        cwd = spec.cwd
+        wt = project.rebased(cwd)
+        src = cwd / "src.txt"
+        src.write_text(src.read_text() + "bad attempt\n")
+        git(cwd, "add", "-A")
+        git(cwd, "commit", "-q", "-m", "bad attempt work")
+        sp = wt.implementation_artifacts / f"spec-{story_key}.md"
+        write_spec(sp, "in-review", "0" * 40)
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": story_key,
+                "spec_file": str(sp),
+                "escalations": [],
+            },
+        )
+
+    return effect
+
+
 def wt_review_effect(project, story_key, clean: bool, patched: int = 0):
     """Follow-up review pass in a worktree — a bmad-dev-auto re-invocation on the
     done spec. ``clean=True`` converges; ``clean=False`` keeps recommending."""
@@ -315,6 +344,15 @@ def test_worktree_defer_keeps_failed_unit(project):
     # the main repo is untouched by the failed unit
     assert "change for 1-1-a" not in (project.project / "src.txt").read_text()
     assert worktree_clean(project.project)
+    # #333: this script never rolls back (dev succeeds; the reviews plateau), so
+    # nothing was parked and the notice points at the kept branch alone. Pin that
+    # premise — a bare `is None` would also pass if isolation simply never parked,
+    # which is false: see test_isolated_defer_names_the_earlier_rolled_back_attempt.
+    assert "rollback-auto" not in journal_kinds(engine)
+    assert task.preserve_ref is None
+    attention = (engine.run_dir / "ATTENTION").read_text()
+    assert "story deferred: 1-1-a" in attention
+    assert "failed work kept on branch `bmad-loop/test-run/1-1-a`" in attention
 
 
 def test_worktree_defer_without_keep_drops_worktree_but_saves_patch(project):
@@ -332,6 +370,10 @@ def test_worktree_defer_without_keep_drops_worktree_but_saves_patch(project):
     # not kept → worktree removed, branch deleted
     assert not branch_exists(project.project, "bmad-loop/test-run/1-1-a")
     assert [p.resolve() for p in worktree_list(project.project)] == [project.project.resolve()]
+    # #333: the branch is gone, so the notification must not name it — the patch
+    # in the run dir is the only surviving artifact.
+    attention = (engine.run_dir / "ATTENTION").read_text()
+    assert "story deferred: 1-1-a" in attention and "kept on branch" not in attention
 
 
 def test_worktree_defer_then_next_story_succeeds(project):
@@ -1388,31 +1430,10 @@ def test_dev_retry_in_worktree_auto_recovers_instead_of_pausing(project):
     touched. rollback_on_failure gates isolation="none" recovery only."""
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
 
-    def bad_dev(spec):
-        # commits work in the worktree, then claims a foreign baseline — the
-        # non-fixable verify retry that routes through _rollback_or_pause
-        cwd = spec.cwd
-        wt = project.rebased(cwd)
-        src = cwd / "src.txt"
-        src.write_text(src.read_text() + "bad attempt\n")
-        git(cwd, "add", "-A")
-        git(cwd, "commit", "-q", "-m", "bad attempt work")
-        sp = wt.implementation_artifacts / "spec-1-1-a.md"
-        write_spec(sp, "in-review", "0" * 40)
-        return SessionResult(
-            status="completed",
-            result_json={
-                "workflow": "auto-dev",
-                "story_key": "1-1-a",
-                "spec_file": str(sp),
-                "escalations": [],
-            },
-        )
-
     engine, _ = make_engine(
         project,
         [
-            bad_dev,
+            wt_bad_dev(project, "1-1-a"),
             wt_dev_effect(project, "1-1-a"),
             wt_review_effect(project, "1-1-a", clean=True),
         ],
@@ -1432,6 +1453,51 @@ def test_dev_retry_in_worktree_auto_recovers_instead_of_pausing(project):
     src = (project.project / "src.txt").read_text()
     assert "change for 1-1-a" in src and "bad attempt" not in src
     assert worktree_clean(project.project)
+
+
+def test_isolated_defer_names_the_earlier_rolled_back_attempt(project):
+    """#333: an isolated defer is NOT the only place a story's work can live. The
+    first attempt's non-fixable retry rolled back *inside* the unit worktree and
+    parked its commits on a shared `attempt-preserve/*` ref; the second attempt
+    exhausts the budget and defers with its own work kept on the unit branch. Both
+    survive, so the notice must name both — `status --json` already reports the ref,
+    and a notice that mentioned only the branch is exactly the "hunt with
+    `git log --all`" failure #333 was filed for.
+
+    No `merge --ff-only` line here on purpose: that ref is not fast-forwardable from
+    either tree, and offering it would land a discarded attempt on the operator's
+    branch.
+
+    Ablations: drop the `if task.preserve_ref:` clause in `_defer_recovery_note`'s
+    isolated arm → the both-named assertion fails; drop `preserve_ref=` from the
+    isolated `story-deferred` emit → the journal assertion fails; route the isolated
+    arm through the in-place tail → the no-command assertion fails."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [wt_bad_dev(project, "1-1-a"), wt_bad_dev(project, "1-1-a")],
+        policy=wt_policy(),
+    )
+    summary = engine.run()
+
+    assert summary.deferred == 1 and not summary.paused
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DEFERRED
+    # falsifies the "an isolated unit parks nothing" reading: the in-worktree
+    # rollback wrote a real ref, and it is reachable from the MAIN repo because
+    # linked worktrees share the common git dir's ref namespace
+    ref = task.preserve_ref
+    assert ref and ref.startswith(("attempt-preserve/", "refs/attempt-preserve-dirty/"))
+    git(project.project, "rev-parse", "--verify", ref)
+
+    attention = (engine.run_dir / "ATTENTION").read_text()
+    assert "story deferred: 1-1-a" in attention
+    assert "failed work kept on branch `bmad-loop/test-run/1-1-a`" in attention
+    assert f"an earlier rolled-back attempt is parked at `{ref}`" in attention
+    assert "merge --ff-only" not in attention
+
+    deferred_entry = [e for e in engine.journal.entries() if e["kind"] == "story-deferred"][-1]
+    assert deferred_entry["preserve_ref"] == ref
 
 
 # ------------------------------------ story-declared deferred-work closure (#234)
