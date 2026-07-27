@@ -125,6 +125,25 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 ### Fixed
 
+- **A deferred finding appended after the last ledger entry is no longer lost (#304).** Found and
+  first fixed by [@Haven2026](https://github.com/Haven2026) in #274. The inner dev session appends
+  each review defer as a flat `- source_spec:` / `summary:` / `evidence:` block; landing after the
+  last canonical `### DW-<n>` entry, it was absorbed into that entry's span, and `parse_legacy()`
+  masks canonical spans before scanning — so the block was invisible to the sweep's migration
+  trigger and leftovers read, to `bmad-loop sweep --dry-run`, and to the TUI's legacy view. The session
+  did its job and recorded the defer; nothing downstream could ever see it. Canonical spans now end
+  at a flat block.
+
+  The boundary recognizes the flat shape exactly as the legacy parser does — the opening line
+  alone, either bullet marker, whatever `summary:`/`evidence:` lines follow — because a stricter
+  boundary silently leaves the bug in place for the partial blocks that parser accepts. It is
+  searched from the entry's own `status:` line and never above it: truncating over the status would
+  leave the entry reading as neither open nor done, trading a lost flat block for a lost tracked
+  entry.
+
+  `append_entry` also now writes the `location:` field (defaulting to `n/a`, as the orchestrator's
+  own refiles take it), which the canonical format documents and the writer had been omitting.
+
 - **`return_attached_client` no longer claims a return that never happened (#227).** It discarded
   `switch_client`'s result and answered `True` unconditionally, so a failed switch plus a failed
   `-l` fallback still journaled the return and sent the sweep unattended while the human sat in
