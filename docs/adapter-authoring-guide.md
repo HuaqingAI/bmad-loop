@@ -103,18 +103,33 @@ seams of a full OS port are in
   _no current client_). If it does not, **measure** — psmux is the worked
   example: every arm of its `detach-client` / `switch-client` exits 0 whether or
   not a client moved, so the backend counts the session's attached clients
-  across the call and answers on the drop. Where even that is unavailable,
-  answer `False` and record the gap in your degradation ledger; a vacuous `True`
-  is the one answer that strands a human),
+  across the call and answers on the drop. Match the measure to what the verb is
+  meant to change, and record what it cannot see: that count reaches a detach,
+  and reaches the switch the return path normally performs — the recorded target
+  is a pane in the session the client came _from_, so a real switch leaves this
+  session — but a switch _within_ this session moves the client between windows
+  without moving the count, and so reads as no effect. Failing that way is
+  conformant: the caller keeps prompting, which is the safe direction. psmux
+  carries exactly that blind spot, in its `Residue:` note. Where even a measure
+  is unavailable, answer `False` and record the gap in your degradation ledger;
+  a vacuous `True` is the one answer that strands a human),
   `available` (is this backend usable on the current host).
 
   The caller's two failures are not symmetric, which is what makes the rule
-  worth the round-trip: a failed `switch_client` leaves the client in the window
-  it was already in, while a failed `detach_client` means there was no client
-  there at all. `tui.launch.return_attached_client` reports those as `ATTENDED`
+  worth the round-trip. A failed `switch_client` is positive evidence: the
+  client is still in the window it was already in, so someone may well be
+  watching. A failed `detach_client` is not evidence of anything — `False` there
+  means only "no verified hand-back", and covers all three of nothing was
+  attached (tmux says so outright), the effect could not be observed, and the
+  backend has no detach verb at all (herdr, whose client only a manual chord
+  releases). `tui.launch.return_attached_client` reports the two as `ATTENDED`
   and `UNREACHABLE`, and an attended sweep keeps prompting on the first but goes
-  unattended on the second. Answering `True` when nothing happened collapses
-  both into "the human has their terminal back", which is #227.
+  unattended on the second. `UNREACHABLE` is therefore the caller's _policy_ for
+  an unverified detach rather than a claim the window is empty: assuming a human
+  is still there costs a `--repeat` cycle blocked forever on `input()` in a
+  window nobody may be viewing, which is the worse way to be wrong. What no
+  backend may do is answer `True` when nothing happened — that collapses both
+  failures into "the human has their terminal back", which is #227.
 
 **Window targets.** The target-taking methods (`kill_window`, `select_window`,
 the window-option trio, `attach_target_argv`, `switch_client`) receive one of two

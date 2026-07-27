@@ -1011,15 +1011,17 @@ class SweepEngine(Engine):
         decisions defer via the unattended path instead, recorded for
         `bmad-loop decisions` or the next attended sweep.
 
-        The trigger for that is "nobody can answer here any more", NOT "the
-        hand-back succeeded" — the two come apart on a failed return, in
-        opposite directions. A failed switch leaves the client in this window
-        with a human in front of it (ATTENDED: keep prompting, which is the
-        whole point of #227). A failed detach means there was no client to
-        detach — nobody is watching, so going unattended is the only outcome
-        that does not strand a --repeat cycle on input(); the same holds for a
-        backend with no detach verb at all. Only a real return is announced:
-        UNREACHABLE prints nothing because there is no one to read it."""
+        The trigger for that is "nobody can be relied on to answer here any
+        more", NOT "the hand-back succeeded" — the two come apart on a failed
+        return, in opposite directions. A failed switch is evidence the client
+        is still in this window with a human in front of it (ATTENDED: keep
+        prompting, which is the whole point of #227). A failed detach reports
+        only that no hand-back was verified — nothing attached, an effect the
+        backend cannot observe, or no detach verb at all — and under that
+        uncertainty going unattended is the outcome that does not strand a
+        --repeat cycle on input(); the decisions it defers stay reachable via
+        `bmad-loop decisions`. Only a real return is announced: UNREACHABLE
+        prints nothing, since there may be no one to read it."""
         from .tui import launch  # import-light: launch.py has no textual imports
 
         outcome = launch.return_attached_client()
