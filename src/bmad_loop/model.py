@@ -513,6 +513,11 @@ class VerifyOutcome:
     # not found / not executable): no repair session can fix it and every
     # story shares the same commands, so it must never charge attempt budgets
     env_fault: bool = False
+    # a session deliberately contradicted a state the orchestrator had already
+    # established (a review revoking the sprint sign-off it advanced at dev
+    # time): no further session can reconcile it, so it routes to a pause with
+    # both sides named rather than to another cycle (#334)
+    contradiction: bool = False
 
     @classmethod
     def passed(cls) -> "VerifyOutcome":
@@ -524,9 +529,19 @@ class VerifyOutcome:
 
     @classmethod
     def escalate(
-        cls, reason: str, severity: str = "CRITICAL", env_fault: bool = False
+        cls,
+        reason: str,
+        severity: str = "CRITICAL",
+        env_fault: bool = False,
+        contradiction: bool = False,
     ) -> "VerifyOutcome":
-        return cls(ok=False, reason=reason, severity=severity, env_fault=env_fault)
+        return cls(
+            ok=False,
+            reason=reason,
+            severity=severity,
+            env_fault=env_fault,
+            contradiction=contradiction,
+        )
 
     @property
     def retryable(self) -> bool:

@@ -101,6 +101,20 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 ### Changed
 
+- **A review that revokes the sprint sign-off now escalates instead of burning review cycles
+  (#334).** The orchestrator advances `sprint-status` to `done` at dev time; a review session that
+  judges the story unfinished and writes the board back to an earlier stage contradicts that — and
+  nothing in the review loop re-advances it, so every remaining cycle re-read the same failure and
+  the story ended deferred with its work rolled back. That regression is now detected at the
+  review-verify gate and pauses the run with both sides named and the two ways out (finish the work
+  and re-arm, or accept the story and advance the board). Keys on `sprint-status` only — the spec's
+  own frontmatter legitimately cycles, and `status: blocked` stays the sanctioned hand-back channel
+  — and stays conservative: without the orchestrator's own launch-time sign-off, or on a status
+  outside the known lifecycle, it falls back to the old retry. New knob
+  `[review] on_status_contradiction`, default `escalate`; `retry` restores the previous
+  burn-cycles-then-defer behavior verbatim. Review prompts are unchanged by design: forbidding the
+  revert would make a correct reviewer comply and the story would commit without sign-off.
+
 - **`bmad-loop-setup` stops registering BMAD config; the installer owns it (#258).** The skill
   wrote `_bmad/config.yaml`, `_bmad/config.user.yaml` and a root `_bmad/module-help.csv` — the
   pre-v6.10 layout, which BMAD's own resolver never reads (it merges four TOML layers, and

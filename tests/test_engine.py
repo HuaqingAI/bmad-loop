@@ -3482,6 +3482,165 @@ def test_budget_exhausted_failed_review_sessions_defer_not_commit(project):
     assert "story-deferred" in kinds and "review-budget-committed" not in kinds
 
 
+# -------------------------------- review revokes the sprint sign-off (#334)
+
+
+def _signoff_revoking_review(project, story_key, *, clean, board="in-progress"):
+    """A review pass that finalizes the spec to `done` but writes the sprint board
+    back off `done` — the reviewer judging the story unfinished while the spec
+    (which the dev pass owns) still claims otherwise."""
+
+    def effect(spec):
+        result = review_effect(project, story_key, clean=clean)(spec)
+        set_sprint(project, story_key, board)
+        return result
+
+    return effect
+
+
+def test_review_signoff_regression_escalates(project):
+    """The reported livelock (#334): the review revokes the sprint sign-off the
+    orchestrator recorded at dev time. Nothing re-advances the board, so the
+    remaining cycles would replay the same failure and end in a defer + rollback.
+    The run pauses on the first one instead — two sessions total.
+
+    Ablation: with the escalate branch deleted from verify_review, the loop
+    `continue`s onto review cycle 2, requests a 3rd session the script does not
+    have, and the run crashes — `not summary.crashed` and the session-role list
+    both fail."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            _signoff_revoking_review(project, "1-1-a", clean=True),
+        ],
+    )
+    summary = engine.run()
+
+    assert not summary.crashed
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]  # no cycle 2
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED and task.review_cycle == 1
+    saved = load_state(engine.run_dir)
+    assert saved.paused_stage == PAUSE_ESCALATION
+    # the paused reason travels to `bmad-loop resolve` — it must name both sides
+    assert "revoked the sprint sign-off" in saved.paused_reason
+    assert "'in-progress'" in saved.paused_reason
+    failed = [e for e in engine.journal.entries() if e["kind"] == "review-verify-failed"][-1]
+    assert failed["contradiction"] is True
+    # the escalation path never rolls back or defers
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "story-deferred" not in kinds
+
+
+def test_review_signoff_regression_retry_mode_keeps_legacy_defer(project):
+    """`review.on_status_contradiction = "retry"` is the compatibility opt-out:
+    the same regression burns all three review cycles and defers + rolls back,
+    exactly as the released build does."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    legacy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=True),
+        review=ReviewPolicy(on_status_contradiction="retry"),
+    )
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a")]
+        + [_signoff_revoking_review(project, "1-1-a", clean=True) for _ in range(3)],
+        policy=legacy,
+    )
+    summary = engine.run()
+
+    assert summary.deferred == 1 and summary.escalated == 0 and not summary.paused
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DEFERRED and task.review_cycle == 3
+    assert "did not converge" in task.defer_reason
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "review", "review"]
+    assert (project.project / "src.txt").read_text() == "original\n"  # rolled back
+    failed = [e for e in engine.journal.entries() if e["kind"] == "review-verify-failed"]
+    assert failed and all(e["contradiction"] is False for e in failed)
+
+
+def test_review_verify_failure_without_regression_still_retries(project):
+    """The new gate must not swallow ordinary review-verify failures: with the
+    board still at `done`, a failing verify command keeps its fixable-retry
+    routing (repair session, then a fresh review) under the default knob."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    marker = project.project / "fixed.marker"
+
+    def dev_with_marker(spec):
+        marker.write_text("ok\n")
+        return dev_effect(project, "1-1-a")(spec)
+
+    def breaking_review(spec):
+        marker.unlink()  # the review's patch broke the gate; the board stays done
+        return review_effect(project, "1-1-a", clean=True)(spec)
+
+    def fix(spec):
+        marker.write_text("ok\n")
+        return SessionResult(
+            status="completed", result_json={"workflow": "auto-dev", "escalations": []}
+        )
+
+    engine, adapter = make_engine(
+        project,
+        [dev_with_marker, breaking_review, fix, review_effect(project, "1-1-a", clean=True)],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            verify=VerifyPolicy(commands=(_file_exists_cmd(marker),)),
+        ),
+    )
+    summary = engine.run()
+
+    assert summary.done == 1 and summary.escalated == 0 and not summary.paused
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "dev", "review"]
+    failed = [e for e in engine.journal.entries() if e["kind"] == "review-verify-failed"]
+    assert failed and all(e["contradiction"] is False for e in failed)
+
+
+def test_review_signoff_regression_at_rescue_gate_escalates(project):
+    """When every cycle recommends its own follow-up, the in-loop verify never
+    runs — the budget-exhaustion rescue is the first read of the board. A
+    revoked sign-off there must escalate too, not fall through to the "did not
+    converge" defer that rolls the work back naming neither side.
+
+    max_followup_reviews=5 keeps damping from firing, so all three cycles stay
+    on the recommend-a-follow-up arm and the loop exits by its own bound."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a")]
+        + [_signoff_revoking_review(project, "1-1-a", clean=False) for _ in range(3)],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            scm=ScmPolicy(rollback_on_failure=True),
+            limits=LimitsPolicy(max_followup_reviews=5),
+        ),
+    )
+    summary = engine.run()
+
+    assert not summary.crashed
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED and task.followup_reviews_spent == 3
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "review", "review"]
+    assert "revoked the sprint sign-off" in load_state(engine.run_dir).paused_reason
+    # journaled under the same kind as the in-loop gates: a consumer keying on
+    # `contradiction` must see this path too, not just `story-escalated`
+    failed = [e for e in engine.journal.entries() if e["kind"] == "review-verify-failed"]
+    assert len(failed) == 1 and failed[0]["contradiction"] is True
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    # neither the rescue commit nor the exhaustion defer
+    assert "review-budget-committed" not in kinds and "story-deferred" not in kinds
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+
+
 def _damp_policy(max_followup_reviews: int) -> Policy:
     return Policy(
         gates=GatesPolicy(mode="none"),

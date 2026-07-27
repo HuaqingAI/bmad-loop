@@ -381,6 +381,10 @@ enabled = true             # false = skip the separate review session; the dev p
 trigger = "recommended"    # when enabled: "recommended" runs the separate review only when
                            # bmad-dev-auto flags followup_review_recommended; "always" = every story
                            # (the loop is bounded by limits.max_review_cycles either way)
+on_status_contradiction = "escalate"
+                           # a review that writes sprint-status back off "done" (revoking the
+                           # sign-off the orchestrator recorded at dev time) pauses the run naming
+                           # both sides; "retry" = legacy — burn review cycles, then defer + roll back
 
 [adapter]
 name = "claude"            # CLI profile: claude | codex | gemini | copilot | antigravity | opencode-http (alias: opencode) | custom

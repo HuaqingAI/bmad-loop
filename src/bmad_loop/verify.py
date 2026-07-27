@@ -24,7 +24,7 @@ from .frontmatter import set_frontmatter_status  # noqa: F401 — re-export
 from .frontmatter import _split_frontmatter, read_frontmatter, status_of
 from .model import StoryTask, VerifyOutcome
 from .policy import POLICY_FILE, Policy
-from .sprintstatus import story_status
+from .sprintstatus import STATUS_ORDER, story_status
 
 GIT_TIMEOUT_S = 120
 COMMAND_TIMEOUT_S = 30 * 60
@@ -1562,7 +1562,26 @@ def verify_commands_outcome(policy: Policy, cwd: Path) -> VerifyOutcome:
     return VerifyOutcome.passed()
 
 
-def verify_review(task: StoryTask, paths: ProjectPaths, policy: Policy) -> VerifyOutcome:
+def verify_review(
+    task: StoryTask,
+    paths: ProjectPaths,
+    policy: Policy,
+    *,
+    sprint_reached_done: bool = False,
+) -> VerifyOutcome:
+    """Gate a completed review pass: spec at ``done``, sprint-status at ``done``,
+    deterministic verify commands green.
+
+    ``sprint_reached_done`` tells the gate that the orchestrator had already
+    advanced this story's sprint-status to ``done`` before the review ran (it is
+    the sole ``sprint_advance`` caller, ``verify_dev`` asserted the write landed,
+    and ``advance`` never regresses). A board now sitting *earlier* than ``done``
+    is therefore not a stage the story never reached — it is a review session
+    deliberately revoking the sign-off. Nothing in the review loop re-advances
+    the board, so retrying only replays the same failure until the budget runs
+    out and the work is rolled back; under
+    ``review.on_status_contradiction = "escalate"`` (the default) the gate
+    escalates instead, naming both sides. See #334."""
     if not task.spec_file:
         return VerifyOutcome.retry("no spec file recorded for task")
     fm = _gate_frontmatter(Path(task.spec_file))
@@ -1574,11 +1593,43 @@ def verify_review(task: StoryTask, paths: ProjectPaths, policy: Policy) -> Verif
 
     sprint = story_status(paths.sprint_status, task.story_key)
     if sprint != "done":
+        if _is_signoff_regression(sprint, sprint_reached_done, policy):
+            return VerifyOutcome.escalate(
+                f"review revoked the sprint sign-off for {task.story_key}: the "
+                f"orchestrator advanced the board to 'done' after dev verified, "
+                f"and the review session wrote it back to {sprint!r} while leaving "
+                f"the spec frontmatter at 'done'. The two sides disagree about "
+                f"whether the story is finished, and no further review cycle can "
+                f"reconcile them — the review loop never re-advances the board, so "
+                f"the remaining cycles would burn down onto a defer that rolls the "
+                f"work back. Resolve by either completing the outstanding work and "
+                f"re-arming the escalation (the attempt budget resets on re-arm), "
+                f"or accepting the story and advancing the board yourself; set "
+                f'review.on_status_contradiction = "retry" to restore the legacy '
+                f"retry-until-budget behavior.",
+                contradiction=True,
+            )
         return VerifyOutcome.retry(
             f"sprint-status for {task.story_key} is {sprint!r}, expected 'done'"
         )
 
     return verify_commands_outcome(policy, paths.project)
+
+
+def _is_signoff_regression(sprint: str | None, sprint_reached_done: bool, policy: Policy) -> bool:
+    """Whether a non-``done`` sprint status is a review deliberately walking the
+    board backward, as opposed to a stage the story simply never reached.
+
+    Conservative on every uncertainty: without the launch-time guarantee, with
+    the knob set to ``retry``, or when the fresh read yields no status at all
+    (missing story entry) or a token outside the known lifecycle (a hand-edited
+    or future board), the caller falls through to the ordinary retry — a wrong
+    escalation halts an otherwise healthy run."""
+    if not sprint_reached_done or policy.review.on_status_contradiction != "escalate":
+        return False
+    if sprint is None or sprint not in STATUS_ORDER:
+        return False
+    return STATUS_ORDER.index(sprint) < STATUS_ORDER.index("done")
 
 
 def verify_review_stories(task: StoryTask, paths: ProjectPaths, policy: Policy) -> VerifyOutcome:
