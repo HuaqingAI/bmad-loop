@@ -24,6 +24,14 @@ breaking changes may land in a minor release.
   commits-only (#338). Inert under the shipped defaults, where the snapshot is reached only on a
   re-drive; it bites `scm.rollback_on_failure = true` and in-worktree dev retries.
 
+### Fixed
+
+- **`safe_rollback` no longer swallows a failed `git stash create`.** The empty snapshot silently
+  disabled the whole `preserve` restore, so the hard reset reverted exactly the paths the caller
+  asked to keep — a resolved re-drive's corrected spec — with no error anywhere. It now raises
+  before the reset, and only when a restore was actually requested, so the no-`preserve` callers
+  (both sweep sites) degrade as before.
+
 - **Defer notifications name where the work survives (#333).** A deferred story's rollback parked
   the attempt on an `attempt-preserve/*` branch (or a `refs/attempt-preserve-dirty/*` snapshot),
   but the ref only ever reached `journal.jsonl` — the notification carried a bare reason, leaving

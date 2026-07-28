@@ -1295,6 +1295,68 @@ def test_safe_rollback_raises_on_genuine_restore_failure(project, monkeypatch):
         )
 
 
+def test_safe_rollback_raises_when_the_preserve_snapshot_cannot_be_taken(project, monkeypatch):
+    """A failed `git stash create` used to be swallowed into an empty snapshot, which
+    silently disabled the whole restore — so the reset reverted exactly the paths
+    `preserve` names (a resolved re-drive's corrected spec) with no error anywhere.
+    Raise before the reset instead.
+
+    Ablation target: drop the `if rc != 0 and preserve: raise` from safe_rollback
+    and this fails — the spec comes back reverted, quietly."""
+    repo = project.project
+    spec = project.implementation_artifacts / "spec-1-1-a.md"
+    spec.write_text("frozen: original\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "spec")
+    baseline = verify.rev_parse_head(repo)
+    snap = sorted(verify.untracked_files(repo))
+    artifact_rel = project.implementation_artifacts.relative_to(repo).as_posix()
+    spec.write_text("frozen: corrected\n")
+
+    real_git = verify._git
+
+    def fake_git(r, *args):
+        if args[:2] == ("stash", "create"):
+            return 1, "fatal: unable to write temporary index"
+        return real_git(r, *args)
+
+    monkeypatch.setattr(verify, "_git", fake_git)
+    with pytest.raises(verify.GitError, match="git stash create"):
+        verify.safe_rollback(
+            repo,
+            baseline,
+            baseline_untracked=snap,
+            keep=(".bmad-loop", artifact_rel),
+            preserve=(artifact_rel,),
+        )
+    # raised BEFORE the reset, so the correction is still on disk to be re-tried
+    assert spec.read_text() == "frozen: corrected\n"
+
+
+def test_safe_rollback_degrades_stash_failure_when_nothing_to_preserve(project, monkeypatch):
+    """The raise is scoped to callers that asked for a restore. With no `preserve`
+    the snapshot is unused, so a `stash create` failure stays a non-event — both
+    sweep call sites reset with no preserve and must not start failing.
+
+    INVERSE ablation: drop the `and preserve` guard and this fails."""
+    repo = project.project
+    baseline = verify.rev_parse_head(repo)
+    snap = sorted(verify.untracked_files(repo))
+    (repo / "src.txt").write_text("dev attempt\n")
+
+    real_git = verify._git
+
+    def fake_git(r, *args):
+        if args[:2] == ("stash", "create"):
+            return 1, "fatal: unable to write temporary index"
+        return real_git(r, *args)
+
+    monkeypatch.setattr(verify, "_git", fake_git)
+    verify.safe_rollback(repo, baseline, baseline_untracked=snap)  # no preserve
+
+    assert (repo / "src.txt").read_text() == "original\n"  # reset still happened
+
+
 def test_safe_rollback_tolerates_empty_preserve_dir(project):
     """A `preserve` dir with no tracked content in the snapshot makes checkout exit
     non-zero ('did not match') — benign, must NOT raise."""
