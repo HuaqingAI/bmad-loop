@@ -642,7 +642,12 @@ def _validate_operator_registry(
     directions because they have opposite remedies: an entry the committed state
     has moved past is stale bookkeeping to discard, while a board sitting at
     `awaiting-operator` with no entry is an obligation nobody can confirm from
-    this machine."""
+    this machine.
+
+    An INTERRUPTED confirmation gets its own id rather than being reported as
+    stale, because its remedy inverts: re-running `confirm` finishes it. Saying
+    "the entry is stale and confirm will refuse it" about a story confirm now
+    completes would be the same class of lie the state itself is."""
     parked = operatoractions.resolve(project, paths)
     for story in parked:
         if story.spec_status == operatoractions.AWAITING_OPERATOR and not story.actions:
@@ -654,8 +659,31 @@ def _validate_operator_registry(
                 f"{story.spec_path}",
                 {"story_key": story.story_key, "spec": str(story.spec_path)},
             )
+            # NO `continue`: the malformed list is about the INDEX side, and a
+            # co-occurring disagreement on the committed side is a separate
+            # finding with a separate remedy (repair the list vs discard the
+            # entry). `committed_drift()` is the half that answers about spec and
+            # board only, so the empty list is not re-reported as the drift —
+            # `drift()` would collapse both into whichever it found first. The
+            # sibling `_validate_closes_deferred` has the same shape and reports
+            # every cause it finds, for the same reason.
+            drift = story.committed_drift()
+        elif story.resumable:
+            # Not `registry-stale`: to `drift()` this looks stale ("its spec now
+            # says status: done"), but the remedy INVERTS — re-run confirm to
+            # finish it, rather than discard the entry — and `checks` splits ids
+            # exactly where the remedy differs.
+            report.warn(
+                "operator.confirm-interrupted",
+                f"{story.story_key} was confirmed but the board was never advanced: its "
+                f"spec is signed off and reads done while the index still lists it. "
+                f"`bmad-loop confirm {story.story_key}` finishes it without asking you to "
+                f"acknowledge anything again",
+                {"story_key": story.story_key, "board_status": story.board_status},
+            )
             continue
-        drift = story.drift()
+        else:
+            drift = story.drift()
         if drift is not None:
             report.warn(
                 "operator.registry-stale",
@@ -1531,8 +1559,14 @@ def _print_parked(parked: list[operatoractions.ParkedStory]) -> int:
         return 0
     print(f"{len(parked)} story/stories awaiting operator actions:\n")
     for p in parked:
-        drift = p.drift()
-        suffix = f"  — NOT CONFIRMABLE: {drift}" if drift else ""
+        # `resumable` first, for the same reason `cmd_confirm` tests it first: an
+        # interrupted confirmation drifts, so reading `drift()` alone would label
+        # a story confirm will happily finish as NOT CONFIRMABLE.
+        if p.resumable:
+            suffix = "  — ALREADY SIGNED OFF: re-run confirm to advance the board"
+        else:
+            drift = p.drift()
+            suffix = f"  — NOT CONFIRMABLE: {drift}" if drift else ""
         print(f"  {p.story_key} (parked {p.parked_at}, commit {p.commit[:8]}){suffix}")
         for i, action in enumerate(p.actions, 1):
             print(f"      {i}. {action}")

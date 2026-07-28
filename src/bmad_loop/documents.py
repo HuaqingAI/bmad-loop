@@ -120,7 +120,19 @@ def confirm_document(parked: list[ParkedStory]) -> dict[str, object]:
     them would make the document say a story "cannot be confirmed" without ever
     saying what is wrong with it, and `drift` is prose, not something to branch
     on. `actions` is the SPEC's list where the spec is readable, matching what
-    the text listing shows and what a human would be acknowledging."""
+    the text listing shows and what a human would be acknowledging.
+
+    `resumable` marks a confirmation interrupted between its spec writes and its
+    board write — a story `confirm` finishes rather than refuses, even though
+    `confirmable` is False and `drift` reads like ordinary staleness. It ships
+    with the raw `confirmation_recorded` it is derived from, for the same reason
+    `confirmable` ships with the two statuses: a consumer triaging a stuck board
+    has to be able to see WHICH reading made the boolean what it is.
+
+    CONFIRM_SCHEMA_VERSION deliberately stays 1. Evolution here is additive-only
+    (machine.py), new fields may appear, and every field that already existed
+    produces the same value for every input — nothing a consumer pinned has
+    moved."""
     return {
         "schema_version": CONFIRM_SCHEMA_VERSION,
         "parked": [
@@ -134,6 +146,8 @@ def confirm_document(parked: list[ParkedStory]) -> dict[str, object]:
                 "run_id": p.run_id,
                 "parked_at": p.parked_at,
                 "confirmable": p.confirmable,
+                "confirmation_recorded": p.confirmation_recorded,
+                "resumable": p.resumable,
                 "drift": p.drift(),
             }
             for p in parked

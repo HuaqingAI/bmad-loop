@@ -4903,6 +4903,46 @@ def test_a_resume_still_honors_reverify_and_says_what_was_not_done(
     assert "1-1-a" in operatoractions.load(project.project)
 
 
+def test_list_marks_an_interrupted_confirmation_as_signed_off_not_refused(project, capsys):
+    """An interrupted confirmation drifts, so a listing that reads `drift()` alone
+    labels it NOT CONFIRMABLE — telling a human confirm will refuse a story confirm
+    will happily finish.
+
+    Ablation: drop the `resumable` arm of `_print_parked` and this fails."""
+    install_bmad_config(project)
+    _interrupted_story(project)
+
+    assert cli.main(_confirm_argv(project, "--list")) == 0
+    out = capsys.readouterr().out
+    assert "ALREADY SIGNED OFF" in out and "re-run confirm" in out
+    assert "NOT CONFIRMABLE" not in out
+
+
+def test_json_carries_resumable_and_the_reading_it_came_from(project, capsys):
+    """The builder commits to shipping the raw inputs a derived boolean came from,
+    so a consumer triaging a stuck board can see WHICH reading made it what it is.
+
+    ⚠️ `schema_version` stays 1 deliberately: evolution is additive-only, and every
+    field that already existed produces the same value for every input."""
+    install_bmad_config(project)
+    _interrupted_story(project)
+
+    doc = machine_json(_confirm_argv(project, "--json"), capsys)
+    assert doc["schema_version"] == 1
+    (entry,) = doc["parked"]
+    assert entry["resumable"] is True and entry["confirmation_recorded"] is True
+    # unchanged for the same input — the half-applied state is still not a park
+    assert entry["confirmable"] is False and entry["drift"] == "its spec now says status: done"
+
+
+def test_json_says_a_plain_park_is_not_resumable(project, capsys):
+    install_bmad_config(project)
+    _park_story(project)
+
+    (entry,) = machine_json(_confirm_argv(project, "--json"), capsys)["parked"]
+    assert entry["resumable"] is False and entry["confirmation_recorded"] is False
+
+
 def test_a_spec_at_done_without_a_sign_off_is_still_refused(project, capsys, monkeypatch):
     """The guard that keeps the resume from swallowing ordinary drift: a story
     re-driven to done, or finished by hand, carries no ``## Operator Confirmation``
@@ -4975,6 +5015,60 @@ def test_validate_is_silent_when_the_index_agrees_with_the_board(project, capsys
     findings = _validate_findings(project, capsys, rc=1)
     assert "operator.registry-stale" not in findings
     assert "operator.actions-malformed" not in findings
+
+
+def test_validate_reports_a_board_drift_alongside_a_malformed_action_list(project, capsys):
+    """Two findings, not one. The malformed list is about the INDEX side and the
+    board disagreement is about the COMMITTED side, and their remedies differ —
+    repair the list versus discard the entry. The `continue` that used to follow
+    the malformed warning dropped the second one entirely, because `drift()`
+    checks the board BEFORE the empty-actions cause, so nothing ever reported it.
+
+    Ablation: restore the `continue` and this fails. ⚠️ `_validate_findings` keys
+    by check id and so cannot prove a COUNT — that is safe here only because the
+    two ids differ; do not reuse it to assert two same-id findings."""
+    install_bmad_config(project)
+    _park_story(project, actions=[], board="done")
+
+    findings = _validate_findings(project, capsys, rc=1)
+    assert "declares nothing readable" in findings["operator.actions-malformed"]["message"]
+    stale = findings["operator.registry-stale"]
+    assert stale["detail"]["drift"] == "the board now says done"
+
+
+def test_validate_does_not_call_a_malformed_park_stale_on_its_own(project, capsys):
+    """The other half of dropping the `continue`: with the committed state still
+    describing a park, the unreadable list is the ONLY finding. Reporting it twice
+    — once as malformed, once as "stale because it declares no readable actions" —
+    would send a human to two remedies for one fault.
+
+    Ablation: call `drift()` instead of `committed_drift()` in the malformed arm
+    and this fails."""
+    install_bmad_config(project)
+    _park_story(project, actions=[])
+
+    findings = _validate_findings(project, capsys, rc=1)
+    assert "operator.actions-malformed" in findings
+    assert "operator.registry-stale" not in findings
+
+
+def test_validate_reports_an_interrupted_confirmation_under_its_own_id(project, capsys):
+    """A new id rather than `registry-stale`, because the remedy INVERTS: re-run
+    confirm to finish it, not discard the entry. Telling a human "the entry is
+    stale and confirm will refuse it" about a story confirm now completes is the
+    same class of lie the half-applied state itself is.
+
+    Ablation: delete the `resumable` arm and this fails — the finding comes back
+    as `operator.registry-stale` saying confirm will refuse it."""
+    install_bmad_config(project)
+    _interrupted_story(project)
+
+    findings = _validate_findings(project, capsys, rc=1)
+    interrupted = findings["operator.confirm-interrupted"]
+    assert interrupted["severity"] == "warning"
+    assert "board was never advanced" in interrupted["message"]
+    assert "confirm 1-1-a" in interrupted["message"]
+    assert "operator.registry-stale" not in findings
 
 
 def test_validate_operator_warnings_never_fail_the_run(project, capsys):

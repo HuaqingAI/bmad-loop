@@ -77,6 +77,7 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "skills.stories-dispatch-stale",
         "operator.registry-stale",
         "operator.actions-malformed",
+        "operator.confirm-interrupted",
         "deferred.closes-unknown",
         "deferred.closes-malformed",
         "deferred.closes-entry-unreadable",
