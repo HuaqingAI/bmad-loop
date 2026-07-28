@@ -12,8 +12,10 @@ reader can see a status it cannot safely move.
 `set_frontmatter_status`'s original tests live in `tests/test_resolve.py:63-138`,
 next to `set_frontmatter_field`'s. They were deliberately left there —
 characterize before restructuring, and moving them would hide this diff behind a
-rename. Consolidating them here is filed as a follow-up.
+rename. Consolidating them here is filed as #357.
 """
+
+import os
 
 import pytest
 import yaml
@@ -31,6 +33,25 @@ def _spec(tmp_path, text: str, name: str = "spec.md"):
     return path
 
 
+def _as_written(text: str) -> str:
+    """What `Path.write_text` actually puts on disk for `text`.
+
+    `set_frontmatter_status` writes with `write_text`, whose default newline
+    handling relays EVERY line ending in the file to `os.linesep` — so on Windows
+    an all-LF spec comes back all-CRLF, from a writer whose contract is "only the
+    status value changes". That is the largest possible violation of it, it has
+    always been there, and it is filed as #357 rather than fixed here: fixing it
+    needs `_replace_value` to carry each line's own ending (today it appends a
+    bare `\n`, which would leave a CRLF file with one LF line) plus its own CRLF
+    characterization, and it is shared with `devcontract.reset_spec_status`.
+
+    Modelling the relay keeps the byte-exact "every OTHER byte unchanged" gate —
+    the half that catches a wrong-target write, which no substring assertion has —
+    while letting Windows say what the writer really does. A no-op on POSIX.
+    """
+    return text.replace("\n", os.linesep)
+
+
 # ============================================================ characterization
 #
 # Green before AND after the rewrite. Anything that fails here is a change to the
@@ -42,7 +63,9 @@ def test_a_plain_flip_changes_the_status_line_and_nothing_else(tmp_path):
     comments, quoting and body survive byte-for-byte."""
     spec = _spec(tmp_path, _PLAIN)
     assert frontmatter.set_frontmatter_status(spec, "done") is True
-    assert spec.read_bytes().decode() == _PLAIN.replace("status: in-review", "status: done")
+    assert spec.read_bytes().decode() == _as_written(
+        _PLAIN.replace("status: in-review", "status: done")
+    )
 
 
 def test_flipping_to_the_status_already_there_returns_false_and_does_not_write(tmp_path):
@@ -63,28 +86,32 @@ def test_a_quoted_value_is_written_back_unquoted(tmp_path):
     value's quotes" breaks those three from here."""
     spec = _spec(tmp_path, "---\nstatus: 'in-review'\n---\nbody\n")
     assert frontmatter.set_frontmatter_status(spec, "done") is True
-    assert spec.read_bytes().decode() == "---\nstatus: done\n---\nbody\n"
+    assert spec.read_bytes().decode() == _as_written("---\nstatus: done\n---\nbody\n")
 
 
 def test_a_trailing_inline_comment_on_the_status_line_is_dropped(tmp_path):
     """The other deliberate non-preservation. Keeping it needs to know where the
     scalar ends — a `#` inside a quoted value is not a comment — and a wrong
-    guess turns a working spec into a refused write. Filed as a follow-up."""
+    guess turns a working spec into a refused write. Filed as #357."""
     spec = _spec(tmp_path, "---\nstatus: in-review  # set by step-03\n---\nbody\n")
     assert frontmatter.set_frontmatter_status(spec, "done") is True
-    assert spec.read_bytes().decode() == "---\nstatus: done\n---\nbody\n"
+    assert spec.read_bytes().decode() == _as_written("---\nstatus: done\n---\nbody\n")
 
 
 def test_a_status_prefixed_key_is_never_targeted(tmp_path):
     spec = _spec(tmp_path, "---\nstatus_note: keep me\nstatus: in-review\n---\nbody\n")
     assert frontmatter.set_frontmatter_status(spec, "done") is True
-    assert spec.read_bytes().decode() == "---\nstatus_note: keep me\nstatus: done\n---\nbody\n"
+    assert spec.read_bytes().decode() == _as_written(
+        "---\nstatus_note: keep me\nstatus: done\n---\nbody\n"
+    )
 
 
 def test_a_commented_out_status_line_is_never_targeted(tmp_path):
     spec = _spec(tmp_path, "---\n# status: draft\nstatus: in-review\n---\nbody\n")
     assert frontmatter.set_frontmatter_status(spec, "done") is True
-    assert spec.read_bytes().decode() == "---\n# status: draft\nstatus: done\n---\nbody\n"
+    assert spec.read_bytes().decode() == _as_written(
+        "---\n# status: draft\nstatus: done\n---\nbody\n"
+    )
 
 
 def test_no_frontmatter_block_returns_false_with_the_bytes_unchanged(tmp_path):
@@ -110,13 +137,13 @@ def test_a_present_but_empty_status_is_filled(tmp_path):
     the writer must be able to move, not as a missing key."""
     spec = _spec(tmp_path, "---\nstatus:\ntitle: t\n---\nbody\n")
     assert frontmatter.set_frontmatter_status(spec, "done") is True
-    assert spec.read_bytes().decode() == "---\nstatus: done\ntitle: t\n---\nbody\n"
+    assert spec.read_bytes().decode() == _as_written("---\nstatus: done\ntitle: t\n---\nbody\n")
 
 
 def test_indentation_on_the_status_line_survives(tmp_path):
     spec = _spec(tmp_path, "---\n  status: in-review\n---\nbody\n")
     assert frontmatter.set_frontmatter_status(spec, "done") is True
-    assert spec.read_bytes().decode() == "---\n  status: done\n---\nbody\n"
+    assert spec.read_bytes().decode() == _as_written("---\n  status: done\n---\nbody\n")
 
 
 # ================================================================== behavior
@@ -205,7 +232,7 @@ def test_a_decoy_before_the_real_status_does_not_capture_the_write(tmp_path, dec
     text = f"---\n{decoy}status: in-review\n---\nbody\n"
     spec = _spec(tmp_path, text)
     assert frontmatter.set_frontmatter_status(spec, "done") is True
-    assert spec.read_bytes().decode() == f"---\n{decoy}status: done\n---\nbody\n"
+    assert spec.read_bytes().decode() == _as_written(f"---\n{decoy}status: done\n---\nbody\n")
     assert frontmatter.status_of(frontmatter.read_frontmatter(spec)) == "done"
 
 
@@ -222,7 +249,7 @@ def test_a_key_spelling_yaml_accepts_is_rewritten_with_its_formatting_kept(tmp_p
     reader ever accepts — it lands on the unparseable-block raise above.)"""
     spec = _spec(tmp_path, f"---\n{key}: {value}\n---\nbody\n")
     assert frontmatter.set_frontmatter_status(spec, "done") is True
-    assert spec.read_bytes().decode() == f"---\n{key}: done\n---\nbody\n"
+    assert spec.read_bytes().decode() == _as_written(f"---\n{key}: done\n---\nbody\n")
     assert frontmatter.status_of(frontmatter.read_frontmatter(spec)) == "done"
 
 
@@ -262,7 +289,9 @@ def test_the_verified_edit_is_never_a_yaml_round_trip(tmp_path):
     )
     spec = _spec(tmp_path, text)
     assert frontmatter.set_frontmatter_status(spec, "done") is True
-    assert spec.read_bytes().decode() == text.replace("status: in-review", "status: done")
+    assert spec.read_bytes().decode() == _as_written(
+        text.replace("status: in-review", "status: done")
+    )
     fm = frontmatter.read_frontmatter(spec)
     assert fm["status"] == "done" and fm["tags"] == ["a", "b"]
     assert list(fm) == ["title", "tags", "status", "owner"]  # order survives
