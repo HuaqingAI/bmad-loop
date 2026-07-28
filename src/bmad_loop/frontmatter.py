@@ -174,6 +174,26 @@ def _replace_value(line: str, m: re.Match[str], value: str) -> str:
     return f"{line[: m.end()]} {value}{nl}"
 
 
+def _last_line_ending(block: str) -> str:
+    """The terminator of ``block``'s last line — what an INSERTED line must carry
+    so an append does not introduce a foreign ending into the file.
+
+    The same per-line reading `_replace_value` does, for the branch that has no
+    line to copy from: an inserted key goes directly after the block's last line,
+    so that line's ending is the one it should share. Falls back to ``"\\n"`` for
+    an empty block (``---``/``---`` with nothing between) and for a last line
+    carrying no terminator at all — neither can happen through
+    `_split_frontmatter`, whose block is always followed by the closing delimiter
+    line, but an appended key that started on the previous line would be a
+    corruption rather than a formatting nit, so it is guarded rather than
+    reasoned about."""
+    lines = block.splitlines(keepends=True)
+    if not lines:
+        return "\n"
+    last = lines[-1]
+    return last[len(last.rstrip("\r\n")) :] or "\n"
+
+
 def _edit_frontmatter_block(
     block: str,
     key: str,
@@ -218,7 +238,9 @@ def _edit_frontmatter_block(
     `devcontract.reset_spec_status` need and `set_frontmatter_status` must never
     do. It is gated on the READER's view rather than on a scan miss, which is the
     other half of the same defect: a scan that missed a quoted key then appended
-    a SECOND one, and the file ended up with two."""
+    a SECOND one, and the file ended up with two. The inserted line takes the
+    ending of the line it follows (`_last_line_ending`), so an insert cannot
+    introduce a foreign line ending any more than a replacement can."""
     pattern = _key_line_re(key) if pattern is None else pattern
     try:
         original = yaml.safe_load(block)
@@ -231,8 +253,7 @@ def _edit_frontmatter_block(
     if not isinstance(original, dict) or key not in original:
         if not insert:
             return None  # the reader sees no such top-level key — nothing to change
-        nl = "\r\n" if block.endswith("\r\n") else "\n"
-        return _verified(block + f"{key}: {value}{nl}", key, value, rest)
+        return _verified(block + f"{key}: {value}{_last_line_ending(block)}", key, value, rest)
     if original[key] == value:
         return None  # already at the target — idempotent no-op, no write
     lines = block.splitlines(keepends=True)

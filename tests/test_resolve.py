@@ -195,6 +195,20 @@ def test_set_frontmatter_field_inserts_with_the_blocks_own_line_ending(tmp_path)
     assert fm == {"title": "t", "status": "done", "baseline_revision": "abc123"}
 
 
+def test_set_frontmatter_field_inserts_without_introducing_a_foreign_line_ending(tmp_path):
+    """The insert copies the ending of the line it follows, so it cannot be the
+    one line in the file with a different one. A CR-only spec is the shape that
+    tells the two readings apart: `block.endswith("\\r\\n")` is False here and a
+    flat `\\n` fallback would append the sole LF line to an all-CR file."""
+    spec = tmp_path / "spec.md"
+    spec.write_bytes(b"---\rtitle: t\rstatus: done\r---\r\rbody\r")
+    assert verify.set_frontmatter_field(spec, "baseline_revision", "abc123") is True
+    text = spec.read_bytes().decode("utf-8")
+    assert text == "---\rtitle: t\rstatus: done\rbaseline_revision: abc123\r---\r\rbody\r"
+    assert "\n" not in text
+    assert verify.read_frontmatter(spec)["baseline_revision"] == "abc123"
+
+
 # ----------------------------------------------------------- build_context
 
 
