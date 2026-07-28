@@ -433,9 +433,10 @@ class RecoveryFlow:
                 workspace.root, ref, baseline_untracked=task.baseline_untracked
             )
         except (verify.GitError, OSError) as exc:
-            # OSError alongside GitError: `_run_git` only translates a timeout, so a
-            # spawn-level EMFILE/ENOMEM escapes untyped (the sibling guards at
-            # verify.is_ancestor / worktree_prune catch both). Uncaught it crashed the
+            # OSError alongside GitError: spawn faults arrive typed as GitSpawnError
+            # since #343, but `snapshot_worktree`'s `TemporaryDirectory` can raise a
+            # plain OSError (ENOSPC) — a non-spawn FS fault the chokepoint cannot
+            # translate, so this arm stays load-bearing. Uncaught it crashed the
             # run here — after the commits ref, before the reset — which is the safe
             # outcome reached the loudest possible way. Preservation is observation,
             # so it degrades into the decision below; `safe_reset` is the repair
