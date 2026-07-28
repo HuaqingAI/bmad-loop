@@ -20,6 +20,7 @@ from typing import Any
 
 from . import deferredwork
 from .bmadconfig import ProjectPaths
+from .frontmatter import FrontmatterWriteError  # noqa: F401 — re-export
 from .frontmatter import set_frontmatter_status  # noqa: F401 — re-export
 from .frontmatter import _split_frontmatter, operator_actions_of, read_frontmatter, status_of
 from .model import StoryTask, VerifyOutcome
