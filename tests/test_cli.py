@@ -4748,6 +4748,7 @@ def test_confirm_refuses_when_the_spec_vanished_before_the_audit_section(
 
     install_bmad_config(project)
     sp = _park_story(project)
+
     def _answer_and_delete(_q):  # the spec goes between `resolve` and the append
         sp.unlink(missing_ok=True)
         return True
@@ -4887,9 +4888,7 @@ def test_a_resume_commits_the_spec_the_interrupted_run_never_committed(
     assert "confirm 1-1-a" in git(project.project, "log", "-1", "--format=%s")
 
 
-def test_a_resume_still_honors_reverify_and_says_what_was_not_done(
-    project, capsys, monkeypatch
-):
+def test_a_resume_still_honors_reverify_and_says_what_was_not_done(project, capsys, monkeypatch):
     """`--reverify` is a gate the caller requested for THIS invocation, not an
     acknowledgment, so it still runs. The message has to say "NOT advanced" — the
     confirmation itself already happened, and telling a human it was "NOT

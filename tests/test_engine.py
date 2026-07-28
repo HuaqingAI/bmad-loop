@@ -1467,7 +1467,7 @@ def test_park_indexing_failure_never_un_commits_the_story(project, monkeypatch):
     assert operatoractions.load(project.project) == {}
 
 
-def _park_engine(project, monkeypatch=None):
+def _park_engine(project):
     """A run whose single story parks with actions owed."""
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     engine, _ = make_engine(
