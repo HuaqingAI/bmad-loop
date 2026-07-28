@@ -501,8 +501,8 @@ def reset_spec_status(spec_path: Path, new_status: str) -> bool:
     ``meta.status:`` in preference to the real key. The shared
     `frontmatter._edit_frontmatter_block` re-parses each trial edit before keeping
     it, so those become a loud refusal instead of a corrupted spec. Only
-    `engine.py:2115` reads the return; the raise is what reaches the other four
-    call sites."""
+    `engine._reconcile_generic_terminal_status` reads the return; the raise is what
+    reaches the other three call sites, which treat it as a repair write."""
     if not spec_path.is_file():
         return False
     text = spec_path.read_text(encoding="utf-8")

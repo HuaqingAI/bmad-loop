@@ -2130,6 +2130,9 @@ class Engine:
         arr = devcontract.parse_auto_run_result(text)
         if not arr.present or arr.status != devcontract.DONE:
             return  # no terminal prose, or a blocked outcome: leave for the escalation path
+        # Repair-write doctrine: the False arm is "nothing to change" only. A status
+        # the reader can see but no line edit can move raises instead, and that raise
+        # is deliberately left uncaught (see _reset_spec_for_repair).
         if not devcontract.reset_spec_status(spec_path, success_status):
             return
         # Keep the in-place result_json the rest of _dev_phase reads consistent with
@@ -3108,6 +3111,9 @@ class Engine:
         if not task.spec_file:
             return
         spec_path = Path(task.spec_file)
+        # Repair-write doctrine: raising beats dispatching a repair at a charged
+        # attempt against a spec still reading `done` — step-01 would ingest it as
+        # context and not resume, re-wedging silently (cf. runs.rearm_escalation).
         devcontract.reset_spec_status(spec_path, "in-progress")
         devcontract.strip_auto_run_result(spec_path)
 

@@ -3287,6 +3287,34 @@ def test_reset_spec_for_repair_strips_stale_terminal_section(project):
     assert "## Intent\n\nbody\n" in text  # frozen intent untouched
 
 
+def test_reset_spec_for_repair_lets_an_unwritable_status_raise(project):
+    """Pins 283a410: the engine's `reset_spec_status` call sites deliberately let
+    `FrontmatterWriteError` propagate rather than swallowing it. Swallowing here
+    would dispatch a repair at a charged attempt against a spec still reading
+    `done` — step-01 ingests such a spec as context and does not resume, so the
+    story re-wedges with nothing on the record. That is exactly why the sibling
+    writer in `runs.rearm_escalation` aborts instead of degrading."""
+    engine, _ = make_engine(project, [])
+    spec = project.implementation_artifacts / "spec-1-1-a.md"
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    # A block-scalar `status:` reads fine and is unmovable by a line edit — the
+    # shape pinned at tests/test_devcontract.py::test_reset_status_refuses_the_
+    # shapes_its_own_regex_misreads.
+    original = (
+        "---\nstatus: |\n  done\n---\n\n## Intent\n\nbody\n\n"
+        "## Auto Run Result\n\nStatus: done\nAll done.\n"
+    ).encode("utf-8")
+    spec.write_bytes(original)
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(spec))
+
+    with pytest.raises(verify.FrontmatterWriteError):
+        engine._reset_spec_for_repair(task)
+
+    # The refusal is total: the status flip did not land, and the strip on the very
+    # next line never ran, so the stale terminal section is still there.
+    assert spec.read_bytes() == original
+
+
 def test_review_launch_snapshot_threaded_into_session_spec(project):
     """The engine captures a launch-state SpecSnapshot right after the review
     marker strip and threads it onto the review SessionSpec; the dev session that
