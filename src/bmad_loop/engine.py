@@ -1312,6 +1312,8 @@ class Engine:
     def _review_and_commit(
         self, task: StoryTask, resume_result: SessionResult | None = None
     ) -> None:
+        if self._park_awaiting_operator(task):
+            return
         if not self.policy.review.enabled:
             # review.enabled = false: the bmad-dev-auto session's own inline
             # review is the only review; verify the deterministic gates + commit.
@@ -1692,12 +1694,53 @@ class Engine:
         self._commit(task)
         return True
 
-    def _skip_review_and_commit(self, task: StoryTask) -> None:
+    def _park_awaiting_operator(self, task: StoryTask) -> bool:
+        """Take a dev-declared ``awaiting-operator`` park down the commit path,
+        skipping the review loop. Returns True when it did (the caller is done).
+
+        The review loop is skipped because there is nothing for it to converge
+        ON. A review pass is bmad-dev-auto re-invoked on the spec to second-guess
+        the diff and finalize `done`; a park's outstanding work is not in the diff
+        at all — it is outside the repo, in a human's hands — so every cycle would
+        either re-park (no progress, budget burned) or "fix" the park away by
+        finalizing `done`, which is the exact false-green the state exists to
+        prevent. What the loop DOES contribute, the deterministic gate, is kept:
+        this delegates to the same skip-review commit path, whose `_verify_review`
+        now holds the park to its (awaiting-operator, awaiting-operator) pair, a
+        non-empty action list, and the project's verify commands. Parked work
+        clears every check `done` work clears — no commit path skips verification.
+
+        No `_defer` machinery: a park is a SUCCESS that commits, so there is no
+        stash, no rollback, and no ledger snapshot to unwind. (A park that fails
+        verification is not a park yet; it defers like any other unverified work,
+        through the shared path below.)"""
+        if not self._operator_park_enabled():
+            return False
+        spec_path = Path(task.spec_file) if task.spec_file else None
+        if spec_path is None or not spec_path.is_file():
+            return False
+        fm = self._observed_frontmatter(spec_path, task.story_key, "operator-park")
+        if fm is None or verify.status_of(fm) != verify.AWAITING_OPERATOR:
+            return False
+        # Latched BEFORE _commit's advance(COMMITTING) + _save, so a host death
+        # anywhere in the commit window resumes into _finalize_commit_phase with
+        # the actions already on the persisted task — and that arm re-derives
+        # AWAITING_OPERATOR from them with no change of its own (#115).
+        task.operator_actions = list(verify.operator_actions_of(fm))
+        self._skip_review_and_commit(task, kind="review-skipped-awaiting-operator")
+        return True
+
+    def _skip_review_and_commit(self, task: StoryTask, *, kind: str = "review-skipped") -> None:
         """review.enabled = false: no separate review session runs. The
         bmad-dev-auto session ran its own inline review and finalized the
         story to done. Validate the deterministic gates (verify commands,
-        spec/sprint = done) and commit, repairing once if verify is fixable."""
-        self.journal.append("review-skipped", story_key=task.story_key)
+        spec/sprint = done) and commit, repairing once if verify is fixable.
+
+        Also the commit path for an ``awaiting-operator`` park, which reaches
+        here with ``kind="review-skipped-awaiting-operator"`` — same gates, same
+        repair-once, same commit; only the reason the review was skipped differs,
+        and the journal says which."""
+        self.journal.append(kind, story_key=task.story_key)
         outcome = self._verify_review(task)
         if not outcome.ok and outcome.fixable and self._fix_phase(task, outcome.reason):
             outcome = self._verify_review(task)
@@ -1805,8 +1848,28 @@ class Engine:
             # re-raise untouched.
             self._restore_deferred_closes(task, snapshot)
             raise
-        advance(task, Phase.DONE)
-        self.journal.append("story-done", story_key=task.story_key, commit=task.commit_sha)
+        # Final-phase rule: AWAITING_OPERATOR iff the task carries actions,
+        # otherwise DONE. Derived from PERSISTED task state, never from a local
+        # flag, so the crash-resume arm that re-enters this method reaches the
+        # same verdict the pre-crash run would have — the park latch is the only
+        # thing that has to survive, and it does.
+        if task.operator_actions:
+            advance(task, Phase.AWAITING_OPERATOR)
+            # The durable record of what a human owes, for now: the actions
+            # themselves, not just a count, because this and the spec frontmatter
+            # are the only places they survive the run. The project-level registry
+            # `bmad-loop confirm` reads, and the park notification, land with that
+            # command (part 3) — they are its data store and its prompt, and
+            # shipping them here would leave a store nothing reads.
+            self.journal.append(
+                "story-awaiting-operator",
+                story_key=task.story_key,
+                commit=task.commit_sha,
+                actions=list(task.operator_actions),
+            )
+        else:
+            advance(task, Phase.DONE)
+            self.journal.append("story-done", story_key=task.story_key, commit=task.commit_sha)
         self._emit("post_commit", task)
         self._save()
 
@@ -1820,6 +1883,19 @@ class Engine:
         as the predicate the decoupled-path seams (B2/B4/B6/B7) read through, so
         a future alternative dev skill can re-introduce the legacy branch."""
         return self.policy.dev.skill == "bmad-dev-auto"
+
+    def _operator_park_enabled(self) -> bool:
+        """Whether a dev session may park a story at ``awaiting-operator`` (#335).
+
+        Sprint mode only. Stories mode has no sprint board, so the pair the
+        verify gates hold a park to does not exist there
+        (``verify_review_stories`` still demands ``done``); sweep bundles carry
+        no board entry either, and a deferred-work bundle owing a human action is
+        a different question from a story owing one. Both subclasses override
+        this to False rather than inheriting a path their verify tail cannot
+        gate — support for either is a follow-up, not an accident of where the
+        branch happens to sit."""
+        return self.policy.operator.enabled
 
     def _dev_review_enabled(self) -> bool:
         """Spec-status/sprint semantics for verify_dev and the sprint sync. The
@@ -2048,7 +2124,12 @@ class Engine:
             return
         fm_status = str(fm.get("status", "")).strip().lower()
         rj_status = str(rj.get("status", "")).strip().lower()
-        if fm_status not in (devcontract.DONE, devcontract.BLOCKED) or fm_status != rj_status:
+        # Same terminal set `devcontract.is_frontmatter_candidate` scans for: that
+        # scan is what FINDS a marker-less finalized spec, and this repair is what
+        # brings it back into contract. A status accepted by one and refused by
+        # the other would leave a park harvested but permanently un-markered.
+        terminal = (devcontract.DONE, devcontract.BLOCKED, devcontract.AWAITING_OPERATOR)
+        if fm_status not in terminal or fm_status != rj_status:
             self.journal.append(
                 "spec-marker-repair-skipped",
                 story_key=task.story_key,
@@ -2110,7 +2191,22 @@ class Engine:
         fm = self._observed_frontmatter(spec_path, task.story_key, "post-dev-sync")
         if fm is None:
             return
-        if verify.status_of(fm) != success_status:
+        status = verify.status_of(fm)
+        # A park is the other terminal a session can reach, so it gets the same
+        # mirror: the board moves to `awaiting-operator`, which sits immediately
+        # below `done` in STATUS_ORDER and is therefore an ordinary FORWARD
+        # advance through the sole writer — no exception to never-regress, and
+        # `bmad-loop confirm` later advances the same board the same way. Mirrored
+        # on the STATUS alone, before the actions are validated: verify_dev owns
+        # the "declared nothing" retry, and its feedback reads far better against
+        # a board that already agrees with the spec than against one two stages
+        # behind it.
+        if self._operator_park_enabled() and status == verify.AWAITING_OPERATOR:
+            sprint_advance(
+                self.workspace.paths.sprint_status, task.story_key, verify.AWAITING_OPERATOR
+            )
+            return
+        if status != success_status:
             return
         target = "review" if review_enabled else "done"
         sprint_advance(self.workspace.paths.sprint_status, task.story_key, target)
@@ -2408,7 +2504,11 @@ class Engine:
 
     def _verify_dev_artifacts(self, task: StoryTask, result_json: dict | None):
         return verify.verify_dev(
-            task, self.workspace.paths, result_json, review_enabled=self._dev_review_enabled()
+            task,
+            self.workspace.paths,
+            result_json,
+            review_enabled=self._dev_review_enabled(),
+            operator_park=self._operator_park_enabled(),
         )
 
     def _verify_review(self, task: StoryTask):
@@ -2421,6 +2521,7 @@ class Engine:
             self.workspace.paths,
             self.policy,
             sprint_reached_done=not self._dev_review_enabled(),
+            operator_park=self._operator_park_enabled(),
         )
 
     def _review_prompt(self, task: StoryTask) -> str:
@@ -2454,6 +2555,16 @@ class Engine:
         )
 
     def _commit_message(self, task: StoryTask) -> str:
+        # The park suffix is appended to a rendered template too. The template
+        # governs the message's SHAPE; whether the story is finished is a fact
+        # about the commit, and `git log` is where an operator looks for it long
+        # after the notification scrolled past. A plugin that wants the suffix
+        # gone can still rewrite the whole message at pre_commit.
+        return self._base_commit_message(task) + (
+            " (awaiting operator)" if task.operator_actions else ""
+        )
+
+    def _base_commit_message(self, task: StoryTask) -> str:
         rendered = self._render_commit_template(task)
         if rendered is not None:
             return rendered
@@ -2861,8 +2972,8 @@ class Engine:
                     f"`{task.spec_file}`. The attempted change was restored onto "
                     f"the working tree after an intent-gap resolution; review it "
                     f"against the amended spec."
-                )
-            return f"/bmad-dev-auto {task.story_key}"
+                ) + self._operator_park_instruction()
+            return f"/bmad-dev-auto {task.story_key}" + self._operator_park_instruction()
         self._reset_spec_for_repair(task)
         spec_ref = task.spec_file or task.story_key
         return (
@@ -2871,6 +2982,40 @@ class Engine:
             f"verification; repair the working tree so verification passes without "
             f"changing the spec's frozen intent contract. Verification evidence is "
             f"in `{feedback}`."
+        ) + self._operator_park_instruction()
+
+    def _operator_park_instruction(self) -> str:
+        """The park contract, injected into every dev prompt while
+        ``[operator] enabled``. "" when the feature is off.
+
+        Engine-injected rather than skill-owned because the durable home for it is
+        upstream — bmad-dev-auto's spec template and step-03/04 finalize rules —
+        and that PR is not landed. This is the shipped interim: the same words the
+        skill will eventually carry, said by the orchestrator so the state is
+        reachable now. When upstream lands, this method is what goes away.
+
+        The "never blocked" clause is the load-bearing half. `blocked` is the
+        skill's existing escape for "I cannot finish", and a human-only action is
+        exactly the shape that tempts it — but blocked HALTS the run, which is the
+        original defect: one story owing a DNS record stops every story behind
+        it.
+
+        Deliberately backtick-free. It is appended AFTER the repair prompt's
+        feedback-file pointer, and the last backtick-wrapped token in a dev prompt
+        is by convention that path — a backticked word here would quietly become
+        the "feedback file" to anything reading the prompt back."""
+        if not self._operator_park_enabled():
+            return ""
+        return (
+            " — If this story's acceptance criteria include actions only a HUMAN "
+            "can perform outside the repo (buy a domain, publish a DNS record, "
+            "grant an API key, click through a vendor console): complete every "
+            "part an agent CAN do, commit it, then finalize the spec frontmatter "
+            "to status: awaiting-operator and enumerate what is owed under an "
+            "operator_actions: key — a YAML list of strings, one imperative "
+            "instruction each, non-empty. Never use the blocked status for this: "
+            "blocked halts the whole run, and this story is finished as far as "
+            "you can take it."
         )
 
     def _reset_spec_for_repair(self, task: StoryTask) -> None:

@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from .platform_util import atomic_replace
-from .verify import DEV_WORKFLOW, read_frontmatter
+from .verify import DEV_WORKFLOW, operator_actions_of, read_frontmatter
 
 # The section the skill appends on EVERY terminal path (success and blocked),
 # per its step-02/03/04 finalize instructions. Its presence is our completion
@@ -43,6 +43,14 @@ STATUS_LINE_RE = re.compile(
 # Terminal frontmatter statuses the skill can leave behind.
 DONE = "done"
 BLOCKED = "blocked"
+# The story's agent-doable work is finished, but its acceptance criteria include
+# external actions only a human can perform (#335). Terminal beside DONE and
+# BLOCKED, and deliberately NOT rendered as an escalation: BLOCKED means the
+# session could not proceed and the run must halt, while a park means it finished
+# everything an agent could and the run should move on. Synthesizing a CRITICAL
+# here would collapse that distinction into the pause channel — exactly the
+# failure the state exists to avoid.
+AWAITING_OPERATOR = "awaiting-operator"
 
 # The status a plan-halt dispatch leaves behind: under folder+id dispatch a
 # `Halt after planning.` directive makes the skill HALT right after the
@@ -239,7 +247,11 @@ def synthesize_result(
     fm_status = str(fm.get("status", "")).strip().lower()
     arr = parse_auto_run_result(_read_text_or_empty(spec_path))
 
-    terminal = (DONE, BLOCKED, PLAN_HALT_STATUS) if plan_halt else (DONE, BLOCKED)
+    terminal = (
+        (DONE, BLOCKED, AWAITING_OPERATOR, PLAN_HALT_STATUS)
+        if plan_halt
+        else (DONE, BLOCKED, AWAITING_OPERATOR)
+    )
     # Not terminal yet: no result section AND frontmatter not at a terminal state.
     if not arr.present and fm_status not in terminal:
         return SynthResult(result_json=None, status_consistent=True)
@@ -273,6 +285,14 @@ def synthesize_result(
     # on a blocked exit, so only carry it through on `done`.
     if status == DONE:
         result["followup_review_recommended"] = bool(fm.get("followup_review_recommended", False))
+    # A park's obligations travel with its result so the engine never has to
+    # re-read the spec to learn them. Folded on the awaiting-operator status
+    # ONLY: an `operator_actions:` list left on a `done` or `blocked` spec is
+    # not a park, and carrying it would let a story register obligations the
+    # verify gates never held it to. Malformed shapes read as [] here and are
+    # refused by verify's non-empty gate, which owns the retry + feedback.
+    if status == AWAITING_OPERATOR:
+        result["operator_actions"] = list(operator_actions_of(fm))
     # Mark the clean plan-halt success so verify/engine expect a planned spec
     # (status ready-for-dev, no implementation work). Never marked when a block
     # escalation is present — that routes to PAUSE, not a plan-review pause.
@@ -350,8 +370,8 @@ def find_frontmatter_candidates(impl_artifacts: Path, *, since_ns: int) -> list[
     A candidate must be modified at/after `since_ns` (same session-launch floor
     as the marker scan), carry ZERO real (non-fenced) marker headings, not be the
     no-spec fallback file (that one is already matched by name on the normal
-    path), and have frontmatter ``status:`` of ``done`` or ``blocked``. Returns
-    ALL matches, most-recent first — the caller refuses to guess between several
+    path), and have a terminal frontmatter ``status:`` (``done``, ``blocked``, or
+    ``awaiting-operator``). Returns ALL matches, most-recent first — the caller refuses to guess between several
     and must apply its own stability fingerprint before synthesizing, because a
     terminal frontmatter under a live window is weaker evidence than the marker.
     """
@@ -380,7 +400,8 @@ def is_frontmatter_candidate(path: Path, *, since_ns: int) -> bool:
     Qualifies when the file is modified at/after ``since_ns``, is NOT the no-spec
     fallback (already matched by name on the marker path), carries ZERO real
     (non-fenced) marker headings — one would put it in `find_result_artifact`'s
-    territory — and has a frontmatter ``status:`` of ``done`` or ``blocked``. Any
+    territory — and has a terminal frontmatter ``status:`` (``done``,
+    ``blocked``, or ``awaiting-operator``). Any
     unreadable/undecodable read degrades to False, never an exception."""
     if path.name.startswith(FALLBACK_RESULT_PREFIX):
         return False
@@ -399,7 +420,7 @@ def is_frontmatter_candidate(path: Path, *, since_ns: int) -> bool:
         fm = read_frontmatter(path)
     except OSError:
         return False
-    return str(fm.get("status", "")).strip().lower() in (DONE, BLOCKED)
+    return str(fm.get("status", "")).strip().lower() in (DONE, BLOCKED, AWAITING_OPERATOR)
 
 
 def _atomic_write_spec(spec_path: Path, text: str) -> None:

@@ -369,6 +369,7 @@ def write_spec(
     *,
     prose_status: str | None = None,
     closes_deferred: object = None,
+    operator_actions: object = None,
 ) -> None:
     """Write a spec the way the real bmad-dev-auto skill does. The skill's step-03
     stamps `baseline_revision` and NEVER `baseline_commit` (that name exists only
@@ -379,12 +380,24 @@ def write_spec(
     ``closes_deferred`` writes the story-declared ledger-closure field (#234): a
     list renders as a YAML flow sequence, and a bare string renders as a scalar —
     the wrong-container mistake whose handling must not depend on which file it
-    was made in."""
+    was made in.
+
+    ``operator_actions`` writes the park declaration (#335) as a real YAML BLOCK
+    sequence — the shape the dev prompt asks a session for, and the shape a human
+    reads back — so the reading under test is the one production sees. A non-list
+    renders as a scalar, which is the wrong-container mistake for this field
+    too (a bare string is iterable, so a lenient reader would turn one
+    instruction into a list of characters)."""
     declare = ""
     if isinstance(closes_deferred, list):
         declare = f"closes_deferred: [{', '.join(closes_deferred)}]\n"
     elif closes_deferred is not None:
         declare = f"closes_deferred: {closes_deferred}\n"
+    if isinstance(operator_actions, list):
+        rendered = "".join(f"  - {a}\n" for a in operator_actions)
+        declare += f"operator_actions:\n{rendered}" if rendered else "operator_actions: []\n"
+    elif operator_actions is not None:
+        declare += f"operator_actions: {operator_actions}\n"
     body = (
         f"---\ntitle: 'test'\ntype: 'feature'\nstatus: '{status}'\n"
         f"baseline_revision: '{baseline}'\n{declare}---\n\n## Intent\n\ntest spec\n"
@@ -402,7 +415,9 @@ def spec_path(paths: ProjectPaths, story_key: str) -> Path:
     return paths.implementation_artifacts / f"spec-{story_key}.md"
 
 
-def committing_crash_state(paths: ProjectPaths, engine, *, post_squash: bool = False) -> str:
+def committing_crash_state(
+    paths: ProjectPaths, engine, *, post_squash: bool = False, operator_actions: list | None = None
+) -> str:
     """Persist the exact state.json shape from issue #115: a task at COMMITTING
     (the save right after advance(COMMITTING), before finalize_commit / the DONE
     save that stamps commit_sha). Fully verified on disk: attempt work committed
@@ -411,16 +426,23 @@ def committing_crash_state(paths: ProjectPaths, engine, *, post_squash: bool = F
     done, sprint synced at DEV time. review_cycle stays 0 — the
     _skip_review_and_commit path reaches COMMITTING with zero review sessions.
     With post_squash, finalize_commit already ran before the death (squashed
-    commit at HEAD, clean tree) but commit_sha was never persisted. Returns the
-    baseline sha."""
+    commit at HEAD, clean tree) but commit_sha was never persisted.
+
+    With ``operator_actions``, the crashed story is a PARK (#335): spec + board at
+    `awaiting-operator` and the actions already latched on the task, exactly as
+    `_park_awaiting_operator` leaves it before `advance(COMMITTING)`. That latch
+    is the whole point — it is what the resume arm re-derives the final phase
+    from, with no code of its own. Returns the baseline sha."""
+    parked = bool(operator_actions)
+    status = "awaiting-operator" if parked else "done"
     baseline = rev_parse_head(paths.project)
     src = paths.project / "src.txt"
     src.write_text(src.read_text() + "change for 1-1-a\n")
     git(paths.project, "add", "src.txt")
     git(paths.project, "commit", "-q", "-m", "attempt work for 1-1-a")
     sp = spec_path(paths, "1-1-a")
-    write_spec(sp, "done", baseline)
-    write_sprint(paths, {"1-1-a": "done"})
+    write_spec(sp, status, baseline, operator_actions=operator_actions)
+    write_sprint(paths, {"1-1-a": status})
     if post_squash:
         finalize_commit(paths.project, baseline, "pre-crash squash")
 
@@ -429,6 +451,7 @@ def committing_crash_state(paths: ProjectPaths, engine, *, post_squash: bool = F
     task.baseline_commit = baseline
     task.baseline_untracked = []
     task.spec_file = str(sp)
+    task.operator_actions = list(operator_actions or [])
     task.record_session(
         SessionRecord(
             task_id="1-1-a-dev-1",
@@ -459,6 +482,7 @@ def dev_effect(
     seen: list[str] | None = None,
     write_src: bool = True,
     closes_deferred: object = None,
+    operator_actions: object = None,
 ):
     """Simulate a successful bmad-dev-auto session: it self-finalizes the spec
     (no in-review handoff — always straight to ``done``) but never touches the
@@ -471,6 +495,11 @@ def dev_effect(
     ``prose_status`` appends a terminal ``## Auto Run Result`` block with that
     Status line — pair it with a non-terminal ``final_status`` to reproduce the
     skill leaving frontmatter behind its prose (the reconcile path).
+
+    ``operator_actions`` pairs with ``final_status="awaiting-operator"`` to
+    simulate a session that finished its agent-doable work and parked the rest on
+    a human (#335); it is written to the spec frontmatter only, never to
+    result.json, because the engine re-reads the spec for it.
 
     ``seen``, when given, collects `src.txt` as the session found it on entry — the
     patch-restore tests assert the re-driven session ran against the RESTORED diff.
@@ -487,7 +516,12 @@ def dev_effect(
             source.write_text(source.read_text() + f"change for {story_key}\n")
         sp = spec_path(paths, story_key)
         write_spec(
-            sp, final_status, baseline, prose_status=prose_status, closes_deferred=closes_deferred
+            sp,
+            final_status,
+            baseline,
+            prose_status=prose_status,
+            closes_deferred=closes_deferred,
+            operator_actions=operator_actions,
         )
         # deliberately NO set_sprint: the dev skill does not write sprint-status
         return SessionResult(

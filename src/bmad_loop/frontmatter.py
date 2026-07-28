@@ -72,6 +72,36 @@ def status_of(fm: dict[str, Any]) -> str:
     return str(fm.get("status", "")).strip().lower()
 
 
+def operator_actions_of(fm: dict[str, Any]) -> tuple[str, ...]:
+    """The external, human-only actions a spec's ``operator_actions:`` frontmatter
+    declares — normalized, order-preserving, deduped.
+
+    Lives here rather than in ``devcontract`` because both sides of the park
+    contract need the same reading and ``verify`` cannot import ``devcontract``
+    (the dependency runs the other way).
+
+    Strict about the container, lenient about each scalar item — the
+    ``closes_deferred`` reading (:func:`deferredwork.parse_declaration`), for the
+    same reason: a bare ``operator_actions: buy the domain`` is iterable, so a
+    lenient container reading would silently turn one instruction into a list of
+    characters. Items that are themselves containers are dropped rather than
+    stringified: ``[{action: ..., check: ...}]`` is the deliberate v2 shape (a
+    per-action verification command), and ``str()``-ing it would hand a human a
+    line of Python repr as their instruction. ``None`` items drop for the same
+    reason — ``str(None)`` is the word "None", not an action.
+
+    Every malformed shape therefore collapses to ``()``, which the verify gates
+    read as "declared nothing" and answer with one fixable retry naming the
+    expected shape — a park is *defined* by owing at least one action, so an
+    empty reading can never be mistaken for a valid park.
+    """
+    raw = fm.get("operator_actions")
+    if not isinstance(raw, list):
+        return ()
+    items = (str(x).strip() for x in raw if x is not None and not isinstance(x, (list, dict)))
+    return tuple(dict.fromkeys(a for a in items if a))
+
+
 def set_frontmatter_status(path: Path, status: str) -> bool:
     """Rewrite the `status:` field in a spec's `---`…`---` frontmatter block.
 

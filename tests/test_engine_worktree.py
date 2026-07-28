@@ -59,7 +59,13 @@ def commit_sprint(project, statuses: dict[str, str]) -> None:
 
 
 def wt_dev_effect(
-    project, story_key, *, final_status="done", followup_review=True, closes_deferred=None
+    project,
+    story_key,
+    *,
+    final_status="done",
+    followup_review=True,
+    closes_deferred=None,
+    operator_actions=None,
 ):
     """Dev session running inside the unit worktree (spec.cwd). Mirrors the
     bmad-dev-auto skill: self-finalizes the spec to done, never writes the sprint
@@ -74,7 +80,13 @@ def wt_dev_effect(
         src = cwd / "src.txt"
         src.write_text(src.read_text() + f"change for {story_key}\n")
         sp = wt.implementation_artifacts / f"spec-{story_key}.md"
-        write_spec(sp, final_status, baseline, closes_deferred=closes_deferred)
+        write_spec(
+            sp,
+            final_status,
+            baseline,
+            closes_deferred=closes_deferred,
+            operator_actions=operator_actions,
+        )
         # NO set_sprint: the orchestrator is the single sprint-status writer
         return SessionResult(
             status="completed",
@@ -197,6 +209,38 @@ def test_worktree_happy_path_merges_to_target(project):
     assert "worktree-opened" in kinds and "unit-merged" in kinds
     # a clean teardown degrades nothing (gh-139): no warning event is emitted
     assert "worktree-teardown-degraded" not in kinds
+
+
+def test_worktree_parked_unit_merges_like_a_done_one(project):
+    """`integrate_unit` branches on DONE-vs-everything-else, and a park is the one
+    non-DONE terminal that CARRIES A COMMIT. Left on the else arm the unit is torn
+    down as failed and finished work is stranded on a deleted branch — over an
+    obligation that lives outside the repo entirely.
+
+    Ablation: narrow the merge test back to `== Phase.DONE` and this fails with
+    the story's change absent from the target branch."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    actions = ["publish the _acme-challenge TXT record"]
+    engine, _ = make_engine(
+        project,
+        [
+            wt_dev_effect(
+                project, "1-1-a", final_status="awaiting-operator", operator_actions=actions
+            )
+        ],
+    )
+
+    summary = engine.run()
+
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.AWAITING_OPERATOR and summary.awaiting_operator == 1
+    # the merge happened: the unit's work is on the target branch, not stranded
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+    assert [p.resolve() for p in worktree_list(project.project)] == [project.project.resolve()]
+    assert worktree_clean(project.project)
+    kinds = journal_kinds(engine)
+    assert "unit-merged" in kinds and "story-awaiting-operator" in kinds
+    assert "unit-closed" not in kinds  # the failed-unit teardown arm never ran
 
 
 def test_worktree_run_dir_is_outside_worktree(project):
