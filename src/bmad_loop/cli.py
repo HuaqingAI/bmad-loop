@@ -1725,6 +1725,15 @@ def _resume_confirmation(
     return _land_confirmation(project, paths, story, spec, time.strftime("%Y-%m-%d"))
 
 
+# Both refusals below land AFTER the audit section is on disk and both ask for a
+# re-run, which appends a second one. Said out loud rather than left as a
+# surprise: only the human can decide whether one sign-off should show as two.
+_SECOND_SECTION_NOTE = (
+    "Note: that re-run appends a SECOND `## Operator Confirmation` section — "
+    "delete this one first if the audit trail should record a single sign-off."
+)
+
+
 def _apply_confirmation(
     project: Path,
     paths: bmadconfig.ProjectPaths,
@@ -1745,6 +1754,12 @@ def _apply_confirmation(
     and signed off again — is a real event the audit trail must not lose), so a
     re-run after a failure *here* appends a second section for one event. That is
     a known gap, not the deliberate case the writer's docstring describes.
+
+    It is not only a crash window either: the refusals below both END by asking
+    for exactly that re-run, so the duplicate is the ORDINARY outcome of taking
+    their advice. Both therefore say so — an unmentioned second sign-off in an
+    audit trail is worse than a mentioned one, and the human is the only one who
+    can decide whether the first record should stay.
 
     Repair-write doctrine: these writes RAISE rather than degrade, and this
     asserts the resulting STATE rather than trusting a return value. `confirm` is
@@ -1770,7 +1785,7 @@ def _apply_confirmation(
             f"error: {spec} carries a status this cannot rewrite, so {story.story_key} "
             f"was NOT confirmed: {e}. The audit section was appended; the board and the "
             f"index entry are untouched, so re-run `bmad-loop confirm {story.story_key}` "
-            f"once the frontmatter is repaired.",
+            f"once the frontmatter is repaired. {_SECOND_SECTION_NOTE}",
             file=sys.stderr,
         )
         return 1
@@ -1784,7 +1799,7 @@ def _apply_confirmation(
         print(
             f"error: {spec} still does not read status: done, so {story.story_key} was "
             f"NOT confirmed. The audit section was appended; the board and the index "
-            f"entry are untouched.",
+            f"entry are untouched. {_SECOND_SECTION_NOTE}",
             file=sys.stderr,
         )
         return 1

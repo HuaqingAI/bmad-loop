@@ -4695,6 +4695,10 @@ def test_confirm_refuses_when_the_spec_status_cannot_be_rewritten(project, capsy
     err = capsys.readouterr().err
     assert "carries a status this cannot rewrite" in err
     assert "NOT confirmed" in err and "re-run" in err
+    # the audit section is already on disk, and this refusal ASKS for the re-run
+    # that appends a second one — surfaced by smoke-testing a real project, where
+    # taking the advice quietly doubled the sign-off record
+    assert "SECOND" in err and "delete this one first" in err
     assert "awaiting-operator" in sp.read_text()  # the status never moved
     assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
     assert "1-1-a" in operatoractions.load(project.project)  # still findable
@@ -4720,6 +4724,7 @@ def test_confirm_refuses_when_the_spec_does_not_read_back_as_done(project, capsy
     assert cli.main(_confirm_argv(project, "1-1-a")) == 1
     err = capsys.readouterr().err
     assert "still does not read status: done" in err and "NOT confirmed" in err
+    assert "SECOND" in err and "delete this one first" in err
     assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
     assert "1-1-a" in operatoractions.load(project.project)
 
