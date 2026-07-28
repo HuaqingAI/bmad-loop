@@ -1883,13 +1883,20 @@ class Engine:
         in both isolation modes, and `verify.resolve_spec_path` resolves it
         against the project. A spec that somehow lies outside the workspace is
         recorded as-is rather than dropped: a wrong path a human can see beats a
-        missing one they cannot."""
+        missing one they cannot.
+
+        `RuntimeError` joins the guard because `Path.resolve` reports a symlink
+        loop that way below 3.13 — the same non-OSError `_ledger_in_repo` already
+        catches, and `requires-python` is 3.11. Catching it HERE rather than only
+        around the call is what keeps the fallback: the index entry is still
+        written, with `spec_file` recorded verbatim, and per #356 the entry is
+        load-bearing (a story key does not yield a spec path)."""
         spec_file = task.spec_file or ""
         if not spec_file:
             return ""
         try:
             return Path(spec_file).resolve().relative_to(self.workspace.root.resolve()).as_posix()
-        except (OSError, ValueError):
+        except (OSError, RuntimeError, ValueError):
             return spec_file
 
     def _index_park(self, task: StoryTask) -> None:
@@ -1901,7 +1908,18 @@ class Engine:
         `awaiting-operator`, and the journal and spec both record what is owed.
         Raising here would abort a story that genuinely succeeded over its
         bookkeeping, so an unwritable index degrades to a journal line — and
-        `validate` reports the resulting drift (`operator.registry-stale`)."""
+        `validate` reports the resulting drift (`operator.registry-stale`).
+
+        This runs at the tail of `_finalize_commit_phase`, OUTSIDE every try
+        there and after `advance(task, Phase.AWAITING_OPERATOR)`, so an escape
+        skips `_notify_park`, `_emit("post_commit")` and `self._save()` — the
+        park phase is never persisted, over an index write that was best-effort
+        by design. `RuntimeError` is in the guard for a second reason beyond the
+        resolve above: `record_park` -> `_write_store` -> `_exclude_from_git` ->
+        `install._worktree_local_exclude` has a bare `.resolve()` outside that
+        function's only try, reachable when `git rev-parse --git-common-dir`
+        answers with a relative path (the linked-worktree case — exactly this
+        one)."""
         try:
             operatoractions.record_park(
                 self.paths.project,
@@ -1912,7 +1930,7 @@ class Engine:
                 run_id=self.state.run_id,
                 parked_at=self._today(),
             )
-        except OSError as e:
+        except (OSError, RuntimeError) as e:
             self.journal.append("operator-index-failed", story_key=task.story_key, error=str(e))
 
     def _notify_park(self, task: StoryTask) -> None:
