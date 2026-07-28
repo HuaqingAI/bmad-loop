@@ -4045,6 +4045,95 @@ def test_rollback_off_pauses_with_manual_notice(project):
     assert "rollback-manual-required" in kinds
 
 
+def test_defer_record_survives_rollback_pause(project):
+    """#342: a defer whose rollback pauses (production default: rollback OFF +
+    dirty tree) must still land the story-deferred journal entry and the defer
+    notification — the pause persists terminal DEFERRED, so resume never
+    re-enters _defer and the record is emitted now or never.
+
+    Ablation target: delete the `except RunPaused` arm in Engine._defer and
+    this fails (no story-deferred entry, no defer line in ATTENTION)."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=False),
+    )
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a")]
+        + [
+            review_effect(project, "1-1-a", clean=False, patched=1, finalized=False)
+            for _ in range(3)
+        ],
+        policy=policy,
+    )
+    summary = engine.run()
+
+    assert summary.paused
+    assert load_state(engine.run_dir).paused_stage == PAUSE_ESCALATION
+    assert engine.state.tasks["1-1-a"].phase == Phase.DEFERRED
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    # the pause's manual-recovery record, then the defer record, then the
+    # run-paused entry _run_inner appends while unwinding
+    assert (
+        kinds.index("rollback-manual-required")
+        < kinds.index("story-deferred")
+        < kinds.index("run-paused")
+    )
+    deferred_entry = next(e for e in engine.journal.entries() if e["kind"] == "story-deferred")
+    assert deferred_entry["preserve_ref"] == ""  # rollback OFF parks nothing
+    attention = (engine.run_dir / "ATTENTION").read_text()
+    assert "story deferred: 1-1-a" in attention
+    # the louder manual-recovery notice still comes first
+    assert attention.index("ACTION REQUIRED") < attention.index("story deferred: 1-1-a")
+
+
+def test_defer_record_on_snapshot_failure_pause_stays_honest(project, monkeypatch):
+    """#342 on the #340 path: rollback ON, commits parked, then the uncommitted
+    snapshot fails and the reset is refused. The defer record must land, name
+    the parked commits ref, and must NOT reuse _defer_recovery_note's partial
+    wording — 'did not survive the rollback' is false here: the reset never ran
+    and the tree is untouched.
+
+    Ablation target: delete the `except RunPaused` arm in Engine._defer and
+    this fails."""
+
+    def dev_with_commit(spec):
+        result = dev_effect(project, "1-1-a")(spec)
+        (project.project / "impl.txt").write_text("committed work\n")
+        git(project.project, "add", "impl.txt")
+        git(project.project, "commit", "-q", "-m", "attempt work")
+        return result
+
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_with_commit]
+        + [
+            review_effect(project, "1-1-a", clean=False, patched=1, finalized=False)
+            for _ in range(3)
+        ],
+    )
+
+    def _fail(*a, **k):
+        raise GitError("simulated write-tree failure")
+
+    monkeypatch.setattr("bmad_loop.verify.snapshot_worktree", _fail)
+    summary = engine.run()
+
+    assert summary.paused
+    deferred_entry = next(e for e in engine.journal.entries() if e["kind"] == "story-deferred")
+    # the committed half IS parked — the record names it factually
+    assert deferred_entry["preserve_ref"].startswith("attempt-preserve/")
+    attention = (engine.run_dir / "ATTENTION").read_text()
+    assert "story deferred: 1-1-a" in attention
+    assert "uncommitted work could not be auto-preserved" in attention
+    # the pause-aware note, not the standard one: nothing was destroyed
+    assert "the tree was NOT rolled back" in attention
+    assert "did not survive the rollback" not in attention
+
+
 def test_rollback_on_preserves_preexisting_untracked(project):
     """With rollback_on_failure=True the auto-rollback reverts tracked changes
     but never deletes untracked files that predate the attempt."""

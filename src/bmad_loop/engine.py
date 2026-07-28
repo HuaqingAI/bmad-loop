@@ -3081,43 +3081,11 @@ class Engine:
             )
         return f" — attempt work parked at `{task.preserve_ref}`{recover}"
 
-    def _defer(self, task: StoryTask, reason: str) -> None:
-        task.defer_reason = reason
-        advance(task, Phase.DEFERRED)
-        if self._isolated:
-            # the failed work lives in the unit's worktree; the diff is captured
-            # and the worktree kept/dropped by _integrate_unit. Don't touch the
-            # tree here (no reset into the main repo — there's nothing to undo).
-            self.journal.append(
-                "story-deferred",
-                story_key=task.story_key,
-                reason=reason,
-                preserve_ref=task.preserve_ref or "",
-            )
-            gates.notify(
-                self.policy,
-                self.run_dir,
-                f"story deferred: {task.story_key}",
-                reason + self._defer_recovery_note(task),
-            )
-            self._save()
-            return
-        if task.baseline_commit:
-            self._stash_deferred_artifacts(task)
-            deferred_work = self.workspace.paths.deferred_work
-            snapshot = (
-                deferred_work.read_text(encoding="utf-8") if deferred_work.is_file() else None
-            )
-            self._rollback_or_pause(task)
-            # reset reverts tracked deferred-work.md edits; restore review-found
-            # defer entries — they are real knowledge worth keeping
-            if snapshot is not None:
-                current = (
-                    deferred_work.read_text(encoding="utf-8") if deferred_work.is_file() else None
-                )
-                if current != snapshot:
-                    deferred_work.parent.mkdir(parents=True, exist_ok=True)
-                    deferred_work.write_text(snapshot, encoding="utf-8")
+    def _record_defer(self, task: StoryTask, reason: str, note: str | None = None) -> None:
+        """Journal + notify + persist the defer decision — the one record shape all
+        three emit sites share (#342). ``note`` overrides the recovery-note tail on
+        the rollback-pause path, where the reset never ran and the standard note's
+        parked/destroyed claims would be wrong."""
         self.journal.append(
             "story-deferred",
             story_key=task.story_key,
@@ -3128,9 +3096,54 @@ class Engine:
             self.policy,
             self.run_dir,
             f"story deferred: {task.story_key}",
-            reason + self._defer_recovery_note(task),
+            reason + (self._defer_recovery_note(task) if note is None else note),
         )
         self._save()
+
+    def _defer(self, task: StoryTask, reason: str) -> None:
+        task.defer_reason = reason
+        advance(task, Phase.DEFERRED)
+        if self._isolated:
+            # the failed work lives in the unit's worktree; the diff is captured
+            # and the worktree kept/dropped by _integrate_unit. Don't touch the
+            # tree here (no reset into the main repo — there's nothing to undo).
+            self._record_defer(task, reason)
+            return
+        if task.baseline_commit:
+            self._stash_deferred_artifacts(task)
+            deferred_work = self.workspace.paths.deferred_work
+            snapshot = (
+                deferred_work.read_text(encoding="utf-8") if deferred_work.is_file() else None
+            )
+            try:
+                self._rollback_or_pause(task)
+            except RunPaused:
+                # Narrow, deliberate catch of the unwind-to-the-top pause (#342):
+                # the pause already persisted Phase.DEFERRED (terminal), so resume
+                # will never re-enter this method — the defer record is emitted
+                # now or never. Every pause path fires BEFORE safe_reset, so the
+                # tree is untouched: the standard recovery note's parked/destroyed
+                # claims would be wrong here — the ACTION REQUIRED notice just
+                # above this one in ATTENTION is the authoritative pointer.
+                # Re-raised untouched: the run still pauses.
+                self._record_defer(
+                    task,
+                    reason,
+                    note=" — the tree was NOT rolled back: the run paused for manual "
+                    "recovery first (see the ACTION REQUIRED notice for where the "
+                    "attempt's work is)",
+                )
+                raise
+            # reset reverts tracked deferred-work.md edits; restore review-found
+            # defer entries — they are real knowledge worth keeping
+            if snapshot is not None:
+                current = (
+                    deferred_work.read_text(encoding="utf-8") if deferred_work.is_file() else None
+                )
+                if current != snapshot:
+                    deferred_work.parent.mkdir(parents=True, exist_ok=True)
+                    deferred_work.write_text(snapshot, encoding="utf-8")
+        self._record_defer(task, reason)
 
     def _stash_deferred_artifacts(self, task: StoryTask) -> None:
         """Move the deferred story's spec out of the artifacts dir into the run
