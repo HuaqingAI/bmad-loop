@@ -2525,6 +2525,21 @@ def test_snapshot_worktree_survives_reset_and_gc(project):
     assert git(repo, "show", f"{ref}:new_test.txt") == "untracked new file"
 
 
+def test_ref_exists_sees_full_refnames_outside_heads(project):
+    """`ref_exists` must resolve FULL refnames in both families the engine probes:
+    the refs/attempt-preserve-dirty/* snapshots (outside refs/heads/, invisible to
+    `branch_exists`) and ordinary branches given as refs/heads/<name>. Absent refs
+    — and git failures, per the best-effort contract — read as False."""
+    repo = project.project
+    ref = "refs/attempt-preserve-dirty/run-abc12345-1"
+    assert verify.ref_exists(repo, ref) is False
+    git(repo, "update-ref", ref, "HEAD")
+    assert verify.ref_exists(repo, ref) is True
+    assert verify.ref_exists(repo, "refs/heads/main") is True
+    assert verify.ref_exists(repo, "refs/heads/no-such-branch") is False
+    assert verify.ref_exists(repo / "no-such-repo", ref) is False  # git failure -> absent
+
+
 def test_snapshot_worktree_noop_clean_tree(project):
     """A clean tree (identical to HEAD) has nothing uncommitted to park: returns
     None and creates no ref, so a plain reset proceeds unchanged."""

@@ -4653,6 +4653,52 @@ def test_rollback_preserves_distinct_refs_across_repeated_dirty_rollbacks(projec
     assert git(repo, "show", f"{refs[1]}:src.txt") == "attempt 1 edit"
 
 
+def test_rollback_preserve_ref_unique_when_attempt_counter_repeats(project):
+    """runs.rearm_escalation resets task.attempt to 0, and a resolve session that
+    commits nothing leaves HEAD at the same baseline — so the post-resolve re-drive's
+    rollback recomputes the exact {slug}-{baseline}-{attempt} ref name of the
+    pre-resolve rollback. The engine must probe for a free name instead of trusting
+    the counter: the 2nd rollback may never overwrite the 1st attempt's snapshot."""
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, _ = make_engine(project, [], policy=policy)
+    repo = project.project
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = rev_parse_head(repo)
+    task.baseline_untracked = []
+
+    # pre-resolve rollback: attempt 1 escalates dirty
+    task.attempt = 1
+    (repo / "src.txt").write_text("first arming edit\n")
+    engine._rollback_or_pause(task)
+    assert rev_parse_head(repo) == task.baseline_commit
+
+    # rearm_escalation resets the counter; the re-drive's first retry lands on the
+    # SAME attempt number against the SAME baseline (resolve committed nothing)
+    task.attempt = 1
+    (repo / "src.txt").write_text("re-drive edit\n")
+    engine._rollback_or_pause(task)
+    assert rev_parse_head(repo) == task.baseline_commit
+
+    refs = [e["ref"] for e in engine.journal.entries() if e["kind"] == "attempt-worktree-preserved"]
+    assert len(refs) == 2
+    assert len(set(refs)) == 2  # the colliding name was suffixed, not overwritten
+    assert git(repo, "show", f"{refs[0]}:src.txt") == "first arming edit"
+    assert git(repo, "show", f"{refs[1]}:src.txt") == "re-drive edit"
+    assert refs[1] == f"{refs[0]}-r2"  # deterministic probe-and-suffix shape
+
+    # a third collision keeps escalating the serial instead of clobbering -r2
+    task.attempt = 1
+    (repo / "src.txt").write_text("third edit\n")
+    engine._rollback_or_pause(task)
+    refs = [e["ref"] for e in engine.journal.entries() if e["kind"] == "attempt-worktree-preserved"]
+    assert refs[2] == f"{refs[0]}-r3"
+    assert git(repo, "show", f"{refs[2]}:src.txt") == "third edit"
+
+
 def test_rollback_preserve_ref_slug_survives_a_ref_illegal_run_id(project):
     """A `--run-id` carrying ref-illegal sequences must not drop the recovery ref.
     Characterization for the safe_ref_segment swap — the old inline alnum/`_-` slug

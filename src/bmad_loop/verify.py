@@ -524,6 +524,16 @@ def snapshot_worktree(
     return ref_name
 
 
+def ref_exists(repo: Path, refname: str) -> bool:
+    """Whether ``refname`` — a FULL refname, e.g. ``refs/attempt-preserve-dirty/…``
+    — currently exists. Sibling of :func:`branch_exists`, which prepends
+    ``refs/heads/`` and so cannot see the snapshot refs that live outside it.
+    Best-effort by design: any git failure reads as "absent" (the caller's
+    subsequent ref write surfaces the real error)."""
+    rc, _ = _git(repo, "show-ref", "--verify", "--quiet", refname)
+    return rc == 0
+
+
 def safe_rollback(
     repo: Path,
     baseline: str,
