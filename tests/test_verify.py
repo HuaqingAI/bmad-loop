@@ -411,16 +411,34 @@ def test_verify_review_accepts_the_park_pair(project):
     task, sp = _park(project)
     task.spec_file = str(sp)
 
-    out = verify.verify_review(task, project, Policy())
+    out = verify.verify_review(task, project, Policy(), operator_park=True)
 
     assert out.ok
+
+
+def test_verify_review_park_refused_without_the_engine_flag(project):
+    """The flag is the SAME one `verify_dev` takes, not a second reading of
+    `policy.operator.enabled`, so the two gates cannot disagree about whether
+    this run parks — `Engine._operator_park_enabled` is an override seam, and a
+    mode that opts out (stories, sweep) while still reaching this gate would
+    otherwise find it accepting a park the engine itself refuses to take.
+
+    Conservative default, like `sprint_reached_done`: a caller that says nothing
+    gets the pre-#335 behavior."""
+    task, sp = _park(project)
+    task.spec_file = str(sp)
+
+    out = verify.verify_review(task, project, Policy())  # operator_park defaults False
+
+    assert not out.ok and out.retryable
+    assert "'awaiting-operator'" in out.reason and "expected 'done'" in out.reason
 
 
 def test_verify_review_park_requires_actions(project):
     task, sp = _park(project, actions=[])
     task.spec_file = str(sp)
 
-    out = verify.verify_review(task, project, Policy())
+    out = verify.verify_review(task, project, Policy(), operator_park=True)
 
     assert not out.ok and out.retryable and out.fixable is True
     assert "operator_actions" in out.reason
@@ -433,7 +451,9 @@ def test_verify_review_park_board_short_is_a_plain_retry_not_a_contradiction(pro
     task, sp = _park(project, sprint="in-progress")
     task.spec_file = str(sp)
 
-    out = verify.verify_review(task, project, Policy(), sprint_reached_done=True)
+    out = verify.verify_review(
+        task, project, Policy(), sprint_reached_done=True, operator_park=True
+    )
 
     assert not out.ok and out.retryable and out.contradiction is False
     assert out.reason == "sprint-status for 1-1-a is 'in-progress', expected 'awaiting-operator'"

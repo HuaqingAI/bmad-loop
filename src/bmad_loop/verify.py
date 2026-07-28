@@ -1658,6 +1658,7 @@ def verify_review(
     policy: Policy,
     *,
     sprint_reached_done: bool = False,
+    operator_park: bool = False,
 ) -> VerifyOutcome:
     """Gate a completed review pass: spec at ``done``, sprint-status at ``done``,
     deterministic verify commands green.
@@ -1679,16 +1680,21 @@ def verify_review(
     parked work clears exactly the deterministic checks every other commit path
     clears — the pair, a non-empty action list, and the verify commands. The
     sign-off-regression arm stays scoped to the ``done`` pair: a board short of
-    ``awaiting-operator`` is a stage never reached, not a revoked sign-off."""
+    ``awaiting-operator`` is a stage never reached, not a revoked sign-off.
+
+    ``operator_park`` is the SAME engine-supplied flag ``verify_dev`` takes, not a
+    second reading of ``policy.operator.enabled``, so the two gates cannot
+    disagree about whether this run parks. They would: the engine's
+    ``_operator_park_enabled`` is an override seam, and a mode that opts out of
+    parking while still reaching this gate would otherwise find it accepting a
+    park the engine itself refuses to take."""
     if not task.spec_file:
         return VerifyOutcome.retry("no spec file recorded for task")
     fm = _gate_frontmatter(Path(task.spec_file))
     if isinstance(fm, VerifyOutcome):
         return fm
     status = status_of(fm)
-    expected = (
-        AWAITING_OPERATOR if (policy.operator.enabled and status == AWAITING_OPERATOR) else "done"
-    )
+    expected = AWAITING_OPERATOR if (operator_park and status == AWAITING_OPERATOR) else "done"
     if status != expected:
         return VerifyOutcome.retry(f"spec status is {status!r}, expected {expected!r}")
     if expected == AWAITING_OPERATOR:

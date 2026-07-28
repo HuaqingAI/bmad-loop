@@ -1235,9 +1235,8 @@ low_frame_rate = false
 # finished and COMMITTED, but its acceptance criteria include external actions
 # only a human can perform (buy a domain, publish a DNS record, grant an API
 # key). The story commits, the run moves on to the next one, and what is owed is
-# recorded in `.bmad-loop/operator-actions.json` plus the spec's
-# `operator_actions:` frontmatter. Turn this off to hold sessions to the two
-# older outcomes (done / blocked).
+# recorded in the story spec's `operator_actions:` frontmatter. Turn this off to
+# hold sessions to the two older outcomes (done / blocked).
 enabled = true
 
 [mux]

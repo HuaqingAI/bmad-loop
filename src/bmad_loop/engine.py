@@ -2521,6 +2521,7 @@ class Engine:
             self.workspace.paths,
             self.policy,
             sprint_reached_done=not self._dev_review_enabled(),
+            operator_park=self._operator_park_enabled(),
         )
 
     def _review_prompt(self, task: StoryTask) -> str:
