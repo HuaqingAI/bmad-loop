@@ -9,6 +9,38 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **`bmad-loop confirm` completes a parked story (#335, part 3 of 4).** Once you have carried out the
+  external actions a story owed, `bmad-loop confirm <story-key>` walks you through them one at a time
+  (`--yes` skips the prompts), writes the spec's `## Operator Confirmation` audit section, advances
+  the spec and the board to `done` through the sole writer, and commits the pair. Nothing is
+  re-driven: the agent-doable work was committed at park time. `--reverify` re-runs the project's
+  `[verify]` commands first and blocks the confirmation if they fail — the external action may have
+  changed what the tests see. `--list` shows every parked story and what each owes; `--json` emits
+  the same set as a schema-versioned document.
+
+  Every write has to answer for itself: the audit append and the spec status are both checked, and
+  the spec is read BACK from disk rather than trusted, so a story is never declared done over a
+  write that did not land. A confirmation interrupted between its spec writes and its board write
+  (the board file in a shape its line writer cannot rewrite, or an IO failure) leaves a signed-off
+  spec at `done` with the index entry still pointing at it — re-running `confirm` now **finishes**
+  that instead of refusing it as stale drift: it advances the board, drops the entry and commits,
+  with no second prompt and no second audit section. It resumes equally from a board a human already
+  fixed by hand, since that is what the failure message asks them to do. `--list`, `--json`
+  (`resumable`, `confirmation_recorded`) and `validate` (`operator.confirm-interrupted`) all report
+  the state under its own name rather than calling it stale. `validate` also no longer drops a board
+  disagreement that co-occurs with an unreadable action list — the two have different remedies, and
+  only the first was ever reported.
+
+  Parks are indexed in `.bmad-loop/operator-actions.json`, written at park time along with a
+  notification naming the actions and the command that ends them. The index is **machine-local and
+  never committed** (it is registered in the repository's local git exclude): it is written from
+  inside a story's commit window, where committing it would either shift `HEAD` past the commit the
+  park just stamped or, under worktree isolation, advance the target branch and break an
+  `scm.merge_strategy = "ff"` merge-back. So a park is confirmed on the machine that ran it. The
+  committed truth stays the spec and the board; `confirm` refuses an index entry that disagrees with
+  them, and `validate` reports the drift in both directions (`operator.registry-stale`,
+  `operator.actions-malformed`).
+
 - **Stories can park at `awaiting-operator` (#335, part 2 of 4).** A dev session whose story needs
   an action only a human can take outside the repo — buy a domain, publish a DNS record, grant an
   API key — now finishes and **commits** everything an agent can do, records what is owed in the
@@ -23,8 +55,7 @@ breaking changes may land in a minor release.
   committed. Under worktree isolation the unit merges like a `done` one. `[operator] enabled =
 false` restores the old two-outcome behavior.
 
-  `bmad-loop confirm` and the project-level registry it reads are part 3; for now a parked story's
-  obligations live in its spec and in the `story-awaiting-operator` journal entry.
+  `bmad-loop confirm` and the project-level index it reads arrived in part 3, above.
 
 - **`awaiting-operator` vocabulary, no writer yet (#335, part 1 of 4).** Names, at every layer, the
   state a story reaches when its agent-doable work is finished and committed but its acceptance
@@ -204,6 +235,35 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   A project still on `bmad-auto` should migrate on 0.9.0 before upgrading past it.
 
 ### Fixed
+
+- **A spec status the writer cannot rewrite is no longer a silent no-op.** `set_frontmatter_status`
+  found the line with `lstrip().startswith("status:")` while every reader parses the block as YAML,
+  so the two disagreed in both directions: a quoted key (`"status": x`), a space before the colon,
+  or a flow mapping wrote nothing and returned `False`, while a block scalar, a value continued on
+  the next line, a nested `status:` under another key, or one quoted inside another key's literal
+  block were rewritten into corruption — `status: done awaiting-operator`, or the wrong key
+  entirely. Nothing verified what the edit meant, and no caller read the return value.
+
+  The edit is now made, re-parsed with `yaml.safe_load` as an _oracle_, and kept only if the block
+  still parses as a mapping, its top-level `status` is exactly the target, and **every other key is
+  unchanged** — so the formatting-preserving single-line edit survives while shapes nobody
+  enumerated are rejected too. `False` now means "nothing to change" and only that; a status the
+  reader can see but no line edit can safely move raises `FrontmatterWriteError`, per the
+  observe-degrade / repair-raise rule. `verify.set_frontmatter_field` (which also appended a
+  duplicate key on a scan miss) and `devcontract.reset_spec_status` are on the same verified edit.
+  `runs.rearm_escalation` translates the raise to `RearmError` and aborts before persisting
+  anything, so a re-driven story can no longer be routed to the wrong step by a write that never
+  landed. One deliberate behavior change: `set_frontmatter_status(spec, "done")` over an already-
+  `done` status returns `False` without rewriting, where it used to rewrite and return `True`.
+
+- **A symlink-loop fault at park no longer loses the run's park (#335).** `_park_spec_relpath`
+  guarded its `resolve()` with `(OSError, ValueError)` and `_index_park` guarded its call with
+  `except OSError`, but below Python 3.13 `Path.resolve` reports a symlink loop as `RuntimeError` —
+  neither. `_index_park` runs outside every `try` in `_finalize_commit_phase` and after the phase
+  advance, so an escape skipped the park notification, the `post_commit` hook and **the state save**,
+  over an index write that is best-effort by design. Both guards now hold the type: the path helper
+  keeps its documented verbatim fallback so the index entry still lands, and the writer degrades to
+  the `operator-index-failed` journal line its `OSError` sibling always did.
 
 - **An unwritable `ATTENTION` file can no longer crash a run.** `gates.notify` promised "never
   raises", but only its desktop half was guarded — the `ATTENTION` append was bare IO, so an

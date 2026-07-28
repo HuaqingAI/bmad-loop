@@ -1401,6 +1401,229 @@ def test_resume_through_committing_re_derives_the_park(project):
     assert "story-done" not in kinds
 
 
+def test_park_indexes_the_story_for_confirm(project):
+    """The park writes the project-level index `bmad-loop confirm` reads (#335
+    part 3). Without it the obligation exists only in a journal nobody greps and
+    a spec nobody re-reads, and there is no way to find the parked story's spec
+    from its key.
+
+    Ablation: delete the `_index_park` call in `_finalize_commit_phase` and this
+    fails — the story parks with nothing to confirm it from."""
+    from bmad_loop import operatoractions
+
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            generic_dev_effect(
+                project, "1-1-a", final_status="awaiting-operator", operator_actions=ACTIONS
+            )
+        ],
+        policy=_park_policy(),
+    )
+
+    engine.run()
+
+    entry = operatoractions.load(project.project)["1-1-a"]
+    assert entry["actions"] == ACTIONS
+    assert entry["commit"] == engine.state.tasks["1-1-a"].commit_sha
+    assert entry["run_id"] == engine.state.run_id
+    # the recorded spec path resolves from the PROJECT, which is what `confirm`
+    # has — a worktree-absolute path would be dead before a human read it
+    (story,) = operatoractions.resolve(project.project, project)
+    assert story.spec_path is not None and story.spec_path.is_file()
+    assert story.confirmable, story.drift()
+
+
+def test_park_indexing_failure_never_un_commits_the_story(project, monkeypatch):
+    """The only best-effort write on the park path. The commit has already
+    landed, so raising here would abort a story that genuinely succeeded over its
+    bookkeeping — it degrades to a journal line instead, and `validate` reports
+    the resulting drift."""
+    from bmad_loop import operatoractions
+
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            generic_dev_effect(
+                project, "1-1-a", final_status="awaiting-operator", operator_actions=ACTIONS
+            )
+        ],
+        policy=_park_policy(),
+    )
+
+    def boom(*a, **k):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr("bmad_loop.operatoractions.record_park", boom)
+    summary = engine.run()
+
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.AWAITING_OPERATOR and task.commit_sha
+    assert summary.awaiting_operator == 1 and not summary.paused
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "operator-index-failed" in kinds and "story-awaiting-operator" in kinds
+    assert operatoractions.load(project.project) == {}
+
+
+def _park_engine(project):
+    """A run whose single story parks with actions owed."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            generic_dev_effect(
+                project, "1-1-a", final_status="awaiting-operator", operator_actions=ACTIONS
+            )
+        ],
+        policy=_park_policy(),
+    )
+    return engine
+
+
+def test_an_unresolvable_spec_path_still_indexes_the_park(project, monkeypatch):
+    """`_park_spec_relpath` resolves inside a try catching `(OSError, ValueError)`,
+    and below 3.13 `Path.resolve` reports a symlink loop as `RuntimeError` —
+    which is neither. It was called as an argument expression inside
+    `_index_park`'s own try, whose handler was `except OSError` only, so the type
+    escaped BOTH.
+
+    Severe because of where: `_index_park` runs at the tail of
+    `_finalize_commit_phase`, outside every try there and after
+    `advance(AWAITING_OPERATOR)`, so an escape skipped `_notify_park`,
+    `_emit("post_commit")` and **`self._save()`** — the park phase was never
+    persisted, over an index write that is best-effort by design.
+
+    Guarding it inside `_park_spec_relpath` rather than only around the call is
+    what preserves the documented fallback: `spec_file` is recorded verbatim and
+    the entry still exists. Per #356 that matters — a story key does not yield a
+    spec path, so losing the entry loses the only route back to the spec.
+
+    ⚠️ The fault is INJECTED. 3.13/3.14 resolve real symlink loops without
+    raising, so a loop-based test is green on this box and red only on the
+    3.11/3.12 CI legs. Ablation: revert `_park_spec_relpath`'s except tuple to
+    `(OSError, ValueError)` and this fails — and run it on 3.11 too, since a
+    real-loop version would not bite here at all.
+
+    Scoped to the `_index_park` window rather than the whole run because the spec
+    is resolved on the verify path too: a fault live from the start stops the
+    story before it ever parks, which tests nothing about this guard.
+    `_park_spec_relpath` has exactly one caller, so the window IS its resolve."""
+    from bmad_loop import operatoractions
+
+    engine = _park_engine(project)
+    real_resolve = Path.resolve
+    real_index = engine._index_park
+
+    def unresolvable(self, *a, **kw):
+        if self.name.startswith("spec-"):
+            raise RuntimeError(f"Symlink loop from {str(self)!r}")
+        return real_resolve(self, *a, **kw)
+
+    def index_with_the_fault_live(task):
+        with monkeypatch.context() as m:
+            m.setattr(Path, "resolve", unresolvable)
+            real_index(task)
+
+    monkeypatch.setattr(engine, "_index_park", index_with_the_fault_live)
+    summary = engine.run()
+
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.AWAITING_OPERATOR and task.commit_sha
+    assert summary.awaiting_operator == 1 and not summary.crashed and not summary.paused
+    # the entry survives with the verbatim fallback path — a wrong path a human
+    # can see beats a missing one they cannot
+    entry = operatoractions.load(project.project)["1-1-a"]
+    assert entry["spec_file"] == task.spec_file and entry["actions"] == ACTIONS
+    # and the phase was PERSISTED — that is the part an escape broke
+    assert load_state(engine.run_dir).tasks["1-1-a"].phase == Phase.AWAITING_OPERATOR
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "story-awaiting-operator" in kinds and "operator-index-failed" not in kinds
+
+
+def test_a_runtime_error_writing_the_index_degrades_like_an_oserror(project, monkeypatch):
+    """The second escape path, and not a duplicate of the guard above:
+    `record_park` -> `_write_store` -> `_exclude_from_git` ->
+    `install._worktree_local_exclude` has a bare `.resolve()` outside that
+    function's only try, reachable when `git rev-parse --git-common-dir` answers
+    with a relative path — the linked-worktree case, which is exactly when a park
+    is committing.
+
+    Degrades to the same journal line its `OSError` sibling does. Ablation:
+    revert `_index_park`'s except tuple to `except OSError` and this fails — the
+    run crashes and the park phase is never saved."""
+    from bmad_loop import operatoractions
+
+    engine = _park_engine(project)
+
+    def boom(*a, **k):
+        raise RuntimeError("Symlink loop from '/w/.git'")
+
+    monkeypatch.setattr("bmad_loop.operatoractions.record_park", boom)
+    summary = engine.run()
+
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.AWAITING_OPERATOR and task.commit_sha
+    assert summary.awaiting_operator == 1 and not summary.paused and not summary.crashed
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "operator-index-failed" in kinds and "story-awaiting-operator" in kinds
+    assert operatoractions.load(project.project) == {}
+    assert load_state(engine.run_dir).tasks["1-1-a"].phase == Phase.AWAITING_OPERATOR
+
+
+def test_park_records_a_worktree_absolute_spec_relative_to_the_workspace(project):
+    """The branch the guards above fall back FROM, and it was untested. Under
+    worktree isolation `task.spec_file` has been rewritten to an absolute path
+    inside the unit worktree, and that worktree is torn down moments later —
+    indexing it verbatim records a path that is dead before a human reads it.
+
+    Ablation: return `spec_file` unconditionally and this fails — the entry holds
+    an absolute path under a directory that no longer exists, and `confirm`
+    reports the spec as missing."""
+    engine = _park_engine(project)
+    task = StoryTask(story_key="1-1-a", epic=1)
+
+    task.spec_file = str(project.project / ".worktrees" / "unit-1" / "docs" / "spec-1-1-a.md")
+    assert engine._park_spec_relpath(task) == ".worktrees/unit-1/docs/spec-1-1-a.md"
+    # a spec genuinely outside the workspace is recorded as-is, not dropped: a
+    # wrong path a human can see beats a missing one they cannot
+    task.spec_file = str(project.project.parent / "elsewhere" / "spec-1-1-a.md")
+    assert engine._park_spec_relpath(task) == task.spec_file
+    # and no spec at all stays empty rather than becoming "."
+    task.spec_file = None
+    assert engine._park_spec_relpath(task) == ""
+
+
+def test_park_notifies_with_the_actions_and_the_confirm_command(project):
+    """The one artifact that reaches someone who is not looking at the repo. It
+    enumerates the actions rather than counting them, and names the command that
+    ends the park — a park is non-blocking, so nothing else will ask again.
+
+    Ablation: delete the `_notify_park` call and this fails — the run moves on and
+    the human is never told a story is waiting on them."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            generic_dev_effect(
+                project, "1-1-a", final_status="awaiting-operator", operator_actions=ACTIONS
+            )
+        ],
+        policy=_park_policy(),
+    )
+
+    engine.run()
+
+    attention = (engine.run_dir / "ATTENTION").read_text()
+    assert "story awaiting operator: 1-1-a" in attention
+    for action in ACTIONS:
+        assert action in attention
+    assert "bmad-loop confirm 1-1-a" in attention
+    # not an escalation: nothing here may read as "the run stopped for you"
+    assert "CRITICAL" not in attention
+
+
 def test_run_summary_render_labels_both_units(project):
     """render() feeds stdout, the ATTENTION file and the desktop notification
     from one place, so this covers all three."""
@@ -3062,6 +3285,34 @@ def test_reset_spec_for_repair_strips_stale_terminal_section(project):
     assert "status: in-progress\n" in text  # re-opened
     assert "Auto Run Result" not in text  # stale terminal section gone
     assert "## Intent\n\nbody\n" in text  # frozen intent untouched
+
+
+def test_reset_spec_for_repair_lets_an_unwritable_status_raise(project):
+    """Pins 283a410: the engine's `reset_spec_status` call sites deliberately let
+    `FrontmatterWriteError` propagate rather than swallowing it. Swallowing here
+    would dispatch a repair at a charged attempt against a spec still reading
+    `done` — step-01 ingests such a spec as context and does not resume, so the
+    story re-wedges with nothing on the record. That is exactly why the sibling
+    writer in `runs.rearm_escalation` aborts instead of degrading."""
+    engine, _ = make_engine(project, [])
+    spec = project.implementation_artifacts / "spec-1-1-a.md"
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    # A block-scalar `status:` reads fine and is unmovable by a line edit — the
+    # shape pinned at tests/test_devcontract.py::test_reset_status_refuses_the_
+    # shapes_its_own_regex_misreads.
+    original = (
+        "---\nstatus: |\n  done\n---\n\n## Intent\n\nbody\n\n"
+        "## Auto Run Result\n\nStatus: done\nAll done.\n"
+    ).encode("utf-8")
+    spec.write_bytes(original)
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(spec))
+
+    with pytest.raises(verify.FrontmatterWriteError):
+        engine._reset_spec_for_repair(task)
+
+    # The refusal is total: the status flip did not land, and the strip on the very
+    # next line never ran, so the stale terminal section is still there.
+    assert spec.read_bytes() == original
 
 
 def test_review_launch_snapshot_threaded_into_session_spec(project):

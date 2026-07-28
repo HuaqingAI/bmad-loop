@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, NoReturn, Sequence
 
-from . import deferredwork, devcontract, envvars, gates, verify
+from . import deferredwork, devcontract, envvars, gates, operatoractions, verify
 from .adapters.base import CodingCLIAdapter, SessionResult, SessionSpec, SpecSnapshot
 from .bmadconfig import ProjectPaths
 from .escalation import (
@@ -1855,23 +1855,101 @@ class Engine:
         # thing that has to survive, and it does.
         if task.operator_actions:
             advance(task, Phase.AWAITING_OPERATOR)
-            # The durable record of what a human owes, for now: the actions
-            # themselves, not just a count, because this and the spec frontmatter
-            # are the only places they survive the run. The project-level registry
-            # `bmad-loop confirm` reads, and the park notification, land with that
-            # command (part 3) — they are its data store and its prompt, and
-            # shipping them here would leave a store nothing reads.
+            # The durable record of what a human owes: the actions themselves,
+            # not just a count, because the journal and the spec frontmatter are
+            # what survive the run.
             self.journal.append(
                 "story-awaiting-operator",
                 story_key=task.story_key,
                 commit=task.commit_sha,
                 actions=list(task.operator_actions),
             )
+            self._index_park(task)
+            self._notify_park(task)
         else:
             advance(task, Phase.DONE)
             self.journal.append("story-done", story_key=task.story_key, commit=task.commit_sha)
         self._emit("post_commit", task)
         self._save()
+
+    def _park_spec_relpath(self, task: StoryTask) -> str:
+        """The parked story's spec as a path relative to the WORKSPACE root, so
+        it re-roots onto the project when read back.
+
+        Under worktree isolation `task.spec_file` has been rewritten to an
+        absolute path inside the unit worktree, and that worktree is torn down
+        moments later — indexing it verbatim would record a path that is dead
+        before the human ever reads it. Relative-to-workspace is the same string
+        in both isolation modes, and `verify.resolve_spec_path` resolves it
+        against the project. A spec that somehow lies outside the workspace is
+        recorded as-is rather than dropped: a wrong path a human can see beats a
+        missing one they cannot.
+
+        `RuntimeError` joins the guard because `Path.resolve` reports a symlink
+        loop that way below 3.13 — the same non-OSError `_ledger_in_repo` already
+        catches, and `requires-python` is 3.11. Catching it HERE rather than only
+        around the call is what keeps the fallback: the index entry is still
+        written, with `spec_file` recorded verbatim, and per #356 the entry is
+        load-bearing (a story key does not yield a spec path)."""
+        spec_file = task.spec_file or ""
+        if not spec_file:
+            return ""
+        try:
+            return Path(spec_file).resolve().relative_to(self.workspace.root.resolve()).as_posix()
+        except (OSError, RuntimeError, ValueError):
+            return spec_file
+
+    def _index_park(self, task: StoryTask) -> None:
+        """Add the parked story to the project's operator-actions index — the
+        store `bmad-loop confirm` reads.
+
+        Best-effort by design, and the only write on this path that is. The
+        commit has already landed: the work is safe, the board says
+        `awaiting-operator`, and the journal and spec both record what is owed.
+        Raising here would abort a story that genuinely succeeded over its
+        bookkeeping, so an unwritable index degrades to a journal line — and
+        `validate` reports the resulting drift (`operator.registry-stale`).
+
+        This runs at the tail of `_finalize_commit_phase`, OUTSIDE every try
+        there and after `advance(task, Phase.AWAITING_OPERATOR)`, so an escape
+        skips `_notify_park`, `_emit("post_commit")` and `self._save()` — the
+        park phase is never persisted, over an index write that was best-effort
+        by design. `RuntimeError` is in the guard for a second reason beyond the
+        resolve above: `record_park` -> `_write_store` -> `_exclude_from_git` ->
+        `install._worktree_local_exclude` has a bare `.resolve()` outside that
+        function's only try, reachable when `git rev-parse --git-common-dir`
+        answers with a relative path (the linked-worktree case — exactly this
+        one)."""
+        try:
+            operatoractions.record_park(
+                self.paths.project,
+                task.story_key,
+                actions=list(task.operator_actions),
+                spec_file=self._park_spec_relpath(task),
+                commit=task.commit_sha or "",
+                run_id=self.state.run_id,
+                parked_at=self._today(),
+            )
+        except (OSError, RuntimeError) as e:
+            self.journal.append("operator-index-failed", story_key=task.story_key, error=str(e))
+
+    def _notify_park(self, task: StoryTask) -> None:
+        """Tell the human a story is waiting on them, and exactly what for.
+
+        Notify-only: a park is non-blocking by design, so unlike an escalation it
+        must not read as "the run stopped for you". The run has already moved on.
+        The actions are enumerated in the body rather than counted because this
+        notification is the one artifact that reaches someone who is not looking
+        at the repo."""
+        actions = "\n".join(f"  {i}. {a}" for i, a in enumerate(task.operator_actions, 1))
+        gates.notify(
+            self.policy,
+            self.run_dir,
+            f"story awaiting operator: {task.story_key}",
+            f"committed, but {len(task.operator_actions)} action(s) are owed outside the repo:\n"
+            f"{actions}\n"
+            f"run `bmad-loop confirm {task.story_key}` once they are done.",
+        )
 
     # ----------------------------------------------------- override seams
     # SweepEngine reuses the dev/review pipeline for deferred-work bundles by
@@ -2052,6 +2130,9 @@ class Engine:
         arr = devcontract.parse_auto_run_result(text)
         if not arr.present or arr.status != devcontract.DONE:
             return  # no terminal prose, or a blocked outcome: leave for the escalation path
+        # Repair-write doctrine: the False arm is "nothing to change" only. A status
+        # the reader can see but no line edit can move raises instead, and that raise
+        # is deliberately left uncaught (see _reset_spec_for_repair).
         if not devcontract.reset_spec_status(spec_path, success_status):
             return
         # Keep the in-place result_json the rest of _dev_phase reads consistent with
@@ -3030,6 +3111,9 @@ class Engine:
         if not task.spec_file:
             return
         spec_path = Path(task.spec_file)
+        # Repair-write doctrine: raising beats dispatching a repair at a charged
+        # attempt against a spec still reading `done` — step-01 would ingest it as
+        # context and not resume, re-wedging silently (cf. runs.rearm_escalation).
         devcontract.reset_spec_status(spec_path, "in-progress")
         devcontract.strip_auto_run_result(spec_path)
 

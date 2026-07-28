@@ -21,10 +21,12 @@ match) still runs in verify.py against actual on-disk state.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .frontmatter import _edit_frontmatter_block
 from .platform_util import atomic_replace
 from .verify import DEV_WORKFLOW, operator_actions_of, read_frontmatter
 
@@ -135,13 +137,20 @@ def _fenced(text: str, offset: int) -> bool:
     return open_marker is not None
 
 
-def _section_headings(text: str) -> list[re.Match[str]]:
-    """`AUTO_RUN_HEADING_RE` matches that are real section headings. A heading
-    quoted inside a fenced code block (a frozen intent showing an example of the
-    terminal section, a log excerpt) is documentation, not structure — treating
-    it as terminal would let such a spec read as a result artifact from the
-    agent's first save (#52)."""
-    return [m for m in AUTO_RUN_HEADING_RE.finditer(text) if not _fenced(text, m.start())]
+def _section_headings(
+    text: str, pattern: re.Pattern[str] = AUTO_RUN_HEADING_RE
+) -> list[re.Match[str]]:
+    """`pattern` matches that are real section headings. A heading quoted inside
+    a fenced code block (a frozen intent showing an example of the terminal
+    section, a log excerpt) is documentation, not structure — treating it as
+    terminal would let such a spec read as a result artifact from the agent's
+    first save (#52).
+
+    `pattern` is a parameter rather than a hard-coded `AUTO_RUN_HEADING_RE`
+    because the ``## Operator Confirmation`` section needs the identical fence
+    reading for the identical reason, and a second copy of `_fenced`'s
+    open-marker walk is exactly the kind of near-duplicate that drifts."""
+    return [m for m in pattern.finditer(text) if not _fenced(text, m.start())]
 
 
 def _next_heading_start(text: str, offset: int) -> int:
@@ -446,6 +455,29 @@ def _atomic_write_spec(spec_path: Path, text: str) -> None:
         raise
 
 
+def _render_status_line(line: str, m: re.Match[str], value: str) -> str:
+    """`reset_spec_status`'s replacement for a matched ``status:`` line: the
+    value moves, its quote style and any trailing inline comment stay.
+
+    Deliberately different from `frontmatter._replace_value`, which drops both —
+    that writer's callers read the result back as a bare ``status: done``, this
+    one's tests pin the preservation. Sharing the VERIFICATION is the point; the
+    formatting each already had right."""
+    # Guarantee `key: value` spacing: a bare `status:` (no trailing space) would
+    # otherwise fill to `status:done` — invalid YAML, the key is lost.
+    pre = m.group("pre")
+    if not pre.endswith((" ", "\t")):
+        pre += " "
+    # When the value was blank with a trailing inline comment, `rest` begins at
+    # the `#`; abutting the value (`status: done# c`) makes the `#` part of the
+    # scalar instead of a comment. Re-insert a separating space.
+    rest = m.group("rest")
+    if rest.startswith("#"):
+        rest = " " + rest
+    q = m.group("q")
+    return f"{pre}{q}{value}{q}{rest}" + ("\n" if line.endswith("\n") else "")
+
+
 def reset_spec_status(spec_path: Path, new_status: str) -> bool:
     """Rewrite the frontmatter ``status:`` value of a spec in place.
 
@@ -458,8 +490,19 @@ def reset_spec_status(spec_path: Path, new_status: str) -> bool:
     prose body (e.g. the ``## Auto Run Result`` section). A present-but-empty status
     is filled, and a frontmatter block with NO ``status:`` line at all gets one
     inserted before the closing fence (the skill's template can leave it blank or
-    absent). Returns True on a real change, False when the spec is absent, has no
-    frontmatter block, or is already at ``new_status``."""
+    absent).
+
+    Returns True on a real change, False when the spec is absent, has no
+    frontmatter block, or is already at ``new_status``. Raises
+    `FrontmatterWriteError` when the reader can see a status the line edit cannot
+    safely move: `_FM_STATUS_RE` reads only a ``[A-Za-z-]*`` value, so it used to
+    fill ``status: |`` to ``status: done|`` and ``status: 123`` to
+    ``status: done123`` — silently, with a True return — and it rewrote a nested
+    ``meta.status:`` in preference to the real key. The shared
+    `frontmatter._edit_frontmatter_block` re-parses each trial edit before keeping
+    it, so those become a loud refusal instead of a corrupted spec. Only
+    `engine._reconcile_generic_terminal_status` reads the return; the raise is what
+    reaches the other three call sites, which treat it as a repair write."""
     if not spec_path.is_file():
         return False
     text = spec_path.read_text(encoding="utf-8")
@@ -467,36 +510,15 @@ def reset_spec_status(spec_path: Path, new_status: str) -> bool:
     if not fm:
         return False
     head, body, tail = fm.group(1), fm.group(2), fm.group(3)
-    changed = False
-
-    def _repl(m: re.Match[str]) -> str:
-        nonlocal changed
-        if m.group("val") == new_status:
-            return m.group(0)
-        changed = True
-        # Guarantee `key: value` spacing: a bare `status:` (no trailing space)
-        # would otherwise fill to `status:done` — invalid YAML, the key is lost.
-        pre = m.group("pre")
-        if not pre.endswith((" ", "\t")):
-            pre += " "
-        # When the value was blank with a trailing inline comment, `rest` begins at
-        # the `#`; abutting the value (`status: done# c`) makes the `#` part of the
-        # scalar instead of a comment. Re-insert a separating space.
-        rest = m.group("rest")
-        if rest.startswith("#"):
-            rest = " " + rest
-        return f"{pre}{m.group('q')}{new_status}{m.group('q')}{rest}"
-
-    if _FM_STATUS_RE.search(body):
-        new_body = _FM_STATUS_RE.sub(_repl, body, count=1)
-    else:
-        # No status: line at all — insert one before the closing fence, matching
-        # the block's line ending. `body` always ends with a newline (captured by
-        # _FRONTMATTER_RE), so this lands on its own line.
-        nl = "\r\n" if body.endswith("\r\n") else "\n"
-        new_body = f"{body}status: {new_status}{nl}"
-        changed = True
-    if not changed:
+    new_body = _edit_frontmatter_block(
+        body,
+        "status",
+        new_status,
+        pattern=_FM_STATUS_RE,
+        render=_render_status_line,
+        insert=True,
+    )
+    if new_body is None:
         return False
     _atomic_write_spec(spec_path, head + new_body + tail + text[fm.end() :])
     return True
@@ -547,6 +569,26 @@ ORCHESTRATOR_SYNTH_NOTE = (
     "session finalized this spec's frontmatter without its `## Auto Run Result` "
     "marker, so the orchestrator synthesized the result from the frontmatter and "
     "appended this section._"
+)
+
+
+# The heading `bmad-loop confirm` writes to record a human's out-of-band sign-off,
+# and the pattern that reads it back. Both spellings live here because the section
+# is now STRUCTURE, not just prose: `confirm` resumes an interrupted confirmation
+# by detecting this heading, so the writer's literal and the reader's pattern must
+# agree or a resumed story is confirmed twice — or never. The writer interpolates
+# the constant; a round-trip test pins the two against each other.
+OPERATOR_CONFIRM_HEADING = "## Operator Confirmation"
+OPERATOR_CONFIRM_HEADING_RE = re.compile(r"^##\s+Operator Confirmation\s*$", re.MULTILINE)
+
+# Provenance for the operator-confirmation section, mirroring
+# ORCHESTRATOR_SYNTH_NOTE: says who wrote the section and on whose word, so a
+# reader never mistakes an out-of-band human sign-off for something a dev
+# session concluded on its own. Single line, for the same reason as its sibling.
+OPERATOR_CONFIRM_NOTE = (
+    "_Appended by the bmad-loop orchestrator (`bmad-loop confirm`, #335): a human "
+    "confirmed these external actions out of band, and the story was advanced from "
+    "`awaiting-operator` to `done`._"
 )
 
 
@@ -610,3 +652,72 @@ def append_auto_run_result(spec_path: Path, status: str, *, detail: str = "") ->
         section += f"{nl}{detail.strip()}{nl}"
     _atomic_write_spec(spec_path, text + section)
     return True
+
+
+def append_operator_confirmation(spec_path: Path, actions: Sequence[str], *, date: str) -> bool:
+    """Append the ``## Operator Confirmation`` audit section `bmad-loop confirm`
+    writes when a human signs off a parked story (#335).
+
+    This section is the whole audit trail for the part of a story that happened
+    OUTSIDE the repository. The commit shows what the agent did; nothing in git
+    can show that someone bought the domain or published the DNS record, so the
+    spec has to say it, next to the ``operator_actions:`` it is answering. The
+    actions are restated rather than referenced because the frontmatter list is
+    the *claim* and this is the *acknowledgment* — a later reader comparing them
+    can see whether the spec was edited between the park and the confirmation.
+
+    Unlike `append_auto_run_result` this does NOT no-op on a heading that is
+    already there. A repeated confirmation is a real event (a spec reverted to
+    the park status and confirmed again), and dropping the second record would
+    make the audit trail claim there was only ever one. Sections accumulate,
+    newest last.
+
+    Repair-write doctrine, as the neighbouring writers: an absent spec returns
+    False (the caller decides whether that is fatal); a present-but-unreadable
+    spec, or a failing write, RAISES — `confirm` is about to move the board to
+    `done`, and it must not do that believing it recorded something it did not.
+
+    Line endings are handled exactly as in `append_auto_run_result`: raw byte
+    read, detected CRLF/LF reused for every break, bare-CR completed so the
+    heading starts on a recognized line boundary."""
+    if not spec_path.is_file():
+        return False
+    text = spec_path.read_bytes().decode("utf-8")
+    nl = "\r\n" if "\r\n" in text else "\n"
+    if text.endswith("\r"):
+        text += "\n"
+    elif text and not text.endswith("\n"):
+        text += nl
+    # A blank line before the heading, not merely a terminated last line: this
+    # section is written to be READ, and every markdown renderer (and linter)
+    # wants a heading separated from the paragraph above it.
+    if text and not text.endswith(nl * 2):
+        text += nl
+    # One line per action, in the order they were declared and acknowledged.
+    items = "".join(f"- {a}{nl}" for a in actions)
+    section = (
+        f"{OPERATOR_CONFIRM_HEADING}{nl}{nl}"
+        f"Confirmed {date}: the external actions this story owed were carried out.{nl}{nl}"
+        f"{items}{nl}{OPERATOR_CONFIRM_NOTE}{nl}"
+    )
+    _atomic_write_spec(spec_path, text + section)
+    return True
+
+
+def has_operator_confirmation(spec_path: Path) -> bool:
+    """Whether a spec already carries a REAL ``## Operator Confirmation`` section
+    — the on-disk acknowledgment `bmad-loop confirm` reads to tell an interrupted
+    confirmation from a fresh one (#335).
+
+    Fence-aware for the same reason `_section_headings` is (#52), and the stakes
+    here are higher than on the auto-run path: a frozen intent that shows an
+    example ``## Operator Confirmation`` block inside a code fence must not let
+    `confirm` conclude a human already signed off and skip straight to advancing
+    the board. The section on disk IS the acknowledgment, so a quoted one would
+    finish a story nobody confirmed.
+
+    Reads on the *observation* path and degrades accordingly (`_read_text_or_empty`):
+    an absent or unreadable spec cannot be SHOWN to carry an acknowledgment, so it
+    reads as False and the caller takes the ordinary path, which does its own
+    reading and reports the real fault."""
+    return bool(_section_headings(_read_text_or_empty(spec_path), OPERATOR_CONFIRM_HEADING_RE))

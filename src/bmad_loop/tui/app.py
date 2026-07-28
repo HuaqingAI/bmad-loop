@@ -703,7 +703,13 @@ class BmadLoopApp(App[None]):
         try:
             reset = devcontract.reset_spec_status(spec_path, "draft")
             devcontract.strip_auto_run_result(spec_path)
-        except OSError as e:
+        except (OSError, verify.FrontmatterWriteError) as e:
+            # FrontmatterWriteError is not an OSError: a spec whose `status:` is a
+            # block scalar or a flow mapping reads fine and fails the WRITE. It
+            # lands in the same notice as a permissions failure because it has the
+            # same shape for the operator — the replan did not happen and the run
+            # is not resumed — and because an uncaught raise inside a Textual
+            # worker takes the dashboard down instead of saying so.
             self.notify(f"replan failed: {e}", severity="error")
             return
         if not reset:

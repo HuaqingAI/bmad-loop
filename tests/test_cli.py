@@ -1152,7 +1152,7 @@ def test_status_reports_a_parked_story_on_both_surfaces(project, capsys):
     assert entry_parked["defer_reason"] is None  # a park is not a failure
     assert doc["schema_version"] == 1  # additive: no consumer breaks
     # the v1 document carries the phase, not the actions themselves — the
-    # registry and `confirm --list` are their surface (part 3)
+    # operator-actions index and `confirm --list` are their surface
     assert "operator_actions" not in entry_parked
 
     assert cli.main(["status", "--project", str(project.project)]) == 0
@@ -4314,3 +4314,774 @@ def test_platform_preflight_notes_forced_selection_provenance(mux_registry, monk
     mux_registry.get_multiplexer.cache_clear()
     notes, problems = _preflight_notes_problems()
     assert any("forced by BMAD_LOOP_MUX_BACKEND" in n for n in notes)
+
+
+# ---------------------------------------- bmad-loop confirm (#335, part 3 of 4)
+#
+# The exit from `awaiting-operator`. Out of band by construction: the run that
+# parked the story is long finished and its task is terminal, so `confirm` writes
+# only the two things that DEFINE completion (the spec and the board) and drops
+# the index entry that pointed at them.
+
+CONFIRM_ACTIONS = ["buy example.com at the registrar", "publish the _acme-challenge TXT record"]
+
+
+def _park_story(paths, key="1-1-a", *, actions=None, spec_status="awaiting-operator", board=None):
+    """Put the project in the state a park leaves behind: spec, board, index."""
+    from bmad_loop import operatoractions
+
+    acts = CONFIRM_ACTIONS if actions is None else actions
+    sp = spec_path(paths, key)
+    write_spec(sp, spec_status, "base", operator_actions=acts)
+    write_sprint(paths, {"epic-1": "in-progress", key: board or "awaiting-operator"})
+    operatoractions.record_park(
+        paths.project,
+        key,
+        actions=list(acts) if isinstance(acts, list) else [],
+        spec_file=sp.relative_to(paths.project).as_posix(),
+        commit="abcdef1234567890",
+        run_id="run-1",
+        parked_at="2026-07-28",
+    )
+    return sp
+
+
+def _confirm_argv(paths, *extra):
+    return ["confirm", "--project", str(paths.project), *extra]
+
+
+def test_confirm_flips_spec_board_index_and_commits(project, capsys, monkeypatch):
+    """The happy path, end to end. All four records move together: the spec gains
+    its audit section and reaches done, the board advances through the sole
+    writer, the index entry goes, and the pair is committed.
+
+    Ablation: delete the `sprintstatus.advance` call in `_apply_confirmation` and
+    this fails on the board assertion — a spec saying done over a board still
+    parked is the false-green the state exists to prevent."""
+    from bmad_loop import devcontract, operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    sp = _park_story(project)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "park")
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 0
+
+    text = sp.read_text()
+    assert "status: 'done'" in text or "status: done" in text
+    assert "## Operator Confirmation" in text
+    assert devcontract.OPERATOR_CONFIRM_NOTE in text
+    for action in CONFIRM_ACTIONS:
+        assert f"- {action}" in text
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+    assert operatoractions.load(project.project) == {}
+    # the spec and board moved into history together, and nothing else did
+    assert "confirm 1-1-a" in git(project.project, "log", "-1", "--format=%s")
+    assert "✓ 1-1-a confirmed" in capsys.readouterr().out
+
+
+def test_confirm_asks_about_every_action_separately(project, capsys, monkeypatch):
+    """One blanket "all done?" invites exactly the failure this state exists to
+    prevent — a story marked done with some obligations quietly unmet."""
+    install_bmad_config(project)
+    _park_story(project)
+    asked = []
+    monkeypatch.setattr(cli, "_confirm", lambda q: asked.append(q) or True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 0
+    assert len(asked) == len(CONFIRM_ACTIONS)
+    for action in CONFIRM_ACTIONS:
+        assert any(action in q for q in asked)
+
+
+def test_confirm_declined_changes_nothing(project, capsys, monkeypatch):
+    """A declined confirmation is a successful no-op (rc 0), and it must not have
+    half-written anything — declining the SECOND action still leaves the first
+    unacknowledged on disk."""
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    sp = _park_story(project)
+    before = sp.read_text()
+    answers = iter([True, False])
+    monkeypatch.setattr(cli, "_confirm", lambda _q: next(answers))
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 0
+    assert "cancelled" in capsys.readouterr().out
+    assert sp.read_text() == before
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+    assert "1-1-a" in operatoractions.load(project.project)
+
+
+def test_confirm_yes_skips_the_prompts_but_still_prints_the_actions(project, capsys, monkeypatch):
+    def _boom(*a, **k):
+        raise AssertionError("--yes must not prompt")
+
+    monkeypatch.setattr("builtins.input", _boom)
+    install_bmad_config(project)
+    _park_story(project)
+
+    assert cli.main(_confirm_argv(project, "1-1-a", "--yes")) == 0
+    out = capsys.readouterr().out
+    for action in CONFIRM_ACTIONS:
+        assert action in out  # unattended still means auditable
+
+
+def test_confirm_unknown_story_explains_the_machine_local_index(project, capsys):
+    """The index is not committed, so "not here" is the common case on a second
+    machine — the error has to say that rather than implying the story is fine."""
+    install_bmad_config(project)
+    write_sprint(project, {"epic-1": "in-progress"})
+
+    assert cli.main(_confirm_argv(project, "9-9-z")) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "not awaiting operator actions on this machine" in captured.err
+    assert "--list" in captured.err
+
+
+@pytest.mark.parametrize(
+    ("spec_status", "board", "expected"),
+    [
+        ("done", "awaiting-operator", "its spec now says status: done"),
+        ("awaiting-operator", "done", "the board now says done"),
+    ],
+)
+def test_confirm_refuses_a_drifted_entry(
+    project, capsys, monkeypatch, spec_status, board, expected
+):
+    """The index can drift from the committed truth it points at. `confirm` must
+    refuse rather than flip a board on the index's word alone.
+
+    Ablation: drop the `drift()` guard in `cmd_confirm` and this fails — the
+    stale entry is confirmed and the disagreement is silently overwritten."""
+    from bmad_loop import operatoractions
+
+    install_bmad_config(project)
+    sp = _park_story(project, spec_status=spec_status, board=board)
+    before = sp.read_text()
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert expected in captured.err and "Nothing was changed" in captured.err
+    assert sp.read_text() == before
+    assert "1-1-a" in operatoractions.load(project.project)  # left for repair
+
+
+def test_confirm_refuses_a_park_declaring_nothing(project, capsys, monkeypatch):
+    """A park is DEFINED by owing at least one action; an entry with none is not
+    something a human can acknowledge."""
+    install_bmad_config(project)
+    _park_story(project, actions=[])
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 1
+    assert "no readable actions" in capsys.readouterr().err
+
+
+def test_confirm_list_shows_what_each_story_owes(project, capsys):
+    install_bmad_config(project)
+    _park_story(project)
+
+    assert cli.main(_confirm_argv(project, "--list")) == 0
+    out = capsys.readouterr().out
+    assert "1-1-a" in out and "parked 2026-07-28" in out
+    for action in CONFIRM_ACTIONS:
+        assert action in out
+
+
+def test_confirm_list_marks_a_drifted_entry_rather_than_hiding_it(project, capsys):
+    install_bmad_config(project)
+    _park_story(project, spec_status="done")
+
+    assert cli.main(_confirm_argv(project, "--list")) == 0
+    assert "NOT CONFIRMABLE" in capsys.readouterr().out
+
+
+def test_confirm_list_with_nothing_parked(project, capsys):
+    install_bmad_config(project)
+    write_sprint(project, {"epic-1": "in-progress"})
+
+    assert cli.main(_confirm_argv(project, "--list")) == 0
+    assert "no stories are awaiting operator actions" in capsys.readouterr().out
+
+
+def test_confirm_with_no_key_and_no_list_is_a_usage_error(project, capsys):
+    install_bmad_config(project)
+    _park_story(project)
+
+    assert cli.main(_confirm_argv(project)) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "--list" in captured.err
+
+
+def test_confirm_json_is_a_pure_document(project, capsys):
+    install_bmad_config(project)
+    _park_story(project)
+
+    doc = machine_json(_confirm_argv(project, "--json"), capsys)
+    assert doc["schema_version"] == cli.CONFIRM_SCHEMA_VERSION
+    (entry,) = doc["parked"]
+    assert entry["story_key"] == "1-1-a"
+    assert entry["actions"] == CONFIRM_ACTIONS
+    assert entry["confirmable"] is True and entry["drift"] is None
+    assert entry["commit"] == "abcdef1234567890" and entry["run_id"] == "run-1"
+
+
+def test_confirm_json_carries_both_sides_of_a_disagreement(project, capsys):
+    """A consumer triaging a stuck board needs to see WHICH side disagreed;
+    `confirmable` alone would say a story cannot be confirmed without ever saying
+    what is wrong with it."""
+    install_bmad_config(project)
+    _park_story(project, spec_status="done")
+
+    doc = machine_json(_confirm_argv(project, "--json"), capsys)
+    (entry,) = doc["parked"]
+    assert entry["spec_status"] == "done" and entry["board_status"] == "awaiting-operator"
+    assert entry["confirmable"] is False and "done" in entry["drift"]
+
+
+def test_confirm_json_with_nothing_parked_is_an_empty_document(project, capsys):
+    install_bmad_config(project)
+    write_sprint(project, {"epic-1": "in-progress"})
+
+    assert machine_json(_confirm_argv(project, "--json"), capsys)["parked"] == []
+
+
+def test_confirm_json_never_reaches_the_prompt(project, capsys, monkeypatch):
+    """--json IS the listing. It cannot fall through to a path that reads stdin —
+    neither the prompt nor its progress prints survive a pure document."""
+
+    def _boom(*a, **k):
+        raise AssertionError("--json must not prompt")
+
+    monkeypatch.setattr("builtins.input", _boom)
+    monkeypatch.setattr(cli, "_confirm", _boom)
+    install_bmad_config(project)
+    _park_story(project)
+
+    machine_json(_confirm_argv(project, "1-1-a", "--json"), capsys)
+
+
+def test_confirm_json_error_keeps_stdout_empty(project, capsys):
+    """No BMAD config: the message goes to stderr, stdout stays empty, rc is 1 —
+    errors never produce a partial document."""
+    assert cli.main(_confirm_argv(project, "--json")) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "BMAD config not found" in captured.err
+
+
+def test_confirm_reverify_failure_blocks_the_flip(project, capsys, monkeypatch):
+    """The external action may have changed what the tests see — that is the whole
+    reason --reverify exists. A failure must leave every record untouched.
+
+    Ablation: ignore `_reverify`'s return value and this fails — the story is
+    confirmed on top of a red verify command."""
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    sp = _park_story(project)
+    before = sp.read_text()
+    _write_policy(project.project, '[verify]\ncommands = ["python -c \\"raise SystemExit(3)\\""]\n')
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a", "--reverify")) == 1
+    captured = capsys.readouterr()
+    assert "--reverify failed" in captured.err and "NOT confirmed" in captured.err
+    assert sp.read_text() == before
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+    assert "1-1-a" in operatoractions.load(project.project)
+
+
+def test_confirm_reverify_success_lets_the_flip_through(project, capsys, monkeypatch):
+    from bmad_loop import sprintstatus
+
+    install_bmad_config(project)
+    _park_story(project)
+    _write_policy(project.project, '[verify]\ncommands = ["python -c \\"pass\\""]\n')
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a", "--reverify")) == 0
+    assert "verify commands passed" in capsys.readouterr().out
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+
+
+def test_confirm_reverify_says_so_when_nothing_is_configured(project, capsys, monkeypatch):
+    """An empty command list is not a green gate, and must not be reported as one."""
+    install_bmad_config(project)
+    _park_story(project)
+    _write_policy(project.project, "[verify]\ncommands = []\n")
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a", "--reverify")) == 0
+    out = capsys.readouterr().out
+    assert "no [verify] commands are configured" in out
+    assert "verify commands passed" not in out
+
+
+def test_confirm_survives_a_non_git_project(project, capsys, monkeypatch):
+    """The files are the state; git history is the record of it. A commit failure
+    must not undo a confirmation that already happened on disk."""
+    from bmad_loop import sprintstatus, verify
+
+    install_bmad_config(project)
+    _park_story(project)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    def boom(*a, **k):
+        raise verify.GitError("not a git repository")
+
+    monkeypatch.setattr(cli.verify, "commit_paths", boom)
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 0
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+
+
+# ------------------------- confirm: a write that did not land is not a confirmation
+#
+# `confirm` used to discard both spec-write results and print "✓ confirmed"
+# regardless. Each of these pins a way a write can fail to land, and each asserts
+# the resulting STATE — the board never moves and the index entry stays, so the
+# command is still re-runnable.
+
+
+def _unrewritable_spec(paths, key="1-1-a"):
+    """A spec whose status reads as `awaiting-operator` (so `drift()` clears and
+    `confirm` proceeds) but sits in a shape no in-place line edit can move: a
+    literal block scalar. Replacing the `status: |` line orphans its indented
+    continuation, so every candidate edit fails verification."""
+    sp = _park_story(paths, key)
+    sp.write_text(
+        "---\n"
+        "status: |\n"
+        "  awaiting-operator\n"
+        "baseline_revision: base\n"
+        "operator_actions:\n" + "".join(f"  - {a}\n" for a in CONFIRM_ACTIONS) + "---\n\n"
+        "# Story\n",
+        encoding="utf-8",
+    )
+    return sp
+
+
+def test_confirm_refuses_when_the_spec_status_cannot_be_rewritten(project, capsys, monkeypatch):
+    """The seam that proves the frontmatter defect mattered. The reader sees
+    `awaiting-operator`, so nothing upstream refuses; the writer cannot move it.
+    Before the fix the discarded `False` still advanced the board, dropped the
+    entry, and printed `✓ confirmed` over a spec still parked.
+
+    ABLATION A1 (`frontmatter._edit_frontmatter_block`: turn the
+    exhausted-candidates `raise` into `return False`) — run, and it FAILS here on
+    the message. Recorded precisely, because the result is not what the plan for
+    this predicted: the confirmation is still refused under A1, since the
+    read-back guard below checks the FILE rather than the writer's word. What A1
+    costs is the diagnosis — the human gets "still does not read status: done"
+    instead of the shape that blocked it and the instruction to repair it. The
+    raise is what carries the reason; the read-back is what carries the refusal.
+    (A1 also fails 7 tests in tests/test_frontmatter.py, and `rearm_escalation`
+    has no read-back at all, so there a `False` is silent.)"""
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    sp = _unrewritable_spec(project)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "park")
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 1
+    err = capsys.readouterr().err
+    assert "carries a status this cannot rewrite" in err
+    assert "NOT confirmed" in err and "re-run" in err
+    # the audit section is already on disk, and this refusal ASKS for the re-run
+    # that appends a second one — surfaced by smoke-testing a real project, where
+    # taking the advice quietly doubled the sign-off record
+    assert "SECOND" in err and "delete this one first" in err
+    assert "awaiting-operator" in sp.read_text()  # the status never moved
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+    assert "1-1-a" in operatoractions.load(project.project)  # still findable
+    assert "confirm 1-1-a" not in git(project.project, "log", "-1", "--format=%s")
+
+
+def test_confirm_refuses_when_the_spec_does_not_read_back_as_done(project, capsys, monkeypatch):
+    """The guard behind the raise: a writer that reports success without landing.
+    Unreachable through `set_frontmatter_status` today by construction — which is
+    the point, since it covers what no return value can (an `atomic_replace`
+    landing elsewhere on Windows, a shape nobody has enumerated, a concurrent
+    writer). Simulated by a writer that claims True and writes nothing.
+
+    Ablation: delete the read-back and this fails — the board advances and the
+    index entry is dropped over a spec still parked."""
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    _park_story(project)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+    monkeypatch.setattr(cli.frontmatter, "set_frontmatter_status", lambda *a, **k: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 1
+    err = capsys.readouterr().err
+    assert "still does not read status: done" in err and "NOT confirmed" in err
+    assert "SECOND" in err and "delete this one first" in err
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+    assert "1-1-a" in operatoractions.load(project.project)
+
+
+def test_confirm_refuses_when_the_spec_vanished_before_the_audit_section(
+    project, capsys, monkeypatch
+):
+    """`append_operator_confirmation` returns False in exactly one case — the spec
+    is gone since `resolve` read it — and its docstring says "the caller decides
+    whether that is fatal". It is: the section is the only record of the part of
+    this story that happened outside the repository.
+
+    Ablation: discard the return value and this fails — but on the MESSAGE, not
+    the refusal, and that is the whole reason the guard is here rather than left
+    to the read-back below. Without it the confirmation is still refused (an
+    absent spec reads back as status "", not "done"), and the human is told "the
+    audit section was appended" about a spec that no longer exists. A refusal that
+    misreports what landed is what sends someone looking for a section to
+    de-duplicate before re-running."""
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    sp = _park_story(project)
+
+    def _answer_and_delete(_q):  # the spec goes between `resolve` and the append
+        sp.unlink(missing_ok=True)
+        return True
+
+    monkeypatch.setattr(cli, "_confirm", _answer_and_delete)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 1
+    err = capsys.readouterr().err
+    assert "disappeared" in err and "nothing was changed" in err
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+    assert "1-1-a" in operatoractions.load(project.project)
+
+
+def test_confirm_reports_a_board_that_did_not_advance(project, capsys, monkeypatch):
+    """`sprintstatus.advance` returns the CURRENT status when its line regex
+    cannot rewrite the entry `story_status` resolved via YAML — a quoted story key
+    is enough, no mock required. That leaves the half-applied state the message
+    has to be honest about: spec signed off and done, board still parked.
+
+    Ablation: drop the `landed != "done"` branch and this fails — `✓ confirmed`
+    is printed and the entry is dropped over a board still at awaiting-operator,
+    with nothing left that can find the story."""
+    from bmad_loop import devcontract, frontmatter, operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    sp = _park_story(project)
+    project.sprint_status.write_text(
+        "last_updated: 01-06-2026 10:00\n"
+        "development_status:\n"
+        "  epic-1: in-progress\n"
+        "  '1-1-a': awaiting-operator\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 1
+    err = capsys.readouterr().err
+    assert "did not advance" in err and "awaiting-operator" in err
+    assert "Fix the board by hand" in err and "re-run" in err
+    # the spec half landed and stays landed — that is what makes this recoverable
+    assert frontmatter.status_of(frontmatter.read_frontmatter(sp)) == "done"
+    assert devcontract.has_operator_confirmation(sp)
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+    assert "1-1-a" in operatoractions.load(project.project)  # NOT dropped
+
+
+# ------------------------------- confirm: finishing an interrupted confirmation
+#
+# The state a failed board write leaves: spec signed off and at `done`, board
+# still parked, index entry still there. `drift()` calls that stale, so before
+# this branch existed `confirm` refused the one state re-running it exists to
+# clear — and nothing else would ever drop the entry.
+
+
+def _interrupted_story(paths, key="1-1-a", *, board="awaiting-operator"):
+    """Exactly what `confirm` leaves when `sprintstatus.advance` raises or returns
+    unchanged: audit section appended, spec at done, board where the park left
+    it, entry still indexed."""
+    from bmad_loop import devcontract
+
+    sp = _park_story(paths, key, spec_status="done", board=board)
+    devcontract.append_operator_confirmation(sp, CONFIRM_ACTIONS, date="2026-07-28")
+    return sp
+
+
+def test_confirm_finishes_an_interrupted_confirmation(project, capsys, monkeypatch):
+    """Ablation: delete the `resumable` branch in `cmd_confirm` and this fails —
+    the refusal names "its spec now says status: done" and the entry is stranded
+    with `validate` warning about it forever."""
+    from bmad_loop import operatoractions, sprintstatus
+
+    def _boom(*a, **k):
+        raise AssertionError("a resume must not re-prompt")
+
+    monkeypatch.setattr("builtins.input", _boom)
+    monkeypatch.setattr(cli, "_confirm", _boom)
+    install_bmad_config(project)
+    _interrupted_story(project)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 0
+    out = capsys.readouterr().out
+    assert "was already confirmed" in out and "✓ 1-1-a confirmed" in out
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+    assert operatoractions.load(project.project) == {}
+
+
+def test_a_resume_does_not_append_a_second_audit_section(project, capsys, monkeypatch):
+    """`append_operator_confirmation` accumulates rather than no-ops, because a
+    genuinely repeated confirmation is a real event. A resume is not one — the
+    section on disk IS the acknowledgment being finished.
+
+    Ablation: route the resume through `_apply_confirmation` and this fails —
+    the audit trail claims two sign-offs for one event."""
+    from bmad_loop import devcontract
+
+    install_bmad_config(project)
+    sp = _interrupted_story(project)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 0
+    assert sp.read_text().count(devcontract.OPERATOR_CONFIRM_HEADING) == 1
+
+
+def test_a_resume_finishes_a_board_a_human_already_fixed(project, capsys, monkeypatch):
+    """⚠️ The half of the resume nothing else can do. Told to "fix the board by
+    hand", a human does — and now spec and board are both `done` with an index
+    entry pointing at neither. Advancing is idempotent there, so all that is left
+    is dropping the entry, which is the only thing that stops `validate` nagging.
+
+    Ablation: narrow `ParkedStory.resumable`'s board arm to `== AWAITING_OPERATOR`
+    and this fails — rc 1, and the entry survives forever."""
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    _interrupted_story(project, board="done")
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 0
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+    assert operatoractions.load(project.project) == {}
+
+
+def test_a_resume_commits_the_spec_the_interrupted_run_never_committed(
+    project, capsys, monkeypatch
+):
+    """The commit is the LAST step, so an interruption before it leaves the
+    signed-off spec uncommitted. The resume carries it into history with the
+    board, exactly as an uninterrupted confirmation would."""
+    install_bmad_config(project)
+    _park_story(project)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "park")
+    _interrupted_story(project)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 0
+    assert "confirm 1-1-a" in git(project.project, "log", "-1", "--format=%s")
+
+
+def test_a_resume_still_honors_reverify_and_says_what_was_not_done(project, capsys, monkeypatch):
+    """`--reverify` is a gate the caller requested for THIS invocation, not an
+    acknowledgment, so it still runs. The message has to say "NOT advanced" — the
+    confirmation itself already happened, and telling a human it was "NOT
+    confirmed" sends them looking for a sign-off to redo."""
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    _interrupted_story(project)
+    _write_policy(project.project, '[verify]\ncommands = ["python -c \\"raise SystemExit(3)\\""]\n')
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a", "--reverify")) == 1
+    err = capsys.readouterr().err
+    assert "NOT advanced" in err and "NOT confirmed" not in err
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+    assert "1-1-a" in operatoractions.load(project.project)
+
+
+def test_list_marks_an_interrupted_confirmation_as_signed_off_not_refused(project, capsys):
+    """An interrupted confirmation drifts, so a listing that reads `drift()` alone
+    labels it NOT CONFIRMABLE — telling a human confirm will refuse a story confirm
+    will happily finish.
+
+    Ablation: drop the `resumable` arm of `_print_parked` and this fails."""
+    install_bmad_config(project)
+    _interrupted_story(project)
+
+    assert cli.main(_confirm_argv(project, "--list")) == 0
+    out = capsys.readouterr().out
+    assert "ALREADY SIGNED OFF" in out and "re-run confirm" in out
+    assert "NOT CONFIRMABLE" not in out
+
+
+def test_json_carries_resumable_and_the_reading_it_came_from(project, capsys):
+    """The builder commits to shipping the raw inputs a derived boolean came from,
+    so a consumer triaging a stuck board can see WHICH reading made it what it is.
+
+    ⚠️ `schema_version` stays 1 deliberately: evolution is additive-only, and every
+    field that already existed produces the same value for every input."""
+    install_bmad_config(project)
+    _interrupted_story(project)
+
+    doc = machine_json(_confirm_argv(project, "--json"), capsys)
+    assert doc["schema_version"] == 1
+    (entry,) = doc["parked"]
+    assert entry["resumable"] is True and entry["confirmation_recorded"] is True
+    # unchanged for the same input — the half-applied state is still not a park
+    assert entry["confirmable"] is False and entry["drift"] == "its spec now says status: done"
+
+
+def test_json_says_a_plain_park_is_not_resumable(project, capsys):
+    install_bmad_config(project)
+    _park_story(project)
+
+    (entry,) = machine_json(_confirm_argv(project, "--json"), capsys)["parked"]
+    assert entry["resumable"] is False and entry["confirmation_recorded"] is False
+
+
+def test_a_spec_at_done_without_a_sign_off_is_still_refused(project, capsys, monkeypatch):
+    """The guard that keeps the resume from swallowing ordinary drift: a story
+    re-driven to done, or finished by hand, carries no ``## Operator Confirmation``
+    section. Confirming it would advance a board on nobody's word.
+
+    Ablation: drop the `confirmation_recorded` arm of `resumable` and this fails —
+    rc 0, and a story no human signed off is reported as confirmed."""
+    from bmad_loop import operatoractions
+
+    install_bmad_config(project)
+    _park_story(project, spec_status="done")
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 1
+    assert "its spec now says status: done" in capsys.readouterr().err
+    assert "1-1-a" in operatoractions.load(project.project)
+
+
+# ------------------------------------- validate: operator-index drift warnings
+
+
+def _validate_findings(paths, capsys, rc=0):
+    doc = machine_json(["validate", "--project", str(paths.project), "--json"], capsys, rc=rc)
+    return {f["check"]: f for f in doc["findings"]}
+
+
+def test_validate_warns_on_a_stale_index_entry(project, capsys):
+    """The index is machine-local and never committed, so it CAN fall out of step
+    with the specs and board that are the real record. That is only a safe trade
+    if something says so out loud.
+
+    Ablation: delete the `drift()` arm of `_validate_operator_registry` and this
+    fails — the stale entry is reported by nothing."""
+    install_bmad_config(project)
+    _park_story(project, spec_status="done")
+
+    findings = _validate_findings(project, capsys, rc=1)
+    assert findings["operator.registry-stale"]["severity"] == "warning"
+    assert "1-1-a" in findings["operator.registry-stale"]["message"]
+
+
+def test_validate_warns_when_the_board_parks_a_story_the_index_lost(project, capsys):
+    """The opposite direction, and the opposite remedy: an obligation nobody can
+    confirm from this machine."""
+    install_bmad_config(project)
+    write_sprint(project, {"epic-1": "in-progress", "1-1-a": "awaiting-operator"})
+
+    findings = _validate_findings(project, capsys, rc=1)
+    stale = findings["operator.registry-stale"]
+    assert "no entry" in stale["message"] and stale["detail"]["story_keys"] == ["1-1-a"]
+
+
+def test_validate_warns_on_a_park_declaring_nothing_readable(project, capsys):
+    """Ablation: delete the `actions-malformed` arm and this fails — a parked
+    story with an unreadable action list is reported as merely stale, or not at
+    all."""
+    install_bmad_config(project)
+    _park_story(project, actions="a bare string is not a list")
+
+    findings = _validate_findings(project, capsys, rc=1)
+    malformed = findings["operator.actions-malformed"]
+    assert malformed["severity"] == "warning"
+    assert "declares nothing readable" in malformed["message"]
+
+
+def test_validate_is_silent_when_the_index_agrees_with_the_board(project, capsys):
+    install_bmad_config(project)
+    _park_story(project)
+
+    findings = _validate_findings(project, capsys, rc=1)
+    assert "operator.registry-stale" not in findings
+    assert "operator.actions-malformed" not in findings
+
+
+def test_validate_reports_a_board_drift_alongside_a_malformed_action_list(project, capsys):
+    """Two findings, not one. The malformed list is about the INDEX side and the
+    board disagreement is about the COMMITTED side, and their remedies differ —
+    repair the list versus discard the entry. The `continue` that used to follow
+    the malformed warning dropped the second one entirely, because `drift()`
+    checks the board BEFORE the empty-actions cause, so nothing ever reported it.
+
+    Ablation: restore the `continue` and this fails. ⚠️ `_validate_findings` keys
+    by check id and so cannot prove a COUNT — that is safe here only because the
+    two ids differ; do not reuse it to assert two same-id findings."""
+    install_bmad_config(project)
+    _park_story(project, actions=[], board="done")
+
+    findings = _validate_findings(project, capsys, rc=1)
+    assert "declares nothing readable" in findings["operator.actions-malformed"]["message"]
+    stale = findings["operator.registry-stale"]
+    assert stale["detail"]["drift"] == "the board now says done"
+
+
+def test_validate_does_not_call_a_malformed_park_stale_on_its_own(project, capsys):
+    """The other half of dropping the `continue`: with the committed state still
+    describing a park, the unreadable list is the ONLY finding. Reporting it twice
+    — once as malformed, once as "stale because it declares no readable actions" —
+    would send a human to two remedies for one fault.
+
+    Ablation: call `drift()` instead of `committed_drift()` in the malformed arm
+    and this fails."""
+    install_bmad_config(project)
+    _park_story(project, actions=[])
+
+    findings = _validate_findings(project, capsys, rc=1)
+    assert "operator.actions-malformed" in findings
+    assert "operator.registry-stale" not in findings
+
+
+def test_validate_reports_an_interrupted_confirmation_under_its_own_id(project, capsys):
+    """A new id rather than `registry-stale`, because the remedy INVERTS: re-run
+    confirm to finish it, not discard the entry. Telling a human "the entry is
+    stale and confirm will refuse it" about a story confirm now completes is the
+    same class of lie the half-applied state itself is.
+
+    Ablation: delete the `resumable` arm and this fails — the finding comes back
+    as `operator.registry-stale` saying confirm will refuse it."""
+    install_bmad_config(project)
+    _interrupted_story(project)
+
+    findings = _validate_findings(project, capsys, rc=1)
+    interrupted = findings["operator.confirm-interrupted"]
+    assert interrupted["severity"] == "warning"
+    assert "board was never advanced" in interrupted["message"]
+    assert "confirm 1-1-a" in interrupted["message"]
+    assert "operator.registry-stale" not in findings
+
+
+def test_validate_operator_warnings_never_fail_the_run(project, capsys):
+    """Warnings only, both directions: `confirm` already refuses a drifted entry,
+    so a stale index must not be able to block a run that would otherwise start."""
+    from bmad_loop.checks import ValidationReport
+
+    report = ValidationReport()
+    install_bmad_config(project)
+    _park_story(project, spec_status="done")
+    cli._validate_operator_registry(project.project, project, report)
+    assert report.findings and report.passed

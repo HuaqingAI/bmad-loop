@@ -20,8 +20,15 @@ from typing import Any
 
 from . import deferredwork
 from .bmadconfig import ProjectPaths
+from .frontmatter import FrontmatterWriteError  # noqa: F401 — re-export
 from .frontmatter import set_frontmatter_status  # noqa: F401 — re-export
-from .frontmatter import _split_frontmatter, operator_actions_of, read_frontmatter, status_of
+from .frontmatter import (
+    _edit_frontmatter_block,
+    _split_frontmatter,
+    operator_actions_of,
+    read_frontmatter,
+    status_of,
+)
 from .model import StoryTask, VerifyOutcome
 from .policy import POLICY_FILE, Policy
 from .sprintstatus import STATUS_ORDER, story_status
@@ -945,13 +952,21 @@ def set_frontmatter_field(path: Path, key: str, value: str) -> bool:
     """Rewrite (or insert) a scalar ``<key>:`` line in a spec's `---`…`---`
     frontmatter block.
 
-    Same minimal in-place line surgery as `set_frontmatter_status` (no YAML
-    round-trip) so the spec's formatting, comments, and field order survive.
+    Same verified in-place line surgery as `set_frontmatter_status` (no YAML
+    round-trip) so the spec's formatting, comments, and field order survive, and
+    the same three-way return: True on a landed rewrite, False for **nothing to
+    change** (no file, no frontmatter block, already at the value), and
+    `FrontmatterWriteError` when the reader can see the key in a shape no line
+    edit can safely move.
+
     Unlike the status helper, a missing key is INSERTED as the block's last
     line: callers assert a field's value whether or not the skill wrote one
     (the patch-restore re-arm re-stamps ``baseline_revision``, which only the
-    skill's step-03 writes). Returns True when the file was rewritten; False
-    when it has no frontmatter or already carries the exact value.
+    skill's step-03 writes). The insert is now gated on what `read_frontmatter`
+    SEES rather than on a line-scan miss, which was a defect of its own — a
+    quoted ``"baseline_revision":`` was missed by the scan and a second one
+    appended, so the spec carried the key twice and the reader resolved the
+    wrong one.
     """
     if not path.is_file():
         return False
@@ -960,22 +975,10 @@ def set_frontmatter_field(path: Path, key: str, value: str) -> bool:
     if split is None:
         return False
     before, block, after = split
-    block_lines = block.splitlines(keepends=True)
-    replaced = False
-    for i, line in enumerate(block_lines):
-        stripped = line.lstrip()
-        if stripped.startswith(f"{key}:"):
-            indent = line[: len(line) - len(stripped)]
-            newline = "\n" if line.endswith("\n") else ""
-            block_lines[i] = f"{indent}{key}: {value}{newline}"
-            replaced = True
-            break
-    if not replaced:
-        block_lines.append(f"{key}: {value}\n")
-    rebuilt = before + "".join(block_lines) + after
-    if rebuilt == text:  # already at the target value — idempotent no-op
+    edited = _edit_frontmatter_block(block, key, value, insert=True)
+    if edited is None:
         return False
-    path.write_text(rebuilt, encoding="utf-8")
+    path.write_text(before + edited + after, encoding="utf-8")
     return True
 
 

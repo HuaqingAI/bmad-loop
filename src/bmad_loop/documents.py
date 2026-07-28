@@ -45,6 +45,7 @@ from . import policy, runs
 if TYPE_CHECKING:
     from .checks import ValidationReport
     from .model import RunState
+    from .operatoractions import ParkedStory
     from .sweep import Decision
     from .tui.data import RunInfo
 
@@ -98,6 +99,58 @@ def validate_document(
                 "detail": f.detail,
             }
             for f in report.findings
+        ],
+    }
+
+
+CONFIRM_SCHEMA_VERSION = 1
+
+
+def confirm_document(parked: list[ParkedStory]) -> dict[str, object]:
+    """The `confirm --list --json` document: every story parked at
+    `awaiting-operator`, in story-key order, with what each owes.
+
+    Obeys the pure-document contract in machine.py (additive-only evolution;
+    anything breaking bumps CONFIRM_SCHEMA_VERSION). Nothing parked is a valid
+    empty document with exit 0, never an error.
+
+    Carries BOTH `confirmable` and the raw `spec_status`/`board_status` it is
+    derived from. A consumer scripting confirmations only needs the boolean, but
+    one triaging a stuck board needs to see which side disagreed — collapsing
+    them would make the document say a story "cannot be confirmed" without ever
+    saying what is wrong with it, and `drift` is prose, not something to branch
+    on. `actions` is the SPEC's list where the spec is readable, matching what
+    the text listing shows and what a human would be acknowledging.
+
+    `resumable` marks a confirmation interrupted between its spec writes and its
+    board write — a story `confirm` finishes rather than refuses, even though
+    `confirmable` is False and `drift` reads like ordinary staleness. It ships
+    with the raw `confirmation_recorded` it is derived from, for the same reason
+    `confirmable` ships with the two statuses: a consumer triaging a stuck board
+    has to be able to see WHICH reading made the boolean what it is.
+
+    CONFIRM_SCHEMA_VERSION deliberately stays 1. Evolution here is additive-only
+    (machine.py), new fields may appear, and every field that already existed
+    produces the same value for every input — nothing a consumer pinned has
+    moved."""
+    return {
+        "schema_version": CONFIRM_SCHEMA_VERSION,
+        "parked": [
+            {
+                "story_key": p.story_key,
+                "actions": list(p.actions),
+                "spec_file": str(p.spec_path) if p.spec_path is not None else None,
+                "spec_status": p.spec_status,
+                "board_status": p.board_status,
+                "commit": p.commit,
+                "run_id": p.run_id,
+                "parked_at": p.parked_at,
+                "confirmable": p.confirmable,
+                "confirmation_recorded": p.confirmation_recorded,
+                "resumable": p.resumable,
+                "drift": p.drift(),
+            }
+            for p in parked
         ],
     }
 
