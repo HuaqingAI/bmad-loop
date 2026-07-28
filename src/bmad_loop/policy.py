@@ -141,6 +141,9 @@ class LimitsPolicy:
     # for a session that never complies. True enables it; False keeps the pre-M4
     # behavior (synthesis only).
     dev_contract_nudge: bool = True
+    # advisory cost-weighted cap on a whole STORY's cumulative spend, re-checked
+    # at every session boundary and warned about once per story (#336). Nothing
+    # is terminated on the crossing — enforcement is max_tokens_per_session below.
     max_tokens_per_story: int = 2_000_000
     # weight of cache-read tokens in the budget check (1.0 = count raw)
     cache_read_weight: float = 0.1
@@ -153,7 +156,8 @@ class LimitsPolicy:
     session_budget_mode: str = "warn"
     # weighted (cache_read_weight-discounted) per-SESSION cap the adapter wait
     # loops sample cumulative usage against every ~30s heartbeat tick. Distinct
-    # from the advisory post-done max_tokens_per_story.
+    # from the advisory per-story max_tokens_per_story: this one is per session
+    # and can end it; that one spans a story's sessions and only warns.
     max_tokens_per_session: int = 4_000_000
     # enforce mode: seconds a tripped session gets to wrap up after the nudge
     # before it is terminated over_budget. 0 = terminate at trip, no nudge.

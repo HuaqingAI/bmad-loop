@@ -101,6 +101,16 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 ### Changed
 
+- **The story token budget is checked while the story runs (#336).** `max_tokens_per_story` was
+  read once, after the story had already been marked done — so an overrun was reported only after
+  every token was spent, and a story that deferred or escalated was never checked at all (one field
+  report burned 8.35M weighted against a 2M cap in silence). The cumulative weighted spend is now
+  re-checked at every session boundary, on every path a story can take, and the first crossing
+  raises an ATTENTION + desktop notice naming the spend and the cap. Latched per story and
+  persisted, so a resume does not re-notify. Still advisory: nothing is terminated — the
+  session-ending cap remains `limits.max_tokens_per_session`. The `token-budget-exceeded` journal
+  entry gains a `budget` field.
+
 - **A failed worktree snapshot now blocks the rollback reset (#340).** The two preserve steps were
   asymmetric: an auto-rollback refused to reset past commits it could not park, but a failed
   _uncommitted_-work snapshot was journaled and the `reset --hard` ran anyway — destroying the

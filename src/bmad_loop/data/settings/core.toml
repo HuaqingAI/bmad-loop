@@ -153,6 +153,8 @@ key = "max_tokens_per_story"
 kind = "int"
 minimum = 1
 default_ref = "LimitsPolicy.max_tokens_per_story"
+label = "story budget (weighted tokens)"
+description = "advisory cap on one story's cumulative weighted spend across all its sessions, re-checked at every session boundary · crossing it raises one ATTENTION + desktop notice per story and nothing else — the story runs on · for a cap that can END a session see session budget mode below"
 [[section.field]]
 key = "cache_read_weight"
 kind = "float"

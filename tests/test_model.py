@@ -193,6 +193,17 @@ def test_preserve_ref_defaults_none_for_legacy_state():
     assert restored.preserve_ref is None and restored.preserve_partial is False
 
 
+def test_token_budget_warned_round_trips():
+    task = StoryTask(story_key="1-1-a", epic=1, token_budget_warned=True)
+    assert StoryTask.from_dict(task.to_dict()).token_budget_warned is True
+
+
+def test_token_budget_warned_defaults_false_for_legacy_state():
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["token_budget_warned"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).token_budget_warned is False
+
+
 def test_stopped_round_trips():
     state = _state(stopped=True)
     assert RunState.from_dict(state.to_dict()).stopped is True
