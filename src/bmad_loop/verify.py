@@ -453,10 +453,16 @@ def snapshot_worktree(
     Returns ``ref_name`` on success, or ``None`` when the tree is clean relative
     to HEAD (nothing to preserve — the intended non-destructive uncommitted-revert
     case). Raises :class:`GitError` on any git failure — the raise *surfaces* the
-    capture failure so the caller can decide: the commit-preservation caller
-    refuses to reset past unpreserved work, while the best-effort worktree caller
-    journals the failure and proceeds (the recovery ref is a safety net, not a
-    gate)."""
+    capture failure so the caller can decide. Since #340 the recovery ref is a
+    gate, not a safety net: the worktree caller's old best-effort "journal the
+    failure and proceed" contract is gone, and a plain rollback now refuses to
+    reset past work it could not park (only a re-drive, whose caller contract
+    forbids pausing, still journals and lets the human-directed reset run).
+
+    Not every failure here is a :class:`GitError`: ``_run_git`` translates only a
+    timeout, so a spawn-level ``OSError`` escapes untyped, and the
+    ``TemporaryDirectory`` below can raise one outright (ENOSPC/EMFILE) before any
+    git child is spawned. Callers guard ``(GitError, OSError)`` (#343)."""
     head = rev_parse_head(repo)
     with tempfile.TemporaryDirectory() as td:
         env = {**os.environ, "GIT_INDEX_FILE": str(Path(td) / "index")}
@@ -529,8 +535,11 @@ def safe_rollback(
     resolve workflow just corrected. The `git reset --hard` would otherwise
     revert them (keep only guards untracked deletion). We snapshot the current
     tree with `git stash create`, reset, then restore those paths from the
-    snapshot. Untracked artifacts need no special handling: the reset leaves them
-    alone and the cleanup below skips `keep` dirs.
+    snapshot. If that snapshot cannot be taken we raise *before* the reset rather
+    than proceed with an empty one: skipping the restore would revert exactly what
+    `preserve` names, and it would do so silently. Untracked artifacts need no
+    special handling: the reset leaves them alone and the cleanup below skips
+    `keep` dirs.
 
     `policy.toml` (the operator's orchestration config) is *always* restored,
     regardless of `preserve`. It lives inside the kept `.bmad-loop` dir but is
@@ -549,6 +558,15 @@ def safe_rollback(
     policy_content = policy_path.read_bytes() if policy_path.is_file() else None
 
     rc, out = _git(repo, "stash", "create")
+    # A failed `stash create` silently empties `snapshot`, which disables the whole
+    # preserve restore below — the reset would then revert the very paths the caller
+    # asked to keep (a resolved re-drive's corrected spec), with no error anywhere.
+    # Raise before the reset, and only when a restore was actually requested: with
+    # no `preserve` the snapshot is unused, so the degrade stays correct there (both
+    # sweep callers rely on it). A clean tree is not a failure — it exits rc 0 with
+    # empty output, which the line below keeps handling as "nothing to restore from".
+    if rc != 0 and preserve:
+        raise GitError(f"git stash create failed in {repo}: {out}")
     snapshot = out.strip() if rc == 0 else ""
     rc, out = _git(repo, "reset", "--hard", baseline)
     if rc != 0:

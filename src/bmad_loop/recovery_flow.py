@@ -118,14 +118,22 @@ class RecoveryFlow:
         later mid-re-drive retry/defer reset can't silently revert the correction.
 
         Otherwise (a stopped/abandoned attempt) recovery depends on where the
-        attempt ran. Inside a mounted unit worktree it always auto-recovers: the
-        worktree is disposable, the attempt's work is parked on preserve refs
-        before the reset, and ``scm.rollback_on_failure`` gates *in-place*
-        (isolation="none") recovery only (#161). In the main checkout the flag
-        governs: OFF (default) leaves the working tree untouched and emits a bold
-        manual-recovery notice that pauses the run (stop-and-wait); ON does a
+        attempt ran. Inside a mounted unit worktree it auto-recovers instead of
+        pausing on policy: the worktree is disposable, the attempt's work is parked
+        on preserve refs before the reset, and ``scm.rollback_on_failure`` gates
+        *in-place* (isolation="none") recovery only (#161). In the main checkout the
+        flag governs: OFF (default) leaves the working tree untouched and emits a
+        bold manual-recovery notice that pauses the run (stop-and-wait); ON does a
         clean reset to baseline. Either way pre-existing untracked files are
-        preserved; there is no blanket ``git clean``."""
+        preserved; there is no blanket ``git clean``.
+
+        The two preserve steps are the one thing that can still pause a rollback the
+        branching above chose to auto-recover, worktree included: when the attempt's
+        committed or uncommitted work cannot be parked and the reset would destroy
+        it, they refuse rather than reset (#340). That is a preservation failure
+        rather than a policy decision, so it does not weaken #161 — the notice
+        targets ``workspace.root``, which is the mounted worktree when there is
+        one."""
         workspace = self._workspace_get()
         resolved = cause == "resolved"
         # preserve the corrected spec for the whole re-drive, not just the first
@@ -146,7 +154,7 @@ class RecoveryFlow:
                     task.baseline_untracked,
                     exclude=protected,
                 )
-            except verify.GitError as exc:
+            except (verify.GitError, OSError) as exc:
                 self.journal.append(
                     "rollback-dirty-check-failed", story_key=task.story_key, error=str(exc)
                 )
@@ -193,8 +201,9 @@ class RecoveryFlow:
             # Park the attempt's uncommitted diff too, so the reset below (and its
             # untracked cleanup) can't silently destroy in-progress work. Runs only
             # if preserve_attempt_commits did not pause (plain-rollback preserve
-            # failure); best-effort, never blocks.
-            self.preserve_attempt_worktree(task)
+            # failure), and refuses the reset on the same terms when a failed
+            # capture would cost unparked work (#340).
+            self.preserve_attempt_worktree(task, allow_pause=not redrive)
             self.safe_reset(task, preserve=protected)
             # Refresh the plugin's view of the now-reset tree (the Unity engine
             # re-imports assets). Observe-only for the same reason as pre_rollback.
@@ -246,7 +255,12 @@ class RecoveryFlow:
         patch = verify.resolve_restore_path(task.restore_patch, workspace.root)
         try:
             verify.apply_patch(workspace.root, patch)
-        except verify.GitError as e:
+        except (verify.GitError, OSError) as e:
+            # OSError joins GitError for the reason the rollback guards do (#343):
+            # `_run_git` translates only a timeout, and the patch file is read from
+            # disk here, so an ENOENT/EACCES/ENOSPC arrives untyped. Crashing would
+            # skip the escalation this branch exists to perform and leave the tree
+            # half-restored with no attention file.
             self.journal.append(
                 "attempt-restore-failed",
                 story_key=task.story_key,
@@ -306,19 +320,44 @@ class RecoveryFlow:
         recoverable by name, not just the reflog). No-op when the attempt added no
         commits — an uncommitted-only revert is the intended, non-destructive case.
 
-        If commits exist but the ref cannot be created: with ``allow_pause`` (a
-        plain rollback) refuse to reset — pause for manual recovery rather than
-        destroy the work. On a re-drive (``allow_pause=False``) the caller's
-        contract forbids pausing, so journal the failure and let the reset proceed
-        (the re-drive is a human-directed discard of the failed attempt)."""
+        If commits exist but the ref cannot be created — or the range cannot be
+        enumerated at all, which is the same thing one step earlier: with
+        ``allow_pause`` (a plain rollback) refuse to reset — pause for manual
+        recovery rather than destroy the work. On a re-drive (``allow_pause=False``)
+        the caller's contract forbids pausing, so journal the failure and let the
+        reset proceed (the re-drive is a human-directed discard of the failed
+        attempt). The two failures journal under distinct events
+        (``attempt-preserve-enumerate-failed`` vs ``attempt-preserve-failed``) so a
+        post-mortem can tell "could not count the work" from "counted it but could
+        not park it" — only the latter can report a HEAD."""
         baseline = task.baseline_commit
         if not baseline:
             return
         workspace = self._workspace_get()
-        commits = verify.commits_above(workspace.root, baseline)
-        if not commits:
-            return
-        head = verify.rev_parse_head(workspace.root)  # the tip the recovery ref parks at
+        # Enumerating the range is what decides whether the reset is safe, so a
+        # fault here is not a no-op: an un-determinable range must read as "there
+        # may be work above baseline" and take the preservation-failure path below,
+        # never the `not commits` early return (which would let the reset run
+        # blind). These two calls carried no guard at all, so until #343 a plain
+        # git *timeout* — which `_run_git` does translate, and which every sibling
+        # here already treats as routine — crashed the rollback outright; OSError
+        # joins it because the translation stops at timeouts. The `not commits`
+        # return sits inside the try to keep the original call order: HEAD is still
+        # only read once there is something to park.
+        try:
+            commits = verify.commits_above(workspace.root, baseline)
+            if not commits:
+                return
+            head = verify.rev_parse_head(workspace.root)  # the tip the ref parks at
+        except (verify.GitError, OSError) as exc:
+            self.journal.append(
+                "attempt-preserve-enumerate-failed", story_key=task.story_key, error=str(exc)
+            )
+            if allow_pause:
+                # Same refusal as an un-parked ref: the notice must not tell the
+                # operator to `reset --hard` past work we could not even count.
+                self.pause_for_manual_recovery(task, baseline, preserve_failed=True)
+            return  # re-drive: never pause — proceed to the (human-directed) reset
         # run_id can be an arbitrary user `--run-id`; ref-sanitize it (same
         # identity-for-clean-ids / digest-for-dirty contract as the unit branches) so
         # an exotic/overlong id can't blow the ref-name limit, fail `git branch`, and
@@ -332,7 +371,7 @@ class RecoveryFlow:
                 f"attempt-preserve/{slug}-{head[:8]}",
                 commits=commits,
             )
-        except verify.GitError:
+        except (verify.GitError, OSError):
             ref = None  # branch creation failed — treat as a preservation failure
         if ref is None:
             # commits exist (just enumerated) but the ref did not take.
@@ -347,16 +386,35 @@ class RecoveryFlow:
             "attempt-commits-preserved", story_key=task.story_key, ref=ref, count=len(commits)
         )
 
-    def preserve_attempt_worktree(self, task: StoryTask) -> None:
+    def preserve_attempt_worktree(self, task: StoryTask, *, allow_pause: bool) -> None:
         """Before an auto-rollback's hard reset, park the attempt's *uncommitted*
         working-tree changes (tracked edits + run-created untracked files) under a
         named recovery ref, so `reset --hard baseline` and its untracked cleanup
         can't silently destroy in-progress work. Complements
         `_preserve_attempt_commits` (which parks *committed* work above baseline);
         together they cover the whole attempt. No-op when the tree is clean vs HEAD
-        — the intended non-destructive uncommitted-revert case. Best-effort: a
-        capture failure is journaled but never blocks the (human-directed re-drive
-        or policy-gated) reset — the recovery ref is a safety net, not a gate."""
+        — the intended non-destructive uncommitted-revert case.
+
+        A capture failure is a gate, not a footnote (#340 — this reverses the
+        original best-effort contract). The two preserve steps used to be
+        asymmetric: the commits path refused to reset past work it could not park,
+        while a failed snapshot journaled and let the reset run. That protected the
+        *more* recoverable half — orphaned commits stay in the object store,
+        reachable by reflog/`git fsck` until gc, whereas an uncommitted edit a
+        `reset --hard` discards is gone permanently. Both paths now refuse on the
+        same terms: with ``allow_pause`` (a plain rollback) pause for manual
+        recovery rather than reset; on a re-drive (``allow_pause=False``) the
+        caller's contract forbids pausing, so journal and let the human-directed
+        reset proceed. Both now guard ``(GitError, OSError)`` too — ``_run_git``
+        translates only a timeout, so a spawn-level fault would otherwise crash the
+        rollback rather than refuse it (#343).
+
+        The refusal is gated on :meth:`_reset_would_destroy`, so a capture failure
+        over a tree with nothing left to lose (commits already parked, nothing
+        uncommitted) still resets instead of halting an unattended run. The failure
+        is journaled either way, and ``preserve_partial`` is latched either way —
+        on the re-drive path the reset still runs, so the defer notice must still
+        downgrade its claim to the committed half (#338)."""
         baseline = task.baseline_commit
         if not baseline:
             return
@@ -373,21 +431,36 @@ class RecoveryFlow:
             parked = verify.snapshot_worktree(
                 workspace.root, ref, baseline_untracked=task.baseline_untracked
             )
-        except verify.GitError as exc:
-            # Keep the git failure detail (commit-tree/update-ref stderr): if the
-            # following reset destroys work, this is the only breadcrumb explaining
-            # why the safety-net snapshot couldn't be captured.
+        except (verify.GitError, OSError) as exc:
+            # OSError alongside GitError: `_run_git` only translates a timeout, so a
+            # spawn-level EMFILE/ENOMEM escapes untyped (the sibling guards at
+            # verify.is_ancestor / worktree_prune catch both). Uncaught it crashed the
+            # run here — after the commits ref, before the reset — which is the safe
+            # outcome reached the loudest possible way. Preservation is observation,
+            # so it degrades into the decision below; `safe_reset` is the repair
+            # write and still raises.
+            # Keep the failure detail (commit-tree/update-ref stderr, or the errno):
+            # if the reset that may follow destroys work, this is the only breadcrumb
+            # explaining why the safety-net snapshot couldn't be captured.
             self.journal.append(
                 "attempt-worktree-preserve-failed", story_key=task.story_key, error=str(exc)
             )
-            # The reset below runs regardless (best-effort contract), so whatever was
-            # uncommitted is now gone. Latch that: `preserve_ref` may still name the
-            # commits branch parked just above, and the defer notice must offer it as
-            # the committed half rather than as the whole attempt. Set unconditionally
-            # — snapshot_worktree can raise before it can tell whether the tree was
-            # even dirty, so "could not capture" is the only honest state. Harmless
-            # when nothing was parked: the notice short-circuits on the ref first.
+            # Latch the partial marker before deciding pause-vs-reset: on the
+            # re-drive path below the reset still runs, so `preserve_ref` may name
+            # the commits branch parked just above and the defer notice must offer
+            # it as the committed half rather than as the whole attempt (#338). Set
+            # unconditionally — snapshot_worktree can raise before it can tell
+            # whether the tree was even dirty, so "could not capture" is the only
+            # honest state. Harmless when nothing was parked: the notice
+            # short-circuits on the ref first.
             task.preserve_partial = True
+            if not allow_pause:
+                return  # re-drive: never pause — proceed to the (human-directed) reset
+            # Refuse the reset rather than destroy what the snapshot failed to save
+            # (#340) — but only when something unparked is actually at stake, so a
+            # git fault over a harmless reset can't halt an unattended run.
+            if self._reset_would_destroy(task):
+                self.pause_for_manual_recovery(task, baseline, snapshot_failed=True)
             return
         if parked:
             # Last writer wins over preserve_attempt_commits' branch on purpose:
@@ -399,11 +472,45 @@ class RecoveryFlow:
             task.preserve_ref = parked
             self.journal.append("attempt-worktree-preserved", story_key=task.story_key, ref=parked)
 
+    def _reset_would_destroy(self, task: StoryTask) -> bool:
+        """True when the pending `safe_reset` would still erase uncommitted work —
+        the decision input for refusing a rollback whose snapshot failed (#340).
+
+        Probes `verify.attempt_dirty` against *HEAD* rather than the attempt
+        baseline. That reports exactly the tracked edits and run-created untracked
+        files `safe_rollback` is about to drop, and ignores commits above baseline,
+        which `preserve_attempt_commits` has already parked — or paused on — by the
+        time this runs. So a capture failure over a tree whose content was all
+        committed reads as nothing-to-lose and the reset proceeds: a snapshot fault
+        must not halt an unattended run when the reset itself is harmless (#123).
+
+        No ``exclude`` is passed because this only runs on the plain-rollback path,
+        where `rollback_or_pause`'s ``protected`` is empty anyway. Fails safe: an
+        un-determinable probe reads as work-at-risk, mirroring the dirty check's
+        own git-fault doctrine (#156).
+
+        Catches ``OSError`` for the same reason the caller does, and it matters more
+        here: this runs immediately after a snapshot fault, against the same git
+        binary, so the EMFILE/ENOMEM that broke the capture is likely to break the
+        probe too. Guarding only `GitError` would undo the broadening one frame up
+        and crash the rollback anyway."""
+        workspace = self._workspace_get()
+        try:
+            head = verify.rev_parse_head(workspace.root)
+            return verify.attempt_dirty(workspace.root, head, task.baseline_untracked)
+        except (verify.GitError, OSError):
+            return True
+
     def pause_for_manual_recovery(
-        self, task: StoryTask, baseline: str, *, preserve_failed: bool = False
+        self,
+        task: StoryTask,
+        baseline: str,
+        *,
+        preserve_failed: bool = False,
+        snapshot_failed: bool = False,
     ) -> None:
         """Leave the tree untouched, surface bold manual-recovery instructions, and
-        pause the run. Always raises RunPaused. Three notice shapes: (a, default)
+        pause the run. Always raises RunPaused. Four notice shapes: (a, default)
         the OFF path for a stopped/abandoned in-place attempt with no commits of
         its own — plain manual-rollback steps; (b, ``preserve_failed``) rollback is
         ON/resolved but the attempt's commits above baseline could not be parked on
@@ -413,9 +520,17 @@ class RecoveryFlow:
         above its baseline (#100: a completed session whose run died before the
         orchestrator folded the result) — instructing a bare ``reset --hard`` there
         would discard finished, possibly already-pushed commits, so this notice
-        tells the operator to save and check integration state first. A *resolved*
-        escalation never reaches here — `_rollback_or_pause` auto-recovers that
-        human-initiated re-drive regardless of `scm.rollback_on_failure`."""
+        tells the operator to save and check integration state first; (d,
+        ``snapshot_failed``) the uncommitted-work snapshot could not be captured and
+        the reset would have destroyed it (#340) — names the at-risk *working tree*
+        rather than commits, and offers a git-free rescue because the fault that
+        broke the snapshot may still be breaking git.
+
+        The two flags are mutually exclusive by construction: they are raised from
+        different call sites, and `preserve_attempt_commits` pauses before
+        `preserve_attempt_worktree` ever runs. A *resolved* escalation never
+        reaches here — `_rollback_or_pause` auto-recovers that human-initiated
+        re-drive regardless of `scm.rollback_on_failure`."""
         workspace = self._workspace_get()
         short = baseline[:12] or "<baseline_commit>"
         # Name the tree every instruction targets. Usually the main checkout,
@@ -427,10 +542,15 @@ class RecoveryFlow:
         root = workspace.root
         commits: list[str] = []
         if baseline:
-            # advisory probe: a git fault here must not block the pause itself
+            # Advisory probe: a git fault here must not block the pause itself —
+            # including an untranslated spawn-level OSError, which is *likelier* on
+            # the snapshot_failed path than anywhere else (the EMFILE/ENOMEM that
+            # broke the capture is still in force when we come to write the notice).
+            # Degrading to "no commits" only costs notice shape (c); crashing here
+            # would lose the pause the caller already decided to take.
             try:
                 commits = verify.commits_above(root, baseline)
-            except verify.GitError:
+            except (verify.GitError, OSError):
                 commits = []
         if preserve_failed:
             notice = (
@@ -445,6 +565,32 @@ class RecoveryFlow:
                 "  2. Only once they are safe, discard the attempt if you want to: "
                 f'`git -C "{root}" reset --hard {short}`, then review/remove leftover '
                 "untracked files.\n"
+                f"Then run `bmad-loop resume {self.state.run_id}`."
+            )
+        elif snapshot_failed:
+            # Name the committed half when it survived, so the operator is not left
+            # assuming the whole attempt is at risk.
+            parked = (
+                f"The attempt's *committed* work is already parked at `{task.preserve_ref}`.\n"
+                if task.preserve_ref
+                else ""
+            )
+            notice = (
+                "**ACTION REQUIRED — uncommitted work could not be auto-preserved**\n"
+                f"Story **{task.story_key}**'s attempt left uncommitted changes, but the "
+                "recovery snapshot could not be captured, so the automatic rollback was "
+                "refused rather than `reset --hard` past (and permanently destroy) them. "
+                "Unlike committed work, an uncommitted edit a reset discards is NOT "
+                f"recoverable from the reflog. **Your working tree at `{root}` is "
+                "untouched.**\n"
+                "  1. **Save what you want to keep** — copy the files out, or "
+                f'`git -C "{root}" diff > rescue.patch` plus any new untracked files.\n'
+                "  2. Check the cause — the journal's `attempt-worktree-preserve-failed` "
+                "entry carries git's own error; a full disk is the most common one.\n"
+                "  3. Only once your work is safe: "
+                f'`git -C "{root}" reset --hard {short}`, then review/remove leftover '
+                "untracked files.\n"
+                f"{parked}"
                 f"Then run `bmad-loop resume {self.state.run_id}`."
             )
         elif commits:
