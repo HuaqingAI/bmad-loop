@@ -1151,6 +1151,9 @@ def test_status_reports_a_parked_story_on_both_surfaces(project, capsys):
     assert entry_parked["commit_sha"] == "abc1234"  # parked work is committed work
     assert entry_parked["defer_reason"] is None  # a park is not a failure
     assert doc["schema_version"] == 1  # additive: no consumer breaks
+    # the v1 document carries the phase, not the actions themselves — the
+    # registry and `confirm --list` are their surface (part 3)
+    assert "operator_actions" not in entry_parked
 
     assert cli.main(["status", "--project", str(project.project)]) == 0
     out = capsys.readouterr().out

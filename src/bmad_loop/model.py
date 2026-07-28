@@ -189,11 +189,14 @@ class StoryTask:
     # session enumerated them in the spec's `operator_actions:` frontmatter.
     # Plain strings in v1: a per-action deterministic `check:` command is a
     # deliberate v2 question, and strings-now/objects-later is the cheaper
-    # migration than the reverse. Empty on every other phase — a park is defined
-    # by owing at least one action, so this being non-empty is what distinguishes
-    # AWAITING_OPERATOR from DONE. Survives the resume serialization round-trip
-    # (it is the durable record of what the human owes, and nothing re-derives it
-    # once the session that wrote the spec is gone).
+    # migration than the reverse. Empty on every other phase: owing at least one
+    # action is what selects AWAITING_OPERATOR over DONE when the park path picks
+    # a committing story's final phase. That choice is the only enforcement —
+    # nothing validates this field on load or on write, so a task carrying the
+    # phase with no actions is unreachable rather than rejected. Survives the
+    # resume serialization round-trip (it is the durable record of what the human
+    # owes, and nothing re-derives it once the session that wrote the spec is
+    # gone).
     operator_actions: list[str] = field(default_factory=list)
     defer_reason: str | None = None
     # the recovery ref this attempt's work was parked on by the last auto-rollback

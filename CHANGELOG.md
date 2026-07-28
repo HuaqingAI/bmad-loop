@@ -12,7 +12,7 @@ breaking changes may land in a minor release.
 - **`awaiting-operator` vocabulary, no writer yet (#335, part 1 of 4).** Names, at every layer, the
   state a story reaches when its agent-doable work is finished and committed but its acceptance
   criteria include external actions only a human can perform: `Phase.AWAITING_OPERATOR` (terminal,
-  reachable only from `COMMITTING`), a `awaiting-operator` sprint-status token ordered immediately
+  reachable only from `COMMITTING`), an `awaiting-operator` sprint-status token ordered immediately
   before `done` and deliberately not actionable, `operator_actions` on each task, and the matching
   run-summary count, `status` output and TUI glyphs. Nothing writes any of it yet — the park path
   is part 2 — so no run can currently reach the phase.
