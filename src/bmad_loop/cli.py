@@ -627,22 +627,26 @@ def _spec_closes_deferred(path: Path) -> tuple[tuple[str, ...], str | None]:
 def _validate_operator_registry(
     project: Path, paths: bmadconfig.ProjectPaths, report: ValidationReport
 ) -> None:
-    """Report drift between the operator-actions index and the committed state it
-    points at (#335).
+    """Report drift between the park records and the committed state they point
+    at (#335, #356).
 
-    The index is machine-local and never committed (see
-    :mod:`bmad_loop.operatoractions` for why), so it CAN fall out of step with
-    the specs and board that are the real record — a story re-driven to done, a
-    reverted commit, a hand-edited spec, or simply a clone that never had one.
-    That is only a safe trade if something says so out loud.
+    A record is committed beside the truth it points at, but it can still
+    disagree with it — a story re-driven to done, a reverted commit, a
+    hand-edited spec, a record file mangled in a merge. That is only a safe
+    trade if something says so out loud.
 
-    Never a failure, always a warning, both directions. `confirm` already refuses
-    to act on a drifted entry, so nothing here gates anything; a stale index must
-    not be able to block a run that would otherwise start. Reported in both
-    directions because they have opposite remedies: an entry the committed state
-    has moved past is stale bookkeeping to discard, while a board sitting at
-    `awaiting-operator` with no entry is an obligation nobody can confirm from
-    this machine.
+    Never a failure, always a warning, in every direction. `confirm` already
+    refuses to act on a drifted entry, so nothing here gates anything; a stale
+    record must not be able to block a run that would otherwise start. The
+    directions carry different ids because their remedies differ: an entry the
+    committed state has moved past is stale bookkeeping to discard
+    (`registry-stale`), while a board sitting at `awaiting-operator` that no
+    record claims (`park-record-missing`) is an obligation whose spec nothing
+    can find. Before #356 that second arm was the fresh-clone NORM and shared
+    `registry-stale`; now the record travels with the park's own commit, so a
+    missing one is always evidence of something — a record write that failed at
+    park time, a park from a version that recorded only machine-locally, a
+    checkout without the park's branch, or a record deleted without confirming.
 
     An INTERRUPTED confirmation gets its own id rather than being reported as
     stale, because its remedy inverts: re-running `confirm` finishes it. Saying
@@ -704,11 +708,15 @@ def _validate_operator_registry(
     )
     if orphans:
         report.warn(
-            "operator.registry-stale",
-            f"the board parks {', '.join(orphans)} at awaiting-operator, but the "
-            f"operator-actions index has no entry for them — the index is machine-local "
-            f"and not committed, so `bmad-loop confirm` cannot complete them from here; "
-            f"confirm them on the machine that ran the story, or finish them by hand",
+            "operator.park-record-missing",
+            f"the board parks {', '.join(orphans)} at awaiting-operator, but no park "
+            f"record under {operatoractions.RECORDS_REL.as_posix()}/ claims them, so "
+            f"`bmad-loop confirm` cannot find their specs from this checkout. The record "
+            f"travels with the park's own commit — a missing one means the record write "
+            f"failed at park time (journaled as operator-index-failed), the park predates "
+            f"committed records (confirm it on the machine that ran it), this checkout "
+            f"lacks the branch carrying the park commit (pull it), or the record was "
+            f"deleted without confirming; otherwise finish the story by hand",
             {"story_keys": orphans},
         )
 

@@ -211,14 +211,23 @@ def test_worktree_happy_path_merges_to_target(project):
     assert "worktree-teardown-degraded" not in kinds
 
 
-def test_worktree_parked_unit_merges_like_a_done_one(project):
+@pytest.mark.parametrize("merge_strategy", ["merge", "ff"])
+def test_worktree_parked_unit_merges_like_a_done_one(project, merge_strategy):
     """`integrate_unit` branches on DONE-vs-everything-else, and a park is the one
     non-DONE terminal that CARRIES A COMMIT. Left on the else arm the unit is torn
     down as failed and finished work is stranded on a deleted branch — over an
     obligation that lives outside the repo entirely.
 
+    The `ff` leg is the #356 acceptance regression guard: the committed park
+    record must never cost a fast-forward merge-back — the failure every
+    commit-something-on-the-target sketch died on, and the reason the record is
+    written inside the unit's own commit window instead.
+
     Ablation: narrow the merge test back to `== Phase.DONE` and this fails with
-    the story's change absent from the target branch."""
+    the story's change absent from the target branch. For the record's placement,
+    root `_write_park_record` at `self.paths.project` instead of the workspace
+    and both legs fail on the ls-tree assertion — the record sits untracked at
+    the target instead of riding the merge."""
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
     actions = ["publish the _acme-challenge TXT record"]
     engine, _ = make_engine(
@@ -228,6 +237,7 @@ def test_worktree_parked_unit_merges_like_a_done_one(project):
                 project, "1-1-a", final_status="awaiting-operator", operator_actions=actions
             )
         ],
+        policy=wt_policy(merge_strategy=merge_strategy),
     )
 
     summary = engine.run()
@@ -253,6 +263,47 @@ def test_worktree_parked_unit_merges_like_a_done_one(project):
     (story,) = operatoractions.resolve(project.project, project)
     assert story.confirmable, story.drift()
     assert story.commit  # derived from the record's history on the target branch
+
+
+def test_a_parked_story_confirms_on_a_fresh_clone(project, tmp_path):
+    """The #356 acceptance criterion end to end: a story parks under worktree
+    isolation, its record rides the unit's commit through the merge-back, and a
+    clone that never ran the orchestrator — no run state, no journal, nothing
+    machine-local — lists and confirms it from the committed files alone.
+
+    Ablation: delete the `_write_park_record` call in `_finalize_commit_phase`
+    and this fails at the confirm — the clone sees a parked board it cannot
+    resolve a spec for."""
+    from conftest import install_bmad_config
+
+    from bmad_loop import bmadconfig, cli, operatoractions, sprintstatus
+
+    install_bmad_config(project)  # `confirm` resolves the clone's paths from it
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    actions = ["publish the _acme-challenge TXT record"]
+    engine, _ = make_engine(
+        project,
+        [
+            wt_dev_effect(
+                project, "1-1-a", final_status="awaiting-operator", operator_actions=actions
+            )
+        ],
+    )
+    summary = engine.run()
+    assert summary.awaiting_operator == 1
+
+    clone = tmp_path / "fresh-clone"
+    git(tmp_path, "clone", "-q", str(project.project), str(clone))
+    # a clone carries no local identity; the confirm commit needs one
+    git(clone, "config", "user.email", "operator@test")
+    git(clone, "config", "user.name", "operator")
+
+    assert cli.main(["confirm", "--project", str(clone), "1-1-a", "--yes"]) == 0
+    clone_paths = bmadconfig.load_paths(clone)
+    assert sprintstatus.story_status(clone_paths.sprint_status, "1-1-a") == "done"
+    assert "confirm 1-1-a" in git(clone, "log", "-1", "--format=%s")
+    assert operatoractions.load(clone) == {}  # the record's deletion rode the commit
+    assert worktree_clean(clone)
 
 
 def test_worktree_run_dir_is_outside_worktree(project):

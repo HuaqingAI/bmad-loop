@@ -5071,15 +5071,26 @@ def test_validate_warns_on_a_stale_index_entry(project, capsys):
     assert "1-1-a" in findings["operator.registry-stale"]["message"]
 
 
-def test_validate_warns_when_the_board_parks_a_story_the_index_lost(project, capsys):
-    """The opposite direction, and the opposite remedy: an obligation nobody can
-    confirm from this machine."""
+def test_validate_reports_a_parked_board_with_no_record_under_its_own_id(project, capsys):
+    """The opposite direction under its own id (#356). Before the committed
+    records this was the fresh-clone NORM and shared `registry-stale`; now the
+    record travels with the park's own commit, so a board at `awaiting-operator`
+    that no record claims is always evidence of something — a failed record
+    write, a pre-upgrade park, a checkout without the park's branch, a deleted
+    record — and its remedy differs from a stale entry's discard-it, which is
+    exactly where `checks` splits ids.
+
+    Ablation: report the orphan arm under `operator.registry-stale` again and
+    this fails on the id lookup."""
     install_bmad_config(project)
     write_sprint(project, {"epic-1": "in-progress", "1-1-a": "awaiting-operator"})
 
     findings = _validate_findings(project, capsys, rc=1)
-    stale = findings["operator.registry-stale"]
-    assert "no entry" in stale["message"] and stale["detail"]["story_keys"] == ["1-1-a"]
+    missing = findings["operator.park-record-missing"]
+    assert missing["severity"] == "warning"
+    assert "no park record" in missing["message"]
+    assert missing["detail"]["story_keys"] == ["1-1-a"]
+    assert "operator.registry-stale" not in findings
 
 
 def test_validate_warns_on_a_park_declaring_nothing_readable(project, capsys):

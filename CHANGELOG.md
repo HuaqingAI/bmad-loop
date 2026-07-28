@@ -21,6 +21,9 @@ breaking changes may land in a minor release.
   failed record write never blocks the story — it parks recordless, journaled and reported by
   `validate` — and a failed commit restores the record as found. Confirming commits the record's
   deletion together with the spec+board flip, and a legacy-only park still gets that commit.
+  `validate` reports a board parked with no record under its own id, `operator.park-record-missing`:
+  no longer the fresh-clone norm, but evidence of a failed record write, a pre-upgrade park, or a
+  deleted record.
 
 - **`bmad-loop confirm` completes a parked story (#335, part 3 of 4).** Once you have carried out the
   external actions a story owed, `bmad-loop confirm <story-key>` walks you through them one at a time
