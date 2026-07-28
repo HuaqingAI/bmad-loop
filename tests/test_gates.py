@@ -38,6 +38,23 @@ def test_notify_file_appends_attention_line(tmp_path):
     assert "worktree-open-failed: mount lost" in line
 
 
+def test_notify_file_swallows_an_unwritable_attention_path(tmp_path, monkeypatch):
+    """The "never raises" contract covers the file sink too. An unwritable
+    ATTENTION path is observability degrading, not a reason to break the run —
+    every engine caller notifies on a path where a raise would crash the run or
+    unwind a decision it has already journaled.
+
+    A directory at the ATTENTION path is the portable way to make the append
+    fail: IsADirectoryError on POSIX, PermissionError on Windows, both OSError.
+    chmod would not do it under root (CI) or on Windows.
+    """
+    (tmp_path / gates.ATTENTION_FILE).mkdir()
+    # the desktop half must not be what absorbs this
+    monkeypatch.setattr(gates, "desktop_notifier_kind", lambda: None)
+
+    gates.notify(_policy(desktop=False, file=True), tmp_path, "story deferred: 1-1-a", "verify")
+
+
 # ------------------------------------------------ desktop_notifier_kind()
 
 
