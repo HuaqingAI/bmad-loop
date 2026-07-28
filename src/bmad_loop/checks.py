@@ -78,6 +78,7 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "operator.registry-stale",
         "operator.actions-malformed",
         "operator.confirm-interrupted",
+        "operator.park-record-missing",
         "deferred.closes-unknown",
         "deferred.closes-malformed",
         "deferred.closes-entry-unreadable",

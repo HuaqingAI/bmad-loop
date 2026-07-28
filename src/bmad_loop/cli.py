@@ -627,22 +627,26 @@ def _spec_closes_deferred(path: Path) -> tuple[tuple[str, ...], str | None]:
 def _validate_operator_registry(
     project: Path, paths: bmadconfig.ProjectPaths, report: ValidationReport
 ) -> None:
-    """Report drift between the operator-actions index and the committed state it
-    points at (#335).
+    """Report drift between the park records and the committed state they point
+    at (#335, #356).
 
-    The index is machine-local and never committed (see
-    :mod:`bmad_loop.operatoractions` for why), so it CAN fall out of step with
-    the specs and board that are the real record — a story re-driven to done, a
-    reverted commit, a hand-edited spec, or simply a clone that never had one.
-    That is only a safe trade if something says so out loud.
+    A record is committed beside the truth it points at, but it can still
+    disagree with it — a story re-driven to done, a reverted commit, a
+    hand-edited spec, a record file mangled in a merge. That is only a safe
+    trade if something says so out loud.
 
-    Never a failure, always a warning, both directions. `confirm` already refuses
-    to act on a drifted entry, so nothing here gates anything; a stale index must
-    not be able to block a run that would otherwise start. Reported in both
-    directions because they have opposite remedies: an entry the committed state
-    has moved past is stale bookkeeping to discard, while a board sitting at
-    `awaiting-operator` with no entry is an obligation nobody can confirm from
-    this machine.
+    Never a failure, always a warning, in every direction. `confirm` already
+    refuses to act on a drifted entry, so nothing here gates anything; a stale
+    record must not be able to block a run that would otherwise start. The
+    directions carry different ids because their remedies differ: an entry the
+    committed state has moved past is stale bookkeeping to discard
+    (`registry-stale`), while a board sitting at `awaiting-operator` that no
+    record claims (`park-record-missing`) is an obligation whose spec nothing
+    can find. Before #356 that second arm was the fresh-clone NORM and shared
+    `registry-stale`; now the record travels with the park's own commit, so a
+    missing one is always evidence of something — a record write that failed at
+    park time, a park from a version that recorded only machine-locally, a
+    checkout without the park's branch, or a record deleted without confirming.
 
     An INTERRUPTED confirmation gets its own id rather than being reported as
     stale, because its remedy inverts: re-running `confirm` finishes it. Saying
@@ -676,7 +680,7 @@ def _validate_operator_registry(
             report.warn(
                 "operator.confirm-interrupted",
                 f"{story.story_key} was confirmed but the board was never advanced: its "
-                f"spec is signed off and reads done while the index still lists it. "
+                f"spec is signed off and reads done while the park entry still lists it. "
                 f"`bmad-loop confirm {story.story_key}` finishes it without asking you to "
                 f"acknowledge anything again",
                 {"story_key": story.story_key, "board_status": story.board_status},
@@ -687,7 +691,7 @@ def _validate_operator_registry(
         if drift is not None:
             report.warn(
                 "operator.registry-stale",
-                f"the operator-actions index lists {story.story_key} as parked, but "
+                f"the park entry lists {story.story_key} as parked, but "
                 f"{drift} — the entry is stale and `bmad-loop confirm "
                 f"{story.story_key}` will refuse it",
                 {"story_key": story.story_key, "drift": drift},
@@ -704,11 +708,15 @@ def _validate_operator_registry(
     )
     if orphans:
         report.warn(
-            "operator.registry-stale",
-            f"the board parks {', '.join(orphans)} at awaiting-operator, but the "
-            f"operator-actions index has no entry for them — the index is machine-local "
-            f"and not committed, so `bmad-loop confirm` cannot complete them from here; "
-            f"confirm them on the machine that ran the story, or finish them by hand",
+            "operator.park-record-missing",
+            f"the board parks {', '.join(orphans)} at awaiting-operator, but no park "
+            f"record under {operatoractions.RECORDS_REL.as_posix()}/ claims them, so "
+            f"`bmad-loop confirm` cannot find their specs from this checkout. The record "
+            f"travels with the park's own commit — a missing one means the record write "
+            f"failed at park time (journaled as operator-index-failed), the park predates "
+            f"committed records (confirm it on the machine that ran it), this checkout "
+            f"lacks the branch carrying the park commit (pull it), or the record was "
+            f"deleted without confirming; otherwise finish the story by hand",
             {"story_keys": orphans},
         )
 
@@ -1653,7 +1661,7 @@ def cmd_confirm(args: argparse.Namespace) -> int:
     drift = story.drift()
     if drift is not None:
         print(
-            f"error: refusing to confirm {key}: {drift}. The index disagrees with the "
+            f"error: refusing to confirm {key}: {drift}. The park entry disagrees with the "
             f"committed state; `bmad-loop validate` reports the same drift. Nothing was "
             f"changed.",
             file=sys.stderr,
@@ -1716,7 +1724,7 @@ def _resume_confirmation(
     assert spec is not None  # resumable requires a spec that read back as done
     print(
         f"{story.story_key} was already confirmed — its spec is signed off and reads "
-        f"done, but the board and the index entry were left behind. Finishing that; "
+        f"done, but the board and the park entry were left behind. Finishing that; "
         f"you will not be asked to acknowledge anything again.\n"
     )
     if args.reverify:
@@ -1745,11 +1753,11 @@ def _apply_confirmation(
     story: operatoractions.ParkedStory,
     spec: Path,
 ) -> int:
-    """Write the confirmation: spec audit section, spec status, board, index.
+    """Write the confirmation: spec audit section, spec status, board, park entry.
 
     Ordered so a failure part-way is recoverable rather than stranded. The audit
     section goes first because it is the only record of what happened outside the
-    repo and it does not change any gate. The index entry is dropped LAST, so
+    repo and it does not change any gate. The park entry is dropped LAST, so
     anything that raises before it leaves the story findable and the command
     re-runnable — see `ParkedStory.resumable` for the state that leaves behind.
 
@@ -1779,7 +1787,7 @@ def _apply_confirmation(
         # left to write a status onto either.
         print(
             f"error: {spec} disappeared before {story.story_key} could be confirmed — "
-            f"nothing was changed and the index entry has been left in place.",
+            f"nothing was changed and the park entry has been left in place.",
             file=sys.stderr,
         )
         return 1
@@ -1789,7 +1797,7 @@ def _apply_confirmation(
         print(
             f"error: {spec} carries a status this cannot rewrite, so {story.story_key} "
             f"was NOT confirmed: {e}. The audit section was appended; the board and the "
-            f"index entry are untouched, so re-run `bmad-loop confirm {story.story_key}` "
+            f"park entry are untouched, so re-run `bmad-loop confirm {story.story_key}` "
             f"once the frontmatter is repaired. {_SECOND_SECTION_NOTE}",
             file=sys.stderr,
         )
@@ -1803,7 +1811,7 @@ def _apply_confirmation(
     if frontmatter.status_of(frontmatter.read_frontmatter(spec)) != "done":
         print(
             f"error: {spec} still does not read status: done, so {story.story_key} was "
-            f"NOT confirmed. The audit section was appended; the board and the index "
+            f"NOT confirmed. The audit section was appended; the board and the park "
             f"entry are untouched. {_SECOND_SECTION_NOTE}",
             file=sys.stderr,
         )
@@ -1835,7 +1843,7 @@ def _land_confirmation(
             f"error: {spec} was updated but {paths.sprint_status} did not advance "
             f"{story.story_key} to done (it reads {landed!r}). Fix the board by hand, then "
             f"re-run `bmad-loop confirm {story.story_key}` — the spec is already correct "
-            f"and signed off, and the index entry has been left in place, so the re-run "
+            f"and signed off, and the park entry has been left in place, so the re-run "
             f"finishes what is left without asking you to acknowledge anything twice.",
             file=sys.stderr,
         )

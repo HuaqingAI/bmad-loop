@@ -43,9 +43,11 @@ exactly right for a file nothing writes.
 
 Because a record can still drift from the committed truth it points at (a
 hand-edited spec, a ``git revert``, a story re-driven to ``done``), ``validate``
-carries ``operator.registry-stale`` and ``operator.actions-malformed``. Both are
-warnings: ``confirm`` refuses drifted entries itself, so nothing gates on the
-record.
+carries ``operator.registry-stale``, ``operator.actions-malformed`` and
+``operator.confirm-interrupted``, and reports a board parked at
+``awaiting-operator`` that no record claims as ``operator.park-record-missing``
+(#356) — ids split where the remedy does. All are warnings: ``confirm`` refuses
+drifted entries itself, so nothing gates on the record.
 """
 
 from __future__ import annotations
