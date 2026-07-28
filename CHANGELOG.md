@@ -174,6 +174,20 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 ### Fixed
 
+- **An unwritable `ATTENTION` file can no longer crash a run.** `gates.notify` promised "never
+  raises", but only its desktop half was guarded — the `ATTENTION` append was bare IO, so an
+  unwritable run dir turned an advisory notice into a run crash at every site that journals a
+  decision and then announces it (defer, escalate, plugin veto, manual-recovery pause, budget
+  warnings). The file sink now degrades like the desktop one, matching the observe-degrade rule the
+  adapter budget guards already applied to the same call. The journal entry each caller writes
+  first remains the durable record.
+
+- **`limits.max_tokens_per_story` is validated like its per-session sibling.** It was parsed with a
+  bare `int()`, so `true` silently became a 1-token story cap and `0` was accepted — both against
+  the documented `int >= 1`. Non-integers and values below 1 now raise `PolicyError` at load, the
+  same rule `max_tokens_per_session` has always used. Note this rejects a `policy.toml` that
+  previously loaded; there is no `0 = off` semantic (set the cap high instead — it only warns).
+
 - **A pause inside a defer's rollback no longer loses the defer record (#342).** `_defer` advanced
   the task to terminal DEFERRED before recovering the tree, so a rollback that paused instead
   (rollback OFF — the default — or a preserve/snapshot failure) unwound past the tail forever: no

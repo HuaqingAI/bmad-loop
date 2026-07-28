@@ -699,7 +699,14 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
 
     # the budget knobs gate enforce-mode termination, so a coerced bool/float
     # (true -> 1 token) must be rejected, not silently accepted (same rule as
-    # scm.preserve_keep below)
+    # scm.preserve_keep below). The per-story cap is checked here on the same
+    # terms even though it only warns: a coerced `true` caps a whole story at 1
+    # token, which now fires at the first session boundary of every story.
+    max_tokens_per_story = limits_d.get("max_tokens_per_story", LimitsPolicy.max_tokens_per_story)
+    if isinstance(max_tokens_per_story, bool) or not isinstance(max_tokens_per_story, int):
+        raise PolicyError(
+            f"limits.max_tokens_per_story must be an integer: got {max_tokens_per_story!r}"
+        )
     max_tokens_per_session = limits_d.get(
         "max_tokens_per_session", LimitsPolicy.max_tokens_per_session
     )
@@ -740,9 +747,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         dev_contract_nudge=bool(
             limits_d.get("dev_contract_nudge", LimitsPolicy.dev_contract_nudge)
         ),
-        max_tokens_per_story=int(
-            limits_d.get("max_tokens_per_story", LimitsPolicy.max_tokens_per_story)
-        ),
+        max_tokens_per_story=max_tokens_per_story,
         cache_read_weight=float(limits_d.get("cache_read_weight", LimitsPolicy.cache_read_weight)),
         session_budget_mode=str(
             limits_d.get("session_budget_mode", LimitsPolicy.session_budget_mode)
@@ -780,6 +785,10 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         raise PolicyError(
             f"limits.session_budget_mode must be one of {sorted(SESSION_BUDGET_MODES)}: "
             f"got {limits.session_budget_mode!r}"
+        )
+    if limits.max_tokens_per_story < 1:
+        raise PolicyError(
+            f"limits.max_tokens_per_story must be >= 1: got {limits.max_tokens_per_story}"
         )
     if limits.max_tokens_per_session < 1:
         raise PolicyError(
