@@ -433,13 +433,18 @@ class RecoveryFlow:
         # rollback and would overwrite that snapshot, destroying the only copy of
         # the first attempt's work. Probe for a free name instead of trusting the
         # counter: uniqueness is enforced against the refs that actually exist.
+        # The probe runs INSIDE the try: `ref_exists` spawns git, and a timeout or
+        # spawn fault arrives as GitError/GitSpawnError rather than a return code.
+        # Uncaught it would crash the rollback here — the one thing this handler
+        # exists to prevent — so a probe that cannot run degrades into the same
+        # "preservation is observation" path as a snapshot that cannot be written.
         base_ref = f"refs/attempt-preserve-dirty/{slug}-{baseline[:8]}-{task.attempt}"
         ref = base_ref
         serial = 2
-        while verify.ref_exists(workspace.root, ref):
-            ref = f"{base_ref}-r{serial}"
-            serial += 1
         try:
+            while verify.ref_exists(workspace.root, ref):
+                ref = f"{base_ref}-r{serial}"
+                serial += 1
             parked = verify.snapshot_worktree(
                 workspace.root, ref, baseline_untracked=task.baseline_untracked
             )
