@@ -1249,9 +1249,9 @@ ACTIONS = ["buy example.com at the registrar", "publish the _acme-challenge TXT 
 def test_dev_declared_park_commits_and_the_run_continues(project):
     """The whole point, end to end: a session finishes what an agent can do and
     hands the rest to a human. The story COMMITS (that is what separates a park
-    from a defer), the board reaches the token, the registry and notification
-    record what is owed, and the run moves on to the next story rather than
-    halting — one story owing a DNS record must never block the ones behind it.
+    from a defer), the board reaches the token, the journal records what is owed,
+    and the run moves on to the next story rather than halting — one story owing
+    a DNS record must never block the ones behind it.
 
     Two ablation targets. Delete the `_park_awaiting_operator` branch in
     `_review_and_commit` and this fails by requesting an unscripted review
