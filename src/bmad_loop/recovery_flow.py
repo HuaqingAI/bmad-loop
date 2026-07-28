@@ -528,8 +528,7 @@ class RecoveryFlow:
             # Name the committed half when it survived, so the operator is not left
             # assuming the whole attempt is at risk.
             parked = (
-                f"The attempt's *committed* work is already parked at "
-                f"`{task.preserve_ref}`.\n"
+                f"The attempt's *committed* work is already parked at `{task.preserve_ref}`.\n"
                 if task.preserve_ref
                 else ""
             )

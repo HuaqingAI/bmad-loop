@@ -7,36 +7,7 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
-### Changed
-
-- **A failed worktree snapshot now blocks the rollback reset (#340).** The two preserve steps were
-  asymmetric: an auto-rollback refused to reset past commits it could not park, but a failed
-  *uncommitted*-work snapshot was journaled and the `reset --hard` ran anyway — destroying the
-  tracked edits and run-created untracked files the snapshot existed to capture. That protected the
-  more recoverable half; orphaned commits stay reachable by reflog until `gc`, while a discarded
-  uncommitted edit is gone. Both paths now refuse on the same terms, pausing with rescue
-  instructions that name the tree (the mounted worktree when there is one) and offer a git-free
-  copy-out, since the fault that broke the snapshot may still be breaking git.
-
-  Gated on there being something left to lose: a capture failure over a tree whose content was all
-  committed still resets, so a git fault can't halt an unattended run over a harmless reset. A
-  resolved re-drive stays pause-free by contract — it journals, resets, and flags the park
-  commits-only (#338). Inert under the shipped defaults, where the snapshot is reached only on a
-  re-drive; it bites `scm.rollback_on_failure = true` and in-worktree dev retries.
-
-### Fixed
-
-- **`safe_rollback` no longer swallows a failed `git stash create`.** The empty snapshot silently
-  disabled the whole `preserve` restore, so the hard reset reverted exactly the paths the caller
-  asked to keep — a resolved re-drive's corrected spec — with no error anywhere. It now raises
-  before the reset, and only when a restore was actually requested, so the no-`preserve` callers
-  (both sweep sites) degrade as before.
-
-- **A spawn-level `OSError` during the attempt snapshot no longer crashes the run.** `_run_git`
-  translates only a timeout, so an EMFILE/ENOMEM from `subprocess.run` escaped untyped out of the
-  middle of a rollback. Preservation is observation rather than a repair write, so it now degrades
-  into the same journal-and-decide path a `GitError` takes, keeping the errno as the breadcrumb;
-  `safe_reset` still raises.
+### Added
 
 - **Defer notifications name where the work survives (#333).** A deferred story's rollback parked
   the attempt on an `attempt-preserve/*` branch (or a `refs/attempt-preserve-dirty/*` snapshot),
@@ -130,6 +101,21 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 ### Changed
 
+- **A failed worktree snapshot now blocks the rollback reset (#340).** The two preserve steps were
+  asymmetric: an auto-rollback refused to reset past commits it could not park, but a failed
+  _uncommitted_-work snapshot was journaled and the `reset --hard` ran anyway — destroying the
+  tracked edits and run-created untracked files the snapshot existed to capture. That protected the
+  more recoverable half; orphaned commits stay reachable by reflog until `gc`, while a discarded
+  uncommitted edit is gone. Both paths now refuse on the same terms, pausing with rescue
+  instructions that name the tree (the mounted worktree when there is one) and offer a git-free
+  copy-out, since the fault that broke the snapshot may still be breaking git.
+
+  Gated on there being something left to lose: a capture failure over a tree whose content was all
+  committed still resets, so a git fault can't halt an unattended run over a harmless reset. A
+  resolved re-drive stays pause-free by contract — it journals, resets, and flags the park
+  commits-only (#338). Inert under the shipped defaults, where the snapshot is reached only on a
+  re-drive; it bites `scm.rollback_on_failure = true` and in-worktree dev retries.
+
 - **A review that revokes the sprint sign-off now escalates instead of burning review cycles
   (#334).** The orchestrator advances `sprint-status` to `done` at dev time; a review session that
   judges the story unfinished and writes the board back to an earlier stage contradicts that — and
@@ -177,6 +163,18 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   A project still on `bmad-auto` should migrate on 0.9.0 before upgrading past it.
 
 ### Fixed
+
+- **`safe_rollback` no longer swallows a failed `git stash create`.** The empty snapshot silently
+  disabled the whole `preserve` restore, so the hard reset reverted exactly the paths the caller
+  asked to keep — a resolved re-drive's corrected spec — with no error anywhere. It now raises
+  before the reset, and only when a restore was actually requested, so the no-`preserve` callers
+  (both sweep sites) degrade as before.
+
+- **A spawn-level `OSError` during the attempt snapshot no longer crashes the run.** `_run_git`
+  translates only a timeout, so an EMFILE/ENOMEM from `subprocess.run` escaped untyped out of the
+  middle of a rollback. Preservation is observation rather than a repair write, so it now degrades
+  into the same journal-and-decide path a `GitError` takes, keeping the errno as the breadcrumb;
+  `safe_reset` still raises.
 
 - **The orchestrator's ledger writers no longer inject lines from a multiline value (#305).** Found
   by [@Haven2026](https://github.com/Haven2026) in #274. The deferred-work ledger is line-oriented,
