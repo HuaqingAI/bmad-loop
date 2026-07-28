@@ -505,7 +505,21 @@ def reset_spec_status(spec_path: Path, new_status: str) -> bool:
     reaches the other three call sites, which treat it as a repair write."""
     if not spec_path.is_file():
         return False
-    text = spec_path.read_text(encoding="utf-8")
+    # Raw read (not read_text), like the append/strip siblings: universal-newline
+    # translation would hand this writer an all-LF copy of a CRLF spec and
+    # `_atomic_write_spec` would then persist it, relaying every line ending in
+    # the file from a repair contracted to move one value.
+    #
+    # Reading the bytes as authored makes one asymmetry with
+    # `frontmatter.set_frontmatter_status` observable, and it is pinned rather
+    # than fixed: that writer splits with `splitlines`, which treats a bare `\r`
+    # as a line break, so a CR-only spec rewrites fine there. `_FRONTMATTER_RE`
+    # and `_FM_STATUS_RE` are line-oriented on `\r?\n`, so a CR-only spec finds
+    # no frontmatter block here and returns False. Widening them to `\r` would
+    # change what counts as a line for every reader keyed on these patterns
+    # (`^` in MULTILINE still would not follow), which is a larger contract than
+    # this fix owns — no BMAD tool authors CR-only files.
+    text = spec_path.read_bytes().decode("utf-8")
     fm = _FRONTMATTER_RE.match(text)
     if not fm:
         return False
@@ -544,7 +558,14 @@ def strip_auto_run_result(spec_path: Path) -> bool:
     first save read as a result — so that failure must surface, not be swallowed."""
     if not spec_path.is_file():
         return False
-    text = spec_path.read_text(encoding="utf-8")
+    # Raw read (not read_text) for the append's reason, in reverse: the append
+    # preserves the spec's endings, so a strip that read through universal
+    # newlines would not round-trip its own sibling's output — it would return a
+    # CRLF spec relaid to LF. An undecodable spec still raises UnicodeDecodeError
+    # (repair-write doctrine). A CR-only spec is invisible to
+    # `AUTO_RUN_HEADING_RE`'s MULTILINE `^` and no-ops — the same pinned
+    # asymmetry `reset_spec_status` documents above.
+    text = spec_path.read_bytes().decode("utf-8")
     matches = _section_headings(text)
     if not matches:
         return False

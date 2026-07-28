@@ -163,6 +163,38 @@ def test_set_frontmatter_field_preserves_triple_dash_in_value(tmp_path):
     assert "body text" in spec.read_text(encoding="utf-8")
 
 
+def test_set_frontmatter_field_replaces_without_relaying_crlf(tmp_path):
+    """#357 part 1. The re-arm re-stamps `baseline_revision` on whatever the skill
+    wrote; if the spec is CRLF, `read_text`/`write_text` rewrote every ending in
+    the file (to LF here, to CRLF for an all-LF spec on Windows) from a write
+    contracted to move one field."""
+    spec = tmp_path / "spec.md"
+    original = "---\r\ntitle: t\r\nbaseline_revision: old\r\nstatus: done\r\n---\r\n\r\nbody\r\n"
+    spec.write_bytes(original.encode("utf-8"))
+    assert verify.set_frontmatter_field(spec, "baseline_revision", "abc123") is True
+    text = spec.read_bytes().decode("utf-8")
+    assert text == original.replace("baseline_revision: old", "baseline_revision: abc123")
+    assert "\n" not in text.replace("\r\n", "")  # no bare LF introduced
+
+
+def test_set_frontmatter_field_inserts_with_the_blocks_own_line_ending(tmp_path):
+    """The insert path, which only this helper has. The appended line takes the
+    block's ending rather than a flat `\\n` — before the byte-level read the block
+    was always LF by the time it got here, so the CRLF branch of the insert was
+    unreachable and untested."""
+    spec = tmp_path / "spec.md"
+    original = "---\r\ntitle: t\r\nstatus: done\r\n---\r\n\r\nbody\r\n"
+    spec.write_bytes(original.encode("utf-8"))
+    assert verify.set_frontmatter_field(spec, "baseline_revision", "abc123") is True
+    text = spec.read_bytes().decode("utf-8")
+    assert text == (
+        "---\r\ntitle: t\r\nstatus: done\r\nbaseline_revision: abc123\r\n---\r\n\r\nbody\r\n"
+    )
+    assert "\n" not in text.replace("\r\n", "")  # the inserted line is CRLF too
+    fm = verify.read_frontmatter(spec)
+    assert fm == {"title": "t", "status": "done", "baseline_revision": "abc123"}
+
+
 # ----------------------------------------------------------- build_context
 
 

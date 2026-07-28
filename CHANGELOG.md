@@ -248,6 +248,16 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 ### Fixed
 
+- **Spec writers no longer relay a spec's line endings (#357, part 1).** `set_frontmatter_status`,
+  `set_frontmatter_field`, `reset_spec_status`, and `strip_auto_run_result` read specs through
+  `read_text`, whose universal-newline translation handed each writer an all-LF copy of a CRLF spec —
+  so a write contracted to move one value rewrote every line ending in the file (to LF everywhere, and
+  to CRLF for an all-LF spec on Windows). All four now read bytes and decode; the two `frontmatter`
+  writers write bytes too, and a replaced line carries its own terminator instead of a flat `\n`.
+  A CRLF spec stays CRLF, a mixed-ending spec keeps each line's ending, and only the value moves.
+  One pinned delta: a CR-only spec — never authored by a BMAD tool — is now a clean no-op through
+  `reset_spec_status` / `strip_auto_run_result`, whose patterns are line-oriented on `\r?\n`.
+
 - **A spec status the writer cannot rewrite is no longer a silent no-op.** `set_frontmatter_status`
   found the line with `lstrip().startswith("status:")` while every reader parses the block as YAML,
   so the two disagreed in both directions: a quoted key (`"status": x`), a space before the colon,

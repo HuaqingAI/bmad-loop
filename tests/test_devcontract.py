@@ -529,6 +529,54 @@ def test_reset_status_no_frontmatter(tmp_path):
     assert "status: done\n" in sp.read_text()  # body status not touched
 
 
+def test_reset_status_preserves_crlf_across_the_whole_spec(tmp_path):
+    """#357 part 1. The re-open path reads the spec the skill wrote; through
+    `read_text` a CRLF spec was decoded to LF and `_atomic_write_spec` then
+    persisted that — every ending in the file relaid by a repair contracted to
+    move one value. `_render_status_line` already carried the `\\r` (it lands in
+    the pattern's `rest` group), so only the read was wrong."""
+    sp = tmp_path / "spec.md"
+    original = (
+        "---\r\ntitle: 'x'\r\nstatus: 'done' # keep me\r\n---\r\n\r\n## Intent\r\n\r\nbody\r\n"
+    )
+    sp.write_bytes(original.encode("utf-8"))
+    assert devcontract.reset_spec_status(sp, "in-progress") is True
+    text = sp.read_bytes().decode("utf-8")
+    assert text == original.replace("status: 'done'", "status: 'in-progress'")
+    assert "\n" not in text.replace("\r\n", "")  # no bare LF introduced
+
+
+def test_reset_status_inserts_a_missing_status_with_the_blocks_crlf(tmp_path):
+    """The insert half of the same path: a template can omit `status:` entirely,
+    and the appended line takes the block's own ending rather than a flat `\\n`."""
+    sp = tmp_path / "spec.md"
+    sp.write_bytes(b"---\r\ntitle: 'x'\r\n---\r\n\r\nbody\r\n")
+    assert devcontract.reset_spec_status(sp, "in-progress") is True
+    text = sp.read_bytes().decode("utf-8")
+    assert text == "---\r\ntitle: 'x'\r\nstatus: in-progress\r\n---\r\n\r\nbody\r\n"
+    assert "\n" not in text.replace("\r\n", "")
+
+
+def test_reset_status_no_ops_on_a_cr_only_spec(tmp_path):
+    """Characterization of a behavior delta the byte-level read introduces, pinned
+    rather than fixed. `_FRONTMATTER_RE` is line-oriented on `\\r?\\n`, so a
+    CR-only spec now finds no frontmatter block and returns False; through
+    `read_text` the CRs were translated to LFs first and the edit landed (writing
+    the file back as LF, which was the defect). Its
+    `frontmatter.set_frontmatter_status` sibling is `splitlines`-based and DOES
+    rewrite this shape — the asymmetry is documented at both writers. Widening
+    the pattern to `\\r` is a larger contract than this fix owns, and no BMAD tool
+    authors CR-only files."""
+    sp = tmp_path / "spec.md"
+    original = "---\rstatus: 'done'\r---\r\rbody\r"
+    sp.write_bytes(original.encode("utf-8"))
+    assert devcontract.reset_spec_status(sp, "in-progress") is False
+    assert sp.read_bytes() == original.encode("utf-8")  # untouched, not half-written
+    # ...and the splitlines-based sibling rewrites the very same bytes
+    assert verify.set_frontmatter_status(sp, "in-progress") is True
+    assert sp.read_bytes() == b"---\rstatus: in-progress\r---\r\rbody\r"
+
+
 def test_reset_spec_status_noop_when_spec_absent(tmp_path):
     """A re-drive against a spec that no longer exists on disk no-ops cleanly
     rather than raising (mirrors verify.set_frontmatter_status)."""
@@ -743,6 +791,45 @@ def test_strip_auto_run_result_raises_on_undecodable_spec(tmp_path):
     sp.write_bytes(b"---\nstatus: done\n---\n\n\xff\xfe## Auto Run Result\n\nStatus: done\n")
     with pytest.raises(UnicodeDecodeError):
         devcontract.strip_auto_run_result(sp)
+
+
+def test_strip_auto_run_result_preserves_crlf_in_what_it_keeps(tmp_path):
+    """#357 part 1. `append_auto_run_result` already wrote its section in the
+    spec's own endings; a strip that read through `read_text` did not round-trip
+    its own sibling's output — it removed the section and returned the surviving
+    CRLF spec relaid to LF."""
+    sp = tmp_path / "spec.md"
+    kept = "---\r\nstatus: done\r\n---\r\n\r\n## Intent\r\n\r\nbody\r\n"
+    sp.write_bytes((kept + "## Auto Run Result\r\n\r\nStatus: done\r\n").encode("utf-8"))
+    assert devcontract.strip_auto_run_result(sp) is True
+    text = sp.read_bytes().decode("utf-8")
+    assert text == kept
+    assert "\n" not in text.replace("\r\n", "")  # no bare LF introduced
+
+
+def test_append_then_strip_round_trips_a_crlf_spec_byte_for_byte(tmp_path):
+    """The pair, end to end: the LF round-trip is already pinned at
+    `test_append_then_strip_roundtrip`, and before the byte-level read the CRLF
+    one could not hold — the strip's own read decided the file's endings."""
+    sp = tmp_path / "spec.md"
+    original = "---\r\nstatus: done\r\n---\r\n\r\n## Intent\r\n\r\nbody\r\n"
+    sp.write_bytes(original.encode("utf-8"))
+    assert devcontract.append_auto_run_result(sp, "done", detail="extra context") is True
+    assert devcontract.strip_auto_run_result(sp) is True
+    assert sp.read_bytes() == original.encode("utf-8")
+
+
+def test_strip_auto_run_result_no_ops_on_a_cr_only_spec(tmp_path):
+    """Sibling of `test_reset_status_no_ops_on_a_cr_only_spec`, same root cause:
+    `AUTO_RUN_HEADING_RE`'s MULTILINE `^` only matches after a `\\n`, so a CR-only
+    spec's heading is invisible to the scan and the strip no-ops. Through
+    `read_text` the CRs were translated first and the section was removed. Pinned,
+    not fixed — `^` would not follow a widened pattern anyway."""
+    sp = tmp_path / "spec.md"
+    original = "---\rstatus: done\r---\r\r## Auto Run Result\r\rStatus: done\r"
+    sp.write_bytes(original.encode("utf-8"))
+    assert devcontract.strip_auto_run_result(sp) is False
+    assert sp.read_bytes() == original.encode("utf-8")
 
 
 def test_strip_auto_run_result_ignores_heading_quoted_in_code_fence(tmp_path):
