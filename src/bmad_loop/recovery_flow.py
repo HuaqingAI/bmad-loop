@@ -375,7 +375,10 @@ class RecoveryFlow:
         same terms: with ``allow_pause`` (a plain rollback) pause for manual
         recovery rather than reset; on a re-drive (``allow_pause=False``) the
         caller's contract forbids pausing, so journal and let the human-directed
-        reset proceed.
+        reset proceed. The symmetry is in the *refusal policy*, not the guard: this
+        path catches ``(GitError, OSError)`` while `preserve_attempt_commits` still
+        catches ``GitError`` alone, so a spawn-level fault there crashes instead of
+        refusing — one instance of the systemic gap tracked in #343.
 
         The refusal is gated on :meth:`_reset_would_destroy`, so a capture failure
         over a tree with nothing left to lose (commits already parked, nothing

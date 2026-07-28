@@ -453,10 +453,16 @@ def snapshot_worktree(
     Returns ``ref_name`` on success, or ``None`` when the tree is clean relative
     to HEAD (nothing to preserve — the intended non-destructive uncommitted-revert
     case). Raises :class:`GitError` on any git failure — the raise *surfaces* the
-    capture failure so the caller can decide: the commit-preservation caller
-    refuses to reset past unpreserved work, while the best-effort worktree caller
-    journals the failure and proceeds (the recovery ref is a safety net, not a
-    gate)."""
+    capture failure so the caller can decide. Since #340 the recovery ref is a
+    gate, not a safety net: the worktree caller's old best-effort "journal the
+    failure and proceed" contract is gone, and a plain rollback now refuses to
+    reset past work it could not park (only a re-drive, whose caller contract
+    forbids pausing, still journals and lets the human-directed reset run).
+
+    Not every failure here is a :class:`GitError`: ``_run_git`` translates only a
+    timeout, so a spawn-level ``OSError`` escapes untyped, and the
+    ``TemporaryDirectory`` below can raise one outright (ENOSPC/EMFILE) before any
+    git child is spawned. Callers guard ``(GitError, OSError)`` (#343)."""
     head = rev_parse_head(repo)
     with tempfile.TemporaryDirectory() as td:
         env = {**os.environ, "GIT_INDEX_FILE": str(Path(td) / "index")}
