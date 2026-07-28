@@ -255,7 +255,12 @@ class RecoveryFlow:
         patch = verify.resolve_restore_path(task.restore_patch, workspace.root)
         try:
             verify.apply_patch(workspace.root, patch)
-        except verify.GitError as e:
+        except (verify.GitError, OSError) as e:
+            # OSError joins GitError for the reason the rollback guards do (#343):
+            # `_run_git` translates only a timeout, and the patch file is read from
+            # disk here, so an ENOENT/EACCES/ENOSPC arrives untyped. Crashing would
+            # skip the escalation this branch exists to perform and leave the tree
+            # half-restored with no attention file.
             self.journal.append(
                 "attempt-restore-failed",
                 story_key=task.story_key,

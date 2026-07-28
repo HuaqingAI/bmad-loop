@@ -184,7 +184,9 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   (pausing for manual recovery, or journalling on a re-drive), never the clean-tree early return.
   Journals `attempt-preserve-enumerate-failed`, distinct from `attempt-preserve-failed`, so a
   post-mortem can tell "could not count the work" from "counted it but could not park it". The
-  rollback's dirty check degrades on an `OSError` for the same reason.
+  rollback's dirty check degrades on an `OSError` for the same reason, and a restore-patch apply
+  that fails with one now escalates instead of crashing past its own escalation — closing every
+  such guard in the recovery collaborator.
 
 - **The orchestrator's ledger writers no longer inject lines from a multiline value (#305).** Found
   by [@Haven2026](https://github.com/Haven2026) in #274. The deferred-work ledger is line-oriented,

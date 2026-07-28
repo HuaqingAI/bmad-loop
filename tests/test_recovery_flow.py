@@ -965,3 +965,26 @@ def test_restore_patch_escalates_on_apply_failure(project, monkeypatch):
     assert flow.calls.escalates  # routed through the engine's escalation
     assert "attempt-restore-failed" in flow.journal.events()
     assert "attempt-restored" not in flow.journal.events()  # never reached on failure
+
+
+def test_restore_patch_escalates_on_apply_oserror(project, monkeypatch):
+    # #343: the patch is read from disk, so an ENOENT/EACCES arrives untyped and
+    # must still escalate rather than crash past the escalation.
+    ws = Workspace.default(project)
+    flow = _make_flow(workspace=ws)
+    task = _task(project.project)
+    task.restore_patch = "patch.diff"
+    task.phase = Phase.DEV_RUNNING
+    monkeypatch.setattr(verify, "resolve_restore_path", lambda raw, root: Path(root) / raw)
+
+    def boom(repo, patch):
+        raise OSError(2, "No such file or directory")
+
+    monkeypatch.setattr(verify, "apply_patch", boom)
+
+    with pytest.raises(_Pause):
+        flow.restore_patch(task)
+
+    assert task.phase == Phase.DEV_VERIFY
+    assert flow.calls.escalates
+    assert "attempt-restore-failed" in flow.journal.events()
