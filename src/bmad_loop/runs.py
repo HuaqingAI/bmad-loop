@@ -841,6 +841,19 @@ def rearm_escalation(
                 # that heading, so leaving it would let the re-driven session's first
                 # save of the spec parse as the prior attempt's terminal outcome.
                 devcontract.strip_auto_run_result(spec_path)
+            except verify.FrontmatterWriteError as e:
+                # The spec reads fine but carries `status:` in a shape no line
+                # edit can move (a block scalar, a flow mapping, a value continued
+                # on the next line). This used to be a silent no-op on a bool
+                # nobody read: the re-drive was dispatched anyway, step-01 saw the
+                # unchanged terminal status and routed the session to "ingest as
+                # context, do not resume", and the story re-wedged with nothing on
+                # the record explaining why. Abort here for the same reason as
+                # below, with the remedy this cause actually has.
+                raise RearmError(
+                    f"cannot re-open story spec {spec_path} for the re-drive: {e} "
+                    f"— the re-drive would repeat the wedge it is meant to clear"
+                ) from e
             except (OSError, UnicodeDecodeError) as e:
                 # Both helpers re-read the spec as UTF-8; an undecodable PRESENT
                 # spec is a first-class escalation state (resolve_story_spec
@@ -906,7 +919,12 @@ def rearm_escalation(
             verify.set_frontmatter_field(
                 Path(task.spec_file), "baseline_revision", task.baseline_commit
             )
-        except (OSError, UnicodeDecodeError) as e:
+        except (OSError, UnicodeDecodeError, verify.FrontmatterWriteError) as e:
+            # FrontmatterWriteError joins the tuple rather than getting its own
+            # arm: the remedy is the same sentence ("fix the file"), and the
+            # exception already says which shape it could not move. What matters
+            # is that it aborts here — the stale-baseline hazard this block exists
+            # to close is exactly what a swallowed write would leave behind.
             raise RearmError(
                 f"cannot re-stamp baseline_revision on {task.spec_file} "
                 f"({e.__class__.__name__}: {e}) — fix the file, then re-run resolve"

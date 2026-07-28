@@ -10,7 +10,7 @@ import tarfile
 import pytest
 from conftest import escalated_run, git
 
-from bmad_loop import platform_util, runs
+from bmad_loop import platform_util, runs, verify
 from bmad_loop.adapters import tmux_base
 from bmad_loop.journal import load_state, save_state
 from bmad_loop.model import RunState
@@ -789,6 +789,34 @@ def test_rearm_plain_mode_sets_ready_for_dev_and_clears_stale_latch(tmp_path):
     assert "status: ready-for-dev" in spec.read_text()
     entry = [e for e in Journal(run_dir).entries() if e["kind"] == "story-escalation-resolved"][-1]
     assert entry["restore"] is False
+
+
+def test_rearm_aborts_when_the_spec_status_cannot_be_reopened(tmp_path):
+    """The seam that proves the silent-`False` defect mattered. This spec reads as
+    `status: blocked` — the reader resolves the block scalar fine — so it clears
+    every gate ahead of the flip, and the flip is the one thing that cannot
+    happen. Under the old line scanner that was a `False` nobody read: the re-drive
+    was dispatched, step-01 saw the unchanged terminal status and routed the
+    session to "ingest as context, do not resume", and the story re-wedged.
+
+    Nothing may be persisted: `save_state` runs BELOW this point, so the task must
+    still be ESCALATED at attempt 2 and the escalation still armed for a retry."""
+    from bmad_loop.model import Phase
+
+    spec_text = (
+        "---\ntitle: t\nstatus: |\n  blocked\n---\n\n## Intent\n\nbody\n"
+        "\n## Auto Run Result\n\n- Status: blocked\n\nboom\n"
+    )
+    run_dir, spec = _escalated_run(tmp_path, spec_text)
+    assert verify.status_of(verify.read_frontmatter(spec)) == "blocked"  # the reader is fine
+
+    with pytest.raises(runs.RearmError, match="re-open story spec"):
+        runs.rearm_escalation(run_dir, restore_patch="artifacts/attempt.patch")
+
+    assert spec.read_text(encoding="utf-8") == spec_text  # byte-identical
+    task = load_state(run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED and task.attempt == 2  # nothing persisted
+    assert task.restore_patch is None  # the latch never landed either
 
 
 def test_rearm_resets_followup_reviews_spent(tmp_path):
