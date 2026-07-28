@@ -122,6 +122,35 @@ def test_capture_diff_timeout_becomes_git_error(project, monkeypatch):
         verify.capture_diff(project.project, baseline)
 
 
+@pytest.mark.parametrize(
+    "make_exc",
+    [
+        lambda: FileNotFoundError(2, "No such file or directory"),
+        lambda: OSError(24, "Too many open files"),
+    ],
+    ids=["enoent", "emfile"],
+)
+def test_git_spawn_oserror_becomes_git_spawn_error(project, monkeypatch, make_exc):
+    """#343: a spawn-level OSError (EMFILE/ENOMEM, git gone from PATH) is raised
+    by `subprocess.run` before any return code exists, so left untranslated it
+    bypassed every `except GitError` guard and crashed the run. It must surface
+    as GitSpawnError — a GitError to every existing guard, a distinct type for
+    the callers that must tell an environment fault from git refusing.
+
+    Ablation target: delete the `except OSError` arm in `_run_git` and this
+    fails with the raw OSError."""
+    exc = make_exc()
+
+    def failing_run(cmd, **kwargs):
+        raise exc
+
+    monkeypatch.setattr(verify.subprocess, "run", failing_run)
+    with pytest.raises(verify.GitError, match="git rev-parse failed to spawn") as excinfo:
+        verify.rev_parse_head(project.project)
+    assert isinstance(excinfo.value, verify.GitSpawnError)
+    assert excinfo.value.__cause__ is exc  # errno stays reachable for callers
+
+
 def test_configure_git_timeout_overrides_bound(project, monkeypatch):
     """The engine-applied `limits.git_timeout_s` value is what reaches
     subprocess.run; the module default stays GIT_TIMEOUT_S for standalone users."""
@@ -205,6 +234,32 @@ def test_verify_dev_happy(project):
     out = verify.verify_dev(task, project, dev_result(sp))
     assert out.ok
     assert task.spec_file == str(sp)
+
+
+def test_verify_dev_spawn_fault_escalates(project, monkeypatch):
+    """#343 acceptance, escalate class: with the OSError injected at
+    `subprocess.run` itself, the shared change-gate's `except GitError` guard
+    catches the translated GitSpawnError and escalates (CRITICAL, not
+    retryable) instead of crashing. Everything on the path before
+    `has_changes_since` is filesystem-only, so the blanket injection's first
+    git spawn is exactly the guarded call.
+
+    Ablation target: delete the `except OSError` arm in `verify._run_git` and
+    this fails with the raw OSError."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    (project.project / "src.txt").write_text("changed\n")
+
+    def cannot_spawn(cmd, **kwargs):
+        raise OSError(12, "Cannot allocate memory")
+
+    monkeypatch.setattr(verify.subprocess, "run", cannot_spawn)
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and not out.retryable
+    assert out.severity == "CRITICAL"
+    assert "failed to spawn" in out.reason
 
 
 def test_verify_dev_status_is_case_insensitive(project):

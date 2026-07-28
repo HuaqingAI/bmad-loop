@@ -264,10 +264,10 @@ def test_rollback_dirty_check_git_fault_degrades_to_dirty(project, monkeypatch):
 
 
 def test_rollback_dirty_check_oserror_degrades_to_dirty(project, monkeypatch):
-    # #343: `_run_git` translates only a timeout, so a spawn-level OSError reaches
-    # this guard untyped. It must degrade exactly like the GitError above — this is
-    # the first git call on the rollback path, so an unguarded OSError here crashes
-    # before any preserve step can run.
+    # #343: spawn faults now arrive typed as GitSpawnError, but the guard keeps a
+    # plain-OSError net for any untyped fault out of the probe. It must degrade
+    # exactly like the GitError above — this is the first git call on the rollback
+    # path, so an unguarded fault here crashes before any preserve step can run.
     repo = project.project
     ws = Workspace.default(project)
     flow = _make_flow(workspace=ws, policy=_policy(rollback_on_failure=False))
@@ -687,9 +687,10 @@ def test_snapshot_failure_never_pauses_on_redrive(project, monkeypatch):
 
 
 def test_snapshot_oserror_degrades_into_the_typed_path(project, monkeypatch):
-    """`_run_git` translates only a timeout, so a spawn-level OSError (EMFILE/ENOMEM)
-    escapes untyped. Preservation is observation, not a repair write, so it degrades
-    into the same journal-and-decide path a GitError takes rather than crashing the
+    """`snapshot_worktree` can raise a plain OSError outright — ENOSPC/EMFILE from
+    its TemporaryDirectory — a filesystem fault the #343 spawn translation cannot
+    cover. Preservation is observation, not a repair write, so it degrades into
+    the same journal-and-decide path a GitError takes rather than crashing the
     run mid-rollback.
 
     Ablation target: narrow the `except` back to `verify.GitError` and this fails

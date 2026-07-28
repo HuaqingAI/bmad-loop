@@ -978,6 +978,34 @@ def test_merge_stray_dirt_escalates_with_clear_message(project):
     assert "merge-target-cleaned" not in journal_kinds(engine)
 
 
+def test_merge_oserror_during_target_clean_keeps_branch_and_escalates(project, monkeypatch):
+    """#343: `clean_incoming_collisions` mutates the checkout directly
+    (unlink/rmdir), so a non-spawn FS fault arrives as a plain OSError no
+    chokepoint can translate. The guard must treat it like any other reconcile
+    failure: keep the branch and escalate rather than crash a DONE unit
+    mid-merge.
+
+    Ablation target: narrow the guard in `merge_local` back to
+    `verify.GitError` and this fails — the OSError crashes the run."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+    )
+
+    def fs_fault(*a, **kw):
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(verify, "clean_incoming_collisions", fs_fault)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and not summary.crashed
+    assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
+    assert "Permission denied" in (engine.state.paused_reason or "")
+    # branch kept for manual merge — the unit's work is not stranded
+    assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
+
+
 def test_spec_file_serialized_relative_to_worktree():
     """A worktree task persists spec_file relative to its worktree so a kept run's
     state stays portable (no dangling absolute path into a pruned worktree)."""
