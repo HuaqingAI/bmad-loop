@@ -38,7 +38,7 @@ breaking changes may land in a minor release.
   the spec is read BACK from disk rather than trusted, so a story is never declared done over a
   write that did not land. A confirmation interrupted between its spec writes and its board write
   (the board file in a shape its line writer cannot rewrite, or an IO failure) leaves a signed-off
-  spec at `done` with the index entry still pointing at it — re-running `confirm` now **finishes**
+  spec at `done` with the park entry still pointing at it — re-running `confirm` now **finishes**
   that instead of refusing it as stale drift: it advances the board, drops the entry and commits,
   with no second prompt and no second audit section. It resumes equally from a board a human already
   fixed by hand, since that is what the failure message asks them to do. `--list`, `--json`
@@ -67,7 +67,7 @@ breaking changes may land in a minor release.
   committed. Under worktree isolation the unit merges like a `done` one. `[operator] enabled =
 false` restores the old two-outcome behavior.
 
-  `bmad-loop confirm` and the project-level index it reads arrived in part 3, above.
+  `bmad-loop confirm` and the park entries it reads arrived in part 3, above.
 
 - **`awaiting-operator` vocabulary, no writer yet (#335, part 1 of 4).** Names, at every layer, the
   state a story reaches when its agent-doable work is finished and committed but its acceptance

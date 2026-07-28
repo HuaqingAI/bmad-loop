@@ -680,7 +680,7 @@ def _validate_operator_registry(
             report.warn(
                 "operator.confirm-interrupted",
                 f"{story.story_key} was confirmed but the board was never advanced: its "
-                f"spec is signed off and reads done while the index still lists it. "
+                f"spec is signed off and reads done while the park entry still lists it. "
                 f"`bmad-loop confirm {story.story_key}` finishes it without asking you to "
                 f"acknowledge anything again",
                 {"story_key": story.story_key, "board_status": story.board_status},
@@ -691,7 +691,7 @@ def _validate_operator_registry(
         if drift is not None:
             report.warn(
                 "operator.registry-stale",
-                f"the operator-actions index lists {story.story_key} as parked, but "
+                f"the park entry lists {story.story_key} as parked, but "
                 f"{drift} — the entry is stale and `bmad-loop confirm "
                 f"{story.story_key}` will refuse it",
                 {"story_key": story.story_key, "drift": drift},
@@ -1661,7 +1661,7 @@ def cmd_confirm(args: argparse.Namespace) -> int:
     drift = story.drift()
     if drift is not None:
         print(
-            f"error: refusing to confirm {key}: {drift}. The index disagrees with the "
+            f"error: refusing to confirm {key}: {drift}. The park entry disagrees with the "
             f"committed state; `bmad-loop validate` reports the same drift. Nothing was "
             f"changed.",
             file=sys.stderr,
@@ -1724,7 +1724,7 @@ def _resume_confirmation(
     assert spec is not None  # resumable requires a spec that read back as done
     print(
         f"{story.story_key} was already confirmed — its spec is signed off and reads "
-        f"done, but the board and the index entry were left behind. Finishing that; "
+        f"done, but the board and the park entry were left behind. Finishing that; "
         f"you will not be asked to acknowledge anything again.\n"
     )
     if args.reverify:
@@ -1753,11 +1753,11 @@ def _apply_confirmation(
     story: operatoractions.ParkedStory,
     spec: Path,
 ) -> int:
-    """Write the confirmation: spec audit section, spec status, board, index.
+    """Write the confirmation: spec audit section, spec status, board, park entry.
 
     Ordered so a failure part-way is recoverable rather than stranded. The audit
     section goes first because it is the only record of what happened outside the
-    repo and it does not change any gate. The index entry is dropped LAST, so
+    repo and it does not change any gate. The park entry is dropped LAST, so
     anything that raises before it leaves the story findable and the command
     re-runnable — see `ParkedStory.resumable` for the state that leaves behind.
 
@@ -1787,7 +1787,7 @@ def _apply_confirmation(
         # left to write a status onto either.
         print(
             f"error: {spec} disappeared before {story.story_key} could be confirmed — "
-            f"nothing was changed and the index entry has been left in place.",
+            f"nothing was changed and the park entry has been left in place.",
             file=sys.stderr,
         )
         return 1
@@ -1797,7 +1797,7 @@ def _apply_confirmation(
         print(
             f"error: {spec} carries a status this cannot rewrite, so {story.story_key} "
             f"was NOT confirmed: {e}. The audit section was appended; the board and the "
-            f"index entry are untouched, so re-run `bmad-loop confirm {story.story_key}` "
+            f"park entry are untouched, so re-run `bmad-loop confirm {story.story_key}` "
             f"once the frontmatter is repaired. {_SECOND_SECTION_NOTE}",
             file=sys.stderr,
         )
@@ -1811,7 +1811,7 @@ def _apply_confirmation(
     if frontmatter.status_of(frontmatter.read_frontmatter(spec)) != "done":
         print(
             f"error: {spec} still does not read status: done, so {story.story_key} was "
-            f"NOT confirmed. The audit section was appended; the board and the index "
+            f"NOT confirmed. The audit section was appended; the board and the park "
             f"entry are untouched. {_SECOND_SECTION_NOTE}",
             file=sys.stderr,
         )
@@ -1843,7 +1843,7 @@ def _land_confirmation(
             f"error: {spec} was updated but {paths.sprint_status} did not advance "
             f"{story.story_key} to done (it reads {landed!r}). Fix the board by hand, then "
             f"re-run `bmad-loop confirm {story.story_key}` — the spec is already correct "
-            f"and signed off, and the index entry has been left in place, so the re-run "
+            f"and signed off, and the park entry has been left in place, so the re-run "
             f"finishes what is left without asking you to acknowledge anything twice.",
             file=sys.stderr,
         )
