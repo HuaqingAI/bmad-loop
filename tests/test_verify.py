@@ -473,7 +473,7 @@ def test_verify_review_signoff_regression_needs_the_launch_flag(project):
     "board, why",
     [
         ({"1-2-b": "done"}, "story absent from the board -> story_status returns None"),
-        ({"1-1-a": "awaiting-operator"}, "token outside STATUS_ORDER (hand-edited/future board)"),
+        ({"1-1-a": "needs-signoff"}, "token outside STATUS_ORDER (hand-edited board)"),
     ],
 )
 def test_verify_review_unrecognized_sprint_status_retries(project, board, why):
@@ -489,6 +489,25 @@ def test_verify_review_unrecognized_sprint_status_retries(project, board, why):
     out = verify.verify_review(task, project, Policy(), sprint_reached_done=True)
 
     assert not out.ok and out.retryable and out.contradiction is False, why
+
+
+def test_verify_review_awaiting_operator_board_is_a_regression(project):
+    """`awaiting-operator` joined STATUS_ORDER below `done`, so a review writing
+    it onto a board the orchestrator had already signed off is now ORDERED, and
+    therefore a deliberate regression — not the unknown token it used to be.
+
+    This is the one behavior the vocabulary PR changes, and it is the intended
+    one: until the park path exists, nothing legitimately writes this token, so a
+    review that writes it has revoked a sign-off the same way `in-progress` does.
+    When the park path lands, `operator.on_review_demotion` is what re-routes it.
+    """
+    task = _signoff_regression_task(project, sprint_status="awaiting-operator")
+
+    out = verify.verify_review(task, project, Policy(), sprint_reached_done=True)
+
+    assert not out.ok and not out.retryable
+    assert out.contradiction is True and out.severity == "CRITICAL"
+    assert "'awaiting-operator'" in out.reason
 
 
 # --------------------------------------------------- verify command exit codes (issue #126)

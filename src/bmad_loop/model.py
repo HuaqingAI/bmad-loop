@@ -32,9 +32,20 @@ class Phase(StrEnum):
     DONE = "done"
     DEFERRED = "deferred"
     ESCALATED = "escalated"
+    # the story's agent-doable work is finished and COMMITTED, but its acceptance
+    # criteria include external actions only a human can perform (buy a domain,
+    # publish a DNS record). Terminal like DONE — the run moves on rather than
+    # halting — but not DONE: the outstanding actions are recorded on the task.
+    # Deliberately NOT a pause: an operator-owed story must never block the
+    # stories behind it (contrast the spec's `Block If:` -> blocked -> CRITICAL
+    # -> pause channel, which is run-halting by design).
+    AWAITING_OPERATOR = "awaiting-operator"
 
 
-TERMINAL_PHASES = frozenset({Phase.DONE, Phase.DEFERRED, Phase.ESCALATED})
+# Terminal = the orchestrator will not drive this story further in this run. It
+# says nothing about success: DONE and AWAITING_OPERATOR carry a commit, DEFERRED
+# and ESCALATED do not.
+TERMINAL_PHASES = frozenset({Phase.DONE, Phase.DEFERRED, Phase.ESCALATED, Phase.AWAITING_OPERATOR})
 
 # Pause stages recorded in RunState.paused_stage
 PAUSE_SPEC_APPROVAL = "spec-approval"
@@ -173,6 +184,20 @@ class StoryTask:
     baseline_untracked: list[str] | None = None
     spec_file: str | None = None
     commit_sha: str | None = None
+    # the external, human-only actions this story still owes when it parks at
+    # Phase.AWAITING_OPERATOR — one free-text instruction per entry, as the dev
+    # session enumerated them in the spec's `operator_actions:` frontmatter.
+    # Plain strings in v1: a per-action deterministic `check:` command is a
+    # deliberate v2 question, and strings-now/objects-later is the cheaper
+    # migration than the reverse. Empty on every other phase: owing at least one
+    # action is what selects AWAITING_OPERATOR over DONE when the park path picks
+    # a committing story's final phase. That choice is the only enforcement —
+    # nothing validates this field on load or on write, so a task carrying the
+    # phase with no actions is unreachable rather than rejected. Survives the
+    # resume serialization round-trip (it is the durable record of what the human
+    # owes, and nothing re-derives it once the session that wrote the spec is
+    # gone).
+    operator_actions: list[str] = field(default_factory=list)
     defer_reason: str | None = None
     # the recovery ref this attempt's work was parked on by the last auto-rollback
     # — an `attempt-preserve/*` branch (commits above baseline) or, when the tree
@@ -299,6 +324,7 @@ class StoryTask:
             "baseline_untracked": self.baseline_untracked,
             "spec_file": self._serialized_spec_file(),
             "commit_sha": self.commit_sha,
+            "operator_actions": self.operator_actions,
             "defer_reason": self.defer_reason,
             "preserve_ref": self.preserve_ref,
             "preserve_partial": self.preserve_partial,
@@ -349,6 +375,7 @@ class StoryTask:
             ),
             spec_file=d.get("spec_file"),
             commit_sha=d.get("commit_sha"),
+            operator_actions=[str(a) for a in d.get("operator_actions", [])],
             defer_reason=d.get("defer_reason"),
             preserve_ref=d.get("preserve_ref"),
             preserve_partial=bool(d.get("preserve_partial", False)),

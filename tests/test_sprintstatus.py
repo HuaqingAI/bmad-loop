@@ -112,6 +112,51 @@ def test_next_actionable_order_and_skip(project):
     assert sprintstatus.next_actionable(ss, skip={"1-2-b", "1-3-c"}) is None
 
 
+def test_awaiting_operator_is_ordered_just_below_done():
+    """The token's whole contract is its POSITION: last stop before `done`, so
+    confirming a parked story is a forward advance and nothing can regress `done`
+    back into it. Asserting the index relationships rather than the literal tuple
+    keeps this from breaking every time a status is added elsewhere."""
+    order = sprintstatus.STATUS_ORDER
+    assert order.index("awaiting-operator") == order.index("done") - 1
+    assert order.index("review") < order.index("awaiting-operator")
+
+
+def test_parked_story_is_never_picked_as_next_actionable(project):
+    """A parked story's agent-doable work is already committed — picking it up
+    again would redo finished work while the human's external actions stay
+    outstanding. The board must walk straight past it to the next real story.
+
+    Ablation (repo rule, inverse form — the gate here is an ABSENCE, so the
+    ablation ADDS rather than deletes): put "awaiting-operator" into
+    ACTIONABLE_STATUSES and this test must fail on the first assert. It does —
+    which is what proves the assertions gate on actionability rather than on
+    file order (1-1-a is first in the file, so a test that merely returned the
+    first pickable story would pass either way).
+    """
+    write_sprint(
+        project,
+        {"1-1-a": "awaiting-operator", "1-2-b": "ready-for-dev"},
+    )
+    ss = sprintstatus.load(project.sprint_status)
+    assert sprintstatus.next_actionable(ss).key == "1-2-b"
+    # and with the only other story taken, there is nothing left to run — the
+    # parked story is not a fallback either
+    assert sprintstatus.next_actionable(ss, skip={"1-2-b"}) is None
+
+
+def test_parked_story_cannot_be_targeted_by_a_selector(project):
+    """`--story` naming a parked story is a user error with a specific message,
+    not a silent re-drive: select_actionable filters on the same set."""
+    write_sprint(project, {"1-1-a": "awaiting-operator"})
+    ss = sprintstatus.load(project.sprint_status)
+    with pytest.raises(
+        sprintstatus.SprintStatusError,
+        match=r"story 1-1 matched 1-1-a but its status is 'awaiting-operator'",
+    ):
+        sprintstatus.select_actionable(ss, None, "1-1")
+
+
 def test_next_actionable_epic_filter(project):
     # document order (epic 5 before epic 9), not numeric; the epic filter returns
     # epic 9's first actionable story even though 5-1 is earlier in the file.

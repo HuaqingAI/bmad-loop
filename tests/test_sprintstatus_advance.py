@@ -72,6 +72,36 @@ def test_advance_never_regresses(tmp_path):
     assert sprintstatus.story_status(p, "4-1-thing") == "review"
 
 
+def test_advance_confirms_a_parked_story_forward_to_done(tmp_path):
+    """The exit move `bmad-loop confirm` will need: because `awaiting-operator`
+    sits below `done` in STATUS_ORDER, completing a parked story is an ordinary
+    forward advance through the sole writer — no invariant exception required."""
+    p = _write(tmp_path)
+    sprintstatus.advance(p, "3-2-digest-delivery", "awaiting-operator")
+    assert sprintstatus.story_status(p, "3-2-digest-delivery") == "awaiting-operator"
+
+    out = sprintstatus.advance(p, "3-2-digest-delivery", "done")
+
+    assert out == "done"
+    assert sprintstatus.story_status(p, "3-2-digest-delivery") == "done"
+
+
+def test_advance_never_regresses_done_into_awaiting_operator(tmp_path):
+    """The other half of the ordering: once a story is `done`, nothing walks the
+    board back to `awaiting-operator`. This is a real hardening, not a restatement
+    — before the token joined STATUS_ORDER it was unordered, so the never-regress
+    guard's `target in STATUS_ORDER` arm short-circuited and this write went
+    through. (Demoting a done story is Phase 4's `operator.on_review_demotion`
+    question, and it will need its own deliberate, allowlisted writer.)"""
+    p = _write(tmp_path)
+    before = p.read_text()
+
+    out = sprintstatus.advance(p, "3-1-login", "awaiting-operator")  # already done
+
+    assert out == "done"
+    assert p.read_text() == before
+
+
 def test_advance_returns_current_when_line_not_rewritable(tmp_path):
     """A quoted story key parses via YAML (story_status finds it) but the line-edit
     writer can't rewrite it. advance() must report the unchanged status, not falsely

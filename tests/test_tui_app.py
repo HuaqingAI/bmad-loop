@@ -2331,7 +2331,32 @@ def test_sprint_story_label_split_suffix():
     assert sprint_story_label(half).plain == "· 6a-build"
 
 
+def test_sprint_glyphs_cover_every_lifecycle_status():
+    """Both maps are read through `.get(..., "?")` — deliberately, because the
+    board is LLM-maintained and an unknown token must render, not raise. The cost
+    is that a lifecycle status nobody added a glyph for renders a silent `?` and
+    no test notices. Scope the coverage claim to STATUS_ORDER, which is exactly
+    the set the orchestrator itself writes, and leave the fallback for the rest.
+    """
+    from bmad_loop.sprintstatus import STATUS_ORDER
+    from bmad_loop.tui.widgets import SPRINT_GLYPHS, SPRINT_STYLES
+
+    assert set(STATUS_ORDER) <= set(SPRINT_GLYPHS)
+    assert set(SPRINT_GLYPHS) == set(SPRINT_STYLES)  # never a glyph without a color
+
+
+def test_sprint_story_label_awaiting_operator():
+    from bmad_loop.sprintstatus import Story
+
+    parked = Story(key="2-7-dns", epic=2, num=7, slug="dns", status="awaiting-operator")
+    label = sprint_story_label(parked)
+    assert label.plain == "⏸ 7-dns"
+    # not the "?"/dim unknown-token fallback
+    assert label.style == "yellow"
+
+
 def test_story_cells_render():
+    assert story_state_cell("awaiting-operator").plain == "⏸ awaiting-operator"
     assert story_state_cell("done").plain == "✓ done"
     assert story_state_cell("sentinel:unresolved").plain.startswith("⚠")
     assert story_checkpoint_cell(True, False).plain == "S·"
@@ -2688,6 +2713,36 @@ async def test_graceful_stop_pending_shows_in_header_and_note(project, monkeypat
             pilot,
             lambda: "stop" in runs_table.get_cell("20260611-100000-aaaa", "note").plain,
         )
+
+
+async def test_header_counts_parked_stories_only_when_there_are_any(project):
+    """The header's done/deferred/escalated trio is the TUI's mirror of
+    RunSummary's counts; a parked story belongs to none of them, so without its
+    own cell it would show up in `tasks N` and nowhere else. Conditional for the
+    same reason the summary clause is: the line is already at the width the
+    narrowest supported pane holds.
+
+    Drives `show_run` directly — the count line is a pure function of the state it
+    is handed, so routing a second run through the dashboard's polling only adds
+    scheduling to what this is actually asserting."""
+    done = StoryTask(story_key="1-2-beta", epic=1, phase=Phase.DONE)
+    parked = StoryTask(story_key="1-1-alpha", epic=1, phase=Phase.AWAITING_OPERATOR)
+
+    def _state(tasks):
+        return RunState(run_id="r1", project=str(project.project), started_at="now", tasks=tasks)
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test():
+        header = dashboard(app).query_one("#runheader", RunHeader)
+
+        header.show_run("r1", "finished", _state({"1-2-beta": done}))
+        assert "awaiting" not in str(header.content)
+
+        header.show_run("r1", "finished", _state({"1-2-beta": done, "1-1-alpha": parked}))
+        content = str(header.content)
+        assert "awaiting 1" in content
+        assert "tasks 2" in content
+        assert "done 1" in content  # the park did not absorb the done story
 
 
 async def test_active_agent_shows_in_header_and_task_cell(project, monkeypatch):

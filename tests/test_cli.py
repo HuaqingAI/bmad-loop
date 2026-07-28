@@ -1124,6 +1124,45 @@ def test_status_text_names_the_preserve_ref_beside_the_reason(project, capsys):
     assert "review did not converge within budget [attempt-preserve/run-1-abcd1234]" in out
 
 
+def test_status_reports_a_parked_story_on_both_surfaces(project, capsys):
+    """The `--json` projection is already phase-agnostic (`str(task.phase)`), so a
+    new phase needs no schema change and no version bump — but "needs no change"
+    is a claim about the contract, and this is what holds it: the parked task
+    reports its own token, carries its commit, and is not confused with a defer.
+
+    On the text side the phase cell is measured, not just matched:
+    `awaiting-operator` is the longest phase token there is, and a field too
+    narrow for it does not truncate — it pushes every following cell one column
+    right on that one row, which reads as corrupt output rather than as a long
+    status. `_story_row` splits on whitespace and so cannot see that; comparing
+    the two rows' column offsets can.
+    """
+    from bmad_loop.model import Phase, StoryTask
+
+    parked = StoryTask(story_key="1-1-login", epic=1, phase=Phase.AWAITING_OPERATOR)
+    parked.commit_sha = "abc1234"
+    parked.operator_actions = ["publish the DKIM TXT record"]
+    done = StoryTask(story_key="1-2-logout", epic=1, phase=Phase.DONE)
+    _make_run_with_tokens(project, {"1-1-login": parked, "1-2-logout": done}, weight=0.1)
+
+    doc = _status_json(project, capsys)
+    entry_parked, _ = doc["tasks"]
+    assert entry_parked["phase"] == "awaiting-operator"
+    assert entry_parked["commit_sha"] == "abc1234"  # parked work is committed work
+    assert entry_parked["defer_reason"] is None  # a park is not a failure
+    assert doc["schema_version"] == 1  # additive: no consumer breaks
+    # the v1 document carries the phase, not the actions themselves — the
+    # registry and `confirm --list` are their surface (part 3)
+    assert "operator_actions" not in entry_parked
+
+    assert cli.main(["status", "--project", str(project.project)]) == 0
+    out = capsys.readouterr().out
+    assert _story_row(out)[1] == "awaiting-operator"
+    (parked_line,) = [ln for ln in out.splitlines() if ln.startswith("  1-1-login ")]
+    (done_line,) = [ln for ln in out.splitlines() if ln.startswith("  1-2-logout ")]
+    assert parked_line.index("dev×") == done_line.index("dev×")
+
+
 def test_status_json_stories_mode_is_pure_json(project, capsys):
     """--json must skip every text trailer (stories board, backlog, decisions
     nudge) — the stories-mode board would otherwise corrupt the document."""
