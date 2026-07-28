@@ -164,6 +164,13 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 ### Fixed
 
+- **A pause inside a defer's rollback no longer loses the defer record (#342).** `_defer` advanced
+  the task to terminal DEFERRED before recovering the tree, so a rollback that paused instead
+  (rollback OFF — the default — or a preserve/snapshot failure) unwound past the tail forever: no
+  `story-deferred` journal entry, no defer notification, an under-counted diagnose `defer_count`.
+  The record is now emitted before the pause re-raises; its notice points at the ACTION REQUIRED
+  manual-recovery notice instead of describing a rollback that never ran.
+
 - **Spawn-level `OSError` is translated at the git chokepoint (#343).** `_run_git` translated only
   a timeout, so an EMFILE/ENOMEM/ENOENT out of `subprocess.run` bypassed all 19 OSError-blind
   `except GitError` guards and crashed the run — under exactly the resource pressure the recovery
