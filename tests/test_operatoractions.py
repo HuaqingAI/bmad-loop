@@ -13,7 +13,7 @@ import json
 import pytest
 from conftest import install_bmad_config, spec_path, write_spec, write_sprint
 
-from bmad_loop import operatoractions, verify
+from bmad_loop import devcontract, operatoractions, verify
 
 ACTIONS = ["buy example.com at the registrar", "publish the _acme-challenge TXT record"]
 
@@ -323,3 +323,127 @@ def test_resolve_tolerates_a_non_dict_entry(project):
 def test_verify_exports_the_same_token(project):
     """One spelling of the token across the park and its exit."""
     assert operatoractions.AWAITING_OPERATOR == verify.AWAITING_OPERATOR == "awaiting-operator"
+
+
+# ------------------------------------------- an interrupted confirmation
+
+
+def _interrupt(project, key="1-1-a", *, board="awaiting-operator"):
+    """Leave on disk exactly what `confirm` leaves when it dies between its spec
+    writes and its board write: the audit section appended, the spec at `done`,
+    the board where the park left it, and the index entry still there."""
+    spec = _park(project, key, status="done", board=board)
+    devcontract.append_operator_confirmation(spec, ACTIONS, date="2026-07-28")
+    return spec
+
+
+def test_resolve_reads_back_whether_the_confirmation_section_is_there(project):
+    """The section on disk IS the acknowledgment, so `resolve` has to carry it —
+    a spec and board reading alone cannot tell an interrupted confirmation from a
+    story someone finished by hand."""
+    _park(project)
+    (fresh,) = operatoractions.resolve(project.project, project)
+    assert fresh.confirmation_recorded is False
+
+    _interrupt(project)
+    (story,) = operatoractions.resolve(project.project, project)
+    assert story.confirmation_recorded is True
+
+
+def test_an_interrupted_confirmation_is_resumable(project):
+    """Spec signed off and at `done`, board still parked, entry still indexed:
+    the state `confirm` leaves when `sprintstatus.advance` raises or returns
+    unchanged. `drift()` calls it stale, so without this predicate a re-run
+    refuses the very state a re-run exists to clear."""
+    _interrupt(project)
+    (story,) = operatoractions.resolve(project.project, project)
+    assert story.resumable is True
+    assert story.confirmable is False
+    assert story.drift() == "its spec now says status: done"
+
+
+def test_a_hand_fixed_board_stays_resumable(project):
+    """⚠️ The board arm accepts `done`, not just `awaiting-operator`. The
+    interruption message tells the human to fix the board by hand; if they do and
+    the predicate then excludes the entry, it is stranded — nothing drops it and
+    `validate` warns about it forever.
+
+    Ablation: narrow the arm to `== AWAITING_OPERATOR` and this fails."""
+    _interrupt(project, board="done")
+    (story,) = operatoractions.resolve(project.project, project)
+    assert story.board_status == "done"
+    assert story.resumable is True
+
+
+@pytest.mark.parametrize(
+    ("spec_status", "board", "confirmed", "why"),
+    [
+        ("awaiting-operator", "awaiting-operator", True, "still parked — a fresh confirm"),
+        ("done", "done", False, "no section: finished by hand or re-driven, not signed off"),
+        ("done", "in-progress", True, "the board moved somewhere confirm never sends it"),
+        ("in-progress", "awaiting-operator", True, "the spec was re-driven past the park"),
+    ],
+)
+def test_resumable_requires_all_three_readings(project, spec_status, board, confirmed, why):
+    """Each arm is load-bearing. Resuming writes no audit section, so a spec at
+    `done` WITHOUT one would have the story declared confirmed on a sign-off that
+    never happened."""
+    spec = _park(project, status=spec_status, board=board)
+    if confirmed:
+        devcontract.append_operator_confirmation(spec, ACTIONS, date="2026-07-28")
+    (story,) = operatoractions.resolve(project.project, project)
+    assert story.resumable is False, why
+
+
+def test_a_fenced_confirmation_heading_does_not_make_a_story_resumable(project):
+    """#52 symmetry, and the stakes are higher here than on the auto-run path: a
+    frozen intent quoting an example ``## Operator Confirmation`` block must not
+    let `confirm` conclude a human signed off and skip to advancing the board."""
+    spec = _park(project, status="done")
+    spec.write_text(
+        spec.read_text() + f"\n```markdown\n{devcontract.OPERATOR_CONFIRM_HEADING}\n```\n"
+    )
+    (story,) = operatoractions.resolve(project.project, project)
+    assert story.confirmation_recorded is False
+    assert story.resumable is False
+
+
+# ------------------------------------ committed drift, split from the index's own
+
+
+def test_committed_drift_ignores_an_unreadable_action_list(project):
+    """The split exists so a caller reporting the malformed list can ALSO report a
+    co-occurring board disagreement. `drift()` collapses both into whichever it
+    finds first; `committed_drift()` answers only about spec and board."""
+    _park(project, actions=[], board="done")
+    (story,) = operatoractions.resolve(project.project, project)
+    assert story.committed_drift() == "the board now says done"
+    assert story.drift() == "the board now says done"
+
+
+def test_committed_drift_is_none_for_a_park_owing_nothing_readable(project):
+    """The one input where the two answers differ: the committed state still
+    describes a park, and only the index's own list is unreadable."""
+    _park(project, actions=[])
+    (story,) = operatoractions.resolve(project.project, project)
+    assert story.committed_drift() is None
+    assert story.drift() == "it declares no readable actions"
+    assert not story.confirmable
+
+
+@pytest.mark.parametrize(
+    ("spec_status", "board"),
+    [
+        ("awaiting-operator", "awaiting-operator"),
+        ("done", "awaiting-operator"),
+        ("awaiting-operator", "done"),
+        ("in-progress", "in-progress"),
+    ],
+)
+def test_drift_still_answers_exactly_as_it_did_for_a_readable_list(project, spec_status, board):
+    """Characterization: splitting the predicate changed no answer `drift()` gave.
+    Every committed-side cause outranks the empty-actions arm, which is where it
+    already sat."""
+    _park(project, status=spec_status, board=board)
+    (story,) = operatoractions.resolve(project.project, project)
+    assert story.drift() == story.committed_drift()

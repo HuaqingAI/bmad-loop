@@ -48,7 +48,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import sprintstatus, verify
+from . import devcontract, sprintstatus, verify
 from .bmadconfig import ProjectPaths
 from .frontmatter import operator_actions_of, read_frontmatter, status_of
 from .install import _worktree_local_exclude
@@ -56,6 +56,10 @@ from .platform_util import atomic_replace
 
 STORE_REL = Path(".bmad-loop") / "operator-actions.json"
 AWAITING_OPERATOR = verify.AWAITING_OPERATOR
+# The status a confirmation lands on. Spelled here rather than imported from
+# `sprintstatus.STATUS_ORDER` because both sides of the join use it — the board
+# token and the spec's frontmatter status — and only one of those is a board.
+DONE = "done"
 
 
 def store_path(project: Path) -> Path:
@@ -155,13 +159,20 @@ class ParkedStory:
 
     ``spec_status`` / ``board_status`` are None when that side could not be read
     at all (spec missing or unreadable, board missing or the key absent), which
-    is deliberately distinct from a side that reads some *other* status."""
+    is deliberately distinct from a side that reads some *other* status.
+
+    ``confirmation_recorded`` is the third reading: whether the spec already
+    carries the ``## Operator Confirmation`` section `confirm` writes. It is what
+    separates a story a human never signed off from one whose confirmation was
+    interrupted part-way — two states whose spec and board readings otherwise
+    look identical to a stale entry."""
 
     story_key: str
     actions: tuple[str, ...]
     spec_path: Path | None
     spec_status: str | None
     board_status: str | None
+    confirmation_recorded: bool
     commit: str
     run_id: str
     parked_at: str
@@ -177,10 +188,49 @@ class ParkedStory:
             and self.board_status == AWAITING_OPERATOR
         )
 
-    def drift(self) -> str | None:
-        """Why this entry is not confirmable, phrased for a human, or None when
-        it is. One sentence per cause, most-fundamental first — a missing spec
-        explains a missing status, so it must be reported instead of it."""
+    @property
+    def resumable(self) -> bool:
+        """Whether this entry is a confirmation that was INTERRUPTED between its
+        spec writes and its board write, and can simply be finished.
+
+        `confirm` writes the audit section, then the spec status, then the board,
+        then drops the entry. Stop it between the spec half and the board half —
+        a raising `sprintstatus.advance`, or one that returns unchanged because
+        the board line is in a shape its line regex cannot rewrite — and what is
+        left on disk is a signed-off spec at `done` with an entry still pointing
+        at it. That reads to :meth:`drift` as a stale index (arm 3, "its spec now
+        says status: done"), so a re-run refuses the very state a re-run exists to
+        clear, and `validate` nags about it forever.
+
+        All three readings are required. The section is the human's acknowledgment
+        — without it a spec at `done` is a story someone finished by hand or
+        re-drove, and confirming it would append an audit record for a sign-off
+        that never happened.
+
+        ⚠️ The board arm accepts `done` as well as `awaiting-operator`. The
+        interruption message tells the human to fix the board by hand; if they do,
+        a strict ``== AWAITING_OPERATOR`` test would drop the entry out of this
+        predicate and strand it — index entry retained, `validate` warning
+        forever, and no command that will remove either. `sprintstatus.advance`
+        is already idempotent at `done`, so resuming from there costs nothing and
+        finishes the one thing left: dropping the entry."""
+        return (
+            self.confirmation_recorded
+            and self.spec_status == DONE
+            and self.board_status in (AWAITING_OPERATOR, DONE)
+        )
+
+    def committed_drift(self) -> str | None:
+        """Why the COMMITTED state — spec and board only — disagrees with this
+        entry, or None when it does not.
+
+        Split from :meth:`drift` so a caller that has already reported something
+        about the *index* side (an unreadable action list) can still report a
+        co-occurring disagreement about the committed side. Folding both into one
+        method meant the first cause found was the only one anybody heard about,
+        and the two have different remedies: repair the list, versus discard the
+        entry. Ordered most-fundamental first — a missing spec explains a missing
+        status, so it is reported instead of it."""
         if self.spec_path is None:
             return "the index records no spec file for it"
         if self.spec_status is None:
@@ -191,9 +241,19 @@ class ParkedStory:
             return "it is not on the sprint board"
         if self.board_status != AWAITING_OPERATOR:
             return f"the board now says {self.board_status}"
-        if not self.actions:
-            return "it declares no readable actions"
         return None
+
+    def drift(self) -> str | None:
+        """Why this entry is not confirmable, phrased for a human, or None when
+        it is — the committed-side causes, then the index's own.
+
+        The empty-actions cause comes last because it is the least fundamental:
+        a spec that has moved on to `done` explains its own unreadable list, and
+        reporting "it declares no readable actions" about a story nobody is
+        parked on anymore sends a human to repair a file they should discard."""
+        return self.committed_drift() or (
+            "it declares no readable actions" if not self.actions else None
+        )
 
 
 def resolve(project: Path, paths: ProjectPaths) -> list[ParkedStory]:
@@ -203,7 +263,10 @@ def resolve(project: Path, paths: ProjectPaths) -> list[ParkedStory]:
     and a `validate` warning, and neither may be the thing that crashes on a spec
     someone deleted. The actions come from the SPEC when it can be read and from
     the index only as a fallback — the spec is the committed truth, so a spec
-    edited after the park shows the human what they actually owe now."""
+    edited after the park shows the human what they actually owe now. The
+    confirmation-section reading degrades the same way — an absent or unreadable
+    spec cannot be SHOWN to carry an acknowledgment, so it reads as False and the
+    entry takes the ordinary path, which reports the real fault."""
     entries = load(project)
     out: list[ParkedStory] = []
     for key in sorted(entries):
@@ -218,6 +281,9 @@ def resolve(project: Path, paths: ProjectPaths) -> list[ParkedStory]:
                 spec_path=spec_path,
                 spec_status=status_of(spec_fm) if spec_fm is not None else None,
                 board_status=_board_status(paths, key),
+                confirmation_recorded=(
+                    spec_path is not None and devcontract.has_operator_confirmation(spec_path)
+                ),
                 commit=str(entry.get("commit") or ""),
                 run_id=str(entry.get("run_id") or ""),
                 parked_at=str(entry.get("parked_at") or ""),
