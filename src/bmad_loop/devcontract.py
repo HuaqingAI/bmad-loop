@@ -136,13 +136,20 @@ def _fenced(text: str, offset: int) -> bool:
     return open_marker is not None
 
 
-def _section_headings(text: str) -> list[re.Match[str]]:
-    """`AUTO_RUN_HEADING_RE` matches that are real section headings. A heading
-    quoted inside a fenced code block (a frozen intent showing an example of the
-    terminal section, a log excerpt) is documentation, not structure — treating
-    it as terminal would let such a spec read as a result artifact from the
-    agent's first save (#52)."""
-    return [m for m in AUTO_RUN_HEADING_RE.finditer(text) if not _fenced(text, m.start())]
+def _section_headings(
+    text: str, pattern: re.Pattern[str] = AUTO_RUN_HEADING_RE
+) -> list[re.Match[str]]:
+    """`pattern` matches that are real section headings. A heading quoted inside
+    a fenced code block (a frozen intent showing an example of the terminal
+    section, a log excerpt) is documentation, not structure — treating it as
+    terminal would let such a spec read as a result artifact from the agent's
+    first save (#52).
+
+    `pattern` is a parameter rather than a hard-coded `AUTO_RUN_HEADING_RE`
+    because the ``## Operator Confirmation`` section needs the identical fence
+    reading for the identical reason, and a second copy of `_fenced`'s
+    open-marker walk is exactly the kind of near-duplicate that drifts."""
+    return [m for m in pattern.finditer(text) if not _fenced(text, m.start())]
 
 
 def _next_heading_start(text: str, offset: int) -> int:
@@ -551,6 +558,15 @@ ORCHESTRATOR_SYNTH_NOTE = (
 )
 
 
+# The heading `bmad-loop confirm` writes to record a human's out-of-band sign-off,
+# and the pattern that reads it back. Both spellings live here because the section
+# is now STRUCTURE, not just prose: `confirm` resumes an interrupted confirmation
+# by detecting this heading, so the writer's literal and the reader's pattern must
+# agree or a resumed story is confirmed twice — or never. The writer interpolates
+# the constant; a round-trip test pins the two against each other.
+OPERATOR_CONFIRM_HEADING = "## Operator Confirmation"
+OPERATOR_CONFIRM_HEADING_RE = re.compile(r"^##\s+Operator Confirmation\s*$", re.MULTILINE)
+
 # Provenance for the operator-confirmation section, mirroring
 # ORCHESTRATOR_SYNTH_NOTE: says who wrote the section and on whose word, so a
 # reader never mistakes an out-of-band human sign-off for something a dev
@@ -666,9 +682,28 @@ def append_operator_confirmation(spec_path: Path, actions: Sequence[str], *, dat
     # One line per action, in the order they were declared and acknowledged.
     items = "".join(f"- {a}{nl}" for a in actions)
     section = (
-        f"## Operator Confirmation{nl}{nl}"
+        f"{OPERATOR_CONFIRM_HEADING}{nl}{nl}"
         f"Confirmed {date}: the external actions this story owed were carried out.{nl}{nl}"
         f"{items}{nl}{OPERATOR_CONFIRM_NOTE}{nl}"
     )
     _atomic_write_spec(spec_path, text + section)
     return True
+
+
+def has_operator_confirmation(spec_path: Path) -> bool:
+    """Whether a spec already carries a REAL ``## Operator Confirmation`` section
+    — the on-disk acknowledgment `bmad-loop confirm` reads to tell an interrupted
+    confirmation from a fresh one (#335).
+
+    Fence-aware for the same reason `_section_headings` is (#52), and the stakes
+    here are higher than on the auto-run path: a frozen intent that shows an
+    example ``## Operator Confirmation`` block inside a code fence must not let
+    `confirm` conclude a human already signed off and skip straight to advancing
+    the board. The section on disk IS the acknowledgment, so a quoted one would
+    finish a story nobody confirmed.
+
+    Reads on the *observation* path and degrades accordingly (`_read_text_or_empty`):
+    an absent or unreadable spec cannot be SHOWN to carry an acknowledgment, so it
+    reads as False and the caller takes the ordinary path, which does its own
+    reading and reports the real fault."""
+    return bool(_section_headings(_read_text_or_empty(spec_path), OPERATOR_CONFIRM_HEADING_RE))

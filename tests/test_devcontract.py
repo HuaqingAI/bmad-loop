@@ -1140,3 +1140,53 @@ def test_operator_confirmation_write_failure_raises_and_keeps_the_spec(tmp_path,
         devcontract.append_operator_confirmation(sp, _ACTIONS, date="2026-07-28")
     assert sp.read_text(encoding="utf-8") == _PARKED
     assert list(tmp_path.glob("*.tmp")) == []
+
+
+# --------------------------------- has_operator_confirmation (#335 part 3)
+#
+# The section stopped being prose the moment `confirm` learned to RESUME an
+# interrupted confirmation off it: the heading on disk is now the machine-readable
+# acknowledgment. Writer literal and reader pattern must agree, and the reading
+# must be fence-aware or a frozen intent quoting an example finishes a story
+# nobody signed off.
+
+
+def test_operator_confirm_heading_round_trips_through_its_own_reader(tmp_path):
+    """The one test that would catch the writer and the reader drifting apart —
+    they are two spellings of the same string and nothing else pins them."""
+    assert devcontract.OPERATOR_CONFIRM_HEADING_RE.match(devcontract.OPERATOR_CONFIRM_HEADING)
+    sp = _write(tmp_path, "spec-a.md", _PARKED)
+    assert devcontract.has_operator_confirmation(sp) is False
+    devcontract.append_operator_confirmation(sp, _ACTIONS, date="2026-07-28")
+    assert devcontract.has_operator_confirmation(sp) is True
+
+
+def test_operator_confirmation_quoted_in_a_fence_is_not_an_acknowledgment(tmp_path):
+    """#52's rule, on the path where getting it wrong is worst: a frozen intent
+    showing what the section looks like is documentation. Reading it as structure
+    would let `confirm` resume — advancing the board — for a human who never
+    acknowledged anything."""
+    sp = _write(
+        tmp_path,
+        "spec-a.md",
+        _PARKED + "\n## Notes\n\n```markdown\n## Operator Confirmation\n\nexample\n```\n",
+    )
+    assert devcontract.has_operator_confirmation(sp) is False
+
+
+def test_operator_confirmation_read_degrades_on_an_unreadable_spec(tmp_path):
+    """Observation path: an absent or undecodable spec cannot be SHOWN to carry
+    an acknowledgment, so it reads False and the caller's own read reports the
+    real fault."""
+    assert devcontract.has_operator_confirmation(tmp_path / "nope.md") is False
+    binary = tmp_path / "spec-b.md"
+    binary.write_bytes(b"---\nstatus: awaiting-operator\n---\n\n\xff\xfe## Operator Confirmation\n")
+    assert devcontract.has_operator_confirmation(binary) is False
+
+
+def test_auto_run_marker_is_not_read_as_an_operator_confirmation(tmp_path):
+    """The two section readers share `_section_headings`; the pattern parameter is
+    what keeps them distinct. Neither heading may answer for the other."""
+    sp = _write(tmp_path, "spec-a.md", _PARKED)
+    devcontract.append_auto_run_result(sp, "done")
+    assert devcontract.has_operator_confirmation(sp) is False
