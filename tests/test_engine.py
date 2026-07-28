@@ -1183,6 +1183,44 @@ def test_summary_weights_per_task_not_over_the_aggregate(project):
     assert summary.weighted_tokens == 30  # NOT 32
 
 
+def test_summary_counts_parked_stories_apart_from_done(project):
+    """A story that committed but owes human external actions is neither `done`
+    (its acceptance criteria are not met) nor `deferred`/`escalated` (nothing
+    failed). Without its own count it would land in none of the three and vanish
+    from a summary that still counts it in the task total.
+
+    Constructed rather than driven: PR-1 ships the vocabulary with no writer, so
+    COMMITTING -> AWAITING_OPERATOR is unreachable through the engine loop.
+    """
+    engine = _cache_heavy_engine(project, snapshot_weight=0.5, live_weight=0.5, usage=TokenUsage())
+    for key, phase in (
+        ("1-1-a", Phase.DONE),
+        ("1-2-b", Phase.AWAITING_OPERATOR),
+        ("1-3-c", Phase.AWAITING_OPERATOR),
+    ):
+        engine.state.tasks[key] = StoryTask(story_key=key, epic=1, phase=phase)
+
+    summary = engine.summary()
+
+    assert summary.awaiting_operator == 2
+    # and it did NOT inflate any of the three existing counts
+    assert summary.done == 1 and summary.deferred == 0 and summary.escalated == 0
+
+
+def test_run_summary_render_names_parked_stories_only_when_there_are_any(project):
+    """The clause earns its space by being absent on the runs it would be 0 on —
+    a standing ", 0 awaiting operator" on every run trains readers to skip the
+    one clause that matters on the run where it is not zero."""
+    engine = _cache_heavy_engine(project, snapshot_weight=0.5, live_weight=0.5, usage=TokenUsage())
+    assert "awaiting operator" not in engine.summary().render()
+
+    engine.state.tasks["1-2-b"] = StoryTask(
+        story_key="1-2-b", epic=1, phase=Phase.AWAITING_OPERATOR
+    )
+
+    assert "1 awaiting operator" in engine.summary().render()
+
+
 def test_run_summary_render_labels_both_units(project):
     """render() feeds stdout, the ATTENTION file and the desktop notification
     from one place, so this covers all three."""

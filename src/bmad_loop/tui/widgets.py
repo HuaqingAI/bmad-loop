@@ -160,7 +160,7 @@ class RunHeader(Static):
         if state.current_epic is not None:
             text.append(f"  epic {state.current_epic}", style="dim")
 
-        counts = {Phase.DONE: 0, Phase.DEFERRED: 0, Phase.ESCALATED: 0}
+        counts = {Phase.DONE: 0, Phase.DEFERRED: 0, Phase.ESCALATED: 0, Phase.AWAITING_OPERATOR: 0}
         weight = state.cache_read_weight()
         weighted = raw = 0
         for task in state.tasks.values():
@@ -174,6 +174,11 @@ class RunHeader(Static):
         text.append(f"  deferred {counts[Phase.DEFERRED]}", style="yellow")
         style = "red" if counts[Phase.ESCALATED] else "dim"
         text.append(f"  escalated {counts[Phase.ESCALATED]}", style=style)
+        # Only when non-zero, unlike the three above: the header line is already
+        # at the width the narrowest supported pane can hold, and a standing
+        # "awaiting 0" would cost that room on every run that never parks a story.
+        if counts[Phase.AWAITING_OPERATOR]:
+            text.append(f"  awaiting {counts[Phase.AWAITING_OPERATOR]}", style="yellow")
         text.append(f"  {weighted:,} tokens ({raw:,} raw)", style="dim")
 
         # The agent line: who is driving (or, when idle, who is configured to).
@@ -600,6 +605,7 @@ SPRINT_GLYPHS = {
     "in-progress": "▶",
     "review": "◆",
     "ready-for-dev": "○",
+    "awaiting-operator": "⏸",
     "backlog": "·",
     "optional": "·",
 }
@@ -609,6 +615,9 @@ SPRINT_STYLES = {
     "in-progress": "cyan",
     "review": "magenta",
     "ready-for-dev": "cyan",
+    # yellow, matching the run header's deferred count: work is finished but the
+    # story is not, and something outside the loop has to happen next.
+    "awaiting-operator": "yellow",
     "backlog": "dim",
     "optional": "dim",
 }
@@ -719,6 +728,7 @@ STORY_GLYPHS = {
     "in-progress": "▶",
     "in-review": "◆",
     "done": "✓",
+    "awaiting-operator": "⏸",
     "blocked": "✖",
     "ambiguous": "⚠",
     "sentinel": "⚠",
@@ -731,6 +741,7 @@ STORY_STYLES = {
     "in-progress": "cyan",
     "in-review": "magenta",
     "done": "green",
+    "awaiting-operator": "yellow",
     "blocked": "bold red",
     "ambiguous": "bold red",
     "sentinel": "bold red",

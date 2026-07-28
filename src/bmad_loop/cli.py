@@ -1581,8 +1581,11 @@ def cmd_status(args: argparse.Namespace) -> int:
         extra = task.defer_reason or task.commit_sha or ""
         if task.preserve_ref:
             extra = f"{extra} [{task.preserve_ref}]".lstrip()
+        # 17 = len("awaiting-operator"), the longest Phase token; a narrower
+        # field does not truncate, it shifts every following column on that one
+        # row, which reads as corrupt output rather than as a long status.
         print(
-            f"  {key:40s} {task.phase:16s} dev×{task.attempt} review×{task.review_cycle} "
+            f"  {key:40s} {task.phase:17s} dev×{task.attempt} review×{task.review_cycle} "
             f"{tokens} {extra}"
         )
     if state.source == "stories":

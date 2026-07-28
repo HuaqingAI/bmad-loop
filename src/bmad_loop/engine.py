@@ -107,6 +107,11 @@ class RunSummary:
     # direction this field exists to fix. There is one construction site; a
     # TypeError beats a plausible zero.
     weighted_tokens: int
+    # stories that committed but owe human-only external actions (Phase
+    # AWAITING_OPERATOR). Defaulted, unlike weighted_tokens: a miscounted 0 here
+    # is a count that is genuinely 0 on every run that never parks a story, so
+    # the default is honest rather than silently wrong.
+    awaiting_operator: int = 0
     crashed: bool = False
     crash_error: str | None = None
 
@@ -124,9 +129,13 @@ class RunSummary:
             # shutdown-only flush). Splitting this into "0 weighted (0 raw)"
             # would assert free work twice over; one plain zero is honest.
             tokens = "0 tokens"
+        # Appended only when non-zero: a run that parks nothing is the norm, and
+        # a standing ", 0 awaiting operator" would train readers to skip the very
+        # clause that matters on the run where it is not zero.
+        parked = f", {self.awaiting_operator} awaiting operator" if self.awaiting_operator else ""
         lines = [
             f"run {self.run_id}: {self.done} done, {self.deferred} deferred, "
-            f"{self.escalated} escalated, {tokens}"
+            f"{self.escalated} escalated{parked}, {tokens}"
         ]
         if self.crashed:
             lines.append(f"CRASHED: {self.crash_error}")
@@ -626,6 +635,7 @@ class Engine:
             done=sum(1 for t in tasks if t.phase == Phase.DONE),
             deferred=sum(1 for t in tasks if t.phase == Phase.DEFERRED),
             escalated=sum(1 for t in tasks if t.phase == Phase.ESCALATED),
+            awaiting_operator=sum(1 for t in tasks if t.phase == Phase.AWAITING_OPERATOR),
             paused=self.state.paused,
             paused_reason=self.state.paused_reason or "",
             total_tokens=sum(t.tokens.total for t in tasks),

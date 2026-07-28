@@ -2,7 +2,7 @@
 
 import pytest
 
-from bmad_loop.model import RunState, SessionRecord, StoryTask, TokenUsage
+from bmad_loop.model import Phase, RunState, SessionRecord, StoryTask, TokenUsage
 
 
 def _state(**kw) -> RunState:
@@ -191,6 +191,36 @@ def test_preserve_ref_defaults_none_for_legacy_state():
     del doc["preserve_partial"]
     restored = StoryTask.from_dict(doc)
     assert restored.preserve_ref is None and restored.preserve_partial is False
+
+
+def test_operator_actions_round_trip():
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=Phase.AWAITING_OPERATOR,
+        operator_actions=["buy the domain", "publish the DKIM TXT record"],
+    )
+    restored = StoryTask.from_dict(task.to_dict())
+    # the phase travels as its plain token, so a parked run resumes parked
+    assert restored.phase is Phase.AWAITING_OPERATOR
+    assert task.to_dict()["phase"] == "awaiting-operator"
+    # order is meaningful — the human works the list top-down
+    assert restored.operator_actions == ["buy the domain", "publish the DKIM TXT record"]
+
+
+def test_operator_actions_defaults_empty_for_legacy_state():
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["operator_actions"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).operator_actions == []
+
+
+def test_operator_actions_are_not_shared_between_tasks():
+    """`field(default_factory=list)` rather than a shared `[]` default: two parked
+    stories in one run must not accumulate each other's actions."""
+    one = StoryTask(story_key="1-1-a", epic=1)
+    other = StoryTask(story_key="1-2-b", epic=1)
+    one.operator_actions.append("buy the domain")
+    assert other.operator_actions == []
 
 
 def test_token_budget_warned_round_trips():

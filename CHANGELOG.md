@@ -9,6 +9,20 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **`awaiting-operator` vocabulary, no writer yet (#335, part 1 of 4).** Names, at every layer, the
+  state a story reaches when its agent-doable work is finished and committed but its acceptance
+  criteria include external actions only a human can perform: `Phase.AWAITING_OPERATOR` (terminal,
+  reachable only from `COMMITTING`), a `awaiting-operator` sprint-status token ordered immediately
+  before `done` and deliberately not actionable, `operator_actions` on each task, and the matching
+  run-summary count, `status` output and TUI glyphs. Nothing writes any of it yet — the park path
+  is part 2 — so no run can currently reach the phase.
+
+  Two consequences worth knowing. A `state.json` carrying the new phase is forward-only: an older
+  binary rejects it, as with every phase addition. And because the sprint token is now _ordered_
+  rather than unknown, a review session writing `awaiting-operator` onto a board the orchestrator
+  had already advanced to `done` is classified as a deliberate sign-off regression and escalates
+  (#334), where it previously fell through to a retry.
+
 - **Defer notifications name where the work survives (#333).** A deferred story's rollback parked
   the attempt on an `attempt-preserve/*` branch (or a `refs/attempt-preserve-dirty/*` snapshot),
   but the ref only ever reached `journal.jsonl` — the notification carried a bare reason, leaving

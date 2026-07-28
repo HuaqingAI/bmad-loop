@@ -24,11 +24,25 @@ STORY_RE = re.compile(r"^(\d+)-(\d+)([a-z]?)-(.+)$")
 SHORT_REF_RE = re.compile(r"^(\d+)[-.](\d+)([a-z]?)$")  # short story ref: 3-1, 3.1, 3-1a
 BARE_NUM_RE = re.compile(r"^(\d+)([a-z]?)$")  # a lone story number, needs --epic
 
-STORY_STATUSES = {"backlog", "ready-for-dev", "in-progress", "review", "done"}
 # Lifecycle order, earliest -> latest. `advance` never moves a story backward
-# through this sequence (matches sync-sprint-status's "never regress").
-STATUS_ORDER = ("backlog", "ready-for-dev", "in-progress", "review", "done")
+# through this sequence (matches sync-sprint-status's "never regress"), and it is
+# the only ordering any caller may use — a token absent from it cannot be ordered
+# at all, so every consumer treats "unknown" conservatively rather than guessing.
+# `awaiting-operator` sits immediately before `done`: parking is the last stop on
+# the way to finished, so confirming a parked story is a legal forward advance
+# through the sole writer, while nothing can ever regress `done` back into it.
+STATUS_ORDER = (
+    "backlog",
+    "ready-for-dev",
+    "in-progress",
+    "review",
+    "awaiting-operator",
+    "done",
+)
 LEGACY_STORY_STATUSES = {"drafted": "ready-for-dev"}
+# Statuses a story may be PICKED UP from. `awaiting-operator` is deliberately
+# absent: the story's agent-doable work is already committed, so re-driving it
+# would redo finished work while the human's external actions stay outstanding.
 ACTIONABLE_STATUSES = {"backlog", "ready-for-dev"}
 
 

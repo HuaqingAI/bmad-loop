@@ -31,13 +31,20 @@ TRANSITIONS: dict[Phase, frozenset[Phase]] = {
             Phase.ESCALATED,
         }
     ),
-    Phase.COMMITTING: frozenset({Phase.DONE, Phase.ESCALATED}),
+    # AWAITING_OPERATOR: a story owing human-only external actions parks on the
+    # NORMAL commit path — the work commits, then the final phase is chosen by
+    # whether the task carries operator_actions. Reachable only from COMMITTING
+    # precisely so a park can never skip the gates/commit a DONE story clears.
+    Phase.COMMITTING: frozenset({Phase.DONE, Phase.ESCALATED, Phase.AWAITING_OPERATOR}),
     Phase.TRIAGE_RUNNING: frozenset({Phase.TRIAGE_VERIFY}),
     # TRIAGE_RUNNING: invalid triage output retries with feedback, like DEV_VERIFY
     Phase.TRIAGE_VERIFY: frozenset({Phase.TRIAGE_RUNNING, Phase.DONE, Phase.ESCALATED}),
     Phase.DONE: frozenset(),
     Phase.DEFERRED: frozenset(),
     Phase.ESCALATED: frozenset(),
+    # terminal: `bmad-loop confirm` completes a parked story out of band, not by
+    # transitioning the (by then finished) run's task.
+    Phase.AWAITING_OPERATOR: frozenset(),
 }
 
 
