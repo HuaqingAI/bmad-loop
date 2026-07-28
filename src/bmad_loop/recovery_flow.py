@@ -154,7 +154,7 @@ class RecoveryFlow:
                     task.baseline_untracked,
                     exclude=protected,
                 )
-            except verify.GitError as exc:
+            except (verify.GitError, OSError) as exc:
                 self.journal.append(
                     "rollback-dirty-check-failed", story_key=task.story_key, error=str(exc)
                 )
@@ -315,19 +315,44 @@ class RecoveryFlow:
         recoverable by name, not just the reflog). No-op when the attempt added no
         commits — an uncommitted-only revert is the intended, non-destructive case.
 
-        If commits exist but the ref cannot be created: with ``allow_pause`` (a
-        plain rollback) refuse to reset — pause for manual recovery rather than
-        destroy the work. On a re-drive (``allow_pause=False``) the caller's
-        contract forbids pausing, so journal the failure and let the reset proceed
-        (the re-drive is a human-directed discard of the failed attempt)."""
+        If commits exist but the ref cannot be created — or the range cannot be
+        enumerated at all, which is the same thing one step earlier: with
+        ``allow_pause`` (a plain rollback) refuse to reset — pause for manual
+        recovery rather than destroy the work. On a re-drive (``allow_pause=False``)
+        the caller's contract forbids pausing, so journal the failure and let the
+        reset proceed (the re-drive is a human-directed discard of the failed
+        attempt). The two failures journal under distinct events
+        (``attempt-preserve-enumerate-failed`` vs ``attempt-preserve-failed``) so a
+        post-mortem can tell "could not count the work" from "counted it but could
+        not park it" — only the latter can report a HEAD."""
         baseline = task.baseline_commit
         if not baseline:
             return
         workspace = self._workspace_get()
-        commits = verify.commits_above(workspace.root, baseline)
-        if not commits:
-            return
-        head = verify.rev_parse_head(workspace.root)  # the tip the recovery ref parks at
+        # Enumerating the range is what decides whether the reset is safe, so a
+        # fault here is not a no-op: an un-determinable range must read as "there
+        # may be work above baseline" and take the preservation-failure path below,
+        # never the `not commits` early return (which would let the reset run
+        # blind). These two calls carried no guard at all, so until #343 a plain
+        # git *timeout* — which `_run_git` does translate, and which every sibling
+        # here already treats as routine — crashed the rollback outright; OSError
+        # joins it because the translation stops at timeouts. The `not commits`
+        # return sits inside the try to keep the original call order: HEAD is still
+        # only read once there is something to park.
+        try:
+            commits = verify.commits_above(workspace.root, baseline)
+            if not commits:
+                return
+            head = verify.rev_parse_head(workspace.root)  # the tip the ref parks at
+        except (verify.GitError, OSError) as exc:
+            self.journal.append(
+                "attempt-preserve-enumerate-failed", story_key=task.story_key, error=str(exc)
+            )
+            if allow_pause:
+                # Same refusal as an un-parked ref: the notice must not tell the
+                # operator to `reset --hard` past work we could not even count.
+                self.pause_for_manual_recovery(task, baseline, preserve_failed=True)
+            return  # re-drive: never pause — proceed to the (human-directed) reset
         # run_id can be an arbitrary user `--run-id`; ref-sanitize it (same
         # identity-for-clean-ids / digest-for-dirty contract as the unit branches) so
         # an exotic/overlong id can't blow the ref-name limit, fail `git branch`, and
@@ -341,7 +366,7 @@ class RecoveryFlow:
                 f"attempt-preserve/{slug}-{head[:8]}",
                 commits=commits,
             )
-        except verify.GitError:
+        except (verify.GitError, OSError):
             ref = None  # branch creation failed — treat as a preservation failure
         if ref is None:
             # commits exist (just enumerated) but the ref did not take.
@@ -375,10 +400,9 @@ class RecoveryFlow:
         same terms: with ``allow_pause`` (a plain rollback) pause for manual
         recovery rather than reset; on a re-drive (``allow_pause=False``) the
         caller's contract forbids pausing, so journal and let the human-directed
-        reset proceed. The symmetry is in the *refusal policy*, not the guard: this
-        path catches ``(GitError, OSError)`` while `preserve_attempt_commits` still
-        catches ``GitError`` alone, so a spawn-level fault there crashes instead of
-        refusing — one instance of the systemic gap tracked in #343.
+        reset proceed. Both now guard ``(GitError, OSError)`` too — ``_run_git``
+        translates only a timeout, so a spawn-level fault would otherwise crash the
+        rollback rather than refuse it (#343).
 
         The refusal is gated on :meth:`_reset_would_destroy`, so a capture failure
         over a tree with nothing left to lose (commits already parked, nothing

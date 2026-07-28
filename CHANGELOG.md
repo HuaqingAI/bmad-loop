@@ -176,6 +176,16 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   into the same journal-and-decide path a `GitError` takes, keeping the errno as the breadcrumb;
   `safe_reset` still raises.
 
+- **A git fault while counting the attempt's commits no longer crashes the rollback (#343).**
+  `preserve_attempt_commits` enumerated the range above baseline with no guard at all, so an
+  ordinary git _timeout_ — already translated and treated as routine everywhere else — took the
+  run down mid-rollback; a spawn-level `OSError` did the same, there and at the ref write. An
+  un-determinable range now reads as "there may be work above baseline" and refuses the reset
+  (pausing for manual recovery, or journalling on a re-drive), never the clean-tree early return.
+  Journals `attempt-preserve-enumerate-failed`, distinct from `attempt-preserve-failed`, so a
+  post-mortem can tell "could not count the work" from "counted it but could not park it". The
+  rollback's dirty check degrades on an `OSError` for the same reason.
+
 - **The orchestrator's ledger writers no longer inject lines from a multiline value (#305).** Found
   by [@Haven2026](https://github.com/Haven2026) in #274. The deferred-work ledger is line-oriented,
   but `deferredwork`'s mutators interpolated their arguments verbatim: a resolution note of

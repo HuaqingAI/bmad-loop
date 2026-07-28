@@ -263,6 +263,28 @@ def test_rollback_dirty_check_git_fault_degrades_to_dirty(project, monkeypatch):
     assert "rollback-skipped-clean" not in flow.journal.events()
 
 
+def test_rollback_dirty_check_oserror_degrades_to_dirty(project, monkeypatch):
+    # #343: `_run_git` translates only a timeout, so a spawn-level OSError reaches
+    # this guard untyped. It must degrade exactly like the GitError above — this is
+    # the first git call on the rollback path, so an unguarded OSError here crashes
+    # before any preserve step can run.
+    repo = project.project
+    ws = Workspace.default(project)
+    flow = _make_flow(workspace=ws, policy=_policy(rollback_on_failure=False))
+    task = _task(repo)
+
+    def boom(*a, **k):
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr(verify, "attempt_dirty", boom)
+
+    with pytest.raises(_Pause):
+        flow.rollback_or_pause(task)
+
+    assert "rollback-dirty-check-failed" in flow.journal.events()
+    assert "rollback-skipped-clean" not in flow.journal.events()
+
+
 # --------------------------------------------------------------- preserve refs
 
 
@@ -335,6 +357,104 @@ def test_preserve_attempt_commits_no_pause_on_redrive(project, monkeypatch):
 
     assert "attempt-preserve-failed" in flow.journal.events()
     assert flow.calls.pauses == []
+
+
+def _commit_something(repo: Path) -> None:
+    (repo / "src.txt").write_text("committed\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "attempt commit")
+
+
+@pytest.mark.parametrize(
+    "make_exc",
+    # Factories, not instances: a parametrized exception *instance* is built once at
+    # collection and shared by every case, and re-raising it mutates its
+    # __traceback__ — which under pytest-randomly's shuffling made these cases
+    # couple to each other and fail for the wrong reason.
+    [lambda: GitError("git log timed out"), lambda: OSError(24, "Too many open files")],
+    ids=["giterror", "oserror"],
+)
+def test_preserve_attempt_commits_pauses_when_range_unenumerable(project, monkeypatch, make_exc):
+    # #343: `commits_above` carried no guard at all, so even a plain GitError (a
+    # translated git timeout) crashed the rollback here. An un-determinable range
+    # must refuse the reset, never fall through the `not commits` early return.
+    repo = project.project
+    ws = Workspace.default(project)
+    flow = _make_flow(workspace=ws)
+    task = _task(repo)
+    _commit_something(repo)
+
+    def boom(*a, **k):
+        raise make_exc()
+
+    monkeypatch.setattr(verify, "commits_above", boom)
+
+    with pytest.raises(_Pause):
+        flow.preserve_attempt_commits(task, allow_pause=True)
+
+    assert "attempt-preserve-enumerate-failed" in flow.journal.events()
+    assert "could not be auto-preserved" in flow.calls.pauses[-1][0]
+    assert task.preserve_ref is None  # nothing parked → nothing to point the operator at
+
+
+def test_preserve_attempt_commits_pauses_when_head_read_fails(project, monkeypatch):
+    # The second unguarded call (#343): the range enumerated fine, but the tip the
+    # ref would park at could not be read — still work we cannot park.
+    repo = project.project
+    ws = Workspace.default(project)
+    flow = _make_flow(workspace=ws)
+    task = _task(repo)
+    _commit_something(repo)
+
+    def boom(*a, **k):
+        raise GitError("git rev-parse timed out")
+
+    monkeypatch.setattr(verify, "rev_parse_head", boom)
+
+    with pytest.raises(_Pause):
+        flow.preserve_attempt_commits(task, allow_pause=True)
+
+    assert "attempt-preserve-enumerate-failed" in flow.journal.events()
+    assert task.preserve_ref is None
+
+
+def test_preserve_attempt_commits_unenumerable_no_pause_on_redrive(project, monkeypatch):
+    # The re-drive contract forbids pausing even here: a human directed the discard.
+    repo = project.project
+    ws = Workspace.default(project)
+    flow = _make_flow(workspace=ws)
+    task = _task(repo)
+    _commit_something(repo)
+
+    def boom(*a, **k):
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr(verify, "commits_above", boom)
+
+    flow.preserve_attempt_commits(task, allow_pause=False)  # must not raise
+
+    assert "attempt-preserve-enumerate-failed" in flow.journal.events()
+    assert flow.calls.pauses == []
+
+
+def test_preserve_attempt_commits_ref_oserror_treated_as_failure(project, monkeypatch):
+    # Sibling of the GitError case above: the ref write can also fail untyped (#343).
+    repo = project.project
+    ws = Workspace.default(project)
+    flow = _make_flow(workspace=ws)
+    task = _task(repo)
+    _commit_something(repo)
+
+    def boom(*a, **k):
+        raise OSError(12, "Cannot allocate memory")
+
+    monkeypatch.setattr(verify, "preserve_commits", boom)
+
+    with pytest.raises(_Pause):
+        flow.preserve_attempt_commits(task, allow_pause=True)
+
+    assert "attempt-preserve-failed" in flow.journal.events()
+    assert task.preserve_ref is None
 
 
 def test_preserve_attempt_worktree_snapshots_dirty_tree(project):
