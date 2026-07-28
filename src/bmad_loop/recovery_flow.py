@@ -455,12 +455,18 @@ class RecoveryFlow:
         No ``exclude`` is passed because this only runs on the plain-rollback path,
         where `rollback_or_pause`'s ``protected`` is empty anyway. Fails safe: an
         un-determinable probe reads as work-at-risk, mirroring the dirty check's
-        own git-fault doctrine (#156)."""
+        own git-fault doctrine (#156).
+
+        Catches ``OSError`` for the same reason the caller does, and it matters more
+        here: this runs immediately after a snapshot fault, against the same git
+        binary, so the EMFILE/ENOMEM that broke the capture is likely to break the
+        probe too. Guarding only `GitError` would undo the broadening one frame up
+        and crash the rollback anyway."""
         workspace = self._workspace_get()
         try:
             head = verify.rev_parse_head(workspace.root)
             return verify.attempt_dirty(workspace.root, head, task.baseline_untracked)
-        except verify.GitError:
+        except (verify.GitError, OSError):
             return True
 
     def pause_for_manual_recovery(

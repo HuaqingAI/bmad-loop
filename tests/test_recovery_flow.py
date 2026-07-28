@@ -383,6 +383,16 @@ def test_dirty_preserve_ref_wins_and_subsumes_the_commits_branch(project):
     assert task.preserve_partial is False
 
 
+def _fail_snapshot(monkeypatch, exc=None):
+    """Make verify.snapshot_worktree raise, the way a full disk or a git timeout
+    inside `add -u`/`write-tree`/`update-ref` would."""
+
+    def _fail(*_a, **_k):
+        raise exc if exc is not None else verify.GitError("simulated commit-tree failure")
+
+    monkeypatch.setattr(verify, "snapshot_worktree", _fail)
+
+
 def test_snapshot_failure_leaves_a_commits_only_ref_flagged_partial(project, monkeypatch):
     """The snapshot raises *after* the commits branch was already parked, and on a
     re-drive the reset runs anyway. `preserve_ref` then names the commits branch
@@ -407,10 +417,7 @@ def test_snapshot_failure_leaves_a_commits_only_ref_flagged_partial(project, mon
     git(repo, "commit", "-q", "-m", "attempt commit")
     (repo / "src.txt").write_text("committed then edited\n")  # the half that will be lost
 
-    def _fail(*_a, **_k):
-        raise verify.GitError("simulated commit-tree failure")
-
-    monkeypatch.setattr(verify, "snapshot_worktree", _fail)
+    _fail_snapshot(monkeypatch)
 
     flow.rollback_or_pause(task, cause="resolved")
 
@@ -425,16 +432,6 @@ def test_snapshot_failure_leaves_a_commits_only_ref_flagged_partial(project, mon
     # `merge --ff-only` would have implied it could restore
     assert "committed" not in (repo / "src.txt").read_text()
     assert git(repo, "show", f"{task.preserve_ref}:src.txt") == "committed"
-
-
-def _fail_snapshot(monkeypatch, exc=None):
-    """Make verify.snapshot_worktree raise, the way a full disk or a git timeout
-    inside `add -u`/`write-tree`/`update-ref` would."""
-
-    def _fail(*_a, **_k):
-        raise exc if exc is not None else verify.GitError("simulated commit-tree failure")
-
-    monkeypatch.setattr(verify, "snapshot_worktree", _fail)
 
 
 def test_snapshot_failure_pauses_when_work_would_be_lost(project, monkeypatch):
@@ -517,6 +514,32 @@ def test_snapshot_failure_probe_fault_pauses(project, monkeypatch):
     monkeypatch.setattr(verify, "rev_parse_head", _fail_probe)
 
     with pytest.raises(_Pause):
+        flow.rollback_or_pause(task)
+
+    assert (repo / "src.txt").read_text() == "uncommitted work\n"  # not reset
+
+
+def test_probe_oserror_also_fails_safe(project, monkeypatch):
+    """The probe runs immediately after a snapshot fault, against the same git
+    binary, so the EMFILE/ENOMEM that broke the capture is likely to break the probe
+    too. Catching only GitError here would undo the broadening one frame up and
+    crash the rollback anyway — the asymmetry, not either half, is the defect.
+
+    Ablation target: narrow `_reset_would_destroy`'s `except` back to
+    `verify.GitError` and this fails with the raw OSError."""
+    repo = project.project
+    ws = Workspace.default(project)
+    flow = _make_flow(workspace=ws, policy=_policy(rollback_on_failure=True))
+    task = _task(repo)
+    (repo / "src.txt").write_text("uncommitted work\n")
+    _fail_snapshot(monkeypatch, OSError(24, "Too many open files"))
+
+    def _fail_probe(*_a, **_k):
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr(verify, "rev_parse_head", _fail_probe)
+
+    with pytest.raises(_Pause):  # the typed pause, not the OSError
         flow.rollback_or_pause(task)
 
     assert (repo / "src.txt").read_text() == "uncommitted work\n"  # not reset
