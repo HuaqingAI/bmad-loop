@@ -127,8 +127,9 @@ def test_capture_diff_timeout_becomes_git_error(project, monkeypatch):
     [
         lambda: FileNotFoundError(2, "No such file or directory"),
         lambda: OSError(24, "Too many open files"),
+        lambda: OSError(12, "Cannot allocate memory"),
     ],
-    ids=["enoent", "emfile"],
+    ids=["enoent", "emfile", "enomem"],
 )
 def test_git_spawn_oserror_becomes_git_spawn_error(project, monkeypatch, make_exc):
     """#343: a spawn-level OSError (EMFILE/ENOMEM, git gone from PATH) is raised
