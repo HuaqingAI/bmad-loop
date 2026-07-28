@@ -44,6 +44,7 @@ from bmad_loop.install import (
     _copy_traversable,
     _git_version_at_least,
     _is_dev_primitive_shim,
+    _register_hooks,
     _shield_undo_extension,
     _worktree_local_exclude,
     dev_primitive_or_default,
@@ -56,6 +57,7 @@ from bmad_loop.install import (
     renderer_stub_resolved,
     resolve_dev_primitive,
     resolve_review_layers,
+    strip_relay_hooks,
 )
 from bmad_loop.worktree_flow import (
     _bmad_scripts_seed_incomplete,
@@ -532,6 +534,58 @@ def test_provision_worktree_lays_down_skills_and_hook(tmp_path):
     cmd = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
     assert str((repo / ".bmad-loop" / "bmad_loop_hook.py")) in cmd
     assert not (wt / ".bmad-loop").exists()
+
+
+def test_provision_worktree_rewrites_seeded_relative_hook_to_absolute(tmp_path):
+    """The main repo's .claude/settings.json carries a $CLAUDE_PROJECT_DIR-relative
+    relay command. Seeded into a worktree, that variable resolves to the worktree,
+    where no .bmad-loop/ relay exists — the hook fails, no Stop signal ever fires and
+    the run stalls. The registration must overwrite the seeded command, which
+    merge_hooks alone will not do (it treats the event as already registered)."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    claude = get_profile("claude")
+    assert _register_hooks(repo, claude) == 0
+    main_settings = json.loads((repo / claude.hooks.config_path).read_text())
+    assert "$CLAUDE_PROJECT_DIR" in main_settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+
+    provision_worktree(wt, [claude], repo, seed_files=[claude.hooks.config_path])
+
+    stop = json.loads((wt / claude.hooks.config_path).read_text())["hooks"]["Stop"]
+    assert len(stop) == 1  # replaced, not appended alongside
+    cmd = stop[0]["hooks"][0]["command"]
+    assert str(repo / ".bmad-loop" / "bmad_loop_hook.py") in cmd
+    assert "$CLAUDE_PROJECT_DIR" not in cmd
+
+
+def test_strip_relay_hooks_leaves_foreign_handlers(tmp_path):
+    """Only bmad relay handlers go. A project's own hooks share the event list and
+    must survive, and an event that held nothing else is dropped rather than left
+    as an empty list."""
+    config = {
+        "hooks": {
+            "Stop": [
+                {
+                    "matcher": "",
+                    "hooks": [{"type": "command", "command": "python bmad_loop_hook.py Stop"}],
+                },
+                {"matcher": "", "hooks": [{"type": "command", "command": "make lint"}]},
+            ],
+            "SessionStart": [
+                {
+                    "matcher": "",
+                    "hooks": [{"type": "command", "command": "python bmad_loop_hook.py start"}],
+                }
+            ],
+        }
+    }
+    assert strip_relay_hooks(config, "claude-settings-json") is True
+    assert config["hooks"]["Stop"] == [
+        {"matcher": "", "hooks": [{"type": "command", "command": "make lint"}]}
+    ]
+    assert "SessionStart" not in config["hooks"]
+    # idempotent: nothing left to remove
+    assert strip_relay_hooks(config, "claude-settings-json") is False
 
 
 def test_provision_worktree_covers_multiple_profiles(tmp_path):

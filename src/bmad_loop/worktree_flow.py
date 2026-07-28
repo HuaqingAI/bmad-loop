@@ -56,6 +56,7 @@ from .install import (
     missing_stories_support,
     renderer_stub_resolved,
     resolve_review_layers,
+    strip_relay_hooks,
 )
 from .model import Phase
 from .process_host import get_process_host
@@ -668,8 +669,15 @@ def provision_worktree(
             native: f"{interp} {host.shell_quote(str(relay))} {canonical}"
             for native, canonical in profile.hooks.events.items()
         }
-        config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
-        if changed:
+        # A seeded config_path (.claude/settings.json is both a seeded file and the
+        # hook config) arrives carrying the MAIN repo's relay command, which for the
+        # claude dialect is $CLAUDE_PROJECT_DIR-relative and resolves to a path that
+        # does not exist inside the worktree. merge_hooks will not replace an
+        # already-registered relay, so strip it first and let this registration —
+        # baked to the main repo's relay, absolute — be authoritative.
+        stripped = strip_relay_hooks(config, profile.hooks.dialect)
+        config, merged = merge_hooks(config, registrations, profile.hooks.dialect)
+        if stripped or merged:
             config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 
     # Shield exactly the paths we wrote (skill trees + hook configs + seeded

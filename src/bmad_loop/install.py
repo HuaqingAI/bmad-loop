@@ -1064,6 +1064,38 @@ def _managed_hook_in_handlers(handlers) -> bool:
     return RELAY_MARKER in dumped or PROBE_MARKER in dumped
 
 
+def strip_relay_hooks(config: dict, dialect: str) -> bool:
+    """Drop every relay registration from a parsed hook config. True if any went.
+
+    The inverse of :func:`merge_hooks`, for the one caller that needs its own
+    registration to be authoritative rather than additive: a worktree seeded with
+    the main repo's hook config (``provision_worktree``). That config already
+    carries a relay command written for the main repo — `$CLAUDE_PROJECT_DIR`-relative
+    for the claude dialect, which resolves inside the worktree, where no relay
+    exists. `merge_hooks` will not replace it, since `_managed_hook_in_handlers`
+    reports the event as already registered, so the stale command has to go first.
+
+    Only RELAY_MARKER handlers are removed. A probe-capture hook is a deliberate,
+    temporary registration that no worktree seeding produces, and is left alone.
+    Empty event lists are dropped; an empty container is left in place for
+    `merge_hooks` to refill.
+    """
+    container = hook_event_container(config, dialect)
+    removed = False
+    for native_event in list(container):
+        handlers = container.get(native_event)
+        if not isinstance(handlers, list):
+            continue
+        kept = [h for h in handlers if RELAY_MARKER not in json.dumps(h)]
+        if len(kept) != len(handlers):
+            removed = True
+            if kept:
+                container[native_event] = kept
+            else:
+                del container[native_event]
+    return removed
+
+
 def relay_registered(config: dict, dialect: str, events: Iterable[str]) -> bool:
     """True if the bmad-loop relay is registered for any of `events`."""
     container = hook_event_container(config, dialect)
