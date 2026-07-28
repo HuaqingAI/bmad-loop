@@ -1349,6 +1349,35 @@ def test_token_budget_latch_survives_resume(project):
     assert len(_budget_entries(resumed)) == 1
 
 
+def test_token_budget_latch_waits_for_the_durable_record(project):
+    """The latch is a pure suppression bit — it must never outlive a failed
+    journal write. `Journal.append` is unguarded IO, and the run-level `finally`
+    persists whatever the task carries on every abort arm, so latching before the
+    record would leave a story that overran suppressed forever with nothing
+    written anywhere: #336 again, from an ordinary OSError."""
+    engine, policy = _budget_engine(project, [dev_effect(project, "1-1-a")], budget=1)
+
+    real_append = engine.journal.append
+
+    def failing_append(kind, **fields):
+        if kind == "token-budget-exceeded":
+            raise OSError("journal.jsonl is not writable")
+        return real_append(kind, **fields)
+
+    engine.journal.append = failing_append
+    assert engine.run().crashed
+    # the record never landed, so the bit that would suppress it must not have
+    assert load_state(engine.run_dir).tasks["1-1-a"].token_budget_warned is False
+
+    engine.journal.append = real_append  # the resumed engine reuses this Journal
+    resumed, _ = resume_engine(
+        project, engine, [review_effect(project, "1-1-a", clean=True)], policy=policy
+    )
+    assert resumed.run().done == 1
+    # still owed, so still delivered — one entry, from the resumed session
+    assert len(_budget_entries(resumed)) == 1
+
+
 # ------------------------------ mid-session token-budget guard (#158)
 
 
