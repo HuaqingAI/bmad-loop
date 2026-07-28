@@ -437,6 +437,27 @@ def test_invalid_session_budget_mode():
         policy.loads('[limits]\nsession_budget_mode = "sometimes"\n')
 
 
+def test_max_tokens_per_story_default_and_parse():
+    assert policy.loads("").limits.max_tokens_per_story == 2_000_000
+    assert policy.loads("[limits]\nmax_tokens_per_story = 500\n").limits.max_tokens_per_story == 500
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_max_tokens_per_story_must_be_positive(bad):
+    """Documented as int >= 1 (core.toml `minimum = 1`), but the parser used a
+    bare int() and took 0 — which now warns on every story at its first session
+    boundary rather than once post-done."""
+    with pytest.raises(policy.PolicyError, match=r"limits\.max_tokens_per_story"):
+        policy.loads(f"[limits]\nmax_tokens_per_story = {bad}\n")
+
+
+@pytest.mark.parametrize("bad", ["true", "2.5", '"2M"'])
+def test_max_tokens_per_story_rejects_non_integers(bad):
+    """Same rule as the per-session cap: `true` coerced to a 1-token story cap."""
+    with pytest.raises(policy.PolicyError, match=r"limits\.max_tokens_per_story"):
+        policy.loads(f"[limits]\nmax_tokens_per_story = {bad}\n")
+
+
 def test_max_tokens_per_session_default_parse_and_template():
     import tomllib
 

@@ -141,6 +141,9 @@ class LimitsPolicy:
     # for a session that never complies. True enables it; False keeps the pre-M4
     # behavior (synthesis only).
     dev_contract_nudge: bool = True
+    # advisory cost-weighted cap on a whole STORY's cumulative spend, re-checked
+    # at every session boundary and warned about once per story (#336). Nothing
+    # is terminated on the crossing — enforcement is max_tokens_per_session below.
     max_tokens_per_story: int = 2_000_000
     # weight of cache-read tokens in the budget check (1.0 = count raw)
     cache_read_weight: float = 0.1
@@ -153,7 +156,8 @@ class LimitsPolicy:
     session_budget_mode: str = "warn"
     # weighted (cache_read_weight-discounted) per-SESSION cap the adapter wait
     # loops sample cumulative usage against every ~30s heartbeat tick. Distinct
-    # from the advisory post-done max_tokens_per_story.
+    # from the advisory per-story max_tokens_per_story: this one is per session
+    # and can end it; that one spans a story's sessions and only warns.
     max_tokens_per_session: int = 4_000_000
     # enforce mode: seconds a tripped session gets to wrap up after the nudge
     # before it is terminated over_budget. 0 = terminate at trip, no nudge.
@@ -695,7 +699,14 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
 
     # the budget knobs gate enforce-mode termination, so a coerced bool/float
     # (true -> 1 token) must be rejected, not silently accepted (same rule as
-    # scm.preserve_keep below)
+    # scm.preserve_keep below). The per-story cap is checked here on the same
+    # terms even though it only warns: a coerced `true` caps a whole story at 1
+    # token, which now fires at the first session boundary of every story.
+    max_tokens_per_story = limits_d.get("max_tokens_per_story", LimitsPolicy.max_tokens_per_story)
+    if isinstance(max_tokens_per_story, bool) or not isinstance(max_tokens_per_story, int):
+        raise PolicyError(
+            f"limits.max_tokens_per_story must be an integer: got {max_tokens_per_story!r}"
+        )
     max_tokens_per_session = limits_d.get(
         "max_tokens_per_session", LimitsPolicy.max_tokens_per_session
     )
@@ -736,9 +747,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         dev_contract_nudge=bool(
             limits_d.get("dev_contract_nudge", LimitsPolicy.dev_contract_nudge)
         ),
-        max_tokens_per_story=int(
-            limits_d.get("max_tokens_per_story", LimitsPolicy.max_tokens_per_story)
-        ),
+        max_tokens_per_story=max_tokens_per_story,
         cache_read_weight=float(limits_d.get("cache_read_weight", LimitsPolicy.cache_read_weight)),
         session_budget_mode=str(
             limits_d.get("session_budget_mode", LimitsPolicy.session_budget_mode)
@@ -776,6 +785,10 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         raise PolicyError(
             f"limits.session_budget_mode must be one of {sorted(SESSION_BUDGET_MODES)}: "
             f"got {limits.session_budget_mode!r}"
+        )
+    if limits.max_tokens_per_story < 1:
+        raise PolicyError(
+            f"limits.max_tokens_per_story must be >= 1: got {limits.max_tokens_per_story}"
         )
     if limits.max_tokens_per_session < 1:
         raise PolicyError(

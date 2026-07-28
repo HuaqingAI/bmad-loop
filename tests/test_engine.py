@@ -1232,18 +1232,21 @@ def test_session_end_journals_weighted_beside_raw(project):
         assert end["tokens_weighted"] == 660  # 100 + 50 + 10 + round(1000 * 0.5)
 
 
-def test_token_budget_exceeded_journals_weighted(project):
+def _budget_engine(project, script, *, budget, usage=None):
+    """A one-story run whose weighted per-session spend is 80k, against `budget`."""
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
-    usage = TokenUsage(input_tokens=15_000, output_tokens=5_000, cache_read_tokens=600_000)
     run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
     adapter = MockAdapter(
-        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
-        usage_per_session=usage,
+        script,
+        usage_per_session=usage
+        or TokenUsage(input_tokens=15_000, output_tokens=5_000, cache_read_tokens=600_000),
     )
     policy = Policy(
         gates=GatesPolicy(mode="none"),
         notify=QUIET,
-        limits=LimitsPolicy(max_tokens_per_story=100_000),  # < 2 x 80k weighted
+        # the deferring-story case needs the retry/defer continuation path
+        scm=ScmPolicy(rollback_on_failure=True),
+        limits=LimitsPolicy(max_tokens_per_story=budget),
     )
     engine = Engine(
         paths=project,
@@ -1253,15 +1256,126 @@ def test_token_budget_exceeded_journals_weighted(project):
         journal=Journal(run_dir),
         state=RunState(run_id="test-run", project=str(project.project), started_at="now"),
     )
+    return engine, policy
+
+
+def _budget_entries(engine):
+    return [e for e in engine.journal.entries() if e["kind"] == "token-budget-exceeded"]
+
+
+def test_token_budget_exceeded_journals_weighted(project):
+    """The crossing is judged at the session boundary that crossed it — here the
+    second of two sessions — and warns exactly once with the story-cumulative
+    figure, the cap it was compared against, and an operator-facing notice."""
+    engine, _ = _budget_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        budget=100_000,  # < 2 x 80k weighted, > 1 x 80k
+    )
     engine.run()
 
-    entries = [
-        line
-        for line in (run_dir / "journal.jsonl").read_text().splitlines()
-        if "token-budget-exceeded" in line
-    ]
+    entries = _budget_entries(engine)
     assert len(entries) == 1
-    assert '"weighted": 160000' in entries[0]
+    assert entries[0]["weighted"] == 160_000
+    assert entries[0]["total"] == 2 * 620_000
+    assert entries[0]["budget"] == 100_000
+    attention = (engine.run_dir / "ATTENTION").read_text()
+    assert "story token budget exceeded: 1-1-a" in attention
+    assert "160000 weighted tokens" in attention
+    assert "advisory" in attention
+    assert engine.state.tasks["1-1-a"].token_budget_warned is True
+
+
+def test_token_budget_warns_on_a_story_that_never_commits(project):
+    """The reported overrun (#336) was on a story that DEFERRED. The predecessor
+    check ran past `advance(task, Phase.DONE)`, so only committing stories were
+    ever judged and this one produced no record at all."""
+    engine, _ = _budget_engine(
+        project,
+        [SessionResult(status="stalled"), SessionResult(status="stalled")],
+        budget=100_000,
+    )
+    summary = engine.run()
+
+    assert summary.deferred == 1
+    assert engine.state.tasks["1-1-a"].phase == Phase.DEFERRED
+    entries = _budget_entries(engine)
+    assert len(entries) == 1
+    assert entries[0]["weighted"] == 160_000
+
+
+def test_token_budget_warns_once_per_story(project):
+    """The latch is per story, not per session: every session AFTER the crossing
+    is over the cap too, so without it an overrunning story would re-notify for
+    the rest of its life."""
+    engine, _ = _budget_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        budget=1,  # every session boundary is over
+    )
+    summary = engine.run()
+
+    assert summary.done == 1
+    entries = _budget_entries(engine)
+    assert len(entries) == 1
+    # the FIRST crossing, not the run total — the notice is not re-sent per session
+    assert entries[0]["weighted"] == 80_000
+
+
+def test_token_budget_latch_survives_resume(project):
+    """The latch is persisted, so the crossing stays a one-time event per story
+    rather than per process — a resumed run inherits "already warned"."""
+    engine, policy = _budget_engine(project, [dev_effect(project, "1-1-a")], budget=1)
+
+    original_emit = engine._emit
+
+    def crashing_emit(stage, *args, **kwargs):
+        # die in the post-session window, just past the budget note
+        if stage == "post_session":
+            raise RuntimeError("host died in the post-session window")
+        return original_emit(stage, *args, **kwargs)
+
+    engine._emit = crashing_emit
+    assert engine.run().crashed
+    assert load_state(engine.run_dir).tasks["1-1-a"].token_budget_warned is True
+
+    resumed, _ = resume_engine(
+        project, engine, [review_effect(project, "1-1-a", clean=True)], policy=policy
+    )
+    assert resumed.run().done == 1
+
+    # the resumed review session is over the cap on the story's persisted totals;
+    # only the inherited latch keeps it quiet.
+    assert len(_budget_entries(resumed)) == 1
+
+
+def test_token_budget_latch_waits_for_the_durable_record(project):
+    """The latch is a pure suppression bit — it must never outlive a failed
+    journal write. `Journal.append` is unguarded IO, and the run-level `finally`
+    persists whatever the task carries on every abort arm, so latching before the
+    record would leave a story that overran suppressed forever with nothing
+    written anywhere: #336 again, from an ordinary OSError."""
+    engine, policy = _budget_engine(project, [dev_effect(project, "1-1-a")], budget=1)
+
+    real_append = engine.journal.append
+
+    def failing_append(kind, **fields):
+        if kind == "token-budget-exceeded":
+            raise OSError("journal.jsonl is not writable")
+        return real_append(kind, **fields)
+
+    engine.journal.append = failing_append
+    assert engine.run().crashed
+    # the record never landed, so the bit that would suppress it must not have
+    assert load_state(engine.run_dir).tasks["1-1-a"].token_budget_warned is False
+
+    engine.journal.append = real_append  # the resumed engine reuses this Journal
+    resumed, _ = resume_engine(
+        project, engine, [review_effect(project, "1-1-a", clean=True)], policy=policy
+    )
+    assert resumed.run().done == 1
+    # still owed, so still delivered — one entry, from the resumed session
+    assert len(_budget_entries(resumed)) == 1
 
 
 # ------------------------------ mid-session token-budget guard (#158)

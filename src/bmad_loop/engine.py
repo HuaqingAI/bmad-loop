@@ -1799,14 +1799,6 @@ class Engine:
         self.journal.append("story-done", story_key=task.story_key, commit=task.commit_sha)
         self._emit("post_commit", task)
         self._save()
-        weighted = task.tokens.weighted_total(self.policy.limits.cache_read_weight)
-        if weighted > self.policy.limits.max_tokens_per_story:
-            self.journal.append(
-                "token-budget-exceeded",
-                story_key=task.story_key,
-                weighted=weighted,
-                total=task.tokens.total,
-            )
 
     # ----------------------------------------------------- override seams
     # SweepEngine reuses the dev/review pipeline for deferred-work bundles by
@@ -2750,6 +2742,7 @@ class Engine:
                 except Exception:  # nosec B110
                     pass
         self._save()
+        self._note_story_token_budget(task)
         self._emit(
             "post_session",
             task,
@@ -2761,6 +2754,79 @@ class Engine:
             result_json=result.result_json,  # pyright: ignore[reportOptionalMemberAccess]
         )
         return result  # pyright: ignore[reportReturnType]
+
+    def _note_story_token_budget(self, task: StoryTask) -> None:
+        """Warn once when a story's cost-weighted spend crosses
+        ``limits.max_tokens_per_story``, at the session boundary that crossed it.
+
+        The cap is advisory by contract (docs/FEATURES.md) — this warns, it never
+        terminates. Enforcement is the separate mid-session guard (#158,
+        ``max_tokens_per_session``), a different cap with its own latch, untouched
+        here.
+
+        Placement is the whole point of #336. The predecessor check sat in
+        ``_finalize_commit_phase`` past ``advance(task, Phase.DONE)``, so it saw
+        only stories that committed and only after their last token was spent: the
+        reported 4x overrun happened on a story that DEFERRED, which produced no
+        record at all — total silence, not late silence. Every session of every run
+        type funnels through ``_run_session``, so judging here covers the deferring
+        and escalating stories too, and SweepEngine/StoriesEngine inherit it
+        unchanged.
+
+        Called after the tail ``_save()``, where ``task.tokens`` is both fresh
+        (``attach_session_usage`` folded this session in above) and
+        story-cumulative (it is the task's running total, not the session's). A
+        session that aborted never reaches here — the exception propagates past the
+        ``finally`` — so no story is judged on a usage read that did not happen.
+
+        Weight comes from live ``self.policy``, not ``state.cache_read_weight()``:
+        this is the enforcement side of the split documented at ``summary()`` —
+        displays must reproduce from state.json, budgets bind at the policy the
+        running process enforces.
+
+        Emit order is load-bearing at both ends — see the comments below. The
+        invariant: never latch a suppression bit before the record it suppresses
+        is durable."""
+        if task.token_budget_warned:
+            return
+        budget = self.policy.limits.max_tokens_per_story
+        weighted = task.tokens.weighted_total(self.policy.limits.cache_read_weight)
+        if weighted <= budget:
+            return
+        self.journal.append(
+            "token-budget-exceeded",
+            story_key=task.story_key,
+            weighted=weighted,
+            total=task.tokens.total,
+            budget=budget,
+        )
+        # Latch only once the record it suppresses is durable. Unlike the phase
+        # this method's siblings set before their own journal write
+        # (`_record_defer`, `_escalate`), `token_budget_warned` is rendered on no
+        # surface — it is a pure suppression bit, so "latch persisted, record
+        # lost" is a story that overran in total silence, i.e. #336 itself. The
+        # append above is unguarded IO (journal.py) and the run-level `finally`
+        # in `_run_inner` persists whatever the task carries on EVERY abort arm,
+        # so latching first would bury the overrun for good on an OSError there.
+        # Leaving it unlatched costs at most a duplicate notice next boundary.
+        task.token_budget_warned = True
+        gates.notify(
+            self.policy,
+            self.run_dir,
+            f"story token budget exceeded: {task.story_key}",
+            f"{weighted} weighted tokens ({task.tokens.total} raw incl. cache reads) "
+            f"past the {budget} `limits.max_tokens_per_story` cap — advisory: the "
+            f"story continues. Stop the run with `bmad-loop stop` if the spend is "
+            f"no longer worth it.",
+        )
+        # ...and `_save()` stays AFTER the notice, the emit order every
+        # record-a-decision site shares. That same run-level `finally` already
+        # makes the latch durable on any in-process abort in this window, so only
+        # a SIGKILL can re-warn — and at-least-once is the right bias for a
+        # warning whose whole purpose is to not be silent: a duplicate ATTENTION
+        # line is cosmetic, a lost one is the bug. Do not hoist this above the
+        # emit pair; that trades the cosmetic failure for the silent one.
+        self._save()
 
     def _dev_prompt(self, task: StoryTask, feedback: Path | None) -> str:
         return self._generic_dev_prompt(task, feedback)

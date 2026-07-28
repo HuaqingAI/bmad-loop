@@ -91,8 +91,18 @@ def notify(policy: Policy, run_dir: Path, title: str, message: str) -> None:
     at the command-construction level; verify visual delivery manually per OS."""
     if policy.notify.file:
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        with (run_dir / ATTENTION_FILE).open("a", encoding="utf-8") as f:
-            f.write(f"[{stamp}] {title}: {message}\n")
+        try:
+            with (run_dir / ATTENTION_FILE).open("a", encoding="utf-8") as f:
+                f.write(f"[{stamp}] {title}: {message}\n")
+        except OSError:
+            # observe-degrade: an unwritable ATTENTION file is observability,
+            # never a reason to break the loop (the _write_heartbeat doctrine,
+            # already applied to this same call in the adapter budget guards).
+            # Without it the "never raises" contract above was false for the
+            # file half, and an unwritable run dir turned an advisory notice
+            # into a run crash at every record-a-decision site. The journal
+            # entry each caller writes first stays the durable record.
+            pass
     # Native desktop notification per platform: osascript (macOS), a best-effort
     # WinRT PowerShell toast (Windows), notify-send (Linux). None → silently skip;
     # `validate` and run start warn separately when notify.desktop is inert here.

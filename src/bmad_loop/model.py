@@ -253,6 +253,14 @@ class StoryTask:
     branch: str = ""
     sessions: list[SessionRecord] = field(default_factory=list)
     tokens: TokenUsage = field(default_factory=TokenUsage)
+    # latched the first time this story's cost-weighted spend crossed
+    # limits.max_tokens_per_story at a session boundary, so the advisory notice
+    # fires once per STORY rather than once per session after the crossing
+    # (every later session of an overrunning story is over the cap too). Never
+    # cleared: the crossing is a fact about the story's spend, and the raw
+    # counts it was computed from stay in `tokens`. Persisted precisely so a
+    # resumed run does not re-notify what the pre-pause process already did.
+    token_budget_warned: bool = False
 
     @property
     def terminal(self) -> bool:
@@ -306,6 +314,7 @@ class StoryTask:
             "branch": self.branch,
             "sessions": [s.to_dict() for s in self.sessions],
             "tokens": self.tokens.to_dict(),
+            "token_budget_warned": self.token_budget_warned,
         }
 
     def _serialized_spec_file(self) -> str | None:
@@ -355,6 +364,7 @@ class StoryTask:
             branch=str(d.get("branch", "")),
             sessions=[SessionRecord.from_dict(s) for s in d.get("sessions", [])],
             tokens=TokenUsage.from_dict(d.get("tokens", {})),
+            token_budget_warned=bool(d.get("token_budget_warned", False)),
         )
 
 

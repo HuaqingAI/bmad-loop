@@ -101,6 +101,16 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 ### Changed
 
+- **The story token budget is checked while the story runs (#336).** `max_tokens_per_story` was
+  read once, after the story had already been marked done — so an overrun was reported only after
+  every token was spent, and a story that deferred or escalated was never checked at all (one field
+  report burned 8.35M weighted against a 2M cap in silence). The cumulative weighted spend is now
+  re-checked at every session boundary, on every path a story can take, and the first crossing
+  raises an ATTENTION + desktop notice naming the spend and the cap. Latched per story and
+  persisted, so a resume does not re-notify. Still advisory: nothing is terminated — the
+  session-ending cap remains `limits.max_tokens_per_session`. The `token-budget-exceeded` journal
+  entry gains a `budget` field.
+
 - **A failed worktree snapshot now blocks the rollback reset (#340).** The two preserve steps were
   asymmetric: an auto-rollback refused to reset past commits it could not park, but a failed
   _uncommitted_-work snapshot was journaled and the `reset --hard` ran anyway — destroying the
@@ -163,6 +173,20 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   A project still on `bmad-auto` should migrate on 0.9.0 before upgrading past it.
 
 ### Fixed
+
+- **An unwritable `ATTENTION` file can no longer crash a run.** `gates.notify` promised "never
+  raises", but only its desktop half was guarded — the `ATTENTION` append was bare IO, so an
+  unwritable run dir turned an advisory notice into a run crash at every site that journals a
+  decision and then announces it (defer, escalate, plugin veto, manual-recovery pause, budget
+  warnings). The file sink now degrades like the desktop one, matching the observe-degrade rule the
+  adapter budget guards already applied to the same call. The journal entry each caller writes
+  first remains the durable record.
+
+- **`limits.max_tokens_per_story` is validated like its per-session sibling.** It was parsed with a
+  bare `int()`, so `true` silently became a 1-token story cap and `0` was accepted — both against
+  the documented `int >= 1`. Non-integers and values below 1 now raise `PolicyError` at load, the
+  same rule `max_tokens_per_session` has always used. Note this rejects a `policy.toml` that
+  previously loaded; there is no `0 = off` semantic (set the cap high instead — it only warns).
 
 - **A pause inside a defer's rollback no longer loses the defer record (#342).** `_defer` advanced
   the task to terminal DEFERRED before recovering the tree, so a rollback that paused instead
