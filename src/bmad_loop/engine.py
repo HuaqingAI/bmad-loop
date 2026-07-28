@@ -1798,10 +1798,11 @@ class Engine:
         inside it. ``finalize_commit`` is content-idempotent across both crash
         states — pre-squash (skill commit chain above baseline) squashes
         normally; post-squash (squashed commit at HEAD, clean tree)
-        re-squashes to an identical-content commit, orphaning the pre-crash
-        squash (harmless). ``commit_sha`` is stamped only here and is
-        write-only (never routing), so the empty persisted value is
-        harmless."""
+        re-squashes to an equivalent-content commit, orphaning the pre-crash
+        squash (harmless; "equivalent" rather than "identical" because a park
+        record regenerated across midnight carries a new ``parked_at``).
+        ``commit_sha`` is stamped only here and is write-only (never routing),
+        so the empty persisted value is harmless."""
         message = self._commit_message(task)
         # pre_commit: a plugin may rewrite the commit message or escalate (pause).
         # A defer/skip veto would have to unwind a COMMITTING task (no legal move
@@ -1821,8 +1822,13 @@ class Engine:
         # the close, before its write, so both failure arms below hold the
         # pre-close text no matter where in the window a raise lands.
         snapshot: list[tuple[Path, str]] = []
+        park_record: tuple[Path, str | None] | None = None
         try:
             self._close_declared_deferred(task, snapshot)
+            # A parked story's record rides this same commit (#356): written into
+            # the workspace ahead of the `git add -A`, it reaches every clone the
+            # story's commit does — including through the worktree merge-back.
+            park_record = self._write_park_record(task)
             # bmad-dev-auto commits its own work each iteration; the orchestrator
             # squashes that chain plus its uncommitted bookkeeping back onto the
             # pre-dev baseline as one commit carrying `message`. None means there
@@ -1837,6 +1843,7 @@ class Engine:
             task.restore_patch = None
         except verify.GitError as e:
             self._restore_deferred_closes(task, snapshot)
+            self._restore_park_record(park_record)
             self._escalate(task, f"commit failed: {e}")
         except BaseException:
             # A failed commit is not the only way out of this window: the signal
@@ -1844,9 +1851,10 @@ class Engine:
             # thread is standing, and an OSError raised outside `_run_git` (an
             # FS fault; the spawn class arrives as GitSpawnError since #343 and
             # takes the arm above) passes through as itself. Either leaves the
-            # ledger flipped for a commit that does not exist. Restore, then
-            # re-raise untouched.
+            # ledger flipped — and the park record written — for a commit that
+            # does not exist. Restore, then re-raise untouched.
             self._restore_deferred_closes(task, snapshot)
+            self._restore_park_record(park_record)
             raise
         # Final-phase rule: AWAITING_OPERATOR iff the task carries actions,
         # otherwise DONE. Derived from PERSISTED task state, never from a local
@@ -1864,7 +1872,6 @@ class Engine:
                 commit=task.commit_sha,
                 actions=list(task.operator_actions),
             )
-            self._index_park(task)
             self._notify_park(task)
         else:
             advance(task, Phase.DONE)
@@ -1888,8 +1895,8 @@ class Engine:
         `RuntimeError` joins the guard because `Path.resolve` reports a symlink
         loop that way below 3.13 — the same non-OSError `_ledger_in_repo` already
         catches, and `requires-python` is 3.11. Catching it HERE rather than only
-        around the call is what keeps the fallback: the index entry is still
-        written, with `spec_file` recorded verbatim, and per #356 the entry is
+        around the call is what keeps the fallback: the park record is still
+        written, with `spec_file` recorded verbatim, and per #356 the record is
         load-bearing (a story key does not yield a spec path)."""
         spec_file = task.spec_file or ""
         if not spec_file:
@@ -1899,39 +1906,65 @@ class Engine:
         except (OSError, RuntimeError, ValueError):
             return spec_file
 
-    def _index_park(self, task: StoryTask) -> None:
-        """Add the parked story to the project's operator-actions index — the
-        store `bmad-loop confirm` reads.
+    def _write_park_record(self, task: StoryTask) -> tuple[Path, str | None] | None:
+        """Write the parked story's committed record — the store `bmad-loop
+        confirm` reads (#356) — returning ``(path, prior_text)`` for the restore
+        arm, or None when nothing was written (not a park, or the write failed).
+
+        Runs inside the commit window, into the WORKSPACE (the unit worktree
+        under isolation, like the sprint-status mirror and the deferred-close
+        annotations), so `finalize_commit`'s `git add -A` folds it into the
+        story's own commit and the merge-back carries it to the target. Rooted
+        at `self.workspace.paths.project`, NOT `self.paths.project`: the main
+        root is the wrong tree here — a record written there would sit
+        untracked beside the commit instead of inside it.
 
         Best-effort by design, and the only write on this path that is. The
-        commit has already landed: the work is safe, the board says
-        `awaiting-operator`, and the journal and spec both record what is owed.
-        Raising here would abort a story that genuinely succeeded over its
-        bookkeeping, so an unwritable index degrades to a journal line — and
-        `validate` reports the resulting drift (`operator.registry-stale`).
-
-        This runs at the tail of `_finalize_commit_phase`, OUTSIDE every try
-        there and after `advance(task, Phase.AWAITING_OPERATOR)`, so an escape
-        skips `_notify_park`, `_emit("post_commit")` and `self._save()` — the
-        park phase is never persisted, over an index write that was best-effort
-        by design. `RuntimeError` is in the guard for a second reason beyond the
-        resolve above: `record_park` -> `_write_store` -> `_exclude_from_git` ->
-        `install._worktree_local_exclude` has a bare `.resolve()` outside that
-        function's only try, reachable when `git rev-parse --git-common-dir`
-        answers with a relative path (the linked-worktree case — exactly this
-        one)."""
+        park itself is defined by the spec frontmatter and the board token;
+        raising here would abort a story that genuinely succeeded over its
+        bookkeeping, so an unwritable record degrades to a journal line — and
+        `validate` reports the board-parked-but-recordless drift. The kind
+        stays `operator-index-failed` so nothing greping journals re-learns a
+        name. `RuntimeError` stays in the guard for `_park_spec_relpath`'s
+        reason (symlink-loop `resolve` below 3.13) and as insurance: the cost
+        of degrading a non-OSError here is a missing record, the cost of NOT
+        catching it is an aborted commit for a finished story."""
+        if not task.operator_actions:
+            return None
+        path = operatoractions.record_path(self.workspace.paths.project, task.story_key)
         try:
+            prior = path.read_text(encoding="utf-8") if path.is_file() else None
             operatoractions.record_park(
-                self.paths.project,
+                self.workspace.paths.project,
                 task.story_key,
                 actions=list(task.operator_actions),
                 spec_file=self._park_spec_relpath(task),
-                commit=task.commit_sha or "",
                 run_id=self.state.run_id,
                 parked_at=self._today(),
             )
         except (OSError, RuntimeError) as e:
             self.journal.append("operator-index-failed", story_key=task.story_key, error=str(e))
+            return None
+        return (path, prior)
+
+    def _restore_park_record(self, record: tuple[Path, str | None] | None) -> None:
+        """Put the park record back the way `_write_park_record` found it, for
+        the failure arms of the commit window: a `GitError` escalation or a
+        pass-through raise must not leave a record — untracked, in a tree the
+        next story's `git add -A` would sweep — for a commit that does not
+        exist. Best-effort like `_restore_deferred_closes`: the restore runs
+        under an exception already in flight and must never replace it."""
+        if record is None:
+            return
+        path, prior = record
+        with contextlib.suppress(OSError):
+            if prior is None:
+                path.unlink(missing_ok=True)
+                parent = path.parent
+                if parent.is_dir() and not any(parent.iterdir()):
+                    parent.rmdir()
+            else:
+                path.write_text(prior, encoding="utf-8")
 
     def _notify_park(self, task: StoryTask) -> None:
         """Tell the human a story is waiting on them, and exactly what for.

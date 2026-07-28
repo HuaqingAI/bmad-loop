@@ -9,6 +9,19 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **A park travels with its story's commit, so `bmad-loop confirm` works from any clone (#356).**
+  Each parked story now writes one committed JSON record to `.bmad-loop/operator/<key>.json`, inside
+  the story's own commit window, so the record rides the park's commit — through the worktree
+  merge-back, under every merge strategy — and reaches every clone the commit does. A teammate,
+  fresh clone, or CI can `confirm --list` and `confirm <key>` a story parked on another machine.
+  The machine-local index (`.bmad-loop/operator-actions.json`) is retired: still read and pruned so
+  an in-flight park from an older version stays confirmable where it was written, never written
+  again. The record carries no commit sha (it cannot name the commit it rides); provenance is
+  derived from the record's own git history, and an uncommitted record renders without one. A
+  failed record write never blocks the story — it parks recordless, journaled and reported by
+  `validate` — and a failed commit restores the record as found. Confirming commits the record's
+  deletion together with the spec+board flip, and a legacy-only park still gets that commit.
+
 - **`bmad-loop confirm` completes a parked story (#335, part 3 of 4).** Once you have carried out the
   external actions a story owed, `bmad-loop confirm <story-key>` walks you through them one at a time
   (`--yes` skips the prompts), writes the spec's `## Operator Confirmation` audit section, advances
@@ -31,15 +44,11 @@ breaking changes may land in a minor release.
   disagreement that co-occurs with an unreadable action list — the two have different remedies, and
   only the first was ever reported.
 
-  Parks are indexed in `.bmad-loop/operator-actions.json`, written at park time along with a
-  notification naming the actions and the command that ends them. The index is **machine-local and
-  never committed** (it is registered in the repository's local git exclude): it is written from
-  inside a story's commit window, where committing it would either shift `HEAD` past the commit the
-  park just stamped or, under worktree isolation, advance the target branch and break an
-  `scm.merge_strategy = "ff"` merge-back. So a park is confirmed on the machine that ran it. The
-  committed truth stays the spec and the board; `confirm` refuses an index entry that disagrees with
-  them, and `validate` reports the drift in both directions (`operator.registry-stale`,
-  `operator.actions-malformed`).
+  Parks are recorded at park time along with a notification naming the actions and the command
+  that ends them — as committed per-story records since #356 (above), which is what lets a clone
+  that never ran the story confirm it. The committed truth stays the spec and the board: `confirm`
+  refuses a record that disagrees with them, and `validate` reports the drift in both directions
+  (`operator.registry-stale`, `operator.actions-malformed`).
 
 - **Stories can park at `awaiting-operator` (#335, part 2 of 4).** A dev session whose story needs
   an action only a human can take outside the repo — buy a domain, publish a DNS record, grant an

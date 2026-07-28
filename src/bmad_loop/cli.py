@@ -1567,7 +1567,11 @@ def _print_parked(parked: list[operatoractions.ParkedStory]) -> int:
         else:
             drift = p.drift()
             suffix = f"  — NOT CONFIRMABLE: {drift}" if drift else ""
-        print(f"  {p.story_key} (parked {p.parked_at}, commit {p.commit[:8]}){suffix}")
+        # `commit` is derived provenance and legitimately empty for a record not
+        # yet in any commit (NO_VCS, or a crash before the park's commit landed)
+        # — render nothing rather than a dangling "commit " fragment.
+        provenance = f", commit {p.commit[:8]}" if p.commit else ""
+        print(f"  {p.story_key} (parked {p.parked_at}{provenance}){suffix}")
         for i, action in enumerate(p.actions, 1):
             print(f"      {i}. {action}")
         print("")
@@ -1606,7 +1610,7 @@ def cmd_confirm(args: argparse.Namespace) -> int:
     Out of band by construction. The run that parked the story is long finished
     and its task is in a terminal phase with no legal transition, so this touches
     no run state at all — it writes the two things that DEFINE the story's
-    completion (the spec and the board) and drops the index entry that pointed at
+    completion (the spec and the board) and drops the park record that pointed at
     them. Nothing is re-driven: the agent-doable work was committed at park time,
     and re-running a session would redo finished work while the human's actions
     stayed outside the repo. `--reverify` is there for the case that matters —
@@ -1636,10 +1640,11 @@ def cmd_confirm(args: argparse.Namespace) -> int:
     story = next((p for p in parked if p.story_key == key), None)
     if story is None:
         print(
-            f"error: {key} is not awaiting operator actions on this machine. The index "
-            f"({operatoractions.STORE_REL}) is written by the run that parked the story "
-            f"and is not committed, so confirm runs where the orchestrator ran. "
-            f"`bmad-loop confirm --list` shows what is parked here.",
+            f"error: {key} is not awaiting operator actions in this checkout. A park is "
+            f"recorded under {operatoractions.RECORDS_REL.as_posix()}/ and travels with "
+            f"the story's own commit, so if another machine's run parked it, pull the "
+            f"branch that carries the park commit. `bmad-loop confirm --list` shows "
+            f"what is parked here.",
             file=sys.stderr,
         )
         return 1
@@ -1814,7 +1819,7 @@ def _land_confirmation(
     today: str,
 ) -> int:
     """The half of a confirmation that lives OUTSIDE the spec: advance the board,
-    drop the index entry, commit the pair.
+    drop the park record, commit the set.
 
     Split out because it is exactly what an interrupted confirmation still owes.
     The spec half is already on disk in that case — audit section appended, status
@@ -1835,12 +1840,18 @@ def _land_confirmation(
             file=sys.stderr,
         )
         return 1
+    # Resolve the record path BEFORE dropping it: the drop unlinks the file, and
+    # a committed record's deletion must ride the confirm commit (#356) — the
+    # record arrived in the park's commit, so leaving its removal uncommitted
+    # would dirty the tree the next run's preflight refuses. `commit_paths`
+    # skips the path when no record was ever committed (a legacy-index park).
+    record = operatoractions.record_path(project, story.story_key)
     operatoractions.drop(project, story.story_key)
     try:
         verify.commit_paths(
             paths.repo_root,
             f"chore(operator): confirm {story.story_key}",
-            [spec, paths.sprint_status],
+            [spec, paths.sprint_status, record],
         )
     except verify.GitError:
         pass  # files are written; git history is best effort (as `decisions`)

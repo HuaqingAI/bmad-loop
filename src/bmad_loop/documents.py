@@ -130,9 +130,12 @@ def confirm_document(parked: list[ParkedStory]) -> dict[str, object]:
     has to be able to see WHICH reading made the boolean what it is.
 
     CONFIRM_SCHEMA_VERSION deliberately stays 1. Evolution here is additive-only
-    (machine.py), new fields may appear, and every field that already existed
-    produces the same value for every input — nothing a consumer pinned has
-    moved."""
+    (machine.py), new fields may appear, and no field has changed presence or
+    type. One value semantic did move with #356, stated honestly: `commit` is now
+    DERIVED from the park record's git history rather than stored at park time
+    (the committed record cannot contain its own sha), so it can be `""` for a
+    record not yet in any commit — a consumer that pinned "always 40 hex chars"
+    must treat empty as "no provenance", which the field always could express."""
     return {
         "schema_version": CONFIRM_SCHEMA_VERSION,
         "parked": [

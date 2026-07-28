@@ -4316,18 +4316,18 @@ def test_platform_preflight_notes_forced_selection_provenance(mux_registry, monk
     assert any("forced by BMAD_LOOP_MUX_BACKEND" in n for n in notes)
 
 
-# ---------------------------------------- bmad-loop confirm (#335, part 3 of 4)
+# ---------------------------------------- bmad-loop confirm (#335 part 3, #356)
 #
 # The exit from `awaiting-operator`. Out of band by construction: the run that
 # parked the story is long finished and its task is terminal, so `confirm` writes
 # only the two things that DEFINE completion (the spec and the board) and drops
-# the index entry that pointed at them.
+# the park record that pointed at them.
 
 CONFIRM_ACTIONS = ["buy example.com at the registrar", "publish the _acme-challenge TXT record"]
 
 
 def _park_story(paths, key="1-1-a", *, actions=None, spec_status="awaiting-operator", board=None):
-    """Put the project in the state a park leaves behind: spec, board, index."""
+    """Put the project in the state a park leaves behind: spec, board, record."""
     from bmad_loop import operatoractions
 
     acts = CONFIRM_ACTIONS if actions is None else actions
@@ -4339,7 +4339,6 @@ def _park_story(paths, key="1-1-a", *, actions=None, spec_status="awaiting-opera
         key,
         actions=list(acts) if isinstance(acts, list) else [],
         spec_file=sp.relative_to(paths.project).as_posix(),
-        commit="abcdef1234567890",
         run_id="run-1",
         parked_at="2026-07-28",
     )
@@ -4350,15 +4349,21 @@ def _confirm_argv(paths, *extra):
     return ["confirm", "--project", str(paths.project), *extra]
 
 
-def test_confirm_flips_spec_board_index_and_commits(project, capsys, monkeypatch):
+def test_confirm_flips_spec_board_record_and_commits(project, capsys, monkeypatch):
     """The happy path, end to end. All four records move together: the spec gains
     its audit section and reaches done, the board advances through the sole
-    writer, the index entry goes, and the pair is committed.
+    writer, the park record goes, and the set is committed — the record's
+    DELETION included, because the record arrived in the park's commit (#356)
+    and leaving its removal uncommitted would dirty the tree the next run's
+    preflight refuses.
 
     Ablation: delete the `sprintstatus.advance` call in `_apply_confirmation` and
     this fails on the board assertion — a spec saying done over a board still
-    parked is the false-green the state exists to prevent."""
-    from bmad_loop import devcontract, operatoractions, sprintstatus
+    parked is the false-green the state exists to prevent. For the deletion leg:
+    drop `record` from `_land_confirmation`'s `commit_paths` list and this fails
+    on the name-only assertion, leaving a staged-nothing deletion dirtying the
+    tree."""
+    from bmad_loop import devcontract, operatoractions, sprintstatus, verify
 
     install_bmad_config(project)
     sp = _park_story(project)
@@ -4376,8 +4381,11 @@ def test_confirm_flips_spec_board_index_and_commits(project, capsys, monkeypatch
         assert f"- {action}" in text
     assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
     assert operatoractions.load(project.project) == {}
-    # the spec and board moved into history together, and nothing else did
+    # the spec, board and record deletion moved into history together
     assert "confirm 1-1-a" in git(project.project, "log", "-1", "--format=%s")
+    changed = git(project.project, "show", "--name-only", "--format=", "HEAD")
+    assert ".bmad-loop/operator/1-1-a.json" in changed
+    assert verify.worktree_clean(project.project)
     assert "✓ 1-1-a confirmed" in capsys.readouterr().out
 
 
@@ -4428,16 +4436,18 @@ def test_confirm_yes_skips_the_prompts_but_still_prints_the_actions(project, cap
         assert action in out  # unattended still means auditable
 
 
-def test_confirm_unknown_story_explains_the_machine_local_index(project, capsys):
-    """The index is not committed, so "not here" is the common case on a second
-    machine — the error has to say that rather than implying the story is fine."""
+def test_confirm_unknown_story_explains_the_committed_record(project, capsys):
+    """Since #356 the record travels with the story's commit, so "not here" means
+    the checkout does not carry it (or the story was never parked) — the error
+    points at pulling the branch that does, never at some other machine."""
     install_bmad_config(project)
     write_sprint(project, {"epic-1": "in-progress"})
 
     assert cli.main(_confirm_argv(project, "9-9-z")) == 1
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert "not awaiting operator actions on this machine" in captured.err
+    assert "not awaiting operator actions in this checkout" in captured.err
+    assert ".bmad-loop/operator" in captured.err and "pull the branch" in captured.err
     assert "--list" in captured.err
 
 
@@ -4529,7 +4539,9 @@ def test_confirm_json_is_a_pure_document(project, capsys):
     assert entry["story_key"] == "1-1-a"
     assert entry["actions"] == CONFIRM_ACTIONS
     assert entry["confirmable"] is True and entry["drift"] is None
-    assert entry["commit"] == "abcdef1234567890" and entry["run_id"] == "run-1"
+    # `commit` is DERIVED provenance since #356 — "" for this uncommitted record,
+    # a real sha once the park's commit exists. Presence and type are stable.
+    assert entry["commit"] == "" and entry["run_id"] == "run-1"
 
 
 def test_confirm_json_carries_both_sides_of_a_disagreement(project, capsys):
@@ -4639,6 +4651,77 @@ def test_confirm_survives_a_non_git_project(project, capsys, monkeypatch):
     monkeypatch.setattr(cli.verify, "commit_paths", boom)
     assert cli.main(_confirm_argv(project, "1-1-a")) == 0
     assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+
+
+def test_confirm_commits_even_without_a_committed_record(project, capsys, monkeypatch):
+    """A pre-#356 park has a legacy machine-local entry and NO record file — so
+    `_land_confirmation` hands `commit_paths` a record path git has never seen.
+    `git add` hard-fails on a pathspec matching nothing, the `GitError` is
+    swallowed as best-effort, and the spec+board commit would silently vanish
+    behind a "✓ confirmed".
+
+    Ablation: revert `commit_paths`' missing-and-untracked filter and this fails
+    on the log assertion — confirm reports success, but nothing was committed."""
+    from bmad_loop import operatoractions, sprintstatus, verify
+
+    install_bmad_config(project)
+    sp = _park_story(project)
+    operatoractions.record_path(project.project, "1-1-a").unlink()  # old versions wrote none
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "park (pre-#356)")
+    # the machine-local entry, written AFTER the commit the way the old version did
+    store = operatoractions.legacy_store_path(project.project)
+    store.write_text(
+        json.dumps(
+            {
+                "1-1-a": {
+                    "actions": CONFIRM_ACTIONS,
+                    "spec_file": sp.relative_to(project.project).as_posix(),
+                    "commit": "abcdef1234567890",
+                    "run_id": "run-legacy",
+                    "parked_at": "2026-07-01",
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 0
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+    # the commit LANDED despite the never-committed record path in its list
+    assert "confirm 1-1-a" in git(project.project, "log", "-1", "--format=%s")
+    assert operatoractions.load(project.project) == {}  # legacy entry pruned too
+    assert verify.worktree_clean(project.project)
+
+
+def test_confirm_works_on_a_fresh_clone_of_a_parked_repo(project, capsys, monkeypatch, tmp_path):
+    """The #356 acceptance criterion at the CLI layer: the record travels with
+    the park commit, so a clone that never ran the orchestrator can list AND
+    confirm the story. Before #356 this exact flow refused with "confirm runs
+    where the orchestrator ran"."""
+    from bmad_loop import bmadconfig, sprintstatus
+
+    install_bmad_config(project)
+    _park_story(project)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "auto: 1-1-a (awaiting operator)")
+
+    clone = tmp_path / "fresh-clone"
+    git(tmp_path, "clone", "-q", str(project.project), str(clone))
+    git(clone, "config", "user.email", "operator@test")
+    git(clone, "config", "user.name", "operator")
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(["confirm", "--project", str(clone), "--list"]) == 0
+    listing = capsys.readouterr().out
+    assert "1-1-a" in listing
+    for action in CONFIRM_ACTIONS:
+        assert action in listing
+
+    assert cli.main(["confirm", "--project", str(clone), "1-1-a"]) == 0
+    clone_paths = bmadconfig.load_paths(clone)
+    assert sprintstatus.story_status(clone_paths.sprint_status, "1-1-a") == "done"
+    assert "confirm 1-1-a" in git(clone, "log", "-1", "--format=%s")
 
 
 # ------------------------- confirm: a write that did not land is not a confirmation

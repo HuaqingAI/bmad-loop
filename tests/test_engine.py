@@ -1399,16 +1399,22 @@ def test_resume_through_committing_re_derives_the_park(project):
     kinds = [e["kind"] for e in resumed.journal.entries()]
     assert "resume-commit" in kinds and "story-awaiting-operator" in kinds
     assert "story-done" not in kinds
+    # the re-driven commit carries the record (#356): `_write_park_record` is
+    # regenerated from persisted state inside the same window the resume re-enters
+    assert ".bmad-loop/operator/1-1-a.json" in git(
+        project.project, "ls-tree", "-r", "--name-only", "HEAD"
+    )
 
 
-def test_park_indexes_the_story_for_confirm(project):
-    """The park writes the project-level index `bmad-loop confirm` reads (#335
-    part 3). Without it the obligation exists only in a journal nobody greps and
+def test_park_commits_a_record_for_confirm(project):
+    """The park writes the per-story record `bmad-loop confirm` reads — INTO the
+    story's own commit (#356), so a fresh clone can confirm what this machine
+    parked. Without it the obligation exists only in a journal nobody greps and
     a spec nobody re-reads, and there is no way to find the parked story's spec
     from its key.
 
-    Ablation: delete the `_index_park` call in `_finalize_commit_phase` and this
-    fails — the story parks with nothing to confirm it from."""
+    Ablation: delete the `_write_park_record` call in `_finalize_commit_phase`
+    and this fails — the story parks with nothing to confirm it from."""
     from bmad_loop import operatoractions
 
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
@@ -1426,20 +1432,29 @@ def test_park_indexes_the_story_for_confirm(project):
 
     entry = operatoractions.load(project.project)["1-1-a"]
     assert entry["actions"] == ACTIONS
-    assert entry["commit"] == engine.state.tasks["1-1-a"].commit_sha
     assert entry["run_id"] == engine.state.run_id
+    assert "commit" not in entry  # the record rides the commit it would name
+    # the record is IN the park commit, not untracked beside it: that is what a
+    # fresh clone receives, and what keeps the tree clean for the next story
+    assert ".bmad-loop/operator/1-1-a.json" in git(
+        project.project, "ls-tree", "-r", "--name-only", "HEAD"
+    )
+    assert worktree_clean(project.project)
     # the recorded spec path resolves from the PROJECT, which is what `confirm`
     # has — a worktree-absolute path would be dead before a human read it
     (story,) = operatoractions.resolve(project.project, project)
     assert story.spec_path is not None and story.spec_path.is_file()
     assert story.confirmable, story.drift()
+    # provenance is derived from the record's own history: the park commit
+    assert story.commit == engine.state.tasks["1-1-a"].commit_sha
 
 
-def test_park_indexing_failure_never_un_commits_the_story(project, monkeypatch):
-    """The only best-effort write on the park path. The commit has already
-    landed, so raising here would abort a story that genuinely succeeded over its
-    bookkeeping — it degrades to a journal line instead, and `validate` reports
-    the resulting drift."""
+def test_park_record_failure_never_blocks_the_story(project, monkeypatch):
+    """The only best-effort write on the park path. Since #356 it runs BEFORE
+    `finalize_commit` (the record rides the story's commit), so raising here
+    would now abort the commit of a story that genuinely finished — it degrades
+    to a journal line instead, the story parks recordless, and `validate`
+    reports the board-parked-but-recordless drift."""
     from bmad_loop import operatoractions
 
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
@@ -1465,6 +1480,9 @@ def test_park_indexing_failure_never_un_commits_the_story(project, monkeypatch):
     kinds = [e["kind"] for e in engine.journal.entries()]
     assert "operator-index-failed" in kinds and "story-awaiting-operator" in kinds
     assert operatoractions.load(project.project) == {}
+    # the commit landed recordless and CLEAN — no record, no half-written .tmp
+    assert ".bmad-loop/operator" not in git(project.project, "ls-tree", "-r", "--name-only", "HEAD")
+    assert worktree_clean(project.project)
 
 
 def _park_engine(project):
@@ -1482,77 +1500,96 @@ def _park_engine(project):
     return engine
 
 
-def test_an_unresolvable_spec_path_still_indexes_the_park(project, monkeypatch):
+def test_a_failed_commit_restores_the_park_record(project):
+    """The record is written just BEFORE `finalize_commit` so it rides the
+    story's own commit — but that commit can still fail, and `_escalate` unwinds
+    nothing. Left alone, the record claims a park that is in no commit, sitting
+    untracked in the tree the run-start preflight refuses and the next story's
+    `git add -A` would sweep into an unrelated commit — the two hazards the old
+    machine-local index dodged with a git exclude, owed a restore now that the
+    record is deliberately visible.
+
+    Ablation: delete the `_restore_park_record` calls in `_finalize_commit_phase`
+    and this fails — the record survives a commit that does not exist."""
+    from bmad_loop import operatoractions
+
+    engine = _park_engine(project)
+    _reject_commits(project)
+
+    summary = engine.run()
+
+    assert summary.awaiting_operator == 0 and summary.paused  # the commit really did fail
+    assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
+    assert operatoractions.load(project.project) == {}
+    # emptied on the way out: no record, no .tmp, no husk of a directory
+    assert not operatoractions.records_dir(project.project).exists()
+
+
+def test_an_unresolvable_spec_path_still_records_the_park(project, monkeypatch):
     """`_park_spec_relpath` resolves inside a try catching `(OSError, ValueError)`,
     and below 3.13 `Path.resolve` reports a symlink loop as `RuntimeError` —
-    which is neither. It was called as an argument expression inside
-    `_index_park`'s own try, whose handler was `except OSError` only, so the type
-    escaped BOTH.
-
-    Severe because of where: `_index_park` runs at the tail of
-    `_finalize_commit_phase`, outside every try there and after
-    `advance(AWAITING_OPERATOR)`, so an escape skipped `_notify_park`,
-    `_emit("post_commit")` and **`self._save()`** — the park phase was never
-    persisted, over an index write that is best-effort by design.
-
-    Guarding it inside `_park_spec_relpath` rather than only around the call is
-    what preserves the documented fallback: `spec_file` is recorded verbatim and
-    the entry still exists. Per #356 that matters — a story key does not yield a
-    spec path, so losing the entry loses the only route back to the spec.
+    which is neither. Guarding it INSIDE `_park_spec_relpath` rather than
+    leaving it to `_write_park_record`'s outer `(OSError, RuntimeError)` guard
+    is what preserves the documented fallback: the record is still written, with
+    `spec_file` recorded verbatim, instead of degrading to no record at all.
+    Per #356 that matters — a story key does not yield a spec path, so losing
+    the record loses the only committed route back to the spec.
 
     ⚠️ The fault is INJECTED. 3.13/3.14 resolve real symlink loops without
     raising, so a loop-based test is green on this box and red only on the
     3.11/3.12 CI legs. Ablation: revert `_park_spec_relpath`'s except tuple to
-    `(OSError, ValueError)` and this fails — and run it on 3.11 too, since a
-    real-loop version would not bite here at all.
+    `(OSError, ValueError)` and this fails — the RuntimeError then lands in
+    `_write_park_record`'s outer guard, which journals `operator-index-failed`
+    and writes nothing. Run it on 3.11 too, since a real-loop version would not
+    bite here at all.
 
-    Scoped to the `_index_park` window rather than the whole run because the spec
-    is resolved on the verify path too: a fault live from the start stops the
-    story before it ever parks, which tests nothing about this guard.
+    Scoped to the `_write_park_record` window rather than the whole run because
+    the spec is resolved on the verify path too: a fault live from the start
+    stops the story before it ever parks, which tests nothing about this guard.
     `_park_spec_relpath` has exactly one caller, so the window IS its resolve."""
     from bmad_loop import operatoractions
 
     engine = _park_engine(project)
     real_resolve = Path.resolve
-    real_index = engine._index_park
+    real_write = engine._write_park_record
 
     def unresolvable(self, *a, **kw):
         if self.name.startswith("spec-"):
             raise RuntimeError(f"Symlink loop from {str(self)!r}")
         return real_resolve(self, *a, **kw)
 
-    def index_with_the_fault_live(task):
+    def write_with_the_fault_live(task):
         with monkeypatch.context() as m:
             m.setattr(Path, "resolve", unresolvable)
-            real_index(task)
+            return real_write(task)
 
-    monkeypatch.setattr(engine, "_index_park", index_with_the_fault_live)
+    monkeypatch.setattr(engine, "_write_park_record", write_with_the_fault_live)
     summary = engine.run()
 
     task = engine.state.tasks["1-1-a"]
     assert task.phase == Phase.AWAITING_OPERATOR and task.commit_sha
     assert summary.awaiting_operator == 1 and not summary.crashed and not summary.paused
-    # the entry survives with the verbatim fallback path — a wrong path a human
+    # the record survives with the verbatim fallback path — a wrong path a human
     # can see beats a missing one they cannot
     entry = operatoractions.load(project.project)["1-1-a"]
     assert entry["spec_file"] == task.spec_file and entry["actions"] == ACTIONS
-    # and the phase was PERSISTED — that is the part an escape broke
     assert load_state(engine.run_dir).tasks["1-1-a"].phase == Phase.AWAITING_OPERATOR
     kinds = [e["kind"] for e in engine.journal.entries()]
     assert "story-awaiting-operator" in kinds and "operator-index-failed" not in kinds
 
 
-def test_a_runtime_error_writing_the_index_degrades_like_an_oserror(project, monkeypatch):
-    """The second escape path, and not a duplicate of the guard above:
-    `record_park` -> `_write_store` -> `_exclude_from_git` ->
-    `install._worktree_local_exclude` has a bare `.resolve()` outside that
-    function's only try, reachable when `git rev-parse --git-common-dir` answers
-    with a relative path — the linked-worktree case, which is exactly when a park
-    is committing.
+def test_a_runtime_error_writing_the_record_degrades_like_an_oserror(project, monkeypatch):
+    """Not a duplicate of the guard above: this pins the OUTER except tuple in
+    `_write_park_record`. `RuntimeError` stays in it for `_park_spec_relpath`'s
+    reason (a symlink-loop `resolve` below 3.13, reachable through any path the
+    record write touches) — and the stakes moved with #356: the write now runs
+    INSIDE the commit window, so an escaping non-OSError no longer just skips
+    the park bookkeeping, it lands in the window's `BaseException` arm and
+    aborts the commit of a story that genuinely finished.
 
     Degrades to the same journal line its `OSError` sibling does. Ablation:
-    revert `_index_park`'s except tuple to `except OSError` and this fails — the
-    run crashes and the park phase is never saved."""
+    revert `_write_park_record`'s except tuple to `except OSError` and this
+    fails — the commit is aborted and the story never parks."""
     from bmad_loop import operatoractions
 
     engine = _park_engine(project)

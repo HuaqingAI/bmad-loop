@@ -143,6 +143,23 @@ def rev_parse_head(repo: Path) -> str:
     return out
 
 
+def last_commit_for(repo: Path, path: Path) -> str:
+    """Sha of the most recent commit touching ``path``, or ``""`` when no commit
+    does (an untracked or deleted-without-history file) or the path lies outside
+    the repo. Backs the derived provenance of an operator park record, which is
+    written into the very commit it rides and so cannot store its own sha. Git
+    failures raise :class:`GitError` like every sibling; only the path relation
+    degrades silently, mirroring `commit_paths`' outside-the-repo contract."""
+    try:
+        rel = Path(path).resolve().relative_to(repo.resolve()).as_posix()
+    except (OSError, RuntimeError, ValueError):
+        return ""
+    rc, out = _git(repo, "log", "-n", "1", "--format=%H", "--", rel)
+    if rc != 0:
+        raise GitError(f"git log failed in {repo}: {out}")
+    return out
+
+
 def worktree_clean(repo: Path) -> bool:
     # The orchestrator's own config file (.bmad-loop/policy.toml) is excluded:
     # the TUI settings editor rewrites it, and a tracked config edit must not
@@ -1969,7 +1986,13 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
     or staged changes untouched. Unlike commit_story's `add -A`, this is safe to
     call out of band (e.g. `bmad-loop decisions`) when the tree may hold the
     user's own uncommitted work. Returns the new HEAD sha, or None when the
-    given paths had no changes to commit. Paths outside the repo are ignored."""
+    given paths had no changes to commit. Paths outside the repo are ignored —
+    and so is a path git has never seen (absent from both the working tree and
+    the index): `git add` hard-fails on a pathspec matching nothing, and one
+    optional path would otherwise sink the whole commit (a swallowed `GitError`
+    in `confirm` silently losing the spec+board commit over a park record that
+    was never committed). A missing-but-TRACKED path stays in: that is a
+    deletion to stage."""
     rels: list[str] = []
     repo_root = repo.resolve()
     for p in paths:
@@ -1977,6 +2000,13 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
             rels.append(str(Path(p).resolve().relative_to(repo_root)))
         except ValueError:
             continue
+    missing = [r for r in rels if not ((repo_root / r).exists() or (repo_root / r).is_symlink())]
+    if missing:
+        rc, out = _git_raw(repo, "ls-files", "-z", "--", *missing)
+        if rc != 0:
+            raise GitError(f"git ls-files failed: {out}")
+        tracked = {t for t in out.split("\0") if t}
+        rels = [r for r in rels if r not in missing or r.replace("\\", "/") in tracked]
     if not rels:
         return None
     rc, out = _git(repo, "add", "--", *rels)

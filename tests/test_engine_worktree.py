@@ -241,6 +241,18 @@ def test_worktree_parked_unit_merges_like_a_done_one(project):
     kinds = journal_kinds(engine)
     assert "unit-merged" in kinds and "story-awaiting-operator" in kinds
     assert "unit-closed" not in kinds  # the failed-unit teardown arm never ran
+    # the park record rode the unit's own commit through the merge (#356): it is
+    # tracked at the target root — written into the WORKTREE, not the main root,
+    # where it would have sat untracked beside the merge instead of inside it —
+    # and `confirm` can resolve the story from the project alone
+    assert ".bmad-loop/operator/1-1-a.json" in git(
+        project.project, "ls-tree", "-r", "--name-only", "HEAD"
+    )
+    from bmad_loop import operatoractions
+
+    (story,) = operatoractions.resolve(project.project, project)
+    assert story.confirmable, story.drift()
+    assert story.commit  # derived from the record's history on the target branch
 
 
 def test_worktree_run_dir_is_outside_worktree(project):
