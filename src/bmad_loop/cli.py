@@ -1609,6 +1609,8 @@ def cmd_confirm(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+    if story.resumable:
+        return _resume_confirmation(project, paths, args, story)
     drift = story.drift()
     if drift is not None:
         print(
@@ -1646,6 +1648,47 @@ def cmd_confirm(args: argparse.Namespace) -> int:
             return 1
 
     return _apply_confirmation(project, paths, story, spec)
+
+
+def _resume_confirmation(
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    args: argparse.Namespace,
+    story: operatoractions.ParkedStory,
+) -> int:
+    """Finish a confirmation that was interrupted between its spec writes and its
+    board write (see `ParkedStory.resumable`).
+
+    Checked BEFORE the drift refusal, because to `drift()` this state looks like
+    an ordinary stale entry ("its spec now says status: done") — so without this
+    branch `confirm` refuses the one state re-running it exists to clear, and
+    nothing else will ever drop the entry.
+
+    Deliberately does NOT re-prompt and does NOT append a second audit section.
+    The section already on disk IS the acknowledgment; asking again would have no
+    honest meaning over a spec that already says `done`, and
+    `append_operator_confirmation` accumulates rather than no-ops, so a second
+    pass would have the audit trail claim two sign-offs for one event.
+
+    `--reverify` still runs, because it is a gate the caller requested for THIS
+    invocation rather than an acknowledgment of anything — its failure says "NOT
+    advanced", since the confirmation itself already happened."""
+    spec = story.spec_path
+    assert spec is not None  # resumable requires a spec that read back as done
+    print(
+        f"{story.story_key} was already confirmed — its spec is signed off and reads "
+        f"done, but the board and the index entry were left behind. Finishing that; "
+        f"you will not be asked to acknowledge anything again.\n"
+    )
+    if args.reverify:
+        failure = _reverify(project, paths.repo_root)
+        if failure is not None:
+            print(
+                f"error: --reverify failed, so {story.story_key} was NOT advanced: {failure}",
+                file=sys.stderr,
+            )
+            return 1
+    return _land_confirmation(project, paths, story, spec, time.strftime("%Y-%m-%d"))
 
 
 def _apply_confirmation(

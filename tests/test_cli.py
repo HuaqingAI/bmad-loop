@@ -4789,6 +4789,138 @@ def test_confirm_reports_a_board_that_did_not_advance(project, capsys, monkeypat
     assert "1-1-a" in operatoractions.load(project.project)  # NOT dropped
 
 
+# ------------------------------- confirm: finishing an interrupted confirmation
+#
+# The state a failed board write leaves: spec signed off and at `done`, board
+# still parked, index entry still there. `drift()` calls that stale, so before
+# this branch existed `confirm` refused the one state re-running it exists to
+# clear — and nothing else would ever drop the entry.
+
+
+def _interrupted_story(paths, key="1-1-a", *, board="awaiting-operator"):
+    """Exactly what `confirm` leaves when `sprintstatus.advance` raises or returns
+    unchanged: audit section appended, spec at done, board where the park left
+    it, entry still indexed."""
+    from bmad_loop import devcontract
+
+    sp = _park_story(paths, key, spec_status="done", board=board)
+    devcontract.append_operator_confirmation(sp, CONFIRM_ACTIONS, date="2026-07-28")
+    return sp
+
+
+def test_confirm_finishes_an_interrupted_confirmation(project, capsys, monkeypatch):
+    """Ablation: delete the `resumable` branch in `cmd_confirm` and this fails —
+    the refusal names "its spec now says status: done" and the entry is stranded
+    with `validate` warning about it forever."""
+    from bmad_loop import operatoractions, sprintstatus
+
+    def _boom(*a, **k):
+        raise AssertionError("a resume must not re-prompt")
+
+    monkeypatch.setattr("builtins.input", _boom)
+    monkeypatch.setattr(cli, "_confirm", _boom)
+    install_bmad_config(project)
+    _interrupted_story(project)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 0
+    out = capsys.readouterr().out
+    assert "was already confirmed" in out and "✓ 1-1-a confirmed" in out
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+    assert operatoractions.load(project.project) == {}
+
+
+def test_a_resume_does_not_append_a_second_audit_section(project, capsys, monkeypatch):
+    """`append_operator_confirmation` accumulates rather than no-ops, because a
+    genuinely repeated confirmation is a real event. A resume is not one — the
+    section on disk IS the acknowledgment being finished.
+
+    Ablation: route the resume through `_apply_confirmation` and this fails —
+    the audit trail claims two sign-offs for one event."""
+    from bmad_loop import devcontract
+
+    install_bmad_config(project)
+    sp = _interrupted_story(project)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 0
+    assert sp.read_text().count(devcontract.OPERATOR_CONFIRM_HEADING) == 1
+
+
+def test_a_resume_finishes_a_board_a_human_already_fixed(project, capsys, monkeypatch):
+    """⚠️ The half of the resume nothing else can do. Told to "fix the board by
+    hand", a human does — and now spec and board are both `done` with an index
+    entry pointing at neither. Advancing is idempotent there, so all that is left
+    is dropping the entry, which is the only thing that stops `validate` nagging.
+
+    Ablation: narrow `ParkedStory.resumable`'s board arm to `== AWAITING_OPERATOR`
+    and this fails — rc 1, and the entry survives forever."""
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    _interrupted_story(project, board="done")
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 0
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+    assert operatoractions.load(project.project) == {}
+
+
+def test_a_resume_commits_the_spec_the_interrupted_run_never_committed(
+    project, capsys, monkeypatch
+):
+    """The commit is the LAST step, so an interruption before it leaves the
+    signed-off spec uncommitted. The resume carries it into history with the
+    board, exactly as an uninterrupted confirmation would."""
+    install_bmad_config(project)
+    _park_story(project)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "park")
+    _interrupted_story(project)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 0
+    assert "confirm 1-1-a" in git(project.project, "log", "-1", "--format=%s")
+
+
+def test_a_resume_still_honors_reverify_and_says_what_was_not_done(
+    project, capsys, monkeypatch
+):
+    """`--reverify` is a gate the caller requested for THIS invocation, not an
+    acknowledgment, so it still runs. The message has to say "NOT advanced" — the
+    confirmation itself already happened, and telling a human it was "NOT
+    confirmed" sends them looking for a sign-off to redo."""
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    _interrupted_story(project)
+    _write_policy(project.project, '[verify]\ncommands = ["python -c \\"raise SystemExit(3)\\""]\n')
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a", "--reverify")) == 1
+    err = capsys.readouterr().err
+    assert "NOT advanced" in err and "NOT confirmed" not in err
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+    assert "1-1-a" in operatoractions.load(project.project)
+
+
+def test_a_spec_at_done_without_a_sign_off_is_still_refused(project, capsys, monkeypatch):
+    """The guard that keeps the resume from swallowing ordinary drift: a story
+    re-driven to done, or finished by hand, carries no ``## Operator Confirmation``
+    section. Confirming it would advance a board on nobody's word.
+
+    Ablation: drop the `confirmation_recorded` arm of `resumable` and this fails —
+    rc 0, and a story no human signed off is reported as confirmed."""
+    from bmad_loop import operatoractions
+
+    install_bmad_config(project)
+    _park_story(project, spec_status="done")
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 1
+    assert "its spec now says status: done" in capsys.readouterr().err
+    assert "1-1-a" in operatoractions.load(project.project)
+
+
 # ------------------------------------- validate: operator-index drift warnings
 
 
