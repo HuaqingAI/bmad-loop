@@ -122,6 +122,31 @@ def test_set_frontmatter_status_preserves_triple_dash_in_value(tmp_path):
     assert "body text" in spec.read_text(encoding="utf-8")
 
 
+def test_set_frontmatter_field_rewrites_a_quoted_key_instead_of_duplicating_it(tmp_path):
+    """The insert-on-miss half of this helper had a defect of its own: the line
+    scan missed a quoted key, so it APPENDED a second one and the spec carried
+    the field twice. The insert is now gated on what `read_frontmatter` sees, not
+    on a scan miss."""
+    spec = tmp_path / "spec.md"
+    spec.write_text('---\n"baseline_revision": old\n---\nbody\n', encoding="utf-8")
+    assert verify.set_frontmatter_field(spec, "baseline_revision", "abc123") is True
+    text = spec.read_text(encoding="utf-8")
+    assert text.count("baseline_revision") == 1  # rewritten, not duplicated
+    assert verify.read_frontmatter(spec)["baseline_revision"] == "abc123"
+
+
+def test_set_frontmatter_field_refuses_a_key_no_line_edit_can_move(tmp_path):
+    """Same three-way contract as `set_frontmatter_status`: False means nothing
+    to change, and a field the reader CAN see in an unrewritable shape raises
+    instead of silently appending a duplicate the reader would never resolve."""
+    spec = tmp_path / "spec.md"
+    original = "---\n{baseline_revision: old, keep: 1}\n---\nbody\n"
+    spec.write_text(original, encoding="utf-8")
+    with pytest.raises(verify.FrontmatterWriteError):
+        verify.set_frontmatter_field(spec, "baseline_revision", "abc123")
+    assert spec.read_text(encoding="utf-8") == original
+
+
 def test_set_frontmatter_field_preserves_triple_dash_in_value(tmp_path):
     """Inserting a field appends before the real standalone closing `---`, not
     inside a scalar that merely contains `---` (which the old split corrupted)."""

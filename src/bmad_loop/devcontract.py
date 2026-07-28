@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .frontmatter import _edit_frontmatter_block
 from .platform_util import atomic_replace
 from .verify import DEV_WORKFLOW, operator_actions_of, read_frontmatter
 
@@ -454,6 +455,29 @@ def _atomic_write_spec(spec_path: Path, text: str) -> None:
         raise
 
 
+def _render_status_line(line: str, m: re.Match[str], value: str) -> str:
+    """`reset_spec_status`'s replacement for a matched ``status:`` line: the
+    value moves, its quote style and any trailing inline comment stay.
+
+    Deliberately different from `frontmatter._replace_value`, which drops both —
+    that writer's callers read the result back as a bare ``status: done``, this
+    one's tests pin the preservation. Sharing the VERIFICATION is the point; the
+    formatting each already had right."""
+    # Guarantee `key: value` spacing: a bare `status:` (no trailing space) would
+    # otherwise fill to `status:done` — invalid YAML, the key is lost.
+    pre = m.group("pre")
+    if not pre.endswith((" ", "\t")):
+        pre += " "
+    # When the value was blank with a trailing inline comment, `rest` begins at
+    # the `#`; abutting the value (`status: done# c`) makes the `#` part of the
+    # scalar instead of a comment. Re-insert a separating space.
+    rest = m.group("rest")
+    if rest.startswith("#"):
+        rest = " " + rest
+    q = m.group("q")
+    return f"{pre}{q}{value}{q}{rest}" + ("\n" if line.endswith("\n") else "")
+
+
 def reset_spec_status(spec_path: Path, new_status: str) -> bool:
     """Rewrite the frontmatter ``status:`` value of a spec in place.
 
@@ -466,8 +490,19 @@ def reset_spec_status(spec_path: Path, new_status: str) -> bool:
     prose body (e.g. the ``## Auto Run Result`` section). A present-but-empty status
     is filled, and a frontmatter block with NO ``status:`` line at all gets one
     inserted before the closing fence (the skill's template can leave it blank or
-    absent). Returns True on a real change, False when the spec is absent, has no
-    frontmatter block, or is already at ``new_status``."""
+    absent).
+
+    Returns True on a real change, False when the spec is absent, has no
+    frontmatter block, or is already at ``new_status``. Raises
+    `FrontmatterWriteError` when the reader can see a status the line edit cannot
+    safely move: `_FM_STATUS_RE` reads only a ``[A-Za-z-]*`` value, so it used to
+    fill ``status: |`` to ``status: done|`` and ``status: 123`` to
+    ``status: done123`` — silently, with a True return — and it rewrote a nested
+    ``meta.status:`` in preference to the real key. The shared
+    `frontmatter._edit_frontmatter_block` re-parses each trial edit before keeping
+    it, so those become a loud refusal instead of a corrupted spec. Only
+    `engine.py:2115` reads the return; the raise is what reaches the other four
+    call sites."""
     if not spec_path.is_file():
         return False
     text = spec_path.read_text(encoding="utf-8")
@@ -475,36 +510,15 @@ def reset_spec_status(spec_path: Path, new_status: str) -> bool:
     if not fm:
         return False
     head, body, tail = fm.group(1), fm.group(2), fm.group(3)
-    changed = False
-
-    def _repl(m: re.Match[str]) -> str:
-        nonlocal changed
-        if m.group("val") == new_status:
-            return m.group(0)
-        changed = True
-        # Guarantee `key: value` spacing: a bare `status:` (no trailing space)
-        # would otherwise fill to `status:done` — invalid YAML, the key is lost.
-        pre = m.group("pre")
-        if not pre.endswith((" ", "\t")):
-            pre += " "
-        # When the value was blank with a trailing inline comment, `rest` begins at
-        # the `#`; abutting the value (`status: done# c`) makes the `#` part of the
-        # scalar instead of a comment. Re-insert a separating space.
-        rest = m.group("rest")
-        if rest.startswith("#"):
-            rest = " " + rest
-        return f"{pre}{m.group('q')}{new_status}{m.group('q')}{rest}"
-
-    if _FM_STATUS_RE.search(body):
-        new_body = _FM_STATUS_RE.sub(_repl, body, count=1)
-    else:
-        # No status: line at all — insert one before the closing fence, matching
-        # the block's line ending. `body` always ends with a newline (captured by
-        # _FRONTMATTER_RE), so this lands on its own line.
-        nl = "\r\n" if body.endswith("\r\n") else "\n"
-        new_body = f"{body}status: {new_status}{nl}"
-        changed = True
-    if not changed:
+    new_body = _edit_frontmatter_block(
+        body,
+        "status",
+        new_status,
+        pattern=_FM_STATUS_RE,
+        render=_render_status_line,
+        insert=True,
+    )
+    if new_body is None:
         return False
     _atomic_write_spec(spec_path, head + new_body + tail + text[fm.end() :])
     return True

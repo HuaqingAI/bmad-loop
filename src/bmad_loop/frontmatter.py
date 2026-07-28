@@ -22,6 +22,7 @@ cannot safely rewrite, it RAISES `FrontmatterWriteError`. That is AGENTS.md's
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -140,9 +141,34 @@ def _key_line_re(key: str) -> re.Pattern[str]:
 
 _STATUS_KEY_RE = _key_line_re("status")
 
+# Builds the replacement for a matched key line, line ending included. A hook
+# rather than one fixed rendering because the two writers on this helper preserve
+# deliberately different things: `set_frontmatter_status` drops the value's quotes
+# and any trailing comment (its callers read the result back as a bare
+# `status: done`), while `devcontract.reset_spec_status` keeps both (its own tests
+# pin them). What they share is the VERIFICATION, which is the part that was
+# wrong in all three writers — not the formatting, which each already had right.
+LineRenderer = Callable[[str, "re.Match[str]", str], str]
+
+
+def _replace_value(line: str, m: re.Match[str], value: str) -> str:
+    """Keep everything through the colon verbatim — indent, a quoted key,
+    whitespace before the colon — then ``<space><value>``.
+
+    The gap after the colon is normalized rather than preserved because a bare
+    ``status:`` has none to preserve, and filling it would write ``status:done``,
+    which is not the key at all."""
+    return f"{line[: m.end()]} {value}" + ("\n" if line.endswith("\n") else "")
+
 
 def _edit_frontmatter_block(
-    block: str, key: str, value: str, pattern: re.Pattern[str]
+    block: str,
+    key: str,
+    value: str,
+    *,
+    pattern: re.Pattern[str] | None = None,
+    render: LineRenderer = _replace_value,
+    insert: bool = False,
 ) -> str | None:
     """Rewrite ``<key>:`` inside a frontmatter block, verifying the edit MEANS
     what it was supposed to mean. Returns the new block, None when there is
@@ -172,7 +198,15 @@ def _edit_frontmatter_block(
     there. An unparseable block raises rather than returning None: the reader
     degrades it to ``{}`` because observation may, but a writer that concluded
     "no status here" from a block it could not read would report success for a
-    spec it never touched."""
+    spec it never touched.
+
+    ``insert`` adds the key as the block's last line when the reader sees no such
+    top-level key — what `verify.set_frontmatter_field` and
+    `devcontract.reset_spec_status` need and `set_frontmatter_status` must never
+    do. It is gated on the READER's view rather than on a scan miss, which is the
+    other half of the same defect: a scan that missed a quoted key then appended
+    a SECOND one, and the file ended up with two."""
+    pattern = _key_line_re(key) if pattern is None else pattern
     try:
         original = yaml.safe_load(block)
     except yaml.YAMLError as e:
@@ -180,39 +214,50 @@ def _edit_frontmatter_block(
             f"the frontmatter block does not parse as YAML, so a {key!r} edit "
             f"cannot be verified ({e.__class__.__name__}: {e})"
         ) from e
+    rest = {k: v for k, v in original.items() if k != key} if isinstance(original, dict) else {}
     if not isinstance(original, dict) or key not in original:
-        return None  # the reader sees no such top-level key — nothing to change
+        if not insert:
+            return None  # the reader sees no such top-level key — nothing to change
+        nl = "\r\n" if block.endswith("\r\n") else "\n"
+        return _verified(block + f"{key}: {value}{nl}", key, value, rest)
     if original[key] == value:
         return None  # already at the target — idempotent no-op, no write
     lines = block.splitlines(keepends=True)
-    rest = {k: v for k, v in original.items() if k != key}
     for i, line in enumerate(lines):
         m = pattern.match(line)
         if m is None:
             continue
         trial = list(lines)
-        # Everything through the colon is preserved verbatim (indent, a quoted
-        # key, whitespace before the colon); the value becomes `<space><value>`.
-        # The gap after the colon is normalized rather than preserved because a
-        # bare `status:` has no gap to preserve and filling it would produce
-        # `status:done`, which is not the key at all.
-        trial[i] = f"{line[: m.end()]} {value}" + ("\n" if line.endswith("\n") else "")
-        candidate = "".join(trial)
-        try:
-            parsed = yaml.safe_load(candidate)
-        except yaml.YAMLError:
-            continue  # the edit broke the block — this line is not a scalar key
-        if not isinstance(parsed, dict) or parsed.get(key) != value:
-            continue  # edited something that is not the key the reader resolves
-        if {k: v for k, v in parsed.items() if k != key} != rest:
-            continue  # right key, collateral damage — e.g. another key's block
-        return candidate
+        trial[i] = render(line, m, value)
+        candidate = _verified("".join(trial), key, value, rest)
+        if candidate is not None:
+            return candidate
     raise FrontmatterWriteError(
         f"the frontmatter carries {key!r} in a shape no in-place line edit can "
         f"safely rewrite to {value!r} (a flow mapping, a block scalar, a value "
         f"continued on the next line, or an anchor another key aliases) — set it "
         f"as a plain `{key}: <value>` line and re-run"
     )
+
+
+def _verified(candidate: str, key: str, value: str, rest: dict[str, Any]) -> str | None:
+    """``candidate`` if it means what the edit intended, else None.
+
+    Three conditions, and the third is the one no pattern-widening design has:
+    the block still parses as a mapping, its top-level ``key`` is exactly
+    ``value``, and every OTHER key is unchanged. Without the last one an edit
+    with the right effect on ``key`` and a wrong effect elsewhere passes — a
+    ``status`` merged in from an anchor block is only reachable by rewriting the
+    anchor, which is shared state the story does not own."""
+    try:
+        parsed = yaml.safe_load(candidate)
+    except yaml.YAMLError:
+        return None  # the edit broke the block — this line is not a scalar key
+    if not isinstance(parsed, dict) or parsed.get(key) != value:
+        return None  # edited something that is not the key the reader resolves
+    if {k: v for k, v in parsed.items() if k != key} != rest:
+        return None  # right key, collateral damage — e.g. another key's block
+    return candidate
 
 
 def set_frontmatter_status(path: Path, status: str) -> bool:
@@ -243,7 +288,7 @@ def set_frontmatter_status(path: Path, status: str) -> bool:
     if split is None:
         return False
     before, block, after = split
-    edited = _edit_frontmatter_block(block, "status", status, _STATUS_KEY_RE)
+    edited = _edit_frontmatter_block(block, "status", status, pattern=_STATUS_KEY_RE)
     if edited is None:
         return False
     path.write_text(before + edited + after, encoding="utf-8")

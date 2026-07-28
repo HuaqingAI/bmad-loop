@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from bmad_loop import devcontract
+from bmad_loop import devcontract, verify
 
 
 def _spec(
@@ -535,6 +535,42 @@ def test_reset_spec_status_noop_when_spec_absent(tmp_path):
     sp = tmp_path / "missing.md"
     assert not sp.exists()
     assert devcontract.reset_spec_status(sp, "in-progress") is False
+
+
+@pytest.mark.parametrize(
+    ("shape", "text"),
+    [
+        ("block-scalar-indicator", "---\nstatus: |\n  in-review\n---\n\nbody\n"),
+        ("numeric-value", "---\nstatus: 123\n---\n\nbody\n"),
+        ("flow-mapping", "---\n{status: in-review, keep: 1}\n---\n\nbody\n"),
+    ],
+    ids=["block-scalar-indicator", "numeric-value", "flow-mapping"],
+)
+def test_reset_status_refuses_the_shapes_its_own_regex_misreads(tmp_path, shape, text):
+    """`_FM_STATUS_RE` reads only a `[A-Za-z-]*` value, so it used to fill
+    `status: |` to `status: done|` and `status: 123` to `status: done123` — with
+    a True return, on the repair path, silently. The shared verified edit
+    re-parses each trial before keeping it, so these become a refusal and the
+    spec is left exactly as authored."""
+    sp = tmp_path / "spec.md"
+    sp.write_bytes(text.encode("utf-8"))
+    with pytest.raises(verify.FrontmatterWriteError):
+        devcontract.reset_spec_status(sp, "done")
+    assert sp.read_bytes() == text.encode("utf-8")
+
+
+def test_reset_status_inserts_rather_than_rewriting_a_nested_decoy(tmp_path):
+    """The old `.sub(count=1)` rewrote the FIRST `status:`-looking line, so a
+    `meta:` block carrying one took the write and the story's real status never
+    appeared. The reader sees no top-level status here, and this writer's
+    contract is to INSERT one — so the decoy survives verbatim and the real key
+    is added."""
+    sp = tmp_path / "spec.md"
+    sp.write_text("---\nmeta:\n  status: draft\n---\n\nbody\n", encoding="utf-8")
+    assert devcontract.reset_spec_status(sp, "done") is True
+    text = sp.read_text()
+    assert "  status: draft\n" in text  # the decoy is not this story's status
+    assert verify.status_of(verify.read_frontmatter(sp)) == "done"
 
 
 # ----------------------------------------------------------- RECONCILABLE_FROM
