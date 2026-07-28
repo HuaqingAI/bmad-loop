@@ -32,6 +32,12 @@ breaking changes may land in a minor release.
   before the reset, and only when a restore was actually requested, so the no-`preserve` callers
   (both sweep sites) degrade as before.
 
+- **A spawn-level `OSError` during the attempt snapshot no longer crashes the run.** `_run_git`
+  translates only a timeout, so an EMFILE/ENOMEM from `subprocess.run` escaped untyped out of the
+  middle of a rollback. Preservation is observation rather than a repair write, so it now degrades
+  into the same journal-and-decide path a `GitError` takes, keeping the errno as the breadcrumb;
+  `safe_reset` still raises.
+
 - **Defer notifications name where the work survives (#333).** A deferred story's rollback parked
   the attempt on an `attempt-preserve/*` branch (or a `refs/attempt-preserve-dirty/*` snapshot),
   but the ref only ever reached `journal.jsonl` — the notification carried a bare reason, leaving

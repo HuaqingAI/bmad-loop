@@ -543,6 +543,29 @@ def test_snapshot_failure_never_pauses_on_redrive(project, monkeypatch):
     assert (repo / "src.txt").read_text() == "original\n"  # reset ran
 
 
+def test_snapshot_oserror_degrades_into_the_typed_path(project, monkeypatch):
+    """`_run_git` translates only a timeout, so a spawn-level OSError (EMFILE/ENOMEM)
+    escapes untyped. Preservation is observation, not a repair write, so it degrades
+    into the same journal-and-decide path a GitError takes rather than crashing the
+    run mid-rollback.
+
+    Ablation target: narrow the `except` back to `verify.GitError` and this fails
+    with the raw OSError."""
+    repo = project.project
+    ws = Workspace.default(project)
+    flow = _make_flow(workspace=ws, policy=_policy(rollback_on_failure=True))
+    task = _task(repo)
+    (repo / "src.txt").write_text("uncommitted work\n")
+    _fail_snapshot(monkeypatch, OSError(24, "Too many open files"))
+
+    with pytest.raises(_Pause):  # the typed pause, not the OSError
+        flow.rollback_or_pause(task)
+
+    entry = flow.journal.fields("attempt-worktree-preserve-failed")
+    assert "Too many open files" in entry["error"]  # errno detail kept as a breadcrumb
+    assert (repo / "src.txt").read_text() == "uncommitted work\n"
+
+
 def test_snapshot_failure_pause_names_the_unit_worktree(project, tmp_path, monkeypatch):
     """#161 compatibility: a preserve-failure pause can fire while a unit worktree is
     mounted, and every instruction must target that tree. Naming the main checkout

@@ -399,10 +399,17 @@ class RecoveryFlow:
             parked = verify.snapshot_worktree(
                 workspace.root, ref, baseline_untracked=task.baseline_untracked
             )
-        except verify.GitError as exc:
-            # Keep the git failure detail (commit-tree/update-ref stderr): if the
-            # following reset destroys work, this is the only breadcrumb explaining
-            # why the safety-net snapshot couldn't be captured.
+        except (verify.GitError, OSError) as exc:
+            # OSError alongside GitError: `_run_git` only translates a timeout, so a
+            # spawn-level EMFILE/ENOMEM escapes untyped (the sibling guards at
+            # verify.is_ancestor / worktree_prune catch both). Uncaught it crashed the
+            # run here — after the commits ref, before the reset — which is the safe
+            # outcome reached the loudest possible way. Preservation is observation,
+            # so it degrades into the decision below; `safe_reset` is the repair
+            # write and still raises.
+            # Keep the failure detail (commit-tree/update-ref stderr, or the errno):
+            # if the reset that may follow destroys work, this is the only breadcrumb
+            # explaining why the safety-net snapshot couldn't be captured.
             self.journal.append(
                 "attempt-worktree-preserve-failed", story_key=task.story_key, error=str(exc)
             )
