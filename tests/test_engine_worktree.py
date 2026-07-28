@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import shutil
 
+import pytest
 from conftest import (
     _OK,
     _exists_run,
@@ -976,6 +977,53 @@ def test_merge_stray_dirt_escalates_with_clear_message(project):
     assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
     assert (project.project / "stray.txt").read_text() == "editor leaked\n"
     assert "merge-target-cleaned" not in journal_kinds(engine)
+
+
+@pytest.mark.parametrize(
+    "make_exc",
+    [
+        lambda: OSError(13, "Permission denied"),
+        lambda: verify.GitSpawnError("git status failed to spawn: Permission denied"),
+    ],
+    ids=["fs-oserror", "git-spawn"],
+)
+def test_merge_env_fault_during_target_clean_keeps_branch_and_escalates(
+    project, monkeypatch, make_exc
+):
+    """#343: `clean_incoming_collisions` mutates the checkout directly
+    (unlink/rmdir), so a non-spawn FS fault arrives as a plain OSError no
+    chokepoint can translate — and its git reads can raise a typed
+    GitSpawnError. The guard must treat both like any other reconcile
+    failure: keep the branch and escalate rather than crash a DONE unit
+    mid-merge — and the escalation must name the environment fault, not
+    claim stray uncommitted files that may not exist.
+
+    Ablation targets: narrow the guard in `merge_local` back to
+    `verify.GitError` and the fs-oserror case fails — the OSError crashes the
+    run. Revert the reason branch to the unconditional stray-files text and
+    both cases fail on the message assertions."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+    )
+    exc = make_exc()
+
+    def env_fault(*a, **kw):
+        raise exc
+
+    monkeypatch.setattr(verify, "clean_incoming_collisions", env_fault)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and not summary.crashed
+    assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
+    reason = engine.state.paused_reason or ""
+    assert "Permission denied" in reason
+    # environment fault, not the stray-files refusal: no "clean them" guidance
+    assert "could not reconcile" in reason
+    assert "clean them" not in reason
+    # branch kept for manual merge — the unit's work is not stranded
+    assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
 
 
 def test_spec_file_serialized_relative_to_worktree():

@@ -428,6 +428,15 @@ class WorktreeFlow:
                 self.policy.scm.branch_per,
                 self.run_dir,
             )
+        except verify.GitSpawnError as e:
+            # a spawn fault is machine-wide, not this unit's: deferring would
+            # march the whole queue into DEFERRED one notification at a time
+            # and end the run "finished" over a broken environment (#194/#343).
+            self._pause(
+                f"cannot spawn git while opening a worktree for {task.story_key}: {e}",
+                task.story_key,
+                cause=e,
+            )
         except verify.GitError as e:
             # could not mount a worktree (e.g. branch_per=run with a kept-failed
             # unit still holding the shared branch). Defer this unit rather than
@@ -554,13 +563,27 @@ class WorktreeFlow:
         # falls outside this branch's path set — that may be real operator work.
         try:
             cleaned = verify.clean_incoming_collisions(repo, target, unit.branch)
-        except verify.GitError as e:
-            reason = (
-                f"merge of {unit.branch} into {target} blocked: the target checkout has "
-                f"uncommitted changes that are not part of this branch (likely a Unity "
-                f"Editor wrote into the main project) — clean them, then "
-                f"`bmad-loop resume {self.state.run_id}`. {e}"
-            )
+        except (verify.GitError, OSError) as e:
+            # OSError joins GitError because clean_incoming_collisions mutates the
+            # checkout directly (unlink/iterdir/rmdir) — a non-spawn FS fault the
+            # #343 chokepoint cannot translate. Crashing here would strand a DONE
+            # unit mid-merge; the keep-branch escalation is the point of this guard.
+            if isinstance(e, (verify.GitSpawnError, OSError)):
+                # environment fault (spawn failure or direct-FS error) — there may
+                # be no stray files at all, so no "clean them" guidance: the inner
+                # error is the diagnosis.
+                reason = (
+                    f"merge of {unit.branch} into {target} blocked: could not "
+                    f"reconcile the target checkout ({e}) — fix the underlying "
+                    f"fault, then `bmad-loop resume {self.state.run_id}`"
+                )
+            else:
+                reason = (
+                    f"merge of {unit.branch} into {target} blocked: the target checkout has "
+                    f"uncommitted changes that are not part of this branch (likely a Unity "
+                    f"Editor wrote into the main project) — clean them, then "
+                    f"`bmad-loop resume {self.state.run_id}`. {e}"
+                )
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
             return
         if cleaned:

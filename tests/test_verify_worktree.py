@@ -108,10 +108,10 @@ def test_worktree_prune_swallows_git_error(project, monkeypatch):
 
 
 def test_worktree_prune_swallows_os_error(project, monkeypatch):
-    """`subprocess.run` can raise OSError outright (a spawn failure — EMFILE,
-    ENOMEM — happens before any return code exists), which #156's timeout
-    translation doesn't cover. prune's never-raise contract must hold for it
-    too — its callers invoke it from inside `except GitError` guards."""
+    """Since #343 a spawn failure arrives typed as GitSpawnError (a GitError),
+    but prune's never-raise contract keeps its own plain-OSError net as the belt
+    for any untyped fault — its callers invoke it from inside `except GitError`
+    guards and lean on it never raising, whatever the cause."""
 
     def boom(*a, **k):
         raise OSError("spawn failed")

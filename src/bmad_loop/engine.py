@@ -1788,9 +1788,11 @@ class Engine:
         except BaseException:
             # A failed commit is not the only way out of this window: the signal
             # handler `_run` installed raises RunStopped from wherever the main
-            # thread is standing, and a raw OSError on spawn escapes `_run_git`
-            # as itself. Either leaves the ledger flipped for a commit that does
-            # not exist. Restore, then re-raise untouched.
+            # thread is standing, and an OSError raised outside `_run_git` (an
+            # FS fault; the spawn class arrives as GitSpawnError since #343 and
+            # takes the arm above) passes through as itself. Either leaves the
+            # ledger flipped for a commit that does not exist. Restore, then
+            # re-raise untouched.
             self._restore_deferred_closes(task, snapshot)
             raise
         advance(task, Phase.DONE)

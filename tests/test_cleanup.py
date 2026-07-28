@@ -94,6 +94,30 @@ def test_reconcile_orphan_worktrees_dry_run(project):
     assert wt.exists()  # dry run removes nothing
 
 
+def test_reconcile_orphan_worktrees_spawn_fault_degrades_to_noop(project, monkeypatch):
+    """#343 acceptance, observation-degrades class: a spawn-level OSError out of
+    `git worktree list` arrives typed as GitSpawnError and reads as "no orphans"
+    — reclaim is housekeeping, so a broken environment degrades it to a no-op
+    rather than crashing the caller. Injected at `subprocess.run` itself to
+    prove the whole chain: the chokepoint translation is what lets the
+    `except GitError` guard hold.
+
+    Ablation target: delete the `except OSError` arm in `verify._run_git` and
+    this fails with the raw OSError."""
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    wt = run_dir / "worktrees" / "unit"
+    wt.parent.mkdir(parents=True)
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    def cannot_spawn(cmd, **kwargs):
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr(verify.subprocess, "run", cannot_spawn)
+    assert runs.reconcile_orphan_worktrees(repo, run_dir) == []
+    assert wt.exists()  # nothing was reclaimed, nothing was rmtree'd
+
+
 def test_reconcile_stale_worktrees_finished_only(project):
     repo = project.project
     fin = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"

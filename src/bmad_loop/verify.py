@@ -69,14 +69,24 @@ class GitError(Exception):
     pass
 
 
+class GitSpawnError(GitError):
+    """The git child could not be spawned at all (an OSError out of
+    `subprocess.run` — EMFILE, ENOMEM, ENOENT on the git binary). A GitError so
+    every existing guard treats it like any other git failure; a distinct type
+    so the rare caller can tell "git said no" from "the machine is broken"
+    (#343). The underlying errno stays reachable via ``exc.__cause__.errno``."""
+
+
 def _run_git(
     cmd: list[str], repo: Path, *, env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
-    """Sole spawn point for git subprocesses. A timeout is raised by
-    `subprocess.run` *before* any return code exists, so left uncaught it would
-    bypass every `except GitError` guard and crash the run (#156); translating
-    it here puts timeouts in the same taxonomy as any other git failure —
-    observation guards degrade, unguarded paths fail typed.
+    """Sole spawn point for git subprocesses. Two failures are raised by
+    `subprocess.run` *before* any return code exists — a timeout (#156) and a
+    spawn-level OSError (#343) — so left uncaught either would bypass every
+    `except GitError` guard and crash the run. Both are translated here into
+    the GitError taxonomy — observation guards degrade, unguarded paths fail
+    typed — with the spawn class marked as `GitSpawnError` for the callers
+    that must distinguish an environment fault from git refusing.
 
     Every git child runs with `LC_ALL=C` so messages stay stable English: the one
     place that inspects git *text* rather than a return code — `safe_rollback`'s
@@ -94,6 +104,8 @@ def _run_git(
         )
     except subprocess.TimeoutExpired as exc:
         raise GitError(f"git {cmd[3]} timed out after {_git_timeout_s}s in {repo}") from exc
+    except OSError as exc:
+        raise GitSpawnError(f"git {cmd[3]} failed to spawn in {repo}: {exc}") from exc
 
 
 def _git(repo: Path, *args: str) -> tuple[int, str]:
@@ -459,10 +471,10 @@ def snapshot_worktree(
     reset past work it could not park (only a re-drive, whose caller contract
     forbids pausing, still journals and lets the human-directed reset run).
 
-    Not every failure here is a :class:`GitError`: ``_run_git`` translates only a
-    timeout, so a spawn-level ``OSError`` escapes untyped, and the
-    ``TemporaryDirectory`` below can raise one outright (ENOSPC/EMFILE) before any
-    git child is spawned. Callers guard ``(GitError, OSError)`` (#343)."""
+    Not every failure here is a :class:`GitError`: spawn faults arrive typed as
+    :class:`GitSpawnError` since #343, but the ``TemporaryDirectory`` below can
+    raise a plain ``OSError`` outright (ENOSPC/EMFILE) — a filesystem fault no
+    git chokepoint can translate. Callers keep guarding ``(GitError, OSError)``."""
     head = rev_parse_head(repo)
     with tempfile.TemporaryDirectory() as td:
         env = {**os.environ, "GIT_INDEX_FILE": str(Path(td) / "index")}
@@ -706,13 +718,12 @@ def worktree_remove(repo: Path, path: Path, force: bool = False) -> None:
 def worktree_prune(repo: Path) -> None:
     """Drop administrative entries for worktrees whose directories are gone.
     Best-effort housekeeping — never raises. The return code is already ignored,
-    but since #156 `_git` can *raise* GitError on a timeout, which would bypass
-    this never-raise contract (and the teardown degrade paths that lean on it —
-    close_unit_workspace / discard_worktree call prune from inside their own
-    GitError guards). `subprocess.run` can also raise OSError outright (a spawn
-    failure — EMFILE, ENOMEM — happens before any return code exists), which the
-    #156 translation doesn't cover. Swallow both here so the contract holds at
-    its source."""
+    but `_git` can *raise* — GitError on a timeout (#156) or GitSpawnError on a
+    spawn fault (#343) — which would bypass this never-raise contract (and the
+    teardown degrade paths that lean on it — close_unit_workspace /
+    discard_worktree call prune from inside their own GitError guards). The
+    OSError in the net predates the #343 translation and stays as the belt for
+    any non-spawn fault: the contract holds at its source."""
     try:
         _git(repo, "worktree", "prune")
     except (GitError, OSError):

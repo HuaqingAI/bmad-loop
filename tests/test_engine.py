@@ -2404,9 +2404,9 @@ def test_closes_deferred_rolls_back_when_a_signal_stops_the_commit(project, monk
 
 
 def test_closes_deferred_rolls_back_when_the_commit_raises_a_non_git_error(project, monkeypatch):
-    """`_run_git` translates only TimeoutExpired, so a raw OSError from the spawn
-    itself (a fork failure, git gone from PATH) reaches the commit boundary as
-    itself and slips past the GitError arm."""
+    """An OSError raised *outside* `_run_git` — an FS fault, here the patched
+    callee itself — is not the spawn class #343 translates, so it reaches the
+    commit boundary as itself and slips past the GitError arm."""
     engine = _closes_deferred_run(project, ["DW-1"])
     before = project.deferred_work.read_bytes()
 
@@ -2420,6 +2420,33 @@ def test_closes_deferred_rolls_back_when_the_commit_raises_a_non_git_error(proje
     assert summary.crashed  # re-raised untouched: the disposition is not ours
     assert _ledger_entries(project)["DW-1"].open
     assert project.deferred_work.read_bytes() == before
+
+
+def test_closes_deferred_restores_and_escalates_when_the_commit_spawn_fails(project, monkeypatch):
+    """#343: a spawn fault during finalize arrives typed as GitSpawnError (a
+    GitError), so the commit window restores the ledger and escalates — the
+    same disposition as a git timeout there — instead of crashing the run. The
+    raw-OSError crash above remains for the non-spawn class only.
+
+    Ablation target: delete the `except verify.GitError` arm in
+    `_finalize_commit_phase` and this fails — the fault falls through to the
+    BaseException arm and the run crashes."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+    before = project.deferred_work.read_bytes()
+
+    def cannot_spawn(*a, **kw):
+        raise verify.GitSpawnError("git add failed to spawn: [Errno 12] Cannot allocate memory")
+
+    monkeypatch.setattr(verify, "finalize_commit", cannot_spawn)
+
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and not summary.crashed
+    assert load_state(engine.run_dir).tasks["1-1-a"].phase == Phase.ESCALATED
+    reasons = [e["reason"] for e in engine.journal.entries() if e["kind"] == "story-escalated"]
+    assert len(reasons) == 1 and reasons[0].startswith("commit failed:")
+    assert _ledger_entries(project)["DW-1"].open
+    assert project.deferred_work.read_bytes() == before  # byte-identical restore
 
 
 def test_closes_deferred_rolls_back_when_the_journal_fails_after_the_ledger_write(

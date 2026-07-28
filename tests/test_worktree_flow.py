@@ -281,6 +281,31 @@ def test_run_isolated_defers_on_open_failure(tmp_path):
     assert not any(e.startswith("unit-") for e in flow.journal.events())
 
 
+def test_run_isolated_spawn_fault_pauses_instead_of_deferring(tmp_path):
+    """#343: a spawn fault is machine-wide, not this unit's — deferring would
+    march the whole queue into DEFERRED one notification at a time and end the
+    run "finished" over a broken environment. Pause instead; per-unit GitErrors
+    still take the defer path.
+
+    Ablation target: delete the `except verify.GitSpawnError` arm in
+    `run_isolated` and this fails — the defer arm catches it and the phase
+    lands on DEFERRED."""
+
+    def boom(*a, **k):
+        raise verify.GitSpawnError("git worktree failed to spawn: [Errno 24] Too many open files")
+
+    drove = []
+    flow = _make_flow(tmp_path, open_unit_workspace=boom)
+    task = StoryTask(story_key="1-1", epic=1)
+    with pytest.raises(_Pause) as excinfo:
+        flow.run_isolated(task, lambda t: drove.append(t))
+    assert task.phase == Phase.PENDING  # not DEFERRED — nothing was burned
+    assert "worktree-open-failed" not in flow.journal.events()
+    assert flow.calls.pauses == [(excinfo.value.reason, "1-1")]
+    assert "cannot spawn git" in excinfo.value.reason
+    assert drove == []  # drive body never ran
+
+
 def test_escalate_unit_marks_escalated_notifies_and_pauses(tmp_path):
     flow = _make_flow(
         tmp_path, state=SimpleNamespace(target_branch="main", run_id="run-9", tasks={})

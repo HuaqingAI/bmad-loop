@@ -256,10 +256,10 @@ class RecoveryFlow:
         try:
             verify.apply_patch(workspace.root, patch)
         except (verify.GitError, OSError) as e:
-            # OSError joins GitError for the reason the rollback guards do (#343):
-            # `_run_git` translates only a timeout, and the patch file is read from
-            # disk here, so an ENOENT/EACCES/ENOSPC arrives untyped. Crashing would
-            # skip the escalation this branch exists to perform and leave the tree
+            # OSError joins GitError because the patch file is read from disk
+            # here, so an ENOENT/EACCES/ENOSPC arrives untyped — a non-spawn FS
+            # fault the #343 chokepoint cannot translate. Crashing would skip
+            # the escalation this branch exists to perform and leave the tree
             # half-restored with no attention file.
             self.journal.append(
                 "attempt-restore-failed",
@@ -405,9 +405,10 @@ class RecoveryFlow:
         same terms: with ``allow_pause`` (a plain rollback) pause for manual
         recovery rather than reset; on a re-drive (``allow_pause=False``) the
         caller's contract forbids pausing, so journal and let the human-directed
-        reset proceed. Both now guard ``(GitError, OSError)`` too — ``_run_git``
-        translates only a timeout, so a spawn-level fault would otherwise crash the
-        rollback rather than refuse it (#343).
+        reset proceed. Both now guard ``(GitError, OSError)`` too: spawn faults
+        arrive typed as ``GitSpawnError`` since #343, but ``snapshot_worktree``'s
+        ``TemporaryDirectory`` can still raise a plain ``OSError`` (ENOSPC),
+        which would otherwise crash the rollback rather than refuse it.
 
         The refusal is gated on :meth:`_reset_would_destroy`, so a capture failure
         over a tree with nothing left to lose (commits already parked, nothing
@@ -432,9 +433,10 @@ class RecoveryFlow:
                 workspace.root, ref, baseline_untracked=task.baseline_untracked
             )
         except (verify.GitError, OSError) as exc:
-            # OSError alongside GitError: `_run_git` only translates a timeout, so a
-            # spawn-level EMFILE/ENOMEM escapes untyped (the sibling guards at
-            # verify.is_ancestor / worktree_prune catch both). Uncaught it crashed the
+            # OSError alongside GitError: spawn faults arrive typed as GitSpawnError
+            # since #343, but `snapshot_worktree`'s `TemporaryDirectory` can raise a
+            # plain OSError (ENOSPC) — a non-spawn FS fault the chokepoint cannot
+            # translate, so this arm stays load-bearing. Uncaught it crashed the
             # run here — after the commits ref, before the reset — which is the safe
             # outcome reached the loudest possible way. Preservation is observation,
             # so it degrades into the decision below; `safe_reset` is the repair
@@ -489,11 +491,12 @@ class RecoveryFlow:
         un-determinable probe reads as work-at-risk, mirroring the dirty check's
         own git-fault doctrine (#156).
 
-        Catches ``OSError`` for the same reason the caller does, and it matters more
-        here: this runs immediately after a snapshot fault, against the same git
-        binary, so the EMFILE/ENOMEM that broke the capture is likely to break the
-        probe too. Guarding only `GitError` would undo the broadening one frame up
-        and crash the rollback anyway."""
+        Catches ``OSError`` for the same reason the caller does: spawn faults
+        arrive as ``GitSpawnError`` since #343, but this runs immediately after a
+        snapshot fault — often an ENOSPC out of ``snapshot_worktree``'s
+        ``TemporaryDirectory`` — and a filesystem this broken can fail the probe
+        in non-spawn ways too. Guarding only `GitError` would undo the broadening
+        one frame up and crash the rollback anyway."""
         workspace = self._workspace_get()
         try:
             head = verify.rev_parse_head(workspace.root)

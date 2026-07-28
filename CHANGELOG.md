@@ -164,6 +164,15 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 ### Fixed
 
+- **Spawn-level `OSError` is translated at the git chokepoint (#343).** `_run_git` translated only
+  a timeout, so an EMFILE/ENOMEM/ENOENT out of `subprocess.run` bypassed all 19 OSError-blind
+  `except GitError` guards and crashed the run — under exactly the resource pressure the recovery
+  paths owning those guards exist for. Spawn faults now raise `GitSpawnError` (a `GitError`), so
+  every guard holds as written; the errno stays on `__cause__`. A spawn fault while opening a unit
+  worktree now pauses the run instead of marching the queue into DEFERRED, and an FS or spawn
+  fault during merge-target reconciliation keeps the unit branch and escalates instead of
+  crashing — naming the fault rather than claiming stray uncommitted files to clean.
+
 - **`safe_rollback` no longer swallows a failed `git stash create`.** The empty snapshot silently
   disabled the whole `preserve` restore, so the hard reset reverted exactly the paths the caller
   asked to keep — a resolved re-drive's corrected spec — with no error anywhere. It now raises
