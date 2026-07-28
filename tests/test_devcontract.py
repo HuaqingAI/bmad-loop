@@ -17,12 +17,17 @@ def _spec(
     auto_run: str | None = "done",
     body_extra: str = "",
     followup: bool | None = None,
+    actions: str | None = None,
 ) -> Path:
     fm = f"---\ntitle: 'x'\ntype: 'feature'\nstatus: '{status}'\n"
     if baseline:
         fm += f"{baseline_field}: '{baseline}'\n"
     if followup is not None:
         fm += f"followup_review_recommended: {str(followup).lower()}\n"
+    if actions is not None:
+        # raw YAML: these tests are ABOUT the container/item shapes, so the
+        # fixture must be able to write a malformed one verbatim
+        fm += f"operator_actions: {actions}\n"
     fm += "---\n\n## Intent\n\nwhatever\n"
     text = fm + body_extra
     if auto_run is not None:
@@ -215,6 +220,82 @@ def test_synth_followup_review_recommended_omitted_on_blocked(tmp_path):
     sp = _spec(tmp_path / "s.md", status="blocked", auto_run="blocked", followup=True)
     out = devcontract.synthesize_result(sp, story_key="1-1-a")
     assert "followup_review_recommended" not in out.result_json
+
+
+# ------------------------------------------- awaiting-operator terminal (#335)
+
+
+def test_synth_awaiting_operator_is_terminal_and_folds_actions(tmp_path):
+    """The park is a third terminal beside done/blocked, and its obligations
+    travel with the result so the engine never re-reads the spec to learn them."""
+    sp = _spec(
+        tmp_path / "s.md",
+        status="awaiting-operator",
+        auto_run="awaiting-operator",
+        actions="['buy example.com', 'publish the TXT record']",
+    )
+    out = devcontract.synthesize_result(sp, story_key="1-1-a")
+
+    assert out.status_consistent
+    rj = out.result_json
+    assert rj is not None and rj["status"] == "awaiting-operator"
+    assert rj["operator_actions"] == ["buy example.com", "publish the TXT record"]
+
+
+def test_synth_awaiting_operator_synthesizes_no_escalation(tmp_path):
+    """The distinction the whole state exists for: `blocked` means the session
+    could not proceed and the run must halt; a park means it finished everything
+    an agent could. A CRITICAL here would collapse the two into the pause
+    channel. `followup_review_recommended` is likewise absent — a parked story
+    does not route into the review loop at all."""
+    sp = _spec(tmp_path / "s.md", status="awaiting-operator", auto_run=None, actions="['do it']")
+    out = devcontract.synthesize_result(sp, story_key="1-1-a")
+
+    assert out.result_json["escalations"] == []
+    assert "followup_review_recommended" not in out.result_json
+
+
+@pytest.mark.parametrize(
+    "actions, expected, why",
+    [
+        ("['a', 'b']", ["a", "b"], "the normal shape"),
+        ("[' a ', '', 'a']", ["a"], "blanks drop, duplicates collapse, order preserved"),
+        ("[5]", ["5"], "a non-string scalar is str()-normalized, like closes_deferred ids"),
+        ("buy the domain", [], "a bare string is the wrong CONTAINER, never one action"),
+        ("[]", [], "an empty list declares nothing"),
+        ("[{action: a, check: b}]", [], "the v2 object shape is refused, not str()-ed to junk"),
+        ("[null]", [], "a null item is not the word 'None'"),
+    ],
+)
+def test_synth_operator_actions_shapes(tmp_path, actions, expected, why):
+    """Strict about the container, lenient about each scalar item — every
+    malformed shape collapses to [], which verify's non-empty gate turns into one
+    fixable retry naming the expected shape."""
+    sp = _spec(tmp_path / "s.md", status="awaiting-operator", auto_run=None, actions=actions)
+    out = devcontract.synthesize_result(sp, story_key="1-1-a")
+
+    assert out.result_json["operator_actions"] == expected, why
+
+
+@pytest.mark.parametrize("status", ["done", "blocked"])
+def test_synth_operator_actions_folded_only_on_the_park_status(tmp_path, status):
+    """An `operator_actions:` list left behind on a done or blocked spec is not a
+    park. Carrying it would let a story register obligations no verify gate ever
+    held it to — and, on `done`, would make _finalize_commit_phase's final-phase
+    rule park a story the session declared finished."""
+    sp = _spec(tmp_path / "s.md", status=status, auto_run=status, actions="['stale leftover']")
+    out = devcontract.synthesize_result(sp, story_key="1-1-a")
+
+    assert "operator_actions" not in out.result_json
+
+
+def test_frontmatter_candidates_include_awaiting_operator(tmp_path):
+    """The missing-marker fallback scan must find a parked spec too: the skill's
+    marker append is intermittent on EVERY terminal path, and a park invisible to
+    the harvest rides stall-nudges to timeout and loses its work."""
+    sp = _spec(tmp_path / "spec-1-1-a.md", status="awaiting-operator", auto_run=None)
+
+    assert devcontract.find_frontmatter_candidates(tmp_path, since_ns=0) == [sp]
 
 
 # --------------------------------------------------- plan-halt expected-terminal

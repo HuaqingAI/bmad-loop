@@ -48,9 +48,11 @@ from bmad_loop.model import (
 )
 from bmad_loop.policy import (
     AdapterPolicy,
+    DevPolicy,
     GatesPolicy,
     LimitsPolicy,
     NotifyPolicy,
+    OperatorPolicy,
     Policy,
     ReviewPolicy,
     ScmPolicy,
@@ -59,6 +61,7 @@ from bmad_loop.policy import (
     VerifyPolicy,
 )
 from bmad_loop.runs import STOP_REQUEST_FILE, graceful_stop_requested, rearm_escalation
+from bmad_loop.sprintstatus import story_status
 from bmad_loop.verify import (
     GitError,
     PrunePreserveError,
@@ -1221,6 +1224,183 @@ def test_run_summary_render_names_parked_stories_only_when_there_are_any(project
     assert "1 awaiting operator" in engine.summary().render()
 
 
+# ---------------------------------------- awaiting-operator park path (#335)
+
+
+def _park_policy(**kw):
+    """review.trigger = "always" so the park has a review loop to SKIP. Under the
+    "recommended" default a story that recommends no follow-up already skips it,
+    and the review-skip branch could be deleted without any test noticing."""
+    return Policy(
+        **{
+            "gates": GatesPolicy(mode="none"),
+            "notify": QUIET,
+            "review": ReviewPolicy(trigger="always"),
+            "dev": DevPolicy(skill="bmad-dev-auto"),
+            "scm": ScmPolicy(rollback_on_failure=True),
+            **kw,
+        }
+    )
+
+
+ACTIONS = ["buy example.com at the registrar", "publish the _acme-challenge TXT record"]
+
+
+def test_dev_declared_park_commits_and_the_run_continues(project):
+    """The whole point, end to end: a session finishes what an agent can do and
+    hands the rest to a human. The story COMMITS (that is what separates a park
+    from a defer), the board reaches the token, the registry and notification
+    record what is owed, and the run moves on to the next story rather than
+    halting — one story owing a DNS record must never block the ones behind it.
+
+    Two ablation targets. Delete the `_park_awaiting_operator` branch in
+    `_review_and_commit` and this fails by requesting an unscripted review
+    session (trigger="always"). Delete the final-phase rule in
+    `_finalize_commit_phase` and the story lands DONE with its actions unrecorded
+    — a false green, the exact defect the state exists to prevent."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev", "1-2-b": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [
+            generic_dev_effect(
+                project, "1-1-a", final_status="awaiting-operator", operator_actions=ACTIONS
+            ),
+            generic_dev_effect(project, "1-2-b"),
+            review_effect(project, "1-2-b", clean=True),
+        ],
+        policy=_park_policy(),
+    )
+
+    summary = engine.run()
+
+    parked = engine.state.tasks["1-1-a"]
+    assert parked.phase == Phase.AWAITING_OPERATOR
+    assert parked.operator_actions == ACTIONS
+    assert parked.commit_sha and parked.commit_sha != parked.baseline_commit
+    assert summary.awaiting_operator == 1 and not summary.paused
+    # the run continued: the next story was driven and finished
+    assert engine.state.tasks["1-2-b"].phase == Phase.DONE
+    assert summary.done == 1 and summary.deferred == 0 and summary.escalated == 0
+    # no review session for the parked story — only its dev pass and 1-2-b's
+    assert [(s.role, s.task_id.split("-dev")[0]) for s in adapter.sessions if s.role == "dev"] == [
+        ("dev", "1-1-a"),
+        ("dev", "1-2-b"),
+    ]
+    assert not any(s.role == "review" and "1-1-a" in s.task_id for s in adapter.sessions)
+    # the board reached the token — a forward advance through the sole writer
+    assert story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+    # the work is really in HEAD, not stashed on a recovery ref
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+    assert parked.preserve_ref is None and parked.defer_reason is None
+
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "review-skipped-awaiting-operator" in kinds and "story-awaiting-operator" in kinds
+    assert "story-deferred" not in kinds and "story-done" in kinds  # 1-2-b's
+    # the journal entry carries the actions themselves, not a count: with the
+    # registry not yet shipped (part 3), it and the spec are the only records
+    parked_entry = next(
+        e for e in engine.journal.entries() if e["kind"] == "story-awaiting-operator"
+    )
+    assert parked_entry["actions"] == ACTIONS and parked_entry["commit"] == parked.commit_sha
+
+
+def test_park_commit_message_marks_the_story_awaiting_operator(project):
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            generic_dev_effect(
+                project, "1-1-a", final_status="awaiting-operator", operator_actions=ACTIONS
+            )
+        ],
+        policy=_park_policy(),
+    )
+
+    engine.run()
+
+    # one commit, the story's own, marked so `git log` still says what the run
+    # summary said long after the summary scrolled past
+    assert git(project.project, "log", "-1", "--format=%s").strip().endswith("(awaiting operator)")
+    assert engine.state.tasks["1-1-a"].commit_sha == rev_parse_head(project.project)
+    assert worktree_clean(project.project)
+
+
+def test_park_without_usable_actions_is_repaired_not_committed(project):
+    """A spec at the park status declaring nothing is not a park yet. verify's
+    non-empty gate is fixable, so a repair session runs with the reason as
+    feedback; here it finalizes `done` honestly and the story commits as DONE.
+
+    Ablation: delete the non-empty gate in `_operator_actions_gate` and this
+    fails — the blank park verifies green and commits as AWAITING_OPERATOR with
+    an empty obligation nobody can ever confirm."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [
+            generic_dev_effect(
+                project, "1-1-a", final_status="awaiting-operator", operator_actions=[]
+            ),
+            generic_dev_effect(project, "1-1-a", followup_review=False),
+        ],
+        policy=_park_policy(review=ReviewPolicy(enabled=False)),
+    )
+
+    summary = engine.run()
+
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE and task.operator_actions == []
+    assert summary.done == 1 and summary.awaiting_operator == 0
+    assert len(adapter.sessions) == 2  # the park attempt, then the repair
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "story-awaiting-operator" not in kinds and "story-done" in kinds
+
+
+def test_park_disabled_by_policy_never_commits_the_token(project):
+    """`[operator] enabled = false` does not reinterpret the token — it makes it
+    unknown. The gate rejects it, the attempt budget runs out, and the story
+    defers with its work preserved rather than committing a phase the operator
+    turned off."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    script = [
+        generic_dev_effect(
+            project, "1-1-a", final_status="awaiting-operator", operator_actions=ACTIONS
+        )
+    ] * 3
+    engine, _ = make_engine(
+        project, script, policy=_park_policy(operator=OperatorPolicy(enabled=False))
+    )
+
+    summary = engine.run()
+
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DEFERRED and summary.awaiting_operator == 0
+    assert story_status(project.sprint_status, "1-1-a") != "awaiting-operator"
+    assert "story-awaiting-operator" not in [e["kind"] for e in engine.journal.entries()]
+
+
+def test_resume_through_committing_re_derives_the_park(project):
+    """The crash-resume contract (#115) needs no park-specific code: the actions
+    are latched BEFORE `advance(COMMITTING)`, so the resume arm re-enters
+    `_finalize_commit_phase` and its final-phase rule reaches the same verdict the
+    pre-crash run would have. Ablation: latch the actions AFTER the advance and
+    the resumed story lands DONE, silently dropping the obligation."""
+    engine, _ = make_engine(project, [])
+    baseline = committing_crash_state(project, engine, operator_actions=ACTIONS)
+
+    resumed, adapter = resume_engine(project, engine, [])
+    summary = resumed.run()
+
+    final = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert final.phase == Phase.AWAITING_OPERATOR
+    assert final.operator_actions == ACTIONS
+    assert final.commit_sha == rev_parse_head(project.project) != baseline
+    assert summary.awaiting_operator == 1 and not summary.crashed
+    assert adapter.sessions == []  # no session re-run, gates included
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "resume-commit" in kinds and "story-awaiting-operator" in kinds
+    assert "story-done" not in kinds
+
+
 def test_run_summary_render_labels_both_units(project):
     """render() feeds stdout, the ATTENTION file and the desktop notification
     from one place, so this covers all three."""
@@ -1731,9 +1911,11 @@ def test_generic_dev_path_orchestrator_advances_sprint(project):
     assert engine.state.tasks["1-1-a"].phase == Phase.DONE
     # the orchestrator advanced sprint-status, not the skill
     assert story_status(project.sprint_status, "1-1-a") == "done"
-    # the generic dev invocation form
+    # the generic dev invocation form, plus the engine-injected awaiting-operator
+    # contract (#335) every dev prompt carries while [operator] enabled
     assert [s.role for s in adapter.sessions] == ["dev"]
-    assert adapter.sessions[0].prompt == "/bmad-dev-auto 1-1-a"
+    assert adapter.sessions[0].prompt.startswith("/bmad-dev-auto 1-1-a")
+    assert "status: awaiting-operator" in adapter.sessions[0].prompt
 
 
 def test_generic_dev_path_no_sprint_advance_when_spec_unfinalized(project):
@@ -2969,7 +3151,10 @@ def test_expected_spec_pinned_only_when_the_prompt_names_the_spec(project):
     # carries a recorded spec, but the dispatch is a bare story key — the session is
     # free to write a different spec, and the scan is the only way to find it.
     fresh = engine._dev_prompt(task, None)
-    assert fresh == "/bmad-dev-auto 1-1-a"
+    # the dispatch itself is a bare key; the engine-injected awaiting-operator
+    # contract (#335) rides along but names no path, which is the property the
+    # pin reads
+    assert fresh.startswith("/bmad-dev-auto 1-1-a")
     assert _pin_probe(project, fresh, spec_file=owed) is None
 
 

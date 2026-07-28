@@ -21,7 +21,7 @@ from typing import Any
 from . import deferredwork
 from .bmadconfig import ProjectPaths
 from .frontmatter import set_frontmatter_status  # noqa: F401 — re-export
-from .frontmatter import _split_frontmatter, read_frontmatter, status_of
+from .frontmatter import _split_frontmatter, operator_actions_of, read_frontmatter, status_of
 from .model import StoryTask, VerifyOutcome
 from .policy import POLICY_FILE, Policy
 from .sprintstatus import STATUS_ORDER, story_status
@@ -1111,13 +1111,16 @@ def _verify_shared_gates(
     expected_status: str,
     extra_exclude: tuple[str, ...] | None,
     allow_ancestor_baseline: bool = False,
+    fm: dict[str, Any] | None = None,
 ) -> VerifyOutcome | None:
     """The workflow-tag, expected-status, baseline-match, and proof-of-work gates
     shared verbatim by :func:`verify_dev`, :func:`verify_dev_bundle`, and
     :func:`verify_dev_stories` — factored out so the sprint-mode and stories-mode
-    gates can't silently drift. Reads frontmatter once (callers must not re-read
-    it). Returns a failing :class:`VerifyOutcome`, or ``None`` when every gate
-    passes and the caller may run its mode-specific tail.
+    gates can't silently drift. Reads frontmatter once; a caller that had to read
+    it first to *choose* ``expected_status`` passes what it read as ``fm`` so the
+    single-read contract still holds (no caller re-reads it).  Returns a failing
+    :class:`VerifyOutcome`, or ``None`` when every gate passes and the caller may
+    run its mode-specific tail.
 
     The proof-of-work exclude is derived here from the `task` this gate already
     receives (`verify_dev_exclude_relpaths`, which needs the latched restore patch);
@@ -1133,9 +1136,11 @@ def _verify_shared_gates(
             f"dev result.json workflow is {workflow!r}, expected {DEV_WORKFLOW!r}"
         )
 
-    fm = _gate_frontmatter(spec_path)
-    if isinstance(fm, VerifyOutcome):
-        return fm
+    if fm is None:
+        read = _gate_frontmatter(spec_path)
+        if isinstance(read, VerifyOutcome):
+            return read
+        fm = read
     status = status_of(fm)
     if status != expected_status:
         return VerifyOutcome.retry(
@@ -1184,11 +1189,45 @@ def _verify_shared_gates(
     return None
 
 
+# The terminal spec status of a story whose agent-doable work is finished but
+# whose acceptance criteria include external actions only a human can perform
+# (#335). Mirrors devcontract.AWAITING_OPERATOR, kept literal here for the same
+# reason PLAN_HALT_STATUS is: devcontract imports verify, never the reverse.
+AWAITING_OPERATOR = "awaiting-operator"
+
+
+def _operator_actions_gate(fm: dict[str, Any], story_key: str) -> VerifyOutcome | None:
+    """Refuse a park that enumerates nothing, with feedback a repair session can
+    act on. ``None`` when the spec declares at least one usable action.
+
+    A park is *defined* by owing external work: a spec at ``awaiting-operator``
+    with no readable ``operator_actions:`` names no obligation, so confirming it
+    later would be a human acknowledging a blank. Every malformed shape reaches
+    here as an empty reading (:func:`frontmatter.operator_actions_of`), and all
+    of them have the same remedy, so one message covers them: name the actions,
+    or finalize the status that matches reality. ``fixable=True`` — the tree is
+    real work and the defect is one frontmatter block, so the reason goes to a
+    repair session as feedback rather than throwing the attempt away.
+    """
+    if operator_actions_of(fm):
+        return None
+    return VerifyOutcome.retry(
+        f"spec for {story_key} is 'awaiting-operator' but declares no usable "
+        f"operator_actions: add a YAML list of strings naming each external "
+        f"action a human must perform, or finalize the status the work actually "
+        f"reached ('done' when nothing is owed, 'blocked' when the story cannot "
+        f"proceed)",
+        fixable=True,
+    )
+
+
 def verify_dev(
     task: StoryTask,
     paths: ProjectPaths,
     result_json: dict[str, Any] | None,
     review_enabled: bool = True,
+    *,
+    operator_park: bool = False,
 ) -> VerifyOutcome:
     """Verify a dev session's on-disk artifacts against its result.json claims.
 
@@ -1198,6 +1237,15 @@ def verify_dev(
     orchestrator's, has produced changes since that baseline, and that the
     story's sprint-status was advanced to the matching stage. Returns a retryable
     VerifyOutcome on any mismatch, escalates on git failure, passes otherwise.
+
+    ``operator_park`` (``[operator] enabled``, engine-supplied) adds one more
+    accepted spec/sprint pair: ``(awaiting-operator, awaiting-operator)``, the
+    park a dev session declares when the story's remaining work is a human's
+    (#335). The OBSERVED spec status selects which pair is demanded — the skill
+    decides whether it parked, and the gate then holds it to the matching board
+    state and to a non-empty action list. Off by policy, the token is simply not
+    a terminal the gate knows, so it fails the ordinary status check and the
+    session is retried with that mismatch as feedback.
     """
     rj = result_json or {}
     spec_file = rj.get("spec_file")
@@ -1207,20 +1255,33 @@ def verify_dev(
     if not spec_path.is_file():
         return VerifyOutcome.retry(f"claimed spec file does not exist: {spec_path}")
 
+    fm = _gate_frontmatter(spec_path)
+    if isinstance(fm, VerifyOutcome):
+        return fm
+    parked = operator_park and status_of(fm) == AWAITING_OPERATOR
+    if parked:
+        actions = _operator_actions_gate(fm, task.story_key)
+        if actions is not None:
+            return actions
+
     # With review disabled, the dev session runs its own internal review and
-    # finalizes straight to done; otherwise it hands off at in-review.
+    # finalizes straight to done; otherwise it hands off at in-review. A park
+    # short-circuits both: the story is finished as far as any agent can take it.
     gate = _verify_shared_gates(
         spec_path,
         rj,
         task,
         paths,
-        expected_status="in-review" if review_enabled else "done",
+        expected_status=(
+            AWAITING_OPERATOR if parked else ("in-review" if review_enabled else "done")
+        ),
         extra_exclude=(),
+        fm=fm,
     )
     if gate is not None:
         return gate
 
-    expected_sprint = "review" if review_enabled else "done"
+    expected_sprint = AWAITING_OPERATOR if parked else ("review" if review_enabled else "done")
     sprint = story_status(paths.sprint_status, task.story_key)
     if sprint != expected_sprint:
         return VerifyOutcome.retry(
@@ -1610,19 +1671,34 @@ def verify_review(
     the board, so retrying only replays the same failure until the budget runs
     out and the work is rolled back; under
     ``review.on_status_contradiction = "escalate"`` (the default) the gate
-    escalates instead, naming both sides. See #334."""
+    escalates instead, naming both sides. See #334.
+
+    ``(awaiting-operator, awaiting-operator)`` is the second accepted pair, on
+    the same observed-spec-status selection ``verify_dev`` uses: this is the gate
+    the park path runs before committing (``Engine._park_awaiting_operator``), so
+    parked work clears exactly the deterministic checks every other commit path
+    clears — the pair, a non-empty action list, and the verify commands. The
+    sign-off-regression arm stays scoped to the ``done`` pair: a board short of
+    ``awaiting-operator`` is a stage never reached, not a revoked sign-off."""
     if not task.spec_file:
         return VerifyOutcome.retry("no spec file recorded for task")
     fm = _gate_frontmatter(Path(task.spec_file))
     if isinstance(fm, VerifyOutcome):
         return fm
     status = status_of(fm)
-    if status != "done":
-        return VerifyOutcome.retry(f"spec status is {status!r}, expected 'done'")
+    expected = (
+        AWAITING_OPERATOR if (policy.operator.enabled and status == AWAITING_OPERATOR) else "done"
+    )
+    if status != expected:
+        return VerifyOutcome.retry(f"spec status is {status!r}, expected {expected!r}")
+    if expected == AWAITING_OPERATOR:
+        actions = _operator_actions_gate(fm, task.story_key)
+        if actions is not None:
+            return actions
 
     sprint = story_status(paths.sprint_status, task.story_key)
-    if sprint != "done":
-        if _is_signoff_regression(sprint, sprint_reached_done, policy):
+    if sprint != expected:
+        if expected == "done" and _is_signoff_regression(sprint, sprint_reached_done, policy):
             return VerifyOutcome.escalate(
                 f"review revoked the sprint sign-off for {task.story_key}: the "
                 f"orchestrator advanced the board to 'done' after dev verified, "
@@ -1639,7 +1715,7 @@ def verify_review(
                 contradiction=True,
             )
         return VerifyOutcome.retry(
-            f"sprint-status for {task.story_key} is {sprint!r}, expected 'done'"
+            f"sprint-status for {task.story_key} is {sprint!r}, expected {expected!r}"
         )
 
     return verify_commands_outcome(policy, paths.project)

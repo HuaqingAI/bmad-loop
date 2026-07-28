@@ -33,6 +33,7 @@ from bmad_loop.policy import (
     LimitsPolicy,
     MuxPolicy,
     NotifyPolicy,
+    OperatorPolicy,
     PluginsPolicy,
     Policy,
     ReviewPolicy,
@@ -63,6 +64,7 @@ SECTION_DC = {
     "scm": ScmPolicy,
     "cleanup": CleanupPolicy,
     "tui": TuiPolicy,
+    "operator": OperatorPolicy,
     "mux": MuxPolicy,
     "dev": DevPolicy,
 }

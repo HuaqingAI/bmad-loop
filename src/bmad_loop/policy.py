@@ -273,6 +273,21 @@ class TuiPolicy:
 
 
 @dataclass(frozen=True)
+class OperatorPolicy:
+    # Whether a dev session may park a story at `awaiting-operator` — the
+    # terminal state for a story whose agent-doable work is finished and
+    # committed but whose acceptance criteria include external actions only a
+    # human can perform (#335). Default-on: without it such a story has no honest
+    # outcome, and the two it would otherwise take are both wrong — `done` hides
+    # the outstanding work behind a green board, `blocked` halts a run over work
+    # the loop was never going to do. Off, the engine injects no park
+    # instruction, never targets the sprint token, and the verify gates do not
+    # know the status, so a session that writes it anyway is retried with that
+    # mismatch as feedback rather than silently committing.
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
 class MuxPolicy:
     # Terminal-multiplexer backend for THIS machine (the transport axis — which
     # tmux-like program hosts sessions; independent of [adapter], the coding-CLI
@@ -553,6 +568,7 @@ class Policy:
     cleanup: CleanupPolicy = field(default_factory=CleanupPolicy)
     plugins: PluginsPolicy = field(default_factory=PluginsPolicy)
     tui: TuiPolicy = field(default_factory=TuiPolicy)
+    operator: OperatorPolicy = field(default_factory=OperatorPolicy)
     mux: MuxPolicy = field(default_factory=MuxPolicy)
 
     def to_dict(self) -> dict[str, Any]:
@@ -683,6 +699,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     engine_d = _section(doc, "engine")  # deprecated; folded into [plugins] below
     plugins_d = _section(doc, "plugins")
     tui_d = _section(doc, "tui")
+    operator_d = _section(doc, "operator")
     mux_d = _section(doc, "mux")
 
     gates = GatesPolicy(
@@ -979,6 +996,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         deferred_height=_tui_dim(tui_d, "deferred_height"),
         tasks_height=_tui_dim(tui_d, "tasks_height"),
     )
+    operator = OperatorPolicy(enabled=bool(operator_d.get("enabled", OperatorPolicy.enabled)))
     mux = MuxPolicy(backend=str(mux_d.get("backend", MuxPolicy.backend)).strip())
     if mux.backend and not _MUX_NAME_RE.match(mux.backend):
         raise PolicyError(
@@ -998,6 +1016,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         cleanup=cleanup,
         plugins=plugins,
         tui=tui,
+        operator=operator,
         mux=mux,
     )
 
@@ -1210,6 +1229,16 @@ low_frame_rate = false
 # runs_height = 0       # Runs pane height, rows
 # deferred_height = 0   # Deferred pane height, rows
 # tasks_height = 0      # Tasks table height, rows
+
+[operator]
+# Let a dev session park a story at `awaiting-operator`: its agent-doable work is
+# finished and COMMITTED, but its acceptance criteria include external actions
+# only a human can perform (buy a domain, publish a DNS record, grant an API
+# key). The story commits, the run moves on to the next one, and what is owed is
+# recorded in `.bmad-loop/operator-actions.json` plus the spec's
+# `operator_actions:` frontmatter. Turn this off to hold sessions to the two
+# older outcomes (done / blocked).
+enabled = true
 
 [mux]
 # Terminal-multiplexer backend for this machine (the transport axis — which

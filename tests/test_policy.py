@@ -767,6 +767,32 @@ def test_to_dict_roundtrips_for_snapshot():
 
 
 # ---------------------------------------------------------------------------
+# [operator] — awaiting-operator parks (issue #335)
+
+
+def test_operator_park_defaults_on():
+    """Default-on because without it a story owing a human action has no honest
+    outcome: `done` hides the outstanding work, `blocked` halts the run over work
+    the loop was never going to do."""
+    assert policy.loads("").operator.enabled is True
+
+
+def test_operator_park_can_be_turned_off():
+    assert policy.loads("[operator]\nenabled = false\n").operator.enabled is False
+
+
+def test_operator_scalar_section_rejected():
+    with pytest.raises(policy.PolicyError, match=r"\[operator\] must be a table"):
+        policy.loads('operator = "on"\n')
+
+
+def test_template_operator_block_parses_to_the_default():
+    # unlike [mux]'s commented anchor, this key ships uncommented — the template
+    # must therefore agree with the dataclass, not merely parse
+    assert policy.loads(policy.POLICY_TEMPLATE).operator.enabled is True
+
+
+# ---------------------------------------------------------------------------
 # [mux] — machine-scoped terminal-multiplexer backend choice (issue #87)
 
 

@@ -429,6 +429,16 @@ label = "low frame rate"
 description = "cap to 15fps + disable animations — fixes repaint tearing/garbage over slow or SSH links · takes effect next time the TUI launches"
 
 [[section]]
+name = "operator"
+description = "stories that owe external, human-only actions"
+[[section.field]]
+key = "enabled"
+kind = "switch"
+default_ref = "OperatorPolicy.enabled"
+label = "allow awaiting-operator parks"
+description = "let a session finish + commit a story whose acceptance criteria need a human action (buy a domain, publish a DNS record) and park it as awaiting-operator instead of forcing done or blocked · what is owed lands in .bmad-loop/operator-actions.json"
+
+[[section]]
 name = "mux"
 description = "terminal-multiplexer backend (machine-specific — policy.toml is gitignored)"
 # options are injected at build-registry time from detect_multiplexers() (plus any

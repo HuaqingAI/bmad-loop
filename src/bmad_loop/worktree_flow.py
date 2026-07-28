@@ -523,7 +523,12 @@ class WorktreeFlow:
     def integrate_unit(self, task: StoryTask, unit: UnitWorkspace) -> None:
         self._emit("pre_integrate", task)
         scm = self.policy.scm
-        if task.phase == Phase.DONE:
+        # AWAITING_OPERATOR merges beside DONE: a parked story CARRIES A COMMIT
+        # (that is what separates it from DEFERRED/ESCALATED), and stranding that
+        # commit on a torn-down unit branch would lose finished work over an
+        # obligation that lives outside the repo entirely. The human's remaining
+        # actions are recorded in the registry, not in this worktree.
+        if task.phase in (Phase.DONE, Phase.AWAITING_OPERATOR):
             # Merge the unit branch into the target branch locally. We open PRs
             # ourselves by hand once the branch has landed; the orchestrator only
             # commits the worktree onto the selected target.

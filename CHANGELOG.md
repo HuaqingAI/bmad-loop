@@ -9,6 +9,23 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **Stories can park at `awaiting-operator` (#335, part 2 of 4).** A dev session whose story needs
+  an action only a human can take outside the repo — buy a domain, publish a DNS record, grant an
+  API key — now finishes and **commits** everything an agent can do, records what is owed in the
+  spec's `operator_actions:` frontmatter, and parks. The run moves on to the next story instead of
+  stopping, and the board advances to `awaiting-operator` (a forward move; nothing regresses).
+  Previously such a story had only two dishonest outcomes: `done`, which hides the outstanding work
+  behind a green board, or `blocked`, which halts the whole run.
+
+  A park clears the same deterministic gates a `done` story clears — the spec/board pair, the
+  project's verify commands, and a non-empty action list — and skips only the review loop, which has
+  nothing in the diff to converge on. A park with no readable actions is refused and repaired, not
+  committed. Under worktree isolation the unit merges like a `done` one. `[operator] enabled =
+false` restores the old two-outcome behavior.
+
+  `bmad-loop confirm` and the project-level registry it reads are part 3; for now a parked story's
+  obligations live in its spec and in the `story-awaiting-operator` journal entry.
+
 - **`awaiting-operator` vocabulary, no writer yet (#335, part 1 of 4).** Names, at every layer, the
   state a story reaches when its agent-doable work is finished and committed but its acceptance
   criteria include external actions only a human can perform: `Phase.AWAITING_OPERATOR` (terminal,

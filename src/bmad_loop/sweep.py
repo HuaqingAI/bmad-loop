@@ -1291,6 +1291,13 @@ class SweepEngine(Engine):
             )
         return verify.verify_review_bundle(task, self.workspace.paths, self.policy)
 
+    def _operator_park_enabled(self) -> bool:
+        # A bundle carries no sprint-status entry, so the pair a park is verified
+        # against does not exist, and `verify_review_bundle` gates on closed dw
+        # ids instead. Whether a deferred-work bundle can owe a human action is a
+        # separate question from whether a story can; not answered here.
+        return False
+
     def _commit_message(self, task: StoryTask) -> str:
         rendered = self._render_commit_template(task)
         if rendered is not None:

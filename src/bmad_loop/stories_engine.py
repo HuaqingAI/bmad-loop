@@ -491,6 +491,15 @@ class StoriesEngine(Engine):
         # story spec's own `done` frontmatter is authoritative.
         return verify.verify_review_stories(task, self.workspace.paths, self.policy)
 
+    def _operator_park_enabled(self) -> bool:
+        # Stories mode has no sprint board, so the (awaiting-operator,
+        # awaiting-operator) pair the park is verified against does not exist
+        # here and `verify_review_stories` still demands `done`. Parking without
+        # that gate would commit on the spec's word alone. Support is a follow-up
+        # (spec-status + registry only); until then the token is simply not a
+        # terminal this mode knows.
+        return False
+
     # -------------------------------------------------------- HITL checkpoints
 
     def _drive_story(self, task: StoryTask, dev_resume: SessionResult | None = None) -> None:

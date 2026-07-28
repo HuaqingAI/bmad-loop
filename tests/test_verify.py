@@ -324,6 +324,121 @@ def test_verify_dev_review_disabled_expects_done(project):
     assert not out.ok and "expected 'done'" in out.reason
 
 
+# ------------------------------------------- awaiting-operator pair (#335)
+
+
+def _park(project, *, sprint="awaiting-operator", actions=("publish the TXT record",)):
+    """A dev session that finished its agent-doable work and parked the rest."""
+    write_sprint(project, {"1-1-a": sprint})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "awaiting-operator", task.baseline_commit, operator_actions=list(actions))
+    (project.project / "src.txt").write_text("changed\n")
+    return task, sp
+
+
+def test_verify_dev_accepts_the_park_pair(project):
+    """The third accepted pair, selected by the OBSERVED spec status: the skill
+    decides whether it parked, and the gate then holds it to the matching board
+    state. `review_enabled` is irrelevant here — a park short-circuits both the
+    in-review handoff and the straight-to-done finish."""
+    task, sp = _park(project)
+
+    out = verify.verify_dev(task, project, dev_result(sp), review_enabled=False, operator_park=True)
+
+    assert out.ok
+    assert task.spec_file == str(sp)
+
+
+def test_verify_dev_park_needs_the_matching_board(project):
+    """Pair, not either half: a parked spec over a board the orchestrator never
+    advanced is a sync that did not land, and committing on the spec's word alone
+    would leave `bmad-loop confirm` advancing a board that never reached the
+    token."""
+    task, sp = _park(project, sprint="in-progress")
+
+    out = verify.verify_dev(task, project, dev_result(sp), review_enabled=False, operator_park=True)
+
+    assert not out.ok and out.retryable
+    assert "expected 'awaiting-operator'" in out.reason
+
+
+@pytest.mark.parametrize(
+    "actions, why",
+    [
+        ([], "an empty list declares nothing"),
+        (["", "   "], "blanks are not actions"),
+        ("buy the domain", "a bare string is the wrong container"),
+    ],
+)
+def test_verify_dev_park_without_usable_actions_retries_fixable(project, actions, why):
+    """A park is DEFINED by owing at least one action, so a spec at the status
+    with nothing readable under `operator_actions:` is refused — confirming it
+    later would be a human acknowledging a blank.
+
+    `fixable=True` is the load-bearing half: the tree is real work and the defect
+    is one frontmatter block, so the reason goes to a repair session as feedback
+    instead of throwing the attempt away. This is the ablation detector for the
+    non-empty gate — delete it and the malformed park verifies green."""
+    write_sprint(project, {"1-1-a": "awaiting-operator"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "awaiting-operator", task.baseline_commit, operator_actions=actions)
+    (project.project / "src.txt").write_text("changed\n")
+
+    out = verify.verify_dev(task, project, dev_result(sp), review_enabled=False, operator_park=True)
+
+    assert not out.ok and out.retryable, why
+    assert out.fixable is True
+    assert "operator_actions" in out.reason and "YAML list of strings" in out.reason
+
+
+def test_verify_dev_park_unknown_when_the_policy_is_off(project):
+    """`[operator] enabled = false` does not make the token mean something else —
+    it makes it mean nothing. The ordinary status gate then rejects it, and the
+    session is retried with that mismatch as feedback rather than committing."""
+    task, sp = _park(project)
+
+    out = verify.verify_dev(task, project, dev_result(sp), review_enabled=False)
+
+    assert not out.ok and out.retryable
+    assert "'awaiting-operator'" in out.reason and "expected 'done'" in out.reason
+
+
+def test_verify_review_accepts_the_park_pair(project):
+    """The gate the park path runs before committing: parked work clears the same
+    deterministic checks `done` work clears."""
+    task, sp = _park(project)
+    task.spec_file = str(sp)
+
+    out = verify.verify_review(task, project, Policy())
+
+    assert out.ok
+
+
+def test_verify_review_park_requires_actions(project):
+    task, sp = _park(project, actions=[])
+    task.spec_file = str(sp)
+
+    out = verify.verify_review(task, project, Policy())
+
+    assert not out.ok and out.retryable and out.fixable is True
+    assert "operator_actions" in out.reason
+
+
+def test_verify_review_park_board_short_is_a_plain_retry_not_a_contradiction(project):
+    """The sign-off-regression arm (#334) stays scoped to the `done` pair. A board
+    short of `awaiting-operator` is a stage never reached — escalating it would
+    halt a run over a sync that simply has not landed."""
+    task, sp = _park(project, sprint="in-progress")
+    task.spec_file = str(sp)
+
+    out = verify.verify_review(task, project, Policy(), sprint_reached_done=True)
+
+    assert not out.ok and out.retryable and out.contradiction is False
+    assert out.reason == "sprint-status for 1-1-a is 'in-progress', expected 'awaiting-operator'"
+
+
 def test_verify_dev_review_disabled_rejects_review_sprint(project):
     # Skip-review finalizes the sprint to 'done'; a run that left it at 'review'
     # must not slip through the sprint-status gate.
