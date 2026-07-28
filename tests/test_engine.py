@@ -4602,15 +4602,14 @@ def test_run_start_branch_prune_failure_does_not_skip_dirty_prune(project, monke
 
 
 def test_rollback_worktree_preserve_failure_journals_git_error(project, monkeypatch):
-    """When the uncommitted-work snapshot can't be captured, the best-effort path still
-    resets (rollback ON, no commits above baseline -> no pause) but journals the underlying
-    git error, so a post-mortem can see WHY preservation failed — not just that it did."""
-    policy = Policy(
-        gates=GatesPolicy(mode="none"),
-        notify=QUIET,
-        scm=ScmPolicy(rollback_on_failure=True),
-    )
-    engine, _ = make_engine(project, [], policy=policy)
+    """When the uncommitted-work snapshot can't be captured, the re-drive path still
+    resets (pause-free by contract) but journals the underlying git error, so a
+    post-mortem can see WHY preservation failed — not just that it did.
+
+    Driven through `cause="resolved"` since #340: a plain rollback now refuses this
+    reset rather than destroying the uncommitted edit, so the re-drive is where the
+    journal-and-proceed behavior survives."""
+    engine, _ = make_engine(project, [])
     repo = project.project
     task = StoryTask(story_key="1-1-a", epic=1)
     task.baseline_commit = rev_parse_head(repo)
@@ -4622,13 +4621,46 @@ def test_rollback_worktree_preserve_failure_journals_git_error(project, monkeypa
 
     monkeypatch.setattr("bmad_loop.verify.snapshot_worktree", _fail)
 
-    engine._rollback_or_pause(task)  # best-effort: journals + proceeds, never raises
+    engine._rollback_or_pause(task, cause="resolved")  # journals + proceeds, never raises
 
     assert rev_parse_head(repo) == task.baseline_commit  # reset still happened
     entry = next(
         e for e in engine.journal.entries() if e["kind"] == "attempt-worktree-preserve-failed"
     )
     assert "simulated commit-tree failure" in entry["error"]  # underlying git detail preserved
+
+
+def test_rollback_refuses_reset_when_the_dirty_snapshot_fails(project, monkeypatch):
+    """#340 end-to-end through a real Engine: an in-place auto-rollback whose dirty
+    snapshot fails pauses instead of resetting, leaving the uncommitted work on disk
+    for the operator to rescue. The engine-level twin of the RecoveryFlow seam test.
+
+    Ablation target: delete the `pause_for_manual_recovery(..., snapshot_failed=True)`
+    call from preserve_attempt_worktree's `except` and this fails."""
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, _ = make_engine(project, [], policy=policy)
+    repo = project.project
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = rev_parse_head(repo)
+    task.baseline_untracked = []
+    (repo / "src.txt").write_text("uncommitted edit\n")
+
+    def _fail(*a, **k):
+        raise GitError("simulated write-tree failure")
+
+    monkeypatch.setattr("bmad_loop.verify.snapshot_worktree", _fail)
+
+    with pytest.raises(RunPaused) as paused:
+        engine._rollback_or_pause(task)
+
+    assert (repo / "src.txt").read_text() == "uncommitted edit\n"  # NOT reset
+    reason = paused.value.reason
+    assert "uncommitted work could not be auto-preserved" in reason
+    assert "rollback-manual-required" in [e["kind"] for e in engine.journal.entries()]
 
 
 def test_rollback_pauses_when_preserve_fails(project, monkeypatch):

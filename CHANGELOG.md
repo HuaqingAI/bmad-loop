@@ -7,7 +7,22 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
-### Added
+### Changed
+
+- **A failed worktree snapshot now blocks the rollback reset (#340).** The two preserve steps were
+  asymmetric: an auto-rollback refused to reset past commits it could not park, but a failed
+  *uncommitted*-work snapshot was journaled and the `reset --hard` ran anyway — destroying the
+  tracked edits and run-created untracked files the snapshot existed to capture. That protected the
+  more recoverable half; orphaned commits stay reachable by reflog until `gc`, while a discarded
+  uncommitted edit is gone. Both paths now refuse on the same terms, pausing with rescue
+  instructions that name the tree (the mounted worktree when there is one) and offer a git-free
+  copy-out, since the fault that broke the snapshot may still be breaking git.
+
+  Gated on there being something left to lose: a capture failure over a tree whose content was all
+  committed still resets, so a git fault can't halt an unattended run over a harmless reset. A
+  resolved re-drive stays pause-free by contract — it journals, resets, and flags the park
+  commits-only (#338). Inert under the shipped defaults, where the snapshot is reached only on a
+  re-drive; it bites `scm.rollback_on_failure = true` and in-worktree dev retries.
 
 - **Defer notifications name where the work survives (#333).** A deferred story's rollback parked
   the attempt on an `attempt-preserve/*` branch (or a `refs/attempt-preserve-dirty/*` snapshot),

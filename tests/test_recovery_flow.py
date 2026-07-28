@@ -345,7 +345,7 @@ def test_preserve_attempt_worktree_snapshots_dirty_tree(project):
     task.attempt = 2
     (repo / "src.txt").write_text("uncommitted edit\n")  # tracked file dirtied
 
-    flow.preserve_attempt_worktree(task)
+    flow.preserve_attempt_worktree(task, allow_pause=False)
 
     assert "attempt-worktree-preserved" in flow.journal.events()
     ref = flow.journal.fields("attempt-worktree-preserved")["ref"]
@@ -384,17 +384,23 @@ def test_dirty_preserve_ref_wins_and_subsumes_the_commits_branch(project):
 
 
 def test_snapshot_failure_leaves_a_commits_only_ref_flagged_partial(project, monkeypatch):
-    """The snapshot raises *after* the commits branch was already parked, and the
-    reset runs anyway (best-effort contract). `preserve_ref` then names the commits
-    branch alone, so the whole-attempt promise no longer holds — `preserve_partial`
-    records that, and the defer notice downgrades its claim instead of telling the
-    operator a `merge --ff-only` restores work the reset just destroyed.
+    """The snapshot raises *after* the commits branch was already parked, and on a
+    re-drive the reset runs anyway. `preserve_ref` then names the commits branch
+    alone, so the whole-attempt promise no longer holds — `preserve_partial` records
+    that, and the defer notice downgrades its claim instead of telling the operator
+    a `merge --ff-only` restores work the reset just destroyed.
+
+    Since #340 a *plain* rollback refuses this reset, so the re-drive
+    (`cause="resolved"`, contractually pause-free) is the surviving path where the
+    partial park is reachable — which is exactly why #338's downgrade is narrowed
+    rather than superseded. `rollback_on_failure` is left OFF so the re-drive is
+    what carries the auto-recover arm here, not the policy flag.
 
     Ablation target: delete `task.preserve_partial = True` from
     preserve_attempt_worktree's `except verify.GitError` block and this fails."""
     repo = project.project
     ws = Workspace.default(project)
-    flow = _make_flow(workspace=ws, policy=_policy(rollback_on_failure=True))
+    flow = _make_flow(workspace=ws)
     task = _task(repo)
     (repo / "src.txt").write_text("committed\n")
     git(repo, "add", "-A")
@@ -406,8 +412,9 @@ def test_snapshot_failure_leaves_a_commits_only_ref_flagged_partial(project, mon
 
     monkeypatch.setattr(verify, "snapshot_worktree", _fail)
 
-    flow.rollback_or_pause(task)
+    flow.rollback_or_pause(task, cause="resolved")
 
+    assert flow.calls.pauses == []  # a re-drive never pauses, even on a preserve failure
     assert "attempt-worktree-preserve-failed" in flow.journal.events()
     assert task.preserve_ref == flow.journal.fields("attempt-commits-preserved")["ref"]
     assert task.preserve_ref.startswith("attempt-preserve/")
@@ -418,6 +425,150 @@ def test_snapshot_failure_leaves_a_commits_only_ref_flagged_partial(project, mon
     # `merge --ff-only` would have implied it could restore
     assert "committed" not in (repo / "src.txt").read_text()
     assert git(repo, "show", f"{task.preserve_ref}:src.txt") == "committed"
+
+
+def _fail_snapshot(monkeypatch, exc=None):
+    """Make verify.snapshot_worktree raise, the way a full disk or a git timeout
+    inside `add -u`/`write-tree`/`update-ref` would."""
+
+    def _fail(*_a, **_k):
+        raise exc if exc is not None else verify.GitError("simulated commit-tree failure")
+
+    monkeypatch.setattr(verify, "snapshot_worktree", _fail)
+
+
+def test_snapshot_failure_pauses_when_work_would_be_lost(project, monkeypatch):
+    """#340: a failed dirty snapshot refuses the reset instead of destroying the
+    uncommitted work it existed to capture. Unlike the commits path's orphaned
+    objects, a tracked edit a `reset --hard` discards is unrecoverable, so the
+    safety net becomes a gate.
+
+    Ablation target: delete the `pause_for_manual_recovery(..., snapshot_failed=True)`
+    call from preserve_attempt_worktree's `except` and this fails."""
+    repo = project.project
+    ws = Workspace.default(project)
+    flow = _make_flow(workspace=ws, policy=_policy(rollback_on_failure=True))
+    task = _task(repo)
+    (repo / "src.txt").write_text("uncommitted work\n")
+    (repo / "new.txt").write_text("run-created untracked\n")
+    _fail_snapshot(monkeypatch)
+
+    with pytest.raises(_Pause):
+        flow.rollback_or_pause(task)
+
+    assert "attempt-worktree-preserve-failed" in flow.journal.events()
+    # the whole point: the tree is untouched, so the work is still there to rescue
+    assert (repo / "src.txt").read_text() == "uncommitted work\n"
+    assert (repo / "new.txt").is_file()
+    notice = flow.calls.pauses[0][0]
+    assert "uncommitted work could not be auto-preserved" in notice
+    assert "attempt-worktree-preserve-failed" in notice  # names the diagnosis breadcrumb
+    # rescue first, discard second — and step 3 is what lets the pause terminate
+    # (reset, resume, rollback-skipped-clean). Anchor on the command, not the bare
+    # phrase: the prose above it also says `reset --hard`, so index() would match there.
+    assert notice.index("Save what you want to keep") < notice.index(
+        f'git -C "{repo}" reset --hard'
+    )
+
+
+def test_snapshot_failure_proceeds_when_nothing_would_be_lost(project, monkeypatch):
+    """The refusal is gated on there being something left to lose. An attempt that
+    committed everything has a tree clean vs HEAD, so the reset destroys nothing and
+    a snapshot fault must not halt an unattended run over it (cf. #123's false-pause
+    complaint).
+
+    INVERSE ablation — `pauses == []` would also pass if the pause were simply
+    unreachable. Make the pause unconditional (drop the `_reset_would_destroy`
+    guard) and this must fail."""
+    repo = project.project
+    ws = Workspace.default(project)
+    flow = _make_flow(workspace=ws, policy=_policy(rollback_on_failure=True))
+    task = _task(repo)
+    (repo / "src.txt").write_text("committed\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "attempt commit")  # nothing left uncommitted
+    _fail_snapshot(monkeypatch)
+
+    flow.rollback_or_pause(task)
+
+    assert flow.calls.pauses == []
+    assert "attempt-worktree-preserve-failed" in flow.journal.events()
+    assert rev_parse_head(repo) == task.baseline_commit  # the harmless reset ran
+    # and the committed half is still recoverable by name
+    assert git(repo, "show", f"{task.preserve_ref}:src.txt") == "committed"
+
+
+def test_snapshot_failure_probe_fault_pauses(project, monkeypatch):
+    """A git fault in the at-risk probe itself must read as work-at-risk, never as
+    permission to reset — the same fail-safe direction as the dirty check (#156).
+
+    Ablation target: flip `_reset_would_destroy`'s `except verify.GitError` to
+    `return False` and this fails."""
+    repo = project.project
+    ws = Workspace.default(project)
+    flow = _make_flow(workspace=ws, policy=_policy(rollback_on_failure=True))
+    task = _task(repo)
+    (repo / "src.txt").write_text("uncommitted work\n")
+    _fail_snapshot(monkeypatch)
+
+    def _fail_probe(*_a, **_k):
+        raise verify.GitError("simulated rev-parse failure")
+
+    monkeypatch.setattr(verify, "rev_parse_head", _fail_probe)
+
+    with pytest.raises(_Pause):
+        flow.rollback_or_pause(task)
+
+    assert (repo / "src.txt").read_text() == "uncommitted work\n"  # not reset
+
+
+def test_snapshot_failure_never_pauses_on_redrive(project, monkeypatch):
+    """The re-drive's pause-free contract outranks the #340 gate: the operator
+    already directed this discard through the resolve workflow, so a failed capture
+    journals and lets the reset run.
+
+    Ablation target: delete `if not allow_pause: return` from the `except` and this
+    fails."""
+    repo = project.project
+    ws = Workspace.default(project)
+    flow = _make_flow(workspace=ws)
+    task = _task(repo)
+    (repo / "src.txt").write_text("uncommitted work\n")
+    _fail_snapshot(monkeypatch)
+
+    flow.rollback_or_pause(task, cause="resolved")
+
+    assert flow.calls.pauses == []
+    assert task.preserve_partial is True  # still latched — the notice must downgrade
+    assert (repo / "src.txt").read_text() == "original\n"  # reset ran
+
+
+def test_snapshot_failure_pause_names_the_unit_worktree(project, tmp_path, monkeypatch):
+    """#161 compatibility: a preserve-failure pause can fire while a unit worktree is
+    mounted, and every instruction must target that tree. Naming the main checkout
+    there quotes a HEAD the attempt never moved and invites a destructive reset of a
+    tree the operator never worked in.
+
+    Ablation target: change `pause_for_manual_recovery`'s `root` back to
+    `self.paths.repo_root` and this fails."""
+    repo = project.project
+    ws = Workspace.default(project)
+    main_checkout = tmp_path / "some-other-main-checkout"
+    flow = _make_flow(
+        workspace=ws,
+        paths=SimpleNamespace(repo_root=main_checkout),
+        policy=_policy(rollback_on_failure=False),  # in-worktree recovery ignores it
+    )
+    task = _task(repo)
+    (repo / "src.txt").write_text("worktree attempt\n")
+    _fail_snapshot(monkeypatch)
+
+    with pytest.raises(_Pause):
+        flow.rollback_or_pause(task)
+
+    notice = flow.calls.pauses[0][0]
+    assert str(repo) in notice
+    assert str(main_checkout) not in notice
 
 
 def test_rollback_clears_a_previous_attempts_preserve_ref(project, monkeypatch):

@@ -765,14 +765,22 @@ class Engine:
     def _preserve_attempt_commits(self, task: StoryTask, *, allow_pause: bool) -> None:
         self._recovery_flow.preserve_attempt_commits(task, allow_pause=allow_pause)
 
-    def _preserve_attempt_worktree(self, task: StoryTask) -> None:
-        self._recovery_flow.preserve_attempt_worktree(task)
+    def _preserve_attempt_worktree(self, task: StoryTask, *, allow_pause: bool) -> None:
+        self._recovery_flow.preserve_attempt_worktree(task, allow_pause=allow_pause)
 
     def _pause_for_manual_recovery(
-        self, task: StoryTask, baseline: str, *, preserve_failed: bool = False
+        self,
+        task: StoryTask,
+        baseline: str,
+        *,
+        preserve_failed: bool = False,
+        snapshot_failed: bool = False,
     ) -> None:
         self._recovery_flow.pause_for_manual_recovery(
-            task, baseline, preserve_failed=preserve_failed
+            task,
+            baseline,
+            preserve_failed=preserve_failed,
+            snapshot_failed=snapshot_failed,
         )
 
     def _finish_inflight(self) -> None:
