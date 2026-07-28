@@ -4641,6 +4641,154 @@ def test_confirm_survives_a_non_git_project(project, capsys, monkeypatch):
     assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
 
 
+# ------------------------- confirm: a write that did not land is not a confirmation
+#
+# `confirm` used to discard both spec-write results and print "✓ confirmed"
+# regardless. Each of these pins a way a write can fail to land, and each asserts
+# the resulting STATE — the board never moves and the index entry stays, so the
+# command is still re-runnable.
+
+
+def _unrewritable_spec(paths, key="1-1-a"):
+    """A spec whose status reads as `awaiting-operator` (so `drift()` clears and
+    `confirm` proceeds) but sits in a shape no in-place line edit can move: a
+    literal block scalar. Replacing the `status: |` line orphans its indented
+    continuation, so every candidate edit fails verification."""
+    sp = _park_story(paths, key)
+    sp.write_text(
+        "---\n"
+        "status: |\n"
+        "  awaiting-operator\n"
+        "baseline_revision: base\n"
+        "operator_actions:\n" + "".join(f"  - {a}\n" for a in CONFIRM_ACTIONS) + "---\n\n"
+        "# Story\n",
+        encoding="utf-8",
+    )
+    return sp
+
+
+def test_confirm_refuses_when_the_spec_status_cannot_be_rewritten(project, capsys, monkeypatch):
+    """The seam that proves the frontmatter defect mattered. The reader sees
+    `awaiting-operator`, so nothing upstream refuses; the writer cannot move it.
+    Before the fix the discarded `False` still advanced the board, dropped the
+    entry, and printed `✓ confirmed` over a spec still parked.
+
+    ABLATION A1 (`frontmatter._edit_frontmatter_block`: turn the
+    exhausted-candidates `raise` into `return False`) — run, and it FAILS here on
+    the message. Recorded precisely, because the result is not what the plan for
+    this predicted: the confirmation is still refused under A1, since the
+    read-back guard below checks the FILE rather than the writer's word. What A1
+    costs is the diagnosis — the human gets "still does not read status: done"
+    instead of the shape that blocked it and the instruction to repair it. The
+    raise is what carries the reason; the read-back is what carries the refusal.
+    (A1 also fails 7 tests in tests/test_frontmatter.py, and `rearm_escalation`
+    has no read-back at all, so there a `False` is silent.)"""
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    sp = _unrewritable_spec(project)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "park")
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 1
+    err = capsys.readouterr().err
+    assert "carries a status this cannot rewrite" in err
+    assert "NOT confirmed" in err and "re-run" in err
+    assert "awaiting-operator" in sp.read_text()  # the status never moved
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+    assert "1-1-a" in operatoractions.load(project.project)  # still findable
+    assert "confirm 1-1-a" not in git(project.project, "log", "-1", "--format=%s")
+
+
+def test_confirm_refuses_when_the_spec_does_not_read_back_as_done(project, capsys, monkeypatch):
+    """The guard behind the raise: a writer that reports success without landing.
+    Unreachable through `set_frontmatter_status` today by construction — which is
+    the point, since it covers what no return value can (an `atomic_replace`
+    landing elsewhere on Windows, a shape nobody has enumerated, a concurrent
+    writer). Simulated by a writer that claims True and writes nothing.
+
+    Ablation: delete the read-back and this fails — the board advances and the
+    index entry is dropped over a spec still parked."""
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    _park_story(project)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+    monkeypatch.setattr(cli.frontmatter, "set_frontmatter_status", lambda *a, **k: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 1
+    err = capsys.readouterr().err
+    assert "still does not read status: done" in err and "NOT confirmed" in err
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+    assert "1-1-a" in operatoractions.load(project.project)
+
+
+def test_confirm_refuses_when_the_spec_vanished_before_the_audit_section(
+    project, capsys, monkeypatch
+):
+    """`append_operator_confirmation` returns False in exactly one case — the spec
+    is gone since `resolve` read it — and its docstring says "the caller decides
+    whether that is fatal". It is: the section is the only record of the part of
+    this story that happened outside the repository.
+
+    Ablation: discard the return value and this fails — but on the MESSAGE, not
+    the refusal, and that is the whole reason the guard is here rather than left
+    to the read-back below. Without it the confirmation is still refused (an
+    absent spec reads back as status "", not "done"), and the human is told "the
+    audit section was appended" about a spec that no longer exists. A refusal that
+    misreports what landed is what sends someone looking for a section to
+    de-duplicate before re-running."""
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    sp = _park_story(project)
+    def _answer_and_delete(_q):  # the spec goes between `resolve` and the append
+        sp.unlink(missing_ok=True)
+        return True
+
+    monkeypatch.setattr(cli, "_confirm", _answer_and_delete)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 1
+    err = capsys.readouterr().err
+    assert "disappeared" in err and "nothing was changed" in err
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+    assert "1-1-a" in operatoractions.load(project.project)
+
+
+def test_confirm_reports_a_board_that_did_not_advance(project, capsys, monkeypatch):
+    """`sprintstatus.advance` returns the CURRENT status when its line regex
+    cannot rewrite the entry `story_status` resolved via YAML — a quoted story key
+    is enough, no mock required. That leaves the half-applied state the message
+    has to be honest about: spec signed off and done, board still parked.
+
+    Ablation: drop the `landed != "done"` branch and this fails — `✓ confirmed`
+    is printed and the entry is dropped over a board still at awaiting-operator,
+    with nothing left that can find the story."""
+    from bmad_loop import devcontract, frontmatter, operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    sp = _park_story(project)
+    project.sprint_status.write_text(
+        "last_updated: 01-06-2026 10:00\n"
+        "development_status:\n"
+        "  epic-1: in-progress\n"
+        "  '1-1-a': awaiting-operator\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 1
+    err = capsys.readouterr().err
+    assert "did not advance" in err and "awaiting-operator" in err
+    assert "Fix the board by hand" in err and "re-run" in err
+    # the spec half landed and stays landed — that is what makes this recoverable
+    assert frontmatter.status_of(frontmatter.read_frontmatter(sp)) == "done"
+    assert devcontract.has_operator_confirmation(sp)
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+    assert "1-1-a" in operatoractions.load(project.project)  # NOT dropped
+
+
 # ------------------------------------- validate: operator-index drift warnings
 
 

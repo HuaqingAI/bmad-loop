@@ -1658,27 +1658,88 @@ def _apply_confirmation(
 
     Ordered so a failure part-way is recoverable rather than stranded. The audit
     section goes first because it is the only record of what happened outside the
-    repo and it does not change any gate — a re-run after a failure appends a
-    second one (deliberate; see `append_operator_confirmation`). The index entry
-    is dropped LAST, so anything that raises before it leaves the story findable
-    and the command re-runnable.
+    repo and it does not change any gate. The index entry is dropped LAST, so
+    anything that raises before it leaves the story findable and the command
+    re-runnable — see `ParkedStory.resumable` for the state that leaves behind.
 
-    Repair-write doctrine: these writes RAISE rather than degrade. `confirm` is
-    about to declare a story finished, and a silently-skipped write would make it
-    declare that falsely. The commit alone is best-effort — the files are the
-    state, git history is the record of it."""
+    A repeat between the section and the status write is the one case that does
+    NOT round-trip cleanly: `append_operator_confirmation` accumulates rather than
+    no-ops (a genuinely repeated confirmation — a spec reverted to the park status
+    and signed off again — is a real event the audit trail must not lose), so a
+    re-run after a failure *here* appends a second section for one event. That is
+    a known gap, not the deliberate case the writer's docstring describes.
+
+    Repair-write doctrine: these writes RAISE rather than degrade, and this
+    asserts the resulting STATE rather than trusting a return value. `confirm` is
+    about to declare a story finished; a skipped write it did not notice would
+    make it declare that falsely. The commit alone is best-effort — the files are
+    the state, git history is the record of it."""
     today = time.strftime("%Y-%m-%d")
-    devcontract.append_operator_confirmation(spec, story.actions, date=today)
-    frontmatter.set_frontmatter_status(spec, "done")
+    if not devcontract.append_operator_confirmation(spec, story.actions, date=today):
+        # The one False the writer returns: the spec is gone since `resolve` read
+        # it. Fatal here — the audit section is the ONLY record of the part of
+        # this story that happened outside the repository, and there is nothing
+        # left to write a status onto either.
+        print(
+            f"error: {spec} disappeared before {story.story_key} could be confirmed — "
+            f"nothing was changed and the index entry has been left in place.",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        frontmatter.set_frontmatter_status(spec, "done")
+    except frontmatter.FrontmatterWriteError as e:
+        print(
+            f"error: {spec} carries a status this cannot rewrite, so {story.story_key} "
+            f"was NOT confirmed: {e}. The audit section was appended; the board and the "
+            f"index entry are untouched, so re-run `bmad-loop confirm {story.story_key}` "
+            f"once the frontmatter is repaired.",
+            file=sys.stderr,
+        )
+        return 1
+    # Read the FILE back, not the writer's return: `set_frontmatter_status`
+    # returns False for "nothing to change" as well as for "already there", and
+    # this is about to declare the story done. It also covers what no return
+    # value can — an `atomic_replace` that landed somewhere else, a shape nobody
+    # enumerated, a concurrent writer. Symmetric with the board half below, which
+    # has always read itself back via `landed`.
+    if frontmatter.status_of(frontmatter.read_frontmatter(spec)) != "done":
+        print(
+            f"error: {spec} still does not read status: done, so {story.story_key} was "
+            f"NOT confirmed. The audit section was appended; the board and the index "
+            f"entry are untouched.",
+            file=sys.stderr,
+        )
+        return 1
+    return _land_confirmation(project, paths, story, spec, today)
+
+
+def _land_confirmation(
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    story: operatoractions.ParkedStory,
+    spec: Path,
+    today: str,
+) -> int:
+    """The half of a confirmation that lives OUTSIDE the spec: advance the board,
+    drop the index entry, commit the pair.
+
+    Split out because it is exactly what an interrupted confirmation still owes.
+    The spec half is already on disk in that case — audit section appended, status
+    at `done` — and re-running it would append a second section for one event, so
+    the resume path enters here instead of at :func:`_apply_confirmation`."""
     # The sole write path to the board, and an ordinary FORWARD move:
     # `awaiting-operator` sits immediately below `done` in STATUS_ORDER, so
-    # confirming needs no exception to never-regress.
+    # confirming needs no exception to never-regress. Idempotent at `done`, which
+    # is what lets a resume run it after a human fixed the board by hand.
     landed = sprintstatus.advance(paths.sprint_status, story.story_key, "done", now=today)
     if landed != "done":
         print(
             f"error: {spec} was updated but {paths.sprint_status} did not advance "
-            f"{story.story_key} to done (it reads {landed!r}). Fix the board by hand; "
-            f"the spec is already correct and the index entry has been left in place.",
+            f"{story.story_key} to done (it reads {landed!r}). Fix the board by hand, then "
+            f"re-run `bmad-loop confirm {story.story_key}` — the spec is already correct "
+            f"and signed off, and the index entry has been left in place, so the re-run "
+            f"finishes what is left without asking you to acknowledge anything twice.",
             file=sys.stderr,
         )
         return 1
