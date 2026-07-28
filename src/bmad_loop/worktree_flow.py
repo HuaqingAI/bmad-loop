@@ -568,12 +568,22 @@ class WorktreeFlow:
             # checkout directly (unlink/iterdir/rmdir) — a non-spawn FS fault the
             # #343 chokepoint cannot translate. Crashing here would strand a DONE
             # unit mid-merge; the keep-branch escalation is the point of this guard.
-            reason = (
-                f"merge of {unit.branch} into {target} blocked: the target checkout has "
-                f"uncommitted changes that are not part of this branch (likely a Unity "
-                f"Editor wrote into the main project) — clean them, then "
-                f"`bmad-loop resume {self.state.run_id}`. {e}"
-            )
+            if isinstance(e, (verify.GitSpawnError, OSError)):
+                # environment fault (spawn failure or direct-FS error) — there may
+                # be no stray files at all, so no "clean them" guidance: the inner
+                # error is the diagnosis.
+                reason = (
+                    f"merge of {unit.branch} into {target} blocked: could not "
+                    f"reconcile the target checkout ({e}) — fix the underlying "
+                    f"fault, then `bmad-loop resume {self.state.run_id}`"
+                )
+            else:
+                reason = (
+                    f"merge of {unit.branch} into {target} blocked: the target checkout has "
+                    f"uncommitted changes that are not part of this branch (likely a Unity "
+                    f"Editor wrote into the main project) — clean them, then "
+                    f"`bmad-loop resume {self.state.run_id}`. {e}"
+                )
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
             return
         if cleaned:
