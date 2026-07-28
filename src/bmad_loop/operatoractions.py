@@ -93,7 +93,7 @@ def load(project: Path) -> dict[str, dict]:
     its key). Tolerant throughout: this is a convenience over committed truth,
     so an unreadable side degrades rather than blocking a human from confirming
     their own work. An unparseable RECORD file still contributes an empty entry
-    under its filename stem — visible as drift ("the index records no spec file
+    under its filename stem — visible as drift ("no spec file could be located
     for it") rather than silently absent, because the file's presence is the
     committed claim that something is owed."""
     data: dict[str, dict] = dict(_load_legacy(project))
@@ -201,7 +201,17 @@ def _record_key(path: Path) -> str:
 def _drop_legacy(project: Path, story_key: str) -> bool:
     """Prune a legacy entry. The emptied store is deleted outright rather than
     rewritten as ``{}``: nothing writes the legacy file anymore, and an empty
-    husk would read as "an index with nothing parked" forever."""
+    husk would read as "an index with nothing parked" forever.
+
+    The rewrite unlinks its temp on any raise, like `record_park` — but for the
+    opposite reason. `drop` runs out of band from `confirm`, not inside a commit
+    window, so the hazard is not a temp RIDING a commit but one OUTLIVING the
+    failure: `.bmad-loop/` is not ignored (`install` excludes only `runs/`,
+    `cache/` and `policy.toml`, and the pre-#356 exclude line was the anchored
+    literal `operator-actions.json`, never its `.tmp` sibling), so a stranded
+    `.bmad-loop/operator-actions.tmp` is an untracked file to
+    `verify.worktree_clean` — a dirty tree blocking the next run's preflight and
+    the epic-boundary auto-sweep, over a prune of a store nothing writes."""
     path = legacy_store_path(project)
     data = _load_legacy(project)
     if story_key not in data:
@@ -209,8 +219,13 @@ def _drop_legacy(project: Path, story_key: str) -> bool:
     del data[story_key]
     if data:
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-        atomic_replace(tmp, path)
+        try:
+            tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+            atomic_replace(tmp, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                tmp.unlink(missing_ok=True)
+            raise
     else:
         path.unlink(missing_ok=True)
     return True
@@ -308,7 +323,7 @@ class ParkedStory:
         entry. Ordered most-fundamental first — a missing spec explains a missing
         status, so it is reported instead of it."""
         if self.spec_path is None:
-            return "the index records no spec file for it"
+            return "no spec file could be located for it"
         if self.spec_status is None:
             return f"its spec is missing or unreadable ({self.spec_path})"
         if self.spec_status != AWAITING_OPERATOR:

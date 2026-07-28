@@ -139,8 +139,8 @@ def test_load_degrades_on_an_unusable_legacy_store(project, content, why):
 def test_a_mangled_record_file_is_still_listed(project):
     """A record file that cannot be parsed still NAMES an obligation — its
     presence in the tree is the committed claim. It degrades to an empty entry
-    under its filename stem, which `resolve` reports as drift ("the index
-    records no spec file for it"), rather than vanishing the way a mangled
+    under its filename stem, which `resolve` reports as drift ("no spec file
+    could be located for it"), rather than vanishing the way a mangled
     legacy store does: the legacy store was one file for every story, so
     degrading it wholesale lost nothing attributable; a per-story file IS the
     attribution."""
@@ -258,6 +258,41 @@ def test_drop_prunes_the_legacy_entry_too(project):
     assert operatoractions.legacy_store_path(project.project).is_file()  # 2-2-b remains
     assert operatoractions.drop(project.project, "2-2-b") is True
     assert not operatoractions.legacy_store_path(project.project).is_file()
+
+
+def test_a_failed_legacy_prune_leaves_no_tmp_residue(project, monkeypatch):
+    """`drop` runs out of band from `confirm`, not inside a commit window, so a
+    stranded `.bmad-loop/operator-actions.tmp` does not ride a commit — it sits
+    UNTRACKED (`.bmad-loop/` is not ignored, and the pre-#356 exclude line named
+    the `.json` only), which `verify.worktree_clean` reads as a dirty tree that
+    blocks the next run's preflight and the epic-boundary auto-sweep.
+
+    TWO entries, deliberately: with one, the prune takes the `else` arm and
+    unlinks the store outright, never reaching `atomic_replace`. That is what
+    the `pytest.raises` is for — it fails LOUDLY on `DID NOT RAISE` rather than
+    letting the residue assertion pass over a rewrite that never ran.
+
+    Ablation: drop the unlink in `_drop_legacy`'s except arm and this fails."""
+
+    def boom(tmp, target):
+        raise OSError(28, "No space left on device")
+
+    _legacy_entry(project, "1-1-a")
+    _legacy_entry(project, "2-2-b")
+    store = operatoractions.legacy_store_path(project.project)
+    before = sorted(p.name for p in store.parent.iterdir())
+    assert before == ["operator-actions.json"]  # a snapshot with something IN it
+
+    monkeypatch.setattr(operatoractions, "atomic_replace", boom)
+    with pytest.raises(OSError):
+        operatoractions.drop(project.project, "1-1-a")
+
+    # Equality against that non-empty snapshot, not `not glob("*.tmp")`: the
+    # bare negative would pass just as happily on a `.bmad-loop/` that was never
+    # created. The failed rewrite also left the store itself as it found it, so
+    # the entry stays confirmable once whatever broke the write is fixed.
+    assert sorted(p.name for p in store.parent.iterdir()) == before
+    assert sorted(operatoractions.load(project.project)) == ["1-1-a", "2-2-b"]
 
 
 def test_drop_matches_the_records_own_key_not_its_filename(project):
@@ -410,7 +445,7 @@ def test_drift_reports_an_entry_with_no_spec_path(project):
     )
     (story,) = operatoractions.resolve(project.project, project)
     assert story.spec_path is None
-    assert story.drift() == "the index records no spec file for it"
+    assert story.drift() == "no spec file could be located for it"
 
 
 def test_a_mangled_record_resolves_as_drift_not_absence(project):
@@ -423,7 +458,7 @@ def test_a_mangled_record_resolves_as_drift_not_absence(project):
     rp.parent.mkdir(parents=True, exist_ok=True)
     rp.write_text("{ not json")
     (story,) = operatoractions.resolve(project.project, project)
-    assert story.drift() == "the index records no spec file for it"
+    assert story.drift() == "no spec file could be located for it"
     assert not story.confirmable
 
 
