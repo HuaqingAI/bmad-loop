@@ -589,6 +589,45 @@ def test_snapshot_oserror_degrades_into_the_typed_path(project, monkeypatch):
     assert (repo / "src.txt").read_text() == "uncommitted work\n"
 
 
+def test_notice_probe_oserror_does_not_swallow_the_pause(project, monkeypatch):
+    """`pause_for_manual_recovery`'s advisory `commits_above` probe runs while the
+    fault that broke the snapshot is still in force, so it is the likeliest place
+    for a second EMFILE. Its own comment says a git fault there must not block the
+    pause — an uncaught OSError did exactly that, losing a pause the caller had
+    already decided to take.
+
+    Ablation target: narrow that probe's `except` back to `verify.GitError` and this
+    fails with the raw OSError instead of pausing."""
+    repo = project.project
+    ws = Workspace.default(project)
+    flow = _make_flow(workspace=ws, policy=_policy(rollback_on_failure=True))
+    task = _task(repo)
+    (repo / "src.txt").write_text("uncommitted work\n")
+    _fail_snapshot(monkeypatch, OSError(24, "Too many open files"))
+
+    # Only the *notice's* probe may fail: preserve_attempt_commits calls
+    # commits_above first, and breaking that would abort the rollback earlier and
+    # never reach the code under test.
+    real_commits_above = verify.commits_above
+    seen = {"n": 0}
+
+    def _flaky(*a, **k):
+        seen["n"] += 1
+        if seen["n"] == 1:
+            return real_commits_above(*a, **k)
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr(verify, "commits_above", _flaky)
+
+    with pytest.raises(_Pause):
+        flow.rollback_or_pause(task)
+
+    assert seen["n"] >= 2  # the advisory probe really was reached and really failed
+    notice = flow.calls.pauses[0][0]
+    assert "uncommitted work could not be auto-preserved" in notice  # shape (d) intact
+    assert (repo / "src.txt").read_text() == "uncommitted work\n"  # not reset
+
+
 def test_snapshot_failure_pause_names_the_unit_worktree(project, tmp_path, monkeypatch):
     """#161 compatibility: a preserve-failure pause can fire while a unit worktree is
     mounted, and every instruction must target that tree. Naming the main checkout

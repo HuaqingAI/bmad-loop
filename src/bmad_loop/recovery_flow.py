@@ -510,10 +510,15 @@ class RecoveryFlow:
         root = workspace.root
         commits: list[str] = []
         if baseline:
-            # advisory probe: a git fault here must not block the pause itself
+            # Advisory probe: a git fault here must not block the pause itself —
+            # including an untranslated spawn-level OSError, which is *likelier* on
+            # the snapshot_failed path than anywhere else (the EMFILE/ENOMEM that
+            # broke the capture is still in force when we come to write the notice).
+            # Degrading to "no commits" only costs notice shape (c); crashing here
+            # would lose the pause the caller already decided to take.
             try:
                 commits = verify.commits_above(root, baseline)
-            except verify.GitError:
+            except (verify.GitError, OSError):
                 commits = []
         if preserve_failed:
             notice = (
