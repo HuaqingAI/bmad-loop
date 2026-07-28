@@ -19,11 +19,13 @@ from . import (
     bmadconfig,
     decisions,
     deferredwork,
+    devcontract,
     envvars,
     frontmatter,
     gates,
     install,
     machine,
+    operatoractions,
 )
 from . import policy as policy_mod
 from . import (
@@ -51,6 +53,7 @@ from .checks import ValidationReport
 # breaks. Keep the noqa when adding a command.
 from .documents import CLEAN_SCHEMA_VERSION  # noqa: F401 — re-export
 from .documents import CLEANUP_SCHEMA_VERSION  # noqa: F401 — re-export
+from .documents import CONFIRM_SCHEMA_VERSION  # noqa: F401 — re-export
 from .documents import DECISIONS_SCHEMA_VERSION  # noqa: F401 — re-export
 from .documents import LIST_SCHEMA_VERSION  # noqa: F401 — re-export
 from .documents import STATUS_SCHEMA_VERSION  # noqa: F401 — re-export
@@ -58,6 +61,7 @@ from .documents import VALIDATE_SCHEMA_VERSION  # noqa: F401 — re-export
 from .documents import (
     clean_document,
     cleanup_document,
+    confirm_document,
     decisions_document,
     list_document,
     run_token_totals,
@@ -235,6 +239,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
             _validate_closes_deferred(paths, report, spec_folder=spec_folder)
         else:
             _validate_closes_deferred(paths, report)
+            _validate_operator_registry(project, paths, report)
             try:
                 ss = sprintstatus.load(paths.sprint_status)
                 actionable = [s for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
@@ -617,6 +622,67 @@ def _spec_closes_deferred(path: Path) -> tuple[tuple[str, ...], str | None]:
     except (OSError, UnicodeDecodeError):
         return (), None
     return deferredwork.parse_declaration(raw)
+
+
+def _validate_operator_registry(
+    project: Path, paths: bmadconfig.ProjectPaths, report: ValidationReport
+) -> None:
+    """Report drift between the operator-actions index and the committed state it
+    points at (#335).
+
+    The index is machine-local and never committed (see
+    :mod:`bmad_loop.operatoractions` for why), so it CAN fall out of step with
+    the specs and board that are the real record — a story re-driven to done, a
+    reverted commit, a hand-edited spec, or simply a clone that never had one.
+    That is only a safe trade if something says so out loud.
+
+    Never a failure, always a warning, both directions. `confirm` already refuses
+    to act on a drifted entry, so nothing here gates anything; a stale index must
+    not be able to block a run that would otherwise start. Reported in both
+    directions because they have opposite remedies: an entry the committed state
+    has moved past is stale bookkeeping to discard, while a board sitting at
+    `awaiting-operator` with no entry is an obligation nobody can confirm from
+    this machine."""
+    parked = operatoractions.resolve(project, paths)
+    for story in parked:
+        if story.spec_status == operatoractions.AWAITING_OPERATOR and not story.actions:
+            report.warn(
+                "operator.actions-malformed",
+                f"{story.story_key} is parked at awaiting-operator but its "
+                f"operator_actions: declares nothing readable — `bmad-loop confirm "
+                f"{story.story_key}` has no actions to acknowledge; repair the list in "
+                f"{story.spec_path}",
+                {"story_key": story.story_key, "spec": str(story.spec_path)},
+            )
+            continue
+        drift = story.drift()
+        if drift is not None:
+            report.warn(
+                "operator.registry-stale",
+                f"the operator-actions index lists {story.story_key} as parked, but "
+                f"{drift} — the entry is stale and `bmad-loop confirm "
+                f"{story.story_key}` will refuse it",
+                {"story_key": story.story_key, "drift": drift},
+            )
+    try:
+        ss = sprintstatus.load(paths.sprint_status)
+    except (sprintstatus.SprintStatusError, OSError, UnicodeDecodeError):
+        return  # the queue gate below owns board readability — don't double-report
+    indexed = {story.story_key for story in parked}
+    orphans = sorted(
+        s.key
+        for s in ss.stories
+        if s.status == operatoractions.AWAITING_OPERATOR and s.key not in indexed
+    )
+    if orphans:
+        report.warn(
+            "operator.registry-stale",
+            f"the board parks {', '.join(orphans)} at awaiting-operator, but the "
+            f"operator-actions index has no entry for them — the index is machine-local "
+            f"and not committed, so `bmad-loop confirm` cannot complete them from here; "
+            f"confirm them on the machine that ran the story, or finish them by hand",
+            {"story_keys": orphans},
+        )
 
 
 def _validate_closes_deferred(
@@ -1457,6 +1523,176 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         )
         launch.detach_client()
     return _resume_paused_run(project, run_dir)
+
+
+def _print_parked(parked: list[operatoractions.ParkedStory]) -> int:
+    if not parked:
+        print("no stories are awaiting operator actions")
+        return 0
+    print(f"{len(parked)} story/stories awaiting operator actions:\n")
+    for p in parked:
+        drift = p.drift()
+        suffix = f"  — NOT CONFIRMABLE: {drift}" if drift else ""
+        print(f"  {p.story_key} (parked {p.parked_at}, commit {p.commit[:8]}){suffix}")
+        for i, action in enumerate(p.actions, 1):
+            print(f"      {i}. {action}")
+        print("")
+    print("confirm one when its actions are done: bmad-loop confirm <story-key>")
+    return 0
+
+
+def _reverify(project: Path, cwd: Path) -> str | None:
+    """Re-run the project's deterministic verify commands, returning a failure
+    reason or None when they all passed.
+
+    Deliberately NOT `verify_commands_outcome`: that classifies into the engine
+    loop's vocabulary (retry/fixable/escalate), and a CLI confirm has no attempt
+    budget and no repair session to dispatch — only "the flip proceeds" or "it
+    does not". The environment-fault reading IS reused, so a missing binary reads
+    as the operator's environment rather than as their story having regressed."""
+    pol = policy_mod.load(_policy_path(project))
+    if not pol.verify.commands:
+        print("note: --reverify: no [verify] commands are configured — nothing to re-run")
+        return None
+    print(f"re-running {len(pol.verify.commands)} verify command(s)...")
+    for result in verify.run_verify_commands(pol, cwd):
+        fault = verify.env_fault_reason(result, cwd)
+        if fault is not None:
+            return f"{result.command!r} could not run: {fault}"
+        if result.returncode != 0:
+            return f"{result.command!r} failed (rc {result.returncode}):\n{result.output_tail}"
+    print("  verify commands passed")
+    return None
+
+
+def cmd_confirm(args: argparse.Namespace) -> int:
+    """Complete a story parked at `awaiting-operator` once the human has carried
+    out the external actions it owes (#335).
+
+    Out of band by construction. The run that parked the story is long finished
+    and its task is in a terminal phase with no legal transition, so this touches
+    no run state at all — it writes the two things that DEFINE the story's
+    completion (the spec and the board) and drops the index entry that pointed at
+    them. Nothing is re-driven: the agent-doable work was committed at park time,
+    and re-running a session would redo finished work while the human's actions
+    stayed outside the repo. `--reverify` is there for the case that matters —
+    the external action may have changed what the tests see."""
+    project = _project(args)
+    try:
+        paths = bmadconfig.load_paths(project)
+    except bmadconfig.BmadConfigError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    parked = operatoractions.resolve(project, paths)
+    if args.json:
+        # Before any early return and before any prompt: --json IS the listing,
+        # and nothing parked is a valid empty document, not a text line.
+        machine.emit(confirm_document(parked))
+        return 0
+    if args.list:
+        return _print_parked(parked)
+    if not args.story_key:
+        print(
+            "error: specify a story key to confirm, or --list to see what is parked",
+            file=sys.stderr,
+        )
+        return 2
+
+    key = args.story_key
+    story = next((p for p in parked if p.story_key == key), None)
+    if story is None:
+        print(
+            f"error: {key} is not awaiting operator actions on this machine. The index "
+            f"({operatoractions.STORE_REL}) is written by the run that parked the story "
+            f"and is not committed, so confirm runs where the orchestrator ran. "
+            f"`bmad-loop confirm --list` shows what is parked here.",
+            file=sys.stderr,
+        )
+        return 1
+    drift = story.drift()
+    if drift is not None:
+        print(
+            f"error: refusing to confirm {key}: {drift}. The index disagrees with the "
+            f"committed state; `bmad-loop validate` reports the same drift. Nothing was "
+            f"changed.",
+            file=sys.stderr,
+        )
+        return 1
+    spec = story.spec_path
+    assert spec is not None  # drift() is non-None whenever the spec path is missing
+
+    print(f"{key} owes {len(story.actions)} external action(s):\n")
+    if args.yes:
+        for i, action in enumerate(story.actions, 1):
+            print(f"  {i}. {action}")
+        print("")
+    else:
+        # Per action, not one blanket prompt: the whole failure this state exists
+        # to prevent is a story marked done with some of its obligations quietly
+        # unmet, and a single "all done? [y/N]" invites exactly that.
+        for i, action in enumerate(story.actions, 1):
+            if not _confirm(f"  {i}. {action}\n     done?"):
+                print("cancelled — nothing was changed")
+                return 0
+        print("")
+
+    if args.reverify:
+        failure = _reverify(project, paths.repo_root)
+        if failure is not None:
+            print(
+                f"error: --reverify failed, so {key} was NOT confirmed: {failure}",
+                file=sys.stderr,
+            )
+            return 1
+
+    return _apply_confirmation(project, paths, story, spec)
+
+
+def _apply_confirmation(
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    story: operatoractions.ParkedStory,
+    spec: Path,
+) -> int:
+    """Write the confirmation: spec audit section, spec status, board, index.
+
+    Ordered so a failure part-way is recoverable rather than stranded. The audit
+    section goes first because it is the only record of what happened outside the
+    repo and it does not change any gate — a re-run after a failure appends a
+    second one (deliberate; see `append_operator_confirmation`). The index entry
+    is dropped LAST, so anything that raises before it leaves the story findable
+    and the command re-runnable.
+
+    Repair-write doctrine: these writes RAISE rather than degrade. `confirm` is
+    about to declare a story finished, and a silently-skipped write would make it
+    declare that falsely. The commit alone is best-effort — the files are the
+    state, git history is the record of it."""
+    today = time.strftime("%Y-%m-%d")
+    devcontract.append_operator_confirmation(spec, story.actions, date=today)
+    frontmatter.set_frontmatter_status(spec, "done")
+    # The sole write path to the board, and an ordinary FORWARD move:
+    # `awaiting-operator` sits immediately below `done` in STATUS_ORDER, so
+    # confirming needs no exception to never-regress.
+    landed = sprintstatus.advance(paths.sprint_status, story.story_key, "done", now=today)
+    if landed != "done":
+        print(
+            f"error: {spec} was updated but {paths.sprint_status} did not advance "
+            f"{story.story_key} to done (it reads {landed!r}). Fix the board by hand; "
+            f"the spec is already correct and the index entry has been left in place.",
+            file=sys.stderr,
+        )
+        return 1
+    operatoractions.drop(project, story.story_key)
+    try:
+        verify.commit_paths(
+            paths.repo_root,
+            f"chore(operator): confirm {story.story_key}",
+            [spec, paths.sprint_status],
+        )
+    except verify.GitError:
+        pass  # files are written; git history is best effort (as `decisions`)
+    print(f"✓ {story.story_key} confirmed — spec and board are done")
+    return 0
 
 
 def cmd_decisions(args: argparse.Namespace) -> int:
@@ -2419,6 +2655,33 @@ def main(argv: list[str] | None = None) -> int:
         help="list the pending decisions without answering them",
     )
     machine.add_json_flag(decisions_p, "pending decisions")
+
+    confirm_p = add(
+        "confirm",
+        cmd_confirm,
+        "complete a story parked at awaiting-operator once its external actions are done",
+    )
+    confirm_p.add_argument(
+        "story_key",
+        nargs="?",
+        help="the parked story to confirm (omit with --list)",
+    )
+    confirm_p.add_argument(
+        "--list",
+        action="store_true",
+        help="list the parked stories and what each owes, without confirming any",
+    )
+    confirm_p.add_argument(
+        "--yes",
+        action="store_true",
+        help="skip the per-action acknowledgment prompts",
+    )
+    confirm_p.add_argument(
+        "--reverify",
+        action="store_true",
+        help="re-run the project's [verify] commands first; a failure blocks the confirmation",
+    )
+    machine.add_json_flag(confirm_p, "stories awaiting operator actions")
 
     list_p = add("list", cmd_list, "list runs/sweeps with their short ref", aliases=["ls"])
     machine.add_json_flag(list_p, "run listing")

@@ -9,6 +9,25 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **`bmad-loop confirm` completes a parked story (#335, part 3 of 4).** Once you have carried out the
+  external actions a story owed, `bmad-loop confirm <story-key>` walks you through them one at a time
+  (`--yes` skips the prompts), writes the spec's `## Operator Confirmation` audit section, advances
+  the spec and the board to `done` through the sole writer, and commits the pair. Nothing is
+  re-driven: the agent-doable work was committed at park time. `--reverify` re-runs the project's
+  `[verify]` commands first and blocks the confirmation if they fail — the external action may have
+  changed what the tests see. `--list` shows every parked story and what each owes; `--json` emits
+  the same set as a schema-versioned document.
+
+  Parks are indexed in `.bmad-loop/operator-actions.json`, written at park time along with a
+  notification naming the actions and the command that ends them. The index is **machine-local and
+  never committed** (it is registered in the repository's local git exclude): it is written from
+  inside a story's commit window, where committing it would either shift `HEAD` past the commit the
+  park just stamped or, under worktree isolation, advance the target branch and break an
+  `scm.merge_strategy = "ff"` merge-back. So a park is confirmed on the machine that ran it. The
+  committed truth stays the spec and the board; `confirm` refuses an index entry that disagrees with
+  them, and `validate` reports the drift in both directions (`operator.registry-stale`,
+  `operator.actions-malformed`).
+
 - **Stories can park at `awaiting-operator` (#335, part 2 of 4).** A dev session whose story needs
   an action only a human can take outside the repo — buy a domain, publish a DNS record, grant an
   API key — now finishes and **commits** everything an agent can do, records what is owed in the
@@ -23,8 +42,7 @@ breaking changes may land in a minor release.
   committed. Under worktree isolation the unit merges like a `done` one. `[operator] enabled =
 false` restores the old two-outcome behavior.
 
-  `bmad-loop confirm` and the project-level registry it reads are part 3; for now a parked story's
-  obligations live in its spec and in the `story-awaiting-operator` journal entry.
+  `bmad-loop confirm` and the project-level index it reads arrived in part 3, above.
 
 - **`awaiting-operator` vocabulary, no writer yet (#335, part 1 of 4).** Names, at every layer, the
   state a story reaches when its agent-doable work is finished and committed but its acceptance

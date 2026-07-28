@@ -1401,6 +1401,101 @@ def test_resume_through_committing_re_derives_the_park(project):
     assert "story-done" not in kinds
 
 
+def test_park_indexes_the_story_for_confirm(project):
+    """The park writes the project-level index `bmad-loop confirm` reads (#335
+    part 3). Without it the obligation exists only in a journal nobody greps and
+    a spec nobody re-reads, and there is no way to find the parked story's spec
+    from its key.
+
+    Ablation: delete the `_index_park` call in `_finalize_commit_phase` and this
+    fails — the story parks with nothing to confirm it from."""
+    from bmad_loop import operatoractions
+
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            generic_dev_effect(
+                project, "1-1-a", final_status="awaiting-operator", operator_actions=ACTIONS
+            )
+        ],
+        policy=_park_policy(),
+    )
+
+    engine.run()
+
+    entry = operatoractions.load(project.project)["1-1-a"]
+    assert entry["actions"] == ACTIONS
+    assert entry["commit"] == engine.state.tasks["1-1-a"].commit_sha
+    assert entry["run_id"] == engine.state.run_id
+    # the recorded spec path resolves from the PROJECT, which is what `confirm`
+    # has — a worktree-absolute path would be dead before a human read it
+    (story,) = operatoractions.resolve(project.project, project)
+    assert story.spec_path is not None and story.spec_path.is_file()
+    assert story.confirmable, story.drift()
+
+
+def test_park_indexing_failure_never_un_commits_the_story(project, monkeypatch):
+    """The only best-effort write on the park path. The commit has already
+    landed, so raising here would abort a story that genuinely succeeded over its
+    bookkeeping — it degrades to a journal line instead, and `validate` reports
+    the resulting drift."""
+    from bmad_loop import operatoractions
+
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            generic_dev_effect(
+                project, "1-1-a", final_status="awaiting-operator", operator_actions=ACTIONS
+            )
+        ],
+        policy=_park_policy(),
+    )
+
+    def boom(*a, **k):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr("bmad_loop.operatoractions.record_park", boom)
+    summary = engine.run()
+
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.AWAITING_OPERATOR and task.commit_sha
+    assert summary.awaiting_operator == 1 and not summary.paused
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "operator-index-failed" in kinds and "story-awaiting-operator" in kinds
+    assert operatoractions.load(project.project) == {}
+
+
+def test_park_notifies_with_the_actions_and_the_confirm_command(project):
+    """The one artifact that reaches someone who is not looking at the repo. It
+    enumerates the actions rather than counting them, and names the command that
+    ends the park — a park is non-blocking, so nothing else will ask again.
+
+    Ablation: delete the `_notify_park` call and this fails — the run moves on and
+    the human is never told a story is waiting on them."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            generic_dev_effect(
+                project, "1-1-a", final_status="awaiting-operator", operator_actions=ACTIONS
+            )
+        ],
+        policy=_park_policy(),
+    )
+
+    engine.run()
+
+    attention = (engine.run_dir / "ATTENTION").read_text()
+    assert "story awaiting operator: 1-1-a" in attention
+    for action in ACTIONS:
+        assert action in attention
+    assert "bmad-loop confirm 1-1-a" in attention
+    # not an escalation: nothing here may read as "the run stopped for you"
+    assert "CRITICAL" not in attention
+
+
 def test_run_summary_render_labels_both_units(project):
     """render() feeds stdout, the ATTENTION file and the desktop notification
     from one place, so this covers all three."""

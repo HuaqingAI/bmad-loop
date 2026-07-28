@@ -436,7 +436,7 @@ key = "enabled"
 kind = "switch"
 default_ref = "OperatorPolicy.enabled"
 label = "allow awaiting-operator parks"
-description = "let a session finish + commit a story whose acceptance criteria need a human action (buy a domain, publish a DNS record) and park it as awaiting-operator instead of forcing done or blocked · what is owed is recorded in the story spec's operator_actions: frontmatter"
+description = "let a session finish + commit a story whose acceptance criteria need a human action (buy a domain, publish a DNS record) and park it as awaiting-operator instead of forcing done or blocked · what is owed is recorded in the story spec's operator_actions: frontmatter, and `bmad-loop confirm <story-key>` completes the story once you have done it"
 
 [[section]]
 name = "mux"

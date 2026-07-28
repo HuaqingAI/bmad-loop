@@ -1022,3 +1022,121 @@ def test_repair_write_failure_never_truncates_spec(tmp_path, monkeypatch, writer
         writer(sp)
     assert sp.read_text(encoding="utf-8") == original  # original untouched
     assert list(tmp_path.glob("*.tmp")) == []  # temp file cleaned up, no litter
+
+
+# ------------------------------ append_operator_confirmation (#335 part 3)
+#
+# The audit section `bmad-loop confirm` writes when a human signs off a parked
+# story. It is the whole record of the part of a story that happened OUTSIDE the
+# repository — the commit shows what the agent did; nothing in git can show that
+# someone bought the domain.
+
+_PARKED = (
+    "---\nstatus: awaiting-operator\nbaseline_revision: 'abc123'\n"
+    "operator_actions:\n  - buy example.com\n  - publish the TXT record\n---\n\n"
+    "## Intent\n\nbody\n"
+)
+_ACTIONS = ["buy example.com", "publish the TXT record"]
+
+
+def test_operator_confirmation_records_the_actions_and_its_provenance(tmp_path):
+    """The actions are RESTATED, not referenced: the frontmatter list is the claim
+    and this is the acknowledgment, so a later reader comparing the two can see
+    whether the spec was edited in between."""
+    sp = _write(tmp_path, "spec-a.md", _PARKED)
+    assert devcontract.append_operator_confirmation(sp, _ACTIONS, date="2026-07-28") is True
+    text = sp.read_text()
+    assert "## Operator Confirmation" in text
+    assert "Confirmed 2026-07-28:" in text
+    assert "- buy example.com\n" in text and "- publish the TXT record\n" in text
+    assert devcontract.OPERATOR_CONFIRM_NOTE in text
+    # the writer records; it does not decide status — `confirm` flips that after
+    assert "status: awaiting-operator\n" in text
+
+
+def test_operator_confirmation_appends_after_the_existing_body(tmp_path):
+    sp = _write(tmp_path, "spec-a.md", _PARKED)
+    devcontract.append_operator_confirmation(sp, _ACTIONS, date="2026-07-28")
+    text = sp.read_text()
+    assert text.index("## Intent") < text.index("## Operator Confirmation")
+    assert text.startswith("---\n")  # frontmatter block untouched at the top
+
+
+def test_operator_confirmation_accumulates_rather_than_no_opping(tmp_path):
+    """Unlike `append_auto_run_result`, a second confirmation is a real event (a
+    spec reverted to the park status and confirmed again). Dropping it would make
+    the audit trail claim there was only ever one sign-off."""
+    sp = _write(tmp_path, "spec-a.md", _PARKED)
+    devcontract.append_operator_confirmation(sp, _ACTIONS, date="2026-07-28")
+    assert (
+        devcontract.append_operator_confirmation(sp, ["the redone one"], date="2026-07-30") is True
+    )
+    text = sp.read_text()
+    assert text.count("## Operator Confirmation") == 2
+    assert text.index("2026-07-28") < text.index("2026-07-30")  # newest last
+
+
+def test_operator_confirmation_is_not_a_marker_the_result_scan_harvests(tmp_path):
+    """The section must not make a parked spec look like it carries an
+    `## Auto Run Result` — that marker is the dev session's completion contract,
+    and a human sign-off is not one."""
+    sp = _write(tmp_path, "spec-a.md", _PARKED)
+    devcontract.append_operator_confirmation(sp, _ACTIONS, date="2026-07-28")
+    assert devcontract.parse_auto_run_result(sp.read_text()).present is False
+
+
+def test_operator_confirmation_on_an_absent_spec_returns_false(tmp_path):
+    assert (
+        devcontract.append_operator_confirmation(tmp_path / "nope.md", _ACTIONS, date="2026-07-28")
+        is False
+    )
+
+
+def test_operator_confirmation_preserves_crlf(tmp_path):
+    """An in-place write must not rewrite line endings it did not author."""
+    sp = tmp_path / "spec-a.md"
+    sp.write_bytes(_PARKED.replace("\n", "\r\n").encode("utf-8"))
+    devcontract.append_operator_confirmation(sp, _ACTIONS, date="2026-07-28")
+    raw = sp.read_bytes().decode("utf-8")
+    assert "## Operator Confirmation\r\n" in raw
+    assert "\n" not in raw.replace("\r\n", "")  # every break is CRLF, none bare
+
+
+def test_operator_confirmation_never_glues_onto_an_unterminated_body(tmp_path):
+    sp = _write(tmp_path, "spec-a.md", "---\nstatus: awaiting-operator\n---\n\nno trailing nl")
+    devcontract.append_operator_confirmation(sp, _ACTIONS, date="2026-07-28")
+    assert "no trailing nl## Operator" not in sp.read_text()
+    assert "\n## Operator Confirmation" in sp.read_text()
+
+
+@pytest.mark.parametrize(
+    "tail",
+    ["body\n", "body", "body\n\n"],
+    ids=["terminated", "unterminated", "already-blank-separated"],
+)
+def test_operator_confirmation_leaves_a_blank_line_before_the_heading(tmp_path, tail):
+    """The section is written to be READ. A heading welded to the paragraph above
+    it renders as one run-on block and trips every markdown linter."""
+    sp = _write(
+        tmp_path, "spec-a.md", f"---\nstatus: awaiting-operator\n---\n\n## Intent\n\n{tail}"
+    )
+    devcontract.append_operator_confirmation(sp, _ACTIONS, date="2026-07-28")
+    text = sp.read_text()
+    assert "\n\n## Operator Confirmation" in text
+    assert "body\n\n\n" not in text  # exactly one blank line, never a growing gap
+
+
+def test_operator_confirmation_write_failure_raises_and_keeps_the_spec(tmp_path, monkeypatch):
+    """Repair-write doctrine: `confirm` is about to move the board to done, so a
+    silently-skipped write would make it declare a story finished on a record it
+    never made."""
+    sp = _write(tmp_path, "spec-a.md", _PARKED)
+
+    def boom(tmp, target):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(devcontract, "atomic_replace", boom)
+    with pytest.raises(OSError, match="no space left"):
+        devcontract.append_operator_confirmation(sp, _ACTIONS, date="2026-07-28")
+    assert sp.read_text(encoding="utf-8") == _PARKED
+    assert list(tmp_path.glob("*.tmp")) == []

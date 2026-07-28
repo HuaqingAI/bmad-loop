@@ -21,6 +21,7 @@ match) still runs in verify.py against actual on-disk state.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -550,6 +551,17 @@ ORCHESTRATOR_SYNTH_NOTE = (
 )
 
 
+# Provenance for the operator-confirmation section, mirroring
+# ORCHESTRATOR_SYNTH_NOTE: says who wrote the section and on whose word, so a
+# reader never mistakes an out-of-band human sign-off for something a dev
+# session concluded on its own. Single line, for the same reason as its sibling.
+OPERATOR_CONFIRM_NOTE = (
+    "_Appended by the bmad-loop orchestrator (`bmad-loop confirm`, #335): a human "
+    "confirmed these external actions out of band, and the story was advanced from "
+    "`awaiting-operator` to `done`._"
+)
+
+
 def append_auto_run_result(spec_path: Path, status: str, *, detail: str = "") -> bool:
     """Append a synthesized ``## Auto Run Result`` marker section — the inverse of
     `strip_auto_run_result`.
@@ -608,5 +620,55 @@ def append_auto_run_result(spec_path: Path, status: str, *, detail: str = "") ->
     section = f"## Auto Run Result{nl}{nl}Status: {status}{nl}{nl}{ORCHESTRATOR_SYNTH_NOTE}{nl}"
     if detail:
         section += f"{nl}{detail.strip()}{nl}"
+    _atomic_write_spec(spec_path, text + section)
+    return True
+
+
+def append_operator_confirmation(spec_path: Path, actions: Sequence[str], *, date: str) -> bool:
+    """Append the ``## Operator Confirmation`` audit section `bmad-loop confirm`
+    writes when a human signs off a parked story (#335).
+
+    This section is the whole audit trail for the part of a story that happened
+    OUTSIDE the repository. The commit shows what the agent did; nothing in git
+    can show that someone bought the domain or published the DNS record, so the
+    spec has to say it, next to the ``operator_actions:`` it is answering. The
+    actions are restated rather than referenced because the frontmatter list is
+    the *claim* and this is the *acknowledgment* — a later reader comparing them
+    can see whether the spec was edited between the park and the confirmation.
+
+    Unlike `append_auto_run_result` this does NOT no-op on a heading that is
+    already there. A repeated confirmation is a real event (a spec reverted to
+    the park status and confirmed again), and dropping the second record would
+    make the audit trail claim there was only ever one. Sections accumulate,
+    newest last.
+
+    Repair-write doctrine, as the neighbouring writers: an absent spec returns
+    False (the caller decides whether that is fatal); a present-but-unreadable
+    spec, or a failing write, RAISES — `confirm` is about to move the board to
+    `done`, and it must not do that believing it recorded something it did not.
+
+    Line endings are handled exactly as in `append_auto_run_result`: raw byte
+    read, detected CRLF/LF reused for every break, bare-CR completed so the
+    heading starts on a recognized line boundary."""
+    if not spec_path.is_file():
+        return False
+    text = spec_path.read_bytes().decode("utf-8")
+    nl = "\r\n" if "\r\n" in text else "\n"
+    if text.endswith("\r"):
+        text += "\n"
+    elif text and not text.endswith("\n"):
+        text += nl
+    # A blank line before the heading, not merely a terminated last line: this
+    # section is written to be READ, and every markdown renderer (and linter)
+    # wants a heading separated from the paragraph above it.
+    if text and not text.endswith(nl * 2):
+        text += nl
+    # One line per action, in the order they were declared and acknowledged.
+    items = "".join(f"- {a}{nl}" for a in actions)
+    section = (
+        f"## Operator Confirmation{nl}{nl}"
+        f"Confirmed {date}: the external actions this story owed were carried out.{nl}{nl}"
+        f"{items}{nl}{OPERATOR_CONFIRM_NOTE}{nl}"
+    )
     _atomic_write_spec(spec_path, text + section)
     return True
