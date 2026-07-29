@@ -2,6 +2,7 @@ import io
 import json
 import os
 import re
+import stat
 import sys
 import zipfile
 from pathlib import Path
@@ -1689,6 +1690,46 @@ def test_worktree_local_exclude_undecodable_git_output_degrades(tmp_path, monkey
     landed = Path(os.fsdecode(common)) / "info" / "exclude"
     assert landed.is_file()
     assert "/probe-374" in landed.read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits; Windows has no umask")
+def test_worktree_local_exclude_created_exclude_stays_readable(project):
+    """An exclude this helper CREATES keeps the mode the `write_text` it replaced
+    would have produced, not `mkstemp`'s private 0600. `atomic_write_text` carries
+    a mode over only when the target already EXISTS (its docstring is explicit),
+    so a fresh one lands 0600 — and git treats an exclude it cannot read as one
+    that is not there. Measured: git warns `unable to access`, exits 0, and
+    `git add -A` stages the very files the exclude was written to shield, with no
+    degrade reason at all, because the write SUCCEEDED. That is the harm the
+    helper's own docstring calls out, arrived at through a successful write.
+
+    Reachable where the common dir is read under another UID —
+    `core.sharedRepository`, a shared checkout — and the create path is live
+    whenever `.git/info/exclude` is absent, which is why the `mkdir(parents=True)`
+    above exists.
+
+    The umask is pinned rather than inherited: at the box's own 0077 the ablated
+    code produces 0600 too, and the ablation would not bite.
+
+    Ablation: drop the `exclude.touch()` and this fails, reporting 0o600."""
+    old_umask = os.umask(0o022)
+    try:
+        exclude = project.project / ".git" / "info" / "exclude"
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        exclude.unlink(missing_ok=True)
+        # what the replaced write_text would have produced, measured not assumed
+        probe = exclude.with_name("umask-probe")
+        probe.write_text("x", encoding="utf-8")
+        expected = stat.S_IMODE(probe.stat().st_mode)
+        probe.unlink()
+
+        assert _worktree_local_exclude(project.project, ["/probe-mode"]) is None
+
+        assert stat.S_IMODE(exclude.stat().st_mode) == expected, oct(
+            stat.S_IMODE(exclude.stat().st_mode)
+        )
+    finally:
+        os.umask(old_umask)
 
 
 def test_worktree_local_exclude_non_git_dir_returns_none(tmp_path):

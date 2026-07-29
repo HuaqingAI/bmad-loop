@@ -792,7 +792,8 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
             common_dir = (worktree / common_dir).resolve()
         exclude = common_dir / "info" / "exclude"
         exclude.parent.mkdir(parents=True, exist_ok=True)
-        existing = exclude.read_text(encoding="utf-8") if exclude.is_file() else ""
+        existed = exclude.is_file()
+        existing = exclude.read_text(encoding="utf-8") if existed else ""
         present = set(existing.splitlines())
         new = [p for p in patterns if p not in present]
         if not new:
@@ -809,15 +810,30 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
         # The helper rather than a hand-rolled tmp+replace: its temp name is
         # unique, and EVERY linked worktree of a repo resolves to this same
         # common dir, so a fixed `.tmp` sibling is a collision between two runs
-        # provisioning against one repo. It also fsyncs before the replace, and
-        # carries the mode over when the exclude already exists, which a bare
-        # replace resets; one it creates from nothing gets the helper's
-        # deliberate 0600 rather than the umask default.
+        # provisioning against one repo. It also fsyncs before the replace and
+        # carries the target's mode over, which a bare replace resets.
         #
         # Atomicity per write is NOT isolation across the read above and this
         # write: they are unserialized, so two such runs interleaving lose one
         # side's patterns outright, both returning None. That race predates
         # #375 and survives this fix — it is #381.
+        if not existed:
+            # Create it first, the way the write_text this replaced did: O_CREAT
+            # under the umask, giving the helper a mode to carry. Left to itself
+            # it creates a new target at mkstemp's private 0600 — and an exclude
+            # git cannot READ is one git silently IGNORES. Measured: git warns,
+            # exits 0, and `git add -A` stages the files the exclude was written
+            # to shield. That is the exact harm the docstring above says silence
+            # must not cause, and here nothing would even be reported, because
+            # the write SUCCEEDS. Reachable wherever the common dir is read
+            # under another UID (core.sharedRepository, a shared checkout) —
+            # which is why atomic_write_text's own docstring says callers of
+            # genuinely shared state need more than the helper alone.
+            #
+            # Safe against the tail below: an empty exclude is equivalent to an
+            # absent one for git, so a fault after this leaves no more damage
+            # than the missing file it replaced.
+            exclude.touch()
         atomic_write_text(exclude, prefix + "\n".join(new) + "\n")
     # UnicodeError, not UnicodeDecodeError: the write raises the ENCODE sibling.
     # Still far short of ValueError-broad, so a programming error still escapes.
