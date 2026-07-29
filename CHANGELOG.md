@@ -175,6 +175,14 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 ### Changed
 
+- **Every spec-frontmatter status read goes through `status_of` (#358 follow-up).** Five inline
+  `str(fm.get("status", ""))` copies remained in the engine and the generic adapter, each of which
+  read a blank `status:` as the token `none` — the defect #358 fixed at the shared reader. Four were
+  neutral (a blank is non-terminal either way); the pair that was not is the review-launch snapshot
+  and the mid-session status-transition tick, which compare against each other. One behavior change
+  falls out: a session that ERASES a previously-set status no longer records a transition — a blank
+  is not an observed live status.
+
 - **`set_frontmatter_status`'s tests now live in `tests/test_frontmatter.py` (#357, part 3).** They
   had stayed in `tests/test_resolve.py` next to `set_frontmatter_field`'s so parts 1 and 2 read as
   changes rather than as a rename. Tests only — no behavior change.

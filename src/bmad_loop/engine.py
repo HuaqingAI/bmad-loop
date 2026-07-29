@@ -1626,7 +1626,7 @@ class Engine:
         fm = self._observed_frontmatter(spec_path, task.story_key, "review-timeout-salvage")
         if fm is None:
             return False
-        fm_status = str(fm.get("status", "")).strip().lower()
+        fm_status = verify.status_of(fm)
         if fm_status not in ("done", "in-review"):
             return False
         reset_from: str | None = None
@@ -2233,7 +2233,7 @@ class Engine:
         fm = self._observed_frontmatter(spec_path, task.story_key, "marker-repair")
         if fm is None:
             return
-        fm_status = str(fm.get("status", "")).strip().lower()
+        fm_status = verify.status_of(fm)
         rj_status = str(rj.get("status", "")).strip().lower()
         # Same terminal set `devcontract.is_frontmatter_candidate` scans for: that
         # scan is what FINDS a marker-less finalized spec, and this repair is what
@@ -3169,7 +3169,12 @@ class Engine:
         content hash, mtime, and normalized frontmatter status — so the generic
         adapter's missing-marker fallback can refuse to synthesize from a candidate
         whose bytes never changed this session (a `done` spec re-opened for review,
-        never re-written). Snapshot capture is best-effort: a torn/unreadable read
+        never re-written). "Normalized" means through `status_of`, the same reading
+        the adapter's `_observe_tick` compares against: a blank/YAML-null `status:`
+        must be `""` on BOTH sides or the tick fabricates a transition off it (see
+        that method's docstring — the two reads are one contract).
+
+        Snapshot capture is best-effort: a torn/unreadable read
         degrades to `None` (journaled, `review-launch-snapshot`), and the fallback
         then keeps its conservative 2-observation fingerprint path. Only the capture
         is guarded — the strip keeps its raise-on-unreadable repair doctrine (see
@@ -3185,7 +3190,7 @@ class Engine:
         try:
             raw = spec_path.read_bytes()
             mtime_ns = spec_path.stat().st_mtime_ns
-            fm_status = str(verify.read_frontmatter(spec_path).get("status", "")).strip().lower()
+            fm_status = verify.status_of(verify.read_frontmatter(spec_path))
         except OSError as e:
             self._journal_spec_read_failed(spec_path, task.story_key, "review-launch-snapshot", e)
             return None

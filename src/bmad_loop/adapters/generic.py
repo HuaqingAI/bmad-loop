@@ -42,7 +42,7 @@ from ..policy import Policy
 from ..process_host import ProcessHostError, get_process_host
 from ..signals import SignalWatcher
 from ..tokens import read_usage as tally_usage
-from ..verify import read_frontmatter
+from ..verify import read_frontmatter, status_of
 from .base import CodingCLIAdapter, SessionHandle, SessionResult, SessionSpec, SpecSnapshot
 from .multiplexer import MultiplexerError, TerminalMultiplexer, get_multiplexer
 from .profile import CLIProfile
@@ -1363,13 +1363,25 @@ class _DevSynthesisMixin(_ResultFileMixin):
         terminal frontmatter is the Stop harvest's business, and the launch status
         itself (the ``done`` a review re-opens) is not a transition. A transition
         that flips entirely between two ticks is simply missed, and the fallback
-        keeps its conservative 2-observation path."""
+        keeps its conservative 2-observation path.
+
+        Both sides of the comparison read through ``status_of``, so a blank/
+        YAML-null ``status:`` normalizes to ``""`` here AND in the snapshot
+        ``_reset_spec_for_review`` captures. That pairing is load-bearing and must
+        stay symmetric: normalizing only the snapshot leaves a bare-status spec at
+        ``snap.fm_status == ""`` while this tick reads the stringified ``"none"``,
+        which is neither blank nor terminal nor equal to the snapshot — a fabricated
+        transition, hence a false ``transition_proven`` and a premature
+        single-sighting frontmatter synthesis. A blank is also not an observed live
+        status in its own right: a skill that ERASES a previously-set status
+        mid-session records nothing (the ``s != ""`` guard), where the old
+        ``"none"`` reading slipped past as if it were a value."""
         task_id = handle.task_id
         snap = spec.spec_snapshot
         if snap is None or task_id in self._fm_transition_obs:
             return
         try:
-            s = str(read_frontmatter(Path(snap.path)).get("status", "")).strip().lower()
+            s = status_of(read_frontmatter(Path(snap.path)))
         except OSError:
             return
         if s != "" and s not in (devcontract.DONE, devcontract.BLOCKED) and s != snap.fm_status:
@@ -1534,7 +1546,7 @@ class _DevSynthesisMixin(_ResultFileMixin):
         same_file = snap is not None and self._same_spec(path, snap.path)
         try:
             mtime_ns = path.stat().st_mtime_ns
-            fm_status = str(read_frontmatter(path).get("status", "")).strip().lower()
+            fm_status = status_of(read_frontmatter(path))
             # Content hash only when the candidate IS the snapshotted spec (compared
             # by filesystem identity) — an unrelated marker-less spec under the same
             # artifacts dir shares no launch state, so hashing it is meaningless work.
