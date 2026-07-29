@@ -1710,6 +1710,14 @@ def test_shield_seeds_xdg_default_when_unset(project, tmp_path, monkeypatch):
     `core.excludesFile` reaches the fallback branch at all instead of passing
     through the branch above and never testing this one.
 
+    That pinning is scoped to the probe rather than the whole test, because
+    switching the system config off mid-test changes what git thinks of files
+    already on disk. Git for Windows ships `core.autocrlf = true` in its SYSTEM
+    config, so `worktree_add` above checks out CRLF; with `GIT_CONFIG_NOSYSTEM`
+    still set, the status below re-reads those same files with autocrlf off and
+    every tracked one reads as modified. The env is what the probe needs, not
+    what the assertions need — so it ends with the probe.
+
     Ablation: return "" when the key is unset (drop the XDG branch) and this fails."""
     repo = project.project
     wt = tmp_path / "wt"
@@ -1717,14 +1725,17 @@ def test_shield_seeds_xdg_default_when_unset(project, tmp_path, monkeypatch):
     xdg = tmp_path / "xdg"
     (xdg / "git").mkdir(parents=True)
     (xdg / "git" / "ignore").write_text("xdg-ignored.tmp\n", encoding="utf-8")
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "no-such-gitconfig"))
-    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
 
-    assert _worktree_local_exclude(wt, ["/probe-384"]) is None
+    with monkeypatch.context() as pinned:
+        pinned.setenv("XDG_CONFIG_HOME", str(xdg))
+        pinned.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "no-such-gitconfig"))
+        pinned.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        assert _worktree_local_exclude(wt, ["/probe-384"]) is None
 
     assert "xdg-ignored.tmp" in _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
     (wt / "xdg-ignored.tmp").write_text("noise\n", encoding="utf-8")
+    # The exclude is activated through a worktree-scoped `core.excludesFile`, i.e.
+    # repo-local config — so this holds without the env pinning, which is the point.
     assert git(wt, "status", "--short") == ""
 
 
