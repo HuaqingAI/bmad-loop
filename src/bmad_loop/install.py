@@ -17,6 +17,7 @@ orchestrator's signal watcher is CLI-agnostic.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -28,6 +29,7 @@ from typing import Any, NamedTuple
 
 from .adapters.profile import ALIASES, CLIProfile, ProfileError, load_profiles
 from .checks import Finding
+from .platform_util import atomic_write_text
 from .policy import POLICY_TEMPLATE
 from .process_host import get_process_host
 
@@ -739,12 +741,10 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
     opposite thing in each:
 
     - git unqueryable (not a repo, git missing) is an EXPECTED skip — returns
-      None silently. Callers hand this plain temp dirs routinely. One residual
-      escape survives here and is tracked in #374: `text=True` decodes git's
-      stdout strictly, so a repo path carrying bytes invalid in the locale
-      encoding raises UnicodeDecodeError, which is neither arm's type. Left out
-      of the #359 fix deliberately — decoding filesystem paths safely is a
-      program-wide decision, not this helper's.
+      None silently. Callers hand this plain temp dirs routinely. Nothing is
+      DECODED in this arm: git's stdout is captured as bytes and decoded in the
+      tail below, because a decode fault is a degrade (git answered; we could
+      not read it), not the silent skip this arm means (#374).
     - a filesystem fault AFTER git answered degrades to a returned reason string
       the caller can surface: `.resolve()` (pre-3.13 a symlink loop raises
       RuntimeError, not OSError), `mkdir`, read/write OSError, and either
@@ -758,16 +758,33 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
     # Callers pass POSIX-slash patterns (glob rels via as_posix; config strings as
     # authored); git's exclude is POSIX-slash on every platform, so nothing to fix here.
     try:
-        common = subprocess.run(
+        # bytes, not text=True: strict decoding here would raise UnicodeDecodeError
+        # out of an arm whose whole contract is "skip silently", and that type is
+        # in neither arm's tuple (#374). POSIX filenames are bytes, so a repo path
+        # with bytes invalid in the locale encoding reaches this on a normal box.
+        #
+        # Deliberately NOT routed through verify._run_git, the chokepoint AGENTS.md
+        # otherwise requires. Nothing structural forbids it — neither module imports
+        # the other — but _run_git hands back CompletedProcess[str], i.e. the strict
+        # decode this call exists to avoid, and it raises GitError rather than the
+        # (SubprocessError, OSError) this arm treats as an expected skip. Adopting it
+        # needs a bytes mode on the chokepoint first; that is #377, which also covers
+        # the decode fault escaping _run_git's own taxonomy. The cost of standing
+        # outside it meanwhile is this call's missing timeout.
+        raw = subprocess.run(
             ["git", "-C", str(worktree), "rev-parse", "--git-common-dir"],
             capture_output=True,
-            text=True,
             check=True,
-        ).stdout.strip()
+        ).stdout
     except (subprocess.SubprocessError, OSError):
         return None
     try:
-        common_dir = Path(common)
+        # fsdecode, so a non-UTF-8 repo path round-trips back to the filesystem
+        # instead of faulting. It can still raise on Windows (utf-8/surrogatepass
+        # rejects a lone invalid byte), which is why it sits inside this try —
+        # defensive placement rather than a path under test: the regression test
+        # is POSIX-only because git on Windows has no such path to hand back.
+        common_dir = Path(os.fsdecode(raw).strip())
         if not common_dir.is_absolute():
             # a PLAIN checkout answers with a relative ".git"; a linked worktree
             # answers with the main repo's absolute .git (verified, git 2.55), so
@@ -775,13 +792,49 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
             common_dir = (worktree / common_dir).resolve()
         exclude = common_dir / "info" / "exclude"
         exclude.parent.mkdir(parents=True, exist_ok=True)
-        existing = exclude.read_text(encoding="utf-8") if exclude.is_file() else ""
+        existed = exclude.is_file()
+        existing = exclude.read_text(encoding="utf-8") if existed else ""
         present = set(existing.splitlines())
         new = [p for p in patterns if p not in present]
         if not new:
             return None
         prefix = existing if not existing or existing.endswith("\n") else existing + "\n"
-        exclude.write_text(prefix + "\n".join(new) + "\n", encoding="utf-8")
+        # atomic_write_text, never write_text onto `exclude` directly (#375).
+        # write_text opens "w", which TRUNCATES before writing, and this is a
+        # read-modify-REWRITE carrying the operator's own excludes in `prefix` —
+        # so a short write (ENOSPC) left the file truncated mid-content while the
+        # degrade reason still said "could not update". Worse, the surviving tail
+        # is a valid git pattern and a prefix of the intended one: cut one char
+        # in and the last line is "/", which excludes the entire worktree.
+        #
+        # The helper rather than a hand-rolled tmp+replace: its temp name is
+        # unique, and EVERY linked worktree of a repo resolves to this same
+        # common dir, so a fixed `.tmp` sibling is a collision between two runs
+        # provisioning against one repo. It also fsyncs before the replace and
+        # carries the target's mode over, which a bare replace resets.
+        #
+        # Atomicity per write is NOT isolation across the read above and this
+        # write: they are unserialized, so two such runs interleaving lose one
+        # side's patterns outright, both returning None. That race predates
+        # #375 and survives this fix — it is #381.
+        if not existed:
+            # Create it first, the way the write_text this replaced did: O_CREAT
+            # under the umask, giving the helper a mode to carry. Left to itself
+            # it creates a new target at mkstemp's private 0600 — and an exclude
+            # git cannot READ is one git silently IGNORES. Measured: git warns,
+            # exits 0, and `git add -A` stages the files the exclude was written
+            # to shield. That is the exact harm the docstring above says silence
+            # must not cause, and here nothing would even be reported, because
+            # the write SUCCEEDS. Reachable wherever the common dir is read
+            # under another UID (core.sharedRepository, a shared checkout) —
+            # which is why atomic_write_text's own docstring says callers of
+            # genuinely shared state need more than the helper alone.
+            #
+            # Safe against the tail below: an empty exclude is equivalent to an
+            # absent one for git, so a fault after this leaves no more damage
+            # than the missing file it replaced.
+            exclude.touch()
+        atomic_write_text(exclude, prefix + "\n".join(new) + "\n")
     # UnicodeError, not UnicodeDecodeError: the write raises the ENCODE sibling.
     # Still far short of ValueError-broad, so a programming error still escapes.
     except (OSError, RuntimeError, UnicodeError) as e:

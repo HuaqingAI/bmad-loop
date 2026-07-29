@@ -1,5 +1,8 @@
+import io
 import json
+import os
 import re
+import stat
 import sys
 import zipfile
 from pathlib import Path
@@ -7,6 +10,7 @@ from pathlib import Path
 import pytest
 from conftest import git
 
+import bmad_loop.install as install_mod
 from bmad_loop import verify
 from bmad_loop.adapters.profile import get_profile
 from bmad_loop.install import (
@@ -1500,14 +1504,14 @@ def test_worktree_local_exclude_degrades_on_write_fault(project, monkeypatch):
 
     Ablation: drop the tail's `try` (or `OSError` from its tuple) and this fails —
     the OSError propagates out of `_worktree_local_exclude`."""
-    real_write = Path.write_text
 
-    def boom(self, *a, **kw):
-        if self.name == "exclude":
-            raise OSError("read-only .git")
-        return real_write(self, *a, **kw)
+    def boom(*a, **kw):
+        raise OSError("read-only .git")
 
-    monkeypatch.setattr(Path, "write_text", boom)
+    # patched at install's OWN binding: the exclude write goes through
+    # atomic_write_text (#375), which writes via os.fdopen on an mkstemp fd, so a
+    # Path.write_text/Path.open patch never fires and would pass vacuously.
+    monkeypatch.setattr(install_mod, "atomic_write_text", boom)
 
     reason = _worktree_local_exclude(project.project, ["/probe-359"])
 
@@ -1560,6 +1564,174 @@ def test_worktree_local_exclude_degrades_on_unencodable_pattern(project):
     assert reason is not None and "surrogates not allowed" in reason
 
 
+def test_worktree_local_exclude_short_write_leaves_exclude_intact(project, monkeypatch):
+    """#375: a fault PARTWAY THROUGH the write must leave the operator's exclude
+    byte-identical, not truncated. `write_text` opens "w" (truncate-then-write)
+    and this is a read-modify-REWRITE carrying their content in `prefix`, so a
+    direct write left the file cut mid-content while the reason still said
+    "could not update". The surviving tail is a valid git pattern and a prefix of
+    the intended one — cut one character in and the last line is `/`, which
+    excludes the whole worktree. Blast radius is the MAIN repo: a linked
+    worktree's --git-common-dir points at the main .git.
+
+    The fault is injected at `Path.open`, NOT at `Path.write_text`: patching
+    write_text means the file is never opened, so the truncation cannot happen
+    and the test would pass against the very bug it exists to catch. Going
+    through the real `open(mode="w")` is the whole point — that is what
+    truncates.
+
+    Ablation: swap `atomic_write_text` back to a direct `exclude.write_text` and
+    this fails — the file comes back truncated."""
+    exclude = project.project / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    exclude.write_text("# OPERATOR'S OWN\n/secret-local\n", encoding="utf-8")
+    before = exclude.read_bytes()
+
+    real_open = io.open
+
+    class ShortWriter:
+        def __init__(self, f):
+            self._f = f
+
+        def write(self, s):
+            self._f.write(s[:8])  # a partial write, then the device gives up
+            raise OSError(28, "No space left on device")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._f.close()
+            return False
+
+        def __getattr__(self, name):
+            return getattr(self._f, name)
+
+    def opener(file, *a, **kw):
+        mode = a[0] if a else kw.get("mode", "r")
+        handle = real_open(file, *a, **kw)
+        # io.open is the ONE seam both shapes share: the fix reaches it through
+        # os.fdopen on an mkstemp fd (an int), the ablation through Path.open (a
+        # path). Patching either one alone injects into only one of them, so the
+        # ablation would silently stop biting.
+        if "w" in mode:
+            return ShortWriter(handle)
+        return handle
+
+    monkeypatch.setattr(io, "open", opener)
+
+    reason = _worktree_local_exclude(project.project, ["/probe-359"])
+
+    monkeypatch.undo()
+    assert reason is not None and "No space left" in reason
+    assert exclude.read_bytes() == before  # untouched, not half-rewritten
+    # no scratch file left lying next to it. Globbed, not a fixed name: the
+    # helper's temp is uniquely named (mkstemp), so asserting one literal
+    # filename is absent would pass no matter what the code did.
+    assert [p.name for p in exclude.parent.iterdir()] == ["exclude"]
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX-only fault: Windows paths are UTF-16, so git cannot emit an undecodable path",
+)
+def test_worktree_local_exclude_undecodable_git_output_degrades(tmp_path, monkeypatch):
+    """#374: the git-query arm used `text=True`, decoding stdout strictly, so a
+    repo path with bytes invalid in the locale encoding raised UnicodeDecodeError
+    — a type in NEITHER arm's tuple, straight out of a function whose whole
+    contract is that it never propagates.
+
+    Driven through a REAL stub `git` on PATH rather than a monkeypatched
+    `subprocess.run`. That distinction is the test: replacing subprocess.run
+    hands the code bytes directly and never runs the stdlib's decoding at all, so
+    such a test passes identically with `text=True` restored — it cannot see the
+    bug. Verified: the run-patching version did NOT fail its own ablation.
+
+    Ablation: restore `text=True` on the subprocess call and this fails — the
+    UnicodeDecodeError propagates from the arm that promises a silent skip."""
+    bin_dir = tmp_path / "stubbin"
+    bin_dir.mkdir()
+    stub = bin_dir / "git"
+    # Emits a path carrying byte 0xff, exactly what a repo whose directory name
+    # is not valid UTF-8 makes `git rev-parse --git-common-dir` print. The path is
+    # rooted in tmp_path, NOT a literal /tmp: the helper mkdir(parents=True)s the
+    # common dir it is handed, so a hardcoded path would create real directories
+    # in the shared system /tmp on every run, outside pytest's cleanup.
+    common = os.fsencode(str(tmp_path)) + b"/repo-\377-name/.git"
+    # SINGLE-QUOTED into the script. Unquoted, a temp root carrying whitespace
+    # (TMPDIR, --basetemp, a username with a space) word-splits into a second
+    # printf argument, and `printf '%s\n'` repeats its format per argument — so
+    # the helper is handed a path with an embedded NEWLINE and mkdir(parents=True)s
+    # it as a sibling of the basetemp pytest reaps. Measured with a spaced
+    # --basetemp: it leaked such a directory and the test still passed.
+    stub.write_bytes(b"#!/bin/sh\nprintf '%s\\n' '" + common.replace(b"'", b"'\\''") + b"'\n")
+    stub.chmod(0o755)
+    # PATH is REPLACED, not prepended: the stub has to be the only resolvable
+    # `git`, or the box's real git answers first with a decodable path and this
+    # passes without ever exercising the decode.
+    monkeypatch.setenv("PATH", str(bin_dir))
+
+    # must not raise: the contract is best-effort in both arms
+    reason = _worktree_local_exclude(tmp_path / "wt", ["/probe-374"])
+
+    assert reason is None or "could not update" in reason
+    # The tail actually RAN, against the decoded path. Not decoration: without
+    # it this test is vacuous whenever the stub cannot exec — a noexec temp dir
+    # (ordinary CI hardening), no /bin/sh, a filesystem that drops the exec bit.
+    # subprocess.run then raises OSError, the git-query arm swallows it as the
+    # expected skip it is, `reason is None` holds, and the ablation above
+    # evaporates with it. Measured: at mode 0644 the stub never runs and every
+    # assertion above still passes.
+    #
+    # This also pins containment better than globbing shared /tmp for a leak:
+    # that glob is non-recursive and tmp_path sits three levels down, so it
+    # could not see this test's own output, while it DID fail for anyone whose
+    # box still carried litter from the hardcoded-path version of this test.
+    landed = Path(os.fsdecode(common)) / "info" / "exclude"
+    assert landed.is_file()
+    assert "/probe-374" in landed.read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits; Windows has no umask")
+def test_worktree_local_exclude_created_exclude_stays_readable(project):
+    """An exclude this helper CREATES keeps the mode the `write_text` it replaced
+    would have produced, not `mkstemp`'s private 0600. `atomic_write_text` carries
+    a mode over only when the target already EXISTS (its docstring is explicit),
+    so a fresh one lands 0600 — and git treats an exclude it cannot read as one
+    that is not there. Measured: git warns `unable to access`, exits 0, and
+    `git add -A` stages the very files the exclude was written to shield, with no
+    degrade reason at all, because the write SUCCEEDED. That is the harm the
+    helper's own docstring calls out, arrived at through a successful write.
+
+    Reachable where the common dir is read under another UID —
+    `core.sharedRepository`, a shared checkout — and the create path is live
+    whenever `.git/info/exclude` is absent, which is why the `mkdir(parents=True)`
+    above exists.
+
+    The umask is pinned rather than inherited: at the box's own 0077 the ablated
+    code produces 0600 too, and the ablation would not bite.
+
+    Ablation: drop the `exclude.touch()` and this fails, reporting 0o600."""
+    old_umask = os.umask(0o022)
+    try:
+        exclude = project.project / ".git" / "info" / "exclude"
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        exclude.unlink(missing_ok=True)
+        # what the replaced write_text would have produced, measured not assumed
+        probe = exclude.with_name("umask-probe")
+        probe.write_text("x", encoding="utf-8")
+        expected = stat.S_IMODE(probe.stat().st_mode)
+        probe.unlink()
+
+        assert _worktree_local_exclude(project.project, ["/probe-mode"]) is None
+
+        assert stat.S_IMODE(exclude.stat().st_mode) == expected, oct(
+            stat.S_IMODE(exclude.stat().st_mode)
+        )
+    finally:
+        os.umask(old_umask)
+
+
 def test_worktree_local_exclude_non_git_dir_returns_none(tmp_path):
     """Not-a-repo is an EXPECTED skip, not a degradation: `OSError` in the
     subprocess arm means "no git to query" and must stay silent, while the same
@@ -1594,14 +1766,14 @@ def test_provision_worktree_exclude_fault_reports_on_degraded(project, tmp_path,
     repo = project.project
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
-    real_write = Path.write_text
 
-    def boom(self, *a, **kw):
-        if self.name == "exclude":
-            raise OSError("read-only .git")
-        return real_write(self, *a, **kw)
+    def boom(*a, **kw):
+        raise OSError("read-only .git")
 
-    monkeypatch.setattr(Path, "write_text", boom)
+    # patched at install's OWN binding: the exclude write goes through
+    # atomic_write_text (#375), which writes via os.fdopen on an mkstemp fd, so a
+    # Path.write_text/Path.open patch never fires and would pass vacuously.
+    monkeypatch.setattr(install_mod, "atomic_write_text", boom)
     msgs: list[str] = []
 
     provision_worktree(wt, [get_profile("claude")], repo, on_degraded=msgs.append)

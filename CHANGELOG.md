@@ -260,6 +260,20 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 ### Fixed
 
+- **A short write no longer truncates the worktree exclude (#375).** The exclude update is a
+  read-modify-rewrite, and `write_text` truncates before writing, so a fault partway through (ENOSPC,
+  EIO) left the operator's own excludes cut mid-content while the degrade reason still reported that
+  nothing had been written. Worse, the surviving tail parses as a valid git pattern and is a prefix
+  of the intended one — cut a character in and the last line is `/`, excluding the whole worktree —
+  and a linked worktree's common dir is the MAIN repo's `.git`, so the damage was repo-wide. Now
+  written to a scratch file and moved into place, so the exclude is either fully updated or untouched.
+
+- **The exclude's git query no longer crashes on a non-UTF-8 repo path (#374).** POSIX filenames are
+  bytes, and `git rev-parse --git-common-dir` was decoded strictly, so a repo path carrying bytes
+  invalid in the locale encoding raised `UnicodeDecodeError` — a type neither arm of the helper
+  caught, out of a function documented as best-effort. Git's output is captured as bytes and decoded
+  with the filesystem codec inside the guarded tail, so such a path round-trips instead of faulting.
+
 - **A worktree's local git exclude really is best-effort now (#359).** `_worktree_local_exclude`
   guarded only its `git rev-parse` call; the filesystem tail behind it (resolve, mkdir, read, write)
   crashed the run — a symlink loop raises `RuntimeError` on 3.11/3.12, an exclude file that is not
