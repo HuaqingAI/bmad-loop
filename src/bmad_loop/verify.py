@@ -1629,6 +1629,15 @@ def env_fault_reason(result: CommandResult, cwd: Path) -> str | None:
 
 
 def run_verify_commands(policy: Policy, cwd: Path) -> list[CommandResult]:
+    """Run each of the policy's verify commands, one CommandResult apiece.
+
+    Output decodes with ``errors="replace"`` (#378): the children are arbitrary
+    operator tools whose bytes are not ours to constrain, the captured tail is
+    display-only feedback for a human or a repair session (already lossy at
+    ``[-2000:]``), and one undecodable byte must not raise mid-loop and lose
+    *every* command's result. Decoding stays on the locale codec (``text=True``)
+    precisely because these are host tools — contrast tui/launch.py, which pins
+    ``encoding="utf-8"`` because its child is our own UTF-8 CLI."""
     results = []
     for command in policy.verify.commands:
         try:
@@ -1640,6 +1649,7 @@ def run_verify_commands(policy: Policy, cwd: Path) -> list[CommandResult]:
                 cwd=cwd,
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=COMMAND_TIMEOUT_S,
             )
             output = (proc.stdout + proc.stderr)[-2000:]

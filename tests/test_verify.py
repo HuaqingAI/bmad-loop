@@ -873,6 +873,64 @@ def test_verify_commands_timeout_stays_charged(tmp_path, monkeypatch):
     assert not out.ok and out.fixable and not out.env_fault
 
 
+# ---- undecodable verify output (issue #378)
+#
+# Both tests drive a REAL child process. Monkeypatching subprocess.run hands the
+# code str objects directly and never runs the stdlib's decoding at all, so such
+# a test passes identically with the bug restored — see the #374 regression
+# test's docstring (tests/test_install.py) for the same distinction.
+
+
+def _undecodable_cmd(tmp_path: Path, rc: int) -> str:
+    """A shell string running a child that emits byte 0xff on stdout and exits
+    with `rc`. Interpreter is `sys.executable`, never a bare `python`: the tests
+    run under uv, where no `python` need be on PATH. The double quotes are
+    honored by both sh and cmd."""
+    script = tmp_path / "emit378.py"
+    script.write_text(
+        "import sys\n"
+        "sys.stdout.buffer.write(b'before \\xff after\\n')\n"
+        "sys.stdout.buffer.flush()\n"
+        f"sys.exit({rc})\n",
+        encoding="utf-8",
+    )
+    return f'"{sys.executable}" "{script}"'
+
+
+def test_verify_commands_undecodable_output_keeps_every_result(tmp_path):
+    """A child emitting a byte invalid in the run's encoding is decoded with
+    replacement, not strictly: the strict decode raised UnicodeDecodeError
+    *before* any result was appended, so the offender's exit code AND every
+    later command's result were lost, and the dev phase crashed instead of
+    classifying a failure.
+
+    The surviving text around the bad byte is asserted, not the replacement
+    glyph itself: which glyph (or how many) appears depends on the locale codec,
+    while the contract here is only that the loop neither raises nor drops.
+
+    Ablation: remove `errors="replace"` from run_verify_commands and this fails
+    with UnicodeDecodeError."""
+    policy = Policy(verify=VerifyPolicy(commands=(_undecodable_cmd(tmp_path, 5), _OK)))
+
+    results = verify.run_verify_commands(policy, tmp_path)
+
+    assert [r.returncode for r in results] == [5, 0]
+    assert "before" in results[0].output_tail and "after" in results[0].output_tail
+
+
+def test_verify_commands_undecodable_failure_stays_fixable_retry(tmp_path):
+    """Through the outcome path: an undecodable tail still classifies as an
+    ordinary fixable failure and still reaches the repair session's feedback —
+    env_fault_reason runs over the replaced text without raising."""
+    policy = Policy(verify=VerifyPolicy(commands=(_undecodable_cmd(tmp_path, 1),)))
+
+    out = verify.verify_commands_outcome(policy, tmp_path)
+
+    assert not out.ok and out.fixable and out.retryable and not out.env_fault
+    assert "rc=1" in out.reason
+    assert "after" in out.reason
+
+
 def make_bundle_task(paths, dw_ids=("DW-1", "DW-2")):
     task = StoryTask(story_key="dw-test-bundle", epic=0, dw_ids=list(dw_ids))
     task.baseline_commit = verify.rev_parse_head(paths.project)

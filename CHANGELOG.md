@@ -260,6 +260,14 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 ### Fixed
 
+- **One undecodable byte of verify output no longer crashes the run (#378).** Verify commands are
+  arbitrary operator tools, and their captured output was decoded strictly — a child emitting bytes
+  invalid in the run's encoding raised `UnicodeDecodeError` out of `run_verify_commands`, losing
+  every command's result and crashing the dev phase instead of classifying the failure. Output now
+  decodes with `errors="replace"`: the tail is display-only feedback for a human or repair session,
+  so a replacement character costs nothing, while exit codes and the rest of the tail keep driving
+  classification.
+
 - **A short write no longer truncates the worktree exclude (#375).** The exclude update is a
   read-modify-rewrite, and `write_text` truncates before writing, so a fault partway through (ENOSPC,
   EIO) left the operator's own excludes cut mid-content while the degrade reason still reported that
