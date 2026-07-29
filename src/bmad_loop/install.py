@@ -752,14 +752,16 @@ def _shield_git(worktree: Path, *args: str) -> subprocess.CompletedProcess[bytes
     is in neither arm's tuple (#374). POSIX filenames are bytes, so a repo path
     with bytes invalid in the locale encoding reaches this on a normal box.
 
-    Deliberately NOT routed through `verify._run_git`, the chokepoint AGENTS.md
-    otherwise requires. Nothing structural forbids it — neither module imports
-    the other — but `_run_git` hands back `CompletedProcess[str]`, i.e. the strict
-    decode this helper exists to avoid, and it raises `GitError` rather than
-    returning the rc the shield reads as an answer. Adopting it needs a bytes
-    mode on the chokepoint first; that is #377, which also covers the decode
-    fault escaping `_run_git`'s own taxonomy. The timeout the chokepoint would
-    bring is carried here meanwhile, so standing outside it no longer costs one.
+    Not yet routed through the `verify` chokepoint AGENTS.md otherwise requires,
+    though the reason has shrunk. `verify.git_bytes` (#377) now offers exactly the
+    shape this helper needs — `CompletedProcess[bytes]` with the rc returned, not
+    raised — so the original blocker is gone. What remains is the guards: through
+    the chokepoint a timeout arrives as `GitError`, which is not a
+    `subprocess.SubprocessError`, and a spawn fault as `GitSpawnError`, which is
+    not an `OSError` — so the `except` tuples wrapping these calls would quietly
+    stop covering what they were written for. Re-deriving all eight is its own
+    change: #389. The 120s bound below is carried meanwhile, so standing outside
+    costs the taxonomy and `LC_ALL=C`, not the timeout.
     """
     return subprocess.run(
         ["git", "-C", str(worktree), *args],
