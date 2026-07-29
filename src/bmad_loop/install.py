@@ -739,7 +739,12 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
     opposite thing in each:
 
     - git unqueryable (not a repo, git missing) is an EXPECTED skip — returns
-      None silently. Callers hand this plain temp dirs routinely.
+      None silently. Callers hand this plain temp dirs routinely. One residual
+      escape survives here and is tracked in #374: `text=True` decodes git's
+      stdout strictly, so a repo path carrying bytes invalid in the locale
+      encoding raises UnicodeDecodeError, which is neither arm's type. Left out
+      of the #359 fix deliberately — decoding filesystem paths safely is a
+      program-wide decision, not this helper's.
     - a filesystem fault AFTER git answered degrades to a returned reason string
       the caller can surface: `.resolve()` (pre-3.13 a symlink loop raises
       RuntimeError, not OSError), `mkdir`, read/write OSError, and either
