@@ -3566,6 +3566,30 @@ def test_observe_tick_ignores_terminal_blank_and_launch_status(tmp_path, on_disk
     assert _lifecycle_events(adapter, "spec-status-transition-observed") == []
 
 
+def test_observe_tick_ignores_bare_null_status(tmp_path):
+    """A bare `status:` line parses to YAML null, and BOTH sides of the comparison
+    read it through `status_of` — the tick here, and the launch snapshot
+    `_reset_spec_for_review` captures (pinned by its sibling,
+    `test_review_launch_snapshot_reads_bare_status_as_blank`). It normalizes to ""
+    on both, so the `s != ""` guard drops it and no transition is fabricated.
+
+    Written as its own case rather than a row on the parametrize above: expressing
+    "a bare status line" through that helper's `f"status: {on_disk}"` template needs
+    a sentinel, and a sentinel is exactly how the #358 parametrize silently
+    collapsed its YAML-null row into the missing-key one."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text("---\nstatus:\nbaseline_revision: abc123\n---\n\n# Story\n\nbody\n")
+    # fm_status="" is what `_reset_spec_for_review` records for this spec.
+    snap = dataclasses.replace(_snap(spec_file), fm_status="")
+    spec = dataclasses.replace(_dev_spec(tmp_path), role="review", spec_snapshot=snap)
+
+    adapter._observe_tick(_dev_handle(), spec)
+
+    assert adapter._fm_transition_obs == {}
+    assert _lifecycle_events(adapter, "spec-status-transition-observed") == []
+
+
 def test_observe_tick_without_snapshot_or_unreadable_is_noop(tmp_path, monkeypatch):
     """No snapshot (every non-review session) is a pure no-op, and a torn/
     unreadable snapshot read (OSError) is a skipped sample — never a verdict —

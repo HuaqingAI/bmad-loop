@@ -3538,6 +3538,31 @@ def test_review_launch_snapshot_degrades_on_unreadable_spec(project):
     assert events[-1]["story_key"] == "1-1-a"
 
 
+def test_review_launch_snapshot_reads_bare_status_as_blank(project):
+    """The snapshot's `fm_status` goes through `status_of` like every other spec
+    status gate, so a bare `status:` (YAML null) is captured as "" — not the
+    stringified "none".
+
+    The other half of a two-sided contract: the generic adapter's `_observe_tick`
+    compares its own `status_of` read against this field. A snapshot carrying
+    "none" while the tick reads "" (or the reverse) makes every tick on a
+    bare-status spec look like a transition off the launch state — a false
+    `transition_proven`, hence a premature single-sighting frontmatter synthesis.
+    Tick side pinned by `test_observe_tick_ignores_bare_null_status`."""
+    engine, _ = make_engine(project, [])
+    spec = spec_path(project, "1-1-a")
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec.write_text(
+        "---\nstatus:\nbaseline_revision: abc123\n---\n\n# Story\n\nbody\n", encoding="utf-8"
+    )
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(spec))
+
+    snap = engine._reset_spec_for_review(task)
+
+    assert snap is not None
+    assert snap.fm_status == ""
+
+
 def test_generic_reconcile_skips_blocked_prose(project):
     """A blocked outcome (prose Status: blocked) is NEVER reconciled: the
     frontmatter stays non-terminal, no `spec-status-reconciled` is emitted, and the
