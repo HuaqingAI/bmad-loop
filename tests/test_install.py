@@ -1686,7 +1686,7 @@ def test_shield_refuses_to_enable_extension_over_old_git(project, tmp_path, monk
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
     shared_before = (repo / ".git" / "info" / "exclude").read_bytes()
-    real = install_mod._shield_git
+    real = install_mod.git_bytes
 
     def ancient(worktree, *args):
         if args == ("version",):
@@ -1697,7 +1697,7 @@ def test_shield_refuses_to_enable_extension_over_old_git(project, tmp_path, monk
             raise AssertionError(f"made a permanent format change on git 2.19.4: {args}")
         return real(worktree, *args)
 
-    monkeypatch.setattr(install_mod, "_shield_git", ancient)
+    monkeypatch.setattr(install_mod, "git_bytes", ancient)
 
     reason = _worktree_local_exclude(wt, ["/probe-384"])
 
@@ -1725,7 +1725,7 @@ def test_shield_reuses_already_enabled_extension(project, tmp_path, monkeypatch)
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
     git(repo, "config", "extensions.worktreeConfig", "true")
-    real = install_mod._shield_git
+    real = install_mod.git_bytes
 
     def no_reenable(worktree, *args):
         # reads of the key must still pass through, or nothing works at all
@@ -1733,7 +1733,7 @@ def test_shield_reuses_already_enabled_extension(project, tmp_path, monkeypatch)
             raise AssertionError(f"re-enabled an extension already on: {args}")
         return real(worktree, *args)
 
-    monkeypatch.setattr(install_mod, "_shield_git", no_reenable)
+    monkeypatch.setattr(install_mod, "git_bytes", no_reenable)
 
     assert _worktree_local_exclude(wt, ["/probe-384"]) is None
 
@@ -1901,7 +1901,7 @@ def test_shield_config_fault_skips_shield_entirely(project, tmp_path, monkeypatc
     verify.worktree_add(repo, wt, "feat", "main")
     shared = repo / ".git" / "info" / "exclude"
     before = shared.read_bytes()
-    real = install_mod._shield_git
+    real = install_mod.git_bytes
 
     def fail_worktree_writes(worktree, *args):
         if "--worktree" in args:
@@ -1910,7 +1910,7 @@ def test_shield_config_fault_skips_shield_entirely(project, tmp_path, monkeypatc
             )
         return real(worktree, *args)
 
-    monkeypatch.setattr(install_mod, "_shield_git", fail_worktree_writes)
+    monkeypatch.setattr(install_mod, "git_bytes", fail_worktree_writes)
 
     reason = _worktree_local_exclude(wt, ["/probe-384"])
 
@@ -2340,6 +2340,136 @@ def test_provision_worktree_non_git_no_degrade_callback(tmp_path):
 
     assert msgs == []
     assert (wt / ".claude" / "skills" / "bmad-loop-sweep" / "SKILL.md").is_file()
+
+
+# ------------------------------------------- the shield runs on the chokepoint (issue #389)
+#
+# The shield's git used to be a bare `subprocess.run` in this module, so its
+# guards caught `subprocess.SubprocessError` and `OSError` — the raw forms of a
+# timeout and a failed spawn. Through `verify.git_bytes` neither type ever
+# arrives: the chokepoint translates them into `GitError` and its `GitSpawnError`
+# subclass first. Every guard was re-derived for that, and these are the tests
+# that would have caught leaving one behind. Each injects at the boundary the
+# chokepoint actually raises from, which is why the fakes RAISE rather than
+# return a non-zero rc — an rc is an answer here, never a fault.
+
+
+@pytest.mark.parametrize("fault", [verify.GitError, verify.GitSpawnError])
+def test_worktree_local_exclude_git_fault_before_answering_is_a_silent_skip(
+    project, tmp_path, monkeypatch, fault
+):
+    """A git that never answered leaves the FIRST arm's contract untouched: silence.
+    Both classes are covered because they enter differently — a timeout is raised
+    as `GitError` itself, a spawn failure as the `GitSpawnError` subclass — and a
+    guard naming only one of them looks correct until the other happens.
+
+    Ablation: narrow the `rev-parse` guard to `subprocess.SubprocessError` (what it
+    caught before the chokepoint) and both cases fail — the fault propagates out of
+    a function whose whole first arm promises it never will."""
+    wt = tmp_path / "wt"
+    verify.worktree_add(project.project, wt, "feat", "main")
+
+    def unanswerable(worktree, *args):
+        raise fault(f"git {args[0]} did not answer in {worktree}")
+
+    monkeypatch.setattr(install_mod, "git_bytes", unanswerable)
+
+    assert _worktree_local_exclude(wt, ["/probe-389"]) is None
+
+
+def test_worktree_local_exclude_git_fault_after_answering_degrades(project, tmp_path, monkeypatch):
+    """Once `rev-parse` has answered, the same fault means the opposite thing — the
+    shield was owed and did not happen — so it must come back as a reason the
+    caller can journal, not as silence.
+
+    Name-filtered onto the activation so everything before it runs for real; that
+    is also what makes this the SECOND arm rather than the first.
+
+    Ablation: drop `GitError` from the tail's except tuple and this fails — the
+    timeout propagates instead of degrading."""
+    wt = tmp_path / "wt"
+    verify.worktree_add(project.project, wt, "feat", "main")
+    real = install_mod.git_bytes
+
+    def timeout_on_activation(worktree, *args):
+        if "--worktree" in args:
+            raise verify.GitError("git config timed out after 120s")
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", timeout_on_activation)
+
+    reason = _worktree_local_exclude(wt, ["/probe-389"])
+
+    assert reason is not None and "timed out" in reason
+
+
+def test_shield_survives_a_git_fault_while_reading_the_users_excludes(
+    project, tmp_path, monkeypatch
+):
+    """The excludes-file seed is best-effort BELOW the shield: a git fault reading
+    the operator's `core.excludesFile` costs their patterns, which is a real loss,
+    but skipping the shield over it would let `git add -A` stage the tool files —
+    strictly worse. So that fault is swallowed there and never reaches the tail.
+
+    Its own guard, its own test: the tail's guard also names `GitError`, so an
+    escape from here degrades into a plausible-looking reason rather than a crash,
+    and only an assertion that the shield SUCCEEDED can tell the two apart.
+
+    Ablation: drop `GitError` from `_shield_inherited_excludes`'s except tuple and
+    this fails — the fault escapes into the tail and returns a reason."""
+    wt = tmp_path / "wt"
+    verify.worktree_add(project.project, wt, "feat", "main")
+    real = install_mod.git_bytes
+
+    def timeout_on_the_excludes_read(worktree, *args):
+        if "core.excludesFile" in args and "--get" in args:
+            raise verify.GitError("git config timed out after 120s")
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", timeout_on_the_excludes_read)
+
+    assert _worktree_local_exclude(wt, ["/probe-389"]) is None
+
+    # the shield itself still landed — the seed is what was lost, not the shield
+    assert "/probe-389" in _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX /bin/sh stub git")
+def test_shield_git_calls_carry_the_locale_pin(project, tmp_path, monkeypatch):
+    """`LC_ALL=C` is one of the two things standing outside the chokepoint used to
+    cost (the other, the engine-configured timeout, has no observable seam here).
+    The shield embeds git's stderr verbatim in its degrade reasons, so without the
+    pin those reasons are whatever language the operator's box speaks — and #236
+    exists because a translated git message had already been misread once.
+
+    Recorded from a real child process rather than asserted on the argv: the pin is
+    an `env=` on the spawn, so only the child can testify that it arrived.
+
+    The ambient `LC_ALL` is deliberately set to something else first — without that
+    the recorded value could be "C" because the runner's box already said so, and
+    the ablation below would pass.
+
+    Ablation: spawn with a bare `subprocess.run` (no `env=`) and this fails — the
+    stub records `en_US.UTF-8`."""
+    bin_dir = tmp_path / "stubbin"
+    bin_dir.mkdir()
+    seen = tmp_path / "locale-seen"
+    stub = bin_dir / "git"
+    stub.write_text(
+        f'#!/bin/sh\nprintf "%s\\n" "${{LC_ALL-<unset>}}" >> {seen}\nexit 1\n', encoding="utf-8"
+    )
+    stub.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.setenv("LC_ALL", "en_US.UTF-8")
+
+    # rc 1 from the stub is the "not a repo" answer, i.e. the silent skip — all
+    # this test needs is that one call was spawned at all.
+    assert _worktree_local_exclude(tmp_path / "wt", ["/probe-389"]) is None
+
+    # non-empty is itself an assertion: an unexecutable stub would leave no file,
+    # and every claim below would hold vacuously.
+    recorded = seen.read_text(encoding="utf-8").split()
+    assert recorded and set(recorded) == {"C"}
 
 
 # ----------------------------------------------------------------- hookless profiles

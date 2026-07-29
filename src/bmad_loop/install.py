@@ -32,6 +32,7 @@ from .checks import Finding
 from .platform_util import atomic_write_text
 from .policy import POLICY_TEMPLATE
 from .process_host import get_process_host
+from .verify import GitError, git_bytes
 
 HOOK_SCRIPT_REL = ".bmad-loop/bmad_loop_hook.py"
 # Markers for bmad-loop-managed hook commands. RELAY_MARKER is shared by
@@ -731,13 +732,6 @@ def _copy_traversable(src, dst: Path, *, skip_existing: bool = False) -> bool:
     return True
 
 
-# Bound on each git call the git-add shield makes. Mirrors `LimitsPolicy.git_timeout_s`'s
-# default rather than reading it: `install` is the pre-run installer surface and holds no
-# Policy — `provision_worktree` is handed paths and profiles, never one — and threading a
-# policy in for this alone would put the installer in the policy's dependency graph. The
-# number matters only as a ceiling on a hung git; the two need not agree.
-_SHIELD_GIT_TIMEOUT_S = 120
-
 # The git that introduced `extensions.worktreeConfig` and `git config --worktree`,
 # both of which the worktree-scoped shield is built out of (git-worktree(1)).
 _WORKTREE_CONFIG_GIT = (2, 20)
@@ -758,37 +752,6 @@ def _git_version_at_least(reported: str, want: tuple[int, int]) -> bool:
     """
     match = re.match(r"git version (\d+)\.(\d+)", reported.strip())
     return match is not None and (int(match[1]), int(match[2])) >= want
-
-
-def _shield_git(worktree: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
-    """Run one `git -C <worktree> …` for the git-add shield, capturing BYTES.
-
-    Never `check=True`, and every caller branches on `returncode` instead: the
-    shield asks git questions whose "no" is a non-zero rc, not a fault —
-    `config --get` of an unset key exits 1, and that answer is what tells the
-    shield to enable the extension / probe the XDG default.
-
-    bytes, not `text=True`: strict decoding would raise `UnicodeDecodeError` out
-    of the git-query arm, whose whole contract is "skip silently", and that type
-    is in neither arm's tuple (#374). POSIX filenames are bytes, so a repo path
-    with bytes invalid in the locale encoding reaches this on a normal box.
-
-    Not yet routed through the `verify` chokepoint AGENTS.md otherwise requires,
-    though the reason has shrunk. `verify.git_bytes` (#377) now offers exactly the
-    shape this helper needs — `CompletedProcess[bytes]` with the rc returned, not
-    raised — so the original blocker is gone. What remains is the guards: through
-    the chokepoint a timeout arrives as `GitError`, which is not a
-    `subprocess.SubprocessError`, and a spawn fault as `GitSpawnError`, which is
-    not an `OSError` — so the `except` tuples wrapping these calls would quietly
-    stop covering what they were written for. Re-deriving all eight is its own
-    change: #389. The 120s bound below is carried meanwhile, so standing outside
-    costs the taxonomy and `LC_ALL=C`, not the timeout.
-    """
-    return subprocess.run(
-        ["git", "-C", str(worktree), *args],
-        capture_output=True,
-        timeout=_SHIELD_GIT_TIMEOUT_S,
-    )
 
 
 def _shield_enable_worktree_config(worktree: Path, common_dir: Path) -> str | None:
@@ -818,7 +781,7 @@ def _shield_enable_worktree_config(worktree: Path, common_dir: Path) -> str | No
     bare" — silently opening the core.bare gate the paragraph above exists to
     hold shut. Refusing at the top is what keeps that pair unreachable.
     """
-    version = _shield_git(worktree, "version")
+    version = git_bytes(worktree, "version")
     if version.returncode != 0 or not _git_version_at_least(
         os.fsdecode(version.stdout), _WORKTREE_CONFIG_GIT
     ):
@@ -844,20 +807,18 @@ def _shield_enable_worktree_config(worktree: Path, common_dir: Path) -> str | No
     # config extension worktreeConfig is enabled` — the shield skipped over a repo
     # that was one write away from supporting it.
     shared = str(common_dir / "config")
-    probe = _shield_git(
+    probe = git_bytes(
         worktree, "config", "--file", shared, "--type=bool", "--get", "extensions.worktreeConfig"
     )
     if probe.returncode == 0 and os.fsdecode(probe.stdout).strip() == "true":
         return None
-    bare = _shield_git(worktree, "config", "--file", shared, "--type=bool", "--get", "core.bare")
+    bare = git_bytes(worktree, "config", "--file", shared, "--type=bool", "--get", "core.bare")
     if bare.returncode == 0 and os.fsdecode(bare.stdout).strip() == "true":
         refused = "core.bare = true"
-    elif (
-        _shield_git(worktree, "config", "--file", shared, "--get", "core.worktree").returncode == 0
-    ):
+    elif git_bytes(worktree, "config", "--file", shared, "--get", "core.worktree").returncode == 0:
         refused = "core.worktree"
     else:
-        enabled = _shield_git(worktree, "config", "extensions.worktreeConfig", "true")
+        enabled = git_bytes(worktree, "config", "extensions.worktreeConfig", "true")
         if enabled.returncode == 0:
             return None
         detail = os.fsdecode(enabled.stderr).strip() or f"git exited {enabled.returncode}"
@@ -890,7 +851,7 @@ def _shield_inherited_excludes(worktree: Path) -> str:
     """
     try:
         # --type=path so `~/.gitignore` arrives expanded, the way git reads it.
-        answer = _shield_git(worktree, "config", "--type=path", "--get", "core.excludesFile")
+        answer = git_bytes(worktree, "config", "--type=path", "--get", "core.excludesFile")
         if answer.returncode == 0 and answer.stdout.strip():
             source = Path(os.fsdecode(answer.stdout).strip())
             if not source.is_absolute():
@@ -909,7 +870,11 @@ def _shield_inherited_excludes(worktree: Path) -> str:
             xdg = os.environ.get("XDG_CONFIG_HOME")
             source = (Path(xdg) if xdg else Path.home() / ".config") / "git" / "ignore"
         return source.read_text(encoding="utf-8") if source.is_file() else ""
-    except (OSError, UnicodeError, subprocess.SubprocessError):
+    # GitError covers both of the chokepoint's raised faults — a timeout and, as
+    # its GitSpawnError subclass, a git that would not spawn. `subprocess`'s own
+    # types are gone from this tuple because nothing here can raise them any more;
+    # OSError and UnicodeError stay for the file read below the call.
+    except (GitError, OSError, UnicodeError):
         return ""
 
 
@@ -948,32 +913,46 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
     `_shield_enable_worktree_config` for the two shapes where enabling it is
     refused outright.
 
-    Best-effort in two arms that must stay separate, because `OSError` means the
+    Every git call goes through `verify.git_bytes`, the chokepoint accessor whose
+    two properties this function is built on: the returncode comes back as an
+    ANSWER rather than a raised fault (`config --get` of an unset key exits 1, and
+    that reply is what tells the shield to enable the extension or fall through to
+    the XDG default), and stdout arrives as BYTES, since POSIX filenames are bytes
+    and a strict decode would raise `UnicodeDecodeError` out of the silent arm
+    below, which promises never to propagate (#374). Standing inside it also buys
+    the `LC_ALL=C` pin and the `limits.git_timeout_s` bound the engine configures.
+
+    Best-effort in two arms that must stay separate, because a fault means the
     opposite thing in each:
 
-    - git unqueryable (not a repo, git missing, a `rev-parse` too old to answer)
-      is an EXPECTED skip — returns None silently. Callers hand this plain temp
-      dirs routinely. Nothing is DECODED in this arm: git's stdout is captured as
-      bytes and decoded in the tail below, because a decode fault is a degrade
-      (git answered; we could not read it), not the silent skip this arm means
-      (#374).
+    - git unqueryable (not a repo, git missing, a `rev-parse` too old to answer,
+      a timeout or spawn failure — both `GitError`) is an EXPECTED skip — returns
+      None silently. Callers hand this plain temp dirs routinely. Nothing is
+      DECODED in this arm: git's stdout is captured as bytes and decoded in the
+      tail below, because a decode fault is a degrade (git answered; we could not
+      read it), not the silent skip this arm means (#374).
     - anything AFTER git answered degrades to a returned reason string the caller
       can surface: a main checkout passed in (nothing to scope to), a refused or
       failed extension enable, a failed activation, `.resolve()` (pre-3.13 a
       symlink loop raises RuntimeError, not OSError), `mkdir`, read/write
-      `OSError`, a later git call timing out or failing to spawn
-      (`SubprocessError`), and either direction of a codec fault
-      (`UnicodeError`) — an exclude file that is not UTF-8 fails the READ, and a
-      pattern carrying a surrogate fails the WRITE, since a seed_globs pattern is
-      built from a real filename and a non-UTF-8 one arrives surrogate-escaped.
-      Silence here is not cosmetic: without the exclude the unit's `git add -A`
-      commits the tool files this provisioning just wrote into the story's merge.
+      `OSError`, a later git call timing out or failing to spawn (`GitError`),
+      and either direction of a codec fault (`UnicodeError`) — an exclude file
+      that is not UTF-8 fails the READ, and a pattern carrying a surrogate fails
+      the WRITE, since a seed_globs pattern is built from a real filename and a
+      non-UTF-8 one arrives surrogate-escaped. Silence here is not cosmetic:
+      without the exclude the unit's `git add -A` commits the tool files this
+      provisioning just wrote into the story's merge.
     """
     # Callers pass POSIX-slash patterns (glob rels via as_posix; config strings as
     # authored); git's exclude is POSIX-slash on every platform, so nothing to fix here.
     try:
-        answered = _shield_git(worktree, "rev-parse", "--absolute-git-dir", "--git-common-dir")
-    except (subprocess.SubprocessError, OSError):
+        answered = git_bytes(worktree, "rev-parse", "--absolute-git-dir", "--git-common-dir")
+    except GitError:
+        # GitError alone, and it is not a narrowing: this `try` wraps the git call
+        # and nothing else, and every fault the chokepoint raises out of one is a
+        # GitError — a timeout directly, a spawn failure as GitSpawnError, which
+        # subclasses it. The `OSError` that used to belong here was the spawn
+        # fault's raw form and is now translated before it arrives.
         return None
     if answered.returncode != 0:
         # not a repo, or a git too old for `--absolute-git-dir` (2.13): the same
@@ -1067,13 +1046,20 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
         # LAST, after the file it names exists: git reads core.excludesFile lazily,
         # but a config pointing at a file that a fault above left unwritten would
         # be a shield that silently excludes nothing while reporting a reason.
-        activated = _shield_git(worktree, "config", "--worktree", "core.excludesFile", str(exclude))
+        activated = git_bytes(worktree, "config", "--worktree", "core.excludesFile", str(exclude))
         if activated.returncode != 0:
             detail = os.fsdecode(activated.stderr).strip() or f"git exited {activated.returncode}"
             return f"could not activate the worktree git exclude ({worktree}): {detail}"
+    # GitError is every fault a chokepoint git call can raise here — a timeout, or
+    # a spawn failure as its GitSpawnError subclass. It replaces the
+    # `subprocess.SubprocessError` this tuple used to carry for exactly that pair,
+    # which the chokepoint now translates before it ever reaches this frame.
+    #
     # UnicodeError, not UnicodeDecodeError: the write raises the ENCODE sibling.
-    # Still far short of ValueError-broad, so a programming error still escapes.
-    except (OSError, RuntimeError, UnicodeError, subprocess.SubprocessError) as e:
+    # It no longer covers anything git does — `git_bytes` never decodes — so what
+    # is left for it is the exclude file's own read and write. Still far short of
+    # ValueError-broad, so a programming error still escapes.
+    except (GitError, OSError, RuntimeError, UnicodeError) as e:
         return f"could not update the worktree-local git exclude ({worktree}): {e}"
     return None
 
