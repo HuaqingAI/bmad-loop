@@ -8,12 +8,13 @@ bmad-loop is a deterministic Python orchestrator that drives unattended BMAD-met
 uv sync --all-extras          # setup (extras: tui, non-linux, opencode)
 uv run pytest -q              # test suite (-n auto to parallelize)
 uv run pytest tests/test_engine.py -q   # single file
+uv run pyright                # typecheck — same pinned version CI runs
 trunk fmt                     # format changed files
 trunk check                   # full lint, no path filter — run before every push (pre-push hook enforces it)
 ```
 
 - Never `pip install`; uv owns the environment. Dependency changes: edit pyproject.toml, run `uv lock` (CI uses `uv sync --locked` and fails on a stale lock).
-- Typecheck: pyright at the CI-pinned version — see the typecheck job in [.github/workflows/ci.yml](.github/workflows/ci.yml).
+- Typecheck: `uv run pyright`. The version is pinned exactly in the `dev` group (pyproject.toml) and CI runs that same command, so there is one pin and no drift — bump it deliberately, never with `uv lock --upgrade`.
 - Windows local runs require `PYTHONUTF8=1` (tests/conftest.py raises UsageError otherwise). Python floor: 3.11.
 
 ## Hard invariants

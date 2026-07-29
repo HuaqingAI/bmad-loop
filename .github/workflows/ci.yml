@@ -132,8 +132,11 @@ jobs:
       - name: Install the project
         # Populates .venv (venvPath/venv in the pyright config) so third-party and
         # optional-extra imports (textual, pyte, httpx, …) resolve instead of being
-        # flagged as missing.
+        # flagged as missing. Also installs pyright itself, which is pinned in the
+        # `dev` dependency group rather than named here — one pin, in the lock.
         run: uv sync --locked --all-extras
 
       - name: Pyright (basic mode)
-        run: uvx pyright@1.1.411
+        # `uv run`, not `uvx pyright@<version>`: the same command a contributor
+        # runs locally, resolving the same pinned version from uv.lock.
+        run: uv run pyright
