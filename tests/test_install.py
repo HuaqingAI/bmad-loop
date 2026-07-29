@@ -1657,16 +1657,38 @@ def test_worktree_local_exclude_undecodable_git_output_degrades(tmp_path, monkey
     # common dir it is handed, so a hardcoded path would create real directories
     # in the shared system /tmp on every run, outside pytest's cleanup.
     common = os.fsencode(str(tmp_path)) + b"/repo-\377-name/.git"
-    stub.write_bytes(b"#!/bin/sh\nprintf '%s\\n' " + common + b"\n")
+    # SINGLE-QUOTED into the script. Unquoted, a temp root carrying whitespace
+    # (TMPDIR, --basetemp, a username with a space) word-splits into a second
+    # printf argument, and `printf '%s\n'` repeats its format per argument — so
+    # the helper is handed a path with an embedded NEWLINE and mkdir(parents=True)s
+    # it as a sibling of the basetemp pytest reaps. Measured with a spaced
+    # --basetemp: it leaked such a directory and the test still passed.
+    stub.write_bytes(b"#!/bin/sh\nprintf '%s\\n' '" + common.replace(b"'", b"'\\''") + b"'\n")
     stub.chmod(0o755)
-    monkeypatch.setenv("PATH", str(bin_dir), prepend=False)
+    # PATH is REPLACED, not prepended: the stub has to be the only resolvable
+    # `git`, or the box's real git answers first with a decodable path and this
+    # passes without ever exercising the decode.
+    monkeypatch.setenv("PATH", str(bin_dir))
 
     # must not raise: the contract is best-effort in both arms
     reason = _worktree_local_exclude(tmp_path / "wt", ["/probe-374"])
 
     assert reason is None or "could not update" in reason
-    # nothing was created outside the sandbox
-    assert not list(Path("/tmp").glob("repo-*-name")) or sys.platform == "win32"
+    # The tail actually RAN, against the decoded path. Not decoration: without
+    # it this test is vacuous whenever the stub cannot exec — a noexec temp dir
+    # (ordinary CI hardening), no /bin/sh, a filesystem that drops the exec bit.
+    # subprocess.run then raises OSError, the git-query arm swallows it as the
+    # expected skip it is, `reason is None` holds, and the ablation above
+    # evaporates with it. Measured: at mode 0644 the stub never runs and every
+    # assertion above still passes.
+    #
+    # This also pins containment better than globbing shared /tmp for a leak:
+    # that glob is non-recursive and tmp_path sits three levels down, so it
+    # could not see this test's own output, while it DID fail for anyone whose
+    # box still carried litter from the hardcoded-path version of this test.
+    landed = Path(os.fsdecode(common)) / "info" / "exclude"
+    assert landed.is_file()
+    assert "/probe-374" in landed.read_text(encoding="utf-8")
 
 
 def test_worktree_local_exclude_non_git_dir_returns_none(tmp_path):
