@@ -87,13 +87,23 @@ class GitSpawnError(GitError):
 def _run_git(
     cmd: list[str], repo: Path, *, env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
-    """Sole spawn point for git subprocesses. Two failures are raised by
-    `subprocess.run` *before* any return code exists — a timeout (#156) and a
-    spawn-level OSError (#343) — so left uncaught either would bypass every
-    `except GitError` guard and crash the run. Both are translated here into
-    the GitError taxonomy — observation guards degrade, unguarded paths fail
-    typed — with the spawn class marked as `GitSpawnError` for the callers
-    that must distinguish an environment fault from git refusing.
+    """Sole spawn point for git subprocesses. Three failures are raised by
+    `subprocess.run` *before* any return code exists — a timeout (#156), a
+    spawn-level OSError (#343), and a strict-decode fault on the child's output
+    (#377) — so left uncaught any of them would bypass every `except GitError`
+    guard and crash the run. All are translated here into the GitError taxonomy
+    — observation guards degrade, unguarded paths fail typed — with the spawn
+    class marked as `GitSpawnError` for the callers that must distinguish an
+    environment fault from git refusing.
+
+    The decode fault is real, not theoretical: POSIX filenames are arbitrary
+    bytes, and while `core.quotePath` C-quotes them to ASCII for ordinary
+    porcelain, `-z` disables that quoting (`dirty_paths`, `branch_incoming_paths`,
+    `commit_paths`), `worktree list --porcelain` never applied it, and `git diff`
+    emits file *content* verbatim (`capture_diff`) — so one latin-1 file is
+    enough. Translating is deliberately all this does; making such paths usable
+    (`errors="surrogateescape"`) is a separate call, since surrogates would then
+    flow into the UTF-8 journal and JSON writes downstream.
 
     Every git child runs with `LC_ALL=C` so messages stay stable English: the one
     place that inspects git *text* rather than a return code — `safe_rollback`'s
@@ -111,6 +121,8 @@ def _run_git(
         )
     except subprocess.TimeoutExpired as exc:
         raise GitError(f"git {cmd[3]} timed out after {_git_timeout_s}s in {repo}") from exc
+    except UnicodeDecodeError as exc:
+        raise GitError(f"git {cmd[3]} returned undecodable output in {repo}: {exc}") from exc
     except OSError as exc:
         raise GitSpawnError(f"git {cmd[3]} failed to spawn in {repo}: {exc}") from exc
 

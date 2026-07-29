@@ -32,6 +32,37 @@ def dev_result(sp):
     return {"workflow": "auto-dev", "spec_file": str(sp)}
 
 
+def _codec_rejects_bad_byte() -> bool:
+    """Whether byte 0xff is undecodable in the codec ``text=True`` will use.
+
+    Probes ``TextIOWrapper`` with ``encoding=None`` rather than naming a codec,
+    because that is the very default ``subprocess``'s text mode resolves for the
+    child's streams — asking the machinery beats predicting it from the locale.
+    """
+    try:
+        io.TextIOWrapper(io.BytesIO(b"\xff")).read()
+    except UnicodeDecodeError:
+        return True
+    return False
+
+
+# Guard for every test whose subject is a STRICT DECODE of subprocess output —
+# the #378 verify-command pair below and the #377 git-chokepoint test above them.
+# Byte 0xff is undecodable only in UTF-8/ASCII; every ISO-8859-x and cp125x codec
+# maps all 256 byte values, so under such a locale the strict decode never raises
+# and those tests pass *with the bug restored* — a silent vacuity rather than a
+# failure (verified: under LC_ALL=et_EE.iso885915 the #378 ablation passes). No
+# single byte is undecodable everywhere, so this skips instead, leaving each test
+# either exercising the fault or saying plainly that it did not. CI is always on
+# the exercising side: the Linux legs run UTF-8 and the Windows legs set
+# PYTHONUTF8=1 (.github/workflows/ci.yml).
+needs_strict_codec = pytest.mark.skipif(
+    not _codec_rejects_bad_byte(),
+    reason="host codec decodes 0xff (e.g. an ISO-8859-x locale), so nothing here "
+    "would exercise the strict decode this fix is about",
+)
+
+
 def test_attempt_dirty_clean_tree(project):
     """At baseline with no changes — nothing for a rollback to undo."""
     baseline = verify.rev_parse_head(project.project)
@@ -209,6 +240,45 @@ def test_run_git_locale_merge_preserves_explicit_env(project, monkeypatch):
     assert seen["env"] is not None
     assert seen["env"]["LC_ALL"] == "C"
     assert seen["env"]["SENTINEL_X"] == "1"  # caller's env preserved
+
+
+# ---- the chokepoint's third pre-returncode fault, and its bytes mode (#377)
+
+
+@needs_strict_codec
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows filenames are UTF-16; no undecodable path exists"
+)
+def test_z_output_undecodable_path_becomes_git_error(project):
+    """#377: a filename carrying bytes invalid in the run's codec makes `_run_git`'s
+    strict decode raise UnicodeDecodeError — a third fault raised before any return
+    code exists, and the one the taxonomy missed. Being a ValueError it matched
+    neither `except` arm, so it sailed past every `except GitError` guard: here
+    `dirty_paths`, reached from `clean_incoming_collisions`' merge pre-flight, whose
+    callers guard exactly that type.
+
+    The file is real and so is git. Monkeypatching `subprocess.run` would hand the
+    code str objects and never run the stdlib's decoding at all, so that version
+    passes identically with the fix ablated (tests/test_install.py:1996 documents
+    the same trap).
+
+    Ablation: delete the `except UnicodeDecodeError` arm in `_run_git` and this
+    fails with the raw UnicodeDecodeError."""
+    repo = project.project
+    # POSIX filenames are arbitrary bytes, so build the path as bytes — a str path
+    # would have to carry the byte as a surrogate and re-encode on the way out.
+    with open(os.fsencode(repo) + b"/weird-\xff-name.txt", "wb") as fh:
+        fh.write(b"content\n")
+
+    with pytest.raises(verify.GitError, match="git status returned undecodable output"):
+        verify.dirty_paths(repo)
+
+    # Why only the `-z` (and raw-diff) sites were ever exposed: plain porcelain
+    # C-quotes the same path down to ASCII. This pins git's `core.quotePath`
+    # default, not our fix — adding `-z` to one of the safe callers would
+    # reintroduce the fault silently, and this is what would notice.
+    rc, out = verify._git(repo, "status", "--porcelain")
+    assert rc == 0 and r"weird-\377-name.txt" in out
 
 
 @pytest.mark.parametrize(
@@ -881,36 +951,8 @@ def test_verify_commands_timeout_stays_charged(tmp_path, monkeypatch):
 # a test passes identically with the bug restored — see the #374 regression
 # test's docstring (tests/test_install.py) for the same distinction.
 #
-# They are also codec-conditional, which is the subtler way they could go quiet.
-# Byte 0xff is undecodable only in UTF-8/ASCII; every ISO-8859-x and cp125x
-# codec maps all 256 byte values, so under such a locale the strict decode never
-# raises and both tests pass *with the bug restored* — a silent vacuity rather
-# than a failure (verified: under LC_ALL=et_EE.iso885915 the ablation passes).
-# No single byte is undecodable everywhere, so the guard below skips instead,
-# leaving the tests either exercising the fault or saying plainly that they did
-# not. CI is always on the exercising side: the Linux legs run UTF-8 and the
-# Windows legs set PYTHONUTF8=1 (.github/workflows/ci.yml).
-
-
-def _codec_rejects_bad_byte() -> bool:
-    """Whether byte 0xff is undecodable in the codec ``text=True`` will use.
-
-    Probes ``TextIOWrapper`` with ``encoding=None`` rather than naming a codec,
-    because that is the very default ``subprocess``'s text mode resolves for the
-    child's streams — asking the machinery beats predicting it from the locale.
-    """
-    try:
-        io.TextIOWrapper(io.BytesIO(b"\xff")).read()
-    except UnicodeDecodeError:
-        return True
-    return False
-
-
-needs_strict_codec = pytest.mark.skipif(
-    not _codec_rejects_bad_byte(),
-    reason="host codec decodes 0xff (e.g. an ISO-8859-x locale), so nothing here "
-    "would exercise the strict decode this fix is about",
-)
+# They are also codec-conditional, which is the subtler way they could go quiet;
+# `needs_strict_codec` (top of file) is what keeps them honest about it.
 
 
 def _undecodable_cmd(tmp_path: Path, rc: int) -> str:
