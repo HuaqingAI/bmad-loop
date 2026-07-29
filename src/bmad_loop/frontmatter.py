@@ -170,6 +170,13 @@ LineRenderer = Callable[[str, "re.Match[str]", str], str]
 # of everywhere else in this module. `[A-Za-z0-9._-]` is every shape a status
 # token and the ordinary scalar frontmatter values have; anything richer than
 # that falls back to the full-drop render, which is merely lossy, never wrong.
+#
+# `sprintstatus._set_mapping_value` solves the same problem with the WIDE `val`
+# this one refuses (`\S(?:.*?\S)?`), and the asymmetry is deliberate rather than
+# an oversight: it writes the orchestrator-owned board, whose values are status
+# tokens and timestamps, while this writes a hand-authored spec. It has the
+# fabricated-comment defect described above and is tracked separately (#366) —
+# do not "unify" the two by widening this one.
 _VALUE_COMMENT_RE = re.compile(
     r"^[ \t]*(?P<q>['\"]?)(?P<val>[A-Za-z0-9._-]*)(?P=q)(?P<sep>[ \t]+)(?P<comment>#.*)$"
 )
