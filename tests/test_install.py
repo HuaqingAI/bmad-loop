@@ -1807,6 +1807,59 @@ def test_shield_seeds_users_excludesfile(project, tmp_path):
     assert git(wt, "status", "--short") == ""
 
 
+def test_shield_reseeds_after_an_interrupted_creation(project, tmp_path, monkeypatch):
+    """A creation that died between `touch()` and the write must not leave a
+    placeholder that the NEXT attempt reads as authoritative.
+
+    `atomic_write_text` "leaves the original untouched and removes the temp" — and the
+    original here is the zero-byte file `touch()` just made, so an ENOSPC in between
+    leaves it behind. That attempt is harmless by itself: the degrade arm returns
+    above the `config --worktree`, and an unactivated private exclude does nothing.
+    The harm is deferred to the next one — an empty file taken as authoritative skips
+    the inherited-excludes seed and THEN activates a shadowing `core.excludesFile`,
+    reintroducing through the back door the exact leak
+    `test_shield_seeds_users_excludesfile` exists to plug.
+
+    Two attempts against the helper directly, because the engine cannot produce this
+    sequence today: every re-mount of a unit path runs `discard_worktree`, whose
+    `worktree_prune` deletes the whole per-worktree gitdir — placeholder included —
+    and when that best-effort prune fails, `git worktree add` refuses the stale path
+    outright and the unit defers before provisioning runs. What this pins is the
+    helper's OWN contract, so a future caller cannot inherit the defect. Do not
+    "simplify" the size check away on the grounds that nothing reaches it.
+
+    The zero-byte assertion between the attempts is not decoration: without it this
+    passes just as well if the first attempt left no file at all, i.e. whenever the
+    placeholder this test is about never existed.
+
+    Ablation: restore `existed = exclude.is_file()` and this fails — `mine.log` is
+    missing from the private exclude and comes back untracked in the worktree."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    users = tmp_path / "my-global-ignores"
+    users.write_text("mine.log\n", encoding="utf-8")
+    git(repo, "config", "core.excludesFile", str(users))
+
+    def boom(*a, **kw):
+        raise OSError("no space left on device")
+
+    # patched at install's OWN binding, as everywhere else in this file: the write
+    # goes through atomic_write_text (#375) on an mkstemp fd via os.fdopen, so a
+    # Path.write_text patch never fires and would pass vacuously.
+    monkeypatch.setattr(install_mod, "atomic_write_text", boom)
+    assert _worktree_local_exclude(wt, ["/probe-384"]) is not None
+    monkeypatch.undo()  # the assertions below do their own file and git I/O
+    assert _wt_private_exclude(wt).stat().st_size == 0  # the placeholder touch() left
+
+    assert _worktree_local_exclude(wt, ["/probe-384"]) is None
+
+    lines = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert "mine.log" in lines and "/probe-384" in lines
+    (wt / "mine.log").write_text("noise\n", encoding="utf-8")
+    assert git(wt, "status", "--short") == ""
+
+
 def test_shield_seeds_a_relative_excludesfile_resolved_like_git(project, tmp_path, monkeypatch):
     """`--type=path` expands `~` and stops there — a RELATIVE `core.excludesFile`
     comes back from git verbatim. Git resolves such a value against the worktree's

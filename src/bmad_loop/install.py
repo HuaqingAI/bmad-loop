@@ -990,10 +990,21 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
             return refusal
         exclude = git_dir / "info" / "exclude"
         exclude.parent.mkdir(parents=True, exist_ok=True)
-        existed = exclude.is_file()
+        # Zero bytes is an INTERRUPTED creation, not an initialized exclude. The
+        # `touch()` below creates the target before `atomic_write_text` fills it, and
+        # a fault in between (ENOSPC, or a kill) leaves that placeholder behind —
+        # harmless on its own, since the degrade arm returns above the activation and
+        # an unactivated private exclude does nothing. The harm would be deferred:
+        # read as authoritative, it skips the seed below and then points a shadowing
+        # `core.excludesFile` at a file missing the operator's own excludes,
+        # un-ignoring inside the worktree everything they ignore globally. Size
+        # rather than unlinking the placeholder on the way out, because no handler
+        # runs when the process is KILLED in that window. Re-seeding costs nothing
+        # either way: git treats an empty exclude and an absent one alike.
+        existed = exclude.is_file() and exclude.stat().st_size > 0
         # On creation the operator's own excludes are copied in, because the
         # activation below shadows them (see _shield_inherited_excludes). On a
-        # re-provision the file's own content is authoritative and the copy is
+        # re-provision a non-empty file's content is authoritative and the copy is
         # not repeated, so the two stay idempotent together.
         existing = (
             exclude.read_text(encoding="utf-8") if existed else _shield_inherited_excludes(worktree)
