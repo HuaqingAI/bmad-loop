@@ -893,6 +893,17 @@ def _shield_inherited_excludes(worktree: Path) -> str:
         answer = _shield_git(worktree, "config", "--type=path", "--get", "core.excludesFile")
         if answer.returncode == 0 and answer.stdout.strip():
             source = Path(os.fsdecode(answer.stdout).strip())
+            if not source.is_absolute():
+                # `--type=path` expands `~` and stops there: a RELATIVE value comes
+                # back verbatim (verified, git 2.55). Git resolves such a value
+                # against the worktree's top level; Python would resolve it against
+                # this process's cwd, which is wherever the orchestrator was
+                # launched. Left alone that reads the wrong file or, far more often,
+                # none — and `is_file()` false is silent, so the operator's patterns
+                # would simply not be carried and the activation below would shadow
+                # them anyway. Un-ignoring inside the worktree exactly what this
+                # function exists to preserve.
+                source = worktree / source
         else:
             # git's documented fallback when the key is unset (gitignore(5)).
             xdg = os.environ.get("XDG_CONFIG_HOME")

@@ -1807,6 +1807,42 @@ def test_shield_seeds_users_excludesfile(project, tmp_path):
     assert git(wt, "status", "--short") == ""
 
 
+def test_shield_seeds_a_relative_excludesfile_resolved_like_git(project, tmp_path, monkeypatch):
+    """`--type=path` expands `~` and stops there — a RELATIVE `core.excludesFile`
+    comes back from git verbatim. Git resolves such a value against the worktree's
+    top level; `Path(value)` resolves it against whatever directory the orchestrator
+    happens to have been launched from.
+
+    The miss is silent, which is what makes it worth a test: `is_file()` comes back
+    false, the seed returns "", and the activation below then SHADOWS the operator's
+    real excludes file — so their patterns stop applying inside the worktree and the
+    unit's `git add -A` stages what they told git to ignore.
+
+    `monkeypatch.chdir` is load-bearing, not hygiene. Run from the worktree, the
+    unfixed code resolves the same relative path by accident and this test passes
+    against the bug it exists to catch.
+
+    Ablation: drop the `is_absolute()` branch and this fails — `mine.log` is missing
+    from the private exclude and comes back untracked in the worktree."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    (wt / "ignores").mkdir()
+    (wt / "ignores" / "global").write_text("mine.log\n", encoding="utf-8")
+    git(repo, "config", "core.excludesFile", "ignores/global")
+    # anywhere that is NOT the worktree, and where no `ignores/global` exists
+    monkeypatch.chdir(tmp_path)
+
+    assert _worktree_local_exclude(wt, ["/probe-384"]) is None
+
+    lines = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert "mine.log" in lines and "/probe-384" in lines
+    (wt / "mine.log").write_text("noise\n", encoding="utf-8")
+    # `ignores/` is the fixture's own scaffolding, not the subject — it is untracked
+    # either way, so exclude it rather than let it mask the assertion.
+    assert "mine.log" not in git(wt, "status", "--short")
+
+
 def test_shield_seeds_xdg_default_when_unset(project, tmp_path, monkeypatch):
     """With `core.excludesFile` unset git falls back to `$XDG_CONFIG_HOME/git/ignore`
     (gitignore(5)) — a real file on plenty of developer boxes and shadowed just as
