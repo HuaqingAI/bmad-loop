@@ -126,7 +126,7 @@ def test_set_frontmatter_status_preserves_triple_dash_in_value(tmp_path):
     fm = frontmatter.read_frontmatter(spec)
     assert fm["status"] == "done"
     assert fm["title"] == "restore --- review"  # scalar with --- intact
-    assert "body text" in spec.read_bytes().decode()
+    assert spec.read_bytes().decode() == text.replace("status: in-review", "status: done")
 
 
 # =============================================================== line endings
