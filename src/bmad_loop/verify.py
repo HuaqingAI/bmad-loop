@@ -16,7 +16,7 @@ import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, overload
 
 from . import deferredwork
 from .bmadconfig import ProjectPaths
@@ -84,9 +84,21 @@ class GitSpawnError(GitError):
     (#343). The underlying errno stays reachable via ``exc.__cause__.errno``."""
 
 
+@overload
 def _run_git(
-    cmd: list[str], repo: Path, *, env: dict[str, str] | None = None
-) -> subprocess.CompletedProcess[str]:
+    cmd: list[str], repo: Path, *, env: dict[str, str] | None = ..., binary: Literal[False] = ...
+) -> subprocess.CompletedProcess[str]: ...
+
+
+@overload
+def _run_git(
+    cmd: list[str], repo: Path, *, env: dict[str, str] | None = ..., binary: Literal[True]
+) -> subprocess.CompletedProcess[bytes]: ...
+
+
+def _run_git(
+    cmd: list[str], repo: Path, *, env: dict[str, str] | None = None, binary: bool = False
+) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
     """Sole spawn point for git subprocesses. Three failures are raised by
     `subprocess.run` *before* any return code exists — a timeout (#156), a
     spawn-level OSError (#343), and a strict-decode fault on the child's output
@@ -105,6 +117,9 @@ def _run_git(
     (`errors="surrogateescape"`) is a separate call, since surrogates would then
     flow into the UTF-8 journal and JSON writes downstream.
 
+    `binary=True` skips the decode entirely and hands back the raw
+    `CompletedProcess[bytes]` — see `git_bytes`, the public accessor for it.
+
     Every git child runs with `LC_ALL=C` so messages stay stable English: the one
     place that inspects git *text* rather than a return code — `safe_rollback`'s
     benign "pathspec did not match" tolerance — must not misread a translated
@@ -115,7 +130,7 @@ def _run_git(
         return subprocess.run(
             cmd,
             capture_output=True,
-            text=True,
+            text=not binary,
             timeout=_git_timeout_s,
             env={**(env if env is not None else os.environ), "LC_ALL": "C"},
         )
@@ -146,6 +161,29 @@ def _git_env(repo: Path, *args: str, env: dict[str, str]) -> tuple[int, str]:
     the real index."""
     proc = _run_git(["git", "-C", str(repo), *args], repo, env=env)
     return proc.returncode, (proc.stdout + proc.stderr).strip()
+
+
+def git_bytes(repo: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
+    """Run one `git -C <repo> …` through the chokepoint, capturing raw BYTES.
+
+    For the callers the `(rc, str)` wrappers above cannot serve, on two counts:
+
+    * **bytes, not a strict decode.** POSIX filenames are arbitrary bytes, so a
+      repo path invalid in the locale codec reaches a `text=True` call on an
+      ordinary box. `_run_git` now translates that into `GitError` (#377) rather
+      than letting it escape untyped — but a caller whose contract is "answer the
+      question or skip silently" wants the bytes themselves, not a raised
+      taxonomy member. Decode at the point of use with `os.fsdecode`.
+    * **the returncode is an answer, not a fault.** The `CompletedProcess` is
+      returned whatever the rc, never `check=True`: `git config --get` of an unset
+      key exits 1, and that *is* the reply. Callers branch on `returncode`.
+
+    Standing inside the chokepoint is what buys the rest: the `LC_ALL=C` pin so
+    git's message text stays stable English (#236), and the `_git_timeout_s` bound
+    the engine sets from `limits.git_timeout_s` (#156). The two faults with no rc
+    to return still raise — a timeout as `GitError`, a spawn failure as
+    `GitSpawnError` — since neither can be expressed as a `CompletedProcess`."""
+    return _run_git(["git", "-C", str(repo), *args], repo, binary=True)
 
 
 def rev_parse_head(repo: Path) -> str:

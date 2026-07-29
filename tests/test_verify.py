@@ -281,6 +281,74 @@ def test_z_output_undecodable_path_becomes_git_error(project):
     assert rc == 0 and r"weird-\377-name.txt" in out
 
 
+def test_git_bytes_returns_bytes_and_reads_rc_as_an_answer(project):
+    """`git_bytes` hands back the CompletedProcess whatever the rc, with stdout as
+    raw bytes. Both halves are load-bearing for the bytes-mode callers: `git config
+    --get` of an unset key exits 1 and that non-zero rc *is* the reply (it is what
+    tells the git-add shield to enable the extension), so a chokepoint that raised
+    on it could not serve them; and bytes are what let a path invalid in the locale
+    codec through to an `os.fsdecode` at the point of use.
+
+    Ablation: drop `binary=True` from `git_bytes` and the bytes assertions fail
+    against str."""
+    unset = verify.git_bytes(project.project, "config", "--get", "bmadloop.definitelyunset")
+    assert unset.returncode == 1  # an answer, not a fault — and not raised
+    assert unset.stdout == b""
+
+    answered = verify.git_bytes(project.project, "rev-parse", "--abbrev-ref", "HEAD")
+    assert answered.returncode == 0
+    assert answered.stdout.strip() == b"main"  # bytes, not str
+
+
+def test_git_bytes_inherits_locale_pin_and_timeout(project, monkeypatch):
+    """What standing inside the chokepoint buys the bytes callers, asserted rather
+    than assumed: the LC_ALL=C pin (#236) and the engine-set `limits.git_timeout_s`
+    bound (#156) reach subprocess.run unchanged, with text mode off."""
+    seen: dict[str, object] = {}
+    real_run = subprocess.run
+
+    def spying_run(cmd, **kwargs):
+        seen.update(kwargs)
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(verify.subprocess, "run", spying_run)
+    verify.configure_git_timeout(9)
+    try:
+        verify.git_bytes(project.project, "rev-parse", "HEAD")
+    finally:
+        verify.configure_git_timeout(verify.GIT_TIMEOUT_S)
+
+    assert not seen["text"]
+    assert seen["timeout"] == 9
+    assert seen["env"]["LC_ALL"] == "C"
+
+
+def test_git_bytes_timeout_still_becomes_git_error(project, monkeypatch):
+    """Bytes mode skips the decode, not the taxonomy: a timeout has no return code
+    to hand back, so it still raises rather than becoming a CompletedProcess.
+
+    Ablation: delete the `except subprocess.TimeoutExpired` arm and this fails with
+    the raw TimeoutExpired."""
+    monkeypatch.setattr(verify.subprocess, "run", _timing_out_run)
+    with pytest.raises(verify.GitError, match=r"git config timed out after \d+s"):
+        verify.git_bytes(project.project, "config", "--get", "core.excludesFile")
+
+
+def test_git_bytes_spawn_oserror_still_becomes_git_spawn_error(project, monkeypatch):
+    """Same for a spawn-level OSError — GitSpawnError, errno still reachable.
+
+    Ablation: delete the `except OSError` arm and this fails with the raw OSError."""
+    exc = OSError(24, "Too many open files")
+
+    def failing_run(cmd, **kwargs):
+        raise exc
+
+    monkeypatch.setattr(verify.subprocess, "run", failing_run)
+    with pytest.raises(verify.GitSpawnError, match="git config failed to spawn") as excinfo:
+        verify.git_bytes(project.project, "config", "--get", "core.excludesFile")
+    assert excinfo.value.__cause__ is exc
+
+
 @pytest.mark.parametrize(
     "fm,expected",
     [
