@@ -189,6 +189,47 @@ def test_synth_status_inconsistent_flagged(tmp_path):
     assert out.status_consistent is False
 
 
+def test_synth_blank_frontmatter_status_falls_back_to_prose_done(tmp_path):
+    """A present-but-blank `status:` (YAML null — the shape a bmad-dev-auto template
+    leaves, per `_FM_STATUS_RE`'s own comment) must read as `""`, so the prose
+    `done` fallback fires and the synthesis is self-consistent. A local
+    `str(fm.get("status", ""))` made it the truthy token `"none"`, which pinned
+    `status="none"` and `status_consistent=False` — and `status_consistent` is the
+    gate on `_post_kill_reconcile`, whose docstring names this very shape as
+    rescuable, so a session that finished real work was discarded (#369).
+
+    Written verbatim rather than through `_spec`: that fixture quotes the value
+    (`status: '{status}'`), which yields an empty *string*, not YAML-null, and so
+    cannot express the failing shape at all.
+    """
+    sp = tmp_path / "spec-1-1-a.md"
+    sp.write_text(
+        "---\ntitle: 'x'\nstatus:\n---\n\n## Auto Run Result\n\n- Status: done\n",
+        encoding="utf-8",
+    )
+    out = devcontract.synthesize_result(sp, story_key="1-1-a")
+
+    assert out.result_json["status"] == "done"
+    assert out.status_consistent is True
+
+
+def test_synth_literal_none_status_still_blocks_the_prose_fallback(tmp_path):
+    """The other half of the #369 fix: `status: none` written as a literal token is
+    a deliberate custom status, not a blank. PyYAML resolves only `~`/`null`/
+    `Null`/`NULL`/empty as null, so this stays the string `"none"` — truthy, so it
+    wins over the prose and the disagreement is surfaced. Without this pin the fix
+    could be "widened" into treating the token itself as blank."""
+    sp = tmp_path / "spec-1-1-a.md"
+    sp.write_text(
+        "---\ntitle: 'x'\nstatus: none\n---\n\n## Auto Run Result\n\n- Status: done\n",
+        encoding="utf-8",
+    )
+    out = devcontract.synthesize_result(sp, story_key="1-1-a")
+
+    assert out.result_json["status"] == "none"
+    assert out.status_consistent is False
+
+
 def test_synth_dw_ids_included(tmp_path):
     sp = _spec(tmp_path / "spec-dw-x.md", status="done", auto_run="done")
     out = devcontract.synthesize_result(sp, story_key=None, dw_ids=["DW-1", "DW-2"])
