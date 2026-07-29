@@ -263,7 +263,8 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 - **A worktree's local git exclude really is best-effort now (#359).** `_worktree_local_exclude`
   guarded only its `git rev-parse` call; the filesystem tail behind it (resolve, mkdir, read, write)
   crashed the run — a symlink loop raises `RuntimeError` on 3.11/3.12, an exclude file that is not
-  UTF-8 raises `UnicodeDecodeError`, and a read-only `.git` raises `OSError`. The tail is guarded and
+  UTF-8 raises `UnicodeDecodeError`, a seeded path whose filename is not UTF-8 raises
+  `UnicodeEncodeError` on the way back out, and a read-only `.git` raises `OSError`. The tail is guarded and
   degrades to a reason string, and provisioning journals it as `worktree-exclude-degraded` on the
   story rather than swallowing it: without the exclude the unit's `git add -A` would commit the
   provisioned skill trees and tool configs into the story's merge. Git being unqueryable at all

@@ -742,10 +742,13 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
       None silently. Callers hand this plain temp dirs routinely.
     - a filesystem fault AFTER git answered degrades to a returned reason string
       the caller can surface: `.resolve()` (pre-3.13 a symlink loop raises
-      RuntimeError, not OSError), `mkdir`, an exclude file that is not UTF-8
-      (UnicodeDecodeError), and read/write OSError. Silence here is not cosmetic:
-      without the exclude the unit's `git add -A` commits the tool files this
-      provisioning just wrote into the story's merge.
+      RuntimeError, not OSError), `mkdir`, read/write OSError, and either
+      direction of a codec fault (`UnicodeError`) — an exclude file that is not
+      UTF-8 fails the READ, and a pattern carrying a surrogate fails the WRITE,
+      since a seed_globs pattern is built from a real filename and a non-UTF-8
+      one arrives surrogate-escaped. Silence here is not cosmetic: without the
+      exclude the unit's `git add -A` commits the tool files this provisioning
+      just wrote into the story's merge.
     """
     # Callers pass POSIX-slash patterns (glob rels via as_posix; config strings as
     # authored); git's exclude is POSIX-slash on every platform, so nothing to fix here.
@@ -774,7 +777,9 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
             return None
         prefix = existing if not existing or existing.endswith("\n") else existing + "\n"
         exclude.write_text(prefix + "\n".join(new) + "\n", encoding="utf-8")
-    except (OSError, RuntimeError, UnicodeDecodeError) as e:
+    # UnicodeError, not UnicodeDecodeError: the write raises the ENCODE sibling.
+    # Still far short of ValueError-broad, so a programming error still escapes.
+    except (OSError, RuntimeError, UnicodeError) as e:
         return f"could not update the worktree-local git exclude ({worktree}): {e}"
     return None
 

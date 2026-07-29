@@ -1532,6 +1532,31 @@ def test_worktree_local_exclude_degrades_on_undecodable_exclude(project):
     assert exclude.read_bytes() == b"\xff\xfe legacy-encoded\n"
 
 
+def test_worktree_local_exclude_degrades_on_unencodable_pattern(project):
+    """The codec fault has a WRITE direction too, and it is not the same exception:
+    `read_text` raises UnicodeDecodeError, `write_text` raises UnicodeEncodeError.
+    Neither is an OSError and they share no subclass but `UnicodeError`, so naming
+    only the decode half leaves the tail escaping on the encode half.
+
+    Reachable, not theoretical: `provision_worktree` builds a pattern per
+    `seed_globs` match via `rel.as_posix()`, so a repo file whose name is not valid
+    UTF-8 arrives surrogate-escaped and cannot be written back as UTF-8.
+
+    REAL fault, no injection. The surrogate is written literally rather than via
+    `os.fsdecode(b"...\xff...")`: that helper decodes with surrogatepass on
+    Windows, which rejects a lone invalid byte outright and would raise in the
+    test's own setup. "\\udcff" is exactly what POSIX surrogateescape yields, and
+    strict UTF-8 refuses to encode it on every platform.
+
+    Ablation: narrow the tail's tuple back to `UnicodeDecodeError` and this fails
+    — UnicodeEncodeError propagates."""
+    pattern = "/vendor/weird-\udcff-name"
+
+    reason = _worktree_local_exclude(project.project, [pattern])
+
+    assert reason is not None and "surrogates not allowed" in reason
+
+
 def test_worktree_local_exclude_non_git_dir_returns_none(tmp_path):
     """Not-a-repo is an EXPECTED skip, not a degradation: `OSError` in the
     subprocess arm means "no git to query" and must stay silent, while the same
