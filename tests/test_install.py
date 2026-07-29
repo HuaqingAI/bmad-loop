@@ -1503,7 +1503,10 @@ def test_worktree_local_exclude_degrades_on_write_fault(project, monkeypatch):
     real_write = Path.write_text
 
     def boom(self, *a, **kw):
-        if self.name == "exclude":
+        # matches the scratch file too: the write lands on "exclude.bmad-loop.tmp"
+        # and is os.replace'd into place, so a filter pinned to "exclude" alone
+        # would stop injecting anything and pass vacuously (#375).
+        if self.name.startswith("exclude"):
             raise OSError("read-only .git")
         return real_write(self, *a, **kw)
 
@@ -1560,6 +1563,100 @@ def test_worktree_local_exclude_degrades_on_unencodable_pattern(project):
     assert reason is not None and "surrogates not allowed" in reason
 
 
+def test_worktree_local_exclude_short_write_leaves_exclude_intact(project, monkeypatch):
+    """#375: a fault PARTWAY THROUGH the write must leave the operator's exclude
+    byte-identical, not truncated. `write_text` opens "w" (truncate-then-write)
+    and this is a read-modify-REWRITE carrying their content in `prefix`, so a
+    direct write left the file cut mid-content while the reason still said
+    "could not update". The surviving tail is a valid git pattern and a prefix of
+    the intended one — cut one character in and the last line is `/`, which
+    excludes the whole worktree. Blast radius is the MAIN repo: a linked
+    worktree's --git-common-dir points at the main .git.
+
+    The fault is injected at `Path.open`, NOT at `Path.write_text`: patching
+    write_text means the file is never opened, so the truncation cannot happen
+    and the test would pass against the very bug it exists to catch. Going
+    through the real `open(mode="w")` is the whole point — that is what
+    truncates.
+
+    Ablation: write directly to `exclude` instead of tmp + atomic_replace and
+    this fails — the file comes back truncated."""
+    exclude = project.project / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    exclude.write_text("# OPERATOR'S OWN\n/secret-local\n", encoding="utf-8")
+    before = exclude.read_bytes()
+
+    real_open = Path.open
+
+    class ShortWriter:
+        def __init__(self, f):
+            self._f = f
+
+        def write(self, s):
+            self._f.write(s[:8])  # a partial write, then the device gives up
+            raise OSError(28, "No space left on device")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._f.close()
+            return False
+
+        def __getattr__(self, name):
+            return getattr(self._f, name)
+
+    def opener(self, *a, **kw):
+        mode = a[0] if a else kw.get("mode", "r")
+        handle = real_open(self, *a, **kw)
+        if "w" in mode and self.name.startswith("exclude"):
+            return ShortWriter(handle)
+        return handle
+
+    monkeypatch.setattr(Path, "open", opener)
+
+    reason = _worktree_local_exclude(project.project, ["/probe-359"])
+
+    monkeypatch.undo()
+    assert reason is not None and "No space left" in reason
+    assert exclude.read_bytes() == before  # untouched, not half-rewritten
+    # and the scratch file is not left lying next to it
+    assert not (exclude.parent / "exclude.bmad-loop.tmp").exists()
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX-only fault: Windows paths are UTF-16, so git cannot emit an undecodable path",
+)
+def test_worktree_local_exclude_undecodable_git_output_degrades(tmp_path, monkeypatch):
+    """#374: the git-query arm used `text=True`, decoding stdout strictly, so a
+    repo path with bytes invalid in the locale encoding raised UnicodeDecodeError
+    — a type in NEITHER arm's tuple, straight out of a function whose whole
+    contract is that it never propagates.
+
+    Driven through a REAL stub `git` on PATH rather than a monkeypatched
+    `subprocess.run`. That distinction is the test: replacing subprocess.run
+    hands the code bytes directly and never runs the stdlib's decoding at all, so
+    such a test passes identically with `text=True` restored — it cannot see the
+    bug. Verified: the run-patching version did NOT fail its own ablation.
+
+    Ablation: restore `text=True` on the subprocess call and this fails — the
+    UnicodeDecodeError propagates from the arm that promises a silent skip."""
+    bin_dir = tmp_path / "stubbin"
+    bin_dir.mkdir()
+    stub = bin_dir / "git"
+    # emits a path carrying byte 0xff, exactly what a repo whose directory name
+    # is not valid UTF-8 makes `git rev-parse --git-common-dir` print
+    stub.write_bytes(b"#!/bin/sh\nprintf '/tmp/repo-\\377-name/.git\\n'\n")
+    stub.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir), prepend=False)
+
+    # must not raise: the contract is best-effort in both arms
+    reason = _worktree_local_exclude(tmp_path / "wt", ["/probe-374"])
+
+    assert reason is None or "could not update" in reason
+
+
 def test_worktree_local_exclude_non_git_dir_returns_none(tmp_path):
     """Not-a-repo is an EXPECTED skip, not a degradation: `OSError` in the
     subprocess arm means "no git to query" and must stay silent, while the same
@@ -1597,7 +1694,10 @@ def test_provision_worktree_exclude_fault_reports_on_degraded(project, tmp_path,
     real_write = Path.write_text
 
     def boom(self, *a, **kw):
-        if self.name == "exclude":
+        # matches the scratch file too: the write lands on "exclude.bmad-loop.tmp"
+        # and is os.replace'd into place, so a filter pinned to "exclude" alone
+        # would stop injecting anything and pass vacuously (#375).
+        if self.name.startswith("exclude"):
             raise OSError("read-only .git")
         return real_write(self, *a, **kw)
 

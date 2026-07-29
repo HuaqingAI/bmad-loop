@@ -17,6 +17,7 @@ orchestrator's signal watcher is CLI-agnostic.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -28,6 +29,7 @@ from typing import Any, NamedTuple
 
 from .adapters.profile import ALIASES, CLIProfile, ProfileError, load_profiles
 from .checks import Finding
+from .platform_util import atomic_replace
 from .policy import POLICY_TEMPLATE
 from .process_host import get_process_host
 
@@ -739,12 +741,10 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
     opposite thing in each:
 
     - git unqueryable (not a repo, git missing) is an EXPECTED skip — returns
-      None silently. Callers hand this plain temp dirs routinely. One residual
-      escape survives here and is tracked in #374: `text=True` decodes git's
-      stdout strictly, so a repo path carrying bytes invalid in the locale
-      encoding raises UnicodeDecodeError, which is neither arm's type. Left out
-      of the #359 fix deliberately — decoding filesystem paths safely is a
-      program-wide decision, not this helper's.
+      None silently. Callers hand this plain temp dirs routinely. Nothing is
+      DECODED in this arm: git's stdout is captured as bytes and decoded in the
+      tail below, because a decode fault is a degrade (git answered; we could
+      not read it), not the silent skip this arm means (#374).
     - a filesystem fault AFTER git answered degrades to a returned reason string
       the caller can surface: `.resolve()` (pre-3.13 a symlink loop raises
       RuntimeError, not OSError), `mkdir`, read/write OSError, and either
@@ -758,16 +758,22 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
     # Callers pass POSIX-slash patterns (glob rels via as_posix; config strings as
     # authored); git's exclude is POSIX-slash on every platform, so nothing to fix here.
     try:
-        common = subprocess.run(
+        # bytes, not text=True: strict decoding here would raise UnicodeDecodeError
+        # out of an arm whose whole contract is "skip silently", and that type is
+        # in neither arm's tuple (#374). POSIX filenames are bytes, so a repo path
+        # with bytes invalid in the locale encoding reaches this on a normal box.
+        raw = subprocess.run(
             ["git", "-C", str(worktree), "rev-parse", "--git-common-dir"],
             capture_output=True,
-            text=True,
             check=True,
-        ).stdout.strip()
+        ).stdout
     except (subprocess.SubprocessError, OSError):
         return None
     try:
-        common_dir = Path(common)
+        # fsdecode, so a non-UTF-8 repo path round-trips back to the filesystem
+        # instead of faulting. It can still raise on Windows (utf-8/surrogatepass
+        # rejects a lone invalid byte), which is why it sits inside this try.
+        common_dir = Path(os.fsdecode(raw).strip())
         if not common_dir.is_absolute():
             # a PLAIN checkout answers with a relative ".git"; a linked worktree
             # answers with the main repo's absolute .git (verified, git 2.55), so
@@ -781,7 +787,22 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
         if not new:
             return None
         prefix = existing if not existing or existing.endswith("\n") else existing + "\n"
-        exclude.write_text(prefix + "\n".join(new) + "\n", encoding="utf-8")
+        # Write-then-replace, never write_text onto `exclude` directly (#375).
+        # write_text opens "w", which TRUNCATES before writing, and this is a
+        # read-modify-REWRITE carrying the operator's own excludes in `prefix` —
+        # so a short write (ENOSPC) left the file truncated mid-content while the
+        # degrade reason still said "could not update". Worse, the surviving tail
+        # is a valid git pattern and a prefix of the intended one: cut one char
+        # in and the last line is "/", which excludes the entire worktree. And
+        # the blast radius is the MAIN repo, since a linked worktree's
+        # --git-common-dir points at the main .git.
+        tmp = exclude.with_name(f"{exclude.name}.bmad-loop.tmp")
+        try:
+            tmp.write_text(prefix + "\n".join(new) + "\n", encoding="utf-8")
+            atomic_replace(tmp, exclude)
+        except (OSError, RuntimeError, UnicodeError):
+            tmp.unlink(missing_ok=True)  # never leave the scratch file behind
+            raise
     # UnicodeError, not UnicodeDecodeError: the write raises the ENCODE sibling.
     # Still far short of ValueError-broad, so a programming error still escapes.
     except (OSError, RuntimeError, UnicodeError) as e:
