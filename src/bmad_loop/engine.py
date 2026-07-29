@@ -3172,7 +3172,9 @@ class Engine:
         never re-written). "Normalized" means through `status_of`, the same reading
         the adapter's `_observe_tick` compares against: a blank/YAML-null `status:`
         must be `""` on BOTH sides or the tick fabricates a transition off it (see
-        that method's docstring — the two reads are one contract). Snapshot capture is best-effort: a torn/unreadable read
+        that method's docstring — the two reads are one contract).
+
+        Snapshot capture is best-effort: a torn/unreadable read
         degrades to `None` (journaled, `review-launch-snapshot`), and the fallback
         then keeps its conservative 2-observation fingerprint path. Only the capture
         is guarded — the strip keeps its raise-on-unreadable repair doctrine (see
