@@ -270,12 +270,19 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   the worktree's own gitdir, activated with a worktree-scoped `core.excludesFile`, so it applies to
   that unit alone and `git worktree remove` deletes it along with the worktree. The operator's
   `core.excludesFile` is copied in when the private file is created, since the worktree-scoped key
-  shadows it. Two caveats: this enables `extensions.worktreeConfig`, a **permanent** repo-format flag
-  that is never removed (git older than 2.20 refuses a repository carrying it), and where git
-  requires that flag's prerequisites be moved by hand first (`core.bare = true` or `core.worktree` in
-  the shared config) the shield is skipped with a journaled reason rather than widened back. Lines an
-  older bmad-loop already wrote into `.git/info/exclude` are **not** removed for you — delete them by
-  hand (a `validate` warning lands separately).
+  shadows it — including a relative value, which git resolves against the worktree rather than
+  wherever the orchestrator was launched. Two caveats: this enables `extensions.worktreeConfig`, a
+  **permanent** repo-format flag that is never removed, and where git requires that flag's
+  prerequisites be moved by hand first (`core.bare = true` or `core.worktree` in the shared config)
+  the shield is skipped with a journaled reason rather than widened back. It also needs **git 2.20**,
+  the release that introduced the flag and `git config --worktree`; below that the shield is skipped
+  and no repo-format change is made, since git that old refuses a repository carrying the flag. Lines
+  an older bmad-loop already wrote into `.git/info/exclude` are **not** removed for you — delete them
+  by hand (a `validate` warning lands separately).
+- **The git-add shield's git calls run on the shared chokepoint (#389).** They were the last bare
+  `git` spawns outside `verify._run_git`, so they missed its `LC_ALL=C` pin — leaving a degrade
+  reason that quotes git's stderr in whatever language the box speaks — and used a hardcoded 120s
+  timeout instead of the configured `[limits] git_timeout_s`. Both now apply.
 - **A non-UTF-8 filename no longer crashes the run past every git guard (#377).** `verify._run_git`
   is the sole git spawn point and exists to give git's faults a type its ~50 `except GitError`
   guards can catch, but it decoded git's output strictly and translated only a timeout and a spawn
