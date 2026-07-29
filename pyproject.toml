@@ -46,6 +46,11 @@ dev = [
   "pytest-xdist>=3.6",
   # the opencode-http adapter tests exercise the real httpx client
   "httpx>=0.28",
+  # Exact, not a floor like the rest: pyright is a GATE, and a newer one adds
+  # checks that fail the build on untouched code. This is the single pin — the
+  # typecheck job runs `uv run pyright`, so CI and `uv run pyright` locally are
+  # the same resolved version and cannot drift apart (#245).
+  "pyright==1.1.411",
 ]
 
 [tool.hatch.build.targets.wheel]
