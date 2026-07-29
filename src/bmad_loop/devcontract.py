@@ -459,10 +459,11 @@ def _render_status_line(line: str, m: re.Match[str], value: str) -> str:
     """`reset_spec_status`'s replacement for a matched ``status:`` line: the
     value moves, its quote style and any trailing inline comment stay.
 
-    Deliberately different from `frontmatter._replace_value`, which drops both —
-    that writer's callers read the result back as a bare ``status: done``, this
-    one's tests pin the preservation. Sharing the VERIFICATION is the point; the
-    formatting each already had right."""
+    Deliberately different from `frontmatter._replace_value`, which carries the
+    comment through but drops the quotes — that writer's callers read the result
+    back as a bare ``status: done``, this one's tests pin the quote style.
+    Sharing the VERIFICATION is the point; the formatting each already had
+    right."""
     # Guarantee `key: value` spacing: a bare `status:` (no trailing space) would
     # otherwise fill to `status:done` — invalid YAML, the key is lost.
     pre = m.group("pre")
