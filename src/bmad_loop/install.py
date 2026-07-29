@@ -762,6 +762,15 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
         # out of an arm whose whole contract is "skip silently", and that type is
         # in neither arm's tuple (#374). POSIX filenames are bytes, so a repo path
         # with bytes invalid in the locale encoding reaches this on a normal box.
+        #
+        # Deliberately NOT routed through verify._run_git, the chokepoint AGENTS.md
+        # otherwise requires. Nothing structural forbids it — neither module imports
+        # the other — but _run_git hands back CompletedProcess[str], i.e. the strict
+        # decode this call exists to avoid, and it raises GitError rather than the
+        # (SubprocessError, OSError) this arm treats as an expected skip. Adopting it
+        # needs a bytes mode on the chokepoint first; that is #377, which also covers
+        # the decode fault escaping _run_git's own taxonomy. The cost of standing
+        # outside it meanwhile is this call's missing timeout.
         raw = subprocess.run(
             ["git", "-C", str(worktree), "rev-parse", "--git-common-dir"],
             capture_output=True,

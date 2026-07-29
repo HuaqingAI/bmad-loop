@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import re
 import sys
 import zipfile
@@ -1650,9 +1651,13 @@ def test_worktree_local_exclude_undecodable_git_output_degrades(tmp_path, monkey
     bin_dir = tmp_path / "stubbin"
     bin_dir.mkdir()
     stub = bin_dir / "git"
-    # emits a path carrying byte 0xff, exactly what a repo whose directory name
-    # is not valid UTF-8 makes `git rev-parse --git-common-dir` print
-    stub.write_bytes(b"#!/bin/sh\nprintf '/tmp/repo-\\377-name/.git\\n'\n")
+    # Emits a path carrying byte 0xff, exactly what a repo whose directory name
+    # is not valid UTF-8 makes `git rev-parse --git-common-dir` print. The path is
+    # rooted in tmp_path, NOT a literal /tmp: the helper mkdir(parents=True)s the
+    # common dir it is handed, so a hardcoded path would create real directories
+    # in the shared system /tmp on every run, outside pytest's cleanup.
+    common = os.fsencode(str(tmp_path)) + b"/repo-\377-name/.git"
+    stub.write_bytes(b"#!/bin/sh\nprintf '%s\\n' " + common + b"\n")
     stub.chmod(0o755)
     monkeypatch.setenv("PATH", str(bin_dir), prepend=False)
 
@@ -1660,6 +1665,8 @@ def test_worktree_local_exclude_undecodable_git_output_degrades(tmp_path, monkey
     reason = _worktree_local_exclude(tmp_path / "wt", ["/probe-374"])
 
     assert reason is None or "could not update" in reason
+    # nothing was created outside the sandbox
+    assert not list(Path("/tmp").glob("repo-*-name")) or sys.platform == "win32"
 
 
 def test_worktree_local_exclude_non_git_dir_returns_none(tmp_path):
