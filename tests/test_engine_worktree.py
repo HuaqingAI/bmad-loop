@@ -23,7 +23,7 @@ from conftest import (
     write_sprint,
 )
 
-from bmad_loop import verify
+from bmad_loop import verify, worktree_flow
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import Engine
@@ -1512,6 +1512,45 @@ def test_engine_deferred_teardown_degrades_are_journaled(project, monkeypatch):
 
     assert summary.deferred == 1 and not summary.paused
     assert "worktree-teardown-degraded" in journal_kinds(engine)
+
+
+def test_isolated_exclude_degrade_is_journaled(project, monkeypatch):
+    """#359: `provision_worktree`'s local-exclude write is best-effort, so the sole
+    caller has to give the degrade somewhere to land — otherwise a swallowed fault
+    silently lets the unit's `git add -A` commit the provisioned tool files.
+
+    The helper is patched at `worktree_flow`'s own `from .install import` binding
+    (worktree_flow.py:35) — patching `install._worktree_local_exclude` would not be
+    seen here. Journal-only by design (the run is unharmed and continues), matching
+    `worktree-teardown-degraded` rather than the notify-worthy `worktree-open-failed`.
+
+    Ablation: delete the `on_degraded=` lambda at the `provision_worktree` call in
+    `run_isolated` and this fails — no `worktree-exclude-degraded` is journaled."""
+    repo = project.project
+    gitignore = repo / ".gitignore"
+    gitignore.write_text(gitignore.read_text() + ".mcp.json\n", encoding="utf-8")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    # gitignored, so the worktree checkout lacks it and provisioning really seeds
+    # it — without a seed of some kind provision_worktree short-circuits before the
+    # exclude step and the wiring under test is never reached.
+    (repo / ".mcp.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(
+        worktree_flow, "_worktree_local_exclude", lambda *a, **k: "boom: read-only .git"
+    )
+
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+        policy=wt_policy(worktree_seed=(".mcp.json",)),
+    )
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    entry = next(e for e in engine.journal.entries() if e["kind"] == "worktree-exclude-degraded")
+    assert entry["story_key"] == "1-1-a" and entry["error"] == "boom: read-only .git"
+    # the degrade is a warning, not a stop: the unit still merged back
+    assert "unit-merged" in journal_kinds(engine)
 
 
 def test_resume_remount_survives_discard_remove_failure(project, monkeypatch):

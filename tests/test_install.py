@@ -2,6 +2,7 @@ import json
 import re
 import sys
 import zipfile
+from pathlib import Path
 
 import pytest
 from conftest import git
@@ -13,6 +14,7 @@ from bmad_loop.install import (
     DEV_BASE_SKILLS,
     MODULE_SKILLS,
     _copy_traversable,
+    _worktree_local_exclude,
     install_into,
     merge_hooks,
     missing_base_skills,
@@ -1448,6 +1450,155 @@ def test_provision_worktree_partial_seed_dir_shielded_in_local_exclude(project, 
     assert (wt / "cfg" / "ignored.yaml").read_text() == "SEED ME"
     exclude = (repo / ".git" / "info" / "exclude").read_text(encoding="utf-8")
     assert "/cfg" in exclude.splitlines()
+
+
+# ------------------------------------------------- local exclude, best-effort (issue #359)
+#
+# The helper's filesystem tail was unguarded while its docstring promised
+# best-effort. Faults below the `git rev-parse` call are INJECTED via name-filtered
+# monkeypatch (the test_engine.py:1553 pattern), not built for real: this box and
+# the 3.13+ legs resolve a real symlink loop without raising, so a hand-built loop
+# would false-green. `_worktree_local_exclude` returns None on success AND on the
+# expected "git can't be queried" skip; a str is the degrade reason.
+
+
+def test_worktree_local_exclude_degrades_on_symlink_loop_resolve(project, monkeypatch):
+    """A symlink loop under `.resolve()` raises RuntimeError, not OSError, on the
+    3.11/3.12 CI legs — so the tail's except tuple must name RuntimeError or the
+    fault escapes a function documented as best-effort.
+
+    The `project` MAIN CHECKOUT (not a linked worktree) is the subject on purpose:
+    `git rev-parse --git-common-dir` answers a plain checkout with a relative
+    ".git" and a linked worktree with the main repo's ABSOLUTE .git, so the plain
+    checkout is the only shape that reaches the `.resolve()` branch at all.
+
+    Ablation: drop `RuntimeError` from the tail's except tuple and this fails —
+    the RuntimeError propagates out of the call instead of becoming a reason."""
+    real_resolve = Path.resolve
+
+    def unresolvable(self, *a, **kw):
+        if self.name == ".git":
+            raise RuntimeError(f"Symlink loop from {str(self)!r}")
+        return real_resolve(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "resolve", unresolvable)
+
+    reason = _worktree_local_exclude(project.project, ["/probe-359"])
+
+    assert reason is not None and "Symlink loop" in reason
+    assert str(project.project) in reason  # names WHICH worktree lost its exclude
+    exclude = project.project / ".git" / "info" / "exclude"
+    assert not exclude.is_file() or "/probe-359" not in exclude.read_text(encoding="utf-8")
+
+
+def test_worktree_local_exclude_degrades_on_write_fault(project, monkeypatch):
+    """A write fault on the exclude file itself (e.g. a read-only .git) degrades to
+    a reason instead of propagating — this pins the guard reaching the LAST
+    statement of the tail, not just the early resolve/mkdir steps.
+
+    Injected rather than chmod: a root-owned CI runner ignores a read-only bit.
+
+    Ablation: drop the tail's `try` (or `OSError` from its tuple) and this fails —
+    the OSError propagates out of `_worktree_local_exclude`."""
+    real_write = Path.write_text
+
+    def boom(self, *a, **kw):
+        if self.name == "exclude":
+            raise OSError("read-only .git")
+        return real_write(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "write_text", boom)
+
+    reason = _worktree_local_exclude(project.project, ["/probe-359"])
+
+    assert reason is not None and "read-only .git" in reason
+
+
+def test_worktree_local_exclude_degrades_on_undecodable_exclude(project):
+    """A REAL fault, no injection needed: an exclude file that is not UTF-8 makes
+    `read_text` raise UnicodeDecodeError — a ValueError subclass, so neither the
+    OSError nor the RuntimeError arm covers it. The bytes must survive untouched;
+    rewriting someone's legacy-encoded exclude would be worse than skipping it.
+
+    Ablation: drop `UnicodeDecodeError` from the tail's except tuple and this
+    fails — it propagates (it is not an OSError)."""
+    exclude = project.project / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    exclude.write_bytes(b"\xff\xfe legacy-encoded\n")
+
+    reason = _worktree_local_exclude(project.project, ["/probe-359"])
+
+    assert reason is not None
+    assert exclude.read_bytes() == b"\xff\xfe legacy-encoded\n"
+
+
+def test_worktree_local_exclude_non_git_dir_returns_none(tmp_path):
+    """Not-a-repo is an EXPECTED skip, not a degradation: `OSError` in the
+    subprocess arm means "no git to query" and must stay silent, while the same
+    type in the tail means "surface it". That is why the two arms cannot merge.
+
+    INVERSE ablation (a negative assertion needs one): make the subprocess arm
+    return a reason string instead of None and this fails."""
+    assert _worktree_local_exclude(tmp_path, ["/probe-359"]) is None
+
+
+def test_worktree_local_exclude_success_returns_none(project, tmp_path):
+    """The happy path returns None too — `None` is "nothing to report", not
+    "nothing happened": the pattern really lands in the common dir's exclude."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    assert _worktree_local_exclude(wt, ["/probe-359"]) is None
+
+    lines = (repo / ".git" / "info" / "exclude").read_text(encoding="utf-8").splitlines()
+    assert "/probe-359" in lines
+
+
+def test_provision_worktree_exclude_fault_reports_on_degraded(project, tmp_path, monkeypatch):
+    """Provisioning forwards the degrade reason to `on_degraded` and otherwise
+    completes. The swallow and the surfacing have to ship together: without this
+    call a lost exclude turns a loud crash into a silent `git add -A` that commits
+    the tool files into the story's merge.
+
+    Ablation: delete the `on_degraded(reason)` call in `provision_worktree` and
+    this fails (`msgs` stays empty)."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    real_write = Path.write_text
+
+    def boom(self, *a, **kw):
+        if self.name == "exclude":
+            raise OSError("read-only .git")
+        return real_write(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "write_text", boom)
+    msgs: list[str] = []
+
+    provision_worktree(wt, [get_profile("claude")], repo, on_degraded=msgs.append)
+
+    assert len(msgs) == 1 and "read-only .git" in msgs[0]
+    # provisioning itself still finished — only the shielding step degraded
+    assert (wt / ".claude" / "skills" / "bmad-loop-sweep" / "SKILL.md").is_file()
+    assert (wt / ".claude" / "settings.json").is_file()
+
+
+def test_provision_worktree_non_git_no_degrade_callback(tmp_path):
+    """The expected skip must not reach `on_degraded`: many callers provision plain
+    non-repo directories, and a degrade event per call would train operators to
+    ignore the one that matters.
+
+    INVERSE ablation: make the subprocess arm return a reason string instead of
+    None and this fails (`msgs` gets an entry)."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    msgs: list[str] = []
+
+    provision_worktree(wt, [get_profile("claude")], repo, on_degraded=msgs.append)
+
+    assert msgs == []
+    assert (wt / ".claude" / "skills" / "bmad-loop-sweep" / "SKILL.md").is_file()
 
 
 # ----------------------------------------------------------------- hookless profiles

@@ -73,6 +73,8 @@ def provision_worktree(
     repo_root: Path,
     seed_files: Sequence[str] = (),
     seed_globs: Sequence[str] = (),
+    *,
+    on_degraded: Callable[[str], None] | None = None,
 ) -> list[str]:
     """Make a freshly-created git worktree a self-sufficient bmad-loop project.
 
@@ -108,7 +110,11 @@ def provision_worktree(
     - the hook points at the MAIN repo's already-installed relay via an absolute
       path (the relay locates the run dir from $BMAD_LOOP_RUN_DIR, not its own
       location), so nothing is written into the worktree's .bmad-loop/;
-    - everything we wrote is added to the worktree's local git exclude.
+    - everything we wrote is added to the worktree's local git exclude. That write
+      is best-effort: when git can't be queried at all it is skipped silently, but
+      a filesystem fault after that is reported to `on_degraded` (once, with the
+      reason) rather than swallowed — an unwritten exclude is what lets `git add -A`
+      stage the tool files, so it must not fail invisibly.
     Skill trees, the per-CLI hook config, and the seeded configs all live in dirs
     projects gitignore — but the exclude shields them even when a project doesn't.
 
@@ -284,7 +290,9 @@ def provision_worktree(
     patterns |= {f"/{rel}" for rel in seeded}
     if customize_seeded:
         patterns.add(f"/{CUSTOMIZE_DIR.as_posix()}")
-    _worktree_local_exclude(worktree, sorted(patterns))
+    reason = _worktree_local_exclude(worktree, sorted(patterns))
+    if reason is not None and on_degraded is not None:
+        on_degraded(reason)
     return skipped
 
 
@@ -475,6 +483,9 @@ class WorktreeFlow:
             self.paths.repo_root,
             seed_files=list(dict.fromkeys(seeds)),  # dedupe, preserve order
             seed_globs=self._registry.seed_globs(),
+            on_degraded=lambda msg: self.journal.append(
+                "worktree-exclude-degraded", story_key=task.story_key, error=msg
+            ),
         )
         if skipped_seeds:
             # A seed entry whose destination already exists is a no-op. Harmless for
