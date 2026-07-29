@@ -67,8 +67,9 @@ PLAN_HALT_STATUS = "ready-for-dev"
 # its prose terminal `## Auto Run Result` Status is `done`. Deliberately an
 # allowlist: anything else (already-`done`, `blocked`, or an unknown custom token)
 # is left untouched, so reconciliation can never override a status the skill set on
-# purpose. `""` covers a blank or missing frontmatter `status:` — `reset_spec_status`
-# fills/inserts the line in that case. `in-review` is included because step-04 sets
+# purpose. `""` covers a blank or missing frontmatter `status:` — `status_of`
+# normalizes a YAML-null value to `""` alongside the missing key (#358), and
+# `reset_spec_status` fills/inserts the line in either case. `in-review` is included because step-04 sets
 # it transiently at the start of a review pass; the skill self-finalizes to `done`,
 # so a spec left AT `in-review` with a prose `done` result is a mid-review interrupt
 # safe to reconcile forward. The intent-gap patch-restore re-drive (BMAD-METHOD

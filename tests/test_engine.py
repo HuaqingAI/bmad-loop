@@ -2387,8 +2387,8 @@ def test_generic_reconcile_in_review_followup_false_skips_review(project):
 
 def test_generic_reconcile_advances_bare_null_frontmatter_status(project):
     """The skill left a bare `status:` (YAML null) but finalized in prose with real
-    code. status_of would read that as "none"; the reconcile normalizes null to ""
-    so it still advances to done — and the filled line is valid YAML."""
+    code. status_of reads that as "" — the same as a missing key — so it is in
+    RECONCILABLE_FROM and still advances to done, and the filled line is valid YAML."""
     from bmad_loop.adapters.base import SessionResult
     from bmad_loop.policy import DevPolicy, ReviewPolicy
     from bmad_loop.sprintstatus import story_status
@@ -2434,6 +2434,40 @@ def test_generic_reconcile_advances_bare_null_frontmatter_status(project):
     assert status_of(read_frontmatter(spec_path(project, "1-1-a"))) == "done"
     recon = [e for e in engine.journal.entries() if e["kind"] == "spec-status-reconciled"]
     assert len(recon) == 1 and recon[0]["frm"] == "" and recon[0]["to"] == "done"
+
+
+def test_generic_reconcile_leaves_unknown_custom_status(project):
+    """The RECONCILABLE_FROM allowlist's design point: a status token nothing in the
+    project writes is a status somebody set on purpose, so a prose `done` never
+    overrides it. `reset_spec_status`'s line regex WOULD happily rewrite it, so the
+    allowlist is the only thing standing between the deliberate token and the
+    repair write — hence the assertion on the untouched bytes."""
+    from bmad_loop.policy import DevPolicy, ReviewPolicy
+
+    sp = spec_path(project, "1-1-a")
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    sp.write_text(
+        "---\ntitle: 'x'\nstatus: needs-triage\n---\n\n## Auto Run Result\n\n- Status: done\n",
+        encoding="utf-8",
+    )
+    before = sp.read_bytes()
+
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, _ = make_engine(project, [generic_dev_effect(project, "1-1-a")], policy=pol)
+    task = StoryTask(story_key="1-1-a", epic=1)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "status": "needs-triage"}
+
+    engine._reconcile_generic_terminal_status(task, rj)
+
+    assert sp.read_bytes() == before  # the deliberate token survives
+    assert rj["status"] == "needs-triage"  # result dict untouched
+    assert "spec-status-reconciled" not in [e["kind"] for e in engine.journal.entries()]
 
 
 def test_generic_reconcile_skips_out_of_tree_spec(project, tmp_path):

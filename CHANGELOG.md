@@ -252,6 +252,18 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 ### Fixed
 
+- **A blank frontmatter `status:` reads as blank, not as the token `none` (#358).** YAML parses a
+  bare `status:` line as null, and `status_of` stringified it — so every status gate saw `"none"`, a
+  token nothing in the project writes. The allowlist that decides whether a half-finalized generic
+  spec may be reconciled forward (`devcontract.RECONCILABLE_FROM`) therefore treated it as a
+  deliberate custom status and left the spec untouched, contradicting both its own comment and the
+  writer side, which fills exactly that shape. A YAML-null status now reads `""`, the same as a
+  missing key; a literal `status: none` is still the string `"none"`, so a hand-written token keeps
+  its meaning. The engine's local workaround at the reconcile is retired. Two renderings change with
+  it: `confirm`'s drift line says `status: (blank)` instead of trailing off, and the stories-mode
+  board (`status`, `dry-run`) labels a bare-status story `present` — its documented fallback —
+  instead of `none`, which was never a documented value.
+
 - **A trailing inline comment on a spec's `status:` line survives the write (#357, part 2).**
   `set_frontmatter_status` and `set_frontmatter_field` kept everything through the colon and dropped
   the rest, so `status: draft  # set by hand` came back as `status: done` — the last part of

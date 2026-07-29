@@ -2124,15 +2124,12 @@ class Engine:
             )
             return
         success_status = "in-review" if self._dev_review_enabled() else "done"
-        # A YAML-null status (bare `status:` / `status: null`) reads as the string
-        # "none" through verify.status_of (str(None)), which would dodge the
-        # RECONCILABLE_FROM allowlist; normalize it (and a missing key) to "" so the
-        # blank-status case reconciles. A literal `status: none` stays "none".
         fm = self._observed_frontmatter(spec_path, task.story_key, "reconcile")
         if fm is None:
             return
-        raw_status = fm.get("status")
-        fm_status = "" if raw_status is None else str(raw_status).strip().lower()
+        # A blank `status:` reads "" here (status_of normalizes YAML-null), so the
+        # blank-status template shape reconciles like a missing key does.
+        fm_status = verify.status_of(fm)
         if fm_status == success_status:
             # Already finalized — idempotent for the spec. But a *resumed* result
             # is the pre-reconcile snapshot persisted before the original run's
