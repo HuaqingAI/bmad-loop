@@ -1,4 +1,5 @@
 import dataclasses
+import io
 import os
 import subprocess
 import sys
@@ -879,6 +880,37 @@ def test_verify_commands_timeout_stays_charged(tmp_path, monkeypatch):
 # code str objects directly and never runs the stdlib's decoding at all, so such
 # a test passes identically with the bug restored — see the #374 regression
 # test's docstring (tests/test_install.py) for the same distinction.
+#
+# They are also codec-conditional, which is the subtler way they could go quiet.
+# Byte 0xff is undecodable only in UTF-8/ASCII; every ISO-8859-x and cp125x
+# codec maps all 256 byte values, so under such a locale the strict decode never
+# raises and both tests pass *with the bug restored* — a silent vacuity rather
+# than a failure (verified: under LC_ALL=et_EE.iso885915 the ablation passes).
+# No single byte is undecodable everywhere, so the guard below skips instead,
+# leaving the tests either exercising the fault or saying plainly that they did
+# not. CI is always on the exercising side: the Linux legs run UTF-8 and the
+# Windows legs set PYTHONUTF8=1 (.github/workflows/ci.yml).
+
+
+def _codec_rejects_bad_byte() -> bool:
+    """Whether byte 0xff is undecodable in the codec ``text=True`` will use.
+
+    Probes ``TextIOWrapper`` with ``encoding=None`` rather than naming a codec,
+    because that is the very default ``subprocess``'s text mode resolves for the
+    child's streams — asking the machinery beats predicting it from the locale.
+    """
+    try:
+        io.TextIOWrapper(io.BytesIO(b"\xff")).read()
+    except UnicodeDecodeError:
+        return True
+    return False
+
+
+needs_strict_codec = pytest.mark.skipif(
+    not _codec_rejects_bad_byte(),
+    reason="host codec decodes 0xff (e.g. an ISO-8859-x locale), so nothing here "
+    "would exercise the strict decode this fix is about",
+)
 
 
 def _undecodable_cmd(tmp_path: Path, rc: int) -> str:
@@ -897,6 +929,7 @@ def _undecodable_cmd(tmp_path: Path, rc: int) -> str:
     return f'"{sys.executable}" "{script}"'
 
 
+@needs_strict_codec
 def test_verify_commands_undecodable_output_keeps_every_result(tmp_path):
     """A child emitting a byte invalid in the run's encoding is decoded with
     replacement, not strictly: the strict decode raised UnicodeDecodeError
@@ -904,9 +937,10 @@ def test_verify_commands_undecodable_output_keeps_every_result(tmp_path):
     later command's result were lost, and the dev phase crashed instead of
     classifying a failure.
 
-    The surviving text around the bad byte is asserted, not the replacement
-    glyph itself: which glyph (or how many) appears depends on the locale codec,
-    while the contract here is only that the loop neither raises nor drops.
+    U+FFFD is asserted, not merely "did not raise": under `needs_strict_codec`
+    the codec provably cannot decode the byte, so `errors="replace"` must have
+    produced exactly that character. Its *count* stays unasserted — that is what
+    varies by codec — and the text on both sides pins the rest of the tail.
 
     Ablation: remove `errors="replace"` from run_verify_commands and this fails
     with UnicodeDecodeError."""
@@ -916,12 +950,19 @@ def test_verify_commands_undecodable_output_keeps_every_result(tmp_path):
 
     assert [r.returncode for r in results] == [5, 0]
     assert "before" in results[0].output_tail and "after" in results[0].output_tail
+    assert "\ufffd" in results[0].output_tail  # the replacement, not a survivor
 
 
+@needs_strict_codec
 def test_verify_commands_undecodable_failure_stays_fixable_retry(tmp_path):
     """Through the outcome path: an undecodable tail still classifies as an
-    ordinary fixable failure and still reaches the repair session's feedback —
-    env_fault_reason runs over the replaced text without raising."""
+    ordinary fixable failure and still reaches the repair session's feedback.
+
+    What the env-fault probe contributes is platform-split, so this does not
+    claim more than it runs: on POSIX `verify.env_fault_reason` returns at its
+    `sys.platform != "win32"` guard without ever reading the tail, and only the
+    Windows leg takes `_win32_env_fault_reason` over the replaced text. The
+    classification asserted here holds on both."""
     policy = Policy(verify=VerifyPolicy(commands=(_undecodable_cmd(tmp_path, 1),)))
 
     out = verify.verify_commands_outcome(policy, tmp_path)
