@@ -2329,6 +2329,25 @@ def test_post_kill_reconcile_blank_frontmatter_prose_done_rescues(tmp_path):
     assert result.result_json["status"] == "done"
 
 
+def test_post_kill_reconcile_present_but_blank_frontmatter_status_rescues(tmp_path):
+    """Sibling of the test above at the shape that actually shipped broken: a
+    frontmatter block IS present, with a blank `status:` line (YAML null) — the
+    bmad-dev-auto template shape. The test above covers only fm={} (no block at
+    all), and the two diverged: the no-block spec rescued while the template shape
+    synthesized `status="none"`/`status_consistent=False` and was discarded as
+    stalled, losing a session's finished work (#369)."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    adapter._window_alive = lambda handle: False
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus:\nbaseline_revision: blankbase\n---\n\n"
+        "## Auto Run Result\n\nStatus: done\nDone.\n"
+    )
+    result = adapter._post_kill_reconcile(_dev_handle(), _dev_spec(tmp_path), _unvouched())
+    assert result.status == "completed"
+    assert result.result_json["status"] == "done"
+    assert result.result_json["baseline_commit"] == "blankbase"
+
+
 def test_post_kill_reconcile_rescues_stories_spec(tmp_path):
     adapter, _ = make_dev_adapter(tmp_path)
     adapter._window_alive = lambda handle: False

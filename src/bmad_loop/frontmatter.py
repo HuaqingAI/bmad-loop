@@ -82,8 +82,9 @@ def status_of(fm: dict[str, Any]) -> str:
     The single point all spec-frontmatter status gates read through, so casing
     never decides a gate — the spec template and sprint-status tokens are
     lowercase, so a stray ``Done``/``In-Review`` from a hand-edited spec still
-    matches. (``devcontract`` keeps its own lowercasing; it parses skill-written
-    prose where casing genuinely varies.)
+    matches. (``devcontract`` reads its frontmatter status through here too; the
+    separate lowercasing it keeps is for the skill-written *prose* ``Status:``
+    line, where casing genuinely varies.)
 
     A YAML-null status (a bare ``status:`` line, or ``status: null``) reads as
     ``""`` — the same as a missing key — because a spec template may legitimately

@@ -252,6 +252,15 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 ### Fixed
 
+- **A finished session whose spec left `status:` blank is rescued again (#369).** The second copy of
+  the #358 stringification lived in `devcontract.synthesize_result`, which that fix did not reach: a
+  present-but-blank `status:` read as the truthy token `"none"`, so the prose `## Auto Run Result`
+  fallback never fired and the synthesis was flagged inconsistent. `status_consistent` gates the
+  post-kill rescue (#61), so a session that finished real work but lost its final Stop event was
+  discarded as `stalled`/`timeout` — for exactly the template shape that gate's docstring names as
+  rescuable. Both readers now go through `frontmatter.status_of`. A blank frontmatter with prose
+  `blocked` or `awaiting-operator` also gets a truthful status label; routing for those is unchanged.
+
 - **A blank frontmatter `status:` reads as blank, not as the token `none` (#358).** YAML parses a
   bare `status:` line as null, and `status_of` stringified it — so every status gate saw `"none"`, a
   token nothing in the project writes. The allowlist that decides whether a half-finalized generic

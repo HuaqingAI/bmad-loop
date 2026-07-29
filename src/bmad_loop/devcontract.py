@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .frontmatter import _edit_frontmatter_block
+from .frontmatter import _edit_frontmatter_block, status_of
 from .platform_util import atomic_replace
 from .verify import DEV_WORKFLOW, operator_actions_of, read_frontmatter
 
@@ -254,7 +254,14 @@ def synthesize_result(
         # rescue. Crashing here would take the whole run down for a spec the CLI
         # merely had open for writing.
         return SynthResult(result_json=None, status_consistent=True)
-    fm_status = str(fm.get("status", "")).strip().lower()
+    # Through `status_of`, never a local `str(...)`: it normalizes a YAML-null
+    # `status:` (the blank line a bmad-dev-auto template legitimately leaves — see
+    # `_FM_STATUS_RE`) to `""` alongside the missing key. A local stringification
+    # made that `"none"`, which is truthy, so the prose fallback below never fired
+    # and a blank-frontmatter/prose-`done` spec synthesized `status="none"` with
+    # `status_consistent=False` — the exact shape `_post_kill_reconcile` documents
+    # as rescuable (#369).
+    fm_status = status_of(fm)
     arr = parse_auto_run_result(_read_text_or_empty(spec_path))
 
     terminal = (
@@ -430,7 +437,7 @@ def is_frontmatter_candidate(path: Path, *, since_ns: int) -> bool:
         fm = read_frontmatter(path)
     except OSError:
         return False
-    return str(fm.get("status", "")).strip().lower() in (DONE, BLOCKED, AWAITING_OPERATOR)
+    return status_of(fm) in (DONE, BLOCKED, AWAITING_OPERATOR)
 
 
 def _atomic_write_spec(spec_path: Path, text: str) -> None:
