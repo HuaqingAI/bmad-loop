@@ -175,6 +175,10 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 ### Changed
 
+- **`set_frontmatter_status`'s tests now live in `tests/test_frontmatter.py` (#357, part 3).** They
+  had stayed in `tests/test_resolve.py` next to `set_frontmatter_field`'s so parts 1 and 2 read as
+  changes rather than as a rename. Tests only — no behavior change.
+
 - **The story token budget is checked while the story runs (#336).** `max_tokens_per_story` was
   read once, after the story had already been marked done — so an overrun was reported only after
   every token was spent, and a story that deferred or escalated was never checked at all (one field

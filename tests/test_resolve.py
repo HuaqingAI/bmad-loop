@@ -1,4 +1,4 @@
-"""Escalation-resolution: context build, re-arm, spec status writer, session."""
+"""Escalation-resolution: context build, re-arm, spec field writer, session."""
 
 import json
 
@@ -60,33 +60,12 @@ def _escalated_run(
     return run.run_dir, run.state, run.task
 
 
-# ----------------------------------------------------------- set_frontmatter_status
-
-
-def test_set_frontmatter_status_replaces(tmp_path):
-    spec = tmp_path / "spec.md"
-    spec.write_text(SPEC, encoding="utf-8")
-    assert verify.set_frontmatter_status(spec, "ready-for-dev") is True
-    assert verify.read_frontmatter(spec)["status"] == "ready-for-dev"
-    # other fields + the frozen block survive untouched
-    text = spec.read_text(encoding="utf-8")
-    assert "owner: amelia" in text
-    assert "<frozen-after-approval>" in text
-    assert "title: List command" in text
-
-
-def test_set_frontmatter_status_idempotent(tmp_path):
-    spec = tmp_path / "spec.md"
-    spec.write_text(SPEC, encoding="utf-8")
-    verify.set_frontmatter_status(spec, "ready-for-dev")
-    # second call is a no-op (already at the target)
-    assert verify.set_frontmatter_status(spec, "ready-for-dev") is False
-
-
-def test_set_frontmatter_status_no_frontmatter(tmp_path):
-    spec = tmp_path / "spec.md"
-    spec.write_text("# just a heading\n", encoding="utf-8")
-    assert verify.set_frontmatter_status(spec, "ready-for-dev") is False
+# ------------------------------------------------------------ set_frontmatter_field
+#
+# `set_frontmatter_status`'s own tests live in tests/test_frontmatter.py, next to
+# the module that defines it (#357). What stays here is `set_frontmatter_field`,
+# which is `verify`'s — it shares the renderer and the verified-edit core, so the
+# tests below are about the half that differs: insert-on-miss.
 
 
 def test_set_frontmatter_field_replaces_inserts_idempotent(tmp_path):
@@ -94,7 +73,8 @@ def test_set_frontmatter_field_replaces_inserts_idempotent(tmp_path):
     spec.write_text(SPEC, encoding="utf-8")
     assert verify.set_frontmatter_field(spec, "owner", "winston") is True
     assert verify.read_frontmatter(spec)["owner"] == "winston"
-    # unlike set_frontmatter_status, a missing key is INSERTED (block's last line)
+    # unlike set_frontmatter_status, a missing key is INSERTED (block's last line);
+    # its refusal to invent one is pinned in tests/test_frontmatter.py
     assert verify.set_frontmatter_field(spec, "baseline_revision", "abc123") is True
     fm = verify.read_frontmatter(spec)
     assert fm["baseline_revision"] == "abc123"
@@ -105,21 +85,6 @@ def test_set_frontmatter_field_replaces_inserts_idempotent(tmp_path):
     bare = tmp_path / "bare.md"
     bare.write_text("# just a heading\n", encoding="utf-8")
     assert verify.set_frontmatter_field(bare, "baseline_revision", "abc123") is False
-
-
-def test_set_frontmatter_status_preserves_triple_dash_in_value(tmp_path):
-    """A `---` inside a scalar is not the closing delimiter: status flips and the
-    ---bearing title + body survive (a plain split("---", 2) corrupted this)."""
-    spec = tmp_path / "spec.md"
-    spec.write_text(
-        "---\ntitle: 'restore --- review'\nstatus: in-review\n---\nbody text\n",
-        encoding="utf-8",
-    )
-    assert verify.set_frontmatter_status(spec, "done") is True
-    fm = verify.read_frontmatter(spec)
-    assert fm["status"] == "done"
-    assert fm["title"] == "restore --- review"  # scalar with --- intact
-    assert "body text" in spec.read_text(encoding="utf-8")
 
 
 def test_set_frontmatter_field_preserves_a_trailing_inline_comment(tmp_path):
@@ -149,9 +114,10 @@ def test_set_frontmatter_field_rewrites_a_quoted_key_instead_of_duplicating_it(t
 
 
 def test_set_frontmatter_field_refuses_a_key_no_line_edit_can_move(tmp_path):
-    """Same three-way contract as `set_frontmatter_status`: False means nothing
-    to change, and a field the reader CAN see in an unrewritable shape raises
-    instead of silently appending a duplicate the reader would never resolve."""
+    """Same three-way contract as `set_frontmatter_status` (pinned in
+    tests/test_frontmatter.py): False means nothing to change, and a field the
+    reader CAN see in an unrewritable shape raises instead of silently appending
+    a duplicate the reader would never resolve."""
     spec = tmp_path / "spec.md"
     original = "---\n{baseline_revision: old, keep: 1}\n---\nbody\n"
     spec.write_text(original, encoding="utf-8")
