@@ -19,6 +19,7 @@ from bmad_loop.install import (
     DEV_BASE_SKILLS,
     MODULE_SKILLS,
     _copy_traversable,
+    _git_version_at_least,
     _worktree_local_exclude,
     install_into,
     merge_hooks,
@@ -1639,6 +1640,75 @@ def test_shield_refuses_to_enable_extension_over_core_bare(project, tmp_path):
     assert shared_exclude.read_bytes() == before
 
 
+@pytest.mark.parametrize(
+    ("reported", "supported"),
+    [
+        ("git version 2.20.0\n", True),  # the boundary itself
+        ("git version 2.19.4\n", False),  # one minor below it
+        ("git version 2.9.5\n", False),  # numeric, not lexicographic: "9" > "20" as text
+        ("git version 2.44.0.windows.1\n", True),
+        ("git version 2.39.5 (Apple Git-154)\n", True),
+        ("git version 3.0\n", True),
+        ("", False),  # nothing at all: a spawn that produced no stdout
+        ("fatal: not a git repository\n", False),
+        # No `git version` prefix. Refused deliberately: a bare-number answer is
+        # not this program's output, and the caller is about to make a permanent
+        # repo-format change on the strength of it.
+        ("2.55.0\n", False),
+    ],
+)
+def test_git_version_at_least_reads_only_a_git_version_line(reported, supported):
+    """The parse behind the shield's 2.20 gate. Unreadable answers must come back
+    False, because the caller reads False as "do not touch this repository" — an
+    optimistic parse is the only failure mode that costs anything."""
+    assert _git_version_at_least(reported, (2, 20)) is supported
+
+
+def test_shield_refuses_to_enable_extension_over_old_git(project, tmp_path, monkeypatch):
+    """`extensions.worktreeConfig` and `git config --worktree` are both git 2.20.
+    Below that the write buys a PERMANENT repo-format change that shields nothing —
+    and git-worktree(1) says older git refuses a repository carrying the extension.
+    So the version is checked before any of it.
+
+    The gate also sits above the two probes underneath it on purpose: `--type=` is
+    git 2.18, so on an older git the `core.bare` read exits non-zero and is read as
+    "not bare" — the safety gate opening silently. Refusing here keeps that pair
+    unreachable.
+
+    Only the `version` call is faked; every other call runs against the real repo,
+    so the assertion below reads the actual shared config rather than a stub's log.
+    The enable is ALSO made to raise, because "the key is absent afterwards" would
+    hold if the write merely failed.
+
+    Ablation: delete the version gate in `_shield_enable_worktree_config` and this
+    fails — the enable fires, the fake raises, and the key lands in the config."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    shared_before = (repo / ".git" / "info" / "exclude").read_bytes()
+    real = install_mod._shield_git
+
+    def ancient(worktree, *args):
+        if args == ("version",):
+            return subprocess.CompletedProcess(
+                args=["git", "version"], returncode=0, stdout=b"git version 2.19.4\n", stderr=b""
+            )
+        if args[:1] == ("config",) and "extensions.worktreeConfig" in args and "--get" not in args:
+            raise AssertionError(f"made a permanent format change on git 2.19.4: {args}")
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "_shield_git", ancient)
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert reason is not None and "2.19.4" in reason and "git 2.20" in reason
+    # the repo's own format is untouched. Read as TEXT for the reason the sibling
+    # refusal tests give: conftest's git() is check=True and an unset key exits 1.
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+    assert not _wt_private_exclude(wt).exists()
+    assert (repo / ".git" / "info" / "exclude").read_bytes() == shared_before
+
+
 def test_shield_reuses_already_enabled_extension(project, tmp_path, monkeypatch):
     """A repo that already carries the extension is used as found — the second
     isolated run in a repo must not re-assert a permanent format change, and must
@@ -2034,11 +2104,13 @@ def test_worktree_local_exclude_undecodable_git_output_degrades(tmp_path, monkey
 
     # Dispatches on the subcommand, because the shield asks git several questions
     # now and a stub that answered them all identically would not get past the
-    # first. `shift 2` drops the `-C <worktree>` every call carries. The extension
-    # reads as already enabled so the stub is never asked to change repo state,
-    # and every other `--get` exits 1, git's own "unset".
+    # first. `shift 2` drops the `-C <worktree>` every call carries. The version
+    # clears the 2.20 gate, the extension reads as already enabled so the stub is
+    # never asked to change repo state, and every other `--get` exits 1, git's own
+    # "unset".
     stub.write_bytes(
         b'#!/bin/sh\nshift 2\ncase "$1" in\n'
+        b"version) printf 'git version 2.55.0\\n' ;;\n"
         b"rev-parse) printf '%s\\n' " + sq(gitdir) + b" " + sq(root) + b" ;;\n"
         b'config) case "$*" in\n'
         b"  *--worktree*) exit 0 ;;\n"

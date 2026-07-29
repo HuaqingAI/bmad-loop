@@ -738,6 +738,27 @@ def _copy_traversable(src, dst: Path, *, skip_existing: bool = False) -> bool:
 # number matters only as a ceiling on a hung git; the two need not agree.
 _SHIELD_GIT_TIMEOUT_S = 120
 
+# The git that introduced `extensions.worktreeConfig` and `git config --worktree`,
+# both of which the worktree-scoped shield is built out of (git-worktree(1)).
+_WORKTREE_CONFIG_GIT = (2, 20)
+
+
+def _git_version_at_least(reported: str, want: tuple[int, int]) -> bool:
+    """Is this `git version …` line at least `want`? Anything unreadable is NO.
+
+    Only `major.minor` is compared, and only from a line that actually starts
+    `git version` — the tail is vendor soup (`2.44.0.windows.1`,
+    `2.39.5 (Apple Git-154)`) and searching the whole string for the first two
+    dotted numbers would happily read a version out of a build tag.
+
+    Refusing an unparseable answer is the point rather than a fallback. The only
+    caller uses this to decide whether to make a PERMANENT repo-format change, so
+    the failure it must not have is the optimistic one; a git that will not say
+    what it is does not get that change made on its behalf.
+    """
+    match = re.match(r"git version (\d+)\.(\d+)", reported.strip())
+    return match is not None and (int(match[1]), int(match[2])) >= want
+
 
 def _shield_git(worktree: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
     """Run one `git -C <worktree> …` for the git-add shield, capturing BYTES.
@@ -787,7 +808,28 @@ def _shield_enable_worktree_config(worktree: Path, common_dir: Path) -> str | No
     `config.worktree` first — a repo-layout edit the installer has no business
     making behind an operator's back — so the shield degrades instead, and the
     run continues with the tool files unshielded rather than the repo rearranged.
+
+    The version gate runs FIRST, ahead of every probe, for two reasons. `git
+    config --worktree` does not exist before 2.20, so on an older git the write
+    below buys a permanent format change with nothing to show for it — and
+    git-worktree(1) says older git refuses a repository carrying the extension.
+    And `--type=` is itself git 2.18: on an older git the two probes below exit
+    non-zero, which this function reads as "not enabled" and, worse, as "not
+    bare" — silently opening the core.bare gate the paragraph above exists to
+    hold shut. Refusing at the top is what keeps that pair unreachable.
     """
+    version = _shield_git(worktree, "version")
+    if version.returncode != 0 or not _git_version_at_least(
+        os.fsdecode(version.stdout), _WORKTREE_CONFIG_GIT
+    ):
+        want = f"{_WORKTREE_CONFIG_GIT[0]}.{_WORKTREE_CONFIG_GIT[1]}"
+        found = os.fsdecode(version.stdout).strip() or f"git exited {version.returncode}"
+        return (
+            f"skipped the git-add shield ({worktree}): needs git {want} for "
+            f"extensions.worktreeConfig and `git config --worktree`, but git answered "
+            f"{found!r} — enabling the extension on an older git is a permanent "
+            "repo-format change that would shield nothing"
+        )
     probe = _shield_git(worktree, "config", "--type=bool", "--get", "extensions.worktreeConfig")
     if probe.returncode == 0 and os.fsdecode(probe.stdout).strip() == "true":
         return None
