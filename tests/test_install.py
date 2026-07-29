@@ -1520,8 +1520,11 @@ def test_worktree_local_exclude_degrades_on_undecodable_exclude(project):
     OSError nor the RuntimeError arm covers it. The bytes must survive untouched;
     rewriting someone's legacy-encoded exclude would be worse than skipping it.
 
-    Ablation: drop `UnicodeDecodeError` from the tail's except tuple and this
-    fails — it propagates (it is not an OSError)."""
+    Ablation: drop `UnicodeError` from the tail's except tuple and this fails —
+    it propagates (it is not an OSError). Narrowing that member to
+    `UnicodeDecodeError` does NOT fail this test; that ablation belongs to the
+    encode sibling below, which is how the two halves stay independently
+    pinned."""
     exclude = project.project / ".git" / "info" / "exclude"
     exclude.parent.mkdir(parents=True, exist_ok=True)
     exclude.write_bytes(b"\xff\xfe legacy-encoded\n")
