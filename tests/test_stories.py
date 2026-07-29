@@ -55,7 +55,8 @@ def test_load_missing_file_raises_pinned_message(tmp_path):
 # A manifest / spec is agent- or human-authored, so it can hold non-UTF-8 bytes.
 # `read_text(encoding="utf-8")` raises UnicodeDecodeError (a ValueError, NOT a
 # yaml.YAMLError), so the stories-mode reads must surface it as a clean error / degrade
-# rather than crash preflight/dry-run/status. Mirrors tests/test_resolve.py:346.
+# rather than crash preflight/dry-run/status. Mirrors the "non-UTF-8 robustness"
+# section of tests/test_resolve.py.
 _BAD_UTF8 = b"\xff\xfe\x00\x01 not utf-8 \x80\x81"
 
 

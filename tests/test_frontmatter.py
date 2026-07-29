@@ -12,11 +12,6 @@ comment, so a regex is the gate and the oracle is only the backstop. The BEHAVIO
 half pins the rewrite: a writer that verifies its own edit by re-parsing, and
 RAISES rather than returning a `False` nobody reads when the reader can see a
 status it cannot safely move.
-
-`set_frontmatter_status`'s original tests live in `tests/test_resolve.py:63-138`,
-next to `set_frontmatter_field`'s. They were deliberately left there —
-characterize before restructuring, and moving them would hide this diff behind a
-rename. Consolidating them here is filed as #357.
 """
 
 import pytest
@@ -24,7 +19,10 @@ import yaml
 
 from bmad_loop import frontmatter, verify
 
-_PLAIN = "---\ntitle: List command\nstatus: in-review\nowner: amelia\n---\n\n# Spec\n\nbody\n"
+_PLAIN = (
+    "---\ntitle: List command\nstatus: in-review\nowner: amelia\n---\n\n# Spec\n\n"
+    "<frozen-after-approval>\nFilter notes by workspace name.\n</frozen-after-approval>\n"
+)
 
 
 def _spec(tmp_path, text: str, name: str = "spec.md"):
@@ -43,7 +41,12 @@ def _spec(tmp_path, text: str, name: str = "spec.md"):
 
 def test_a_plain_flip_changes_the_status_line_and_nothing_else(tmp_path):
     """The whole point of a line edit over a YAML round-trip: field order,
-    comments, quoting and body survive byte-for-byte."""
+    comments, quoting and body survive byte-for-byte.
+
+    The fixture carries the shape the orchestrator actually flips — the other
+    frontmatter fields plus a `<frozen-after-approval>` body block the writer must
+    never reach. One byte-exact comparison subsumes any list of per-field
+    substring assertions: it also fails on what such a list forgot to name."""
     spec = _spec(tmp_path, _PLAIN)
     assert frontmatter.set_frontmatter_status(spec, "done") is True
     assert spec.read_bytes().decode() == _PLAIN.replace("status: in-review", "status: done")
@@ -112,6 +115,18 @@ def test_indentation_on_the_status_line_survives(tmp_path):
     spec = _spec(tmp_path, "---\n  status: in-review\n---\nbody\n")
     assert frontmatter.set_frontmatter_status(spec, "done") is True
     assert spec.read_bytes().decode() == "---\n  status: done\n---\nbody\n"
+
+
+def test_set_frontmatter_status_preserves_triple_dash_in_value(tmp_path):
+    """A `---` inside a scalar is not the closing delimiter: status flips and the
+    ---bearing title + body survive (a plain split("---", 2) corrupted this)."""
+    text = "---\ntitle: 'restore --- review'\nstatus: in-review\n---\nbody text\n"
+    spec = _spec(tmp_path, text)
+    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    fm = frontmatter.read_frontmatter(spec)
+    assert fm["status"] == "done"
+    assert fm["title"] == "restore --- review"  # scalar with --- intact
+    assert spec.read_bytes().decode() == text.replace("status: in-review", "status: done")
 
 
 # =============================================================== line endings
