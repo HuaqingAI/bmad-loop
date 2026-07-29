@@ -122,6 +122,19 @@ def test_set_frontmatter_status_preserves_triple_dash_in_value(tmp_path):
     assert "body text" in spec.read_text(encoding="utf-8")
 
 
+def test_set_frontmatter_field_preserves_a_trailing_inline_comment(tmp_path):
+    """This helper's docstring has always promised "comments survive"; until #357
+    part 2 that was true of every line except the one it edited. It shares
+    `frontmatter._replace_value` with `set_frontmatter_status`, so the carry is
+    inherited rather than reimplemented — pinned here because a renderer change
+    made for the status writer reaches this caller silently."""
+    spec = tmp_path / "spec.md"
+    spec.write_bytes(b"---\nbaseline_revision: old  # stamped by step-03\n---\nbody\n")
+    assert verify.set_frontmatter_field(spec, "baseline_revision", "abc123") is True
+    assert spec.read_bytes() == b"---\nbaseline_revision: abc123  # stamped by step-03\n---\nbody\n"
+    assert verify.read_frontmatter(spec)["baseline_revision"] == "abc123"
+
+
 def test_set_frontmatter_field_rewrites_a_quoted_key_instead_of_duplicating_it(tmp_path):
     """The insert-on-miss half of this helper had a defect of its own: the line
     scan missed a quoted key, so it APPENDED a second one and the spec carried

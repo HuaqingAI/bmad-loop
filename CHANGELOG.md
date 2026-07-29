@@ -248,6 +248,16 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 ### Fixed
 
+- **A trailing inline comment on a spec's `status:` line survives the write (#357, part 2).**
+  `set_frontmatter_status` and `set_frontmatter_field` kept everything through the colon and dropped
+  the rest, so `status: draft  # set by hand` came back as `status: done` — the last part of
+  "formatting and comments survive" the writers did not honor. The comment and its separating
+  whitespace now carry through whenever a conservative token pattern can certify where the scalar
+  ends; a value it cannot read as a bare token (a quoted `#`, a `#` abutting the value) falls back to
+  today's full drop rather than guessing. The verified-edit oracle is only a backstop here: it strips
+  comments before it compares, so it cannot see a fabricated one. The value's own quotes are still
+  dropped — deliberately, and pinned.
+
 - **Spec writers no longer relay a spec's line endings (#357, part 1).** `set_frontmatter_status`,
   `set_frontmatter_field`, `reset_spec_status`, and `strip_auto_run_result` read specs through
   `read_text`, whose universal-newline translation handed each writer an all-LF copy of a CRLF spec —

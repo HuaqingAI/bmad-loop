@@ -146,22 +146,62 @@ _STATUS_KEY_RE = _key_line_re("status")
 
 # Builds the replacement for a matched key line, line ending included. A hook
 # rather than one fixed rendering because the two writers on this helper preserve
-# deliberately different things: `set_frontmatter_status` drops the value's quotes
-# and any trailing comment (its callers read the result back as a bare
-# `status: done`), while `devcontract.reset_spec_status` keeps both (its own tests
-# pin them). What they share is the VERIFICATION, which is the part that was
-# wrong in all three writers — not the formatting, which each already had right.
+# deliberately different things: `_replace_value` drops the value's quotes (its
+# callers read the result back as a bare `status: done`), while
+# `devcontract.reset_spec_status` keeps them (its own tests pin them). Both carry
+# a trailing inline comment through. What they share is the VERIFICATION, which
+# is the part that was wrong in all three writers — not the formatting, which
+# each already had right.
 LineRenderer = Callable[[str, "re.Match[str]", str], str]
+
+
+# What follows a key line's colon when the remainder is a bare scalar token and
+# nothing else but a trailing inline comment. Only `sep` and `comment` are data;
+# `q` and `val` are GATES — they certify that the scalar ends exactly where the
+# render assumes it does, which is the one fact a `#` on the line cannot tell you
+# by itself.
+#
+# NEVER WIDEN `val` TO `[^#]*?`. `_verified` cannot backstop this. Against
+# `status: "a # b"` a widened pattern matches with `val` = `"a` and renders
+# `status: done # b"` — which `yaml.safe_load` reads as a clean `status: done`,
+# because it strips comments BEFORE the oracle compares. All three `_verified`
+# gates pass and a fabricated comment lands in the spec. The conservative token
+# class is therefore the gate and `_verified` is only the backstop, the reverse
+# of everywhere else in this module. `[A-Za-z0-9._-]` is every shape a status
+# token and the ordinary scalar frontmatter values have; anything richer than
+# that falls back to the full-drop render, which is merely lossy, never wrong.
+#
+# `sprintstatus._set_mapping_value` solves the same problem with the WIDE `val`
+# this one refuses (`\S(?:.*?\S)?`), and the asymmetry is deliberate rather than
+# an oversight: it writes the orchestrator-owned board, whose values are status
+# tokens and timestamps, while this writes a hand-authored spec. It has the
+# fabricated-comment defect described above and is tracked separately (#366) —
+# do not "unify" the two by widening this one.
+_VALUE_COMMENT_RE = re.compile(
+    r"^[ \t]*(?P<q>['\"]?)(?P<val>[A-Za-z0-9._-]*)(?P=q)(?P<sep>[ \t]+)(?P<comment>#.*)$"
+)
 
 
 def _replace_value(line: str, m: re.Match[str], value: str) -> str:
     """Keep everything through the colon verbatim — indent, a quoted key,
-    whitespace before the colon — then ``<space><value>``, then THIS LINE'S OWN
-    terminator.
+    whitespace before the colon — then ``<space><value>``, then any trailing
+    inline comment the old value carried, then THIS LINE'S OWN terminator.
 
     The gap after the colon is normalized rather than preserved because a bare
     ``status:`` has none to preserve, and filling it would write ``status:done``,
     which is not the key at all.
+
+    The comment is carried only when `_VALUE_COMMENT_RE` can certify where the
+    scalar ends, and its separating whitespace comes through as authored. When it
+    cannot — a quoted value containing a ``#``, a ``#`` abutting the scalar
+    (``done#x``, where it is part of the value, not a comment), a value richer
+    than a bare token — the whole remainder is dropped, which is what this
+    renderer did for every input before. Lossy, never wrong.
+
+    The value's own quotes are still dropped, and that non-preservation is
+    load-bearing rather than pending: `conftest.write_spec` writes
+    ``status: '<v>'`` and three tests read the result back as an unquoted
+    ``status: done`` (tests/test_runs.py, tests/test_stories_e2e.py).
 
     The terminator is carried rather than re-emitted as ``"\\n"``: a CRLF spec
     would otherwise come back with exactly one bare-LF line — the status line the
@@ -171,6 +211,9 @@ def _replace_value(line: str, m: re.Match[str], value: str) -> str:
     final line with no terminator at all each round-trip as authored."""
     stripped = line.rstrip("\r\n")
     nl = line[len(stripped) :]
+    cm = _VALUE_COMMENT_RE.match(stripped[m.end() :])
+    if cm is not None:
+        return f"{line[: m.end()]} {value}{cm['sep']}{cm['comment']}{nl}"
     return f"{line[: m.end()]} {value}{nl}"
 
 
@@ -317,12 +360,14 @@ def set_frontmatter_status(path: Path, status: str) -> bool:
     `FrontmatterWriteError` when the reader CAN see a status the edit cannot
     safely move — `False` never means "I failed".
 
-    Two deliberate non-preservations, both pinned in tests/test_frontmatter.py:
+    A trailing inline comment on the status line survives too, when the render
+    can certify where the scalar ends (`_VALUE_COMMENT_RE`); a value it cannot
+    read as a bare token drops the comment rather than guessing at one.
+
+    ONE deliberate non-preservation remains, pinned in tests/test_frontmatter.py:
     the value's own quotes are dropped (`status: 'x'` -> `status: done`), because
     the standard fixture shape is quoted and callers read the result back
-    unquoted; and a trailing inline comment on the status line is dropped,
-    because knowing where the scalar ends is exactly the guesswork this rewrite
-    exists to stop making.
+    unquoted.
     """
     if not path.is_file():
         return False

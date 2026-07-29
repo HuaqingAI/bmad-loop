@@ -1,15 +1,17 @@
 """`frontmatter.set_frontmatter_status` — the verified in-place status writer.
 
-Three sections. The CHARACTERIZATION half was written
+Four sections. The CHARACTERIZATION half was written
 against the pre-rewrite line scanner and is green on both sides of it: it pins
-the formatting-preserving minimal edit, and the two deliberate non-preservations
-(a quoted value and a trailing inline comment are both dropped) that a "make it a
-YAML round-trip" refactor would silently change out from under callers three
-files away. The LINE ENDINGS half pins #357 part 1: the same contract, over the
-bytes the old `read_text`/`write_text` pair relaid across the whole file. The
-BEHAVIOR half pins the rewrite: a writer that verifies its own edit by
-re-parsing, and RAISES rather than returning a `False` nobody reads when the
-reader can see a status it cannot safely move.
+the formatting-preserving minimal edit, and the one surviving deliberate
+non-preservation (a quoted value is written back unquoted) that a "make it a YAML
+round-trip" refactor would silently change out from under callers three files
+away. LINE ENDINGS pins #357 part 1: the same contract, over the bytes the old
+`read_text`/`write_text` pair relaid across the whole file. INLINE COMMENTS pins
+#357 part 2, where the gating is inverted — `_verified` cannot see a fabricated
+comment, so a regex is the gate and the oracle is only the backstop. The BEHAVIOR
+half pins the rewrite: a writer that verifies its own edit by re-parsing, and
+RAISES rather than returning a `False` nobody reads when the reader can see a
+status it cannot safely move.
 
 `set_frontmatter_status`'s original tests live in `tests/test_resolve.py:63-138`,
 next to `set_frontmatter_field`'s. They were deliberately left there —
@@ -64,15 +66,6 @@ def test_a_quoted_value_is_written_back_unquoted(tmp_path):
     tests/test_stories_e2e.py:594,793). A refactor that "also preserves the
     value's quotes" breaks those three from here."""
     spec = _spec(tmp_path, "---\nstatus: 'in-review'\n---\nbody\n")
-    assert frontmatter.set_frontmatter_status(spec, "done") is True
-    assert spec.read_bytes().decode() == "---\nstatus: done\n---\nbody\n"
-
-
-def test_a_trailing_inline_comment_on_the_status_line_is_dropped(tmp_path):
-    """The other deliberate non-preservation. Keeping it needs to know where the
-    scalar ends — a `#` inside a quoted value is not a comment — and a wrong
-    guess turns a working spec into a refused write. Filed as #357."""
-    spec = _spec(tmp_path, "---\nstatus: in-review  # set by step-03\n---\nbody\n")
     assert frontmatter.set_frontmatter_status(spec, "done") is True
     assert spec.read_bytes().decode() == "---\nstatus: done\n---\nbody\n"
 
@@ -177,6 +170,108 @@ def test_a_mixed_ending_spec_keeps_each_line_its_own_ending(tmp_path):
     spec = _spec(tmp_path, mixed)
     assert frontmatter.set_frontmatter_status(spec, "done") is True
     assert spec.read_bytes().decode() == mixed.replace("status: in-review", "status: done")
+    assert frontmatter.status_of(frontmatter.read_frontmatter(spec)) == "done"
+
+
+# ============================================================= inline comments
+#
+# #357 part 2. The other half of "comments survive": a trailing comment on the
+# STATUS line itself, which this writer used to drop on every call.
+#
+# WHAT GATES WHAT, because it is the reverse of the rest of this module. Every
+# other edit here is gated by `_verified` re-parsing the candidate. That oracle
+# is BLIND to this one: `yaml.safe_load` strips comments before it compares, so a
+# render that invents a comment out of the tail of a quoted value produces a
+# block whose `status` is exactly right and whose other keys are untouched, and
+# all three gates pass it. `_VALUE_COMMENT_RE`'s conservative token class is the
+# real gate; `_verified` is only the backstop. The quoted-`#` case below is the
+# test that holds that line — ablate it by widening `val` to `[^#]*?` and it
+# writes `status: done # b"`.
+
+
+def test_a_trailing_inline_comment_on_the_status_line_is_preserved(tmp_path):
+    """This used to be the file's other deliberate non-preservation. The
+    separating whitespace comes through as authored (two spaces here), so a
+    hand-aligned comment column is not silently reflowed by a status flip."""
+    spec = _spec(tmp_path, "---\nstatus: in-review  # set by step-03\n---\nbody\n")
+    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    assert spec.read_bytes().decode() == "---\nstatus: done  # set by step-03\n---\nbody\n"
+    assert frontmatter.status_of(frontmatter.read_frontmatter(spec)) == "done"
+
+
+def test_a_hash_inside_a_quoted_value_never_becomes_a_comment(tmp_path):
+    """The case the whole design is shaped around. `status: "a # b"` carries no
+    comment at all — the `#` is scalar text — so the only correct answers are the
+    full drop or a refusal, and the full drop is the one that keeps working specs
+    working. A renderer that split at the `#` would write `status: done # b"`,
+    which reads back as a clean `status: done` and therefore SURVIVES `_verified`
+    with a fabricated comment attached."""
+    spec = _spec(tmp_path, '---\nstatus: "a # b"\ntitle: t\n---\nbody\n')
+    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    assert spec.read_bytes().decode() == "---\nstatus: done\ntitle: t\n---\nbody\n"
+
+
+def test_a_hash_abutting_the_scalar_is_part_of_the_value_not_a_comment(tmp_path):
+    """`status: in-review#x` is the single value `in-review#x` — YAML needs
+    whitespace before a `#` for it to open a comment. `_VALUE_COMMENT_RE`'s `sep`
+    requires that whitespace, so this falls to the full drop rather than carrying
+    `#x` forward as a comment the spec never had."""
+    spec = _spec(tmp_path, "---\nstatus: in-review#x\ntitle: t\n---\nbody\n")
+    assert frontmatter.read_frontmatter(spec)["status"] == "in-review#x"  # one scalar
+    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    assert spec.read_bytes().decode() == "---\nstatus: done\ntitle: t\n---\nbody\n"
+
+
+def test_a_quoted_value_keeps_its_comment_while_losing_its_quotes(tmp_path):
+    """The two preservations pull in opposite directions on the same line, and
+    both answers are deliberate: the comment is carried, the quotes are not (see
+    test_a_quoted_value_is_written_back_unquoted for what depends on that)."""
+    spec = _spec(tmp_path, "---\nstatus: 'in-review' # c\n---\nbody\n")
+    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    assert spec.read_bytes().decode() == "---\nstatus: done # c\n---\nbody\n"
+
+
+def test_a_present_but_empty_status_keeps_its_comment(tmp_path):
+    """`val` matching empty is not an oversight — a template's blank
+    `status:` line is a shape the writer must fill (see
+    test_a_present_but_empty_status_is_filled), and its comment is as real as any
+    other. The value slots in ahead of the comment instead of replacing it."""
+    spec = _spec(tmp_path, "---\nstatus:  # set by step-03\ntitle: t\n---\nbody\n")
+    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    assert spec.read_bytes().decode() == "---\nstatus: done # set by step-03\ntitle: t\n---\nbody\n"
+
+
+def test_a_comment_glued_to_the_colon_falls_back_to_the_full_drop(tmp_path):
+    """Pinned against the renderer, not through a spec, because no spec can reach
+    it: PyYAML needs whitespace after a `:` for it to separate a key, so
+    `status:# c` is the plain scalar `"status:# c"` and `read_frontmatter` sees
+    no mapping at all — asserted here so the reason is checked, not just claimed.
+    That leaves `_replace_value` the only layer where the shape is observable,
+    and it is worth observing: it is the boundary of `sep`'s `[ \\t]+`, the one
+    character that decides whether a `#` is a comment or scalar text."""
+    spec = _spec(tmp_path, "---\nstatus:# c\n---\nbody\n")
+    assert frontmatter.read_frontmatter(spec) == {}  # not a mapping — unreachable
+    assert frontmatter.set_frontmatter_status(spec, "done") is False
+    line = "status:# c\n"
+    m = frontmatter._STATUS_KEY_RE.match(line)
+    assert m is not None  # the KEY pattern matches; only the value render declines
+    assert frontmatter._replace_value(line, m, "done") == "status: done\n"
+
+
+def test_a_comment_and_a_crlf_ending_both_survive_the_same_write(tmp_path):
+    """Part 1 and part 2 of #357 stack: the comment is carried from the value
+    side of the line and the terminator from the end of it, so a CRLF spec with a
+    commented status line comes back with both. Written as one test because the
+    render builds them in a single f-string — a fix for either that dropped the
+    other would pass both of their own tests."""
+    crlf = (
+        "---\r\ntitle: t\r\nstatus: in-review  # set by step-03\r\nowner: amelia\r\n---\r\nbody\r\n"
+    )
+    spec = _spec(tmp_path, crlf)
+    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    text = spec.read_bytes().decode()
+    assert text == crlf.replace("status: in-review", "status: done")
+    assert "\n" not in text.replace("\r\n", "")  # not one bare LF, anywhere
     assert frontmatter.status_of(frontmatter.read_frontmatter(spec)) == "done"
 
 

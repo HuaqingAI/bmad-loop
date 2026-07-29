@@ -974,7 +974,10 @@ def set_frontmatter_field(path: Path, key: str, value: str) -> bool:
     the same three-way return: True on a landed rewrite, False for **nothing to
     change** (no file, no frontmatter block, already at the value), and
     `FrontmatterWriteError` when the reader can see the key in a shape no line
-    edit can safely move.
+    edit can safely move. "Comments survive" includes a trailing inline comment
+    on the edited line itself: this shares `frontmatter._replace_value` with the
+    status helper, so it inherits that renderer's certified-boundary carry (and
+    its quote drop) rather than restating either.
 
     Unlike the status helper, a missing key is INSERTED as the block's last
     line: callers assert a field's value whether or not the skill wrote one
