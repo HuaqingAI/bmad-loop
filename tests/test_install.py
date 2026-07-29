@@ -3,6 +3,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
 import zipfile
 from pathlib import Path
@@ -43,6 +44,16 @@ def _install_skills(root, tree, catalog):
 def _install_base_skills(root, tree=".claude/skills"):
     """Lay down stubs of the non-bundled upstream skills the orchestrator drives."""
     _install_skills(root, tree, BASE_SKILLS)
+
+
+def _wt_private_exclude(wt):
+    """The file the git-add shield writes: the exclude in the worktree's OWN
+    gitdir (`.git/worktrees/<id>/info/exclude`), never the repo-wide one (#384).
+
+    Asked of git rather than composed from `.git/worktrees/<basename>`: git
+    appends a disambiguating number when the basename is already taken, so a
+    hand-built path is right only by luck."""
+    return Path(git(wt, "rev-parse", "--absolute-git-dir")) / "info" / "exclude"
 
 
 def _registrations(profile, command="python3 /x/.bmad-loop/bmad_loop_hook.py {event}"):
@@ -1161,17 +1172,23 @@ def test_provision_worktree_bmad_custom_does_not_clobber_checkout(tmp_path):
 
 def test_provision_worktree_bmad_custom_shielded_in_local_exclude(project, tmp_path):
     """Seeded customization must stay out of the unit's `git add -A` — a project
-    that doesn't gitignore `_bmad/` would otherwise merge it back on every story."""
+    that doesn't gitignore `_bmad/` would otherwise merge it back on every story.
+
+    The pattern lands in the worktree's PRIVATE exclude, and the repo-wide one is
+    byte-identical afterwards (#384)."""
     repo = project.project
     _write_override(repo, _layer("house-style", "bmad-review-company"), user=True)
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
+    shared = repo / ".git" / "info" / "exclude"
+    before = shared.read_bytes()
 
     provision_worktree(wt, [get_profile("claude")], repo)
 
     assert (wt / "_bmad" / "custom" / "bmad-dev-auto.user.toml").is_file()
-    exclude = (repo / ".git" / "info" / "exclude").read_text(encoding="utf-8")
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8")
     assert "/_bmad/custom" in exclude.splitlines()
+    assert shared.read_bytes() == before
 
 
 def test_missing_stories_support_findings_split_absent_from_stale(tmp_path):
@@ -1421,18 +1438,22 @@ def test_provision_worktree_seed_then_hook_merge_preserves_settings(tmp_path):
 
 
 def test_provision_worktree_seed_shielded_in_local_exclude(project, tmp_path):
-    """Seeded configs are added to the worktree's local git exclude so a project
-    that doesn't gitignore them won't have the unit's `git add -A` stage them."""
+    """Seeded configs are added to the worktree's private git exclude so a project
+    that doesn't gitignore them won't have the unit's `git add -A` stage them —
+    without a line reaching the repo-wide exclude the main checkout shares (#384)."""
     repo = project.project
     (repo / ".mcp.json").write_text("{}", encoding="utf-8")
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
+    shared = repo / ".git" / "info" / "exclude"
+    before = shared.read_bytes()
 
     provision_worktree(wt, [get_profile("claude")], repo, seed_files=[".mcp.json"])
 
     assert (wt / ".mcp.json").is_file()
-    exclude = (repo / ".git" / "info" / "exclude").read_text(encoding="utf-8")
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8")
     assert "/.mcp.json" in exclude.splitlines()
+    assert shared.read_bytes() == before
 
 
 def test_provision_worktree_partial_seed_dir_shielded_in_local_exclude(project, tmp_path):
@@ -1449,11 +1470,321 @@ def test_provision_worktree_partial_seed_dir_shielded_in_local_exclude(project, 
     (wt / "cfg").mkdir(parents=True)
     (wt / "cfg" / "tracked.yaml").write_text("FROM_REPO", encoding="utf-8")
 
+    shared = repo / ".git" / "info" / "exclude"
+    before = shared.read_bytes()
+
     provision_worktree(wt, [get_profile("claude")], repo, seed_files=["cfg"])
 
     assert (wt / "cfg" / "ignored.yaml").read_text() == "SEED ME"
-    exclude = (repo / ".git" / "info" / "exclude").read_text(encoding="utf-8")
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8")
     assert "/cfg" in exclude.splitlines()
+    assert shared.read_bytes() == before
+
+
+# ------------------------------------------- the shield is scoped to the worktree (issue #384)
+#
+# Real linked worktrees throughout (`verify.worktree_add` on the `project` fixture),
+# never a stand-in: every property under test is git's, not the filesystem's — which
+# exclude file git reads, which config scope wins, what `git worktree remove` deletes.
+# A mocked git would assert the test author's model of those instead of git's answer.
+
+
+def test_shield_never_touches_main_checkout(project, tmp_path):
+    """THE #384 regression: after a worktree is provisioned, a NEW file under a
+    TRACKED tool dir must still be staged by `git add -A` in the main checkout.
+
+    The reported harm exactly. `.claude/skills` is a directory projects legitimately
+    track, the shield names it, and the repo-wide `.git/info/exclude` the helper
+    used to append to is shared with the operator's own checkout, permanent, and
+    unversioned. Their next `git add -A` then captured only diffs to files git
+    already tracked, while every newly created sibling silently vanished — 51 files
+    and three whole skills across two upgrade commits in the reporter's repo, with
+    nothing in either diff able to reveal why.
+
+    Both assertions are needed. Git's own answer (the file stages) is the harm; the
+    shared file's BYTES are the mechanism, and pin that nothing was appended even in
+    a form that happens not to match this fixture's paths.
+
+    Ablation: target `common_dir / "info" / "exclude"` again and both fail."""
+    repo = project.project
+    tracked = repo / ".claude" / "skills" / "committed-skill"
+    tracked.mkdir(parents=True)
+    (tracked / "SKILL.md").write_text("# tracked\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "track the skill tree")
+    shared = repo / ".git" / "info" / "exclude"
+    before = shared.read_bytes()
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [get_profile("claude")], repo)
+
+    # what the operator does next, in their own checkout: add a skill
+    fresh = repo / ".claude" / "skills" / "written-after-the-run"
+    fresh.mkdir(parents=True)
+    (fresh / "SKILL.md").write_text("# new\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    staged = git(repo, "diff", "--cached", "--name-only").splitlines()
+    assert ".claude/skills/written-after-the-run/SKILL.md" in staged
+    assert shared.read_bytes() == before
+
+
+def test_shield_excludes_only_inside_the_worktree(project, tmp_path):
+    """The shield still shields: the very path the main checkout must keep seeing
+    is invisible to the WORKTREE's `git add -A`.
+
+    Paired with the regression above deliberately. Issue #384 measured that a
+    private exclude alone does NOTHING — git reads only `$GIT_COMMON_DIR/info/exclude`
+    — so writing the file and skipping the `config --worktree core.excludesFile`
+    activation would satisfy that test while quietly committing the tool files here.
+    Neither test is meaningful without the other.
+
+    Ablation: drop the activation call and this fails — the provisioned skills and
+    settings.json show up staged."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [get_profile("claude")], repo)
+
+    assert (wt / ".claude" / "skills" / "bmad-loop-sweep" / "SKILL.md").is_file()
+    assert (wt / ".claude" / "settings.json").is_file()
+    git(wt, "add", "-A")
+    assert git(wt, "diff", "--cached", "--name-only") == ""
+
+
+def test_shield_dies_with_the_worktree(project, tmp_path):
+    """Lifetime, the other half of #384: `git worktree remove` deletes the whole
+    per-worktree gitdir, taking the private exclude AND the `config.worktree` that
+    points at it. The shield expires exactly when the thing it shields does.
+
+    That is why this fix needs no remover. The old design had none either, and that
+    was the bug: `gc_run_worktrees` reclaimed the worktree and left the patterns in
+    the shared exclude forever — surviving `isolation` going back to `"none"`, and
+    the run, and the release.
+
+    Ablation is git's own behavior, so the inverse is the check that matters: a
+    shield written to the shared exclude survives this removal by construction, and
+    this test would fail against it."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [get_profile("claude")], repo)
+
+    private = _wt_private_exclude(wt)
+    assert private.is_file()  # it really was there to be lost
+    gitdir = private.parent.parent
+
+    verify.worktree_remove(repo, wt, force=True)
+
+    assert not private.exists()
+    assert not gitdir.exists()  # the whole .git/worktrees/<id>, config.worktree too
+
+
+def test_shield_refuses_to_enable_extension_over_core_worktree(project, tmp_path):
+    """`core.worktree` in the shared config is one of the two shapes git's own docs
+    (git-worktree(1), CONFIGURATION FILE) say must be moved into the main worktree's
+    `config.worktree` BEFORE `extensions.worktreeConfig` is enabled: enabling drops
+    the exception that confines those keys to the main worktree, so they would start
+    applying to every worktree.
+
+    Rearranging an operator's repo layout is not something an installer may do
+    behind their back, so the shield degrades and the run continues unshielded.
+    Enabling anyway is the loud failure this refuses to risk.
+
+    Ablation: delete the `core.worktree` branch in `_shield_enable_worktree_config`
+    and this fails — `worktreeConfig` appears in the shared config."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    git(repo, "config", "core.worktree", str(repo))
+    shared_exclude = repo / ".git" / "info" / "exclude"
+    before = shared_exclude.read_bytes()
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert reason is not None and "core.worktree" in reason
+    # read as TEXT, not via `git config --get`: conftest's git() is check=True and
+    # an unset key exits 1, which would error the test rather than assert it.
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+    assert not _wt_private_exclude(wt).exists()
+    assert shared_exclude.read_bytes() == before
+
+
+def test_shield_refuses_to_enable_extension_over_core_bare(project, tmp_path):
+    """The second refused shape: `core.bare = true` in the shared config. Same
+    reasoning as its `core.worktree` sibling, different key, and it needs its own
+    case because only a TRUE value is disqualifying — `core.bare = false` is written
+    into every ordinary repo by `git init` and must not block the shield.
+
+    Set after the worktree is mounted, and nothing below asks git about the repo
+    itself: a repo declaring itself bare answers most commands with a refusal,
+    which is precisely why git wants the key moved.
+
+    Ablation: delete the `core.bare` branch and this fails; narrow the value check
+    to "is the key present" and every ordinary repo (`bare = false`) stops being
+    shielded, which the sibling tests above catch."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    shared_exclude = repo / ".git" / "info" / "exclude"
+    before = shared_exclude.read_bytes()
+    git(repo, "config", "core.bare", "true")
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert reason is not None and "core.bare" in reason
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+    assert shared_exclude.read_bytes() == before
+
+
+def test_shield_reuses_already_enabled_extension(project, tmp_path, monkeypatch):
+    """A repo that already carries the extension is used as found — the second
+    isolated run in a repo must not re-assert a permanent format change, and must
+    not re-run the refusal gates against a repo whose format it did not change.
+
+    Injected as a hard failure rather than an equality assertion on the shared
+    config: `git config` rewriting `true` over `true` leaves the file byte-identical,
+    so a bytes comparison would pass with the early return deleted. Forbidding the
+    WRITE is the only form of this that bites.
+
+    Ablation: drop the already-true early return in `_shield_enable_worktree_config`
+    and this fails — the enable call fires and the fake raises."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    git(repo, "config", "extensions.worktreeConfig", "true")
+    real = install_mod._shield_git
+
+    def no_reenable(worktree, *args):
+        # reads of the key must still pass through, or nothing works at all
+        if args[:1] == ("config",) and "extensions.worktreeConfig" in args and "--get" not in args:
+            raise AssertionError(f"re-enabled an extension already on: {args}")
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "_shield_git", no_reenable)
+
+    assert _worktree_local_exclude(wt, ["/probe-384"]) is None
+
+    assert "/probe-384" in _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+
+
+def test_shield_seeds_users_excludesfile(project, tmp_path):
+    """A worktree-scoped `core.excludesFile` SHADOWS the operator's own — git reads
+    the key from the most specific scope that sets it and does not concatenate
+    across scopes (verified) — so their patterns are copied into the private file
+    when it is created. Without the copy, activating the shield silently un-ignores,
+    inside the worktree, everything they ignore globally, and the unit's
+    `git add -A` commits it: a shield that creates the leak it exists to plug.
+
+    Asserted through git rather than the file's content alone: the content could be
+    right while the activation pointed somewhere else.
+
+    Ablation: make `_shield_inherited_excludes` return "" and this fails —
+    `mine.log` comes back untracked in the worktree."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    users = tmp_path / "my-global-ignores"
+    users.write_text("mine.log\n", encoding="utf-8")
+    git(repo, "config", "core.excludesFile", str(users))
+
+    assert _worktree_local_exclude(wt, ["/probe-384"]) is None
+
+    lines = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert "mine.log" in lines and "/probe-384" in lines
+    (wt / "mine.log").write_text("noise\n", encoding="utf-8")
+    assert git(wt, "status", "--short") == ""
+
+
+def test_shield_seeds_xdg_default_when_unset(project, tmp_path, monkeypatch):
+    """With `core.excludesFile` unset git falls back to `$XDG_CONFIG_HOME/git/ignore`
+    (gitignore(5)) — a real file on plenty of developer boxes and shadowed just as
+    hard. The probe has to reproduce that fallback because git cannot be asked for
+    it: `config --get` answers "unset", not "here is the default I would use".
+
+    The environment is pinned three ways, and each one is load-bearing:
+    XDG_CONFIG_HOME so the file under test is this test's, GIT_CONFIG_GLOBAL and
+    GIT_CONFIG_NOSYSTEM so a developer box whose own `~/.gitconfig` sets
+    `core.excludesFile` reaches the fallback branch at all instead of passing
+    through the branch above and never testing this one.
+
+    Ablation: return "" when the key is unset (drop the XDG branch) and this fails."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    xdg = tmp_path / "xdg"
+    (xdg / "git").mkdir(parents=True)
+    (xdg / "git" / "ignore").write_text("xdg-ignored.tmp\n", encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "no-such-gitconfig"))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+    assert _worktree_local_exclude(wt, ["/probe-384"]) is None
+
+    assert "xdg-ignored.tmp" in _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    (wt / "xdg-ignored.tmp").write_text("noise\n", encoding="utf-8")
+    assert git(wt, "status", "--short") == ""
+
+
+def test_shield_config_fault_skips_shield_entirely(project, tmp_path, monkeypatch):
+    """When the activation fails, the shield stops there. It must NEVER fall back to
+    the repository-wide exclude: that fallback is #384 itself, trading one reported
+    degrade for permanent, silent, unreviewable damage to the operator's checkout.
+
+    The fault is name-filtered — only `config --worktree` calls fail — so everything
+    before it runs for real and this pins the LAST step rather than a short-circuit
+    somewhere earlier. Returned as a non-zero rc rather than raised, because that is
+    the shape git actually produces and the shield reads rc, not exceptions.
+
+    Ablation: add any shared-exclude fallback on this path and the last two
+    assertions fail."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    shared = repo / ".git" / "info" / "exclude"
+    before = shared.read_bytes()
+    real = install_mod._shield_git
+
+    def fail_worktree_writes(worktree, *args):
+        if "--worktree" in args:
+            return subprocess.CompletedProcess(
+                args=["git", *args], returncode=1, stdout=b"", stderr=b"fatal: read-only .git\n"
+            )
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "_shield_git", fail_worktree_writes)
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert reason is not None and "read-only .git" in reason
+    assert shared.read_bytes() == before
+    # and nothing else the MAIN checkout consults changed either: a file created
+    # there afterwards is still visible to git
+    (repo / "written-after-the-run.tmp").write_text("x\n", encoding="utf-8")
+    assert "written-after-the-run.tmp" in git(repo, "status", "--short")
+
+
+def test_shield_main_checkout_degrades(project):
+    """Handed a MAIN checkout there is nothing to scope to — its gitdir IS the
+    common dir — so the only exclude file on offer is the shared one. That is the
+    #384 write, so the shield refuses and says why rather than falling back.
+
+    Not a hypothetical caller: `provision_worktree` is handed plain directories and
+    project roots by tests and by non-isolated paths, and the pre-fix helper wrote
+    the repo-wide exclude for every one of them.
+
+    Ablation: restore the common-dir target and this fails — the reason is None and
+    `/probe-384` lands in the shared exclude."""
+    repo = project.project
+    shared = repo / ".git" / "info" / "exclude"
+    before = shared.read_bytes()
+
+    reason = _worktree_local_exclude(repo, ["/probe-384"])
+
+    assert reason is not None and "not a linked worktree" in reason
+    assert shared.read_bytes() == before
 
 
 # ------------------------------------------------- local exclude, best-effort (issue #359)
@@ -1471,10 +1802,14 @@ def test_worktree_local_exclude_degrades_on_symlink_loop_resolve(project, monkey
     3.11/3.12 CI legs — so the tail's except tuple must name RuntimeError or the
     fault escapes a function documented as best-effort.
 
-    The `project` MAIN CHECKOUT (not a linked worktree) is the subject on purpose:
-    `git rev-parse --git-common-dir` answers a plain checkout with a relative
-    ".git" and a linked worktree with the main repo's ABSOLUTE .git, so the plain
-    checkout is the only shape that reaches the `.resolve()` branch at all.
+    Both dirs are resolved before they are compared (a symlinked repo path is
+    absolute but not canonical, and an unresolved comparison would read a main
+    checkout as a linked worktree), so the injected fault fires on the common dir
+    every shape has. The `project` MAIN CHECKOUT is the subject only because it
+    needs no worktree to mount.
+
+    Not vacuous through the main-checkout refusal that also returns a reason: the
+    assertion is on the LOOP's message, which only the propagating fault produces.
 
     Ablation: drop `RuntimeError` from the tail's except tuple and this fails —
     the RuntimeError propagates out of the call instead of becoming a reason."""
@@ -1495,15 +1830,22 @@ def test_worktree_local_exclude_degrades_on_symlink_loop_resolve(project, monkey
     assert not exclude.is_file() or "/probe-359" not in exclude.read_text(encoding="utf-8")
 
 
-def test_worktree_local_exclude_degrades_on_write_fault(project, monkeypatch):
+def test_worktree_local_exclude_degrades_on_write_fault(project, tmp_path, monkeypatch):
     """A write fault on the exclude file itself (e.g. a read-only .git) degrades to
     a reason instead of propagating — this pins the guard reaching the LAST
     statement of the tail, not just the early resolve/mkdir steps.
 
     Injected rather than chmod: a root-owned CI runner ignores a read-only bit.
 
+    A real LINKED worktree is the subject here and in the rest of this block: since
+    #384 the tail's write only happens for one (a main checkout is refused before
+    it), so a main-checkout subject would degrade for the wrong reason and pass
+    without ever reaching the statement under test.
+
     Ablation: drop the tail's `try` (or `OSError` from its tuple) and this fails —
     the OSError propagates out of `_worktree_local_exclude`."""
+    wt = tmp_path / "wt"
+    verify.worktree_add(project.project, wt, "feat", "main")
 
     def boom(*a, **kw):
         raise OSError("read-only .git")
@@ -1513,12 +1855,12 @@ def test_worktree_local_exclude_degrades_on_write_fault(project, monkeypatch):
     # Path.write_text/Path.open patch never fires and would pass vacuously.
     monkeypatch.setattr(install_mod, "atomic_write_text", boom)
 
-    reason = _worktree_local_exclude(project.project, ["/probe-359"])
+    reason = _worktree_local_exclude(wt, ["/probe-359"])
 
     assert reason is not None and "read-only .git" in reason
 
 
-def test_worktree_local_exclude_degrades_on_undecodable_exclude(project):
+def test_worktree_local_exclude_degrades_on_undecodable_exclude(project, tmp_path):
     """A REAL fault, no injection needed: an exclude file that is not UTF-8 makes
     `read_text` raise UnicodeDecodeError — a ValueError subclass, so neither the
     OSError nor the RuntimeError arm covers it. The bytes must survive untouched;
@@ -1529,17 +1871,19 @@ def test_worktree_local_exclude_degrades_on_undecodable_exclude(project):
     `UnicodeDecodeError` does NOT fail this test; that ablation belongs to the
     encode sibling below, which is how the two halves stay independently
     pinned."""
-    exclude = project.project / ".git" / "info" / "exclude"
+    wt = tmp_path / "wt"
+    verify.worktree_add(project.project, wt, "feat", "main")
+    exclude = _wt_private_exclude(wt)
     exclude.parent.mkdir(parents=True, exist_ok=True)
     exclude.write_bytes(b"\xff\xfe legacy-encoded\n")
 
-    reason = _worktree_local_exclude(project.project, ["/probe-359"])
+    reason = _worktree_local_exclude(wt, ["/probe-359"])
 
     assert reason is not None
     assert exclude.read_bytes() == b"\xff\xfe legacy-encoded\n"
 
 
-def test_worktree_local_exclude_degrades_on_unencodable_pattern(project):
+def test_worktree_local_exclude_degrades_on_unencodable_pattern(project, tmp_path):
     """The codec fault has a WRITE direction too, and it is not the same exception:
     `read_text` raises UnicodeDecodeError, `write_text` raises UnicodeEncodeError.
     Neither is an OSError and they share no subclass but `UnicodeError`, so naming
@@ -1558,21 +1902,27 @@ def test_worktree_local_exclude_degrades_on_unencodable_pattern(project):
     Ablation: narrow the tail's tuple back to `UnicodeDecodeError` and this fails
     — UnicodeEncodeError propagates."""
     pattern = "/vendor/weird-\udcff-name"
+    wt = tmp_path / "wt"
+    verify.worktree_add(project.project, wt, "feat", "main")
 
-    reason = _worktree_local_exclude(project.project, [pattern])
+    reason = _worktree_local_exclude(wt, [pattern])
 
     assert reason is not None and "surrogates not allowed" in reason
 
 
-def test_worktree_local_exclude_short_write_leaves_exclude_intact(project, monkeypatch):
+def test_worktree_local_exclude_short_write_leaves_exclude_intact(project, tmp_path, monkeypatch):
     """#375: a fault PARTWAY THROUGH the write must leave the operator's exclude
     byte-identical, not truncated. `write_text` opens "w" (truncate-then-write)
     and this is a read-modify-REWRITE carrying their content in `prefix`, so a
     direct write left the file cut mid-content while the reason still said
     "could not update". The surviving tail is a valid git pattern and a prefix of
     the intended one — cut one character in and the last line is `/`, which
-    excludes the whole worktree. Blast radius is the MAIN repo: a linked
-    worktree's --git-common-dir points at the main .git.
+    excludes the whole worktree.
+
+    Blast radius is smaller since #384 (the file is this worktree's own, not the
+    main repo's shared exclude) but the fault is not: the content carried through
+    `prefix` is the operator's global excludes, copied in when the private file was
+    created, and `/` still swallows the whole worktree.
 
     The fault is injected at `Path.open`, NOT at `Path.write_text`: patching
     write_text means the file is never opened, so the truncation cannot happen
@@ -1582,7 +1932,9 @@ def test_worktree_local_exclude_short_write_leaves_exclude_intact(project, monke
 
     Ablation: swap `atomic_write_text` back to a direct `exclude.write_text` and
     this fails — the file comes back truncated."""
-    exclude = project.project / ".git" / "info" / "exclude"
+    wt = tmp_path / "wt"
+    verify.worktree_add(project.project, wt, "feat", "main")
+    exclude = _wt_private_exclude(wt)
     exclude.parent.mkdir(parents=True, exist_ok=True)
     exclude.write_text("# OPERATOR'S OWN\n/secret-local\n", encoding="utf-8")
     before = exclude.read_bytes()
@@ -1620,7 +1972,7 @@ def test_worktree_local_exclude_short_write_leaves_exclude_intact(project, monke
 
     monkeypatch.setattr(io, "open", opener)
 
-    reason = _worktree_local_exclude(project.project, ["/probe-359"])
+    reason = _worktree_local_exclude(wt, ["/probe-359"])
 
     monkeypatch.undo()
     assert reason is not None and "No space left" in reason
@@ -1652,24 +2004,47 @@ def test_worktree_local_exclude_undecodable_git_output_degrades(tmp_path, monkey
     bin_dir = tmp_path / "stubbin"
     bin_dir.mkdir()
     stub = bin_dir / "git"
-    # Emits a path carrying byte 0xff, exactly what a repo whose directory name
-    # is not valid UTF-8 makes `git rev-parse --git-common-dir` print. The path is
-    # rooted in tmp_path, NOT a literal /tmp: the helper mkdir(parents=True)s the
-    # common dir it is handed, so a hardcoded path would create real directories
-    # in the shared system /tmp on every run, outside pytest's cleanup.
-    common = os.fsencode(str(tmp_path)) + b"/repo-\377-name/.git"
+    # Emits paths carrying byte 0xff, exactly what a repo whose directory name is
+    # not valid UTF-8 makes `git rev-parse` print. Rooted in tmp_path, NOT a
+    # literal /tmp: the helper mkdir(parents=True)s the gitdir it is handed, so a
+    # hardcoded path would create real directories in the shared system /tmp on
+    # every run, outside pytest's cleanup.
+    root = os.fsencode(str(tmp_path)) + b"/repo-\377-name/.git"
+    gitdir = root + b"/worktrees/wt"  # distinct from the common dir: a LINKED worktree
+
     # SINGLE-QUOTED into the script. Unquoted, a temp root carrying whitespace
     # (TMPDIR, --basetemp, a username with a space) word-splits into a second
     # printf argument, and `printf '%s\n'` repeats its format per argument — so
     # the helper is handed a path with an embedded NEWLINE and mkdir(parents=True)s
     # it as a sibling of the basetemp pytest reaps. Measured with a spaced
     # --basetemp: it leaked such a directory and the test still passed.
-    stub.write_bytes(b"#!/bin/sh\nprintf '%s\\n' '" + common.replace(b"'", b"'\\''") + b"'\n")
+    def sq(raw):
+        return b"'" + raw.replace(b"'", b"'\\''") + b"'"
+
+    # Dispatches on the subcommand, because the shield asks git several questions
+    # now and a stub that answered them all identically would not get past the
+    # first. `shift 2` drops the `-C <worktree>` every call carries. The extension
+    # reads as already enabled so the stub is never asked to change repo state,
+    # and every other `--get` exits 1, git's own "unset".
+    stub.write_bytes(
+        b'#!/bin/sh\nshift 2\ncase "$1" in\n'
+        b"rev-parse) printf '%s\\n' " + sq(gitdir) + b" " + sq(root) + b" ;;\n"
+        b'config) case "$*" in\n'
+        b"  *--worktree*) exit 0 ;;\n"
+        b"  *extensions.worktreeConfig*) printf 'true\\n' ;;\n"
+        b"  *) exit 1 ;;\n"
+        b"  esac ;;\n"
+        b"*) exit 1 ;;\nesac\n"
+    )
     stub.chmod(0o755)
     # PATH is REPLACED, not prepended: the stub has to be the only resolvable
     # `git`, or the box's real git answers first with a decodable path and this
     # passes without ever exercising the decode.
     monkeypatch.setenv("PATH", str(bin_dir))
+    # the excludes-file seed falls back to the XDG default when the key is unset
+    # (which the stub reports); pointed at an empty dir so the runner's own
+    # ~/.config/git/ignore cannot leak into the assertion below.
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
 
     # must not raise: the contract is best-effort in both arms
     reason = _worktree_local_exclude(tmp_path / "wt", ["/probe-374"])
@@ -1687,13 +2062,15 @@ def test_worktree_local_exclude_undecodable_git_output_degrades(tmp_path, monkey
     # that glob is non-recursive and tmp_path sits three levels down, so it
     # could not see this test's own output, while it DID fail for anyone whose
     # box still carried litter from the hardcoded-path version of this test.
-    landed = Path(os.fsdecode(common)) / "info" / "exclude"
+    landed = Path(os.fsdecode(gitdir)) / "info" / "exclude"
     assert landed.is_file()
     assert "/probe-374" in landed.read_text(encoding="utf-8")
+    # and not in the common dir's exclude, which is where #384 put it
+    assert not (Path(os.fsdecode(root)) / "info" / "exclude").exists()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits; Windows has no umask")
-def test_worktree_local_exclude_created_exclude_stays_readable(project):
+def test_worktree_local_exclude_created_exclude_stays_readable(project, tmp_path):
     """An exclude this helper CREATES keeps the mode the `write_text` it replaced
     would have produced, not `mkstemp`'s private 0600. `atomic_write_text` carries
     a mode over only when the target already EXISTS (its docstring is explicit),
@@ -1703,10 +2080,10 @@ def test_worktree_local_exclude_created_exclude_stays_readable(project):
     degrade reason at all, because the write SUCCEEDED. That is the harm the
     helper's own docstring calls out, arrived at through a successful write.
 
-    Reachable where the common dir is read under another UID —
-    `core.sharedRepository`, a shared checkout — and the create path is live
-    whenever `.git/info/exclude` is absent, which is why the `mkdir(parents=True)`
-    above exists.
+    Reachable where the gitdir is read under another UID —
+    `core.sharedRepository`, a shared checkout — and since #384 the create path is
+    live for EVERY worktree, not just a repo whose `.git/info/exclude` is missing:
+    the private exclude never exists until the shield writes it.
 
     The umask is pinned rather than inherited: at the box's own 0077 the ablated
     code produces 0600 too, and the ablation would not bite.
@@ -1714,16 +2091,18 @@ def test_worktree_local_exclude_created_exclude_stays_readable(project):
     Ablation: drop the `exclude.touch()` and this fails, reporting 0o600."""
     old_umask = os.umask(0o022)
     try:
-        exclude = project.project / ".git" / "info" / "exclude"
+        wt = tmp_path / "wt"
+        verify.worktree_add(project.project, wt, "feat", "main")
+        exclude = _wt_private_exclude(wt)
         exclude.parent.mkdir(parents=True, exist_ok=True)
-        exclude.unlink(missing_ok=True)
+        assert not exclude.exists()
         # what the replaced write_text would have produced, measured not assumed
         probe = exclude.with_name("umask-probe")
         probe.write_text("x", encoding="utf-8")
         expected = stat.S_IMODE(probe.stat().st_mode)
         probe.unlink()
 
-        assert _worktree_local_exclude(project.project, ["/probe-mode"]) is None
+        assert _worktree_local_exclude(wt, ["/probe-mode"]) is None
 
         assert stat.S_IMODE(exclude.stat().st_mode) == expected, oct(
             stat.S_IMODE(exclude.stat().st_mode)
@@ -1744,15 +2123,19 @@ def test_worktree_local_exclude_non_git_dir_returns_none(tmp_path):
 
 def test_worktree_local_exclude_success_returns_none(project, tmp_path):
     """The happy path returns None too — `None` is "nothing to report", not
-    "nothing happened": the pattern really lands in the common dir's exclude."""
+    "nothing happened": the pattern really lands in the worktree's own exclude,
+    and nowhere the main checkout reads."""
     repo = project.project
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
+    shared = repo / ".git" / "info" / "exclude"
+    before = shared.read_bytes()
 
     assert _worktree_local_exclude(wt, ["/probe-359"]) is None
 
-    lines = (repo / ".git" / "info" / "exclude").read_text(encoding="utf-8").splitlines()
+    lines = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
     assert "/probe-359" in lines
+    assert shared.read_bytes() == before
 
 
 def test_provision_worktree_exclude_fault_reports_on_degraded(project, tmp_path, monkeypatch):
@@ -1841,11 +2224,15 @@ def test_provision_worktree_hookless_exclude_never_blankets_worktree(project, tm
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
 
+    shared = repo / ".git" / "info" / "exclude"
+    before = shared.read_bytes()
+
     provision_worktree(wt, [get_profile("opencode-http")], repo)
 
-    lines = (repo / ".git" / "info" / "exclude").read_text(encoding="utf-8").splitlines()
+    lines = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
     assert "/.claude/skills" in lines
     assert "/" not in lines
+    assert shared.read_bytes() == before
 
 
 # ----------------------------------------------------------------- seed_globs (engine plugin)
@@ -1893,13 +2280,16 @@ def test_provision_worktree_seed_globs_shielded_in_local_exclude(project, tmp_pa
     (skill / "SKILL.md").write_text("tool", encoding="utf-8")
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
+    shared = repo / ".git" / "info" / "exclude"
+    before = shared.read_bytes()
 
     provision_worktree(wt, [get_profile("claude")], repo, seed_globs=[".claude/skills/*"])
 
     assert (wt / ".claude" / "skills" / "tests-run" / "SKILL.md").is_file()
-    exclude = (repo / ".git" / "info" / "exclude").read_text(encoding="utf-8").splitlines()
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
     assert "/.claude/skills/tests-run" in exclude
     assert git(wt, "status", "--short", "--", ".claude/skills/tests-run") == ""
+    assert shared.read_bytes() == before
 
 
 # ----------------------------------------------------------------- seed file modes (issue #126)

@@ -731,52 +731,187 @@ def _copy_traversable(src, dst: Path, *, skip_existing: bool = False) -> bool:
     return True
 
 
+# Bound on each git call the git-add shield makes. Mirrors `LimitsPolicy.git_timeout_s`'s
+# default rather than reading it: `install` is the pre-run installer surface and holds no
+# Policy — `provision_worktree` is handed paths and profiles, never one — and threading a
+# policy in for this alone would put the installer in the policy's dependency graph. The
+# number matters only as a ceiling on a hung git; the two need not agree.
+_SHIELD_GIT_TIMEOUT_S = 120
+
+
+def _shield_git(worktree: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
+    """Run one `git -C <worktree> …` for the git-add shield, capturing BYTES.
+
+    Never `check=True`, and every caller branches on `returncode` instead: the
+    shield asks git questions whose "no" is a non-zero rc, not a fault —
+    `config --get` of an unset key exits 1, and that answer is what tells the
+    shield to enable the extension / probe the XDG default.
+
+    bytes, not `text=True`: strict decoding would raise `UnicodeDecodeError` out
+    of the git-query arm, whose whole contract is "skip silently", and that type
+    is in neither arm's tuple (#374). POSIX filenames are bytes, so a repo path
+    with bytes invalid in the locale encoding reaches this on a normal box.
+
+    Deliberately NOT routed through `verify._run_git`, the chokepoint AGENTS.md
+    otherwise requires. Nothing structural forbids it — neither module imports
+    the other — but `_run_git` hands back `CompletedProcess[str]`, i.e. the strict
+    decode this helper exists to avoid, and it raises `GitError` rather than
+    returning the rc the shield reads as an answer. Adopting it needs a bytes
+    mode on the chokepoint first; that is #377, which also covers the decode
+    fault escaping `_run_git`'s own taxonomy. The timeout the chokepoint would
+    bring is carried here meanwhile, so standing outside it no longer costs one.
+    """
+    return subprocess.run(
+        ["git", "-C", str(worktree), *args],
+        capture_output=True,
+        timeout=_SHIELD_GIT_TIMEOUT_S,
+    )
+
+
+def _shield_enable_worktree_config(worktree: Path, common_dir: Path) -> str | None:
+    """Make `git config --worktree` writable in this repo, or say why not.
+
+    `extensions.worktreeConfig` is what makes a per-worktree config file exist at
+    all; without it `git config --worktree` either refuses outright (a repo with
+    linked worktrees) or silently writes the SHARED config. Already-true is the
+    common case after the first isolated run — reused, never rewritten.
+
+    Enabling it is a PERMANENT, repo-wide format change this code never reverses,
+    so it is refused in the two shapes git's own documentation calls out
+    (git-worktree(1), CONFIGURATION FILE): with `core.bare = true` or
+    `core.worktree` in the shared config, enabling the extension drops the
+    exception that confined those keys to the main worktree, and they would start
+    applying to every worktree. Git says to move them into the main worktree's
+    `config.worktree` first — a repo-layout edit the installer has no business
+    making behind an operator's back — so the shield degrades instead, and the
+    run continues with the tool files unshielded rather than the repo rearranged.
+    """
+    probe = _shield_git(worktree, "config", "--type=bool", "--get", "extensions.worktreeConfig")
+    if probe.returncode == 0 and os.fsdecode(probe.stdout).strip() == "true":
+        return None
+    # Read the SHARED config as a file rather than by scope: `--local` from a
+    # linked worktree already resolves to this same file, but naming it keeps the
+    # check honest if that ever stops being true, and it cannot be answered by a
+    # value the operator set globally.
+    shared = str(common_dir / "config")
+    bare = _shield_git(worktree, "config", "--file", shared, "--type=bool", "--get", "core.bare")
+    if bare.returncode == 0 and os.fsdecode(bare.stdout).strip() == "true":
+        refused = "core.bare = true"
+    elif (
+        _shield_git(worktree, "config", "--file", shared, "--get", "core.worktree").returncode == 0
+    ):
+        refused = "core.worktree"
+    else:
+        enabled = _shield_git(worktree, "config", "extensions.worktreeConfig", "true")
+        if enabled.returncode == 0:
+            return None
+        detail = os.fsdecode(enabled.stderr).strip() or f"git exited {enabled.returncode}"
+        return (
+            f"could not enable extensions.worktreeConfig ({worktree}): {detail} — the "
+            "provisioned tool files are not shielded from the unit's `git add -A`"
+        )
+    return (
+        f"skipped the git-add shield ({worktree}): the repository's shared config sets "
+        f"{refused}, which git requires moving into the main worktree's config.worktree "
+        "before extensions.worktreeConfig may be enabled"
+    )
+
+
+def _shield_inherited_excludes(worktree: Path) -> str:
+    """The content of whatever `core.excludesFile` this worktree resolves to now.
+
+    A worktree-scoped `core.excludesFile` SHADOWS the operator's own: git reads
+    the key from the most specific scope that sets it and does not concatenate
+    across scopes (verified — with a worktree value set, a path listed in the
+    global excludes file shows up as untracked inside the worktree and stays
+    ignored in the main checkout). Activating the shield without carrying their
+    patterns over would therefore un-ignore, inside the worktree, everything they
+    ignore globally — and the unit's `git add -A` would commit it.
+
+    Seeded once, at creation, so the copy never fights later edits to the private
+    file. Best-effort and silent: a missing/unreadable/undecodable excludes file
+    is not a reason to skip the shield itself, which is what an escaping fault
+    would cause in the guarded tail this runs inside.
+    """
+    try:
+        # --type=path so `~/.gitignore` arrives expanded, the way git reads it.
+        answer = _shield_git(worktree, "config", "--type=path", "--get", "core.excludesFile")
+        if answer.returncode == 0 and answer.stdout.strip():
+            source = Path(os.fsdecode(answer.stdout).strip())
+        else:
+            # git's documented fallback when the key is unset (gitignore(5)).
+            xdg = os.environ.get("XDG_CONFIG_HOME")
+            source = (Path(xdg) if xdg else Path.home() / ".config") / "git" / "ignore"
+        return source.read_text(encoding="utf-8") if source.is_file() else ""
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        return ""
+
+
 def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | None:
-    """Add anchored ignore patterns to the worktree's local git exclude so the
-    provisioned tool files are never staged by the unit's `git add -A`. Uses
-    git's standard local-only exclude (never committed or pushed); it does not
-    affect already-tracked files.
+    """Shield the just-provisioned tool files from the unit's `git add -A`, in a
+    private exclude file scoped to THIS worktree alone.
+
+    Two properties, both load-bearing, and both of them were wrong before #384:
+
+    - SCOPE — the patterns land in `<worktree gitdir>/info/exclude`
+      (`.git/worktrees/<id>/info/exclude`), activated by
+      `git config --worktree core.excludesFile <that path>`. Git only ever reads
+      `$GIT_COMMON_DIR/info/exclude`, so the private file does nothing on its own;
+      the worktree-scoped config key is what makes it apply, and it applies to
+      this worktree only. The main checkout and every sibling worktree are
+      untouched.
+    - LIFETIME — `git worktree remove`/`prune` deletes the whole per-worktree
+      gitdir, taking the private exclude AND the `config.worktree` that points at
+      it. The shield expires exactly when the thing it shields does; there is no
+      remover to keep in step with it.
+
+    The repository-wide `.git/info/exclude` is NEVER written again, on any path.
+    That file is what #384 reported: shared by every worktree, permanent, and
+    unversioned, so patterns naming directories a project legitimately tracks
+    (`.claude/skills`, `.claude/settings.json`) went on hiding every NEW file
+    under them from `git add -A` in the operator's own checkout, long after the
+    run that wrote them. The old docstring's defense — that an exclude "does not
+    affect already-tracked files" — is precisely what made it invisible: the
+    tracked files kept diffing normally while their new siblings vanished. So a
+    refusal below SKIPS the shield and reports; falling back to the shared file
+    would reintroduce the bug this function exists to fix.
+
+    The price is a permanent one: `extensions.worktreeConfig` is repo-wide format
+    state, enabled once and never removed here, and git versions older than 2.20
+    refuse to access a repository carrying it (git-worktree(1)). See
+    `_shield_enable_worktree_config` for the two shapes where enabling it is
+    refused outright.
 
     Best-effort in two arms that must stay separate, because `OSError` means the
     opposite thing in each:
 
-    - git unqueryable (not a repo, git missing) is an EXPECTED skip — returns
-      None silently. Callers hand this plain temp dirs routinely. Nothing is
-      DECODED in this arm: git's stdout is captured as bytes and decoded in the
-      tail below, because a decode fault is a degrade (git answered; we could
-      not read it), not the silent skip this arm means (#374).
-    - a filesystem fault AFTER git answered degrades to a returned reason string
-      the caller can surface: `.resolve()` (pre-3.13 a symlink loop raises
-      RuntimeError, not OSError), `mkdir`, read/write OSError, and either
-      direction of a codec fault (`UnicodeError`) — an exclude file that is not
-      UTF-8 fails the READ, and a pattern carrying a surrogate fails the WRITE,
-      since a seed_globs pattern is built from a real filename and a non-UTF-8
-      one arrives surrogate-escaped. Silence here is not cosmetic: without the
-      exclude the unit's `git add -A` commits the tool files this provisioning
-      just wrote into the story's merge.
+    - git unqueryable (not a repo, git missing, a `rev-parse` too old to answer)
+      is an EXPECTED skip — returns None silently. Callers hand this plain temp
+      dirs routinely. Nothing is DECODED in this arm: git's stdout is captured as
+      bytes and decoded in the tail below, because a decode fault is a degrade
+      (git answered; we could not read it), not the silent skip this arm means
+      (#374).
+    - anything AFTER git answered degrades to a returned reason string the caller
+      can surface: a main checkout passed in (nothing to scope to), a refused or
+      failed extension enable, a failed activation, `.resolve()` (pre-3.13 a
+      symlink loop raises RuntimeError, not OSError), `mkdir`, read/write
+      `OSError`, a later git call timing out or failing to spawn
+      (`SubprocessError`), and either direction of a codec fault
+      (`UnicodeError`) — an exclude file that is not UTF-8 fails the READ, and a
+      pattern carrying a surrogate fails the WRITE, since a seed_globs pattern is
+      built from a real filename and a non-UTF-8 one arrives surrogate-escaped.
+      Silence here is not cosmetic: without the exclude the unit's `git add -A`
+      commits the tool files this provisioning just wrote into the story's merge.
     """
     # Callers pass POSIX-slash patterns (glob rels via as_posix; config strings as
     # authored); git's exclude is POSIX-slash on every platform, so nothing to fix here.
     try:
-        # bytes, not text=True: strict decoding here would raise UnicodeDecodeError
-        # out of an arm whose whole contract is "skip silently", and that type is
-        # in neither arm's tuple (#374). POSIX filenames are bytes, so a repo path
-        # with bytes invalid in the locale encoding reaches this on a normal box.
-        #
-        # Deliberately NOT routed through verify._run_git, the chokepoint AGENTS.md
-        # otherwise requires. Nothing structural forbids it — neither module imports
-        # the other — but _run_git hands back CompletedProcess[str], i.e. the strict
-        # decode this call exists to avoid, and it raises GitError rather than the
-        # (SubprocessError, OSError) this arm treats as an expected skip. Adopting it
-        # needs a bytes mode on the chokepoint first; that is #377, which also covers
-        # the decode fault escaping _run_git's own taxonomy. The cost of standing
-        # outside it meanwhile is this call's missing timeout.
-        raw = subprocess.run(
-            ["git", "-C", str(worktree), "rev-parse", "--git-common-dir"],
-            capture_output=True,
-            check=True,
-        ).stdout
+        answered = _shield_git(worktree, "rev-parse", "--absolute-git-dir", "--git-common-dir")
     except (subprocess.SubprocessError, OSError):
+        return None
+    if answered.returncode != 0:
+        # not a repo, or a git too old for `--absolute-git-dir` (2.13): the same
+        # expected skip the previous `check=True` raised its way into.
         return None
     try:
         # fsdecode, so a non-UTF-8 repo path round-trips back to the filesystem
@@ -784,60 +919,95 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
         # rejects a lone invalid byte), which is why it sits inside this try —
         # defensive placement rather than a path under test: the regression test
         # is POSIX-only because git on Windows has no such path to hand back.
-        common_dir = Path(os.fsdecode(raw).strip())
+        lines = os.fsdecode(answered.stdout).splitlines()
+        if len(lines) != 2:
+            return f"could not read this worktree's git dirs ({worktree}): {lines}"
+        git_dir = Path(lines[0].strip())
+        common_dir = Path(lines[1].strip())
         if not common_dir.is_absolute():
             # a PLAIN checkout answers with a relative ".git"; a linked worktree
-            # answers with the main repo's absolute .git (verified, git 2.55), so
-            # this branch is the plain-checkout case, not the worktree one.
-            common_dir = (worktree / common_dir).resolve()
-        exclude = common_dir / "info" / "exclude"
+            # answers with the main repo's absolute .git (verified, git 2.55).
+            common_dir = worktree / common_dir
+        # resolve BOTH before comparing: --absolute-git-dir is absolute but not
+        # canonical, so a symlinked repo path would otherwise read as two
+        # different dirs and a main checkout would pass for a linked worktree.
+        git_dir, common_dir = git_dir.resolve(), common_dir.resolve()
+        if git_dir == common_dir:
+            # The main checkout itself: its gitdir IS the common dir, so the only
+            # exclude file to write would be the shared one — the #384 bug.
+            # Nothing here is transient enough to shield, so say so and stop.
+            return (
+                f"skipped the git-add shield ({worktree}): not a linked worktree, and the "
+                "shield never writes the repository-wide exclude (#384)"
+            )
+        refusal = _shield_enable_worktree_config(worktree, common_dir)
+        if refusal is not None:
+            return refusal
+        exclude = git_dir / "info" / "exclude"
         exclude.parent.mkdir(parents=True, exist_ok=True)
         existed = exclude.is_file()
-        existing = exclude.read_text(encoding="utf-8") if existed else ""
+        # On creation the operator's own excludes are copied in, because the
+        # activation below shadows them (see _shield_inherited_excludes). On a
+        # re-provision the file's own content is authoritative and the copy is
+        # not repeated, so the two stay idempotent together.
+        existing = (
+            exclude.read_text(encoding="utf-8") if existed else _shield_inherited_excludes(worktree)
+        )
         present = set(existing.splitlines())
         new = [p for p in patterns if p not in present]
-        if not new:
-            return None
-        prefix = existing if not existing or existing.endswith("\n") else existing + "\n"
-        # atomic_write_text, never write_text onto `exclude` directly (#375).
-        # write_text opens "w", which TRUNCATES before writing, and this is a
-        # read-modify-REWRITE carrying the operator's own excludes in `prefix` —
-        # so a short write (ENOSPC) left the file truncated mid-content while the
-        # degrade reason still said "could not update". Worse, the surviving tail
-        # is a valid git pattern and a prefix of the intended one: cut one char
-        # in and the last line is "/", which excludes the entire worktree.
-        #
-        # The helper rather than a hand-rolled tmp+replace: its temp name is
-        # unique, and EVERY linked worktree of a repo resolves to this same
-        # common dir, so a fixed `.tmp` sibling is a collision between two runs
-        # provisioning against one repo. It also fsyncs before the replace and
-        # carries the target's mode over, which a bare replace resets.
-        #
-        # Atomicity per write is NOT isolation across the read above and this
-        # write: they are unserialized, so two such runs interleaving lose one
-        # side's patterns outright, both returning None. That race predates
-        # #375 and survives this fix — it is #381.
-        if not existed:
-            # Create it first, the way the write_text this replaced did: O_CREAT
-            # under the umask, giving the helper a mode to carry. Left to itself
-            # it creates a new target at mkstemp's private 0600 — and an exclude
-            # git cannot READ is one git silently IGNORES. Measured: git warns,
-            # exits 0, and `git add -A` stages the files the exclude was written
-            # to shield. That is the exact harm the docstring above says silence
-            # must not cause, and here nothing would even be reported, because
-            # the write SUCCEEDS. Reachable wherever the common dir is read
-            # under another UID (core.sharedRepository, a shared checkout) —
-            # which is why atomic_write_text's own docstring says callers of
-            # genuinely shared state need more than the helper alone.
+        # `not existed` keeps a re-provision that adds no pattern from leaving the
+        # config below pointing at a file that was never created.
+        if new or not existed:
+            prefix = existing if not existing or existing.endswith("\n") else existing + "\n"
+            # atomic_write_text, never write_text onto `exclude` directly (#375).
+            # write_text opens "w", which TRUNCATES before writing, and this is a
+            # read-modify-REWRITE carrying the operator's own excludes in
+            # `prefix` — so a short write (ENOSPC) left the file truncated
+            # mid-content while the degrade reason still said "could not update".
+            # Worse, the surviving tail is a valid git pattern and a prefix of the
+            # intended one: cut one char in and the last line is "/", which
+            # excludes the entire worktree.
             #
-            # Safe against the tail below: an empty exclude is equivalent to an
-            # absent one for git, so a fault after this leaves no more damage
-            # than the missing file it replaced.
-            exclude.touch()
-        atomic_write_text(exclude, prefix + "\n".join(new) + "\n")
+            # The helper rather than a hand-rolled tmp+replace: it fsyncs before
+            # the replace and carries the target's mode over, which a bare replace
+            # resets.
+            #
+            # #381's interleaving race is mooted for NEW writes rather than fixed:
+            # this file lives in one worktree's private gitdir, so the two runs
+            # that used to race here — every linked worktree of a repo resolved to
+            # the same shared common dir — no longer share a target at all. Only a
+            # second provisioning of the SAME worktree can reach this file, which
+            # the engine does serially. The atomic write stays for #375, whose
+            # fault (a short write) needs no second writer.
+            if not existed:
+                # Create it first, the way the write_text this replaced did:
+                # O_CREAT under the umask, giving the helper a mode to carry. Left
+                # to itself it creates a new target at mkstemp's private 0600 —
+                # and an exclude git cannot READ is one git silently IGNORES.
+                # Measured: git warns, exits 0, and `git add -A` stages the files
+                # the exclude was written to shield. That is the exact harm the
+                # docstring above says silence must not cause, and here nothing
+                # would even be reported, because the write SUCCEEDS. Reachable
+                # wherever the gitdir is read under another UID
+                # (core.sharedRepository, a shared checkout) — which is why
+                # atomic_write_text's own docstring says callers of genuinely
+                # shared state need more than the helper alone.
+                #
+                # Safe against the tail below: an empty exclude is equivalent to
+                # an absent one for git, so a fault after this leaves no more
+                # damage than the missing file it replaced.
+                exclude.touch()
+            atomic_write_text(exclude, prefix + "".join(f"{p}\n" for p in new))
+        # LAST, after the file it names exists: git reads core.excludesFile lazily,
+        # but a config pointing at a file that a fault above left unwritten would
+        # be a shield that silently excludes nothing while reporting a reason.
+        activated = _shield_git(worktree, "config", "--worktree", "core.excludesFile", str(exclude))
+        if activated.returncode != 0:
+            detail = os.fsdecode(activated.stderr).strip() or f"git exited {activated.returncode}"
+            return f"could not activate the worktree git exclude ({worktree}): {detail}"
     # UnicodeError, not UnicodeDecodeError: the write raises the ENCODE sibling.
     # Still far short of ValueError-broad, so a programming error still escapes.
-    except (OSError, RuntimeError, UnicodeError) as e:
+    except (OSError, RuntimeError, UnicodeError, subprocess.SubprocessError) as e:
         return f"could not update the worktree-local git exclude ({worktree}): {e}"
     return None
 

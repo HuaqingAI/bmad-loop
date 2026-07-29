@@ -260,6 +260,23 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 ### Fixed
 
+- **The worktree git-add shield no longer hides new files in your own checkout (#384).** Worktree
+  provisioning shielded the tool files it writes (`.claude/skills`, the per-CLI hook config, seeded
+  configs) by appending to `.git/info/exclude` — a file shared with the main checkout and every
+  sibling worktree, permanent, and unversioned. Those paths are ones projects legitimately track, so
+  every **new** file under them silently stopped being staged by `git add -A` in the operator's own
+  checkout, long after the run: one report lost 51 files and three whole skills across two upgrade
+  commits, with nothing in either diff able to reveal why. The shield now writes a private exclude in
+  the worktree's own gitdir, activated with a worktree-scoped `core.excludesFile`, so it applies to
+  that unit alone and `git worktree remove` deletes it along with the worktree. The operator's
+  `core.excludesFile` is copied in when the private file is created, since the worktree-scoped key
+  shadows it. Two caveats: this enables `extensions.worktreeConfig`, a **permanent** repo-format flag
+  that is never removed (git older than 2.20 refuses a repository carrying it), and where git
+  requires that flag's prerequisites be moved by hand first (`core.bare = true` or `core.worktree` in
+  the shared config) the shield is skipped with a journaled reason rather than widened back. Lines an
+  older bmad-loop already wrote into `.git/info/exclude` are **not** removed for you — delete them by
+  hand (a `validate` warning lands separately).
+
 - **One undecodable byte of verify output no longer crashes the run (#378).** Verify commands are
   arbitrary operator tools, and their captured output was decoded strictly — a child emitting bytes
   invalid in the run's encoding raised `UnicodeDecodeError` out of `run_verify_commands`, losing

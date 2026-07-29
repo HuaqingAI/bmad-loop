@@ -110,11 +110,17 @@ def provision_worktree(
     - the hook points at the MAIN repo's already-installed relay via an absolute
       path (the relay locates the run dir from $BMAD_LOOP_RUN_DIR, not its own
       location), so nothing is written into the worktree's .bmad-loop/;
-    - everything we wrote is added to the worktree's local git exclude. That write
-      is best-effort: when git can't be queried at all it is skipped silently, but
-      a filesystem fault after that is reported to `on_degraded` (once, with the
-      reason) rather than swallowed — an unwritten exclude is what lets `git add -A`
-      stage the tool files, so it must not fail invisibly.
+    - everything we wrote is excluded from git, in a file private to THIS worktree
+      (`.git/worktrees/<id>/info/exclude`, activated per-worktree) that dies with it
+      when the worktree is removed. It is never the repository-wide
+      `.git/info/exclude`: that file is shared with the operator's own checkout and
+      permanent, so shielding through it hid every new file under a tool dir from
+      their `git add -A` forever (#384). That write is best-effort: when git can't
+      be queried at all it is skipped silently, but any fault after that — including
+      a refusal to scope the shield — is reported to `on_degraded` (once, with the
+      reason) rather than swallowed, and the shield is skipped rather than widened
+      back to the shared file. An unshielded worktree lets `git add -A` stage the
+      tool files, so it must not fail invisibly.
     Skill trees, the per-CLI hook config, and the seeded configs all live in dirs
     projects gitignore — but the exclude shields them even when a project doesn't.
 
@@ -282,7 +288,9 @@ def provision_worktree(
 
     # Shield exactly the paths we wrote (skill trees + hook configs + seeded
     # configs) from the unit's `git add -A`, in case a project doesn't gitignore
-    # its tool dirs.
+    # its tool dirs. Scoped to this worktree and expiring with it — these are
+    # paths projects legitimately TRACK, so a repo-wide exclude here went on
+    # hiding their new files from the operator's own checkout (#384).
     patterns = {f"/{p.skill_tree}" for p in profiles}
     # hookless profiles have no config_path — and their empty string would render
     # as the pattern "/", git-excluding the entire worktree.

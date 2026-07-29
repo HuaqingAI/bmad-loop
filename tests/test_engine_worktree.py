@@ -902,6 +902,15 @@ def test_per_worktree_setup_then_gate_then_teardown_and_seed(project):
     """Happy path: the worktree is seeded, the setup hook runs, the ready gate
     waits (and only passes because setup ran first), the agent runs, teardown
     fires. Ordering is proven by the gate depending on a setup marker."""
+    # The MCP-generated skill tree really is gitignored in a per_worktree project
+    # (docs/FEATURES.md), and this fixture has to say so itself: until #384 the
+    # git-add shield wrote its patterns into the repo-wide `.git/info/exclude`, so
+    # the untracked dir below was hidden in the MAIN checkout too and the pre-merge
+    # cleanliness gate never saw it. The shield is per-worktree now, and an
+    # untracked file in the operator's own checkout blocks a merge as it always has
+    # (`verify.dirty_paths` counts untracked). Committed before the dir exists.
+    gitignore = project.project / ".gitignore"
+    gitignore.write_text(gitignore.read_text() + ".claude/skills/\n", encoding="utf-8")
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
     # a gitignored MCP skill dir present in the main repo (untracked) to be seeded
     skill = project.project / ".claude" / "skills" / "gameobject-create"
