@@ -729,11 +729,31 @@ def _copy_traversable(src, dst: Path, *, skip_existing: bool = False) -> bool:
     return True
 
 
-def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> None:
+def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | None:
     """Add anchored ignore patterns to the worktree's local git exclude so the
     provisioned tool files are never staged by the unit's `git add -A`. Uses
     git's standard local-only exclude (never committed or pushed); it does not
-    affect already-tracked files. Best-effort — skipped if git can't be queried.
+    affect already-tracked files.
+
+    Best-effort in two arms that must stay separate, because `OSError` means the
+    opposite thing in each:
+
+    - git unqueryable (not a repo, git missing) is an EXPECTED skip — returns
+      None silently. Callers hand this plain temp dirs routinely. One residual
+      escape survives here and is tracked in #374: `text=True` decodes git's
+      stdout strictly, so a repo path carrying bytes invalid in the locale
+      encoding raises UnicodeDecodeError, which is neither arm's type. Left out
+      of the #359 fix deliberately — decoding filesystem paths safely is a
+      program-wide decision, not this helper's.
+    - a filesystem fault AFTER git answered degrades to a returned reason string
+      the caller can surface: `.resolve()` (pre-3.13 a symlink loop raises
+      RuntimeError, not OSError), `mkdir`, read/write OSError, and either
+      direction of a codec fault (`UnicodeError`) — an exclude file that is not
+      UTF-8 fails the READ, and a pattern carrying a surrogate fails the WRITE,
+      since a seed_globs pattern is built from a real filename and a non-UTF-8
+      one arrives surrogate-escaped. Silence here is not cosmetic: without the
+      exclude the unit's `git add -A` commits the tool files this provisioning
+      just wrote into the story's merge.
     """
     # Callers pass POSIX-slash patterns (glob rels via as_posix; config strings as
     # authored); git's exclude is POSIX-slash on every platform, so nothing to fix here.
@@ -745,19 +765,28 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> None:
             check=True,
         ).stdout.strip()
     except (subprocess.SubprocessError, OSError):
-        return
-    common_dir = Path(common)
-    if not common_dir.is_absolute():
-        common_dir = (worktree / common_dir).resolve()
-    exclude = common_dir / "info" / "exclude"
-    exclude.parent.mkdir(parents=True, exist_ok=True)
-    existing = exclude.read_text(encoding="utf-8") if exclude.is_file() else ""
-    present = set(existing.splitlines())
-    new = [p for p in patterns if p not in present]
-    if not new:
-        return
-    prefix = existing if not existing or existing.endswith("\n") else existing + "\n"
-    exclude.write_text(prefix + "\n".join(new) + "\n", encoding="utf-8")
+        return None
+    try:
+        common_dir = Path(common)
+        if not common_dir.is_absolute():
+            # a PLAIN checkout answers with a relative ".git"; a linked worktree
+            # answers with the main repo's absolute .git (verified, git 2.55), so
+            # this branch is the plain-checkout case, not the worktree one.
+            common_dir = (worktree / common_dir).resolve()
+        exclude = common_dir / "info" / "exclude"
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        existing = exclude.read_text(encoding="utf-8") if exclude.is_file() else ""
+        present = set(existing.splitlines())
+        new = [p for p in patterns if p not in present]
+        if not new:
+            return None
+        prefix = existing if not existing or existing.endswith("\n") else existing + "\n"
+        exclude.write_text(prefix + "\n".join(new) + "\n", encoding="utf-8")
+    # UnicodeError, not UnicodeDecodeError: the write raises the ENCODE sibling.
+    # Still far short of ValueError-broad, so a programming error still escapes.
+    except (OSError, RuntimeError, UnicodeError) as e:
+        return f"could not update the worktree-local git exclude ({worktree}): {e}"
+    return None
 
 
 def _copy_skills(project: Path, trees: Sequence[str], force: bool) -> bool:
