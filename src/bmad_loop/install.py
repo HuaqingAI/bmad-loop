@@ -781,7 +781,9 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
     try:
         # fsdecode, so a non-UTF-8 repo path round-trips back to the filesystem
         # instead of faulting. It can still raise on Windows (utf-8/surrogatepass
-        # rejects a lone invalid byte), which is why it sits inside this try.
+        # rejects a lone invalid byte), which is why it sits inside this try —
+        # defensive placement rather than a path under test: the regression test
+        # is POSIX-only because git on Windows has no such path to hand back.
         common_dir = Path(os.fsdecode(raw).strip())
         if not common_dir.is_absolute():
             # a PLAIN checkout answers with a relative ".git"; a linked worktree
@@ -807,8 +809,15 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
         # The helper rather than a hand-rolled tmp+replace: its temp name is
         # unique, and EVERY linked worktree of a repo resolves to this same
         # common dir, so a fixed `.tmp` sibling is a collision between two runs
-        # provisioning against one repo. It also fsyncs before the replace and
-        # carries the mode over, which a bare replace resets.
+        # provisioning against one repo. It also fsyncs before the replace, and
+        # carries the mode over when the exclude already exists, which a bare
+        # replace resets; one it creates from nothing gets the helper's
+        # deliberate 0600 rather than the umask default.
+        #
+        # Atomicity per write is NOT isolation across the read above and this
+        # write: they are unserialized, so two such runs interleaving lose one
+        # side's patterns outright, both returning None. That race predates
+        # #375 and survives this fix — it is #381.
         atomic_write_text(exclude, prefix + "\n".join(new) + "\n")
     # UnicodeError, not UnicodeDecodeError: the write raises the ENCODE sibling.
     # Still far short of ValueError-broad, so a programming error still escapes.
