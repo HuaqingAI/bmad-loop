@@ -29,7 +29,7 @@ from typing import Any, NamedTuple
 
 from .adapters.profile import ALIASES, CLIProfile, ProfileError, load_profiles
 from .checks import Finding
-from .platform_util import atomic_replace
+from .platform_util import atomic_write_text
 from .policy import POLICY_TEMPLATE
 from .process_host import get_process_host
 
@@ -787,22 +787,20 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
         if not new:
             return None
         prefix = existing if not existing or existing.endswith("\n") else existing + "\n"
-        # Write-then-replace, never write_text onto `exclude` directly (#375).
+        # atomic_write_text, never write_text onto `exclude` directly (#375).
         # write_text opens "w", which TRUNCATES before writing, and this is a
         # read-modify-REWRITE carrying the operator's own excludes in `prefix` —
         # so a short write (ENOSPC) left the file truncated mid-content while the
         # degrade reason still said "could not update". Worse, the surviving tail
         # is a valid git pattern and a prefix of the intended one: cut one char
-        # in and the last line is "/", which excludes the entire worktree. And
-        # the blast radius is the MAIN repo, since a linked worktree's
-        # --git-common-dir points at the main .git.
-        tmp = exclude.with_name(f"{exclude.name}.bmad-loop.tmp")
-        try:
-            tmp.write_text(prefix + "\n".join(new) + "\n", encoding="utf-8")
-            atomic_replace(tmp, exclude)
-        except (OSError, RuntimeError, UnicodeError):
-            tmp.unlink(missing_ok=True)  # never leave the scratch file behind
-            raise
+        # in and the last line is "/", which excludes the entire worktree.
+        #
+        # The helper rather than a hand-rolled tmp+replace: its temp name is
+        # unique, and EVERY linked worktree of a repo resolves to this same
+        # common dir, so a fixed `.tmp` sibling is a collision between two runs
+        # provisioning against one repo. It also fsyncs before the replace and
+        # carries the mode over, which a bare replace resets.
+        atomic_write_text(exclude, prefix + "\n".join(new) + "\n")
     # UnicodeError, not UnicodeDecodeError: the write raises the ENCODE sibling.
     # Still far short of ValueError-broad, so a programming error still escapes.
     except (OSError, RuntimeError, UnicodeError) as e:

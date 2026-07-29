@@ -1,3 +1,4 @@
+import io
 import json
 import re
 import sys
@@ -7,6 +8,7 @@ from pathlib import Path
 import pytest
 from conftest import git
 
+import bmad_loop.install as install_mod
 from bmad_loop import verify
 from bmad_loop.adapters.profile import get_profile
 from bmad_loop.install import (
@@ -1500,17 +1502,14 @@ def test_worktree_local_exclude_degrades_on_write_fault(project, monkeypatch):
 
     Ablation: drop the tail's `try` (or `OSError` from its tuple) and this fails —
     the OSError propagates out of `_worktree_local_exclude`."""
-    real_write = Path.write_text
 
-    def boom(self, *a, **kw):
-        # matches the scratch file too: the write lands on "exclude.bmad-loop.tmp"
-        # and is os.replace'd into place, so a filter pinned to "exclude" alone
-        # would stop injecting anything and pass vacuously (#375).
-        if self.name.startswith("exclude"):
-            raise OSError("read-only .git")
-        return real_write(self, *a, **kw)
+    def boom(*a, **kw):
+        raise OSError("read-only .git")
 
-    monkeypatch.setattr(Path, "write_text", boom)
+    # patched at install's OWN binding: the exclude write goes through
+    # atomic_write_text (#375), which writes via os.fdopen on an mkstemp fd, so a
+    # Path.write_text/Path.open patch never fires and would pass vacuously.
+    monkeypatch.setattr(install_mod, "atomic_write_text", boom)
 
     reason = _worktree_local_exclude(project.project, ["/probe-359"])
 
@@ -1579,14 +1578,14 @@ def test_worktree_local_exclude_short_write_leaves_exclude_intact(project, monke
     through the real `open(mode="w")` is the whole point — that is what
     truncates.
 
-    Ablation: write directly to `exclude` instead of tmp + atomic_replace and
+    Ablation: swap `atomic_write_text` back to a direct `exclude.write_text` and
     this fails — the file comes back truncated."""
     exclude = project.project / ".git" / "info" / "exclude"
     exclude.parent.mkdir(parents=True, exist_ok=True)
     exclude.write_text("# OPERATOR'S OWN\n/secret-local\n", encoding="utf-8")
     before = exclude.read_bytes()
 
-    real_open = Path.open
+    real_open = io.open
 
     class ShortWriter:
         def __init__(self, f):
@@ -1606,22 +1605,28 @@ def test_worktree_local_exclude_short_write_leaves_exclude_intact(project, monke
         def __getattr__(self, name):
             return getattr(self._f, name)
 
-    def opener(self, *a, **kw):
+    def opener(file, *a, **kw):
         mode = a[0] if a else kw.get("mode", "r")
-        handle = real_open(self, *a, **kw)
-        if "w" in mode and self.name.startswith("exclude"):
+        handle = real_open(file, *a, **kw)
+        # io.open is the ONE seam both shapes share: the fix reaches it through
+        # os.fdopen on an mkstemp fd (an int), the ablation through Path.open (a
+        # path). Patching either one alone injects into only one of them, so the
+        # ablation would silently stop biting.
+        if "w" in mode:
             return ShortWriter(handle)
         return handle
 
-    monkeypatch.setattr(Path, "open", opener)
+    monkeypatch.setattr(io, "open", opener)
 
     reason = _worktree_local_exclude(project.project, ["/probe-359"])
 
     monkeypatch.undo()
     assert reason is not None and "No space left" in reason
     assert exclude.read_bytes() == before  # untouched, not half-rewritten
-    # and the scratch file is not left lying next to it
-    assert not (exclude.parent / "exclude.bmad-loop.tmp").exists()
+    # no scratch file left lying next to it. Globbed, not a fixed name: the
+    # helper's temp is uniquely named (mkstemp), so asserting one literal
+    # filename is absent would pass no matter what the code did.
+    assert [p.name for p in exclude.parent.iterdir()] == ["exclude"]
 
 
 @pytest.mark.skipif(
@@ -1691,17 +1696,14 @@ def test_provision_worktree_exclude_fault_reports_on_degraded(project, tmp_path,
     repo = project.project
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
-    real_write = Path.write_text
 
-    def boom(self, *a, **kw):
-        # matches the scratch file too: the write lands on "exclude.bmad-loop.tmp"
-        # and is os.replace'd into place, so a filter pinned to "exclude" alone
-        # would stop injecting anything and pass vacuously (#375).
-        if self.name.startswith("exclude"):
-            raise OSError("read-only .git")
-        return real_write(self, *a, **kw)
+    def boom(*a, **kw):
+        raise OSError("read-only .git")
 
-    monkeypatch.setattr(Path, "write_text", boom)
+    # patched at install's OWN binding: the exclude write goes through
+    # atomic_write_text (#375), which writes via os.fdopen on an mkstemp fd, so a
+    # Path.write_text/Path.open patch never fires and would pass vacuously.
+    monkeypatch.setattr(install_mod, "atomic_write_text", boom)
     msgs: list[str] = []
 
     provision_worktree(wt, [get_profile("claude")], repo, on_degraded=msgs.append)
