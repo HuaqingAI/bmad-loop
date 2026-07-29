@@ -276,6 +276,17 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   the shared config) the shield is skipped with a journaled reason rather than widened back. Lines an
   older bmad-loop already wrote into `.git/info/exclude` are **not** removed for you — delete them by
   hand (a `validate` warning lands separately).
+- **A non-UTF-8 filename no longer crashes the run past every git guard (#377).** `verify._run_git`
+  is the sole git spawn point and exists to give git's faults a type its ~50 `except GitError`
+  guards can catch, but it decoded git's output strictly and translated only a timeout and a spawn
+  `OSError`. `UnicodeDecodeError` is a third fault raised before any return code exists, and being a
+  `ValueError` it matched neither arm — so one file whose name is not valid in the run's encoding
+  (POSIX filenames are arbitrary bytes) escaped untyped. Reachable wherever git's own quoting is
+  off: the `-z` callers (merge pre-flight collision detection), `worktree list --porcelain` — which
+  crashed the unguarded stale-run reconcile at every run and sweep start — and `git diff`, whose
+  content is verbatim, so a failed unit's forensic capture bypassed the valve that preserves its
+  uncaptured work. Such output is now a `GitError` like any other git failure. Making those paths
+  usable rather than merely non-fatal is a separate change.
 
 - **One undecodable byte of verify output no longer crashes the run (#378).** Verify commands are
   arbitrary operator tools, and their captured output was decoded strictly — a child emitting bytes
