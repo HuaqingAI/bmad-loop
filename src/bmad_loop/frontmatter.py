@@ -84,8 +84,18 @@ def status_of(fm: dict[str, Any]) -> str:
     lowercase, so a stray ``Done``/``In-Review`` from a hand-edited spec still
     matches. (``devcontract`` keeps its own lowercasing; it parses skill-written
     prose where casing genuinely varies.)
+
+    A YAML-null status (a bare ``status:`` line, or ``status: null``) reads as
+    ``""`` — the same as a missing key — because a spec template may legitimately
+    leave the value blank (see the comment on ``devcontract._FM_STATUS_RE``, whose
+    writer side fills exactly that shape). Without the guard ``str(None)`` would
+    make it the token ``"none"``, which every allowlist then treats as a
+    deliberate custom status (#358). A *literal* ``status: none`` is the string
+    ``"none"`` — PyYAML resolves only ``~``/``null``/``Null``/``NULL``/empty as
+    null — so a hand-written token still reads back exactly as written.
     """
-    return str(fm.get("status", "")).strip().lower()
+    raw = fm.get("status", "")
+    return ("" if raw is None else str(raw)).strip().lower()
 
 
 def operator_actions_of(fm: dict[str, Any]) -> tuple[str, ...]:

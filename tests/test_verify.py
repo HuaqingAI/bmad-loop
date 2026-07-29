@@ -211,18 +211,20 @@ def test_run_git_locale_merge_preserves_explicit_env(project, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "raw,expected",
+    "fm,expected",
     [
-        ("in-review", "in-review"),
-        ("  in-review  ", "in-review"),
-        ("In-Review", "in-review"),
-        ("DONE", "done"),
-        (None, ""),
-        (123, "123"),
+        ({"status": "in-review"}, "in-review"),
+        ({"status": "  in-review  "}, "in-review"),
+        ({"status": "In-Review"}, "in-review"),
+        ({"status": "DONE"}, "done"),
+        ({}, ""),  # missing key
+        ({"status": None}, ""),  # YAML-null (bare `status:`) reads like a missing key
+        ({"status": "none"}, "none"),  # a literal token stays itself
+        ({"status": 123}, "123"),
     ],
 )
-def test_status_of_normalizes(raw, expected):
-    assert verify.status_of({"status": raw} if raw is not None else {}) == expected
+def test_status_of_normalizes(fm, expected):
+    assert verify.status_of(fm) == expected
 
 
 def test_verify_dev_happy(project):

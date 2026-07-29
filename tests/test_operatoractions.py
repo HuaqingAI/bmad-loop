@@ -423,6 +423,20 @@ def test_drift_names_the_side_that_disagrees(project, spec_status, board, expect
     assert story.confirmable is (expect_drift is None)
 
 
+def test_drift_renders_a_blank_spec_status_readably(project):
+    """A YAML-null `status:` reads back as "" (`status_of`, #358), so this line would
+    otherwise trail off after "status: " and tell a human nothing. The remedy is the
+    same as for any moved-on spec — but only if they can see what it actually says."""
+    spec = _park(project)
+    spec.write_text(
+        spec.read_text().replace("status: 'awaiting-operator'", "status:"), encoding="utf-8"
+    )
+    (story,) = operatoractions.resolve(project.project, project)
+    assert story.spec_status == ""
+    assert story.drift() == "its spec now says status: (blank)"
+    assert story.confirmable is False
+
+
 def test_drift_reports_a_missing_spec_before_a_missing_status(project):
     spec = _park(project)
     spec.unlink()

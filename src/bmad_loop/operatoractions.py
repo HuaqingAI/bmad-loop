@@ -329,7 +329,9 @@ class ParkedStory:
         if self.spec_status is None:
             return f"its spec is missing or unreadable ({self.spec_path})"
         if self.spec_status != AWAITING_OPERATOR:
-            return f"its spec now says status: {self.spec_status}"
+            # A blank frontmatter `status:` reads "" (status_of normalizes YAML-null),
+            # which would otherwise render as an empty tail on a human-facing line.
+            return f"its spec now says status: {self.spec_status or '(blank)'}"
         if self.board_status is None:
             return "it is not on the sprint board"
         if self.board_status != AWAITING_OPERATOR:
