@@ -1,10 +1,12 @@
 """`frontmatter.set_frontmatter_status` — the verified in-place status writer.
 
-Two halves. The CHARACTERIZATION half was written against the pre-rewrite line
-scanner and is green on both sides of it: it pins the formatting-preserving
-minimal edit, and the two deliberate non-preservations (a quoted value and a
-trailing inline comment are both dropped) that a "make it a YAML round-trip"
-refactor would silently change out from under callers three files away. The
+Three sections. The CHARACTERIZATION half was written
+against the pre-rewrite line scanner and is green on both sides of it: it pins
+the formatting-preserving minimal edit, and the two deliberate non-preservations
+(a quoted value and a trailing inline comment are both dropped) that a "make it a
+YAML round-trip" refactor would silently change out from under callers three
+files away. The LINE ENDINGS half pins #357 part 1: the same contract, over the
+bytes the old `read_text`/`write_text` pair relaid across the whole file. The
 BEHAVIOR half pins the rewrite: a writer that verifies its own edit by
 re-parsing, and RAISES rather than returning a `False` nobody reads when the
 reader can see a status it cannot safely move.
@@ -14,8 +16,6 @@ next to `set_frontmatter_field`'s. They were deliberately left there —
 characterize before restructuring, and moving them would hide this diff behind a
 rename. Consolidating them here is filed as #357.
 """
-
-import os
 
 import pytest
 import yaml
@@ -33,25 +33,6 @@ def _spec(tmp_path, text: str, name: str = "spec.md"):
     return path
 
 
-def _as_written(text: str) -> str:
-    """What `Path.write_text` actually puts on disk for `text`.
-
-    `set_frontmatter_status` writes with `write_text`, whose default newline
-    handling relays EVERY line ending in the file to `os.linesep` — so on Windows
-    an all-LF spec comes back all-CRLF, from a writer whose contract is "only the
-    status value changes". That is the largest possible violation of it, it has
-    always been there, and it is filed as #357 rather than fixed here: fixing it
-    needs `_replace_value` to carry each line's own ending (today it appends a
-    bare `\n`, which would leave a CRLF file with one LF line) plus its own CRLF
-    characterization, and it is shared with `devcontract.reset_spec_status`.
-
-    Modelling the relay keeps the byte-exact "every OTHER byte unchanged" gate —
-    the half that catches a wrong-target write, which no substring assertion has —
-    while letting Windows say what the writer really does. A no-op on POSIX.
-    """
-    return text.replace("\n", os.linesep)
-
-
 # ============================================================ characterization
 #
 # Green before AND after the rewrite. Anything that fails here is a change to the
@@ -63,9 +44,7 @@ def test_a_plain_flip_changes_the_status_line_and_nothing_else(tmp_path):
     comments, quoting and body survive byte-for-byte."""
     spec = _spec(tmp_path, _PLAIN)
     assert frontmatter.set_frontmatter_status(spec, "done") is True
-    assert spec.read_bytes().decode() == _as_written(
-        _PLAIN.replace("status: in-review", "status: done")
-    )
+    assert spec.read_bytes().decode() == _PLAIN.replace("status: in-review", "status: done")
 
 
 def test_flipping_to_the_status_already_there_returns_false_and_does_not_write(tmp_path):
@@ -86,7 +65,7 @@ def test_a_quoted_value_is_written_back_unquoted(tmp_path):
     value's quotes" breaks those three from here."""
     spec = _spec(tmp_path, "---\nstatus: 'in-review'\n---\nbody\n")
     assert frontmatter.set_frontmatter_status(spec, "done") is True
-    assert spec.read_bytes().decode() == _as_written("---\nstatus: done\n---\nbody\n")
+    assert spec.read_bytes().decode() == "---\nstatus: done\n---\nbody\n"
 
 
 def test_a_trailing_inline_comment_on_the_status_line_is_dropped(tmp_path):
@@ -95,23 +74,19 @@ def test_a_trailing_inline_comment_on_the_status_line_is_dropped(tmp_path):
     guess turns a working spec into a refused write. Filed as #357."""
     spec = _spec(tmp_path, "---\nstatus: in-review  # set by step-03\n---\nbody\n")
     assert frontmatter.set_frontmatter_status(spec, "done") is True
-    assert spec.read_bytes().decode() == _as_written("---\nstatus: done\n---\nbody\n")
+    assert spec.read_bytes().decode() == "---\nstatus: done\n---\nbody\n"
 
 
 def test_a_status_prefixed_key_is_never_targeted(tmp_path):
     spec = _spec(tmp_path, "---\nstatus_note: keep me\nstatus: in-review\n---\nbody\n")
     assert frontmatter.set_frontmatter_status(spec, "done") is True
-    assert spec.read_bytes().decode() == _as_written(
-        "---\nstatus_note: keep me\nstatus: done\n---\nbody\n"
-    )
+    assert spec.read_bytes().decode() == "---\nstatus_note: keep me\nstatus: done\n---\nbody\n"
 
 
 def test_a_commented_out_status_line_is_never_targeted(tmp_path):
     spec = _spec(tmp_path, "---\n# status: draft\nstatus: in-review\n---\nbody\n")
     assert frontmatter.set_frontmatter_status(spec, "done") is True
-    assert spec.read_bytes().decode() == _as_written(
-        "---\n# status: draft\nstatus: done\n---\nbody\n"
-    )
+    assert spec.read_bytes().decode() == "---\n# status: draft\nstatus: done\n---\nbody\n"
 
 
 def test_no_frontmatter_block_returns_false_with_the_bytes_unchanged(tmp_path):
@@ -137,13 +112,72 @@ def test_a_present_but_empty_status_is_filled(tmp_path):
     the writer must be able to move, not as a missing key."""
     spec = _spec(tmp_path, "---\nstatus:\ntitle: t\n---\nbody\n")
     assert frontmatter.set_frontmatter_status(spec, "done") is True
-    assert spec.read_bytes().decode() == _as_written("---\nstatus: done\ntitle: t\n---\nbody\n")
+    assert spec.read_bytes().decode() == "---\nstatus: done\ntitle: t\n---\nbody\n"
 
 
 def test_indentation_on_the_status_line_survives(tmp_path):
     spec = _spec(tmp_path, "---\n  status: in-review\n---\nbody\n")
     assert frontmatter.set_frontmatter_status(spec, "done") is True
-    assert spec.read_bytes().decode() == _as_written("---\n  status: done\n---\nbody\n")
+    assert spec.read_bytes().decode() == "---\n  status: done\n---\nbody\n"
+
+
+# =============================================================== line endings
+#
+# The half of "only the status value changes" the writer used to break on every
+# call (#357). `read_text`/`write_text` relaid EVERY ending in the file — a CRLF
+# spec came back all-LF on POSIX and an all-LF spec came back all-CRLF on
+# Windows — so these were unwritable before the byte-level read/write. Two gates
+# per case, because either alone passes for the wrong reason: byte-exact equality
+# (which a substring assertion cannot give) AND "no bare LF was introduced", the
+# one that catches `_replace_value` re-emitting a flat `"\n"` for the single line
+# it touched and leaving the file mixed.
+#
+# WHICH PLATFORM PROVES WHAT. These three cover the READ half; reverting it to
+# `read_text` fails all three anywhere. The WRITE half is POSIX-invisible —
+# `write_text`'s `newline=None` translates `"\n"` to `os.linesep`, which on POSIX
+# is `"\n"` — so reverting `write_bytes` keeps this whole file green on Linux and
+# only the Windows CI leg catches it. What catches it there is the byte-exact
+# equality in the CHARACTERIZATION half above: those fixtures are all-LF, and
+# `write_text` on Windows returns them all-CRLF. That is why those assertions are
+# bare comparisons rather than routed through an os.linesep-modelling helper —
+# the helper that used to sit here described the defect instead of failing on it.
+
+
+def test_a_crlf_spec_keeps_every_crlf_and_only_the_status_line_changes(tmp_path):
+    crlf = _PLAIN.replace("\n", "\r\n")
+    spec = _spec(tmp_path, crlf)
+    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    text = spec.read_bytes().decode()
+    assert text == crlf.replace("status: in-review", "status: done")
+    assert "\n" not in text.replace("\r\n", "")  # not one bare LF, anywhere
+    assert frontmatter.status_of(frontmatter.read_frontmatter(spec)) == "done"
+
+
+def test_a_cr_only_spec_keeps_its_bare_carriage_returns(tmp_path):
+    """`_split_frontmatter` and `_replace_value` are both `splitlines`-based, which
+    treats a bare `\\r` as a line break — so this writer rewrites a CR-only spec as
+    authored. Its `devcontract.reset_spec_status` sibling is regex-based on
+    `\\r?\\n` and no-ops on the same input; that asymmetry is pinned deliberately
+    in tests/test_devcontract.py."""
+    cr = _PLAIN.replace("\n", "\r")
+    spec = _spec(tmp_path, cr)
+    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    text = spec.read_bytes().decode()
+    assert text == cr.replace("status: in-review", "status: done")
+    assert "\n" not in text
+    assert frontmatter.status_of(frontmatter.read_frontmatter(spec)) == "done"
+
+
+def test_a_mixed_ending_spec_keeps_each_line_its_own_ending(tmp_path):
+    """The ending is carried from the line being edited, not detected once for the
+    file. The status line is the odd one out on purpose — a whole-file `nl =
+    "\\r\\n" if "\\r\\n" in text else "\\n"` reading is green on the pure-CRLF case
+    above and rewrites this LF status line to CRLF."""
+    mixed = "---\r\ntitle: List command\r\nstatus: in-review\nowner: amelia\r\n---\r\nbody\r\n"
+    spec = _spec(tmp_path, mixed)
+    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    assert spec.read_bytes().decode() == mixed.replace("status: in-review", "status: done")
+    assert frontmatter.status_of(frontmatter.read_frontmatter(spec)) == "done"
 
 
 # ================================================================== behavior
@@ -232,7 +266,7 @@ def test_a_decoy_before_the_real_status_does_not_capture_the_write(tmp_path, dec
     text = f"---\n{decoy}status: in-review\n---\nbody\n"
     spec = _spec(tmp_path, text)
     assert frontmatter.set_frontmatter_status(spec, "done") is True
-    assert spec.read_bytes().decode() == _as_written(f"---\n{decoy}status: done\n---\nbody\n")
+    assert spec.read_bytes().decode() == f"---\n{decoy}status: done\n---\nbody\n"
     assert frontmatter.status_of(frontmatter.read_frontmatter(spec)) == "done"
 
 
@@ -249,7 +283,7 @@ def test_a_key_spelling_yaml_accepts_is_rewritten_with_its_formatting_kept(tmp_p
     reader ever accepts — it lands on the unparseable-block raise above.)"""
     spec = _spec(tmp_path, f"---\n{key}: {value}\n---\nbody\n")
     assert frontmatter.set_frontmatter_status(spec, "done") is True
-    assert spec.read_bytes().decode() == _as_written(f"---\n{key}: done\n---\nbody\n")
+    assert spec.read_bytes().decode() == f"---\n{key}: done\n---\nbody\n"
     assert frontmatter.status_of(frontmatter.read_frontmatter(spec)) == "done"
 
 
@@ -289,9 +323,7 @@ def test_the_verified_edit_is_never_a_yaml_round_trip(tmp_path):
     )
     spec = _spec(tmp_path, text)
     assert frontmatter.set_frontmatter_status(spec, "done") is True
-    assert spec.read_bytes().decode() == _as_written(
-        text.replace("status: in-review", "status: done")
-    )
+    assert spec.read_bytes().decode() == text.replace("status: in-review", "status: done")
     fm = frontmatter.read_frontmatter(spec)
     assert fm["status"] == "done" and fm["tags"] == ["a", "b"]
     assert list(fm) == ["title", "tags", "status", "owner"]  # order survives

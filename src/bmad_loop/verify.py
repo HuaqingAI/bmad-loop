@@ -984,10 +984,15 @@ def set_frontmatter_field(path: Path, key: str, value: str) -> bool:
     quoted ``"baseline_revision":`` was missed by the scan and a second one
     appended, so the spec carried the key twice and the reader resolved the
     wrong one.
+
+    Byte-preserving on the same terms as its sibling: ``read_bytes().decode`` in,
+    ``write_bytes`` out, so a CRLF spec is not relaid to LF (nor an LF one to
+    CRLF on Windows) by a write contracted to move one field. The INSERTED line
+    takes the block's own ending, not a bare ``\\n``.
     """
     if not path.is_file():
         return False
-    text = path.read_text(encoding="utf-8")
+    text = path.read_bytes().decode("utf-8")
     split = _split_frontmatter(text)
     if split is None:
         return False
@@ -995,7 +1000,7 @@ def set_frontmatter_field(path: Path, key: str, value: str) -> bool:
     edited = _edit_frontmatter_block(block, key, value, insert=True)
     if edited is None:
         return False
-    path.write_text(before + edited + after, encoding="utf-8")
+    path.write_bytes((before + edited + after).encode("utf-8"))
     return True
 
 

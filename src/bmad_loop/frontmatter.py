@@ -6,8 +6,11 @@ Zero git/subprocess dependencies (only stdlib + PyYAML) so pure domain modules
 and dragging in its whole git surface (assessment finding F-1). ``verify``
 re-exports these names, so every existing ``verify.<name>`` / ``from .verify
 import <name>`` call site stays valid. (The same docstring rule bars importing
-``platform_util`` here — it pulls in ``subprocess`` — so this module's writes use
-``write_text``, not ``atomic_replace``.)
+``platform_util`` here — it pulls in ``subprocess`` — so this module's writes are
+a plain ``write_bytes``, not ``atomic_replace``: byte-preserving, but not atomic.
+``read_bytes().decode`` on the way in for the same reason — ``read_text``'s
+universal-newline translation would hand the writer an all-LF copy of a CRLF
+spec, and every line ending in the file would be relaid on the way back out.)
 
 READER AND WRITER DEGRADE IN OPPOSITE DIRECTIONS, deliberately. `read_frontmatter`
 turns an unparseable or undecodable block into ``{}``: it runs on the observation
@@ -153,12 +156,42 @@ LineRenderer = Callable[[str, "re.Match[str]", str], str]
 
 def _replace_value(line: str, m: re.Match[str], value: str) -> str:
     """Keep everything through the colon verbatim — indent, a quoted key,
-    whitespace before the colon — then ``<space><value>``.
+    whitespace before the colon — then ``<space><value>``, then THIS LINE'S OWN
+    terminator.
 
     The gap after the colon is normalized rather than preserved because a bare
     ``status:`` has none to preserve, and filling it would write ``status:done``,
-    which is not the key at all."""
-    return f"{line[: m.end()]} {value}" + ("\n" if line.endswith("\n") else "")
+    which is not the key at all.
+
+    The terminator is carried rather than re-emitted as ``"\\n"``: a CRLF spec
+    would otherwise come back with exactly one bare-LF line — the status line the
+    writer was asked to touch — leaving the file mixed. ``rstrip`` is safe here
+    because the caller splits with ``splitlines(keepends=True)``, so a line
+    carries at most one terminator; ``\\r\\n``, ``\\n``, a bare ``\\r`` and a
+    final line with no terminator at all each round-trip as authored."""
+    stripped = line.rstrip("\r\n")
+    nl = line[len(stripped) :]
+    return f"{line[: m.end()]} {value}{nl}"
+
+
+def _last_line_ending(block: str) -> str:
+    """The terminator of ``block``'s last line — what an INSERTED line must carry
+    so an append does not introduce a foreign ending into the file.
+
+    The same per-line reading `_replace_value` does, for the branch that has no
+    line to copy from: an inserted key goes directly after the block's last line,
+    so that line's ending is the one it should share. Falls back to ``"\\n"`` for
+    an empty block (``---``/``---`` with nothing between) and for a last line
+    carrying no terminator at all — neither can happen through
+    `_split_frontmatter`, whose block is always followed by the closing delimiter
+    line, but an appended key that started on the previous line would be a
+    corruption rather than a formatting nit, so it is guarded rather than
+    reasoned about."""
+    lines = block.splitlines(keepends=True)
+    if not lines:
+        return "\n"
+    last = lines[-1]
+    return last[len(last.rstrip("\r\n")) :] or "\n"
 
 
 def _edit_frontmatter_block(
@@ -205,7 +238,9 @@ def _edit_frontmatter_block(
     `devcontract.reset_spec_status` need and `set_frontmatter_status` must never
     do. It is gated on the READER's view rather than on a scan miss, which is the
     other half of the same defect: a scan that missed a quoted key then appended
-    a SECOND one, and the file ended up with two."""
+    a SECOND one, and the file ended up with two. The inserted line takes the
+    ending of the line it follows (`_last_line_ending`), so an insert cannot
+    introduce a foreign line ending any more than a replacement can."""
     pattern = _key_line_re(key) if pattern is None else pattern
     try:
         original = yaml.safe_load(block)
@@ -218,8 +253,7 @@ def _edit_frontmatter_block(
     if not isinstance(original, dict) or key not in original:
         if not insert:
             return None  # the reader sees no such top-level key — nothing to change
-        nl = "\r\n" if block.endswith("\r\n") else "\n"
-        return _verified(block + f"{key}: {value}{nl}", key, value, rest)
+        return _verified(block + f"{key}: {value}{_last_line_ending(block)}", key, value, rest)
     if original[key] == value:
         return None  # already at the target — idempotent no-op, no write
     lines = block.splitlines(keepends=True)
@@ -268,6 +302,15 @@ def set_frontmatter_status(path: Path, status: str) -> bool:
     changes, and the edit is verified by re-parsing before it lands (see
     `_edit_frontmatter_block`).
 
+    That includes the file's LINE ENDINGS, every one of them: the read is
+    ``read_bytes().decode`` and the write is ``write_bytes``, so a CRLF spec
+    stays CRLF and a mixed-ending spec keeps each line's own terminator. Going
+    through ``read_text``/``write_text`` instead relaid the whole file — CRLF in,
+    LF out on POSIX, and every LF out as CRLF on Windows — which is the largest
+    violation a writer contracted to "only the status value changes" can commit.
+    Not atomic (see the module docstring); a torn write is a separate concern
+    from a byte-preserving one.
+
     Returns True when the file was rewritten. Returns False for **nothing to
     change** only: no file, no frontmatter block, no top-level `status` for
     `read_frontmatter` to see, or already at the target. Raises
@@ -283,7 +326,7 @@ def set_frontmatter_status(path: Path, status: str) -> bool:
     """
     if not path.is_file():
         return False
-    text = path.read_text(encoding="utf-8")
+    text = path.read_bytes().decode("utf-8")
     split = _split_frontmatter(text)
     if split is None:
         return False
@@ -291,5 +334,5 @@ def set_frontmatter_status(path: Path, status: str) -> bool:
     edited = _edit_frontmatter_block(block, "status", status, pattern=_STATUS_KEY_RE)
     if edited is None:
         return False
-    path.write_text(before + edited + after, encoding="utf-8")
+    path.write_bytes((before + edited + after).encode("utf-8"))
     return True
