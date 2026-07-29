@@ -1740,6 +1740,45 @@ def test_shield_reuses_already_enabled_extension(project, tmp_path, monkeypatch)
     assert "/probe-384" in _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
 
 
+def test_shield_enables_extension_when_only_the_global_config_claims_it(
+    project, tmp_path, monkeypatch
+):
+    """`extensions.*` is repo-format state git honors ONLY from the repository's own
+    config, so the "is it already enabled" question has exactly one legitimate place
+    to be asked. Asked unscoped, a `worktreeConfig = true` in the operator's
+    ~/.gitconfig answers it — the shield concludes the repo is ready, skips the
+    write, and the activation then dies with git's own `--worktree cannot be used
+    with multiple working trees` — a repo one write away from being shielded,
+    skipped over instead.
+
+    The global value is planted through GIT_CONFIG_GLOBAL, pinned around the shield
+    call alone for the reason the XDG test gives at length: an env pin that outlives
+    the code under test changes what git thinks of files already checked out.
+
+    Ablation: drop `--file <shared>` from the extension probe and this fails — the
+    global value is believed, the extension never reaches the repo config, and the
+    activation returns a reason instead of None."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    fake_global = tmp_path / "gitconfig-with-the-extension"
+    fake_global.write_text("[extensions]\n\tworktreeConfig = true\n", encoding="utf-8")
+
+    with monkeypatch.context() as pinned:
+        pinned.setenv("GIT_CONFIG_GLOBAL", str(fake_global))
+        reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert reason is None
+    # the repo's OWN format was changed, i.e. the global claim was not mistaken
+    # for one about this repository
+    assert "worktreeConfig" in (repo / ".git" / "config").read_text(encoding="utf-8")
+    # ...and the shield it unlocks actually holds, which is what the unscoped probe
+    # cost: without the write above, `config --worktree` cannot store the pointer.
+    assert "/probe-384" in _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    (wt / "probe-384").write_text("noise\n", encoding="utf-8")
+    assert git(wt, "status", "--short") == ""
+
+
 def test_shield_seeds_users_excludesfile(project, tmp_path):
     """A worktree-scoped `core.excludesFile` SHADOWS the operator's own — git reads
     the key from the most specific scope that sets it and does not concatenate

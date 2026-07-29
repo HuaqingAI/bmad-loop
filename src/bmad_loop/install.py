@@ -830,14 +830,25 @@ def _shield_enable_worktree_config(worktree: Path, common_dir: Path) -> str | No
             f"{found!r} — enabling the extension on an older git is a permanent "
             "repo-format change that would shield nothing"
         )
-    probe = _shield_git(worktree, "config", "--type=bool", "--get", "extensions.worktreeConfig")
+    # EVERY read below names the SHARED config as a file rather than going by
+    # scope. `--local` from a linked worktree already resolves to this same file,
+    # but naming it keeps the checks honest if that ever stops being true — and,
+    # load-bearing for the first of them, it stops a value the operator set
+    # GLOBALLY from answering a question about this repository's format.
+    #
+    # `extensions.*` is repo-format state git honors only from the repo's own
+    # config, so an unscoped `--get extensions.worktreeConfig` asks the wrong file:
+    # a `worktreeConfig = true` in ~/.gitconfig answers it, this returns "already
+    # enabled", the write below never happens, and the activation dies with
+    # `fatal: --worktree cannot be used with multiple working trees unless the
+    # config extension worktreeConfig is enabled` — the shield skipped over a repo
+    # that was one write away from supporting it.
+    shared = str(common_dir / "config")
+    probe = _shield_git(
+        worktree, "config", "--file", shared, "--type=bool", "--get", "extensions.worktreeConfig"
+    )
     if probe.returncode == 0 and os.fsdecode(probe.stdout).strip() == "true":
         return None
-    # Read the SHARED config as a file rather than by scope: `--local` from a
-    # linked worktree already resolves to this same file, but naming it keeps the
-    # check honest if that ever stops being true, and it cannot be answered by a
-    # value the operator set globally.
-    shared = str(common_dir / "config")
     bare = _shield_git(worktree, "config", "--file", shared, "--type=bool", "--get", "core.bare")
     if bare.returncode == 0 and os.fsdecode(bare.stdout).strip() == "true":
         refused = "core.bare = true"
