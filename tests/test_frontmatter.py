@@ -209,14 +209,13 @@ def test_a_hash_inside_a_quoted_value_never_becomes_a_comment(tmp_path):
     spec = _spec(tmp_path, '---\nstatus: "a # b"\ntitle: t\n---\nbody\n')
     assert frontmatter.set_frontmatter_status(spec, "done") is True
     assert spec.read_bytes().decode() == "---\nstatus: done\ntitle: t\n---\nbody\n"
-    assert "#" not in spec.read_bytes().decode().split("---")[1]
 
 
 def test_a_hash_abutting_the_scalar_is_part_of_the_value_not_a_comment(tmp_path):
-    """`status: done#x` is the single value `done#x` — YAML needs whitespace
-    before a `#` for it to open a comment. `_VALUE_COMMENT_RE`'s `sep` requires
-    that whitespace, so this falls to the full drop rather than carrying `#x`
-    forward as a comment the spec never had."""
+    """`status: in-review#x` is the single value `in-review#x` — YAML needs
+    whitespace before a `#` for it to open a comment. `_VALUE_COMMENT_RE`'s `sep`
+    requires that whitespace, so this falls to the full drop rather than carrying
+    `#x` forward as a comment the spec never had."""
     spec = _spec(tmp_path, "---\nstatus: in-review#x\ntitle: t\n---\nbody\n")
     assert frontmatter.read_frontmatter(spec)["status"] == "in-review#x"  # one scalar
     assert frontmatter.set_frontmatter_status(spec, "done") is True
