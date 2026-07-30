@@ -1996,6 +1996,19 @@ def test_shield_rolls_back_despite_its_own_partial_config_worktree(project, tmp_
     exist to make, and leave the operator's repo carrying a permanent format change for
     a shield that never held.
 
+    The fixture has to be hand-written — asking git for it would need the extension
+    already enabled, which makes `needs_enable` False and removes the rollback this
+    test is about — and `as_posix()` on the embedded value is load-bearing, not style.
+    WINDOWS CI CAUGHT THIS AND POSIX CANNOT: `str(WindowsPath)` renders
+    `C:\\Users\\…`, and a backslash in a git config VALUE is an escape sequence, so
+    `\\U`/`\\A`/`\\T` make the file unparseable. Once this call's own enable turns the
+    extension on, every git invocation from this worktree — including the rollback's
+    `--unset` — then dies with `fatal: bad config line 2 in …/config.worktree`, the
+    flag survives, and the test fails for a reason the fixture invented (measured;
+    git accepts forward slashes on Windows and needs no escaping for them). The
+    PRODUCTION write is unaffected: it passes the path to `git config` as an argument
+    and git escapes it itself, storing `C:\\\\Users\\\\…` and reading it back intact.
+
     Ablation: include our own `git_dir` in the scan and this fails — `worktreeConfig`
     stays in the shared config and the reason claims a sibling depends on it."""
     repo = project.project
@@ -2004,7 +2017,8 @@ def test_shield_rolls_back_despite_its_own_partial_config_worktree(project, tmp_
     git_dir = Path(git(wt, "rev-parse", "--absolute-git-dir")).resolve()
     # what a timed-out activation leaves behind: our own pointer, already written
     (git_dir / "config.worktree").write_text(
-        f"[core]\n\texcludesFile = {git_dir / 'info' / 'exclude'}\n", encoding="utf-8"
+        f"[core]\n\texcludesFile = {(git_dir / 'info' / 'exclude').as_posix()}\n",
+        encoding="utf-8",
     )
     real = install_mod.git_bytes
 
@@ -2021,6 +2035,11 @@ def test_shield_rolls_back_despite_its_own_partial_config_worktree(project, tmp_
 
     assert reason is not None and "read-only .git" in reason
     assert "LEFT enabled" not in reason  # our own file is not a dependency on anyone
+    # Separates the two ways the flag could survive, because the flag-text assertion
+    # below cannot: "the guard declined" (above) and "the unset itself failed" (here).
+    # Without this the Windows fixture fault above presented as a silent failure of
+    # the property under test, and cost several rounds of measurement to attribute.
+    assert "could NOT be rolled back" not in reason
     assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
 
 
