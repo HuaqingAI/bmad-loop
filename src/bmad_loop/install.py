@@ -1367,9 +1367,9 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
     state, enabled once and never removed here, and git versions older than 2.20
     refuse to access a repository carrying it (git-worktree(1)). See
     `_shield_enable_worktree_config` for the two shapes where enabling it is
-    refused outright. It is paid ONLY when the shield actually activates: that
-    function probes, and the write itself happens here, one line above the
-    activation. Enabling it up front — where it used to be — charged the operator's
+    refused outright. It is paid at the LAST possible moment, so no degrade above it
+    can charge it: that function probes, and the write itself happens here, one line
+    above the activation. Enabling it up front — where it used to be — charged the operator's
     repo that permanent price on every path that then degraded away without
     shielding anything. Moving it down leaves exactly two writes able to set it
     without shielding anything — the enable itself and the activation — and each

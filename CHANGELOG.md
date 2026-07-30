@@ -291,9 +291,9 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   depends on it: without either, one run's failed shield silently switched off a sibling run's
   working one mid-story. Three caveats: this enables `extensions.worktreeConfig`, a **permanent**
   repo-format flag that is never removed — written at the last possible moment, so a run that
-  degrades away leaves your repo's format untouched, and if either of the two writes that can leave
-  it set without a working shield then fails (the enable itself, or the activation) the flag is
-  rolled back. It outlives a failed shield only where the rollback was declined because a sibling
+  degrades away **above** it leaves your repo's format untouched, and if either of the two writes
+  that can leave it set without a working shield then fails (the enable itself, or the activation)
+  the flag is rolled back. It outlives a failed shield only where the rollback was declined because a sibling
   worktree depends on the flag, or could not be made at all — and both are named in the reason — the
   lock leaves a
   zero-length `.git/bmad-loop-shield.lock` behind (inside `.git`, so never in your working tree and
