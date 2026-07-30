@@ -798,6 +798,52 @@ def _git_version_at_least(reported: str, want: tuple[int, int]) -> bool:
     return match is not None and (int(match[1]), int(match[2])) >= want
 
 
+def _shield_shared_config(worktree: Path, shared: str, key: str, *opts: str) -> bytes | None:
+    """`key`'s raw value in the SHARED config, or None when it is definitely ABSENT.
+
+    Raises `GitError` when git did not answer. **rc 1 is the only non-zero rc that
+    means "no such key"** — the funnel `_shield_inherited_excludes` already applies to
+    its own read (round 9), applied here to the three probes that were still reading
+    every non-zero rc as an absence (#384, Codex round 10). Routing those to ABSENT
+    degrades the `core.bare` / `core.worktree` gates OPEN, and what they guard is
+    irreversible: enabling `extensions.worktreeConfig` drops the exception that
+    confined those keys to the main worktree, after which a genuine `core.worktree`
+    starts applying to every linked worktree.
+
+    Measured at git 2.20.4 AND 2.55.0, identical at both ends of the supported range:
+
+        absent key ......................... 1     malformed config file ..... 128
+        missing file ....................... 1     --type=bool on a non-bool . 128
+        `--file` naming a directory ........ 1     key present ................ 0
+        unreadable file (EACCES, non-root) . 1     empty or valueless key ..... 0
+
+    git-config(1) prefaces its own list with "Some exit codes are:", i.e. the list is
+    not closed, and it documents a malformed file as ret=3 while both versions
+    actually answer 128 — so a `{0,1}`-closed reading is wrong on git's documentation
+    AND on its behavior. Hence a funnel rather than a per-rc taxonomy (round 7).
+
+    THE RESIDUAL THIS CANNOT CLOSE, stated rather than left for another round: a
+    momentarily missing or unreadable `.git/config` answers **rc 1**, byte-identical
+    to "no such key" — all four rc-1 rows above are the same answer from here. git
+    exposes no way to separate them, so this is a bound on the interface rather than a
+    defect. Deliberately NOT narrowed with a pre-`--get` stat: that is TOCTOU, which
+    shrinks the window instead of closing it, adds a syscall to every probe, and
+    trades a very rare silent-wrong for a less rare noisy-degrade. Bounded in practice
+    because git rewrites config atomically (lock + rename), so only a non-git tool
+    truncating in place can produce it.
+
+    Returns the value RAW and undecoded — `core.worktree` is a path — so callers test
+    presence with `is not None`, never truthiness. See the call sites for why.
+    """
+    answer = git_bytes(worktree, "config", "--file", shared, *opts, "--get", key)
+    if answer.returncode == 0:
+        return answer.stdout
+    if answer.returncode == 1:
+        return None
+    detail = os.fsdecode(answer.stderr).strip() or f"git exited {answer.returncode}"
+    raise GitError(f"git could not read {key} from the shared config: {detail}")
+
+
 def _shield_enable_worktree_config(worktree: Path, common_dir: Path) -> tuple[str | None, bool]:
     """May `git config --worktree` be made writable in this repo? `(reason, needs_enable)`.
 
@@ -809,8 +855,11 @@ def _shield_enable_worktree_config(worktree: Path, common_dir: Path) -> tuple[st
     the mkdir, the write and the activation — so every degrade below it, including
     the `_shield_inherited_excludes` one, left the operator's repo permanently
     marked for a shield that never applied. The caller now enables it immediately
-    before the activation, and rolls it back if the activation itself then fails, so
-    the flag survives only a shield that actually holds.
+    before the activation, and rolls the flag back when the shield then fails to
+    hold — including when the ENABLE ITSELF fails in a way that leaves the outcome
+    unknown, which is round 10. The flag outlives a failed shield only where the
+    rollback was DECLINED because a sibling worktree depends on it, or could not be
+    made at all; both are named in the returned reason.
 
     `extensions.worktreeConfig` is what makes a per-worktree config file exist at
     all; without it `git config --worktree` either refuses outright (a repo with
@@ -834,12 +883,30 @@ def _shield_enable_worktree_config(worktree: Path, common_dir: Path) -> tuple[st
     permanent format change with nothing to show for it — and git-worktree(1) says
     older git refuses a repository carrying the extension. And `--type=` is itself
     git 2.18: on an older git the two probes below exit non-zero, which this
-    function would read as "not enabled" and, worse, as "not bare" — silently
+    function USED to read as "not enabled" and, worse, as "not bare" — silently
     opening the core.bare gate the paragraph above exists to hold shut. That is the
-    safety-gate-degrading-open trap, and refusing at the top is what keeps the pair
-    unreachable. The caller's own `--type=path` excludesFile read depends on the
-    same floor. So: the GATES run first and early, the WRITE runs last and late.
+    safety-gate-degrading-open trap, and it had a second door: ANY unanswerable rc
+    did the same thing, not just an old git's. `_shield_shared_config` now closes
+    that one by raising on every rc but 0 and 1 (round 10).
+
+    THAT IS DEFENCE IN DEPTH BEHIND THIS GATE, NOT A REPLACEMENT FOR IT, and the
+    distinction is worth stating because the funnel makes the 2.18 pair fail closed
+    on its own and a later round could read that as licence to relax the floor. It is
+    not: this gate rests on two arguments the funnel does not touch — a permanent
+    format change bought on a git that cannot use it, and git-worktree(1)'s older-git
+    refusal — and it keeps the 2.18 pair UNREACHABLE rather than merely survivable.
+    The caller's own `--type=path` excludesFile read depends on the same floor.
+    So: the GATES run first and early, the WRITE runs last and late.
     """
+    # Polarity note, deliberately recorded: this gate reads `returncode != 0` as
+    # REFUSE, while the funnel below reads it as "git did not answer" and raises.
+    # Both fail closed, by opposite-looking means, and unifying them would reverse
+    # one of them — an unanswerable `git version` must refuse here, not degrade into
+    # a question about a key. Nor can this gate catch a bad repo config on git's
+    # behalf: `{ "version", cmd_version }` carries no flags at all in git.c, so it
+    # never does repository setup, and measured at 2.20.4 and 2.55.0 `git version`
+    # exits 0 under both a malformed `.git/config` and a non-bool `core.bare` while
+    # `rev-parse` fatals 128 on each.
     version = git_bytes(worktree, "version")
     if version.returncode != 0 or not _git_version_at_least(
         os.fsdecode(version.stdout), _WORKTREE_CONFIG_GIT
@@ -905,15 +972,22 @@ def _shield_enable_worktree_config(worktree: Path, common_dir: Path) -> tuple[st
     # question either way — `--includes` dates to git 1.7.10, far below the 2.20
     # floor the gate above enforces.
     shared = str(common_dir / "config")
-    probe = git_bytes(
-        worktree, "config", "--file", shared, "--type=bool", "--get", "extensions.worktreeConfig"
-    )
-    if probe.returncode == 0 and os.fsdecode(probe.stdout).strip() == "true":
+    carried = _shield_shared_config(worktree, shared, "extensions.worktreeConfig", "--type=bool")
+    if carried is not None and os.fsdecode(carried).strip() == "true":
         return None, False  # already carried: nothing for the caller to write
-    bare = git_bytes(worktree, "config", "--file", shared, "--type=bool", "--get", "core.bare")
-    if bare.returncode == 0 and os.fsdecode(bare.stdout).strip() == "true":
+    bare = _shield_shared_config(worktree, shared, "core.bare", "--type=bool")
+    if bare is not None and os.fsdecode(bare).strip() == "true":
         refused = "core.bare = true"
-    elif git_bytes(worktree, "config", "--file", shared, "--get", "core.worktree").returncode == 0:
+    elif _shield_shared_config(worktree, shared, "core.worktree") is not None:
+        # `is not None`, NEVER truthiness: any value refuses, including an empty one.
+        # Measured at 2.20.4 and 2.55.0 — `core.worktree = ""` and a valueless
+        # `worktree` line BOTH answer rc 0 with a lone b"\n", so raw truthiness
+        # happens to hold today, but it is one `.strip()` away from b"", which is
+        # falsy, and that would re-open this gate for a key that IS set. The rc is the
+        # only thing separating present-but-empty from absent, and returning it as
+        # None-or-value is exactly what the helper exists to do. Never decoded, and
+        # the value never inspected: this key is a path, and its mere PRESENCE is the
+        # refusal — unlike `core.bare`, where only a true value disqualifies.
         refused = "core.worktree"
     else:
         # Cleared, not enabled. The write itself is the caller's, deferred to the
@@ -933,10 +1007,11 @@ def _shield_undo_extension(worktree: Path, git_dir: Path, common_dir: Path) -> s
     clause naming the fault when it is not — never raises, because every caller is
     already reporting a degrade and this exists to say what it could not undo.
 
-    Callers MUST gate this on having enabled the flag themselves. Unsetting one the
-    repository already carried would stop git reading the `config.worktree` files
-    other worktrees may depend on — the reason the shield's rollback is conditional
-    rather than unconditional cleanup.
+    Callers MUST gate this on having enabled the flag themselves — or, since round
+    10, on not having been able to FIND OUT whether they did, which is what the
+    enable's own raise means. Unsetting one the repository already carried would stop
+    git reading the `config.worktree` files other worktrees may depend on — the
+    reason the shield's rollback is conditional rather than unconditional cleanup.
 
     That caller-side gate is necessary and NOT sufficient, which is round 8 (#384,
     Codex P2). `needs_enable` records what the probe saw, and the enable itself is an
@@ -973,11 +1048,19 @@ def _shield_undo_extension(worktree: Path, git_dir: Path, common_dir: Path) -> s
     accepted — a stale admin dir git has not pruned yet counts as a dependent, which
     costs a flag left enabled and nothing else.
 
+    Round 10 widened that window's APERTURE without changing its bound: this rollback
+    now also runs from the enable's own raise, one call earlier, so there are two
+    occasions on which a non-lock-taking party can be caught mid-transaction rather
+    than one. Same class and same bounded consequence, twice as often.
+
     Measured, because "the key is gone" and "the extension is off" are two claims:
-    `--unset` exits 0, removes the key AND the now-empty `[extensions]` section (the
+    the unset exits 0, removes the key AND the now-empty `[extensions]` section (the
     config file returns to its original bytes), and `git config --worktree` refuses
     again afterwards with git's own fatal — so this is a real rollback, not cosmetic.
-    `--unset` of an absent key exits 5, which the gate above means we never do.
+    An ABSENT key exits 5, which used to be unreachable ("the gate above means we
+    never do") and stopped being so in round 10: the enable's raise routes here
+    without knowing whether anything was written. See the call below for why that
+    makes rc 5 a success and why the spelling is `--unset-all`.
     """
     try:
         # The main worktree's own, then every SIBLING's — never ours (above).
@@ -1009,13 +1092,29 @@ def _shield_undo_extension(worktree: Path, git_dir: Path, common_dir: Path) -> s
         dependent = f"the scan for sibling worktrees failed ({e})"
     if dependent is not None:
         return (
-            "; extensions.worktreeConfig was enabled for this shield and deliberately "
-            f"LEFT enabled — {dependent} exists, so another worktree's shield depends "
+            "; extensions.worktreeConfig was deliberately LEFT enabled — "
+            f"{dependent} exists, so another worktree's shield depends "
             "on the flag and unsetting it would stop git reading that file"
         )
     try:
-        undone = git_bytes(worktree, "config", "--unset", "extensions.worktreeConfig")
-        if undone.returncode == 0:
+        # `--unset-all`, and rc 5 counts as SUCCESS. Both halves are round 10's, and
+        # neither is cosmetic. Routing an uncertain ENABLE into this rollback makes an
+        # absent flag reachable here for the first time, and `--unset` of an absent
+        # key exits 5 — which rendered as "could NOT be rolled back (git exited 5)"
+        # for a repository whose flag is in fact gone: a false disclosure.
+        #
+        # `--unset` alone could not simply treat 5 as success, because git-config(1)
+        # gives that code TWO meanings — "unset an option which does not exist" and
+        # "unset/set an option for which multiple lines match" — so a doubled key that
+        # SURVIVED would report a clean rollback. Measured at 2.20.4 and 2.55.0,
+        # identical: `--unset` against a doubled key exits 5 and removes NOTHING,
+        # while `--unset-all` exits 0 and removes both lines. `--unset-all` therefore
+        # collapses rc 5 to the single meaning "no line matched", which makes the
+        # guarantee structural instead of resting on a four-step argument about which
+        # doubled values can reach here. It is also what this function actually
+        # promises: a statement about the KEY, not about one line.
+        undone = git_bytes(worktree, "config", "--unset-all", "extensions.worktreeConfig")
+        if undone.returncode in (0, 5):
             return ""
         detail = os.fsdecode(undone.stderr).strip() or f"git exited {undone.returncode}"
     except GitError as e:
@@ -1023,10 +1122,17 @@ def _shield_undo_extension(worktree: Path, git_dir: Path, common_dir: Path) -> s
         # is the coherent case rather than a contrived one: a read-only `.git` or a
         # dead git fails the unset for the same reason it failed the activation.
         detail = str(e)
+    # Both clauses HEDGE whether this shield set the flag, which round 10 made
+    # necessary: reached from the enable's own raise, a spawn failure can kill the
+    # enable and this unset for the same reason, having written nothing at all — and
+    # the old wording ("was enabled for this shield and could NOT be rolled back")
+    # then asserted a format change the repository does not carry. No real precision
+    # is lost: `needs_enable` is probe-derived and already cannot tell "we enabled it"
+    # from "we and a concurrent run both thought we did".
     return (
-        "; extensions.worktreeConfig was enabled for this shield and could NOT be "
-        f"rolled back ({detail}) — the repository keeps a permanent format change "
-        "that shields nothing"
+        "; extensions.worktreeConfig could NOT be "
+        f"rolled back ({detail}) — if this shield set the flag, the repository keeps "
+        "a permanent format change that shields nothing"
     )
 
 
@@ -1265,13 +1371,18 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
     function probes, and the write itself happens here, one line above the
     activation. Enabling it up front — where it used to be — charged the operator's
     repo that permanent price on every path that then degraded away without
-    shielding anything. Moving it down leaves only the activation's OWN failure able
-    to set it without shielding anything, and that arm ROLLS THE FLAG BACK — for both
-    of the ways that call can fail (a non-zero rc and a raise), which took two review
-    rounds to get right because the first two attempts enumerated failure shapes
-    instead of funnelling them. Only when this call is what set the flag, and only
-    when no other worktree's `config.worktree` depends on it; see
-    `_shield_undo_extension`.
+    shielding anything. Moving it down leaves exactly two writes able to set it
+    without shielding anything — the enable itself and the activation — and each
+    classifies both of the ways a chokepoint call can fail (a non-zero rc and a
+    raise). The ACTIVATION rolls the flag back on either shape. The ENABLE rolls it
+    back on the raise ONLY, because an rc from that write is git declining to make
+    it: nothing was written, so there is nothing to undo, and undoing it anyway
+    would unset a concurrent writer's flag. That asymmetry is load-bearing, not an
+    unfinished enumeration. Getting here took four review rounds, because the early
+    attempts enumerated failure shapes instead of funnelling them, and the funnel was
+    then applied to the activation but not to the enable one line above it. Rollback
+    only when this call is what set the flag, and only when no other worktree's
+    `config.worktree` depends on it; see `_shield_undo_extension`.
 
     CONCURRENCY — the probe→enable→activate→rollback sequence runs under an exclusive
     `file_lock` on `<common dir>/bmad-loop-shield.lock`, because that flag is the one
@@ -1553,21 +1664,57 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
             # forever AHEAD of the seed, the mkdir and the write, so every degrade
             # below it (including the `_shield_inherited_excludes` fault that round 5
             # turned from a swallow into a degrade) left the repo marked for a shield
-            # that never applied. Nothing between here and the activation can degrade,
-            # so the only path that can still set the flag without shielding anything is
-            # the activation's OWN failure — which is why that arm rolls it back below.
+            # that never applied. Nothing BETWEEN this write and the activation can
+            # degrade — and that sentence used to stop right there, which is what
+            # round 10 caught: "nothing between here and X" never covered the ENABLE
+            # ITSELF, precisely as round 6 found it did not cover the activation
+            # itself. This call has its own two failure shapes. So the paths that can
+            # still set the flag without shielding anything are the enable's own raise
+            # (handled immediately below) and the activation's failure (handled after
+            # it), and each rolls the flag back.
             #
             # It cannot move BELOW the activation: `git config --worktree` is what the
             # extension unlocks, so the activation fatals without it.
             if needs_enable:
-                enabled = git_bytes(worktree, "config", "extensions.worktreeConfig", "true")
-                if enabled.returncode != 0:
-                    detail = (
-                        os.fsdecode(enabled.stderr).strip() or f"git exited {enabled.returncode}"
+                # BOTH of the chokepoint's failure shapes, classified into one value
+                # before anything is decided — round 7's funnel, applied to the one
+                # call that never received it (#384, Codex round 10). Handling only
+                # the rc left a raise (a timeout, a spawn failure) to the tail, which
+                # cannot roll anything back: `git config` can be killed AFTER it has
+                # renamed the new config into place, so the flag survived with no
+                # shield ever activated.
+                #
+                # THE ROLLBACK FIRES ON THE RAISE ONLY, and that asymmetry is
+                # deliberate — it is NOT the enumeration defect it resembles, so do
+                # not "finish" it by rolling back the rc too. Round 5's taxonomy draws
+                # the line: an rc IS an answer. git refused, which means the lock file
+                # was never renamed into place and there is nothing to undo; the
+                # likeliest cause is `.git/config.lock` contention with a concurrent
+                # writer, and that writer is exactly the party whose flag an `--unset`
+                # would then remove. A raise is NOT an answer — we did not find out —
+                # and only the uncertain case may trigger repair. Both shapes are
+                # still CLASSIFIED in one place, which is the part round 7 was about.
+                #
+                # `needs_enable` is True on this branch, so `_shield_undo_extension`'s
+                # caller-side gate is satisfied by construction; the callee applies
+                # its own sibling-ownership gate on top.
+                rolled_back = ""
+                try:
+                    enabled = git_bytes(worktree, "config", "extensions.worktreeConfig", "true")
+                    enable_fault = (
+                        None
+                        if enabled.returncode == 0
+                        else os.fsdecode(enabled.stderr).strip()
+                        or f"git exited {enabled.returncode}"
                     )
+                except GitError as e:
+                    enable_fault = str(e)
+                    rolled_back = _shield_undo_extension(worktree, git_dir, common_dir)
+                if enable_fault is not None:
                     return (
-                        f"could not enable extensions.worktreeConfig ({worktree}): {detail} — the "
-                        "provisioned tool files are not shielded from the unit's `git add -A`"
+                        f"could not enable extensions.worktreeConfig ({worktree}): "
+                        f"{enable_fault} — the provisioned tool files are not shielded "
+                        f"from the unit's `git add -A`{rolled_back}"
                     )
             # LAST, after the file it names exists: git reads core.excludesFile lazily,
             # but a config pointing at a file that a fault above left unwritten would
@@ -1578,14 +1725,23 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
             # timeout, or a spawn failure as its GitSpawnError subclass) — and the two
             # preceding rounds each fixed ONE of them, because each fix ENUMERATED the
             # failure it had been shown. Enumeration is what kept being incomplete. So
-            # both shapes converge on one `fault` string BEFORE anything is decided, and
-            # there is a single place where the flag can be rolled back; a third failure
-            # shape would have to get past the `try` itself.
+            # both shapes converge on one `fault` string BEFORE anything is decided; a
+            # third failure shape for THIS call would have to get past the `try`
+            # itself. What that sentence used to add — "and there is a single place
+            # where the flag can be rolled back" — was true of the failure SHAPES and
+            # false of the WRITES: round 10 added a second rollback point at the
+            # enable above, because rollback sites track the number of writes that can
+            # fail, not the number of ways each one fails.
             #
             # The rollback exists because the enable one line above is a PERMANENT
             # repo-format change, and the guarantee this code owes (docstring, CHANGELOG,
-            # docs/FEATURES.md) is that the flag survives only a shield that actually
-            # activated. `needs_enable` gates it — see `_shield_undo_extension` for why
+            # docs/FEATURES.md) is that the flag outlives a failed shield only where a
+            # rollback was declined or could not be made, and the reason says which.
+            # That wording is round 10's: it used to read "survives only a shield that
+            # actually activated", which the enable's own raise falsified. When a
+            # fix's value proposition is a GUARANTEE, the same edit has to reach every
+            # copy of it — these three, plus this function's own docstring.
+            # `needs_enable` gates it — see `_shield_undo_extension` for why
             # that condition is a safety property and not a micro-optimization, and for
             # the second gate it applies itself: `needs_enable` records what the PROBE
             # saw, so it cannot tell "we enabled it" from "we and a concurrent run both

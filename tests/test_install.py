@@ -59,6 +59,19 @@ def _wt_private_exclude(wt):
     return Path(git(wt, "rev-parse", "--absolute-git-dir")) / "info" / "exclude"
 
 
+def _is_unset(args):
+    """Does this `git_bytes` argv unset a key, in ANY of git's spellings?
+
+    A PREFIX test rather than `"--unset" in args`, and the reason is a trap this
+    suite walked into: `args` is a tuple, so membership is exact-token, and round
+    10's switch from `--unset` to `--unset-all` silently stopped four fakes from
+    matching. Two were assertions and failed loudly; the other two were TRIPWIRES,
+    which simply went quiet — a tripwire that no longer matches passes exactly like
+    a gate that works, and it takes the ablations built on it down with it.
+    """
+    return any(a.startswith("--unset") for a in args)
+
+
 def _registrations(profile, command="python3 /x/.bmad-loop/bmad_loop_hook.py {event}"):
     return {
         native: command.format(event=canonical)
@@ -1666,6 +1679,145 @@ def test_git_version_at_least_reads_only_a_git_version_line(reported, supported)
     assert _git_version_at_least(reported, (2, 20)) is supported
 
 
+def test_shield_refuses_when_the_core_worktree_probe_cannot_answer(project, tmp_path, monkeypatch):
+    """A safety probe that could not be ANSWERED must not read as "that key is unset".
+    `core.worktree` is genuinely set here, and the shield must refuse exactly as it
+    does when it can see the key — because what it guards is irreversible: enabling
+    `extensions.worktreeConfig` drops the exception confining `core.worktree` to the
+    main worktree, after which it applies to every linked one (git-worktree(1)).
+
+    THE ANSWER IS INJECTED, NOT THE ILLNESS — round 9's lesson, and the reason this
+    fixture is not a repo with a broken config. A genuinely malformed `.git/config`
+    fatals the caller's own earlier `rev-parse --absolute-git-dir` (measured 128 at
+    both 2.20.4 and 2.55.0), which takes the SILENT-SKIP arm above this branch, so
+    such a fixture would be vacuous. Keeping git healthy is also what leaves the harm
+    assertable through git itself once the gate is ablated.
+
+    rc 128 is what git really answers for a config it cannot parse (measured at 2.20.4
+    and 2.55.0); git-config(1) documents that case as ret=3 and prefaces its whole list
+    with "Some exit codes are:", so neither the docs nor the behavior support treating
+    every non-1 rc as an absence.
+
+    Ablation: in `_shield_shared_config`, replace the raise with `return None` (the old
+    `else` semantics) and this fails — the gate opens and `extensions.worktreeConfig`
+    lands in the shared config of a repo that sets `core.worktree`."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    git(repo, "config", "core.worktree", str(repo))
+    real = install_mod.git_bytes
+
+    def unanswerable_worktree_probe(worktree, *args):
+        # onto the core.worktree READ alone: everything else, including the sibling
+        # core.bare probe, runs for real so this pins THIS branch
+        if "--get" in args and "core.worktree" in args:
+            return subprocess.CompletedProcess(
+                args=["git", *args],
+                returncode=128,
+                stdout=b"",
+                stderr=b"fatal: config file was replaced mid-probe\n",
+            )
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", unanswerable_worktree_probe)
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert reason is not None and "replaced mid-probe" in reason
+    assert "core.worktree" in reason  # the reason names the question git could not answer
+    # read as TEXT, not `git config --get`: conftest's git() is check=True
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+    assert not _wt_private_exclude(wt).exists()
+
+
+def test_shield_refuses_when_the_core_bare_probe_cannot_answer(project, tmp_path, monkeypatch):
+    """The `core.bare` sibling of the probe above, and it needs its own case because
+    the two branches read their answers differently: `core.bare` refuses only on a
+    TRUE value, `core.worktree` on mere presence. An unanswerable rc must refuse in
+    both, and a fix applied to one arm only would leave this one open.
+
+    `--type=bool` gives this probe a second way to fail that the plain read has not:
+    measured at 2.20.4 and 2.55.0, `--type=bool` over a non-bool value exits 128
+    (2.20.4 words it "bad numeric config value", 2.55.0 "bad boolean config value" —
+    same rc). Note that no STATIC config value can reach that: a repo whose
+    `core.bare` is a non-bool fatals the caller's earlier `rev-parse` first (measured
+    128 at both). What reaches here is a transient fault inside the caller's lock.
+
+    Ablation: same one-line change in `_shield_shared_config` — the gate opens over a
+    repository that declares itself bare."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    shared_exclude = repo / ".git" / "info" / "exclude"
+    before = shared_exclude.read_bytes()
+    git(repo, "config", "core.bare", "true")
+    real = install_mod.git_bytes
+
+    def unanswerable_bare_probe(worktree, *args):
+        if "--get" in args and "core.bare" in args:
+            return subprocess.CompletedProcess(
+                args=["git", *args],
+                returncode=128,
+                stdout=b"",
+                stderr=b"fatal: bare probe could not be answered\n",
+            )
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", unanswerable_bare_probe)
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert reason is not None and "bare probe could not be answered" in reason
+    assert "core.bare" in reason
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+    assert shared_exclude.read_bytes() == before
+
+
+def test_shield_refuses_when_the_extension_probe_cannot_answer(project, tmp_path, monkeypatch):
+    """The third probe, whose unanswerable rc is harmful in the opposite direction to
+    its siblings'. Read as "not enabled" it does not open a safety gate — it makes the
+    shield WRITE, re-asserting a repo-format change over a repository whose flag is
+    already `true` and whose state we failed to read.
+
+    The flag is genuinely on here, so the correct outcome is a degrade that touches
+    nothing: not knowing is not the same as knowing it is off. The write is forbidden
+    by tripwire rather than asserted on the config text, for the reason
+    `test_shield_reuses_already_enabled_extension` gives — `git config` rewriting
+    `true` over `true` leaves the file byte-identical, so a bytes comparison passes
+    with the fix removed.
+
+    Ablation: same one-line change in `_shield_shared_config` — the probe's 128 reads
+    as "not enabled", the enable fires, and the fake raises."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    git(repo, "config", "extensions.worktreeConfig", "true")
+    real = install_mod.git_bytes
+
+    def unanswerable_extension_probe(worktree, *args):
+        if args[:1] == ("config",) and "extensions.worktreeConfig" in args and "--get" not in args:
+            raise AssertionError(f"wrote a repo-format change it could not read first: {args}")
+        if "--get" in args and "extensions.worktreeConfig" in args:
+            return subprocess.CompletedProcess(
+                args=["git", *args],
+                returncode=128,
+                stdout=b"",
+                stderr=b"fatal: extension probe could not be answered\n",
+            )
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", unanswerable_extension_probe)
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert reason is not None and "extension probe could not be answered" in reason
+    assert "extensions.worktreeConfig" in reason
+    # the flag the repo already carried is untouched, and no rollback was attempted
+    assert "worktreeConfig" in (repo / ".git" / "config").read_text(encoding="utf-8")
+    assert "could NOT be rolled back" not in reason
+    assert not _wt_private_exclude(wt).exists()
+
+
 def test_shield_refuses_to_enable_extension_over_old_git(project, tmp_path, monkeypatch):
     """`extensions.worktreeConfig` and `git config --worktree` are both git 2.20.
     Below that the write buys a PERMANENT repo-format change that shields nothing —
@@ -1774,11 +1926,13 @@ def test_shield_enables_the_extension_on_the_path_that_activates(project, tmp_pa
 
 
 def test_shield_rolls_back_the_extension_when_activation_fails(project, tmp_path, monkeypatch):
-    """The one degrade left that can still have made a permanent repo-format change:
-    the ACTIVATION's own failure, which happens one line after the enable. Round 5
-    moved the enable down to close every path above it; Codex then pointed out this
-    one, and it is real — read-only `.git` and a lock on `config.worktree` both reach
-    it. So the arm rolls the flag back.
+    """One of the two degrades that can still have made a permanent repo-format
+    change: the ACTIVATION's own failure, which happens one line after the enable.
+    Round 5 moved the enable down to close every path above it; Codex then pointed out
+    this one, and it is real — read-only `.git` and a lock on `config.worktree` both
+    reach it. So the arm rolls the flag back. (This docstring said "the one degrade
+    left" until round 10, which found the other: the ENABLE's own raise, covered by
+    `test_shield_rolls_back_an_enable_whose_git_faulted`.)
 
     Measured, not assumed: `--unset` removes the key *and* the now-empty
     `[extensions]` section, and `git config --worktree` refuses again afterwards, so
@@ -1835,7 +1989,7 @@ def test_shield_reports_a_rollback_it_could_not_make(project, tmp_path, monkeypa
             return subprocess.CompletedProcess(
                 args=["git", *args], returncode=1, stdout=b"", stderr=b"fatal: read-only .git\n"
             )
-        if "--unset" in args:
+        if _is_unset(args):
             return subprocess.CompletedProcess(
                 args=["git", *args], returncode=1, stdout=b"", stderr=b"fatal: could not lock\n"
             )
@@ -1869,7 +2023,7 @@ def test_shield_reports_a_rollback_whose_own_git_faulted(project, tmp_path, monk
     real = install_mod.git_bytes
 
     def fail_activation_and_raise_on_unset(worktree, *args):
-        if "--unset" in args:
+        if _is_unset(args):
             raise verify.GitSpawnError("git could not spawn")
         if "--worktree" in args:
             return subprocess.CompletedProcess(
@@ -1885,6 +2039,258 @@ def test_shield_reports_a_rollback_whose_own_git_faulted(project, tmp_path, monk
     assert "read-only .git" in reason  # the activation fault survived the rollback
     assert "could NOT be rolled back" in reason and "could not spawn" in reason
     assert "permanent format change" in reason
+
+
+@pytest.mark.parametrize("fault", [verify.GitError, verify.GitSpawnError])
+def test_shield_rolls_back_an_enable_whose_git_faulted(project, tmp_path, monkeypatch, fault):
+    """The ENABLE's own raise, which is round 10 (#384, Codex P2). `git_bytes` fails
+    two ways and this call handled only the rc, so a fault left the permanent
+    repo-format change in place with no shield ever activated: the raise went to the
+    caller's tail, which returns a reason and cannot roll anything back.
+
+    THE FAKE PERFORMS THE WRITE AND THEN RAISES, and that is the whole difference
+    between this test and a vacuous one. `git config` can be killed after it has
+    renamed the new config into place — the write landed, we never learned it — so
+    without the pass-through the flag would never have been set, "the flag is absent
+    afterwards" would hold trivially, and the assertion below would prove nothing.
+    That is the exact failure mode round 7 recorded, where a fault-injection test
+    asserting only the reason string sat on a live defect for two rounds.
+
+    The `--unset-all` is deliberately let through to the real git, so the rollback
+    asserted here is the real one rather than the fake's.
+
+    Ordering matters as much as the outcome: round 9 found that hoisting a rollback
+    out of the `with` passed all 53 shield tests, so the rollback is pinned INSIDE
+    the lock here too.
+
+    Parametrized over both classes because they enter differently — a timeout as
+    `GitError`, a spawn failure as the `GitSpawnError` subclass. The message says
+    neither "timed out" (a lie for a spawn failure) nor "did not answer" (taken by
+    the excludes-read test, which could then not tell which call faulted).
+
+    Ablation: delete the new `except GitError` around the enable and both cases fail —
+    the fault reaches the tail, no rollback runs, and the flag survives."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+    events = []
+    real_lock, real_git, real_undo = (
+        install_mod.file_lock,
+        install_mod.git_bytes,
+        install_mod._shield_undo_extension,
+    )
+
+    @contextlib.contextmanager
+    def spy_lock(path, **kwargs):
+        events.append("lock-enter")
+        with real_lock(path, **kwargs):
+            yield
+        events.append("lock-exit")
+
+    def enable_then_die(worktree, *args):
+        if (
+            args[:1] == ("config",)
+            and "extensions.worktreeConfig" in args
+            and "--get" not in args
+            and not _is_unset(args)
+        ):
+            events.append("enable")
+            real_git(worktree, *args)  # the rename into place DID land...
+            # non-vacuity, checked mid-flight: without this the harm below is trivial
+            assert "worktreeConfig" in (repo / ".git" / "config").read_text(encoding="utf-8")
+            raise fault("git config never reported back")  # ...and then git was killed
+        return real_git(worktree, *args)
+
+    def spy_undo(*a, **kw):
+        events.append("rollback")
+        return real_undo(*a, **kw)
+
+    monkeypatch.setattr(install_mod, "file_lock", spy_lock)
+    monkeypatch.setattr(install_mod, "git_bytes", enable_then_die)
+    monkeypatch.setattr(install_mod, "_shield_undo_extension", spy_undo)
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert reason is not None and "never reported back" in reason
+    # THE HARM, and it is only assertable because the write above really happened:
+    # the permanent repo-format change is gone again
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+    # names its own cause: a still-present flag would ALSO hold if the unset had failed
+    assert "could NOT be rolled back" not in reason
+    assert events == ["lock-enter", "enable", "rollback", "lock-exit"]
+
+
+def test_shield_rollback_treats_an_absent_flag_as_completed(project, tmp_path):
+    """`--unset-all` of a key that is not there exits 5, and that is a COMPLETED
+    rollback, not a failed one. Round 10 made this reachable for the first time: the
+    enable's raise routes into the rollback without knowing whether anything was
+    written, so "nothing was" is now an ordinary outcome rather than an impossible
+    one, and reporting it as a failure would tell the operator their repository keeps
+    a format change it does not have.
+
+    `--unset-all` rather than `--unset`, and the spelling is load-bearing because
+    git-config(1) gives rc 5 TWO meanings — "unset an option which does not exist" and
+    "unset/set an option for which multiple lines match". Measured at 2.20.4 and
+    2.55.0, identical at both: `--unset` against a DOUBLED key exits 5 and removes
+    nothing, while `--unset-all` exits 0 and removes both lines. So under `--unset`,
+    "treat 5 as success" would have reported a clean rollback for a key that survived;
+    under `--unset-all` rc 5 can only mean "no line matched".
+
+    Driven directly rather than through the shield: the caller reaches this state only
+    via an injected fault, and the claim under test is about the helper's own contract.
+
+    Ablation: drop `5` from the success tuple and this fails — the helper returns the
+    "could NOT be rolled back" clause for a repository that carries nothing."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    git_dir = Path(git(wt, "rev-parse", "--absolute-git-dir")).resolve()
+    common_dir = Path(git(wt, "rev-parse", "--git-common-dir")).resolve()
+    # the preconditions the clause depends on: no flag, and no sibling to decline for
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+    assert not (common_dir / "config.worktree").exists()
+
+    clause = _shield_undo_extension(wt, git_dir, common_dir)
+
+    assert clause == ""
+
+
+def test_shield_rollback_removes_every_line_of_a_doubled_flag(project, tmp_path):
+    """The other half of the `--unset-all` decision, and the one that makes the
+    spelling load-bearing rather than cosmetic. git-config(1) gives rc 5 two meanings,
+    and a key written on TWO lines is the second: measured at 2.20.4 and 2.55.0,
+    `--unset` against it exits 5 and removes NOTHING, while `--unset-all` exits 0 and
+    removes both.
+
+    So under `--unset` the "treat 5 as success" this fix needs would report a clean
+    rollback for a flag that is still enabled — the repository keeps a permanent
+    format change while the operator is told it does not. `--unset-all` collapses rc 5
+    to the single meaning "no line matched", which is what lets the sibling test above
+    treat it as success safely. The guarantee is then structural instead of resting on
+    an argument about which doubled values can reach here.
+
+    Written by hand rather than through `git config`, which de-duplicates: two literal
+    lines is the state git itself warns about ("has multiple values"). No path appears
+    in the fixture, so the `as_posix()` rule for hand-written config does not apply.
+
+    Ablation: change `--unset-all` back to `--unset` and this fails — the clause still
+    reads as a clean rollback while both lines survive in the config."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    git_dir = Path(git(wt, "rev-parse", "--absolute-git-dir")).resolve()
+    common_dir = Path(git(wt, "rev-parse", "--git-common-dir")).resolve()
+    shared = repo / ".git" / "config"
+    shared.write_text(
+        shared.read_text(encoding="utf-8")
+        + "[extensions]\n\tworktreeConfig = true\n\tworktreeConfig = true\n",
+        encoding="utf-8",
+    )
+    assert shared.read_text(encoding="utf-8").count("worktreeConfig") == 2  # non-vacuity
+
+    clause = _shield_undo_extension(wt, git_dir, common_dir)
+
+    assert clause == ""
+    # ...and the flag really is gone, which is what "" claimed
+    assert "worktreeConfig" not in shared.read_text(encoding="utf-8")
+
+
+def test_shield_hedges_a_rollback_it_could_not_make_after_an_uncertain_enable(
+    project, tmp_path, monkeypatch
+):
+    """When the ENABLE raised and the rollback then also failed, the reason may not
+    assert that this shield set the flag — because nothing may have been written at
+    all. That is the double fault round 10 introduced a path to: a spawn failure kills
+    the enable, so we never learn whether the config was replaced, and if the unset
+    fails too the operator is handed a clause about a format change that may not exist.
+
+    The old wording said "extensions.worktreeConfig **was enabled for this shield** and
+    could NOT be rolled back", which is a claim this frame cannot support. Both clauses
+    now hedge it. No precision is lost that was really there: `needs_enable` is
+    probe-derived and already cannot tell "we enabled it" from "we and a concurrent run
+    both thought we did".
+
+    The disclosure itself must survive the hedging — the operator still has to be told
+    the repository may keep a permanent format change — so this asserts the retained
+    clause AND the absence of the overclaim.
+
+    Ablation: restore the unhedged wording in `_shield_undo_extension` and this fails —
+    the reason states as fact that this shield enabled the flag."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    real = install_mod.git_bytes
+
+    def die_on_enable_and_fail_the_unset(worktree, *args):
+        if _is_unset(args) and "extensions.worktreeConfig" in args:
+            return subprocess.CompletedProcess(
+                args=["git", *args],
+                returncode=1,
+                stdout=b"",
+                stderr=b"fatal: config is read-only\n",
+            )
+        if args[:1] == ("config",) and "extensions.worktreeConfig" in args and "--get" not in args:
+            # no pass-through: the spawn never happened, so nothing was written
+            raise verify.GitSpawnError("git binary vanished")
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", die_on_enable_and_fail_the_unset)
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert reason is not None and "git binary vanished" in reason
+    # the disclosure survives...
+    assert "could NOT be rolled back" in reason and "config is read-only" in reason
+    assert "permanent format change" in reason
+    # ...but it is hedged, because this frame cannot know the write ever landed
+    assert "was enabled for this shield" not in reason
+    assert "if this shield set the flag" in reason
+
+
+def test_shield_does_not_claim_a_format_change_it_never_made(project, tmp_path, monkeypatch):
+    """The message-honesty half of the same fix. A spawn failure can kill the enable
+    before anything is written at all, and the rollback then finds nothing to undo —
+    so the reason must not tell the operator their repository keeps a permanent format
+    change. Before round 10 this path rendered as "extensions.worktreeConfig was
+    enabled for this shield and could NOT be rolled back (git exited 5)": a claim that
+    was false twice over, about a flag that was never set and a rollback that in fact
+    completed.
+
+    The unset is let through to the real git precisely so the rollback SUCCEEDS at
+    finding nothing; the fault is confined to the enable. Both clauses of
+    `_shield_undo_extension` now hedge whether this shield set the flag, since
+    `needs_enable` is probe-derived and cannot tell "we enabled it" from "we and a
+    concurrent run both thought we did".
+
+    Ablation: drop `5` from the success tuple in `_shield_undo_extension` and this
+    fails — the reason claims a permanent format change the repository does not carry."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    real = install_mod.git_bytes
+
+    def never_spawn_the_enable(worktree, *args):
+        # the ENABLE only — `--unset-all` names the same key, so it has to be excluded
+        # explicitly or the rollback would fault too and prove something else
+        if (
+            args[:1] == ("config",)
+            and "extensions.worktreeConfig" in args
+            and "--get" not in args
+            and not _is_unset(args)
+        ):
+            raise verify.GitSpawnError("git binary vanished")
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", never_spawn_the_enable)
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert reason is not None and "git binary vanished" in reason
+    # nothing was written, so nothing may be claimed
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+    assert "could NOT be rolled back" not in reason
+    assert "permanent format change" not in reason
 
 
 def test_shield_never_unsets_an_extension_the_repo_already_carried(project, tmp_path, monkeypatch):
@@ -1908,7 +2314,7 @@ def test_shield_never_unsets_an_extension_the_repo_already_carried(project, tmp_
     real = install_mod.git_bytes
 
     def fail_worktree_writes_forbid_unset(worktree, *args):
-        if "--unset" in args and "extensions.worktreeConfig" in args:
+        if _is_unset(args) and "extensions.worktreeConfig" in args:
             raise AssertionError(f"unset an extension this call did not enable: {args}")
         if "--worktree" in args:
             return subprocess.CompletedProcess(
@@ -1968,7 +2374,7 @@ def test_shield_never_unsets_an_extension_a_sibling_worktree_depends_on(
     real = install_mod.git_bytes
 
     def fail_worktree_writes_forbid_unset(worktree, *args):
-        if "--unset" in args and "extensions.worktreeConfig" in args:
+        if _is_unset(args) and "extensions.worktreeConfig" in args:
             raise AssertionError(f"unset a flag a sibling worktree depends on: {args}")
         if "--worktree" in args:
             return subprocess.CompletedProcess(
@@ -3323,6 +3729,11 @@ def test_worktree_local_exclude_git_fault_after_answering_degrades(
     and the raise bypassed the rollback that the non-zero-rc arm had. Codex found it
     by reading this test rather than the code. A degrade assertion that stops at the
     reason string cannot tell a clean degrade from one that left state behind.
+
+    Name-filtering on `--worktree` is what keeps this pinned to the ACTIVATION. The
+    enable's own raise is a different degrade with its own rollback (round 10) — see
+    `test_shield_rolls_back_an_enable_whose_git_faulted` — so this test no longer
+    covers "every way the flag can be left behind", only this one.
 
     Parametrized over both classes because they enter differently — a timeout is
     raised as `GitError` itself, a spawn failure as the `GitSpawnError` subclass.

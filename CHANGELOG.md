@@ -290,9 +290,12 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   activation never rolls the repo-format flag back while another worktree's `config.worktree` still
   depends on it: without either, one run's failed shield silently switched off a sibling run's
   working one mid-story. Three caveats: this enables `extensions.worktreeConfig`, a **permanent**
-  repo-format flag that is never removed — set only when the shield actually activates, so a run that
-  degrades away leaves your repo's format untouched (if the activation itself fails the flag is
-  rolled back, and a rollback that cannot be made is named in the reason) — the lock leaves a
+  repo-format flag that is never removed — written at the last possible moment, so a run that
+  degrades away leaves your repo's format untouched, and if either of the two writes that can leave
+  it set without a working shield then fails (the enable itself, or the activation) the flag is
+  rolled back. It outlives a failed shield only where the rollback was declined because a sibling
+  worktree depends on the flag, or could not be made at all — and both are named in the reason — the
+  lock leaves a
   zero-length `.git/bmad-loop-shield.lock` behind (inside `.git`, so never in your working tree and
   never stageable) — and where git requires that flag's
   prerequisites be moved by hand first (`core.bare = true` or `core.worktree` in the shared config)
@@ -301,6 +304,15 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   and no repo-format change is made, since git that old refuses a repository carrying the flag. Lines
   an older bmad-loop already wrote into `.git/info/exclude` are **not** removed for you — delete them
   by hand (a `validate` warning lands separately).
+- **The git-add shield no longer opens its own safety gates when git cannot answer (#384).** The
+  three probes that ask whether enabling `extensions.worktreeConfig` is safe read every non-zero
+  exit code as "that key is not set", so a git that could not answer — rather than one answering
+  "absent" — let a repository that really sets `core.worktree` cross the gate and take a permanent,
+  irreversible repo-format change. Only exit code 1 means "no such key" now; anything else skips the
+  shield with a reason. Separately, the write that enables the flag handled git _refusing_ but not
+  git _failing to reply_, so a timeout landing after the config was already replaced left the flag
+  set with no shield ever activated; that path now rolls the flag back too. A rollback of a flag
+  that was already absent is no longer reported as a rollback that failed.
 - **The git-add shield's git calls run on the shared chokepoint (#389).** They were the last bare
   `git` spawns outside `verify._run_git`, so they missed its `LC_ALL=C` pin — leaving a degrade
   reason that quotes git's stderr in whatever language the box speaks — and used a hardcoded 120s
