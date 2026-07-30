@@ -957,6 +957,22 @@ def _shield_undo_extension(worktree: Path, git_dir: Path, common_dir: Path) -> s
     this rollback (a timeout can leave one behind), and treating that as a dependent
     would suppress every rollback the round-6/7 fixes exist to make.
 
+    WHAT THIS DOES NOT COVER, stated rather than left for another round to find (the
+    round-6 lesson: a rationale of "now nothing can go wrong" has to enumerate its own
+    remaining cases). The scan reads an EXISTING file, so a non-lock-taking party
+    sitting between its own enable and its own activation owns the flag while having
+    written nothing yet, and this rollback will unset it. The consequence is bounded
+    and different in kind from the finding above: that party's `git config --worktree`
+    then fatals for want of the extension, so its shield degrades with a REPORTED
+    reason instead of silently going inert mid-run. That bound depends on a
+    precondition this scenario supplies for free, and it is worth naming because the
+    other branch is #384 itself: `git config --worktree` only REFUSES (rc 128) once a
+    repository has more than one worktree, and in a single-worktree repo it exits 0
+    and writes the SHARED config instead. Here a sibling exists by construction — it
+    is the other party — so the refusal is the one git gives. The reverse asymmetry is also
+    accepted — a stale admin dir git has not pruned yet counts as a dependent, which
+    costs a flag left enabled and nothing else.
+
     Measured, because "the key is gone" and "the extension is off" are two claims:
     `--unset` exits 0, removes the key AND the now-empty `[extensions]` section (the
     config file returns to its original bytes), and `git config --worktree` refuses
