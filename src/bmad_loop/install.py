@@ -976,6 +976,23 @@ def _shield_shared_repository(worktree: Path, common_dir: Path) -> str | None:
     THIS repository is shared. What is refused is a repository CONFIGURED as shared,
     which is the shape `git init --shared` writes: measured, `--shared=group` records
     `sharedrepository = 1`, the legacy numeric form the table above lists as group.
+
+    WORKTREE SCOPE is unread too, and unlike the global case that omission rests on a
+    barrier two modules away rather than on anything this function does. git DOES honor
+    `core.sharedRepository` from a linked worktree's own `config.worktree` — measured at
+    2.20.4 and 2.55.0, an object written from such a worktree under `umask 077` came back
+    `r--r-----` against a `r--------` control, while the `--file` read below answers rc 1
+    for it. What makes that unreachable is the provisioning flow: the shield only ever
+    runs on a worktree this process just created (`workspace.open_unit_workspace` ->
+    `verify.worktree_add` -> `worktree_flow.provision_worktree`), `git worktree add`
+    creates the admin dir with NO `config.worktree` at either version, and a re-mount
+    prunes `.git/worktrees/<id>` whole. The MAIN worktree's `.git/config.worktree` does
+    not reach a linked one either (measured, `r--------`), and the tree's only
+    worktree-scoped write is the shield's own `core.excludesFile`, further down this
+    file. So the value has no writer and no window. If a re-provision path onto an
+    EXISTING worktree is ever added, or anything upstream of the shield starts writing
+    the unit worktree's config, this read must grow a second
+    `--file <git_dir>/config.worktree` probe in the same change.
     """
     raw = _shield_shared_config(worktree, str(common_dir / "config"), "core.sharedRepository")
     if raw is None:
