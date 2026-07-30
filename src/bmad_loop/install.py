@@ -844,6 +844,93 @@ def _shield_shared_config(worktree: Path, shared: str, key: str, *opts: str) -> 
     raise GitError(f"git could not read {key} from the shared config: {detail}")
 
 
+def _shield_shared_repository(worktree: Path, common_dir: Path) -> str | None:
+    """Refuse a repository configured to be SHARED BETWEEN OS USERS, else None.
+
+    A repository shared between OS users is not a supported configuration
+    (maintainer decision, #384): the shield creates files of its own inside `.git`,
+    and making those work across OS users is out of scope. Refusing the
+    configuration up front is what makes that decision visible — it fails LOUDLY and
+    identically for every user, with a reason that is journaled and notified, rather
+    than behaving differently depending on which user provisioned first and leaving
+    state behind for the next run to meet.
+
+    This gate runs ABOVE the shield's lock, which is the point of it: nothing is
+    created in a shared repository at all. That is safe here and would not be for
+    `extensions.worktreeConfig` — this key is static configuration the tool never
+    writes, so there is no shared mutable state to serialize.
+
+    It adds no version floor: a plain `--get` with no `--type=`, so it does not
+    reintroduce the 2.18 trap that keeps the version gate above the probes in
+    `_shield_enable_worktree_config`.
+
+    AN ALLOWLIST, NOT AN ENUMERATION OF SHARED SHAPES (round 7's funnel). git accepts
+    keywords, booleans, the legacy 0/1/2, and bare octal modes; enumerating the
+    shared ones leaves every value git adds later, and every value git rejects,
+    silently opening the gate. Measured at git 2.20.4 AND 2.55.0, byte-identical at
+    both ends of the supported range. The verdict column is git's OWN answer — the
+    mode of a loose object git writes under `umask 077` — not a reading of `config.c`:
+
+        absent .................. rc 1              (no key)
+        umask / false/no/off / 0  rc 0   r--------  PRIVATE
+        FALSE, Off .............. rc 0   r--------  PRIVATE
+        empty      (`= ""`) ..... rc 0   r--------  PRIVATE   <- stdout is b"\\n"
+        valueless  (no `=`) ..... rc 0   r--r-----  group     <- stdout is b"\\n" TOO
+        true/yes/on / group / 1 . rc 0   r--r-----  group
+        0660 .................... rc 0   r--r-----  group
+        all/world/everybody / 2 . rc 0   r--r--r--  everybody
+
+    THE MIDDLE TWO ROWS ARE INDISTINGUISHABLE AND MEAN OPPOSITE THINGS: an explicitly
+    empty value is PERM_UMASK (private) and a VALUELESS `sharedRepository` line is
+    PERM_GROUP (shared), while `--get` answers both rc 0 with a lone b"\\n". git
+    exposes nothing that separates them, so the empty answer REFUSES — a false refusal
+    is a reported skip, a false accept is the bug this gate exists to prevent.
+
+    `removesuffix("\\n")`, NEVER `.strip()`, and that is live rather than defensive
+    here: `--get` returns edge whitespace VERBATIM (a quoted `" umask"` comes back as
+    b" umask\\n", measured at both versions), so stripping would widen a value git
+    itself rejects straight into the accept set below. Round 15's lesson at a second
+    site in this same function.
+
+    The case handling is measured rather than inferred from the accept list's shape:
+    `FALSE` and `Off` really are not shared at both versions and are accepted, while
+    `UMASK` and `GROUP` are values git REJECTS — git comparing the keywords with
+    strcmp and the booleans with strcasecmp. Values git rejects DO reach this gate:
+    `rev-parse --absolute-git-dir` answers rc 0 for every one of them, `banana`
+    included, so the "it would have fatalled earlier" reasoning that fits some other
+    probes in this file does not hold here. They fall off the allowlist into a
+    refusal deliberately — their repository is already unusable (`git status` exits
+    128, `fatal: bad boolean config value ... for 'core.sharedrepository'`), so
+    refusing costs nothing while guessing at a malformed value would.
+
+    SCOPE, stated because this is NARROWER than git's own resolution: the read names
+    the repository's SHARED CONFIG, as every probe in `_shield_enable_worktree_config`
+    does. Measured, git honors `core.sharedRepository` from a GLOBAL config too (an
+    object written under a global `= group` came back `r--r-----` with the repo config
+    empty), so an operator's global setting is not consulted here and such a
+    repository is still shielded — unchanged from the behavior before this gate
+    existed, and deliberately so, since a global preference is not a statement that
+    THIS repository is shared. What is refused is a repository CONFIGURED as shared,
+    which is the shape `git init --shared` writes: measured, `--shared=group` records
+    `sharedrepository = 1`, the legacy numeric form the table above lists as group.
+    """
+    raw = _shield_shared_config(worktree, str(common_dir / "config"), "core.sharedRepository")
+    if raw is None:
+        return None
+    value = os.fsdecode(raw).removesuffix("\n")
+    if value in ("umask", "0") or value.lower() in ("false", "no", "off"):
+        return None
+    # {value!r}: operator-authored text going into a journaled reason, and repr
+    # neutralizes a newline in it. The version gate above renders git's own answer
+    # the same way.
+    return (
+        f"skipped the git-add shield ({worktree}): the repository's shared config sets "
+        f"core.sharedRepository = {value!r}, and a repository shared between OS users is "
+        "not a supported configuration — the provisioned tool files are not shielded "
+        "from the unit's `git add -A`"
+    )
+
+
 def _shield_enable_worktree_config(worktree: Path, common_dir: Path) -> tuple[str | None, bool]:
     """May `git config --worktree` be made writable in this repo? `(reason, needs_enable)`.
 
@@ -1446,6 +1533,8 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
       has already answered (round 11 — it sat in the silent arm above from round 3,
       when one combined `rev-parse` became two calls, until this list was read as
       the specification it is), a main checkout passed in (nothing to scope to), a
+      repository configured to be shared between OS users (refused above the lock —
+      see `_shield_shared_repository`), a
       shield lock that could not be taken (contention on Windows, or an `os.open`
       fault in the common dir), a refused or
       failed extension enable, a failed activation, `.resolve()` (pre-3.13 a
@@ -1592,6 +1681,17 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
                 f"skipped the git-add shield ({worktree}): not a linked worktree, and the "
                 "shield never writes the repository-wide exclude (#384)"
             )
+        # ABOVE THE LOCK DELIBERATELY, and the placement is the whole value of this
+        # gate: a repository shared between OS users is refused before anything is
+        # created in it, so every user gets this same reason rather than the second
+        # one meeting a lock file the first left behind. Safe above the lock because
+        # `core.sharedRepository` is static config the tool never writes — unlike
+        # `extensions.worktreeConfig` there is no shared mutable state to serialize.
+        # It is one deletion point if shared repositories are ever supported for real.
+        # A `GitError` from the read lands in this try's tail, which returns a reason.
+        shared_repository = _shield_shared_repository(worktree, common_dir)
+        if shared_repository is not None:
+            return shared_repository
         # EVERYTHING BELOW IS ONE TRANSACTION, serialized per repository — round 8
         # (#384, Codex P2). `_shield_enable_worktree_config` PROBES the flag and the
         # enable further down is an idempotent no-op when it is already `true`, so two

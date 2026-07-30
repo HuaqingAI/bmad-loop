@@ -1656,6 +1656,162 @@ def test_shield_refuses_to_enable_extension_over_core_bare(project, tmp_path):
     assert shared_exclude.read_bytes() == before
 
 
+def test_shield_refuses_a_repository_shared_between_os_users(project, tmp_path):
+    """A repository configured as shared between OS users is not supported (#384), and
+    is refused UP FRONT rather than shielded — loudly, and identically for every user.
+
+    The refusal sits ABOVE the shield's lock, which is why the last four assertions
+    matter more than the first. A reason string alone cannot distinguish a clean
+    refusal from one that left state behind: that is exactly the gap that let round 7's
+    defect sit under a passing fault-injection test for two review rounds. So this pins
+    that NOTHING was created — no lock file for a peer's run to meet, no permanent
+    repo-format change, no private exclude, and the repository-wide exclude untouched.
+
+    Set after the worktree is mounted, as the `core.bare` sibling above is: git honors
+    the key for files it creates, and nothing here needs it applied during the mount.
+
+    Ablation: delete the `_shield_shared_repository` call in `_worktree_local_exclude`
+    and this fails. What the deletion falls through to was checked by RUNNING the
+    ablated helper rather than inferred from the first failing assertion, because
+    twice on this PR a deleted arm landed on an adjacent guard that also returned a
+    reason: it falls through to a clean SUCCESS — `reason is None`, the lock file
+    created, `worktreeConfig` written — so every assertion below is load-bearing and
+    none of them can pass against the bug."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    shared_exclude = repo / ".git" / "info" / "exclude"
+    before = shared_exclude.read_bytes()
+    git(repo, "config", "core.sharedRepository", "group")
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    # "shared between OS users" is wording ONLY this gate produces. The key name alone
+    # is not enough to identify the refusal: git's own rejection message names the key
+    # too (lowercased, `'core.sharedrepository'`), and it reaches a degrade reason from
+    # further down this function — see the sibling test on the parse.
+    assert reason is not None and "shared between OS users" in reason
+    assert "core.sharedRepository" in reason and "group" in reason
+    assert not (repo / ".git" / "bmad-loop-shield.lock").exists()
+    # read as TEXT, not via `git config --get`: conftest's git() is check=True and an
+    # unset key exits 1, which would error the test rather than assert it.
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+    assert not _wt_private_exclude(wt).exists()
+    assert shared_exclude.read_bytes() == before
+
+
+def test_shield_runs_in_a_repository_that_is_not_shared(project, tmp_path):
+    """The allowlist's accept side, which nothing else covers: `core.sharedRepository`
+    being PRESENT is not the refusal — being present with a value git resolves to
+    something other than "private" is.
+
+    `umask` rather than `false` on purpose. Measured at git 2.20.4 and 2.55.0, git
+    compares this keyword with strcmp while it compares the booleans with strcasecmp,
+    so the two sides of the accept test are separate code paths and this is the one a
+    bool-only reading would drop.
+
+    Ablation: refuse whenever the key is present (drop the value test) and this
+    fails — an ordinary repository stops being shielded."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    git(repo, "config", "core.sharedRepository", "umask")
+
+    assert _worktree_local_exclude(wt, ["/probe-384"]) is None
+
+    assert "/probe-384" in _wt_private_exclude(wt).read_text(encoding="utf-8")
+
+
+def test_shield_refuses_a_valueless_shared_repository_key(project, tmp_path):
+    """`sharedRepository` with NO value is git's `PERM_GROUP` — a shared repository —
+    and `--get` answers it rc 0 with a lone newline, byte-identical to an explicitly
+    EMPTY value, which git reads as `PERM_UMASK`, i.e. private. Measured at 2.20.4 and
+    2.55.0 by the mode of a loose object git writes under `umask 077`: valueless gives
+    `r--r-----`, empty gives `r--------`.
+
+    git exposes nothing that separates the two answers, so the gate refuses the
+    ambiguous one. That is the deliberate direction of error — a false refusal is a
+    reported skip, a false accept is the bug the gate exists to prevent — and it is
+    recorded here because the obvious "simplification" is to read the empty answer as
+    "not shared" and let the shared case through.
+
+    Hand-written because `git config` cannot express a key with no value. Appended as
+    a fresh `[core]` section rather than edited into the existing one: a repeated
+    section is legal in git config, and it carries no path, so none of this PR's
+    Windows fixture hazards (a backslash is a config ESCAPE) apply.
+
+    Ablation: add "" to the accepted values and this fails — the shield proceeds."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    config = repo / ".git" / "config"
+    text = config.read_text(encoding="utf-8")
+    config.write_text(
+        (text if text.endswith("\n") else text + "\n") + "[core]\n\tsharedRepository\n",
+        encoding="utf-8",
+    )
+    # non-vacuity, and it names this test's own precondition: git must answer the key
+    # rc 0 with an EMPTY value. Were the hand-written line unparsed it would answer
+    # rc 1 (absent) and the refusal below would be testing nothing it claims to.
+    assert git(repo, "config", "--get", "core.sharedRepository") == ""
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert reason is not None and "shared between OS users" in reason
+    assert not (repo / ".git" / "bmad-loop-shield.lock").exists()
+    assert not _wt_private_exclude(wt).exists()
+
+
+def test_shield_reads_shared_repository_without_stripping_it(project, tmp_path):
+    """The gate removes `--get`'s TERMINATOR and nothing else. `git config --get`
+    returns edge whitespace VERBATIM (measured at 2.20.4 and 2.55.0: a quoted
+    `" umask"` comes back as b" umask\\n"), so `.strip()` would widen a value into the
+    accept set — round 15's defect at a second site in this same function, and live
+    rather than defensive: `rev-parse --absolute-git-dir` answers rc 0 for such a
+    repository, so the gate really is reached with this value in hand.
+
+    The value is one git itself REJECTS (`fatal: bad boolean config value ... for
+    'core.sharedrepository'`, and `git status` exits 128), which is why refusing is
+    the only defensible reading of it — but what is pinned here is the PARSE, not the
+    verdict on that value.
+
+    No Windows skip: the fixture is a config value, not a path, and it carries no
+    backslash — the escape that made a hand-written config fixture unparseable on
+    Windows CI earlier in this PR.
+
+    Ablation: use `.strip()` instead of `removesuffix("\\n")` and this fails — but NOT
+    in the shape the obvious note would claim, which is why the assertions below are
+    written the way they are. Measured with the ablation applied: the value reads as
+    `umask`, the gate lets it through, the shield takes the lock and then degrades one
+    step later with git's OWN rejection of the value ("could not enable
+    extensions.worktreeConfig ... fatal: bad boolean config value ' umask' for
+    'core.sharedrepository'"). So `assert reason is not None` PASSES against the bug,
+    and so would a check for the key name — git lowercases it in that message, but a
+    test may not rest on that. What bites is the wording only this gate emits, plus
+    the lock file the refusal must never create."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    config = repo / ".git" / "config"
+    text = config.read_text(encoding="utf-8")
+    config.write_text(
+        (text if text.endswith("\n") else text + "\n") + '[core]\n\tsharedRepository = " umask"\n',
+        encoding="utf-8",
+    )
+    # non-vacuity, through the same chokepoint the gate reads with, because conftest's
+    # git() strips its stdout and so cannot testify about edge whitespace at all
+    answer = install_mod.git_bytes(
+        repo, "config", "--file", str(config), "--get", "core.sharedRepository"
+    )
+    assert answer.returncode == 0 and answer.stdout == b" umask\n"
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert reason is not None and "shared between OS users" in reason
+    assert not (repo / ".git" / "bmad-loop-shield.lock").exists()
+    assert not _wt_private_exclude(wt).exists()
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="a trailing space is not a legal Windows path")
 def test_shield_keeps_edge_whitespace_in_the_common_dir(tmp_path):
     """`rev-parse` terminates its answer with one newline; every other byte belongs to
