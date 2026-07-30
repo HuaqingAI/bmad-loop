@@ -21,6 +21,7 @@ from bmad_loop.install import (
     MODULE_SKILLS,
     _copy_traversable,
     _git_version_at_least,
+    _shield_undo_extension,
     _worktree_local_exclude,
     install_into,
     merge_hooks,
@@ -2043,6 +2044,105 @@ def test_shield_rolls_back_despite_its_own_partial_config_worktree(project, tmp_
     assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
 
 
+def test_shield_rollback_scan_fault_is_reported_not_raised(project, tmp_path, monkeypatch):
+    """`_shield_undo_extension` is contracted never to raise — every caller is already
+    reporting a degrade, and a raise escaping it would replace the activation fault
+    AND the retained-flag disclosure with the caller's generic tail reason, losing
+    exactly what rounds 6 and 7 added.
+
+    The dependents scan added in round 8 broke that promise for two fault shapes its
+    `except OSError` did not name (#384, CodeRabbit round 9). On the 3.11/3.12 floor
+    `Path.resolve()` raises `RuntimeError` for a symlink loop rather than `OSError` —
+    the caller's own tail already carries `RuntimeError` for precisely that reason, so
+    the gap was internally inconsistent as well as wrong.
+
+    Driven at the helper rather than through `_worktree_local_exclude`, which is the
+    lowest layer that can catch this regression: the shield resolves its own `git_dir`
+    (also under `worktrees/`) before the scan runs, so a fault injected end-to-end
+    would fire on the wrong call and prove something else.
+
+    Ablation: narrow the tuple back to `OSError` and this fails — the RuntimeError
+    escapes instead of being reported."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    git(repo, "config", "extensions.worktreeConfig", "true")
+    git_dir = Path(git(wt, "rev-parse", "--absolute-git-dir")).resolve()
+    common = Path(git(wt, "rev-parse", "--git-common-dir")).resolve()
+    real_resolve = Path.resolve
+
+    def loop(self, *a, **kw):
+        if self.parent.name == "worktrees":  # the scan's own resolve, not ours
+            raise RuntimeError(f"Symlink loop while resolving {self}")
+        return real_resolve(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "resolve", loop)
+
+    clause = _shield_undo_extension(wt, git_dir, common)
+
+    assert "Symlink loop" in clause  # reported...
+    assert "LEFT enabled" in clause  # ...and it took the conservative branch
+    monkeypatch.undo()
+    # the conservative default really is conservative: the flag is still there, which
+    # is the cosmetic residue this trades for never silently un-shielding a sibling
+    assert "worktreeConfig" in (repo / ".git" / "config").read_text(encoding="utf-8")
+
+
+def test_shield_rolls_back_inside_the_lock(project, tmp_path, monkeypatch):
+    """The ROLLBACK has to happen while the lock is still held, and that placement is
+    load-bearing rather than incidental: released first, a second run probes in the
+    gap, sees the flag this run is about to unset, skips its own enable as redundant,
+    activates against it — and then this run's `--unset` lands. That is the round-8
+    race rebuilt out of the fix for it.
+
+    The sibling lock test cannot pin this: its activation SUCCEEDS, so no rollback
+    ever runs and `activation < lock_exit` is all it can show. Ablation proved the gap
+    was real — hoisting the rollback out of the `with` passed all 53 shield tests
+    (#384, CodeRabbit round 9).
+
+    Ablation: move the rollback below the `with` block and this fails — the rollback
+    is recorded after the lock's exit."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    events = []
+    real_lock, real_git, real_undo = (
+        install_mod.file_lock,
+        install_mod.git_bytes,
+        install_mod._shield_undo_extension,
+    )
+
+    @contextlib.contextmanager
+    def spy_lock(path, **kwargs):
+        events.append("lock-enter")
+        with real_lock(path, **kwargs):
+            yield
+        events.append("lock-exit")
+
+    def fail_activation(worktree, *args):
+        if "--worktree" in args:
+            events.append("activation")
+            return subprocess.CompletedProcess(
+                args=["git", *args], returncode=1, stdout=b"", stderr=b"fatal: read-only .git\n"
+            )
+        return real_git(worktree, *args)
+
+    def spy_undo(*a, **kw):
+        events.append("rollback")
+        return real_undo(*a, **kw)
+
+    monkeypatch.setattr(install_mod, "file_lock", spy_lock)
+    monkeypatch.setattr(install_mod, "git_bytes", fail_activation)
+    monkeypatch.setattr(install_mod, "_shield_undo_extension", spy_undo)
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert reason is not None and "read-only .git" in reason
+    assert events == ["lock-enter", "activation", "rollback", "lock-exit"]
+    # and the rollback it performed inside the lock was the real one
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+
+
 def test_shield_takes_the_repo_scoped_lock(project, tmp_path, monkeypatch):
     """The probe→enable→activate→rollback sequence is ONE transaction, serialized per
     repository — the ownership guard above covers a flag enabled outside bmad-loop's
@@ -2056,11 +2156,19 @@ def test_shield_takes_the_repo_scoped_lock(project, tmp_path, monkeypatch):
     - it is a dedicated file rather than the config or the exclude, per `file_lock`'s
       own contract — the lock rides an open fd's inode, and an `atomic_replace` would
       swap that inode out from under later acquirers;
-    - it is taken BEFORE the extension probe and released AFTER the rollback, since the
+    - it is taken BEFORE the extension probe and held past the ACTIVATION, since the
       race is the window between the probe's answer and the activation's outcome.
 
+    That third bullet is the whole span only in company: this test's activation
+    SUCCEEDS, so no rollback runs in it and `activation < lock-exit` is the strongest
+    ordering it can witness. The rollback half — released only after the `--unset` —
+    is a separate property with its own test, `test_shield_rolls_back_inside_the_lock`,
+    which had to exist because hoisting the rollback out of the `with` passed all 53
+    shield tests including this one (#384, CodeRabbit round 9). A success-path ordering
+    test cannot pin a rollback-path ordering property.
+
     Ordering is recorded from the calls themselves rather than asserted on the lock's
-    existence: a lock taken after the probe, or released before the rollback, leaves
+    existence: a lock taken after the probe, or released before the activation, leaves
     exactly the window this closes.
 
     Ablation: drop the `with` and this fails — `file_lock` is never entered."""
@@ -3310,6 +3418,84 @@ def test_shield_degrades_when_git_will_not_say_what_the_users_excludes_are(
     status = git(wt, "status", "--short")
     assert "mine.log" not in status  # their ignore was never shadowed — THE HARM
     assert "probe-389" in status  # ...and the shield really was skipped
+
+
+def test_shield_degrades_when_the_excludes_read_answers_with_a_fault_rc(
+    project, tmp_path, monkeypatch
+):
+    """The sibling above is UNKNOWN arriving as a RAISE; this is UNKNOWN arriving as an
+    rc. They are one funnel deliberately: `git_bytes` has exactly these two failure
+    shapes, and this PR's activation arm took three review rounds precisely because
+    each fix enumerated the shape it had just been shown.
+
+    rc 1 is the ONLY non-zero rc that means "no such key". Every other one is git
+    saying it could not answer, and the `else:` used to route all of them into the XDG
+    fallback — seeding ignore patterns the operator never chose for this repository and
+    then ACTIVATING them over the file it had failed to read (#384, CodeRabbit round 9).
+
+    INJECTED rather than provoked from a config value, and the measurement behind that
+    is why this docstring is long, because the plausible version is wrong.
+    `core.excludesFile = ~nosuchuser/ignore` really does make this read exit 128
+    (`fatal: failed to expand user dir`) — but git expands that same value while
+    parsing core config for any command that sets the repository up, so
+    `rev-parse --absolute-git-dir` in the caller fatals identically and the shield
+    silently skips ABOVE this branch. Measured at git 2.20.4 and 2.55.0, both ends of
+    the supported range. Nothing static reaches this arm; its occupants appear between
+    that rev-parse and this read, and the repo-scoped lock in between — `flock`, which
+    blocks indefinitely on POSIX — is what makes the window wide enough to hold a
+    dotfile sync or an NSS/LDAP hiccup.
+
+    Injecting the ANSWER rather than breaking the repository is also what lets the harm
+    be asserted through git's own status: the fault clears, the activation does not, so
+    what a shielded-over-a-transient worktree would carry is a durable
+    `core.excludesFile` shadowing the operator's real excludes with the XDG file's.
+
+    Ablation: replace `elif answer.returncode != 1:` with `elif False:` and this fails —
+    the fallback seeds `xdg-ignored.tmp`, the activation succeeds, the reason comes back
+    None, and a file the operator can still see in their own checkout goes invisible
+    inside the worktree."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    xdg = tmp_path / "xdg"
+    (xdg / "git").mkdir(parents=True)
+    # non-vacuity: the fallback this must NOT take has a real file with a real pattern
+    # behind it, so the assertions below can tell "skipped" from "found nothing".
+    (xdg / "git" / "ignore").write_text("xdg-ignored.tmp\n", encoding="utf-8")
+    real = install_mod.git_bytes
+
+    def unresolvable_excludes_read(worktree, *args):
+        # name-filtered onto the READ (`--get`), never the activation, which also names
+        # core.excludesFile — everything else runs for real, so this pins this branch
+        # rather than a short-circuit somewhere earlier.
+        if "--get" in args and "core.excludesFile" in args:
+            return subprocess.CompletedProcess(
+                args=["git", *args],
+                returncode=128,
+                stdout=b"",
+                stderr=b"fatal: failed to expand user dir in: '~nosuchuser/ignore'\n",
+            )
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", unresolvable_excludes_read)
+
+    with monkeypatch.context() as pinned:
+        pinned.setenv("XDG_CONFIG_HOME", str(xdg))
+        reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert reason is not None and "failed to expand user dir" in reason
+    assert not _wt_private_exclude(wt).exists()  # nothing to point a shadowing key at
+    # ...and no permanent repo-format change was left behind for a shield that never ran
+    assert not (Path(git(wt, "rev-parse", "--absolute-git-dir")) / "config.worktree").exists()
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+    (wt / "xdg-ignored.tmp").write_text("noise\n", encoding="utf-8")
+    (wt / "probe-384").write_text("noise\n", encoding="utf-8")
+    status = git(wt, "status", "--short")
+    # THE HARM, in git's own words. git is healthy here — the fault was one answer, not
+    # a broken repo — so this is exactly what the operator would see once a transient
+    # cleared: their own file, still visible, un-shadowed by patterns they never chose.
+    assert "xdg-ignored.tmp" in status
+    assert "probe-384" in status  # ...and the shield really was skipped
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX /bin/sh stub git")

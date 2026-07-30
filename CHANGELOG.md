@@ -276,7 +276,8 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   than against wherever the orchestrator was launched. Paths are read NUL-terminated, so an
   excludes file whose path begins or ends in whitespace is copied rather than mangled. An excludes
   file that **exists but cannot be read** — or a **git that will not say which file applies** (a
-  timeout or a failed spawn on that query) — skips the shield with a journaled reason instead:
+  timeout, a failed spawn, or any answer to that query other than a definite "there is no such
+  key") — skips the shield with a journaled reason instead:
   activating over patterns that could not be copied would shadow them exactly as an empty copy did,
   and not knowing whether there is anything to copy has the same standing as failing to read it.
   Only a definite **absent** answer stays a silent no-op — there is nothing to shadow. The skip is

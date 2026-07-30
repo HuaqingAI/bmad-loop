@@ -988,11 +988,24 @@ def _shield_undo_extension(worktree: Path, git_dir: Path, common_dir: Path) -> s
             if d.resolve() != git_dir
         ]
         dependent = next((str(p) for p in others if p.exists()), None)
-    except OSError as e:
+    except (OSError, RuntimeError, UnicodeError) as e:
         # Conservative on purpose, and the asymmetry is the argument: skipping
         # leaves a reported flag this call did not earn, while unsetting one that
         # IS depended on silently un-shields a live worktree. A cosmetic residue
         # beats silent file loss, so an unreadable scan counts as a dependent.
+        #
+        # The tuple mirrors the caller's tail minus `GitError` (nothing here spawns
+        # git), and the two beyond `OSError` are what keeps this function's "never
+        # raises" promise true rather than merely stated — round 9 (#384,
+        # CodeRabbit), and measured, not reasoned: with `resolve()` made to fail the
+        # way a symlink loop does, the bare `OSError` tuple let it escape. On the
+        # Python 3.11/3.12 floor `Path.resolve()` raises `RuntimeError` for a
+        # symlink loop rather than `OSError` (the caller's own tail already carries
+        # it for exactly that), and `UnicodeError` covers the fsdecode of a
+        # directory name on Windows. Escaping here is not a crash — the caller's
+        # tail catches all three — but it replaces the activation fault AND the
+        # retained-flag disclosure with a generic reason, losing precisely what
+        # rounds 6 and 7 added.
         dependent = f"the scan for sibling worktrees failed ({e})"
     if dependent is not None:
         return (
@@ -1069,12 +1082,15 @@ def _shield_inherited_excludes(worktree: Path) -> bytes:
       caller's degrade arm, which skips the activation — the only safe answer, since
       activating over patterns that could not be copied shadows them exactly as an
       empty seed did.
-    - UNKNOWN propagates too, and that is round 5's fix (#384, Codex P1). A
-      `GitError` out of the read below used to be swallowed here on the premise that
-      "git unqueryable ⇒ no key to resolve ⇒ nothing to copy". The premise is a
-      false inference: it holds for `rc != 0`, which is an answer, while a raised
-      fault means we did not FIND OUT — so the code mapped UNKNOWN onto ABSENT and
-      then activated a key that shadowed the file it had failed to read. Measured,
+    - UNKNOWN propagates too, and it arrives in TWO shapes that this function
+      deliberately funnels rather than enumerates — a raised `GitError`, and any
+      returncode that is neither 0 nor 1.
+
+      The raise is round 5's fix (#384, Codex P1). A `GitError` out of the read below
+      used to be swallowed here on the premise that "git unqueryable ⇒ no key to
+      resolve ⇒ nothing to copy". The premise is a false inference: a raised fault
+      means we did not FIND OUT — so the code mapped UNKNOWN onto ABSENT and then
+      activated a key that shadowed the file it had failed to read. Measured,
       and pinned by the ablation on
       `test_shield_degrades_when_git_will_not_say_what_the_users_excludes_are`:
       inject a fault on this one call and a file the operator ignores globally comes
@@ -1086,6 +1102,17 @@ def _shield_inherited_excludes(worktree: Path) -> bytes:
       premise is false by construction: the key is there, we just cannot see it.
       The accepted cost is that such a fault now loses the shield for that run,
       which the caller surfaces; the harm it buys off is unbounded and silent.
+
+      The rc shape is round 9's (#384, CodeRabbit). Round 5's bullet used to justify
+      itself by saying the swallow "holds for `rc != 0`, which is an answer" — and
+      that generalization was too broad, which is the correction worth recording
+      here rather than quietly dropping. Only **rc 1** means "no such key"; every
+      other non-zero rc is git reporting that it could not answer, and routed to
+      ABSENT it seeded and activated the XDG file over patterns it had not read.
+      What can actually occupy that branch is narrower than it looks, and the
+      comment at the call below carries the measurement: not a static config value
+      — those fatal the `rev-parse` in the caller first, which skips the shield
+      silently — but a fault arriving inside the window the caller holds its lock.
     """
     # -z, not a bare read plus `.strip()` — round 5, Codex P2. A `.strip()` here
     # DESTROYED a legal POSIX path: `--type=path --get` returns leading and
@@ -1154,6 +1181,43 @@ def _shield_inherited_excludes(worktree: Path) -> bytes:
             # them anyway. Un-ignoring inside the worktree exactly what this
             # function exists to preserve.
             source = worktree / source
+    elif answer.returncode != 1:
+        # UNKNOWN, through git's OTHER failure shape. rc 1 is the ONLY non-zero rc
+        # that means "no such key"; every other one is git saying it could not answer,
+        # and routing those to the fallback below is the same UNKNOWN-as-ABSENT
+        # mistake round 5 fixed for the RAISED shape (#384, CodeRabbit round 9).
+        #
+        # WHAT CAN REACH HERE is narrower than the finding's own example, and the
+        # measurement is worth keeping because the plausible version of it is wrong.
+        # `core.excludesFile = ~nosuchuser/ignore` — an ordinary thing to inherit from
+        # a `.gitconfig` synced between machines — does make THIS read exit 128
+        # (`fatal: failed to expand user dir`). But git expands that same value while
+        # parsing core config for any command that sets the repository up, so
+        # `rev-parse --absolute-git-dir` in the caller fatals identically and the
+        # shield SILENTLY SKIPS there, above this line. Measured at git 2.20.4 and
+        # 2.55.0, both ends of the supported range. No static config value reaches
+        # this branch: its occupants are faults that appear BETWEEN that rev-parse
+        # and this read.
+        #
+        # That window is structural rather than theoretical, and the caller sets its
+        # width: the rev-parse runs before the repo-scoped lock, this read runs after
+        # it, and POSIX `flock` blocks INDEFINITELY — so a run waiting on a sibling
+        # worktree's shield sits between the two calls for that sibling's whole git
+        # transaction. A dotfile manager writing `~otheruser/ignore` in, or an
+        # `~alice` whose NSS/LDAP lookup fails for a moment, lands here.
+        #
+        # "The repo is broken anyway, so the harm is bounded" does not survive that:
+        # the fault can CLEAR (the sync finishes, LDAP answers) while an activation
+        # performed over it lasts as long as the worktree — a `core.excludesFile`
+        # shadowing the operator's real excludes with the XDG file's patterns. #384's
+        # own harm, reached through a transient.
+        #
+        # Deliberately shaped as a FUNNEL rather than a per-rc taxonomy, which is
+        # round 7's lesson: git-config(1) allocates several failure codes and
+        # enumerating them one per review round is how the activation arm took three.
+        # Anything that is not "answered" or "no such key" is not an answer.
+        detail = os.fsdecode(answer.stderr).strip() or f"git exited {answer.returncode}"
+        raise GitError(f"git could not resolve core.excludesFile: {detail}")
     else:
         # ABSENT (rc 1, an unset key): git's documented fallback (gitignore(5)), and
         # the ONLY outcome that gets one. Not reachable for an empty value any more.
