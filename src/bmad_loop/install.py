@@ -1329,6 +1329,26 @@ def _shield_inherited_excludes(worktree: Path) -> bytes:
         # the ONLY outcome that gets one. Not reachable for an empty value any more.
         xdg = os.environ.get("XDG_CONFIG_HOME")
         source = (Path(xdg) if xdg else Path.home() / ".config") / "git" / "ignore"
+        if not source.is_absolute():
+            # THE SAME DEFECT AS THE RELATIVE `core.excludesFile` ABOVE, at the
+            # sibling site (#384, Codex round 12) — this branch reproduces git's
+            # fallback, so it has to reproduce git's RESOLUTION too, and it did not.
+            #
+            # A relative XDG_CONFIG_HOME is invalid per the XDG base-directory spec
+            # ("All paths ... must be absolute. If an implementation encounters a
+            # relative path ... it should consider the path invalid and ignore it"),
+            # but git does not ignore it: measured at 2.20.4 and 2.55.0, git HONORS
+            # the value and resolves it against the worktree's TOP LEVEL. Measured
+            # from a SUBDIR to tell top-level from cwd, the same way the branch above
+            # was — `git -C <wt>/sub` with `XDG_CONFIG_HOME=rel` read
+            # `<wt>/rel/git/ignore`, not `<wt>/sub/rel/git/ignore`.
+            #
+            # Python resolves it against the orchestrator's launch cwd instead, and
+            # the miss is SILENT: `is_file()` false, an empty seed, and then the
+            # activation shadows the file git really reads. Un-ignoring inside the
+            # worktree exactly what this function exists to preserve — #384's harm
+            # reached through a misconfigured environment rather than a fault.
+            source = worktree / source
     # `is_file()` is the ABSENT test and swallows its own OSError; `read_bytes`
     # on a file that exists but cannot be read raises, deliberately (docstring).
     return source.read_bytes() if source.is_file() else b""

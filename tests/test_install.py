@@ -3086,6 +3086,55 @@ def test_shield_seeds_xdg_default_when_unset(project, tmp_path, monkeypatch):
     assert git(wt, "status", "--short") == ""
 
 
+def test_shield_seeds_a_relative_xdg_config_home_resolved_like_git(project, tmp_path, monkeypatch):
+    """The relative-path defect of the `core.excludesFile` branch, at the XDG fallback
+    branch (#384, Codex round 12). This branch exists to REPRODUCE git's fallback, so
+    it has to reproduce git's resolution too.
+
+    A relative `XDG_CONFIG_HOME` is invalid per the XDG base-directory spec, which says
+    an implementation "should consider the path invalid and ignore it". Git does not
+    ignore it. Measured at 2.20.4 and 2.55.0: git honors the value and resolves it
+    against the worktree's TOP LEVEL — and measured from a SUBDIR to separate
+    top-level from cwd, `git -C <wt>/sub` with `XDG_CONFIG_HOME=rel` read
+    `<wt>/rel/git/ignore` rather than `<wt>/sub/rel/git/ignore`. So "git ignores an
+    invalid value" is the plausible guess this test exists to refute.
+
+    `monkeypatch.chdir` is load-bearing here for the same reason as in the
+    `core.excludesFile` sibling: run from inside the worktree, the unfixed code
+    resolves the same relative path BY ACCIDENT and passes against the bug.
+
+    The env pinning is scoped to the probe, not the test — `GIT_CONFIG_NOSYSTEM`
+    suppresses Git for Windows' `core.autocrlf`, and leaving it set across the status
+    below makes every tracked file read as modified.
+
+    Ablation: drop the `is_absolute()` branch from the XDG arm and this fails —
+    `xdg-relative.tmp` is missing from the private exclude and comes back visible to
+    git in the worktree, which is the harm: the activation shadows the file git really
+    reads, so patterns the operator set are switched off inside the unit."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    (wt / "relxdg" / "git").mkdir(parents=True)
+    (wt / "relxdg" / "git" / "ignore").write_text("xdg-relative.tmp\n", encoding="utf-8")
+    # non-vacuity: the key really is unset, so this run reaches the XDG arm at all
+    assert "excludesFile" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+    # anywhere that is NOT the worktree, and where no `relxdg/git/ignore` exists
+    monkeypatch.chdir(tmp_path)
+
+    with monkeypatch.context() as pinned:
+        pinned.setenv("XDG_CONFIG_HOME", "relxdg")
+        pinned.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "no-such-gitconfig"))
+        pinned.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        assert _worktree_local_exclude(wt, ["/probe-r12"]) is None
+
+    lines = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert "xdg-relative.tmp" in lines and "/probe-r12" in lines
+    (wt / "xdg-relative.tmp").write_text("noise\n", encoding="utf-8")
+    # THE HARM, in git's own words. One filename rather than whole-worktree
+    # cleanliness: `relxdg/` is this fixture's own untracked scaffolding.
+    assert "xdg-relative.tmp" not in git(wt, "status", "--short")
+
+
 def test_shield_honors_an_explicitly_empty_excludesfile(project, tmp_path, monkeypatch):
     """An EXPLICITLY EMPTY `core.excludesFile` is an ANSWER, not an unset key: it is the
     operator saying "no excludes file at all", and git honors that literally — no
