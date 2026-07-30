@@ -269,9 +269,14 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   commits, with nothing in either diff able to reveal why. The shield now writes a private exclude in
   the worktree's own gitdir, activated with a worktree-scoped `core.excludesFile`, so it applies to
   that unit alone and `git worktree remove` deletes it along with the worktree. The operator's
-  `core.excludesFile` is copied in when the private file is created, since the worktree-scoped key
-  shadows it — including a relative value, which git resolves against the worktree rather than
-  wherever the orchestrator was launched. Two caveats: this enables `extensions.worktreeConfig`, a
+  `core.excludesFile` is copied in **byte for byte** when the private file is created, since the
+  worktree-scoped key shadows it and git never concatenates across config scopes — so the copy has
+  to survive an exclude file in any legacy encoding at all (its patterns are paths, and POSIX paths
+  are arbitrary bytes). Relative values are resolved against the worktree, the way git does, rather
+  than against wherever the orchestrator was launched. An excludes file that **exists but cannot be
+  read** skips the shield with a reason instead: activating over patterns that could not be copied
+  would shadow them exactly as an empty copy did. An absent one stays a silent no-op — there is
+  nothing to shadow. Two caveats: this enables `extensions.worktreeConfig`, a
   **permanent** repo-format flag that is never removed, and where git requires that flag's
   prerequisites be moved by hand first (`core.bare = true` or `core.worktree` in the shared config)
   the shield is skipped with a journaled reason rather than widened back. It also needs **git 2.20**,
@@ -319,9 +324,10 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 - **A worktree's local git exclude really is best-effort now (#359).** `_worktree_local_exclude`
   guarded only its `git rev-parse` call; the filesystem tail behind it (resolve, mkdir, read, write)
-  crashed the run — a symlink loop raises `RuntimeError` on 3.11/3.12, an exclude file that is not
-  UTF-8 raises `UnicodeDecodeError`, a seeded path whose filename is not UTF-8 raises
-  `UnicodeEncodeError` on the way back out, and a read-only `.git` raises `OSError`. The tail is guarded and
+  crashed the run — a symlink loop raises `RuntimeError` on 3.11/3.12, a read-only `.git` raises
+  `OSError`, and the codec faults of the day raised `UnicodeError` (an exclude file that is not UTF-8
+  on the way in, a seeded path whose filename is not UTF-8 on the way back out — both since removed
+  as fault modes, because the exclude payload is now read, deduped and written as bytes). The tail is guarded and
   degrades to a reason string, and provisioning journals it as `worktree-exclude-degraded` on the
   story rather than swallowing it: without the exclude the unit's `git add -A` would commit the
   provisioned skill trees and tool configs into the story's merge. Git being unqueryable at all

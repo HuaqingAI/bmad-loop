@@ -29,7 +29,7 @@ from typing import Any, NamedTuple
 
 from .adapters.profile import ALIASES, CLIProfile, ProfileError, load_profiles
 from .checks import Finding
-from .platform_util import atomic_write_text
+from .platform_util import atomic_write_bytes
 from .policy import POLICY_TEMPLATE
 from .process_host import get_process_host
 from .verify import GitError, git_bytes
@@ -872,8 +872,8 @@ def _shield_enable_worktree_config(worktree: Path, common_dir: Path) -> str | No
     )
 
 
-def _shield_inherited_excludes(worktree: Path) -> str:
-    """The content of whatever `core.excludesFile` this worktree resolves to now.
+def _shield_inherited_excludes(worktree: Path) -> bytes:
+    """The BYTES of whatever `core.excludesFile` this worktree resolves to now.
 
     A worktree-scoped `core.excludesFile` SHADOWS the operator's own: git reads
     the key from the most specific scope that sets it and does not concatenate
@@ -884,9 +884,26 @@ def _shield_inherited_excludes(worktree: Path) -> str:
     ignore globally — and the unit's `git add -A` would commit it.
 
     Seeded once, at creation, so the copy never fights later edits to the private
-    file. Best-effort and silent: a missing/unreadable/undecodable excludes file
-    is not a reason to skip the shield itself, which is what an escaping fault
-    would cause in the guarded tail this runs inside.
+    file.
+
+    BYTES, never decoded text, and the return type is the fix: an exclude file is
+    a list of path patterns, POSIX paths are arbitrary bytes, and a `read_text`
+    here made one non-UTF-8 byte anywhere in the operator's file collapse the whole
+    seed to empty — after which the activation SHADOWED the excludes it had failed
+    to copy, and `git add -A` staged what they told git to ignore (measured
+    end-to-end). Copying verbatim also keeps every pattern intact for the caller's
+    dedupe, which a text round trip could not promise. Git reads the result either
+    way: it strips a trailing `\\r` from an exclude line and skips a UTF-8 BOM.
+
+    Two arms, and which fault means what is the whole subtlety:
+
+    - ABSENT is silent and empty. The common case — no `core.excludesFile`, no XDG
+      fallback file — and not a reason to skip the shield.
+    - PRESENT BUT UNREADABLE is NOT silent. A read `OSError` (EACCES, EIO)
+      propagates into the caller's degrade arm, which skips the activation — the
+      only safe answer, since activating over patterns that could not be copied
+      shadows them exactly as an empty seed did. Only `GitError` is swallowed here:
+      git unqueryable means there is no key to resolve, so there is nothing to copy.
     """
     try:
         # --type=path so `~/.gitignore` arrives expanded, the way git reads it.
@@ -895,9 +912,16 @@ def _shield_inherited_excludes(worktree: Path) -> str:
             source = Path(os.fsdecode(answer.stdout).strip())
             if not source.is_absolute():
                 # `--type=path` expands `~` and stops there: a RELATIVE value comes
-                # back verbatim (verified, git 2.55). Git resolves such a value
-                # against the worktree's top level; Python would resolve it against
-                # this process's cwd, which is wherever the orchestrator was
+                # back verbatim. Git resolves such a value against the worktree's
+                # top level (MEASURED — git 2.20.4, 2.49.1, 2.55.0 — and NOT
+                # specified: relative values for this key were deliberately never
+                # implemented, and the worktree-top result is an artifact of git's
+                # setup chdir, so a consumer reached through RUN_SETUP alone with an
+                # explicit git dir and an outside cwd resolves it against the
+                # CALLER's cwd instead. bmad-loop is not exposed to that: every git
+                # call here goes through `_run_git`'s `git -C <repo>`, and the
+                # activation below writes an absolute path.) Python would resolve it
+                # against this process's cwd, which is wherever the orchestrator was
                 # launched. Left alone that reads the wrong file or, far more often,
                 # none — and `is_file()` false is silent, so the operator's patterns
                 # would simply not be carried and the activation below would shadow
@@ -908,13 +932,18 @@ def _shield_inherited_excludes(worktree: Path) -> str:
             # git's documented fallback when the key is unset (gitignore(5)).
             xdg = os.environ.get("XDG_CONFIG_HOME")
             source = (Path(xdg) if xdg else Path.home() / ".config") / "git" / "ignore"
-        return source.read_text(encoding="utf-8") if source.is_file() else ""
-    # GitError covers both of the chokepoint's raised faults — a timeout and, as
-    # its GitSpawnError subclass, a git that would not spawn. `subprocess`'s own
-    # types are gone from this tuple because nothing here can raise them any more;
-    # OSError and UnicodeError stay for the file read below the call.
-    except (GitError, OSError, UnicodeError):
-        return ""
+        # `is_file()` is the ABSENT test and swallows its own OSError; `read_bytes`
+        # on a file that exists but cannot be read raises, deliberately (docstring).
+        return source.read_bytes() if source.is_file() else b""
+    # GitError ALONE, and the narrowing is the second half of the fix. It covers
+    # both of the chokepoint's raised faults — a timeout and, as its GitSpawnError
+    # subclass, a git that would not spawn — which mean "no key to resolve, nothing
+    # to copy". Everything else must reach the caller's degrade arm: an `OSError`
+    # from the read (the file exists and we could not read it) and, on Windows only,
+    # a `UnicodeError` out of the `fsdecode` above (#374/#377) — in both cases git
+    # answered, so activating over an uncopied file would shadow it silently.
+    except GitError:
+        return b""
 
 
 def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | None:
@@ -976,13 +1005,24 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
       can surface: a main checkout passed in (nothing to scope to), a refused or
       failed extension enable, a failed activation, `.resolve()` (pre-3.13 a
       symlink loop raises RuntimeError, not OSError), `mkdir`, read/write
-      `OSError`, a later git call timing out or failing to spawn (`GitError`),
-      and either direction of a codec fault (`UnicodeError`) — an exclude file
-      that is not UTF-8 fails the READ, and a pattern carrying a surrogate fails
-      the WRITE, since a seed_globs pattern is built from a real filename and a
-      non-UTF-8 one arrives surrogate-escaped. Silence here is not cosmetic:
-      without the exclude the unit's `git add -A` commits the tool files this
-      provisioning just wrote into the story's merge.
+      `OSError` — including the operator's own excludes file existing but being
+      unreadable, which must NOT be silent, because activating over patterns that
+      could not be copied shadows them — a later git call timing out or failing to
+      spawn (`GitError`), and a `UnicodeError` (below). Silence here is not
+      cosmetic: without the exclude the unit's `git add -A` commits the tool files
+      this provisioning just wrote into the story's merge.
+
+    The exclude PAYLOAD is bytes end-to-end — read, dedupe and write — so nothing
+    on this path decodes or encodes an exclude file at all. That leaves two real
+    sources for the `UnicodeError` in the tail's tuple, neither of them a
+    file-content codec fault: the `os.fsdecode` of git's own stdout, which can raise
+    on Windows only (#374/#377), and `os.fsencode` of a caller's pattern when that
+    pattern carries a surrogate POSIX surrogateescape never produced — a
+    hand-authored `"\\ud800"` in a config string rather than a real filename, which
+    fsencode's surrogateescape rejects. The seed_globs case the tuple was originally
+    written for is GONE: a pattern built from a genuinely non-UTF-8 filename arrives
+    surrogate-escaped and `os.fsencode` returns its exact original bytes (POSIX);
+    Windows' utf-8/surrogatepass encodes such a name to WTF-8 without raising.
     """
     # Callers pass POSIX-slash patterns (glob rels via as_posix; config strings as
     # authored); git's exclude is POSIX-slash on every platform, so nothing to fix here.
@@ -1063,7 +1103,7 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
         exclude = git_dir / "info" / "exclude"
         exclude.parent.mkdir(parents=True, exist_ok=True)
         # Zero bytes is an INTERRUPTED creation, not an initialized exclude. The
-        # `touch()` below creates the target before `atomic_write_text` fills it, and
+        # `touch()` below creates the target before `atomic_write_bytes` fills it, and
         # a fault in between (ENOSPC, or a kill) leaves that placeholder behind —
         # harmless on its own, since the degrade arm returns above the activation and
         # an unactivated private exclude does nothing. The harm would be deferred:
@@ -1078,17 +1118,31 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
         # activation below shadows them (see _shield_inherited_excludes). On a
         # re-provision a non-empty file's content is authoritative and the copy is
         # not repeated, so the two stay idempotent together.
-        existing = (
-            exclude.read_text(encoding="utf-8") if existed else _shield_inherited_excludes(worktree)
-        )
+        #
+        # BYTES on both sides of that choice, and never decoded text: an exclude
+        # file holds path patterns, POSIX paths are arbitrary bytes, and a legacy
+        # 8-bit encoding is a perfectly ordinary thing for an operator's own file to
+        # be in. `bytes.splitlines()` is also the git-CORRECT line split, not merely
+        # the type-consistent one — `str.splitlines()` breaks on \x0b, \x0c, \x1c,
+        # \x1d, \x1e and \x85, none of which git treats as a line boundary, so a
+        # legitimate pattern containing one fragmented into wrong dedupe keys.
+        existing = exclude.read_bytes() if existed else _shield_inherited_excludes(worktree)
         present = set(existing.splitlines())
-        new = [p for p in patterns if p not in present]
+        # fsencode, the inverse of the fsdecode above: a pattern derived from a real
+        # filename round-trips to its exact original bytes. Both sides of the `in`
+        # MUST be bytes — with `patterns` left as str every one of them reads as
+        # absent and gets re-appended on every re-provision.
+        wanted = [os.fsencode(p) for p in patterns]
+        new = [p for p in wanted if p not in present]
         # `not existed` keeps a re-provision that adds no pattern from leaving the
         # config below pointing at a file that was never created.
         if new or not existed:
-            prefix = existing if not existing or existing.endswith("\n") else existing + "\n"
-            # atomic_write_text, never write_text onto `exclude` directly (#375).
-            # write_text opens "w", which TRUNCATES before writing, and this is a
+            # b"\n", not "\n": `bytes.endswith(str)` is a TypeError, and TypeError is
+            # not in the tail's except tuple — it would escape a function contracted
+            # never to propagate.
+            prefix = existing if not existing or existing.endswith(b"\n") else existing + b"\n"
+            # atomic_write_bytes, never write_bytes onto `exclude` directly (#375).
+            # write_bytes opens "wb", which TRUNCATES before writing, and this is a
             # read-modify-REWRITE carrying the operator's own excludes in
             # `prefix` — so a short write (ENOSPC) left the file truncated
             # mid-content while the degrade reason still said "could not update".
@@ -1118,14 +1172,15 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
                 # would even be reported, because the write SUCCEEDS. Reachable
                 # wherever the gitdir is read under another UID
                 # (core.sharedRepository, a shared checkout) — which is why
-                # atomic_write_text's own docstring says callers of genuinely
-                # shared state need more than the helper alone.
+                # atomic_write_text's own docstring, which atomic_write_bytes
+                # shares, says callers of genuinely shared state need more than
+                # the helper alone.
                 #
                 # Safe against the tail below: an empty exclude is equivalent to
                 # an absent one for git, so a fault after this leaves no more
                 # damage than the missing file it replaced.
                 exclude.touch()
-            atomic_write_text(exclude, prefix + "".join(f"{p}\n" for p in new))
+            atomic_write_bytes(exclude, prefix + b"".join(p + b"\n" for p in new))
         # LAST, after the file it names exists: git reads core.excludesFile lazily,
         # but a config pointing at a file that a fault above left unwritten would
         # be a shield that silently excludes nothing while reporting a reason.
@@ -1138,10 +1193,17 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
     # `subprocess.SubprocessError` this tuple used to carry for exactly that pair,
     # which the chokepoint now translates before it ever reaches this frame.
     #
-    # UnicodeError, not UnicodeDecodeError: the write raises the ENCODE sibling.
-    # It no longer covers anything git does — `git_bytes` never decodes — so what
-    # is left for it is the exclude file's own read and write. Still far short of
-    # ValueError-broad, so a programming error still escapes.
+    # UnicodeError, not UnicodeDecodeError, and NOT for the exclude file any more:
+    # the payload is bytes end-to-end, so neither its read nor its write can raise a
+    # codec fault at all. What is left for it is stated in the docstring — the
+    # `os.fsdecode` of git's stdout (Windows-only) and `os.fsencode` of a pattern
+    # carrying a surrogate that POSIX surrogateescape never produced. Both are
+    # ENCODE-or-DECODE depending on which, hence the shared base class. Still far
+    # short of ValueError-broad, so a programming error still escapes.
+    #
+    # TypeError is deliberately absent: a str/bytes mixup on the payload path is a
+    # programming error, and letting it crash beats reporting it as an operator's
+    # degraded shield once per run.
     except (GitError, OSError, RuntimeError, UnicodeError) as e:
         return f"could not update the worktree-local git exclude ({worktree}): {e}"
     return None

@@ -1807,11 +1807,99 @@ def test_shield_seeds_users_excludesfile(project, tmp_path):
     assert git(wt, "status", "--short") == ""
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="POSIX-only: a 0xff byte cannot be a Windows filename"
+)
+def test_shield_preserves_a_non_utf8_excludesfile(project, tmp_path):
+    """THE round-4 regression (#384, Codex P1): the seed is a VERBATIM BYTE COPY, so
+    an operator's excludes file that is not UTF-8 survives it intact.
+
+    A `read_text(encoding="utf-8")` inside a handler naming `UnicodeError` made one
+    non-UTF-8 byte anywhere in their file collapse the WHOLE seed to empty — and the
+    activation that follows then SHADOWED the excludes it had just failed to copy,
+    because git takes `core.excludesFile` from the most specific scope that sets it
+    and never concatenates across scopes. So `git add -A` committed a file the
+    operator had told git to ignore: the exact leak the seed exists to prevent,
+    caused by the seed. An exclude file holds path patterns and POSIX paths are
+    arbitrary bytes, so a legacy 8-bit encoding here is ordinary, not exotic.
+
+    Both halves are asserted because either alone would pass against a different
+    bug: the private file's BYTES (the mechanism — a lossy copy is still a copy) and
+    git's own answer inside the worktree (the harm).
+
+    Ablation: restore `source.read_text(encoding="utf-8")` in
+    `_shield_inherited_excludes` and this fails — the seed comes back empty and
+    `secret-\\377` shows up untracked in the worktree, ready for `git add -A`."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    users = tmp_path / "my-global-ignores"
+    users.write_bytes(b"secret-\xff\nplain.log\n")
+    git(repo, "config", "core.excludesFile", str(users))
+
+    assert _worktree_local_exclude(wt, ["/probe-384"]) is None
+
+    assert _wt_private_exclude(wt).read_bytes() == b"secret-\xff\nplain.log\n/probe-384\n"
+    (wt / os.fsdecode(b"secret-\xff")).write_text("noise\n", encoding="utf-8")
+    (wt / "plain.log").write_text("noise\n", encoding="utf-8")
+    assert git(wt, "status", "--short") == ""
+
+
+def test_shield_degrades_when_the_users_excludesfile_cannot_be_read(project, tmp_path, monkeypatch):
+    """An excludes file that EXISTS but cannot be read must skip the shield, not
+    activate over patterns it never copied. Absent is silent (the common case, and
+    there is nothing to shadow); unreadable is a degrade, because the shadow is real.
+
+    The other half of the round-4 fix, and untested in either direction before it:
+    `OSError` was swallowed beside the decode fault, so an EACCES/EIO on their file
+    produced the identical silent empty seed — and then the shadow.
+
+    Injected at `Path.read_bytes` rather than `chmod(0o000)`, for a reason the
+    assertions depend on: git runs as this same user, so a file WE cannot read is
+    one git cannot read either, and "their ignores still apply" — the property that
+    makes the shadow a harm — would be untestable. With the fault injected the file
+    stays readable to git, so the third assertion is git's own answer. (It also
+    sidesteps a root-owned CI runner ignoring the mode bits, the reason the sibling
+    write-fault test injects too.)
+
+    The last assertion is the non-vacuity check: without it this passes just as well
+    if the shield had silently excluded everything.
+
+    Ablation: put `OSError` back in `_shield_inherited_excludes`'s except tuple and
+    this fails — `reason` comes back None, the activation shadows their file, and
+    `mine.log` shows up untracked."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    users = tmp_path / "my-global-ignores"
+    users.write_text("mine.log\n", encoding="utf-8")
+    git(repo, "config", "core.excludesFile", str(users))
+    real_read_bytes = Path.read_bytes
+
+    def unreadable(self):
+        if self == users:
+            raise PermissionError(13, "Permission denied", str(users))
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", unreadable)
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    monkeypatch.undo()  # the assertions below do their own file and git I/O
+    assert reason is not None and "Permission denied" in reason
+    assert not _wt_private_exclude(wt).exists()  # nothing to point a shadowing key at
+    (wt / "mine.log").write_text("noise\n", encoding="utf-8")
+    (wt / "probe-384").write_text("noise\n", encoding="utf-8")
+    status = git(wt, "status", "--short")
+    assert "mine.log" not in status  # their ignore was never shadowed
+    assert "probe-384" in status  # ...and the shield really was skipped
+
+
 def test_shield_reseeds_after_an_interrupted_creation(project, tmp_path, monkeypatch):
     """A creation that died between `touch()` and the write must not leave a
     placeholder that the NEXT attempt reads as authoritative.
 
-    `atomic_write_text` "leaves the original untouched and removes the temp" — and the
+    `atomic_write_bytes` "leaves the original untouched and removes the temp" — and the
     original here is the zero-byte file `touch()` just made, so an ENOSPC in between
     leaves it behind. That attempt is harmless by itself: the degrade arm returns
     above the `config --worktree`, and an unactivated private exclude does nothing.
@@ -1845,9 +1933,11 @@ def test_shield_reseeds_after_an_interrupted_creation(project, tmp_path, monkeyp
         raise OSError("no space left on device")
 
     # patched at install's OWN binding, as everywhere else in this file: the write
-    # goes through atomic_write_text (#375) on an mkstemp fd via os.fdopen, so a
-    # Path.write_text patch never fires and would pass vacuously.
-    monkeypatch.setattr(install_mod, "atomic_write_text", boom)
+    # goes through atomic_write_bytes (#375, #384 round 4) on an mkstemp fd via
+    # os.fdopen, so a Path.write_bytes patch never fires and would pass vacuously.
+    # The NAME matters as much as the binding — left pointing at atomic_write_text
+    # this patch became a silent no-op and the test failed on the degrade assertion.
+    monkeypatch.setattr(install_mod, "atomic_write_bytes", boom)
     assert _worktree_local_exclude(wt, ["/probe-384"]) is not None
     monkeypatch.undo()  # the assertions below do their own file and git I/O
     assert _wt_private_exclude(wt).stat().st_size == 0  # the placeholder touch() left
@@ -1858,6 +1948,70 @@ def test_shield_reseeds_after_an_interrupted_creation(project, tmp_path, monkeyp
     assert "mine.log" in lines and "/probe-384" in lines
     (wt / "mine.log").write_text("noise\n", encoding="utf-8")
     assert git(wt, "status", "--short") == ""
+
+
+def test_shield_reprovision_does_not_duplicate_patterns(project, tmp_path):
+    """Provisioning the SAME worktree twice must leave the private exclude
+    byte-identical. The dedupe is what makes that true, and it compares the
+    already-present lines against the patterns being added — so both sides have to
+    be the same type. Left as `str` against a `bytes` set (the shape the round-4
+    bytes conversion invites), every pattern reads as absent and is re-appended on
+    every single re-provision, growing the file without bound.
+
+    Nothing pinned this before: `test_shield_reseeds_after_an_interrupted_creation`
+    does run the helper twice, but the second run sees a ZERO-BYTE file, i.e. the
+    create path both times — it never exercises the dedupe at all.
+
+    Through `provision_worktree` rather than the helper, because the real pattern
+    set is what a re-provision re-offers, and `on_degraded` is collected so a
+    surprise degrade cannot make the two runs match by both doing nothing.
+
+    Ablation: drop the `os.fsencode` and compare `str` patterns against the bytes
+    `present` set — this fails, with every tool pattern appearing twice."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    msgs: list[str] = []
+
+    provision_worktree(wt, [get_profile("claude")], repo, on_degraded=msgs.append)
+    first = _wt_private_exclude(wt).read_bytes()
+    provision_worktree(wt, [get_profile("claude")], repo, on_degraded=msgs.append)
+
+    assert msgs == []
+    assert _wt_private_exclude(wt).read_bytes() == first
+    lines = first.splitlines()
+    assert lines and len(set(lines)) == len(lines)  # nor duplicated within one run
+
+
+def test_shield_dedupe_does_not_split_on_non_git_line_breaks(project, tmp_path):
+    """The dedupe splits the existing content into lines the way GIT does, which is
+    the second thing the bytes conversion bought (#384 round 4).
+
+    `str.splitlines()` breaks on `\\x0b`, `\\x0c`, `\\x1c`, `\\x1d`, `\\x1e` and
+    `\\x85` as well as on newlines; git treats none of those as a line boundary, and
+    every one of them is a legal byte in a POSIX filename. So a legitimate pattern
+    containing one fragmented into two wrong dedupe keys, the identical pattern then
+    read as absent, and it was appended a second time. `bytes.splitlines()` splits on
+    `\\n`, `\\r` and `\\r\\n` only — git's own boundary set (it also strips a trailing
+    `\\r`, which is why `\\r` costs nothing here).
+
+    Asserted on the bytes rather than through `git status`: the subject is which
+    dedupe KEY the pattern produces, and a `\\x0c` in a filename is POSIX-only
+    while this fault is not.
+
+    Ablation: restore `set(existing.splitlines())` over decoded text and this fails —
+    the seeded pattern fragments into `weird`/`pattern`, the identical pattern reads
+    as absent, and the file comes back carrying it twice."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    users = tmp_path / "my-global-ignores"
+    users.write_bytes(b"weird\x0cpattern\n")
+    git(repo, "config", "core.excludesFile", str(users))
+
+    assert _worktree_local_exclude(wt, ["weird\x0cpattern", "/probe-384"]) is None
+
+    assert _wt_private_exclude(wt).read_bytes() == b"weird\x0cpattern\n/probe-384\n"
 
 
 def test_shield_seeds_a_relative_excludesfile_resolved_like_git(project, tmp_path, monkeypatch):
@@ -2103,57 +2257,69 @@ def test_worktree_local_exclude_degrades_on_write_fault(project, tmp_path, monke
         raise OSError("read-only .git")
 
     # patched at install's OWN binding: the exclude write goes through
-    # atomic_write_text (#375), which writes via os.fdopen on an mkstemp fd, so a
-    # Path.write_text/Path.open patch never fires and would pass vacuously.
-    monkeypatch.setattr(install_mod, "atomic_write_text", boom)
+    # atomic_write_bytes (#375, #384 round 4), which writes via os.fdopen on an
+    # mkstemp fd, so a Path.write_bytes/Path.open patch never fires and would pass
+    # vacuously — and so would a patch left on the atomic_write_TEXT this replaced.
+    monkeypatch.setattr(install_mod, "atomic_write_bytes", boom)
 
     reason = _worktree_local_exclude(wt, ["/probe-359"])
 
     assert reason is not None and "read-only .git" in reason
 
 
-def test_worktree_local_exclude_degrades_on_undecodable_exclude(project, tmp_path):
-    """A REAL fault, no injection needed: an exclude file that is not UTF-8 makes
-    `read_text` raise UnicodeDecodeError — a ValueError subclass, so neither the
-    OSError nor the RuntimeError arm covers it. The bytes must survive untouched;
-    rewriting someone's legacy-encoded exclude would be worse than skipping it.
+def test_worktree_local_exclude_appends_to_a_non_utf8_private_exclude(project, tmp_path):
+    """REPURPOSED, and the reversal is the fix (#384 review round 4). This case used
+    to assert that a private exclude which is not UTF-8 DEGRADES the shield away,
+    because `read_text` raised UnicodeDecodeError on it. The payload is bytes
+    end-to-end now, so those bytes survive untouched *and* the shield still applies
+    — strictly better than the old policy, which preserved the file by giving up on
+    shielding the worktree at all.
 
-    Ablation: drop `UnicodeError` from the tail's except tuple and this fails —
-    it propagates (it is not an OSError). Narrowing that member to
-    `UnicodeDecodeError` does NOT fail this test; that ablation belongs to the
-    encode sibling below, which is how the two halves stay independently
-    pinned."""
+    The legacy bytes are asserted byte-identical in place, as before: rewriting
+    someone's legacy-encoded exclude would still be worse than skipping it.
+
+    Ablation: restore `exclude.read_text(encoding="utf-8")` for the re-read and this
+    fails — UnicodeDecodeError comes back as a degrade reason and `/probe-359` never
+    reaches the file."""
     wt = tmp_path / "wt"
     verify.worktree_add(project.project, wt, "feat", "main")
     exclude = _wt_private_exclude(wt)
     exclude.parent.mkdir(parents=True, exist_ok=True)
     exclude.write_bytes(b"\xff\xfe legacy-encoded\n")
 
-    reason = _worktree_local_exclude(wt, ["/probe-359"])
+    assert _worktree_local_exclude(wt, ["/probe-359"]) is None
 
-    assert reason is not None
-    assert exclude.read_bytes() == b"\xff\xfe legacy-encoded\n"
+    assert exclude.read_bytes() == b"\xff\xfe legacy-encoded\n/probe-359\n"
+    (wt / "probe-359").write_text("noise\n", encoding="utf-8")
+    assert git(wt, "status", "--short") == ""
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="fsencode uses utf-8/surrogatepass on Windows, which encodes any surrogate",
+)
 def test_worktree_local_exclude_degrades_on_unencodable_pattern(project, tmp_path):
-    """The codec fault has a WRITE direction too, and it is not the same exception:
-    `read_text` raises UnicodeDecodeError, `write_text` raises UnicodeEncodeError.
-    Neither is an OSError and they share no subclass but `UnicodeError`, so naming
-    only the decode half leaves the tail escaping on the encode half.
+    """RE-POINTED (#384 review round 4) at the one shape that still raises. The
+    encode fault used to be reachable from a real filename: `provision_worktree`
+    builds a `seed_globs` pattern via `rel.as_posix()`, a non-UTF-8 name arrived
+    surrogate-escaped, and `write_text` could not encode it back. The payload is
+    bytes now and `os.fsencode` is surrogateescape's inverse, so THAT name
+    round-trips to its exact original bytes and no longer degrades anything —
+    `test_shield_preserves_a_non_utf8_excludesfile` covers the improvement.
 
-    Reachable, not theoretical: `provision_worktree` builds a pattern per
-    `seed_globs` match via `rel.as_posix()`, so a repo file whose name is not valid
-    UTF-8 arrives surrogate-escaped and cannot be written back as UTF-8.
+    What remains is a pattern carrying a surrogate surrogateescape never produces:
+    a hand-authored `"\\ud800"` in a config string (`worktree_seed`, a plugin's
+    `seed_globs`) rather than a decoded filename. `os.fsencode` rejects it on POSIX,
+    because surrogateescape only round-trips \\udc80-\\udcff. Windows is skipped
+    rather than adapted: its filesystem codec is utf-8/surrogatepass, which encodes
+    every surrogate, so there is no encode fault to pin there at all.
 
-    REAL fault, no injection. The surrogate is written literally rather than via
-    `os.fsdecode(b"...\xff...")`: that helper decodes with surrogatepass on
-    Windows, which rejects a lone invalid byte outright and would raise in the
-    test's own setup. "\\udcff" is exactly what POSIX surrogateescape yields, and
-    strict UTF-8 refuses to encode it on every platform.
+    `"\\udcff"` — what this test used to use — is deliberately NOT the subject any
+    more: it is the case that now succeeds.
 
-    Ablation: narrow the tail's tuple back to `UnicodeDecodeError` and this fails
-    — UnicodeEncodeError propagates."""
-    pattern = "/vendor/weird-\udcff-name"
+    Ablation: drop `UnicodeError` from the tail's except tuple and this fails —
+    UnicodeEncodeError propagates out of a function contracted never to."""
+    pattern = "/vendor/weird-\ud800-name"
     wt = tmp_path / "wt"
     verify.worktree_add(project.project, wt, "feat", "main")
 
@@ -2164,7 +2330,7 @@ def test_worktree_local_exclude_degrades_on_unencodable_pattern(project, tmp_pat
 
 def test_worktree_local_exclude_short_write_leaves_exclude_intact(project, tmp_path, monkeypatch):
     """#375: a fault PARTWAY THROUGH the write must leave the operator's exclude
-    byte-identical, not truncated. `write_text` opens "w" (truncate-then-write)
+    byte-identical, not truncated. `write_bytes` opens "wb" (truncate-then-write)
     and this is a read-modify-REWRITE carrying their content in `prefix`, so a
     direct write left the file cut mid-content while the reason still said
     "could not update". The surviving tail is a valid git pattern and a prefix of
@@ -2176,13 +2342,13 @@ def test_worktree_local_exclude_short_write_leaves_exclude_intact(project, tmp_p
     `prefix` is the operator's global excludes, copied in when the private file was
     created, and `/` still swallows the whole worktree.
 
-    The fault is injected at `Path.open`, NOT at `Path.write_text`: patching
-    write_text means the file is never opened, so the truncation cannot happen
+    The fault is injected at `Path.open`, NOT at `Path.write_bytes`: patching
+    write_bytes means the file is never opened, so the truncation cannot happen
     and the test would pass against the very bug it exists to catch. Going
-    through the real `open(mode="w")` is the whole point — that is what
+    through the real `open(mode="wb")` is the whole point — that is what
     truncates.
 
-    Ablation: swap `atomic_write_text` back to a direct `exclude.write_text` and
+    Ablation: swap `atomic_write_bytes` back to a direct `exclude.write_bytes` and
     this fails — the file comes back truncated."""
     wt = tmp_path / "wt"
     verify.worktree_add(project.project, wt, "feat", "main")
@@ -2335,8 +2501,9 @@ def test_worktree_local_exclude_undecodable_git_output_degrades(tmp_path, monkey
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits; Windows has no umask")
 def test_worktree_local_exclude_created_exclude_stays_readable(project, tmp_path):
     """An exclude this helper CREATES keeps the mode the `write_text` it replaced
-    would have produced, not `mkstemp`'s private 0600. `atomic_write_text` carries
-    a mode over only when the target already EXISTS (its docstring is explicit),
+    would have produced, not `mkstemp`'s private 0600. `atomic_write_bytes` carries
+    a mode over only when the target already EXISTS (the shared contract on
+    `atomic_write_text` is explicit),
     so a fresh one lands 0600 — and git treats an exclude it cannot read as one
     that is not there. Measured: git warns `unable to access`, exits 0, and
     `git add -A` stages the very files the exclude was written to shield, with no
@@ -2417,9 +2584,10 @@ def test_provision_worktree_exclude_fault_reports_on_degraded(project, tmp_path,
         raise OSError("read-only .git")
 
     # patched at install's OWN binding: the exclude write goes through
-    # atomic_write_text (#375), which writes via os.fdopen on an mkstemp fd, so a
-    # Path.write_text/Path.open patch never fires and would pass vacuously.
-    monkeypatch.setattr(install_mod, "atomic_write_text", boom)
+    # atomic_write_bytes (#375, #384 round 4), which writes via os.fdopen on an
+    # mkstemp fd, so a Path.write_bytes/Path.open patch never fires and would pass
+    # vacuously — and so would a patch left on the atomic_write_TEXT this replaced.
+    monkeypatch.setattr(install_mod, "atomic_write_bytes", boom)
     msgs: list[str] = []
 
     provision_worktree(wt, [get_profile("claude")], repo, on_degraded=msgs.append)
@@ -2511,10 +2679,17 @@ def test_worktree_local_exclude_git_fault_after_answering_degrades(project, tmp_
 def test_shield_survives_a_git_fault_while_reading_the_users_excludes(
     project, tmp_path, monkeypatch
 ):
-    """The excludes-file seed is best-effort BELOW the shield: a git fault reading
-    the operator's `core.excludesFile` costs their patterns, which is a real loss,
-    but skipping the shield over it would let `git add -A` stage the tool files —
-    strictly worse. So that fault is swallowed there and never reaches the tail.
+    """A GIT fault reading the operator's `core.excludesFile` is swallowed below the
+    shield and never reaches the tail: git unqueryable means there is no key to
+    resolve and so nothing to copy, and skipping the shield over that would let
+    `git add -A` stage the tool files — strictly worse than losing the seed.
+
+    `GitError` is now the ONLY fault with that standing, which is the round-4 fix
+    (#384): a read `OSError` on an excludes file that EXISTS degrades instead, since
+    activating over patterns that could not be copied shadows them exactly as an
+    empty seed did. `test_shield_degrades_when_the_users_excludesfile_cannot_be_read`
+    is that half; the two together are the whole taxonomy — absent is silent,
+    unreadable is not.
 
     Its own guard, its own test: the tail's guard also names `GitError`, so an
     escape from here degrades into a plausible-looking reason rather than a crash,
