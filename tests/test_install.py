@@ -1646,7 +1646,12 @@ def test_shield_degrades_when_a_command_scope_excludesfile_outranks_it(
 
     assert reason is not None
     assert "another configuration scope outranks it" in reason
-    assert str(operator) in reason
+    # The reason renders the path with `!r`, deliberately — a legal POSIX path can
+    # carry edge whitespace or control bytes, and only the repr discloses them. So
+    # compare against the REPR, not the raw string: on Windows `repr()` doubles every
+    # backslash, and `str(operator) in reason` fails there while the shield is behaving
+    # perfectly. Windows CI was the oracle for this, as it keeps being for this shield.
+    assert repr(str(operator))[1:-1] in reason
     # and the shield really is skipped rather than half-applied
     (wt / "probe-384").write_text("noise\n", encoding="utf-8")
     assert "probe-384" in git(wt, "status", "--porcelain", "-uall")
