@@ -925,12 +925,14 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
     Best-effort in two arms that must stay separate, because a fault means the
     opposite thing in each:
 
-    - git unqueryable (not a repo, git missing, a `rev-parse` too old to answer,
-      a timeout or spawn failure — both `GitError`) is an EXPECTED skip — returns
-      None silently. Callers hand this plain temp dirs routinely. Nothing is
-      DECODED in this arm: git's stdout is captured as bytes and decoded in the
-      tail below, because a decode fault is a degrade (git answered; we could not
-      read it), not the silent skip this arm means (#374).
+    - git unqueryable (not a repo, git missing, a timeout or spawn failure — both
+      `GitError`) is an EXPECTED skip — returns None silently. Callers hand this
+      plain temp dirs routinely. Nothing is DECODED in this arm: git's stdout is
+      captured as bytes and decoded in the tail below, because a decode fault is a
+      degrade (git answered; we could not read it), not the silent skip this arm
+      means (#374). A git too old for a flag is NOT here: rev-parse echoes an
+      option it does not know and exits 0, so that lands in the arm below, via
+      the version refusal in `_shield_enable_worktree_config`.
     - anything AFTER git answered degrades to a returned reason string the caller
       can surface: a main checkout passed in (nothing to scope to), a refused or
       failed extension enable, a failed activation, `.resolve()` (pre-3.13 a
@@ -946,17 +948,34 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
     # Callers pass POSIX-slash patterns (glob rels via as_posix; config strings as
     # authored); git's exclude is POSIX-slash on every platform, so nothing to fix here.
     try:
-        answered = git_bytes(worktree, "rev-parse", "--absolute-git-dir", "--git-common-dir")
+        # ONE path per call, never both in one answer. `rev-parse` separates its
+        # answers with a newline, which is a legal BYTE IN A POSIX PATH — asking
+        # for both at once made the split of a repo directory carrying one produce
+        # four "paths" instead of two, and the length check below then degraded the
+        # shield away *after* provisioning had copied the very files it exists to
+        # hide (verified, git 2.55: the newlines come back raw, unquoted). No
+        # NUL-delimited mode to reach for instead — `rev-parse` has no `-z`; it
+        # echoes one back as a literal argument. A path that ENDS in a newline is
+        # still beyond this parse, and beyond rev-parse's output format itself.
+        answered = git_bytes(worktree, "rev-parse", "--absolute-git-dir")
+        if answered.returncode != 0:
+            # Not a repo (rc 128) — the expected skip the previous `check=True` raised
+            # its way into. NOT "a git too old for `--absolute-git-dir`", which this
+            # comment used to also claim: rev-parse ECHOES an option it does not know
+            # and exits 0 (measured), so a git predating the flag (2.13) answers with
+            # the flag's own name. That lands in the git 2.20 refusal in
+            # `_shield_enable_worktree_config`, which returns above any write — a
+            # degrade, not this silent skip.
+            return None
+        shared_answer = git_bytes(worktree, "rev-parse", "--git-common-dir")
+        if shared_answer.returncode != 0:
+            return None
     except GitError:
-        # GitError alone, and it is not a narrowing: this `try` wraps the git call
-        # and nothing else, and every fault the chokepoint raises out of one is a
-        # GitError — a timeout directly, a spawn failure as GitSpawnError, which
-        # subclasses it. The `OSError` that used to belong here was the spawn
-        # fault's raw form and is now translated before it arrives.
-        return None
-    if answered.returncode != 0:
-        # not a repo, or a git too old for `--absolute-git-dir` (2.13): the same
-        # expected skip the previous `check=True` raised its way into.
+        # GitError alone, and it is not a narrowing: this `try` wraps the two git
+        # calls and nothing that can raise, and every fault the chokepoint raises
+        # out of one is a GitError — a timeout directly, a spawn failure as
+        # GitSpawnError, which subclasses it. The `OSError` that used to belong here
+        # was the spawn fault's raw form and is now translated before it arrives.
         return None
     try:
         # fsdecode, so a non-UTF-8 repo path round-trips back to the filesystem
@@ -964,11 +983,25 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
         # rejects a lone invalid byte), which is why it sits inside this try —
         # defensive placement rather than a path under test: the regression test
         # is POSIX-only because git on Windows has no such path to hand back.
-        lines = os.fsdecode(answered.stdout).splitlines()
-        if len(lines) != 2:
-            return f"could not read this worktree's git dirs ({worktree}): {lines}"
-        git_dir = Path(lines[0].strip())
-        common_dir = Path(lines[1].strip())
+        #
+        # strip(), not removesuffix("\n"): these two answers cannot be harmed by it
+        # (both open with "/" or ".", so there is no leading whitespace to lose, and
+        # a final component is `.git` or `worktrees/<id>`), it keeps the shield's
+        # decodes uniform, and it absorbs a CRLF should git ever emit one.
+        raw_git_dir = os.fsdecode(answered.stdout).strip()
+        raw_common = os.fsdecode(shared_answer.stdout).strip()
+        if not raw_git_dir or not raw_common:
+            # Defensive, and deliberately still a REASON rather than a silent skip:
+            # git answered, so the two-arm taxonomy in the docstring puts an
+            # unreadable answer on the degrade side. Unreachable with real git — an
+            # rc of 0 from `rev-parse` always prints a path — which is the same
+            # standing the fsdecode placement above has.
+            return (
+                f"could not read this worktree's git dirs ({worktree}): "
+                f"{raw_git_dir!r}, {raw_common!r}"
+            )
+        git_dir = Path(raw_git_dir)
+        common_dir = Path(raw_common)
         if not common_dir.is_absolute():
             # a PLAIN checkout answers with a relative ".git"; a linked worktree
             # answers with the main repo's absolute .git (verified, git 2.55).

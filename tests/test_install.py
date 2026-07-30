@@ -1996,6 +1996,49 @@ def test_shield_main_checkout_degrades(project):
     assert shared.read_bytes() == before
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="newline is a legal POSIX path byte")
+def test_shield_survives_a_newline_in_the_repository_path(tmp_path):
+    """A repository directory carrying a NEWLINE must still get its shield.
+
+    `git rev-parse` separates its answers with a newline, so asking ONE call for both
+    `--absolute-git-dir` and `--git-common-dir` read a legal path byte as a record
+    delimiter: measured on git 2.55, the two answers below split into FOUR entries and
+    the helper returned a degrade instead. Degrading is not a safe default here —
+    `provision_worktree` has already copied the tool files by the time the shield runs,
+    so the unit's `git add -A` commits them into the story's merge.
+
+    The degrade was also a FALSE one, which is why the assertion that matters is git's
+    own answer rather than the private file's content: git honors every step of this at
+    such a path. `config --worktree core.excludesFile` round-trips the newline (escaped
+    as `\\n` in `config.worktree`) and the pattern then applies.
+
+    A fresh repo rather than the `project` fixture, whose path has no newline. The
+    worktree itself may sit at a plain path — the private gitdir inherits the newline
+    through the repo, which is where `--absolute-git-dir` picks it up.
+
+    Ablation: ask for both dirs in one `rev-parse` again and this fails on the first
+    assertion, with "could not read this worktree's git dirs"."""
+    repo = tmp_path / "re\npo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.email", "test@test")
+    git(repo, "config", "user.name", "test")
+    (repo / "seed.txt").write_text("x\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "seed")
+    shared = repo / ".git" / "info" / "exclude"
+    before = shared.read_bytes()
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    assert _worktree_local_exclude(wt, ["/probe-384"]) is None
+
+    assert "/probe-384" in _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    (wt / "probe-384").write_text("noise\n", encoding="utf-8")
+    assert git(wt, "status", "--short") == ""
+    assert shared.read_bytes() == before
+
+
 # ------------------------------------------------- local exclude, best-effort (issue #359)
 #
 # The helper's filesystem tail was unguarded while its docstring promised
@@ -2236,10 +2279,19 @@ def test_worktree_local_exclude_undecodable_git_output_degrades(tmp_path, monkey
     # clears the 2.20 gate, the extension reads as already enabled so the stub is
     # never asked to change repo state, and every other `--get` exits 1, git's own
     # "unset".
+    #
+    # `rev-parse` dispatches one level further, on the FLAG, because the shield asks
+    # for the two dirs in two calls — a newline is a legal byte in a POSIX path, so it
+    # cannot serve as a record separator between them. Answering both here regardless
+    # of the flag is what real git does not do, and it would hand the helper one
+    # two-line "path" for each dir, making them equal and reading as a main checkout.
     stub.write_bytes(
         b'#!/bin/sh\nshift 2\ncase "$1" in\n'
         b"version) printf 'git version 2.55.0\\n' ;;\n"
-        b"rev-parse) printf '%s\\n' " + sq(gitdir) + b" " + sq(root) + b" ;;\n"
+        b'rev-parse) case "$2" in\n'
+        b"  --absolute-git-dir) printf '%s\\n' " + sq(gitdir) + b" ;;\n"
+        b"  *) printf '%s\\n' " + sq(root) + b" ;;\n"
+        b"  esac ;;\n"
         b'config) case "$*" in\n'
         b"  *--worktree*) exit 0 ;;\n"
         b"  *extensions.worktreeConfig*) printf 'true\\n' ;;\n"
