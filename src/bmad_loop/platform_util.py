@@ -6,9 +6,9 @@ delegate to it. ``detach_kwargs`` stays a real implementation — it is spawn
 configuration, not a process-lifecycle primitive, so it does not belong on the
 host. On Linux/macOS — and WSL, which *is* Linux — these preserve today's exact
 behavior. The file-replace and segment helpers below (``atomic_replace``,
-``atomic_write_text``, ``safe_segment``, ``safe_ref_segment``) are exercised by the
-platform tests; the pid kill/liveness Windows branch degrades gracefully and is not
-yet exercised.
+``atomic_write_text``, ``atomic_write_bytes``, ``safe_segment``,
+``safe_ref_segment``) are exercised by the platform tests; the pid kill/liveness
+Windows branch degrades gracefully and is not yet exercised.
 
 ``safe_segment`` and ``safe_ref_segment`` share a contract but not a rule set: the
 first coerces a Windows *filename* segment, the second a *git ref* component, and
@@ -201,15 +201,44 @@ def atomic_write_text(path: Path, text: str) -> None:
     Ordering the flush before the rename means a crash yields either the old file
     or the complete new one. The directory itself is deliberately not synced: that
     would make the *rename* durable, and losing the rename just leaves the old
-    contents in place — stale, never corrupt."""
+    contents in place — stale, never corrupt.
+
+    The bytes sibling is :func:`atomic_write_bytes`; the two share every property
+    above and differ only in the ``os.fdopen`` mode. Text mode's *newline*
+    default (translating) is deliberate here — it matches the ``Path.write_text``
+    this replaced, so a ledger's line endings do not change under Windows."""
+    _atomic_write(path, text, mode="w", encoding="utf-8")
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Replace ``path``'s contents with ``data`` atomically — the byte-exact
+    sibling of :func:`atomic_write_text`, whose docstring carries the shared
+    contract (symlinks followed, mode and xattrs preserved when the target already
+    exists, a fresh target left at ``mkstemp``'s private ``0600``, fsync before the
+    replace, temp removed on any failure).
+
+    The one difference is the whole point: ``data`` lands byte-for-byte. No encode
+    and no newline translation, so a payload carrying LF keeps LF on Windows and
+    bytes that are not valid text in any codec survive the round trip. Callers
+    handling filesystem-derived content want this variant — a POSIX filename is
+    arbitrary bytes, and an operator's git exclude file may be in any legacy
+    encoding at all."""
+    _atomic_write(path, data, mode="wb", encoding=None)
+
+
+def _atomic_write(path: Path, payload: str | bytes, *, mode: str, encoding: str | None) -> None:
+    """The shared body of the two public helpers above — see
+    :func:`atomic_write_text` for the contract every step here implements.
+
+    Written through ``os.fdopen`` rather than a raw ``os.write`` loop on purpose:
+    it routes to ``io.open``, the one seam a test can inject a short write at for
+    both variants at once (tests/test_install.py's #375 case)."""
     target = path.resolve()
     fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=target.name + ".", suffix=".tmp")
     tmp = Path(tmp_name)
     try:
-        # newline default (translating) deliberately: matches the Path.write_text
-        # this replaced, so a ledger's line endings do not change under Windows.
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
+        with os.fdopen(fd, mode, encoding=encoding) as fh:
+            fh.write(payload)
             fh.flush()  # userspace buffer -> kernel, so there is something to sync
             os.fsync(fh.fileno())
         if target.exists():
@@ -243,12 +272,42 @@ def file_lock(path: Path, *, blocking: bool = True) -> Iterator[None]:
     Lock a dedicated sibling file, never data that is swapped via
     :func:`atomic_replace` — the lock rides the open fd's inode, and a replace
     would swap that inode out from under later acquirers. ``fcntl.flock`` on
-    POSIX (blocks indefinitely; holders only do brief file I/O); ``msvcrt.locking``
-    on Windows, where the blocking mode's built-in ~10 s retry bounds the wait
-    and surfaces contention as ``OSError``.
+    POSIX; ``msvcrt.locking`` on Windows, where the blocking mode's built-in
+    ~10 s retry bounds the wait and surfaces contention as ``OSError``.
+
+    THE WAIT IS PLATFORM-ASYMMETRIC, and a caller has to decide what that means
+    for it: POSIX blocks indefinitely, Windows gives up after ~10 s and raises.
+    This docstring used to add "holders only do brief file I/O" — true when the
+    only consumers were tests, and falsified by the first production caller
+    (``install._worktree_local_exclude``, #384), which holds it across a
+    multi-step git transaction of roughly seven ``git`` spawns, each bounded by
+    ``[limits] git_timeout_s``. So a Windows acquirer can genuinely time out
+    under contention rather than only under a deadlock. Hold it for as short a
+    span as correctness allows, and handle the ``OSError`` from acquisition.
+
+    OWNER-ONLY, AND DELIBERATELY NOT MADE TO WORK ACROSS OS USERS. A repository
+    shared between OS users is not a supported configuration (maintainer
+    decision, #384); ``install._shield_shared_repository`` refuses one up front,
+    above the shield's acquisition of this lock, so no lock file is created there
+    at all. That gate is where the case is handled — not here. Three "fixes"
+    belong to it rather than to this function, and each is worse than it looks:
+    widening the mode (from the umask, from ``.git``'s own bits, from a
+    ``core.sharedRepository`` read) hands a peer write access to a file this
+    process is relying on; falling back to ``O_RDONLY`` when the open fails
+    rescues only the modes that happen to grant group read; and unlinking a
+    badly-moded lock to recreate it is the actively dangerous one — a lock
+    another process currently HOLDS would be replaced by a new inode, ``flock``
+    exclusion rides the inode, and both processes would then believe they hold
+    it, rebuilding the concurrency bug this lock was added to prevent.
+
+    The explicit ``0o600`` states that policy rather than leaving it to the
+    caller's umask, which would make the mode a property of whoever provisioned
+    first (measured: umask 022 gives 0o755, umask 077 gives 0o700 — both
+    arbitrary). It is a ceiling, not a floor: ``os.open``'s mode is still masked,
+    so an unusual umask can only narrow it further, never widen it.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         if sys.platform == "win32":
             import msvcrt

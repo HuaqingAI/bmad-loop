@@ -260,6 +260,94 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 ### Fixed
 
+- **The worktree git-add shield no longer hides new files in your own checkout (#384).** Worktree
+  provisioning shielded the tool files it writes (`.claude/skills`, the per-CLI hook config, seeded
+  configs) by appending to `.git/info/exclude` — a file shared with the main checkout and every
+  sibling worktree, permanent, and unversioned. Those paths are ones projects legitimately track, so
+  every **new** file under them silently stopped being staged by `git add -A` in the operator's own
+  checkout, long after the run: one report lost 51 files and three whole skills across two upgrade
+  commits, with nothing in either diff able to reveal why. The shield now writes a private exclude in
+  the worktree's own gitdir, activated with a worktree-scoped `core.excludesFile`, so it applies to
+  that unit alone and `git worktree remove` deletes it along with the worktree. The operator's
+  `core.excludesFile` is copied in **byte for byte** when the private file is created, since the
+  worktree-scoped key shadows it and git never concatenates across config scopes — so the copy has
+  to survive an exclude file in any legacy encoding at all (its patterns are paths, and POSIX paths
+  are arbitrary bytes). Relative values — of that key, or of an `XDG_CONFIG_HOME`
+  git falls back through — are resolved against the worktree, the way git does, rather
+  than against wherever the orchestrator was launched. Paths are read NUL-terminated, so an
+  excludes file whose path begins or ends in whitespace is copied rather than mangled. An excludes
+  file that **exists but cannot be read** — or a **git that will not say which file applies** (a
+  timeout, a failed spawn, or any answer to that query other than a definite "there is no such
+  key") — skips the shield with a journaled reason instead:
+  activating over patterns that could not be copied would shadow them exactly as an empty copy did,
+  and not knowing whether there is anything to copy has the same standing as failing to read it.
+  Only a definite **absent** answer stays a silent no-op — there is nothing to shadow. The skip is
+  also **notified**, not just journaled, since skipping is only defensible if you find out. The same
+  rule governs the pair of `rev-parse` probes that identify the repository: only a failure of the
+  first is the expected silent skip (a plain directory, no git at all); once git has answered it, a
+  fault on the second is journaled rather than swallowed. An
+  **explicitly empty** `core.excludesFile` is an answer too, and not the same one as unset: git
+  honors it as "no excludes file at all" and does **not** fall back to `$XDG_CONFIG_HOME/git/ignore`,
+  so patterns you switched off are no longer copied into the private file and switched back on inside
+  the worktree — the mirror image of the same file-loss bug, over-ignoring instead of under-ignoring.
+  Concurrent runs against one repository are **serialized** on a lock in `.git/`, and a failed
+  activation never rolls the repo-format flag back while another worktree's `config.worktree` still
+  depends on it: without either, one run's failed shield silently switched off a sibling run's
+  working one mid-story. A repository configured as **shared between OS users**
+  (`core.sharedRepository`) is refused with a journaled reason rather than shielded — but only
+  where the value really grants peer access: `umask`, a false boolean, and an octal filemode with
+  no group or other bits (`0600`, `0700`, `0711`) leave the repository private to you, and it is
+  shielded normally.
+  Three caveats: this enables `extensions.worktreeConfig`, a **permanent**
+  repo-format flag that is never removed — written at the last possible moment, so a run that
+  degrades away **above** it leaves your repo's format untouched, and wherever it could be left set
+  without a working shield (the enable failing, the activation failing, or the activation succeeding
+  without taking effect) the flag is rolled back. It outlives a failed shield only where the rollback was declined because a sibling
+  worktree depends on the flag, or could not be made at all — and both are named in the reason — the
+  lock leaves a
+  zero-length `.git/bmad-loop-shield.lock` behind (inside `.git`, so never in your working tree and
+  never stageable) — and where git requires that flag's
+  prerequisites be moved by hand first (`core.bare = true` or `core.worktree` in the shared config)
+  the shield is skipped with a journaled reason rather than widened back. It also needs **git 2.20**,
+  the release that introduced the flag and `git config --worktree`; below that the shield is skipped
+  and no repo-format change is made, since git that old refuses a repository carrying the flag. Lines
+  an older bmad-loop already wrote into `.git/info/exclude` are **not** removed for you — delete them
+  by hand (a `validate` warning lands separately).
+- **The git-add shield's patterns survive an inherited negation (#384).** A pattern the seeded
+  excludes already carried was treated as done — but gitignore's rule is last match wins, so a
+  `!` line below it cancelled the shield's own pattern and the provisioned tool files stayed
+  stageable, with nothing reported because nothing had failed. A pattern is now re-appended
+  unless it already sits after the last negation in the file.
+- **The git-add shield checks that it actually applies (#384).** Writing the worktree-scoped
+  `core.excludesFile` proved only that the value was stored, not that git reads it: config supplied
+  through the environment (`GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`) outranks the worktree scope,
+  so an operator carrying an ambient `core.excludesFile` got a shield that reported success and never
+  applied — the provisioned tool files stayed stageable, with nothing reported because nothing had
+  failed. The shield now asks git which excludes file it resolves and skips with a journaled reason
+  when that is not the one it just wrote.
+- **The git-add shield finds the same global ignore file git does, on Windows too (#384).** With
+  `core.excludesFile` and `XDG_CONFIG_HOME` both unset, git falls back to `$HOME/.config/git/ignore`
+  — and it locates that with `HOME` on every platform, while Python's `Path.home()` reads
+  `USERPROFILE` on Windows and never consults `HOME` at all. Git for Windows derives `HOME` itself,
+  preferring a `HOMEDRIVE`+`HOMEPATH` home share over `USERPROFILE`, so the two disagreed for anyone
+  whose shell sets `HOME` (Git Bash and MSYS2 do) or whose home directory is a network drive. The
+  wrong path is simply not a file, so the copy came back empty and the shield then shadowed the very
+  global ignores it exists to preserve — silently, since nothing had failed. The shield now asks git
+  where its home is rather than guessing, and a home git will not resolve skips the shield with a
+  journaled reason instead of being assumed to mean "there is no ignore file".
+- **The git-add shield no longer opens its own safety gates when git cannot answer (#384).** The
+  three probes that ask whether enabling `extensions.worktreeConfig` is safe read every non-zero
+  exit code as "that key is not set", so a git that could not answer — rather than one answering
+  "absent" — let a repository that really sets `core.worktree` cross the gate and take a permanent,
+  irreversible repo-format change. Only exit code 1 means "no such key" now; anything else skips the
+  shield with a reason. Separately, the write that enables the flag handled git _refusing_ but not
+  git _failing to reply_, so a timeout landing after the config was already replaced left the flag
+  set with no shield ever activated; that path now rolls the flag back too. A rollback of a flag
+  that was already absent is no longer reported as a rollback that failed.
+- **The git-add shield's git calls run on the shared chokepoint (#389).** They were the last bare
+  `git` spawns outside `verify._run_git`, so they missed its `LC_ALL=C` pin — leaving a degrade
+  reason that quotes git's stderr in whatever language the box speaks — and used a hardcoded 120s
+  timeout instead of the configured `[limits] git_timeout_s`. Both now apply.
 - **A non-UTF-8 filename no longer crashes the run past every git guard (#377).** `verify._run_git`
   is the sole git spawn point and exists to give git's faults a type its ~50 `except GitError`
   guards can catch, but it decoded git's output strictly and translated only a timeout and a spawn
@@ -296,9 +384,10 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 - **A worktree's local git exclude really is best-effort now (#359).** `_worktree_local_exclude`
   guarded only its `git rev-parse` call; the filesystem tail behind it (resolve, mkdir, read, write)
-  crashed the run — a symlink loop raises `RuntimeError` on 3.11/3.12, an exclude file that is not
-  UTF-8 raises `UnicodeDecodeError`, a seeded path whose filename is not UTF-8 raises
-  `UnicodeEncodeError` on the way back out, and a read-only `.git` raises `OSError`. The tail is guarded and
+  crashed the run — a symlink loop raises `RuntimeError` on 3.11/3.12, a read-only `.git` raises
+  `OSError`, and the codec faults of the day raised `UnicodeError` (an exclude file that is not UTF-8
+  on the way in, a seeded path whose filename is not UTF-8 on the way back out — both since removed
+  as fault modes, because the exclude payload is now read, deduped and written as bytes). The tail is guarded and
   degrades to a reason string, and provisioning journals it as `worktree-exclude-degraded` on the
   story rather than swallowing it: without the exclude the unit's `git add -A` would commit the
   provisioned skill trees and tool configs into the story's merge. Git being unqueryable at all

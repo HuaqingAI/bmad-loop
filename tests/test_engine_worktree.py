@@ -902,6 +902,15 @@ def test_per_worktree_setup_then_gate_then_teardown_and_seed(project):
     """Happy path: the worktree is seeded, the setup hook runs, the ready gate
     waits (and only passes because setup ran first), the agent runs, teardown
     fires. Ordering is proven by the gate depending on a setup marker."""
+    # The MCP-generated skill tree really is gitignored in a per_worktree project
+    # (docs/FEATURES.md), and this fixture has to say so itself: until #384 the
+    # git-add shield wrote its patterns into the repo-wide `.git/info/exclude`, so
+    # the untracked dir below was hidden in the MAIN checkout too and the pre-merge
+    # cleanliness gate never saw it. The shield is per-worktree now, and an
+    # untracked file in the operator's own checkout blocks a merge as it always has
+    # (`verify.dirty_paths` counts untracked). Committed before the dir exists.
+    gitignore = project.project / ".gitignore"
+    gitignore.write_text(gitignore.read_text() + ".claude/skills/\n", encoding="utf-8")
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
     # a gitignored MCP skill dir present in the main repo (untracked) to be seeded
     skill = project.project / ".claude" / "skills" / "gameobject-create"
@@ -1514,18 +1523,29 @@ def test_engine_deferred_teardown_degrades_are_journaled(project, monkeypatch):
     assert "worktree-teardown-degraded" in journal_kinds(engine)
 
 
-def test_isolated_exclude_degrade_is_journaled(project, monkeypatch):
+def test_isolated_exclude_degrade_is_journaled_and_notified(project, monkeypatch):
     """#359: `provision_worktree`'s local-exclude write is best-effort, so the sole
     caller has to give the degrade somewhere to land — otherwise a swallowed fault
     silently lets the unit's `git add -A` commit the provisioned tool files.
 
     The helper is patched at `worktree_flow`'s own `from .install import` binding
     (worktree_flow.py:35) — patching `install._worktree_local_exclude` would not be
-    seen here. Journal-only by design (the run is unharmed and continues), matching
-    `worktree-teardown-degraded` rather than the notify-worthy `worktree-open-failed`.
+    seen here.
 
-    Ablation: delete the `on_degraded=` lambda at the `provision_worktree` call in
-    `run_isolated` and this fails — no `worktree-exclude-degraded` is journaled."""
+    BOTH CHANNELS, and round 5 added the second. This was journal-only, on the
+    reasoning that the run is unharmed and continues — so it matched
+    `worktree-teardown-degraded` rather than the notify-worthy
+    `worktree-open-failed`. What that missed is that the shield's entire degrade
+    policy is to SKIP rather than widen (activating over patterns it could not copy
+    would shadow the operator's own excludes), and a skip is only defensible if the
+    operator finds out. Round 5 also turned a swallowed `GitError` into a degrade,
+    so the path is now reachable from a transient git fault rather than only from a
+    write fault. A journal line nobody reads is how the provisioned tool files reach
+    a story's merge unnoticed.
+
+    Ablations, one per channel: delete the `on_degraded=` lambda at the
+    `provision_worktree` call in `run_isolated` and both assertions fail; drop the
+    `gates.notify` from `_exclude_degraded` and only the ATTENTION one does."""
     repo = project.project
     gitignore = repo / ".gitignore"
     gitignore.write_text(gitignore.read_text() + ".mcp.json\n", encoding="utf-8")
@@ -1549,6 +1569,9 @@ def test_isolated_exclude_degrade_is_journaled(project, monkeypatch):
     assert summary.done == 1 and not summary.paused and not summary.crashed
     entry = next(e for e in engine.journal.entries() if e["kind"] == "worktree-exclude-degraded")
     assert entry["story_key"] == "1-1-a" and entry["error"] == "boom: read-only .git"
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert "worktree exclude degraded: 1-1-a" in attention
+    assert "boom: read-only .git" in attention
     # the degrade is a warning, not a stop: the unit still merged back
     assert "unit-merged" in journal_kinds(engine)
 

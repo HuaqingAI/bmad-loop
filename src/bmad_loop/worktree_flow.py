@@ -110,11 +110,18 @@ def provision_worktree(
     - the hook points at the MAIN repo's already-installed relay via an absolute
       path (the relay locates the run dir from $BMAD_LOOP_RUN_DIR, not its own
       location), so nothing is written into the worktree's .bmad-loop/;
-    - everything we wrote is added to the worktree's local git exclude. That write
-      is best-effort: when git can't be queried at all it is skipped silently, but
-      a filesystem fault after that is reported to `on_degraded` (once, with the
-      reason) rather than swallowed — an unwritten exclude is what lets `git add -A`
-      stage the tool files, so it must not fail invisibly.
+    - everything we wrote is excluded from git, in a file private to THIS worktree
+      (`.git/worktrees/<id>/info/exclude`, activated per-worktree) that dies with it
+      when the worktree is removed. It is never the repository-wide
+      `.git/info/exclude`: that file is shared with the operator's own checkout and
+      permanent, so shielding through it hid every new file under a tool dir from
+      their `git add -A` forever (#384). That write is best-effort: when git can't
+      be queried at all it is skipped silently, but any fault after that — including
+      a refusal to scope the shield, and a shield that was written but which git does
+      not resolve to — is reported to `on_degraded` (once, with the reason) rather
+      than swallowed, and the shield is skipped rather than widened back to the
+      shared file. An unshielded worktree lets `git add -A` stage the tool files, so
+      it must not fail invisibly.
     Skill trees, the per-CLI hook config, and the seeded configs all live in dirs
     projects gitignore — but the exclude shields them even when a project doesn't.
 
@@ -282,7 +289,9 @@ def provision_worktree(
 
     # Shield exactly the paths we wrote (skill trees + hook configs + seeded
     # configs) from the unit's `git add -A`, in case a project doesn't gitignore
-    # its tool dirs.
+    # its tool dirs. Scoped to this worktree and expiring with it — these are
+    # paths projects legitimately TRACK, so a repo-wide exclude here went on
+    # hiding their new files from the operator's own checkout (#384).
     patterns = {f"/{p.skill_tree}" for p in profiles}
     # hookless profiles have no config_path — and their empty string would render
     # as the pattern "/", git-excluding the entire worktree.
@@ -483,9 +492,7 @@ class WorktreeFlow:
             self.paths.repo_root,
             seed_files=list(dict.fromkeys(seeds)),  # dedupe, preserve order
             seed_globs=self._registry.seed_globs(),
-            on_degraded=lambda msg: self.journal.append(
-                "worktree-exclude-degraded", story_key=task.story_key, error=msg
-            ),
+            on_degraded=lambda msg: self._exclude_degraded(task.story_key, msg),
         )
         if skipped_seeds:
             # A seed entry whose destination already exists is a no-op. Harmless for
@@ -522,6 +529,23 @@ class WorktreeFlow:
         # reached only on a normal return (DONE or DEFERRED); a RunPaused from the
         # spec gate or an escalation propagates past here, leaving the worktree up.
         self.integrate_unit(task, unit)
+
+    def _exclude_degraded(self, story_key: str, msg: str) -> None:
+        """The git-add shield was owed for this unit's worktree and did not happen.
+
+        Journaled AND notified, the way `worktree-open-failed` is above. The notify
+        is the half that was missing: the shield's whole degrade policy is to SKIP
+        rather than widen — activating over patterns it could not copy would shadow
+        the operator's own excludes — and skipping is only defensible if the operator
+        finds out. A run that ends "finished" with a journal line nobody reads is how
+        the provisioned tool files reach a story's merge unnoticed.
+
+        `gates.notify` is best-effort and never raises, and is inert unless
+        `notify.file`/`notify.desktop` is configured, so this cannot break a run —
+        which matters, because it is called from inside provisioning.
+        """
+        self.journal.append("worktree-exclude-degraded", story_key=story_key, error=msg)
+        gates.notify(self.policy, self.run_dir, f"worktree exclude degraded: {story_key}", msg)
 
     def failed_diff_max_bytes(self) -> int | None:
         """Per-untracked-file size cap for a failed unit's forensic patch, in

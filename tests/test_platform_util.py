@@ -148,14 +148,18 @@ def test_atomic_write_text_replaces_contents(tmp_path):
 def test_atomic_write_text_preserves_the_target_mode(tmp_path):
     """`os.replace` swaps in a NEW inode, so a naive tmp-write-and-replace resets
     the file's permissions to the umask default — silently widening a 0600 ledger
-    to world-readable, or dropping group-write on a shared artifact dir."""
+    to world-readable, or dropping group-write on a shared artifact dir.
+
+    0o640, NOT 0o600: `mkstemp` creates its temp at 0600 already, so asserting that
+    value passed with `copymode` deleted — the pin held for the wrong reason. Any
+    mode the staging temp does not arrive with makes the ablation bite."""
     target = tmp_path / "ledger.md"
     target.write_text("before", encoding="utf-8")
-    target.chmod(0o600)
+    target.chmod(0o640)
 
     platform_util.atomic_write_text(target, "after")
 
-    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
@@ -268,6 +272,211 @@ def test_atomic_write_text_temp_name_is_unique_per_call(tmp_path, monkeypatch):
     assert len(set(seen)) == 2
 
 
+# ------------------------------------------------------------ atomic_write_bytes
+#
+# Mirrored from the eight text cases above rather than parametrized over both, and
+# deliberately: each property is a separate PIN the git-add shield now depends on
+# (install.py's `_worktree_local_exclude` writes through this variant, not the text
+# one), and the two helpers share a private tail that a later edit could split
+# without either name changing. A parametrized suite would also lose the
+# per-property rationale the text docstrings carry, which is where the reasons live.
+# What is NOT mirrored is anything about encoding — the last case below is the whole
+# difference between the two.
+
+
+def test_atomic_write_bytes_replaces_contents(tmp_path):
+    target = tmp_path / "exclude"
+    target.write_bytes(b"before")
+
+    platform_util.atomic_write_bytes(target, b"after")
+
+    assert target.read_bytes() == b"after"
+
+
+def test_atomic_write_bytes_writes_bytes_no_codec_can_decode(tmp_path):
+    """The reason this variant exists (#384 review round 4): the payload is an
+    operator's git exclude file, whose patterns are POSIX paths and therefore
+    arbitrary bytes. `atomic_write_text` would have to encode, and a strict UTF-8
+    encode of a legacy-encoded file's content raises."""
+    target = tmp_path / "exclude"
+    target.write_bytes(b"before\n")
+
+    platform_util.atomic_write_bytes(target, b"secret-\xff\n/probe\n")
+
+    assert target.read_bytes() == b"secret-\xff\n/probe\n"
+
+
+def test_atomic_write_bytes_does_not_translate_newlines(tmp_path):
+    """The one behavioral difference from the text sibling, and it is load-bearing on
+    Windows. `atomic_write_text` opens in text mode with the translating `newline`
+    default, so an LF payload lands as CRLF there — correct for a ledger a human
+    edits, wrong for a file being copied byte-for-byte from somewhere else. Binary
+    mode does no translation on any platform, which is what makes a verbatim copy
+    verbatim."""
+    target = tmp_path / "exclude"
+    target.write_bytes(b"before\n")
+
+    platform_util.atomic_write_bytes(target, b"a\nb\n")
+
+    assert target.read_bytes() == b"a\nb\n"  # never b"a\r\nb\r\n"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+def test_atomic_write_bytes_preserves_the_target_mode(tmp_path):
+    """Same pin as the text sibling — and the one the shield leans on hardest: an
+    exclude file git cannot READ is one git silently IGNORES, so a mode reset here
+    stages the very files the exclude was written to hide.
+
+    0o640 rather than 0o600 for the reason the text sibling gives: `mkstemp`'s temp
+    is already 0600, so that value cannot tell a preserved mode from a fresh one."""
+    target = tmp_path / "exclude"
+    target.write_bytes(b"before")
+    target.chmod(0o640)
+
+    platform_util.atomic_write_bytes(target, b"after")
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_atomic_write_bytes_writes_through_a_symlink(tmp_path):
+    real = tmp_path / "real-exclude"
+    real.write_bytes(b"before")
+    link = tmp_path / "exclude"
+    link.symlink_to(real)
+
+    platform_util.atomic_write_bytes(link, b"after")
+
+    assert link.is_symlink()
+    assert real.read_bytes() == b"after"
+
+
+def test_atomic_write_bytes_preserves_extended_attributes(tmp_path):
+    """Skipped where the platform or filesystem has no user xattrs, exactly as the
+    text sibling is — the helper is best-effort there by design."""
+    target = tmp_path / "exclude"
+    target.write_bytes(b"before")
+    setxattr = getattr(os, "setxattr", None)
+    if setxattr is None:
+        pytest.skip("no os.setxattr on this platform")
+    try:
+        setxattr(target, "user.bmad-loop-test", b"kept")
+    except OSError as e:
+        pytest.skip(f"filesystem does not support user xattrs: {e}")
+
+    platform_util.atomic_write_bytes(target, b"after")
+
+    assert target.read_bytes() == b"after"
+    assert os.getxattr(target, "user.bmad-loop-test") == b"kept"
+
+
+def test_atomic_write_bytes_fsyncs_before_it_publishes(tmp_path, monkeypatch):
+    """Same ordering pin as the text sibling: a durable rename over data still in the
+    page cache comes back as a zero-length file, which for an exclude reads as "no
+    patterns" — a shield that silently excludes nothing."""
+    order = []
+    real_fsync, real_replace = os.fsync, os.replace
+    monkeypatch.setattr(
+        platform_util.os, "fsync", lambda fd: (order.append("fsync"), real_fsync(fd))[1]
+    )
+    monkeypatch.setattr(
+        platform_util.os, "replace", lambda s, d: (order.append("replace"), real_replace(s, d))[1]
+    )
+    target = tmp_path / "exclude"
+    target.write_bytes(b"before")
+
+    platform_util.atomic_write_bytes(target, b"after")
+
+    assert order == ["fsync", "replace"]  # the sync must precede the publish
+    assert target.read_bytes() == b"after"
+
+
+def test_atomic_write_bytes_leaves_no_temp_behind(tmp_path):
+    target = tmp_path / "exclude"
+    target.write_bytes(b"before")
+
+    platform_util.atomic_write_bytes(target, b"after")
+
+    assert [p.name for p in tmp_path.iterdir()] == ["exclude"]
+
+
+def test_atomic_write_bytes_cleans_up_and_keeps_the_original_on_failure(tmp_path, monkeypatch):
+    target = tmp_path / "exclude"
+    target.write_bytes(b"before")
+
+    def boom(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(platform_util.os, "replace", boom)
+
+    with pytest.raises(OSError):
+        platform_util.atomic_write_bytes(target, b"after")
+
+    assert target.read_bytes() == b"before"
+    assert [p.name for p in tmp_path.iterdir()] == ["exclude"]  # no orphaned temp
+
+
+def test_atomic_write_bytes_temp_name_is_unique_per_call(tmp_path, monkeypatch):
+    target = tmp_path / "exclude"
+    target.write_bytes(b"before")
+    seen: list[str] = []
+    real_replace = os.replace
+
+    def record(src, dst):
+        seen.append(os.path.basename(src))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(platform_util.os, "replace", record)
+
+    platform_util.atomic_write_bytes(target, b"a")
+    platform_util.atomic_write_bytes(target, b"b")
+
+    assert len(set(seen)) == 2
+
+
+def test_atomic_write_bytes_stages_in_the_targets_own_directory(tmp_path, monkeypatch):
+    """The temp has to be a SIBLING of the target, and this pins the shared tail for
+    both variants. `os.replace` cannot cross a filesystem, and the default temp dir
+    is a different mount on plenty of boxes (always, on a runner with a tmpfs
+    `/tmp`) — so a temp staged there fails the publish with EXDEV *after* the
+    content is written, turning an atomic write into a guaranteed one.
+
+    Recorded from `os.replace`'s source argument, because the pre-existing
+    "leaves no temp behind" assertion cannot see this: it lists the TARGET's
+    directory, which a temp staged in `/tmp` is trivially absent from. Measured —
+    with `dir=` dropped, that test passed."""
+    target = tmp_path / "sub" / "exclude"
+    target.parent.mkdir()
+    target.write_bytes(b"before")
+    staged: list[str] = []
+    real_replace = os.replace
+
+    def record(src, dst):
+        staged.append(os.path.dirname(str(src)))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(platform_util.os, "replace", record)
+
+    platform_util.atomic_write_bytes(target, b"after")
+
+    assert staged == [str(target.parent)]
+    assert target.read_bytes() == b"after"
+
+
+def test_atomic_write_bytes_creates_a_missing_target_at_the_private_mode(tmp_path):
+    """A target that does not exist yet is created at `mkstemp`'s 0600, not the umask
+    default — the shared contract's deliberate choice, and the reason
+    `_worktree_local_exclude` `touch()`es the exclude before calling this: it needs
+    the file to already exist so a readable mode is what gets carried over."""
+    target = tmp_path / "exclude"
+
+    platform_util.atomic_write_bytes(target, b"fresh")
+
+    assert target.read_bytes() == b"fresh"
+    if sys.platform != "win32":
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
 # --------------------------------------------------------------- retrying_unlink
 
 
@@ -351,6 +560,34 @@ def test_file_lock_reentry_after_exception(tmp_path):
             raise RuntimeError("boom")
     with platform_util.file_lock(lock, blocking=False):
         pass
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes; Windows has no umask")
+def test_file_lock_is_created_owner_only(tmp_path):
+    """The lock's mode is stated by the code, not inherited from whoever ran first.
+
+    A repository shared between OS users is refused before the shield ever takes
+    this lock (`install._shield_shared_repository`, #384), so owner-only is the
+    whole policy — but leaving `os.open` mode-less would still make the mode a
+    property of the creator's umask rather than a decision: measured, 022 yields
+    0o755 and 077 yields 0o700.
+
+    `os.umask(0o022)` is the point of the fixture, not hygiene. At this box's own
+    0o077 the mode-less code produces 0o600 by accident and the ablation does not
+    bite — the same trap as
+    `test_install.py::test_worktree_local_exclude_created_exclude_stays_readable`.
+
+    Ablation (run): drop the `0o600` argument from `file_lock`'s `os.open` and this
+    fails reporting 0o755."""
+    lock = tmp_path / "s.lock"
+    previous = os.umask(0o022)
+    try:
+        with platform_util.file_lock(lock):
+            pass
+    finally:
+        os.umask(previous)
+
+    assert stat.S_IMODE(lock.stat().st_mode) == 0o600, oct(stat.S_IMODE(lock.stat().st_mode))
 
 
 # ------------------------------------------------------------------ safe_segment
