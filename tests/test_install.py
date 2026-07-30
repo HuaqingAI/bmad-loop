@@ -1849,6 +1849,42 @@ def test_shield_reports_a_rollback_it_could_not_make(project, tmp_path, monkeypa
     assert "permanent format change" in reason
 
 
+def test_shield_reports_a_rollback_whose_own_git_faulted(project, tmp_path, monkeypatch):
+    """The rollback's OWN git can raise, not just return non-zero — it is another
+    chokepoint call. `_shield_undo_extension` catches that and reports it, because it
+    is called from a function contracted never to propagate, and because a raise
+    escaping it would lose the activation fault that prompted the rollback.
+
+    The coherent case rather than a contrived one: a dead git or a read-only `.git`
+    fails the unset for the same reason it failed the activation.
+
+    Ablation: drop the `except GitError` in `_shield_undo_extension` and this fails —
+    the fault escapes into the caller's tail and the reason names neither the
+    activation fault nor the retained format change."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    real = install_mod.git_bytes
+
+    def fail_activation_and_raise_on_unset(worktree, *args):
+        if "--unset" in args:
+            raise verify.GitSpawnError("git could not spawn")
+        if "--worktree" in args:
+            return subprocess.CompletedProcess(
+                args=["git", *args], returncode=1, stdout=b"", stderr=b"fatal: read-only .git\n"
+            )
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", fail_activation_and_raise_on_unset)
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert reason is not None
+    assert "read-only .git" in reason  # the activation fault survived the rollback
+    assert "could NOT be rolled back" in reason and "could not spawn" in reason
+    assert "permanent format change" in reason
+
+
 def test_shield_never_unsets_an_extension_the_repo_already_carried(project, tmp_path, monkeypatch):
     """The rollback is gated on having enabled the flag IN THIS CALL, and that gate is
     a safety property rather than a micro-optimization: a repo that already carries
@@ -2875,7 +2911,10 @@ def test_worktree_local_exclude_git_fault_before_answering_is_a_silent_skip(
     assert _worktree_local_exclude(wt, ["/probe-389"]) is None
 
 
-def test_worktree_local_exclude_git_fault_after_answering_degrades(project, tmp_path, monkeypatch):
+@pytest.mark.parametrize("fault", [verify.GitError, verify.GitSpawnError])
+def test_worktree_local_exclude_git_fault_after_answering_degrades(
+    project, tmp_path, monkeypatch, fault
+):
     """Once `rev-parse` has answered, the same fault means the opposite thing — the
     shield was owed and did not happen — so it must come back as a reason the
     caller can journal, not as silence.
@@ -2883,22 +2922,41 @@ def test_worktree_local_exclude_git_fault_after_answering_degrades(project, tmp_
     Name-filtered onto the activation so everything before it runs for real; that
     is also what makes this the SECOND arm rather than the first.
 
-    Ablation: drop `GitError` from the tail's except tuple and this fails — the
-    timeout propagates instead of degrading."""
+    THE FLAG ASSERTION IS THE POINT OF THE SECOND HALF. This test injected exactly
+    the raised activation fault for two review rounds while asserting only the
+    returned reason — so it sat directly on top of a live defect and could not see
+    it: the enable one line above had already made a permanent repo-format change,
+    and the raise bypassed the rollback that the non-zero-rc arm had. Codex found it
+    by reading this test rather than the code. A degrade assertion that stops at the
+    reason string cannot tell a clean degrade from one that left state behind.
+
+    Parametrized over both classes because they enter differently — a timeout is
+    raised as `GitError` itself, a spawn failure as the `GitSpawnError` subclass.
+
+    Ablation: drop the `except GitError` around the activation and both cases fail on
+    the flag assertion (the fault reaches the tail, which cannot roll back). Note the
+    ablation this docstring USED to name — "drop `GitError` from the tail's except
+    tuple" — no longer applies here, since the activation's fault is now caught
+    locally; the tail's guard is pinned by
+    `test_shield_degrades_when_git_will_not_say_what_the_users_excludes_are`."""
+    repo = project.project
     wt = tmp_path / "wt"
-    verify.worktree_add(project.project, wt, "feat", "main")
+    verify.worktree_add(repo, wt, "feat", "main")
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
     real = install_mod.git_bytes
 
-    def timeout_on_activation(worktree, *args):
+    def fault_on_activation(worktree, *args):
         if "--worktree" in args:
-            raise verify.GitError("git config timed out after 120s")
+            raise fault("git config timed out after 120s")
         return real(worktree, *args)
 
-    monkeypatch.setattr(install_mod, "git_bytes", timeout_on_activation)
+    monkeypatch.setattr(install_mod, "git_bytes", fault_on_activation)
 
     reason = _worktree_local_exclude(wt, ["/probe-389"])
 
     assert reason is not None and "timed out" in reason
+    # ...and the permanent format change the enable made one line earlier is gone
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("fault", [verify.GitError, verify.GitSpawnError])
