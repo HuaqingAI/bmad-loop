@@ -286,7 +286,34 @@ def file_lock(path: Path, *, blocking: bool = True) -> Iterator[None]:
     span as correctness allows, and handle the ``OSError`` from acquisition.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT)
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT)
+    except PermissionError:
+        # A PEER'S lock file, in a group-shared repository (#384, Codex round 13).
+        # `os.open` takes no mode here, so it defaults to 0o777 masked by the umask —
+        # measured, the usual 022 yields **0o755**, i.e. owner-writable only. So the
+        # first user to provision a worktree from a `core.sharedRepository = group`
+        # repo leaves a lock every OTHER user then fails `O_RDWR` on with EACCES
+        # (measured with two real uids in one group), and their shield is skipped for
+        # the life of the repository — after provisioning has already copied the tool
+        # files the shield exists to hide.
+        #
+        # The fix is to stop demanding write access rather than to widen the mode:
+        # creating it 0o666/0o777 would put a group- or world-writable file inside
+        # `.git`, which is a worse trade than the problem. POSIX `flock` needs only an
+        # OPEN FD, not a writable one — and the exclusion is inode-based, so it still
+        # holds ACROSS the two fd kinds: measured, while a peer holds the lock through
+        # an `O_RDWR` fd, `LOCK_EX | LOCK_NB` on an `O_RDONLY` fd here returns
+        # EWOULDBLOCK exactly as it should. The fallback therefore costs no mutual
+        # exclusion, which is the only property this function sells.
+        #
+        # NOT on Windows: `msvcrt.locking` locks a byte range and requires the file be
+        # open for WRITING, so a read-only fd cannot carry the lock there. Re-raise and
+        # let the caller report it, which `install._worktree_local_exclude` already
+        # does by naming the lock.
+        if sys.platform == "win32":
+            raise
+        fd = os.open(path, os.O_RDONLY)
     try:
         if sys.platform == "win32":
             import msvcrt

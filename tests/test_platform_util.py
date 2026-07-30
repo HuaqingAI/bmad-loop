@@ -562,6 +562,51 @@ def test_file_lock_reentry_after_exception(tmp_path):
         pass
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="msvcrt.locking needs a writable fd, so the fallback is POSIX-only",
+)
+def test_file_lock_acquires_a_lock_file_it_cannot_write(tmp_path):
+    """A peer's lock file in a group-shared repository must not lock us out.
+
+    `os.open` here takes no mode, so it defaults to 0o777 masked by the umask — the
+    usual 022 makes the lock **0o755**, owner-writable only. Measured with two real
+    uids in one group: the second user's `O_RDWR | O_CREAT` fails EACCES, so under
+    `core.sharedRepository = group` every user but the first would have their git-add
+    shield skipped for the life of the repository, after provisioning had already
+    copied the tool files it exists to hide (#384, Codex round 13).
+
+    0o444 stands in for "a file this process cannot write", which is what a peer's
+    0o755 lock is from here. The mode is the whole fixture, so a run that does not
+    ENFORCE it proves nothing — hence the root guard: root bypasses the permission
+    check entirely and would open O_RDWR happily, making this pass against the bug.
+    That is the same void-measurement trap as reading a docker permission result
+    without checking `id -u`.
+
+    Mutual exclusion is asserted here too, not assumed: it is the only property this
+    function sells, and a fallback that silently stopped excluding would be a far worse
+    bug than the one it fixes. flock is inode-based, so it holds across the two fd
+    kinds — measured independently with two uids, and pinned below within one process.
+
+    Ablation: drop the `except PermissionError` fallback and this fails at the first
+    `with` — PermissionError, exactly as a peer's run gets today."""
+    lock = tmp_path / "shared.lock"
+    lock.touch()
+    lock.chmod(0o444)
+    if os.access(lock, os.W_OK):  # root ignores the mode; the fixture would be inert
+        pytest.skip("running as root, so 0o444 is not enforced")
+
+    with platform_util.file_lock(lock):
+        # ...and it is a real exclusive lock, not a no-op that merely opened the file
+        with pytest.raises(OSError):
+            with platform_util.file_lock(lock, blocking=False):
+                pass
+
+    # released on exit, same as the writable path
+    with platform_util.file_lock(lock, blocking=False):
+        pass
+
+
 # ------------------------------------------------------------------ safe_segment
 
 
