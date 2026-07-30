@@ -969,23 +969,22 @@ def _shield_inherited_excludes(worktree: Path) -> bytes:
     """
     # -z, not a bare read plus `.strip()` — round 5, Codex P2. A `.strip()` here
     # DESTROYED a legal POSIX path: `--type=path --get` returns leading and
-    # trailing whitespace VERBATIM (git writes such a value quoted, so it
-    # round-trips — measured at 2.20.4 and 2.55.0), so an operator whose
-    # excludesFile ends in a space had the strip mangle the path, `is_file()` read
-    # absent, the seed come back empty, and the activation shadow the file it
-    # never copied. The same leak as the encoding bug above, through a different
-    # door. `-z` terminates the value with NUL instead, which git-config(1)
-    # recommends for exactly this ("allows for secure parsing of the output
-    # without getting confused by values that contain line breaks").
+    # trailing whitespace VERBATIM, because git writes such a value quoted and it
+    # round-trips. So an operator whose excludesFile ended in a space had the strip
+    # mangle the path, `is_file()` read absent, the seed come back empty, and the
+    # activation shadow the file it never copied — the same leak as the encoding bug
+    # above, through a different door. `-z` terminates the value with NUL instead,
+    # which git-config(1) recommends for exactly this ("allows for secure parsing of
+    # the output without getting confused by values that contain line breaks").
     #
-    # Every branch below is preserved, measured at both ends of the supported
-    # range: `-z` still expands `~`, gives an unset key rc 1 + empty stdout, an
-    # empty value a lone NUL (falsy after the split, so it falls to XDG the way it
-    # did), a multi-valued key the LAST value + NUL at rc 0, and a relative value
-    # verbatim. Both ends means git 2.20.4 and 2.55.0 — the flag is checked AT the
-    # floor rather than inferred from git-config(1), because the 2.20 refusal in
-    # `_shield_enable_worktree_config` has already run by the time this does, so
-    # 2.20 is the oldest git that can reach this line at all.
+    # Everything below is measured at git 2.20.4 AND 2.55.0 — both ends of the
+    # supported range, the flag checked AT the floor rather than inferred from
+    # git-config(1), since the 2.20 refusal in `_shield_enable_worktree_config` has
+    # already run by the time this does and 2.20 is therefore the oldest git that
+    # can reach this line. Every branch is preserved: `-z` still expands `~`, gives
+    # an unset key rc 1 + empty stdout, an empty value a lone NUL (falsy after the
+    # split, so it falls to XDG the way it did), a multi-valued key the LAST value +
+    # NUL at rc 0, and a relative value verbatim.
     #
     # The sibling `rev-parse` strips below are deliberately NOT getting the same
     # treatment, and this is the note that stops a later round re-raising it:
