@@ -3227,6 +3227,47 @@ def test_shield_dedupe_does_not_split_on_non_git_line_breaks(project, tmp_path):
     assert _wt_private_exclude(wt).read_bytes() == b"weird\x0cpattern\n/probe-384\n"
 
 
+def test_shield_appends_a_pattern_an_inherited_negation_would_cancel(project, tmp_path):
+    """A pattern the file already CONTAINS can still be ineffective: gitignore's rule
+    is LAST MATCH WINS, so a `!` line below it cancels it (#384, Codex round 17).
+
+    The plain set-membership dedupe therefore declined to append the shield's own
+    pattern, and the provisioned tool files stayed stageable — SILENTLY, because
+    nothing failed. That is why the assertions here go through git rather than through
+    the return value: `_worktree_local_exclude` answers None both with the bug and
+    with the fix, so a `reason` assertion cannot bite at all. Same shape as the
+    fault-injection test that sat on a live defect for two rounds by asserting only
+    the reason string.
+
+    Measured, the negation need not repeat the positive's spelling — `!.claude/skills`
+    cancels `/.claude/skills` too. What does NOT cancel it is a negation leaving the
+    directory itself excluded (`!*.md` below it, or `!/.claude`, which re-includes only
+    the parent): git never descends into an excluded directory. The fix is deliberately
+    conservative across that line, appending a harmless duplicate in those cases rather
+    than reimplementing git's matcher, so this test pins the defeating shape only.
+
+    Ablation (run): restore `settled = set(existing.splitlines())` and this fails at the
+    status assertion with `?? .claude/skills/tool.md`."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    users = tmp_path / "my-global-ignores"
+    users.write_bytes(b"/.claude/skills\n!/.claude/skills\n")
+    git(repo, "config", "core.excludesFile", str(users))
+
+    assert _worktree_local_exclude(wt, ["/.claude/skills"]) is None
+
+    # non-vacuity: the operator's negation really did reach the private file, so the
+    # fixture expresses the scenario rather than merely naming it
+    assert b"!/.claude/skills\n" in _wt_private_exclude(wt).read_bytes()
+    # THE HARM, through git's own answer. A substring rather than whole-worktree
+    # cleanliness: that form has already failed on Windows CI in this PR over unrelated
+    # CRLF churn, and the subject here is this one path.
+    (wt / ".claude" / "skills").mkdir(parents=True, exist_ok=True)
+    (wt / ".claude" / "skills" / "tool.md").write_text("generated\n", encoding="utf-8")
+    assert "tool.md" not in git(wt, "status", "--porcelain", "-uall")
+
+
 def test_shield_seeds_a_relative_excludesfile_resolved_like_git(project, tmp_path, monkeypatch):
     """`--type=path` expands `~` and stops there — a RELATIVE `core.excludesFile`
     comes back from git verbatim. Git resolves such a value against the worktree's

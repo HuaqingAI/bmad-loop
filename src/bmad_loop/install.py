@@ -1772,13 +1772,45 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
             # \x1d, \x1e and \x85, none of which git treats as a line boundary, so a
             # legitimate pattern containing one fragmented into wrong dedupe keys.
             existing = exclude.read_bytes() if existed else _shield_inherited_excludes(worktree)
-            present = set(existing.splitlines())
+            lines = existing.splitlines()
+            # PRESENT IS NOT THE SAME AS EFFECTIVE (#384, Codex round 17). gitignore's
+            # rule is LAST MATCH WINS, so a pattern this file already contains can be
+            # cancelled by a `!` line below it — and a plain set-membership dedupe then
+            # declined to append the shield's own pattern, leaving the provisioned tool
+            # files stageable with NO degrade reason at all, because nothing failed.
+            # Measured end-to-end through this function: seeded from an operator's
+            # `core.excludesFile` holding `/.claude/skills` then `!/.claude/skills`,
+            # `git status --porcelain -uall` in the worktree answers
+            # `?? .claude/skills/tool.md` and `git add -A` stages it.
+            #
+            # So a pattern may be skipped only where it is already GUARANTEED effective:
+            # it sits after the LAST negation in the file. That is airtight without
+            # reimplementing git's matching — no later line can negate it, so the last
+            # pattern matching any path it covers is either this one or a positive below
+            # it, and both ignore. Anything earlier is appended instead, which is always
+            # safe: the appended copy is last, so it is the one that decides.
+            #
+            # Deliberately CONSERVATIVE rather than exact. Measured, the only negation
+            # that actually defeats the shield is one re-including the pattern's own
+            # directory (`!.claude/skills` does it too — the negation need not repeat the
+            # positive's spelling); a `!*.md` below it does NOT, since git never descends
+            # into an excluded directory, and neither does `!/.claude`, since re-including
+            # a parent leaves the child matched. Telling those apart is git's matcher, so
+            # this appends a duplicate line in the harmless cases instead of guessing.
+            #
+            # `startswith(b"!")` with NO lstrip, which is git-correct twice over: git does
+            # not strip leading whitespace from a pattern, and `\!` escapes a literal
+            # leading `!` — both then read as positives here, as they do in git.
+            last_negation = max(
+                (i for i, line in enumerate(lines) if line.startswith(b"!")), default=-1
+            )
+            settled = set(lines[last_negation + 1 :])
             # fsencode, the inverse of the fsdecode above: a pattern derived from a real
             # filename round-trips to its exact original bytes. Both sides of the `in`
             # MUST be bytes — with `patterns` left as str every one of them reads as
             # absent and gets re-appended on every re-provision.
             wanted = [os.fsencode(p) for p in patterns]
-            new = [p for p in wanted if p not in present]
+            new = [p for p in wanted if p not in settled]
             # `not existed` keeps a re-provision that adds no pattern from leaving the
             # config below pointing at a file that was never created.
             if new or not existed:

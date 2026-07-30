@@ -310,6 +310,11 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   and no repo-format change is made, since git that old refuses a repository carrying the flag. Lines
   an older bmad-loop already wrote into `.git/info/exclude` are **not** removed for you — delete them
   by hand (a `validate` warning lands separately).
+- **The git-add shield's patterns survive an inherited negation (#384).** A pattern the seeded
+  excludes already carried was treated as done — but gitignore's rule is last match wins, so a
+  `!` line below it cancelled the shield's own pattern and the provisioned tool files stayed
+  stageable, with nothing reported because nothing had failed. A pattern is now re-appended
+  unless it already sits after the last negation in the file.
 - **The git-add shield no longer opens its own safety gates when git cannot answer (#384).** The
   three probes that ask whether enabling `extensions.worktreeConfig` is safe read every non-zero
   exit code as "that key is not set", so a git that could not answer — rather than one answering
