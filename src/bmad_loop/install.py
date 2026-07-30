@@ -1422,9 +1422,12 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
       option it does not know and exits 0, so that lands in the arm below, via
       the version refusal in `_shield_enable_worktree_config`.
     - anything AFTER git answered degrades to a returned reason string the caller
-      can surface: a main checkout passed in (nothing to scope to), a shield lock
-      that could not be taken (contention on Windows, or an `os.open` fault in the
-      common dir), a refused or
+      can surface: the `--git-common-dir` probe failing once `--absolute-git-dir`
+      has already answered (round 11 — it sat in the silent arm above from round 3,
+      when one combined `rev-parse` became two calls, until this list was read as
+      the specification it is), a main checkout passed in (nothing to scope to), a
+      shield lock that could not be taken (contention on Windows, or an `os.open`
+      fault in the common dir), a refused or
       failed extension enable, a failed activation, `.resolve()` (pre-3.13 a
       symlink loop raises RuntimeError, not OSError), `mkdir`, read/write
       `OSError` — including the operator's own excludes file existing but being
@@ -1472,17 +1475,44 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
             # `_shield_enable_worktree_config`, which returns above any write — a
             # degrade, not this silent skip.
             return None
-        shared_answer = git_bytes(worktree, "rev-parse", "--git-common-dir")
-        if shared_answer.returncode != 0:
-            return None
     except GitError:
-        # GitError alone, and it is not a narrowing: this `try` wraps the two git
-        # calls and nothing that can raise, and every fault the chokepoint raises
-        # out of one is a GitError — a timeout directly, a spawn failure as
+        # GitError alone, and it is not a narrowing: this `try` wraps ONE git call
+        # and nothing else that can raise, and every fault the chokepoint raises out
+        # of it is a GitError — a timeout directly, a spawn failure as
         # GitSpawnError, which subclasses it. The `OSError` that used to belong here
         # was the spawn fault's raw form and is now translated before it arrives.
         return None
     try:
+        # The COMMON-DIR probe lives in THIS try, not the silent one above, and that
+        # placement IS the fix (round 11). Once `--absolute-git-dir` has answered,
+        # git has identified the repository, so every later fault is on the degrade
+        # side of the two-arm taxonomy — which the silent arm's own docstring already
+        # said ("a timeout or spawn failure on the FIRST rev-parse ... that scope is
+        # the whole of it, and the qualifier is load-bearing"), and which
+        # `worktree_flow`'s contract says too ("any fault after that ... is reported
+        # to on_degraded rather than swallowed"). Round 3 split one combined
+        # `rev-parse` into two calls to survive a newline in a repo path, and the
+        # second call inherited the first's silent arm — leaving a timeout on it to
+        # skip the shield with NO reason, after provisioning had already copied the
+        # files the shield exists to hide.
+        #
+        # Both failure shapes are handled without an `except` of its own, per round
+        # 7's funnel lesson: a non-zero rc returns the specific reason below, and a
+        # raise is caught by this try's tail, which reports a reason too. The tail
+        # also catches the `UnicodeError` this `fsdecode` of git's stderr can raise
+        # on Windows — the same defect #394 records at a sibling block, so the stderr
+        # read is deliberately INSIDE a guarded region rather than above one.
+        shared_answer = git_bytes(worktree, "rev-parse", "--git-common-dir")
+        if shared_answer.returncode != 0:
+            detail = (
+                os.fsdecode(shared_answer.stderr).strip()
+                or f"git exited {shared_answer.returncode}"
+            )
+            return (
+                f"skipped the git-add shield ({worktree}): git identified the "
+                f"repository but could not name its common dir: {detail} — the "
+                "provisioned tool files are not shielded from the unit's `git add -A`"
+            )
         # fsdecode, so a non-UTF-8 repo path round-trips back to the filesystem
         # instead of faulting. It can still raise on Windows (utf-8/surrogatepass
         # rejects a lone invalid byte), which is why it sits inside this try —

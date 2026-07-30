@@ -3711,6 +3711,98 @@ def test_worktree_local_exclude_git_fault_before_answering_is_a_silent_skip(
     assert _worktree_local_exclude(wt, ["/probe-389"]) is None
 
 
+def test_worktree_local_exclude_common_dir_probe_rc_degrades(project, tmp_path, monkeypatch):
+    """The SECOND `rev-parse` is past the silent arm: `--absolute-git-dir` has already
+    answered, so git has identified the repository and a failure here is a degrade.
+
+    Round 3 split one combined `rev-parse` into two calls (a newline is a legal byte
+    in a POSIX path), and the second call inherited the FIRST call's silent arm. That
+    left a shield that was owed, did not happen, and said nothing — after provisioning
+    had already copied the files it exists to hide. Both the function's own docstring
+    ("a timeout or spawn failure on the FIRST rev-parse ... that scope is the whole of
+    it") and `worktree_flow`'s contract ("any fault after that ... is reported to
+    on_degraded rather than swallowed") already specified the fix; only the code
+    disagreed.
+
+    Name-filtered onto `--git-common-dir` alone, so `--absolute-git-dir` answers for
+    real and this pins the boundary BETWEEN the two arms rather than the first arm.
+    If the production flag ever changes, this filter stops matching, the shield
+    succeeds, and `reason is not None` fails loudly — the opposite polarity to a
+    tripwire that goes quiet (round 10).
+
+    The stderr detail is asserted, not just non-None: deleting the new arm lets the
+    empty stdout fall through to the `could not read this worktree's git dirs` guard,
+    which ALSO returns a reason. Asserting only `is not None` would pass against the
+    bug.
+
+    Ablation: replace this arm's `return (...)` with `return None` — the round-8 rule
+    that a gate whose deletion does not reproduce the bug must be ablated by restoring
+    the OLD behavior, since deleting it lands on that other guard instead."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    real = install_mod.git_bytes
+
+    def rc_on_common_dir(worktree, *args):
+        if args[:2] == ("rev-parse", "--git-common-dir"):
+            return subprocess.CompletedProcess(
+                args=["git", *args],
+                returncode=128,
+                stdout=b"",
+                stderr=b"fatal: common dir vanished mid-probe\n",
+            )
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", rc_on_common_dir)
+
+    reason = _worktree_local_exclude(wt, ["/probe-r11"])
+
+    assert reason is not None
+    assert "common dir vanished mid-probe" in reason
+    assert "could not name its common dir" in reason
+
+
+@pytest.mark.parametrize("fault", [verify.GitError, verify.GitSpawnError])
+def test_worktree_local_exclude_common_dir_probe_raise_degrades(
+    project, tmp_path, monkeypatch, fault
+):
+    """The raise half of the same boundary, which is the shape that is actually
+    reachable.
+
+    A non-zero rc from `--git-common-dir` after `--absolute-git-dir` answered rc 0 has
+    no static occupant — measured at 2.20.4 and 2.55.0, a healthy linked worktree
+    answers both rc 0, and an unknown flag is ECHOED at rc 0 rather than refused, so
+    "a git too old for the flag" cannot land there either. What reaches this boundary
+    is a TRANSIENT fault on the second spawn: the two probes are two separate
+    processes, each bounded by `limits.git_timeout_s`. Same standing round 9 accepted
+    one function away, and the reason it is worth a guard at all.
+
+    Both classes, because they enter differently — a timeout raises `GitError`
+    itself, a spawn failure the `GitSpawnError` subclass. Neither is caught locally:
+    the call sits inside the tail's `try`, so the raise is funnelled into a reason
+    there rather than by an `except` of its own (round 7 — enumerating one failure
+    shape per round is what cost this PR three of them).
+
+    Ablation: wrap the `--git-common-dir` call in `try: ... except GitError: return
+    None`, restoring the pre-round-11 structure — both cases then return None."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    real = install_mod.git_bytes
+
+    def raise_on_common_dir(worktree, *args):
+        if args[:2] == ("rev-parse", "--git-common-dir"):
+            raise fault("git rev-parse was killed mid-probe")
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", raise_on_common_dir)
+
+    reason = _worktree_local_exclude(wt, ["/probe-r11"])
+
+    assert reason is not None
+    assert "killed mid-probe" in reason
+
+
 @pytest.mark.parametrize("fault", [verify.GitError, verify.GitSpawnError])
 def test_worktree_local_exclude_git_fault_after_answering_degrades(
     project, tmp_path, monkeypatch, fault

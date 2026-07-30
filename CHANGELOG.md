@@ -281,7 +281,10 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   activating over patterns that could not be copied would shadow them exactly as an empty copy did,
   and not knowing whether there is anything to copy has the same standing as failing to read it.
   Only a definite **absent** answer stays a silent no-op — there is nothing to shadow. The skip is
-  also **notified**, not just journaled, since skipping is only defensible if you find out. An
+  also **notified**, not just journaled, since skipping is only defensible if you find out. The same
+  rule governs the pair of `rev-parse` probes that identify the repository: only a failure of the
+  first is the expected silent skip (a plain directory, no git at all); once git has answered it, a
+  fault on the second is journaled rather than swallowed. An
   **explicitly empty** `core.excludesFile` is an answer too, and not the same one as unset: git
   honors it as "no excludes file at all" and does **not** fall back to `$XDG_CONFIG_HOME/git/ignore`,
   so patterns you switched off are no longer copied into the private file and switched back on inside
