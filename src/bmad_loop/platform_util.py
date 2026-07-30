@@ -24,6 +24,7 @@ import os
 import random
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -261,6 +262,79 @@ def retrying_unlink(path: Path) -> None:
     _retry_on_sharing_violation(path.unlink)
 
 
+def _widen_lock_to_directory(fd: int, parent: Path) -> None:
+    """Stamp a just-created lock file with the group/other access its CONTAINING
+    DIRECTORY already grants, ignoring the creator's umask.
+
+    The umask is the wrong authority for this file (#384, Codex rounds 13 and 14).
+    ``os.open``'s mode is masked by it, so the lock inherits whatever policy the
+    FIRST user to provision happened to have: measured, umask 022 yields 0o755 and
+    umask 077 yields 0o700, and under both a peer in a group-shared repository is
+    locked out of a lock that is supposed to serialize them. Round 13 fixed only the
+    022 shape, by falling back to a read-only open; 0o700 grants no group read, so
+    that fallback could not rescue it either. Deriving the mode from the directory
+    funnels every umask instead of answering them one review round at a time.
+
+    The directory is the right authority because git has already written the
+    repository's sharing policy onto it: ``core.sharedRepository = group`` produces a
+    group-writable (and setgid) ``.git``, and that is also the precondition for a peer
+    to do anything here at all. So a shared repo widens the lock and a private one
+    (0o700 ``.git``) leaves it at 0o600 — no git config read, and no widening that the
+    directory does not already imply.
+
+    Granting group WRITE where the directory is group-writable concedes nothing: a
+    peer who can write the directory can already unlink and replace this file. Never
+    called on a file this process did not create, which is what ``O_EXCL`` above is
+    for — stamping a mode onto a peer's file would be a real escalation.
+
+    Best-effort: a filesystem that cannot ``fchmod`` (or Windows, which has no
+    meaningful POSIX mode) leaves the file as created rather than failing the lock.
+    """
+    if sys.platform == "win32":
+        return
+    try:
+        directory = os.stat(parent).st_mode
+        mode = 0o600
+        if directory & stat.S_IWGRP:
+            mode |= 0o060
+        elif directory & stat.S_IRGRP:
+            mode |= 0o040
+        if directory & stat.S_IWOTH:
+            mode |= 0o006
+        elif directory & stat.S_IROTH:
+            mode |= 0o004
+        os.fchmod(fd, mode)
+    except OSError:
+        pass
+
+
+def _open_existing_lock(path: Path) -> int:
+    """Open a lock file that already exists, preferring write access but not needing it.
+
+    A lock written before rounds 13/14 — or by any other tool — carries the creator's
+    umask, so a peer's ``O_RDWR`` can fail EACCES. POSIX ``flock`` needs only an OPEN
+    fd, and its exclusion is inode-based, so a read-only fd carries the same lock:
+    measured, while a peer holds it through an ``O_RDWR`` fd, ``LOCK_EX | LOCK_NB`` on
+    an ``O_RDONLY`` fd returns EWOULDBLOCK exactly as it should. The fallback therefore
+    costs none of the mutual exclusion this function exists to sell.
+
+    Deliberately NOT repaired by unlinking and recreating, however tempting: unlinking
+    a lock file that another process currently holds gives the next acquirer a NEW
+    inode, so both would believe they hold it — silently trading this reported degrade
+    for the concurrency bug the lock was added to prevent (round 8).
+
+    Windows re-raises: ``msvcrt.locking`` locks a byte range and requires the file be
+    open for writing, so a read-only fd cannot carry the lock there. The caller already
+    reports that ``OSError`` by naming the lock.
+    """
+    try:
+        return os.open(path, os.O_RDWR)
+    except PermissionError:
+        if sys.platform == "win32":
+            raise
+        return os.open(path, os.O_RDONLY)
+
+
 @contextmanager
 def file_lock(path: Path, *, blocking: bool = True) -> Iterator[None]:
     """Exclusive OS advisory lock on ``path`` (created if missing), released on
@@ -287,33 +361,12 @@ def file_lock(path: Path, *, blocking: bool = True) -> Iterator[None]:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        fd = os.open(path, os.O_RDWR | os.O_CREAT)
-    except PermissionError:
-        # A PEER'S lock file, in a group-shared repository (#384, Codex round 13).
-        # `os.open` takes no mode here, so it defaults to 0o777 masked by the umask —
-        # measured, the usual 022 yields **0o755**, i.e. owner-writable only. So the
-        # first user to provision a worktree from a `core.sharedRepository = group`
-        # repo leaves a lock every OTHER user then fails `O_RDWR` on with EACCES
-        # (measured with two real uids in one group), and their shield is skipped for
-        # the life of the repository — after provisioning has already copied the tool
-        # files the shield exists to hide.
-        #
-        # The fix is to stop demanding write access rather than to widen the mode:
-        # creating it 0o666/0o777 would put a group- or world-writable file inside
-        # `.git`, which is a worse trade than the problem. POSIX `flock` needs only an
-        # OPEN FD, not a writable one — and the exclusion is inode-based, so it still
-        # holds ACROSS the two fd kinds: measured, while a peer holds the lock through
-        # an `O_RDWR` fd, `LOCK_EX | LOCK_NB` on an `O_RDONLY` fd here returns
-        # EWOULDBLOCK exactly as it should. The fallback therefore costs no mutual
-        # exclusion, which is the only property this function sells.
-        #
-        # NOT on Windows: `msvcrt.locking` locks a byte range and requires the file be
-        # open for WRITING, so a read-only fd cannot carry the lock there. Re-raise and
-        # let the caller report it, which `install._worktree_local_exclude` already
-        # does by naming the lock.
-        if sys.platform == "win32":
-            raise
-        fd = os.open(path, os.O_RDONLY)
+        # O_EXCL so CREATING is distinguishable from opening: the mode below must be
+        # stamped only on a file we made, never onto a peer's (or a hostile) one.
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        _widen_lock_to_directory(fd, path.parent)
+    except FileExistsError:
+        fd = _open_existing_lock(path)
     try:
         if sys.platform == "win32":
             import msvcrt

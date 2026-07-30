@@ -588,8 +588,12 @@ def test_file_lock_acquires_a_lock_file_it_cannot_write(tmp_path):
     bug than the one it fixes. flock is inode-based, so it holds across the two fd
     kinds — measured independently with two uids, and pinned below within one process.
 
-    Ablation: drop the `except PermissionError` fallback and this fails at the first
-    `with` — PermissionError, exactly as a peer's run gets today."""
+    This covers a lock file THIS code did not create with the current rules — one
+    written by a pre-round-13/14 bmad-loop, or by another tool. Freshly created locks
+    are handled by the mode in `_widen_lock_to_directory`; see the sibling test.
+
+    Ablation: drop the `except PermissionError` fallback in `_open_existing_lock` and
+    this fails at the first `with` — PermissionError, exactly as a peer's run gets."""
     lock = tmp_path / "shared.lock"
     lock.touch()
     lock.chmod(0o444)
@@ -605,6 +609,56 @@ def test_file_lock_acquires_a_lock_file_it_cannot_write(tmp_path):
     # released on exit, same as the writable path
     with platform_util.file_lock(lock, blocking=False):
         pass
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+@pytest.mark.parametrize(
+    ("dir_mode", "expected"),
+    [
+        (0o2775, 0o664),  # `core.sharedRepository = group` — peers must get in
+        (0o755, 0o644),  # group-readable only: read access, no write
+        (0o700, 0o600),  # a private repo is NOT widened
+    ],
+)
+def test_file_lock_mode_follows_the_directory_not_the_umask(tmp_path, dir_mode, expected):
+    """The creator's umask is the wrong authority for a lock meant to serialize
+    DIFFERENT USERS, and round 13 fixed only one of its shapes (#384, Codex round 14).
+
+    `os.open`'s mode is masked by the umask, so the lock inherited whatever the first
+    user to provision happened to have — measured, 022 gives 0o755 and 077 gives 0o700.
+    Round 13's read-only fallback rescues the first (group can read) and cannot rescue
+    the second (group cannot), which is exactly the "enumerate one failure shape per
+    review round" trap this PR has paid for repeatedly. Deriving the mode from the
+    containing DIRECTORY funnels every umask at once.
+
+    The directory is the right authority because git has already stamped the
+    repository's sharing policy onto it, and that policy is the precondition for a peer
+    to be here at all. Hence the third case: a private `.git` must NOT be widened, which
+    is what stops this from being "make the lock world-writable and move on".
+
+    `os.umask(0o077)` is the point of the fixture, not hygiene — under the old code it
+    is what produced the unrescuable 0o700. If this test ever passes with the umask left
+    at the runner's default, it has stopped testing anything.
+
+    Measured end-to-end with two real uids in one group (docker, python:3.12-slim): with
+    a 0o2775 `.git` the lock lands 0o664 under BOTH umasks and the peer acquires it;
+    with a 0o700 `.git` it stays 0o600 and the peer is correctly denied.
+
+    Ablation: drop the `_widen_lock_to_directory` call and the first two cases fail —
+    the lock comes back 0o600, the umask's answer rather than the directory's."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    repo.chmod(dir_mode)
+    lock = repo / "shield.lock"
+
+    previous = os.umask(0o077)
+    try:
+        with platform_util.file_lock(lock):
+            pass
+    finally:
+        os.umask(previous)
+
+    assert stat.S_IMODE(lock.stat().st_mode) == expected
 
 
 # ------------------------------------------------------------------ safe_segment
