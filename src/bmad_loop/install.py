@@ -806,6 +806,45 @@ def _shield_enable_worktree_config(worktree: Path, common_dir: Path) -> str | No
     # `fatal: --worktree cannot be used with multiple working trees unless the
     # config extension worktreeConfig is enabled` — the shield skipped over a repo
     # that was one write away from supporting it.
+    #
+    # And NO `--includes` on any of the three, which is the asymmetry a later
+    # reader (or bot round) will want to "fix" — `--file` without it does miss a
+    # value an `include.path` supplies. Adding it would break both gates:
+    #
+    # - The two REFUSAL probes ask whether enabling the extension would break the
+    #   operator's worktrees, and git's worktree SETUP reads `core.bare` /
+    #   `core.worktree` only from the common config literally. It reaches them
+    #   through `git_config_from_file` (setup.c's `check_repo_format`), and include
+    #   expansion is not a parser feature but a callback wrapper installed in
+    #   `config_with_options()` alone — so `git_config_from_file` does not respect
+    #   includes, in git's own header's words (config.h). An `include.path` arrives
+    #   there as an ordinary unmatched key. Measured with the extension enabled at
+    #   git 2.20.4 / 2.32.7 / 2.43.7 / 2.49.1 / 2.55.0, identical at all five: a
+    #   LITERAL `core.worktree` moves a linked worktree's toplevel to the main
+    #   checkout and a literal `core.bare = true` fatals every command, while
+    #   include-supplied values of either do nothing at all. `--includes` here
+    #   would therefore refuse repos git is perfectly happy to shield — leaving the
+    #   provisioned tool files unshielded, the harm this shield exists to prevent.
+    # - The ENABLED probe is worse: an include-supplied `extensions.worktreeConfig`
+    #   is not honored either (`git config --worktree` still fatals at all five
+    #   versions), because the `config.worktree` read is gated on the flag harvested
+    #   by that same include-blind setup read. `--includes` there is a false
+    #   "already enabled" → the write is skipped → the activation dies → nothing is
+    #   shielded. That is commit c6d5960's bug re-entering through the include door.
+    #
+    # Two bounds on the claim, so a later reader knows what would invalidate it.
+    # It is an undocumented IMPLEMENTATION DETAIL, not a compatibility contract:
+    # git has deliberately converted reads to respect includes before (ecec57b3c973,
+    # git 2.39, "config: respect includes in protected config"), and a future
+    # `config_with_options()` conversion could flip it with no release note. And
+    # `core.bare`'s inertness is a CONJUNCTION, not an absence — an include-supplied
+    # `core.bare = true` does reach `repo->bare_cfg` on the normal
+    # include-respecting path; what keeps it harmless is `is_bare_repository()`
+    # requiring `bare_cfg && !repo_get_work_tree(repo)`, and every worktree this
+    # shield touches has a work tree. `core.worktree` needs no such caveat: it is
+    # read as a config key only in setup.c. Flag availability was never the
+    # question either way — `--includes` dates to git 1.7.10, far below the 2.20
+    # floor the gate above enforces.
     shared = str(common_dir / "config")
     probe = git_bytes(
         worktree, "config", "--file", shared, "--type=bool", "--get", "extensions.worktreeConfig"
