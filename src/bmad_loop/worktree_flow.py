@@ -117,10 +117,11 @@ def provision_worktree(
       permanent, so shielding through it hid every new file under a tool dir from
       their `git add -A` forever (#384). That write is best-effort: when git can't
       be queried at all it is skipped silently, but any fault after that — including
-      a refusal to scope the shield — is reported to `on_degraded` (once, with the
-      reason) rather than swallowed, and the shield is skipped rather than widened
-      back to the shared file. An unshielded worktree lets `git add -A` stage the
-      tool files, so it must not fail invisibly.
+      a refusal to scope the shield, and a shield that was written but which git does
+      not resolve to — is reported to `on_degraded` (once, with the reason) rather
+      than swallowed, and the shield is skipped rather than widened back to the
+      shared file. An unshielded worktree lets `git add -A` stage the tool files, so
+      it must not fail invisibly.
     Skill trees, the per-CLI hook config, and the seeded configs all live in dirs
     projects gitignore — but the exclude shields them even when a project doesn't.
 

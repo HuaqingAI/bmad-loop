@@ -1570,6 +1570,235 @@ def test_shield_excludes_only_inside_the_worktree(project, tmp_path):
     assert git(wt, "diff", "--cached", "--name-only") == ""
 
 
+@pytest.mark.parametrize("channel", ["GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"])
+def test_shield_degrades_when_a_command_scope_excludesfile_outranks_it(
+    project, tmp_path, monkeypatch, channel
+):
+    """A successful `git config --worktree core.excludesFile` proves the value was
+    WRITTEN, not that git READS it. `command` scope outranks `worktree`, and it is fed
+    by the environment the orchestrator was launched with, so an operator carrying an
+    ambient `core.excludesFile` got a shield that reported success and never applied:
+    the provisioned tool files stayed stageable, with no reason to journal.
+
+    Round 17 was "a pattern PRESENT in the file is not EFFECTIVE"; this is that gap one
+    level up — WRITTEN is not EFFECTIVE.
+
+    PARAMETRIZED BECAUSE THE ENUMERATION FIX WOULD PASS ONE AND FAIL THE OTHER, which
+    is the whole argument for verifying the post-condition instead of detecting the
+    override's origin. Measured end to end on real linked worktrees at both ends of the
+    supported range:
+
+                                        git 2.20.4        git 2.55.0
+        GIT_CONFIG_COUNT/KEY_n/VALUE_n  inert (2.31)      shield defeated
+        GIT_CONFIG_PARAMETERS 'k=v'     shield defeated   shield defeated
+        GIT_CONFIG_PARAMETERS 'k'='v'   fatal: bogus      shield defeated
+        what `git -c` itself emits      'k=v'             'k'='v'
+
+    So the channel the finding named does not exist at this shield's own 2.20 floor,
+    the one that does exist there uses an encoding the newer git rewrote, and a `git -c`
+    on a session's own command line is a third that never appears in our environment at
+    all. The fix names none of them.
+
+    `'k=v'` is the encoding used below because it is the only one honored at BOTH ends;
+    the newer `'k'='v'` form is `fatal: bogus format in GIT_CONFIG_PARAMETERS` at 2.20.4.
+
+    The reason string is the discriminator here, and deliberately so — unlike round 17,
+    where it could not bite. `git status` shows the tool file with the bug AND with the
+    fix; what changes is whether the operator is told. Non-vacuity is pinned separately,
+    by asserting the override really is in force before trusting the degrade.
+
+    The sibling that keeps this from being a blanket refusal already exists:
+    `test_shield_seeds_users_excludesfile` sets `core.excludesFile` at LOCAL scope and
+    asserts the shield still activates. Only a scope ABOVE worktree may degrade.
+
+    Ablation: drop the `_shield_verify_activation` call and both cases fail on
+    `reason is not None` — the shield reports success while `git status` in the worktree
+    still shows `probe-384`."""
+    repo = project.project
+    if channel == "GIT_CONFIG_COUNT" and not install_mod._git_version_at_least(
+        git(repo, "version"), (2, 31)
+    ):
+        pytest.skip("GIT_CONFIG_COUNT is git 2.31; the GIT_CONFIG_PARAMETERS case covers older git")
+    if channel == "GIT_CONFIG_PARAMETERS" and sys.platform == "win32":
+        # POSIX-only: the pre-2.31 encoding is sq-quoted, so a Windows path's
+        # backslashes would be exercising git's own quoting rules rather than this
+        # funnel. The GIT_CONFIG_COUNT case covers Windows, and needs no quoting.
+        pytest.skip("POSIX-only: sq-quoted encoding vs. backslash paths is not what this pins")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    operator = tmp_path / "operator-ignores"
+    operator.write_text("/something-else\n", encoding="utf-8")
+
+    with monkeypatch.context() as env:
+        if channel == "GIT_CONFIG_COUNT":
+            env.setenv("GIT_CONFIG_COUNT", "1")
+            env.setenv("GIT_CONFIG_KEY_0", "core.excludesFile")
+            env.setenv("GIT_CONFIG_VALUE_0", str(operator))
+        else:
+            env.setenv("GIT_CONFIG_PARAMETERS", f"'core.excludesFile={operator}'")
+
+        reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+        # Non-vacuity, inside the same environment: git really does resolve the
+        # operator's file rather than ours. Without this the test would also pass on a
+        # git where the channel is inert, for entirely the wrong reason.
+        assert git(wt, "config", "--type=path", "--get", "core.excludesFile") == str(operator)
+
+    assert reason is not None
+    assert "another configuration scope outranks it" in reason
+    assert str(operator) in reason
+    # and the shield really is skipped rather than half-applied
+    (wt / "probe-384").write_text("noise\n", encoding="utf-8")
+    assert "probe-384" in git(wt, "status", "--porcelain", "-uall")
+
+
+def test_shield_outranked_degrade_leaves_no_permanent_repo_format_change(
+    project, tmp_path, monkeypatch
+):
+    """The outranked degrade is the first one reachable AFTER a write that SUCCEEDED,
+    so the rollback runs in a repo state none of its other tests produce: the
+    worktree-scoped `core.excludesFile` is really there in `config.worktree`.
+
+    Two claims, and they are separate: the permanent flag must be gone, and the key the
+    activation did land must be harmless. Measured rather than assumed — unsetting
+    `extensions.worktreeConfig` makes git stop reading `config.worktree` at all, so the
+    leftover key is inert and needs no second `--unset`. That is why this arm has one
+    rollback rather than two; a second write would be a second failure shape and a
+    second rollback site, which is the enumeration this block exists to avoid.
+
+    Ablation: drop the `needs_enable` rollback and the first assertion fails —
+    `worktreeConfig` survives a degrade that shielded nothing."""
+    repo = project.project
+    if not install_mod._git_version_at_least(git(repo, "version"), (2, 31)):
+        pytest.skip("GIT_CONFIG_COUNT is git 2.31")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    shared = repo / ".git" / "config"
+    assert "worktreeConfig" not in shared.read_text(encoding="utf-8")
+    operator = tmp_path / "operator-ignores"
+    operator.write_text("/something-else\n", encoding="utf-8")
+
+    with monkeypatch.context() as env:
+        env.setenv("GIT_CONFIG_COUNT", "1")
+        env.setenv("GIT_CONFIG_KEY_0", "core.excludesFile")
+        env.setenv("GIT_CONFIG_VALUE_0", str(operator))
+        reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert reason is not None
+    assert "worktreeConfig" not in shared.read_text(encoding="utf-8")
+    # the rollback is silent when it works: the operator is told the shield did not
+    # apply, not handed a second fault that never happened
+    assert "could NOT be rolled back" not in reason
+    # And with the extension off, the key the activation DID land is inert: git stops
+    # reading `config.worktree` entirely, so the read comes back UNSET (rc 1) even
+    # though the value is still sitting in that file. Spawned directly rather than
+    # through the `git` helper, whose `check=True` turns git's own "no such key" into
+    # an error — the rc IS the assertion here.
+    wt_config = Path(git(wt, "rev-parse", "--absolute-git-dir")) / "config.worktree"
+    assert "excludesFile" in wt_config.read_text(
+        encoding="utf-8"
+    ), "the activation's key should still be on disk — this pins INERT, not removed"
+    left_behind = subprocess.run(
+        ["git", "-C", str(wt), "config", "--type=path", "--get", "core.excludesFile"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert left_behind.returncode == 1 and left_behind.stdout == ""
+
+
+@pytest.mark.parametrize("fault", [verify.GitError, verify.GitSpawnError])
+def test_shield_degrades_when_git_will_not_confirm_the_activation(
+    project, tmp_path, monkeypatch, fault
+):
+    """The verification is itself a chokepoint call, so it inherits both of
+    `git_bytes`' failure shapes. Neither may be read as "the shield is fine": not
+    knowing whether the written key is the one git resolves has exactly the standing of
+    knowing it is not.
+
+    THE FAKE MUST TELL THE TWO READS APART BY STATE, not by argv, and that is the trap
+    this test exists on top of. The seed read and the verification read use byte-identical
+    arguments — real git distinguishes them only by what has been written in between — so
+    a fake keyed on the arguments alone would fault the SEED instead and this would pass
+    while testing a completely different arm.
+
+    Parametrized over both classes because `GitSpawnError` is a subclass, so a
+    `GitError`-only test would keep passing against a handler narrowed to the parent.
+
+    Ablation: move the verification call out of the `try` and both cases fail — the
+    fault reaches the tail, which returns a reason but cannot roll the flag back."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    real = install_mod.git_bytes
+    activated = []
+
+    def fault_after_activation(worktree, *args):
+        if args[:2] == ("config", "--worktree"):
+            activated.append(args)
+            return real(worktree, *args)
+        if activated and "--get" in args and "core.excludesFile" in args:
+            raise fault("git did not answer")
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", fault_after_activation)
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert activated, "the fake never saw the activation — it faulted the seed read instead"
+    assert reason is not None and "did not answer" in reason
+    # the permanent format change does not outlive a shield that never confirmed
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+
+
+def test_shield_degrades_when_the_activation_read_back_is_unreadable(
+    project, tmp_path, monkeypatch
+):
+    """The rc half of the same call. Any non-zero rc here is a fault rather than an
+    ABSENT answer, and the difference from `_shield_inherited_excludes` is the point:
+    that helper reads a key the operator may simply never have set, so rc 1 is real
+    news. This one asks about a key we have just written, where "there is no such key"
+    is not good news about it.
+
+    The taxonomies must not be unified, and this test is what makes that concrete —
+    routing rc 1 here through the seed's ABSENT branch would report a working shield.
+
+    Ablation: treat any rc as an answer. THE DELETION DOES NOT FALL THROUGH TO SUCCESS,
+    which is why the assertions below are on the wording rather than on
+    `reason is not None` — measured, not predicted: an unread stdout is `b""`, which
+    compares unequal to the written path, so the mismatch arm one line down still
+    degrades and still returns a reason. It just returns the WRONG one, claiming another
+    scope outranks us and naming `''` as what git reads. A reason-is-not-None assertion
+    would pass against that bug."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    real = install_mod.git_bytes
+    activated = []
+
+    def refuse_after_activation(worktree, *args):
+        if args[:2] == ("config", "--worktree"):
+            activated.append(args)
+            return real(worktree, *args)
+        if activated and "--get" in args and "core.excludesFile" in args:
+            return subprocess.CompletedProcess(
+                args=["git", *args],
+                returncode=128,
+                stdout=b"",
+                stderr=b"fatal: bad config line 1\n",
+            )
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", refuse_after_activation)
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert activated, "the fake never saw the activation — it refused the seed read instead"
+    assert reason is not None
+    assert "would not confirm which excludes file now applies" in reason
+    assert "bad config line 1" in reason
+
+
 def test_shield_dies_with_the_worktree(project, tmp_path):
     """Lifetime, the other half of #384: `git worktree remove` deletes the whole
     per-worktree gitdir, taking the private exclude AND the `config.worktree` that
@@ -3806,15 +4035,28 @@ def test_worktree_local_exclude_undecodable_git_output_degrades(tmp_path, monkey
     # Dispatches on the subcommand, because the shield asks git several questions
     # now and a stub that answered them all identically would not get past the
     # first. `shift 2` drops the `-C <worktree>` every call carries. The version
-    # clears the 2.20 gate, the extension reads as already enabled so the stub is
-    # never asked to change repo state, and every other `--get` exits 1, git's own
-    # "unset".
+    # clears the 2.20 gate and the extension reads as already enabled, so the stub is
+    # never asked to change repo state.
     #
     # `rev-parse` dispatches one level further, on the FLAG, because the shield asks
     # for the two dirs in two calls — a newline is a legal byte in a POSIX path, so it
     # cannot serve as a record separator between them. Answering both here regardless
     # of the flag is what real git does not do, and it would hand the helper one
     # two-line "path" for each dir, making them equal and reading as a main checkout.
+    #
+    # `core.excludesFile` is asked TWICE with byte-identical argv — once to seed the
+    # private file from whatever applies now, and once after the activation to verify
+    # the written key is the one git resolves. Real git tells them apart by STATE, not
+    # by the arguments, so the stub has to as well: unset before the activation (git's
+    # own rc 1, which sends the seed down its XDG branch) and the activated path after.
+    # A stub that answered one way for both would either strand the seed or fail the
+    # verification, and in each case for a reason having nothing to do with #374.
+    # No external commands — PATH is replaced below, so `cat` would not resolve;
+    # `read`, `printf` and `[` are shell builtins. Written without a trailing NUL on
+    # purpose: the reader splits on the first one and takes what precedes it, so
+    # emitting none leaves the whole payload, and `\000` through `printf` is not
+    # portable across the shells that may be /bin/sh here.
+    activated = os.fsencode(str(tmp_path / "activated"))
     stub.write_bytes(
         b'#!/bin/sh\nshift 2\ncase "$1" in\n'
         b"version) printf 'git version 2.55.0\\n' ;;\n"
@@ -3823,8 +4065,12 @@ def test_worktree_local_exclude_undecodable_git_output_degrades(tmp_path, monkey
         b"  *) printf '%s\\n' " + sq(root) + b" ;;\n"
         b"  esac ;;\n"
         b'config) case "$*" in\n'
-        b"  *--worktree*) exit 0 ;;\n"
+        b"  *--worktree*) printf '%s' \"$4\" > " + sq(activated) + b" ;;\n"
         b"  *extensions.worktreeConfig*) printf 'true\\n' ;;\n"
+        b"  *core.excludesFile*)\n"
+        b"      if [ -f " + sq(activated) + b" ]; then\n"
+        b"        IFS= read -r seen < " + sq(activated) + b'; printf %s "$seen"\n'
+        b"      else exit 1 ; fi ;;\n"
         b"  *) exit 1 ;;\n"
         b"  esac ;;\n"
         b"*) exit 1 ;;\nesac\n"

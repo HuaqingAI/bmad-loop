@@ -297,9 +297,9 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   (`core.sharedRepository`) is refused with a journaled reason rather than shielded.
   Three caveats: this enables `extensions.worktreeConfig`, a **permanent**
   repo-format flag that is never removed — written at the last possible moment, so a run that
-  degrades away **above** it leaves your repo's format untouched, and if either of the two writes
-  that can leave it set without a working shield then fails (the enable itself, or the activation)
-  the flag is rolled back. It outlives a failed shield only where the rollback was declined because a sibling
+  degrades away **above** it leaves your repo's format untouched, and wherever it could be left set
+  without a working shield (the enable failing, the activation failing, or the activation succeeding
+  without taking effect) the flag is rolled back. It outlives a failed shield only where the rollback was declined because a sibling
   worktree depends on the flag, or could not be made at all — and both are named in the reason — the
   lock leaves a
   zero-length `.git/bmad-loop-shield.lock` behind (inside `.git`, so never in your working tree and
@@ -315,6 +315,13 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   `!` line below it cancelled the shield's own pattern and the provisioned tool files stayed
   stageable, with nothing reported because nothing had failed. A pattern is now re-appended
   unless it already sits after the last negation in the file.
+- **The git-add shield checks that it actually applies (#384).** Writing the worktree-scoped
+  `core.excludesFile` proved only that the value was stored, not that git reads it: config supplied
+  through the environment (`GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`) outranks the worktree scope,
+  so an operator carrying an ambient `core.excludesFile` got a shield that reported success and never
+  applied — the provisioned tool files stayed stageable, with nothing reported because nothing had
+  failed. The shield now asks git which excludes file it resolves and skips with a journaled reason
+  when that is not the one it just wrote.
 - **The git-add shield no longer opens its own safety gates when git cannot answer (#384).** The
   three probes that ask whether enabling `extensions.worktreeConfig` is safe read every non-zero
   exit code as "that key is not set", so a git that could not answer — rather than one answering

@@ -1441,6 +1441,74 @@ def _shield_inherited_excludes(worktree: Path) -> bytes:
     return source.read_bytes() if source.is_file() else b""
 
 
+def _shield_verify_activation(worktree: Path, exclude: Path) -> str | None:
+    """Why the just-written `core.excludesFile` is NOT the one git reads, or None.
+
+    A successful `git config --worktree core.excludesFile` proves the value was
+    WRITTEN, not that it is in FORCE. git resolves the key from the most specific
+    scope that carries it, and `worktree` is not the most specific one — `command`
+    outranks it, and that scope is fed by the ENVIRONMENT the orchestrator was
+    launched with. So an operator carrying an ambient `core.excludesFile` gets a
+    shield that reports success, writes the private file, and never has it read:
+    the provisioned tool files stay stageable by the unit's `git add -A`, with no
+    degrade reason to journal. Round 17 was "a pattern PRESENT in the file is not
+    EFFECTIVE"; this is the same gap one level up — WRITTEN is not EFFECTIVE.
+
+    So the post-condition is asked of git rather than assumed, and the shape is the
+    point. The obvious fix is to detect the ORIGIN — look for `GIT_CONFIG_COUNT`
+    and friends in `os.environ` — and it is the enumeration this function exists to
+    avoid, because the channels are neither one nor stable. Measured end to end, on
+    a real linked worktree with the shield fully installed, at BOTH ends of the
+    supported range:
+
+                                        git 2.20.4        git 2.55.0
+        GIT_CONFIG_COUNT/KEY_n/VALUE_n  inert (2.31)      shield defeated
+        GIT_CONFIG_PARAMETERS 'k=v'     shield defeated   shield defeated
+        GIT_CONFIG_PARAMETERS 'k'='v'   fatal: bogus      shield defeated
+        what `git -c` itself emits      'k=v'             'k'='v'
+
+    Three names in two mutually incompatible encodings, and the one the finding
+    that prompted this named does not exist at this shield's own floor. A `git -c`
+    on a session's own command line is a fourth and is not visible in our
+    environment at all. Asking git what it RESOLVED costs one call and covers every
+    one of them, including whatever git adds next.
+
+    `--show-scope` would name the winning scope and make the reason better, and is
+    deliberately not used: it is git 2.26, above the 2.20 floor, and a probe flag
+    with its own version floor turns every rc-branch below it into a silent default
+    (the `--type=` 2.18 trap, one round-1 finding away from this one).
+
+    The read shape is the seed read's, already measured at 2.20.4 and 2.55.0: `-z`
+    because a legal POSIX path may carry edge whitespace, `--type=path` because
+    that is how git itself resolves the key. Any non-zero rc is a fault here rather
+    than an ABSENT answer — this call asks about a key we have just written, so
+    "there is no such key" is not good news about it. That is a DIFFERENT taxonomy
+    from `_shield_inherited_excludes`, which reads a key the operator may simply
+    not have set; the two must not be unified.
+
+    The comparison is byte-exact and stays that way. Round-tripping a path through
+    `git config` and back was measured for every hazard this shield has already
+    been burned by — a space, leading and trailing whitespace, an embedded newline,
+    a non-UTF-8 byte, an interior `~` — all seven exact at both versions, so an
+    inexact comparison would be buying nothing and could only mask a real
+    mismatch. Windows CI is the oracle for the one platform not measured here: git
+    escapes a backslash path it is handed as an ARGUMENT and reads it back intact,
+    which is why the shield's other tests pass there, but that claim is about the
+    config file rather than about `--type=path`.
+    """
+    resolved = git_bytes(worktree, "config", "-z", "--type=path", "--get", "core.excludesFile")
+    if resolved.returncode != 0:
+        detail = os.fsdecode(resolved.stderr).strip() or f"git exited {resolved.returncode}"
+        return f"git would not confirm which excludes file now applies: {detail}"
+    effective = resolved.stdout.split(b"\0", 1)[0]
+    if effective == os.fsencode(str(exclude)):
+        return None
+    return (
+        "the write succeeded but another configuration scope outranks it, so git "
+        f"reads {os.fsdecode(effective)!r} instead and the shield's patterns never apply"
+    )
+
+
 def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | None:
     """Shield the just-provisioned tool files from the unit's `git add -A`, in a
     private exclude file scoped to THIS worktree alone.
@@ -1453,7 +1521,10 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
       `$GIT_COMMON_DIR/info/exclude`, so the private file does nothing on its own;
       the worktree-scoped config key is what makes it apply, and it applies to
       this worktree only. The main checkout and every sibling worktree are
-      untouched.
+      untouched. Writing that key is not the same as it being in FORCE — `command`
+      scope outranks `worktree`, and it is fed by the environment the orchestrator
+      was launched with — so the activation is VERIFIED against what git actually
+      resolves rather than trusted; see `_shield_verify_activation`.
     - LIFETIME — `git worktree remove`/`prune` deletes the whole per-worktree
       gitdir, taking the private exclude AND the `config.worktree` that points at
       it. The shield expires exactly when the thing it shields does; there is no
@@ -1481,13 +1552,18 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
     shielding anything. Moving it down leaves exactly two writes able to set it
     without shielding anything — the enable itself and the activation — and each
     classifies both of the ways a chokepoint call can fail (a non-zero rc and a
-    raise). The ACTIVATION rolls the flag back on either shape. The ENABLE rolls it
+    raise). The ACTIVATION rolls the flag back on either shape, and on a third
+    outcome that is not a failure at all — a write that succeeds without taking
+    effect, which a later round showed is reachable whenever the environment
+    supplies the same key at `command` scope. The ENABLE rolls it
     back on the raise ONLY, because an rc from that write is git declining to make
     it: nothing was written, so there is nothing to undo, and undoing it anyway
     would unset a concurrent writer's flag. That asymmetry is load-bearing, not an
-    unfinished enumeration. Getting here took four review rounds, because the early
-    attempts enumerated failure shapes instead of funnelling them, and the funnel was
-    then applied to the activation but not to the enable one line above it. Rollback
+    unfinished enumeration. Getting here took five review rounds, because the early
+    attempts enumerated failure shapes instead of funnelling them, the funnel was
+    then applied to the activation but not to the enable one line above it, and even
+    a complete funnel over the ways a CALL can fail said nothing about whether the
+    call achieved what it was for. Rollback
     only when this call is what set the flag, and only when no other worktree's
     `config.worktree` depends on it; see `_shield_undo_extension`.
 
@@ -1927,15 +2003,26 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
             # LAST, after the file it names exists: git reads core.excludesFile lazily,
             # but a config pointing at a file that a fault above left unwritten would
             # be a shield that silently excludes nothing while reporting a reason.
-            # ONE rollback covering BOTH of the chokepoint's failure shapes, and the
-            # shape of this arm is the lesson rather than an incidental style choice.
-            # `git_bytes` can fail two ways — a non-zero rc (git refused) and a RAISE (a
-            # timeout, or a spawn failure as its GitSpawnError subclass) — and the two
-            # preceding rounds each fixed ONE of them, because each fix ENUMERATED the
-            # failure it had been shown. Enumeration is what kept being incomplete. So
-            # both shapes converge on one `fault` string BEFORE anything is decided; a
-            # third failure shape for THIS call would have to get past the `try`
-            # itself. What that sentence used to add — "and there is a single place
+            # ONE rollback covering EVERY way this step can fail to leave a working
+            # shield, and the shape of this arm is the lesson rather than an incidental
+            # style choice. `git_bytes` can fail two ways — a non-zero rc (git refused)
+            # and a RAISE (a timeout, or a spawn failure as its GitSpawnError subclass)
+            # — and two consecutive rounds each fixed ONE of them, because each fix
+            # ENUMERATED the failure it had been shown. Enumeration is what kept being
+            # incomplete. So every shape converges on one `fault` string BEFORE
+            # anything is decided.
+            #
+            # A later round then supplied the shape that sentence could not have
+            # anticipated, because it is not a FAILURE at all: the write SUCCEEDS and
+            # the shield still does not apply, since `command` scope outranks
+            # `worktree` and git resolves the key from the most specific scope that
+            # carries it. So the `try` now spans the write AND the verification that
+            # it took effect, and rc-0 is no longer an exit from this block — see
+            # `_shield_verify_activation`. The rule that survived all of it: ask what
+            # the POST-CONDITION is and confirm it, rather than enumerating the ways
+            # the call in front of you can go wrong.
+            #
+            # What that first paragraph used to add — "and there is a single place
             # where the flag can be rolled back" — was true of the failure SHAPES and
             # false of the WRITES: round 10 added a second rollback point at the
             # enable above, because rollback sites track the number of writes that can
@@ -1965,12 +2052,25 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
                     else os.fsdecode(activated.stderr).strip()
                     or f"git exited {activated.returncode}"
                 )
+                if fault is None:
+                    # An rc 0 here means the value was WRITTEN, not that it is in
+                    # FORCE — `command` scope outranks `worktree` and is fed by the
+                    # environment we were launched with. Verified rather than
+                    # assumed, INSIDE this same `try` and above the one decision
+                    # below, so the verification's own two failure shapes reach the
+                    # existing rollback instead of growing a second one. See
+                    # `_shield_verify_activation` for why this asks git what it
+                    # resolved instead of looking for the override's origin.
+                    fault = _shield_verify_activation(worktree, exclude)
             except GitError as e:
                 # Deliberately NOT left to the tail: the tail cannot roll the flag back,
-                # and a GitError from THIS call means exactly what a refusal means — the
-                # shield did not activate. The tail's own GitError guard stays
-                # load-bearing for the seed read above, which round 5 turned into a
-                # degrade, so this is a narrowing of what reaches it, not a bypass.
+                # and a GitError from EITHER call in this block means exactly what a
+                # refusal means — the shield is not in force. That now covers the
+                # verification's own fault as well as the write's, which is the point of
+                # putting it inside this `try` rather than after it. The tail's own
+                # GitError guard stays load-bearing for the seed read above, which round
+                # 5 turned into a degrade, so this is a narrowing of what reaches it,
+                # not a bypass.
                 fault = str(e)
             if fault is not None:
                 if needs_enable:
