@@ -3544,6 +3544,14 @@ def test_shield_seeds_xdg_default_when_unset(project, tmp_path, monkeypatch):
     hard. The probe has to reproduce that fallback because git cannot be asked for
     it: `config --get` answers "unset", not "here is the default I would use".
 
+    That is true of the fallback FILE only, and the distinction is load-bearing now
+    that the sibling limb depends on it: git CAN be asked where its own `$HOME` is,
+    because `--type=path` interpolates a leading `~/` through the same
+    `getenv("HOME")`. This limb needs no such probe — `XDG_CONFIG_HOME` is read from
+    the same environment git reads it from — but see
+    `test_shield_resolves_the_home_fallback_through_git_not_python` for the one that
+    does, and why Python's answer is wrong there.
+
     The environment is pinned three ways, and each one is load-bearing:
     XDG_CONFIG_HOME so the file under test is this test's, GIT_CONFIG_GLOBAL and
     GIT_CONFIG_NOSYSTEM so a developer box whose own `~/.gitconfig` sets
@@ -3577,6 +3585,117 @@ def test_shield_seeds_xdg_default_when_unset(project, tmp_path, monkeypatch):
     # The exclude is activated through a worktree-scoped `core.excludesFile`, i.e.
     # repo-local config — so this holds without the env pinning, which is the point.
     assert git(wt, "status", "--short") == ""
+
+
+def test_shield_resolves_the_home_fallback_through_git_not_python(project, tmp_path, monkeypatch):
+    """With `core.excludesFile` AND `XDG_CONFIG_HOME` unset, git's fallback is
+    `$HOME/.config/git/ignore` — and WHOSE `$HOME` is a real question. This branch
+    used to spell it `Path.home()`, which is wrong on Windows.
+
+    Git resolves it with `getenv("HOME")` on every platform
+    (`path.c::xdg_config_home`, semantics unchanged 2.20.0 → 2.55). Python does not:
+    `ntpath.expanduser` reads `USERPROFILE` first and never consults `HOME` at all,
+    while Git for Windows DERIVES `HOME` in-process (`compat/mingw.c`) preferring
+    `HOMEDRIVE`+`HOMEPATH` over `USERPROFILE`. So the two genuinely disagree whenever
+    `HOME` is set (Git Bash and MSYS2 set it) or the home share is a network drive.
+    The miss is SILENT — the wrong path is simply not a file, so the seed comes back
+    empty and the activation then shadows the operator's real global ignores, which
+    is #384's own harm reached through the platform split.
+
+    The env makes both halves explicit: `HOME` is the answer git must give,
+    `USERPROFILE` the wrong one Windows' Python would give. On POSIX those two agree
+    by construction, so the divergence is SIMULATED by pointing `Path.home()` at the
+    wrong directory — which is what makes this bite on every platform instead of
+    waiting for Windows CI, the way this shield's other platform bugs had to. The
+    wrong home carries a real ignore file of its own so that seeding the wrong one is
+    distinguishable from seeding nothing.
+
+    Ablation: restore `Path.home() / ".config"` for the no-XDG limb and this fails —
+    `home-ignored.tmp` is missing from the private exclude, `wrong-home.tmp` is in
+    it, and `git status` stops hiding the file the operator's real home names."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    home = tmp_path / "githome"
+    (home / ".config" / "git").mkdir(parents=True)
+    (home / ".config" / "git" / "ignore").write_text("home-ignored.tmp\n", encoding="utf-8")
+    wrong = tmp_path / "python-home"
+    (wrong / ".config" / "git").mkdir(parents=True)
+    (wrong / ".config" / "git" / "ignore").write_text("wrong-home.tmp\n", encoding="utf-8")
+
+    with monkeypatch.context() as pinned:
+        pinned.delenv("XDG_CONFIG_HOME", raising=False)
+        pinned.setenv("HOME", str(home))
+        pinned.setenv("USERPROFILE", str(wrong))
+        pinned.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "no-such-gitconfig"))
+        pinned.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        pinned.setattr(Path, "home", staticmethod(lambda: wrong))
+        assert _worktree_local_exclude(wt, ["/probe-384"]) is None
+
+    seeded = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert "home-ignored.tmp" in seeded
+    assert "wrong-home.tmp" not in seeded
+    # The activation is repo-local config, so this holds with the env restored.
+    (wt / "home-ignored.tmp").write_text("noise\n", encoding="utf-8")
+    assert "home-ignored.tmp" not in git(wt, "status", "--porcelain", "-uall")
+
+
+def test_shield_degrades_when_git_will_not_resolve_its_home_directory(
+    project, tmp_path, monkeypatch
+):
+    """A probe that does not ANSWER is not "there is no fallback" — the same
+    absent/unknown split this function's docstring is built on, at the newest limb.
+
+    `HOME` unset makes the probe exit 128, and so does a transient fault; git's own
+    message is version-dependent, so the two cannot be told apart without asserting
+    on wording this suite has already been burned by. Guessing "no fallback" is the
+    SILENT direction — seed nothing, then activate over whatever git does read — so
+    the non-zero rc is funnelled into `GitError` and the caller degrades with a
+    reason instead. The cost is that a genuinely `HOME`-less environment skips the
+    shield rather than proceeding, and that direction is reported.
+
+    The flag assertion is the second half: the seed read runs ABOVE the enable, so a
+    fault here must leave no permanent repo-format change behind.
+
+    Ablation: return an empty seed instead of raising on the probe's non-zero rc and
+    this fails — `reason` comes back None and `git status` stops showing the probe
+    file, i.e. the shield reports success while shadowing the operator's excludes."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+    real = install_mod.git_bytes
+    seen: list[tuple[str, ...]] = []
+
+    def fail_home_probe(worktree, *args):
+        # A PREFIX predicate, not tuple membership: the key travels both as the `-c`
+        # assignment and as the bare `--get` argument (#384, round 10's de-fanged
+        # fakes). Recording it is what proves this faulted the probe and not the
+        # seed read, whose argv is otherwise byte-identical.
+        if any(a.startswith("bmadloop.xdghomeprobe") for a in args):
+            seen.append(args)
+            return subprocess.CompletedProcess(
+                args=list(args),
+                returncode=128,
+                stdout=b"",
+                stderr=b"fatal: failed to expand user dir in: '~/.config/git/ignore'\n",
+            )
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", fail_home_probe)
+
+    with monkeypatch.context() as pinned:
+        pinned.delenv("XDG_CONFIG_HOME", raising=False)
+        pinned.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "no-such-gitconfig"))
+        pinned.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert seen, "the fake never saw the home probe — it faulted a different arm"
+    assert reason is not None
+    assert "could not resolve its own home directory" in reason
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+    (wt / "probe-384").write_text("noise\n", encoding="utf-8")
+    assert "probe-384" in git(wt, "status", "--porcelain", "-uall")
 
 
 def test_shield_seeds_a_relative_xdg_config_home_resolved_like_git(project, tmp_path, monkeypatch):

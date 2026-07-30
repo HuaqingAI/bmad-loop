@@ -1223,6 +1223,76 @@ def _shield_undo_extension(worktree: Path, git_dir: Path, common_dir: Path) -> s
     )
 
 
+def _shield_home_git_ignore(worktree: Path) -> Path:
+    """`$HOME/.config/git/ignore` — git's XDG fallback — asked of GIT, not of Python.
+
+    `Path.home()` is the obvious spelling here and it is WRONG on Windows, the one
+    platform where git's home and Python's home are derived differently. Git locates
+    this fallback with `getenv("HOME")` on every platform (`path.c::xdg_config_home`,
+    semantics unchanged 2.20.0 → 2.55) — but on Windows
+    `compat/mingw.c::setup_windows_environment()` DERIVES `HOME` inside the git
+    process before that runs, preferring `HOMEDRIVE`+`HOMEPATH` (and only when that
+    names a real directory) over `USERPROFILE`. Python's `ntpath.expanduser` has the
+    OPPOSITE precedence — `USERPROFILE` first — and never consults `HOME` at all. Two
+    ordinary setups therefore disagree:
+
+    * anything that sets `HOME` (Git Bash and MSYS2 do), where git obeys it and
+      Python cannot see it; and
+    * a domain-joined machine whose `HOMEDRIVE`+`HOMEPATH` is a network home share,
+      where git reads `H:\\…\\.config\\git\\ignore` and Python reads `C:\\Users\\…`.
+
+    The miss is SILENT, and it is #384's own harm reached through the platform split:
+    the wrong path is simply not a file, the seed comes back empty, and the caller's
+    activation then SHADOWS the global ignore file git really reads — un-ignoring
+    inside the worktree exactly what this branch exists to preserve.
+
+    So ask git. `--type=path` interpolates a leading `~/` through the same
+    `getenv("HOME")` git uses for the fallback itself, which makes the answer correct
+    by construction on every platform and names no environment variable — round 18's
+    lesson (ask what git RESOLVED, not how the environment might have told it) at the
+    sibling site. `-c` is COMMAND scope, the most specific git has, so the probe's
+    value cannot be outranked by the operator's config: the very precedence rule that
+    caused round 18 is what makes this reliable.
+
+    MEASURED at git 2.20.4 (docker `alpine:3.9`, non-root, `id -u` checked) and
+    2.55.0, byte-identical: the probe returns `$HOME/.config/git/ignore` NUL-
+    terminated at rc 0, and that is the file git really loads patterns from — proven
+    through `git status` hiding a name the file lists, not inferred from the path.
+    With `HOME` unset it exits 128 and git applies no fallback at all.
+
+    KNOWN GAP, recorded so this is not read as complete: this answers "where is
+    git's `$HOME`", which is the whole of the fallback UPSTREAM but not on **Git for
+    Windows >= 2.46**, whose fork patches `xdg_config_home_for` to prefer
+    `%APPDATA%/Git/<file>` whenever that file EXISTS — it even warns that the `$HOME`
+    one "was ignored because" the APPDATA one is there. Verified by reading the
+    fork's `path.c` and bounded by version: 1 occurrence of `APPDATA` at
+    `v2.46.0.windows.1`, 0 at `v2.45.0.windows.1`, `v2.20.0.windows.1`, and 0
+    upstream at master. So an operator on a current Git for Windows who keeps their
+    global ignores at `%APPDATA%\\Git\\ignore` still gets the wrong file seeded here.
+    Deliberately NOT fixed in this pass: it is a downstream fork's behavior, gated on
+    a version well above this shield's floor, and there is no way to MEASURE it from
+    a POSIX box — which is this branch's standing bar for a git claim.
+
+    Raises `GitError` when git did not answer, INCLUDING that `HOME`-unset rc.
+    Proceeding on a non-zero rc would be a guess, and a guess here is silent: the
+    caller seeds nothing and activates over whatever git does read. git's message is
+    deliberately NOT matched to tell "no HOME" apart from a transient fault, because
+    that wording is version-dependent (it differs between 2.20.4 and 2.55.0 for other
+    config faults on this same branch). The cost is that a genuinely `HOME`-less
+    environment now skips the shield with a journaled reason instead of proceeding
+    with an empty seed — and that direction is REPORTED, which is the whole taxonomy
+    of the caller: only a definite absent may be silent.
+    """
+    key = "bmadloop.xdghomeprobe"
+    probe = git_bytes(
+        worktree, "-c", f"{key}=~/.config/git/ignore", "config", "-z", "--type=path", "--get", key
+    )
+    if probe.returncode != 0:
+        detail = os.fsdecode(probe.stderr).strip() or f"git exited {probe.returncode}"
+        raise GitError(f"git could not resolve its own home directory: {detail}")
+    return Path(os.fsdecode(probe.stdout.split(b"\0", 1)[0]))
+
+
 def _shield_inherited_excludes(worktree: Path) -> bytes:
     """The BYTES of whatever `core.excludesFile` this worktree resolves to now.
 
@@ -1254,7 +1324,10 @@ def _shield_inherited_excludes(worktree: Path) -> bytes:
     - ABSENT is silent and empty, and the only outcome that falls back. The common
       case — no `core.excludesFile`, no XDG fallback file — and not a reason to skip
       the shield. It is an ANSWER: `--get` of an unset key exits 1, and `is_file()`
-      false says the file is not there.
+      false says the file is not there. One caveat added with the `$HOME` probe:
+      REACHING the fallback path can itself fail, and `_shield_home_git_ignore`
+      raises when it does. That is not this outcome — an unresolvable home is
+      UNKNOWN, not absent, and gets the loud arm like every other unknown here.
     - DISABLED is silent and empty too, and it is NOT absent (#384, Codex round 8).
       An explicitly EMPTY `core.excludesFile` is the operator saying "no excludes
       file at all", and git honors that literally rather than treating it as unset:
@@ -1414,8 +1487,15 @@ def _shield_inherited_excludes(worktree: Path) -> bytes:
     else:
         # ABSENT (rc 1, an unset key): git's documented fallback (gitignore(5)), and
         # the ONLY outcome that gets one. Not reachable for an empty value any more.
+        #
+        # `XDG_CONFIG_HOME` this process may read for itself: git reads the same
+        # variable from the same environment (`_run_git` passes `os.environ`
+        # through), and set-but-empty counts as unset for BOTH — git's guard is
+        # `if (config_home && *config_home)`, the falsy check below is the same
+        # test. The `$HOME` limb is the one Python cannot answer; see
+        # `_shield_home_git_ignore` for why it is asked of git instead.
         xdg = os.environ.get("XDG_CONFIG_HOME")
-        source = (Path(xdg) if xdg else Path.home() / ".config") / "git" / "ignore"
+        source = Path(xdg) / "git" / "ignore" if xdg else _shield_home_git_ignore(worktree)
         if not source.is_absolute():
             # THE SAME DEFECT AS THE RELATIVE `core.excludesFile` ABOVE, at the
             # sibling site (#384, Codex round 12) — this branch reproduces git's

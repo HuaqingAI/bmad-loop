@@ -322,6 +322,16 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   applied — the provisioned tool files stayed stageable, with nothing reported because nothing had
   failed. The shield now asks git which excludes file it resolves and skips with a journaled reason
   when that is not the one it just wrote.
+- **The git-add shield finds the same global ignore file git does, on Windows too (#384).** With
+  `core.excludesFile` and `XDG_CONFIG_HOME` both unset, git falls back to `$HOME/.config/git/ignore`
+  — and it locates that with `HOME` on every platform, while Python's `Path.home()` reads
+  `USERPROFILE` on Windows and never consults `HOME` at all. Git for Windows derives `HOME` itself,
+  preferring a `HOMEDRIVE`+`HOMEPATH` home share over `USERPROFILE`, so the two disagreed for anyone
+  whose shell sets `HOME` (Git Bash and MSYS2 do) or whose home directory is a network drive. The
+  wrong path is simply not a file, so the copy came back empty and the shield then shadowed the very
+  global ignores it exists to preserve — silently, since nothing had failed. The shield now asks git
+  where its home is rather than guessing, and a home git will not resolve skips the shield with a
+  journaled reason instead of being assumed to mean "there is no ignore file".
 - **The git-add shield no longer opens its own safety gates when git cannot answer (#384).** The
   three probes that ask whether enabling `extensions.worktreeConfig` is safe read every non-zero
   exit code as "that key is not set", so a git that could not answer — rather than one answering
