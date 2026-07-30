@@ -1539,12 +1539,31 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
         # defensive placement rather than a path under test: the regression test
         # is POSIX-only because git on Windows has no such path to hand back.
         #
-        # strip(), not removesuffix("\n"): these two answers cannot be harmed by it
-        # (both open with "/" or ".", so there is no leading whitespace to lose, and
-        # a final component is `.git` or `worktrees/<id>`), it keeps the shield's
-        # decodes uniform, and it absorbs a CRLF should git ever emit one.
-        raw_git_dir = os.fsdecode(answered.stdout).strip()
-        raw_common = os.fsdecode(shared_answer.stdout).strip()
+        # removesuffix("\n"), NOT strip() — rev-parse terminates its answer with one
+        # newline and every other byte belongs to the path (#384, Codex round 15).
+        #
+        # This comment used to argue strip() was harmless because "a final component
+        # is `.git` or `worktrees/<id>`". That is true for a NON-bare repo and false
+        # for a bare one, whose common dir IS the repository directory. Measured at
+        # 2.55.0, a worktree of a bare repo at `…/common ` answers
+        # `--git-common-dir` = `…/common ` — trailing space and all — while
+        # `--absolute-git-dir` stays safe at `…/common /worktrees/<id>`, since git
+        # sanitizes the admin id (round 5). So exactly one of the two answers was
+        # exposed, and stripping it pointed every later step at `…/common`, which does
+        # not exist: `--file <that>/config` reads rc 1, i.e. ABSENT (round 10), so the
+        # `core.bare = true` refusal was MISSED and the shield went on to make the
+        # permanent format change on a bare repository. The lock's own
+        # `mkdir(parents=True)` then CREATED the stripped directory as a side effect.
+        # A safety gate defeated by whitespace in a path, which is why this is the
+        # parse and not a cosmetic.
+        #
+        # The dropped CRLF absorption is deliberate: git writes LF here on every
+        # platform, and a path legitimately ending in `\r` is indistinguishable from a
+        # CRLF terminator — so guessing would trade this bug for a rarer one. Windows
+        # CI is the oracle: were git to emit CRLF there, every shield test would fail
+        # on the malformed path rather than degrade quietly.
+        raw_git_dir = os.fsdecode(answered.stdout).removesuffix("\n")
+        raw_common = os.fsdecode(shared_answer.stdout).removesuffix("\n")
         if not raw_git_dir or not raw_common:
             # Defensive, and deliberately still a REASON rather than a silent skip:
             # git answered, so the two-arm taxonomy in the docstring puts an

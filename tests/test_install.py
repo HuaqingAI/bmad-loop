@@ -3,6 +3,7 @@ import io
 import json
 import os
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -1653,6 +1654,67 @@ def test_shield_refuses_to_enable_extension_over_core_bare(project, tmp_path):
     assert reason is not None and "core.bare" in reason
     assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
     assert shared_exclude.read_bytes() == before
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="a trailing space is not a legal Windows path")
+def test_shield_keeps_edge_whitespace_in_the_common_dir(tmp_path):
+    """`rev-parse` terminates its answer with one newline; every other byte belongs to
+    the path — so the parse may remove only that terminator (#384, Codex round 15).
+
+    A comment here used to justify `.strip()` on the grounds that "a final component is
+    `.git` or `worktrees/<id>`". True for a NON-bare repo, false for a BARE one, whose
+    common dir IS the repository directory. Measured at 2.55.0, a worktree of a bare
+    repo at `…/common ` answers `--git-common-dir` = `…/common `, while
+    `--absolute-git-dir` stays safe at `…/common /worktrees/<id>` because git sanitizes
+    the admin id — so exactly ONE of the two answers was exposed.
+
+    THE HARM IS A DEFEATED SAFETY GATE, which is why this is a P1 and not a cosmetic
+    path bug: stripped, every later step points at `…/common`, which does not exist,
+    and `config --file <that>/config --get core.bare` answers rc 1 — ABSENT, not
+    "unreadable" (round 10). So `core.bare = true` is MISSED and the shield proceeds to
+    make its permanent repo-format change on a bare repository. The lock's own
+    `mkdir(parents=True)` then creates the stripped directory as a side effect, which
+    is the visible symptom.
+
+    The three assertions are one per consequence, and the sibling-directory one is what
+    makes the others non-vacuous: a refusal for the WRONG reason would still satisfy
+    the first two.
+
+    Bare repo built by hand rather than through the `project` fixture, since the whole
+    point is a common dir that is not `<something>/.git`.
+
+    Ablation: restore `.strip()` on the two rev-parse answers and this fails — the
+    refusal is gone, `extensions.worktreeConfig` lands in the real config, and
+    `<tmp>/common` exists."""
+    bare = tmp_path / "common "  # trailing space is the fixture
+    seed = tmp_path / "seed"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    subprocess.run(["git", "init", "-q", str(seed)], check=True)
+    for k, v in (("user.email", "t@e"), ("user.name", "t")):
+        subprocess.run(["git", "-C", str(seed), "config", k, v], check=True)
+    (seed / "f").write_text("x", encoding="utf-8")
+    subprocess.run(["git", "-C", str(seed), "add", "f"], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "-qm", "c"], check=True)
+    subprocess.run(
+        ["git", "-C", str(seed), "push", "-q", str(bare), "HEAD:refs/heads/main"], check=True
+    )
+    wt = tmp_path / "wt"
+    subprocess.run(["git", "-C", str(bare), "worktree", "add", "-q", str(wt), "main"], check=True)
+    # non-vacuity: git really does hand back the trailing space, so this fixture can
+    # express the bug at all
+    answered = subprocess.run(
+        ["git", "-C", str(wt), "rev-parse", "--git-common-dir"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert answered.stdout.endswith(" \n"), repr(answered.stdout)
+
+    reason = _worktree_local_exclude(wt, ["/probe-r15"])
+
+    assert reason is not None and "core.bare" in reason
+    assert "worktreeConfig" not in (bare / "config").read_text(encoding="utf-8")
+    assert not (tmp_path / "common").exists()  # no stripped sibling was created
 
 
 @pytest.mark.parametrize(
@@ -4071,8 +4133,13 @@ def test_shield_git_calls_carry_the_locale_pin(project, tmp_path, monkeypatch):
     bin_dir.mkdir()
     seen = tmp_path / "locale-seen"
     stub = bin_dir / "git"
+    # shlex.quote, for the reason the `sq()` helper further up exists: unquoted, a
+    # temp root carrying whitespace (a spaced `--basetemp`, or TMPDIR) word-splits
+    # this redirect, so the stub appends to the wrong path and leaks a stray file
+    # outside the basetemp pytest reaps (#384, CodeRabbit at round 15).
     stub.write_text(
-        f'#!/bin/sh\nprintf "%s\\n" "${{LC_ALL-<unset>}}" >> {seen}\nexit 1\n', encoding="utf-8"
+        f'#!/bin/sh\nprintf "%s\\n" "${{LC_ALL-<unset>}}" >> {shlex.quote(str(seen))}\nexit 1\n',
+        encoding="utf-8",
     )
     stub.chmod(0o755)
     monkeypatch.setenv("PATH", str(bin_dir))
