@@ -1,6 +1,6 @@
 # AGENTS.md — bmad-loop
 
-bmad-loop is a deterministic Python orchestrator that drives unattended BMAD-method dev loops by spawning coding-CLI sessions (claude, codex, gemini, copilot, antigravity, opencode) inside terminal multiplexers (tmux; psmux on Windows). **The control loop contains no LLM calls — hard rule.** Orchestration is deterministic Python; LLMs run only inside disposable coding-CLI sessions. PRs that move orchestration into an LLM are rejected ([CONTRIBUTING.md](CONTRIBUTING.md)). User-facing overview: [README.md](README.md); behavior reference: [docs/FEATURES.md](docs/FEATURES.md).
+bmad-loop is a deterministic Python orchestrator that drives unattended BMAD-method dev loops by spawning coding-CLI sessions (claude, codex, gemini, copilot, antigravity, opencode) inside terminal multiplexers (tmux; psmux on Windows). **The control loop contains no LLM calls — hard rule.** Orchestration is deterministic Python; LLMs run only inside disposable coding-CLI sessions. Never move orchestration into an LLM. User-facing overview: [README.md](README.md); behavior reference: [docs/FEATURES.md](docs/FEATURES.md).
 
 ## Dev environment
 
@@ -61,11 +61,8 @@ Two orthogonal seams: **which CLI** (adapter axis: `adapters/base.py` `CodingCLI
 - Ablation rule: for any test asserting "X is refused/absent", delete the gating code and confirm the test FAILS before trusting it — negative assertions pass for every reason a value could be absent.
 - New behavior lands with a test at the lowest layer that can catch its regression: pure-core unit > seam > sandbox E2E.
 
-## Git & PRs
+## Repo hygiene
 
-[CONTRIBUTING.md](CONTRIBUTING.md) is binding: conventional commits (subject < 72 chars), PRs 200–400 LOC ideal / 800 max, one logical change, feature-sized work needs maintainer confirmation first. Additional working agreements:
-
-- Open PRs ready for review, never draft.
 - CHANGELOG entries: terse, scannable, imperative, under the Unreleased heading.
 - Never commit session notes, probe records, or run artifacts. Durable facts belong in docstrings; records in git history.
 - Review non-convergence is evidence about the approach, not just a defect queue — escalate rather than grind.
