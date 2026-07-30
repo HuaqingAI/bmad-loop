@@ -1956,6 +1956,146 @@ def test_shield_runs_in_a_repository_that_is_not_shared(project, tmp_path):
     assert "/probe-384" in _wt_private_exclude(wt).read_text(encoding="utf-8")
 
 
+@pytest.mark.parametrize(
+    ("value", "private"),
+    [
+        # keywords and booleans — `umask` by strcmp, the booleans by strcasecmp
+        ("umask", True),
+        ("false", True),
+        ("FALSE", True),
+        ("no", True),
+        ("off", True),
+        ("Off", True),
+        ("group", False),
+        ("all", False),
+        ("world", False),
+        ("everybody", False),
+        ("true", False),
+        ("yes", False),
+        ("on", False),
+        # PERM_UMASK, in every octal spelling of zero
+        ("0", True),
+        ("00", True),
+        ("0000", True),
+        # owner-only filemodes. 0711 is the row a "has no execute bits" reading gets
+        # wrong: git masks the value with 0666, which discards the execute bits.
+        ("0600", True),
+        ("0700", True),
+        ("0711", True),
+        # NOT owner-only. 0755 is the mirror row — its group/other READ bits survive
+        # the 0666 mask, so it is `everybody` despite looking like a private dir mode.
+        ("0755", False),
+        ("0640", False),
+        ("0660", False),
+        ("0666", False),
+        ("0604", False),
+        ("07777", False),
+        # the legacy 0/1/2 compatibility values, which git special-cases ahead of its
+        # filemode branch. 1 and 2 need no arm of their own here — neither satisfies
+        # `& 0600`, so they land on the same refusal.
+        ("1", False),
+        ("01", False),
+        ("2", False),
+        ("02", False),
+        # values git itself REJECTS (`git add` exits 128 at both versions). They are
+        # refused, like every other value that makes the repository unusable.
+        ("0400", False),
+        ("0200", False),
+        ("0600x", False),
+        ("banana", False),
+        (" umask", False),
+        # Python's `int(value, 8)` accepts these two and git REJECTS them, which is why
+        # the pattern is applied BEFORE the conversion rather than relying on the
+        # conversion to raise. This is the strictness that is load-bearing.
+        ("0o600", False),
+        ("0_600", False),
+        # deliberate FALSE REFUSALS: git's `strtol` accepts a leading `+` and leading
+        # whitespace, and measured, `+0600` really is private to git. The gate refuses
+        # in that direction on purpose — a false refusal is a reported skip.
+        ("+0600", False),
+        (" 0600", False),
+        # the empty value is PERM_UMASK, i.e. private, and is refused anyway: `--get`
+        # cannot distinguish it from a VALUELESS key, which is PERM_GROUP. Refusing
+        # the ambiguity is the caller's documented policy.
+        ("", False),
+    ],
+)
+def test_shared_repository_private_verdicts(value, private):
+    """git's `core.sharedRepository` verdicts, mirrored value by value.
+
+    The pure-core layer for the octal support: `0600` is an owner-only filemode, not
+    a shared repository, so refusing it skipped the shield for a single-user repo
+    (#384, Codex round 20). Every row was measured at git 2.20.4 AND 2.55.0 —
+    byte-identical at both ends — by the mode of a loose object git writes under
+    `umask 077`, which is git's own answer rather than a reading of `setup.c`.
+
+    Ablation, per row group: restore the old literal accept set
+    (`value in ("umask", "0") or value.lower() in ("false", "no", "off")`) and the
+    five owner-only octal rows fail; drop the `& 0066` mask and the six shared-octal
+    rows fail; drop the `& 0600` test and `0400`/`0200` fail; relax `fullmatch` to
+    `match` and `0600x` fails; drop the pattern and let `int(value, 8)` raise instead
+    and `0o600`/`0_600` fail."""
+    assert install_mod._shared_repository_is_private(value) is private
+
+
+def test_shield_runs_in_a_repository_with_an_owner_only_octal_mode(project, tmp_path):
+    """`core.sharedRepository = 0600` is a filemode granting no peer access at all —
+    a repository private to its owner, not one shared between OS users — so the
+    shield runs (#384, Codex round 20).
+
+    The refusal is deliberately coarse everywhere else in this gate, but it may not
+    be coarse HERE: an owner-only octal mode is exactly the shape the refusal exists
+    to let through, and refusing it left a single-user repository's provisioned tool
+    files eligible for the unit's `git add -A` — the bug this whole branch is about,
+    reintroduced by the guard against a different one.
+
+    `0600` rather than `0700`/`0711` because it is the value `git init --shared=0600`
+    stores verbatim, i.e. the one an operator actually ends up with. The sibling
+    parametrized test carries the rows that pin the MASK.
+
+    Ablation: restore the old literal accept set and this fails — at the status
+    assertion as well as the reason, which is checked below rather than assumed."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    git(repo, "config", "core.sharedRepository", "0600")
+    # non-vacuity: git stores the octal verbatim rather than normalizing it to a
+    # keyword, so the gate really is handed the string this test is about.
+    assert git(repo, "config", "--get", "core.sharedRepository") == "0600"
+
+    assert _worktree_local_exclude(wt, ["/probe-384"]) is None
+
+    assert "/probe-384" in _wt_private_exclude(wt).read_text(encoding="utf-8")
+    # THE HARM, through git's own answer: with the shield skipped this file is
+    # untracked-and-visible, which is what reaches the unit's `git add -A`.
+    (wt / "probe-384").write_text("generated\n", encoding="utf-8")
+    assert "probe-384" not in git(wt, "status", "--porcelain", "-uall")
+
+
+def test_shield_refuses_a_group_readable_octal_mode(project, tmp_path):
+    """`core.sharedRepository = 0640` is a filemode granting GROUP access, so it is
+    refused exactly like the `group` keyword — the octal support added for round 20
+    accepts owner-only modes and must not widen past them.
+
+    `0640` rather than `0666` on purpose: it is the row immediately across the
+    boundary from the accepted `0600`, so it fails first if the mask is loosened.
+
+    Ablation: drop the `& 0066` mask from `_shared_repository_is_private` (accept any
+    octal git does not reject) and this fails — the shield proceeds in a repository
+    shared between OS users."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    git(repo, "config", "core.sharedRepository", "0640")
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert reason is not None and "shared between OS users" in reason
+    assert "0640" in reason
+    assert not (repo / ".git" / "bmad-loop-shield.lock").exists()
+    assert not _wt_private_exclude(wt).exists()
+
+
 def test_shield_refuses_a_valueless_shared_repository_key(project, tmp_path):
     """`sharedRepository` with NO value is git's `PERM_GROUP` — a shared repository —
     and `--get` answers it rc 0 with a lone newline, byte-identical to an explicitly

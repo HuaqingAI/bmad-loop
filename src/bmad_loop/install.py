@@ -844,6 +844,69 @@ def _shield_shared_config(worktree: Path, shared: str, key: str, *opts: str) -> 
     raise GitError(f"git could not read {key} from the shared config: {detail}")
 
 
+_SHARED_REPOSITORY_OCTAL = re.compile(r"[0-7]+")
+
+
+def _shared_repository_is_private(value: str) -> bool:
+    """Does `core.sharedRepository = value` leave the repository private to its owner?
+
+    git's parse, mirrored (`setup.c::git_config_perm`): the keyword `umask` and the
+    false booleans are private, `group`/`all`/`world`/`everybody` and the true
+    booleans are not, and an octal value is a FILEMODE with the legacy 0/1/2
+    special-cased ahead of it.
+
+    Measured at git 2.20.4 AND 2.55.0, byte-identical at both ends of the supported
+    range, by the mode of a loose object git writes under `umask 077` — git's OWN
+    answer, not a reading of `setup.c`:
+
+        0 / 00 / 0000 ....... r--------  PRIVATE     0400 / 0200 ... REJECTED (128)
+        0600 / 0700 / 0711 .. r--------  PRIVATE     -0600 ......... REJECTED
+        +0600 ............... r--------  PRIVATE     0o600 / 0_600 . REJECTED
+        01 / 1 .............. r--r-----  group       0600x ......... REJECTED
+        0640 / 0660 ......... r--r-----  group
+        02 / 2 / 07777 ...... r--r--r--  everybody
+        0666 / 0755 ......... r--r--r--  everybody
+        0604 ................ r-----r--  other
+
+    So the mask is `value & 0666` and private is `& 0066 == 0` — NOT "no execute
+    bits" and NOT "equals 0600". `0711` IS private, because the mask discards the
+    execute bits; `0755` is NOT, because its group/other READ bits survive it. Those
+    two rows are why this is a mask test and not a literal set, and both were
+    mispredicted before they were measured.
+
+    `(mode & 0600) != 0600` is git's own `die()` condition, so such a value reaches
+    us only in a repository git already refuses to operate on. It stays off the
+    accept side with every other value git rejects.
+
+    THE PATTERN IS DELIBERATELY STRICTER THAN `strtol`, in the refusing direction.
+    git accepts leading whitespace and a leading `+` (measured: `+0600` is private)
+    which `[0-7]+` refuses — a false refusal, which this gate is contracted to
+    prefer. Strictness in the other direction is the load-bearing half: Python's
+    `int(value, 8)` accepts `0o600` and `0_600`, which git REJECTS, so parsing with
+    Python's own rules would accept a repository git cannot open.
+
+    THE EMPTY STRING IS EXCLUDED ON PURPOSE, and the `+` quantifier is what excludes
+    it. `strtol("")` converts nothing, leaves `*end == 0` and yields 0, so git reads
+    an explicitly empty value as PERM_UMASK, i.e. private. It is refused anyway,
+    because `--get` answers an empty value and a VALUELESS `sharedRepository` line
+    (PERM_GROUP, shared) with the same rc 0 and the same lone newline. What is
+    refused there is the ambiguity, not the value — see the caller.
+    """
+    if value == "umask" or value.lower() in ("false", "no", "off"):
+        return True
+    if not _SHARED_REPOSITORY_OCTAL.fullmatch(value):
+        return False
+    mode = int(value, 8)
+    if mode == 0:  # PERM_UMASK
+        return True
+    # The legacy 1 (PERM_GROUP) and 2 (PERM_EVERYBODY) need NO special case here even
+    # though git special-cases them ahead of its filemode branch: neither satisfies
+    # `& 0600`, so both land on the same refusal this line already returns. Written as
+    # one test rather than three because a `mode in (1, 2)` arm would be indistinguish-
+    # able from dead code — no test could fail without it (#384, round 10's rule).
+    return mode & 0o600 == 0o600 and mode & 0o066 == 0
+
+
 def _shield_shared_repository(worktree: Path, common_dir: Path) -> str | None:
     """Refuse a repository configured to be SHARED BETWEEN OS USERS, else None.
 
@@ -877,8 +940,8 @@ def _shield_shared_repository(worktree: Path, common_dir: Path) -> str | None:
         empty      (`= ""`) ..... rc 0   r--------  PRIVATE   <- stdout is b"\\n"
         valueless  (no `=`) ..... rc 0   r--r-----  group     <- stdout is b"\\n" TOO
         true/yes/on / group / 1 . rc 0   r--r-----  group
-        0660 .................... rc 0   r--r-----  group
         all/world/everybody / 2 . rc 0   r--r--r--  everybody
+        octal filemodes ......... rc 0   varies     `_shared_repository_is_private`
 
     THE MIDDLE TWO ROWS ARE INDISTINGUISHABLE AND MEAN OPPOSITE THINGS: an explicitly
     empty value is PERM_UMASK (private) and a VALUELESS `sharedRepository` line is
@@ -918,7 +981,7 @@ def _shield_shared_repository(worktree: Path, common_dir: Path) -> str | None:
     if raw is None:
         return None
     value = os.fsdecode(raw).removesuffix("\n")
-    if value in ("umask", "0") or value.lower() in ("false", "no", "off"):
+    if _shared_repository_is_private(value):
         return None
     # {value!r}: operator-authored text going into a journaled reason, and repr
     # neutralizes a newline in it. The version gate above renders git's own answer

@@ -294,7 +294,10 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   activation never rolls the repo-format flag back while another worktree's `config.worktree` still
   depends on it: without either, one run's failed shield silently switched off a sibling run's
   working one mid-story. A repository configured as **shared between OS users**
-  (`core.sharedRepository`) is refused with a journaled reason rather than shielded.
+  (`core.sharedRepository`) is refused with a journaled reason rather than shielded — but only
+  where the value really grants peer access: `umask`, a false boolean, and an octal filemode with
+  no group or other bits (`0600`, `0700`, `0711`) leave the repository private to you, and it is
+  shielded normally.
   Three caveats: this enables `extensions.worktreeConfig`, a **permanent**
   repo-format flag that is never removed — written at the last possible moment, so a run that
   degrades away **above** it leaves your repo's format untouched, and wherever it could be left set
