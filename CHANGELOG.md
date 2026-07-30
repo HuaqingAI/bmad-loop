@@ -280,11 +280,20 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   activating over patterns that could not be copied would shadow them exactly as an empty copy did,
   and not knowing whether there is anything to copy has the same standing as failing to read it.
   Only a definite **absent** answer stays a silent no-op — there is nothing to shadow. The skip is
-  also **notified**, not just journaled, since skipping is only defensible if you find out. Two
-  caveats: this enables `extensions.worktreeConfig`, a **permanent** repo-format flag that is never
-  removed — set only when the shield actually activates, so a run that degrades away leaves your
-  repo's format untouched (if the activation itself fails the flag is rolled back, and a rollback
-  that cannot be made is named in the reason) — and where git requires that flag's
+  also **notified**, not just journaled, since skipping is only defensible if you find out. An
+  **explicitly empty** `core.excludesFile` is an answer too, and not the same one as unset: git
+  honors it as "no excludes file at all" and does **not** fall back to `$XDG_CONFIG_HOME/git/ignore`,
+  so patterns you switched off are no longer copied into the private file and switched back on inside
+  the worktree — the mirror image of the same file-loss bug, over-ignoring instead of under-ignoring.
+  Concurrent runs against one repository are **serialized** on a lock in `.git/`, and a failed
+  activation never rolls the repo-format flag back while another worktree's `config.worktree` still
+  depends on it: without either, one run's failed shield silently switched off a sibling run's
+  working one mid-story. Three caveats: this enables `extensions.worktreeConfig`, a **permanent**
+  repo-format flag that is never removed — set only when the shield actually activates, so a run that
+  degrades away leaves your repo's format untouched (if the activation itself fails the flag is
+  rolled back, and a rollback that cannot be made is named in the reason) — the lock leaves a
+  zero-length `.git/bmad-loop-shield.lock` behind (inside `.git`, so never in your working tree and
+  never stageable) — and where git requires that flag's
   prerequisites be moved by hand first (`core.bare = true` or `core.worktree` in the shared config)
   the shield is skipped with a journaled reason rather than widened back. It also needs **git 2.20**,
   the release that introduced the flag and `git config --worktree`; below that the shield is skipped

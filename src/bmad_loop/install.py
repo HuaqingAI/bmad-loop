@@ -23,13 +23,14 @@ import shutil
 import subprocess
 import tomllib
 from collections.abc import Iterable, Sequence
+from contextlib import ExitStack
 from importlib import resources
 from pathlib import Path
 from typing import Any, NamedTuple
 
 from .adapters.profile import ALIASES, CLIProfile, ProfileError, load_profiles
 from .checks import Finding
-from .platform_util import atomic_write_bytes
+from .platform_util import atomic_write_bytes, file_lock
 from .policy import POLICY_TEMPLATE
 from .process_host import get_process_host
 from .verify import GitError, git_bytes
@@ -736,6 +737,15 @@ def _copy_traversable(src, dst: Path, *, skip_existing: bool = False) -> bool:
 # both of which the worktree-scoped shield is built out of (git-worktree(1)).
 _WORKTREE_CONFIG_GIT = (2, 20)
 
+# The shield's mutual exclusion, held in the repository's COMMON dir so every
+# worktree of a repo contends on one file — a per-worktree gitdir would give each
+# concurrent run its own lock and exclude nothing. A dedicated file, never config
+# or the exclude itself, per `file_lock`'s contract: the lock rides an open fd's
+# inode, so anything written through `atomic_replace` swaps that inode out from
+# under later acquirers. Zero bytes, and inside `.git` — never in the working tree,
+# so it is not something the operator's `git add -A` can see.
+_SHIELD_LOCK_NAME = "bmad-loop-shield.lock"
+
 # THE ALTERNATIVE ARCHITECTURE, EVALUATED AND REJECTED — recorded here the way the
 # `--includes` finding below is, so a later reader or bot round does not re-propose
 # it as a simplification of the whole block.
@@ -916,7 +926,7 @@ def _shield_enable_worktree_config(worktree: Path, common_dir: Path) -> tuple[st
     ), False
 
 
-def _shield_undo_extension(worktree: Path) -> str:
+def _shield_undo_extension(worktree: Path, git_dir: Path, common_dir: Path) -> str:
     """Undo the `extensions.worktreeConfig` THIS provisioning just enabled.
 
     Returns `""` when the repository is back in the state it was found in, or a
@@ -928,12 +938,52 @@ def _shield_undo_extension(worktree: Path) -> str:
     other worktrees may depend on — the reason the shield's rollback is conditional
     rather than unconditional cleanup.
 
+    That caller-side gate is necessary and NOT sufficient, which is round 8 (#384,
+    Codex P2). `needs_enable` records what the probe saw, and the enable itself is an
+    idempotent rc-0 no-op against a flag that is already `true` — so two concurrent
+    provisionings that both probed an absent flag both believe they own it, and
+    whichever one's activation fails then unsets a flag the other's LIVE shield
+    depends on: git stops reading its `config.worktree`, its `core.excludesFile`
+    goes inert, and its shielded tool paths become stageable again mid-run. The
+    caller serializes the whole transaction under a repository lock, which closes
+    that window for processes taking the lock. This scan is the fallback for the
+    flag having been enabled OUTSIDE that discipline — an older bmad-loop, a
+    concurrently running different version, an operator, or another tool entirely
+    (`git sparse-checkout` enables this same extension) — so it is not redundant
+    with the lock and must not be deleted as such. A lock binds only its holders.
+
+    EXCLUDING OUR OWN `git_dir` IS LOAD-BEARING, not tidiness: a `config.worktree`
+    in it is the half-written product of the very activation whose failure prompted
+    this rollback (a timeout can leave one behind), and treating that as a dependent
+    would suppress every rollback the round-6/7 fixes exist to make.
+
     Measured, because "the key is gone" and "the extension is off" are two claims:
     `--unset` exits 0, removes the key AND the now-empty `[extensions]` section (the
     config file returns to its original bytes), and `git config --worktree` refuses
     again afterwards with git's own fatal — so this is a real rollback, not cosmetic.
     `--unset` of an absent key exits 5, which the gate above means we never do.
     """
+    try:
+        # The main worktree's own, then every SIBLING's — never ours (above).
+        others = [common_dir / "config.worktree"]
+        others += [
+            d / "config.worktree"
+            for d in (common_dir / "worktrees").iterdir()
+            if d.resolve() != git_dir
+        ]
+        dependent = next((str(p) for p in others if p.exists()), None)
+    except OSError as e:
+        # Conservative on purpose, and the asymmetry is the argument: skipping
+        # leaves a reported flag this call did not earn, while unsetting one that
+        # IS depended on silently un-shields a live worktree. A cosmetic residue
+        # beats silent file loss, so an unreadable scan counts as a dependent.
+        dependent = f"the scan for sibling worktrees failed ({e})"
+    if dependent is not None:
+        return (
+            "; extensions.worktreeConfig was enabled for this shield and deliberately "
+            f"LEFT enabled — {dependent} exists, so another worktree's shield depends "
+            "on the flag and unsetting it would stop git reading that file"
+        )
     try:
         undone = git_bytes(worktree, "config", "--unset", "extensions.worktreeConfig")
         if undone.returncode == 0:
@@ -974,13 +1024,31 @@ def _shield_inherited_excludes(worktree: Path) -> bytes:
     dedupe, which a text round trip could not promise. Git reads the result either
     way: it strips a trailing `\\r` from an exclude line and skips a UTF-8 BOM.
 
-    THREE outcomes, and which fault means what is the whole subtlety. Only the
-    first is silent; this function RAISES for the other two, and the caller's tail
-    turns that into the degrade reason that skips the activation.
+    FOUR outcomes, and which answer means what is the whole subtlety. The first
+    two are silent; this function RAISES for the other two, and the caller's tail
+    turns that into the degrade reason that skips the activation. Only ABSENT has a
+    fallback, and routing DISABLED into it was round 8's bug.
 
-    - ABSENT is silent and empty. The common case — no `core.excludesFile`, no XDG
-      fallback file — and not a reason to skip the shield. It is an ANSWER: `--get`
-      of an unset key exits 1, and `is_file()` false says the file is not there.
+    - ABSENT is silent and empty, and the only outcome that falls back. The common
+      case — no `core.excludesFile`, no XDG fallback file — and not a reason to skip
+      the shield. It is an ANSWER: `--get` of an unset key exits 1, and `is_file()`
+      false says the file is not there.
+    - DISABLED is silent and empty too, and it is NOT absent (#384, Codex round 8).
+      An explicitly EMPTY `core.excludesFile` is the operator saying "no excludes
+      file at all", and git honors that literally rather than treating it as unset:
+      measured at 2.55.0, `-z --get` answers rc 0 with a lone NUL, after which git
+      loads no patterns and does NOT reach for XDG (`git check-ignore` exits 1
+      against a name the XDG file lists). The mechanism is in git's source, not
+      inferred: `dir.c::setup_standard_excludes` guards the XDG fallback on
+      `if (!excludes_file)` — a NULL POINTER — while `config.c` resolves an empty
+      value through `interpolate_path("")`, which returns a non-NULL empty string.
+      Byte-identical guard at v2.20.0, this shield's own floor, and at master.
+      Reading that as unset (the pre-round-8 `and raw`) seeded the XDG file's
+      patterns in and activated them, which is the MIRROR IMAGE of every other
+      fault here: instead of shadowing patterns it failed to copy it OVER-ignores,
+      so session-created files the operator deliberately stopped ignoring go
+      silently missing from the unit's `git add -A` and from the story's commit.
+      Same silent-file-loss class as #384 itself, in the other direction.
     - PRESENT BUT UNREADABLE propagates. A read `OSError` (EACCES, EIO) reaches the
       caller's degrade arm, which skips the activation — the only safe answer, since
       activating over patterns that could not be copied shadows them exactly as an
@@ -1017,10 +1085,17 @@ def _shield_inherited_excludes(worktree: Path) -> bytes:
     # supported range, the flag checked AT the floor rather than inferred from
     # git-config(1), since the 2.20 refusal in `_shield_enable_worktree_config` has
     # already run by the time this does and 2.20 is therefore the oldest git that
-    # can reach this line. Every branch is preserved: `-z` still expands `~`, gives
-    # an unset key rc 1 + empty stdout, an empty value a lone NUL (falsy after the
-    # split, so it falls to XDG the way it did), a multi-valued key the LAST value +
+    # can reach this line. `-z` still expands `~`, gives an unset key rc 1 + empty
+    # stdout, an empty value a lone NUL at rc 0, a multi-valued key the LAST value +
     # NUL at rc 0, and a relative value verbatim.
+    #
+    # That empty-value branch is the one round 5 got WRONG, and how is worth
+    # recording: this comment used to say the lone NUL "falls to XDG the way it
+    # did" — a measurement of OUR READER's classification and of behavior
+    # preservation, which never asked what GIT does with the same value. Preserving
+    # a behavior is not the same as that behavior being correct. Git treats it as
+    # "no excludes file", so the value is an ANSWER and gets its own branch below;
+    # see the docstring's DISABLED outcome for git's own source.
     #
     # The sibling `rev-parse` strips below are deliberately NOT getting the same
     # treatment, and this is the note that stops a later round re-raising it:
@@ -1030,7 +1105,20 @@ def _shield_inherited_excludes(worktree: Path) -> bytes:
     # `--git-common-dir` ends in `.git`.
     answer = git_bytes(worktree, "config", "-z", "--type=path", "--get", "core.excludesFile")
     raw = answer.stdout.split(b"\0", 1)[0]
-    if answer.returncode == 0 and raw:
+    # rc FIRST, and the value only once rc says there IS one — the condition used to
+    # be `returncode == 0 and raw`, which collapsed DISABLED onto ABSENT. Round 8's
+    # fix is the branch below, not this reordering; the reordering is what makes the
+    # two answers nameable apart.
+    if answer.returncode == 0:
+        if not raw:
+            # DISABLED: an explicit "no excludes file", so there is nothing to copy
+            # and NO fallback to reach for — see the docstring. Note for a later
+            # reader (or ablation): deleting this arm does not restore the bug, it
+            # only hides it, because `Path(os.fsdecode(b""))` is `.`, which resolves
+            # to the worktree directory and reads `is_file()` false. The bug is the
+            # ROUTING of this answer into the XDG branch, so the only faithful
+            # ablation is restoring `and raw` on the condition above.
+            return b""
         source = Path(os.fsdecode(raw))
         if not source.is_absolute():
             # `--type=path` expands `~` and stops there: a RELATIVE value comes
@@ -1051,7 +1139,8 @@ def _shield_inherited_excludes(worktree: Path) -> bytes:
             # function exists to preserve.
             source = worktree / source
     else:
-        # git's documented fallback when the key is unset (gitignore(5)).
+        # ABSENT (rc 1, an unset key): git's documented fallback (gitignore(5)), and
+        # the ONLY outcome that gets one. Not reachable for an empty value any more.
         xdg = os.environ.get("XDG_CONFIG_HOME")
         source = (Path(xdg) if xdg else Path.home() / ".config") / "git" / "ignore"
     # `is_file()` is the ABSENT test and swallows its own OSError; `read_bytes`
@@ -1100,8 +1189,22 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
     to set it without shielding anything, and that arm ROLLS THE FLAG BACK — for both
     of the ways that call can fail (a non-zero rc and a raise), which took two review
     rounds to get right because the first two attempts enumerated failure shapes
-    instead of funnelling them. Only when this call is what set the flag; see
+    instead of funnelling them. Only when this call is what set the flag, and only
+    when no other worktree's `config.worktree` depends on it; see
     `_shield_undo_extension`.
+
+    CONCURRENCY — the probe→enable→activate→rollback sequence runs under an exclusive
+    `file_lock` on `<common dir>/bmad-loop-shield.lock`, because that flag is the one
+    piece of state two simultaneous runs in one repository share (round 8). Without
+    it both probe an absent flag, both believe they own it, and a failed activation
+    in one rolls the flag back out from under the other's live shield. The lock is
+    per REPOSITORY, not per worktree, and it leaves a residue: a zero-length file in
+    `.git/` — never in the working tree, so nothing the operator's `git add -A` can
+    see, and nothing that needs a stale-lock scheme, since the kernel drops the lock
+    when a holder dies. Its wait is platform-asymmetric by inheritance: POSIX `flock`
+    blocks indefinitely (the transaction is ~7 git spawns, each bounded by
+    `limits.git_timeout_s`), while `msvcrt.locking` gives up after ~10 s and raises
+    `OSError`, which this function reports as a skipped shield naming the lock.
 
     Every git call goes through `verify.git_bytes`, the chokepoint accessor whose
     two properties this function is built on: the returncode comes back as an
@@ -1128,7 +1231,9 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
       option it does not know and exits 0, so that lands in the arm below, via
       the version refusal in `_shield_enable_worktree_config`.
     - anything AFTER git answered degrades to a returned reason string the caller
-      can surface: a main checkout passed in (nothing to scope to), a refused or
+      can surface: a main checkout passed in (nothing to scope to), a shield lock
+      that could not be taken (contention on Windows, or an `os.open` fault in the
+      common dir), a refused or
       failed extension enable, a failed activation, `.resolve()` (pre-3.13 a
       symlink loop raises RuntimeError, not OSError), `mkdir`, read/write
       `OSError` — including the operator's own excludes file existing but being
@@ -1227,161 +1332,206 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
                 f"skipped the git-add shield ({worktree}): not a linked worktree, and the "
                 "shield never writes the repository-wide exclude (#384)"
             )
-        refusal, needs_enable = _shield_enable_worktree_config(worktree, common_dir)
-        if refusal is not None:
-            return refusal
-        exclude = git_dir / "info" / "exclude"
-        exclude.parent.mkdir(parents=True, exist_ok=True)
-        # Zero bytes is an INTERRUPTED creation, not an initialized exclude. The
-        # `touch()` below creates the target before `atomic_write_bytes` fills it, and
-        # a fault in between (ENOSPC, or a kill) leaves that placeholder behind —
-        # harmless on its own, since the degrade arm returns above the activation and
-        # an unactivated private exclude does nothing. The harm would be deferred:
-        # read as authoritative, it skips the seed below and then points a shadowing
-        # `core.excludesFile` at a file missing the operator's own excludes,
-        # un-ignoring inside the worktree everything they ignore globally. Size
-        # rather than unlinking the placeholder on the way out, because no handler
-        # runs when the process is KILLED in that window. Re-seeding costs nothing
-        # either way: git treats an empty exclude and an absent one alike.
-        existed = exclude.is_file() and exclude.stat().st_size > 0
-        # On creation the operator's own excludes are copied in, because the
-        # activation below shadows them (see _shield_inherited_excludes). On a
-        # re-provision a non-empty file's content is authoritative and the copy is
-        # not repeated, so the two stay idempotent together.
+        # EVERYTHING BELOW IS ONE TRANSACTION, serialized per repository — round 8
+        # (#384, Codex P2). `_shield_enable_worktree_config` PROBES the flag and the
+        # enable further down is an idempotent no-op when it is already `true`, so two
+        # concurrent provisionings in one repo both read an absent flag, both believe
+        # they enabled it, and whichever one's activation then fails rolls the flag
+        # back out from under the other's LIVE shield — git stops reading its
+        # `config.worktree`, its `core.excludesFile` goes inert, and its shielded tool
+        # files become stageable again mid-run. Nothing else collides first: every
+        # other per-run name is keyed on the run id (worktree path, branch, tmux
+        # session, run dir), so the flag is the one piece of state two runs share.
+        # `cmd_run` has no liveness check and the TUI's warning modal offers "launch
+        # anyway", so concurrent runs against one repo are permitted by design.
         #
-        # A COPY FAULT SKIPS THE ACTIVATION. `_shield_inherited_excludes` raises on
-        # anything but a definite "absent" — an unreadable file, and since round 5 a
-        # git that will not say which file applies — and the raise lands in this
-        # function's tail, which returns a reason. That is the whole point of it
-        # raising rather than returning empty: an empty seed plus the activation
-        # below is not "the seed was lost", it is the operator's global ignores
-        # SHADOWED inside this worktree, and `git add -A` staging what they told git
-        # to ignore. There is nothing to clean up on that path — the raise is above
-        # `exclude.touch()`, so no placeholder is left for a later provisioning to
-        # read as authoritative, and the `mkdir` above leaves an inert empty `info/`
-        # that dies with the worktree.
+        # The lock also removes a benign second consequence: `git config` writes take
+        # `.git/config.lock`, so a concurrent writer got an rc≠0 the enable read as a
+        # degrade and skipped the shield for that unit.
         #
-        # BYTES on both sides of that choice, and never decoded text: an exclude
-        # file holds path patterns, POSIX paths are arbitrary bytes, and a legacy
-        # 8-bit encoding is a perfectly ordinary thing for an operator's own file to
-        # be in. `bytes.splitlines()` is also the git-CORRECT line split, not merely
-        # the type-consistent one — `str.splitlines()` breaks on \x0b, \x0c, \x1c,
-        # \x1d, \x1e and \x85, none of which git treats as a line boundary, so a
-        # legitimate pattern containing one fragmented into wrong dedupe keys.
-        existing = exclude.read_bytes() if existed else _shield_inherited_excludes(worktree)
-        present = set(existing.splitlines())
-        # fsencode, the inverse of the fsdecode above: a pattern derived from a real
-        # filename round-trips to its exact original bytes. Both sides of the `in`
-        # MUST be bytes — with `patterns` left as str every one of them reads as
-        # absent and gets re-appended on every re-provision.
-        wanted = [os.fsencode(p) for p in patterns]
-        new = [p for p in wanted if p not in present]
-        # `not existed` keeps a re-provision that adds no pattern from leaving the
-        # config below pointing at a file that was never created.
-        if new or not existed:
-            # b"\n", not "\n": `bytes.endswith(str)` is a TypeError, and TypeError is
-            # not in the tail's except tuple — it would escape a function contracted
-            # never to propagate.
-            prefix = existing if not existing or existing.endswith(b"\n") else existing + b"\n"
-            # atomic_write_bytes, never write_bytes onto `exclude` directly (#375).
-            # write_bytes opens "wb", which TRUNCATES before writing, and this is a
-            # read-modify-REWRITE carrying the operator's own excludes in
-            # `prefix` — so a short write (ENOSPC) left the file truncated
-            # mid-content while the degrade reason still said "could not update".
-            # Worse, the surviving tail is a valid git pattern and a prefix of the
-            # intended one: cut one char in and the last line is "/", which
-            # excludes the entire worktree.
-            #
-            # The helper rather than a hand-rolled tmp+replace: it fsyncs before
-            # the replace and carries the target's mode over, which a bare replace
-            # resets.
-            #
-            # #381's interleaving race is mooted for NEW writes rather than fixed:
-            # this file lives in one worktree's private gitdir, so the two runs
-            # that used to race here — every linked worktree of a repo resolved to
-            # the same shared common dir — no longer share a target at all. Only a
-            # second provisioning of the SAME worktree can reach this file, which
-            # the engine does serially. The atomic write stays for #375, whose
-            # fault (a short write) needs no second writer.
-            if not existed:
-                # Create it first, the way the write_text this replaced did:
-                # O_CREAT under the umask, giving the helper a mode to carry. Left
-                # to itself it creates a new target at mkstemp's private 0600 —
-                # and an exclude git cannot READ is one git silently IGNORES.
-                # Measured: git warns, exits 0, and `git add -A` stages the files
-                # the exclude was written to shield. That is the exact harm the
-                # docstring above says silence must not cause, and here nothing
-                # would even be reported, because the write SUCCEEDS. Reachable
-                # wherever the gitdir is read under another UID
-                # (core.sharedRepository, a shared checkout) — which is why
-                # atomic_write_text's own docstring, which atomic_write_bytes
-                # shares, says callers of genuinely shared state need more than
-                # the helper alone.
-                #
-                # Safe against the tail below: an empty exclude is equivalent to
-                # an absent one for git, so a fault after this leaves no more
-                # damage than the missing file it replaced.
-                exclude.touch()
-            atomic_write_bytes(exclude, prefix + b"".join(p + b"\n" for p in new))
-        # The PERMANENT repo-format change, deliberately the last-but-one thing
-        # this function does. `_shield_enable_worktree_config` probed the gates
-        # above and reported that the write is still owed; performing it there —
-        # where it used to live — put a format change the operator's repo carries
-        # forever AHEAD of the seed, the mkdir and the write, so every degrade
-        # below it (including the `_shield_inherited_excludes` fault that round 5
-        # turned from a swallow into a degrade) left the repo marked for a shield
-        # that never applied. Nothing between here and the activation can degrade,
-        # so the only path that can still set the flag without shielding anything is
-        # the activation's OWN failure — which is why that arm rolls it back below.
+        # It spans the probe→enable→activate→rollback sequence and cannot be narrowed
+        # to just those: the enable must stay immediately above the activation (round
+        # 5), the private exclude must exist before the activation, and the version +
+        # `core.bare`/`core.worktree` gates inside the probe must stay above the seed
+        # read, which depends on the same `--type=` floor. So the file write sits in
+        # the middle of the locked span rather than outside it.
         #
-        # It cannot move BELOW the activation: `git config --worktree` is what the
-        # extension unlocks, so the activation fatals without it.
-        if needs_enable:
-            enabled = git_bytes(worktree, "config", "extensions.worktreeConfig", "true")
-            if enabled.returncode != 0:
-                detail = os.fsdecode(enabled.stderr).strip() or f"git exited {enabled.returncode}"
-                return (
-                    f"could not enable extensions.worktreeConfig ({worktree}): {detail} — the "
-                    "provisioned tool files are not shielded from the unit's `git add -A`"
-                )
-        # LAST, after the file it names exists: git reads core.excludesFile lazily,
-        # but a config pointing at a file that a fault above left unwritten would
-        # be a shield that silently excludes nothing while reporting a reason.
-        # ONE rollback covering BOTH of the chokepoint's failure shapes, and the
-        # shape of this arm is the lesson rather than an incidental style choice.
-        # `git_bytes` can fail two ways — a non-zero rc (git refused) and a RAISE (a
-        # timeout, or a spawn failure as its GitSpawnError subclass) — and the two
-        # preceding rounds each fixed ONE of them, because each fix ENUMERATED the
-        # failure it had been shown. Enumeration is what kept being incomplete. So
-        # both shapes converge on one `fault` string BEFORE anything is decided, and
-        # there is a single place where the flag can be rolled back; a third failure
-        # shape would have to get past the `try` itself.
-        #
-        # The rollback exists because the enable one line above is a PERMANENT
-        # repo-format change, and the guarantee this code owes (docstring, CHANGELOG,
-        # docs/FEATURES.md) is that the flag survives only a shield that actually
-        # activated. `needs_enable` gates it — see `_shield_undo_extension` for why
-        # that condition is a safety property and not a micro-optimization.
+        # The acquisition's own `OSError` is caught HERE rather than left to the tail,
+        # only so the operator is told which step failed: POSIX `flock` blocks
+        # indefinitely, but `msvcrt.locking` bounds the wait at ~10 s and then raises,
+        # so on Windows contention is a real, reportable outcome. Behaviorally the
+        # tail would also return a reason — this arm names the lock in it.
+        held = ExitStack()
         try:
-            activated = git_bytes(
-                worktree, "config", "--worktree", "core.excludesFile", str(exclude)
+            held.enter_context(file_lock(common_dir / _SHIELD_LOCK_NAME))
+        except OSError as e:
+            return (
+                f"skipped the git-add shield ({worktree}): could not take this "
+                f"repository's shield lock ({e}) — another bmad-loop run may hold it"
             )
-            fault = (
-                None
-                if activated.returncode == 0
-                else os.fsdecode(activated.stderr).strip() or f"git exited {activated.returncode}"
-            )
-        except GitError as e:
-            # Deliberately NOT left to the tail: the tail cannot roll the flag back,
-            # and a GitError from THIS call means exactly what a refusal means — the
-            # shield did not activate. The tail's own GitError guard stays
-            # load-bearing for the seed read above, which round 5 turned into a
-            # degrade, so this is a narrowing of what reaches it, not a bypass.
-            fault = str(e)
-        if fault is not None:
+        with held:
+            refusal, needs_enable = _shield_enable_worktree_config(worktree, common_dir)
+            if refusal is not None:
+                return refusal
+            exclude = git_dir / "info" / "exclude"
+            exclude.parent.mkdir(parents=True, exist_ok=True)
+            # Zero bytes is an INTERRUPTED creation, not an initialized exclude. The
+            # `touch()` below creates the target before `atomic_write_bytes` fills it, and
+            # a fault in between (ENOSPC, or a kill) leaves that placeholder behind —
+            # harmless on its own, since the degrade arm returns above the activation and
+            # an unactivated private exclude does nothing. The harm would be deferred:
+            # read as authoritative, it skips the seed below and then points a shadowing
+            # `core.excludesFile` at a file missing the operator's own excludes,
+            # un-ignoring inside the worktree everything they ignore globally. Size
+            # rather than unlinking the placeholder on the way out, because no handler
+            # runs when the process is KILLED in that window. Re-seeding costs nothing
+            # either way: git treats an empty exclude and an absent one alike.
+            existed = exclude.is_file() and exclude.stat().st_size > 0
+            # On creation the operator's own excludes are copied in, because the
+            # activation below shadows them (see _shield_inherited_excludes). On a
+            # re-provision a non-empty file's content is authoritative and the copy is
+            # not repeated, so the two stay idempotent together.
+            #
+            # A COPY FAULT SKIPS THE ACTIVATION. `_shield_inherited_excludes` raises on
+            # anything but a definite "absent" — an unreadable file, and since round 5 a
+            # git that will not say which file applies — and the raise lands in this
+            # function's tail, which returns a reason. That is the whole point of it
+            # raising rather than returning empty: an empty seed plus the activation
+            # below is not "the seed was lost", it is the operator's global ignores
+            # SHADOWED inside this worktree, and `git add -A` staging what they told git
+            # to ignore. There is nothing to clean up on that path — the raise is above
+            # `exclude.touch()`, so no placeholder is left for a later provisioning to
+            # read as authoritative, and the `mkdir` above leaves an inert empty `info/`
+            # that dies with the worktree.
+            #
+            # BYTES on both sides of that choice, and never decoded text: an exclude
+            # file holds path patterns, POSIX paths are arbitrary bytes, and a legacy
+            # 8-bit encoding is a perfectly ordinary thing for an operator's own file to
+            # be in. `bytes.splitlines()` is also the git-CORRECT line split, not merely
+            # the type-consistent one — `str.splitlines()` breaks on \x0b, \x0c, \x1c,
+            # \x1d, \x1e and \x85, none of which git treats as a line boundary, so a
+            # legitimate pattern containing one fragmented into wrong dedupe keys.
+            existing = exclude.read_bytes() if existed else _shield_inherited_excludes(worktree)
+            present = set(existing.splitlines())
+            # fsencode, the inverse of the fsdecode above: a pattern derived from a real
+            # filename round-trips to its exact original bytes. Both sides of the `in`
+            # MUST be bytes — with `patterns` left as str every one of them reads as
+            # absent and gets re-appended on every re-provision.
+            wanted = [os.fsencode(p) for p in patterns]
+            new = [p for p in wanted if p not in present]
+            # `not existed` keeps a re-provision that adds no pattern from leaving the
+            # config below pointing at a file that was never created.
+            if new or not existed:
+                # b"\n", not "\n": `bytes.endswith(str)` is a TypeError, and TypeError is
+                # not in the tail's except tuple — it would escape a function contracted
+                # never to propagate.
+                prefix = existing if not existing or existing.endswith(b"\n") else existing + b"\n"
+                # atomic_write_bytes, never write_bytes onto `exclude` directly (#375).
+                # write_bytes opens "wb", which TRUNCATES before writing, and this is a
+                # read-modify-REWRITE carrying the operator's own excludes in
+                # `prefix` — so a short write (ENOSPC) left the file truncated
+                # mid-content while the degrade reason still said "could not update".
+                # Worse, the surviving tail is a valid git pattern and a prefix of the
+                # intended one: cut one char in and the last line is "/", which
+                # excludes the entire worktree.
+                #
+                # The helper rather than a hand-rolled tmp+replace: it fsyncs before
+                # the replace and carries the target's mode over, which a bare replace
+                # resets.
+                #
+                # #381's interleaving race is mooted for NEW writes rather than fixed:
+                # this file lives in one worktree's private gitdir, so the two runs
+                # that used to race here — every linked worktree of a repo resolved to
+                # the same shared common dir — no longer share a target at all. Only a
+                # second provisioning of the SAME worktree can reach this file, which
+                # the engine does serially. The atomic write stays for #375, whose
+                # fault (a short write) needs no second writer.
+                if not existed:
+                    # Create it first, the way the write_text this replaced did:
+                    # O_CREAT under the umask, giving the helper a mode to carry. Left
+                    # to itself it creates a new target at mkstemp's private 0600 —
+                    # and an exclude git cannot READ is one git silently IGNORES.
+                    # Measured: git warns, exits 0, and `git add -A` stages the files
+                    # the exclude was written to shield. That is the exact harm the
+                    # docstring above says silence must not cause, and here nothing
+                    # would even be reported, because the write SUCCEEDS. Reachable
+                    # wherever the gitdir is read under another UID
+                    # (core.sharedRepository, a shared checkout) — which is why
+                    # atomic_write_text's own docstring, which atomic_write_bytes
+                    # shares, says callers of genuinely shared state need more than
+                    # the helper alone.
+                    #
+                    # Safe against the tail below: an empty exclude is equivalent to
+                    # an absent one for git, so a fault after this leaves no more
+                    # damage than the missing file it replaced.
+                    exclude.touch()
+                atomic_write_bytes(exclude, prefix + b"".join(p + b"\n" for p in new))
+            # The PERMANENT repo-format change, deliberately the last-but-one thing
+            # this function does. `_shield_enable_worktree_config` probed the gates
+            # above and reported that the write is still owed; performing it there —
+            # where it used to live — put a format change the operator's repo carries
+            # forever AHEAD of the seed, the mkdir and the write, so every degrade
+            # below it (including the `_shield_inherited_excludes` fault that round 5
+            # turned from a swallow into a degrade) left the repo marked for a shield
+            # that never applied. Nothing between here and the activation can degrade,
+            # so the only path that can still set the flag without shielding anything is
+            # the activation's OWN failure — which is why that arm rolls it back below.
+            #
+            # It cannot move BELOW the activation: `git config --worktree` is what the
+            # extension unlocks, so the activation fatals without it.
             if needs_enable:
-                fault += _shield_undo_extension(worktree)
-            return f"could not activate the worktree git exclude ({worktree}): {fault}"
+                enabled = git_bytes(worktree, "config", "extensions.worktreeConfig", "true")
+                if enabled.returncode != 0:
+                    detail = (
+                        os.fsdecode(enabled.stderr).strip() or f"git exited {enabled.returncode}"
+                    )
+                    return (
+                        f"could not enable extensions.worktreeConfig ({worktree}): {detail} — the "
+                        "provisioned tool files are not shielded from the unit's `git add -A`"
+                    )
+            # LAST, after the file it names exists: git reads core.excludesFile lazily,
+            # but a config pointing at a file that a fault above left unwritten would
+            # be a shield that silently excludes nothing while reporting a reason.
+            # ONE rollback covering BOTH of the chokepoint's failure shapes, and the
+            # shape of this arm is the lesson rather than an incidental style choice.
+            # `git_bytes` can fail two ways — a non-zero rc (git refused) and a RAISE (a
+            # timeout, or a spawn failure as its GitSpawnError subclass) — and the two
+            # preceding rounds each fixed ONE of them, because each fix ENUMERATED the
+            # failure it had been shown. Enumeration is what kept being incomplete. So
+            # both shapes converge on one `fault` string BEFORE anything is decided, and
+            # there is a single place where the flag can be rolled back; a third failure
+            # shape would have to get past the `try` itself.
+            #
+            # The rollback exists because the enable one line above is a PERMANENT
+            # repo-format change, and the guarantee this code owes (docstring, CHANGELOG,
+            # docs/FEATURES.md) is that the flag survives only a shield that actually
+            # activated. `needs_enable` gates it — see `_shield_undo_extension` for why
+            # that condition is a safety property and not a micro-optimization, and for
+            # the second gate it applies itself: `needs_enable` records what the PROBE
+            # saw, so it cannot tell "we enabled it" from "we and a concurrent run both
+            # thought we did", and the callee declines when a sibling worktree's
+            # `config.worktree` would stop being read.
+            try:
+                activated = git_bytes(
+                    worktree, "config", "--worktree", "core.excludesFile", str(exclude)
+                )
+                fault = (
+                    None
+                    if activated.returncode == 0
+                    else os.fsdecode(activated.stderr).strip()
+                    or f"git exited {activated.returncode}"
+                )
+            except GitError as e:
+                # Deliberately NOT left to the tail: the tail cannot roll the flag back,
+                # and a GitError from THIS call means exactly what a refusal means — the
+                # shield did not activate. The tail's own GitError guard stays
+                # load-bearing for the seed read above, which round 5 turned into a
+                # degrade, so this is a narrowing of what reaches it, not a bypass.
+                fault = str(e)
+            if fault is not None:
+                if needs_enable:
+                    fault += _shield_undo_extension(worktree, git_dir, common_dir)
+                return f"could not activate the worktree git exclude ({worktree}): {fault}"
     # GitError is every fault a chokepoint git call can raise here — a timeout, or
     # a spawn failure as its GitSpawnError subclass. It replaces the
     # `subprocess.SubprocessError` this tuple used to carry for exactly that pair,

@@ -272,9 +272,18 @@ def file_lock(path: Path, *, blocking: bool = True) -> Iterator[None]:
     Lock a dedicated sibling file, never data that is swapped via
     :func:`atomic_replace` — the lock rides the open fd's inode, and a replace
     would swap that inode out from under later acquirers. ``fcntl.flock`` on
-    POSIX (blocks indefinitely; holders only do brief file I/O); ``msvcrt.locking``
-    on Windows, where the blocking mode's built-in ~10 s retry bounds the wait
-    and surfaces contention as ``OSError``.
+    POSIX; ``msvcrt.locking`` on Windows, where the blocking mode's built-in
+    ~10 s retry bounds the wait and surfaces contention as ``OSError``.
+
+    THE WAIT IS PLATFORM-ASYMMETRIC, and a caller has to decide what that means
+    for it: POSIX blocks indefinitely, Windows gives up after ~10 s and raises.
+    This docstring used to add "holders only do brief file I/O" — true when the
+    only consumers were tests, and falsified by the first production caller
+    (``install._worktree_local_exclude``, #384), which holds it across a
+    multi-step git transaction of roughly seven ``git`` spawns, each bounded by
+    ``[limits] git_timeout_s``. So a Windows acquirer can genuinely time out
+    under contention rather than only under a deadlock. Hold it for as short a
+    span as correctness allows, and handle the ``OSError`` from acquisition.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT)

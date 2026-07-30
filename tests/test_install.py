@@ -1,3 +1,4 @@
+import contextlib
 import io
 import json
 import os
@@ -1922,6 +1923,211 @@ def test_shield_never_unsets_an_extension_the_repo_already_carried(project, tmp_
     assert "worktreeConfig" in (repo / ".git" / "config").read_text(encoding="utf-8")
 
 
+def test_shield_never_unsets_an_extension_a_sibling_worktree_depends_on(
+    project, tmp_path, monkeypatch
+):
+    """`needs_enable` is necessary and NOT sufficient (#384, Codex round 8). It records
+    what the PROBE saw, and the enable is an idempotent rc-0 no-op against a flag that
+    is already `true` — so two concurrent provisionings in one repository both read an
+    absent flag and both believe they own it. Whichever one's activation then fails
+    unsets a flag the OTHER's live shield depends on: git stops reading its
+    `config.worktree`, its `core.excludesFile` goes inert, and its shielded tool files
+    become stageable again mid-run. So the rollback also refuses when any
+    `config.worktree` that is not ours exists.
+
+    THE FIRST TEST IN THIS SUITE WITH TWO WORKTREES IN ONE REPOSITORY, which is why the
+    finding survived eight rounds: the flag is repo-wide state, and a single-worktree
+    fixture cannot express a dependent.
+
+    The interleaving is reproduced rather than mimed. The sibling's shield is run for
+    REAL — its `config.worktree` and private exclude are git's own work, not files
+    written by hand — and the flag is then unset to rewind the repository to what this
+    run's probe saw. That is exactly the state the race produces: A probes, B enables
+    and activates, A's own enable is a no-op, A's activation fails.
+
+    The `--unset` is injected as a hard failure rather than asserted on the config
+    text, for the reason the sibling test above gives: the flag being present
+    afterwards would also hold if the unset had run and failed. Forbidding the CALL is
+    the only form that bites.
+
+    Ablation: drop the dependents scan in `_shield_undo_extension` and this fails — the
+    fake raises. With the raise removed too, the last assertion is the harm: the
+    sibling's own `git status` starts showing the file its shield was hiding."""
+    repo = project.project
+    sibling = tmp_path / "sibling"
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, sibling, "sib", "main")
+    verify.worktree_add(repo, wt, "feat", "main")
+    # the concurrent run that got there first, in full
+    assert _worktree_local_exclude(sibling, ["/probe-sibling"]) is None
+    sibling_gitdir = Path(git(sibling, "rev-parse", "--absolute-git-dir")).resolve()
+    assert (sibling_gitdir / "config.worktree").is_file()  # non-vacuity: a real dependent
+    # rewind to what THIS run's probe saw, leaving the sibling's config.worktree behind
+    git(repo, "config", "--unset", "extensions.worktreeConfig")
+    real = install_mod.git_bytes
+
+    def fail_worktree_writes_forbid_unset(worktree, *args):
+        if "--unset" in args and "extensions.worktreeConfig" in args:
+            raise AssertionError(f"unset a flag a sibling worktree depends on: {args}")
+        if "--worktree" in args:
+            return subprocess.CompletedProcess(
+                args=["git", *args], returncode=1, stdout=b"", stderr=b"fatal: read-only .git\n"
+            )
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", fail_worktree_writes_forbid_unset)
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert reason is not None and "read-only .git" in reason  # our activation did fail
+    assert "LEFT enabled" in reason and str(sibling_gitdir) in reason
+    assert "worktreeConfig" in (repo / ".git" / "config").read_text(encoding="utf-8")
+    # THE HARM, asked of git rather than of the config text: the sibling's shield still
+    # holds. A rolled-back flag would make this file stageable again mid-run.
+    (sibling / "probe-sibling").write_text("noise\n", encoding="utf-8")
+    assert "probe-sibling" not in git(sibling, "status", "--short")
+
+
+def test_shield_rolls_back_despite_its_own_partial_config_worktree(project, tmp_path, monkeypatch):
+    """The dependents scan excludes OUR OWN gitdir, and that exclusion is load-bearing
+    rather than tidiness: a `config.worktree` in it is the half-written product of the
+    very activation whose failure prompted the rollback — a timeout can leave one
+    behind — so counting it as a dependent would suppress every rollback rounds 6 and 7
+    exist to make, and leave the operator's repo carrying a permanent format change for
+    a shield that never held.
+
+    Ablation: include our own `git_dir` in the scan and this fails — `worktreeConfig`
+    stays in the shared config and the reason claims a sibling depends on it."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    git_dir = Path(git(wt, "rev-parse", "--absolute-git-dir")).resolve()
+    # what a timed-out activation leaves behind: our own pointer, already written
+    (git_dir / "config.worktree").write_text(
+        f"[core]\n\texcludesFile = {git_dir / 'info' / 'exclude'}\n", encoding="utf-8"
+    )
+    real = install_mod.git_bytes
+
+    def fail_worktree_writes(worktree, *args):
+        if "--worktree" in args:
+            return subprocess.CompletedProcess(
+                args=["git", *args], returncode=1, stdout=b"", stderr=b"fatal: read-only .git\n"
+            )
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", fail_worktree_writes)
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert reason is not None and "read-only .git" in reason
+    assert "LEFT enabled" not in reason  # our own file is not a dependency on anyone
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+
+
+def test_shield_takes_the_repo_scoped_lock(project, tmp_path, monkeypatch):
+    """The probe→enable→activate→rollback sequence is ONE transaction, serialized per
+    repository — the ownership guard above covers a flag enabled outside bmad-loop's
+    discipline, and this covers the ordinary case of two bmad-loop runs.
+
+    Three properties, and each one is a separate way to get this wrong:
+
+    - the lock lives in the COMMON dir, so every worktree of a repo contends on one
+      file (a per-worktree gitdir would give each run its own lock and exclude
+      nothing);
+    - it is a dedicated file rather than the config or the exclude, per `file_lock`'s
+      own contract — the lock rides an open fd's inode, and an `atomic_replace` would
+      swap that inode out from under later acquirers;
+    - it is taken BEFORE the extension probe and released AFTER the rollback, since the
+      race is the window between the probe's answer and the activation's outcome.
+
+    Ordering is recorded from the calls themselves rather than asserted on the lock's
+    existence: a lock taken after the probe, or released before the rollback, leaves
+    exactly the window this closes.
+
+    Ablation: drop the `with` and this fails — `file_lock` is never entered."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    events = []
+    real_lock, real_git = install_mod.file_lock, install_mod.git_bytes
+
+    @contextlib.contextmanager
+    def spy_lock(path, **kwargs):
+        events.append(("lock-enter", path))
+        with real_lock(path, **kwargs):
+            yield
+        events.append(("lock-exit", path))
+
+    def spy_git(worktree, *args):
+        events.append(("git", args))
+        return real_git(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "file_lock", spy_lock)
+    monkeypatch.setattr(install_mod, "git_bytes", spy_git)
+
+    assert _worktree_local_exclude(wt, ["/probe-384"]) is None
+
+    kinds = [kind for kind, _ in events]
+    assert kinds.count("lock-enter") == 1 and kinds.count("lock-exit") == 1
+    common = Path(git(wt, "rev-parse", "--git-common-dir")).resolve()
+    assert events[kinds.index("lock-enter")][1] == common / "bmad-loop-shield.lock"
+    probe = next(
+        i
+        for i, (kind, a) in enumerate(events)
+        if kind == "git" and "extensions.worktreeConfig" in a
+    )
+    activation = next(
+        i for i, (kind, a) in enumerate(events) if kind == "git" and "--worktree" in a
+    )
+    assert kinds.index("lock-enter") < probe
+    assert activation < kinds.index("lock-exit")
+    # the residue this buys, disclosed in the docs: a zero-length file inside `.git`,
+    # so nothing the operator's own `git add -A` can ever see
+    lock_file = common / "bmad-loop-shield.lock"
+    assert lock_file.is_file() and lock_file.stat().st_size == 0
+    assert git(repo, "status", "--short") == ""
+
+
+def test_shield_degrades_when_the_lock_cannot_be_taken(project, tmp_path, monkeypatch):
+    """Taking the lock can fail, and on Windows that is a routine outcome rather than a
+    contrived one: POSIX `flock` blocks indefinitely, but `msvcrt.locking` gives up
+    after ~10 s and raises `OSError` — and this holder spans ~7 git spawns, each bounded
+    by `[limits] git_timeout_s`, so a real contender can outlast it.
+
+    The acquisition's `OSError` is caught at the lock rather than left to the function's
+    tail purely so the operator is told which step failed; the tail would return a
+    reason too, just not one naming the lock. What must hold either way is that a
+    shield that never started leaves NOTHING behind — no permanent repo-format flag, no
+    activated pointer.
+
+    Ablation: drop the `except OSError` around the acquisition and this fails — the
+    tail's generic "could not update the worktree-local git exclude" reason says
+    nothing about a lock."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    @contextlib.contextmanager
+    def unavailable(path, **kwargs):
+        # the shape `msvcrt.locking` raises when the ~10 s blocking retry runs out
+        raise OSError(11, "Resource deadlock avoided")
+        yield  # pragma: no cover — unreachable; keeps this a generator function
+
+    monkeypatch.setattr(install_mod, "file_lock", unavailable)
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert reason is not None
+    assert "shield lock" in reason and "Resource deadlock avoided" in reason
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+    git_dir = Path(git(wt, "rev-parse", "--absolute-git-dir"))
+    assert not (git_dir / "config.worktree").exists()  # nothing was activated
+    # ...and the reason is honest about the consequence: the shield is off, so the
+    # files it would have hidden really are stageable. Reported, never silent.
+    (wt / "probe-384").write_text("noise\n", encoding="utf-8")
+    assert "probe-384" in git(wt, "status", "--short")
+
+
 def test_shield_reuses_already_enabled_extension(project, tmp_path, monkeypatch):
     """A repo that already carries the extension is used as found — the second
     isolated run in a repo must not re-assert a permanent format change, and must
@@ -2345,6 +2551,67 @@ def test_shield_seeds_xdg_default_when_unset(project, tmp_path, monkeypatch):
     # The exclude is activated through a worktree-scoped `core.excludesFile`, i.e.
     # repo-local config — so this holds without the env pinning, which is the point.
     assert git(wt, "status", "--short") == ""
+
+
+def test_shield_honors_an_explicitly_empty_excludesfile(project, tmp_path, monkeypatch):
+    """An EXPLICITLY EMPTY `core.excludesFile` is an ANSWER, not an unset key: it is the
+    operator saying "no excludes file at all", and git honors that literally — no
+    patterns, and NO fallback to `$XDG_CONFIG_HOME/git/ignore`. Reading it as unset
+    (#384, Codex round 8) imported the XDG file's patterns and ACTIVATED them, which is
+    the mirror image of every other finding in this family: instead of shadowing
+    patterns it failed to copy it OVER-ignores, so session-created files the operator
+    deliberately stopped ignoring go silently missing from the unit's `git add -A` and
+    from the story's commit. Same silent-file-loss class as #384 itself, inverted.
+
+    Measured at git 2.55.0 on a fixture built for exactly this: `-z --type=path --get`
+    answers rc 0 with a lone NUL, `git check-ignore -v` then exits 1 against a name the
+    XDG file lists, and `git status` shows it untracked. The mechanism is in git's
+    source rather than inferred — `dir.c::setup_standard_excludes` guards the XDG
+    fallback on `if (!excludes_file)`, a NULL POINTER, while an empty value resolves
+    through `interpolate_path("")` to a non-NULL empty string. Byte-identical guard at
+    v2.20.0, this shield's floor, and at master. It is undocumented: `core.adoc` says
+    only "Defaults to $XDG_CONFIG_HOME/git/ignore" — the same standing as the relative-
+    value behavior the sibling test above pins.
+
+    `GIT_CONFIG_NOSYSTEM` is deliberately NOT pinned, unlike the XDG sibling: a
+    repo-LOCAL key already outranks a global one, so there is nothing to suppress, and
+    pinning it would suppress Git-for-Windows' `core.autocrlf` and make unrelated
+    tracked files read as modified. The assertions name one file each instead of
+    demanding whole-worktree cleanliness.
+
+    Ablation: restore `and raw` on the rc branch of `_shield_inherited_excludes` (the
+    pre-round-8 condition) and this fails — `xdg-ignored.tmp` is seeded into the private
+    exclude and disappears from git's status. Deleting the `if not raw:` arm alone does
+    NOT reproduce the bug: `os.fsdecode(b"")` makes `Path(".")`, which resolves to the
+    worktree directory and reads `is_file()` false, so the seed comes back empty
+    anyway. The defect is the ROUTING of this answer into the XDG branch."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    xdg = tmp_path / "xdg"
+    (xdg / "git").mkdir(parents=True)
+    (xdg / "git" / "ignore").write_text("xdg-ignored.tmp\n", encoding="utf-8")
+    git(repo, "config", "core.excludesFile", "")
+    # non-vacuous both ways: git really did write an EMPTY value (not a quoted one, and
+    # not a deleted key), and the XDG file it must NOT reach for really does exist and
+    # really does carry the pattern the assertions below look for.
+    assert re.search(r"excludesFile = *\n", (repo / ".git" / "config").read_text(encoding="utf-8"))
+    assert (xdg / "git" / "ignore").read_text(encoding="utf-8") == "xdg-ignored.tmp\n"
+
+    with monkeypatch.context() as pinned:
+        pinned.setenv("XDG_CONFIG_HOME", str(xdg))
+        assert _worktree_local_exclude(wt, ["/probe-384"]) is None
+
+    lines = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert "xdg-ignored.tmp" not in lines  # switched-off patterns were not imported
+    assert "/probe-384" in lines  # ...and the shield's own pattern still is
+    (wt / "xdg-ignored.tmp").write_text("noise\n", encoding="utf-8")
+    (wt / "probe-384").write_text("noise\n", encoding="utf-8")
+    status = git(wt, "status", "--short")
+    # THE HARM, in git's own words: the file stays visible to `git add -A`, exactly as
+    # it does in the main checkout. The shield did not quietly re-ignore it.
+    assert "xdg-ignored.tmp" in status
+    assert "probe-384" not in status
 
 
 def test_shield_config_fault_skips_shield_entirely(project, tmp_path, monkeypatch):
