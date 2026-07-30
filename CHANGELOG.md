@@ -272,7 +272,8 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   `core.excludesFile` is copied in **byte for byte** when the private file is created, since the
   worktree-scoped key shadows it and git never concatenates across config scopes — so the copy has
   to survive an exclude file in any legacy encoding at all (its patterns are paths, and POSIX paths
-  are arbitrary bytes). Relative values are resolved against the worktree, the way git does, rather
+  are arbitrary bytes). Relative values — of that key, or of an `XDG_CONFIG_HOME`
+  git falls back through — are resolved against the worktree, the way git does, rather
   than against wherever the orchestrator was launched. Paths are read NUL-terminated, so an
   excludes file whose path begins or ends in whitespace is copied rather than mangled. An excludes
   file that **exists but cannot be read** — or a **git that will not say which file applies** (a
