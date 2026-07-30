@@ -1808,18 +1808,25 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
                 # fault (a short write) needs no second writer.
                 if not existed:
                     # Create it first, the way the write_text this replaced did:
-                    # O_CREAT under the umask, giving the helper a mode to carry. Left
-                    # to itself it creates a new target at mkstemp's private 0600 —
-                    # and an exclude git cannot READ is one git silently IGNORES.
-                    # Measured: git warns, exits 0, and `git add -A` stages the files
-                    # the exclude was written to shield. That is the exact harm the
-                    # docstring above says silence must not cause, and here nothing
-                    # would even be reported, because the write SUCCEEDS. Reachable
-                    # wherever the gitdir is read under another UID
-                    # (core.sharedRepository, a shared checkout) — which is why
-                    # atomic_write_text's own docstring, which atomic_write_bytes
-                    # shares, says callers of genuinely shared state need more than
-                    # the helper alone.
+                    # O_CREAT under the umask, giving the helper a mode to carry.
+                    # BEHAVIOR PRESERVATION is the whole of the rationale (#375).
+                    # `atomic_write_bytes` carries a mode over only when the target
+                    # already EXISTS — its own docstring says a fresh one gets
+                    # mkstemp's private 0600 — so dropping this line would narrow
+                    # every private exclude's mode as an unannounced side effect of
+                    # that refactor.
+                    #
+                    # The mode is load-bearing only where another OS user reads this
+                    # gitdir, and that configuration no longer reaches here:
+                    # `_shield_shared_repository` refuses a repository configured
+                    # `core.sharedRepository` above the lock (#384). What keeps the
+                    # line anyway is the SHAPE the mode's failure takes — measured,
+                    # git treats an exclude it cannot read as one that is not there:
+                    # it warns, exits 0, and `git add -A` stages the very files the
+                    # exclude was written to shield, with no degrade reason at all
+                    # because the write SUCCEEDED. Silence is the one outcome this
+                    # function's docstring rules out, so a line that cannot produce
+                    # it is worth its cost.
                     #
                     # Safe against the tail below: an empty exclude is equivalent to
                     # an absent one for git, so a fault after this leaves no more

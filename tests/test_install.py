@@ -3824,19 +3824,21 @@ def test_worktree_local_exclude_undecodable_git_output_degrades(tmp_path, monkey
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits; Windows has no umask")
 def test_worktree_local_exclude_created_exclude_stays_readable(project, tmp_path):
     """An exclude this helper CREATES keeps the mode the `write_text` it replaced
-    would have produced, not `mkstemp`'s private 0600. `atomic_write_bytes` carries
-    a mode over only when the target already EXISTS (the shared contract on
-    `atomic_write_text` is explicit),
-    so a fresh one lands 0600 — and git treats an exclude it cannot read as one
-    that is not there. Measured: git warns `unable to access`, exits 0, and
-    `git add -A` stages the very files the exclude was written to shield, with no
-    degrade reason at all, because the write SUCCEEDED. That is the harm the
-    helper's own docstring calls out, arrived at through a successful write.
+    would have produced, not `mkstemp`'s private 0600 — behavior preservation
+    across #375's move to `atomic_write_bytes`, which carries a mode over only when
+    the target already EXISTS (its own docstring is explicit that a fresh one gets
+    0600). Without the `touch()` the refactor would have narrowed every private
+    exclude's mode with nothing recording the change, and the create path is live
+    for EVERY worktree since #384, not just a repo whose `.git/info/exclude` is
+    missing: the private exclude never exists until the shield writes it.
 
-    Reachable where the gitdir is read under another UID —
-    `core.sharedRepository`, a shared checkout — and since #384 the create path is
-    live for EVERY worktree, not just a repo whose `.git/info/exclude` is missing:
-    the private exclude never exists until the shield writes it.
+    The mode itself only matters where another OS user reads the gitdir, and that
+    configuration is refused above the lock now (`_shield_shared_repository`), so
+    this pins a mode rather than a supported cross-user path. It is still worth
+    pinning for the SHAPE of the failure a wrong mode produces: measured, git treats
+    an exclude it cannot read as one that is not there — it warns `unable to
+    access`, exits 0, and `git add -A` stages the very files the exclude was written
+    to shield, with no degrade reason at all, because the write SUCCEEDED.
 
     The umask is pinned rather than inherited: at the box's own 0077 the ablated
     code produces 0600 too, and the ablation would not bite.

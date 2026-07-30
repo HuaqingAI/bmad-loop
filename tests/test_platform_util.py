@@ -562,103 +562,32 @@ def test_file_lock_reentry_after_exception(tmp_path):
         pass
 
 
-@pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="msvcrt.locking needs a writable fd, so the fallback is POSIX-only",
-)
-def test_file_lock_acquires_a_lock_file_it_cannot_write(tmp_path):
-    """A peer's lock file in a group-shared repository must not lock us out.
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes; Windows has no umask")
+def test_file_lock_is_created_owner_only(tmp_path):
+    """The lock's mode is stated by the code, not inherited from whoever ran first.
 
-    `os.open` here takes no mode, so it defaults to 0o777 masked by the umask — the
-    usual 022 makes the lock **0o755**, owner-writable only. Measured with two real
-    uids in one group: the second user's `O_RDWR | O_CREAT` fails EACCES, so under
-    `core.sharedRepository = group` every user but the first would have their git-add
-    shield skipped for the life of the repository, after provisioning had already
-    copied the tool files it exists to hide (#384, Codex round 13).
+    A repository shared between OS users is refused before the shield ever takes
+    this lock (`install._shield_shared_repository`, #384), so owner-only is the
+    whole policy — but leaving `os.open` mode-less would still make the mode a
+    property of the creator's umask rather than a decision: measured, 022 yields
+    0o755 and 077 yields 0o700.
 
-    0o444 stands in for "a file this process cannot write", which is what a peer's
-    0o755 lock is from here. The mode is the whole fixture, so a run that does not
-    ENFORCE it proves nothing — hence the root guard: root bypasses the permission
-    check entirely and would open O_RDWR happily, making this pass against the bug.
-    That is the same void-measurement trap as reading a docker permission result
-    without checking `id -u`.
+    `os.umask(0o022)` is the point of the fixture, not hygiene. At this box's own
+    0o077 the mode-less code produces 0o600 by accident and the ablation does not
+    bite — the same trap as
+    `test_install.py::test_worktree_local_exclude_created_exclude_stays_readable`.
 
-    Mutual exclusion is asserted here too, not assumed: it is the only property this
-    function sells, and a fallback that silently stopped excluding would be a far worse
-    bug than the one it fixes. flock is inode-based, so it holds across the two fd
-    kinds — measured independently with two uids, and pinned below within one process.
-
-    This covers a lock file THIS code did not create with the current rules — one
-    written by a pre-round-13/14 bmad-loop, or by another tool. Freshly created locks
-    are handled by the mode in `_widen_lock_to_directory`; see the sibling test.
-
-    Ablation: drop the `except PermissionError` fallback in `_open_existing_lock` and
-    this fails at the first `with` — PermissionError, exactly as a peer's run gets."""
-    lock = tmp_path / "shared.lock"
-    lock.touch()
-    lock.chmod(0o444)
-    if os.access(lock, os.W_OK):  # root ignores the mode; the fixture would be inert
-        pytest.skip("running as root, so 0o444 is not enforced")
-
-    with platform_util.file_lock(lock):
-        # ...and it is a real exclusive lock, not a no-op that merely opened the file
-        with pytest.raises(OSError):
-            with platform_util.file_lock(lock, blocking=False):
-                pass
-
-    # released on exit, same as the writable path
-    with platform_util.file_lock(lock, blocking=False):
-        pass
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
-@pytest.mark.parametrize(
-    ("dir_mode", "expected"),
-    [
-        (0o2775, 0o664),  # `core.sharedRepository = group` — peers must get in
-        (0o755, 0o644),  # group-readable only: read access, no write
-        (0o700, 0o600),  # a private repo is NOT widened
-    ],
-)
-def test_file_lock_mode_follows_the_directory_not_the_umask(tmp_path, dir_mode, expected):
-    """The creator's umask is the wrong authority for a lock meant to serialize
-    DIFFERENT USERS, and round 13 fixed only one of its shapes (#384, Codex round 14).
-
-    `os.open`'s mode is masked by the umask, so the lock inherited whatever the first
-    user to provision happened to have — measured, 022 gives 0o755 and 077 gives 0o700.
-    Round 13's read-only fallback rescues the first (group can read) and cannot rescue
-    the second (group cannot), which is exactly the "enumerate one failure shape per
-    review round" trap this PR has paid for repeatedly. Deriving the mode from the
-    containing DIRECTORY funnels every umask at once.
-
-    The directory is the right authority because git has already stamped the
-    repository's sharing policy onto it, and that policy is the precondition for a peer
-    to be here at all. Hence the third case: a private `.git` must NOT be widened, which
-    is what stops this from being "make the lock world-writable and move on".
-
-    `os.umask(0o077)` is the point of the fixture, not hygiene — under the old code it
-    is what produced the unrescuable 0o700. If this test ever passes with the umask left
-    at the runner's default, it has stopped testing anything.
-
-    Measured end-to-end with two real uids in one group (docker, python:3.12-slim): with
-    a 0o2775 `.git` the lock lands 0o664 under BOTH umasks and the peer acquires it;
-    with a 0o700 `.git` it stays 0o600 and the peer is correctly denied.
-
-    Ablation: drop the `_widen_lock_to_directory` call and the first two cases fail —
-    the lock comes back 0o600, the umask's answer rather than the directory's."""
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    repo.chmod(dir_mode)
-    lock = repo / "shield.lock"
-
-    previous = os.umask(0o077)
+    Ablation (run): drop the `0o600` argument from `file_lock`'s `os.open` and this
+    fails reporting 0o755."""
+    lock = tmp_path / "s.lock"
+    previous = os.umask(0o022)
     try:
         with platform_util.file_lock(lock):
             pass
     finally:
         os.umask(previous)
 
-    assert stat.S_IMODE(lock.stat().st_mode) == expected
+    assert stat.S_IMODE(lock.stat().st_mode) == 0o600, oct(stat.S_IMODE(lock.stat().st_mode))
 
 
 # ------------------------------------------------------------------ safe_segment
