@@ -1771,6 +1771,121 @@ def test_shield_enables_the_extension_on_the_path_that_activates(project, tmp_pa
     assert git(wt, "status", "--short") == ""
 
 
+def test_shield_rolls_back_the_extension_when_activation_fails(project, tmp_path, monkeypatch):
+    """The one degrade left that can still have made a permanent repo-format change:
+    the ACTIVATION's own failure, which happens one line after the enable. Round 5
+    moved the enable down to close every path above it; Codex then pointed out this
+    one, and it is real — read-only `.git` and a lock on `config.worktree` both reach
+    it. So the arm rolls the flag back.
+
+    Measured, not assumed: `--unset` removes the key *and* the now-empty
+    `[extensions]` section, and `git config --worktree` refuses again afterwards, so
+    the repo is genuinely returned to the state we found rather than cosmetically
+    tidied.
+
+    Only `--worktree` writes are failed, so the enable itself succeeds — which is
+    what makes this the enable-then-fail ordering rather than a short-circuit.
+
+    Ablation: drop the `--unset` rollback and this fails — `worktreeConfig` is left
+    in the shared config after a degrade that shielded nothing."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+    real = install_mod.git_bytes
+
+    def fail_worktree_writes(worktree, *args):
+        if "--worktree" in args:
+            return subprocess.CompletedProcess(
+                args=["git", *args], returncode=1, stdout=b"", stderr=b"fatal: read-only .git\n"
+            )
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", fail_worktree_writes)
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert reason is not None and "read-only .git" in reason
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+    # the rollback is silent when it works: the operator is told the shield failed,
+    # not handed a second fault that did not happen
+    assert "could NOT be rolled back" not in reason
+
+
+def test_shield_reports_a_rollback_it_could_not_make(project, tmp_path, monkeypatch):
+    """If the rollback ALSO fails the operator has to be told, because the repo then
+    really does keep a permanent format change that shields nothing — the coherent
+    case, since a read-only `.git` fails both writes. Reported rather than raised:
+    this function is contracted never to propagate.
+
+    Both faults are named in the one reason, so the second is not lost behind the
+    first.
+
+    Ablation: drop the `undone.returncode != 0` branch and this fails — the reason
+    mentions only the activation, and the format change goes unreported."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    real = install_mod.git_bytes
+
+    def fail_worktree_writes_and_the_unset(worktree, *args):
+        if "--worktree" in args:
+            return subprocess.CompletedProcess(
+                args=["git", *args], returncode=1, stdout=b"", stderr=b"fatal: read-only .git\n"
+            )
+        if "--unset" in args:
+            return subprocess.CompletedProcess(
+                args=["git", *args], returncode=1, stdout=b"", stderr=b"fatal: could not lock\n"
+            )
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", fail_worktree_writes_and_the_unset)
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert reason is not None
+    assert "read-only .git" in reason  # the activation fault
+    assert "could NOT be rolled back" in reason and "could not lock" in reason
+    assert "permanent format change" in reason
+
+
+def test_shield_never_unsets_an_extension_the_repo_already_carried(project, tmp_path, monkeypatch):
+    """The rollback is gated on having enabled the flag IN THIS CALL, and that gate is
+    a safety property rather than a micro-optimization: a repo that already carries
+    `extensions.worktreeConfig` may have `config.worktree` files other worktrees
+    depend on, and unsetting it would stop git reading them. So an activation failure
+    against an already-enabled repo must leave the flag alone.
+
+    The `--unset` is injected as a hard failure rather than asserted on the config
+    text, for the reason the already-enabled sibling test gives: the flag being
+    present afterwards would also hold if the unset had run and failed. Forbidding
+    the CALL is the only form that bites.
+
+    Ablation: drop the `if needs_enable:` gate on the rollback and this fails — the
+    fake raises."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    git(repo, "config", "extensions.worktreeConfig", "true")
+    real = install_mod.git_bytes
+
+    def fail_worktree_writes_forbid_unset(worktree, *args):
+        if "--unset" in args and "extensions.worktreeConfig" in args:
+            raise AssertionError(f"unset an extension this call did not enable: {args}")
+        if "--worktree" in args:
+            return subprocess.CompletedProcess(
+                args=["git", *args], returncode=1, stdout=b"", stderr=b"fatal: read-only .git\n"
+            )
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", fail_worktree_writes_forbid_unset)
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert reason is not None and "read-only .git" in reason
+    assert "worktreeConfig" in (repo / ".git" / "config").read_text(encoding="utf-8")
+
+
 def test_shield_reuses_already_enabled_extension(project, tmp_path, monkeypatch):
     """A repo that already carries the extension is used as found — the second
     isolated run in a repo must not re-assert a permanent format change, and must

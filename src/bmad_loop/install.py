@@ -799,7 +799,8 @@ def _shield_enable_worktree_config(worktree: Path, common_dir: Path) -> tuple[st
     the mkdir, the write and the activation — so every degrade below it, including
     the `_shield_inherited_excludes` one, left the operator's repo permanently
     marked for a shield that never applied. The caller now enables it immediately
-    before the activation, which is the one point past which nothing can degrade.
+    before the activation, and rolls it back if the activation itself then fails, so
+    the flag survives only a shield that actually holds.
 
     `extensions.worktreeConfig` is what makes a per-worktree config file exist at
     all; without it `git config --worktree` either refuses outright (a repo with
@@ -1058,9 +1059,11 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
     `_shield_enable_worktree_config` for the two shapes where enabling it is
     refused outright. It is paid ONLY when the shield actually activates: that
     function probes, and the write itself happens here, one line above the
-    activation, past the last point anything can degrade. Enabling it up front —
-    where it used to be — charged the operator's repo that permanent price on every
-    path that then degraded away without shielding anything.
+    activation. Enabling it up front — where it used to be — charged the operator's
+    repo that permanent price on every path that then degraded away without
+    shielding anything. Moving it down leaves exactly one path that can still set it
+    without shielding anything, the activation's OWN failure, and that arm ROLLS THE
+    FLAG BACK (only when this call is what set it — see the comment there).
 
     Every git call goes through `verify.git_bytes`, the chokepoint accessor whose
     two properties this function is built on: the returncode comes back as an
@@ -1290,7 +1293,8 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
         # below it (including the `_shield_inherited_excludes` fault that round 5
         # turned from a swallow into a degrade) left the repo marked for a shield
         # that never applied. Nothing between here and the activation can degrade,
-        # so past this point the flag is only ever set for a shield that holds.
+        # so the only path that can still set the flag without shielding anything is
+        # the activation's OWN failure — which is why that arm rolls it back below.
         #
         # It cannot move BELOW the activation: `git config --worktree` is what the
         # extension unlocks, so the activation fatals without it.
@@ -1308,6 +1312,37 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
         activated = git_bytes(worktree, "config", "--worktree", "core.excludesFile", str(exclude))
         if activated.returncode != 0:
             detail = os.fsdecode(activated.stderr).strip() or f"git exited {activated.returncode}"
+            # ROLL BACK the format change, because this is the one degrade left that
+            # can have made one (round 5 follow-up, Codex P2 on the fix above: moving
+            # the enable down to here closed every path except the activation's own
+            # failure, and the guarantee is "the flag is set only when the shield
+            # actually activates"). Read-only `.git` and a lock on `config.worktree`
+            # both reach here.
+            #
+            # `needs_enable` gates it, and that condition is the safety property, not
+            # a micro-optimization: a repo that ALREADY carried the extension may have
+            # `config.worktree` files that other worktrees depend on, and unsetting it
+            # would stop git reading them. We only ever undo a flag WE set in this
+            # call, which returns the repo to exactly the state we found — measured:
+            # `--unset` removes the key and the now-empty `[extensions]` section, and
+            # `git config --worktree` refuses again afterwards, so the rollback is
+            # real rather than cosmetic.
+            #
+            # A failed rollback is REPORTED, not raised: this function is contracted
+            # never to propagate, and the operator needs to know the repo kept a
+            # format change. (Both writes failing is the coherent case — a read-only
+            # `.git` fails the unset too — so the reason names both faults.)
+            if needs_enable:
+                undone = git_bytes(worktree, "config", "--unset", "extensions.worktreeConfig")
+                if undone.returncode != 0:
+                    undo_detail = (
+                        os.fsdecode(undone.stderr).strip() or f"git exited {undone.returncode}"
+                    )
+                    detail += (
+                        "; extensions.worktreeConfig was enabled for this shield and could "
+                        f"NOT be rolled back ({undo_detail}) — the repository keeps a "
+                        "permanent format change that shields nothing"
+                    )
             return f"could not activate the worktree git exclude ({worktree}): {detail}"
     # GitError is every fault a chokepoint git call can raise here — a timeout, or
     # a spawn failure as its GitSpawnError subclass. It replaces the

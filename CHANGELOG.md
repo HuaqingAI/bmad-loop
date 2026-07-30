@@ -283,7 +283,8 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   also **notified**, not just journaled, since skipping is only defensible if you find out. Two
   caveats: this enables `extensions.worktreeConfig`, a **permanent** repo-format flag that is never
   removed — set only when the shield actually activates, so a run that degrades away leaves your
-  repo's format untouched — and where git requires that flag's
+  repo's format untouched (if the activation itself fails the flag is rolled back, and a rollback
+  that cannot be made is named in the reason) — and where git requires that flag's
   prerequisites be moved by hand first (`core.bare = true` or `core.worktree` in the shared config)
   the shield is skipped with a journaled reason rather than widened back. It also needs **git 2.20**,
   the release that introduced the flag and `git config --worktree`; below that the shield is skipped
