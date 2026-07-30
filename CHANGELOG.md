@@ -293,7 +293,9 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   Concurrent runs against one repository are **serialized** on a lock in `.git/`, and a failed
   activation never rolls the repo-format flag back while another worktree's `config.worktree` still
   depends on it: without either, one run's failed shield silently switched off a sibling run's
-  working one mid-story. Three caveats: this enables `extensions.worktreeConfig`, a **permanent**
+  working one mid-story. A repository configured as **shared between OS users**
+  (`core.sharedRepository`) is refused with a journaled reason rather than shielded.
+  Three caveats: this enables `extensions.worktreeConfig`, a **permanent**
   repo-format flag that is never removed — written at the last possible moment, so a run that
   degrades away **above** it leaves your repo's format untouched, and if either of the two writes
   that can leave it set without a working shield then fails (the enable itself, or the activation)
