@@ -1709,6 +1709,68 @@ def test_shield_refuses_to_enable_extension_over_old_git(project, tmp_path, monk
     assert (repo / ".git" / "info" / "exclude").read_bytes() == shared_before
 
 
+def test_shield_degrade_leaves_no_permanent_repo_format_change(project, tmp_path, monkeypatch):
+    """`extensions.worktreeConfig` is a PERMANENT repo-format change bmad-loop never
+    reverses, so it must not be paid for a shield that then degrades away. Round 5:
+    `_shield_enable_worktree_config` used to perform the enable itself, ahead of the
+    seed, the mkdir, the write and the activation — so every degrade below it left
+    the operator's repo marked forever for a shield that never applied. It now only
+    PROBES; the write happens one line above the activation.
+
+    Driven through the seed fault the round-5 GitError fix introduced, because that
+    is the degrade path this reordering exists for — a fault the old code could not
+    even reach, since it swallowed instead of degrading.
+
+    Read as TEXT rather than via `git config --get`, for the reason the sibling
+    refusal tests give: conftest's git() is check=True and an unset key exits 1.
+
+    Ablation: move the enable back above the seed (into
+    `_shield_enable_worktree_config`, where it was) and this fails —
+    `worktreeConfig` is in the shared config after a degrade that shielded nothing."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    users = tmp_path / "my-global-ignores"
+    users.write_text("mine.log\n", encoding="utf-8")
+    git(repo, "config", "core.excludesFile", str(users))
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+    real = install_mod.git_bytes
+
+    def unanswerable_excludes_read(worktree, *args):
+        if "core.excludesFile" in args and "--get" in args:
+            raise verify.GitError("git config did not answer")
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", unanswerable_excludes_read)
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert reason is not None  # it really did degrade
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+
+
+def test_shield_enables_the_extension_on_the_path_that_activates(project, tmp_path):
+    """The other half of the deferral: moving the enable down must not lose it. A
+    happy path still leaves the repo carrying the extension — that write is what
+    `git config --worktree` needs to exist at all, so without it the activation
+    fatals and the shield does nothing.
+
+    The sibling above proves the flag is absent after a degrade; this proves the
+    reordering did not simply stop setting it. Neither alone distinguishes the fix
+    from a deletion."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+
+    assert _worktree_local_exclude(wt, ["/probe-384"]) is None
+
+    assert "worktreeConfig" in (repo / ".git" / "config").read_text(encoding="utf-8")
+    # ...and it bought a shield that actually holds
+    (wt / "probe-384").write_text("noise\n", encoding="utf-8")
+    assert git(wt, "status", "--short") == ""
+
+
 def test_shield_reuses_already_enabled_extension(project, tmp_path, monkeypatch):
     """A repo that already carries the extension is used as found — the second
     isolated run in a repo must not re-assert a permanent format change, and must
@@ -1798,6 +1860,49 @@ def test_shield_seeds_users_excludesfile(project, tmp_path):
     users = tmp_path / "my-global-ignores"
     users.write_text("mine.log\n", encoding="utf-8")
     git(repo, "config", "core.excludesFile", str(users))
+
+    assert _worktree_local_exclude(wt, ["/probe-384"]) is None
+
+    lines = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert "mine.log" in lines and "/probe-384" in lines
+    (wt / "mine.log").write_text("noise\n", encoding="utf-8")
+    assert git(wt, "status", "--short") == ""
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="POSIX-only: Windows strips a trailing space from a filename"
+)
+def test_shield_seeds_an_excludesfile_whose_path_has_edge_whitespace(project, tmp_path):
+    """Round 5 (#384, Codex P2): the same leak as the encoding bug, through the PATH
+    rather than the content. A `.strip()` on git's answer destroyed a legal POSIX
+    path — `git config --type=path --get` returns leading and trailing whitespace
+    VERBATIM (git writes such a value quoted, so it round-trips; measured at 2.20.4
+    and 2.55.0) — so the stripped path read absent via `is_file()`, the seed came
+    back empty, and the activation then SHADOWED the excludes it had failed to copy.
+    Silent: `_shield_inherited_excludes` returned empty rather than raising, and the
+    caller only journals a non-None reason.
+
+    `-z` is the fix: it terminates the value with NUL, so the path survives whatever
+    whitespace it carries.
+
+    One filename covers BOTH sides of the strip — `" my-global-ignores "` has a
+    leading and a trailing space — so a half-fix (`rstrip` only, say) still fails.
+
+    Both halves asserted, as in the non-UTF-8 sibling below: the private file's
+    content (the mechanism) and git's own answer inside the worktree (the harm).
+
+    Ablation: restore `.strip()` in place of the `-z` split in
+    `_shield_inherited_excludes` and this fails — `mine.log` comes back untracked."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    users = tmp_path / " my-global-ignores "
+    users.write_text("mine.log\n", encoding="utf-8")
+    git(repo, "config", "core.excludesFile", str(users))
+    # git really did keep the whitespace, so the seed below has something to lose.
+    # Read from the config FILE, not through `git config --get`: conftest's git()
+    # strips its stdout, which would defeat the very check being made here.
+    assert f'"{users}"' in (repo / ".git" / "config").read_text(encoding="utf-8")
 
     assert _worktree_local_exclude(wt, ["/probe-384"]) is None
 
@@ -2542,11 +2647,16 @@ def test_worktree_local_exclude_created_exclude_stays_readable(project, tmp_path
 
 
 def test_worktree_local_exclude_non_git_dir_returns_none(tmp_path):
-    """Not-a-repo is an EXPECTED skip, not a degradation: `OSError` in the
-    subprocess arm means "no git to query" and must stay silent, while the same
-    type in the tail means "surface it". That is why the two arms cannot merge.
+    """Not-a-repo is an EXPECTED skip, not a degradation, and must stay silent —
+    while a fault in the tail means "surface it". That is why the two arms cannot
+    merge.
 
-    INVERSE ablation (a negative assertion needs one): make the subprocess arm
+    Two corrections to what this comment used to say, both worth keeping straight:
+    not-a-repo is not a raised fault at all — `rev-parse` answers rc 128 and the
+    silent arm reads that returncode — and the arm's `except` catches `GitError`,
+    not `OSError`, since the chokepoint translates a failed spawn before it arrives.
+
+    INVERSE ablation (a negative assertion needs one): make the rev-parse arm
     return a reason string instead of None and this fails."""
     assert _worktree_local_exclude(tmp_path, ["/probe-359"]) is None
 
@@ -2676,42 +2786,71 @@ def test_worktree_local_exclude_git_fault_after_answering_degrades(project, tmp_
     assert reason is not None and "timed out" in reason
 
 
-def test_shield_survives_a_git_fault_while_reading_the_users_excludes(
-    project, tmp_path, monkeypatch
+@pytest.mark.parametrize("fault", [verify.GitError, verify.GitSpawnError])
+def test_shield_degrades_when_git_will_not_say_what_the_users_excludes_are(
+    project, tmp_path, monkeypatch, fault
 ):
-    """A GIT fault reading the operator's `core.excludesFile` is swallowed below the
-    shield and never reaches the tail: git unqueryable means there is no key to
-    resolve and so nothing to copy, and skipping the shield over that would let
-    `git add -A` stage the tool files — strictly worse than losing the seed.
+    """A git fault reading `core.excludesFile` means we did NOT FIND OUT which file
+    applies — and that must skip the shield, not activate over it.
 
-    `GitError` is now the ONLY fault with that standing, which is the round-4 fix
-    (#384): a read `OSError` on an excludes file that EXISTS degrades instead, since
-    activating over patterns that could not be copied shadows them exactly as an
-    empty seed did. `test_shield_degrades_when_the_users_excludesfile_cannot_be_read`
-    is that half; the two together are the whole taxonomy — absent is silent,
-    unreadable is not.
+    THIS TEST REVERSES what it asserted before round 5. It used to pin the swallow,
+    on the premise that "git unqueryable ⇒ no key to resolve ⇒ nothing to copy" and
+    that skipping was "strictly worse than losing the seed". Both halves were wrong:
 
-    Its own guard, its own test: the tail's guard also names `GitError`, so an
-    escape from here degrades into a plausible-looking reason rather than a crash,
-    and only an assertion that the shield SUCCEEDED can tell the two apart.
+    - The premise is a false inference. It holds for `rc != 0`, which is an ANSWER
+      (an unset key exits 1, and that arm is still correctly silent). A raised fault
+      is not an answer, so the code mapped UNKNOWN onto ABSENT.
+    - The outcome was never "a lost seed". It was a lost seed PLUS a worktree-scoped
+      key that SHADOWS the file the seed failed to read — the compound harm round 4
+      named as the bug. Skipping stages a bounded, journaled set of bmad-loop's own
+      files; continuing silently un-ignores whatever the operator's personal excludes
+      cover, which is by definition what their `.gitignore` does not, and merges it
+      back into their checkout as tracked content.
 
-    Ablation: drop `GitError` from `_shield_inherited_excludes`'s except tuple and
-    this fails — the fault escapes into the tail and returns a reason."""
+    Assertion 3 is the harm and is why the operator's excludes are planted FIRST: the
+    version of this test that pinned the swallow planted none at all, so it could not
+    observe the shadow in either direction. Assertion 4 is the non-vacuity check —
+    without it this passes just as well if the shield had excluded everything.
+
+    Parametrized because of RE-INTRODUCTION, not coverage: `GitSpawnError` exists so
+    callers can tell "git said no" from "the machine is broken", which makes
+    `except GitSpawnError: return b""` the most plausible future re-narrowing — and a
+    `GitError`-only test would pass against it.
+
+    Ablation: restore `except GitError: return b""` in `_shield_inherited_excludes`
+    and both cases fail — on assertion 1 (`reason` comes back None) and again on
+    assertion 3 (`mine.log` shows up untracked, the shadow).
+
+    Asserts on "did not answer", NOT "timed out": the latter is a lie for
+    `GitSpawnError`, and it is the substring the activation-fault test above already
+    asserts, so it could not tell which call faulted."""
+    repo = project.project
     wt = tmp_path / "wt"
-    verify.worktree_add(project.project, wt, "feat", "main")
+    verify.worktree_add(repo, wt, "feat", "main")
+    users = tmp_path / "my-global-ignores"
+    users.write_text("mine.log\n", encoding="utf-8")
+    git(repo, "config", "core.excludesFile", str(users))
     real = install_mod.git_bytes
 
-    def timeout_on_the_excludes_read(worktree, *args):
+    def unanswerable_excludes_read(worktree, *args):
         if "core.excludesFile" in args and "--get" in args:
-            raise verify.GitError("git config timed out after 120s")
+            raise fault(f"git config did not answer in {worktree}")
         return real(worktree, *args)
 
-    monkeypatch.setattr(install_mod, "git_bytes", timeout_on_the_excludes_read)
+    # No monkeypatch.undo() below, unlike the read_bytes sibling: this patch is on
+    # `install_mod.git_bytes`, while conftest's git() is a bare subprocess.run — so
+    # the assertions' own git is untouched.
+    monkeypatch.setattr(install_mod, "git_bytes", unanswerable_excludes_read)
 
-    assert _worktree_local_exclude(wt, ["/probe-389"]) is None
+    reason = _worktree_local_exclude(wt, ["/probe-389"])
 
-    # the shield itself still landed — the seed is what was lost, not the shield
-    assert "/probe-389" in _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert reason is not None and "did not answer" in reason
+    assert not _wt_private_exclude(wt).exists()  # nothing to point a shadowing key at
+    (wt / "mine.log").write_text("noise\n", encoding="utf-8")
+    (wt / "probe-389").write_text("noise\n", encoding="utf-8")
+    status = git(wt, "status", "--short")
+    assert "mine.log" not in status  # their ignore was never shadowed — THE HARM
+    assert "probe-389" in status  # ...and the shield really was skipped
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX /bin/sh stub git")

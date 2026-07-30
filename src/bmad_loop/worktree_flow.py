@@ -491,9 +491,7 @@ class WorktreeFlow:
             self.paths.repo_root,
             seed_files=list(dict.fromkeys(seeds)),  # dedupe, preserve order
             seed_globs=self._registry.seed_globs(),
-            on_degraded=lambda msg: self.journal.append(
-                "worktree-exclude-degraded", story_key=task.story_key, error=msg
-            ),
+            on_degraded=lambda msg: self._exclude_degraded(task.story_key, msg),
         )
         if skipped_seeds:
             # A seed entry whose destination already exists is a no-op. Harmless for
@@ -530,6 +528,23 @@ class WorktreeFlow:
         # reached only on a normal return (DONE or DEFERRED); a RunPaused from the
         # spec gate or an escalation propagates past here, leaving the worktree up.
         self.integrate_unit(task, unit)
+
+    def _exclude_degraded(self, story_key: str, msg: str) -> None:
+        """The git-add shield was owed for this unit's worktree and did not happen.
+
+        Journaled AND notified, the way `worktree-open-failed` is above. The notify
+        is the half that was missing: the shield's whole degrade policy is to SKIP
+        rather than widen — activating over patterns it could not copy would shadow
+        the operator's own excludes — and skipping is only defensible if the operator
+        finds out. A run that ends "finished" with a journal line nobody reads is how
+        the provisioned tool files reach a story's merge unnoticed.
+
+        `gates.notify` is best-effort and never raises, and is inert unless
+        `notify.file`/`notify.desktop` is configured, so this cannot break a run —
+        which matters, because it is called from inside provisioning.
+        """
+        self.journal.append("worktree-exclude-degraded", story_key=story_key, error=msg)
+        gates.notify(self.policy, self.run_dir, f"worktree exclude degraded: {story_key}", msg)
 
     def failed_diff_max_bytes(self) -> int | None:
         """Per-untracked-file size cap for a failed unit's forensic patch, in

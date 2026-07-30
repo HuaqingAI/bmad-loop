@@ -273,11 +273,17 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   worktree-scoped key shadows it and git never concatenates across config scopes — so the copy has
   to survive an exclude file in any legacy encoding at all (its patterns are paths, and POSIX paths
   are arbitrary bytes). Relative values are resolved against the worktree, the way git does, rather
-  than against wherever the orchestrator was launched. An excludes file that **exists but cannot be
-  read** skips the shield with a reason instead: activating over patterns that could not be copied
-  would shadow them exactly as an empty copy did. An absent one stays a silent no-op — there is
-  nothing to shadow. Two caveats: this enables `extensions.worktreeConfig`, a
-  **permanent** repo-format flag that is never removed, and where git requires that flag's
+  than against wherever the orchestrator was launched. Paths are read NUL-terminated, so an
+  excludes file whose path begins or ends in whitespace is copied rather than mangled. An excludes
+  file that **exists but cannot be read** — or a **git that will not say which file applies** (a
+  timeout or a failed spawn on that query) — skips the shield with a journaled reason instead:
+  activating over patterns that could not be copied would shadow them exactly as an empty copy did,
+  and not knowing whether there is anything to copy has the same standing as failing to read it.
+  Only a definite **absent** answer stays a silent no-op — there is nothing to shadow. The skip is
+  also **notified**, not just journaled, since skipping is only defensible if you find out. Two
+  caveats: this enables `extensions.worktreeConfig`, a **permanent** repo-format flag that is never
+  removed — set only when the shield actually activates, so a run that degrades away leaves your
+  repo's format untouched — and where git requires that flag's
   prerequisites be moved by hand first (`core.bare = true` or `core.worktree` in the shared config)
   the shield is skipped with a journaled reason rather than widened back. It also needs **git 2.20**,
   the release that introduced the flag and `git config --worktree`; below that the shield is skipped

@@ -736,6 +736,40 @@ def _copy_traversable(src, dst: Path, *, skip_existing: bool = False) -> bool:
 # both of which the worktree-scoped shield is built out of (git-worktree(1)).
 _WORKTREE_CONFIG_GIT = (2, 20)
 
+# THE ALTERNATIVE ARCHITECTURE, EVALUATED AND REJECTED — recorded here the way the
+# `--includes` finding below is, so a later reader or bot round does not re-propose
+# it as a simplification of the whole block.
+#
+# Every finding in this family (an empty seed plus an activation that shadows what
+# the seed failed to copy) exists because the shield SHADOWS a config key. One
+# design dissolves the class outright: drop `core.excludesFile` entirely and instead
+# unstage the tool paths in the orchestrator's own commit path — `git reset --
+# <paths>` after the `add -A` at `verify.py:1891` and `:1932`. No shadow, so no
+# seed, no `_shield_inherited_excludes`, no permanent `extensions.worktreeConfig`,
+# no 2.20 floor. It is MECHANICALLY REACHABLE: those adds are the orchestrator's
+# own, not an LLM's (no skill in `data/skills/` runs git).
+#
+# Rejected on the merits, for two reasons that are about correctness rather than
+# scope:
+#
+# - It converts AMBIENT protection into CALL-SITE protection. An ignore binds
+#   whoever runs the add; a reset covers only the call sites we remember to patch.
+#   These adds run around disposable coding-CLI sessions that have shell access and
+#   can stage and commit on their own initiative, so the shield has to hold for a
+#   `git add -A` bmad-loop never issued. That actor is the one we cannot constrain,
+#   and the reset design is the one that stops protecting against it.
+# - It leaves the tool files permanently UNTRACKED-VISIBLE in the worktree. Every
+#   `git status` a session runs would list the skill trees, the per-CLI hook config
+#   and the seeded configs as untracked — inviting exactly the commit the shield
+#   exists to prevent, from exactly that actor.
+#
+# The shadow is also structural, not an artifact of this implementation, so there is
+# no third way to look for: gitignore(5) documents four pattern sources and the
+# per-repo one is `$GIT_COMMON_DIR/info/exclude` — the COMMON dir, shared by every
+# worktree. There is no per-worktree exclude file, `core.excludesFile` is singular,
+# and git never concatenates the key across scopes. Checked against current sources
+# at git 2.55.0, the newest release.
+
 
 def _git_version_at_least(reported: str, want: tuple[int, int]) -> bool:
     """Is this `git version …` line at least `want`? Anything unreadable is NO.
@@ -754,13 +788,24 @@ def _git_version_at_least(reported: str, want: tuple[int, int]) -> bool:
     return match is not None and (int(match[1]), int(match[2])) >= want
 
 
-def _shield_enable_worktree_config(worktree: Path, common_dir: Path) -> str | None:
-    """Make `git config --worktree` writable in this repo, or say why not.
+def _shield_enable_worktree_config(worktree: Path, common_dir: Path) -> tuple[str | None, bool]:
+    """May `git config --worktree` be made writable in this repo? `(reason, needs_enable)`.
+
+    PROBE ONLY — it does not write. `needs_enable` is True when every gate passed
+    and the caller must still set `extensions.worktreeConfig` itself; False when the
+    repo already carries it (or when `reason` is set and nothing may be written).
+    Splitting the answer from the write is round 5's fix: enabling the extension is
+    a PERMANENT repo-format change, and performed here it landed BEFORE the seed,
+    the mkdir, the write and the activation — so every degrade below it, including
+    the `_shield_inherited_excludes` one, left the operator's repo permanently
+    marked for a shield that never applied. The caller now enables it immediately
+    before the activation, which is the one point past which nothing can degrade.
 
     `extensions.worktreeConfig` is what makes a per-worktree config file exist at
     all; without it `git config --worktree` either refuses outright (a repo with
     linked worktrees) or silently writes the SHARED config. Already-true is the
-    common case after the first isolated run — reused, never rewritten.
+    common case after the first isolated run — reported as `needs_enable` False, so
+    the caller never rewrites it.
 
     Enabling it is a PERMANENT, repo-wide format change this code never reverses,
     so it is refused in the two shapes git's own documentation calls out
@@ -772,14 +817,17 @@ def _shield_enable_worktree_config(worktree: Path, common_dir: Path) -> str | No
     making behind an operator's back — so the shield degrades instead, and the
     run continues with the tool files unshielded rather than the repo rearranged.
 
-    The version gate runs FIRST, ahead of every probe, for two reasons. `git
-    config --worktree` does not exist before 2.20, so on an older git the write
-    below buys a permanent format change with nothing to show for it — and
-    git-worktree(1) says older git refuses a repository carrying the extension.
-    And `--type=` is itself git 2.18: on an older git the two probes below exit
-    non-zero, which this function reads as "not enabled" and, worse, as "not
-    bare" — silently opening the core.bare gate the paragraph above exists to
-    hold shut. Refusing at the top is what keeps that pair unreachable.
+    The version gate and both refusal probes STAY HERE, ahead of everything, and
+    deferring them the way the write was deferred would be a bug. `git config
+    --worktree` does not exist before 2.20, so on an older git the enable buys a
+    permanent format change with nothing to show for it — and git-worktree(1) says
+    older git refuses a repository carrying the extension. And `--type=` is itself
+    git 2.18: on an older git the two probes below exit non-zero, which this
+    function would read as "not enabled" and, worse, as "not bare" — silently
+    opening the core.bare gate the paragraph above exists to hold shut. That is the
+    safety-gate-degrading-open trap, and refusing at the top is what keeps the pair
+    unreachable. The caller's own `--type=path` excludesFile read depends on the
+    same floor. So: the GATES run first and early, the WRITE runs last and late.
     """
     version = git_bytes(worktree, "version")
     if version.returncode != 0 or not _git_version_at_least(
@@ -792,7 +840,7 @@ def _shield_enable_worktree_config(worktree: Path, common_dir: Path) -> str | No
             f"extensions.worktreeConfig and `git config --worktree`, but git answered "
             f"{found!r} — enabling the extension on an older git is a permanent "
             "repo-format change that would shield nothing"
-        )
+        ), False
     # EVERY read below names the SHARED config as a file rather than going by
     # scope. `--local` from a linked worktree already resolves to this same file,
     # but naming it keeps the checks honest if that ever stops being true — and,
@@ -850,26 +898,21 @@ def _shield_enable_worktree_config(worktree: Path, common_dir: Path) -> str | No
         worktree, "config", "--file", shared, "--type=bool", "--get", "extensions.worktreeConfig"
     )
     if probe.returncode == 0 and os.fsdecode(probe.stdout).strip() == "true":
-        return None
+        return None, False  # already carried: nothing for the caller to write
     bare = git_bytes(worktree, "config", "--file", shared, "--type=bool", "--get", "core.bare")
     if bare.returncode == 0 and os.fsdecode(bare.stdout).strip() == "true":
         refused = "core.bare = true"
     elif git_bytes(worktree, "config", "--file", shared, "--get", "core.worktree").returncode == 0:
         refused = "core.worktree"
     else:
-        enabled = git_bytes(worktree, "config", "extensions.worktreeConfig", "true")
-        if enabled.returncode == 0:
-            return None
-        detail = os.fsdecode(enabled.stderr).strip() or f"git exited {enabled.returncode}"
-        return (
-            f"could not enable extensions.worktreeConfig ({worktree}): {detail} — the "
-            "provisioned tool files are not shielded from the unit's `git add -A`"
-        )
+        # Cleared, not enabled. The write itself is the caller's, deferred to the
+        # last moment before the activation (see the docstring).
+        return None, True
     return (
         f"skipped the git-add shield ({worktree}): the repository's shared config sets "
         f"{refused}, which git requires moving into the main worktree's config.worktree "
         "before extensions.worktreeConfig may be enabled"
-    )
+    ), False
 
 
 def _shield_inherited_excludes(worktree: Path) -> bytes:
@@ -895,55 +938,90 @@ def _shield_inherited_excludes(worktree: Path) -> bytes:
     dedupe, which a text round trip could not promise. Git reads the result either
     way: it strips a trailing `\\r` from an exclude line and skips a UTF-8 BOM.
 
-    Two arms, and which fault means what is the whole subtlety:
+    THREE outcomes, and which fault means what is the whole subtlety. Only the
+    first is silent; this function RAISES for the other two, and the caller's tail
+    turns that into the degrade reason that skips the activation.
 
     - ABSENT is silent and empty. The common case — no `core.excludesFile`, no XDG
-      fallback file — and not a reason to skip the shield.
-    - PRESENT BUT UNREADABLE is NOT silent. A read `OSError` (EACCES, EIO)
-      propagates into the caller's degrade arm, which skips the activation — the
-      only safe answer, since activating over patterns that could not be copied
-      shadows them exactly as an empty seed did. Only `GitError` is swallowed here:
-      git unqueryable means there is no key to resolve, so there is nothing to copy.
+      fallback file — and not a reason to skip the shield. It is an ANSWER: `--get`
+      of an unset key exits 1, and `is_file()` false says the file is not there.
+    - PRESENT BUT UNREADABLE propagates. A read `OSError` (EACCES, EIO) reaches the
+      caller's degrade arm, which skips the activation — the only safe answer, since
+      activating over patterns that could not be copied shadows them exactly as an
+      empty seed did.
+    - UNKNOWN propagates too, and that is round 5's fix (#384, Codex P1). A
+      `GitError` out of the read below used to be swallowed here on the premise that
+      "git unqueryable ⇒ no key to resolve ⇒ nothing to copy". The premise is a
+      false inference: it holds for `rc != 0`, which is an answer, while a raised
+      fault means we did not FIND OUT — so the code mapped UNKNOWN onto ABSENT and
+      then activated a key that shadowed the file it had failed to read. Measured,
+      and pinned by the ablation on
+      `test_shield_degrades_when_git_will_not_say_what_the_users_excludes_are`:
+      inject a fault on this one call and a file the operator ignores globally comes
+      back `?? <name>` inside the worktree, ready for the unit's `git add -A`, with
+      no reason returned at all. Nor is a permanently
+      unqueryable git reachable here — by the time this runs `git_bytes` has
+      answered at least four times, so such a git already left through the caller's
+      silent `rev-parse` arm. What arrives is a TRANSIENT fault, and for those the
+      premise is false by construction: the key is there, we just cannot see it.
+      The accepted cost is that such a fault now loses the shield for that run,
+      which the caller surfaces; the harm it buys off is unbounded and silent.
     """
-    try:
-        # --type=path so `~/.gitignore` arrives expanded, the way git reads it.
-        answer = git_bytes(worktree, "config", "--type=path", "--get", "core.excludesFile")
-        if answer.returncode == 0 and answer.stdout.strip():
-            source = Path(os.fsdecode(answer.stdout).strip())
-            if not source.is_absolute():
-                # `--type=path` expands `~` and stops there: a RELATIVE value comes
-                # back verbatim. Git resolves such a value against the worktree's
-                # top level (MEASURED — git 2.20.4, 2.49.1, 2.55.0 — and NOT
-                # specified: relative values for this key were deliberately never
-                # implemented, and the worktree-top result is an artifact of git's
-                # setup chdir, so a consumer reached through RUN_SETUP alone with an
-                # explicit git dir and an outside cwd resolves it against the
-                # CALLER's cwd instead. bmad-loop is not exposed to that: every git
-                # call here goes through `_run_git`'s `git -C <repo>`, and the
-                # activation below writes an absolute path.) Python would resolve it
-                # against this process's cwd, which is wherever the orchestrator was
-                # launched. Left alone that reads the wrong file or, far more often,
-                # none — and `is_file()` false is silent, so the operator's patterns
-                # would simply not be carried and the activation below would shadow
-                # them anyway. Un-ignoring inside the worktree exactly what this
-                # function exists to preserve.
-                source = worktree / source
-        else:
-            # git's documented fallback when the key is unset (gitignore(5)).
-            xdg = os.environ.get("XDG_CONFIG_HOME")
-            source = (Path(xdg) if xdg else Path.home() / ".config") / "git" / "ignore"
-        # `is_file()` is the ABSENT test and swallows its own OSError; `read_bytes`
-        # on a file that exists but cannot be read raises, deliberately (docstring).
-        return source.read_bytes() if source.is_file() else b""
-    # GitError ALONE, and the narrowing is the second half of the fix. It covers
-    # both of the chokepoint's raised faults — a timeout and, as its GitSpawnError
-    # subclass, a git that would not spawn — which mean "no key to resolve, nothing
-    # to copy". Everything else must reach the caller's degrade arm: an `OSError`
-    # from the read (the file exists and we could not read it) and, on Windows only,
-    # a `UnicodeError` out of the `fsdecode` above (#374/#377) — in both cases git
-    # answered, so activating over an uncopied file would shadow it silently.
-    except GitError:
-        return b""
+    # -z, not a bare read plus `.strip()` — round 5, Codex P2. A `.strip()` here
+    # DESTROYED a legal POSIX path: `--type=path --get` returns leading and
+    # trailing whitespace VERBATIM (git writes such a value quoted, so it
+    # round-trips — measured at 2.20.4 and 2.55.0), so an operator whose
+    # excludesFile ends in a space had the strip mangle the path, `is_file()` read
+    # absent, the seed come back empty, and the activation shadow the file it
+    # never copied. The same leak as the encoding bug above, through a different
+    # door. `-z` terminates the value with NUL instead, which git-config(1)
+    # recommends for exactly this ("allows for secure parsing of the output
+    # without getting confused by values that contain line breaks").
+    #
+    # Every branch below is preserved, measured at both ends of the supported
+    # range: `-z` still expands `~`, gives an unset key rc 1 + empty stdout, an
+    # empty value a lone NUL (falsy after the split, so it falls to XDG the way it
+    # did), a multi-valued key the LAST value + NUL at rc 0, and a relative value
+    # verbatim. Both ends means git 2.20.4 and 2.55.0 — the flag is checked AT the
+    # floor rather than inferred from git-config(1), because the 2.20 refusal in
+    # `_shield_enable_worktree_config` has already run by the time this does, so
+    # 2.20 is the oldest git that can reach this line at all.
+    #
+    # The sibling `rev-parse` strips below are deliberately NOT getting the same
+    # treatment, and this is the note that stops a later round re-raising it:
+    # `rev-parse` has no `-z` (it echoes one back as a literal argument), and it
+    # cannot answer with edge whitespace anyway — git SANITIZES the worktree admin
+    # id, so a worktree at `…/wt ` gets `.git/worktrees/wt-` (measured), and
+    # `--git-common-dir` ends in `.git`.
+    answer = git_bytes(worktree, "config", "-z", "--type=path", "--get", "core.excludesFile")
+    raw = answer.stdout.split(b"\0", 1)[0]
+    if answer.returncode == 0 and raw:
+        source = Path(os.fsdecode(raw))
+        if not source.is_absolute():
+            # `--type=path` expands `~` and stops there: a RELATIVE value comes
+            # back verbatim. Git resolves such a value against the worktree's
+            # top level (MEASURED — git 2.20.4, 2.49.1, 2.55.0 — and NOT
+            # specified: relative values for this key were deliberately never
+            # implemented, and the worktree-top result is an artifact of git's
+            # setup chdir, so a consumer reached through RUN_SETUP alone with an
+            # explicit git dir and an outside cwd resolves it against the
+            # CALLER's cwd instead. bmad-loop is not exposed to that: every git
+            # call here goes through `_run_git`'s `git -C <repo>`, and the
+            # activation below writes an absolute path.) Python would resolve it
+            # against this process's cwd, which is wherever the orchestrator was
+            # launched. Left alone that reads the wrong file or, far more often,
+            # none — and `is_file()` false is silent, so the operator's patterns
+            # would simply not be carried and the activation below would shadow
+            # them anyway. Un-ignoring inside the worktree exactly what this
+            # function exists to preserve.
+            source = worktree / source
+    else:
+        # git's documented fallback when the key is unset (gitignore(5)).
+        xdg = os.environ.get("XDG_CONFIG_HOME")
+        source = (Path(xdg) if xdg else Path.home() / ".config") / "git" / "ignore"
+    # `is_file()` is the ABSENT test and swallows its own OSError; `read_bytes`
+    # on a file that exists but cannot be read raises, deliberately (docstring).
+    return source.read_bytes() if source.is_file() else b""
 
 
 def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | None:
@@ -979,7 +1057,11 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
     state, enabled once and never removed here, and git versions older than 2.20
     refuse to access a repository carrying it (git-worktree(1)). See
     `_shield_enable_worktree_config` for the two shapes where enabling it is
-    refused outright.
+    refused outright. It is paid ONLY when the shield actually activates: that
+    function probes, and the write itself happens here, one line above the
+    activation, past the last point anything can degrade. Enabling it up front —
+    where it used to be — charged the operator's repo that permanent price on every
+    path that then degraded away without shielding anything.
 
     Every git call goes through `verify.git_bytes`, the chokepoint accessor whose
     two properties this function is built on: the returncode comes back as an
@@ -993,8 +1075,12 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
     Best-effort in two arms that must stay separate, because a fault means the
     opposite thing in each:
 
-    - git unqueryable (not a repo, git missing, a timeout or spawn failure — both
-      `GitError`) is an EXPECTED skip — returns None silently. Callers hand this
+    - git unqueryable BEFORE GIT HAS ANSWERED AT ALL (not a repo, git missing, a
+      timeout or spawn failure on the first `rev-parse` — both `GitError`) is an
+      EXPECTED skip — returns None silently. That scope is the whole of it, and the
+      qualifier is load-bearing: read loosely as "any `GitError` is silent" it
+      licensed the swallow round 5 deleted from `_shield_inherited_excludes`, which
+      is BELOW this arm and therefore in the one below. Callers hand this
       plain temp dirs routinely. Nothing is DECODED in this arm: git's stdout is
       captured as bytes and decoded in the tail below, because a decode fault is a
       degrade (git answered; we could not read it), not the silent skip this arm
@@ -1008,7 +1094,11 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
       `OSError` — including the operator's own excludes file existing but being
       unreadable, which must NOT be silent, because activating over patterns that
       could not be copied shadows them — a later git call timing out or failing to
-      spawn (`GitError`), and a `UnicodeError` (below). Silence here is not
+      spawn (`GitError`), and a `UnicodeError` (below). Since round 5 that
+      `GitError` case explicitly covers a git that will not say WHICH excludes file
+      applies: not knowing whether there is anything to copy is the same standing as
+      knowing there is and failing to read it, because the activation shadows it
+      either way. Only a definite ABSENT answer stays silent. Silence here is not
       cosmetic: without the exclude the unit's `git add -A` commits the tool files
       this provisioning just wrote into the story's merge.
 
@@ -1097,7 +1187,7 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
                 f"skipped the git-add shield ({worktree}): not a linked worktree, and the "
                 "shield never writes the repository-wide exclude (#384)"
             )
-        refusal = _shield_enable_worktree_config(worktree, common_dir)
+        refusal, needs_enable = _shield_enable_worktree_config(worktree, common_dir)
         if refusal is not None:
             return refusal
         exclude = git_dir / "info" / "exclude"
@@ -1118,6 +1208,18 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
         # activation below shadows them (see _shield_inherited_excludes). On a
         # re-provision a non-empty file's content is authoritative and the copy is
         # not repeated, so the two stay idempotent together.
+        #
+        # A COPY FAULT SKIPS THE ACTIVATION. `_shield_inherited_excludes` raises on
+        # anything but a definite "absent" — an unreadable file, and since round 5 a
+        # git that will not say which file applies — and the raise lands in this
+        # function's tail, which returns a reason. That is the whole point of it
+        # raising rather than returning empty: an empty seed plus the activation
+        # below is not "the seed was lost", it is the operator's global ignores
+        # SHADOWED inside this worktree, and `git add -A` staging what they told git
+        # to ignore. There is nothing to clean up on that path — the raise is above
+        # `exclude.touch()`, so no placeholder is left for a later provisioning to
+        # read as authoritative, and the `mkdir` above leaves an inert empty `info/`
+        # that dies with the worktree.
         #
         # BYTES on both sides of that choice, and never decoded text: an exclude
         # file holds path patterns, POSIX paths are arbitrary bytes, and a legacy
@@ -1181,6 +1283,26 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
                 # damage than the missing file it replaced.
                 exclude.touch()
             atomic_write_bytes(exclude, prefix + b"".join(p + b"\n" for p in new))
+        # The PERMANENT repo-format change, deliberately the last-but-one thing
+        # this function does. `_shield_enable_worktree_config` probed the gates
+        # above and reported that the write is still owed; performing it there —
+        # where it used to live — put a format change the operator's repo carries
+        # forever AHEAD of the seed, the mkdir and the write, so every degrade
+        # below it (including the `_shield_inherited_excludes` fault that round 5
+        # turned from a swallow into a degrade) left the repo marked for a shield
+        # that never applied. Nothing between here and the activation can degrade,
+        # so past this point the flag is only ever set for a shield that holds.
+        #
+        # It cannot move BELOW the activation: `git config --worktree` is what the
+        # extension unlocks, so the activation fatals without it.
+        if needs_enable:
+            enabled = git_bytes(worktree, "config", "extensions.worktreeConfig", "true")
+            if enabled.returncode != 0:
+                detail = os.fsdecode(enabled.stderr).strip() or f"git exited {enabled.returncode}"
+                return (
+                    f"could not enable extensions.worktreeConfig ({worktree}): {detail} — the "
+                    "provisioned tool files are not shielded from the unit's `git add -A`"
+                )
         # LAST, after the file it names exists: git reads core.excludesFile lazily,
         # but a config pointing at a file that a fault above left unwritten would
         # be a shield that silently excludes nothing while reporting a reason.
