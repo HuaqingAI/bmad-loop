@@ -62,7 +62,7 @@ ROLES = ("dev", "review", "triage")
 
 def make_adapters(project: Path, run_dir: Path, policy) -> dict[str, CodingCLIAdapter]:
     from .adapters.generic import GenericAdapter, GenericDevAdapter
-    from .adapters.multiplexer import get_multiplexer, mux_usable
+    from .adapters.multiplexer import fold_version, get_multiplexer, mux_usable
     from .adapters.profile import ProfileError, get_profile
 
     # The dev skill (bmad-dev-auto) writes no result.json: its adapter
@@ -120,7 +120,7 @@ def make_adapters(project: Path, run_dir: Path, policy) -> dict[str, CodingCLIAd
                     mux = get_multiplexer()
                     if not mux_usable(mux):
                         try:
-                            version = mux.version()
+                            version = fold_version(mux.version())
                         except Exception:  # diagnosing must not mask the refusal
                             version = None
                         raise SystemExit(
@@ -171,6 +171,7 @@ def platform_preflight() -> list[Finding]:
     from .adapters.multiplexer import (
         detect_multiplexers,
         external_backend_errors,
+        fold_version,
         get_multiplexer,
     )
     from .process_host import get_process_host
@@ -180,7 +181,9 @@ def platform_preflight() -> list[Finding]:
     try:
         backend = get_multiplexer()
         label = type(backend).__name__
-        version = backend.version()
+        # Defensive fold: an out-of-tree backend can break the seam's
+        # single-line promise, and this string lands in an inline message.
+        version = fold_version(backend.version())
         if backend.available():
             found.append(
                 Finding(

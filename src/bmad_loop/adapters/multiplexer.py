@@ -306,9 +306,19 @@ class TerminalMultiplexer(ABC):
 
     def version(self) -> str | None:
         """The backend binary's version string, or None when unavailable. Not
-        abstract: backends that can't report one inherit this default. Used by
-        the diagnostic dump; the implementation owns the binary invocation so it
-        stays behind the seam."""
+        abstract: backends that can't report one inherit this default. The
+        implementation owns the binary invocation so it stays behind the seam.
+
+        **Single line.** Consumers render this inline — the `bmad-loop mux`
+        table, `validate`'s preflight finding, the diagnostic dump, the
+        forced-backend warning — so a binary whose `--version` prints several
+        lines (psmux prints a `tmux X.Y.Z` compatibility line plus its own)
+        must fold them into one here rather than leave each caller to cope.
+        :func:`fold_version` is the canonical fold, and the inline consumers
+        also apply it defensively: an out-of-tree backend can only be asked to
+        keep this promise, not made to. The one caller that also *parses* this
+        string (the psmux backend's version gate) anchors at its start, so a
+        folding backend keeps the identifying version in the first segment."""
         return None
 
     def window_pane_pids(self, target: str) -> list[int]:
@@ -318,6 +328,17 @@ class TerminalMultiplexer(ABC):
         callers must degrade (skip the pid-level escalation) and never read
         ``[]`` as "no processes". Must not raise."""
         return []
+
+
+def fold_version(raw: str | None) -> str | None:
+    """Collapse a version string onto the single line the
+    :meth:`TerminalMultiplexer.version` seam promises. Segments keep their
+    order (the psmux version gate anchors a parse at the first) and are
+    stripped; an all-blank value folds to None — the seam's "no version"
+    sentinel — never to ``""``."""
+    if not raw:
+        return None
+    return "; ".join(line.strip() for line in raw.splitlines() if line.strip()) or None
 
 
 # (name, matches(platform) -> bool, factory() -> TerminalMultiplexer)
@@ -486,7 +507,7 @@ def mux_usable(backend: TerminalMultiplexer | None = None) -> bool:
     if not _FORCED_UNUSABLE_WARNED:
         _FORCED_UNUSABLE_WARNED = True
         try:
-            version = backend.version()
+            version = fold_version(backend.version())
         except Exception:  # a broken probe must not break the warning
             version = None
         print(
@@ -626,7 +647,7 @@ def detect_multiplexers() -> list[MuxBackendInfo]:
             # already-computed availability (a selected backend would
             # otherwise show a contradictory available=False row).
             try:
-                version = backend.version()
+                version = fold_version(backend.version())
             except Exception:
                 version = None
         selected = name == selected_name

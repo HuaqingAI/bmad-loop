@@ -338,8 +338,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
         channel = (
             "the ATTENTION file in the run directory is the only alert channel left"
             if pol.notify.file
-            else "notify.file is also off, so no alert channel is configured — "
-            "enable notify.file"
+            else "notify.file is also off, so no alert channel is configured — enable notify.file"
         )
         report.warn(
             "notify.desktop-unavailable",
@@ -485,6 +484,8 @@ def cmd_mux(args: argparse.Namespace) -> int:
             r.name,
             "yes" if r.matches_platform else "no",
             "yes" if r.available else "no",
+            # detect_multiplexers folds multi-line versions (fold_version), so
+            # an out-of-tree backend can't split the row and strand SELECTED.
             r.version or "-",
             f"* {_mux_reason_label(r.reason)}" if r.selected else "",
         )
@@ -493,6 +494,22 @@ def cmd_mux(args: argparse.Namespace) -> int:
     widths = [max(len(h), *(len(row[i]) for row in table), 0) for i, h in enumerate(header)]
     for row in (header, *table):
         print("  ".join(cell.ljust(w) for cell, w in zip(row, widths)).rstrip())
+    # AVAILABLE answers "could this backend run here", not "could it be picked",
+    # and the two diverge whenever a foreign-platform binary shares a name with
+    # a local one — on Windows `tmux` is psmux's compatibility shim, so the tmux
+    # row reads as a real tmux install. Explaining the row beats gating the
+    # column: a forced choice genuinely does reach these backends.
+    # A forced backend is exempt: it IS selected, and telling an operator the
+    # row they just pinned cannot be selected reads as a contradiction of the
+    # `*` marker one line above.
+    stranded = [r.name for r in rows if r.available and not r.matches_platform and not r.selected]
+    if stranded:
+        print(
+            f"note: AVAILABLE yes but not selectable on {sys.platform}: {', '.join(stranded)} "
+            "— automatic selection only picks backends that match the platform, and AVAILABLE "
+            f"means the binary answers here, not that the backend supports {sys.platform}. "
+            "A forced choice bypasses the platform check"
+        )
     # A failed external package is invisible in the table (it never registered),
     # so name it here — the one place an operator looks when a backend is missing.
     for ep_name, reason in sorted(external_backend_errors().items()):

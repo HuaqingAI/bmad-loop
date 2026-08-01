@@ -569,6 +569,21 @@ whose seams had diverged enough that several ports needed a different fix, and t
   report apart: `ATTENDED` (a human is still there) versus `UNREACHABLE` (no client at all), which
   journals `sweep-return-no-client`.
 
+- **`bmad-loop mux` renders a readable table whatever a backend reports as its version (#321).**
+  `psmux -V` prints two lines — a `tmux X.Y.Z` compat line plus its own — and the embedded newline
+  split every row, stranding SELECTED on a line of its own; a very long single line broke the same
+  table just as thoroughly, since the column widths are sized off the widest cell.
+  `TerminalMultiplexer.version()` now promises one bounded line. The tmux-family base folds the
+  probe with `"; "` rather than truncating (the tail is what names psmux as the answering binary),
+  keeps the compat segment first because psmux's own version gate parses it with an anchored match,
+  and reports `None` — not `""` — for an all-blank probe. Every inline consumer applies the same
+  fold defensively, so an out-of-tree backend that breaks the promise cannot split a row or a
+  message: the `mux` table, `validate`'s preflight finding and its `version` detail, the
+  forced-backend warning, the unusable-backend refusal, and `diagnose`'s `tmux_version` — where the
+  old line cap's "(N more lines redacted)" marker had been re-introducing the newline it removed.
+  `mux` also now explains the row where a backend is AVAILABLE because its binary answers here
+  while the platform check still excludes it from automatic selection.
+
 - **Both mux client verbs now owe effect, not dispatch (#317).** `TerminalMultiplexer.detach_client`
   widens from `None` to `bool`. tmux reads the effect off the exit code; psmux cannot — every arm of
   its `detach-client`/`switch-client` exits 0 whether or not a client moved — so it measures the

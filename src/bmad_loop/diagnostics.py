@@ -241,14 +241,16 @@ class Diagnostics:
 
 
 def collect_env() -> EnvInfo:
-    from .adapters.multiplexer import get_multiplexer
+    from .adapters.multiplexer import fold_version, get_multiplexer
 
     mux = "none"
     tmux_v = None
     try:
         backend = get_multiplexer()
         mux = type(backend).__name__
-        raw = backend.version()
+        # Fold before the line cap: on a multi-line version scrub_text's
+        # "(N more lines redacted)" marker would re-introduce the newline.
+        raw = fold_version(backend.version())
         tmux_v = sanitize.scrub_text(raw, max_lines=1) if raw else None
     except Exception:  # nosec B110 - env probe is best-effort; absent mux is fine
         pass

@@ -517,6 +517,30 @@ def test_available_composes_real_version_probe(monkeypatch):
     assert rec.argv == ["psmux", "-V"]
 
 
+def test_available_parses_the_gate_out_of_a_real_two_line_probe(monkeypatch):
+    # psmux -V really prints two lines. version() folds them (#321), and the
+    # gate reads the compat segment out of the fold — if a future change ever
+    # puts psmux's own line first, this fails instead of silently reporting the
+    # backend unavailable and taking psmux off Windows with no diagnostic.
+    # One stub, not two: psmux_backend.shutil IS tmux_base.shutil (both plain
+    # `import shutil`), so a second setattr would silently replace the first and
+    # leave available()'s psmux+pwsh probe unexercised. This one answers for the
+    # three binaries both layers ask about and refuses everything else.
+    monkeypatch.setattr(
+        psmux_backend.shutil,
+        "which",
+        lambda name: f"C:\\bin\\{name}.exe" if name in ("psmux", "pwsh", "tmux") else None,
+    )
+
+    for release, expected in (("3.3.7", True), ("3.3.6", False)):
+        rec = _RecordRun(stdout=f"tmux {release}\npsmux {release} (05cc5d4 2026-07-20)\n")
+        monkeypatch.setattr(tmux_base.subprocess, "run", rec)
+        mux = PsmuxMultiplexer()
+        assert mux.available() is expected
+        # The fold reached the gate whole — both segments, one line.
+        assert mux.version() == f"tmux {release}; psmux {release} (05cc5d4 2026-07-20)"
+
+
 def test_available_caches_version_gate_per_instance(monkeypatch):
     monkeypatch.setattr(
         psmux_backend.shutil,

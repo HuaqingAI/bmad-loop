@@ -482,6 +482,23 @@ def test_non_ascii_sensitive_value_reaches_the_guard(monkeypatch):
     assert json.loads(rendered)["backstop_repairs"] == {f"story:{alias}": 1}
 
 
+def test_env_tmux_version_folds_a_multi_line_probe(monkeypatch):
+    """tmux_version is a scalar JSON field. Pre-fold (#321), a two-line probe
+    hit scrub_text's line cap, whose "(N more lines redacted)" marker line
+    re-introduced the very newline the cap was meant to remove."""
+    from bmad_loop.adapters import multiplexer as mux_mod
+
+    class _TwoLineMux:
+        def version(self):
+            return "tmux 3.3.7\npsmux 3.3.7"
+
+    monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _TwoLineMux())
+
+    env = diagnostics.collect_env()
+    assert env.tmux_version == "tmux 3.3.7; psmux 3.3.7"
+    assert env.multiplexer == "_TwoLineMux"
+
+
 def test_non_ascii_survives_the_utf8_round_trip(tmp_path, monkeypatch):
     """ensure_ascii=False emits real non-ASCII, so confirm the document still
     round-trips through the encoding the CLI writes it with."""
