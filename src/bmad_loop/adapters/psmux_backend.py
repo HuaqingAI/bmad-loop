@@ -25,8 +25,12 @@ back to an index first. Per-window user options do not exist at all, so
 the window-option verbs, the ``@``-prefixed columns of ``list_windows``
 and the parked trailer route through a substitute channel — see the
 ``per-window option channel (#310)`` block below for the model and its
-rules. ``detach-client`` and ``switch-client`` report dispatch rather than
-effect — every arm exits 0 whether or not a client moved — so both seam
+rules. Session-scoped options need no such substitute — one server per
+session means that server's single map is the session's — but they cross
+the same lossy control line, so ``set_session_option`` gates its value on
+the same transportability rule (#320). ``detach-client`` and
+``switch-client`` report dispatch rather than effect — every arm exits 0
+whether or not a client moved — so both seam
 booleans are measured against the session's attached-client count instead of
 read off the exit code; see the ``client verbs: observed effect (#317)``
 block. ``available()`` additionally gates on
@@ -466,6 +470,39 @@ class PsmuxMultiplexer(BaseTmuxBackend):
                 return False
             return all(tok not in (";", "\\;") for tok in value.split())
         return not any(c in value for c in ";'\"")
+
+    def set_session_option(self, name: str, option: str, value: str) -> None:
+        # Session scope itself needs no substitute channel: psmux serves one
+        # session per server, so that server's single option map IS the
+        # session's map — the same model that makes per-window options unusable
+        # makes session options correct by construction (probed on 3.3.7: two
+        # sessions on two servers read back their own values). What it does
+        # share with the window channel is the lossy CLI->server control line,
+        # and this write was ungated (#320): a spaced value silently loses
+        # `\\`, a trailing `\`, and standalone `;` tokens at rc 0. A corrupted
+        # tag is non-empty and never equals the caller's tag again, so the
+        # prune skips that session forever.
+        #
+        # Refusing leaves the option UNSET, which is the correct degradation
+        # and not the lesser evil: the prune's untagged path falls back to the
+        # run dir, claiming our own dead runs and skipping foreign ones.
+        #
+        # The refusal frees the key rather than just returning. A session this
+        # backend just created is NOT a blank map — the server loads the user's
+        # psmux config (same shared-map basis as the option-channel block
+        # below), so this name can arrive pre-seeded. Leaving a foreign value
+        # in place would read back as a real non-matching tag and strand the
+        # session forever, which is exactly the failure the gate exists to stop.
+        if option.startswith("@") and not self._transportable(value):
+            print(
+                f"warning: set-option {option} skipped on session {name} — value does "
+                "not survive psmux's control-line transport verbatim; the key is freed "
+                "and ownership falls back to the run dir",
+                file=sys.stderr,
+            )
+            self._write_scoped(["set-option", "-u", "-t", name, option], option)
+            return
+        super().set_session_option(name, option, value)
 
     def _write_scoped(self, verb: list[str], key: str) -> None:
         # Both mutating verbs, one body. A write that silently failed re-opens

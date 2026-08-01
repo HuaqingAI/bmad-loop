@@ -15,6 +15,7 @@ from bmad_loop.adapters import psmux_backend, tmux_base
 from bmad_loop.adapters.multiplexer import MultiplexerError, get_multiplexer
 from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
 from bmad_loop.adapters.tmux_backend import TmuxMultiplexer
+from bmad_loop.adapters.tmux_base import TmuxError
 
 
 class _RecordRun:
@@ -1071,6 +1072,80 @@ def test_set_window_option_write_failure_warns(monkeypatch, capsys):
     PsmuxMultiplexer().set_window_option("ctl:@3", "@bmad_project", "C:/p")
     assert rec_.calls  # the write was attempted
     assert "failed" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "C:\\a ; b\\proj",  # live-probed: stores as `C:\a`, remainder EXECUTES
+        "C:\\projects\\my proj\\",  # live-probed: trailing `\` eats the closing quote
+        "\\\\srv\\share name\\proj",  # live-probed: spaced → `\\` collapses to `\`
+        "C:\\Users\\O'Brien\\proj",  # live-probed UNSPACED `'`: read back as `OBrien`
+        'C:\\a"b\\proj',  # live-probed unspaced `"`: read back as `ab`
+        "-flag",  # dropped as a flag server-side
+        "bad\nline",  # the control line is `\n`-terminated
+        "",  # an empty write is a silent server-side no-op
+    ],
+)
+def test_set_session_option_refuses_untransportable_values(monkeypatch, capsys, value):
+    # Same lossy CLI→server hop as the window channel, previously ungated on the
+    # session tag. The first three round-trips were measured on a live psmux
+    # 3.3.7 (sent → read back: `C:\a ; b\proj` → `C:\a`, `C:\projects\my proj\`
+    # → `C:\projects\my proj"`, `\\srv\share name\proj` → `\srv\share name\proj`).
+    # Refusing leaves the option unset, which the prune's run-dir fallback
+    # handles correctly — a corrupted tag would strand the session forever.
+    # The refusal FREES the key instead of just returning: the server loads the
+    # user's psmux config, so the name can arrive pre-seeded, and a surviving
+    # foreign value would read back as a real non-matching tag.
+    rec_ = _option_fake(monkeypatch)
+    PsmuxMultiplexer().set_session_option("bmad-loop-x", "@bmad_project", value)
+    assert [c[0][1:5] for c in rec_.calls] == [["set-option", "-u", "-t", "bmad-loop-x"]]
+    assert rec_.argv[-1] == "@bmad_project"  # the key, never the rejected value
+    assert "transport" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "C:\\my proj\\app",  # spaced but quote-safe
+        "C:\\app",  # unspaced
+        "\\\\srv\\share\\app",  # unspaced UNC rides verbatim (no client quoting)
+        "C:\\Users\\O'Brien Files\\proj",  # spaced `'` is literal inside the quotes
+    ],
+)
+def test_set_session_option_accepts_transportable_values(monkeypatch, value):
+    # All four were confirmed to round-trip unchanged on live psmux 3.3.7; a
+    # gate that refused them would untag ordinary Windows project paths.
+    rec_ = _option_fake(monkeypatch)
+    PsmuxMultiplexer().set_session_option("bmad-loop-x", "@bmad_project", value)
+    assert rec_.argv[1:] == ["set-option", "-t", "bmad-loop-x", "@bmad_project", value]
+
+
+def test_set_session_option_passes_builtin_options_through(monkeypatch):
+    # The gate is for `@` user options only. A builtin keeps the base path even
+    # with a value the `@` branch would refuse — narrowing it here would change
+    # a verb this backend has no evidence about.
+    rec_ = _option_fake(monkeypatch)
+    PsmuxMultiplexer().set_session_option("bmad-loop-x", "status-left", "-flag")
+    assert rec_.argv[1:] == ["set-option", "-t", "bmad-loop-x", "status-left", "-flag"]
+
+
+def test_set_session_option_refusal_free_failure_warns_not_raises(monkeypatch, capsys):
+    # The free is best-effort like every other write in this channel: a dead
+    # multiplexer must not abort session creation over a tag that is only an
+    # optimization — but it must not pass silently either.
+    _option_fake(monkeypatch, rc=1)
+    PsmuxMultiplexer().set_session_option("bmad-loop-x", "@bmad_project", "C:\\a ; b")
+    err = capsys.readouterr().err
+    assert "transport" in err and "failed" in err
+
+
+def test_set_session_option_write_failure_still_raises(monkeypatch):
+    # An accepted value keeps the base's strict contract: session tagging runs
+    # at session creation, where a dead multiplexer must not pass silently.
+    _option_fake(monkeypatch, rc=1)
+    with pytest.raises(TmuxError):
+        PsmuxMultiplexer().set_session_option("bmad-loop-x", "@bmad_project", "C:\\app")
 
 
 def test_list_windows_option_read_failure_degrades_to_unset_with_a_warning(monkeypatch, capsys):
