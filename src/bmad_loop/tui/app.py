@@ -217,10 +217,16 @@ class BmadLoopApp(App[None]):
 
     def _stories_defaults(self) -> tuple[str, str]:
         """The [stories] policy source + spec_folder to prefill the start-run
-        modal, or the sprint-mode default when policy is unreadable."""
+        modal, or the sprint-mode default when policy is unreadable — including
+        undecodable, which `policy.load` reports as a `PolicyError` rather than
+        letting a raw `UnicodeDecodeError` past this handler.
+
+        `ParseError` is not in the tuple: `policy.load` parses with `tomllib`, so
+        the tomlkit error can only arrive from the `PolicyDoc` path in
+        :meth:`action_settings`, which catches it there."""
         try:
             pol = policy.load(self.project / POLICY_FILE)
-        except (policy.PolicyError, OSError, ParseError):
+        except (policy.PolicyError, OSError):
             return "sprint-status", ""
         return pol.stories.source, pol.stories.spec_folder
 
