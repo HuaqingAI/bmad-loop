@@ -260,6 +260,26 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 ### Fixed
 
+- **An undecodable `policy.toml` or `_bmad/bmm/config.yaml` is reported, not a crash.**
+  `UnicodeDecodeError` is a `ValueError`, not an `OSError`, so a config file saved in UTF-16 or
+  latin-1 escaped every `except (PolicyError, OSError)` handler in the codebase — and those handlers
+  are the ones whose whole job is to degrade to defaults rather than take the process down. It hit
+  `_configure_mux`, which runs before argument dispatch on **every** command, and the TUI dashboard's
+  constructor, which runs before the app can draw anything. `policy.load` and `bmadconfig.load_paths`
+  convert it to their own typed errors, so `validate` names the file under its `policy` /
+  `bmad-config` finding and the TUI degrades to defaults.
+
+- **`diagnose` pseudonymizes the spec name, and gives one spec one alias.** A journal record's
+  `spec` field carries the customer's feature name; a bare basename is identifier-shaped, so the
+  scrub fallback shipped it verbatim in a dump, and the egress backstop could not rescue it — it
+  only repairs values already in the legend. `spec` is now aliased in a namespace of its own, not
+  `story`, where a filename would render as an epic-less `story-<hex>` indistinguishable from a
+  story key whose epic could not be resolved. The value is reduced to its basename first, because
+  the producers disagree on shape — `engine.py` journals an absolute path, `stories_engine.py` the
+  worktree-relative one — so without it a single spec drew two aliases in one dump and an absolute
+  home path landed in the local `--legend` file. The split handles both separators, so a journal
+  written on Windows normalizes when it is diagnosed on POSIX.
+
 - **The upstream `bmad-dev-auto` → `bmad-build-auto` rename no longer breaks a project (#393).**
   The dev primitive is resolved on disk — `bmad-build-auto` preferred, a marker-complete
   `bmad-dev-auto` accepted — so `validate`/`run`/`sweep`/`resume` pass on either era with no

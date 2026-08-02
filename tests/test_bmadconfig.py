@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from conftest import install_bmad_config
 
 from bmad_loop import bmadconfig
@@ -44,6 +45,20 @@ def test_load_paths_reads_repo_root_key(project) -> None:
     cfg.write_text(cfg.read_text() + "repo_root: '{project-root}/sub'\n")
     loaded = bmadconfig.load_paths(project.project)
     assert loaded.repo_root == (project.project / "sub").resolve()
+
+
+def test_load_paths_non_utf8_config_raises_bmad_config_error(project) -> None:
+    """An undecodable config.yaml is as much a BmadConfigError as malformed YAML.
+    `read_text` raises UnicodeDecodeError, which is a ValueError and NOT an OSError,
+    so raw it slips past every `except (BmadConfigError, OSError)` degrade handler —
+    the `cli` command tails, `tui/data.py`'s project scans — and kills the process
+    instead of reporting a bad config. Asserting the type is the point:
+    UnicodeDecodeError is an exception too."""
+    install_bmad_config(project)
+    cfg = project.project / "_bmad" / "bmm" / "config.yaml"
+    cfg.write_bytes(b"implementation_artifacts: '\xff\xfe'\n")
+    with pytest.raises(bmadconfig.BmadConfigError, match="not valid UTF-8"):
+        bmadconfig.load_paths(project.project)
 
 
 def test_rebased_reroots_project_and_artifacts(tmp_path: Path) -> None:

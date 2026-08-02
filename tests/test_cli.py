@@ -4000,6 +4000,43 @@ def test_validate_json_failing_check_emits_whole_document_at_rc_1(project, capsy
     assert "bmad-config" in {f["check"] for f in failed}
 
 
+def test_validate_reports_an_undecodable_policy_instead_of_crashing(project, capsys):
+    """`read_text` raises `UnicodeDecodeError` on a policy.toml saved as UTF-16 or
+    latin-1 — a ValueError, not an OSError, so it used to escape every
+    `except (PolicyError, OSError)` in the codebase, including `_configure_mux`,
+    which runs before argument dispatch on EVERY command. The result was a bare
+    `error:` line at startup in place of the named findings validate exists to print.
+    `policy.load` converts it, so the file is reported like any other bad policy.
+
+    Routed through `machine_json` deliberately: `main`'s bare `except Exception`
+    backstop also returns 1, so an rc-only assertion is green with the conversion
+    reverted. What bites is the document — stderr carries the backstop's line and
+    stdout carries nothing to parse."""
+    _write_policy(project.project, CLAUDE_ONLY_POLICY)
+    (project.project / ".bmad-loop" / "policy.toml").write_bytes(b'[scm]\nisolation = "\xff\xfe"\n')
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    finding = next(f for f in doc["findings"] if f["check"] == "policy")
+    assert finding["severity"] == "problem"
+    assert "not valid UTF-8" in finding["message"]
+
+
+def test_validate_reports_an_undecodable_bmad_config_instead_of_crashing(project, capsys):
+    """The `config.yaml` half of the same conversion. Separate from the policy leg
+    because they are separate loaders with separate typed errors, and the callers that
+    first exposed this call BOTH — a fix to one would leave the other raising a raw
+    ValueError straight through the handler."""
+    _write_policy(project.project, CLAUDE_ONLY_POLICY)
+    install_bmad_config(project)
+    config = project.project / "_bmad" / "bmm" / "config.yaml"
+    config.write_bytes(b"implementation_artifacts: '\xff\xfe'\n")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    finding = next(f for f in doc["findings"] if f["check"] == "bmad-config")
+    assert finding["severity"] == "problem"
+    assert "not valid UTF-8" in finding["message"]
+
+
 def test_validate_json_counts_and_ok_agree_with_findings(project, capsys):
     """`ok` mirrors the exit code exactly: problems clear it, warnings never do."""
     install_bmad_config(project)

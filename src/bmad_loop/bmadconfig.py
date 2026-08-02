@@ -73,7 +73,14 @@ def load_paths(project: Path) -> ProjectPaths:
     if not config_path.is_file():
         raise BmadConfigError(f"BMAD config not found: {config_path} (is BMAD installed here?)")
     try:
-        doc = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        # UnicodeDecodeError is a ValueError, not an OSError, so an undecodable file
+        # would otherwise escape every caller's `except BmadConfigError` and crash
+        # them. Same reasoning as `policy.load`.
+        raw = config_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as e:
+        raise BmadConfigError(f"{config_path} is not valid UTF-8: {e}") from e
+    try:
+        doc = yaml.safe_load(raw) or {}
     except yaml.YAMLError as e:
         raise BmadConfigError(f"invalid YAML in {config_path}: {e}") from e
 
