@@ -549,6 +549,57 @@ def _skill_trees(project: Path, pol) -> list[str]:
     return trees
 
 
+def _dev_skill_for_role(pol, project: Path, role: str) -> str:
+    """The dev-primitive skill name ``role``'s adapter would invoke, for dry-run
+    previews. Mirrors `_require_base_skills`' profile→skill_tree lookup so the
+    preview and the real dispatch (``Engine._dev_skill``) resolve identically —
+    a pre-rename project previews ``/bmad-dev-auto``, a post-rename one
+    ``/bmad-build-auto``. An unloadable profile falls back to the legacy name;
+    the run itself would fail preflight before ever dispatching."""
+    from .adapters.profile import ProfileError, get_profile
+
+    try:
+        tree = get_profile(pol.adapter.resolved(role).name, project).skill_tree
+    except ProfileError:
+        tree = None
+    return install.dev_primitive_or_default(project, tree)
+
+
+def _warn_preflight_would_abort(project: Path, pol, *, require_stories: bool = False) -> None:
+    """Dry-run honesty banner: say so when the real command would refuse to run.
+
+    ``--dry-run`` returns before `_require_base_skills` (cmd_run/cmd_sweep), so a
+    project whose skills are broken still gets a plausible-looking preview. Since
+    the upstream rename that preview is actively misleading rather than merely
+    incomplete: the forwarding shim IS a valid slash command, so a previewed
+    ``/bmad-dev-auto`` reads fine and would HALT an unattended session on the
+    shim's interactive migration gate.
+
+    Reads the same finding list `_require_base_skills` gates on, so the two cannot
+    disagree about what "runnable" means.
+
+    The exit code deliberately stays 0. A dry-run is a diagnostic — refusing to
+    print the schedule would withhold the very thing the operator asked for, and
+    every existing caller reads rc 0 as "the preview rendered", not as "the
+    project is ready". The banner goes to stderr so stdout stays the preview."""
+    trees = _skill_trees(project, pol)
+    problems = [
+        p.message
+        for p in install.missing_base_skills(project, trees)
+        + (install.missing_stories_support(project, trees) if require_stories else [])
+        if p.severity == "problem"
+    ]
+    if not problems:
+        return
+    print(
+        "note: this preview is NOT runnable as-is — the real command aborts at preflight:",
+        file=sys.stderr,
+    )
+    for problem in problems:
+        print(f"  FAIL: {problem}", file=sys.stderr)
+    print("run `bmad-loop validate` for details", file=sys.stderr)
+
+
 def _require_base_skills(project: Path, pol, *, require_stories: bool = False) -> bool:
     """Preflight the upstream skills the orchestrator drives (the dev primitive —
     bmad-build-auto, or a complete pre-rename bmad-dev-auto — plus the review layers
@@ -1040,6 +1091,8 @@ def _dry_run(
     if stories_on:
         return _dry_run_stories(paths, pol, args, spec_folder)
 
+    _warn_preflight_would_abort(paths.project, pol)
+
     def render(role: str, prompt: str) -> str:
         return _render_invocation(pol, paths.project, role, prompt)
 
@@ -1056,10 +1109,12 @@ def _dry_run(
         print("no actionable stories")
         return 0
     print(f"would process {len(queue)} stories (gates={pol.gates.mode}):")
+    dev_skill = _dev_skill_for_role(pol, paths.project, "dev")
+    review_skill = _dev_skill_for_role(pol, paths.project, "review")
     for story in queue:
         print(f"\n  {story.key} (epic {story.epic}, status {story.status})")
-        print(f"    dev:    {render('dev', f'/bmad-dev-auto {story.key}')}")
-        print(f"    review: {render('review', '/bmad-dev-auto <done spec from dev>')}")
+        print(f"    dev:    {render('dev', f'/{dev_skill} {story.key}')}")
+        print(f"    review: {render('review', f'/{review_skill} <done spec from dev>')}")
         print(f"    env:    BMAD_LOOP_MODE=1 BMAD_LOOP_STORY_KEY={story.key}")
     return 0
 
@@ -1080,6 +1135,7 @@ def _dry_run_stories(
 ) -> int:
     """Print the linear stories-mode schedule (list order, checkpoints, live
     on-disk state) — no topo waves, one story per line, spawns nothing."""
+    _warn_preflight_would_abort(paths.project, pol, require_stories=True)
     folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
     # The real dispatch always uses the project-relative folder (the engine
     # relativizes it); render the identical string here so dry-run and run agree.
@@ -1098,13 +1154,14 @@ def _dry_run_stories(
         f"(gates={pol.gates.mode}){spec_ok}"
     )
     print("linear schedule (list order — no depends_on, strictly serial):")
+    dev_skill = _dev_skill_for_role(pol, paths.project, "dev")
     for row in rows:
         print(f"\n  {row.position}. {row.id}  ({row.label}){_checkpoint_badge(row)}  {row.title}")
         # A spec_checkpoint story whose plan is not yet on disk dispatches leg 1
         # (Halt after planning + BMAD_LOOP_PLAN_HALT); mirror the real dispatch's
         # markers so dry-run does not under-report what run would emit.
         plan_halt = stories_mod.is_plan_halt_leg(row.spec_checkpoint, row.state)
-        dispatch = f"/bmad-dev-auto Spec folder: {rel}. Story id: {row.id}."
+        dispatch = f"/{dev_skill} Spec folder: {rel}. Story id: {row.id}."
         if plan_halt:
             dispatch += " Halt after planning."
         print(f"    dev:    {_render_invocation(pol, paths.project, 'dev', dispatch)}")
@@ -1225,6 +1282,9 @@ def cmd_sweep(args: argparse.Namespace) -> int:
 
 
 def _sweep_dry_run(paths: bmadconfig.ProjectPaths, pol) -> int:
+    # Before the no-ledger early return below: a broken install is worth saying so
+    # about whether or not there is anything to sweep.
+    _warn_preflight_would_abort(paths.project, pol)
     ledger = paths.deferred_work
     if not ledger.is_file():
         print(f"no deferred-work ledger at {ledger}")

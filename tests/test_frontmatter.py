@@ -65,9 +65,14 @@ def test_flipping_to_the_status_already_there_returns_false_and_does_not_write(t
 def test_a_quoted_value_is_written_back_unquoted(tmp_path):
     """A deliberate non-preservation, and the most load-bearing pin in this file.
     `conftest.write_spec` writes `status: '<v>'`, and substring assertions read
-    the result back as an unquoted `status: done` (tests/test_runs.py:772,
-    tests/test_stories_e2e.py:594,793). A refactor that "also preserves the
-    value's quotes" breaks those three from here."""
+    the result back as an unquoted `status: done`, in
+    `test_runs.test_rearm_restore_mode_sets_in_review_strips_arr_and_latches` and
+    `test_stories_e2e.test_e2e_{sprint,sweep}_intent_gap_patch_restore`. A refactor
+    that "also preserves the value's quotes" breaks those three from here.
+
+    Named rather than cited by line: the previous line numbers had already gone
+    stale before anyone noticed, which is the failure mode a cross-file pointer
+    has."""
     spec = _spec(tmp_path, "---\nstatus: 'in-review'\n---\nbody\n")
     assert frontmatter.set_frontmatter_status(spec, "done") is True
     assert spec.read_bytes().decode() == "---\nstatus: done\n---\nbody\n"

@@ -6,11 +6,13 @@ from pathlib import Path
 
 import pytest
 from conftest import (
+    attach_profile,
     bundle_dev_effect,
     bundle_dev_escalates,
     bundle_review_effect,
     fault_read_text,
     git,
+    install_build_auto_skill,
     migrate_effect,
     triage_effect,
     write_ledger,
@@ -1363,6 +1365,42 @@ def test_generic_bundle_prompt_restore_branch_points_at_spec(project):
     fresh_prompt = engine._generic_bundle_prompt(task, None)
     assert "Implement the deferred-work bundle" in fresh_prompt
     assert "Resume review of the in-review spec" not in fresh_prompt
+
+
+def test_generic_bundle_prompt_spells_the_post_rename_primitive(project):
+    """All three bundle legs (restore, fresh implement, repair) spell the dev
+    primitive resolved off the dev adapter's skill tree, not a hardcoded name —
+    upstream renamed it bmad-dev-auto -> bmad-build-auto (BMAD-METHOD #2651).
+
+    Both setup lines are load-bearing: the `project` fixture installs no skills
+    and `MockAdapter` carries no profile, so dropping either one resolves every
+    leg through `dev_primitive_or_default`'s legacy fallback — which the sibling
+    tests above already pin, and which would make this one pass for the wrong
+    reason."""
+    install_build_auto_skill(project.project, ".claude/skills")
+    engine, adapter = make_sweep(project, [])
+    attach_profile(adapter)  # claude -> .claude/skills, where the new name now lives
+    spec = str(project.implementation_artifacts / "spec-dw-fix.md")
+    task = StoryTask(
+        story_key="dw-fix",
+        epic=0,
+        dw_ids=["DW-1"],
+        bundle_file="/run/bundles/fix/intent.md",
+        spec_file=spec,
+        restore_patch="/run/artifacts/attempt-dw-fix.patch",
+    )
+
+    assert engine._generic_bundle_prompt(task, None).startswith(
+        "/bmad-build-auto Resume review of the in-review spec"
+    )
+    task.restore_patch = None
+    assert engine._generic_bundle_prompt(task, None).startswith(
+        "/bmad-build-auto Implement the deferred-work bundle"
+    )
+    feedback = project.implementation_artifacts / "feedback.md"
+    assert engine._generic_bundle_prompt(task, feedback).startswith(
+        "/bmad-build-auto Resume the autonomous dev session"
+    )
 
 
 def test_sweep_bundle_restore_redrive_reaches_done_and_clears_latch(project, monkeypatch):

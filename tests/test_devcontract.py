@@ -424,16 +424,51 @@ def test_find_artifact_missing_dir(tmp_path):
     assert devcontract.find_result_artifact(tmp_path / "ghost", since_ns=0) is None
 
 
-def test_find_artifact_accepts_no_spec_fallback_prefix(tmp_path):
+@pytest.mark.parametrize("prefix", ["bmad-build-auto-result-", "bmad-dev-auto-result-"])
+def test_find_artifact_accepts_no_spec_fallback_prefix(tmp_path, prefix):
     # The no-spec fallback (intent too unclear to create a spec) carries a terminal
     # frontmatter status but NO `## Auto Run Result` heading — it is matched by its
-    # `bmad-dev-auto-result-` filename prefix instead.
-    fallback = tmp_path / "bmad-dev-auto-result-unclear-1234.md"
+    # `<skill>-result-` filename prefix instead. BOTH eras are matched: the artifact
+    # is named after whichever skill wrote it (BMAD-METHOD #2651 renamed
+    # bmad-dev-auto to bmad-build-auto), and a run can meet either.
+    fallback = tmp_path / f"{prefix}unclear-1234.md"
     fallback.write_text(
         "---\nstatus: blocked\n---\n\nBlocking condition: unclear intent\n",
         encoding="utf-8",
     )
     assert devcontract.find_result_artifact(tmp_path, since_ns=0) == fallback
+
+
+def test_every_dev_primitive_has_a_fallback_result_prefix():
+    """The name the orchestrator WRITES a completion marker under and the set of
+    names it will MATCH are independent literals in two modules. Nothing derived
+    one from the other until this test.
+
+    The failure this prevents is silent and total: `engine` names the marker
+    `f"{resolved_primitive}-result-{task_id}.md"`, and `find_result_artifact`
+    only looks at names starting with one of these prefixes. A marker outside the
+    set is not merely unmatched — it falls through to the `## Auto Run Result`
+    heading branch, which the workflow-completion contract never writes, so the
+    marker is invisible and every plugin workflow livelocks to
+    `session_timeout_min` with no error anywhere.
+
+    Subset, not equality, and the direction is the whole point: a primitive with
+    no prefix is the unreadable-marker bug, while a prefix with no primitive is a
+    RETIRED era deliberately kept matchable — the comment on
+    `FALLBACK_RESULT_PREFIXES` asks for exactly that, so a resume can read an
+    artifact written before an upstream upgrade.
+
+    Reading the constants off the module rather than restating them is what makes
+    this hold: a third `DEV_PRIMITIVE_*` name added tomorrow is enforced without
+    anyone remembering this file exists."""
+    from bmad_loop import install
+
+    primitives = {
+        v for n, v in vars(install).items() if n.startswith("DEV_PRIMITIVE_") and isinstance(v, str)
+    }
+    assert primitives, "no DEV_PRIMITIVE_* string constants found — has the naming changed?"
+    missing = {f"{p}-result-" for p in primitives} - set(devcontract.FALLBACK_RESULT_PREFIXES)
+    assert not missing, f"dev primitives whose completion marker cannot be read back: {missing}"
 
 
 def test_find_artifact_ignores_fence_quoted_heading(tmp_path):
@@ -1004,10 +1039,15 @@ def test_frontmatter_candidates_includes_fence_quoted_heading_only(tmp_path):
     assert devcontract.find_frontmatter_candidates(tmp_path, since_ns=0) == [p]
 
 
-def test_frontmatter_candidates_excludes_no_spec_fallback_file(tmp_path):
-    """bmad-dev-auto-result-*.md is the skill's no-spec fallback — matched by
-    name on the normal scan, so the fallback scan must not double-claim it."""
-    _write(tmp_path, "bmad-dev-auto-result-x.md", "---\nstatus: done\n---\n\nbody\n")
+@pytest.mark.parametrize("prefix", ["bmad-build-auto-result-", "bmad-dev-auto-result-"])
+def test_frontmatter_candidates_excludes_no_spec_fallback_file(tmp_path, prefix):
+    """`<primitive>-result-*.md` is the skill's no-spec fallback — matched by
+    name on the normal scan, so the fallback scan must not double-claim it.
+
+    Both eras, because this is the OTHER consumer of `FALLBACK_RESULT_PREFIXES`
+    and it was pinned on the legacy spelling alone — which post-rename is the
+    era a project is least likely to be on."""
+    _write(tmp_path, f"{prefix}x.md", "---\nstatus: done\n---\n\nbody\n")
     assert devcontract.find_frontmatter_candidates(tmp_path, since_ns=0) == []
 
 

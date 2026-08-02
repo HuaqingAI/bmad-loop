@@ -28,6 +28,10 @@ sweep-specific CLI resolve→resume path (SweepEngine rebuilt from sweep.json).
 Scenarios (3) `done_checkpoint` and (5) worktree isolation are covered
 deterministically at the engine level in test_stories_engine.py; here we prove
 the end-to-end CLI stack.
+
+(9) is the post-rename row (BMAD-METHOD #2651): the same two-story happy path
+against a project carrying only `bmad-build-auto`, proving the real CLI resolves
+the invoked primitive off disk instead of spelling a constant.
 """
 
 from __future__ import annotations
@@ -43,7 +47,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from conftest import install_dev_base_skills
+from conftest import install_build_auto_skill, install_dev_base_skills
 
 # Linux-only, not merely non-win32: every fake CLI below is bash + GNU coreutils
 # (`date +%s%N`; the detached-writer fake also needs setsid(1)) — BSD/macOS date
@@ -62,9 +66,13 @@ rd="$BMAD_LOOP_RUN_DIR"; tid="$BMAD_LOOP_TASK_ID"
 story="$BMAD_LOOP_STORY_KEY"; folder="$BMAD_LOOP_SPEC_FOLDER"
 prompt="${1:-}"
 ts=$(date +%s%N)
-mkdir -p "$rd/events"
+mkdir -p "$rd/events" "$rd/tasks/$tid"
 printf '{"ts": %s, "event": "SessionStart", "task_id": "%s", "session_id": "fake-1"}' \
     "$ts" "$tid" > "$rd/events/$ts-$tid-SessionStart.json"
+# argv as it ARRIVED, after profile render + tmux quoting — the orchestrator's own
+# tasks/<id>/prompt.txt records the pre-render prompt, so only this file can prove a
+# dispatched skill NAME actually reached the binary.
+printf '%s' "$prompt" > "$rd/tasks/$tid/fake-prompt.txt"
 baseline=$(git rev-parse HEAD)
 
 # SWEEP triage (`/bmad-loop-sweep`): the triage adapter is a plain GenericAdapter
@@ -259,11 +267,16 @@ def _entry(story_id: str, **over) -> dict:
     return d
 
 
-def _scaffold(root: Path, entries: list[dict]) -> None:
+def _scaffold(root: Path, entries: list[dict], *, install_skills=install_dev_base_skills) -> None:
     """A committed, clean sandbox: git repo, BMAD config + artifact dirs, the
     base-skill stubs the stories preflight requires (incl. the folder+id dispatch
     probe), a stories.yaml + SPEC.md, the fake-CLI profile, and a stories-mode
-    policy — everything committed so the run-start worktree_clean gate passes."""
+    policy — everything committed so the run-start worktree_clean gate passes.
+
+    ``install_skills`` picks the dev-primitive ERA laid on disk: the legacy
+    `install_dev_base_skills` by default, `install_build_auto_skill` for the
+    post-rename tree. Both take ``(root, *, folder_id)`` and write the folder+id
+    dispatch probe under whichever name `resolve_dev_primitive` will pick."""
     root.mkdir(parents=True, exist_ok=True)
     (root / "src.txt").write_text("original\n", encoding="utf-8")
     (root / ".gitignore").write_text(".bmad-loop/runs/\n", encoding="utf-8")
@@ -279,7 +292,7 @@ def _scaffold(root: Path, entries: list[dict]) -> None:
         (root / "_bmad-output" / sub).mkdir(parents=True, exist_ok=True)
         (root / "_bmad-output" / sub / ".keep").write_text("", encoding="utf-8")
 
-    install_dev_base_skills(root, folder_id=True)  # tree matches PROFILE_TOML's skill_tree
+    install_skills(root, folder_id=True)  # tree matches PROFILE_TOML's skill_tree
 
     folder = root / SPEC_FOLDER
     (folder / "stories").mkdir(parents=True)
@@ -502,6 +515,38 @@ def test_e2e_two_story_happy_path(tmp_path):
     assert _status(root, "2") == "done"
     # one squashed story commit per story above the sandbox baseline
     assert _commit_count(root) == base + 2
+
+
+def test_e2e_two_story_happy_path_build_auto(tmp_path):
+    """Scenario 9, the post-rename twin of the happy path (BMAD-METHOD #2651):
+    the project carries ONLY `bmad-build-auto`, so the real CLI has to resolve the
+    invoked primitive off disk. The fake routes on env vars and spec status and
+    never on the skill name, so the run lands identically either era — the name
+    assertion below is the whole difference between this row and the legacy one,
+    and without it this test would pass with the resolution ablated.
+
+    Asserted against the prompt the FAKE recorded (post-render, post-tmux argv),
+    not the orchestrator's own prompt.txt: a name that never reached the binary
+    would still be in prompt.txt."""
+    root = tmp_path / "sbx"
+    _scaffold(root, [_entry("1"), _entry("2")], install_skills=install_build_auto_skill)
+    base = _commit_count(root)
+
+    proc = _run(root, "run")
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    assert _status(root, "1") == "done"
+    assert _status(root, "2") == "done"
+    assert _commit_count(root) == base + 2
+
+    run_dir = root / ".bmad-loop" / "runs" / _run_id(root)
+    dispatched = [
+        p.read_text(encoding="utf-8") for p in (run_dir / "tasks").glob("*/fake-prompt.txt")
+    ]
+    assert len(dispatched) == 2, dispatched  # one dev session per story, both recorded
+    # The fakestories profile renders `{prompt}` verbatim, so the dispatch is the
+    # literal skill invocation; a codex-shaped profile would rewrite it to `$skill`.
+    assert all(p.startswith("/bmad-build-auto Spec folder: ") for p in dispatched), dispatched
+    assert not any("bmad-dev-auto" in p for p in dispatched), dispatched
 
 
 def test_e2e_spec_checkpoint_two_leg(tmp_path):
