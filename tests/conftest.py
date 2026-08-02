@@ -323,11 +323,73 @@ def install_dev_base_skills(root: Path, tree: str = ".claude/skills", *, folder_
     return skills
 
 
+def install_build_auto_skill(
+    root: Path, tree: str = ".claude/skills", *, folder_id: bool = True
+) -> Path:
+    """The post-rename twin of :func:`install_dev_base_skills`: lay down the NEW dev
+    primitive (`install.DEV_PRIMITIVE_NEW`) plus the review hunters under ``root/tree``.
+
+    Deliberately lays down ONE era. A test that wants both names on disk calls this
+    *and* :func:`install_dev_base_skills`; a test that wants only the legacy era calls
+    that one alone. (Note :func:`install_base_skills` lays down BOTH, because
+    `BASE_SKILLS` is the copy-if-present worktree catalog and names both eras — so a
+    scaffold built from it resolves to the new name.)
+
+    ``folder_id`` writes the resolved primitive's step-01 carrying the dispatch marker
+    `install.missing_stories_support` content-probes for, exactly as the legacy twin
+    does — under `bmad-build-auto`, since that is the name that resolves here."""
+    from bmad_loop.install import (
+        DEV_BASE_SKILLS,
+        DEV_PRIMITIVE_LEGACY,
+        DEV_PRIMITIVE_MARKERS,
+        DEV_PRIMITIVE_NEW,
+        STORIES_PROBE_FILE,
+        STORIES_PROBE_TEXT,
+    )
+
+    # The hunters, read off the catalog rather than restated — but with the primitive
+    # entry swapped for the new name, since DEV_BASE_SKILLS is keyed on the legacy one.
+    hunters = {k: v for k, v in DEV_BASE_SKILLS.items() if k != DEV_PRIMITIVE_LEGACY}
+    skills = Path(root) / tree
+    _write_skill_stubs(skills, {DEV_PRIMITIVE_NEW: DEV_PRIMITIVE_MARKERS, **hunters})
+    if folder_id:
+        (skills / DEV_PRIMITIVE_NEW / STORIES_PROBE_FILE).write_text(
+            f"This is a **{STORIES_PROBE_TEXT}** router.\n", encoding="utf-8"
+        )
+    return skills
+
+
+def install_dev_shim(root: Path, tree: str = ".claude/skills", *, with_review: bool = True) -> Path:
+    """Lay down ONLY the post-rename forwarding shim: a lone `bmad-dev-auto/SKILL.md`
+    with no marker files and no new-name skill beside it.
+
+    This is the install `bmad-loop validate` must REFUSE (`skills.base-shim`) rather
+    than drive: the shim's customization-migration gate is interactive, so an
+    unattended session dispatched into it HALTs having written nothing to disk.
+
+    ``with_review`` also stubs the merged reviewer, which satisfies `_review_findings`'
+    static fallback — so a shim test's findings are exactly the shim finding, and an
+    assertion on their count is not silently counting absent review layers too."""
+    from bmad_loop.install import DEV_PRIMITIVE_LEGACY, MERGED_REVIEW_SKILL
+
+    skills = Path(root) / tree
+    shim = skills / DEV_PRIMITIVE_LEGACY
+    shim.mkdir(parents=True, exist_ok=True)
+    (shim / "SKILL.md").write_text(f"# {DEV_PRIMITIVE_LEGACY}\n", encoding="utf-8")
+    if with_review:
+        _write_skill_stubs(skills, {MERGED_REVIEW_SKILL: ()})
+    return skills
+
+
 def install_base_skills(paths: ProjectPaths, trees=(".claude/skills", ".agents/skills")) -> None:
     """Stub every non-bundled upstream skill (`install.BASE_SKILLS` — a superset of
     DEV_BASE_SKILLS that also covers what a worktree mount must copy) in each of a
-    sandbox project's active CLI skill trees. Sprint mode drives any bmad-dev-auto,
-    so no folder+id probe is written."""
+    sandbox project's active CLI skill trees. Sprint mode drives any dev primitive,
+    so no folder+id probe is written.
+
+    BASE_SKILLS names BOTH primitive eras, so this lays down both and the tree
+    resolves to `bmad-build-auto`. For a single-era scaffold use
+    :func:`install_dev_base_skills` (legacy) or :func:`install_build_auto_skill`."""
     from bmad_loop.install import BASE_SKILLS
 
     for tree in trees:

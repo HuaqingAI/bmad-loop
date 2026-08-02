@@ -230,12 +230,19 @@ def cmd_validate(args: argparse.Namespace) -> int:
     except policy_mod.PolicyError as e:
         report.fail("policy", str(e))
 
+    # Built exactly the way run/sweep's real preflight builds it, so validate's
+    # verdict and their abort cannot disagree. Deliberately NOT `[p.skill_tree for p
+    # in profiles]`: that carries triage's tree, and every skills check below asks a
+    # dev-primitive question. The `pol is not None` guard is load-bearing —
+    # `resolved` never raises, so the except above fires only on a policy that failed
+    # to load, and an unguarded call would crash validate instead of reporting the
+    # parse failure.
+    dev_trees = _skill_trees(project, pol) if pol is not None else []
+
     stories_on, spec_folder = _stories_mode(args, pol)
     if paths:
         if stories_on:
-            _validate_stories_queue(
-                project, paths, spec_folder, [p.skill_tree for p in profiles], report
-            )
+            _validate_stories_queue(project, paths, spec_folder, dev_trees, report)
             _validate_closes_deferred(paths, report, spec_folder=spec_folder)
         else:
             _validate_closes_deferred(paths, report)
@@ -363,17 +370,34 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     {"role": role, "model": cfg.model, "profile": prof.name},
                 )
 
-    base_findings = install.missing_base_skills(project, [p.skill_tree for p in profiles])
+    base_findings = install.missing_base_skills(project, dev_trees)
     # gated on PROBLEMS, not on any finding: an advisory review layer (a `when`
     # gate, a phrasing this check can't confirm, a broken override) is a warning
     # that must ride alongside the ok line rather than suppress it.
-    if profiles and not any(f.severity == "problem" for f in base_findings):
+    #
+    # Gate on `dev_trees`, not `profiles`: policy never validates an adapter name
+    # (the first test is `get_profile`), so `[adapter] name = "nosuchcli"` beside a
+    # loadable `[adapter.triage]` leaves `profiles` non-empty while nothing dev-side
+    # resolved — and the ok line would then be a green sentence assembled from an
+    # empty probe. Can only tighten: `dev_trees` truthy implies `profiles` truthy.
+    if dev_trees and not any(f.severity == "problem" for f in base_findings):
+        # Name the primitive that actually resolved, not a hardcoded era: on an
+        # upgraded project this is the operator's confirmation that the rename was
+        # picked up (and, across trees, that both picked up the same one).
+        resolved = list(
+            dict.fromkeys(
+                name
+                for tree in dict.fromkeys(dev_trees)
+                if (name := install.resolve_dev_primitive(project, tree)) is not None
+            )
+        )
         report.ok(
             "skills.base",
-            "upstream skills present (bmad-dev-auto + review layers)",
-            {"trees": list(dict.fromkeys(p.skill_tree for p in profiles))},
+            f"upstream skills present ({' + '.join(resolved)} + review layers)",
+            {"trees": list(dict.fromkeys(dev_trees)), "dev_primitive": resolved},
         )
     report.extend(base_findings)
+    report.extend(install.dev_primitive_warnings(project, dev_trees))
 
     if getattr(args, "json", False):
         # getattr, not args.json: cmd_validate is called directly by tests (and by
@@ -491,27 +515,57 @@ def _mux_set(project: Path, args: argparse.Namespace) -> int:
     return 0
 
 
+def _skill_trees(project: Path, pol) -> list[str]:
+    """The skill trees this run's dev-primitive adapters read, one per distinct name.
+
+    Shared by the real preflight and `cmd_validate` so the two cannot drift:
+    validate's verdict has to key on exactly what makes run abort. Profiles that
+    fail to load are skipped rather than raising — an unknown adapter name is the
+    policy loader's problem, not the skill probe's.
+
+    Scoped to :data:`install.DEV_PRIMITIVE_ROLES`, not :data:`ROLES`: every skill
+    these trees are asked about is one only a dev or review session dispatches, and
+    triage's whole prompt surface ships in this wheel. It is also the set
+    `WorktreeFlow.worktree_profiles` provisions, so what is gated and what is carried
+    into a worktree stay one decision.
+
+    Deliberately does NOT consult `review.enabled`. Disabling review does not retire
+    the review ADAPTER: a plugin workflow may declare `role = "review"` and dispatch
+    on `adapters["review"]` with review disabled, and `worktree_profiles` drives
+    per-CLI Stop-signal hook registration as well as seeding — a worktree
+    provisioned without the review profile has no completion signal for those
+    sessions and stalls rather than merely missing a skill. See #424 for the narrow
+    residue that IS real."""
+    from .adapters.profile import ProfileError, get_profile
+
+    trees = []
+    for name in dict.fromkeys(
+        pol.adapter.resolved(role).name for role in install.DEV_PRIMITIVE_ROLES
+    ):
+        try:
+            trees.append(get_profile(name, project).skill_tree)
+        except ProfileError:
+            continue
+    return trees
+
+
 def _require_base_skills(project: Path, pol, *, require_stories: bool = False) -> bool:
-    """Preflight the upstream skills the orchestrator drives (bmad-dev-auto + the
-    review layers it invokes inline).
+    """Preflight the upstream skills the orchestrator drives (the dev primitive —
+    bmad-build-auto, or a complete pre-rename bmad-dev-auto — plus the review layers
+    it invokes inline).
 
     Returns True when everything is in place; otherwise prints the problems and
     returns False so the caller can abort before spawning any session (a missing
     skill would otherwise stall as an `Unknown command` until the run times out).
     Warnings are printed but never abort — only ``problem`` findings block.
+    A post-rename install left with only the forwarding shim fails here too: the
+    shim's interactive migration gate would HALT the session with nothing written.
 
-    ``require_stories`` additionally content-probes bmad-dev-auto for folder+id
-    dispatch — stories mode needs a newer skill than sprint mode, so an older
-    install must fail loudly here rather than HALT `no stories.yaml`-style at
+    ``require_stories`` additionally content-probes the resolved primitive for
+    folder+id dispatch — stories mode needs a newer skill than sprint mode, so an
+    older install must fail loudly here rather than HALT `no stories.yaml`-style at
     dispatch time."""
-    from .adapters.profile import ProfileError, get_profile
-
-    skill_trees = []
-    for name in dict.fromkeys(pol.adapter.resolved(role).name for role in ROLES):
-        try:
-            skill_trees.append(get_profile(name, project).skill_tree)
-        except ProfileError:
-            continue
+    skill_trees = _skill_trees(project, pol)
     findings = install.missing_base_skills(project, skill_trees)
     if require_stories:
         findings += install.missing_stories_support(project, skill_trees)
@@ -582,9 +636,9 @@ def _validate_stories_queue(
 ) -> None:
     """Stories-mode counterpart of ``cmd_validate``'s sprint-status gate: validate
     the ``stories.yaml`` manifest + ``SPEC.md`` and confirm the installed
-    ``bmad-dev-auto`` carries the folder+id dispatch flow stories mode needs (an
-    older skill would HALT at dispatch). Appends findings to ``report`` in place;
-    the probe carries its own remediation text ("update the bmm module")."""
+    dev primitive carries the folder+id dispatch flow stories mode needs (an older
+    skill would HALT at dispatch). Appends findings to ``report`` in place; the
+    probe carries its own remediation text ("update the bmm module")."""
     folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
     problem = _validate_stories_folder(paths, spec_folder)
     if problem:
@@ -605,10 +659,20 @@ def _validate_stories_queue(
             )
     stories_probs = install.missing_stories_support(project, skill_trees)
     if skill_trees and not stories_probs:
+        # The total form, not `resolve_dev_primitive`: this ok line only renders when
+        # the probe passed, and the probe ran against exactly this name — so an
+        # unresolvable tree that somehow satisfied it is still reported as what was
+        # actually read.
+        probed = list(
+            dict.fromkeys(
+                install.dev_primitive_or_default(project, tree)
+                for tree in dict.fromkeys(skill_trees)
+            )
+        )
         report.ok(
             "skills.stories-dispatch",
-            "bmad-dev-auto supports folder+id dispatch (stories mode)",
-            {"trees": list(dict.fromkeys(skill_trees))},
+            f"{' + '.join(probed)} supports folder+id dispatch (stories mode)",
+            {"trees": list(dict.fromkeys(skill_trees)), "dev_primitive": probed},
         )
     report.extend(stories_probs)
 
