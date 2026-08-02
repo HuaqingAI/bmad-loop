@@ -263,9 +263,11 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 - **The upstream `bmad-dev-auto` → `bmad-build-auto` rename no longer breaks a project (#393).**
   The dev primitive is resolved on disk — `bmad-build-auto` preferred, a marker-complete
   `bmad-dev-auto` accepted — so `validate`/`run`/`sweep`/`resume` pass on either era with no
-  `policy.toml` edit. The forwarding shim upstream left behind is refused by name
-  (`skills.base-shim`): it is a valid slash command, so an unattended session dispatched into it
-  would HALT on its interactive migration gate having written nothing. Every session prompt spells
+  `policy.toml` edit. The forwarding shim upstream left behind is refused as marker-incomplete
+  (`skills.base-shim`) — no step files, no `customize.toml`, which is also what a truncated
+  install looks like, so the message names both causes: the shim is a valid slash command, so an
+  unattended session dispatched into it would HALT on its interactive migration gate having
+  written nothing. Every session prompt spells
   the resolved name, per skill tree, so a run mixing `.claude/skills` and `.agents/skills` at
   different eras gets the right one per role; the no-spec fallback result marker is matched under
   both prefixes. The name is resolved against the **workspace**, so a run resumed into an existing
