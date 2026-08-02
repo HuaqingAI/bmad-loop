@@ -7911,8 +7911,8 @@ def test_dev_prompt_falls_back_to_the_legacy_name_without_a_profile(project):
     assert getattr(adapter, "profile", None) is None
 
     assert engine._generic_dev_prompt(_prompt_task(), None).startswith("/bmad-dev-auto 1-1-a")
-    # the None key IS the fallback path, not an unresolved tree that happened to miss
-    assert engine._dev_skill_cache == {None: "bmad-dev-auto"}
+    # the None tree IS the fallback path, not an unresolved tree that happened to miss
+    assert engine._dev_skill_cache == {(project.project, None): "bmad-dev-auto"}
 
 
 def test_review_prompt_resolves_through_the_review_adapters_own_tree(project):
@@ -7933,10 +7933,11 @@ def test_review_prompt_resolves_through_the_review_adapters_own_tree(project):
     assert engine._review_prompt(_prompt_task(spec_file=spec)).startswith(
         f"/bmad-dev-auto {spec} —"
     )
-    # each tree resolved independently — one memo entry per tree, not one per run
+    # each tree resolved independently — one memo entry per (workspace, tree), not
+    # one per run
     assert engine._dev_skill_cache == {
-        ".claude/skills": "bmad-build-auto",
-        ".agents/skills": "bmad-dev-auto",
+        (project.project, ".claude/skills"): "bmad-build-auto",
+        (project.project, ".agents/skills"): "bmad-dev-auto",
     }
 
 
@@ -7972,6 +7973,44 @@ def test_workflow_marker_is_named_for_the_workflows_own_role_tree(project):
     # happen to coincide.
     assert engine._dev_skill() == "bmad-build-auto"
     assert engine._dev_skill_cache == {
-        ".agents/skills": "bmad-dev-auto",
-        ".claude/skills": "bmad-build-auto",
+        (project.project, ".agents/skills"): "bmad-dev-auto",
+        (project.project, ".claude/skills"): "bmad-build-auto",
+    }
+
+
+def test_dev_prompt_resolves_in_the_reopened_worktree_not_the_main_checkout(project, tmp_path):
+    """A resumed unit dispatches the name ITS OWN worktree carries.
+
+    `reopen_unit` re-mounts an existing worktree without re-provisioning it (only
+    the fresh-mount path in `run_isolated` calls `provision_worktree`), so a main
+    checkout upgraded across the pause — the operator updated bmm while the run sat
+    at an escalation — leaves the worktree on the old era while the resume preflight
+    passes against the upgraded checkout. Resolving off the main checkout would
+    spell `/bmad-build-auto` into a worktree carrying only `bmad-dev-auto`: the
+    session runs with `cwd=self.workspace.root`, HALTs on an unknown command having
+    written nothing for verify to read, and burns its dev attempts through to DEFER.
+
+    The second half pins the MEMO, which is the half a workspace-rooted resolution
+    alone gets wrong: one Engine drives every unit of a run, so the reopened
+    worktree's answer must not be served to the fresh worktrees mounted after it."""
+    from conftest import attach_profile, install_build_auto_skill, install_dev_base_skills
+
+    from bmad_loop.workspace import Workspace
+
+    install_build_auto_skill(project.project, ".claude/skills")  # main checkout: upgraded
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    install_dev_base_skills(worktree, ".claude/skills", folder_id=False)  # worktree: legacy
+    engine, adapter = make_engine(project, [])
+    attach_profile(adapter)
+    default = engine.workspace
+
+    engine.workspace = Workspace(root=worktree, paths=engine.paths.rebased(worktree))
+    assert engine._generic_dev_prompt(_prompt_task(), None).startswith("/bmad-dev-auto 1-1-a")
+
+    engine.workspace = default
+    assert engine._generic_dev_prompt(_prompt_task(), None).startswith("/bmad-build-auto 1-1-a")
+    assert engine._dev_skill_cache == {
+        (worktree.resolve(), ".claude/skills"): "bmad-dev-auto",
+        (project.project, ".claude/skills"): "bmad-build-auto",
     }

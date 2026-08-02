@@ -268,7 +268,14 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   would HALT on its interactive migration gate having written nothing. Every session prompt spells
   the resolved name, per skill tree, so a run mixing `.claude/skills` and `.agents/skills` at
   different eras gets the right one per role; the no-spec fallback result marker is matched under
-  both prefixes. `--dry-run` now says on stderr when its preview is not runnable rather than
+  both prefixes. The name is resolved against the **workspace**, so a run resumed into an existing
+  worktree spells the era that worktree actually carries: resume re-mounts a worktree without
+  re-provisioning it, and a main checkout upgraded across the pause would otherwise dispatch a
+  command that worktree does not have, halting the session having written nothing. On a project
+  mid-upgrade, with a different era in each tree, the orphaned-override warning says to **copy**
+  `_bmad/custom/bmad-dev-auto.toml` rather than rename it — the legacy tree still applies it, so a
+  rename would move the customization between trees instead of migrating it. `--dry-run` now says
+  on stderr when its preview is not runnable rather than
   printing a plausible schedule for an install that would abort at preflight (exit code stays 0,
   stdout untouched). The skills preflight also stopped gating a triage-only CLI's skill tree — a
   hard FAIL, with no `--force`, over skills no triage session ever dispatches. `[dev] skill` stays

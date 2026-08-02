@@ -631,33 +631,63 @@ def dev_primitive_warnings(project: Path, trees: Sequence[str]) -> list[Finding]
     One condition, and it is genuinely survivable — which is what keeps it out of
     :func:`missing_base_skills`:
 
-    - ``skills.customize-legacy``: the tree resolved to the NEW name while a
+    - ``skills.customize-legacy``: at least one tree resolved to the NEW name while a
       customization override still sits under the OLD one with no counterpart, i.e.
       the rename silently orphaned it. Emitted once per project (the override files
       are project-global, not per tree). The session still runs; it just runs
       unstyled, so naming it is an operator heads-up rather than a gate.
 
+    ⚠️ The remediation is COPY, not rename, whenever another active tree still
+    resolves to the legacy primitive. A project can sit mid-upgrade with a different
+    era in each tree (`.claude/skills` on the new name, `.agents/skills` still on a
+    marker-complete old one), and each tree resolves its overrides under its OWN
+    era — so the legacy file is orphaned for the new tree and LIVE for the legacy
+    one. Telling that operator to rename it moves the customization from one tree to
+    the other instead of fixing anything. Suppressing the finding instead would be
+    the opposite error: the new tree really is running unstyled, which is precisely
+    the silent degradation this warning exists to surface.
+
     Deliberately a warning and not a problem. :func:`missing_base_skills` feeds a
     gate with no severity filter and no ``--force``: a false FAIL there pauses every
     run behind a remediation nobody can apply, so on these checks a false green is
-    the safe direction. The orphaned file's layers really are inert — upstream's
-    resolver keys on the skill dir — so the honest response is to say so and name
-    the rename, not to block.
+    the safe direction. The orphaned file's layers really are inert for a new-era
+    tree — upstream's resolver keys on the skill dir — so the honest response is to
+    say so and name the rename, not to block.
 
     Returns [] when nothing resolves — :func:`missing_base_skills` owns that story.
     """
     findings: list[Finding] = []
-    resolved_new = any(
-        resolve_dev_primitive(project, tree) == DEV_PRIMITIVE_NEW for tree in dict.fromkeys(trees)
-    )
-    if resolved_new:
+    resolved = {tree: resolve_dev_primitive(project, tree) for tree in dict.fromkeys(trees)}
+    new_trees = [tree for tree, name in resolved.items() if name == DEV_PRIMITIVE_NEW]
+    legacy_trees = [tree for tree, name in resolved.items() if name == DEV_PRIMITIVE_LEGACY]
+    if new_trees:
         orphaned = [
             (CUSTOMIZE_DIR / f"{DEV_PRIMITIVE_LEGACY}{suffix}").as_posix()
             for suffix in (".toml", ".user.toml")
             if (project / CUSTOMIZE_DIR / f"{DEV_PRIMITIVE_LEGACY}{suffix}").is_file()
             and not (project / CUSTOMIZE_DIR / f"{DEV_PRIMITIVE_NEW}{suffix}").is_file()
         ]
-        if orphaned:
+        if orphaned and legacy_trees:
+            # Mixed-era project: the file is live for the legacy tree, so name the
+            # tree it still styles and say copy. `legacy_trees` rides in `detail`
+            # only on this branch, keeping the all-new detail dict unchanged.
+            findings.append(
+                Finding(
+                    "skills.customize-legacy",
+                    "warning",
+                    f"{', '.join(orphaned)} does not apply in "
+                    f"{', '.join(new_trees)} (resolved {DEV_PRIMITIVE_NEW}) but still "
+                    f"applies in {', '.join(legacy_trees)} — COPY the override file(s) "
+                    f"to the {DEV_PRIMITIVE_NEW} name; renaming would drop the "
+                    f"customization from {', '.join(legacy_trees)}",
+                    {
+                        "files": orphaned,
+                        "skill": DEV_PRIMITIVE_NEW,
+                        "legacy_trees": legacy_trees,
+                    },
+                )
+            )
+        elif orphaned:
             findings.append(
                 Finding(
                     "skills.customize-legacy",

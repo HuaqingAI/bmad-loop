@@ -271,11 +271,13 @@ class Engine:
         # best-effort hint (None when the estimate could not be computed).
         self._graceful_stopped = False
         self._graceful_remaining: int | None = None
-        # dev-primitive name resolved from disk, memoized per skill tree (see
-        # _dev_skill). Keyed by tree — one run can mix trees (dev=claude reads
-        # .claude/skills, review=codex reads .agents/skills) — with None for an
-        # adapter that carries no profile at all.
-        self._dev_skill_cache: dict[str | None, str] = {}
+        # dev-primitive name resolved from disk, memoized per (workspace project
+        # root, skill tree) — see _dev_skill. By tree because one run can mix them
+        # (dev=claude reads .claude/skills, review=codex reads .agents/skills), with
+        # None for an adapter that carries no profile at all; by project root
+        # because under isolation each unit resolves against its OWN worktree and
+        # one Engine drives every unit of a run.
+        self._dev_skill_cache: dict[tuple[Path, str | None], str] = {}
         # Per-unit worktree isolation + integration flow (issue #244 F-3/F-9a).
         # Built from narrow deps + engine callbacks; the same-name Engine._* worktree
         # methods below delegate to it. `emit` is late-bound (a lambda, not the bound
@@ -2019,14 +2021,23 @@ class Engine:
         with no ``profile`` (test fakes) yields tree None, which
         ``dev_primitive_or_default`` maps to the legacy name.
 
-        Resolving against the main checkout is correct under worktree isolation
-        too: ``provision_worktree`` copies the skill from this same tree path,
-        so the worktree can only carry the name resolved here."""
+        Resolved against the WORKSPACE, never the main checkout: the session runs
+        with ``cwd=self.workspace.root``, so the tree deciding whether the spelled
+        name is a command at all is the worktree's. The two agree on a freshly
+        provisioned unit — ``provision_worktree`` copies the primitive in from the
+        main repo — but NOT on resume: ``reopen_unit`` re-mounts an existing
+        worktree without re-provisioning it, so a main checkout upgraded across the
+        pause would resolve the new name into a worktree carrying only the legacy
+        one, and the session HALTs on an unknown command having written nothing.
+        The cache is keyed on the workspace root for the same reason: one Engine
+        drives every unit of a run, so a resumed unit's worktree must not answer
+        for the fresh worktrees mounted after it."""
         adapter = self.adapters.get(role)
         tree = getattr(getattr(adapter, "profile", None), "skill_tree", None)
-        if tree not in self._dev_skill_cache:
-            self._dev_skill_cache[tree] = dev_primitive_or_default(self.paths.project, tree)
-        return self._dev_skill_cache[tree]
+        project = self.workspace.paths.project
+        if (project, tree) not in self._dev_skill_cache:
+            self._dev_skill_cache[project, tree] = dev_primitive_or_default(project, tree)
+        return self._dev_skill_cache[project, tree]
 
     def _operator_park_enabled(self) -> bool:
         """Whether a dev session may park a story at ``awaiting-operator`` (#335).

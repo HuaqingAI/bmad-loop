@@ -1488,6 +1488,40 @@ def test_orphaned_legacy_customize_warns_once(tmp_path, files, expected):
     assert "skills.customize-legacy" in VALIDATE_CHECKS
 
 
+def test_mixed_era_orphan_says_copy_because_the_legacy_tree_still_applies_it(tmp_path):
+    """A project mid-upgrade carries a different era in each tree, and each tree
+    resolves its overrides under its OWN era — so `_bmad/custom/bmad-dev-auto.toml`
+    is orphaned for the new tree and LIVE for the legacy one.
+
+    Still a finding: the new tree really is running unstyled, and suppressing it
+    there would be the silent degradation this warning exists to surface. But the
+    remediation flips to COPY, because following a rename would simply move the
+    customization from the legacy tree to the new one — trading one unstyled tree
+    for another rather than fixing anything. `legacy_trees` rides in `detail` only
+    on this branch, so the all-new dict above stays an exact-match oracle."""
+    claude, codex = get_profile("claude"), get_profile("codex")
+    new_tree, legacy_tree = claude.skill_tree, codex.skill_tree
+    assert new_tree != legacy_tree
+    _install_skills(tmp_path, new_tree, {DEV_PRIMITIVE_NEW: DEV_PRIMITIVE_MARKERS})
+    _install_skills(tmp_path, legacy_tree, {DEV_PRIMITIVE_LEGACY: DEV_PRIMITIVE_MARKERS})
+    _write_customize_files(tmp_path, f"{DEV_PRIMITIVE_LEGACY}.toml")
+
+    findings = dev_primitive_warnings(tmp_path, [new_tree, legacy_tree])
+    assert [f.check for f in findings] == ["skills.customize-legacy"]
+    assert findings[0].severity == "warning"
+    assert findings[0].detail == {
+        "files": [_LEGACY_TEAM_TOML],
+        "skill": DEV_PRIMITIVE_NEW,
+        "legacy_trees": [legacy_tree],
+    }
+    # names BOTH trees, so the operator can tell which one still styles the file...
+    assert new_tree in findings[0].message
+    assert legacy_tree in findings[0].message
+    # ...and the remediation is the non-destructive one
+    assert "COPY" in findings[0].message
+    assert "rename the override file(s) to match" not in findings[0].message
+
+
 @pytest.mark.parametrize(
     ("catalog", "files"),
     [
