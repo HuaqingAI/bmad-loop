@@ -407,8 +407,12 @@ def resolve_review_layers(project: Path, tree: str) -> ReviewResolution | None:
     the model in run context — undecidable here, so hard-requiring its skill would
     be a false FAIL.
     """
-    skill = dev_primitive_or_default(project, tree)
-    merged = _merged_review_layers(project, tree, skill)
+    # `primitive`, not `skill`: the layer loop below binds `skill` to each INVOKED
+    # review skill, and the step-04 fallback after it reads this name as a directory.
+    # Sharing one name is safe only while the layer branch returns first — a
+    # shadowing this function should not be one edit away from.
+    primitive = dev_primitive_or_default(project, tree)
+    merged = _merged_review_layers(project, tree, primitive)
     if merged is None:
         return None
     layers, unreadable = merged
@@ -446,7 +450,7 @@ def resolve_review_layers(project: Path, tree: str) -> ReviewResolution | None:
             unreadable,
         )
     try:
-        step04 = (project / tree / skill / "step-04-review.md").read_text(encoding="utf-8")
+        step04 = (project / tree / primitive / "step-04-review.md").read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return None
     # step-04 is a whole prose document rather than a self-contained execution

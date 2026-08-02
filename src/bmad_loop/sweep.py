@@ -1188,7 +1188,8 @@ class SweepEngine(Engine):
         return self._generic_bundle_prompt(task, feedback)
 
     def _generic_bundle_prompt(self, task: StoryTask, feedback: Path | None) -> str:
-        """Bundle invocation for the generic bmad-dev-auto dev skill: the self-contained
+        """Bundle invocation for the generic dev primitive (disk-resolved, see
+        ``Engine._dev_skill``): the self-contained
         intent.md (intent + verbatim ledger entries) is handed over as freeform
         intent. The orchestrator owns the deferred-work ledger — the skill is told
         not to edit it — and records resolution itself in `_post_dev_state_sync`.
