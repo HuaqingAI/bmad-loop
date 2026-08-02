@@ -627,15 +627,14 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         return options
 
     def _free_scoped_key(self, session: str, name: str) -> None:
-        # The one unset path both sweeps share. rc-0 is not proof the key is
+        # The one unset path both sweeps share, routed through the same warn-
+        # never-raise body as every other write. rc-0 is not proof the key is
         # gone on psmux's write side, but a nonzero rc IS proof it is not —
         # silence here would leak a key for the server's life with no signal.
-        proc = self._run(["set-option", "-u", "-t", session, name], check=False)
-        if proc.returncode != 0:
-            print(
-                f"warning: could not free option {name} on {session}: {proc.stderr.strip()}",
-                file=sys.stderr,
-            )
+        # Delegating also contains a dead round-trip to its own key: the outer
+        # guard in either sweep would otherwise catch it and abandon the keys
+        # after it in the batch.
+        self._write_scoped(["set-option", "-u", "-t", session, name], f"{name} on {session}")
 
     def _sweep_orphan_keys(self, session: str) -> None:
         # Free seam-minted (`__blw@N`) keys whose window no longer exists

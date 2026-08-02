@@ -1032,6 +1032,26 @@ def test_kill_window_name_target_resolves_scope_before_the_kill(monkeypatch):
     assert [c[5] for c in calls if c[1] == "set-option"] == ["@bmad_project__blw@3"]
 
 
+def test_kill_window_sends_the_kill_when_the_scope_lookup_dies(monkeypatch):
+    # Resolving a name target costs a listing round-trip, and it happens BEFORE
+    # the kill (a name is unresolvable once the window is dead) — so a dead
+    # probe there must not cost the kill. It cannot: the base list_windows
+    # swallows transport failures to [], so the scope degrades to None and the
+    # kill goes out unscoped, leaving the keys to the orphan sweep. Pinned
+    # because the ordering makes the opposite reading plausible on sight.
+    sent = []
+
+    def fake(argv, **kwargs):
+        if argv[1] == "list-windows":
+            raise subprocess.TimeoutExpired(argv, 1)
+        sent.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    PsmuxMultiplexer().kill_window("=ctl:run-abc")  # must not raise
+    assert [c[1] for c in sent] == ["kill-window"]
+
+
 def test_kill_window_failed_kill_retains_the_keys(monkeypatch):
     # The containment flip: a kill that did not land (the window is still in
     # the liveness listing) must leave the live window its keys — a key-less
@@ -1159,7 +1179,31 @@ def test_kill_window_unfreeable_key_warns(monkeypatch, capsys):
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     PsmuxMultiplexer().kill_window("ctl:@3")  # must not raise
-    assert "could not free option @bmad_project__blw@3" in capsys.readouterr().err
+    assert "set-option -u @bmad_project__blw@3 on ctl failed" in capsys.readouterr().err
+
+
+def test_a_dead_free_round_trip_does_not_abandon_the_rest_of_the_batch(monkeypatch, capsys):
+    # Every free is contained to its own key. A transport failure on key N used
+    # to escape to the sweep's outer guard, which warned once and left keys
+    # N+1..M stranded — one intermittent round-trip costing the whole batch.
+    attempted = []
+
+    def fake(argv, **kwargs):
+        if argv[1] == "show-options":
+            out = '@bmad_project__blw@7 "gone"\n@bmad_return_pane__blw@7 "%9"\n'
+            return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+        if argv[1] == "list-windows":
+            return subprocess.CompletedProcess(argv, 0, stdout="@1\n", stderr="")
+        if argv[1] == "set-option":
+            attempted.append(argv[-1])
+            if len(attempted) == 1:
+                raise subprocess.TimeoutExpired(argv, 1)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    PsmuxMultiplexer()._sweep_orphan_keys("ctl")
+    assert attempted == ["@bmad_project__blw@7", "@bmad_return_pane__blw@7"]
+    assert "set-option -u @bmad_project__blw@7 on ctl failed" in capsys.readouterr().err
 
 
 def test_kill_window_unroutable_target_skips_cleanup_but_kills(monkeypatch):
