@@ -92,9 +92,13 @@ _FM_STATUS_RE = re.compile(
 )
 
 # The skill's no-spec fallback artifact (HALT when {spec_file} is unknown/missing):
-# `{implementation_artifacts}/bmad-dev-auto-result-<slug-or-timestamp>.md`. It
-# carries a terminal frontmatter `status:` but no `## Auto Run Result` heading.
-FALLBACK_RESULT_PREFIX = "bmad-dev-auto-result-"
+# `{implementation_artifacts}/<skill>-result-<slug-or-timestamp>.md`. It carries a
+# terminal frontmatter `status:` but no `## Auto Run Result` heading. BOTH eras are
+# listed and matched unconditionally: the artifact is named after whichever skill
+# wrote it, and a run can read an artifact left by the other era (a resume across an
+# upstream upgrade, or a project mid-migration), so this must never be keyed on the
+# skill name resolved on disk today.
+FALLBACK_RESULT_PREFIXES = ("bmad-build-auto-result-", "bmad-dev-auto-result-")
 
 
 @dataclass(frozen=True)
@@ -356,8 +360,9 @@ def is_result_artifact(path: Path, *, since_ns: int) -> bool:
     scanning a directory shared with every concurrent run (#261).
 
     Qualifies when the file was modified at/after ``since_ns`` (the session-launch
-    floor) AND either is the by-name no-spec fallback (`bmad-dev-auto-result-*`,
-    which carries no heading by design) or carries a real, non-fenced
+    floor) AND either is the by-name no-spec fallback (`bmad-build-auto-result-*`,
+    or `bmad-dev-auto-result-*` pre-rename — it carries no heading by design, and
+    both spellings match unconditionally) or carries a real, non-fenced
     ``## Auto Run Result`` heading — a fence-quoted example must not qualify the
     spec (#52). An unreadable/undecodable candidate cannot be SHOWN to carry a
     terminal section, so it does not qualify (UnicodeDecodeError is a ValueError,
@@ -367,7 +372,7 @@ def is_result_artifact(path: Path, *, since_ns: int) -> bool:
             return False
     except OSError:
         return False
-    if path.name.startswith(FALLBACK_RESULT_PREFIX):
+    if path.name.startswith(FALLBACK_RESULT_PREFIXES):
         return True
     try:
         text = path.read_text(encoding="utf-8")
@@ -420,7 +425,7 @@ def is_frontmatter_candidate(path: Path, *, since_ns: int) -> bool:
     territory — and has a terminal frontmatter ``status:`` (``done``,
     ``blocked``, or ``awaiting-operator``). Any
     unreadable/undecodable read degrades to False, never an exception."""
-    if path.name.startswith(FALLBACK_RESULT_PREFIX):
+    if path.name.startswith(FALLBACK_RESULT_PREFIXES):
         return False
     try:
         if path.stat().st_mtime_ns < since_ns:

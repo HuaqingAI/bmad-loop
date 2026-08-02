@@ -40,7 +40,7 @@ Inspired by the original [bmad-automator](https://github.com/bmad-code-org/bmad-
 
 - **Python 3.11+**, a **terminal multiplexer** (tmux is the bundled default), and a supported coding CLI — `claude` by default; `codex`, `gemini`, `copilot`, and `antigravity` (`agy`) via [profiles](#other-coding-clis).
 - **Linux or macOS** (or **Windows via WSL**, which _is_ Linux — it runs as-is). tmux is the bundled terminal-multiplexer backend (externals like the [herdr adapter](https://github.com/pbean/bmad-loop-adapter-herdr) co-install as packages and self-register — see [Terminal multiplexer backends](docs/multiplexer-backends.md)), and all of it sits behind a pluggable **registry** of OS seams (transport, process lifecycle, hook interpreter) with availability-aware selection — env var → persisted `[mux] backend` choice (`bmad-loop mux set <name>`) → platform default (`psmux` on Windows, `tmux` elsewhere) → first available platform match — so a native-Windows backend slots in as new files + a registration line each, with no engine edits — see [Porting bmad-loop to a new OS](docs/porting-to-a-new-os.md). Native Windows is not yet shipped.
-- A **BMAD v6 project** (`_bmad/bmm/config.yaml`, a `sprint-status.yaml` from `bmad-sprint-planning`) on **BMAD-METHOD ≥ 6.10.0**, with the upstream `bmad-dev-auto` skill (and the review-layer skills its step-04 invokes inline: `bmad-review-adversarial-general` + `bmad-review-edge-case-hunter`, or the merged `bmad-review` skill that supersedes them in newer releases) and the bmad-loop skill module from this repo installed (`bmad-loop-resolve`, `bmad-loop-sweep` — see [Installing the skill module](#installing-the-skill-module)). Standard BMAD skills stay untouched.
+- A **BMAD v6 project** (`_bmad/bmm/config.yaml`, a `sprint-status.yaml` from `bmad-sprint-planning`) on **BMAD-METHOD ≥ 6.10.0**, with the upstream dev primitive installed — `bmad-build-auto`, or a complete `bmad-dev-auto` on pre-rename releases (bmad-loop resolves whichever is on disk and drives it under that name, so either era works with no config edit; the bare forwarding shim the rename leaves behind is refused as incomplete — it carries none of the step files or `customize.toml` a real install has — because a session dispatched into it stalls on an interactive migration gate) — plus the review-layer skills its step-04 invokes inline (`bmad-review-adversarial-general` + `bmad-review-edge-case-hunter`, or the merged `bmad-review` skill that supersedes them in newer releases) and the bmad-loop skill module from this repo installed (`bmad-loop-resolve`, `bmad-loop-sweep` — see [Installing the skill module](#installing-the-skill-module)). Standard BMAD skills stay untouched.
 
 ## Quick start
 
@@ -165,7 +165,7 @@ Press **`g`** to edit `.bmad-loop/policy.toml` in a form grouped by section — 
 bmad-loop drives the same dev → verify → review → commit loop from **either** of two story sources — chosen per project, or per run:
 
 - **Sprint mode (default).** Stories come from `sprint-status.yaml` (written by `bmad-sprint-planning` from your PRD/epics). The loop walks the board by `ready-for-dev` status, keyed by story ref (`1-2-account-mgmt`). This is what the rest of this README describes.
-- **Stories mode (opt-in).** Stories come from a typed `stories.yaml` — the **Story Breakdown** output of `bmad-spec`, a fixed-name sibling of `SPEC.md` in the epic's spec folder. The loop dispatches each entry by **folder + id** (`/bmad-dev-auto Spec folder: <folder>. Story id: <id>.`); the dev skill creates-or-resumes the story spec at `<folder>/stories/<id>-<slug>.md`, and the orchestrator reads that id-keyed path back deterministically — no shared board to line-edit, no mtime-scan of result artifacts.
+- **Stories mode (opt-in).** Stories come from a typed `stories.yaml` — the **Story Breakdown** output of `bmad-spec`, a fixed-name sibling of `SPEC.md` in the epic's spec folder. The loop dispatches each entry by **folder + id** (`/bmad-build-auto Spec folder: <folder>. Story id: <id>.`, spelled with whichever primitive name resolves on disk); the dev skill creates-or-resumes the story spec at `<folder>/stories/<id>-<slug>.md`, and the orchestrator reads that id-keyed path back deterministically — no shared board to line-edit, no mtime-scan of result artifacts.
 
 Turn it on per project with `[stories] source = "stories"` + `spec_folder = "<epic folder>"`, or per run with `bmad-loop run --spec <epic folder>` (which overrides the policy). Everything downstream — dev/verify/review/commit, worktree isolation, gates, crash resume, the TUI — is identical; only the story source and the per-story controls below differ.
 
@@ -191,7 +191,7 @@ A story may set both checkpoints (it pauses twice); `gates.mode` pauses stack on
 
 `bmad-loop run --dry-run --spec <folder>` prints the linear schedule (list order, checkpoint markers, live on-disk state); `bmad-loop status` shows the same stories board.
 
-> Stories mode requires a `bmad-dev-auto` new enough to support folder+id dispatch; the run preflight (and `bmad-loop validate`) checks for it and tells you to update the BMAD module if it is missing. Sprint mode is unaffected and remains the default indefinitely.
+> Stories mode requires a dev primitive new enough to support folder+id dispatch; the run preflight (and `bmad-loop validate`) checks for it and tells you to update the BMAD module if it is missing. Sprint mode is unaffected and remains the default indefinitely.
 
 ## How a story flows
 
@@ -200,14 +200,14 @@ A story may set both checkpoints (it pauses twice); `gates.mode` pauses stack on
 ```text
 sprint-status.yaml: 1-2-account-mgmt: ready-for-dev
   │
-  ├─ DEV     tmux window: claude "/bmad-dev-auto 1-2-account-mgmt"
-  │          bmad-dev-auto: plans a 1.5–4k-token spec, auto-approves it,
+  ├─ DEV     tmux window: claude "/bmad-build-auto 1-2-account-mgmt"
+  │          bmad-build-auto: plans a 1.5–4k-token spec, auto-approves it,
   │          implements, self-reviews inline (parallel review layers),
   │          commits, finalizes spec → done … Stop hook signals the orchestrator
   ├─ VERIFY  spec exists · status done · baseline matches · diff non-empty
   │          · run [verify].commands (pytest, ruff…) — a broken build never
   │          reaches review; a failure spawns a fix session fed the output
-  ├─ REVIEW  fresh window: claude "/bmad-dev-auto <done spec>" — re-invoking on a
+  ├─ REVIEW  fresh window: claude "/bmad-build-auto <done spec>" — re-invoking on a
   │  (gated) done spec runs a fresh independent step-04 review pass (parallel review
   │          layers → triage → auto-apply patches → ledger → defer ambiguity →
   │          commit). Gated on the skill's `followup_review_recommended` flag
@@ -243,7 +243,7 @@ bmad-loop sweep [--no-prompt] [--decisions-only] [--max-bundles N] [--repeat] [-
   │           terminal (build / close / keep-open per option, with a
   │           recommendation); answers land in the ledger as `decision:`
   │           lines. Unattended runs skip this and leave decisions open.
-  └─ BUNDLES  each bundle runs the normal pipeline: bmad-dev-auto (on the bundle
+  └─ BUNDLES  each bundle runs the normal pipeline: bmad-build-auto (on the bundle
               spec, then re-invoked on the done spec for review) → verify commands
               → commit. The review gate also checks every bundle entry is
               `status: done` in the ledger.
@@ -273,19 +273,19 @@ Bundle dev sessions can themselves append new deferred entries (split-off goals,
 
 ## Installing the skill module
 
-The orchestrator drives the upstream `bmad-dev-auto` skill as its inner dev primitive — unmodified, so there is no fork to keep in sync; it both implements and (re-invoked on the done spec) runs the follow-up review — plus its own bundled `bmad-loop-*` skills for escalation, sweep, and setup. Your standard BMAD install is never modified. The three bundled skills ship in the `bmad-loop` wheel (canonical source: `src/bmad_loop/data/skills/`, BMAD module code `bmad-loop`) so `bmad-loop init` lays them down for you; `bmad-dev-auto` and the review-layer skills its step-04 invokes inline are prerequisites installed by the BMad Method (bmm) module:
+The orchestrator drives the upstream dev primitive — `bmad-build-auto`, or `bmad-dev-auto` on pre-rename releases — unmodified, so there is no fork to keep in sync; it both implements and (re-invoked on the done spec) runs the follow-up review — plus its own bundled `bmad-loop-*` skills for escalation, sweep, and setup. Your standard BMAD install is never modified. The three bundled skills ship in the `bmad-loop` wheel (canonical source: `src/bmad_loop/data/skills/`, BMAD module code `bmad-loop`) so `bmad-loop init` lays them down for you; the dev primitive and the review-layer skills its step-04 invokes inline are prerequisites installed by the BMad Method (bmm) module:
 
-| Skill                             | Role                                                                                        |
-| --------------------------------- | ------------------------------------------------------------------------------------------- |
-| `bmad-dev-auto`                   | unattended implementation + follow-up review (**upstream** — bmm prerequisite, not bundled) |
-| `bmad-review-adversarial-general` | inline step-04 review layer (**upstream** — bmm prerequisite, not bundled)                  |
-| `bmad-review-edge-case-hunter`    | inline step-04 review layer (**upstream** — bmm prerequisite, not bundled)                  |
-| `bmad-review`                     | merged lens-based reviewer, supersedes the hunters (**upstream** — bmm prereq, not bundled) |
-| `bmad-loop-resolve`               | interactive CRITICAL-escalation resolution (`/bmad-loop-resolve <story>`)                   |
-| `bmad-loop-sweep`                 | deferred-work ledger triage (automation-only)                                               |
-| `bmad-loop-setup`                 | installs the orchestrator tool from Git, then runs `bmad-loop init` + `validate`            |
+| Skill                             | Role                                                                                                                                                           |
+| --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bmad-build-auto`                 | unattended implementation + follow-up review (**upstream** — bmm prerequisite, not bundled; named `bmad-dev-auto` before the rename, and either era is driven) |
+| `bmad-review-adversarial-general` | inline step-04 review layer (**upstream** — bmm prerequisite, not bundled)                                                                                     |
+| `bmad-review-edge-case-hunter`    | inline step-04 review layer (**upstream** — bmm prerequisite, not bundled)                                                                                     |
+| `bmad-review`                     | merged lens-based reviewer, supersedes the hunters (**upstream** — bmm prereq, not bundled)                                                                    |
+| `bmad-loop-resolve`               | interactive CRITICAL-escalation resolution (`/bmad-loop-resolve <story>`)                                                                                      |
+| `bmad-loop-sweep`                 | deferred-work ledger triage (automation-only)                                                                                                                  |
+| `bmad-loop-setup`                 | installs the orchestrator tool from Git, then runs `bmad-loop init` + `validate`                                                                               |
 
-`bmad-loop validate` preflights `bmad-dev-auto` (always) plus the review skills that copy of the skill will actually invoke — read from its `customize.toml` review layers, or from `step-04-review.md` on releases that name their reviewers inline. So a merged-`bmad-review` install needs only `bmad-review`, a v6.10.0 install needs the two hunters it names, and a tree whose configured layers reference a skill it does not have is reported instead of failing on every dev run. Missing skills (or a `bmad-dev-auto` without its `customize.toml`) are reported with bmm-module remediation before any run starts.
+`bmad-loop validate` preflights the dev primitive (always — reporting which name it resolved) plus the review skills that copy of the skill will actually invoke — read from its `customize.toml` review layers, or from `step-04-review.md` on releases that name their reviewers inline. So a merged-`bmad-review` install needs only `bmad-review`, a v6.10.0 install needs the two hunters it names, and a tree whose configured layers reference a skill it does not have is reported instead of failing on every dev run. Missing skills (or a dev primitive without its `customize.toml`) are reported with bmm-module remediation before any run starts.
 
 **Via uv + `bmad-loop init` (self-sufficient).** Installing the tool and running `init` is all you need — `init` installs the `bmad-loop-*` skills into `.claude/skills/` (claude) and/or `.agents/skills/` (codex/gemini) for the CLIs you select, alongside the hooks and policy:
 
@@ -327,7 +327,7 @@ Your `.bmad-loop/policy.toml` is left untouched on upgrade — new keys are opti
 
 To remove bmad-loop from a project, see [Uninstalling](docs/setup-guide.md#uninstalling) — it reverses what `init` laid down (state, skills, hooks, gitignore) and uninstalls the tool.
 
-**Via the BMAD-method installer.** The installer copies the bundled `bmad-loop-*` skills into your project (but not the orchestrator tool), alongside the upstream `bmad-dev-auto` skill the orchestrator drives. Finish setup with `/bmad-loop-setup`, which installs the tool from Git, asks which coding CLIs to drive, registers their hooks (`init` skips the already-present skills), and runs the preflight:
+**Via the BMAD-method installer.** The installer copies the bundled `bmad-loop-*` skills into your project (but not the orchestrator tool), alongside the upstream dev primitive the orchestrator drives. Finish setup with `/bmad-loop-setup`, which installs the tool from Git, asks which coding CLIs to drive, registers their hooks (`init` skips the already-present skills), and runs the preflight:
 
 ```bash
 claude "/bmad-loop-setup accept all defaults"
@@ -335,7 +335,7 @@ claude "/bmad-loop-setup accept all defaults"
 
 See **[docs/setup-guide.md](docs/setup-guide.md)** for the full walkthrough — choosing CLIs, installing the tool and TUI together or separately, and initializing codex/gemini.
 
-The bundled skills must be installed together with the upstream `bmad-dev-auto` dev session: `bmad-loop-sweep` owns the canonical `deferred-work-format.md` that the orchestrator normalizes the ledger to, and `bmad-dev-auto` appends the flat deferred-work entries it normalizes. The `bmad-dev-auto` skill is driven unmodified, so its own `customize.toml` applies as-is; it needs no merge — it is consumed directly from the bmm module. There is no review fork to keep in sync: review is just a re-invocation of `bmad-dev-auto` on the done spec.
+The bundled skills must be installed together with the upstream dev primitive: `bmad-loop-sweep` owns the canonical `deferred-work-format.md` that the orchestrator normalizes the ledger to, and the primitive appends the flat deferred-work entries it normalizes. The primitive is driven unmodified, so its own `customize.toml` applies as-is; it needs no merge — it is consumed directly from the bmm module. There is no review fork to keep in sync: review is just a re-invocation of the primitive on the done spec.
 
 ## Policy (`.bmad-loop/policy.toml`)
 

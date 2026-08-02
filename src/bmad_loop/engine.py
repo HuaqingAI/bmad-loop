@@ -33,6 +33,7 @@ from .escalation import (
     preference_escalations,
     review_retry_or_exhaust,
 )
+from .install import dev_primitive_or_default
 from .journal import Journal, save_state
 from .model import (
     PAUSE_EPIC_BOUNDARY,
@@ -150,8 +151,9 @@ class RunSummary:
 # *infer* the completion-marker convention, and one that finishes its work but
 # never writes the marker leaves the orchestrator waiting (a completion-signal
 # livelock, bounded only by session_timeout_min). The orchestrator's adapter
-# discovers the marker by its `bmad-dev-auto-result-` filename prefix and
-# mtime, not by exact name.
+# discovers the marker by its `<dev primitive>-result-` filename prefix and
+# mtime, not by exact name (devcontract.FALLBACK_RESULT_PREFIXES accepts both
+# the pre- and post-rename spellings, so either resolution reads back).
 WORKFLOW_COMPLETION_CONTRACT = """
 
 ## Completion signal (required)
@@ -269,6 +271,13 @@ class Engine:
         # best-effort hint (None when the estimate could not be computed).
         self._graceful_stopped = False
         self._graceful_remaining: int | None = None
+        # dev-primitive name resolved from disk, memoized per (workspace project
+        # root, skill tree) — see _dev_skill. By tree because one run can mix them
+        # (dev=claude reads .claude/skills, review=codex reads .agents/skills), with
+        # None for an adapter that carries no profile at all; by project root
+        # because under isolation each unit resolves against its OWN worktree and
+        # one Engine drives every unit of a run.
+        self._dev_skill_cache: dict[tuple[Path, str | None], str] = {}
         # Per-unit worktree isolation + integration flow (issue #244 F-3/F-9a).
         # Built from narrow deps + engine callbacks; the same-name Engine._* worktree
         # methods below delegate to it. `emit` is late-bound (a lambda, not the bound
@@ -1291,20 +1300,22 @@ class Engine:
         (``devcontract.synthesize_result``). No-op once set or when the claimed
         spec is absent.
 
-        The skill's no-spec fallback artifact (``bmad-dev-auto-result-*``, written
-        when intent was too unclear to even CREATE a spec) is refused: it is not the
-        story's spec, so every consumer here misreads it. ``rearm_escalation`` would
-        flip frontmatter on a marker no re-drive reads, ``_reset_spec_for_repair``
-        would re-open it as if it were the frozen intent contract, and the repair
-        prompt would point the session at it — which the #261 read-back then pins to,
-        polling a stale marker while the re-drive's real spec goes unread."""
+        The skill's no-spec fallback artifact (``bmad-build-auto-result-*``, or
+        ``bmad-dev-auto-result-*`` pre-rename — ``FALLBACK_RESULT_PREFIXES`` matches
+        both; written when intent was too unclear to even CREATE a spec) is refused:
+        it is not the story's spec, so every consumer here misreads it.
+        ``rearm_escalation`` would flip frontmatter on a marker no re-drive reads,
+        ``_reset_spec_for_repair`` would re-open it as if it were the frozen intent
+        contract, and the repair prompt would point the session at it — which the
+        #261 read-back then pins to, polling a stale marker while the re-drive's
+        real spec goes unread."""
         if task.spec_file:
             return
         spec_file = (result_json or {}).get("spec_file")
         if not spec_file:
             return
         spec_path = verify.resolve_spec_path(str(spec_file), self.workspace.paths)
-        if spec_path.name.startswith(devcontract.FALLBACK_RESULT_PREFIX):
+        if spec_path.name.startswith(devcontract.FALLBACK_RESULT_PREFIXES):
             return
         if spec_path.is_file():
             task.spec_file = str(spec_path)
@@ -1995,6 +2006,39 @@ class Engine:
         a future alternative dev skill can re-introduce the legacy branch."""
         return self.policy.dev.skill == "bmad-dev-auto"
 
+    def _dev_skill(self, role: str = "dev") -> str:
+        """The dev-primitive skill NAME to spell in ``role``'s session prompt.
+
+        Upstream renamed the primitive ``bmad-dev-auto`` → ``bmad-build-auto``
+        (BMAD-METHOD #2651), so the invoked name is resolved from what is
+        actually on disk rather than hardcoded: a target project can be on
+        either era. This is NOT ``policy.dev.skill`` — that stays the adapter
+        discriminator ``_generic_dev`` reads; only the spelled name moves.
+
+        Resolution is per skill tree because one run can mix them (dev=claude →
+        ``.claude/skills``, review=codex → ``.agents/skills``), and memoized
+        because every prompt build would otherwise re-stat the tree. An adapter
+        with no ``profile`` (test fakes) yields tree None, which
+        ``dev_primitive_or_default`` maps to the legacy name.
+
+        Resolved against the WORKSPACE, never the main checkout: the session runs
+        with ``cwd=self.workspace.root``, so the tree deciding whether the spelled
+        name is a command at all is the worktree's. The two agree on a freshly
+        provisioned unit — ``provision_worktree`` copies the primitive in from the
+        main repo — but NOT on resume: ``reopen_unit`` re-mounts an existing
+        worktree without re-provisioning it, so a main checkout upgraded across the
+        pause would resolve the new name into a worktree carrying only the legacy
+        one, and the session HALTs on an unknown command having written nothing.
+        The cache is keyed on the workspace root for the same reason: one Engine
+        drives every unit of a run, so a resumed unit's worktree must not answer
+        for the fresh worktrees mounted after it."""
+        adapter = self.adapters.get(role)
+        tree = getattr(getattr(adapter, "profile", None), "skill_tree", None)
+        project = self.workspace.paths.project
+        if (project, tree) not in self._dev_skill_cache:
+            self._dev_skill_cache[project, tree] = dev_primitive_or_default(project, tree)
+        return self._dev_skill_cache[project, tree]
+
     def _operator_park_enabled(self) -> bool:
         """Whether a dev session may park a story at ``awaiting-operator`` (#335).
 
@@ -2646,7 +2690,7 @@ class Engine:
         # ledger is append-only for sessions — new findings are fine, existing
         # entries are orchestrator-owned.
         return (
-            f"/bmad-dev-auto {task.spec_file} — If this review defers new "
+            f"/{self._dev_skill('review')} {task.spec_file} — If this review defers new "
             f"findings, append them to the deferred-work ledger as NEW entries "
             f"only; do NOT modify, re-open, or rewrite existing ledger entries — "
             f"the orchestrator owns their status and resolution."
@@ -2791,8 +2835,18 @@ class Engine:
             # the same implementation-artifacts dir the dev adapter already
             # searches — correct in place and under worktree isolation alike,
             # because spec.cwd is self.workspace.root either way.
+            # This is the PRODUCER of the marker name. ``role``, not the default:
+            # a workflow declares its own role (WORKFLOW_ROLES = dev | review) and
+            # runs on THAT adapter, whose skill tree can be a different one at a
+            # different era — dev=claude on .claude/skills post-rename, review=codex
+            # on .agents/skills pre-rename. Resolving off the dev tree would name
+            # the session a primitive its own tree does not carry. The reader still
+            # accepts the legacy spelling because devcontract.FALLBACK_RESULT_PREFIXES
+            # matches both eras unconditionally, so discovery survives either
+            # resolution — the two halves agreeing, not a broken read-back.
             marker_path = (
-                self.workspace.paths.implementation_artifacts / f"bmad-dev-auto-result-{task_id}.md"
+                self.workspace.paths.implementation_artifacts
+                / f"{self._dev_skill(role)}-result-{task_id}.md"
             )
             prompt += WORKFLOW_COMPLETION_CONTRACT.format(marker_path=marker_path)
         spec = SessionSpec(
@@ -3079,16 +3133,16 @@ class Engine:
         if feedback is None:
             if task.restore_patch and task.spec_file:
                 return (
-                    f"/bmad-dev-auto Resume review of the in-review spec at "
+                    f"/{self._dev_skill()} Resume review of the in-review spec at "
                     f"`{task.spec_file}`. The attempted change was restored onto "
                     f"the working tree after an intent-gap resolution; review it "
                     f"against the amended spec."
                 ) + self._operator_park_instruction()
-            return f"/bmad-dev-auto {task.story_key}" + self._operator_park_instruction()
+            return f"/{self._dev_skill()} {task.story_key}" + self._operator_park_instruction()
         self._reset_spec_for_repair(task)
         spec_ref = task.spec_file or task.story_key
         return (
-            f"/bmad-dev-auto Resume the autonomous dev session on the in-progress "
+            f"/{self._dev_skill()} Resume the autonomous dev session on the in-progress "
             f"spec at `{spec_ref}`. The previous session's work failed deterministic "
             f"verification; repair the working tree so verification passes without "
             f"changing the spec's frozen intent contract. Verification evidence is "

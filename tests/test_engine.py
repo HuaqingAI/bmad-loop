@@ -3497,15 +3497,20 @@ def test_expected_spec_withheld_from_labeled_workflow_session(project):
     assert pinned is None
 
 
-def test_record_dev_spec_refuses_the_no_spec_fallback_marker(project):
-    """`bmad-dev-auto-result-*` is the skill's "intent too unclear to even create a
+@pytest.mark.parametrize("prefix", ["bmad-build-auto-result-", "bmad-dev-auto-result-"])
+def test_record_dev_spec_refuses_the_no_spec_fallback_marker(project, prefix):
+    """`<primitive>-result-*` is the skill's "intent too unclear to even create a
     spec" artifact. Recording it as the story's spec misroutes every consumer: the
     escalation re-arm flips frontmatter on a marker nothing reads, the repair leg
     re-opens it as the frozen intent contract, and the #261 read-back then pins to
-    it — polling a stale marker while the re-drive's real spec goes unread."""
+    it — polling a stale marker while the re-drive's real spec goes unread.
+
+    Both eras: this refusal reads `FALLBACK_RESULT_PREFIXES`, and pinning only the
+    legacy spelling left the post-rename marker — the one a current project
+    actually writes — free to be recorded as the story's spec."""
     engine, _ = make_engine(project, [])
     task = StoryTask(story_key="1-1-a", epic=1)
-    marker = project.implementation_artifacts / "bmad-dev-auto-result-1-1-a-dev-1.md"
+    marker = project.implementation_artifacts / f"{prefix}1-1-a-dev-1.md"
     marker.write_text("---\nstatus: blocked\n---\n\nIntent unclear.\n")
 
     engine._record_dev_spec(task, {"spec_file": str(marker)})
@@ -7853,3 +7858,159 @@ def test_marker_repair_skips_on_fm_mismatch(project):
     (skipped,) = [e for e in engine.journal.entries() if e["kind"] == "spec-marker-repair-skipped"]
     assert skipped["reason"] == "fm-mismatch"
     assert "## Auto Run Result" not in sp.read_text()
+
+
+# ------------------------------------ dev-primitive name resolution (BMAD-METHOD #2651)
+# Upstream renamed the dev primitive `bmad-dev-auto` → `bmad-build-auto`, leaving a
+# forwarding shim behind. The orchestrator therefore spells the invoked name from what
+# is actually on disk (Engine._dev_skill) instead of hardcoding it, and must keep
+# working against BOTH eras. The rest of this file's ~49 `/bmad-dev-auto` assertions
+# pin the profile-less fallback (see the no-profile test below), not the resolution.
+
+
+def _prompt_task(**kw) -> StoryTask:
+    return StoryTask(story_key="1-1-a", epic=1, **kw)
+
+
+def test_dev_prompts_spell_the_post_rename_primitive(project):
+    """Every generic-dev leg (fresh, restore, repair) invokes the name resolved
+    from the dev adapter's skill tree — here the post-rename bmad-build-auto."""
+    from conftest import attach_profile, install_build_auto_skill
+
+    install_build_auto_skill(project.project, ".claude/skills")
+    engine, adapter = make_engine(project, [])
+    attach_profile(adapter)
+
+    # The engine-injected awaiting-operator contract (#335) rides on the tail of
+    # every dev prompt, so the invocation is asserted as the head plus the
+    # explicit absence of the legacy spelling anywhere in the string.
+    fresh = engine._generic_dev_prompt(_prompt_task(), None)
+    assert fresh.startswith("/bmad-build-auto 1-1-a")
+    assert "bmad-dev-auto" not in fresh
+
+    spec = str(spec_path(project, "1-1-a"))
+    restore = engine._generic_dev_prompt(
+        _prompt_task(spec_file=spec, restore_patch="/run/attempt.patch"), None
+    )
+    assert restore.startswith("/bmad-build-auto Resume review of the in-review spec")
+
+    feedback = project.implementation_artifacts / "feedback.md"
+    repair = engine._generic_dev_prompt(_prompt_task(), feedback)
+    assert repair.startswith("/bmad-build-auto Resume the autonomous dev session")
+
+
+def test_dev_prompt_falls_back_to_the_legacy_name_without_a_profile(project):
+    """The no-profile shape (test fakes, and any adapter that carries no skill
+    tree) resolves to the pre-rename name. Pinned rather than incidental: it is
+    what keeps the rest of this suite — and a pre-rename target project whose
+    resolution fails open — dispatching a name that exists."""
+    from conftest import install_build_auto_skill
+
+    install_build_auto_skill(project.project, ".claude/skills")  # present but unreachable
+    engine, adapter = make_engine(project, [])
+    assert getattr(adapter, "profile", None) is None
+
+    assert engine._generic_dev_prompt(_prompt_task(), None).startswith("/bmad-dev-auto 1-1-a")
+    # the None tree IS the fallback path, not an unresolved tree that happened to miss
+    assert engine._dev_skill_cache == {(project.project, None): "bmad-dev-auto"}
+
+
+def test_review_prompt_resolves_through_the_review_adapters_own_tree(project):
+    """A run can mix skill trees (dev=claude → .claude/skills, review=gemini →
+    .agents/skills) and the two trees can sit on different upstream eras. Each
+    prompt must spell the primitive ITS adapter would actually find, so the
+    per-role lookup and the per-tree memo are both load-bearing."""
+    from conftest import attach_profile, install_build_auto_skill, install_dev_base_skills
+
+    install_build_auto_skill(project.project, ".claude/skills")
+    install_dev_base_skills(project.project, ".agents/skills", folder_id=False)
+    review = attach_profile(MockAdapter([]), "gemini")
+    engine, dev = make_engine(project, [], review_adapter=review)
+    attach_profile(dev, "claude")
+    spec = str(spec_path(project, "1-1-a"))
+
+    assert engine._generic_dev_prompt(_prompt_task(), None).startswith("/bmad-build-auto 1-1-a")
+    assert engine._review_prompt(_prompt_task(spec_file=spec)).startswith(
+        f"/bmad-dev-auto {spec} —"
+    )
+    # each tree resolved independently — one memo entry per (workspace, tree), not
+    # one per run
+    assert engine._dev_skill_cache == {
+        (project.project, ".claude/skills"): "bmad-build-auto",
+        (project.project, ".agents/skills"): "bmad-dev-auto",
+    }
+
+
+def test_workflow_marker_is_named_for_the_workflows_own_role_tree(project):
+    """The completion-marker filename (WORKFLOW_COMPLETION_CONTRACT) is PRODUCED
+    from ``_dev_skill(role)`` — the injected workflow's OWN role, not the dev
+    default. A plugin workflow declares `role = "dev" | "review"` (WORKFLOW_ROLES)
+    and runs on THAT adapter, whose skill tree can sit at a different upstream era
+    than dev's: here review=gemini on a pre-rename `.agents/skills` beside
+    dev=claude on a post-rename `.claude/skills`. Resolving off the dev tree would
+    name the marker after a primitive the session's own tree does not carry.
+
+    Asserted at the `_run_session` seam — the lowest layer that runs the producer —
+    by reading the prompt that actually reached the review adapter."""
+    from conftest import attach_profile, install_build_auto_skill, install_dev_base_skills
+
+    install_build_auto_skill(project.project, ".claude/skills")  # dev tree: post-rename
+    install_dev_base_skills(project.project, ".agents/skills", folder_id=False)  # review: legacy
+    review = attach_profile(MockAdapter([SessionResult(status="completed")]), "gemini")
+    engine, dev = make_engine(project, [], review_adapter=review)
+    attach_profile(dev, "claude")
+    task = StoryTask(story_key="1-1-a", epic=1)
+
+    engine._run_session(task, role="review", prompt="p", seq=1, label="tea.pre_commit_gate")
+
+    (dispatched,) = review.sessions
+    assert not dev.sessions  # the workflow ran on the role's adapter, not dev's
+    marker = project.implementation_artifacts / f"bmad-dev-auto-result-{dispatched.task_id}.md"
+    assert str(marker) in dispatched.prompt  # the REVIEW tree's era
+    assert "bmad-build-auto-result-" not in dispatched.prompt  # never the dev tree's
+    # ...and the dev tree genuinely resolves to the other era, so the two trees
+    # disagreeing is what the assertions above are reading — not two names that
+    # happen to coincide.
+    assert engine._dev_skill() == "bmad-build-auto"
+    assert engine._dev_skill_cache == {
+        (project.project, ".agents/skills"): "bmad-dev-auto",
+        (project.project, ".claude/skills"): "bmad-build-auto",
+    }
+
+
+def test_dev_prompt_resolves_in_the_reopened_worktree_not_the_main_checkout(project, tmp_path):
+    """A resumed unit dispatches the name ITS OWN worktree carries.
+
+    `reopen_unit` re-mounts an existing worktree without re-provisioning it (only
+    the fresh-mount path in `run_isolated` calls `provision_worktree`), so a main
+    checkout upgraded across the pause — the operator updated bmm while the run sat
+    at an escalation — leaves the worktree on the old era while the resume preflight
+    passes against the upgraded checkout. Resolving off the main checkout would
+    spell `/bmad-build-auto` into a worktree carrying only `bmad-dev-auto`: the
+    session runs with `cwd=self.workspace.root`, HALTs on an unknown command having
+    written nothing for verify to read, and burns its dev attempts through to DEFER.
+
+    The second half pins the MEMO, which is the half a workspace-rooted resolution
+    alone gets wrong: one Engine drives every unit of a run, so the reopened
+    worktree's answer must not be served to the fresh worktrees mounted after it."""
+    from conftest import attach_profile, install_build_auto_skill, install_dev_base_skills
+
+    from bmad_loop.workspace import Workspace
+
+    install_build_auto_skill(project.project, ".claude/skills")  # main checkout: upgraded
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    install_dev_base_skills(worktree, ".claude/skills", folder_id=False)  # worktree: legacy
+    engine, adapter = make_engine(project, [])
+    attach_profile(adapter)
+    default = engine.workspace
+
+    engine.workspace = Workspace(root=worktree, paths=engine.paths.rebased(worktree))
+    assert engine._generic_dev_prompt(_prompt_task(), None).startswith("/bmad-dev-auto 1-1-a")
+
+    engine.workspace = default
+    assert engine._generic_dev_prompt(_prompt_task(), None).startswith("/bmad-build-auto 1-1-a")
+    assert engine._dev_skill_cache == {
+        (worktree.resolve(), ".claude/skills"): "bmad-dev-auto",
+        (project.project, ".claude/skills"): "bmad-build-auto",
+    }

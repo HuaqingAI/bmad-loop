@@ -251,6 +251,15 @@ class DevPolicy:
     # it writes no result.json — the GenericDevAdapter synthesizes one from the
     # spec the session leaves on disk. The field is retained (rather than inlined)
     # as the seam for a future alternative dev skill; see DEV_SKILLS.
+    #
+    # NOT the name a session is dispatched with. Upstream renamed the primitive
+    # bmad-dev-auto -> bmad-build-auto (BMAD-METHOD#2651), so the invoked name is
+    # resolved from what is actually on disk (Engine._dev_skill, via
+    # install.dev_primitive_or_default) and a project on either era works with
+    # this field untouched. This value is the ADAPTER DISCRIMINATOR — it selects
+    # the decoupled generic-dev behaviour seams (engine._generic_dev,
+    # runsetup.py's result-synthesis switch) — so it keeps the pre-rename
+    # spelling as a stable key rather than tracking the upstream directory name.
     skill: str = "bmad-dev-auto"
 
 
@@ -859,7 +868,12 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         raise PolicyError('stories.source = "stories" requires stories.spec_folder to be set')
     dev = DevPolicy(skill=str(dev_d.get("skill", DevPolicy.skill)))
     if dev.skill not in DEV_SKILLS:
-        raise PolicyError(f"dev.skill must be one of {sorted(DEV_SKILLS)}: got {dev.skill!r}")
+        raise PolicyError(
+            f"dev.skill must be one of {sorted(DEV_SKILLS)}: got {dev.skill!r}. This is the "
+            f"adapter discriminator, not the invoked skill name — the name a session is "
+            f"dispatched with is resolved from the skill tree on disk, so a project on the "
+            f"post-rename bmad-build-auto needs no change here"
+        )
     for legacy, replacement in (
         ("model_dev", "[adapter.dev] model"),
         ("model_review", "[adapter.review] model"),

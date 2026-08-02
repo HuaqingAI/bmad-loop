@@ -12,7 +12,9 @@ from conftest import (
     fault_read_text,
     git,
     install_bmad_config,
+    install_build_auto_skill,
     install_dev_base_skills,
+    install_dev_shim,
     machine_json,
     mark_ledger_done,
     spec_path,
@@ -101,6 +103,136 @@ def test_dry_run_renders_per_stage_commands(project, capsys):
     assert "claude" in dev_line and "--model opus" in dev_line
     assert review_line.split("review:")[1].strip().startswith("codex ")
     assert "--model gpt-5-codex" in review_line
+
+
+def _shim_only(paths) -> None:
+    """Post-rename install left with nothing but the forwarding shim, in every
+    tree the dual-client policy reads."""
+    import shutil
+
+    from conftest import install_base_skills
+
+    install_base_skills(paths)
+    for tree in (".claude/skills", ".agents/skills"):
+        shutil.rmtree(paths.project / tree / "bmad-build-auto")
+        shutil.rmtree(paths.project / tree / "bmad-dev-auto")
+        install_dev_shim(paths.project, tree)
+
+
+def test_dry_run_warns_when_preflight_would_abort(project, capsys):
+    """`--dry-run` returns before `_require_base_skills`, so a broken install still
+    renders a plausible preview. On a shim-only project that preview is a lie the
+    operator cannot see through — the shim IS a valid slash command, so
+    `/bmad-dev-auto ...` reads fine and would HALT the session. Say so.
+
+    stdout keeps the schedule (a diagnostic must not withhold what was asked for)
+    and the exit code stays 0; the banner is stderr-only."""
+    _shim_only(project)
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args) == 0
+    out, err = capsys.readouterr()
+    assert "NOT runnable" in err and "bmad-build-auto" in err
+    assert "run `bmad-loop validate` for details" in err
+    assert "1-1-a" in out  # the schedule itself still rendered
+
+
+def test_dry_run_stories_warns_when_preflight_would_abort(project, capsys):
+    """Same banner on the stories preview, which additionally probes folder+id
+    dispatch support on the resolved primitive."""
+    _shim_only(project)
+    _setup_stories_fixture(project, [_stories_entry("1")])
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(spec=STORIES_SPEC_FOLDER, epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args, True, STORIES_SPEC_FOLDER) == 0
+    out, err = capsys.readouterr()
+    assert "NOT runnable" in err and "bmad-build-auto" in err
+    assert "Story id: 1." in out
+
+
+def test_sweep_dry_run_warns_when_preflight_would_abort(project, capsys):
+    """`cmd_sweep` has the same shape — dry-run returns before its preflight. The
+    banner is emitted BEFORE the no-ledger early return, so a project with a broken
+    install and nothing to sweep still hears about the install."""
+    _shim_only(project)
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+
+    assert not project.deferred_work.is_file()  # the early-return leg
+    assert cli._sweep_dry_run(project, pol) == 0
+    assert "NOT runnable" in capsys.readouterr().err
+
+
+def test_dry_run_is_silent_when_preflight_would_pass(project, capsys):
+    """The banner must be evidence, not decoration: a complete install prints
+    nothing to stderr. Without this the warning could be unconditional and every
+    assertion above would still pass."""
+    from conftest import install_base_skills
+
+    install_base_skills(project)
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args) == 0
+    out, err = capsys.readouterr()
+    assert err == ""
+    # ...and the preview spells the name that actually resolved: install_base_skills
+    # lays down BOTH eras, so the tree resolves to the post-rename primitive.
+    assert "/bmad-build-auto 1-1-a" in out
+
+
+def test_dry_run_banner_stays_silent_for_a_warning_only_finding(project, capsys):
+    """Severity decides, exactly as in `_require_base_skills`. That gate steps over
+    non-problem findings — an unresolvable review layer is reported and the run
+    proceeds — so listing one under a banner that claims "the real command aborts"
+    would be a false alarm on a project that runs fine. A false "NOT runnable" is
+    the wrong direction for a check with no severity filter and no `--force`.
+
+    (The shipped 0.9.1 banner had no severity filter; this is a deliberate
+    correction, not a port artefact.)"""
+    from conftest import install_base_skills
+
+    from bmad_loop import install
+
+    install_base_skills(project)
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+
+    # The stub installer writes every marker as placeholder text, so the primitive's
+    # OWN customize.toml does not parse — and that is the one case `_merged_review_layers`
+    # reads as "shape unknown", which short-circuits to the static catalog and returns no
+    # finding at all. Give it a real layer so resolution SUCCEEDS; only then is an
+    # override reached, and only then can an unparseable one be reported.
+    layer = (
+        "[[workflow.review_layers]]\n"
+        'id = "adversarial"\n'
+        'instruction = "Invoke the `bmad-review` skill with only the `adversarial` lens."\n'
+    )
+    for tree in cli._skill_trees(project.project, pol):
+        primitive = project.project / tree / install.DEV_PRIMITIVE_NEW
+        (primitive / "customize.toml").write_text(layer, encoding="utf-8")
+
+    # an unparseable override layer: the resolver skips it and the run still goes
+    custom = project.project / install.CUSTOMIZE_DIR
+    custom.mkdir(parents=True, exist_ok=True)
+    (custom / f"{install.DEV_PRIMITIVE_NEW}.toml").write_text("not = [toml\n", encoding="utf-8")
+
+    findings = install.missing_base_skills(project.project, cli._skill_trees(project.project, pol))
+    severities = {f.severity for f in findings}
+    assert severities == {"warning"}, f"fixture no longer produces a warning-only set: {findings}"
+    assert {f.check for f in findings} == {"skills.customize-unreadable"}
+
+    assert cli._dry_run(project, pol, args) == 0
+    assert capsys.readouterr().err == ""
 
 
 @pytest.mark.parametrize(
@@ -3811,16 +3943,26 @@ def test_validate_stories_folder_known_selector_ok(project):
 CLAUDE_ONLY_POLICY = '[adapter]\nname = "claude"\nmodel = "opus"\n'
 
 
-def _make_validate_pass(project, monkeypatch, capsys):
+def _make_validate_pass(project, monkeypatch, capsys, *, policy=CLAUDE_ONLY_POLICY, skills=None):
     """Set a project up so every validate gate passes, and pin the two gates whose
     outcome is a property of the *host* rather than of the project: whether the CLI
     binary is on PATH and whether a multiplexer is installed. Without those pins the
     rc-0 leg would pass or fail by machine, which is exactly the kind of green that
-    means nothing."""
+    means nothing.
+
+    ``policy`` and ``skills`` exist so the dev-primitive-rename tests can vary the
+    project's *topology* (which CLIs on which roles, which primitive era in which
+    tree) while keeping every other gate green — an rc-0 assertion about one check is
+    worthless if some unrelated gate is what is actually failing. ``skills`` is called
+    with the project root BEFORE the commit, so whatever it lays down is committed and
+    the worktree-clean gate still passes."""
     install_bmad_config(project)
-    _write_policy(project.project, CLAUDE_ONLY_POLICY)
+    _write_policy(project.project, policy)
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
-    install_dev_base_skills(project.project, folder_id=True)
+    if skills is None:
+        install_dev_base_skills(project.project, folder_id=True)
+    else:
+        skills(project.project)
     assert cli.main(["init", "--project", str(project.project)]) == 0  # registers the hooks
     git(project.project, "add", "-A")  # every file above is a worktree change
     git(project.project, "commit", "-q", "-m", "validate fixture")
@@ -4087,8 +4229,7 @@ def test_external_backend_failure_is_a_warning_not_a_note(mux_registry, monkeypa
     report.extend([finding])
     report.render()
     assert capsys.readouterr().out == (
-        "  ok:   warning: external mux backend 'brokenmux' failed to load: "
-        "ImportError: no ghost\n"
+        "  ok:   warning: external mux backend 'brokenmux' failed to load: ImportError: no ghost\n"
     )
 
 
@@ -5179,3 +5320,277 @@ def test_validate_operator_warnings_never_fail_the_run(project, capsys):
     _park_story(project, spec_status="done")
     cli._validate_operator_registry(project.project, project, report)
     assert report.findings and report.passed
+
+
+# ------------- the dev primitive's rename: bmad-dev-auto -> bmad-build-auto ---
+
+# dev+review on claude (skill tree `.claude/skills`) with triage on a CLI whose
+# profile reads a DIFFERENT tree (`.agents/skills`). This is the topology the
+# 3-roles-vs-2 mismatch broke: nothing ever dispatches a bmm skill into triage's
+# tree, so gating it refused runs over skills that tree will never need.
+TRIAGE_SPLIT_POLICY = (
+    '[adapter]\nname = "claude"\nmodel = "opus"\n[adapter.triage]\nname = "gemini"\n'
+)
+
+# Two CLIs across two trees, with the review STAGE switched off. The adapter is
+# still resolved, still provisioned, and still hooked — see #424 below.
+REVIEW_DISABLED_POLICY = DUAL_CLIENT_POLICY + "[review]\nenabled = false\n"
+
+
+def test_require_base_skills_does_not_gate_a_triage_only_skill_tree(project):
+    """A triage CLI on its own skill tree must not be able to refuse a run.
+
+    ``_skill_trees`` iterates :data:`install.DEV_PRIMITIVE_ROLES` (dev, review), not
+    :data:`runsetup.ROLES` (dev, review, triage). Every skill this preflight asks
+    about — the dev primitive and the review layers its step-04 invokes inline — is
+    one only a dev or review session dispatches, and ``WorktreeFlow`` only ever
+    provisions those same two profiles. Gating all three meant
+    ``[adapter.triage] name = "gemini"`` beside a claude dev/review pair demanded the
+    whole bmm module in ``.agents/skills`` before the run could start: a hard FAIL
+    over a tree no session dispatches one of these skills into, on a gate with no
+    ``--force``. Triage's only prompt is ``/bmad-loop-sweep``, which ships in this
+    wheel and is laid down by ``bmad-loop init``.
+
+    Ablation: point ``_skill_trees`` back at ``ROLES`` and the ``is True`` below goes
+    False — nothing installed ``.agents/skills/bmad-build-auto``, and nothing ever
+    will."""
+    from bmad_loop.install import DEV_PRIMITIVE_ROLES
+    from bmad_loop.runsetup import ROLES
+
+    _write_policy(project.project, TRIAGE_SPLIT_POLICY)
+    install_build_auto_skill(project.project, ".claude/skills")  # claude's tree ONLY
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+
+    assert cli._require_base_skills(project.project, pol) is True
+    # ...because triage's tree was never asked about. Asserting the whole list, not
+    # `".agents/skills" not in`: the point is which trees ARE gated, and an empty
+    # list would satisfy the negative form while gating nothing at all.
+    assert cli._skill_trees(project.project, pol) == [".claude/skills"]
+
+    # The structural half, so a `triage` that creeps back into the constant fails
+    # here by name rather than only through a filesystem shape. The two sets are one
+    # decision — `WorktreeFlow.worktree_profiles` reads the same constant — so the
+    # dev-primitive set being a STRICT subset is what keeps "gated" and "provisioned"
+    # from drifting apart in either direction.
+    assert DEV_PRIMITIVE_ROLES == ("dev", "review")
+    assert set(DEV_PRIMITIVE_ROLES) < set(ROLES)
+
+
+def test_skill_trees_covers_review_even_when_review_is_disabled(project):
+    """``review.enabled = false`` must NOT narrow the gated trees (#424).
+
+    This test exists to make a future narrowing FAIL. The obvious follow-on to the
+    role-scoping above is "and drop review's tree when the review stage is off" — it
+    is wrong, and it is wrong quietly. Disabling the review stage does not retire the
+    review ADAPTER: a plugin workflow can declare ``role = "review"`` and dispatch on
+    ``adapters["review"]`` with review disabled, and the same profile list drives
+    per-CLI Stop-signal hook registration as well as worktree seeding. A worktree
+    provisioned without the review profile has no completion signal for those
+    sessions, so narrowing here would convert a clean, actionable preflight refusal
+    into a silent stall that burns the run's whole budget."""
+    _write_policy(project.project, REVIEW_DISABLED_POLICY)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    assert pol.review.enabled is False, "the fixture only bites with the stage off"
+
+    trees = cli._skill_trees(project.project, pol)
+    assert trees == [".claude/skills", ".agents/skills"]  # dev=claude, review=codex
+
+
+def test_gated_trees_and_provisioned_trees_stay_one_decision(project):
+    """Constraint 1, pinned from BOTH sides rather than asserted in a comment.
+
+    ``cli._skill_trees`` decides which trees can REFUSE a run;
+    ``WorktreeFlow.worktree_profiles`` decides which profiles get carried INTO a
+    worktree. The only thing making those one decision is that both iterate
+    :data:`install.DEV_PRIMITIVE_ROLES` — nothing enforced it, so a one-sided edit
+    used to be invisible here. Either direction ships a silent bug: gated but not
+    provisioned drops the session into the `Unknown command` stall the preflight
+    exists to catch, provisioned but not gated refuses runs over a skill nothing
+    reads.
+
+    The triage split is what makes the two sets separable at all — with one CLI
+    everywhere, both readings agree by construction and the test proves nothing.
+
+    ``worktree_profiles`` is called unbound on a stub carrying only
+    ``_adapters_get``, which is the entirety of the ``self`` it touches: building a
+    whole `WorktreeFlow` here would drag in the engine callbacks without making the
+    assertion any stronger. The adapters dict carries ALL of `runsetup.ROLES`, so a
+    one-sided revert to `ROLES` fails on the set comparison below rather than
+    escaping as a `KeyError` on a missing triage key."""
+    from types import SimpleNamespace
+
+    from bmad_loop.adapters.profile import get_profile
+    from bmad_loop.runsetup import ROLES
+    from bmad_loop.worktree_flow import WorktreeFlow
+
+    _write_policy(project.project, TRIAGE_SPLIT_POLICY)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    adapters = {
+        role: SimpleNamespace(profile=get_profile(pol.adapter.resolved(role).name, project.project))
+        for role in ROLES
+    }
+
+    gated = cli._skill_trees(project.project, pol)
+    provisioned = WorktreeFlow.worktree_profiles(SimpleNamespace(_adapters_get=lambda: adapters))
+
+    # Pin the value, not just the agreement: two empty sets would satisfy the
+    # equality below while gating and provisioning nothing at all.
+    assert gated == [".claude/skills"]
+    assert {p.skill_tree for p in provisioned} == set(gated)
+
+
+@pytest.mark.parametrize(
+    ("installer", "primitive"),
+    [
+        (lambda root: install_build_auto_skill(root), "bmad-build-auto"),
+        (lambda root: install_dev_base_skills(root, folder_id=True), "bmad-dev-auto"),
+    ],
+    ids=["renamed", "legacy"],
+)
+def test_validate_names_the_dev_primitive_that_actually_resolved(
+    project, capsys, monkeypatch, installer, primitive
+):
+    """The ``skills.base`` ok line names what is on disk, not a hardcoded era.
+
+    It used to read "upstream skills present (bmad-dev-auto + review layers)"
+    unconditionally, which on an upgraded project is a green line asserting the
+    rename did not happen. On a rename this line is the operator's only confirmation
+    that the new name was picked up, so it is asserted whole rather than by
+    substring, and the machine-readable ``dev_primitive`` beside it is what a
+    consumer reads instead of parsing the sentence back apart."""
+    _make_validate_pass(project, monkeypatch, capsys, skills=installer)
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    base = next(f for f in doc["findings"] if f["check"] == "skills.base")
+    assert base["message"] == f"upstream skills present ({primitive} + review layers)"
+    assert base["detail"]["dev_primitive"] == [primitive]
+    assert base["detail"]["trees"] == [".claude/skills"]
+
+
+def test_validate_reports_a_different_primitive_era_in_each_tree(project, capsys, monkeypatch):
+    """Why ``dev_primitive`` is a list and the ok line joins it.
+
+    A project can sit mid-upgrade: ``.claude/skills`` (claude, dev) already carries
+    ``bmad-build-auto`` while ``.agents/skills`` (codex, review) still carries a
+    complete pre-rename ``bmad-dev-auto``. Both are drivable, and each tree is driven
+    under its OWN name — the resolution is per tree, not per project. A scalar field
+    would have to pick a winner and would then tell the operator the rename landed
+    everywhere when it landed in one tree."""
+
+    def _mixed_eras(root):
+        install_build_auto_skill(root, ".claude/skills")
+        install_dev_base_skills(root, ".agents/skills", folder_id=True)
+
+    _make_validate_pass(project, monkeypatch, capsys, policy=DUAL_CLIENT_POLICY, skills=_mixed_eras)
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    base = next(f for f in doc["findings"] if f["check"] == "skills.base")
+    assert base["detail"]["trees"] == [".claude/skills", ".agents/skills"]
+    assert base["detail"]["dev_primitive"] == ["bmad-build-auto", "bmad-dev-auto"]
+    assert base["message"] == (
+        "upstream skills present (bmad-build-auto + bmad-dev-auto + review layers)"
+    )
+
+
+def test_a_forwarding_shim_install_fails_validate_and_aborts_the_run(project, capsys, monkeypatch):
+    """The shim upstream's rename left behind is REFUSED, not driven.
+
+    Post-rename ``bmad-dev-auto`` is a lone SKILL.md whose customization-migration
+    gate is interactive. An unattended session dispatched into it HALTs having
+    written nothing to disk — no spec, no result artifact, nothing the post-session
+    verification can read — so the story stalls rather than fails, and the run burns
+    its budget on it. Both entry points must refuse it before any session is spawned,
+    and the remediation has to name the rename: without that, an operator is being
+    told a skill that is visibly PRESENT is missing."""
+    install_bmad_config(project)
+    _write_policy(project.project, CLAUDE_ONLY_POLICY)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    install_dev_shim(project.project)  # lays the review stub too, so this is the only finding
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "shim fixture")
+
+    findings = _validate_findings(project, capsys, rc=1)
+    shim = findings["skills.base-shim"]
+    assert shim["severity"] == "problem"
+    assert shim["detail"] == {
+        "tree": ".claude/skills",
+        "skill": "bmad-dev-auto",
+        "expected": "bmad-build-auto",
+        "missing_markers": ["step-04-review.md", "customize.toml"],
+    }
+    assert "skills.base" not in findings  # no green line riding beside the refusal
+
+    # ...and the same install aborts `run` through _require_base_skills, before the
+    # engine is reached at all.
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+
+    assert cli.main(["run", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert "forwarding shim the BMad Method's rename left behind" in err
+    assert "bmad-build-auto is not installed" in err
+
+
+def test_validate_reports_an_orphaned_legacy_override_as_a_warning(project, capsys, monkeypatch):
+    """The rename orphans ``_bmad/custom/bmad-dev-auto.toml`` — and that is a WARNING.
+
+    Upstream's resolver keys on the skill directory, so on a renamed project the
+    legacy override is simply never read: the session still runs, it just runs
+    unstyled. The severity is the whole point. ``missing_base_skills`` feeds
+    ``_require_base_skills``, which has no severity filter and no ``--force`` — a
+    problem here would pause every run behind a remediation nobody can apply, so on a
+    survivable condition a false green is the safe direction and the honest response
+    is to name the rename rather than block."""
+    custom = project.project / "_bmad" / "custom"
+
+    def _renamed_with_an_orphan(root):
+        install_build_auto_skill(root)
+        custom.mkdir(parents=True, exist_ok=True)
+        (custom / "bmad-dev-auto.toml").write_text("# stale override\n", encoding="utf-8")
+
+    _make_validate_pass(project, monkeypatch, capsys, skills=_renamed_with_an_orphan)
+
+    findings = _validate_findings(project, capsys)  # rc 0: the warning never gates
+    orphan = findings["skills.customize-legacy"]
+    assert orphan["severity"] == "warning"
+    assert orphan["detail"]["files"] == ["_bmad/custom/bmad-dev-auto.toml"]
+    assert findings["skills.base"]["detail"]["dev_primitive"] == ["bmad-build-auto"]
+
+    # ...and it is the ORPHANING that is reported, not the legacy file's existence:
+    # land the counterpart and the finding goes.
+    (custom / "bmad-build-auto.toml").write_text("# migrated\n", encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "migrate the override")
+
+    assert "skills.customize-legacy" not in _validate_findings(project, capsys)
+
+
+def test_validate_does_not_gate_a_triage_only_skill_tree(project, capsys, monkeypatch):
+    """validate's verdict and run's abort are now one decision, on the same trees.
+
+    ``cmd_validate`` builds its trees through the same ``_skill_trees`` the real
+    preflight calls, so a triage CLI on its own tree can no more fail validate than
+    it can abort a run. Before that, ``cmd_validate`` passed
+    ``[p.skill_tree for p in profiles]`` — every loaded profile, triage included —
+    and reported ``.agents/skills/bmad-build-auto not found`` as a hard problem about
+    a tree no session dispatches into."""
+    _make_validate_pass(
+        project,
+        monkeypatch,
+        capsys,
+        policy=TRIAGE_SPLIT_POLICY,
+        skills=lambda root: install_build_auto_skill(root, ".claude/skills"),
+    )
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    assert doc["ok"] is True and doc["counts"]["problem"] == 0
+    base = next(f for f in doc["findings"] if f["check"] == "skills.base")
+    assert base["detail"]["trees"] == [".claude/skills"]  # the member, not a prefix
+    # and nothing under skills.* so much as mentions triage's tree — keyed on the
+    # detail's own `tree` field, because a past bug here was a substring assertion
+    # that three unrelated review findings happened to satisfy.
+    assert not [
+        f
+        for f in doc["findings"]
+        if f["check"].startswith("skills.") and (f["detail"] or {}).get("tree") == ".agents/skills"
+    ]

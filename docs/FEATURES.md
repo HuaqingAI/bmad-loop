@@ -40,7 +40,7 @@ See [README.md](../README.md) for the narrative overview and [setup-guide.md](se
 
 ### Spec + implementation (dev stage)
 
-- Drives the upstream `bmad-dev-auto` skill (unmodified) in a fresh tmux session: it plans a 1.5–4k-token spec, auto-approves it, implements, and self-finalizes the spec; the orchestrator syncs `sprint-status` and synthesizes `result.json` from the spec the skill leaves on disk.
+- Drives the upstream dev primitive (unmodified) in a fresh tmux session — `bmad-build-auto`, or `bmad-dev-auto` on pre-rename releases, resolved from disk per skill tree and invoked under the name it resolves to, so either era runs with no config edit (the legacy name is accepted only when marker-complete, which refuses the forwarding shim the rename leaves behind): it plans a 1.5–4k-token spec, auto-approves it, implements, and self-finalizes the spec; the orchestrator syncs `sprint-status` and synthesizes `result.json` from the spec the skill leaves on disk.
 - Deterministic missing-marker catch + repair (#276): the review HALT intermittently finalizes a spec's frontmatter to a terminal `status:` without appending the `## Auto Run Result` section the harvest scan keys on, which once livelocked a finished story to a DEFER-drop (#224). Four harness-side mechanisms make catch + fix deterministic without ever mutating the launch frontmatter (load-bearing skill routing): a **launch-state content-hash snapshot** the fallback refuses to synthesize from when the candidate is byte-identical (a `done` spec merely re-opened for review — in every mode, killing the dead-window false positive); **mid-session status-transition observation** (a heartbeat-tick sighting of the spec moving off its launch status proves a later terminal frontmatter is this session's write, so synthesis needs one sighting, not two); **artifact repair** that appends the owed marker onto the spec on synthesis so it re-enters the normal scan; and — gated by `limits.dev_contract_nudge` (default on) — one **targeted contract nudge** per session asking the skill to append the section itself. Frontmatter synthesis stays the backstop for a session that never complies.
 - Spec-only contract between stages — review consumes the frozen spec, not the dev session's context.
 
@@ -122,9 +122,9 @@ See [README.md](../README.md) for the narrative overview and [setup-guide.md](se
 ### Stories mode (folder+id dispatch)
 
 - Opt-in second story source (`[stories] source = "stories"` + `spec_folder`, or `bmad-loop run --spec <folder>`): drives the same loop off a typed `stories.yaml` (a `bmad-spec` Story Breakdown, sibling of `SPEC.md`) instead of `sprint-status.yaml`.
-- Dispatches each entry by **folder + id** (`/bmad-dev-auto Spec folder: <folder>. Story id: <id>.`); the story spec lands at `<folder>/stories/<id>-<slug>.md` and is read back by a deterministic id-keyed glob — no shared board to line-edit, no result-artifact mtime-scan.
+- Dispatches each entry by **folder + id** (`/bmad-build-auto Spec folder: <folder>. Story id: <id>.`, spelled with whichever primitive name resolves on disk); the story spec lands at `<folder>/stories/<id>-<slug>.md` and is read back by a deterministic id-keyed glob — no shared board to line-edit, no result-artifact mtime-scan.
 - Strictly linear schedule (list order, no `depends_on`); `done` skipped, non-terminal statuses resumed on re-dispatch, `blocked`/sentinel/ambiguous stops the run for resolve. `bmad-loop run --dry-run --spec <folder>` and `bmad-loop status` print the schedule/board (id · live disk state · checkpoint markers · title).
-- Preflight content-probe: stories mode requires a `bmad-dev-auto` new enough for folder+id dispatch, or the run aborts with remediation. Sprint mode keeps working with any installed version.
+- Preflight content-probe: stories mode requires a dev primitive new enough for folder+id dispatch, or the run aborts with remediation. Sprint mode keeps working with any installed version.
 - Sentinel recovery: a pre-planning-halt sentinel spec (`<id>-unresolved.md` / `<id>-ambiguous.md`) is auto-deleted with a preserved copy under the run dir on re-arm, matching the contract's delete-to-retry.
 
 ### Gates & human checkpoints
@@ -182,8 +182,8 @@ See [README.md](../README.md) for the narrative overview and [setup-guide.md](se
 ### Setup & install
 
 - `bmad-loop init` installs the three `bmad-loop-*` skills (`bmad-loop-setup`, `bmad-loop-resolve`, `bmad-loop-sweep`, into `.claude/skills/` and/or `.agents/skills/`), the hook relay, `.bmad-loop/policy.toml`, and a gitignore covering the runs dir, plugin caches, and policy.toml itself (per-machine config). Flags: `--cli` (repeatable), `--no-skills`, `--force-skills`.
-- `bmad-loop validate` preflights every prerequisite: BMAD config, sprint-status, git, the selected terminal-multiplexer backend (listing all detected when more than one is registered), CLI binary, hook registration, and the review skills the installed `bmad-dev-auto` actually invokes — derived from its `customize.toml` review layers (or from `step-04-review.md` on releases that name reviewers inline), so both the merged `bmad-review` topology and the standalone-hunter one validate, and configured layers naming an uninstalled skill are caught — plus its `customize.toml`.
-- Non-invasive: drives the upstream `bmad-dev-auto` skill unmodified — there is no fork to keep in sync — and review is just a re-invocation of it on the `done` spec. Your standard BMAD install is never modified.
+- `bmad-loop validate` preflights every prerequisite: BMAD config, sprint-status, git, the selected terminal-multiplexer backend (listing all detected when more than one is registered), CLI binary, hook registration, and the review skills the installed dev primitive actually invokes (reporting which name it resolved) — derived from its `customize.toml` review layers (or from `step-04-review.md` on releases that name reviewers inline), so both the merged `bmad-review` topology and the standalone-hunter one validate, and configured layers naming an uninstalled skill are caught — plus its `customize.toml`.
+- Non-invasive: drives the upstream dev primitive unmodified — there is no fork to keep in sync — and review is just a re-invocation of it on the `done` spec. Your standard BMAD install is never modified.
 
 ### Command reference
 

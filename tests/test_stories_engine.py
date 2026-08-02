@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from conftest import git, write_spec
+from conftest import attach_profile, git, install_build_auto_skill, write_spec
 
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
@@ -493,6 +493,41 @@ def test_dev_prompt_repair_leg_is_explicit_spec_resume(project, tmp_path):
     prompt = engine._dev_prompt(task, feedback)
     assert prompt.startswith("/bmad-dev-auto Resume the autonomous dev session on the in-progress")
     assert "Story id:" not in prompt  # repair is an explicit-spec-file invocation
+
+
+def test_dev_prompt_spells_the_post_rename_primitive(project, tmp_path, monkeypatch):
+    """Every leg spells the primitive resolved from the dev adapter's skill tree,
+    not a hardcoded name (upstream renamed it bmad-dev-auto -> bmad-build-auto,
+    BMAD-METHOD #2651): fresh folder+id dispatch, its plan-halt tail, and the
+    inherited repair leg.
+
+    Both the installer and `attach_profile` are load-bearing. `project` installs no
+    skills and `MockAdapter` carries no `profile`, so either one alone resolves the
+    tree to None and falls back to the LEGACY name — which the tests above already
+    pin, and which would make this one green for the wrong reason."""
+    setup_stories(project, [entry("1")])
+    install_build_auto_skill(project.project, ".claude/skills")
+    engine, adapter = make_engine(project, [])
+    attach_profile(adapter)  # claude -> .claude/skills
+    task = StoryTask(story_key="1", epic=0)
+
+    assert (
+        engine._dev_prompt(task, None)
+        == "/bmad-build-auto Spec folder: _bmad-output/epic-1. Story id: 1."
+    )
+    # the plan-halt tail rides the same f-string (third caller of the resolved name)
+    monkeypatch.setattr(engine, "_plan_halt_leg", lambda task, e: True)
+    assert engine._dev_prompt(task, None) == (
+        "/bmad-build-auto Spec folder: _bmad-output/epic-1. Story id: 1. Halt after planning."
+    )
+
+    task.spec_file = str(story_spec(project, "1"))
+    write_spec(story_spec(project, "1"), "done", "abc")  # _reset_spec_for_repair needs it
+    feedback = tmp_path / "fb.md"
+    feedback.write_text("boom")
+    assert engine._dev_prompt(task, feedback).startswith(
+        "/bmad-build-auto Resume the autonomous dev session on the in-progress"
+    )
 
 
 # ------------------------------------------------------------- other seams

@@ -29,6 +29,7 @@ from . import gates, verify
 from .install import (
     BASE_SKILLS,
     CUSTOMIZE_DIR,
+    DEV_PRIMITIVE_ROLES,
     HOOK_SCRIPT_REL,
     MODULE_SKILLS,
     _copy_traversable,
@@ -216,16 +217,24 @@ def provision_worktree(
             _copy_traversable(skills_root.joinpath(skill), dst)
         # The orchestrator-driven upstream skills are not in the wheel; copy them
         # from the MAIN REPO's installed tree (same tree path) so an isolated
-        # worktree can still resolve /bmad-dev-auto and the review layers. Skip
+        # worktree can still resolve the dev primitive and the review layers. Skip
         # silently when the main repo lacks them — the run-start preflight reports
         # it.
         #
+        # BASE_SKILLS names BOTH primitive eras, which is what carries the skill
+        # across the rename: the resolution below returns REVIEW skills only, so a
+        # primitive the catalog did not name would be silently left behind (the
+        # is_dir guard swallows the miss) and every isolated session would stall on
+        # an Unknown command.
+        #
         # BASE_SKILLS is only the floor. The review layers this project actually
-        # invokes are read from the installed bmad-dev-auto, exactly as the
-        # preflight reads them, so a reviewer named by a project override (a
-        # custom or renamed skill) is provisioned too. Validating a skill here and
-        # then not copying it is how preflight passes in the main checkout while
-        # the isolated review fails on a skill that was never there.
+        # invokes are read from the installed primitive — resolved on disk, so a
+        # renamed project resolves its own layers rather than degrading to the
+        # static catalog — exactly as the preflight reads them, so a reviewer named
+        # by a project override (a custom or renamed skill) is provisioned too.
+        # Validating a skill here and then not copying it is how preflight passes in
+        # the main checkout while the isolated review fails on a skill that was
+        # never there.
         resolved = resolve_review_layers(repo_root, tree)
         required = dict.fromkeys((*BASE_SKILLS, *(resolved.skills() if resolved else ())))
         for skill in required:
@@ -408,10 +417,17 @@ class WorktreeFlow:
     def worktree_profiles(self) -> list[CLIProfile]:
         """The distinct CLI profiles of the dev + review adapters, for provisioning
         their skills/hooks into a worktree. Adapters without a `profile` (e.g. test
-        fakes) contribute nothing, so provisioning is a no-op for them."""
+        fakes) contribute nothing, so provisioning is a no-op for them.
+
+        The role set is :data:`install.DEV_PRIMITIVE_ROLES` — the same constant
+        `cli._skill_trees` gates on — rather than a local pair, so the provisioned
+        set and the gated set cannot drift apart. A tree gated but not provisioned
+        ships a session into the `Unknown command` stall the preflight exists to
+        catch; a tree provisioned but not gated refuses runs over a skill no session
+        reads."""
         seen: dict[str, CLIProfile] = {}
         adapters = self._adapters_get()
-        for adapter in (adapters["dev"], adapters["review"]):
+        for adapter in (adapters[role] for role in DEV_PRIMITIVE_ROLES):
             profile = getattr(adapter, "profile", None)
             if profile is not None and profile.name not in seen:
                 seen[profile.name] = profile
