@@ -600,6 +600,18 @@ whose seams had diverged enough that several ports needed a different fix, and t
   rather than a vacuous `True` when that is unobservable. Out-of-tree backends still returning
   `None` read as "nothing detached" — degraded, not broken.
 
+- **Harden the psmux option channel's safety core (#313).** The cleanup sweeps matched any
+  `<name>_@<digits>` key, so a hand-written `@theme_@3` died with window `@3`; keys now carry a
+  seam-owned marker (`@bmad_project__blw@3`) only a deliberate imitation collides with.
+  `kill_window` kills first and frees the keys only once a liveness listing proves the kill landed,
+  so a failed kill no longer strips a live window's project tag and return key; a free that fails
+  now warns instead of leaking silently. The launcher's ctl-window consumers resolve the window id
+  once and replay it, so duplicate-named ctl windows cannot take another's option write or kill
+  (`launch.ctl_window`/`select_ctl_window` fold into `ctl_window_id`/`select_ctl_window_id`), and a
+  Windows-local zero-token gate proves cross-project prune isolation on a real psmux server. Dev
+  builds only: pre-marker keys read as foreign and are never swept — restart the ctl psmux server
+  after upgrading.
+
 - **Gate the psmux session project tag on transportability (#320).** The session tag rode psmux's
   CLI→server control line ungated, which stores some project paths corrupted at rc 0 — and a
   corrupted tag never equals the caller's again, so the prune skipped that session forever.
@@ -613,7 +625,7 @@ whose seams had diverged enough that several ports needed a different fix, and t
   server and answers `''` to any `-w` read of an `@`-prefixed name, so the ctl-window project tag
   bled across rows — letting a prune in one project `kill-window` another's — and the parked-return
   option always read empty. Both now use a session-scoped key carrying the window id
-  (`@bmad_project_@3`), routed with `-t <session>` and freed on `kill_window`; the `switch-client`
+  (`@bmad_project__blw@3`), routed with `-t <session>` and freed on `kill_window`; the `switch-client`
   leg stays inert on builds predating psmux/psmux#483 — still inert at 3.3.7.
 
 - **Session-qualify the psmux TUI-side window ids (#291).** #254 covered the engine seam but left

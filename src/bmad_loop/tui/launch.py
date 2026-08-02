@@ -43,34 +43,36 @@ def session_exists(session: str) -> bool:
     return get_multiplexer().has_session(session)
 
 
-def ctl_window(run_id: str) -> str | None:
-    """Name of the control-session window hosting this run's orchestrator
-    process (start_detached names windows <kind>-<run_id>), or None when the
-    run was not launched from the TUI or the session is gone."""
+def ctl_window_id(run_id: str) -> str | None:
+    """Stable window id (bare `@N` on tmux, session-qualified on psmux) of the
+    control-session window hosting this run's orchestrator process
+    (start_detached names windows <kind>-<run_id>), or None when the run was
+    not launched from the TUI or the session is gone. An id, not a name:
+    window names collide when several kinds share a run_id, and every consumer
+    replays the value as a select/kill/option target, where re-resolving a
+    name first-match can land each verb on a different duplicate."""
     if not mux_available():
         return None
-    for (name,) in get_multiplexer().list_windows(CTL_SESSION, ["window_name"]):
-        if name.endswith(f"-{run_id}"):
-            return name
+    for win_id, name in get_multiplexer().list_windows(CTL_SESSION, ["window_id", "window_name"]):
+        # win_id can be "": the base pads short rows, and psmux's qualifier
+        # passes falsy ids through. An empty id must never become a target —
+        # an empty `-t` resolves against the *current* window.
+        if win_id and name.endswith(f"-{run_id}"):
+            return win_id
     return None
 
 
-def ctl_target(window: str | None = None) -> str:
-    """Seam-canonical target token for the control session (optionally one of
-    its windows, by name); see :meth:`TerminalMultiplexer.target`."""
-    return get_multiplexer().target(CTL_SESSION, window)
-
-
-def select_ctl_window(window: str) -> None:
-    """Make `window` the control session's current window, so a plain attach
-    to the session lands on it (attach-session itself takes no window)."""
-    get_multiplexer().select_window(ctl_target(window))
+def ctl_target() -> str:
+    """Seam-canonical target token for the control session; see
+    :meth:`TerminalMultiplexer.target`. Windows are targeted by stable id
+    (ctl_window_id), never by name through this token."""
+    return get_multiplexer().target(CTL_SESSION)
 
 
 def select_ctl_window_id(window_id: str) -> None:
-    """Like select_ctl_window but by the backend's stable window id (bare `@N` on
-    tmux, session-qualified on psmux), as returned by start_detached. Immune to
-    the by-name first-match ambiguity in ctl_window and to tmux auto-rename."""
+    """Make the window with this id (from start_detached/ctl_window_id) the
+    control session's current window, so a plain attach to the session lands
+    on it (attach-session itself takes no window)."""
     get_multiplexer().select_window(window_id)
 
 
@@ -103,8 +105,9 @@ def set_return_pane(window_target: str, target: str) -> None:
     """Record `target` (a current_return_target value or RETURN_DETACH) as the
     return move on a control-session window, so its trailing shell sends the
     client back there when the window's command exits. `window_target` is any
-    window spec the backend accepts (e.g. `=bmad-loop-ctl:run-…`, or a stable id
-    from start_detached — bare `@N` on tmux, session-qualified on psmux)."""
+    window spec the backend accepts; callers pass the id from
+    start_detached/ctl_window_id so the write cannot land on a
+    duplicate-named window."""
     get_multiplexer().set_window_option(window_target, RETURN_OPTION, target)
 
 
@@ -221,13 +224,13 @@ def attach_plan(project: Path, run_id: str) -> tuple[list[str], str | None] | No
     live agent session. Returns (tmux argv, return_window) or None when there is
     nothing to attach to."""
     session = runs.session_name(run_id)
-    window = ctl_window(run_id)
+    win_id = ctl_window_id(run_id)
     agent_live = session_exists(session)
-    if window is not None and (
+    if win_id is not None and (
         decision_pending(runs.run_dir_for(project, run_id)) or not agent_live
     ):
-        select_ctl_window(window)
-        return runs.attach_target_argv(ctl_target()), ctl_target(window)
+        select_ctl_window_id(win_id)
+        return runs.attach_target_argv(ctl_target()), win_id
     if agent_live:
         return runs.attach_target_argv(runs.session_target(run_id)), None
     return None
@@ -236,9 +239,9 @@ def attach_plan(project: Path, run_id: str) -> tuple[list[str], str | None] | No
 def kill_ctl_window(run_id: str) -> None:
     """Kill the control-session window hosting this run's orchestrator process,
     if any. A no-op when the run was not launched from the TUI or tmux is gone."""
-    window = ctl_window(run_id)
-    if window is not None:
-        get_multiplexer().kill_window(ctl_target(window))
+    win_id = ctl_window_id(run_id)
+    if win_id is not None:
+        get_multiplexer().kill_window(win_id)
 
 
 def _ctl_window_candidates(project: Path) -> list[tuple[str, str]]:
