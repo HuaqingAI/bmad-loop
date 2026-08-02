@@ -3067,6 +3067,52 @@ async def test_start_run_modal_stories_source_blank_folder_errors(project, monke
         assert not calls
 
 
+def _write_undecodable_policy(root: Path, text: str) -> Path:
+    """Write `text` to policy.toml followed by bytes no UTF-8 decoder accepts.
+
+    0xff/0xfe are illegal as UTF-8 lead bytes anywhere in a stream, so
+    `read_text(encoding="utf-8")` — what `policy.load` calls — raises
+    `UnicodeDecodeError` over the whole file however valid the leading TOML is.
+    Real bytes, not a monkeypatched raiser: the decode is the thing under test."""
+    bmad = root / ".bmad-loop"
+    bmad.mkdir(parents=True, exist_ok=True)
+    path = bmad / "policy.toml"
+    path.write_bytes(text.encode("utf-8") + b"# \xff\xfe\n")
+    with pytest.raises(UnicodeDecodeError):  # the fixture is genuinely undecodable
+        path.read_text(encoding="utf-8")
+    return path
+
+
+async def test_start_run_modal_prefill_degrades_on_undecodable_policy(project, monkeypatch):
+    """Pins the `except (PolicyError, OSError)` handler in BmadLoopApp._stories_defaults
+    against a policy.toml whose *bytes* won't decode: the modal prefills sprint mode.
+
+    `UnicodeDecodeError` is a `ValueError`, so before `policy.load` converted it to
+    `PolicyError` it walked past that handler untouched. It never even got that far in
+    practice — BmadLoopApp.__init__ eagerly builds DashboardScreen, which loads the same
+    file, so the failure mode was a crash at app CONSTRUCTION rather than a degraded
+    prefill: the operator could not reach the modal at all. This is the direct oracle for
+    the prefill half; the dashboard half is test_dashboard_survives_undecodable_policy_bytes."""
+    text = '[stories]\nsource = "stories"\nspec_folder = "_bmad-output/epic-1"\n'
+    # Precondition: decodable, this file would prefill stories mode + that folder. So the
+    # sprint-mode assertions below show the *decode* was refused, not an inert fixture.
+    pol = policy_mod.loads(text)
+    assert (pol.stories.source, pol.stories.spec_folder) == ("stories", "_bmad-output/epic-1")
+    _write_undecodable_policy(project.project, text)
+    # action_start_run bails on _mux_missing() before it can push the modal — see the
+    # comment on test_start_run_modal_stories_preview_validates.
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("r")
+        await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+        await ready(pilot, "#ok")
+        modal = app.screen
+        assert modal.query_one("#source", Select).value == "sprint-status"
+        assert modal.query_one("#spec-folder", Input).value == ""
+
+
 # --------------------------------------------------------------- pane resizing
 
 
@@ -3308,6 +3354,29 @@ async def test_dashboard_survives_policy_read_oserror(project, monkeypatch):
         screen = await _seeded(pilot, app)
         assert screen._tui_policy == policy_mod.TuiPolicy()
         assert screen.query_one("#left").size.width == 34  # CSS default, unseeded
+        assert not screen._left_frozen and not screen._detail_frozen
+
+
+async def test_dashboard_survives_undecodable_policy_bytes(project):
+    """Pins the `except (PolicyError, OSError)` handler in DashboardScreen.__init__
+    against a policy.toml whose *bytes* won't decode.
+
+    `UnicodeDecodeError` is a `ValueError`, so before `policy.load` converted it to
+    `PolicyError` it walked straight past that handler — and since BmadLoopApp.__init__
+    eagerly constructs DashboardScreen, the failure was a crash at app CONSTRUCTION,
+    before run_test ever mounted a screen or a key was pressed. Not a degraded render:
+    no render at all. The sibling OSError test monkeypatches its raiser; this one uses
+    real bytes, which is what makes it a decode test rather than a duplicate."""
+    text = "[tui]\nleft_width = 50\n"
+    # Precondition: decodable, this file would seed a 50-column sidebar. So asserting
+    # the CSS default below shows the *decode* was refused, not that the file was inert.
+    assert policy_mod.loads(text).tui.left_width == 50
+    _write_undecodable_policy(project.project, text)
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(120, 40)) as pilot:
+        screen = await _seeded(pilot, app)
+        assert screen._tui_policy == policy_mod.TuiPolicy()
+        assert screen.query_one("#left").size.width == 34  # CSS default, not the file's 50
         assert not screen._left_frozen and not screen._detail_frozen
 
 

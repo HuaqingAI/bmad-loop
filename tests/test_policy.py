@@ -323,6 +323,20 @@ def test_bad_toml(tmp_path):
         policy.load(p)
 
 
+def test_non_utf8_file_raises_policy_error(tmp_path):
+    """An undecodable policy.toml is as much a PolicyError as a malformed one.
+    `read_text` raises UnicodeDecodeError, which is a ValueError and NOT an OSError,
+    so raw it slips past every `except (PolicyError, OSError)` degrade handler —
+    `cli._configure_mux` (which runs before argument dispatch on every command),
+    `tui/app.py`, and the dashboard constructor — and kills the process instead of
+    falling back to defaults. Asserting the type is the point: UnicodeDecodeError is
+    an exception too."""
+    p = tmp_path / "policy.toml"
+    p.write_bytes(b'[gates]\nmode = "\xff\xfe"\n')
+    with pytest.raises(policy.PolicyError, match="not valid UTF-8"):
+        policy.load(p)
+
+
 def test_loads_defaults_and_text():
     assert policy.loads("").gates.mode == policy.GatesPolicy.mode
     assert policy.loads('[gates]\nmode = "none"\n').gates.mode == "none"
