@@ -39,12 +39,13 @@ from .install import (
     MODULE_SKILLS,
     RENDER_DIR_REL,
     RENDERER_SCRIPT_MARKER,
-    RENDERER_SCRIPT_REL,
+    RENDERER_SCRIPT_UNIT_REL,
     RENDERER_SEED_SENTINELS,
     _copy_traversable,
     _is_dir,
     _is_file,
     _occupied,
+    _renderer_unit_required,
     _walk_traversable_files,
     _worktree_local_exclude,
     dev_primitive_or_default,
@@ -139,19 +140,17 @@ def _seed_bmad_tree(worktree: Path, repo_root: Path) -> list[str]:
 
 
 def _bmad_scripts_seed_incomplete(worktree: Path, repo_root: Path) -> bool:
-    """Whether a repo renderer script unit reached the worktree incomplete.
+    """Whether a required repo renderer unit member missed the worktree.
 
-    The walk matches :func:`_seed_bmad_tree`, including child-directory symlinks.
-    A directory the walk could not inspect counts as incomplete: the seed cannot
-    deliver it, and silence would dispatch every story into the same renderer HALT.
+    Match the renderer preflight's content-keyed required-file predicate. Arbitrary
+    sibling scripts are still merge-seeded, but their absence cannot prove the
+    renderer will HALT and therefore must not arm the CRITICAL escalation gate.
     """
-    if not _is_file(repo_root / RENDERER_SCRIPT_REL):
-        return False
-    scripts = repo_root.joinpath(*BMAD_SCRIPTS_SEED_REL.split("/"))
-    dst_scripts = worktree.joinpath(*BMAD_SCRIPTS_SEED_REL.split("/"))
     return any(
-        (_is_file(src) or _is_dir(src)) and not _is_file(dst_scripts.joinpath(*rel.split("/")))
-        for rel, src in _walk_traversable_files(scripts)
+        _renderer_unit_required(repo_root, rel)
+        and _is_file(repo_root / rel)
+        and not _is_file(worktree / rel)
+        for rel in RENDERER_SCRIPT_UNIT_REL
     )
 
 
@@ -247,6 +246,35 @@ def worktree_seed_undelivered(
         except (OSError, RuntimeError):
             return False
 
+    def delivered(src: Path, dst: Path) -> bool:
+        """Whether every usable source descendant has a matching destination."""
+        if not contained(dst, worktree):
+            return False
+        if _is_file(src):
+            return _is_file(dst)
+        if not _is_dir(src) or not _is_dir(dst):
+            return False
+
+        complete = True
+
+        def visit_dir(rel: str, _src) -> bool:
+            nonlocal complete
+            target = dst.joinpath(*rel.split("/")) if rel else dst
+            if not contained(target, worktree) or not _is_dir(target):
+                complete = False
+            return True
+
+        for child_rel, child in _walk_traversable_files(src, _visit_dir=visit_dir):
+            target = dst.joinpath(*child_rel.split("/")) if child_rel else dst
+            if _is_file(child):
+                if not contained(target, worktree) or not _is_file(target):
+                    complete = False
+            elif _is_dir(child):
+                # Directories are yielded only when enumeration was refused, so
+                # their unknown descendants cannot be claimed as delivered.
+                complete = False
+        return complete
+
     undelivered: list[str] = []
     for rel in dict.fromkeys(rels):
         src = repo_root / rel
@@ -261,7 +289,7 @@ def worktree_seed_undelivered(
             if not contained(src, repo_root) or not contained(dst, worktree) or destination_is_link:
                 undelivered.append(rel)
             continue
-        if contained(dst, worktree) and (_is_file(dst) or _is_dir(dst)):
+        if delivered(src, dst):
             continue
         undelivered.append(rel)
     return undelivered

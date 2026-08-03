@@ -6778,6 +6778,33 @@ def test_renderer_seed_predicates_report_only_missing_repo_content(tmp_path):
     assert _central_config_seed_incomplete(wt, repo)
 
 
+@pytest.mark.parametrize(
+    ("renderer_body", "missing_name"),
+    [
+        ("# standalone renderer\n", "config_utils.py"),
+        ("import config_utils\n", "unrelated.py"),
+    ],
+)
+def test_renderer_scripts_seed_ignores_files_the_renderer_does_not_require(
+    tmp_path, renderer_body, missing_name
+):
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    _write_worktree_renderer_surface(repo)
+    _write_worktree_renderer_surface(wt)
+    for root in (repo, wt):
+        (root / BMAD_SCRIPTS_SEED_REL / "render_skill.py").write_text(
+            renderer_body, encoding="utf-8"
+        )
+    if missing_name == "unrelated.py":
+        (repo / BMAD_SCRIPTS_SEED_REL / missing_name).write_text(
+            "# not imported by the renderer\n", encoding="utf-8"
+        )
+    else:
+        (wt / BMAD_SCRIPTS_SEED_REL / missing_name).unlink()
+
+    assert not _bmad_scripts_seed_incomplete(wt, repo)
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_provision_reports_a_symlinked_out_renderer_scripts_seed(tmp_path):
     repo, wt = tmp_path / "repo", tmp_path / "wt"
@@ -6806,6 +6833,27 @@ def test_worktree_seed_undelivered_names_a_symlinked_out_source(tmp_path):
 
     assert provision_worktree(wt, [], repo, seed_files=[".mcp.json"]) == []
     assert worktree_seed_undelivered(wt, repo, seed_files=[".mcp.json"]) == [".mcp.json"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("seed_kind", ["files", "globs"])
+def test_worktree_seed_undelivered_names_a_partial_directory_seed(tmp_path, seed_kind):
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    seed_dir = repo / "plugins" / "tool"
+    seed_dir.mkdir(parents=True)
+    (seed_dir / "copied.json").write_text("{}\n", encoding="utf-8")
+    shared = tmp_path / "shared-config"
+    shared.mkdir()
+    (shared / "dropped.json").write_text("{}\n", encoding="utf-8")
+    (seed_dir / "shared").symlink_to(shared, target_is_directory=True)
+    seed_args = (
+        {"seed_files": ["plugins/tool"]} if seed_kind == "files" else {"seed_globs": ["plugins/*"]}
+    )
+
+    provision_worktree(wt, [], repo, **seed_args)
+
+    assert (wt / "plugins" / "tool" / "copied.json").is_file()
+    assert worktree_seed_undelivered(wt, repo, **seed_args) == ["plugins/tool"]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
