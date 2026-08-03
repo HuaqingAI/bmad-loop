@@ -32,6 +32,11 @@ the end-to-end CLI stack.
 (9) is the post-rename row (BMAD-METHOD #2651): the same two-story happy path
 against a project carrying only `bmad-build-auto`, proving the real CLI resolves
 the invoked primitive off disk instead of spelling a constant.
+
+(10) is the renderer preflight row: content-confirmed renderer stubs with missing
+project-global or skill-relative inputs are refused before tmux can spawn the
+fake, dry-run stays diagnostic, and the complete surface reaches the same
+zero-token real-tmux success path.
 """
 
 from __future__ import annotations
@@ -47,7 +52,19 @@ from pathlib import Path
 
 import pytest
 import yaml
-from conftest import install_build_auto_skill, install_dev_base_skills
+from conftest import (
+    RENDERER_SCRIPT_IMPORTING_SIBLING,
+    install_build_auto_skill,
+    install_dev_base_skills,
+)
+
+from bmad_loop.install import (
+    CENTRAL_CONFIG_REL,
+    DEV_PRIMITIVE_NEW,
+    RENDERER_CONFIG_UTILS_REL,
+    RENDERER_ENTRY_REL,
+    RENDERER_SCRIPT_REL,
+)
 
 # Linux-only, not merely non-win32: every fake CLI below is bash + GNU coreutils
 # (`date +%s%N`; the detached-writer fake also needs setsid(1)) — BSD/macOS date
@@ -323,6 +340,38 @@ def _scaffold(root: Path, entries: list[dict], *, install_skills=install_dev_bas
     _git(root, "commit", "-q", "-m", "sandbox")
 
 
+def _scaffold_renderer(
+    root: Path, *, script: bool = True, config: bool = True, workflow: bool = True
+) -> None:
+    """A clean renderer-era stories sandbox with independently mutable surfaces.
+
+    The helper is always present so ``script=False`` isolates the entry-point gate,
+    while ``config=False`` isolates the central-config gate. Every mutation after
+    :func:`_scaffold` is committed so the real run's clean-worktree check cannot
+    hide a missing renderer finding behind an earlier refusal.
+    """
+
+    def install_renderer_skills(skill_root: Path, *, folder_id: bool) -> None:
+        install_build_auto_skill(skill_root, folder_id=folder_id, renderer_stub=True)
+
+    _scaffold(root, [_entry("1")], install_skills=install_renderer_skills)
+
+    helper = root / RENDERER_CONFIG_UTILS_REL
+    helper.parent.mkdir(parents=True, exist_ok=True)
+    helper.write_text("# renderer config helper\n", encoding="utf-8")
+    if script:
+        (root / RENDERER_SCRIPT_REL).write_text(RENDERER_SCRIPT_IMPORTING_SIBLING, encoding="utf-8")
+    if config:
+        central = root / CENTRAL_CONFIG_REL
+        central.parent.mkdir(parents=True, exist_ok=True)
+        central.write_text("[core]\nname = 'renderer-e2e'\n", encoding="utf-8")
+    if not workflow:
+        (root / ".claude" / "skills" / DEV_PRIMITIVE_NEW / RENDERER_ENTRY_REL).unlink()
+
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "renderer fixture")
+
+
 def _scaffold_sprint(
     root: Path, story_key: str, fake_cli: str = FAKE_CLI, extra_policy: str = ""
 ) -> None:
@@ -547,6 +596,69 @@ def test_e2e_two_story_happy_path_build_auto(tmp_path):
     # literal skill invocation; a codex-shaped profile would rewrite it to `$skill`.
     assert all(p.startswith("/bmad-build-auto Spec folder: ") for p in dispatched), dispatched
     assert not any("bmad-dev-auto" in p for p in dispatched), dispatched
+
+
+def test_e2e_renderer_missing_script_fails_validate_and_refuses_before_spawn(tmp_path):
+    root = tmp_path / "sbx"
+    _scaffold_renderer(root, script=False)
+
+    validate = _run(root, "validate", "--json")
+    assert validate.returncode == 1
+    findings = {finding["check"]: finding for finding in json.loads(validate.stdout)["findings"]}
+    renderer = findings["skills.dev-renderer"]
+    assert renderer["severity"] == "problem"
+    assert renderer["detail"] == {
+        "tree": ".claude/skills",
+        "skill": DEV_PRIMITIVE_NEW,
+        "missing_scripts": [RENDERER_SCRIPT_REL],
+    }
+
+    run = _run(root, "run")
+    assert run.returncode == 1
+    assert RENDERER_SCRIPT_REL in run.stderr and "HALT" in run.stderr
+    assert not (root / ".bmad-loop" / "runs").exists(), "preflight must precede session spawn"
+
+    dry = _run(root, "run", "--dry-run")
+    assert dry.returncode == 0, dry.stderr or dry.stdout
+    assert "NOT runnable" in dry.stderr and RENDERER_SCRIPT_REL in dry.stderr
+    assert "Story id: 1." in dry.stdout
+    assert not (root / ".bmad-loop" / "runs").exists()
+
+
+def test_e2e_renderer_missing_central_config_refuses_before_spawn(tmp_path):
+    root = tmp_path / "sbx"
+    _scaffold_renderer(root, config=False)
+
+    run = _run(root, "run")
+    assert run.returncode == 1
+    assert CENTRAL_CONFIG_REL in run.stderr and "HALT" in run.stderr
+    assert not (root / ".bmad-loop" / "runs").exists(), "preflight must precede session spawn"
+
+
+def test_e2e_renderer_missing_workflow_refuses_before_spawn(tmp_path):
+    root = tmp_path / "sbx"
+    _scaffold_renderer(root, workflow=False)
+
+    run = _run(root, "run")
+    assert run.returncode == 1
+    assert RENDERER_ENTRY_REL in run.stderr and "HALT" in run.stderr
+    assert not (root / ".bmad-loop" / "runs").exists(), "preflight must precede session spawn"
+
+
+def test_e2e_renderer_complete_surface_reaches_real_tmux_fake_cli(tmp_path):
+    root = tmp_path / "sbx"
+    _scaffold_renderer(root)
+    base = _commit_count(root)
+
+    run = _run(root, "run")
+    assert run.returncode == 0, run.stderr or run.stdout
+    assert _status(root, "1") == "done"
+    assert _commit_count(root) == base + 1
+
+    run_dir = root / ".bmad-loop" / "runs" / _run_id(root)
+    dispatched = list((run_dir / "tasks").glob("*/fake-prompt.txt"))
+    assert len(dispatched) == 1, dispatched
+    assert dispatched[0].read_text(encoding="utf-8").startswith("/bmad-build-auto Spec folder: ")
 
 
 def test_e2e_spec_checkpoint_two_leg(tmp_path):

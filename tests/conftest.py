@@ -299,6 +299,13 @@ def _write_skill_stubs(skills: Path, catalog: dict) -> None:
             (d / marker).write_text("x\n", encoding="utf-8")
 
 
+RENDERER_STUB_SKILL_MD = (
+    "Run `uv run {project-root}/_bmad/scripts/render_skill.py` and follow its output.\n"
+)
+RENDERER_WORKFLOW_MD = "Read [[bmad-snapshot:step-04-review.md]] fully.\n"
+RENDERER_SCRIPT_IMPORTING_SIBLING = "from config_utils import load_central_config\n"
+
+
 def install_dev_base_skills(root: Path, tree: str = ".claude/skills", *, folder_id: bool) -> Path:
     """Lay down stubs of the upstream skills the orchestrator drives on every dev run
     (`install.DEV_BASE_SKILLS`: bmad-dev-auto + the review hunters) under
@@ -324,7 +331,11 @@ def install_dev_base_skills(root: Path, tree: str = ".claude/skills", *, folder_
 
 
 def install_build_auto_skill(
-    root: Path, tree: str = ".claude/skills", *, folder_id: bool = True
+    root: Path,
+    tree: str = ".claude/skills",
+    *,
+    folder_id: bool = True,
+    renderer_stub: bool = False,
 ) -> Path:
     """The post-rename twin of :func:`install_dev_base_skills`: lay down the NEW dev
     primitive (`install.DEV_PRIMITIVE_NEW`) plus the review hunters under ``root/tree``.
@@ -337,7 +348,11 @@ def install_build_auto_skill(
 
     ``folder_id`` writes the resolved primitive's step-01 carrying the dispatch marker
     `install.missing_stories_support` content-probes for, exactly as the legacy twin
-    does — under `bmad-build-auto`, since that is the name that resolves here."""
+    does — under `bmad-build-auto`, since that is the name that resolves here.
+
+    ``renderer_stub`` changes only the installed primitive's content discriminator
+    and adds a complete source graph. Project-global renderer files stay explicit in
+    each test so every presence gate has an observable clearing leg."""
     from bmad_loop.install import (
         DEV_BASE_SKILLS,
         DEV_PRIMITIVE_LEGACY,
@@ -352,8 +367,12 @@ def install_build_auto_skill(
     hunters = {k: v for k, v in DEV_BASE_SKILLS.items() if k != DEV_PRIMITIVE_LEGACY}
     skills = Path(root) / tree
     _write_skill_stubs(skills, {DEV_PRIMITIVE_NEW: DEV_PRIMITIVE_MARKERS, **hunters})
+    primitive = skills / DEV_PRIMITIVE_NEW
+    if renderer_stub:
+        (primitive / "SKILL.md").write_text(RENDERER_STUB_SKILL_MD, encoding="utf-8")
+        (primitive / "workflow.md").write_text(RENDERER_WORKFLOW_MD, encoding="utf-8")
     if folder_id:
-        (skills / DEV_PRIMITIVE_NEW / STORIES_PROBE_FILE).write_text(
+        (primitive / STORIES_PROBE_FILE).write_text(
             f"This is a **{STORIES_PROBE_TEXT}** router.\n", encoding="utf-8"
         )
     return skills

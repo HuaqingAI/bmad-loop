@@ -99,6 +99,57 @@ DEV_PRIMITIVE_MARKERS = ("step-04-review.md", "customize.toml")
 # catch. Neither has a defensible reading, so the two move together or not at all.
 DEV_PRIMITIVE_ROLES: tuple[str, ...] = ("dev", "review")
 
+# Where project-level customization of an upstream skill lives. This main-native
+# Path remains the single source; renderer strings derive their `_bmad` spelling
+# from it so the install and validation surfaces cannot drift.
+CUSTOMIZE_DIR = Path("_bmad") / "custom"
+
+# BMAD's project-local configuration and tooling root. Renderer paths derive from
+# this one spelling so the validate-side checks in this phase and the worktree seed
+# added later cannot drift.
+BMAD_DIR = CUSTOMIZE_DIR.parent.as_posix()
+
+# Since BMAD-METHOD PR #2601 a skill's SKILL.md can be a renderer stub that shells
+# out to this project-local script. Its absence makes the session HALT before the
+# dev workflow can write a spec or result, so a content-confirmed stub makes this a
+# preflight problem rather than a best-effort advisory.
+RENDERER_SCRIPT_REL = f"{BMAD_DIR}/scripts/render_skill.py"
+RENDERER_SCRIPT_MARKER = "render_skill.py"
+
+# The renderer currently imports this sibling helper at module scope. Require it
+# only when the installed script still names that import surface; a false positive
+# would refuse every run and has no --force escape hatch.
+RENDERER_CONFIG_UTILS_REL = f"{BMAD_DIR}/scripts/config_utils.py"
+RENDERER_CONFIG_UTILS_MARKER = "config_utils"
+RENDERER_SCRIPT_UNIT_REL: tuple[str, ...] = (
+    RENDERER_SCRIPT_REL,
+    RENDERER_CONFIG_UTILS_REL,
+)
+
+# The renderer's only required project-global config layer. This is deliberately
+# not `_bmad/bmm/config.yaml`, which configures bmad-loop's artifact paths.
+CENTRAL_CONFIG_REL = f"{BMAD_DIR}/config.toml"
+
+# Reserved completeness sentinels for the worktree seeding half in phase 6H. They
+# intentionally ship without a reader here: the validate-side contract must exist
+# before provisioning can report these exact strings across the install/engine seam.
+BMAD_SCRIPTS_SEED_REL = f"{BMAD_DIR}/scripts"
+RENDERER_SEED_SENTINELS: tuple[str, ...] = (BMAD_SCRIPTS_SEED_REL, CENTRAL_CONFIG_REL)
+
+# The skill-relative render entry plus snapshot-reference grammar. The regex is a
+# byte-for-byte mirror of BMAD-METHOD main's render_skill.py `_SNAPSHOT_TOKEN` at
+# 57e70562e3776b47bce1a54710f1edb1f0bd3618. Loosening it invents failures the
+# renderer ignores; tightening it misses a real HALT.
+RENDERER_ENTRY_REL = "workflow.md"
+SNAPSHOT_TOKEN_RE = re.compile(r"\[\[bmad-snapshot:([A-Za-z0-9_./-]+\.md)\]\]")
+
+# Renderer output is regenerated with checkout-absolute paths and must never be
+# copied into a worktree or committed. BMAD_SEED_EXCLUDES is consumed by the 6H
+# seeding half; RENDER_DIR_REL is already live in init and validate in this phase.
+RENDER_DIR_NAME = "render"
+BMAD_SEED_EXCLUDES = (RENDER_DIR_NAME,)
+RENDER_DIR_REL = f"{BMAD_DIR}/{RENDER_DIR_NAME}"
+
 # Upstream skills the orchestrator invokes but does NOT bundle in the wheel — the
 # BMad Method (bmm) module installs them. Each must exist in every ``trees`` entry —
 # callers pass the DEV_PRIMITIVE_ROLES trees — and carry its marker files (a
@@ -167,11 +218,6 @@ _INVOKE_SKILL_RE = re.compile(r"[Ii]nvoke the `(bmad-[a-z0-9-]+)` skill")
 # rebuild #260's false FAIL. Lens names (`adversarial`) lack the prefix, so the
 # shipped layers add nothing here.
 _SKILL_REF_RE = re.compile(r"`(bmad-[a-z0-9-]+)`")
-# Where project-level customization of an upstream skill lives. Both the
-# preflight (which reads the overrides) and worktree provisioning (which seeds
-# them, so an isolated run resolves the same layers) derive their paths from
-# this one constant, or they drift.
-CUSTOMIZE_DIR = Path("_bmad") / "custom"
 
 
 def _customize_overrides(skill: str) -> tuple[Path, ...]:
@@ -224,6 +270,91 @@ def _is_dev_primitive_shim(project: Path, tree: str) -> bool:
     if not (legacy / "SKILL.md").is_file():
         return False
     return any(not (legacy / marker).is_file() for marker in DEV_PRIMITIVE_MARKERS)
+
+
+def _is_renderer_stub(skill_dir: Path) -> bool:
+    """Whether ``skill_dir`` delegates to the project renderer.
+
+    Content, not the skill's era/name, is the discriminator. An unreadable or
+    non-UTF-8 SKILL.md cannot prove the renderer is involved, so this fails open;
+    the ordinary marker checks still report the damaged skill tree.
+    """
+    try:
+        skill_md = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    return RENDERER_SCRIPT_MARKER in skill_md
+
+
+def _renderer_unit_required(project: Path, rel: str) -> bool:
+    """Whether the installed renderer requires project-relative unit member ``rel``.
+
+    The entry point is unconditional. The sibling helper is content-keyed because
+    it is required only while ``render_skill.py`` imports it; this preflight has no
+    force override, so the installed script is the honest compatibility boundary.
+    An absent/unreadable script already earns the entry-point finding and does not
+    also fabricate a helper diagnosis.
+    """
+    if rel != RENDERER_CONFIG_UTILS_REL:
+        return True
+    try:
+        script = (project / RENDERER_SCRIPT_REL).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    return RENDERER_CONFIG_UTILS_MARKER in script
+
+
+def _absent_renderer_sources(skill_dir: Path) -> list[str]:
+    """Required renderer sources absent from ``skill_dir``, as POSIX rels.
+
+    This validates the two statically decidable source HALTs: the hard-coded
+    ``workflow.md`` entry and any ``[[bmad-snapshot:...]]`` target declared by a
+    Markdown source. Missing config-token values are deliberately outside this
+    presence-only check (#407).
+
+    The era guard lives here: an inline pre-renderer SKILL.md legitimately has no
+    workflow entry, so asking it renderer questions would refuse a healthy install.
+
+    The ``rglob`` walk deliberately mirrors upstream
+    ``render_skill.py::_load_sources`` and must not be unified with
+    :func:`_copy_traversable`'s ``iterdir`` recursion. ``rglob`` does not descend a
+    symlinked sub-directory; the copier does. Using the copier's enumeration here
+    would invent sources the renderer never loads and turn a guaranteed HALT green.
+
+    Upstream keys nested sources by POSIX relative path and excludes every basename
+    ``SKILL.md``. Read/decode faults fail open because they have different remediation
+    from an absent declared source. Filesystem-totality hardening (including the FIFO
+    guard) belongs to phase 6G, not this validate-side presence contract.
+    """
+    if not _is_renderer_stub(skill_dir):
+        return []
+    sources = {
+        path.relative_to(skill_dir).as_posix(): path
+        for path in skill_dir.rglob("*.md")
+        if path.name != "SKILL.md"
+    }
+    absent = [] if RENDERER_ENTRY_REL in sources else [RENDERER_ENTRY_REL]
+    for path in sources.values():
+        try:
+            body = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        absent.extend(target for target in SNAPSHOT_TOKEN_RE.findall(body) if target not in sources)
+    return sorted(set(absent))
+
+
+def renderer_stub_resolved(project: Path, trees: Sequence[str]) -> bool:
+    """Whether any active tree resolves to a renderer-backed dev primitive.
+
+    Resolution is per tree and deduplicated exactly like :func:`missing_base_skills`.
+    This public predicate intentionally lands before its 6H engine reader so the
+    later seed-escalation decision can reuse the exact preflight discriminator.
+    """
+    for tree in dict.fromkeys(trees):
+        resolved = resolve_dev_primitive(project, tree)
+        if resolved is not None and _is_renderer_stub(project / tree / resolved):
+            return True
+    return False
 
 
 def dev_primitive_or_default(project: Path, tree: str | None) -> str:
@@ -571,8 +702,24 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
     ``skills.base-incomplete`` carries ``missing_markers`` as a list — the message
     joins it with ", " for the human line, which a consumer would otherwise have to
     split back apart on a separator the message is free to change.
+
+    A resolved renderer stub is also checked at the project-global and
+    skill-relative surfaces whose absence deterministically HALTs before the
+    workflow can write its contract:
+
+    - ``skills.dev-renderer``: a required project-relative renderer script-unit
+      member is absent (``missing_scripts`` detail, per tree);
+    - ``skills.dev-renderer-config``: the project-global required config is absent
+      (emitted once even when multiple trees resolve a stub);
+    - ``skills.dev-renderer-sources``: the skill-relative workflow entry or a
+      declared snapshot source is absent (``missing_sources`` detail, per tree).
+
+    These are independent of the ordinary marker check: a damaged primitive may
+    need both remediations. All are content-gated on the installed SKILL.md, so an
+    inline pre-renderer install sees byte-stable behavior.
     """
     problems: list[Finding] = []
+    resolved_stub = False
     for tree in dict.fromkeys(trees):
         resolved = resolve_dev_primitive(project, tree)
         if resolved is None and _is_dev_primitive_shim(project, tree):
@@ -621,7 +768,60 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
                         {"tree": tree, "skill": resolved, "missing_markers": absent},
                     )
                 )
+            if _is_renderer_stub(skill_dir):
+                resolved_stub = True
+                absent_scripts = [
+                    rel
+                    for rel in RENDERER_SCRIPT_UNIT_REL
+                    if _renderer_unit_required(project, rel) and not (project / rel).is_file()
+                ]
+                if absent_scripts:
+                    problems.append(
+                        Finding(
+                            "skills.dev-renderer",
+                            "problem",
+                            f"{tree}/{resolved}/SKILL.md renders via "
+                            f"{RENDERER_SCRIPT_MARKER} but the renderer script unit is "
+                            f"incomplete (missing {', '.join(absent_scripts)}) — the "
+                            "session would HALT without writing a spec; reinstall the "
+                            "BMad Method (bmm) module",
+                            {
+                                "tree": tree,
+                                "skill": resolved,
+                                "missing_scripts": absent_scripts,
+                            },
+                        )
+                    )
+            absent_sources = _absent_renderer_sources(skill_dir)
+            if absent_sources:
+                problems.append(
+                    Finding(
+                        "skills.dev-renderer-sources",
+                        "problem",
+                        f"{tree}/{resolved} renders via {RENDERER_SCRIPT_MARKER} but its "
+                        f"render sources are incomplete (unresolved: "
+                        f"{', '.join(absent_sources)}) — the session would HALT without "
+                        "writing a spec; reinstall the BMad Method (bmm) module",
+                        {
+                            "tree": tree,
+                            "skill": resolved,
+                            "missing_sources": absent_sources,
+                        },
+                    )
+                )
         problems.extend(_review_findings(project, tree))
+    if resolved_stub and not (project / CENTRAL_CONFIG_REL).is_file():
+        problems.append(
+            Finding(
+                "skills.dev-renderer-config",
+                "problem",
+                f"the dev primitive renders via {RENDERER_SCRIPT_MARKER} but "
+                f"{CENTRAL_CONFIG_REL} is missing — the renderer requires that layer "
+                "and would HALT without writing a spec; reinstall the BMad Method "
+                "(bmm) module",
+                {"config": CENTRAL_CONFIG_REL},
+            )
+        )
     return problems
 
 
@@ -938,6 +1138,11 @@ def _copy_traversable(src, dst: Path, *, skip_existing: bool = False) -> bool:
 
     Walks via the Traversable API (.iterdir/.read_bytes) rather than resolving a
     filesystem path, so it works even when the package is zip-imported.
+
+    Its ``iterdir`` recursion deliberately descends a symlinked source directory.
+    Do not unify this walk with :func:`_absent_renderer_sources`, whose ``rglob``
+    mirrors the renderer and does not descend one. The copier asks what it can carry;
+    the renderer gate asks what upstream will enumerate.
 
     ``skip_existing`` makes the copy no-clobber at FILE granularity: an existing
     destination file is left untouched and its siblings are still copied — even
@@ -2621,7 +2826,12 @@ def install_into(
     have = set(existing.splitlines())
     to_add = [
         line
-        for line in (".bmad-loop/runs/", ".bmad-loop/cache/", ".bmad-loop/policy.toml")
+        for line in (
+            ".bmad-loop/runs/",
+            ".bmad-loop/cache/",
+            ".bmad-loop/policy.toml",
+            f"{RENDER_DIR_REL}/",
+        )
         if line not in have
     ]
     if to_add:
