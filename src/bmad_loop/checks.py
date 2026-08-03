@@ -66,6 +66,7 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "mux.selection",
         "mux.external-backend",
         "host.process",
+        "host.wsl-interop",
         "notify.desktop-unavailable",
         "skills.base",
         "skills.base-missing",

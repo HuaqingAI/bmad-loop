@@ -57,7 +57,12 @@ names carry over. It is selected automatically when available; `available()` req
 releases can force-kill a recycled PID during teardown, so they report unavailable and
 selection falls through). Native Windows is still experimental — see the
 [roadmap](ROADMAP.md#native-windows-multiplexer-backend) for the remaining work. WSL is
-unaffected: it _is_ Linux and uses tmux.
+unaffected: it _is_ Linux and uses tmux — provided bmad-loop was installed with the
+distro's own Python. WSL appends the Windows `PATH` to its own, so a Windows-installed
+bmad-loop is reachable from the bash prompt; that process reports `win32` and takes the
+psmux default no matter how Linux the shell looks. `bmad-loop validate` names the
+selection reason on every host, and warns (`host.wsl-interop`) when a `win32` interpreter
+is working on a `\\wsl.localhost\...` project (#332).
 
 Two model differences matter if you port a backend or read psmux argv. psmux runs one server
 per session, so window ids are minted per server and the backend session-qualifies every id it

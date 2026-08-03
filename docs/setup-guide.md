@@ -42,7 +42,14 @@ of the README.
   not yet at the Linux/macOS/WSL support tier — the remaining native-Windows work (window
   hosting, attach/detach, Unity cache paths) is tracked in
   [the roadmap](ROADMAP.md#native-windows-multiplexer-backend); the port path is in
-  [Porting bmad-loop to a new OS](porting-to-a-new-os.md).
+  [Porting bmad-loop to a new OS](porting-to-a-new-os.md). Inside WSL, install with the
+  **Linux** interpreter — a Windows-installed bmad-loop is reachable from the bash prompt
+  and silently behaves as Windows
+  ([why](multiplexer-backends.md#psmux-native-windows-experimental)). To check:
+  `bmad-loop mux` should read `platform default for linux`; if it names `win32` you are
+  running the Windows build, and `bmad-loop validate` says so too. (A forced choice —
+  `BMAD_LOOP_MUX_BACKEND` or `[mux] backend` — is reported as the reason _instead_ of the
+  platform, so clear it before reading that line as a platform check.)
 
 ## Installed via the BMAD-method installer? (recommended)
 

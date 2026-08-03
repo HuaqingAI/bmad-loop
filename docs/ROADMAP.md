@@ -26,7 +26,7 @@ matching seam, `ProcessHost` (`src/bmad_loop/process_host.py`): `terminate` / `f
 `is_alive` / `identity` (a PID-reuse guard) plus `hook_interpreter()` (so hook registration
 never branches on platform), registered the same way (`register_process_host`,
 `BMAD_LOOP_PROCESS_HOST`); `WindowsProcessHost` already ships. `bmad-loop validate` runs a
-`_platform_preflight()` that reports the selected backend's readiness and names the process
+`_platform_preflight(project)` that reports the selected backend's readiness and names the process
 host — so a new OS surfaces in preflight by registering, not by a `validate` edit. The Unity
 plugin's `/proc`/`/tmp`/`cp -a`/symlink primitives degrade off Linux (with `psutil` from the
 optional `non-linux` extra) and its pid lifecycle now delegates to `ProcessHost`; everything is

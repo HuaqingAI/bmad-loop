@@ -41,7 +41,7 @@ from . import runs
 from .checks import Finding
 from .journal import Journal, save_state
 from .model import RunState
-from .platform_util import atomic_replace
+from .platform_util import atomic_replace, is_wsl_unc_path
 from .runs import RUNS_DIR
 
 if TYPE_CHECKING:
@@ -155,11 +155,14 @@ def mux_reason_label(reason: str) -> str:
         "policy": f"set by [mux] backend in {policy_mod.POLICY_FILE}",
         "platform-default": f"platform default for {sys.platform}",
         "first-match": "first available platform match",
-        "fallback": "fallback (no registered backend is available)",
+        # not "no registered backend is available": `_select` reaches `fallback` when no
+        # *available* backend matches this platform — an available backend registered for
+        # another platform leaves the reason here just the same.
+        "fallback": "fallback (no available backend matches this platform)",
     }.get(reason, reason)
 
 
-def platform_preflight() -> list[Finding]:
+def platform_preflight(project: Path) -> list[Finding]:
     """Probe the platform-selected seams — the terminal multiplexer and the process
     host — for `cmd_validate`, returning the findings in emission order.
 
@@ -167,6 +170,11 @@ def platform_preflight() -> list[Finding]:
     a new OS or transport surfaces here by *registering* rather than by adding a
     ``sys.platform`` branch to validate. The process host is named so a
     misselection (e.g. the Windows host picked on Linux) is visible at a glance.
+
+    ``project`` is read only to name the host/interpreter mismatch behind #332 — a
+    win32 interpreter working on a WSL UNC path. Selection is unaffected by it: for
+    a win32 interpreter psmux *is* the right pick, so this warns rather than
+    re-chooses.
     """
     from .adapters.multiplexer import (
         detect_multiplexers,
@@ -211,7 +219,14 @@ def platform_preflight() -> list[Finding]:
 
     try:
         infos = detect_multiplexers()
-    except Exception:  # detection is advisory; never break validate
+    except Exception as e:
+        # Advisory, so it must not abort validate — but it must not be silent either.
+        # Two findings below read `infos`: `mux.selection` vanishes entirely, and the
+        # #332 warning degrades to its no-backend wording. Without this line the report
+        # shows a healthy `mux.backend` (independent, from `get_multiplexer`) above a
+        # warning naming no backend — which reads as "selection failed" when what
+        # actually failed was detection.
+        found.append(Finding("mux.backends-detected", "warning", f"mux detection failed: {e}"))
         infos = []
     if len(infos) > 1:  # a lone tmux needs no listing; keep single-backend output stable
         listed = ", ".join(
@@ -248,14 +263,23 @@ def platform_preflight() -> list[Finding]:
             )
         )
     chosen = next((i for i in infos if i.selected), None)
-    if chosen and chosen.reason in ("env", "policy"):
-        # detail keeps the raw enum, not mux_reason_label's prose: the label is
-        # wording ("set by [mux] backend in .bmad-loop/policy.toml"), the enum is
-        # the value MuxBackendInfo.reason actually carries.
+    if chosen:
+        # Emitted for EVERY reason, not just the forced ones (#332): the reason that
+        # most needs naming is `platform-default`, which is how a win32 interpreter
+        # silently lands on psmux. detail keeps the raw enum, not mux_reason_label's
+        # prose: the label is wording ("set by [mux] backend in
+        # .bmad-loop/policy.toml"), the enum is the value MuxBackendInfo.reason
+        # actually carries.
+        #
+        # Severity follows the reason. `fallback` is the one `_select` returns when no
+        # *available* backend matches this platform, and its label says exactly that — so
+        # emitting it at "ok" would print a green line whose own text contradicts it.
+        # It stays a warning rather than a problem because `mux.backend` above already
+        # carries the problem for that host; this line only names how it got there.
         found.append(
             Finding(
                 "mux.selection",
-                "ok",
+                "warning" if chosen.reason == "fallback" else "ok",
                 f"multiplexer selection {mux_reason_label(chosen.reason)}",
                 {"backend": chosen.name, "reason": chosen.reason},
             )
@@ -285,6 +309,51 @@ def platform_preflight() -> list[Finding]:
         found.append(Finding("host.process", "ok", f"process host: {host}", {"host": host}))
     except Exception as e:  # a bad BMAD_LOOP_PROCESS_HOST must report, not crash
         found.append(Finding("host.process", "problem", f"process host preflight failed: {e}"))
+
+    # A `warning`, never a `problem`: nothing here is broken from this interpreter's
+    # point of view — the selected backend is the right win32 pick and every seam above
+    # reports healthy — so the verdict and the exit code must not flip. What is wrong is
+    # the interpreter, and only the operator can swap it.
+    if sys.platform == "win32" and is_wsl_unc_path(project):
+        # State only what the evidence supports. A win32 interpreter on a distro path
+        # is NOT proof of a WSL shell: `cd \\wsl.localhost\...` from native PowerShell
+        # reaches the same condition, and nothing here can separate the two (the interop
+        # env markers do not survive the boundary — see `is_wsl_unc_path`). So the
+        # finding reports the mismatch it can actually see and leaves the WSL remedy
+        # conditional, rather than telling an operator where they are standing.
+        #
+        # The backend clause names what was *actually* chosen instead of assuming psmux
+        # — a forced `env`/`policy` choice would otherwise contradict the `mux.selection`
+        # line above — and is dropped entirely when selection failed (`chosen is None`,
+        # e.g. a forced unknown name), since there is no backend to name and inventing
+        # one is the exact failure this check exists to stop.
+        picked = (
+            f"{chosen.name} was selected and the distro's own tmux is invisible to it"
+            if chosen
+            else "the distro's own tmux is invisible to it"
+        )
+        found.append(
+            Finding(
+                "host.wsl-interop",
+                "warning",
+                "the native-Windows build (this interpreter reports win32) is working on a "
+                f"WSL distro path — {picked}; if you are running from a WSL shell, install "
+                "bmad-loop with the WSL/Linux Python instead",
+                # `project` is deliberately NOT carried here. `validate --json` is not a
+                # sanitized surface, and a distro path ends in the *Linux* username,
+                # which the egress redactor does not know (it compares against the
+                # Windows account). The caller passed the path in; it needs no echo.
+                #
+                # `selection_resolved` because a null backend has two causes a consumer
+                # would otherwise conflate: selection failed, or detection did (which
+                # `mux.backends-detected` reports at `warning`).
+                {
+                    "backend": chosen.name if chosen else None,
+                    "platform": sys.platform,
+                    "selection_resolved": chosen is not None,
+                },
+            )
+        )
 
     return found
 

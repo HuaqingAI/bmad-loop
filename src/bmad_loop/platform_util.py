@@ -160,6 +160,38 @@ def names_tree_root(value: str | Path) -> bool:
     return bool(parts) and all(part.strip(" .") == "" and part != ".." for part in parts)
 
 
+def is_wsl_unc_path(value: str | Path) -> bool:
+    """True if ``value`` addresses a WSL distro's filesystem through the Windows UNC
+    bridge — ``\\\\wsl.localhost\\<distro>\\...`` or its legacy ``\\\\wsl$\\<distro>\\...``
+    spelling, matched case-insensitively and with either separator, since Windows
+    accepts ``//wsl$/...`` as readily as the backslash form.
+
+    Used to spot a native-Windows interpreter working a distro path — the #332
+    mis-pick, where WSL's appended Windows ``PATH`` lands a bash prompt on a ``win32``
+    build that takes the win32 defaults and never sees the distro's tmux.
+
+    The path is the signal because the obvious alternative does not survive: probed on
+    a live interop launch (Windows 11, WSL2, Ubuntu-24.04, 2026-08), ``WSL_DISTRO_NAME``
+    and ``WSL_INTEROP`` were absent from the child and ``PWD``, when present at all,
+    carried the *Windows*-side parent's value rather than the distro cwd — WSL hands a
+    Windows binary the *Windows* environment block. So an env marker is not merely
+    missing, it can be present and wrong. Nothing pins that observation, so re-probe
+    before adding an env-marker check rather than assuming one would work.
+
+    Platform-blind by design (reads no ``sys.platform``): the "is this interpreter the
+    wrong one" half stays at the call site.
+
+    Callers pass a resolved path (``cli._project``), and resolution is what decides the
+    coverage: measured on Windows 11 / CPython 3.13, ``Path.resolve()`` leaves both
+    bridge spellings untouched, folds ``//wsl.localhost/...`` into the backslash form,
+    and dereferences a mapped drive or ``subst`` alias back to the UNC spelling — so all
+    of those match. It does *not* strip a ``\\\\?\\UNC\\...`` prefix the input already
+    carried (``ntpath.realpath`` only strips one it added itself), and that spelling is
+    the one shape left unmatched. It falls back to the ``mux.selection`` line, which
+    names the platform regardless."""
+    return str(value).replace("/", "\\").lower().startswith(("\\\\wsl.localhost\\", "\\\\wsl$\\"))
+
+
 def _retry_on_sharing_violation(op: Callable[[], None]) -> None:
     """Run ``op``, retrying the transient Windows sharing violation a concurrent
     handle on the file triggers (WinError 5/32). Gated to win32 so a real POSIX

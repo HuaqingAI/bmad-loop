@@ -77,7 +77,16 @@ def validate_document(
       no finding at all. A check id missing from ``findings`` means "did not run",
       never "passed" — check ``ok`` for the verdict, not the absence of an id.
     - **``mux.backends-detected`` is gated on more than one registered backend**,
-      so a lone-tmux host carries no backend inventory. Same rule as above.
+      so a lone-tmux host carries no backend inventory. Same rule as above. The one
+      exception to its ``ok`` severity is a detection failure, which reports under
+      the same id at ``warning`` with an empty inventory.
+    - **``mux.selection`` is not gated on the reason.** It used to appear only for a
+      forced ``env``/``policy`` choice and now names the reason wherever selection
+      resolves. It is absent whenever no backend row is *selected*, which has two
+      causes: a forced name matching no registered backend (``mux.preflight``
+      carries that failure) and ``_select`` bottoming out at its historical tmux
+      fallback with tmux unregistered (nothing else reports that — the inventory
+      simply holds no selected row). Same rule as above.
 
     ``findings`` stays flat and in emission order rather than grouped by severity:
     grouping would destroy the cross-severity ordering (the order the gates ran)

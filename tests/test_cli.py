@@ -4,6 +4,7 @@ import argparse
 import io
 import json
 import sys
+from pathlib import Path
 
 import pytest
 import yaml
@@ -3427,10 +3428,13 @@ def _patch_preflight(monkeypatch, backend):
     monkeypatch.setattr(ph_mod, "get_process_host", lambda: _FakeHost())
 
 
-def _preflight_notes_problems():
+def _preflight_notes_problems(project=Path("C:/p")):
     """The preflight's pre-#205 (notes, problems) shape, rebuilt from its findings —
-    these tests assert the *seam probing*, which the Finding refactor did not change."""
-    found = cli._platform_preflight()
+    these tests assert the *seam probing*, which the Finding refactor did not change.
+
+    The default project is a plain drive path so the #332 WSL check stays quiet;
+    the tests that care pass their own."""
+    found = cli._platform_preflight(project)
     return (
         [f.message for f in found if f.severity != "problem"],
         [f.message for f in found if f.severity == "problem"],
@@ -3970,7 +3974,10 @@ def _make_validate_pass(project, monkeypatch, capsys, *, policy=CLAUDE_ONLY_POLI
     monkeypatch.setattr(
         cli,
         "_platform_preflight",
-        lambda: [cli.Finding("mux.backend", "ok", "multiplexer TmuxBackend available (tmux 3.4)")],
+        # arity follows runsetup.platform_preflight, which takes the project (#332)
+        lambda _project: [
+            cli.Finding("mux.backend", "ok", "multiplexer TmuxBackend available (tmux 3.4)")
+        ],
     )
     capsys.readouterr()  # drop `init`'s chatter — the next read must see only the document
 
@@ -4213,7 +4220,7 @@ def test_validate_json_mux_detail_keeps_the_rows_the_text_flattens(mux_registry,
     )
     mux_registry.register_multiplexer("beta", lambda p: False, lambda: _MuxStub(avail=False))
 
-    found = cli._platform_preflight()
+    found = cli._platform_preflight(Path("C:/p"))
     listing = next(f for f in found if f.check == "mux.backends-detected")
     # unchanged text
     assert "alpha*" in listing.message and "beta (unavailable)" in listing.message
@@ -4239,7 +4246,7 @@ def test_platform_preflight_selection_detail_keeps_the_raw_reason(mux_registry, 
     monkeypatch.setenv("BMAD_LOOP_MUX_BACKEND", "alpha")
     mux_registry.get_multiplexer.cache_clear()
 
-    selection = next(f for f in cli._platform_preflight() if f.check == "mux.selection")
+    selection = next(f for f in cli._platform_preflight(Path("C:/p")) if f.check == "mux.selection")
     assert selection.detail == {"backend": "alpha", "reason": "env"}
     assert "forced by BMAD_LOOP_MUX_BACKEND" in selection.message  # prose stays in the message
 
@@ -4258,7 +4265,9 @@ def test_external_backend_failure_is_a_warning_not_a_note(mux_registry, monkeypa
     monkeypatch.setattr(mux_registry, "_EXTERNAL_ERRORS", {"brokenmux": "ImportError: no ghost"})
     monkeypatch.setattr(mux_registry, "_EXTERNALS_LOADED", True)  # no rescan over the stub
 
-    finding = next(f for f in cli._platform_preflight() if f.check == "mux.external-backend")
+    finding = next(
+        f for f in cli._platform_preflight(Path("C:/p")) if f.check == "mux.external-backend"
+    )
     assert finding.severity == "warning"
     assert finding.detail == {"entry_point": "brokenmux", "error": "ImportError: no ghost"}
 
@@ -4532,7 +4541,7 @@ def test_platform_preflight_folds_a_multi_line_version(mux_registry):
         lambda: _MuxStub(avail=True, version="alpha 1.2\nextra build line"),
     )
 
-    finding = next(f for f in cli._platform_preflight() if f.check == "mux.backend")
+    finding = next(f for f in cli._platform_preflight(Path("p")) if f.check == "mux.backend")
     assert finding.detail["version"] == "alpha 1.2; extra build line"
     assert "\n" not in finding.message
 
@@ -4550,7 +4559,7 @@ def test_platform_preflight_bounds_an_over_long_version(mux_registry):
         lambda: _MuxStub(avail=True, version="alpha 1.2 " + "x" * 300),
     )
 
-    finding = next(f for f in cli._platform_preflight() if f.check == "mux.backend")
+    finding = next(f for f in cli._platform_preflight(Path("p")) if f.check == "mux.backend")
     assert len(finding.detail["version"]) == VERSION_MAX_CHARS
     assert finding.detail["version"].endswith("…")
 
@@ -4677,6 +4686,214 @@ def test_platform_preflight_notes_forced_selection_provenance(mux_registry, monk
     mux_registry.get_multiplexer.cache_clear()
     notes, problems = _preflight_notes_problems()
     assert any("forced by BMAD_LOOP_MUX_BACKEND" in n for n in notes)
+
+
+# ------------------------------------ native-Windows-from-WSL visibility (#332)
+#
+# A WSL shell reaches a native-Windows bmad-loop through interop (WSL appends the
+# Windows PATH to its own). That interpreter reports win32, takes the psmux
+# platform default, and never sees the distro's tmux — while the operator is
+# looking at a bash prompt. Selection is right for what the interpreter is; the
+# bug is that nothing named the platform. These pin the naming.
+
+WSL_UNC_PROJECT = Path("\\\\wsl.localhost\\Ubuntu-24.04\\home\\u\\p")
+
+
+@pytest.fixture
+def fake_platform(monkeypatch):
+    """Patch `sys.platform` for a preflight call and un-poison what that call caches.
+
+    The patch is *process-wide* — spelled `sys` deliberately, because `cli.runsetup.sys`
+    is the same module object and the qualified spelling would imply a module-local
+    scope that does not exist. Every `sys.platform` reader on the path under test sees
+    it: `mux_reason_label`'s label, `_PLATFORM_DEFAULTS`, and the process host's
+    `matches()`.
+
+    `platform_preflight` reaches `get_process_host()`, which is `lru_cache(maxsize=1)`
+    and selects on `sys.platform`. Patching the platform without clearing the cache
+    leaves the *Windows* process host cached for every later test in the worker —
+    silently, and worst on a POSIX CI worker. (`get_multiplexer` has the same shape;
+    the `mux_registry` fixture already clears it.) Clearing on the way in and on the
+    way out keeps the poisoning inside one test in both directions. Within the test,
+    constructing `WindowsProcessHost` on a POSIX worker is harmless: a raise becomes a
+    `host.process` problem finding, which no assertion here reads."""
+    from bmad_loop.process_host import get_process_host
+
+    def _set(platform_name: str) -> None:
+        get_process_host.cache_clear()
+        monkeypatch.setattr(sys, "platform", platform_name)
+
+    yield _set
+    get_process_host.cache_clear()
+
+
+def test_platform_preflight_names_the_platform_default_selection(mux_registry):
+    """The reason that most needs naming is `platform-default` — it is how a win32
+    interpreter silently lands on psmux — and it used to be the one the gate dropped."""
+    default = mux_registry._PLATFORM_DEFAULTS.get(sys.platform, mux_registry._DEFAULT_BACKEND)
+    mux_registry.register_multiplexer(default, lambda p: True, lambda: _MuxStub(avail=True))
+    mux_registry.get_multiplexer.cache_clear()
+
+    selection = next(f for f in cli._platform_preflight(Path("C:/p")) if f.check == "mux.selection")
+    assert selection.severity == "ok"
+    assert selection.detail == {"backend": default, "reason": "platform-default"}
+    assert f"platform default for {sys.platform}" in selection.message
+
+
+def test_platform_preflight_selection_warns_when_the_reason_is_fallback(mux_registry):
+    """`fallback` is what `_select` returns when no available backend matches this
+    platform, and the label says so — so un-gating this finding must not print that
+    sentence at `ok`."""
+    mux_registry.register_multiplexer("alpha", lambda p: True, lambda: _MuxStub(avail=False))
+    mux_registry.get_multiplexer.cache_clear()
+
+    selection = next(f for f in cli._platform_preflight(Path("C:/p")) if f.check == "mux.selection")
+    assert selection.detail == {"backend": "alpha", "reason": "fallback"}
+    assert selection.severity == "warning"
+    assert "no available backend matches this platform" in selection.message
+
+
+def test_wsl_interop_warns_when_a_win32_interpreter_works_a_distro_path(
+    mux_registry, fake_platform
+):
+    mux_registry.register_multiplexer("psmux", lambda p: True, lambda: _MuxStub(avail=True))
+    mux_registry.get_multiplexer.cache_clear()
+    fake_platform("win32")
+    finding = next(
+        f for f in cli._platform_preflight(WSL_UNC_PROJECT) if f.check == "host.wsl-interop"
+    )
+    assert "WSL/Linux Python" in finding.message
+    assert "psmux was selected" in finding.message
+    # The evidence is `win32` + a distro path. That is NOT proof of a WSL shell —
+    # `cd \\wsl.localhost\...` from native PowerShell reaches the same condition — so
+    # the finding must not assert where the operator is standing. Exactly one mention,
+    # and it is the conditional remedy rather than a claim about the session.
+    assert finding.message.count("WSL shell") == 1
+    assert "if you are running from a WSL shell" in finding.message
+    # The project path must not ride along: `validate --json` is unsanitized and a
+    # distro path ends in the Linux username.
+    assert finding.detail == {
+        "backend": "psmux",
+        "platform": "win32",
+        "selection_resolved": True,
+    }
+    assert str(WSL_UNC_PROJECT) not in str(finding.detail) + finding.message
+
+
+def test_wsl_interop_names_the_backend_actually_selected(mux_registry, fake_platform, monkeypatch):
+    """A forced choice must not be described as psmux — the `mux.selection` line in the
+    same report would say otherwise, in the one check whose point is to stop misleading."""
+    mux_registry.register_multiplexer("herdr", lambda p: False, lambda: _MuxStub(avail=True))
+    monkeypatch.setenv("BMAD_LOOP_MUX_BACKEND", "herdr")
+    mux_registry.get_multiplexer.cache_clear()
+    fake_platform("win32")
+    findings = cli._platform_preflight(WSL_UNC_PROJECT)
+    warning = next(f for f in findings if f.check == "host.wsl-interop")
+    selection = next(f for f in findings if f.check == "mux.selection")
+    assert warning.detail == {"backend": "herdr", "platform": "win32", "selection_resolved": True}
+    assert "herdr was selected" in warning.message
+    assert "psmux" not in warning.message
+    assert selection.detail == {"backend": "herdr", "reason": "env"}
+
+
+def test_wsl_interop_names_no_backend_when_selection_failed(
+    mux_registry, fake_platform, monkeypatch
+):
+    """A forced unknown name makes `_select` raise, so no row is selected. The warning
+    must then name no backend at all — inventing one ("the win32 default") is the exact
+    confident-wrong output this check exists to remove — and `mux.selection` is absent
+    because there is nothing to name; `mux.preflight` carries that failure instead."""
+    monkeypatch.setenv("BMAD_LOOP_MUX_BACKEND", "nosuchbackend")
+    mux_registry.get_multiplexer.cache_clear()
+    fake_platform("win32")
+    findings = cli._platform_preflight(WSL_UNC_PROJECT)
+
+    warning = next(f for f in findings if f.check == "host.wsl-interop")
+    # `selection_resolved` because a null backend has a second cause a consumer would
+    # otherwise conflate with this one: detection raising (`mux.backends-detected`).
+    assert warning.detail == {
+        "backend": None,
+        "platform": "win32",
+        "selection_resolved": False,
+    }
+    assert "was selected" not in warning.message
+    assert "win32 default" not in warning.message
+    assert not [f for f in findings if f.check == "mux.selection"]
+    assert [f for f in findings if f.check == "mux.preflight"]
+
+
+def test_wsl_interop_is_a_warning_so_the_validate_verdict_never_flips(mux_registry, fake_platform):
+    """Severity asserted through the real preflight, not a hand-built Finding: every
+    seam is healthy from this interpreter's point of view, so only the operator's
+    choice of interpreter is wrong and the exit code must not move."""
+    from bmad_loop.checks import ValidationReport
+
+    mux_registry.register_multiplexer("psmux", lambda p: True, lambda: _MuxStub(avail=True))
+    mux_registry.get_multiplexer.cache_clear()
+    fake_platform("win32")
+    findings = cli._platform_preflight(WSL_UNC_PROJECT)
+    assert next(f for f in findings if f.check == "host.wsl-interop").severity == "warning"
+
+    report = ValidationReport()
+    report.extend(findings)
+    assert report.passed is True
+
+
+@pytest.mark.parametrize(
+    ("platform_name", "project"),
+    [
+        # win32 on a real Windows path: psmux works, cwd is genuinely Windows.
+        ("win32", Path("C:/p")),
+        # the WSL/Linux interpreter on the same distro path — the correct install.
+        ("linux", WSL_UNC_PROJECT),
+        ("linux", Path("/home/u/p")),
+        # UNC, but somebody else's file server: the predicate matches wsl only.
+        ("win32", Path("\\\\fileserver\\share\\p")),
+    ],
+)
+def test_wsl_interop_stays_silent_off_the_interop_shape(
+    mux_registry, fake_platform, platform_name, project
+):
+    fake_platform(platform_name)
+    assert not [f for f in cli._platform_preflight(project) if f.check == "host.wsl-interop"]
+
+
+def test_wsl_interop_survives_the_render_and_the_json_projection(mux_registry, fake_platform):
+    """The other tests read the finding straight off `_platform_preflight`, which cannot
+    catch it being dropped between there and a surface the operator actually sees — and
+    every validate-rendering test stubs the preflight out wholesale."""
+    mux_registry.register_multiplexer("psmux", lambda p: True, lambda: _MuxStub(avail=True))
+    mux_registry.get_multiplexer.cache_clear()
+    fake_platform("win32")
+
+    report = cli.ValidationReport()
+    report.extend(cli._platform_preflight(WSL_UNC_PROJECT))  # asserts the id is registered
+    doc = cli.validate_document(report, False, "")
+
+    rows = [f for f in doc["findings"] if f["check"] == "host.wsl-interop"]
+    assert len(rows) == 1
+    assert rows[0]["severity"] == "warning"
+    assert rows[0]["detail"]["selection_resolved"] is True
+    assert doc["ok"] is True  # a warning never moves the verdict
+    assert str(WSL_UNC_PROJECT) not in json.dumps(doc)  # unsanitized surface
+
+
+def test_mux_detection_failure_reports_instead_of_vanishing(mux_registry, monkeypatch):
+    """Detection is advisory, so it must not abort validate — but silence here reads as
+    "selection failed": `mux.selection` disappears while `mux.backend` (independent, from
+    `get_multiplexer`) still names a healthy backend right above it."""
+    mux_registry.register_multiplexer("alpha", lambda p: True, lambda: _MuxStub(avail=True))
+    mux_registry.get_multiplexer.cache_clear()
+    monkeypatch.setattr(
+        mux_registry, "detect_multiplexers", lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+
+    findings = cli._platform_preflight(Path("C:/p"))
+    detected = next(f for f in findings if f.check == "mux.backends-detected")
+    assert detected.severity == "warning"
+    assert "boom" in detected.message
+    assert not [f for f in findings if f.check == "mux.selection"]  # the vanishing it explains
+    assert [f for f in findings if f.check == "mux.backend"]  # selection itself was fine
 
 
 # ---------------------------------------- bmad-loop confirm (#335 part 3, #356)
