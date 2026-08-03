@@ -5234,6 +5234,62 @@ def _validate_findings(paths, capsys, rc=0):
     return {f["check"]: f for f in doc["findings"]}
 
 
+def _render_snapshot(project):
+    snapshot = (
+        project.project
+        / "_bmad"
+        / "render"
+        / "bmad-build-auto"
+        / "sandbox-a1b2"
+        / "generation-c3d4"
+    )
+    snapshot.mkdir(parents=True, exist_ok=True)
+    (snapshot / "workflow.md").write_text("rendered\n", encoding="utf-8")
+    return snapshot
+
+
+def test_validate_warns_when_renderer_output_is_already_tracked(project, monkeypatch, capsys):
+    _make_validate_pass(project, monkeypatch, capsys)
+    _render_snapshot(project)
+    git(project.project, "add", "-f", "_bmad/render")
+    git(project.project, "commit", "-q", "-m", "track renderer output")
+
+    findings = _validate_findings(project, capsys)
+    warning = findings["git.render-tracked"]
+    assert warning["severity"] == "warning"
+    assert warning["detail"] == {"path": "_bmad/render"}
+    assert "git rm -r --cached _bmad/render" in warning["message"]
+
+
+def test_validate_is_silent_for_renderer_output_only_present_on_disk(project, monkeypatch, capsys):
+    """Clearing leg: filesystem presence is not index membership."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    snapshot = _render_snapshot(project)
+
+    findings = _validate_findings(project, capsys)
+    assert (snapshot / "workflow.md").is_file()
+    assert "git.render-tracked" not in findings
+
+
+def test_validate_render_tracked_probe_degrades_without_a_fabricated_result(
+    project, monkeypatch, capsys
+):
+    from bmad_loop import verify
+
+    _make_validate_pass(project, monkeypatch, capsys)
+    calls = 0
+
+    def unavailable(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise verify.GitError("index disappeared")
+
+    monkeypatch.setattr(verify, "path_tracked", unavailable)
+    findings = _validate_findings(project, capsys)
+    assert calls == 1
+    assert "git.render-tracked" not in findings
+
+
 def test_validate_warns_on_a_stale_index_entry(project, capsys):
     """The index is machine-local and never committed, so it CAN fall out of step
     with the specs and board that are the real record. That is only a safe trade
@@ -5529,6 +5585,57 @@ def test_validate_reports_a_different_primitive_era_in_each_tree(project, capsys
     )
 
 
+def test_validate_reports_each_renderer_problem_and_the_complete_surface_clears(
+    project, capsys, monkeypatch
+):
+    """Validate consumes the canonical missing_base_skills findings, with no side gate."""
+    from conftest import RENDERER_WORKFLOW_MD
+
+    from bmad_loop.install import (
+        CENTRAL_CONFIG_REL,
+        DEV_PRIMITIVE_NEW,
+        RENDERER_ENTRY_REL,
+        RENDERER_SCRIPT_REL,
+    )
+
+    def broken_renderer(root):
+        skills = install_build_auto_skill(root, renderer_stub=True)
+        (skills / DEV_PRIMITIVE_NEW / RENDERER_ENTRY_REL).unlink()
+
+    _make_validate_pass(project, monkeypatch, capsys, skills=broken_renderer)
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    found = {f["check"]: f for f in doc["findings"]}
+    assert doc["ok"] is False
+    assert found["skills.dev-renderer"]["severity"] == "problem"
+    assert found["skills.dev-renderer"]["detail"]["missing_scripts"] == [RENDERER_SCRIPT_REL]
+    assert found["skills.dev-renderer-sources"]["detail"]["missing_sources"] == [RENDERER_ENTRY_REL]
+    assert found["skills.dev-renderer-config"]["detail"] == {"config": CENTRAL_CONFIG_REL}
+    rendered = _render_findings(doc)
+    for check in (
+        "skills.dev-renderer",
+        "skills.dev-renderer-sources",
+        "skills.dev-renderer-config",
+    ):
+        assert check in rendered
+
+    # The far side: restore each precise prerequisite and every renderer finding
+    # disappears while the rest of validate stays green.
+    primitive = project.project / ".claude/skills" / DEV_PRIMITIVE_NEW
+    (primitive / RENDERER_ENTRY_REL).write_text(RENDERER_WORKFLOW_MD, encoding="utf-8")
+    renderer = project.project / RENDERER_SCRIPT_REL
+    renderer.parent.mkdir(parents=True, exist_ok=True)
+    renderer.write_text("# self-contained renderer\n", encoding="utf-8")
+    central = project.project / CENTRAL_CONFIG_REL
+    central.parent.mkdir(parents=True, exist_ok=True)
+    central.write_text("[core]\nname = 'fixture'\n", encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "complete renderer surface")
+
+    cleared = _validate_findings(project, capsys)
+    assert not {check for check in cleared if check.startswith("skills.dev-renderer")}
+
+
 def test_a_forwarding_shim_install_fails_validate_and_aborts_the_run(project, capsys, monkeypatch):
     """The shim upstream's rename left behind is REFUSED, not driven.
 
@@ -5566,6 +5673,122 @@ def test_a_forwarding_shim_install_fails_validate_and_aborts_the_run(project, ca
     err = capsys.readouterr().err
     assert "forwarding shim the BMad Method's rename left behind" in err
     assert "bmad-build-auto is not installed" in err
+
+
+def _install_renderer_stub_project(
+    project, monkeypatch, *, script: bool, utils: bool, config: bool
+):
+    """Committed run sandbox with one renderer-backed dev primitive.
+
+    Each Boolean controls one project-global prerequisite; the skill-relative
+    workflow graph comes from ``install_build_auto_skill(renderer_stub=True)``.
+    The installed script uses upstream's module-scope helper import so ``utils``
+    exercises the real content discriminator.
+    """
+    from conftest import RENDERER_SCRIPT_IMPORTING_SIBLING
+
+    from bmad_loop.install import (
+        CENTRAL_CONFIG_REL,
+        DEV_PRIMITIVE_NEW,
+        RENDERER_CONFIG_UTILS_REL,
+        RENDERER_SCRIPT_REL,
+    )
+
+    install_bmad_config(project)
+    _write_policy(project.project, CLAUDE_ONLY_POLICY)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    skills = install_build_auto_skill(project.project, renderer_stub=True)
+    if script:
+        renderer = project.project / RENDERER_SCRIPT_REL
+        renderer.parent.mkdir(parents=True, exist_ok=True)
+        renderer.write_text(RENDERER_SCRIPT_IMPORTING_SIBLING, encoding="utf-8")
+    if utils:
+        helper = project.project / RENDERER_CONFIG_UTILS_REL
+        helper.parent.mkdir(parents=True, exist_ok=True)
+        helper.write_text("# helper\n", encoding="utf-8")
+    if config:
+        central = project.project / CENTRAL_CONFIG_REL
+        central.parent.mkdir(parents=True, exist_ok=True)
+        central.write_text("[core]\nname = 'sandbox'\n", encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "renderer sandbox")
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+    return skills / DEV_PRIMITIVE_NEW
+
+
+@pytest.mark.parametrize(
+    ("script", "utils", "config", "missing"),
+    [
+        (False, False, True, "_bmad/scripts/render_skill.py"),
+        (True, False, True, "_bmad/scripts/config_utils.py"),
+        (True, True, False, "_bmad/config.toml"),
+    ],
+    ids=["script", "helper", "central-config"],
+)
+def test_run_aborts_before_engine_on_missing_renderer_surface(
+    project, monkeypatch, capsys, script, utils, config, missing
+):
+    """Full CLI sandbox: each deterministic renderer HALT refuses the run."""
+    _install_renderer_stub_project(project, monkeypatch, script=script, utils=utils, config=config)
+
+    assert cli.main(["run", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert missing in err
+    assert "HALT" in err
+
+
+def test_run_aborts_when_the_renderer_entry_source_is_missing(project, monkeypatch, capsys):
+    from bmad_loop.install import RENDERER_ENTRY_REL
+
+    skill = _install_renderer_stub_project(
+        project, monkeypatch, script=True, utils=True, config=True
+    )
+    (skill / RENDERER_ENTRY_REL).unlink()
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "truncate renderer sources")
+
+    assert cli.main(["run", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert RENDERER_ENTRY_REL in err and "HALT" in err
+
+
+def test_run_proceeds_once_the_complete_renderer_surface_is_present(project, monkeypatch, capsys):
+    """Clearing leg: a healthy renderer stub is allowed to reach the engine."""
+    _install_renderer_stub_project(project, monkeypatch, script=True, utils=True, config=True)
+
+    assert cli.main(["run", "--project", str(project.project)]) == 0
+    assert "render_skill.py" not in capsys.readouterr().err
+
+
+def test_dry_run_warns_that_a_missing_renderer_makes_the_preview_unrunnable(
+    project, monkeypatch, capsys
+):
+    _install_renderer_stub_project(project, monkeypatch, script=False, utils=False, config=True)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+    capsys.readouterr()
+
+    assert cli._dry_run(project, pol, args) == 0
+    out, err = capsys.readouterr()
+    assert "NOT runnable" in err and "_bmad/scripts/render_skill.py" in err
+    assert "1-1-a" in out
+
+
+def test_require_base_skills_ignores_a_broken_renderer_in_a_triage_only_tree(project, capsys):
+    """Renderer problems obey the same dev+review role scope as every base check."""
+    _write_policy(project.project, TRIAGE_SPLIT_POLICY)
+    install_build_auto_skill(project.project, ".claude/skills")
+    install_build_auto_skill(project.project, ".agents/skills", renderer_stub=True)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+
+    assert cli._require_base_skills(project.project, pol) is True
+    assert "render_skill.py" not in capsys.readouterr().err
+
+    # Move the identical broken shape onto the dev tree: the problem now gates.
+    install_build_auto_skill(project.project, ".claude/skills", renderer_stub=True)
+    assert cli._require_base_skills(project.project, pol) is False
+    assert "render_skill.py" in capsys.readouterr().err
 
 
 def test_validate_reports_an_orphaned_legacy_override_as_a_warning(project, capsys, monkeypatch):

@@ -311,6 +311,21 @@ def cmd_validate(args: argparse.Namespace) -> int:
     except verify.GitError as e:
         report.fail("git.probe", f"git check failed: {e}")
 
+    # An ignore/exclude cannot shield renderer output that is already in the index.
+    # This is advisory: tracked output causes churn but does not prevent a session
+    # from running. A failed git probe stays silent rather than fabricating an OK.
+    try:
+        if verify.path_tracked(project, install.RENDER_DIR_REL):
+            report.warn(
+                "git.render-tracked",
+                f"{install.RENDER_DIR_REL}/ is tracked by git; run "
+                f"`git rm -r --cached {install.RENDER_DIR_REL}` and commit once to stop "
+                "committing rendered skill output",
+                {"path": install.RENDER_DIR_REL},
+            )
+    except verify.GitError:
+        pass
+
     report.extend(_platform_preflight())
 
     # #231: notify.desktop defaults to true but only fires when a platform notifier

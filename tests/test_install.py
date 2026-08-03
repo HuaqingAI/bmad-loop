@@ -11,19 +11,32 @@ import zipfile
 from pathlib import Path
 
 import pytest
-from conftest import git, install_build_auto_skill, install_dev_shim
+from conftest import (
+    RENDERER_SCRIPT_IMPORTING_SIBLING,
+    RENDERER_STUB_SKILL_MD,
+    git,
+    install_build_auto_skill,
+    install_dev_shim,
+)
 
 import bmad_loop.install as install_mod
 from bmad_loop import verify
 from bmad_loop.adapters.profile import get_profile
 from bmad_loop.install import (
     BASE_SKILLS,
+    CENTRAL_CONFIG_REL,
     CUSTOMIZE_DIR,
     DEV_BASE_SKILLS,
     DEV_PRIMITIVE_LEGACY,
     DEV_PRIMITIVE_MARKERS,
     DEV_PRIMITIVE_NEW,
     MODULE_SKILLS,
+    RENDER_DIR_REL,
+    RENDERER_CONFIG_UTILS_REL,
+    RENDERER_ENTRY_REL,
+    RENDERER_SCRIPT_REL,
+    SNAPSHOT_TOKEN_RE,
+    _absent_renderer_sources,
     _copy_traversable,
     _git_version_at_least,
     _is_dev_primitive_shim,
@@ -36,6 +49,7 @@ from bmad_loop.install import (
     missing_base_skills,
     missing_stories_support,
     provision_worktree,
+    renderer_stub_resolved,
     resolve_dev_primitive,
     resolve_review_layers,
 )
@@ -333,6 +347,7 @@ def test_install_into_full(tmp_path):
     assert ".bmad-loop/runs/" in gitignore
     assert ".bmad-loop/cache/" in gitignore  # engine plugins' rebuildable caches
     assert ".bmad-loop/policy.toml" in gitignore  # per-machine config ([mux] backend)
+    assert f"{RENDER_DIR_REL}/" in gitignore  # regenerated, checkout-absolute renderer output
 
     # all bundled skills land in claude's tree, with nested files intact
     skills_dir = tmp_path / ".claude" / "skills"
@@ -348,6 +363,7 @@ def test_install_into_full(tmp_path):
     assert final_gitignore.count(".bmad-loop/runs/") == 1
     assert final_gitignore.count(".bmad-loop/cache/") == 1
     assert final_gitignore.count(".bmad-loop/policy.toml") == 1
+    assert final_gitignore.count(f"{RENDER_DIR_REL}/") == 1
 
 
 def test_install_into_warns_when_policy_is_tracked(tmp_path, capsys):
@@ -622,6 +638,321 @@ def test_missing_base_skills_findings_carry_ids_and_detail(tmp_path):
     assert incomplete[0].detail["missing_markers"] == ["step-04-review.md", "customize.toml"]
     for marker in incomplete[0].detail["missing_markers"]:
         assert marker in incomplete[0].message
+
+
+def _renderer_checks(root: Path, trees=(".claude/skills",)):
+    return [
+        f for f in missing_base_skills(root, trees) if f.check.startswith("skills.dev-renderer")
+    ]
+
+
+def _write_renderer_surface(
+    root: Path, *, script: str = "# renderer\n", helper: bool = False, config: bool = True
+) -> None:
+    script_path = root / RENDERER_SCRIPT_REL
+    script_path.parent.mkdir(parents=True, exist_ok=True)
+    script_path.write_text(script, encoding="utf-8")
+    if helper:
+        (root / RENDERER_CONFIG_UTILS_REL).write_text("# config helper\n", encoding="utf-8")
+    if config:
+        config_path = root / CENTRAL_CONFIG_REL
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text("[core]\nname = 'fixture'\n", encoding="utf-8")
+
+
+def test_renderer_script_gate_is_content_keyed_and_has_a_clearing_leg(tmp_path):
+    """Only a SKILL.md that names render_skill.py arms the project-global checks.
+
+    The first assertion is the far side of the discrimination, not merely a healthy
+    renderer project: the exact same missing script is legitimate for an inline-era
+    skill. After changing only that content discriminator, the absence fires; after
+    creating the entry point, it clears.
+    """
+    tree = ".claude/skills"
+    install_build_auto_skill(tmp_path, tree)
+    skill = tmp_path / tree / DEV_PRIMITIVE_NEW
+    (skill / RENDERER_ENTRY_REL).write_text("inline workflow\n", encoding="utf-8")
+    config = tmp_path / CENTRAL_CONFIG_REL
+    config.parent.mkdir(parents=True)
+    config.write_text("[core]\n", encoding="utf-8")
+
+    assert _renderer_checks(tmp_path, (tree,)) == []
+
+    (skill / "SKILL.md").write_text(RENDERER_STUB_SKILL_MD, encoding="utf-8")
+    findings = _renderer_checks(tmp_path, (tree,))
+    assert [f.check for f in findings] == ["skills.dev-renderer"]
+    assert findings[0].detail["missing_scripts"] == [RENDERER_SCRIPT_REL]
+
+    _write_renderer_surface(tmp_path)
+    assert _renderer_checks(tmp_path, (tree,)) == []
+
+
+def test_renderer_helper_gate_follows_the_installed_script_and_clears(tmp_path):
+    """The sibling is required only while the installed renderer imports it."""
+    tree = ".claude/skills"
+    install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    _write_renderer_surface(tmp_path, script=RENDERER_SCRIPT_IMPORTING_SIBLING)
+
+    findings = _renderer_checks(tmp_path, (tree,))
+    assert [f.check for f in findings] == ["skills.dev-renderer"]
+    assert findings[0].detail["missing_scripts"] == [RENDERER_CONFIG_UTILS_REL]
+    assert RENDERER_SCRIPT_REL not in findings[0].detail["missing_scripts"]
+
+    (tmp_path / RENDERER_CONFIG_UTILS_REL).write_text("# helper\n", encoding="utf-8")
+    assert _renderer_checks(tmp_path, (tree,)) == []
+
+
+def test_renderer_helper_is_not_required_after_the_import_disappears(tmp_path):
+    """Opposite side of the helper-content discriminator: no import, no false FAIL."""
+    tree = ".claude/skills"
+    install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    _write_renderer_surface(tmp_path, script="# self-contained renderer\n")
+
+    assert not (tmp_path / RENDERER_CONFIG_UTILS_REL).exists()
+    assert _renderer_checks(tmp_path, (tree,)) == []
+
+
+def test_renderer_central_config_problem_is_once_per_project_and_clears(tmp_path):
+    trees = (".claude/skills", ".agents/skills")
+    for tree in trees:
+        install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    _write_renderer_surface(tmp_path, config=False)
+
+    findings = _renderer_checks(tmp_path, trees)
+    assert [f.check for f in findings] == ["skills.dev-renderer-config"]
+    assert findings[0].detail == {"config": CENTRAL_CONFIG_REL}
+
+    config = tmp_path / CENTRAL_CONFIG_REL
+    config.write_text("[core]\n", encoding="utf-8")
+    assert _renderer_checks(tmp_path, trees) == []
+
+
+def test_renderer_script_and_source_findings_are_attributed_per_tree(tmp_path):
+    trees = (".claude/skills", ".agents/skills")
+    for tree in trees:
+        install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    config = tmp_path / CENTRAL_CONFIG_REL
+    config.parent.mkdir(parents=True)
+    config.write_text("[core]\n", encoding="utf-8")
+    for tree in trees:
+        (tmp_path / tree / DEV_PRIMITIVE_NEW / RENDERER_ENTRY_REL).unlink()
+
+    findings = _renderer_checks(tmp_path, trees)
+    scripts = [f for f in findings if f.check == "skills.dev-renderer"]
+    sources = [f for f in findings if f.check == "skills.dev-renderer-sources"]
+    assert [f.detail for f in scripts] == [
+        {"tree": tree, "skill": DEV_PRIMITIVE_NEW, "missing_scripts": [RENDERER_SCRIPT_REL]}
+        for tree in trees
+    ]
+    assert [f.detail for f in sources] == [
+        {"tree": tree, "skill": DEV_PRIMITIVE_NEW, "missing_sources": [RENDERER_ENTRY_REL]}
+        for tree in trees
+    ]
+
+
+def test_renderer_stub_resolved_is_per_tree_and_content_keyed(tmp_path):
+    claude = ".claude/skills"
+    codex = ".agents/skills"
+    assert renderer_stub_resolved(tmp_path, []) is False
+    assert renderer_stub_resolved(tmp_path, [claude]) is False
+
+    install_build_auto_skill(tmp_path, claude)
+    assert renderer_stub_resolved(tmp_path, [claude]) is False
+    install_build_auto_skill(tmp_path, codex, renderer_stub=True)
+    assert renderer_stub_resolved(tmp_path, [codex]) is True
+    assert renderer_stub_resolved(tmp_path, [claude, codex]) is True  # ANY, not ALL
+
+    # A complete legacy install is equally renderer-backed when its content says so.
+    legacy = ".legacy/skills"
+    _install_skills(tmp_path, legacy, _era_catalog(DEV_PRIMITIVE_LEGACY))
+    assert renderer_stub_resolved(tmp_path, [legacy]) is False
+    (tmp_path / legacy / DEV_PRIMITIVE_LEGACY / "SKILL.md").write_text(
+        RENDERER_STUB_SKILL_MD, encoding="utf-8"
+    )
+    assert renderer_stub_resolved(tmp_path, [legacy]) is True
+
+
+def test_renderer_checks_coexist_with_an_incomplete_primitive(tmp_path):
+    tree = ".claude/skills"
+    install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    skill = tmp_path / tree / DEV_PRIMITIVE_NEW
+    (skill / "customize.toml").unlink()
+
+    checks = [f.check for f in missing_base_skills(tmp_path, (tree,))]
+    assert "skills.base-incomplete" in checks
+    assert "skills.dev-renderer" in checks
+    assert "skills.dev-renderer-config" in checks
+
+
+def test_unresolved_renderer_prose_does_not_invent_renderer_findings(tmp_path):
+    tree = ".claude/skills"
+    install_dev_shim(tmp_path, tree)
+    (tmp_path / tree / DEV_PRIMITIVE_LEGACY / "SKILL.md").write_text(
+        RENDERER_STUB_SKILL_MD, encoding="utf-8"
+    )
+
+    findings = missing_base_skills(tmp_path, (tree,))
+    assert [f.check for f in findings] == ["skills.base-shim"]
+
+
+def test_renderer_workflow_presence_gate_has_a_clearing_leg(tmp_path):
+    tree = ".claude/skills"
+    install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    _write_renderer_surface(tmp_path)
+    skill = tmp_path / tree / DEV_PRIMITIVE_NEW
+    (skill / RENDERER_ENTRY_REL).unlink()
+
+    findings = _renderer_checks(tmp_path, (tree,))
+    assert [f.check for f in findings] == ["skills.dev-renderer-sources"]
+    assert findings[0].detail["missing_sources"] == [RENDERER_ENTRY_REL]
+
+    (skill / RENDERER_ENTRY_REL).write_text("entry\n", encoding="utf-8")
+    assert _renderer_checks(tmp_path, (tree,)) == []
+
+
+def test_renderer_snapshot_target_presence_gate_has_a_clearing_leg(tmp_path):
+    tree = ".claude/skills"
+    install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    _write_renderer_surface(tmp_path)
+    skill = tmp_path / tree / DEV_PRIMITIVE_NEW
+    workflow = skill / RENDERER_ENTRY_REL
+    workflow.write_text("Read [[bmad-snapshot:phases/plan.md]].\n", encoding="utf-8")
+
+    findings = _renderer_checks(tmp_path, (tree,))
+    assert findings[0].detail["missing_sources"] == ["phases/plan.md"]
+
+    target = skill / "phases" / "plan.md"
+    target.parent.mkdir()
+    target.write_text("plan\n", encoding="utf-8")
+    assert _renderer_checks(tmp_path, (tree,)) == []
+
+    target.unlink()
+    assert _renderer_checks(tmp_path, (tree,))[0].detail["missing_sources"] == ["phases/plan.md"]
+
+
+def test_renderer_scans_tokens_in_every_markdown_source(tmp_path):
+    tree = ".claude/skills"
+    install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    _write_renderer_surface(tmp_path)
+    skill = tmp_path / tree / DEV_PRIMITIVE_NEW
+    (skill / "extra.md").write_text(
+        "Then [[bmad-snapshot:missing-followup.md]].\n", encoding="utf-8"
+    )
+
+    findings = _renderer_checks(tmp_path, (tree,))
+    assert findings[0].detail["missing_sources"] == ["missing-followup.md"]
+
+
+def test_renderer_excludes_skill_md_from_its_source_set(tmp_path):
+    tree = ".claude/skills"
+    install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    _write_renderer_surface(tmp_path)
+    skill = tmp_path / tree / DEV_PRIMITIVE_NEW
+    (skill / RENDERER_ENTRY_REL).write_text(
+        "Do not snapshot [[bmad-snapshot:SKILL.md]].\n", encoding="utf-8"
+    )
+
+    findings = _renderer_checks(tmp_path, (tree,))
+    assert findings[0].detail["missing_sources"] == ["SKILL.md"]
+
+
+def test_renderer_excludes_nested_skill_md_from_its_source_set(tmp_path):
+    tree = ".claude/skills"
+    install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    _write_renderer_surface(tmp_path)
+    skill = tmp_path / tree / DEV_PRIMITIVE_NEW
+    nested = skill / "sub" / "SKILL.md"
+    nested.parent.mkdir()
+    nested.write_text("nested metadata\n", encoding="utf-8")
+    (skill / RENDERER_ENTRY_REL).write_text(
+        "Do not snapshot [[bmad-snapshot:sub/SKILL.md]].\n", encoding="utf-8"
+    )
+
+    findings = _renderer_checks(tmp_path, (tree,))
+    assert findings[0].detail["missing_sources"] == ["sub/SKILL.md"]
+
+
+def test_customization_prose_is_not_mined_for_snapshot_tokens(tmp_path):
+    tree = ".claude/skills"
+    install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    _write_renderer_surface(tmp_path)
+    skill = tmp_path / tree / DEV_PRIMITIVE_NEW
+    (skill / "customize.toml").write_text(
+        'instruction = "Ignore [[bmad-snapshot:not-a-source.md]]."\n', encoding="utf-8"
+    )
+
+    assert _renderer_checks(tmp_path, (tree,)) == []
+
+
+def test_snapshot_regex_matches_upstream_and_ignores_near_tokens(tmp_path):
+    assert SNAPSHOT_TOKEN_RE.pattern == r"\[\[bmad-snapshot:([A-Za-z0-9_./-]+\.md)\]\]"
+
+    tree = ".claude/skills"
+    install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    _write_renderer_surface(tmp_path)
+    skill = tmp_path / tree / DEV_PRIMITIVE_NEW
+    (skill / RENDERER_ENTRY_REL).write_text(
+        "Literal [[bmad-snapshot:not-a-markdown-source]].\n", encoding="utf-8"
+    )
+    assert _renderer_checks(tmp_path, (tree,)) == []
+
+
+def test_renderer_source_read_fault_fails_open(tmp_path, monkeypatch):
+    from conftest import fault_read_text
+
+    tree = ".claude/skills"
+    install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    _write_renderer_surface(tmp_path)
+    workflow = tmp_path / tree / DEV_PRIMITIVE_NEW / RENDERER_ENTRY_REL
+    fault_read_text(monkeypatch, workflow)
+
+    assert _renderer_checks(tmp_path, (tree,)) == []
+
+
+def test_renderer_binary_source_fails_open_without_losing_its_declaration(tmp_path):
+    tree = ".claude/skills"
+    install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    _write_renderer_surface(tmp_path)
+    skill = tmp_path / tree / DEV_PRIMITIVE_NEW
+    (skill / RENDERER_ENTRY_REL).write_text("Read [[bmad-snapshot:binary.md]].\n", encoding="utf-8")
+    (skill / "binary.md").write_bytes(b"\xff\xfe")
+
+    assert _renderer_checks(tmp_path, (tree,)) == []
+
+
+def test_renderer_binary_discriminators_fail_open(tmp_path):
+    tree = ".claude/skills"
+    install_build_auto_skill(tmp_path, tree)
+    skill = tmp_path / tree / DEV_PRIMITIVE_NEW
+    (skill / "SKILL.md").write_bytes(b"\xff\xfe")
+    assert _renderer_checks(tmp_path, (tree,)) == []
+
+    install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    config = tmp_path / CENTRAL_CONFIG_REL
+    config.parent.mkdir(parents=True)
+    config.write_text("[core]\n", encoding="utf-8")
+    script = tmp_path / RENDERER_SCRIPT_REL
+    script.parent.mkdir(parents=True)
+    script.write_bytes(b"\xff\xfe")
+    assert _renderer_checks(tmp_path, (tree,)) == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="directory symlink semantics require POSIX")
+def test_renderer_walk_does_not_descend_a_symlinked_source_directory(tmp_path):
+    """The renderer's rglob walk and copier's iterdir walk differ on purpose."""
+    tree = ".claude/skills"
+    install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    _write_renderer_surface(tmp_path)
+    skill = tmp_path / tree / DEV_PRIMITIVE_NEW
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "plan.md").write_text("plan\n", encoding="utf-8")
+    (skill / "linked").symlink_to(outside, target_is_directory=True)
+    (skill / RENDERER_ENTRY_REL).write_text(
+        "Read [[bmad-snapshot:linked/plan.md]].\n", encoding="utf-8"
+    )
+
+    assert _absent_renderer_sources(skill) == ["linked/plan.md"]
 
 
 @pytest.mark.parametrize("primitive", [DEV_PRIMITIVE_NEW, DEV_PRIMITIVE_LEGACY])
