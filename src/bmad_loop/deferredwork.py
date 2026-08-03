@@ -368,6 +368,37 @@ def mark_done(path: Path, dw_id: str, date: str, note: str) -> bool:
     return bool(mark_done_many(path, [dw_id], date, note))
 
 
+_MARK_DONE_TAIL_RE = re.compile(r"\nresolution:[ \t]*(.*)$", re.MULTILINE)
+
+
+def mark_open(path: Path, dw_id: str, note: str) -> bool:
+    """Undo one specific :func:`mark_done` operation.
+
+    The entry must be closed and the line immediately below its status must be
+    the resolution note this caller identifies. A close from another run, the
+    legacy writer, or a human is never reopened by resemblance alone.
+    """
+    if not path.is_file():
+        return False
+    text = path.read_text(encoding="utf-8")
+    entry = _find_entry(text, dw_id)
+    if entry is None or entry.open:
+        return False
+    status_m = STATUS_RE.search(entry.body)
+    if status_m is None:
+        # parse_ledger deliberately tolerates status-less entries. This primitive
+        # is later called from _defer, where an AttributeError would crash the run
+        # instead of completing the deferral.
+        return False
+    res_m = _MARK_DONE_TAIL_RE.match(entry.body, status_m.end())
+    if res_m is None or res_m.group(1).strip() != _one_line(note).strip():
+        return False
+    start = entry.span[0] + status_m.start()
+    end = entry.span[0] + res_m.end()
+    atomic_write_text(path, text[:start] + "status: open" + text[end:])
+    return True
+
+
 def append_decision(path: Path, dw_id: str, date: str, label: str, detail: str) -> bool:
     """Record a human decision on an entry without changing its status.
 

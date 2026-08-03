@@ -20,12 +20,14 @@ match) still runs in verify.py against actual on-disk state.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import deferredwork
 from .frontmatter import _edit_frontmatter_block, status_of
 from .platform_util import atomic_replace
 from .verify import DEV_WORKFLOW, operator_actions_of, read_frontmatter
@@ -185,6 +187,86 @@ def parse_auto_run_result(text: str) -> AutoRunResult:
     status_m = STATUS_LINE_RE.search(body)
     status = status_m.group(1).strip().lower() if status_m else ""
     return AutoRunResult(present=True, status=status, detail=body.strip())
+
+
+# ------------------------------------------------ deferred review findings
+#
+# Since BMAD-METHOD #2640 the dev primitive records findings triaged as `defer`
+# in its spec's frontmatter. The parser stays content-keyed so an older skill
+# (field absent) and a newer skill with no findings are indistinguishable.
+DEFERRED_FIELD = "deferred"
+_SUMMARY_LIMIT = 200
+_EVIDENCE_LIMIT = 1000
+_LOCATION_LIMIT = 200
+
+
+@dataclass(frozen=True)
+class DeferredFinding:
+    """One well-formed deferred finding, normalized for a ledger entry."""
+
+    summary: str
+    evidence: str
+    location: str
+    severity: str
+    fingerprint: str
+
+
+def harvest_fingerprint(*parts: str) -> str:
+    """Return a stable short identity over NUL-separated ledger values."""
+    return hashlib.sha1(
+        "\0".join(parts).encode("utf-8"),
+        usedforsecurity=False,
+    ).hexdigest()[:12]
+
+
+def _flatten(value: Any, limit: int) -> str:
+    """Collapse a YAML scalar to one clamped line.
+
+    Strip after clamping because the cut can land on a join space. Keeping that
+    cleanup here makes the value written to the ledger and the value used in its
+    fingerprint identical.
+    """
+    if value is None:
+        return ""
+    return " ".join(str(value).split())[:limit].strip()
+
+
+def parse_deferred_findings(fm: dict[str, Any]) -> tuple[list[DeferredFinding], list[str]]:
+    """Parse a frontmatter ``deferred:`` list into findings and malformed notes.
+
+    Missing, null, and empty lists mean no findings. Malformed items cost only
+    themselves; well-formed siblings still parse. This observation path never
+    raises for the YAML shapes it accepts.
+    """
+    raw = fm.get(DEFERRED_FIELD)
+    if raw is None:
+        return [], []
+    if not isinstance(raw, list):
+        return [], [f"`{DEFERRED_FIELD}:` is not a list (got {type(raw).__name__})"]
+
+    findings: list[DeferredFinding] = []
+    malformed: list[str] = []
+    for i, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            malformed.append(f"item {i}: not a mapping (got {type(item).__name__})")
+            continue
+        summary = _flatten(item.get("summary"), _SUMMARY_LIMIT)
+        if not summary:
+            malformed.append(f"item {i}: no usable `summary`")
+            continue
+        location = _flatten(item.get("location"), _LOCATION_LIMIT)
+        findings.append(
+            DeferredFinding(
+                summary=summary,
+                evidence=_flatten(item.get("evidence"), _EVIDENCE_LIMIT),
+                location=location,
+                severity=deferredwork.SEVERITY_ALIASES.get(
+                    str(item.get("severity", "")).strip().lower(), ""
+                ),
+                fingerprint=harvest_fingerprint(summary, location),
+            )
+        )
+    return findings, malformed
 
 
 @dataclass(frozen=True)

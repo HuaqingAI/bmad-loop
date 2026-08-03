@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from bmad_loop import deferredwork
 from bmad_loop.deferredwork import (
     _ISO_DATE_RE,
     LINE_BREAK_RE,
@@ -16,6 +17,7 @@ from bmad_loop.deferredwork import (
     has_legacy,
     mark_done,
     mark_done_many,
+    mark_open,
     next_seq,
     open_ids,
     parse_declaration,
@@ -119,6 +121,136 @@ def test_mark_done_missing_entry(tmp_path):
     snapshot = path.read_text(encoding="utf-8")
     assert not mark_done(path, "DW-99", "2026-06-11", "n/a")
     assert path.read_text(encoding="utf-8") == snapshot
+
+
+def test_mark_open_round_trips_one_mark_done_character_for_character(tmp_path):
+    path = write_ledger(tmp_path)
+    before = path.read_text(encoding="utf-8")
+    note = "resolved by sweep bundle dw-fix"
+    assert mark_done(path, "DW-1", "2026-06-11", note)
+    assert mark_open(path, "DW-1", note)
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_mark_open_touches_only_the_target_entry(tmp_path):
+    path = write_ledger(tmp_path)
+    assert mark_done(path, "DW-1", "2026-06-11", "by dw-a")
+    assert mark_done(path, "DW-3", "2026-06-11", "by dw-a")
+    assert mark_open(path, "DW-1", "by dw-a")
+
+    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    assert entries["DW-1"].open
+    assert "resolution:" not in entries["DW-1"].body
+    assert entries["DW-2"].status == "done 2026-05-25"
+    assert entries["DW-3"].status == "done 2026-06-11"
+
+
+def test_mark_open_refuses_a_missing_ledger(tmp_path):
+    assert not mark_open(tmp_path / "nope.md", "DW-1", "by dw-a")
+
+
+def test_mark_open_refuses_a_missing_entry(tmp_path):
+    path = write_ledger(tmp_path)
+    snapshot = path.read_text(encoding="utf-8")
+    assert not mark_open(path, "DW-99", "by dw-a")
+    assert path.read_text(encoding="utf-8") == snapshot
+
+
+def test_mark_open_refuses_an_entry_that_is_still_open(tmp_path):
+    """The open guard is independent of note matching: an LLM-written open entry
+    can carry a matching resolution line, but the orchestrator must not delete it."""
+    path = write_ledger(
+        tmp_path,
+        "### DW-1: partially handled\n\nstatus: open\nresolution: by dw-a\n",
+    )
+    snapshot = path.read_text(encoding="utf-8")
+    assert not mark_open(path, "DW-1", "by dw-a")
+    assert path.read_text(encoding="utf-8") == snapshot
+
+
+def test_mark_open_refuses_a_status_less_entry(tmp_path):
+    """parse_ledger tolerates this shape. Without the explicit guard, a future
+    call from _defer raises AttributeError and crashes instead of deferring."""
+    path = write_ledger(
+        tmp_path,
+        "### DW-1: malformed but tolerated\n\norigin: session\nresolution: by dw-a\n",
+    )
+    snapshot = path.read_text(encoding="utf-8")
+    assert parse_ledger(snapshot)[0].status == ""
+    assert not mark_open(path, "DW-1", "by dw-a")
+    assert path.read_text(encoding="utf-8") == snapshot
+
+
+def test_mark_open_refuses_a_closed_entry_without_a_resolution(tmp_path):
+    path = write_ledger(tmp_path)
+    snapshot = path.read_text(encoding="utf-8")
+    assert not mark_open(path, "DW-2", "")
+    assert path.read_text(encoding="utf-8") == snapshot
+
+
+def test_mark_open_refuses_a_close_with_another_callers_note(tmp_path):
+    path = write_ledger(tmp_path)
+    assert mark_done(path, "DW-1", "2026-06-11", "by dw-other")
+    snapshot = path.read_text(encoding="utf-8")
+    assert not mark_open(path, "DW-1", "by dw-mine")
+    assert path.read_text(encoding="utf-8") == snapshot
+
+
+def test_mark_open_requires_the_resolution_directly_below_status(tmp_path):
+    """A later matching resolution belongs to a different annotation. Searching
+    the whole entry would turn this specific undo into a general reopen."""
+    path = write_ledger(
+        tmp_path,
+        "### DW-1: closed elsewhere\n\nstatus: done 2026-06-11\n"
+        "decision: 2026-06-11 keep\nresolution: by dw-a\n",
+    )
+    snapshot = path.read_text(encoding="utf-8")
+    assert not mark_open(path, "DW-1", "by dw-a")
+    assert path.read_text(encoding="utf-8") == snapshot
+
+
+def test_mark_open_tolerates_reformatted_resolution_whitespace(tmp_path):
+    path = write_ledger(
+        tmp_path,
+        "### DW-1: closed then reflowed\n\nstatus: done 2026-06-11\n" "resolution:   by dw-a  \n",
+    )
+    assert mark_open(path, "DW-1", "by dw-a")
+    entry = parse_ledger(path.read_text(encoding="utf-8"))[0]
+    assert entry.open and "resolution:" not in entry.body
+
+
+@pytest.mark.parametrize("note", ["  padded note  ", "line one\nline two"])
+def test_mark_open_uses_the_same_note_normalization_as_mark_done(tmp_path, note):
+    """Main's mark_done flattens line breaks and permits padded clean text. The
+    undo accepts the original caller value, not only the rendered ledger line."""
+    path = write_ledger(tmp_path)
+    before = path.read_text(encoding="utf-8")
+    assert mark_done(path, "DW-1", "2026-06-11", note)
+    assert mark_open(path, "DW-1", note)
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_mark_open_is_idempotent_after_the_undo(tmp_path):
+    path = write_ledger(tmp_path)
+    assert mark_done(path, "DW-1", "2026-06-11", "by dw-a")
+    assert mark_open(path, "DW-1", "by dw-a")
+    snapshot = path.read_text(encoding="utf-8")
+    assert not mark_open(path, "DW-1", "by dw-a")
+    assert path.read_text(encoding="utf-8") == snapshot
+
+
+def test_mark_open_write_failure_raises_and_keeps_the_closed_entry(tmp_path, monkeypatch):
+    path = write_ledger(tmp_path)
+    assert mark_done(path, "DW-1", "2026-06-11", "by dw-a")
+    closed = path.read_text(encoding="utf-8")
+
+    def boom(path, text):
+        raise OSError("no space left")
+
+    monkeypatch.setattr(deferredwork, "atomic_write_text", boom)
+    with pytest.raises(OSError, match="no space left"):
+        mark_open(path, "DW-1", "by dw-a")
+    assert path.read_text(encoding="utf-8") == closed
 
 
 def test_append_decision(tmp_path):
