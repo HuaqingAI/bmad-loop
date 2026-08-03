@@ -527,6 +527,7 @@ def test_provision_refuses_a_live_hook_config_symlink(tmp_path):
     provision_worktree(wt, [claude], repo)
 
     assert outside.read_bytes() == before
+    assert (wt / claude.hooks.config_path).is_symlink()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
@@ -6341,6 +6342,19 @@ def test_probe_refused_distinguishes_absence_from_refusal(monkeypatch, fault_err
 
     monkeypatch.setattr(Path, "stat", refused)
     assert _probe_refused(Path("probe")) is expected
+
+
+@pytest.mark.parametrize("fault_winerror", [21, 123, 1921])
+def test_probe_refused_recognizes_windows_absence_codes(fault_winerror):
+    from bmad_loop.install import _probe_refused
+
+    class FaultPath(type(Path())):
+        def stat(self, *args, **kwargs):
+            fault = OSError(errno.EIO, os.strerror(errno.EIO))
+            fault.winerror = fault_winerror
+            raise fault
+
+    assert _probe_refused(FaultPath("probe")) is False
 
 
 def test_probe_refused_is_total_for_non_paths_and_invalid_paths():

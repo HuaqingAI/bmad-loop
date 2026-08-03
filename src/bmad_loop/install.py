@@ -324,9 +324,9 @@ def _absent_renderer_sources(skill_dir: Path) -> list[str]:
     would invent sources the renderer never loads and turn a guaranteed HALT green.
 
     Upstream keys nested sources by POSIX relative path and excludes every basename
-    ``SKILL.md``. Read/decode faults fail open because they have different remediation
-    from an absent declared source. Filesystem-totality hardening (including the FIFO
-    guard) belongs to phase 6G, not this validate-side presence contract.
+    ``SKILL.md``. :func:`_is_file` enforces filesystem totality, including the FIFO
+    guard, before any source is read. Remaining read/decode faults fail open because
+    they have different remediation from an absent declared source.
     """
     if not _is_renderer_stub(skill_dir):
         return []
@@ -1219,9 +1219,14 @@ def _is_dir(path) -> bool:
     return _probe_refused(path)
 
 
-# pathlib's version-dependent private ignored-errno set, copied here so absence and
-# refusal retain the same meaning on every supported interpreter.
+# pathlib's version-dependent private ignored-error sets, copied here so absence and
+# refusal retain the same meaning on every supported interpreter and platform.
 _ABSENCE_ERRNOS = (errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP)
+_ABSENCE_WINERRORS = (
+    21,  # ERROR_NOT_READY: drive exists but is not accessible
+    123,  # ERROR_INVALID_NAME
+    1921,  # ERROR_CANT_RESOLVE_FILENAME: broken self-referential symlink
+)
 
 
 def _probe_refused(path) -> bool:
@@ -1232,7 +1237,10 @@ def _probe_refused(path) -> bool:
     try:
         path.stat()
     except OSError as exc:
-        return exc.errno not in _ABSENCE_ERRNOS
+        return (
+            exc.errno not in _ABSENCE_ERRNOS
+            and getattr(exc, "winerror", None) not in _ABSENCE_WINERRORS
+        )
     except ValueError:
         # Embedded-null and otherwise invalid paths are absent, not refused.
         return False
@@ -1304,6 +1312,8 @@ def _copy_traversable(
 
     def visit_dir(rel: str, entry) -> bool:
         nonlocal copied
+        # Recheck after enumeration: iterdir may block while a source or destination
+        # component is replaced, so the pre-walk containment result can go stale.
         if not should_descend(rel, entry):
             return False
         target = target_for(rel)
