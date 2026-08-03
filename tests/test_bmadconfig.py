@@ -1,6 +1,7 @@
 """ProjectPaths.repo_root / rebased and load_paths(repo_root) — the Phase 1
 Workspace-seam foundation. repo_root defaults to project (today's behavior);
-rebased re-roots artifacts onto a worktree-style checkout."""
+rebased re-roots artifacts onto a worktree-style checkout. Plus
+worktree_isolation_conflict, the #414 refusal predicate built on the same pair."""
 
 from __future__ import annotations
 
@@ -104,3 +105,19 @@ def test_workspace_default_uses_repo_root(tmp_path: Path) -> None:
     ws = Workspace.default(paths)
     assert ws.root == tmp_path / "repo"
     assert ws.paths is paths
+
+
+def test_worktree_isolation_conflict_compares_normalized_paths(tmp_path: Path) -> None:
+    """A refusal gate's false positives are worse than the bug it forecloses (#414):
+    this one would refuse an ordinary isolated project whose `repo_root` merely spells
+    the same directory a different way. `load_paths` resolves both sides, but nothing
+    obliges a hand-built ProjectPaths — or a future caller — to have done so."""
+    (tmp_path / "p").mkdir()
+    paths = ProjectPaths(
+        project=tmp_path / "p",
+        implementation_artifacts=tmp_path / "p" / "impl",
+        planning_artifacts=tmp_path / "p" / "plan",
+        repo_root=tmp_path / "p" / ".." / "p",
+    )
+    assert paths.repo_root != paths.project, "the two spellings really are different"
+    assert bmadconfig.worktree_isolation_conflict(paths, "worktree") is None

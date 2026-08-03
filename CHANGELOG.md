@@ -260,6 +260,13 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 ### Fixed
 
+- **Refuse `isolation = "worktree"` combined with a `repo_root` override (#414).** The pair
+  previously produced a green preflight and then an isolated session with no dev primitive, no
+  result, and nothing journaled naming the cause. `validate` now reports it; `run`, `sweep`,
+  `resume` and the auto-triggered child sweep refuse to start; the dry-run banner names it first;
+  the TUI toasts it ahead of its clean-tree gate. Plumbing `project` through provisioning so both
+  work together is #443.
+
 - **A configured path carrying `[`, `]`, `*` or `?` no longer makes git act on the wrong files
   (#423).** `implementation_artifacts` reaches git verbatim out of the operator's
   `_bmad/bmm/config.yaml`, and git reads a positional operand as a _pathspec_, not a path — so such
