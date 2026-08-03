@@ -6748,6 +6748,100 @@ def test_base_skills_seed_incomplete_uses_the_resolved_primitive_era(tmp_path):
     assert base_skills_seed_incomplete(wt, repo, [tree]) == []
 
 
+def test_base_skills_seed_incomplete_ignores_inactive_catalog_symlink(tmp_path):
+    """An obsolete copy-if-present reviewer is not a fatal session requirement.
+
+    A shared-install symlink passes the main-checkout preflight but is deliberately
+    refused by worktree provisioning's source-containment guard. Modern layers invoke
+    only the merged reviewer, so that unused refusal must not pause the run.
+    """
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    tree = ".claude/skills"
+    obsolete = "bmad-review-edge-case-hunter"
+    _install_dev_auto(
+        repo,
+        tree,
+        skill=DEV_PRIMITIVE_NEW,
+        customize="[workflow]\n" + _layer("blind", "bmad-review"),
+    )
+    _install_skills(repo, tree, {"bmad-review": ()})
+    shared_skill = tmp_path / "shared" / obsolete
+    shared_skill.mkdir(parents=True)
+    (shared_skill / "SKILL.md").write_text("# obsolete\n", encoding="utf-8")
+    (repo / tree / obsolete).symlink_to(shared_skill, target_is_directory=True)
+
+    assert missing_base_skills(repo, [tree]) == []
+    provision_worktree(wt, [get_profile("claude")], repo)
+
+    assert not (wt / tree / obsolete).exists()
+    assert base_skills_seed_incomplete(wt, repo, [tree]) == []
+
+
+def test_advisory_review_skill_is_copied_best_effort_but_not_fatal(tmp_path):
+    """Conditional review skills remain copy candidates, never hard requirements."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    tree = ".claude/skills"
+    advisory = "bmad-review-performance"
+    _install_dev_auto(
+        repo,
+        tree,
+        skill=DEV_PRIMITIVE_NEW,
+        customize="[workflow]\n"
+        + _layer("blind", "bmad-review")
+        + _layer("perf", advisory, when="the diff touches hot paths"),
+    )
+    _install_skills(repo, tree, {"bmad-review": (), advisory: ()})
+
+    assert missing_base_skills(repo, [tree]) == []
+    provision_worktree(wt, [get_profile("claude")], repo)
+
+    copied = wt / tree / advisory
+    assert (copied / "SKILL.md").is_file()
+    shutil.rmtree(copied)
+    assert base_skills_seed_incomplete(wt, repo, [tree]) == []
+
+
+@pytest.mark.parametrize("merged_fallback", [True, False])
+def test_base_skills_seed_incomplete_preserves_unknown_review_fallback(tmp_path, merged_fallback):
+    """An unknown review shape gates the same fallback topology as preflight."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    tree = ".claude/skills"
+    obsolete = "bmad-review-edge-case-hunter"
+    _install_dev_auto(
+        repo,
+        tree,
+        skill=DEV_PRIMITIVE_NEW,
+        customize="this is not = valid toml [[[",
+    )
+    if merged_fallback:
+        _install_skills(repo, tree, {"bmad-review": ()})
+        shared_skill = tmp_path / "shared" / obsolete
+        shared_skill.mkdir(parents=True)
+        (shared_skill / "SKILL.md").write_text("# obsolete\n", encoding="utf-8")
+        (repo / tree / obsolete).symlink_to(shared_skill, target_is_directory=True)
+    else:
+        _install_skills(
+            repo,
+            tree,
+            {
+                "bmad-review-adversarial-general": (),
+                obsolete: (),
+            },
+        )
+
+    assert resolve_review_layers(repo, tree) is None
+    assert missing_base_skills(repo, [tree]) == []
+    provision_worktree(wt, [get_profile("claude")], repo)
+
+    if merged_fallback:
+        assert not (wt / tree / obsolete).exists()
+        expected = []
+    else:
+        shutil.rmtree(wt / tree / obsolete)
+        expected = [f"{tree}/{obsolete}"]
+    assert base_skills_seed_incomplete(wt, repo, [tree]) == expected
+
+
 def test_base_skills_seed_incomplete_names_a_short_skill_file(tmp_path):
     wt, repo = tmp_path / "wt", tmp_path / "repo"
     tree = ".claude/skills"

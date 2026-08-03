@@ -27,15 +27,15 @@ from typing import TYPE_CHECKING, Callable, NoReturn
 
 from . import gates, verify
 from .install import (
+    _REVIEW_LAYER_SKILLS,
     BASE_SKILLS,
     BMAD_DIR,
     BMAD_SCRIPTS_SEED_REL,
     BMAD_SEED_EXCLUDES,
     CENTRAL_CONFIG_REL,
-    DEV_PRIMITIVE_LEGACY,
-    DEV_PRIMITIVE_NEW,
     DEV_PRIMITIVE_ROLES,
     HOOK_SCRIPT_REL,
+    MERGED_REVIEW_SKILL,
     MODULE_SKILLS,
     RENDER_DIR_REL,
     RENDERER_SCRIPT_MARKER,
@@ -84,10 +84,29 @@ def _setup_mcp_agent_id(profile_name: str) -> str:
     return _SETUP_MCP_AGENT_IDS.get(profile_name, profile_name)
 
 
-def _required_worktree_skills(repo_root: Path, tree: str) -> tuple[str, ...]:
-    """Every upstream skill the dev/review sessions in ``tree`` may invoke."""
+def _worktree_skill_copy_candidates(repo_root: Path, tree: str) -> tuple[str, ...]:
+    """Every upstream skill worth best-effort copying into ``tree``."""
     resolved = resolve_review_layers(repo_root, tree)
     return tuple(dict.fromkeys((*BASE_SKILLS, *(resolved.skills() if resolved else ()))))
+
+
+def _required_worktree_skills(repo_root: Path, tree: str) -> tuple[str, ...]:
+    """Upstream skills whose absence deterministically stalls this tree's run.
+
+    Match :func:`install.missing_base_skills`: gate the selected dev primitive and
+    resolved required review skills only. If the review shape is unknown, prefer a
+    present merged reviewer; otherwise require the standalone fallback reviewers.
+    Catalog-only and advisory skills remain copy candidates but never arm the fatal
+    pre-dispatch completeness gate.
+    """
+    resolved = resolve_review_layers(repo_root, tree)
+    if resolved is not None:
+        review_skills = tuple(resolved.required)
+    elif (repo_root / tree / MERGED_REVIEW_SKILL / "SKILL.md").is_file():
+        review_skills = (MERGED_REVIEW_SKILL,)
+    else:
+        review_skills = tuple(sorted(_REVIEW_LAYER_SKILLS))
+    return tuple(dict.fromkeys((dev_primitive_or_default(repo_root, tree), *review_skills)))
 
 
 def _is_under_bmad(rel: str) -> bool:
@@ -178,10 +197,11 @@ def _absent_skill_files(repo_skill: Path, worktree_skill: Path) -> list[str]:
 def base_skills_seed_incomplete(worktree: Path, repo_root: Path, trees: Sequence[str]) -> list[str]:
     """Upstream skill rels present in the repo but absent from the worktree.
 
-    ``BASE_SKILLS`` is a copy-if-present catalog containing both primitive eras,
-    not a requirement set. Only the era this project resolves is gated. Main also
-    provisions the project's resolved review layers, so those join the same parity
-    check rather than becoming an unguarded second copy leg.
+    ``BASE_SKILLS`` is a copy-if-present catalog, not a requirement set. Gate only
+    the selected primitive and required review skills; advisory/conditional and
+    inactive catalog entries are still provisioned best-effort, but their absence
+    cannot prove the dev/review session will stall. Unknown review shapes use the
+    same merged-or-standalone fallback as the run-start preflight.
 
     A missing ``SKILL.md`` reports the coarse skill rel; once the skill is present,
     every missing file is named. A repo directory without ``SKILL.md`` remains the
@@ -189,12 +209,7 @@ def base_skills_seed_incomplete(worktree: Path, repo_root: Path, trees: Sequence
     """
     missing: list[str] = []
     for tree in dict.fromkeys(trees):
-        unused_era = {DEV_PRIMITIVE_NEW, DEV_PRIMITIVE_LEGACY} - {
-            dev_primitive_or_default(repo_root, tree)
-        }
         for skill in _required_worktree_skills(repo_root, tree):
-            if skill in unused_era:
-                continue
             repo_skill = repo_root / tree / skill
             worktree_skill = worktree / tree / skill
             if not _is_file(repo_skill / "SKILL.md"):
@@ -518,7 +533,7 @@ def provision_worktree(
         # Validating a skill here and then not copying it is how preflight passes in
         # the main checkout while the isolated review fails on a skill that was
         # never there.
-        for skill in _required_worktree_skills(repo_root, tree):
+        for skill in _worktree_skill_copy_candidates(repo_root, tree):
             dst = tree_dir / skill
             src = (repo_root / tree / skill).resolve()
             if not src.is_relative_to(repo_root) or not _is_dir(src):
