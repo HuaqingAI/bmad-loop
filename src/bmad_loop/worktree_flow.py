@@ -33,6 +33,9 @@ from .install import (
     HOOK_SCRIPT_REL,
     MODULE_SKILLS,
     _copy_traversable,
+    _is_dir,
+    _is_file,
+    _occupied,
     _worktree_local_exclude,
     merge_hooks,
     resolve_review_layers,
@@ -156,24 +159,37 @@ def provision_worktree(
     skipped: list[str] = []
     for rel in seed_files:
         src = (repo_root / rel).resolve()
-        dst = (worktree / rel).resolve()
+        raw = worktree / rel
+        dst = raw.resolve()
         if not src.is_relative_to(repo_root) or not dst.is_relative_to(worktree):
             continue
-        if not src.exists():
+        if not (_is_file(src) or _is_dir(src)):
             continue
-        if dst.exists():
+        if _occupied(dst):
+            # A live symlink remains the ordinary existing-destination no-op. This
+            # arm must precede the raw-vs-resolved refusal below so it stays named in
+            # `skipped` rather than turning into a silent drop.
+            if dst != raw:
+                skipped.append(str(rel))
+                continue
             # File entries keep the classic copy-when-absent skip. A destination
             # that is not a directory while the source is (the checkout carries a
             # FILE where the seed names a dir) is a type mismatch: recursing would
             # try to mkdir over the file, so the entry is skipped whole instead.
-            if not src.is_dir() or not dst.is_dir():
+            if not _is_dir(src) or not _is_dir(raw):
                 skipped.append(str(rel))
                 continue
             # A DIRECTORY whose destination exists is the case #230 reported: the
             # checkout carries some tracked child, so the whole entry used to be a
             # no-op — including the gitignored children that are absent and would
             # clobber nothing. Recurse instead, copying only what is missing.
-            if not _copy_traversable(src, dst, skip_existing=True):
+            if not _copy_traversable(
+                src,
+                raw,
+                skip_existing=True,
+                worktree=worktree,
+                repo_root=repo_root,
+            ):
                 # every child was already present: still a total no-op, still
                 # reported. Only a PARTIAL seed stops being reported.
                 skipped.append(str(rel))
@@ -184,9 +200,19 @@ def provision_worktree(
             # untrack the tracked children that were already there.
             seeded.append(rel)
             continue
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        _copy_traversable(src, dst)
-        seeded.append(rel)
+        # `resolve()` is non-strict, so a dangling leaf or parent link answers for
+        # its target. Never mkdir/copy through it. Existing live links were handled
+        # by the skip arm above, preserving copy-when-absent reporting.
+        if dst != raw:
+            continue
+        if _copy_traversable(
+            src,
+            raw,
+            skip_existing=True,
+            worktree=worktree,
+            repo_root=repo_root,
+        ):
+            seeded.append(rel)
 
     # glob-seeded trees (e.g. an engine plugin's MCP skill dirs): expand each
     # pattern against the main repo and copy matches in, same contain guard +
@@ -196,13 +222,22 @@ def provision_worktree(
         for match in sorted(repo_root.glob(pattern)):
             rel = match.relative_to(repo_root)
             src = match.resolve()
-            dst = (worktree / rel).resolve()
+            raw = worktree / rel
+            dst = raw.resolve()
             if not src.is_relative_to(repo_root) or not dst.is_relative_to(worktree):
                 continue
-            if not src.exists() or dst.exists():
+            if not (_is_file(src) or _is_dir(src)) or _occupied(dst):
                 continue
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            _copy_traversable(src, dst)
+            if dst != raw:
+                continue
+            if not _copy_traversable(
+                src,
+                raw,
+                skip_existing=True,
+                worktree=worktree,
+                repo_root=repo_root,
+            ):
+                continue
             # as_posix so the exclude pattern anchors on Windows too (os.sep would not)
             seeded.append(rel.as_posix())
 
@@ -212,9 +247,12 @@ def provision_worktree(
         tree_dir = worktree / tree
         for skill in MODULE_SKILLS:
             dst = tree_dir / skill
-            if dst.exists():
-                continue
-            _copy_traversable(skills_root.joinpath(skill), dst)
+            _copy_traversable(
+                skills_root.joinpath(skill),
+                dst,
+                skip_existing=True,
+                worktree=worktree,
+            )
         # The orchestrator-driven upstream skills are not in the wheel; copy them
         # from the MAIN REPO's installed tree (same tree path) so an isolated
         # worktree can still resolve the dev primitive and the review layers. Skip
@@ -239,12 +277,16 @@ def provision_worktree(
         required = dict.fromkeys((*BASE_SKILLS, *(resolved.skills() if resolved else ())))
         for skill in required:
             dst = tree_dir / skill
-            if dst.exists():
-                continue
             src = (repo_root / tree / skill).resolve()
-            if not src.is_relative_to(repo_root) or not src.is_dir():
+            if not src.is_relative_to(repo_root) or not _is_dir(src):
                 continue
-            _copy_traversable(src, dst)
+            _copy_traversable(
+                src,
+                dst,
+                skip_existing=True,
+                worktree=worktree,
+                repo_root=repo_root,
+            )
 
     # The project's customization of those upstream skills (_bmad/custom/*.toml).
     # The preflight resolves review layers through these files, but the run inside
@@ -260,28 +302,49 @@ def provision_worktree(
     # one of those — journaling it would read as a project misconfiguration.
     customize_seeded = False
     src_customize = (repo_root / CUSTOMIZE_DIR).resolve()
-    dst_customize = (worktree / CUSTOMIZE_DIR).resolve()
+    raw_customize = worktree / CUSTOMIZE_DIR
+    dst_customize = raw_customize.resolve()
     if (
-        src_customize.is_dir()
+        _is_dir(src_customize)
         and src_customize.is_relative_to(repo_root)
         and dst_customize.is_relative_to(worktree)
+        and dst_customize == raw_customize
     ):
-        if not dst_customize.exists():
-            dst_customize.parent.mkdir(parents=True, exist_ok=True)
-            _copy_traversable(src_customize, dst_customize)
-            customize_seeded = True
-        elif dst_customize.is_dir():
-            customize_seeded = _copy_traversable(src_customize, dst_customize, skip_existing=True)
+        customize_seeded = _copy_traversable(
+            src_customize,
+            raw_customize,
+            skip_existing=True,
+            worktree=worktree,
+            repo_root=repo_root,
+        )
 
     # per-CLI signal-hook registration, baked to the main repo's relay (absolute).
     # Hookless profiles (HTTP/SSE transport) have no config to merge.
     for profile in profiles:
         if profile.hookless:
             continue
-        config_path = worktree / profile.hooks.config_path
+        raw_config_path = worktree / profile.hooks.config_path
+        # Refuse before mkdir, read, or write: hook commands are worktree-specific
+        # and must never mutate a shared dotfile through a live or dangling link.
+        # Inspect every component because Python 3.14's non-strict resolve leaves a
+        # symlink cycle unresolved (and therefore textually equal to the raw path).
+        # The resolved comparison additionally refuses ``..`` and absolute profiles.
+        refused = not raw_config_path.is_relative_to(worktree)
+        cursor = raw_config_path
+        try:
+            while not refused and cursor != worktree:
+                if cursor.is_symlink():
+                    refused = True
+                    break
+                cursor = cursor.parent
+            config_path = raw_config_path.resolve()
+        except (OSError, RuntimeError):
+            continue
+        if refused or config_path != raw_config_path or not config_path.is_relative_to(worktree):
+            continue
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config: dict = {}
-        if config_path.is_file():
+        if _is_file(config_path):
             try:
                 config = json.loads(config_path.read_text(encoding="utf-8"))
             except json.JSONDecodeError:

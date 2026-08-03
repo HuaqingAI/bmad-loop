@@ -16,15 +16,17 @@ orchestrator's signal watcher is CLI-agnostic.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
 import shutil
 import subprocess
 import tomllib
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import ExitStack
 from importlib import resources
+from importlib.resources.abc import Traversable
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -252,11 +254,11 @@ def resolve_dev_primitive(project: Path, tree: str) -> str | None:
     instead would make a truncated bmad-build-auto silently resolve to a legacy
     install (or to the shim's failure message), hiding the real problem.
     """
-    if (project / tree / DEV_PRIMITIVE_NEW / "SKILL.md").is_file():
+    if _is_file(project / tree / DEV_PRIMITIVE_NEW / "SKILL.md"):
         return DEV_PRIMITIVE_NEW
     legacy = project / tree / DEV_PRIMITIVE_LEGACY
-    if (legacy / "SKILL.md").is_file() and all(
-        (legacy / marker).is_file() for marker in DEV_PRIMITIVE_MARKERS
+    if _is_file(legacy / "SKILL.md") and all(
+        _is_file(legacy / marker) for marker in DEV_PRIMITIVE_MARKERS
     ):
         return DEV_PRIMITIVE_LEGACY
     return None
@@ -331,7 +333,7 @@ def _absent_renderer_sources(skill_dir: Path) -> list[str]:
     sources = {
         path.relative_to(skill_dir).as_posix(): path
         for path in skill_dir.rglob("*.md")
-        if path.name != "SKILL.md"
+        if path.name != "SKILL.md" and _is_file(path)
     }
     absent = [] if RENDERER_ENTRY_REL in sources else [RENDERER_ENTRY_REL]
     for path in sources.values():
@@ -1133,54 +1135,214 @@ def _register_hooks(project: Path, profile: CLIProfile) -> int:
     return 0
 
 
-def _copy_traversable(src, dst: Path, *, skip_existing: bool = False) -> bool:
-    """Recursively copy a packaged resource tree to a filesystem path.
+def _walk_traversable_files(
+    src,
+    rel: str = "",
+    _seen: frozenset[str] = frozenset(),
+    _should_descend=None,
+    _visit_dir=None,
+    _suppress_errors: bool = True,
+) -> Iterator[tuple[str, Traversable]]:
+    """Yield the leaves of a Traversable tree as deterministic POSIX rels.
 
-    Walks via the Traversable API (.iterdir/.read_bytes) rather than resolving a
-    filesystem path, so it works even when the package is zip-imported.
+    ``iterdir`` recursion deliberately descends symlinked source directories, unlike
+    the renderer's ``rglob`` enumeration in :func:`_absent_renderer_sources`. A
+    branch-local real-path set terminates cycles without dropping a second sibling
+    that points at the same shared tree.
 
-    Its ``iterdir`` recursion deliberately descends a symlinked source directory.
-    Do not unify this walk with :func:`_absent_renderer_sources`, whose ``rglob``
-    mirrors the renderer and does not descend one. The copier asks what it can carry;
-    the renderer gate asks what upstream will enumerate.
+    A directory the filesystem refuses to list is yielded as a leaf. That lets a
+    copier decline content it cannot confirm while a result-side completeness check
+    can still name the unreadable rel. Wheel Traversables have no real-path cycle leg.
 
-    ``skip_existing`` makes the copy no-clobber at FILE granularity: an existing
-    destination file is left untouched and its siblings are still copied — even
-    when it stands where the source has a directory (that subtree is skipped
-    whole rather than mkdir'd over the file). It is
-    opt-in because the `--force-skills` path (`install_into`) rmtree's the
-    destination precisely to overwrite it, and a guard baked into this helper
-    would silently regress that. Only the worktree-seed caller passes it.
-
-    Returns whether anything was actually written, so a caller seeding into an
-    existing directory can tell a partial seed (something landed) from a total
-    no-op (every child was already present). Every other call site ignores it.
+    ``_should_descend`` and ``_visit_dir`` are private copier plumbing. The first may
+    prune before ``iterdir`` (preserving no-clobber when a destination file stands
+    where the source has a directory); the second sees every successfully enumerated
+    directory, including empty ones. Keeping materialization after enumeration means
+    an unreadable source directory never leaves an empty destination behind.
     """
-    if src.is_dir():
-        if skip_existing and dst.exists() and not dst.is_dir():
-            # a FILE sits where the source has a directory: mkdir would raise
-            # FileExistsError. Under the no-clobber contract the file wins and
-            # the whole subtree is skipped, like any existing destination.
-            return False
-        # creating a missing directory IS a write: an empty dir seeded into an
-        # existing tree must count, or the entry is misreported as a total no-op.
-        copied = not dst.exists()
-        dst.mkdir(parents=True, exist_ok=True)
-        # `any(...)` would short-circuit and skip the remaining children.
-        for child in src.iterdir():
-            if _copy_traversable(child, dst / child.name, skip_existing=skip_existing):
-                copied = True
-        return copied
-    if skip_existing and dst.exists():
+    if _is_dir(src):
+        real = str(src.resolve()) if isinstance(src, Path) else None
+        if real is not None and real in _seen:
+            return
+        if _should_descend is not None and not _should_descend(rel, src):
+            return
+        try:
+            children = sorted(src.iterdir(), key=lambda entry: entry.name)
+        except OSError:
+            if not _suppress_errors:
+                raise
+            yield rel, src
+            return
+        if _visit_dir is not None and not _visit_dir(rel, src):
+            return
+        inner = _seen if real is None else _seen | {real}
+        for child in children:
+            child_rel = f"{rel}/{child.name}" if rel else child.name
+            yield from _walk_traversable_files(
+                child,
+                child_rel,
+                inner,
+                _should_descend,
+                _visit_dir,
+                _suppress_errors,
+            )
+        return
+    yield rel, src
+
+
+def _is_file(path) -> bool:
+    """Answer whether ``path`` is a usable file, total over filesystem faults.
+
+    A refused probe and an absent/non-file path all mean the same thing to a reader
+    or copier: there are no bytes it can promise to consume. Python <=3.13 raises on
+    an entry below an unsearchable parent while 3.14 answers false; both fold to false
+    here. The directory reading is deliberately different — see :func:`_is_dir`.
+    """
+    try:
+        return path.is_file()
+    except OSError:
         return False
-    if isinstance(src, Path):
-        # real filesystem source (worktree seeds, non-zip package data): copy2
-        # preserves the mode so a seeded vendor/bin/* keeps +x (issue #126)
-        shutil.copy2(src, dst)
-    else:
-        # zip-imported Traversable exposes no stat: content-only copy
-        dst.write_bytes(src.read_bytes())
-    return True
+
+
+def _is_dir(path) -> bool:
+    """Answer whether a walk may have unseen content below ``path``.
+
+    Refusal is true, not false: an unreadable source must reach the walk as a named
+    leaf instead of collapsing into absence. Python 3.14 made ``Path.is_dir`` return
+    false for faults older interpreters raise, so a false is re-asked with ``stat``.
+    """
+    try:
+        if path.is_dir():
+            return True
+    except OSError:
+        return True
+    return _probe_refused(path)
+
+
+# pathlib's version-dependent private ignored-errno set, copied here so absence and
+# refusal retain the same meaning on every supported interpreter.
+_ABSENCE_ERRNOS = (errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP)
+
+
+def _probe_refused(path) -> bool:
+    """True when a false pathlib convenience probe actually means I/O refusal."""
+    if not isinstance(path, Path):
+        # A wheel Traversable has no stat() method and no permission mode to recover.
+        return False
+    try:
+        path.stat()
+    except OSError as exc:
+        return exc.errno not in _ABSENCE_ERRNOS
+    except ValueError:
+        # Embedded-null and otherwise invalid paths are absent, not refused.
+        return False
+    return False
+
+
+def _occupied(path: Path) -> bool:
+    """Whether a destination slot is taken, dangling symlinks included."""
+    try:
+        return path.exists() or path.is_symlink()
+    except OSError:
+        # A slot that cannot even be inspected is not safe to write through.
+        return True
+
+
+def _copy_traversable(
+    src,
+    dst: Path,
+    *,
+    skip_existing: bool = False,
+    worktree: Path | None = None,
+    repo_root: Path | None = None,
+) -> bool:
+    """Recursively copy a Traversable tree, optionally confined to a worktree.
+
+    ``skip_existing`` remains the install helper's opt-in per-file no-clobber mode.
+    Supplying ``worktree`` makes no-clobber mandatory and adds destination
+    containment plus per-entry OSError degradation: provisioning never escapes the
+    worktree through a link or crashes the run because one entry cannot be read.
+    ``repo_root`` additionally refuses real source entries resolving outside the main
+    checkout. Wheel Traversables have no source containment leg.
+
+    The shared walk classifies every source leaf through :func:`_is_file`; FIFOs,
+    dangling links, and refused entries therefore have no copy/read path. Directory
+    visits preserve main's existing empty-directory behavior and its boolean result:
+    true means at least one directory or file actually landed, false means total no-op.
+    """
+    copied = False
+    no_clobber = skip_existing or worktree is not None
+
+    def source_contained(entry) -> bool:
+        if repo_root is None or not isinstance(entry, Path):
+            return True
+        try:
+            return entry.resolve().is_relative_to(repo_root)
+        except (OSError, RuntimeError):
+            return False
+
+    def target_for(rel: str) -> Path:
+        return dst.joinpath(*rel.split("/"))
+
+    def target_contained(target: Path) -> bool:
+        if worktree is None:
+            return True
+        try:
+            return target.resolve().is_relative_to(worktree)
+        except (OSError, RuntimeError):
+            return False
+
+    def should_descend(rel: str, entry) -> bool:
+        target = target_for(rel)
+        if not source_contained(entry) or not target_contained(target):
+            return False
+        if no_clobber and _occupied(target) and not _is_dir(target):
+            # A file or dangling link sits where the source has a directory. It wins;
+            # mkdir must never replace it or write through its target.
+            return False
+        return True
+
+    def visit_dir(rel: str, entry) -> bool:
+        nonlocal copied
+        if not should_descend(rel, entry):
+            return False
+        target = target_for(rel)
+        existed = _occupied(target)
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            if worktree is None:
+                raise
+            return False
+        if not existed:
+            copied = True
+        return True
+
+    for rel, child in _walk_traversable_files(
+        src,
+        _should_descend=should_descend,
+        _visit_dir=visit_dir,
+        _suppress_errors=worktree is not None,
+    ):
+        if not _is_file(child) or not source_contained(child):
+            continue
+        target = target_for(rel)
+        if not target_contained(target) or (no_clobber and _occupied(target)):
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if isinstance(child, Path):
+                # Preserve modes for filesystem sources (notably vendor/bin/*).
+                shutil.copy2(child, target)
+            else:
+                # Zip-imported Traversables expose no stat: content only.
+                target.write_bytes(child.read_bytes())
+        except OSError:
+            if worktree is None:
+                raise
+            continue
+        copied = True
+    return copied
 
 
 # The git that introduced `extensions.worktreeConfig` and `git config --worktree`,
