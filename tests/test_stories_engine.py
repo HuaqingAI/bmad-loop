@@ -1107,7 +1107,9 @@ def test_worktree_reprobes_stories_dispatch_support_before_session(
     summary = engine.run()
 
     assert summary.paused and adapter.sessions == []
-    assert STORIES_PROBE_FILE in (engine.state.paused_reason or "")
+    reason = engine.state.paused_reason or ""
+    assert STORIES_PROBE_FILE in reason
+    assert (STORIES_PROBE_TEXT in reason) is (checkout_probe == "stale")
     assert Path(engine.state.tasks["1"].worktree_path).is_dir()
 
 
