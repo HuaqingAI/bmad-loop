@@ -194,9 +194,8 @@ def journal_kinds(engine):
 def ignore_before_commit(project, *patterns):
     gitignore = project.project / ".gitignore"
     existing = gitignore.read_text(encoding="utf-8")
-    gitignore.write_text(
-        existing + "".join(f"{pattern}\n" for pattern in patterns), encoding="utf-8"
-    )
+    prefix = existing if not existing or existing.endswith("\n") else existing + "\n"
+    gitignore.write_text(prefix + "".join(f"{pattern}\n" for pattern in patterns), encoding="utf-8")
 
 
 # ----------------------------------------------------------------- happy path

@@ -677,8 +677,10 @@ def test_e2e_renderer_surface_is_seeded_into_isolated_real_tmux_session(tmp_path
     root = tmp_path / "sbx"
     _scaffold_renderer(root)
     gitignore = root / ".gitignore"
+    existing = gitignore.read_text(encoding="utf-8")
+    prefix = existing if not existing or existing.endswith("\n") else existing + "\n"
     gitignore.write_text(
-        gitignore.read_text(encoding="utf-8") + f"{BMAD_SCRIPTS_SEED_REL}/\n{CENTRAL_CONFIG_REL}\n",
+        prefix + f"{BMAD_SCRIPTS_SEED_REL}/\n{CENTRAL_CONFIG_REL}\n",
         encoding="utf-8",
     )
     policy = root / ".bmad-loop" / "policy.toml"
