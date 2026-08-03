@@ -47,6 +47,7 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "bmad-config",
         "policy",
         "policy.model-qualified",
+        "policy.isolation-repo-root",
         "adapter.profile",
         "adapter.binary",
         "adapter.hookless",
