@@ -1898,6 +1898,236 @@ def test_worktree_clean_flags_untracked_non_policy(project):
     assert not verify.worktree_clean(project.project)
 
 
+# ------------------------------------------------- git pathspec hardening (#423)
+#
+# Every fixture below is built in PYTHON, never through a shell: fish and zsh
+# glob-expand `docs[a]` / `a*b` / `q?r` into non-existence, and `git rm --cached
+# '<glob>'` takes its argument as a pathspec too — both produced void fixtures
+# (a test that passes because it tested nothing) on the 0.9.1 hotfix.
+#
+# `*` and `?` are illegal in Windows FILENAMES, so a fixture that must create a
+# directory carrying one is Linux-only. `[` and `]` are legal everywhere — and
+# per #423's reachability analysis they are also the realistic carrier, since
+# `implementation_artifacts` comes out of the operator's config — so the
+# bracket rows stay unmarked and cover both CI platforms. Note this constrains
+# only fixture FILENAMES: a pathspec STRING containing `*` is just a string, so
+# the tests that merely pass `doc*` as a configured prefix run everywhere.
+NO_GLOB_FILENAMES = pytest.mark.skipif(
+    sys.platform == "win32", reason="`*` and `?` are illegal in Windows filenames"
+)
+
+
+def _metachar_pair(repo, meta: str, victim: str):
+    """A metachar dir and the sibling its glob collides with, both committed.
+
+    Returns the two `f.md` paths. `doc*` is the shape that matters most: `*`
+    crosses `/`, so it is the only one that reaches a sibling DIRECTORY's
+    contents — `[…]`/`?` are same-length and reach a sibling FILE only.
+    """
+    for d in (meta, victim):
+        (repo / d).mkdir(parents=True, exist_ok=True)
+        (repo / d / "f.md").write_text("v1\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "metachar fixture")
+    return repo / meta / "f.md", repo / victim / "f.md"
+
+
+def test_path_tracked_reports_index_membership(project):
+    """The basic contract: an index entry is True, an untracked file is False."""
+    repo = project.project
+    assert verify.path_tracked(repo, "src.txt")
+    (repo / "stray.txt").write_text("untracked\n")
+    assert not verify.path_tracked(repo, "stray.txt")
+    assert not verify.path_tracked(repo, "never_existed.txt")
+
+
+@pytest.mark.parametrize(
+    ("meta", "neighbour"),
+    [
+        ("docs[a]", "docsa"),
+        pytest.param("a*b", "axb", marks=NO_GLOB_FILENAMES),
+        pytest.param("q?r", "qxr", marks=NO_GLOB_FILENAMES),
+    ],
+)
+def test_path_tracked_refuses_a_glob_match_from_a_neighbour(project, meta, neighbour):
+    """An ABSENT path whose name carries pathspec metacharacters must not read as
+    tracked just because some OTHER tracked path matches it as a glob.
+
+    This is the inverted, silent failure: `_ledger_is_gits_to_restore` answers
+    "git owns it" for a ledger git has never seen, so the harvest revert skips
+    its `unlink()` and a finding about discarded code stays open. Ablating the
+    `:(literal)` prefix flips the first assertion to True."""
+    repo = project.project
+    _metachar_pair(repo, meta, neighbour)
+    # Untrack ONLY the metachar path; its glob-colliding neighbour stays tracked.
+    git(repo, "rm", "-r", "-q", "--cached", "--", f":(literal){meta}")
+    assert not verify.path_tracked(repo, f"{meta}/f.md")
+    assert verify.path_tracked(repo, f"{neighbour}/f.md")
+
+
+def test_path_tracked_still_matches_a_directory_prefix(project):
+    """`:(literal)` must not cost the callers the prefix match they rely on —
+    `cmd_validate`'s render-tracked warning probes a DIRECTORY, not a file."""
+    repo = project.project
+    (repo / "_bmad" / "render").mkdir(parents=True, exist_ok=True)
+    (repo / "_bmad" / "render" / "render_skill.py").write_text("# renderer\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "render")
+    assert verify.path_tracked(repo, "_bmad/render")
+
+
+def test_path_tracked_reads_a_rel_beginning_with_a_colon(project):
+    """A leading `:` is pathspec magic. Bare, git parses it as an (unknown) magic
+    word and answers the empty set — i.e. "untracked", the direction that
+    authorizes a delete. The literal prefix disarms it."""
+    repo = project.project
+    odd = repo / ":weird"
+    odd.mkdir(exist_ok=True)
+    (odd / "f.md").write_text("v1\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "colon dir")
+    assert verify.path_tracked(repo, ":weird/f.md")
+
+
+def test_path_tracked_keeps_a_tracked_but_deleted_path(project):
+    """The index entry outlives the file, and that is exactly the state a caller
+    must not mistake for "not git's" — `reset --hard` will bring it back."""
+    repo = project.project
+    (repo / "src.txt").unlink()
+    assert verify.path_tracked(repo, "src.txt")
+
+
+def test_path_tracked_ignores_stderr_chatter_on_success(project, monkeypatch):
+    """`ls-files` exits 0 while still writing to stderr (an unexecutable
+    `core.fsmonitor` hook, an unknown `core.fsyncMethod`). Read against `_git`'s
+    stdout+stderr MERGE that chatter is indistinguishable from an index entry, so
+    an untracked path answers "tracked" — silent and inverted. Only stdout counts."""
+    real = verify._run_git
+
+    def noisy(cmd, repo, **kw):
+        proc = real(cmd, repo, **kw)
+        if "ls-files" in cmd:
+            proc.stderr = "warning: unable to access '.git/hooks/fsmonitor': no such file\n"
+        return proc
+
+    monkeypatch.setattr(verify, "_run_git", noisy)
+    assert not verify.path_tracked(project.project, "never_existed.txt")
+
+
+def test_path_tracked_raises_on_git_failure(project):
+    """Raises GitError like every other probe here — callers inside a rollback
+    `finally` degrade toward leaving the file alone."""
+    with pytest.raises(verify.GitError, match="ls-files"):
+        verify.path_tracked(project.project / "not-a-repo", "src.txt")
+
+
+def test_worktree_clean_ignores_stderr_chatter_on_success(project, monkeypatch):
+    """A pristine tree must not read DIRTY because git wrote to stderr while
+    exiting 0. Seven callers gate on this and `cli.py`'s three refuse the command
+    outright, so the merged-stream read made a noisy git config unable to start a
+    run — with no file named in the message."""
+    real = verify._run_git
+
+    def noisy(cmd, repo, **kw):
+        proc = real(cmd, repo, **kw)
+        if "status" in cmd:
+            proc.stderr = "warning: core.fsyncMethod unknown value\n"
+        return proc
+
+    monkeypatch.setattr(verify, "_run_git", noisy)
+    assert verify.worktree_clean(project.project)
+    (project.project / "stray.txt").write_text("real change\n")
+    assert not verify.worktree_clean(project.project)  # a genuine change still shows
+
+
+def test_commit_paths_refuses_to_stage_a_glob_neighbour(project):
+    """`commit_paths` promises "exactly `paths` (and nothing else)". Unescaped, a
+    configured artifacts dir carrying `[` also stages the operator's unrelated
+    edit in the colliding sibling — committed under a story's name."""
+    repo = project.project
+    target, victim = _metachar_pair(repo, "docs[a]", "docsa")
+    target.write_text("the artifact this commit is for\n")
+    victim.write_text("the operator's own uncommitted work\n")
+
+    sha = verify.commit_paths(repo, "chore: artifact only", [target])
+
+    assert sha is not None
+    status = git(repo, "status", "--porcelain")
+    assert "docsa/f.md" in status  # the neighbour is STILL uncommitted
+    assert "docs[a]" not in status  # the named path did land
+    assert victim.read_text() == "the operator's own uncommitted work\n"
+
+
+def test_commit_paths_leaves_a_record_for_a_gitignored_path(project):
+    """With the ledger gitignored — the shape `_carry_harvested_deferrals` hits —
+    `git add` REFUSES an explicitly named ignored path (rc 1) but SKIPS a globbed
+    one. Bare, the call could exit rc 0 having staged nothing and report success
+    having committed no ledger; the literal operand raises instead, so the caller
+    still has a record."""
+    repo = project.project
+    gitignore = repo / ".gitignore"
+    gitignore.write_text(gitignore.read_text() + "ignored-dir/\n")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore")
+    (repo / "ignored-dir").mkdir(exist_ok=True)
+    ledger = repo / "ignored-dir" / "deferred-work.md"
+    ledger.write_text("# ledger\n")
+
+    with pytest.raises(verify.GitError, match="git add failed"):
+        verify.commit_paths(repo, "chore: ledger", [ledger])
+
+
+def test_exclude_specs_does_not_hide_a_siblings_diff(project):
+    """An artifacts dir whose name carries `*` must not also exclude the sibling
+    tree it glob-matches: `has_changes_since` would answer "no changes" for a dev
+    attempt that changed real code, the false-green direction (#423 item 3)."""
+    repo = project.project
+    _metachar_pair(repo, "doc-x", "doc-y")  # committed, both under the `doc*` glob
+    baseline = verify.rev_parse_head(repo)
+    (repo / "doc-y" / "f.md").write_text("a real change outside the artifacts dir\n")
+
+    assert verify.has_changes_since(repo, baseline, exclude=("doc*",))
+
+
+def test_exclude_specs_agrees_with_path_under_any(project):
+    """The two halves of ONE `has_changes_since` answer — the git exclusion over
+    tracked changes and `_path_under_any` over untracked ones — must not disagree
+    about what "under the artifact dir" means (#423 item 4)."""
+    for prefix, path in (("docs[a]", "docsa"), ("q?r", "qxr"), ("doc*", "docsa/f.md")):
+        git_excludes = verify._exclude_specs((prefix,)) == [f":(exclude,literal){prefix}"]
+        python_under = verify._path_under_any(path, (prefix,))
+        assert git_excludes and not python_under, f"{prefix} vs {path}"
+
+
+def test_safe_rollback_preserve_does_not_restore_a_glob_neighbour(project):
+    """`preserve` restores operator-configured dirs from the snapshot, and this leg
+    WRITES. Bare, `checkout <snap> -- 'doc*'` also restores every sibling the glob
+    reaches — and because the snapshot is a `stash create` of the DIRTY tree, that
+    hands the dev attempt's change back after the reset was supposed to discard it.
+    The rollback silently under-reverts, and the next preflight sees a tree the
+    engine believes it rolled back (#423 item 5)."""
+    repo = project.project
+    # Only the NEIGHBOUR exists on disk; `doc*` is the operator's configured
+    # preserve dir, which the literal reading matches nothing for (a benign
+    # "pathspec did not match"). Keeping it absent is what makes the assertion
+    # discriminating AND lets the row run on Windows, where `*` cannot be a
+    # filename: bare, the glob reaches `docsa` and hands its change back.
+    (repo / "docsa").mkdir(parents=True, exist_ok=True)
+    neighbour = repo / "docsa" / "f.md"
+    neighbour.write_text("v1\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "neighbour")
+    baseline = verify.rev_parse_head(repo)
+    snap = sorted(verify.untracked_files(repo))
+    neighbour.write_text("the dev attempt's change\n")  # outside preserve — must revert
+
+    verify.safe_rollback(
+        repo, baseline, baseline_untracked=snap, keep=(".bmad-loop",), preserve=("doc*",)
+    )
+
+    assert neighbour.read_text() == "v1\n"  # reverted, not resurrected by the glob
+
+
 def test_commit_story(project):
     task = make_task(project)
     (project.project / "src.txt").write_text("done work\n")

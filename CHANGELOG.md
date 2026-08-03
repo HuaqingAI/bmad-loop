@@ -260,6 +260,25 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 ### Fixed
 
+- **A configured path carrying `[`, `]`, `*` or `?` no longer makes git act on the wrong files
+  (#423).** `implementation_artifacts` reaches git verbatim out of the operator's
+  `_bmad/bmm/config.yaml`, and git reads a positional operand as a _pathspec_, not a path — so such
+  a name matched a wider set than the one it named, always on the over-match side. `commit_paths`
+  broke its own "commit exactly these paths (and nothing else)" promise, staging an unrelated
+  sibling's edit under a story's name; with the ledger gitignored it could also exit clean having
+  committed nothing, where the fixed form leaves a record. `has_changes_since` and `attempt_dirty`
+  excluded a sibling tree along with the artifacts dir and reported a changed attempt as CLEAN, and
+  their git half disagreed with the Python half about what "under the artifact dir" means.
+  `safe_rollback`'s preserve restore reached siblings too, handing back a change the reset had just
+  discarded. Every operand is now literal, and the two halves agree.
+
+- **A noisy git config no longer makes a pristine tree read as dirty.** `worktree_clean` compared
+  git's stdout and stderr merged, so `status` exiting 0 while warning about an unexecutable
+  `core.fsmonitor` hook or an unknown `core.fsyncMethod` was indistinguishable from a porcelain
+  record. Seven callers gate on it and three of them refuse the command outright, so such a host
+  could never start a run — and the message named no file. Only stdout is read now; the error path
+  still reports both.
+
 - **An undecodable `policy.toml` or `_bmad/bmm/config.yaml` is reported, not a crash.**
   `UnicodeDecodeError` is a `ValueError`, not an `OSError`, so a config file saved in UTF-16 or
   latin-1 escaped every `except (PolicyError, OSError)` handler in the codebase — and those handlers
