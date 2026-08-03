@@ -2455,6 +2455,25 @@ def test_provision_worktree_reports_seed_skipped_as_noop(tmp_path):
     assert provision_worktree(wt, [], repo, seed_files=[".mcp.json"]) == [".mcp.json"]
 
 
+def test_provision_preserves_unrelated_bmad_noop_when_internal_sibling_lands(tmp_path):
+    """An internal BMAD copy cannot erase an unrelated user-seed no-op report."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    rel = f"{BMAD_DIR}/custom/already.toml"
+    for root, content in ((repo, "FROM_REPO\n"), (wt, "IN_WORKTREE\n")):
+        target = root / rel
+        target.parent.mkdir(parents=True)
+        target.write_text(content, encoding="utf-8")
+    sibling = repo / BMAD_SCRIPTS_SEED_REL / "unrelated.py"
+    sibling.parent.mkdir(parents=True)
+    sibling.write_text("# best-effort sibling\n", encoding="utf-8")
+
+    skipped = provision_worktree(wt, [], repo, seed_files=[rel])
+
+    assert skipped == [rel]
+    assert (wt / rel).read_text(encoding="utf-8") == "IN_WORKTREE\n"
+    assert (wt / BMAD_SCRIPTS_SEED_REL / "unrelated.py").is_file()
+
+
 def test_provision_worktree_seeds_absent_children_of_existing_dir(tmp_path):
     """The case that motivated #230: a worktree checks out tracked files, so a seed
     DIRECTORY with any tracked child already exists. Its absent children are seeded
@@ -6801,6 +6820,29 @@ def test_advisory_review_skill_is_copied_best_effort_but_not_fatal(tmp_path):
     assert base_skills_seed_incomplete(wt, repo, [tree]) == []
 
 
+@pytest.mark.parametrize("skill", [DEV_PRIMITIVE_NEW, "bmad-review"])
+def test_required_skill_unreferenced_auxiliary_is_best_effort_not_fatal(tmp_path, skill):
+    """A refused note in an active skill does not prove the session will stall."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    tree = ".claude/skills"
+    _install_dev_auto(
+        repo,
+        tree,
+        skill=DEV_PRIMITIVE_NEW,
+        customize="[workflow]\n" + _layer("blind", "bmad-review"),
+    )
+    _install_skills(repo, tree, {"bmad-review": ()})
+    shared = tmp_path / f"shared-{skill}.md"
+    shared.write_text("# unreferenced note\n", encoding="utf-8")
+    (repo / tree / skill / "README.md").symlink_to(shared)
+
+    assert missing_base_skills(repo, [tree]) == []
+    assert provision_worktree(wt, [get_profile("claude")], repo) == []
+
+    assert not (wt / tree / skill / "README.md").exists()
+    assert base_skills_seed_incomplete(wt, repo, [tree]) == []
+
+
 @pytest.mark.parametrize("merged_fallback", [True, False])
 def test_base_skills_seed_incomplete_preserves_unknown_review_fallback(tmp_path, merged_fallback):
     """An unknown review shape gates the same fallback topology as preflight."""
@@ -6842,20 +6884,33 @@ def test_base_skills_seed_incomplete_preserves_unknown_review_fallback(tmp_path,
     assert base_skills_seed_incomplete(wt, repo, [tree]) == expected
 
 
-def test_base_skills_seed_incomplete_names_a_short_skill_file(tmp_path):
+def test_base_skills_seed_incomplete_names_a_missing_primitive_marker(tmp_path):
     wt, repo = tmp_path / "wt", tmp_path / "repo"
     tree = ".claude/skills"
     catalog = {DEV_PRIMITIVE_NEW: DEV_PRIMITIVE_MARKERS}
     for root in (repo, wt):
         _install_skills(root, tree, catalog)
-        skill = root / tree / DEV_PRIMITIVE_NEW
-        (skill / "review-prompts").mkdir()
-        (skill / "review-prompts" / "adversarial.md").write_text("x\n", encoding="utf-8")
-    (wt / tree / DEV_PRIMITIVE_NEW / "review-prompts" / "adversarial.md").unlink()
+    (wt / tree / DEV_PRIMITIVE_NEW / "customize.toml").unlink()
 
     assert base_skills_seed_incomplete(wt, repo, [tree]) == [
-        f"{tree}/{DEV_PRIMITIVE_NEW}/review-prompts/adversarial.md"
+        f"{tree}/{DEV_PRIMITIVE_NEW}/customize.toml"
     ]
+
+
+def test_base_skills_seed_incomplete_names_a_missing_renderer_snapshot(tmp_path):
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    tree = ".claude/skills"
+    target = "sources/plan.md"
+    for root in (repo, wt):
+        install_build_auto_skill(root, tree, renderer_stub=True)
+        (root / tree / DEV_PRIMITIVE_NEW / "workflow.md").write_text(
+            f"Read [[bmad-snapshot:{target}]].\n", encoding="utf-8"
+        )
+    source = repo / tree / DEV_PRIMITIVE_NEW / target
+    source.parent.mkdir()
+    source.write_text("# plan\n", encoding="utf-8")
+
+    assert base_skills_seed_incomplete(wt, repo, [tree]) == [f"{tree}/{DEV_PRIMITIVE_NEW}/{target}"]
 
 
 def test_renderer_seed_predicates_report_only_missing_repo_content(tmp_path):
@@ -6918,15 +6973,44 @@ def test_provision_reports_a_symlinked_out_renderer_scripts_seed(tmp_path):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
-def test_worktree_seed_undelivered_names_a_symlinked_out_source(tmp_path):
+def test_worktree_seed_undelivered_names_an_escaped_source_despite_stale_destination(tmp_path):
     repo, wt = tmp_path / "repo", tmp_path / "wt"
     repo.mkdir()
     shared = tmp_path / "shared-mcp.json"
     shared.write_text("{}\n", encoding="utf-8")
     (repo / ".mcp.json").symlink_to(shared)
+    wt.mkdir()
+    (wt / ".mcp.json").write_text("STALE\n", encoding="utf-8")
 
     assert provision_worktree(wt, [], repo, seed_files=[".mcp.json"]) == []
+    assert (wt / ".mcp.json").read_text(encoding="utf-8") == "STALE\n"
     assert worktree_seed_undelivered(wt, repo, seed_files=[".mcp.json"]) == [".mcp.json"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("escaped_kind", ["file", "directory"])
+def test_worktree_seed_undelivered_rejects_stale_nested_escaped_source(tmp_path, escaped_kind):
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    rel = "plugins/tool"
+    source = repo / rel
+    source.mkdir(parents=True)
+    (source / "copied.json").write_text("{}\n", encoding="utf-8")
+    destination = wt / rel
+    destination.mkdir(parents=True)
+    shared = tmp_path / "shared"
+    if escaped_kind == "file":
+        shared.write_text("CURRENT\n", encoding="utf-8")
+        (source / "escaped.json").symlink_to(shared)
+        (destination / "escaped.json").write_text("STALE\n", encoding="utf-8")
+    else:
+        shared.mkdir()
+        (source / "escaped").symlink_to(shared, target_is_directory=True)
+        (destination / "escaped").mkdir()
+
+    provision_worktree(wt, [], repo, seed_files=[rel])
+
+    assert (destination / "copied.json").is_file()
+    assert worktree_seed_undelivered(wt, repo, seed_files=[rel]) == [rel]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
@@ -6955,13 +7039,16 @@ def test_hook_config_cannot_supply_its_dropped_seed_alibi(tmp_path):
     profile = get_profile("claude")
     rel = profile.hooks.config_path
     repo, wt = tmp_path / "repo", tmp_path / "wt"
-    (repo / rel).parent.mkdir(parents=True)
-    shared = tmp_path / "shared-settings.json"
-    shared.write_text('{"env": {"FROM_REPO": "1"}}\n', encoding="utf-8")
-    (repo / rel).symlink_to(shared)
+    source = repo / rel
+    source.parent.mkdir(parents=True)
+    source.write_text('{"env": {"FROM_REPO": "1"}}\n', encoding="utf-8")
+    stale = wt / ".claude/stale-settings.json"
+    stale.parent.mkdir(parents=True)
+    stale.write_text('{"env": {"STALE": "1"}}\n', encoding="utf-8")
+    (wt / rel).symlink_to(stale)
 
     provision_worktree(wt, [profile], repo, seed_files=[rel])
 
-    assert (wt / rel).is_file(), "the hook registration itself creates this path"
+    assert (wt / rel).is_file(), "the in-worktree link looks delivered generically"
     assert worktree_seed_undelivered(wt, repo, seed_files=[rel]) == []
     assert worktree_seed_undelivered(wt, repo, seed_files=[rel], config_paths=[rel]) == [rel]

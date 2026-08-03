@@ -3,6 +3,7 @@ adapter — no tmux, no LLM. Mirrors test_engine.py / test_sweep.py conventions.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,12 @@ from conftest import attach_profile, git, install_build_auto_skill, write_spec
 
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
+from bmad_loop.install import (
+    DEV_PRIMITIVE_NEW,
+    STORIES_PROBE_FILE,
+    STORIES_PROBE_TEXT,
+    missing_stories_support,
+)
 from bmad_loop.journal import Journal, load_state, save_state
 from bmad_loop.model import (
     PAUSE_ESCALATION,
@@ -1063,6 +1070,45 @@ def test_worktree_isolation_two_stories(project):
     assert dev and all(Path(s.cwd) != project.project for s in dev)
     assert status_of(read_frontmatter(story_spec(project, "1"))) == "done"
     assert status_of(read_frontmatter(story_spec(project, "2"))) == "done"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("checkout_probe", ["missing", "stale"])
+def test_worktree_reprobes_stories_dispatch_support_before_session(
+    project, tmp_path, checkout_probe
+):
+    """The main checkout's valid through-link cannot alibi a short worktree router."""
+    setup_stories(project, [entry("1")])
+    tree = ".claude/skills"
+    skills = install_build_auto_skill(project.project, tree, folder_id=True)
+    probe = skills / DEV_PRIMITIVE_NEW / STORIES_PROBE_FILE
+    if checkout_probe == "stale":
+        probe.write_text("old router without the required protocol\n", encoding="utf-8")
+        git(
+            project.project,
+            "add",
+            "-f",
+            str(probe.relative_to(project.project)),
+        )
+        git(project.project, "commit", "-q", "-m", "tracked stale stories router")
+    probe.unlink()
+    shared = tmp_path / STORIES_PROBE_FILE
+    shared.write_text(f"This is a **{STORIES_PROBE_TEXT}** router.\n", encoding="utf-8")
+    probe.symlink_to(shared)
+
+    assert missing_stories_support(project.project, [tree]) == []
+    engine, adapter = make_engine(
+        project,
+        [stories_dev_effect()],
+        policy=_stories_policy(scm=ScmPolicy(isolation="worktree")),
+    )
+    attach_profile(adapter)
+
+    summary = engine.run()
+
+    assert summary.paused and adapter.sessions == []
+    assert STORIES_PROBE_FILE in (engine.state.paused_reason or "")
+    assert Path(engine.state.tasks["1"].worktree_path).is_dir()
 
 
 # ---------------------- item 10: MINOR/NOTE batch (Session 3) ----------------
