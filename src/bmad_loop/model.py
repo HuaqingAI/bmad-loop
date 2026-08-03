@@ -182,6 +182,19 @@ class StoryTask:
     # user already had on disk are never deleted. None = pre-upgrade run (no
     # snapshot); rollback then removes no untracked files at all.
     baseline_untracked: list[str] | None = None
+    # Deferred-work bookkeeping is persisted before its readers land so an older
+    # state.json remains resumable throughout the forward-port.  The nullable
+    # snapshot text and its captured flag are deliberately separate: None means
+    # "no ledger existed", while False means "no snapshot was taken".
+    baseline_ledger_digest: str | None = None
+    pre_harvest_ledger: str | None = None
+    pre_harvest_ledger_captured: bool = False
+    harvest_wrote_ledger: bool = False
+    ledger_changed_before_harvest: bool = False
+    # JSON-native containers only; callers persist these through state.json.
+    harvested_deferrals: list[dict[str, Any]] = field(default_factory=list)
+    bundle_closes_intended: list[str] = field(default_factory=list)
+    isolated_ledger_carried: bool = False
     spec_file: str | None = None
     commit_sha: str | None = None
     # the external, human-only actions this story still owes when it parks at
@@ -322,6 +335,14 @@ class StoryTask:
             "followup_review_recommended": self.followup_review_recommended,
             "baseline_commit": self.baseline_commit,
             "baseline_untracked": self.baseline_untracked,
+            "baseline_ledger_digest": self.baseline_ledger_digest,
+            "pre_harvest_ledger": self.pre_harvest_ledger,
+            "pre_harvest_ledger_captured": self.pre_harvest_ledger_captured,
+            "harvest_wrote_ledger": self.harvest_wrote_ledger,
+            "ledger_changed_before_harvest": self.ledger_changed_before_harvest,
+            "harvested_deferrals": self.harvested_deferrals,
+            "bundle_closes_intended": self.bundle_closes_intended,
+            "isolated_ledger_carried": self.isolated_ledger_carried,
             "spec_file": self._serialized_spec_file(),
             "commit_sha": self.commit_sha,
             "operator_actions": self.operator_actions,
@@ -373,6 +394,22 @@ class StoryTask:
                 if d.get("baseline_untracked") is not None
                 else None
             ),
+            baseline_ledger_digest=(
+                str(d.get("baseline_ledger_digest"))
+                if d.get("baseline_ledger_digest") is not None
+                else None
+            ),
+            pre_harvest_ledger=(
+                str(d.get("pre_harvest_ledger"))
+                if d.get("pre_harvest_ledger") is not None
+                else None
+            ),
+            pre_harvest_ledger_captured=bool(d.get("pre_harvest_ledger_captured", False)),
+            harvest_wrote_ledger=bool(d.get("harvest_wrote_ledger", False)),
+            ledger_changed_before_harvest=bool(d.get("ledger_changed_before_harvest", False)),
+            harvested_deferrals=[dict(item) for item in d.get("harvested_deferrals", [])],
+            bundle_closes_intended=[str(i) for i in d.get("bundle_closes_intended", [])],
+            isolated_ledger_carried=bool(d.get("isolated_ledger_carried", False)),
             spec_file=d.get("spec_file"),
             commit_sha=d.get("commit_sha"),
             operator_actions=[str(a) for a in d.get("operator_actions", [])],
