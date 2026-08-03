@@ -1,4 +1,5 @@
 import contextlib
+import errno
 import io
 import json
 import os
@@ -512,6 +513,66 @@ def test_provision_worktree_does_not_clobber_existing_skill(tmp_path):
     assert (wt / claude.skill_tree / "bmad-loop-resolve" / "SKILL.md").is_file()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_provision_refuses_a_live_hook_config_symlink(tmp_path):
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    claude = get_profile("claude")
+    repo.mkdir()
+    (wt / ".claude").mkdir(parents=True)
+    outside = tmp_path / "outside-settings.json"
+    outside.write_text('{"env":{"KEEP":"BYTE-IDENTICAL"}}\n', encoding="utf-8")
+    before = outside.read_bytes()
+    (wt / claude.hooks.config_path).symlink_to(outside)
+
+    provision_worktree(wt, [claude], repo)
+
+    assert outside.read_bytes() == before
+    assert (wt / claude.hooks.config_path).is_symlink()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_provision_refuses_a_dangling_hook_config_symlink(tmp_path):
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    claude = get_profile("claude")
+    repo.mkdir()
+    (wt / ".claude").mkdir(parents=True)
+    target = wt / "not-checked-out.json"
+    (wt / claude.hooks.config_path).symlink_to(target)
+
+    provision_worktree(wt, [claude], repo)
+
+    assert not target.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_provision_refuses_a_hook_config_below_a_symlinked_parent(tmp_path):
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    claude = get_profile("claude")
+    repo.mkdir()
+    wt.mkdir()
+    outside = tmp_path / "outside-config"
+    outside.mkdir()
+    (wt / ".claude").symlink_to(outside, target_is_directory=True)
+
+    provision_worktree(wt, [claude], repo)
+
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_provision_refuses_a_cyclic_hook_config_symlink(tmp_path):
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    claude = get_profile("claude")
+    repo.mkdir()
+    config = wt / claude.hooks.config_path
+    config.parent.mkdir(parents=True)
+    config.symlink_to(config)
+
+    provision_worktree(wt, [claude], repo)
+
+    assert config.is_symlink()
+
+
 def test_provision_worktree_empty_profiles_is_noop(tmp_path):
     provision_worktree(tmp_path / "wt", [], tmp_path / "repo")
     assert not (tmp_path / "wt").exists()
@@ -907,6 +968,52 @@ def test_renderer_source_read_fault_fails_open(tmp_path, monkeypatch):
     fault_read_text(monkeypatch, workflow)
 
     assert _renderer_checks(tmp_path, (tree,)) == []
+
+
+def test_renderer_workflow_directory_is_not_a_source(tmp_path):
+    """A directory named ``workflow.md`` is portable and not renderer input."""
+    tree = ".claude/skills"
+    install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    _write_renderer_surface(tmp_path)
+    workflow = tmp_path / tree / DEV_PRIMITIVE_NEW / RENDERER_ENTRY_REL
+    workflow.unlink()
+    workflow.mkdir()
+
+    findings = _renderer_checks(tmp_path, (tree,))
+
+    assert [finding.check for finding in findings] == ["skills.dev-renderer-sources"]
+    assert findings[0].detail["missing_sources"] == [RENDERER_ENTRY_REL]
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFOs")
+def test_renderer_fifo_is_filtered_without_an_unbounded_read(tmp_path):
+    """The preflight must never call ``read_text`` on a FIFO (issue #422).
+
+    Run the real helper in a child with a timeout: deleting its ``_is_file`` filter
+    blocks that child on ``pipe.md``, but can never hang the pytest worker or CI.
+    """
+    tree = ".claude/skills"
+    install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    _write_renderer_surface(tmp_path)
+    skill = tmp_path / tree / DEV_PRIMITIVE_NEW
+    os.mkfifo(skill / "pipe.md")
+    code = (
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "from bmad_loop.install import _absent_renderer_sources\n"
+        "print(json.dumps(_absent_renderer_sources(Path(sys.argv[1]))))\n"
+    )
+
+    child = subprocess.run(
+        [sys.executable, "-c", code, str(skill)],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert child.returncode == 0, child.stderr
+    assert json.loads(child.stdout) == []
 
 
 def test_renderer_binary_source_fails_open_without_losing_its_declaration(tmp_path):
@@ -2443,6 +2550,137 @@ def test_provision_worktree_seed_rejects_escaping_path(tmp_path):
     (tmp_path / "outside.txt").write_text("SECRET", encoding="utf-8")
     provision_worktree(wt, [], repo, seed_files=["../outside.txt"])
     assert not wt.exists()  # nothing copied, no dirs created
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_seed_files_refuses_a_dangling_destination_leaf_without_excluding_it(tmp_path, monkeypatch):
+    import bmad_loop.worktree_flow as worktree_flow
+
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    repo.mkdir()
+    wt.mkdir()
+    (repo / ".mcp.json").write_text("FROM_REPO", encoding="utf-8")
+    stray = wt / "stray.json"
+    (wt / ".mcp.json").symlink_to(stray)
+    patterns = []
+    monkeypatch.setattr(
+        worktree_flow,
+        "_worktree_local_exclude",
+        lambda _worktree, entries: patterns.extend(entries),
+    )
+    monkeypatch.setattr(
+        worktree_flow,
+        "_copy_traversable",
+        lambda *_args, **_kwargs: pytest.fail("seed copied through a dangling link"),
+    )
+
+    skipped = provision_worktree(wt, [], repo, seed_files=[".mcp.json"])
+
+    assert skipped == []
+    assert not stray.exists()
+    assert "/.mcp.json" not in patterns
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_seed_files_refuses_a_dangling_destination_parent_without_excluding_it(
+    tmp_path, monkeypatch
+):
+    import bmad_loop.worktree_flow as worktree_flow
+
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    source = repo / "vendor" / "config.json"
+    source.parent.mkdir(parents=True)
+    source.write_text("FROM_REPO", encoding="utf-8")
+    wt.mkdir()
+    stray = wt / "stray-parent"
+    (wt / "vendor").symlink_to(stray, target_is_directory=True)
+    patterns = []
+    monkeypatch.setattr(
+        worktree_flow,
+        "_worktree_local_exclude",
+        lambda _worktree, entries: patterns.extend(entries),
+    )
+    monkeypatch.setattr(
+        worktree_flow,
+        "_copy_traversable",
+        lambda *_args, **_kwargs: pytest.fail("seed copied through a dangling parent"),
+    )
+
+    skipped = provision_worktree(wt, [], repo, seed_files=["vendor/config.json"])
+
+    assert skipped == []
+    assert not stray.exists()
+    assert "/vendor/config.json" not in patterns
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_seed_globs_refuses_a_dangling_destination_leaf_without_excluding_it(tmp_path, monkeypatch):
+    import bmad_loop.worktree_flow as worktree_flow
+
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    source = repo / "plugins" / "config.json"
+    source.parent.mkdir(parents=True)
+    source.write_text("FROM_REPO", encoding="utf-8")
+    (wt / "plugins").mkdir(parents=True)
+    stray = wt / "stray.json"
+    (wt / "plugins" / "config.json").symlink_to(stray)
+    patterns = []
+    monkeypatch.setattr(
+        worktree_flow,
+        "_worktree_local_exclude",
+        lambda _worktree, entries: patterns.extend(entries),
+    )
+    monkeypatch.setattr(
+        worktree_flow,
+        "_copy_traversable",
+        lambda *_args, **_kwargs: pytest.fail("glob copied through a dangling link"),
+    )
+
+    provision_worktree(wt, [], repo, seed_globs=["plugins/*.json"])
+
+    assert not stray.exists()
+    assert "/plugins/config.json" not in patterns
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_seed_files_keeps_a_live_symlink_as_an_existing_noop(tmp_path):
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    repo.mkdir()
+    wt.mkdir()
+    (repo / ".mcp.json").write_text("FROM_REPO", encoding="utf-8")
+    live = wt / "live.json"
+    live.write_text("IN_WORKTREE", encoding="utf-8")
+    (wt / ".mcp.json").symlink_to(live)
+
+    skipped = provision_worktree(wt, [], repo, seed_files=[".mcp.json"])
+
+    assert skipped == [".mcp.json"]
+    assert live.read_text() == "IN_WORKTREE"
+
+
+@pytest.mark.parametrize("seed_kind", ["files", "globs"])
+def test_failed_explicit_copy_never_enters_exclude_bookkeeping(tmp_path, monkeypatch, seed_kind):
+    import bmad_loop.worktree_flow as worktree_flow
+
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    source = repo / "plugins" / "config.json"
+    source.parent.mkdir(parents=True)
+    source.write_text("FROM_REPO", encoding="utf-8")
+    patterns = []
+    monkeypatch.setattr(
+        worktree_flow,
+        "_worktree_local_exclude",
+        lambda _worktree, entries: patterns.extend(entries),
+    )
+    monkeypatch.setattr(worktree_flow, "_copy_traversable", lambda *_args, **_kwargs: False)
+
+    if seed_kind == "files":
+        provision_worktree(wt, [], repo, seed_files=["plugins/config.json"])
+    else:
+        provision_worktree(wt, [], repo, seed_globs=["plugins/*.json"])
+
+    assert "/plugins/config.json" not in patterns
+    assert not (wt / "plugins" / "config.json").exists()
 
 
 def test_provision_worktree_seed_then_hook_merge_preserves_settings(tmp_path):
@@ -6010,6 +6248,342 @@ def test_provision_worktree_seed_globs_preserve_exec_bit(tmp_path):
     provision_worktree(wt, [], repo, seed_globs=["node_modules/*"])
 
     assert (wt / "node_modules" / ".bin" / "eslint").stat().st_mode & 0o111
+
+
+# ------------------------------------------------ provisioning filesystem totality
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_walk_yields_an_unlistable_directory_as_a_named_leaf(tmp_path):
+    from bmad_loop.install import _walk_traversable_files
+
+    root = tmp_path / "tree"
+    locked = root / "locked"
+    locked.mkdir(parents=True)
+    (locked / "deep.md").write_text("deep\n", encoding="utf-8")
+    (root / "sibling.md").write_text("sibling\n", encoding="utf-8")
+    locked.chmod(0o000)
+    try:
+        walked = dict(_walk_traversable_files(root))
+    finally:
+        locked.chmod(0o755)
+
+    assert sorted(walked) == ["locked", "sibling.md"]
+    assert walked["locked"].is_dir()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_walk_yields_names_below_a_listable_but_unsearchable_directory(tmp_path):
+    from bmad_loop.install import _walk_traversable_files
+
+    root = tmp_path / "tree"
+    listable = root / "listable"
+    listable.mkdir(parents=True)
+    (listable / "deep.md").write_text("deep\n", encoding="utf-8")
+    (root / "sibling.md").write_text("sibling\n", encoding="utf-8")
+    listable.chmod(0o444)
+    try:
+        rels = sorted(rel for rel, _ in _walk_traversable_files(root))
+    finally:
+        listable.chmod(0o755)
+
+    assert rels == ["listable/deep.md", "sibling.md"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_total_probes_keep_the_refusal_asymmetry(tmp_path):
+    from bmad_loop.install import _is_dir, _is_file
+
+    child = tmp_path / "unsearchable" / "child.md"
+    child.parent.mkdir()
+    child.write_text("child\n", encoding="utf-8")
+    child.parent.chmod(0o444)
+    try:
+        assert _is_dir(child) is True
+        assert _is_file(child) is False
+    finally:
+        child.parent.chmod(0o755)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_is_dir_reasks_a_python_314_false_probe(tmp_path, monkeypatch):
+    from bmad_loop.install import _is_dir
+
+    child = tmp_path / "unsearchable" / "child.md"
+    child.parent.mkdir()
+    child.write_text("child\n", encoding="utf-8")
+    child.parent.chmod(0o444)
+    try:
+        with pytest.raises(PermissionError):
+            child.stat()
+        monkeypatch.setattr(Path, "is_dir", lambda self: False)
+        assert _is_dir(child) is True
+        assert _is_dir(tmp_path / "absent") is False
+    finally:
+        child.parent.chmod(0o755)
+
+
+@pytest.mark.parametrize(
+    ("fault_errno", "expected"),
+    [
+        (errno.ENOENT, False),
+        (errno.ENOTDIR, False),
+        (errno.EBADF, False),
+        (errno.ELOOP, False),
+        (errno.EACCES, True),
+        (errno.EIO, True),
+    ],
+)
+def test_probe_refused_distinguishes_absence_from_refusal(monkeypatch, fault_errno, expected):
+    from bmad_loop.install import _probe_refused
+
+    def refused(_self):
+        raise OSError(fault_errno, os.strerror(fault_errno))
+
+    monkeypatch.setattr(Path, "stat", refused)
+    assert _probe_refused(Path("probe")) is expected
+
+
+@pytest.mark.parametrize("fault_winerror", [21, 123, 1921])
+def test_probe_refused_recognizes_windows_absence_codes(fault_winerror):
+    from bmad_loop.install import _probe_refused
+
+    class FaultPath(type(Path())):
+        def stat(self, *args, **kwargs):
+            fault = OSError(errno.EIO, os.strerror(errno.EIO))
+            fault.winerror = fault_winerror
+            raise fault
+
+    assert _probe_refused(FaultPath("probe")) is False
+
+
+def test_probe_refused_is_total_for_non_paths_and_invalid_paths():
+    from bmad_loop.install import _probe_refused
+
+    assert _probe_refused(object()) is False
+    assert _probe_refused(Path("embedded\0nul")) is False
+
+
+def test_is_dir_keeps_an_absent_path_false(tmp_path):
+    from bmad_loop.install import _is_dir
+
+    assert _is_dir(tmp_path / "absent") is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_walk_terminates_a_symlink_cycle(tmp_path):
+    from bmad_loop.install import _walk_traversable_files
+
+    root = tmp_path / "tree"
+    scripts = root / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "render_skill.py").write_text("renderer\n", encoding="utf-8")
+    (scripts / "loop").symlink_to(root, target_is_directory=True)
+
+    assert [rel for rel, _ in _walk_traversable_files(root)] == ["scripts/render_skill.py"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_walk_keeps_sibling_symlinks_to_one_shared_tree(tmp_path):
+    from bmad_loop.install import _walk_traversable_files
+
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (shared / "tool.py").write_text("tool\n", encoding="utf-8")
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "first").symlink_to(shared, target_is_directory=True)
+    (root / "second").symlink_to(shared, target_is_directory=True)
+
+    assert [rel for rel, _ in _walk_traversable_files(root)] == [
+        "first/tool.py",
+        "second/tool.py",
+    ]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_guarded_copy_treats_a_dangling_destination_leaf_as_occupied(tmp_path):
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    repo.mkdir()
+    wt.mkdir()
+    source = repo / "source.txt"
+    source.write_text("source\n", encoding="utf-8")
+    stray = wt / "stray.txt"
+    destination = wt / "destination.txt"
+    destination.symlink_to(stray)
+
+    copied = _copy_traversable(source, destination, worktree=wt, repo_root=repo)
+
+    assert copied is False
+    assert destination.is_symlink()
+    assert not stray.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_guarded_copy_degrades_a_dangling_destination_parent(tmp_path):
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    repo.mkdir()
+    wt.mkdir()
+    source = repo / "source.txt"
+    source.write_text("source\n", encoding="utf-8")
+    missing = wt / "missing-parent"
+    (wt / "linked-parent").symlink_to(missing, target_is_directory=True)
+
+    copied = _copy_traversable(
+        source,
+        wt / "linked-parent" / "destination.txt",
+        worktree=wt,
+        repo_root=repo,
+    )
+
+    assert copied is False
+    assert not missing.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_guarded_copy_skips_an_unreadable_file_and_keeps_its_sibling(tmp_path):
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    source = repo / "source"
+    source.mkdir(parents=True)
+    (source / "readable.txt").write_text("readable\n", encoding="utf-8")
+    locked = source / "locked.txt"
+    locked.write_text("locked\n", encoding="utf-8")
+    locked.chmod(0o000)
+    try:
+        copied = _copy_traversable(
+            source,
+            wt / "destination",
+            worktree=wt,
+            repo_root=repo,
+        )
+    finally:
+        locked.chmod(0o644)
+
+    assert copied is True
+    assert (wt / "destination" / "readable.txt").read_text() == "readable\n"
+    assert not (wt / "destination" / "locked.txt").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_guarded_copy_does_not_materialize_an_unlistable_source_directory(tmp_path):
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    source = repo / "source"
+    locked = source / "locked"
+    locked.mkdir(parents=True)
+    (locked / "deep.txt").write_text("deep\n", encoding="utf-8")
+    (source / "sibling.txt").write_text("sibling\n", encoding="utf-8")
+    locked.chmod(0o000)
+    try:
+        _copy_traversable(
+            source,
+            wt / "destination",
+            worktree=wt,
+            repo_root=repo,
+        )
+    finally:
+        locked.chmod(0o755)
+
+    assert not (wt / "destination" / "locked").exists()
+    assert (wt / "destination" / "sibling.txt").is_file()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_guarded_copy_accepts_a_read_only_searchable_source_directory(tmp_path):
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    source = repo / "source"
+    readonly = source / "readonly"
+    readonly.mkdir(parents=True)
+    (readonly / "child.txt").write_text("child\n", encoding="utf-8")
+    readonly.chmod(0o555)
+    try:
+        copied = _copy_traversable(
+            source,
+            wt / "destination",
+            worktree=wt,
+            repo_root=repo,
+        )
+    finally:
+        readonly.chmod(0o755)
+
+    assert copied is True
+    assert (wt / "destination" / "readonly" / "child.txt").is_file()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_no_clobber_prunes_a_source_directory_before_enumerating_it(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "child.txt").write_text("child\n", encoding="utf-8")
+    destination = tmp_path / "destination"
+    destination.write_text("KEEP\n", encoding="utf-8")
+    source.chmod(0o000)
+    try:
+        copied = _copy_traversable(source, destination, skip_existing=True)
+    finally:
+        source.chmod(0o755)
+
+    assert copied is False
+    assert destination.read_text() == "KEEP\n"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_guarded_copy_refuses_a_source_child_escaping_the_repo(tmp_path):
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    source = repo / "source"
+    source.mkdir(parents=True)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside\n", encoding="utf-8")
+    (source / "escaped.txt").symlink_to(outside)
+
+    _copy_traversable(
+        source,
+        wt / "destination",
+        worktree=wt,
+        repo_root=repo,
+    )
+
+    assert not (wt / "destination" / "escaped.txt").exists()
+    assert outside.read_text() == "outside\n"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_guarded_copy_refuses_a_destination_tree_escaping_the_worktree(tmp_path):
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    source = repo / "source"
+    source.mkdir(parents=True)
+    (source / "child.txt").write_text("child\n", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    wt.mkdir()
+    (wt / "destination").symlink_to(outside, target_is_directory=True)
+
+    copied = _copy_traversable(
+        source,
+        wt / "destination",
+        worktree=wt,
+        repo_root=repo,
+    )
+
+    assert copied is False
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFOs")
+def test_guarded_copy_filters_a_fifo_before_materializing_its_parent(tmp_path):
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    repo.mkdir()
+    source = repo / "pipe.md"
+    os.mkfifo(source)
+
+    copied = _copy_traversable(
+        source,
+        wt / "nested" / "pipe.md",
+        worktree=wt,
+        repo_root=repo,
+    )
+
+    assert copied is False
+    assert not (wt / "nested").exists()
 
 
 def test_copy_traversable_zip_source_copies_content(tmp_path):
