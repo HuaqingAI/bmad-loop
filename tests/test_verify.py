@@ -1905,15 +1905,17 @@ def test_worktree_clean_flags_untracked_non_policy(project):
 # '<glob>'` takes its argument as a pathspec too — both produced void fixtures
 # (a test that passes because it tested nothing) on the 0.9.1 hotfix.
 #
-# `*` and `?` are illegal in Windows FILENAMES, so a fixture that must create a
-# directory carrying one is Linux-only. `[` and `]` are legal everywhere — and
-# per #423's reachability analysis they are also the realistic carrier, since
-# `implementation_artifacts` comes out of the operator's config — so the
-# bracket rows stay unmarked and cover both CI platforms. Note this constrains
-# only fixture FILENAMES: a pathspec STRING containing `*` is just a string, so
-# the tests that merely pass `doc*` as a configured prefix run everywhere.
-NO_GLOB_FILENAMES = pytest.mark.skipif(
-    sys.platform == "win32", reason="`*` and `?` are illegal in Windows filenames"
+# `*`, `?` and `:` are all reserved in Windows FILENAMES (`:` is the drive
+# separator), so a fixture that must CREATE a directory carrying one is
+# Linux-only — `mkdir` raises WinError 123 before the test can assert anything.
+# `[` and `]` are legal everywhere, and per #423's reachability analysis they are
+# also the realistic carrier since `implementation_artifacts` comes out of the
+# operator's config, so the bracket rows stay unmarked and cover both CI
+# platforms. Note this constrains only fixture FILENAMES: a pathspec STRING
+# containing `*` is just a string, so the rows that merely pass `doc*` as a
+# configured prefix run everywhere.
+RESERVED_IN_WINDOWS_FILENAMES = pytest.mark.skipif(
+    sys.platform == "win32", reason="`*`, `?` and `:` are reserved in Windows filenames"
 )
 
 
@@ -1945,8 +1947,8 @@ def test_path_tracked_reports_index_membership(project):
     ("meta", "neighbour"),
     [
         ("docs[a]", "docsa"),
-        pytest.param("a*b", "axb", marks=NO_GLOB_FILENAMES),
-        pytest.param("q?r", "qxr", marks=NO_GLOB_FILENAMES),
+        pytest.param("a*b", "axb", marks=RESERVED_IN_WINDOWS_FILENAMES),
+        pytest.param("q?r", "qxr", marks=RESERVED_IN_WINDOWS_FILENAMES),
     ],
 )
 def test_path_tracked_refuses_a_glob_match_from_a_neighbour(project, meta, neighbour):
@@ -1976,6 +1978,7 @@ def test_path_tracked_still_matches_a_directory_prefix(project):
     assert verify.path_tracked(repo, "_bmad/render")
 
 
+@RESERVED_IN_WINDOWS_FILENAMES
 def test_path_tracked_reads_a_rel_beginning_with_a_colon(project):
     """A leading `:` is pathspec magic. Bare, git parses it as an (unknown) magic
     word and answers the empty set — i.e. "untracked", the direction that
