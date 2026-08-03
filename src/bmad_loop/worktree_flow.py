@@ -27,17 +27,33 @@ from typing import TYPE_CHECKING, Callable, NoReturn
 
 from . import gates, verify
 from .install import (
+    _REVIEW_LAYER_SKILLS,
     BASE_SKILLS,
-    CUSTOMIZE_DIR,
+    BMAD_DIR,
+    BMAD_SCRIPTS_SEED_REL,
+    BMAD_SEED_EXCLUDES,
+    CENTRAL_CONFIG_REL,
+    DEV_PRIMITIVE_MARKERS,
     DEV_PRIMITIVE_ROLES,
     HOOK_SCRIPT_REL,
+    MERGED_REVIEW_SKILL,
     MODULE_SKILLS,
+    RENDER_DIR_REL,
+    RENDERER_SCRIPT_MARKER,
+    RENDERER_SCRIPT_UNIT_REL,
+    RENDERER_SEED_SENTINELS,
+    _absent_renderer_sources,
     _copy_traversable,
     _is_dir,
     _is_file,
     _occupied,
+    _renderer_unit_required,
+    _walk_traversable_files,
     _worktree_local_exclude,
+    dev_primitive_or_default,
     merge_hooks,
+    missing_stories_support,
+    renderer_stub_resolved,
     resolve_review_layers,
 )
 from .model import Phase
@@ -69,6 +85,236 @@ _SETUP_MCP_AGENT_IDS = {"claude": "claude-code"}
 def _setup_mcp_agent_id(profile_name: str) -> str:
     """Map a CLI profile name to its Unity-MCP `setup-mcp` agent id."""
     return _SETUP_MCP_AGENT_IDS.get(profile_name, profile_name)
+
+
+def _worktree_skill_copy_candidates(repo_root: Path, tree: str) -> tuple[str, ...]:
+    """Every upstream skill worth best-effort copying into ``tree``."""
+    resolved = resolve_review_layers(repo_root, tree)
+    return tuple(dict.fromkeys((*BASE_SKILLS, *(resolved.skills() if resolved else ()))))
+
+
+def _required_worktree_skills(repo_root: Path, tree: str) -> tuple[str, ...]:
+    """Upstream skills whose absence deterministically stalls this tree's run.
+
+    Match :func:`install.missing_base_skills`: gate the selected dev primitive and
+    resolved required review skills only. If the review shape is unknown, prefer a
+    present merged reviewer; otherwise require the standalone fallback reviewers.
+    Catalog-only and advisory skills remain copy candidates but never arm the fatal
+    pre-dispatch completeness gate.
+    """
+    resolved = resolve_review_layers(repo_root, tree)
+    if resolved is not None:
+        review_skills = tuple(resolved.required)
+    elif (repo_root / tree / MERGED_REVIEW_SKILL / "SKILL.md").is_file():
+        review_skills = (MERGED_REVIEW_SKILL,)
+    else:
+        review_skills = tuple(sorted(_REVIEW_LAYER_SKILLS))
+    return tuple(dict.fromkeys((dev_primitive_or_default(repo_root, tree), *review_skills)))
+
+
+def _seed_bmad_tree(worktree: Path, repo_root: Path) -> list[str]:
+    """Merge the repo's project-local BMAD surface into an isolated worktree.
+
+    Renderer-backed skills receive the worktree as their project root and do not
+    walk upward for ``_bmad``. Copy every usable file except generated render output,
+    per-file and without clobbering checkout content. The shared Traversable walk is
+    intentional: unlike ``rglob``, it descends a symlinked child directory, allowing
+    the result-side completeness predicates to see every file the copier considered.
+
+    Returns the paths that need the worktree-local git-add shield: the root when it
+    was absent before seeding, otherwise each file that actually landed.
+    """
+    src_root = repo_root / BMAD_DIR
+    if not _is_dir(src_root):
+        return []
+    dst_root = worktree / BMAD_DIR
+    had_bmad = _is_dir(dst_root)
+    try:
+        tops = sorted(src_root.iterdir(), key=lambda entry: entry.name)
+    except OSError:
+        return []
+
+    seeded: list[str] = []
+    for top in tops:
+        if top.name in BMAD_SEED_EXCLUDES:
+            continue
+        for rel, src in _walk_traversable_files(top, top.name):
+            if not _is_file(src):
+                continue
+            dst = dst_root.joinpath(*rel.split("/"))
+            if _copy_traversable(
+                src,
+                dst,
+                skip_existing=True,
+                worktree=worktree,
+                repo_root=repo_root,
+            ):
+                seeded.append(f"{BMAD_DIR}/{rel}")
+    if not seeded:
+        return []
+    return [BMAD_DIR] if not had_bmad else seeded
+
+
+def _bmad_scripts_seed_incomplete(worktree: Path, repo_root: Path) -> bool:
+    """Whether a required repo renderer unit member missed the worktree.
+
+    Match the renderer preflight's content-keyed required-file predicate. Arbitrary
+    sibling scripts are still merge-seeded, but their absence cannot prove the
+    renderer will HALT and therefore must not arm the CRITICAL escalation gate.
+    """
+    return any(
+        _renderer_unit_required(repo_root, rel)
+        and _is_file(repo_root / rel)
+        and not _is_file(worktree / rel)
+        for rel in RENDERER_SCRIPT_UNIT_REL
+    )
+
+
+def _central_config_seed_incomplete(worktree: Path, repo_root: Path) -> bool:
+    """Whether the repo's required renderer config failed to reach the worktree."""
+    return _is_file(repo_root / CENTRAL_CONFIG_REL) and not _is_file(worktree / CENTRAL_CONFIG_REL)
+
+
+def base_skills_seed_incomplete(worktree: Path, repo_root: Path, trees: Sequence[str]) -> list[str]:
+    """Required upstream skill rels present in the repo but absent in the worktree.
+
+    ``BASE_SKILLS`` is a copy-if-present catalog, not a requirement set. Gate only
+    the selected primitive and required review skills; advisory/conditional and
+    inactive catalog entries are still provisioned best-effort, but their absence
+    cannot prove the dev/review session will stall. Unknown review shapes use the
+    same merged-or-standalone fallback as the run-start preflight.
+
+    Within those active skills, mirror the deterministic run-start contract rather
+    than treating every descendant as fatal: reviewers require ``SKILL.md``; the dev
+    primitive additionally requires its defined markers and any renderer snapshot
+    sources its worktree copy resolves. Other descendants still copy best-effort,
+    but their absence does not prove the outer session will write no artifact.
+
+    A missing ``SKILL.md`` reports the coarse skill rel. A repo directory without
+    ``SKILL.md`` remains the run-start preflight's concern and cannot produce a false
+    CRITICAL escalation here. Stories mode adds its content-keyed dispatch probe at
+    the caller, where the run mode is available.
+    """
+    missing: list[str] = []
+    for tree in dict.fromkeys(trees):
+        primitive = dev_primitive_or_default(repo_root, tree)
+        for skill in _required_worktree_skills(repo_root, tree):
+            repo_skill = repo_root / tree / skill
+            worktree_skill = worktree / tree / skill
+            if not _is_file(repo_skill / "SKILL.md"):
+                # Distinguish an unreadable directory from a skill the repo simply
+                # does not carry. The walk yields only the former as a directory leaf.
+                if any(_is_dir(src) for _, src in _walk_traversable_files(repo_skill)):
+                    missing.append(f"{tree}/{skill}")
+                continue
+            if not _is_file(worktree_skill / "SKILL.md"):
+                missing.append(f"{tree}/{skill}")
+                continue
+            if skill != primitive:
+                continue
+            missing.extend(
+                f"{tree}/{skill}/{rel}"
+                for rel in DEV_PRIMITIVE_MARKERS
+                if _is_file(repo_skill / rel) and not _is_file(worktree_skill / rel)
+            )
+            missing.extend(
+                f"{tree}/{skill}/{rel}"
+                for rel in _absent_renderer_sources(worktree_skill)
+                if _is_file(repo_skill.joinpath(*rel.split("/")))
+            )
+    return missing
+
+
+def worktree_seed_undelivered(
+    worktree: Path,
+    repo_root: Path,
+    seed_files: Sequence[str] = (),
+    seed_globs: Sequence[str] = (),
+    config_paths: Sequence[str] = (),
+) -> list[str]:
+    """Seed rels the repo carries that never reached the worktree.
+
+    Source containment is deliberately *not* an eligibility requirement: a source
+    symlink resolving outside the repo is the canonical entry the seed loop refuses
+    and this result check must report. Delivery does require every usable source
+    entry to remain within the repo, matching the copier. Destination containment is
+    likewise required so a path outside the worktree cannot masquerade as delivery.
+
+    Hook configs need a different result question because provisioning writes the
+    hook registration itself after seeding. For those rels, existence proves nothing;
+    source escape, a symlinked destination, or destination escape proves the seed was
+    refused. This report is informational and is never an escalation gate.
+    """
+    worktree = worktree.resolve()
+    repo_root = repo_root.resolve()
+    rels = [str(rel) for rel in seed_files]
+    for pattern in seed_globs:
+        rels.extend(
+            match.relative_to(repo_root).as_posix() for match in sorted(repo_root.glob(pattern))
+        )
+    hook_configs = {Path(rel) for rel in config_paths}
+
+    def contained(path: Path, root: Path) -> bool:
+        try:
+            return path.resolve().is_relative_to(root)
+        except (OSError, RuntimeError):
+            return False
+
+    def delivered(src: Path, dst: Path) -> bool:
+        """Whether every usable source descendant has a matching destination."""
+        if not contained(src, repo_root) or not contained(dst, worktree):
+            return False
+        if _is_file(src):
+            return _is_file(dst)
+        if not _is_dir(src) or not _is_dir(dst):
+            return False
+
+        complete = True
+
+        def visit_dir(rel: str, source) -> bool:
+            nonlocal complete
+            if not isinstance(source, Path) or not contained(source, repo_root):
+                complete = False
+                return False
+            target = dst.joinpath(*rel.split("/")) if rel else dst
+            if not contained(target, worktree) or not _is_dir(target):
+                complete = False
+            return True
+
+        for child_rel, child in _walk_traversable_files(src, _visit_dir=visit_dir):
+            target = dst.joinpath(*child_rel.split("/")) if child_rel else dst
+            if _is_file(child):
+                if (
+                    not isinstance(child, Path)
+                    or not contained(child, repo_root)
+                    or not contained(target, worktree)
+                    or not _is_file(target)
+                ):
+                    complete = False
+            elif _is_dir(child):
+                # Directories are yielded only when enumeration was refused, so
+                # their unknown descendants cannot be claimed as delivered.
+                complete = False
+        return complete
+
+    undelivered: list[str] = []
+    for rel in dict.fromkeys(rels):
+        src = repo_root / rel
+        if not (_is_file(src) or _is_dir(src)):
+            continue
+        dst = worktree / rel
+        if Path(rel) in hook_configs:
+            try:
+                destination_is_link = dst.is_symlink()
+            except OSError:
+                destination_is_link = True
+            if not contained(src, repo_root) or not contained(dst, worktree) or destination_is_link:
+                undelivered.append(rel)
+            continue
+        if delivered(src, dst):
+            continue
+        undelivered.append(rel)
+    return undelivered
 
 
 def provision_worktree(
@@ -133,13 +379,16 @@ def provision_worktree(
     also a hook config_path (.claude/settings.json, .gemini/settings.json) keeps its
     real content and just gets the Stop hook merged in, rather than being created empty.
 
+    The repo's `_bmad/` surface is also merge-seeded, excluding generated render
+    output. Renderer and upstream-skill completeness failures share the return
+    channel with ordinary no-op seeds so they are journaled, but the caller re-probes
+    the skill result and content-gates the renderer sentinels before escalating.
+
     Returns the `seed_files` entries that copied NOTHING because everything they
-    name was already present — copy-when-absent turned them into no-ops. The caller
-    journals them: a user-authored `worktree_seed` entry that silently copies
-    nothing reads as applied configuration and is not. A directory entry that
-    seeded even one child is not reported: it is applied configuration.
+    name was already present, plus reserved completeness reports. A directory entry
+    that seeded even one child is not a no-op and is not reported.
     """
-    if not profiles and not seed_files and not seed_globs:
+    if not profiles and not seed_files and not seed_globs and not _is_dir(repo_root / BMAD_DIR):
         return []
     worktree = worktree.resolve()
     repo_root = repo_root.resolve()
@@ -241,6 +490,16 @@ def provision_worktree(
             # as_posix so the exclude pattern anchors on Windows too (os.sep would not)
             seeded.append(rel.as_posix())
 
+    # Renderer-backed skills are handed the worktree as their project root. Merge
+    # the repo's project-local BMAD surface after explicit seeds (operator intent wins
+    # on collisions) and reserve the two renderer sentinels for result-side checks.
+    seeded_bmad = _seed_bmad_tree(worktree, repo_root)
+    skipped = [rel for rel in skipped if rel not in RENDERER_SEED_SENTINELS]
+    if _bmad_scripts_seed_incomplete(worktree, repo_root):
+        skipped.append(BMAD_SCRIPTS_SEED_REL)
+    if _central_config_seed_incomplete(worktree, repo_root):
+        skipped.append(CENTRAL_CONFIG_REL)
+
     # bundled skills into each CLI's skill tree (deduped: codex+gemini share one);
     # never clobber a skill the checkout already carries (tracked or pre-existing).
     for tree in dict.fromkeys(p.skill_tree for p in profiles):
@@ -253,6 +512,12 @@ def provision_worktree(
                 skip_existing=True,
                 worktree=worktree,
             )
+        # Known gap, deliberately restated rather than folded into the CRITICAL gate
+        # below: wheel MODULE_SKILLS have no result-side completeness predicate. Story
+        # worktrees deterministically dispatch the upstream dev/review skills, while
+        # these bundled operator/triage skills are a different invocation surface; a
+        # partial wheel copy therefore cannot honestly reuse the guaranteed-stall gate.
+        # Closing that observability gap needs its own required-consumer contract.
         # The orchestrator-driven upstream skills are not in the wheel; copy them
         # from the MAIN REPO's installed tree (same tree path) so an isolated
         # worktree can still resolve the dev primitive and the review layers. Skip
@@ -273,9 +538,7 @@ def provision_worktree(
         # Validating a skill here and then not copying it is how preflight passes in
         # the main checkout while the isolated review fails on a skill that was
         # never there.
-        resolved = resolve_review_layers(repo_root, tree)
-        required = dict.fromkeys((*BASE_SKILLS, *(resolved.skills() if resolved else ())))
-        for skill in required:
+        for skill in _worktree_skill_copy_candidates(repo_root, tree):
             dst = tree_dir / skill
             src = (repo_root / tree / skill).resolve()
             if not src.is_relative_to(repo_root) or not _is_dir(src):
@@ -288,35 +551,13 @@ def provision_worktree(
                 repo_root=repo_root,
             )
 
-    # The project's customization of those upstream skills (_bmad/custom/*.toml).
-    # The preflight resolves review layers through these files, but the run inside
-    # the worktree resolves them again from ITS OWN project root — and they are
-    # routinely absent from a fresh checkout: the upstream installer gitignores
-    # `*.user.toml`, and plenty of projects gitignore `_bmad/` whole. Without this
-    # the two disagree, and validate approves a layer set the isolated run never
-    # runs. Copy-when-absent at file granularity, so a checkout that tracks its
-    # own customization keeps every tracked file untouched.
-    #
-    # Deliberately NOT routed through seed_files: `skipped` reports user-authored
-    # `worktree_seed` entries that silently no-op, and this internal seed is not
-    # one of those — journaling it would read as a project misconfiguration.
-    customize_seeded = False
-    src_customize = (repo_root / CUSTOMIZE_DIR).resolve()
-    raw_customize = worktree / CUSTOMIZE_DIR
-    dst_customize = raw_customize.resolve()
-    if (
-        _is_dir(src_customize)
-        and src_customize.is_relative_to(repo_root)
-        and dst_customize.is_relative_to(worktree)
-        and dst_customize == raw_customize
-    ):
-        customize_seeded = _copy_traversable(
-            src_customize,
-            raw_customize,
-            skip_existing=True,
-            worktree=worktree,
-            repo_root=repo_root,
+    # Re-ask the result rather than trusting copy bookkeeping. A user-authored seed
+    # can happen to spell a skill rel, so only this disk predicate may arm the gate.
+    skipped.extend(
+        base_skills_seed_incomplete(
+            worktree, repo_root, [profile.skill_tree for profile in profiles]
         )
+    )
 
     # per-CLI signal-hook registration, baked to the main repo's relay (absolute).
     # Hookless profiles (HTTP/SSE transport) have no config to merge.
@@ -369,8 +610,15 @@ def provision_worktree(
     # as the pattern "/", git-excluding the entire worktree.
     patterns |= {f"/{p.hooks.config_path}" for p in profiles if not p.hookless}
     patterns |= {f"/{rel}" for rel in seeded}
-    if customize_seeded:
-        patterns.add(f"/{CUSTOMIZE_DIR.as_posix()}")
+    patterns |= {f"/{rel}" for rel in seeded_bmad}
+    if f"/{BMAD_DIR}" not in patterns:
+        # The renderer may create or rewrite this generated directory during the
+        # session, after provisioning has finished. Give it a dedicated transient
+        # shield unless the blanket root shield already subsumes it: `/_bmad` prunes
+        # the directory before git descends, so `/_bmad/render/` would provably never
+        # be consulted. Avoiding that inert sibling keeps the worktree-local exclude
+        # precise; the file and its lines disappear with this worktree.
+        patterns.add(f"/{RENDER_DIR_REL}/")
     reason = _worktree_local_exclude(worktree, sorted(patterns))
     if reason is not None and on_degraded is not None:
         on_degraded(reason)
@@ -546,6 +794,9 @@ class WorktreeFlow:
             self._save()
             return
         task.worktree_path = str(unit.path)
+        self.journal.append(
+            "worktree-opened", story_key=task.story_key, branch=unit.branch, path=str(unit.path)
+        )
         task.branch = unit.branch
         # A worktree checks out tracked files only, but the bmad-loop-* skill
         # trees + signal-hook config are typically gitignored, so they are absent
@@ -565,12 +816,14 @@ class WorktreeFlow:
         # config so the worktree's Editor MCP is reachable. Aggregate every loaded
         # plugin's declared seeds.
         seeds.extend(self._registry.seed_files())
+        seed_files = list(dict.fromkeys(seeds))  # dedupe, preserve order
+        seed_globs = self._registry.seed_globs()
         skipped_seeds = provision_worktree(
             unit.path,
             profiles,
             self.paths.repo_root,
-            seed_files=list(dict.fromkeys(seeds)),  # dedupe, preserve order
-            seed_globs=self._registry.seed_globs(),
+            seed_files=seed_files,
+            seed_globs=seed_globs,
             on_degraded=lambda msg: self._exclude_degraded(task.story_key, msg),
         )
         if skipped_seeds:
@@ -582,9 +835,80 @@ class WorktreeFlow:
             self.journal.append(
                 "worktree-seed-skipped", story_key=task.story_key, entries=skipped_seeds
             )
-        self.journal.append(
-            "worktree-opened", story_key=task.story_key, branch=unit.branch, path=str(unit.path)
+
+        # A dropped arbitrary seed is observable but not fatal. Unlike the two gates
+        # below, bmad-loop cannot know that a user/plugin config is required by the
+        # session, and its usual trigger is a healthy shared/dotfile-managed config.
+        # Hook config destinations cannot prove delivery because provisioning writes
+        # the Stop registration itself after the seed step.
+        undelivered_seeds = worktree_seed_undelivered(
+            unit.path,
+            self.paths.repo_root,
+            seed_files=seed_files,
+            seed_globs=seed_globs,
+            config_paths=[p.hooks.config_path for p in profiles if not p.hookless],
         )
+        if undelivered_seeds:
+            self.journal.append(
+                "worktree-seed-dropped", story_key=task.story_key, entries=undelivered_seeds
+            )
+
+        # Missing upstream skill content is a determinate stall for both inline and
+        # renderer-era primitives. Re-probe disk rather than trusting skipped_seeds,
+        # which a user-authored seed rel could otherwise forge. Check this first so a
+        # wholly absent primitive is not misdiagnosed as a renderer-surface problem.
+        trees = [p.skill_tree for p in profiles]
+        absent_skills = base_skills_seed_incomplete(unit.path, self.paths.repo_root, trees)
+        if absent_skills:
+            reason = (
+                "the worktree is missing required upstream skill contract files the repo has "
+                f"({', '.join(absent_skills)}) — the session would stall having "
+                "written nothing: on `Unknown command` when the whole skill is "
+                "absent, or at a required primitive marker or renderer source. "
+                "The usual cause is a required skill directory or file symlinked "
+                "to a shared BMad install outside the repo, which worktree seeding "
+                "cannot follow"
+            )
+            self.escalate_unit(task, reason)  # always raises RunPaused
+
+        # Stories mode has a stricter, content-keyed primitive contract than sprint
+        # mode. Re-run that exact preflight against the mounted worktree: a step-01
+        # through-link can pass in the main checkout yet be refused during copying,
+        # while a tracked stale worktree copy proves that existence alone is not
+        # enough. Either shape would HALT a folder+id dispatch before writing a spec.
+        stories_support = (
+            missing_stories_support(unit.path, trees) if self.state.source == "stories" else []
+        )
+        if stories_support:
+            short_dispatch = []
+            for finding in stories_support:
+                detail = finding.detail or {}
+                rel = f"{detail['tree']}/{detail['skill']}/{detail['file']}"
+                marker = detail.get("marker")
+                short_dispatch.append(f"{rel} (missing {marker!r})" if marker else rel)
+            reason = (
+                "the worktree's dev primitive does not satisfy stories-mode dispatch "
+                f"support ({', '.join(short_dispatch)}) — the folder+id session would "
+                "HALT without writing a spec. The usual cause is a required router "
+                "file symlinked to a shared BMad install outside the repo, which "
+                "worktree seeding cannot follow"
+            )
+            self.escalate_unit(task, reason)  # always raises RunPaused
+
+        # Provisioning owns these exact sentinel strings, but only a content-confirmed
+        # renderer stub consumes the surface. The conjunct is load-bearing: inline
+        # pre-#2601 SKILL.md projects may carry the same repo paths and must proceed.
+        short_surface = [rel for rel in RENDERER_SEED_SENTINELS if rel in skipped_seeds]
+        if short_surface and renderer_stub_resolved(self.paths.project, trees):
+            reason = (
+                f"the dev primitive renders via {RENDERER_SCRIPT_MARKER} but the "
+                "worktree's renderer surface came up short of the repo's "
+                f"({', '.join(short_surface)}) — the session would HALT without "
+                "writing a spec. The usual cause is a symlinked _bmad/ pointing "
+                "outside the repo, which worktree seeding cannot follow"
+            )
+            self.escalate_unit(task, reason)  # always raises RunPaused
+
         self._save()
         prev = self._workspace_get()
         self._workspace_set(unit.workspace)
@@ -764,8 +1088,11 @@ class WorktreeFlow:
         self.escalate_unit(task, reason)  # always raises RunPaused
 
     def escalate_unit(self, task: StoryTask, reason: str) -> None:
-        """Mark a DONE unit ESCALATED, notify, and pause the run. DONE has no
-        legal transition, so the phase is set directly rather than via advance()."""
+        """Mark a unit ESCALATED, notify, and pause the run.
+
+        Callers escalate outside a legal transition, before dispatch or after a
+        completed merge attempt, so the phase is set directly rather than advanced.
+        """
         task.phase = Phase.ESCALATED
         self.journal.append("story-escalated", story_key=task.story_key, reason=reason)
         gates.notify(

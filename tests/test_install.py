@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -25,6 +26,8 @@ from bmad_loop import verify
 from bmad_loop.adapters.profile import get_profile
 from bmad_loop.install import (
     BASE_SKILLS,
+    BMAD_DIR,
+    BMAD_SCRIPTS_SEED_REL,
     CENTRAL_CONFIG_REL,
     CUSTOMIZE_DIR,
     DEV_BASE_SKILLS,
@@ -53,6 +56,13 @@ from bmad_loop.install import (
     renderer_stub_resolved,
     resolve_dev_primitive,
     resolve_review_layers,
+)
+from bmad_loop.worktree_flow import (
+    _bmad_scripts_seed_incomplete,
+    _central_config_seed_incomplete,
+    _seed_bmad_tree,
+    base_skills_seed_incomplete,
+    worktree_seed_undelivered,
 )
 
 
@@ -2315,7 +2325,10 @@ def test_provision_worktree_bmad_custom_shielded_in_local_exclude(project, tmp_p
 
     assert (wt / "_bmad" / "custom" / "bmad-dev-auto.user.toml").is_file()
     exclude = _wt_private_exclude(wt).read_text(encoding="utf-8")
-    assert "/_bmad/custom" in exclude.splitlines()
+    # The whole `_bmad` seed now owns customization too. Its root shield subsumes
+    # both custom and render descendants without redundant sibling patterns.
+    assert "/_bmad" in exclude.splitlines()
+    assert "/_bmad/custom" not in exclude.splitlines()
     assert shared.read_bytes() == before
 
 
@@ -2440,6 +2453,25 @@ def test_provision_worktree_reports_seed_skipped_as_noop(tmp_path):
     dst.parent.mkdir(parents=True)
     dst.write_text("IN_WORKTREE", encoding="utf-8")
     assert provision_worktree(wt, [], repo, seed_files=[".mcp.json"]) == [".mcp.json"]
+
+
+def test_provision_preserves_unrelated_bmad_noop_when_internal_sibling_lands(tmp_path):
+    """An internal BMAD copy cannot erase an unrelated user-seed no-op report."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    rel = f"{BMAD_DIR}/custom/already.toml"
+    for root, content in ((repo, "FROM_REPO\n"), (wt, "IN_WORKTREE\n")):
+        target = root / rel
+        target.parent.mkdir(parents=True)
+        target.write_text(content, encoding="utf-8")
+    sibling = repo / BMAD_SCRIPTS_SEED_REL / "unrelated.py"
+    sibling.parent.mkdir(parents=True)
+    sibling.write_text("# best-effort sibling\n", encoding="utf-8")
+
+    skipped = provision_worktree(wt, [], repo, seed_files=[rel])
+
+    assert skipped == [rel]
+    assert (wt / rel).read_text(encoding="utf-8") == "IN_WORKTREE\n"
+    assert (wt / BMAD_SCRIPTS_SEED_REL / "unrelated.py").is_file()
 
 
 def test_provision_worktree_seeds_absent_children_of_existing_dir(tmp_path):
@@ -6640,3 +6672,383 @@ def test_copy_traversable_skip_existing_never_mkdirs_over_file(tmp_path):
 
     assert _copy_traversable(src, dst, skip_existing=True) is False
     assert (dst / "d").read_text() == "A FILE, NOT A DIR"
+
+
+# -------------------------------------------------------- worktree seed completeness
+
+
+def _write_worktree_renderer_surface(repo):
+    scripts = repo / BMAD_SCRIPTS_SEED_REL
+    scripts.mkdir(parents=True)
+    (scripts / "render_skill.py").write_text("import config_utils\n", encoding="utf-8")
+    (scripts / "config_utils.py").write_text("# config\n", encoding="utf-8")
+    (repo / CENTRAL_CONFIG_REL).write_text("[core]\n", encoding="utf-8")
+
+
+def test_seed_bmad_tree_merges_per_file_and_excludes_render_output(tmp_path):
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    _write_worktree_renderer_surface(repo)
+    (repo / BMAD_DIR / "custom").mkdir()
+    (repo / BMAD_DIR / "custom" / "style.toml").write_text("x = 1\n", encoding="utf-8")
+    (repo / RENDER_DIR_REL).mkdir()
+    (repo / RENDER_DIR_REL / "generated.md").write_text("machine local\n", encoding="utf-8")
+    carried = wt / CENTRAL_CONFIG_REL
+    carried.parent.mkdir(parents=True)
+    carried.write_text("[checkout]\n", encoding="utf-8")
+
+    seeded = _seed_bmad_tree(wt, repo)
+
+    assert carried.read_text(encoding="utf-8") == "[checkout]\n"
+    assert (wt / BMAD_SCRIPTS_SEED_REL / "render_skill.py").is_file()
+    assert (wt / BMAD_DIR / "custom" / "style.toml").is_file()
+    assert not (wt / RENDER_DIR_REL).exists()
+    assert seeded == [
+        f"{BMAD_DIR}/custom/style.toml",
+        f"{BMAD_SCRIPTS_SEED_REL}/config_utils.py",
+        f"{BMAD_SCRIPTS_SEED_REL}/render_skill.py",
+    ]
+
+
+def test_render_shield_is_omitted_when_root_shield_subsumes_it(tmp_path, monkeypatch):
+    import bmad_loop.worktree_flow as worktree_flow
+
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    _write_worktree_renderer_surface(repo)
+    captured = []
+    monkeypatch.setattr(
+        worktree_flow,
+        "_worktree_local_exclude",
+        lambda _worktree, patterns: captured.extend(patterns),
+    )
+
+    provision_worktree(wt, [], repo)
+
+    assert f"/{BMAD_DIR}" in captured
+    assert f"/{RENDER_DIR_REL}/" not in captured
+
+
+def test_render_shield_does_not_depend_on_bmad_provisioning_order(tmp_path, monkeypatch):
+    """No `_bmad` directory is needed to arm the transient render shield.
+
+    `_seed_bmad_tree` may create the directory, so gating on its post-seed existence
+    makes protection depend on provisioning order. The only suppression is the root
+    pattern's structural subsumption.
+    """
+    import bmad_loop.worktree_flow as worktree_flow
+
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    repo.mkdir()
+    captured = []
+    monkeypatch.setattr(
+        worktree_flow,
+        "_worktree_local_exclude",
+        lambda _worktree, patterns: captured.extend(patterns),
+    )
+
+    provision_worktree(wt, [get_profile("claude")], repo)
+
+    assert not (wt / BMAD_DIR).exists()
+    assert f"/{BMAD_DIR}" not in captured
+    assert f"/{RENDER_DIR_REL}/" in captured
+
+
+def test_base_skills_seed_incomplete_uses_the_resolved_primitive_era(tmp_path):
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    tree = ".claude/skills"
+    catalog = {
+        DEV_PRIMITIVE_NEW: DEV_PRIMITIVE_MARKERS,
+        DEV_PRIMITIVE_LEGACY: DEV_PRIMITIVE_MARKERS,
+    }
+    for root in (repo, wt):
+        _install_skills(root, tree, catalog)
+    shutil.rmtree(wt / tree / DEV_PRIMITIVE_LEGACY)
+
+    assert resolve_dev_primitive(repo, tree) == DEV_PRIMITIVE_NEW
+    assert base_skills_seed_incomplete(wt, repo, [tree]) == []
+
+
+def test_base_skills_seed_incomplete_ignores_inactive_catalog_symlink(tmp_path):
+    """An obsolete copy-if-present reviewer is not a fatal session requirement.
+
+    A shared-install symlink passes the main-checkout preflight but is deliberately
+    refused by worktree provisioning's source-containment guard. Modern layers invoke
+    only the merged reviewer, so that unused refusal must not pause the run.
+    """
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    tree = ".claude/skills"
+    obsolete = "bmad-review-edge-case-hunter"
+    _install_dev_auto(
+        repo,
+        tree,
+        skill=DEV_PRIMITIVE_NEW,
+        customize="[workflow]\n" + _layer("blind", "bmad-review"),
+    )
+    _install_skills(repo, tree, {"bmad-review": ()})
+    shared_skill = tmp_path / "shared" / obsolete
+    shared_skill.mkdir(parents=True)
+    (shared_skill / "SKILL.md").write_text("# obsolete\n", encoding="utf-8")
+    (repo / tree / obsolete).symlink_to(shared_skill, target_is_directory=True)
+
+    assert missing_base_skills(repo, [tree]) == []
+    provision_worktree(wt, [get_profile("claude")], repo)
+
+    assert not (wt / tree / obsolete).exists()
+    assert base_skills_seed_incomplete(wt, repo, [tree]) == []
+
+
+def test_advisory_review_skill_is_copied_best_effort_but_not_fatal(tmp_path):
+    """Conditional review skills remain copy candidates, never hard requirements."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    tree = ".claude/skills"
+    advisory = "bmad-review-performance"
+    _install_dev_auto(
+        repo,
+        tree,
+        skill=DEV_PRIMITIVE_NEW,
+        customize="[workflow]\n"
+        + _layer("blind", "bmad-review")
+        + _layer("perf", advisory, when="the diff touches hot paths"),
+    )
+    _install_skills(repo, tree, {"bmad-review": (), advisory: ()})
+
+    assert missing_base_skills(repo, [tree]) == []
+    provision_worktree(wt, [get_profile("claude")], repo)
+
+    copied = wt / tree / advisory
+    assert (copied / "SKILL.md").is_file()
+    shutil.rmtree(copied)
+    assert base_skills_seed_incomplete(wt, repo, [tree]) == []
+
+
+@pytest.mark.parametrize("skill", [DEV_PRIMITIVE_NEW, "bmad-review"])
+def test_required_skill_unreferenced_auxiliary_is_best_effort_not_fatal(tmp_path, skill):
+    """A refused note in an active skill does not prove the session will stall."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    tree = ".claude/skills"
+    _install_dev_auto(
+        repo,
+        tree,
+        skill=DEV_PRIMITIVE_NEW,
+        customize="[workflow]\n" + _layer("blind", "bmad-review"),
+    )
+    _install_skills(repo, tree, {"bmad-review": ()})
+    shared = tmp_path / f"shared-{skill}.md"
+    shared.write_text("# unreferenced note\n", encoding="utf-8")
+    (repo / tree / skill / "README.md").symlink_to(shared)
+
+    assert missing_base_skills(repo, [tree]) == []
+    assert provision_worktree(wt, [get_profile("claude")], repo) == []
+
+    assert not (wt / tree / skill / "README.md").exists()
+    assert base_skills_seed_incomplete(wt, repo, [tree]) == []
+
+
+@pytest.mark.parametrize("merged_fallback", [True, False])
+def test_base_skills_seed_incomplete_preserves_unknown_review_fallback(tmp_path, merged_fallback):
+    """An unknown review shape gates the same fallback topology as preflight."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    tree = ".claude/skills"
+    obsolete = "bmad-review-edge-case-hunter"
+    _install_dev_auto(
+        repo,
+        tree,
+        skill=DEV_PRIMITIVE_NEW,
+        customize="this is not = valid toml [[[",
+    )
+    if merged_fallback:
+        _install_skills(repo, tree, {"bmad-review": ()})
+        shared_skill = tmp_path / "shared" / obsolete
+        shared_skill.mkdir(parents=True)
+        (shared_skill / "SKILL.md").write_text("# obsolete\n", encoding="utf-8")
+        (repo / tree / obsolete).symlink_to(shared_skill, target_is_directory=True)
+    else:
+        _install_skills(
+            repo,
+            tree,
+            {
+                "bmad-review-adversarial-general": (),
+                obsolete: (),
+            },
+        )
+
+    assert resolve_review_layers(repo, tree) is None
+    assert missing_base_skills(repo, [tree]) == []
+    provision_worktree(wt, [get_profile("claude")], repo)
+
+    if merged_fallback:
+        assert not (wt / tree / obsolete).exists()
+        expected = []
+    else:
+        shutil.rmtree(wt / tree / obsolete)
+        expected = [f"{tree}/{obsolete}"]
+    assert base_skills_seed_incomplete(wt, repo, [tree]) == expected
+
+
+def test_base_skills_seed_incomplete_names_a_missing_primitive_marker(tmp_path):
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    tree = ".claude/skills"
+    catalog = {DEV_PRIMITIVE_NEW: DEV_PRIMITIVE_MARKERS}
+    for root in (repo, wt):
+        _install_skills(root, tree, catalog)
+    (wt / tree / DEV_PRIMITIVE_NEW / "customize.toml").unlink()
+
+    assert base_skills_seed_incomplete(wt, repo, [tree]) == [
+        f"{tree}/{DEV_PRIMITIVE_NEW}/customize.toml"
+    ]
+
+
+def test_base_skills_seed_incomplete_names_a_missing_renderer_snapshot(tmp_path):
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    tree = ".claude/skills"
+    target = "sources/plan.md"
+    for root in (repo, wt):
+        install_build_auto_skill(root, tree, renderer_stub=True)
+        (root / tree / DEV_PRIMITIVE_NEW / "workflow.md").write_text(
+            f"Read [[bmad-snapshot:{target}]].\n", encoding="utf-8"
+        )
+    source = repo / tree / DEV_PRIMITIVE_NEW / target
+    source.parent.mkdir()
+    source.write_text("# plan\n", encoding="utf-8")
+
+    assert base_skills_seed_incomplete(wt, repo, [tree]) == [f"{tree}/{DEV_PRIMITIVE_NEW}/{target}"]
+
+
+def test_renderer_seed_predicates_report_only_missing_repo_content(tmp_path):
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    _write_worktree_renderer_surface(repo)
+    _write_worktree_renderer_surface(wt)
+
+    assert not _bmad_scripts_seed_incomplete(wt, repo)
+    assert not _central_config_seed_incomplete(wt, repo)
+
+    (wt / BMAD_SCRIPTS_SEED_REL / "config_utils.py").unlink()
+    (wt / CENTRAL_CONFIG_REL).unlink()
+    assert _bmad_scripts_seed_incomplete(wt, repo)
+    assert _central_config_seed_incomplete(wt, repo)
+
+
+@pytest.mark.parametrize(
+    ("renderer_body", "missing_name"),
+    [
+        ("# standalone renderer\n", "config_utils.py"),
+        ("import config_utils\n", "unrelated.py"),
+    ],
+)
+def test_renderer_scripts_seed_ignores_files_the_renderer_does_not_require(
+    tmp_path, renderer_body, missing_name
+):
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    _write_worktree_renderer_surface(repo)
+    _write_worktree_renderer_surface(wt)
+    for root in (repo, wt):
+        (root / BMAD_SCRIPTS_SEED_REL / "render_skill.py").write_text(
+            renderer_body, encoding="utf-8"
+        )
+    if missing_name == "unrelated.py":
+        (repo / BMAD_SCRIPTS_SEED_REL / missing_name).write_text(
+            "# not imported by the renderer\n", encoding="utf-8"
+        )
+    else:
+        (wt / BMAD_SCRIPTS_SEED_REL / missing_name).unlink()
+
+    assert not _bmad_scripts_seed_incomplete(wt, repo)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_provision_reports_a_symlinked_out_renderer_scripts_seed(tmp_path):
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    (repo / BMAD_DIR).mkdir(parents=True)
+    shared = tmp_path / "shared-scripts"
+    shared.mkdir()
+    (shared / "render_skill.py").write_text("import config_utils\n", encoding="utf-8")
+    (shared / "config_utils.py").write_text("# config\n", encoding="utf-8")
+    (repo / BMAD_SCRIPTS_SEED_REL).symlink_to(shared, target_is_directory=True)
+    (repo / CENTRAL_CONFIG_REL).write_text("[core]\n", encoding="utf-8")
+
+    skipped = provision_worktree(wt, [], repo)
+
+    assert skipped == [BMAD_SCRIPTS_SEED_REL]
+    assert not (wt / BMAD_SCRIPTS_SEED_REL).exists()
+    assert (wt / CENTRAL_CONFIG_REL).is_file()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_worktree_seed_undelivered_names_an_escaped_source_despite_stale_destination(tmp_path):
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    repo.mkdir()
+    shared = tmp_path / "shared-mcp.json"
+    shared.write_text("{}\n", encoding="utf-8")
+    (repo / ".mcp.json").symlink_to(shared)
+    wt.mkdir()
+    (wt / ".mcp.json").write_text("STALE\n", encoding="utf-8")
+
+    assert provision_worktree(wt, [], repo, seed_files=[".mcp.json"]) == []
+    assert (wt / ".mcp.json").read_text(encoding="utf-8") == "STALE\n"
+    assert worktree_seed_undelivered(wt, repo, seed_files=[".mcp.json"]) == [".mcp.json"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("escaped_kind", ["file", "directory"])
+def test_worktree_seed_undelivered_rejects_stale_nested_escaped_source(tmp_path, escaped_kind):
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    rel = "plugins/tool"
+    source = repo / rel
+    source.mkdir(parents=True)
+    (source / "copied.json").write_text("{}\n", encoding="utf-8")
+    destination = wt / rel
+    destination.mkdir(parents=True)
+    shared = tmp_path / "shared"
+    if escaped_kind == "file":
+        shared.write_text("CURRENT\n", encoding="utf-8")
+        (source / "escaped.json").symlink_to(shared)
+        (destination / "escaped.json").write_text("STALE\n", encoding="utf-8")
+    else:
+        shared.mkdir()
+        (source / "escaped").symlink_to(shared, target_is_directory=True)
+        (destination / "escaped").mkdir()
+
+    provision_worktree(wt, [], repo, seed_files=[rel])
+
+    assert (destination / "copied.json").is_file()
+    assert worktree_seed_undelivered(wt, repo, seed_files=[rel]) == [rel]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("seed_kind", ["files", "globs"])
+def test_worktree_seed_undelivered_names_a_partial_directory_seed(tmp_path, seed_kind):
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    seed_dir = repo / "plugins" / "tool"
+    seed_dir.mkdir(parents=True)
+    (seed_dir / "copied.json").write_text("{}\n", encoding="utf-8")
+    shared = tmp_path / "shared-config"
+    shared.mkdir()
+    (shared / "dropped.json").write_text("{}\n", encoding="utf-8")
+    (seed_dir / "shared").symlink_to(shared, target_is_directory=True)
+    seed_args = (
+        {"seed_files": ["plugins/tool"]} if seed_kind == "files" else {"seed_globs": ["plugins/*"]}
+    )
+
+    provision_worktree(wt, [], repo, **seed_args)
+
+    assert (wt / "plugins" / "tool" / "copied.json").is_file()
+    assert worktree_seed_undelivered(wt, repo, **seed_args) == ["plugins/tool"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_hook_config_cannot_supply_its_dropped_seed_alibi(tmp_path):
+    profile = get_profile("claude")
+    rel = profile.hooks.config_path
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    source = repo / rel
+    source.parent.mkdir(parents=True)
+    source.write_text('{"env": {"FROM_REPO": "1"}}\n', encoding="utf-8")
+    stale = wt / ".claude/stale-settings.json"
+    stale.parent.mkdir(parents=True)
+    stale.write_text('{"env": {"STALE": "1"}}\n', encoding="utf-8")
+    (wt / rel).symlink_to(stale)
+
+    provision_worktree(wt, [profile], repo, seed_files=[rel])
+
+    assert (wt / rel).is_file(), "the in-worktree link looks delivered generically"
+    assert worktree_seed_undelivered(wt, repo, seed_files=[rel]) == []
+    assert worktree_seed_undelivered(wt, repo, seed_files=[rel], config_paths=[rel]) == [rel]

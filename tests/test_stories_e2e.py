@@ -37,6 +37,10 @@ the invoked primitive off disk instead of spelling a constant.
 project-global or skill-relative inputs are refused before tmux can spawn the
 fake, dry-run stays diagnostic, and the complete surface reaches the same
 zero-token real-tmux success path.
+
+(11) runs that complete renderer project under worktree isolation after removing
+the renderer script unit and central config from the index. The real tmux session
+can start only if runtime provisioning reconstructs the ignored `_bmad` surface.
 """
 
 from __future__ import annotations
@@ -59,6 +63,7 @@ from conftest import (
 )
 
 from bmad_loop.install import (
+    BMAD_SCRIPTS_SEED_REL,
     CENTRAL_CONFIG_REL,
     DEV_PRIMITIVE_NEW,
     RENDERER_CONFIG_UTILS_REL,
@@ -659,6 +664,48 @@ def test_e2e_renderer_complete_surface_reaches_real_tmux_fake_cli(tmp_path):
     dispatched = list((run_dir / "tasks").glob("*/fake-prompt.txt"))
     assert len(dispatched) == 1, dispatched
     assert dispatched[0].read_text(encoding="utf-8").startswith("/bmad-build-auto Spec folder: ")
+
+
+def test_e2e_renderer_surface_is_seeded_into_isolated_real_tmux_session(tmp_path):
+    """The required sandbox E2E for the runtime half of renderer support.
+
+    The main checkout keeps the renderer files as ignored working-tree content,
+    while the linked worktree starts without them. A green completion crosses the
+    real CLI, worktree provision, completeness gates, tmux fake, verification and
+    merge path; no LLM is invoked.
+    """
+    root = tmp_path / "sbx"
+    _scaffold_renderer(root)
+    gitignore = root / ".gitignore"
+    existing = gitignore.read_text(encoding="utf-8")
+    prefix = existing if not existing or existing.endswith("\n") else existing + "\n"
+    gitignore.write_text(
+        prefix + f"{BMAD_SCRIPTS_SEED_REL}/\n{CENTRAL_CONFIG_REL}\n",
+        encoding="utf-8",
+    )
+    policy = root / ".bmad-loop" / "policy.toml"
+    policy.write_text(
+        policy.read_text(encoding="utf-8") + '\n[scm]\nisolation = "worktree"\n',
+        encoding="utf-8",
+    )
+    _git(root, "rm", "-r", "--cached", "--", BMAD_SCRIPTS_SEED_REL, CENTRAL_CONFIG_REL)
+    _git(root, "add", ".gitignore", ".bmad-loop/policy.toml")
+    _git(root, "commit", "-q", "-m", "ignore renderer runtime surface")
+    base = _commit_count(root)
+
+    run = _run(root, "run")
+
+    assert run.returncode == 0, run.stderr or run.stdout
+    assert _status(root, "1") == "done"
+    # Isolation records the unit commit and the local integration commit.
+    assert _commit_count(root) == base + 2
+    run_dir = root / ".bmad-loop" / "runs" / _run_id(root)
+    kinds = [
+        json.loads(line)["kind"]
+        for line in (run_dir / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert "worktree-opened" in kinds and "unit-merged" in kinds
+    assert "story-escalated" not in kinds
 
 
 def test_e2e_spec_checkpoint_two_leg(tmp_path):
