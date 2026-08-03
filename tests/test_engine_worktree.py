@@ -9,6 +9,8 @@ adapter (no tmux, no LLM).
 from __future__ import annotations
 
 import shutil
+import sys
+from pathlib import Path
 
 import pytest
 from conftest import (
@@ -17,7 +19,9 @@ from conftest import (
     _seeded_then_touch,
     _spec_baseline,
     _touch_run,
+    attach_profile,
     git,
+    install_build_auto_skill,
     set_sprint,
     write_spec,
     write_sprint,
@@ -27,6 +31,11 @@ from bmad_loop import verify, worktree_flow
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import Engine
+from bmad_loop.install import (
+    BMAD_SCRIPTS_SEED_REL,
+    CENTRAL_CONFIG_REL,
+    DEV_PRIMITIVE_NEW,
+)
 from bmad_loop.journal import Journal, load_state
 from bmad_loop.model import Phase, RunState, SessionRecord, StoryTask, TokenUsage
 from bmad_loop.policy import GatesPolicy, LimitsPolicy, NotifyPolicy, Policy, ScmPolicy
@@ -182,6 +191,14 @@ def journal_kinds(engine):
     return [e["kind"] for e in engine.journal.entries()]
 
 
+def ignore_before_commit(project, *patterns):
+    gitignore = project.project / ".gitignore"
+    existing = gitignore.read_text(encoding="utf-8")
+    gitignore.write_text(
+        existing + "".join(f"{pattern}\n" for pattern in patterns), encoding="utf-8"
+    )
+
+
 # ----------------------------------------------------------------- happy path
 
 
@@ -209,6 +226,119 @@ def test_worktree_happy_path_merges_to_target(project):
     assert "worktree-opened" in kinds and "unit-merged" in kinds
     # a clean teardown degrades nothing (gh-139): no warning event is emitted
     assert "worktree-teardown-degraded" not in kinds
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_missing_upstream_skill_seed_escalates_before_dispatch_and_records_mount(project, tmp_path):
+    """A shared install outside the repo passes main's through-link resolution but
+    cannot be copied into the worktree. The flow pauses before invoking the adapter,
+    with the mount journaled early enough for the operator to inspect it."""
+    tree = ".claude/skills"
+    ignore_before_commit(project, ".claude/")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    shared_skills = install_build_auto_skill(tmp_path / "shared", tree)
+    linked_skill = project.project / tree / DEV_PRIMITIVE_NEW
+    linked_skill.parent.mkdir(parents=True)
+    linked_skill.symlink_to(shared_skills / DEV_PRIMITIVE_NEW, target_is_directory=True)
+
+    engine, adapter = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+    )
+    attach_profile(adapter)
+
+    summary = engine.run()
+
+    assert summary.paused and adapter.sessions == []
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED
+    assert f"{tree}/{DEV_PRIMITIVE_NEW}" in (engine.state.paused_reason or "")
+    entries = engine.journal.entries()
+    kinds = [entry["kind"] for entry in entries]
+    assert kinds.index("worktree-opened") < kinds.index("story-escalated")
+    opened = next(entry for entry in entries if entry["kind"] == "worktree-opened")
+    assert opened["path"] == task.worktree_path
+    assert Path(task.worktree_path).is_dir(), "an escalated worktree stays mounted"
+
+
+def _install_short_renderer_case(project, tmp_path, *, renderer_stub):
+    """Install a complete primitive beside renderer scripts the seed cannot follow."""
+    tree = ".claude/skills"
+    ignore_before_commit(project, ".claude/", f"{BMAD_SCRIPTS_SEED_REL}", CENTRAL_CONFIG_REL)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    install_build_auto_skill(project.project, tree, renderer_stub=renderer_stub)
+    shared_scripts = tmp_path / "shared-scripts"
+    shared_scripts.mkdir()
+    (shared_scripts / "render_skill.py").write_text("import config_utils\n", encoding="utf-8")
+    (shared_scripts / "config_utils.py").write_text("# config\n", encoding="utf-8")
+    scripts_link = project.project / BMAD_SCRIPTS_SEED_REL
+    scripts_link.parent.mkdir(parents=True, exist_ok=True)
+    scripts_link.symlink_to(shared_scripts, target_is_directory=True)
+    central = project.project / CENTRAL_CONFIG_REL
+    central.write_text("[core]\n", encoding="utf-8")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_short_renderer_seed_escalates_in_worktree_flow(project, tmp_path):
+    _install_short_renderer_case(project, tmp_path, renderer_stub=True)
+    engine, adapter = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+    )
+    attach_profile(adapter)
+
+    summary = engine.run()
+
+    assert summary.paused and adapter.sessions == []
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED
+    assert BMAD_SCRIPTS_SEED_REL in (engine.state.paused_reason or "")
+    assert Path(task.worktree_path).is_dir()
+    assert "worktree-opened" in journal_kinds(engine)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_short_renderer_seed_does_not_escalate_an_inline_skill(project, tmp_path):
+    """The exact consumer-side era conjunct: a pre-#2601 inline SKILL.md never
+    reads the renderer surface, even when the provisioning predicate emits a sentinel."""
+    _install_short_renderer_case(project, tmp_path, renderer_stub=False)
+    engine, adapter = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+    )
+    attach_profile(adapter)
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    assert "story-escalated" not in journal_kinds(engine)
+    skipped = [
+        entry for entry in engine.journal.entries() if entry["kind"] == "worktree-seed-skipped"
+    ]
+    assert skipped and BMAD_SCRIPTS_SEED_REL in skipped[0]["entries"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_undelivered_arbitrary_seed_is_journaled_never_escalated(project, tmp_path):
+    ignore_before_commit(project, ".mcp.json")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    shared = tmp_path / "shared-mcp.json"
+    shared.write_text("{}\n", encoding="utf-8")
+    (project.project / ".mcp.json").symlink_to(shared)
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+        policy=wt_policy(worktree_seed=(".mcp.json",)),
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    dropped = [
+        entry for entry in engine.journal.entries() if entry["kind"] == "worktree-seed-dropped"
+    ]
+    assert len(dropped) == 1 and dropped[0]["entries"] == [".mcp.json"]
+    assert "story-escalated" not in journal_kinds(engine)
 
 
 @pytest.mark.parametrize("merge_strategy", ["merge", "ff"])

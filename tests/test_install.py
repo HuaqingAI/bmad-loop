@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -25,6 +26,8 @@ from bmad_loop import verify
 from bmad_loop.adapters.profile import get_profile
 from bmad_loop.install import (
     BASE_SKILLS,
+    BMAD_DIR,
+    BMAD_SCRIPTS_SEED_REL,
     CENTRAL_CONFIG_REL,
     CUSTOMIZE_DIR,
     DEV_BASE_SKILLS,
@@ -53,6 +56,13 @@ from bmad_loop.install import (
     renderer_stub_resolved,
     resolve_dev_primitive,
     resolve_review_layers,
+)
+from bmad_loop.worktree_flow import (
+    _bmad_scripts_seed_incomplete,
+    _central_config_seed_incomplete,
+    _seed_bmad_tree,
+    base_skills_seed_incomplete,
+    worktree_seed_undelivered,
 )
 
 
@@ -2315,7 +2325,10 @@ def test_provision_worktree_bmad_custom_shielded_in_local_exclude(project, tmp_p
 
     assert (wt / "_bmad" / "custom" / "bmad-dev-auto.user.toml").is_file()
     exclude = _wt_private_exclude(wt).read_text(encoding="utf-8")
-    assert "/_bmad/custom" in exclude.splitlines()
+    # The whole `_bmad` seed now owns customization too. Its root shield subsumes
+    # both custom and render descendants without redundant sibling patterns.
+    assert "/_bmad" in exclude.splitlines()
+    assert "/_bmad/custom" not in exclude.splitlines()
     assert shared.read_bytes() == before
 
 
@@ -6640,3 +6653,173 @@ def test_copy_traversable_skip_existing_never_mkdirs_over_file(tmp_path):
 
     assert _copy_traversable(src, dst, skip_existing=True) is False
     assert (dst / "d").read_text() == "A FILE, NOT A DIR"
+
+
+# -------------------------------------------------------- worktree seed completeness
+
+
+def _write_worktree_renderer_surface(repo):
+    scripts = repo / BMAD_SCRIPTS_SEED_REL
+    scripts.mkdir(parents=True)
+    (scripts / "render_skill.py").write_text("import config_utils\n", encoding="utf-8")
+    (scripts / "config_utils.py").write_text("# config\n", encoding="utf-8")
+    (repo / CENTRAL_CONFIG_REL).write_text("[core]\n", encoding="utf-8")
+
+
+def test_seed_bmad_tree_merges_per_file_and_excludes_render_output(tmp_path):
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    _write_worktree_renderer_surface(repo)
+    (repo / BMAD_DIR / "custom").mkdir()
+    (repo / BMAD_DIR / "custom" / "style.toml").write_text("x = 1\n", encoding="utf-8")
+    (repo / RENDER_DIR_REL).mkdir()
+    (repo / RENDER_DIR_REL / "generated.md").write_text("machine local\n", encoding="utf-8")
+    carried = wt / CENTRAL_CONFIG_REL
+    carried.parent.mkdir(parents=True)
+    carried.write_text("[checkout]\n", encoding="utf-8")
+
+    seeded = _seed_bmad_tree(wt, repo)
+
+    assert carried.read_text(encoding="utf-8") == "[checkout]\n"
+    assert (wt / BMAD_SCRIPTS_SEED_REL / "render_skill.py").is_file()
+    assert (wt / BMAD_DIR / "custom" / "style.toml").is_file()
+    assert not (wt / RENDER_DIR_REL).exists()
+    assert seeded == [
+        f"{BMAD_DIR}/custom/style.toml",
+        f"{BMAD_SCRIPTS_SEED_REL}/config_utils.py",
+        f"{BMAD_SCRIPTS_SEED_REL}/render_skill.py",
+    ]
+
+
+def test_render_shield_is_omitted_when_root_shield_subsumes_it(tmp_path, monkeypatch):
+    import bmad_loop.worktree_flow as worktree_flow
+
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    _write_worktree_renderer_surface(repo)
+    captured = []
+    monkeypatch.setattr(
+        worktree_flow,
+        "_worktree_local_exclude",
+        lambda _worktree, patterns: captured.extend(patterns),
+    )
+
+    provision_worktree(wt, [], repo)
+
+    assert f"/{BMAD_DIR}" in captured
+    assert f"/{RENDER_DIR_REL}/" not in captured
+
+
+def test_render_shield_does_not_depend_on_bmad_provisioning_order(tmp_path, monkeypatch):
+    """No `_bmad` directory is needed to arm the transient render shield.
+
+    `_seed_bmad_tree` may create the directory, so gating on its post-seed existence
+    makes protection depend on provisioning order. The only suppression is the root
+    pattern's structural subsumption.
+    """
+    import bmad_loop.worktree_flow as worktree_flow
+
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    repo.mkdir()
+    captured = []
+    monkeypatch.setattr(
+        worktree_flow,
+        "_worktree_local_exclude",
+        lambda _worktree, patterns: captured.extend(patterns),
+    )
+
+    provision_worktree(wt, [get_profile("claude")], repo)
+
+    assert not (wt / BMAD_DIR).exists()
+    assert f"/{BMAD_DIR}" not in captured
+    assert f"/{RENDER_DIR_REL}/" in captured
+
+
+def test_base_skills_seed_incomplete_uses_the_resolved_primitive_era(tmp_path):
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    tree = ".claude/skills"
+    catalog = {
+        DEV_PRIMITIVE_NEW: DEV_PRIMITIVE_MARKERS,
+        DEV_PRIMITIVE_LEGACY: DEV_PRIMITIVE_MARKERS,
+    }
+    for root in (repo, wt):
+        _install_skills(root, tree, catalog)
+    shutil.rmtree(wt / tree / DEV_PRIMITIVE_LEGACY)
+
+    assert resolve_dev_primitive(repo, tree) == DEV_PRIMITIVE_NEW
+    assert base_skills_seed_incomplete(wt, repo, [tree]) == []
+
+
+def test_base_skills_seed_incomplete_names_a_short_skill_file(tmp_path):
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    tree = ".claude/skills"
+    catalog = {DEV_PRIMITIVE_NEW: DEV_PRIMITIVE_MARKERS}
+    for root in (repo, wt):
+        _install_skills(root, tree, catalog)
+        skill = root / tree / DEV_PRIMITIVE_NEW
+        (skill / "review-prompts").mkdir()
+        (skill / "review-prompts" / "adversarial.md").write_text("x\n", encoding="utf-8")
+    (wt / tree / DEV_PRIMITIVE_NEW / "review-prompts" / "adversarial.md").unlink()
+
+    assert base_skills_seed_incomplete(wt, repo, [tree]) == [
+        f"{tree}/{DEV_PRIMITIVE_NEW}/review-prompts/adversarial.md"
+    ]
+
+
+def test_renderer_seed_predicates_report_only_missing_repo_content(tmp_path):
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    _write_worktree_renderer_surface(repo)
+    _write_worktree_renderer_surface(wt)
+
+    assert not _bmad_scripts_seed_incomplete(wt, repo)
+    assert not _central_config_seed_incomplete(wt, repo)
+
+    (wt / BMAD_SCRIPTS_SEED_REL / "config_utils.py").unlink()
+    (wt / CENTRAL_CONFIG_REL).unlink()
+    assert _bmad_scripts_seed_incomplete(wt, repo)
+    assert _central_config_seed_incomplete(wt, repo)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_provision_reports_a_symlinked_out_renderer_scripts_seed(tmp_path):
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    (repo / BMAD_DIR).mkdir(parents=True)
+    shared = tmp_path / "shared-scripts"
+    shared.mkdir()
+    (shared / "render_skill.py").write_text("import config_utils\n", encoding="utf-8")
+    (shared / "config_utils.py").write_text("# config\n", encoding="utf-8")
+    (repo / BMAD_SCRIPTS_SEED_REL).symlink_to(shared, target_is_directory=True)
+    (repo / CENTRAL_CONFIG_REL).write_text("[core]\n", encoding="utf-8")
+
+    skipped = provision_worktree(wt, [], repo)
+
+    assert skipped == [BMAD_SCRIPTS_SEED_REL]
+    assert not (wt / BMAD_SCRIPTS_SEED_REL).exists()
+    assert (wt / CENTRAL_CONFIG_REL).is_file()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_worktree_seed_undelivered_names_a_symlinked_out_source(tmp_path):
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    repo.mkdir()
+    shared = tmp_path / "shared-mcp.json"
+    shared.write_text("{}\n", encoding="utf-8")
+    (repo / ".mcp.json").symlink_to(shared)
+
+    assert provision_worktree(wt, [], repo, seed_files=[".mcp.json"]) == []
+    assert worktree_seed_undelivered(wt, repo, seed_files=[".mcp.json"]) == [".mcp.json"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_hook_config_cannot_supply_its_dropped_seed_alibi(tmp_path):
+    profile = get_profile("claude")
+    rel = profile.hooks.config_path
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    (repo / rel).parent.mkdir(parents=True)
+    shared = tmp_path / "shared-settings.json"
+    shared.write_text('{"env": {"FROM_REPO": "1"}}\n', encoding="utf-8")
+    (repo / rel).symlink_to(shared)
+
+    provision_worktree(wt, [profile], repo, seed_files=[rel])
+
+    assert (wt / rel).is_file(), "the hook registration itself creates this path"
+    assert worktree_seed_undelivered(wt, repo, seed_files=[rel]) == []
+    assert worktree_seed_undelivered(wt, repo, seed_files=[rel], config_paths=[rel]) == [rel]
