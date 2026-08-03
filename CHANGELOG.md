@@ -260,6 +260,18 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 ### Fixed
 
+- **`isolation = "worktree"` under a `repo_root` override is refused instead of running empty
+  (#414).** Worktree provisioning seeds every off-disk surface from `repo_root` — skill trees,
+  `_bmad/` and the `_bmad/custom/` overrides in it, each `seed_files`/`seed_globs` entry — and bakes
+  the hook relay's absolute path from it, while `init`, `validate` and the run preflight write and
+  probe those same surfaces under `project`. `load_paths` requires `project/_bmad/bmm/config.yaml`,
+  so `repo_root/_bmad/` generally does not exist at all. A project that set both got a green
+  preflight and then an isolated session with no dev primitive, stopping with no result and nothing
+  journaled naming the cause; the seed-completeness gates went inert rather than fired. `validate`
+  now reports the pair, `run`/`sweep`/`resume` and the auto-triggered child sweep refuse to start,
+  the dry-run banner names it first, and the TUI toasts it ahead of its clean-tree gate. Plumbing
+  `project` through provisioning so both work together is #443.
+
 - **A configured path carrying `[`, `]`, `*` or `?` no longer makes git act on the wrong files
   (#423).** `implementation_artifacts` reaches git verbatim out of the operator's
   `_bmad/bmm/config.yaml`, and git reads a positional operand as a _pathspec_, not a path — so such
