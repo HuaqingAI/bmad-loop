@@ -2689,6 +2689,13 @@ class Engine:
         target = "review" if review_enabled else "done"
         sprint_advance(self.workspace.paths.sprint_status, task.story_key, target)
 
+    def _harvest_spec_path(self, task: StoryTask, result_json: dict | None) -> Path | None:
+        """Resolve the spec whose frontmatter this mode may harvest."""
+        spec_file = (result_json or {}).get("spec_file")
+        if not spec_file:
+            return None
+        return verify.resolve_spec_path(str(spec_file), self.workspace.paths)
+
     def _harvest_spec_deferrals(
         self, task: StoryTask, result_json: dict | None
     ) -> VerifyOutcome | None:
@@ -2718,13 +2725,13 @@ class Engine:
         """
         if not self._generic_dev():
             return
-        spec_file = (result_json or {}).get("spec_file")
-        if not spec_file:
+        spec_path = self._harvest_spec_path(task, result_json)
+        if spec_path is None:
             return
-        spec_path = verify.resolve_spec_path(str(spec_file), self.workspace.paths)
-        # A session supplies `spec_file`; like reconcile, marker repair, and
-        # declared closes, harvesting must not let an arbitrary readable path
-        # outside the orchestrator-owned roots steer a ledger write.
+        # A session supplies `spec_file`; a mode may replace its untrusted value
+        # with a deterministic artifact path. Like reconcile, marker repair, and
+        # declared closes, harvesting must not let any readable path outside the
+        # orchestrator-owned roots steer a ledger write.
         try:
             within = verify.spec_within_roots(spec_path, self.workspace.paths)
         except (OSError, RuntimeError):

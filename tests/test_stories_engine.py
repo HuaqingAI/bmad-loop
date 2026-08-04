@@ -1575,6 +1575,47 @@ def test_stories_mode_harvests_spec_deferrals_into_the_ledger(project):
     assert _kinds(engine.journal, "spec-deferrals-harvested")[0]["dw_ids"] == ["DW-1"]
 
 
+def test_stories_mode_harvests_id_resolved_spec_not_reported_sibling(project):
+    """The harvest and verifier must consume the same story-id-keyed artifact.
+
+    A session-reported sibling is untrusted in stories mode: harvesting it before
+    ``verify_dev_stories`` resolves the real spec can file another story's finding
+    even though only the id-keyed spec is subsequently accepted and committed.
+    """
+    from bmad_loop import deferredwork
+
+    sibling_finding = {
+        "summary": "A stale sibling must not drive the harvest",
+        "evidence": "The session reported an unrelated spec path",
+        "location": "src/unrelated.py:1",
+        "severity": "high",
+    }
+    write_id_spec = stories_dev_effect(deferred=[STORY_FINDING])
+
+    def report_sibling(spec):
+        result = write_id_spec(spec)
+        result_json = dict(result.result_json or {})
+        sibling = Path(spec.cwd) / SPEC_FOLDER / "stories" / "stale-sibling.md"
+        write_spec(
+            sibling,
+            "done",
+            result_json["baseline_commit"],
+            deferred=[sibling_finding],
+        )
+        result_json["spec_file"] = str(sibling)
+        return SessionResult(status="completed", result_json=result_json)
+
+    setup_stories(project, [entry("1")])
+    engine, _ = make_engine(project, [report_sibling])
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    entries = deferredwork.parse_ledger(project.deferred_work.read_text(encoding="utf-8"))
+    assert [item.title for item in entries] == [STORY_FINDING["summary"]]
+    assert "source_spec: `1-slug.md`" in entries[0].body
+
+
 def test_plan_halt_leg_does_not_harvest_then_implement_leg_does(project):
     from bmad_loop import deferredwork
 
