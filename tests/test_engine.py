@@ -8510,7 +8510,9 @@ def test_ledger_classifier_reports_tracked_inside_workspace_as_gits(project):
     assert engine._ledger_is_gits_to_restore(StoryTask(story_key="1-1-a", epic=1)) is True
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="directory symlink needs no elevation on POSIX")
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="creating a directory symlink needs elevation on Windows"
+)
 def test_ledger_classifier_retries_lexical_outside_with_resolved_paths(project, tmp_path):
     from bmad_loop.workspace import Workspace
 
@@ -8902,6 +8904,99 @@ def test_failed_auto_reset_disarms_snapshot_before_ambient_crash_save(project, m
     assert "rollback-auto" in [e["kind"] for e in engine.journal.entries()]
     assert seen_before_ambient_save == [(False, None)]
     assert not project.deferred_work.exists()
+
+
+@pytest.mark.parametrize(
+    ("rollback_on_failure", "terminal_event"),
+    [(False, "run-paused"), (True, "run-crash")],
+)
+def test_restore_failure_preserves_existing_unwind_and_durably_disarms(
+    project, monkeypatch, rollback_on_failure, terminal_event
+):
+    """A secondary restore fault cannot replace a pause or reset failure."""
+    policy = dataclasses.replace(
+        _harvest_policy(attempts=2),
+        scm=ScmPolicy(rollback_on_failure=rollback_on_failure),
+    )
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [_baseline_liar_effect(project, deferred=[HARVEST_A])],
+        policy=policy,
+    )
+
+    if rollback_on_failure:
+
+        def failing_reset(*args, **kwargs):
+            raise GitError("primary reset failure")
+
+        monkeypatch.setattr(verify, "safe_rollback", failing_reset)
+
+    def failing_restore(*args, **kwargs):
+        raise OSError("secondary ledger restore failure")
+
+    monkeypatch.setattr(engine, "_restore_persisted_ledger", failing_restore)
+    seen_before_ambient_save: list[tuple[bool, str | None]] = []
+    real_append = engine.journal.append
+
+    def probing_append(kind, **fields):
+        if kind == terminal_event:
+            persisted = load_state(engine.run_dir).tasks["1-1-a"]
+            seen_before_ambient_save.append(
+                (persisted.pre_harvest_ledger_captured, persisted.pre_harvest_ledger)
+            )
+        return real_append(kind, **fields)
+
+    monkeypatch.setattr(engine.journal, "append", probing_append)
+
+    summary = engine.run()
+
+    if rollback_on_failure:
+        assert summary.crashed and summary.crash_error.startswith("GitError")
+    else:
+        assert summary.paused and not summary.crashed
+    (restore_event,) = [e for e in engine.journal.entries() if e["kind"] == "ledger-restore-failed"]
+    assert restore_event["error"] == "OSError: secondary ledger restore failure"
+    assert seen_before_ambient_save == [(False, None)]
+    assert project.deferred_work.exists()
+
+
+def test_restore_failure_after_returned_rollback_raises_after_durable_disarm(project, monkeypatch):
+    """With no prior unwind, the repair failure stays fail-loud after cleanup."""
+    policy = dataclasses.replace(
+        _harvest_policy(attempts=2),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [_baseline_liar_effect(project, deferred=[HARVEST_A])],
+        policy=policy,
+    )
+
+    def failing_restore(*args, **kwargs):
+        raise OSError("sole ledger restore failure")
+
+    monkeypatch.setattr(engine, "_restore_persisted_ledger", failing_restore)
+    seen_before_ambient_save: list[tuple[bool, str | None]] = []
+    real_append = engine.journal.append
+
+    def probing_append(kind, **fields):
+        if kind == "run-crash":
+            persisted = load_state(engine.run_dir).tasks["1-1-a"]
+            seen_before_ambient_save.append(
+                (persisted.pre_harvest_ledger_captured, persisted.pre_harvest_ledger)
+            )
+        return real_append(kind, **fields)
+
+    monkeypatch.setattr(engine.journal, "append", probing_append)
+
+    summary = engine.run()
+
+    assert summary.crashed and summary.crash_error.startswith("OSError")
+    (restore_event,) = [e for e in engine.journal.entries() if e["kind"] == "ledger-restore-failed"]
+    assert restore_event["error"] == "OSError: sole ledger restore failure"
+    assert seen_before_ambient_save == [(False, None)]
 
 
 def test_awaiting_operator_resume_spends_snapshot_before_commit_window(project, monkeypatch):

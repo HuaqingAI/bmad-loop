@@ -1489,6 +1489,7 @@ class Engine:
                         # rollback. Detect the active unwind without limiting it to
                         # RunPaused: reset/preserve failures are the #420 gap.
                         unwinding = sys.exc_info()[0] is not None
+                        restore_error: OSError | None = None
                         # Recovery resets code/spec state but protects artifact
                         # directories through `_safe_reset`'s
                         # keep=(".bmad-loop", *self._protected_relpaths()) shield.
@@ -1497,21 +1498,40 @@ class Engine:
                         # performs the ledger revert only when the ledger is tracked.
                         # Run this for stop-and-wait too: the operator's eventual
                         # reset would not remove an untracked or ignored file either.
-                        self._restore_persisted_ledger(task, replayed=replayed)
+                        try:
+                            self._restore_persisted_ledger(task, replayed=replayed)
+                        except OSError as e:
+                            # Preserve an exception already in flight; replacing a
+                            # RunPaused/reset fault would misclassify the run and
+                            # skip the stale-arm cleanup below. The journal keeps
+                            # this secondary repair failure visible.
+                            restore_error = e
+                            self.journal.append(
+                                "ledger-restore-failed",
+                                story_key=task.story_key,
+                                error=f"{type(e).__name__}: {e}",
+                            )
                         # Rebase from the snapshot already in hand so a filesystem
                         # fault cannot replace a RunPaused while unwinding.
                         if task.pre_harvest_ledger_captured:
                             task.baseline_ledger_digest = _digest_of(task.pre_harvest_ledger)
-                        # The completed restore spent the chain snapshot whether
-                        # rollback returned, paused, or failed while resetting. A
+                        # Leaving this attempt spends the chain snapshot even when
+                        # its repair failed: retaining stale bytes across a pause or
+                        # crash would let resume overwrite later operator work. A
                         # fixable retry never enters this branch and keeps its arm.
                         self._disarm_ledger_snapshot(task)
-                        if unwinding:
+                        if unwinding or restore_error is not None:
                             # A pause or rollback failure skips the next loop/save;
                             # persist before it can ride a human window or #420's
-                            # crash path. On a returned rollback the next attempt's
-                            # ordinary save supplies durability.
+                            # crash path. A restore failure must likewise persist
+                            # the disarm before it is raised. On a cleanly returned
+                            # rollback the next attempt's ordinary save supplies
+                            # durability.
                             self._save()
+                        if restore_error is not None and not unwinding:
+                            # Repair writes fail loud when there is no earlier
+                            # exception whose identity must be preserved.
+                            raise restore_error
                 continue
             # DEFER and escalation preserve their current tree/knowledge rather
             # than rejecting the attempt, so neither may later consume this arm.
