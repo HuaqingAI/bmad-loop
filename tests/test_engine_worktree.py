@@ -1185,11 +1185,14 @@ def test_awaiting_operator_isolated_unit_carries_a_gitignored_harvest(project):
     assert [event["dw_ids"] for event in _harvest_carry_events(engine)] == [["DW-1"]]
 
 
-@pytest.mark.parametrize("merge_strategy", ["merge", "ff", "squash"])
+@pytest.mark.parametrize(
+    ("merge_strategy", "resumed_strategy"),
+    [("merge", "ff"), ("ff", "squash"), ("squash", "merge")],
+)
 def test_host_loss_after_merge_before_evidence_replays_gitignored_harvest(
-    project, monkeypatch, merge_strategy
+    project, monkeypatch, merge_strategy, resumed_strategy
 ):
-    """A landed branch remains recoverable before `unit-merged` is journaled."""
+    """Replay uses durable merge intent even when the live policy changed."""
     ignore_before_commit(project, "deferred-work.md")
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
     engine, _ = make_engine(
@@ -1226,6 +1229,7 @@ def test_host_loss_after_merge_before_evidence_replays_gitignored_harvest(
     monkeypatch.setattr(engine.journal, "append", real_append)
     replay_collision_refs: list[str] = []
     replay_merge_refs: list[str] = []
+    replay_strategies: list[str] = []
     real_clean = verify.clean_incoming_collisions
     real_merge = verify.merge_branch
 
@@ -1235,13 +1239,14 @@ def test_host_loss_after_merge_before_evidence_replays_gitignored_harvest(
 
     def record_merge_ref(repo, merge_ref, **kwargs):
         replay_merge_refs.append(merge_ref)
+        replay_strategies.append(kwargs["strategy"])
         return real_merge(repo, merge_ref, **kwargs)
 
     monkeypatch.setattr(verify, "clean_incoming_collisions", record_collision_ref)
     monkeypatch.setattr(verify, "merge_branch", record_merge_ref)
     resumed = Engine(
         paths=project,
-        policy=engine.policy,
+        policy=wt_policy(merge_strategy=resumed_strategy),
         adapter=MockAdapter([]),
         run_dir=engine.run_dir,
         journal=engine.journal,
@@ -1253,8 +1258,19 @@ def test_host_loss_after_merge_before_evidence_replays_gitignored_harvest(
     assert rev_parse_head(project.project) == landed_head
     assert replay_collision_refs == [crashed.commit_sha]
     assert replay_merge_refs == [crashed.commit_sha]
+    assert replay_strategies == [merge_strategy]
     assert "unit-merge-started" in journal_kinds(resumed)
     assert "unit-merged" in journal_kinds(resumed)
+    assert [
+        (entry["strategy"], entry["source"])
+        for entry in resumed.journal.entries()
+        if entry["kind"] == "resume-unit-merge"
+    ] == [(merge_strategy, crashed.commit_sha)]
+    assert [
+        (entry["strategy"], entry["source"])
+        for entry in resumed.journal.entries()
+        if entry["kind"] == "unit-merged"
+    ] == [(merge_strategy, crashed.commit_sha)]
     assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
     assert load_state(resumed.run_dir).tasks["1-1-a"].isolated_ledger_carried
 

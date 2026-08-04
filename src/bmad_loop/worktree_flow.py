@@ -1008,11 +1008,19 @@ class WorktreeFlow:
                 patch=str(patch) if patch else None,
             )
 
-    def merge_local(self, task: StoryTask, unit: UnitWorkspace, *, replay: bool = False) -> None:
+    def merge_local(
+        self,
+        task: StoryTask,
+        unit: UnitWorkspace,
+        *,
+        replay: bool = False,
+        replay_strategy: str | None = None,
+    ) -> None:
         """Merge a DONE unit's branch into the target branch from the main repo."""
         if not replay:
             self._emit("pre_merge", task)
         scm = self.policy.scm
+        merge_strategy = scm.merge_strategy if replay_strategy is None else replay_strategy
         repo = self.paths.repo_root
         target = self.state.target_branch
         source = task.commit_sha or verify.rev_parse_head(unit.path)
@@ -1079,14 +1087,14 @@ class WorktreeFlow:
                 story_key=task.story_key,
                 branch=unit.branch,
                 target=target,
-                strategy=scm.merge_strategy,
+                strategy=merge_strategy,
                 source=source,
             )
         try:
             verify.merge_branch(
                 repo,
                 merge_ref,
-                strategy=scm.merge_strategy,
+                strategy=merge_strategy,
                 message=self.merge_message(task),
                 allow_empty_squash=replay,
             )
@@ -1105,7 +1113,7 @@ class WorktreeFlow:
             story_key=task.story_key,
             branch=unit.branch,
             target=self.state.target_branch,
-            strategy=scm.merge_strategy,
+            strategy=merge_strategy,
             source=source,
         )
         self._emit("post_merge", task)

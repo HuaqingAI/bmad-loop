@@ -632,8 +632,20 @@ class Engine:
     def _integrate_unit(self, task: StoryTask, unit: UnitWorkspace) -> None:
         self._worktree_flow.integrate_unit(task, unit)
 
-    def _merge_local(self, task: StoryTask, unit: UnitWorkspace, *, replay: bool = False) -> None:
-        self._worktree_flow.merge_local(task, unit, replay=replay)
+    def _merge_local(
+        self,
+        task: StoryTask,
+        unit: UnitWorkspace,
+        *,
+        replay: bool = False,
+        replay_strategy: str | None = None,
+    ) -> None:
+        self._worktree_flow.merge_local(
+            task,
+            unit,
+            replay=replay,
+            replay_strategy=replay_strategy,
+        )
 
     def _keep_branch_and_escalate(self, task: StoryTask, unit: UnitWorkspace, reason: str) -> None:
         self._worktree_flow.keep_branch_and_escalate(task, unit, reason)
@@ -841,9 +853,8 @@ class Engine:
                 str(entry.get("story_key", "")),
                 str(entry.get("branch", "")),
                 str(entry.get("target", "")),
-                str(entry.get("strategy", "")),
                 str(entry.get("source", "")),
-            )
+            ): str(entry.get("strategy", ""))
             for entry in entries
             if entry.get("kind") == "unit-merge-started"
         }
@@ -866,12 +877,9 @@ class Engine:
                 continue
             if merged_key not in merged_units:
                 source = task.commit_sha or ""
-                started_key = (
-                    *merged_key,
-                    self.policy.scm.merge_strategy,
-                    source,
-                )
-                if not source or started_key not in started_units:
+                started_key = (*merged_key, source)
+                replay_strategy = started_units.get(started_key)
+                if not source or replay_strategy is None:
                     continue
                 # The write-ahead record is intent, never merge proof. Re-run the
                 # exact merge and latch completion only after git confirms it;
@@ -882,11 +890,16 @@ class Engine:
                     story_key=task.story_key,
                     branch=task.branch,
                     target=self.state.target_branch,
-                    strategy=self.policy.scm.merge_strategy,
+                    strategy=replay_strategy,
                     source=source,
                 )
                 unit = self._reopen_unit(task)
-                self._merge_local(task, unit, replay=True)
+                self._merge_local(
+                    task,
+                    unit,
+                    replay=True,
+                    replay_strategy=replay_strategy,
+                )
                 merged_units.add(merged_key)
             self.journal.append("resume-ledger-carry", story_key=task.story_key)
             self._carry_isolated_ledger_writes(task)
