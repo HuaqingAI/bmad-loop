@@ -43,6 +43,7 @@ from .model import (
     RunState,
     SessionRecord,
     StoryTask,
+    VerifyOutcome,
 )
 from .platform_util import atomic_replace, atomic_write_text, retrying_unlink, safe_segment
 from .plugins import HookBus, HookContext, PluginRegistry
@@ -1331,7 +1332,7 @@ class Engine:
                 # ledger before the artifact gate so an accepted attempt carries
                 # them in its story commit. `_harvest_gate_exclude` keeps this
                 # engine-authored append from becoming proof of session work.
-                self._harvest_spec_deferrals(task, result.result_json)
+                harvest_outcome = self._harvest_spec_deferrals(task, result.result_json)
                 # carry the skill's follow-up-review recommendation (PR #2505)
                 # onto the task so _review_and_commit can gate the review loop.
                 # A present key is authoritative (folded from the frontmatter, or
@@ -1344,7 +1345,7 @@ class Engine:
                     task.followup_review_recommended = bool(rj["followup_review_recommended"])
                 else:
                     task.followup_review_recommended = self._followup_from_spec(task, rj)
-                outcome = self._verify_dev_artifacts(task, result.result_json)
+                outcome = harvest_outcome or self._verify_dev_artifacts(task, result.result_json)
                 if outcome.ok and self._run_verify_commands_after_dev(task, result.result_json):
                     # deterministic gates run here too: a broken build must not
                     # reach the (far more expensive) review loop
@@ -1605,7 +1606,18 @@ class Engine:
             # A follow-up review is another full dev-primitive pass and may add
             # findings to the same frontmatter list. Harvest after reconciliation
             # makes a prose-finalized pass visible; the dev-leg entries dedupe.
-            self._harvest_spec_deferrals(task, rj)
+            harvest_outcome = self._harvest_spec_deferrals(task, rj)
+            if harvest_outcome is not None:
+                self.journal.append(
+                    "review-verify-failed",
+                    story_key=task.story_key,
+                    reason=harvest_outcome.reason,
+                    env_fault=harvest_outcome.env_fault,
+                    contradiction=harvest_outcome.contradiction,
+                )
+                if not harvest_outcome.retryable:
+                    self._escalate(task, harvest_outcome.reason)
+                continue
             status = str(rj.get("status", "")).strip()
             last_status = status  # remember the last completed pass for the defer reason
             followup = bool(rj.get("followup_review_recommended", False))
@@ -1793,8 +1805,8 @@ class Engine:
         # A timed-out review can still have recorded new frontmatter findings.
         # Normalize first so the success-status gate sees `done`, then mirror the
         # normal review path before deterministic verification and commit.
-        self._harvest_spec_deferrals(task, {"spec_file": str(spec_path)})
-        outcome = self._verify_review(task)
+        harvest_outcome = self._harvest_spec_deferrals(task, {"spec_file": str(spec_path)})
+        outcome = harvest_outcome or self._verify_review(task)
         if not outcome.ok:
             self.journal.append(
                 "review-timeout-salvage-failed",
@@ -2513,7 +2525,9 @@ class Engine:
         target = "review" if review_enabled else "done"
         sprint_advance(self.workspace.paths.sprint_status, task.story_key, target)
 
-    def _harvest_spec_deferrals(self, task: StoryTask, result_json: dict | None) -> None:
+    def _harvest_spec_deferrals(
+        self, task: StoryTask, result_json: dict | None
+    ) -> VerifyOutcome | None:
         """Carry a successful dev primitive's ``deferred:`` findings into the ledger.
 
         BMAD-METHOD #2640 moved defer-triaged review findings from
@@ -2532,10 +2546,11 @@ class Engine:
         status. The spec frontmatter is never mutated; the ledger watermark is
         sufficient and avoids unsafe YAML block-scalar surgery.
 
-        Ledger writes are unguarded by design: observation may degrade, but a
-        failed repair write must raise rather than silently drop recorded work.
-        Phase 6K will pair this with rollback snapshot/restore; until then a
-        harvested entry can survive a rolled-back attempt.
+        Reading the finding source is part of this required repair. A transient
+        read failure returns a retry outcome rather than degrading like optional
+        bookkeeping observation: a later verify read must not accept the session
+        while silently dropping its recorded work. Ledger writes remain unguarded
+        so a failed repair write raises.
         """
         if not self._generic_dev():
             return
@@ -2561,8 +2576,15 @@ class Engine:
                 spec=str(spec_path),
             )
             return
-        fm = self._observed_frontmatter(spec_path, task.story_key, "spec-deferrals")
-        if fm is None or devcontract.DEFERRED_FIELD not in fm:
+        try:
+            fm = verify.read_frontmatter(spec_path)
+        except OSError as e:
+            self._journal_spec_read_failed(spec_path, task.story_key, "spec-deferrals", e)
+            return VerifyOutcome.retry(
+                "spec unreadable while harvesting deferrals "
+                f"({e.__class__.__name__}: {e}): {spec_path}"
+            )
+        if devcontract.DEFERRED_FIELD not in fm:
             return
         status = verify.status_of(fm)
         success_status = "in-review" if self._dev_review_enabled() else "done"
