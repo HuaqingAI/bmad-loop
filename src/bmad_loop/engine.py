@@ -2441,6 +2441,22 @@ class Engine:
         spec_path = verify.resolve_spec_path(str(spec_file), self.workspace.paths)
         if not spec_path.is_file():
             return
+        # A session supplies `spec_file`; like reconcile, marker repair, and
+        # declared closes, harvesting must not let an arbitrary readable path
+        # outside the orchestrator-owned roots steer a ledger write.
+        try:
+            within = verify.spec_within_roots(spec_path, self.workspace.paths)
+        except (OSError, RuntimeError):
+            # resolve() faulted (a symlink loop, an unreadable component):
+            # containment can vouch for nothing, so refuse the same way.
+            within = False
+        if not within:
+            self.journal.append(
+                "spec-deferrals-skipped-out-of-tree",
+                story_key=task.story_key,
+                spec=str(spec_path),
+            )
+            return
         fm = self._observed_frontmatter(spec_path, task.story_key, "spec-deferrals")
         if fm is None or devcontract.DEFERRED_FIELD not in fm:
             return
@@ -2877,6 +2893,14 @@ class Engine:
             # The proof-of-work gate only sees the project tree, so an external
             # ledger cannot satisfy it and needs no exclusion.
             return ()
+        except (OSError, RuntimeError):
+            # ProjectPaths are normalized when loaded. If filesystem resolution
+            # nevertheless faults, keep a lexically in-project ledger excluded:
+            # uncertainty must not turn the engine's append into session proof.
+            try:
+                rel = paths.deferred_work.relative_to(paths.project)
+            except ValueError:
+                return ()
         return (rel.as_posix(),)
 
     def _verify_dev_artifacts(self, task: StoryTask, result_json: dict | None):

@@ -8038,6 +8038,48 @@ def test_spec_deferrals_absent_field_writes_no_ledger(project):
     assert not [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
 
 
+def test_spec_deferrals_skip_out_of_tree_session_spec(project, tmp_path):
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    outside = tmp_path / "outside-spec.md"
+    write_spec(outside, "done", "abc123", deferred=[HARVEST_A])
+
+    engine._harvest_spec_deferrals(task, {"spec_file": str(outside)})
+
+    assert not project.deferred_work.exists()
+    assert task.harvested_deferrals == []
+    assert task.harvest_wrote_ledger is False
+    skipped = [
+        e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-skipped-out-of-tree"
+    ]
+    assert len(skipped) == 1
+    assert skipped[0]["story_key"] == task.story_key
+    assert skipped[0]["spec"] == str(outside)
+
+
+@pytest.mark.parametrize("error_type", [OSError, RuntimeError])
+def test_spec_deferrals_skip_when_containment_probe_faults(project, monkeypatch, error_type):
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    sp = spec_path(project, task.story_key)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(sp, "done", "abc123", deferred=[HARVEST_A])
+
+    def containment_fault(*args, **kwargs):
+        raise error_type("injected containment fault")
+
+    monkeypatch.setattr(verify, "spec_within_roots", containment_fault)
+    engine._harvest_spec_deferrals(task, {"spec_file": str(sp)})
+
+    assert not project.deferred_work.exists()
+    assert task.harvested_deferrals == []
+    assert task.harvest_wrote_ledger is False
+    skipped = [
+        e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-skipped-out-of-tree"
+    ]
+    assert len(skipped) == 1 and skipped[0]["spec"] == str(sp)
+
+
 def test_spec_deferrals_harvest_across_the_disk_resolved_skill_rename(project):
     from conftest import attach_profile, install_build_auto_skill
 
@@ -8275,6 +8317,49 @@ def test_harvest_alone_is_not_proof_of_work(project):
     assert "no changes" in decisions[0]["reason"]
     assert [s.role for s in adapter.sessions] == ["dev", "dev"]
     assert summary.done == 1
+
+
+@pytest.mark.parametrize("error_type", [OSError, RuntimeError])
+def test_harvest_gate_resolve_fault_fails_proof_conservatively_without_crashing(
+    project, monkeypatch, error_type
+):
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(
+                project,
+                "1-1-a",
+                followup_review=False,
+                write_src=False,
+                deferred=[HARVEST_A],
+            ),
+            dev_effect(project, "1-1-a", followup_review=False),
+        ],
+        policy=_harvest_policy(attempts=2),
+    )
+    real_gate = engine._harvest_gate_exclude
+    real_resolve = Path.resolve
+
+    def resolve_fault(self, *args, **kwargs):
+        if self == project.deferred_work:
+            raise error_type("injected ledger resolve fault")
+        return real_resolve(self, *args, **kwargs)
+
+    def gate_with_fault(task):
+        with monkeypatch.context() as m:
+            m.setattr(Path, "resolve", resolve_fault)
+            return real_gate(task)
+
+    monkeypatch.setattr(engine, "_harvest_gate_exclude", gate_with_fault)
+
+    summary = engine.run()
+
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert [decision["action"] for decision in decisions] == ["retry", "proceed"]
+    assert "no changes" in decisions[0]["reason"]
+    assert len(adapter.sessions) == 2
+    assert summary.done == 1 and not summary.crashed and not summary.paused
 
 
 def test_real_work_plus_a_harvest_still_proceeds(project):
