@@ -34,7 +34,7 @@ from conftest import (
 from bmad_loop import deferredwork, platform_util, verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
-from bmad_loop.engine import Engine, RunPaused, RunStopped, _run_depth
+from bmad_loop.engine import Engine, RunPaused, RunStopped, _digest_of, _run_depth
 from bmad_loop.journal import Journal, load_state
 from bmad_loop.model import (
     PAUSE_EPIC_BOUNDARY,
@@ -7976,6 +7976,84 @@ def _harvest_entries(project):
     return deferredwork.parse_ledger(text)
 
 
+# A well-formed sha that is not any commit in the sandbox repo. The dev artifact
+# gate rejects it non-fixably after the completed session has been harvested,
+# which drives the snapshot restore path rather than the fixable-feedback path.
+LYING_BASELINE = "deadbeef" * 5
+
+
+def _baseline_liar_effect(project, story_key: str = "1-1-a", *, deferred=None):
+    def effect(_spec):
+        source = project.project / "src.txt"
+        source.write_text(source.read_text() + f"change for {story_key}\n")
+        sp = spec_path(project, story_key)
+        write_spec(sp, "done", LYING_BASELINE, deferred=deferred)
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": story_key,
+                "spec_file": str(sp),
+                "baseline_commit": LYING_BASELINE,
+                "tasks_total": 3,
+                "tasks_done": 3,
+                "verification": [],
+                "escalations": [],
+                "followup_review_recommended": False,
+            },
+        )
+
+    return effect
+
+
+def _gitignore_harvest_ledger(project) -> str:
+    """Ignore and commit the ledger rule without losing the template rules."""
+    rel = project.deferred_work.relative_to(project.project).as_posix()
+    gitignore = project.project / ".gitignore"
+    gitignore.write_text(gitignore.read_text(encoding="utf-8") + rel + "\n", encoding="utf-8")
+    git(project.project, "add", ".gitignore")
+    git(project.project, "commit", "-q", "-m", "ignore deferred-work ledger")
+    assert git(project.project, "check-ignore", rel).strip() == rel
+    return rel
+
+
+def _crash_after_harvest(engine) -> None:
+    """Crash after the ledger write but before the attempt decision acts."""
+    original_emit = engine._emit
+
+    def crashing_emit(stage, *args, **kwargs):
+        if stage == "post_dev_verify":
+            raise RuntimeError("host died after harvest")
+        return original_emit(stage, *args, **kwargs)
+
+    engine._emit = crashing_emit
+
+
+def _pause_harvest_policy(*, attempts: int = 2) -> Policy:
+    return dataclasses.replace(
+        _harvest_policy(attempts=attempts),
+        scm=ScmPolicy(rollback_on_failure=False),
+    )
+
+
+def _run_harvest_to_pause(project, *, attempts: int = 2):
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [_baseline_liar_effect(project, deferred=[HARVEST_A])],
+        policy=_pause_harvest_policy(attempts=attempts),
+    )
+    assert engine.run().paused
+    return engine
+
+
+def _fixable_harvest_chain_policy(marker: Path, *, attempts: int = 3) -> Policy:
+    return dataclasses.replace(
+        _harvest_policy(attempts=attempts),
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker),)),
+    )
+
+
 def _fail_nth_harvest(engine, monkeypatch, nth: int) -> None:
     """Inject the retry outcome produced by a one-shot harvest read fault."""
     real_harvest = engine._harvest_spec_deferrals
@@ -8375,6 +8453,128 @@ def test_review_pass_deferrals_harvested_and_deduped_across_both_sites(project):
     assert events[-1]["deduped"] == 1
 
 
+def test_ledger_digest_collapses_absent_and_empty_only():
+    assert _digest_of(None) == _digest_of("")
+    assert _digest_of("# Deferred Work\n") != _digest_of(None)
+
+
+def test_persisted_ledger_restore_is_gated_by_capture_flag(project):
+    """None text is active only with the independent captured flag."""
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("operator-owned\n", encoding="utf-8")
+
+    task.pre_harvest_ledger = None
+    task.pre_harvest_ledger_captured = False
+    engine._restore_persisted_ledger(task, replayed=False)
+    assert project.deferred_work.read_text(encoding="utf-8") == "operator-owned\n"
+
+    task.pre_harvest_ledger_captured = True
+    engine._restore_persisted_ledger(task, replayed=False)
+    assert not project.deferred_work.exists()
+    # Restore never prunes the harmless orchestrator-owned parent.
+    assert project.deferred_work.parent.is_dir()
+
+
+def test_unarmed_replay_journals_missing_snapshot_without_touching_ledger(project):
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("operator-owned\n", encoding="utf-8")
+
+    engine._restore_persisted_ledger(task, replayed=True)
+
+    assert project.deferred_work.read_text(encoding="utf-8") == "operator-owned\n"
+    assert "ledger-snapshot-missing" in [e["kind"] for e in engine.journal.entries()]
+
+
+def test_ledger_classifier_reports_external_as_not_gits(project, tmp_path):
+    outside = dataclasses.replace(
+        project,
+        implementation_artifacts=tmp_path / "shared" / "implementation-artifacts",
+    )
+    outside.implementation_artifacts.mkdir(parents=True)
+    engine, _ = make_engine(outside, [], policy=_harvest_policy())
+
+    assert engine._ledger_is_gits_to_restore(StoryTask(story_key="1-1-a", epic=1)) is False
+
+
+def test_ledger_classifier_reports_tracked_inside_workspace_as_gits(project):
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track deferred-work")
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+
+    assert engine._ledger_is_gits_to_restore(StoryTask(story_key="1-1-a", epic=1)) is True
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="creating a directory symlink needs elevation on Windows"
+)
+def test_ledger_classifier_retries_lexical_outside_with_resolved_paths(project, tmp_path):
+    from bmad_loop.workspace import Workspace
+
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track deferred-work")
+    linked_root = tmp_path / "linked-root"
+    linked_root.symlink_to(project.project, target_is_directory=True)
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    engine.workspace = Workspace(root=linked_root, paths=project)
+    with pytest.raises(ValueError):
+        project.deferred_work.relative_to(linked_root)
+
+    assert engine._ledger_is_gits_to_restore(StoryTask(story_key="1-1-a", epic=1)) is True
+
+
+def test_ledger_tracked_probe_failure_keeps_file_and_journals(project, monkeypatch):
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("uncertain ownership\n", encoding="utf-8")
+
+    def fail_probe(*args, **kwargs):
+        raise GitError("injected tracked probe failure")
+
+    monkeypatch.setattr(verify, "path_tracked", fail_probe)
+    engine._restore_ledger(task, None)
+
+    assert project.deferred_work.read_text(encoding="utf-8") == "uncertain ownership\n"
+    (event,) = [e for e in engine.journal.entries() if e["kind"] == "ledger-tracked-probe-failed"]
+    assert event["story_key"] == task.story_key
+
+
+def test_ledger_scope_probe_failure_keeps_file_and_journals(project, monkeypatch):
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("uncertain scope\n", encoding="utf-8")
+    ledger = project.deferred_work
+    real_relative_to = Path.relative_to
+    real_resolve = Path.resolve
+
+    def outside_relative_to(self, *other, **kwargs):
+        if self == ledger:
+            raise ValueError("injected lexical outside")
+        return real_relative_to(self, *other, **kwargs)
+
+    def failed_resolve(self, *args, **kwargs):
+        if self == ledger:
+            raise OSError("injected scope probe failure")
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "relative_to", outside_relative_to)
+    monkeypatch.setattr(Path, "resolve", failed_resolve)
+    engine._restore_ledger(task, None)
+
+    assert project.deferred_work.read_text(encoding="utf-8") == "uncertain scope\n"
+    (event,) = [e for e in engine.journal.entries() if e["kind"] == "ledger-scope-probe-failed"]
+    assert event["story_key"] == task.story_key
+
+
 def test_pre_harvest_ledger_restore_is_atomic_on_publication_failure(project, monkeypatch):
     """A failed rollback publish leaves the current ledger byte-intact."""
     engine, _ = make_engine(project, [], policy=_harvest_policy())
@@ -8395,9 +8595,114 @@ def test_pre_harvest_ledger_restore_is_atomic_on_publication_failure(project, mo
     assert list(project.deferred_work.parent.glob("deferred-work.md.*.tmp")) == []
 
 
-def test_nonfixable_retry_reverts_harvest_before_the_next_attempt(project):
+def test_nonfixable_retry_leaves_tracked_ledger_at_its_baseline_bytes(project):
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    before = "# Deferred Work\n\ntracked baseline\n"
+    project.deferred_work.write_text(before, encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track deferred-work")
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            _baseline_liar_effect(project, deferred=[HARVEST_A]),
+            dev_effect(project, "1-1-a", followup_review=False),
+        ],
+        policy=_harvest_policy(attempts=2),
+    )
+
+    assert engine.run().done == 1
+
+    assert project.deferred_work.read_text(encoding="utf-8") == before
+    assert HARVEST_A["summary"] not in before
+    persisted = load_state(engine.run_dir).tasks["1-1-a"]
+    assert persisted.pre_harvest_ledger_captured is False
+    assert persisted.pre_harvest_ledger is None
+
+
+@pytest.mark.parametrize(
+    "ledger_state",
+    [
+        "created-untracked",
+        "existing-untracked",
+        "created-ignored",
+        "existing-ignored",
+        "tracked-deleted",
+    ],
+)
+def test_crash_replay_restores_the_rejected_attempts_ledger_state(project, ledger_state):
+    """Snapshots cover Git-blind states; reset owns the tracked-deleted row."""
+    before: str | None = None
+    ledger_rel = project.deferred_work.relative_to(project.project).as_posix()
+    if "ignored" in ledger_state:
+        _gitignore_harvest_ledger(project)
+    if ledger_state in ("existing-untracked", "existing-ignored"):
+        project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+        before = "# Deferred Work\n\noperator-owned bytes\n"
+        project.deferred_work.write_text(before, encoding="utf-8")
+    elif ledger_state == "tracked-deleted":
+        project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+        before = "# Deferred Work\n\ncommitted bytes\n"
+        project.deferred_work.write_text(before, encoding="utf-8")
+        git(project.project, "add", "-A")
+        git(project.project, "commit", "-q", "-m", "track then delete deferred-work")
+        project.deferred_work.unlink()
+        assert verify.path_tracked(project.project, ledger_rel)
+
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [_baseline_liar_effect(project, deferred=[HARVEST_A])],
+        policy=_harvest_policy(attempts=2),
+    )
+    _crash_after_harvest(engine)
+    assert engine.run().crashed
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed.pre_harvest_ledger_captured is True
+    assert HARVEST_A["summary"] in project.deferred_work.read_text(encoding="utf-8")
+    if "ignored" in ledger_state:
+        assert ledger_rel not in verify.untracked_files(project.project)
+        assert not verify.path_tracked(project.project, ledger_rel)
+
+    resumed, _ = resume_engine(
+        project,
+        engine,
+        [dev_effect(project, "1-1-a", followup_review=False)],
+        policy=_harvest_policy(attempts=2),
+    )
+    assert resumed.run().done == 1
+
+    if before is None:
+        assert not project.deferred_work.exists()
+    else:
+        assert project.deferred_work.read_text(encoding="utf-8") == before
+    assert "resume-verify" in [e["kind"] for e in resumed.journal.entries()]
+
+
+def test_nonfixable_retry_reverts_harvest_from_external_ledger(project, tmp_path):
+    paths = dataclasses.replace(
+        project,
+        implementation_artifacts=tmp_path / "shared" / "implementation-artifacts",
+    )
+    paths.implementation_artifacts.mkdir(parents=True)
+    write_sprint(paths, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        paths,
+        [
+            _baseline_liar_effect(paths, deferred=[HARVEST_A]),
+            dev_effect(paths, "1-1-a", followup_review=False),
+        ],
+        policy=_harvest_policy(attempts=2),
+    )
+
+    assert engine.run().done == 1
+    assert not paths.deferred_work.exists()
+
+
+def test_nonfixable_retry_reverts_harvest_before_the_next_attempt(project, monkeypatch):
     """A rejected attempt's finding is removed and the retry files it afresh."""
     ledger_present_at_retry: list[bool] = []
+    ledger_present_after_reset: list[bool] = []
 
     def retry_with_the_same_finding(spec):
         ledger_present_at_retry.append(project.deferred_work.exists())
@@ -8423,6 +8728,16 @@ def test_nonfixable_retry_reverts_harvest_before_the_next_attempt(project):
         ],
         policy=_harvest_policy(attempts=2),
     )
+    real_restore = engine._restore_persisted_ledger
+
+    def probing_restore(task, *, replayed):
+        # `_safe_reset`'s protected keep roots—not reset-hard—leave an ordinary
+        # untracked artifacts ledger standing until the explicit restore unlinks
+        # it. Patching RecoveryFlow.protected_relpaths to () makes this False.
+        ledger_present_after_reset.append(project.deferred_work.exists())
+        return real_restore(task, replayed=replayed)
+
+    monkeypatch.setattr(engine, "_restore_persisted_ledger", probing_restore)
 
     summary = engine.run()
 
@@ -8431,6 +8746,7 @@ def test_nonfixable_retry_reverts_harvest_before_the_next_attempt(project):
     assert "no changes" in decisions[0]["reason"]
     harvests = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
     assert [event["dw_ids"] for event in harvests] == [["DW-1"], ["DW-1"]]
+    assert ledger_present_after_reset == [True]
     assert ledger_present_at_retry == [False]
     assert [entry.title for entry in _harvest_entries(project)] == [HARVEST_A["summary"]]
     assert len(adapter.sessions) == 2
@@ -8466,6 +8782,379 @@ def test_nonfixable_retry_resets_harvest_records_to_the_fresh_attempt(project):
     assert summary.done == 1 and not summary.crashed and not summary.paused
     assert [item["title"] for item in task.harvested_deferrals] == [HARVEST_B["summary"]]
     assert [entry.title for entry in _harvest_entries(project)] == [HARVEST_B["summary"]]
+
+
+def test_pre_harvest_snapshot_is_on_disk_before_harvest(project, monkeypatch):
+    """Probe the arm's own save before run()'s ambient finally can mask it."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A])],
+        policy=_harvest_policy(),
+    )
+    seen: list[tuple[bool, str | None]] = []
+    real_harvest = engine._harvest_spec_deferrals
+
+    def probing_harvest(task, result_json):
+        persisted = load_state(engine.run_dir).tasks[task.story_key]
+        seen.append((persisted.pre_harvest_ledger_captured, persisted.pre_harvest_ledger))
+        return real_harvest(task, result_json)
+
+    monkeypatch.setattr(engine, "_harvest_spec_deferrals", probing_harvest)
+    assert engine.run().done == 1
+    assert seen[0] == (True, None)
+
+
+def test_proceed_disarm_is_on_disk_before_review_handoff(project, monkeypatch):
+    """Probe PROCEED's explicit save before any later commit/finally save."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("operator-owned snapshot bytes\n", encoding="utf-8")
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False)],
+        policy=_harvest_policy(),
+    )
+    seen: list[tuple[bool, str | None]] = []
+    real_emit = engine._emit
+
+    def probing_emit(stage, task=None, **fields):
+        if stage == "post_dev_phase" and task is not None:
+            persisted = load_state(engine.run_dir).tasks[task.story_key]
+            seen.append((persisted.pre_harvest_ledger_captured, persisted.pre_harvest_ledger))
+        return real_emit(stage, task, **fields)
+
+    monkeypatch.setattr(engine, "_emit", probing_emit)
+    assert engine.run().done == 1
+    assert seen == [(False, None)]
+
+
+def test_dev_defer_keeps_harvest_and_disarms_snapshot(project):
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [_baseline_liar_effect(project, deferred=[HARVEST_A])],
+        policy=_harvest_policy(attempts=1),
+    )
+
+    assert engine.run().deferred == 1
+
+    assert [entry.title for entry in _harvest_entries(project)] == [HARVEST_A["summary"]]
+    persisted = load_state(engine.run_dir).tasks["1-1-a"]
+    assert persisted.phase == Phase.DEFERRED
+    assert (persisted.pre_harvest_ledger_captured, persisted.pre_harvest_ledger) == (False, None)
+
+
+def test_dev_escalation_keeps_harvest_and_disarms_snapshot(project):
+    inner = dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A])
+
+    def escalating(spec):
+        result = inner(spec)
+        result.result_json["escalations"] = [
+            {"type": "missing-config", "severity": "CRITICAL", "detail": "operator needed"}
+        ]
+        return result
+
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [escalating], policy=_harvest_policy())
+
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1
+    assert [entry.title for entry in _harvest_entries(project)] == [HARVEST_A["summary"]]
+    persisted = load_state(engine.run_dir).tasks["1-1-a"]
+    assert persisted.phase == Phase.ESCALATED
+    assert (persisted.pre_harvest_ledger_captured, persisted.pre_harvest_ledger) == (False, None)
+
+
+def test_failed_auto_reset_disarms_snapshot_before_ambient_crash_save(project, monkeypatch):
+    """#420: rollback-on plus a reset failure must still spend the snapshot."""
+    policy = dataclasses.replace(
+        _harvest_policy(attempts=2),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    assert policy.scm.rollback_on_failure is True
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [_baseline_liar_effect(project, deferred=[HARVEST_A])],
+        policy=policy,
+    )
+
+    def failing_reset(*args, **kwargs):
+        raise GitError("injected git reset --hard failure")
+
+    monkeypatch.setattr(verify, "safe_rollback", failing_reset)
+    seen_before_ambient_save: list[tuple[bool, str | None]] = []
+    real_append = engine.journal.append
+
+    def probing_append(kind, **fields):
+        if kind == "run-crash":
+            persisted = load_state(engine.run_dir).tasks["1-1-a"]
+            seen_before_ambient_save.append(
+                (persisted.pre_harvest_ledger_captured, persisted.pre_harvest_ledger)
+            )
+        return real_append(kind, **fields)
+
+    monkeypatch.setattr(engine.journal, "append", probing_append)
+
+    summary = engine.run()
+
+    assert summary.crashed and summary.crash_error.startswith("GitError")
+    assert "rollback-auto" in [e["kind"] for e in engine.journal.entries()]
+    assert seen_before_ambient_save == [(False, None)]
+    assert not project.deferred_work.exists()
+
+
+@pytest.mark.parametrize(
+    ("rollback_on_failure", "terminal_event"),
+    [(False, "run-paused"), (True, "run-crash")],
+)
+def test_restore_failure_preserves_existing_unwind_and_durably_disarms(
+    project, monkeypatch, rollback_on_failure, terminal_event
+):
+    """A secondary restore fault cannot replace a pause or reset failure."""
+    policy = dataclasses.replace(
+        _harvest_policy(attempts=2),
+        scm=ScmPolicy(rollback_on_failure=rollback_on_failure),
+    )
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [_baseline_liar_effect(project, deferred=[HARVEST_A])],
+        policy=policy,
+    )
+
+    if rollback_on_failure:
+
+        def failing_reset(*args, **kwargs):
+            raise GitError("primary reset failure")
+
+        monkeypatch.setattr(verify, "safe_rollback", failing_reset)
+
+    def failing_restore(*args, **kwargs):
+        raise OSError("secondary ledger restore failure")
+
+    monkeypatch.setattr(engine, "_restore_persisted_ledger", failing_restore)
+    seen_before_ambient_save: list[tuple[bool, str | None]] = []
+    real_append = engine.journal.append
+
+    def probing_append(kind, **fields):
+        if kind == terminal_event:
+            persisted = load_state(engine.run_dir).tasks["1-1-a"]
+            seen_before_ambient_save.append(
+                (persisted.pre_harvest_ledger_captured, persisted.pre_harvest_ledger)
+            )
+        return real_append(kind, **fields)
+
+    monkeypatch.setattr(engine.journal, "append", probing_append)
+
+    summary = engine.run()
+
+    if rollback_on_failure:
+        assert summary.crashed and summary.crash_error.startswith("GitError")
+    else:
+        assert summary.paused and not summary.crashed
+    (restore_event,) = [e for e in engine.journal.entries() if e["kind"] == "ledger-restore-failed"]
+    assert restore_event["error"] == "OSError: secondary ledger restore failure"
+    assert seen_before_ambient_save == [(False, None)]
+    assert project.deferred_work.exists()
+
+
+def test_restore_failure_after_returned_rollback_raises_after_durable_disarm(project, monkeypatch):
+    """With no prior unwind, the repair failure stays fail-loud after cleanup."""
+    policy = dataclasses.replace(
+        _harvest_policy(attempts=2),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [_baseline_liar_effect(project, deferred=[HARVEST_A])],
+        policy=policy,
+    )
+
+    def failing_restore(*args, **kwargs):
+        raise OSError("sole ledger restore failure")
+
+    monkeypatch.setattr(engine, "_restore_persisted_ledger", failing_restore)
+    seen_before_ambient_save: list[tuple[bool, str | None]] = []
+    real_append = engine.journal.append
+
+    def probing_append(kind, **fields):
+        if kind == "run-crash":
+            persisted = load_state(engine.run_dir).tasks["1-1-a"]
+            seen_before_ambient_save.append(
+                (persisted.pre_harvest_ledger_captured, persisted.pre_harvest_ledger)
+            )
+        return real_append(kind, **fields)
+
+    monkeypatch.setattr(engine.journal, "append", probing_append)
+
+    summary = engine.run()
+
+    assert summary.crashed and summary.crash_error.startswith("OSError")
+    (restore_event,) = [e for e in engine.journal.entries() if e["kind"] == "ledger-restore-failed"]
+    assert restore_event["error"] == "OSError: sole ledger restore failure"
+    assert seen_before_ambient_save == [(False, None)]
+
+
+def test_awaiting_operator_resume_spends_snapshot_before_commit_window(project, monkeypatch):
+    """Main-only DEV_VERIFY resume bypasses `_dev_phase`'s PROCEED disarm."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            generic_dev_effect(
+                project,
+                "1-1-a",
+                final_status="awaiting-operator",
+                operator_actions=ACTIONS,
+                deferred=[HARVEST_A],
+            )
+        ],
+        policy=_park_policy(),
+    )
+    real_disarm = engine._disarm_ledger_snapshot
+
+    def crash_at_proceed_disarm(task):
+        if task.pre_harvest_ledger_captured:
+            raise RuntimeError("host died before the accepted-attempt disarm")
+        return real_disarm(task)
+
+    monkeypatch.setattr(engine, "_disarm_ledger_snapshot", crash_at_proceed_disarm)
+    assert engine.run().crashed
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed.phase == Phase.DEV_VERIFY and crashed.spec_file
+    assert crashed.pre_harvest_ledger_captured is True
+
+    resumed, _ = resume_engine(project, engine, [], policy=_park_policy())
+    seen_before_commit: list[tuple[bool, str | None]] = []
+    real_skip = resumed._skip_review_and_commit
+
+    def probing_skip(task, **kwargs):
+        persisted = load_state(resumed.run_dir).tasks[task.story_key]
+        seen_before_commit.append(
+            (persisted.pre_harvest_ledger_captured, persisted.pre_harvest_ledger)
+        )
+        return real_skip(task, **kwargs)
+
+    monkeypatch.setattr(resumed, "_skip_review_and_commit", probing_skip)
+
+    assert resumed.run().awaiting_operator == 1
+    assert seen_before_commit == [(False, None)]
+    persisted = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert persisted.phase == Phase.AWAITING_OPERATOR
+
+
+@pytest.mark.parametrize(
+    "ledger_state",
+    ["created-during-pause", "existing-untracked", "existing-tracked", "existing-ignored"],
+)
+def test_operator_ledger_edits_survive_pause_and_resume(project, ledger_state):
+    before = ""
+    if ledger_state == "existing-ignored":
+        _gitignore_harvest_ledger(project)
+    if ledger_state != "created-during-pause":
+        project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+        before = f"# Deferred Work\n\n{ledger_state}\n"
+        project.deferred_work.write_text(before, encoding="utf-8")
+    if ledger_state == "existing-tracked":
+        git(project.project, "add", "-A")
+        git(project.project, "commit", "-q", "-m", "track deferred-work")
+        rel = project.deferred_work.relative_to(project.project).as_posix()
+        assert verify.path_tracked(project.project, rel)
+
+    engine = _run_harvest_to_pause(project)
+    operator_text = before + "\noperator edit while paused\n"
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text(operator_text, encoding="utf-8")
+    resumed, _ = resume_engine(project, engine, [], policy=engine.policy)
+
+    assert resumed.run().paused
+    assert project.deferred_work.read_text(encoding="utf-8") == operator_text
+
+
+def test_pause_disarm_is_on_disk_before_run_paused_event(project, monkeypatch):
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [_baseline_liar_effect(project, deferred=[HARVEST_A])],
+        policy=_pause_harvest_policy(),
+    )
+    seen_before_ambient_save: list[tuple[bool, str | None]] = []
+    real_append = engine.journal.append
+
+    def probing_append(kind, **fields):
+        if kind == "run-paused":
+            persisted = load_state(engine.run_dir).tasks["1-1-a"]
+            seen_before_ambient_save.append(
+                (persisted.pre_harvest_ledger_captured, persisted.pre_harvest_ledger)
+            )
+        return real_append(kind, **fields)
+
+    monkeypatch.setattr(engine.journal, "append", probing_append)
+    assert engine.run().paused
+    assert seen_before_ambient_save == [(False, None)]
+
+
+def test_fixable_retry_chain_snapshot_reaches_phase_baseline(project, tmp_path):
+    marker = tmp_path / "fixed.marker"
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+
+    def repairing_liar(spec):
+        marker.write_text("ok\n", encoding="utf-8")
+        return _baseline_liar_effect(project)(spec)
+
+    engine, _ = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A]),
+            repairing_liar,
+            dev_effect(project, "1-1-a", followup_review=False),
+        ],
+        policy=_fixable_harvest_chain_policy(marker),
+    )
+
+    assert engine.run().done == 1
+    actions = [e["action"] for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert actions == ["retry", "retry", "proceed"]
+    assert [e["kind"] for e in engine.journal.entries()].count("rollback-auto") == 1
+    assert not project.deferred_work.exists()
+
+
+def test_nonfixable_chain_rollback_rebases_ledger_proof_reference(project, tmp_path):
+    marker = tmp_path / "fixed.marker"
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+
+    def repairing_liar(spec):
+        marker.write_text("ok\n", encoding="utf-8")
+        return _baseline_liar_effect(project)(spec)
+
+    engine, _ = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A]),
+            repairing_liar,
+            dev_effect(
+                project,
+                "1-1-a",
+                followup_review=False,
+                write_src=False,
+                deferred=[HARVEST_A],
+            ),
+        ],
+        policy=_fixable_harvest_chain_policy(marker),
+    )
+
+    summary = engine.run()
+
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert summary.deferred == 1 and summary.done == 0
+    assert [d["action"] for d in decisions] == ["retry", "retry", "defer"]
+    assert "no changes" in decisions[-1]["reason"]
+    harvests = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert [event["dw_ids"] for event in harvests] == [["DW-1"], ["DW-1"]]
 
 
 def test_awaiting_operator_spec_deferrals_are_harvested_before_park(project):

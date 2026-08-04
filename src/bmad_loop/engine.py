@@ -1481,31 +1481,57 @@ class Engine:
                     task.baseline_ledger_digest = self._ledger_digest()
                 else:
                     feedback = None
-                    paused = False
                     try:
                         self._rollback_or_pause(task)
-                    except RunPaused:
-                        paused = True
-                        raise
                     finally:
+                        # An exception from rollback means this attempt is leaving
+                        # the decision pipeline just as surely as a returned
+                        # rollback. Detect the active unwind without limiting it to
+                        # RunPaused: reset/preserve failures are the #420 gap.
+                        unwinding = sys.exc_info()[0] is not None
+                        restore_error: OSError | None = None
                         # Recovery resets code/spec state but protects artifact
-                        # directories, so an untracked or ignored harvest-created
-                        # ledger survives unless restored explicitly. Run this for
-                        # stop-and-wait too: the operator's eventual reset would not
-                        # remove such a file either.
-                        self._restore_persisted_ledger(task, replayed=replayed)
+                        # directories through `_safe_reset`'s
+                        # keep=(".bmad-loop", *self._protected_relpaths()) shield.
+                        # Consequently an ordinary untracked harvest-created ledger
+                        # survives unless restored explicitly; `git reset --hard`
+                        # performs the ledger revert only when the ledger is tracked.
+                        # Run this for stop-and-wait too: the operator's eventual
+                        # reset would not remove an untracked or ignored file either.
+                        try:
+                            self._restore_persisted_ledger(task, replayed=replayed)
+                        except OSError as e:
+                            # Preserve an exception already in flight; replacing a
+                            # RunPaused/reset fault would misclassify the run and
+                            # skip the stale-arm cleanup below. The journal keeps
+                            # this secondary repair failure visible.
+                            restore_error = e
+                            self.journal.append(
+                                "ledger-restore-failed",
+                                story_key=task.story_key,
+                                error=f"{type(e).__name__}: {e}",
+                            )
                         # Rebase from the snapshot already in hand so a filesystem
                         # fault cannot replace a RunPaused while unwinding.
                         if task.pre_harvest_ledger_captured:
                             task.baseline_ledger_digest = _digest_of(task.pre_harvest_ledger)
-                        if paused:
-                            # Do not carry the snapshot across a human-scale pause;
-                            # resume re-arms from the operator's then-current ledger.
-                            self._disarm_ledger_snapshot(task)
+                        # Leaving this attempt spends the chain snapshot even when
+                        # its repair failed: retaining stale bytes across a pause or
+                        # crash would let resume overwrite later operator work. A
+                        # fixable retry never enters this branch and keeps its arm.
+                        self._disarm_ledger_snapshot(task)
+                        if unwinding or restore_error is not None:
+                            # A pause or rollback failure skips the next loop/save;
+                            # persist before it can ride a human window or #420's
+                            # crash path. A restore failure must likewise persist
+                            # the disarm before it is raised. On a cleanly returned
+                            # rollback the next attempt's ordinary save supplies
+                            # durability.
                             self._save()
-                    # The completed rollback spent the chain snapshot. The next
-                    # genuinely new attempt will arm its own after its session.
-                    self._disarm_ledger_snapshot(task)
+                        if restore_error is not None and not unwinding:
+                            # Repair writes fail loud when there is no earlier
+                            # exception whose identity must be preserved.
+                            raise restore_error
                 continue
             # DEFER and escalation preserve their current tree/knowledge rather
             # than rejecting the attempt, so neither may later consume this arm.
@@ -2018,9 +2044,11 @@ class Engine:
         clears every check `done` work clears — no commit path skips verification.
 
         No `_defer` machinery: a park is a SUCCESS that commits, so there is no
-        stash, no rollback, and no ledger snapshot to unwind. (A park that fails
-        verification is not a park yet; it defers like any other unverified work,
-        through the shared path below.)"""
+        stash or rollback, and the ordinary path has no ledger snapshot to
+        unwind. A crash-resumed DEV_VERIFY park can inherit an arm from before
+        PROCEED's disarm; that exceptional snapshot is spent below. (A park that
+        fails verification is not a park yet; it defers like any other unverified
+        work, through the shared path below.)"""
         if not self._operator_park_enabled():
             return False
         spec_path = Path(task.spec_file) if task.spec_file else None
@@ -2029,6 +2057,14 @@ class Engine:
         fm = self._observed_frontmatter(spec_path, task.story_key, "operator-park")
         if fm is None or verify.status_of(fm) != verify.AWAITING_OPERATOR:
             return False
+        # A crash can resume a persisted DEV_VERIFY task directly into this
+        # main-only path, bypassing `_dev_phase`'s accepted-attempt disarm. Spend
+        # any inherited snapshot before the commit/awaiting-human window, and
+        # persist it now so a host loss inside that window cannot strand stale
+        # pre-harvest bytes on the terminal task.
+        if task.pre_harvest_ledger_captured:
+            self._disarm_ledger_snapshot(task)
+            self._save()
         # Latched BEFORE _commit's advance(COMMITTING) + _save, so a host death
         # anywhere in the commit window resumes into _finalize_commit_phase with
         # the actions already on the persisted task — and that arm re-derives
