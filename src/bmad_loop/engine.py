@@ -3771,7 +3771,16 @@ class Engine:
                 self._escalate(task, f"CRITICAL escalation from fix session: {details}")
             outcome = None
             if result.status == "completed":
-                outcome = verify.verify_commands_outcome(self.policy, self.workspace.root)
+                # A repair is another generic dev-primitive pass: it can leave
+                # terminal prose ahead of frontmatter and record fresh deferred
+                # findings just like the initial dev and review legs. Normalize
+                # and harvest before accepting its verify-green tree, because the
+                # next review pass may replace the frontmatter list.
+                self._reconcile_generic_terminal_status(task, result.result_json)
+                harvest_outcome = self._harvest_spec_deferrals(task, result.result_json)
+                outcome = harvest_outcome or verify.verify_commands_outcome(
+                    self.policy, self.workspace.root
+                )
                 if not outcome.ok:
                     reason = outcome.reason
             ok = outcome is not None and outcome.ok

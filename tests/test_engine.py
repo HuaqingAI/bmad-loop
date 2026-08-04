@@ -8400,6 +8400,103 @@ def test_review_timeout_salvage_harvests_new_frontmatter_deferrals(project):
     assert events[-1]["dw_ids"] == [harvested[-1].id]
 
 
+def test_fix_phase_harvests_findings_before_followup_review_replaces_them(project):
+    marker = project.project / "fixed.marker"
+
+    def dev_with_marker(spec):
+        marker.write_text("ok\n", encoding="utf-8")
+        return dev_effect(project, "1-1-a", deferred=[HARVEST_A])(spec)
+
+    def breaking_review(spec):
+        marker.unlink()
+        return review_effect(project, "1-1-a", clean=True)(spec)
+
+    def fix_with_new_deferral(spec):
+        marker.write_text("ok\n", encoding="utf-8")
+        return dev_effect(
+            project,
+            "1-1-a",
+            final_status="in-progress",
+            prose_status="done",
+            deferred=[HARVEST_B],
+        )(spec)
+
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    policy = dataclasses.replace(
+        _harvest_policy(review=True),
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker),)),
+    )
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_with_marker,
+            breaking_review,
+            fix_with_new_deferral,
+            review_effect(project, "1-1-a", clean=True),
+        ],
+        policy=policy,
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed and not summary.paused
+    assert [session.role for session in adapter.sessions] == ["dev", "review", "dev", "review"]
+    assert [entry.title for entry in _harvest_entries(project)] == [
+        HARVEST_A["summary"],
+        HARVEST_B["summary"],
+    ]
+    events = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert [event["dw_ids"] for event in events] == [["DW-1"], ["DW-2"]]
+
+
+def test_fix_harvest_read_failure_retries_before_rereview(project, monkeypatch):
+    marker = project.project / "fixed.marker"
+
+    def dev_with_marker(spec):
+        marker.write_text("ok\n", encoding="utf-8")
+        return dev_effect(project, "1-1-a")(spec)
+
+    def breaking_review(spec):
+        marker.unlink()
+        return review_effect(project, "1-1-a", clean=True)(spec)
+
+    def fix_with_deferral(spec):
+        marker.write_text("ok\n", encoding="utf-8")
+        return dev_effect(project, "1-1-a", deferred=[HARVEST_A])(spec)
+
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    policy = dataclasses.replace(
+        _harvest_policy(review=True),
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker),)),
+    )
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_with_marker,
+            breaking_review,
+            fix_with_deferral,
+            fix_with_deferral,
+            review_effect(project, "1-1-a", clean=True),
+        ],
+        policy=policy,
+    )
+    _fail_nth_harvest(engine, monkeypatch, 3)
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed and not summary.paused
+    assert [session.role for session in adapter.sessions] == [
+        "dev",
+        "review",
+        "dev",
+        "dev",
+        "review",
+    ]
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "fix-decision"]
+    assert [decision["ok"] for decision in decisions] == [False, True]
+    assert [entry.title for entry in _harvest_entries(project)] == [HARVEST_A["summary"]]
+
+
 def test_spec_deferrals_malformed_siblings_file_valid_and_one_aggregated_entry(project):
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     engine, _ = make_engine(

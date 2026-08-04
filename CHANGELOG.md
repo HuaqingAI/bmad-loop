@@ -1121,7 +1121,7 @@ that rode the same window. Both skill eras are supported; the rename itself need
 
 - **Deferred review findings are harvested out of the spec's frontmatter (#405).**
   BMAD-METHOD#2640 moved `defer`-triaged findings from `deferred-work.md` into the spec's own
-  `deferred:` list, silently starving the sweep pipeline. A successful dev or review session
+  `deferred:` list, silently starving the sweep pipeline. A successful dev, repair, or review session
   now files each finding into the ledger with its `location` and `severity`, journals
   `spec-deferrals-harvested`, and dedups on a fingerprint of the summary and location so a
   _fixable_ retry, a resume replay or a second review pass never re-files one — including after a
