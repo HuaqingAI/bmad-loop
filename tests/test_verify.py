@@ -3190,3 +3190,13 @@ def test_snapshot_worktree_unknown_baseline_skips_untracked(project):
     tree = git(repo, "ls-tree", "-r", "--name-only", ref)
     assert "src.txt" in tree  # tracked edit captured
     assert "user_untracked.txt" not in tree  # unknown-baseline untracked left untouched
+
+
+def test_engine_written_is_keyword_only_on_all_dev_verifiers():
+    """The three mode gates share one call contract; stories was positional in 0.9.x."""
+    import inspect
+
+    for fn in (verify.verify_dev, verify.verify_dev_bundle, verify.verify_dev_stories):
+        parameter = inspect.signature(fn).parameters["engine_written"]
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert "operator_park" in inspect.signature(verify.verify_dev).parameters

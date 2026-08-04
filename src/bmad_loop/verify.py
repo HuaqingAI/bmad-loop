@@ -1436,6 +1436,7 @@ def verify_dev(
     review_enabled: bool = True,
     *,
     operator_park: bool = False,
+    engine_written: tuple[str, ...] = (),
 ) -> VerifyOutcome:
     """Verify a dev session's on-disk artifacts against its result.json claims.
 
@@ -1454,6 +1455,11 @@ def verify_dev(
     state and to a non-empty action list. Off by policy, the token is simply not
     a terminal the gate knows, so it fails the ordinary status check and the
     session is retried with that mismatch as feedback.
+
+    ``engine_written`` names project-relative paths the orchestrator itself
+    wrote above this gate during the attempt. They compose with the mode's normal
+    proof-of-work exclusions so engine bookkeeping cannot masquerade as session
+    work; see :meth:`Engine._harvest_gate_exclude`.
     """
     rj = result_json or {}
     spec_file = rj.get("spec_file")
@@ -1483,7 +1489,7 @@ def verify_dev(
         expected_status=(
             AWAITING_OPERATOR if parked else ("in-review" if review_enabled else "done")
         ),
-        extra_exclude=(),
+        extra_exclude=engine_written,
         fm=fm,
     )
     if gate is not None:
@@ -1505,13 +1511,17 @@ def verify_dev_bundle(
     paths: ProjectPaths,
     result_json: dict[str, Any] | None,
     review_enabled: bool = True,
+    *,
+    engine_written: tuple[str, ...] = (),
 ) -> VerifyOutcome:
     """verify_dev for a deferred-work bundle: bundles have no sprint-status
     entry. The orchestrator owns the bundle→dw-id binding (``task.dw_ids``,
     marked done by ``SweepEngine``'s ledger sync); the generic ``bmad-dev-auto``
     primitive never authors dw ids. So the dw_ids cross-check is enforced only
     when the session actually claims them — an empty/absent claim is the normal
-    generic path and passes."""
+    generic path and passes.
+
+    ``engine_written`` has the same contract as :func:`verify_dev`."""
     rj = result_json or {}
     spec_file = rj.get("spec_file")
     if not spec_file:
@@ -1529,7 +1539,7 @@ def verify_dev_bundle(
         task,
         paths,
         expected_status="in-review" if review_enabled else "done",
-        extra_exclude=(),
+        extra_exclude=engine_written,
         allow_ancestor_baseline=True,
     )
     if gate is not None:
@@ -1561,6 +1571,7 @@ def verify_dev_stories(
     spec_folder: Path,
     review_enabled: bool = True,
     plan_halt: bool = False,
+    engine_written: tuple[str, ...] = (),
 ) -> VerifyOutcome:
     """verify_dev for stories mode: the story spec lives at the id-keyed path
     ``<spec-folder>/stories/<id>-<slug>.md`` and there is no sprint-status entry.
@@ -1632,14 +1643,18 @@ def verify_dev_stories(
     # Otherwise stories mode adds the spec folder's stories/ subdir + stories.yaml
     # on top of the gate's own file-granular exclude — NOT the whole-folder
     # artifact_relpaths, so a story whose entire authorized scope is ledger/spec
-    # reconciliation doesn't register as a false "no changes".
+    # reconciliation doesn't register as a false "no changes". Engine-written
+    # paths compose only on that live-gate leg; ``None`` must remain ``None`` for
+    # plan halt rather than being combined with a tuple.
     gate = _verify_shared_gates(
         spec_path,
         rj,
         task,
         paths,
         expected_status=expected,
-        extra_exclude=(None if plan_halt else _stories_relpaths(paths.project, spec_folder)),
+        extra_exclude=(
+            None if plan_halt else _stories_relpaths(paths.project, spec_folder) + engine_written
+        ),
     )
     if gate is not None:
         return gate

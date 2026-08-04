@@ -63,6 +63,14 @@ if TYPE_CHECKING:
     from .adapters.profile import CLIProfile
 
 
+# `origin:` marker prefix for ledger entries harvested out of a spec's
+# frontmatter `deferred:` list (BMAD-METHOD #2640). The full marker is
+# `<prefix> <fingerprint>` — matched verbatim on every later harvest, so it is
+# the dedup key and must never be reworded; `<prefix>-malformed <fingerprint>`
+# marks the aggregated unparseable-items meta-entry.
+HARVEST_ORIGIN = "spec-deferred"
+
+
 class RunPaused(Exception):
     def __init__(self, reason: str, stage: str, story_key: str | None = None):
         super().__init__(reason)
@@ -1185,8 +1193,15 @@ class Engine:
             # would shift the rollback/squash reference onto the completed
             # session's own tree.
             task.baseline_untracked = sorted(verify.untracked_files(self.workspace.root))
+            # Start the ledger attribution reference under the same fresh-entry
+            # rule. The harvest exclusion compares each attempt's pre-harvest
+            # ledger with this reference so a session-authored ledger edit is
+            # never hidden along with the orchestrator's own append. A fixable
+            # retry rebases it onto the tree that retry deliberately keeps.
+            task.baseline_ledger_digest = self._ledger_digest()
         feedback: Path | None = None
         while True:
+            replayed = resume_result is not None
             if resume_result is None:
                 # a resumed result replays the attempt it was recorded under, so
                 # the counter (and the session task_id derived from it) must not
@@ -1220,6 +1235,20 @@ class Engine:
             advance(task, Phase.DEV_VERIFY)
             outcome = None
             if result.status == "completed":
+                # Everything below this point that appends to the ledger is the
+                # orchestrator, not the session. Reset the write flag only when
+                # this attempt starts from a reset tree. A fixable retry keeps the
+                # prior attempt's tree and harvest, so that provenance must carry
+                # into its repair session. Preserve it on a crash replay too: the
+                # replayed harvest dedupes against the dead attempt's on-disk append.
+                if not replayed:
+                    if feedback is None:
+                        task.harvest_wrote_ledger = False
+                    if task.baseline_ledger_digest is not None:
+                        task.ledger_changed_before_harvest = (
+                            self._ledger_digest() != task.baseline_ledger_digest
+                        )
+                    self._save()
                 # bmad-dev-auto sometimes finalizes the spec in prose (## Auto Run
                 # Result: Status done) but leaves the frontmatter status at the
                 # template default. Repair it BEFORE any frontmatter reader runs —
@@ -1230,6 +1259,11 @@ class Engine:
                 # skill never touches (sprint-status for stories, the deferred-work
                 # ledger for sweep bundles), before verify reads that state.
                 self._post_dev_state_sync(task, result.result_json)
+                # Harvest the session's frontmatter `deferred:` findings into the
+                # ledger before the artifact gate so an accepted attempt carries
+                # them in its story commit. `_harvest_gate_exclude` keeps this
+                # engine-authored append from becoming proof of session work.
+                self._harvest_spec_deferrals(task, result.result_json)
                 # carry the skill's follow-up-review recommendation (PR #2505)
                 # onto the task so _review_and_commit can gate the review loop.
                 # A present key is authoritative (folded from the frontmatter, or
@@ -1278,6 +1312,11 @@ class Engine:
                     # work exists and the failure is concrete: keep the tree,
                     # hand the failing output to a repair session
                     feedback = self._write_feedback(task, decision.reason)
+                    # The repair session is judged against the kept chain. Move
+                    # the ledger reference onto that tree so the retained harvest
+                    # is accounted for, while a new session-authored ledger edit
+                    # still makes `ledger_changed_before_harvest` true.
+                    task.baseline_ledger_digest = self._ledger_digest()
                 else:
                     feedback = None
                     self._rollback_or_pause(task)
@@ -1463,6 +1502,10 @@ class Engine:
             # frontmatter's followup flag into `rj` (only when present), so the
             # convergence/damping gate below sees the finalized state.
             self._reconcile_generic_terminal_status(task, rj)
+            # A follow-up review is another full dev-primitive pass and may add
+            # findings to the same frontmatter list. Harvest after reconciliation
+            # makes a prose-finalized pass visible; the dev-leg entries dedupe.
+            self._harvest_spec_deferrals(task, rj)
             status = str(rj.get("status", "")).strip()
             last_status = status  # remember the last completed pass for the defer reason
             followup = bool(rj.get("followup_review_recommended", False))
@@ -2366,6 +2409,148 @@ class Engine:
         target = "review" if review_enabled else "done"
         sprint_advance(self.workspace.paths.sprint_status, task.story_key, target)
 
+    def _harvest_spec_deferrals(self, task: StoryTask, result_json: dict | None) -> None:
+        """Carry a successful dev primitive's ``deferred:`` findings into the ledger.
+
+        BMAD-METHOD #2640 moved defer-triaged review findings from
+        ``deferred-work.md`` into the spec frontmatter. The orchestrator owns the
+        follow-up policy, so without this bridge the recorded findings are
+        invisible to every sweep reader downstream.
+
+        This is era-agnostic: the gates are the generic-dev seam and the field's
+        presence, never the skill name resolved on disk. A pre-#2640 spec simply
+        takes the no-op path. The spec must also be at the current dev success
+        status, matching the append-on-success behavior of the former writer.
+
+        Replays are idempotent even after an entry is closed. ``append_entry``
+        intentionally dedupes open entries only, so the pre-scan checks the
+        fingerprinted ``origin:`` plus ``source_spec:`` across entries of every
+        status. The spec frontmatter is never mutated; the ledger watermark is
+        sufficient and avoids unsafe YAML block-scalar surgery.
+
+        Ledger writes are unguarded by design: observation may degrade, but a
+        failed repair write must raise rather than silently drop recorded work.
+        Phase 6K will pair this with rollback snapshot/restore; until then a
+        harvested entry can survive a rolled-back attempt.
+        """
+        if not self._generic_dev():
+            return
+        spec_file = (result_json or {}).get("spec_file")
+        if not spec_file:
+            return
+        spec_path = verify.resolve_spec_path(str(spec_file), self.workspace.paths)
+        if not spec_path.is_file():
+            return
+        fm = self._observed_frontmatter(spec_path, task.story_key, "spec-deferrals")
+        if fm is None or devcontract.DEFERRED_FIELD not in fm:
+            return
+        success_status = "in-review" if self._dev_review_enabled() else "done"
+        if verify.status_of(fm) != success_status:
+            return
+        findings, malformed = devcontract.parse_deferred_findings(fm)
+        if not findings and not malformed:
+            return
+
+        spec_name = spec_path.name
+        # (origin, title, reason, location, severity), one row per entry this
+        # harvest may file. The malformed loss is aggregated per spec so a bad
+        # sibling never suppresses a valid finding and never disappears silently.
+        pending: list[tuple[str, str, str, str | None, str | None]] = [
+            (
+                f"{HARVEST_ORIGIN} {finding.fingerprint}",
+                finding.summary,
+                finding.evidence or finding.summary,
+                finding.location or None,
+                finding.severity or None,
+            )
+            for finding in findings
+        ]
+        if malformed:
+            self.journal.append(
+                "spec-deferrals-malformed",
+                story_key=task.story_key,
+                spec=spec_name,
+                items=malformed,
+            )
+            pending.append(
+                (
+                    f"{HARVEST_ORIGIN}-malformed "
+                    f"{devcontract.harvest_fingerprint(spec_name, *malformed)}",
+                    f"Unreadable `deferred:` items in {spec_name}",
+                    "The dev session recorded deferred findings the orchestrator could not "
+                    "parse, so they were NOT filed as entries: "
+                    + "; ".join(malformed)
+                    + f". Read `{spec_name}`'s frontmatter and re-file them by hand.",
+                    None,
+                    "low",
+                )
+            )
+
+        # Persist the full intended set, not only newly-filed rows. A replay can
+        # dedupe every append while a later isolation carry still needs the data.
+        # Assignment (rather than append) also keeps the dev→review double call
+        # from duplicating the dev-leg rows in state.json.
+        task.harvested_deferrals = [
+            {
+                "origin": origin,
+                "title": title,
+                "reason": reason,
+                "location": location,
+                "severity": severity,
+                "source_spec": spec_name,
+            }
+            for origin, title, reason, location, severity in pending
+        ]
+
+        ledger = self.workspace.paths.deferred_work
+        text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+        seen = deferredwork.parse_ledger(text)
+        filed: list[str] = []
+        deduped = 0
+        for origin, title, reason, location, severity in pending:
+            if any(
+                deferredwork.field_line_present(entry.body, "origin", origin)
+                and deferredwork.field_line_present(entry.body, "source_spec", spec_name)
+                for entry in seen
+            ):
+                deduped += 1
+                continue
+            # Persist the provenance before the write. A hard host loss after
+            # append but before the later dev-decision save leaves the ledger on
+            # disk; replay then dedupes and cannot reconstruct authorship from a
+            # newly-filed id. Pre-latching is conservative if the append itself
+            # fails: excluding an unchanged path cannot create proof of work.
+            if not task.harvest_wrote_ledger:
+                task.harvest_wrote_ledger = True
+                self._save()
+            dw_id = deferredwork.append_entry(
+                ledger,
+                title=title,
+                origin=origin,
+                location=location or "n/a",
+                source_spec=spec_name,
+                reason=reason,
+                severity=severity,
+            )
+            # The writer's open-entry guard can catch two frontmatter items with
+            # the same clamped fingerprint inside this one pre-scan snapshot.
+            if dw_id is None:
+                deduped += 1
+            else:
+                filed.append(dw_id)
+        # The flag is set-only within an attempt and was latched durably before
+        # the first append. A crash replay dedupes to an empty `filed` list while
+        # the dead attempt's engine-authored ledger diff is still on disk, so it
+        # must never be cleared from the return values here.
+        self.journal.append(
+            "spec-deferrals-harvested",
+            story_key=task.story_key,
+            spec=spec_name,
+            dw_ids=filed,
+            deduped=deduped,
+            malformed=len(malformed),
+        )
+
     def _manifest_closes_deferred(self, task: StoryTask) -> tuple[str, ...]:
         """Deferred-work ids declared for this story by a *manifest* the
         orchestrator reads, as opposed to the story spec's own frontmatter.
@@ -2657,6 +2842,43 @@ class Engine:
         unit is merged before the run stops."""
         return
 
+    def _ledger_digest(self) -> str:
+        """Digest the current ledger text for proof-of-work attribution.
+
+        An absent ledger and an empty one intentionally hash alike: neither
+        carries an entry, and this comparison never restores or unlinks the file.
+        Reads stay fail-loud because guessing either equality answer can misjudge
+        the session's work.
+        """
+        ledger = self.workspace.paths.deferred_work
+        text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def _harvest_gate_exclude(self, task: StoryTask) -> tuple[str, ...]:
+        """Exclude only this attempt's engine-authored ledger append from proof of work.
+
+        ``_harvest_spec_deferrals`` runs above the artifact gate. Without this
+        exclusion a session that wrote no code can pass because the orchestrator
+        itself changed the ledger. The persisted flag survives crash replay, when
+        the repeated harvest dedupes and reports no newly-filed ids.
+
+        The exclusion is path-granular, so it stands down when the ledger had
+        already changed from the current attribution reference before harvesting. That preserves
+        a session-authored ledger-only change as valid work even when the same
+        attempt also records a frontmatter deferral. Standing down exposes more
+        of the tree to the gate, which is the conservative direction.
+        """
+        if not task.harvest_wrote_ledger or task.ledger_changed_before_harvest:
+            return ()
+        paths = self.workspace.paths
+        try:
+            rel = paths.deferred_work.resolve().relative_to(paths.project.resolve())
+        except ValueError:
+            # The proof-of-work gate only sees the project tree, so an external
+            # ledger cannot satisfy it and needs no exclusion.
+            return ()
+        return (rel.as_posix(),)
+
     def _verify_dev_artifacts(self, task: StoryTask, result_json: dict | None):
         return verify.verify_dev(
             task,
@@ -2664,6 +2886,7 @@ class Engine:
             result_json,
             review_enabled=self._dev_review_enabled(),
             operator_park=self._operator_park_enabled(),
+            engine_written=self._harvest_gate_exclude(task),
         )
 
     def _verify_review(self, task: StoryTask):
@@ -2686,14 +2909,17 @@ class Engine:
         # separate review skill. task.spec_file is set by verify_dev on success.
         # The ledger instruction is the prevention side of the reclose in
         # SweepEngine._verify_review: a review that rewrites deferred-work.md
-        # from a stale snapshot clobbers orchestrator-recorded closures. The
-        # ledger is append-only for sessions — new findings are fine, existing
-        # entries are orchestrator-owned.
+        # from a stale snapshot clobbers orchestrator-recorded closures.
+        # Existing entries are orchestrator-owned; new ones are simply not asked
+        # for. Post-BMAD-METHOD#2640 the primitive records its own `defer`
+        # findings in the spec frontmatter and `_harvest_spec_deferrals` files
+        # them. An affirmative append instruction would therefore file each
+        # finding twice. Keep this neutral for pre-#2640 skills, whose flat append
+        # may still be the only record.
         return (
-            f"/{self._dev_skill('review')} {task.spec_file} — If this review defers new "
-            f"findings, append them to the deferred-work ledger as NEW entries "
-            f"only; do NOT modify, re-open, or rewrite existing ledger entries — "
-            f"the orchestrator owns their status and resolution."
+            f"/{self._dev_skill('review')} {task.spec_file} — do NOT modify, "
+            f"re-open, or rewrite existing deferred-work ledger entries; the "
+            f"orchestrator owns their status and resolution."
         )
 
     def _render_commit_template(self, task: StoryTask) -> str | None:
