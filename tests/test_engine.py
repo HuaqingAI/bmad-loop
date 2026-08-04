@@ -8277,6 +8277,7 @@ def test_nonfixable_retry_kept_harvest_is_not_the_next_sessions_work(project):
 
     decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
     assert [decision["action"] for decision in decisions] == ["retry", "retry", "proceed"]
+    assert "no changes" in decisions[0]["reason"]
     assert "no changes" in decisions[1]["reason"]
     assert len(adapter.sessions) == 3
     assert summary.done == 1 and not summary.crashed and not summary.paused
@@ -8522,6 +8523,105 @@ def test_session_ledger_edit_is_proof_of_work_even_when_the_attempt_harvests(pro
     assert [entry.title for entry in _harvest_entries(project)] == [
         "Session's own ledger work",
         HARVEST_A["summary"],
+    ]
+
+
+def test_replay_before_harvest_recovers_session_ledger_attribution(project):
+    """A crash after session persistence but before harvest has no latched
+    engine write. Its session-authored ledger attribution must already be
+    durable so replay harvesting cannot hide the attempt's only work.
+    """
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [_session_authored_ledger_effect(project, deferred=[HARVEST_A])],
+        policy=_harvest_policy(),
+    )
+
+    original_emit = engine._emit
+
+    def crash_after_session_save(stage, *args, **kwargs):
+        if stage == "post_session":
+            raise RuntimeError("host died before ledger attribution")
+        return original_emit(stage, *args, **kwargs)
+
+    engine._emit = crash_after_session_save
+    assert engine.run().crashed
+
+    crashed_task = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed_task.phase == Phase.DEV_RUNNING
+    assert crashed_task.sessions[0].status == "completed"
+    assert crashed_task.harvest_wrote_ledger is False
+    assert crashed_task.ledger_changed_before_harvest is True
+
+    resumed, adapter = resume_engine(project, engine, [])
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.crashed
+    final = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert final.ledger_changed_before_harvest is True
+    assert adapter.sessions == []
+    decisions = [e for e in resumed.journal.entries() if e["kind"] == "dev-decision"]
+    assert [decision["action"] for decision in decisions] == ["proceed"]
+    assert [entry.title for entry in _harvest_entries(project)] == [
+        "Session's own ledger work",
+        HARVEST_A["summary"],
+    ]
+
+
+def test_retry_replay_recovers_session_ledger_attribution_after_prior_harvest(project):
+    """A prior attempt's harvest latch survives rollback. Attempt 2's completed
+    result must persist its own attribution before replay can consume it, rather
+    than mistaking the old latch for proof that attempt 2 already harvested.
+    """
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            dev_effect(
+                project,
+                "1-1-a",
+                followup_review=False,
+                write_src=False,
+                deferred=[HARVEST_A],
+            ),
+            _session_authored_ledger_effect(project, deferred=[HARVEST_B]),
+        ],
+        policy=_harvest_policy(),
+    )
+
+    original_emit = engine._emit
+    post_sessions = 0
+
+    def crash_after_retry_session_save(stage, *args, **kwargs):
+        nonlocal post_sessions
+        if stage == "post_session":
+            post_sessions += 1
+            if post_sessions == 2:
+                raise RuntimeError("host died before retry ledger attribution")
+        return original_emit(stage, *args, **kwargs)
+
+    engine._emit = crash_after_retry_session_save
+    assert engine.run().crashed
+
+    crashed_task = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed_task.phase == Phase.DEV_RUNNING
+    assert crashed_task.attempt == 2
+    assert crashed_task.sessions[-1].status == "completed"
+    assert crashed_task.harvest_wrote_ledger is True
+    assert crashed_task.ledger_changed_before_harvest is True
+
+    resumed, adapter = resume_engine(project, engine, [])
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.crashed
+    assert adapter.sessions == []
+    decisions = [e for e in resumed.journal.entries() if e["kind"] == "dev-decision"]
+    assert [decision["action"] for decision in decisions] == ["retry", "proceed"]
+    assert [entry.title for entry in _harvest_entries(project)] == [
+        HARVEST_A["summary"],
+        "Session's own ledger work",
+        HARVEST_B["summary"],
     ]
 
 

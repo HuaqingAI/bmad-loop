@@ -1246,7 +1246,11 @@ class Engine:
                 # non-fixable retry's protected ledger. Preserve it on a crash
                 # replay too: the replayed harvest dedupes against the dead
                 # attempt's on-disk append.
-                if not replayed:
+                # Before the first harvest write, a replay can still reconstruct
+                # session authorship from the persisted baseline digest. Once an
+                # engine write is latched, the current ledger includes that write
+                # and replay must preserve the attribution saved before harvest.
+                if not replayed or not task.harvest_wrote_ledger:
                     if task.baseline_ledger_digest is not None:
                         task.ledger_changed_before_harvest = (
                             self._ledger_digest() != task.baseline_ledger_digest
@@ -3218,6 +3222,22 @@ class Engine:
             # returned rather than aliasing a later, half-mutated dict. Shallow is
             # enough — reconcile only touches top-level keys.
             resumable = label is None and role in ("dev", "review")
+            # Make a completed dev result and its proof-of-work attribution
+            # durable in the same state save. A host death after this save makes
+            # the result replayable, so leaving the comparison until _dev_phase
+            # resumes would lose attempt identity when a prior retry already
+            # latched harvest_wrote_ledger. The ordinary-path comparison remains
+            # after post_session so later hook-side changes are still observed.
+            if (
+                resumable
+                and role == "dev"
+                and result.status == "completed"
+                and result.result_json is not None
+                and task.baseline_ledger_digest is not None
+            ):
+                task.ledger_changed_before_harvest = (
+                    self._ledger_digest() != task.baseline_ledger_digest
+                )
             task.record_session(
                 SessionRecord(
                     task_id=task_id,
