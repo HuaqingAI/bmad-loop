@@ -819,14 +819,31 @@ class Engine:
 
     def _replay_unlatched_ledger_carries(self) -> None:
         """Replay a successful isolated unit's carry after merge-time host loss."""
+        merged_units = {
+            (
+                str(entry.get("story_key", "")),
+                str(entry.get("branch", "")),
+                str(entry.get("target", "")),
+            )
+            for entry in self.journal.entries()
+            if entry.get("kind") == "unit-merged"
+        }
         for task in list(self.state.tasks.values()):
+            if (
+                task.phase == Phase.DEFERRED
+                and task.worktree_path
+                and task.harvest_carry_commit_pending
+            ):
+                self.journal.append("resume-ledger-carry", story_key=task.story_key)
+                self._carry_isolated_ledger_writes(task)
+                continue
             if task.isolated_ledger_carried or task.phase not in (
                 Phase.DONE,
                 Phase.AWAITING_OPERATOR,
             ):
                 continue
-            wt = task.worktree_path
-            if not wt or Path(wt).is_dir():
+            merged_key = (task.story_key, task.branch, self.state.target_branch)
+            if not task.worktree_path or merged_key not in merged_units:
                 continue
             if not task.harvested_deferrals:
                 continue
@@ -834,6 +851,9 @@ class Engine:
             self._carry_isolated_ledger_writes(task)
             task.isolated_ledger_carried = True
             self._save()
+            # The failed integration unwound before _run_story returned, so the
+            # loop never reached its normal post-integration continuation.
+            self._after_story(task)
 
     def _finish_inflight(self) -> None:
         """Complete or roll back tasks interrupted by a pause or crash."""
@@ -2590,9 +2610,10 @@ class Engine:
 
         # Persist the full intended set, not only newly-filed rows. A replay can
         # dedupe every append while a later isolation carry still needs the data.
-        # Assignment (rather than append) also keeps the dev→review double call
-        # from duplicating the dev-leg rows in state.json.
-        task.harvested_deferrals = [
+        # Keep a stable union across a retained retry/review chain: a later pass
+        # may replace the frontmatter list, but every earlier accepted finding is
+        # still present in an ignored unit ledger and must survive final carry.
+        current_records = [
             {
                 "origin": origin,
                 "title": title,
@@ -2603,6 +2624,15 @@ class Engine:
             }
             for origin, title, reason, location, severity in pending
         ]
+        known = {
+            (str(item.get("origin", "")), str(item.get("source_spec", "")))
+            for item in task.harvested_deferrals
+        }
+        for record in current_records:
+            key = (str(record["origin"]), str(record["source_spec"]))
+            if key not in known:
+                task.harvested_deferrals.append(record)
+                known.add(key)
 
         ledger = self.workspace.paths.deferred_work
         text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
@@ -3914,16 +3944,20 @@ class Engine:
 
     def _defer(self, task: StoryTask, reason: str) -> None:
         task.defer_reason = reason
-        advance(task, Phase.DEFERRED)
         if self._isolated:
             # the failed work lives in the unit's worktree; the diff is captured
             # and the worktree kept/dropped by _integrate_unit. Don't touch the
             # tree here (no reset into the main repo — there's nothing to undo).
             # Harvested findings are the exception: re-file them into the main
-            # checkout before the terminal save makes this defer durable.
+            # checkout before the terminal save makes this defer durable. Keep
+            # the pre-terminal phase until that repair write succeeds: if its git
+            # commit fails, ordinary inflight recovery must re-enter this decision
+            # and then finish defer recording + unit teardown/integration.
             self._carry_harvested_deferrals(task)
+            advance(task, Phase.DEFERRED)
             self._record_defer(task, reason)
             return
+        advance(task, Phase.DEFERRED)
         if task.baseline_commit:
             self._stash_deferred_artifacts(task)
             deferred_work = self.workspace.paths.deferred_work
@@ -3964,6 +3998,17 @@ class Engine:
         """Apply Engine-owned ledger writes that an isolated merge may omit."""
         self._carry_harvested_deferrals(task)
 
+    def _harvest_carry_commit_may_degrade(self, ledger: Path) -> bool:
+        """Whether a carry may remain uncommitted because git cannot own its path."""
+        repo = self.paths.repo_root
+        try:
+            rel = ledger.resolve().relative_to(repo.resolve()).as_posix()
+        except (OSError, RuntimeError, ValueError):
+            return True  # external or unresolvable ledgers are advisory artifacts
+        if verify.path_tracked(repo, rel):
+            return False
+        return rel not in verify.untracked_files(repo)
+
     def _carry_harvested_deferrals(self, task: StoryTask) -> None:
         """Re-file an isolated unit's harvested findings into the main ledger."""
         if not task.harvested_deferrals:
@@ -3981,6 +4026,15 @@ class Engine:
                 for entry in seen
             ):
                 continue
+            # Persist the commit obligation before the filesystem write. A host
+            # loss after append_entry writes the row but before it returns must
+            # still make replay commit the now-deduplicated tracked/untracked row.
+            # Latch only once a novel provenance is known: when every row already
+            # arrived through the merge, committing here could sweep unrelated
+            # operator edits to the same ledger into the carry commit.
+            if not task.harvest_carry_commit_pending:
+                task.harvest_carry_commit_pending = True
+                self._save()
             location = item.get("location")
             severity = item.get("severity")
             dw_id = deferredwork.append_entry(
@@ -3996,7 +4050,12 @@ class Engine:
                 carried.append(dw_id)
                 # Keep the same-call dedupe status-agnostic too.
                 seen = deferredwork.parse_ledger(ledger.read_text(encoding="utf-8"))
-        if carried:
+        commit_needed = bool(carried) or task.harvest_carry_commit_pending
+        if commit_needed:
+            # The pre-append latch also covers every git observation/write below.
+            # A failed add/status/commit can leave the row staged or dirty; replay
+            # must retry even when the provenance scan dedupes it to `carried == []`.
+            may_degrade = self._harvest_carry_commit_may_degrade(ledger)
             try:
                 verify.commit_paths(
                     self.paths.repo_root,
@@ -4004,12 +4063,16 @@ class Engine:
                     [ledger],
                 )
             except verify.GitError as e:
+                if not may_degrade:
+                    raise
                 self.journal.append(
                     "harvest-carry-uncommitted",
                     story_key=task.story_key,
                     dw_ids=carried,
                     error=str(e),
                 )
+            task.harvest_carry_commit_pending = False
+            self._save()
         self.journal.append("harvest-carried", story_key=task.story_key, dw_ids=carried)
 
     def _stash_deferred_artifacts(self, task: StoryTask) -> None:

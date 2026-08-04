@@ -1302,10 +1302,11 @@ that rode the same window. Both skill eras are supported; the rename itself need
   kept worktree.) `_defer` now re-files what the final attempt's harvest intended to file into the
   main checkout's ledger and commits that path alone — leaving it dirty would escalate the next
   story's merge. `append_entry` dedups on `origin:` + `source_spec:`, so an entry already open
-  there is not duplicated. Only the final attempt's record carries: it is cleared at each attempt's
-  start, so an attempt whose session never completed cannot re-file the findings its predecessor's
-  rollback removed. The gap pre-dates this release; the harvest added a systematic producer of
-  such entries.
+  there is not duplicated. The retained retry/review chain carries the stable union of every
+  successful pass: a later pass replacing its frontmatter list no longer erases an earlier
+  finding before an ignored ledger's final carry. A genuinely new attempt still clears the
+  record, so it cannot re-file findings whose code and ledger rows were rolled back. The gap
+  pre-dates this release; the harvest added a systematic producer of such entries.
 
 - **…and so does a unit that LANDS (#405).** A landing unit looked untouched — its ledger edit
   merges with the branch. Not when the ledger is gitignored: `finalize_commit` stages with
@@ -1338,11 +1339,20 @@ that rode the same window. Both skill eras are supported; the rename itself need
   both payloads are already in `state.json`, so only the replay was missing. Resume now re-runs
   an unlatched carry, once, guarded by a persisted latch — the writes are only partly idempotent,
   since `append_entry` dedups against **open** entries and a later close would turn a blind
-  replay into a duplicate. Skipped when the worktree is still mounted (the branch may never have
-  landed, and the human's merge would bring the entry itself), on the in-place path, and on any
-  phase but DONE. The sweep half is the sharper one: a lost close leaves ids open, the
+  replay into a duplicate. Skipped without a matching durable `unit-merged` journal record, on
+  the in-place path, and on any phase but DONE or AWAITING_OPERATOR. Directory disappearance is
+  not evidence: teardown may degrade after a successful merge and leave the directory behind.
+  The sweep half is the sharper one: a lost close leaves ids open, the
   suppression filter does not cover DONE, and every later sweep re-drives already-merged work
   into a non-fixable retry that pauses the run.
+
+- **Tracked ledger carry failures stop and remain replayable (#405).** A rejected `git add`,
+  `status`, or `commit` used to be journaled and swallowed, letting an isolated unit finish with
+  a dirty or staged main ledger. A committable carry now persists its pending commit intent before
+  the first append and raises; resume retries the commit even after provenance dedupes that row.
+  Deferred units remain nonterminal until this repair write succeeds, so resume still records the
+  defer and closes its worktree; post-merge replay likewise completes the after-story continuation.
+  Gitignored and external ledgers keep their advisory degrade behavior.
 
 - **An artifacts dir whose name holds `[` or `]` no longer misdirects the two paths above
   (#405, #423).** Git reads a positional operand as a pathspec, so such a path was a glob that

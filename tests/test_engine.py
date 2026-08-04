@@ -8292,6 +8292,37 @@ def test_nonfixable_retry_reverts_harvest_before_the_next_attempt(project):
     assert summary.done == 1 and not summary.crashed and not summary.paused
 
 
+def test_nonfixable_retry_resets_harvest_records_to_the_fresh_attempt(project):
+    """A rolled-back finding cannot survive in the next attempt's carry set."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            dev_effect(
+                project,
+                "1-1-a",
+                followup_review=False,
+                write_src=False,
+                deferred=[HARVEST_A],
+            ),
+            dev_effect(
+                project,
+                "1-1-a",
+                followup_review=False,
+                deferred=[HARVEST_B],
+            ),
+        ],
+        policy=_harvest_policy(attempts=2),
+    )
+
+    summary = engine.run()
+
+    task = engine.state.tasks["1-1-a"]
+    assert summary.done == 1 and not summary.crashed and not summary.paused
+    assert [item["title"] for item in task.harvested_deferrals] == [HARVEST_B["summary"]]
+    assert [entry.title for entry in _harvest_entries(project)] == [HARVEST_B["summary"]]
+
+
 def test_awaiting_operator_spec_deferrals_are_harvested_before_park(project):
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     engine, _ = make_engine(
@@ -8662,6 +8693,37 @@ def test_fixable_retry_kept_harvest_is_not_the_repair_sessions_work(project, tmp
     assert [decision["action"] for decision in decisions] == ["retry", "retry"]
     assert "no changes" in decisions[-1]["reason"]
     assert summary.paused and summary.done == 0
+
+
+def test_fixable_retry_unions_harvest_records_across_the_retained_chain(project, tmp_path):
+    """A repair pass adds to, rather than replaces, its kept predecessor's records."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    marker = tmp_path / "repair-complete"
+    engine, _ = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A]),
+            _repairing_effect(
+                project,
+                marker,
+                dev_effect(
+                    project,
+                    "1-1-a",
+                    followup_review=False,
+                    deferred=[HARVEST_B],
+                ),
+            ),
+        ],
+        policy=_fixable_harvest_policy(marker),
+    )
+
+    summary = engine.run()
+
+    task = engine.state.tasks["1-1-a"]
+    expected = [HARVEST_A["summary"], HARVEST_B["summary"]]
+    assert summary.done == 1 and not summary.crashed and not summary.paused
+    assert [item["title"] for item in task.harvested_deferrals] == expected
+    assert [entry.title for entry in _harvest_entries(project)] == expected
 
 
 def test_fixable_retry_recomputes_attribution_for_repairs_own_ledger_work(project, tmp_path):
