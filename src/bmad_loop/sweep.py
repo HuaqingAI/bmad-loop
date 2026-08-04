@@ -488,8 +488,10 @@ class SweepEngine(Engine):
         Runs before the ledger is read, so a bundle it closes leaves the open set
         and no fresh triage can re-bundle those ids (validate_triage rejects a plan
         whose open_ids disagree with the ledger). A recovered bundle that defers or
-        escalates keeps its ids open, where the existing failed_ids filter drops the
-        fresh plan's overlapping bundle."""
+        escalates keeps its ids open. A dev-leg discard never closes them; an
+        in-place post-acceptance defer reopens this run's close, while an isolated
+        unit's close dies with its unmerged worktree. The existing failed_ids filter
+        then drops the fresh plan's overlapping bundle."""
         recovered = 0
         for task in list(self.state.tasks.values()):
             if task.terminal or not BUNDLE_KEY_RE.match(task.story_key):
@@ -1192,7 +1194,7 @@ class SweepEngine(Engine):
         ``Engine._dev_skill``): the self-contained
         intent.md (intent + verbatim ledger entries) is handed over as freeform
         intent. The orchestrator owns the deferred-work ledger — the skill is told
-        not to edit it — and records resolution itself in `_post_dev_state_sync`.
+        not to edit it — and records resolution itself in `_post_dev_accepted_sync`.
         On a repair the bundle spec is re-opened first (B6) so step-01 resumes.
 
         A patch-restore re-drive (#2564, #75) must point at the bundle spec
@@ -1230,11 +1232,26 @@ class SweepEngine(Engine):
         )
 
     def _post_dev_state_sync(self, task: StoryTask, result_json: dict | None) -> None:
+        """No-op: bundles have no sprint-status row for the pre-gate sync.
+
+        This override and the accepted-only override below are one behavior
+        change. Leaving the former close here as well would run bundle closure
+        twice at two different gate positions.
+        """
+        return
+
+    def _post_dev_accepted_sync(self, task: StoryTask, result_json: dict | None) -> None:
         """Generic-path ledger single-writer for bundles. The decoupled
         bmad-dev-auto skill does not touch the ledger, so the orchestrator marks
         each dw id the bundle owns ``done`` once the bundle's spec reaches the
-        terminal status for the current stage. Mirrors the story sprint sync;
-        no-op on the legacy path."""
+        terminal status for the current stage. No-op on the legacy path.
+
+        This runs only after the artifact gate, verify commands, and ``decide_dev``
+        have accepted the attempt. In particular, ``outcome.ok`` is insufficient:
+        a CRITICAL escalation in the session result preempts that outcome. The
+        review gate later requires these entries closed; ``_verify_review`` retains
+        its separate reclose because a review session can rewrite the ledger.
+        """
         if not self._generic_dev():
             return
         spec_file = (result_json or {}).get("spec_file")
@@ -1243,14 +1260,18 @@ class SweepEngine(Engine):
         success_status = "in-review" if self._dev_review_enabled() else "done"
         self._close_bundle_ledger_when_spec_status(task, str(spec_file), success_status)
 
+    def _bundle_close_operation_id(self, task: StoryTask) -> str:
+        """Stable identity for a close and its possible defer-time undo."""
+        return f"{self.state.run_id}/{task.story_key}"
+
     def _close_declared_deferred(
         self, task: StoryTask, snapshot: list[tuple[Path, str]] | None = None
     ) -> None:
         """No-op: a bundle's ledger closure is owned by
-        ``_close_bundle_ledger_when_spec_status``, which runs at dev-sync time
-        because ``verify_review_bundle`` *requires* those entries closed before it
-        will pass. Letting the base class's commit-boundary hook (#234) also fire
-        here would re-derive closure for a task whose ids come from
+        ``_close_bundle_ledger_when_spec_status``, which runs after accepted dev
+        because ``verify_review_bundle`` *requires* those entries closed before the
+        later commit boundary. Letting the base class's commit-boundary hook (#234)
+        also fire here would re-derive closure for a task whose ids come from
         ``task.dw_ids``, not from a ``closes_deferred:`` declaration."""
 
     def _close_bundle_ledger_when_spec_status(
@@ -1270,9 +1291,36 @@ class SweepEngine(Engine):
             return
         ledger = self.workspace.paths.deferred_work
         note = f"resolved by sweep bundle {task.story_key}"
-        marked = [i for i in task.dw_ids if deferredwork.mark_done(ledger, i, self._today(), note)]
+        # Record the intended ids, never only `marked`. This method is called once
+        # after accepted dev and again by the review-leg reclose. The second call
+        # normally finds every entry already done, so `marked` is empty; deriving
+        # the record from it would erase exactly the state a landing bundle needs.
+        task.bundle_closes_intended = list(task.dw_ids)
+        marked = deferredwork.mark_done_many_reopenable(
+            ledger,
+            task.dw_ids,
+            self._today(),
+            note,
+            self._bundle_close_operation_id(task),
+        )
         if marked:
             self.journal.append(kind, story_key=task.story_key, dw_ids=marked)
+
+    def _reopen_ledger_after_defer(self, task: StoryTask) -> None:
+        """Reopen only this run's bundle closes after its code was discarded.
+
+        ``Engine._defer`` deliberately restores the whole post-review ledger after
+        rollback so harvested findings survive. That restore can also replay a
+        bundle close whose code no longer exists. The operation-specific undo marker
+        makes this "undo my close", not "open these ids": human, legacy, and earlier
+        run closures remain untouched. Replaying this method is idempotent.
+        """
+        ledger = self.workspace.paths.deferred_work
+        note = f"resolved by sweep bundle {task.story_key}"
+        operation_id = self._bundle_close_operation_id(task)
+        reopened = [i for i in task.dw_ids if deferredwork.mark_open(ledger, i, note, operation_id)]
+        if reopened:
+            self.journal.append("sweep-bundle-reopened", story_key=task.story_key, dw_ids=reopened)
 
     def _verify_dev_artifacts(self, task: StoryTask, result_json: dict | None):
         return verify.verify_dev_bundle(

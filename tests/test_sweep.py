@@ -14,6 +14,7 @@ from conftest import (
     git,
     install_build_auto_skill,
     migrate_effect,
+    passes_once,
     triage_effect,
     write_ledger,
     write_legacy_ledger,
@@ -36,6 +37,7 @@ from bmad_loop.policy import (
     ScmPolicy,
     StageAdapterPolicy,
     SweepPolicy,
+    VerifyPolicy,
 )
 from bmad_loop.sweep import (
     Decision,
@@ -560,8 +562,9 @@ def test_sweep_happy_path(project):
 
 def test_generic_skill_bundle_orchestrator_closes_ledger(project):
     """B4: on the generic bmad-dev-auto path the bundle session never edits the
-    ledger; the orchestrator marks each owned dw id done (in _post_dev_state_sync)
-    and verify_review_bundle confirms its own write. The invocation is freeform."""
+    ledger; the orchestrator marks each owned dw id done only after the dev attempt
+    is accepted, and verify_review_bundle confirms its own write. The invocation is
+    freeform."""
     write_ledger(project, {"DW-1": "open", "DW-2": "open"})
     plan = triage_result(
         ["DW-1", "DW-2"],
@@ -595,8 +598,228 @@ def test_generic_skill_bundle_orchestrator_closes_ledger(project):
     dev_prompt = adapter.sessions[1].prompt
     assert dev_prompt.startswith("/bmad-dev-auto Implement the deferred-work bundle")
     assert "--dw-bundle" not in dev_prompt
+    events = engine.journal.entries()
+    close_at = next(i for i, e in enumerate(events) if e["kind"] == "sweep-bundle-closed")
+    decision_at = next(
+        i for i, e in enumerate(events) if e["kind"] == "dev-decision" and e["action"] == "proceed"
+    )
+    assert decision_at < close_at
+    # Review-disabled still calls `_verify_review`, so this flow invokes the close
+    # twice. The second call marks nothing and must not erase the durable carry
+    # receipt recorded from task.dw_ids.
+    assert "sweep-bundle-reclosed" not in {e["kind"] for e in events}
+    saved = load_state(engine.run_dir).tasks["dw-fix-things"]
+    assert saved.bundle_closes_intended == ["DW-1", "DW-2"]
+
+
+def test_bundle_ledger_close_withheld_on_a_non_fixable_retry(project):
+    """A rejected attempt must not close the ids whose code it rolls back."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
+    )
+    seen = []
+
+    def capture_then_die(spec):
+        seen.append(project.deferred_work.read_text(encoding="utf-8"))
+        return SessionResult(status="died")
+
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+        limits=LimitsPolicy(max_dev_attempts=2),
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "fix", ["DW-99"], mark_ledger=False, followup_review=False),
+            capture_then_die,
+        ],
+        policy=pol,
+    )
+
+    summary = engine.run()
+
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert decisions[0]["action"] == "retry" and "do not match" in decisions[0]["reason"]
+    assert "rollback-auto" in journal_text(engine)
+    assert "sweep-bundle-closed" not in {e["kind"] for e in engine.journal.entries()}
+    assert "status: open" in seen[0]
+    assert "resolved by sweep bundle dw-fix" not in seen[0]
+    assert summary.deferred == 1 and not summary.paused
+    assert ledger_entries(project)["DW-1"].open
+
+
+def test_bundle_ledger_close_withheld_when_a_completed_attempt_defers(project):
+    """A completed but rejected final attempt reaches DEFER with the ids still open."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
+    )
+
+    def mismatching_attempt():
+        return bundle_dev_effect(
+            project, "fix", ["DW-99"], mark_ledger=False, followup_review=False
+        )
+
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+        limits=LimitsPolicy(max_dev_attempts=2),
+    )
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(plan), mismatching_attempt(), mismatching_attempt()],
+        policy=pol,
+    )
+
+    summary = engine.run()
+
+    actions = [e["action"] for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert actions == ["retry", "defer"]
+    assert summary.deferred == 1 and not summary.paused
+    text = project.deferred_work.read_text(encoding="utf-8")
+    assert "resolved by sweep bundle dw-fix" not in text
+    assert deferredwork.open_ids(text) == {"DW-1"}
+    assert "change for dw-fix" not in (project.project / "src.txt").read_text()
     kinds = {e["kind"] for e in engine.journal.entries()}
+    assert "sweep-bundle-closed" not in kinds
+    assert "sweep-bundle-reopened" not in kinds
+
+
+def test_bundle_ledger_close_withheld_when_critical_preempts_a_passing_gate(project):
+    """PROCEED, not outcome.ok, authorizes the close."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
+    )
+    clean = bundle_dev_effect(project, "fix", ["DW-1"], mark_ledger=False, followup_review=False)
+
+    def clean_but_critical(spec):
+        result = clean(spec)
+        assert result.result_json is not None
+        result.result_json["escalations"] = [
+            {"type": "bundle-item-blocked", "severity": "CRITICAL", "detail": "intent gap"}
+        ]
+        return result
+
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, _ = make_sweep(project, [triage_effect(plan), clean_but_critical], policy=pol)
+
+    summary = engine.run()
+
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert len(decisions) == 1
+    assert decisions[0]["action"] == "pause" and "CRITICAL" in decisions[0]["reason"]
+    assert summary.paused
+    assert ledger_entries(project)["DW-1"].open
+    assert "sweep-bundle-closed" not in {e["kind"] for e in engine.journal.entries()}
+
+
+def test_bundle_ledger_close_reopened_when_the_review_leg_defers(project):
+    """A later review failure undoes the accepted close after rollback."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
+    )
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=True, trigger="always"),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+        limits=LimitsPolicy(max_review_cycles=1),
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "fix", ["DW-1"], mark_ledger=False),
+            lambda spec: SessionResult(status="died"),
+        ],
+        policy=pol,
+    )
+
+    summary = engine.run()
+
+    kinds = [e["kind"] for e in engine.journal.entries()]
     assert "sweep-bundle-closed" in kinds
+    assert summary.deferred == 1 and not summary.paused
+    assert "change for dw-fix" not in (project.project / "src.txt").read_text()
+    text = project.deferred_work.read_text(encoding="utf-8")
+    assert deferredwork.open_ids(text) == {"DW-1"}
+    assert "resolved by sweep bundle dw-fix" not in text
+    reopened = [e for e in engine.journal.entries() if e["kind"] == "sweep-bundle-reopened"]
+    assert len(reopened) == 1 and reopened[0]["dw_ids"] == ["DW-1"]
+    assert worktree_clean(project.project)
+
+
+def test_bundle_ledger_close_reopened_when_review_disabled_defers_at_gate(project, tmp_path):
+    """The no-review path also reopens when its post-accept verify gate defers."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
+    )
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+        verify=VerifyPolicy(commands=(passes_once(tmp_path / "verify-ran"),)),
+        limits=LimitsPolicy(max_dev_attempts=1),
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "fix", ["DW-1"], mark_ledger=False, followup_review=False),
+        ],
+        policy=pol,
+    )
+
+    summary = engine.run()
+
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "sweep-bundle-closed" in kinds
+    assert summary.deferred == 1 and not summary.paused
+    assert "change for dw-fix" not in (project.project / "src.txt").read_text()
+    assert deferredwork.open_ids(project.deferred_work.read_text(encoding="utf-8")) == {"DW-1"}
+    assert "sweep-bundle-reopened" in kinds
+
+
+def test_bundle_pre_gate_state_sync_is_a_noop(project):
+    """The sweep override must not retain the old pre-gate close."""
+    write_ledger(project, {"DW-1": "open"})
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+    )
+    engine, _ = make_sweep(project, [], policy=pol)
+    spec = project.implementation_artifacts / "spec-dw-fix.md"
+    write_spec(spec, "done", git(project.project, "rev-parse", "HEAD"))
+    task = StoryTask(story_key="dw-fix", epic=0, dw_ids=["DW-1"])
+
+    engine._post_dev_state_sync(task, {"spec_file": str(spec)})
+
+    assert ledger_entries(project)["DW-1"].open
+    assert task.bundle_closes_intended == []
+    assert "sweep-bundle-closed" not in {e["kind"] for e in engine.journal.entries()}
 
 
 def test_bundle_ledger_close_skips_on_unreadable_spec(project, monkeypatch):
@@ -618,7 +841,7 @@ def test_bundle_ledger_close_skips_on_unreadable_spec(project, monkeypatch):
     task = StoryTask(story_key="dw-fix-things", epic=0, dw_ids=["DW-1", "DW-2"])
     fault_read_text(monkeypatch, sp)
 
-    engine._post_dev_state_sync(task, {"spec_file": str(sp)})
+    engine._post_dev_accepted_sync(task, {"spec_file": str(sp)})
 
     entries = ledger_entries(project)
     assert entries["DW-1"].status == "open" and entries["DW-2"].status == "open"
@@ -667,7 +890,7 @@ def test_generic_bundle_reconcile_closes_ledger_on_stale_frontmatter(project):
     """Regression for the DW-159/160/162 false-defer: the bundle session finalized
     in prose (## Auto Run Result: Status done) but left the bundle spec frontmatter
     at the template default `draft`. The orchestrator reconciles the frontmatter
-    before the ledger sync, so the bundle CLOSES — its dw ids are marked done and
+    before accepted bookkeeping, so the bundle CLOSES — its dw ids are marked done and
     not stranded in failed_ids — instead of falsely deferring completed work."""
     write_ledger(project, {"DW-1": "open", "DW-2": "open"})
     plan = triage_result(
@@ -715,7 +938,7 @@ def test_generic_bundle_reconcile_closes_ledger_on_in_review_frontmatter(project
     prose (## Auto Run Result: Status done) but left the bundle spec frontmatter at
     the transient `in-review` marker. in-review is never a deliberate terminal on
     the generic path (the legacy review-handoff fork is retired), so the
-    orchestrator reconciles it to done before the ledger sync — the bundle CLOSES
+    orchestrator reconciles it to done before accepted bookkeeping — the bundle CLOSES
     instead of false-deferring + rolling back into an endless re-sweep loop."""
     write_ledger(project, {"DW-1": "open", "DW-2": "open"})
     plan = triage_result(

@@ -1394,7 +1394,10 @@ class Engine:
                     self._save()
                 # Snapshot after the session has finished, preserving any ledger
                 # edits it authored, and before reconcile/state-sync/harvest can
-                # write on the engine's behalf. Keep the chain's first snapshot
+                # write on the engine's behalf. The harvest is the engine-side
+                # ledger write this snapshot currently protects; the sweep bundle
+                # close lives below the acceptance gate instead. Keep the chain's
+                # first snapshot
                 # across fixable retries because a later non-fixable reset returns
                 # all the way to the phase baseline. An unarmed replay may safely
                 # arm from disk; an armed replay must retain the dead attempt's
@@ -1417,9 +1420,10 @@ class Engine:
                 # observation faulted, so state sync follows it and sees the
                 # repaired terminal status.
                 harvest_outcome = self._harvest_spec_deferrals(task, result.result_json)
-                # generic-path single-writer for the bookkeeping the decoupled
-                # skill never touches (sprint-status for stories, the deferred-work
-                # ledger for sweep bundles), before verify reads that state.
+                # Generic-path single-writer for the sprint bookkeeping the
+                # decoupled skill never touches, before verify reads that state.
+                # Sweep bundles override this pre-gate seam to a no-op; their
+                # ledger close belongs to the accepted-only seam below.
                 self._post_dev_state_sync(task, result.result_json)
                 # carry the skill's follow-up-review recommendation (PR #2505)
                 # onto the task so _review_and_commit can gate the review loop.
@@ -1460,6 +1464,9 @@ class Engine:
             )
             self._save()
             if decision.action == Action.PROCEED:
+                # Every gate that can reject this dev attempt has passed, including
+                # verify commands and CRITICAL-escalation preemption in decide_dev.
+                self._post_dev_accepted_sync(task, result.result_json)
                 # The attempt is accepted; no later path may restore its snapshot.
                 # Persist now because a crash can resume directly into review and
                 # never re-enter this method.
@@ -2477,8 +2484,8 @@ class Engine:
         frontmatter. ``bmad-dev-auto`` sometimes appends a terminal
         ``## Auto Run Result`` (``Status: done``) yet leaves the frontmatter
         ``status`` at the template default. The orchestrator reads ONLY
-        frontmatter, so without this the sprint/ledger sync no-ops and the verify
-        gate falsely defers completed, tested work.
+        frontmatter, so without this the sprint sync and accepted bundle close
+        no-op and the verify gate falsely defers completed, tested work.
 
         When (and only when) the prose terminal Status is ``done`` AND the
         frontmatter sits at a reconcilable non-terminal status, advance the
@@ -2489,8 +2496,9 @@ class Engine:
         an already-``done`` or unknown frontmatter status. Idempotent and
         never-regress: every deterministic verify gate still runs afterward against
         real on-disk/git state, so this repairs bookkeeping only — it cannot pass
-        uncompleted work. Runs ahead of ``_post_dev_state_sync`` so both the story
-        (sprint) and bundle (ledger) sync, then verify, read the reconciled spec."""
+        uncompleted work. Runs ahead of ``_post_dev_state_sync`` and the later
+        ``_post_dev_accepted_sync`` so the story board, bundle ledger, and verify
+        all read the reconciled spec."""
         if not self._generic_dev():
             return
         spec_file = (result_json or {}).get("spec_file")
@@ -2689,9 +2697,12 @@ class Engine:
         before ``verify_dev`` checks the sprint stage. Mirrors ``verify_dev``:
         advance the story to the sprint stage matching the spec status the skill
         actually reached, so a failed or blocked session (spec not at the success
-        status) never advances the sprint. No-op for the legacy path; SweepEngine
-        overrides this to flip the deferred-work ledger instead (bundles carry no
-        sprint-status entry)."""
+        status) never advances the sprint. No-op for the legacy path.
+
+        This runs above the artifact gate because ``verify_dev`` reads the board it
+        writes. That ordering does not generalize to bookkeeping a gate does not
+        consume: ``SweepEngine`` makes this a no-op and closes bundle ledger entries
+        from ``_post_dev_accepted_sync`` instead."""
         if not self._generic_dev():
             return
         spec_file = (result_json or {}).get("spec_file")
@@ -2724,6 +2735,25 @@ class Engine:
             return
         target = "review" if review_enabled else "done"
         sprint_advance(self.workspace.paths.sprint_status, task.story_key, target)
+
+    def _post_dev_accepted_sync(self, task: StoryTask, result_json: dict | None) -> None:
+        """Write bookkeeping that is valid only after a dev attempt is accepted.
+
+        This is the accepted-only counterpart to ``_post_dev_state_sync``. It is
+        called only after ``decide_dev`` returns PROCEED, not merely when
+        ``outcome.ok`` is true: CRITICAL escalations preempt a passing outcome, and
+        a failing verify command can replace the artifact outcome before the
+        decision. The base path has nothing to write; ``SweepEngine`` closes bundle
+        ledger entries here so a rejected attempt cannot leave resolved work hidden
+        from later sweeps.
+
+        Do not combine this seam with ``_close_declared_deferred``. That regular-
+        story mechanism already runs at the commit boundary and its caller takes a
+        snapshot and restores it on commit failure, so it already has the acceptance
+        property this seam supplies for sweep bundles through a different, correct
+        transaction boundary.
+        """
+        return
 
     def _harvest_spec_path(self, task: StoryTask, result_json: dict | None) -> Path | None:
         """Resolve the spec whose frontmatter this mode may harvest."""
@@ -4369,7 +4399,22 @@ class Engine:
                 if current != snapshot:
                     deferred_work.parent.mkdir(parents=True, exist_ok=True)
                     deferred_work.write_text(snapshot, encoding="utf-8")
+            # The restore deliberately keeps review-found ledger knowledge, but
+            # it also replays this bundle's accepted close after the code was
+            # discarded. Let the mode undo only the close it can identify as its
+            # own; the base path has no bundle close and is a no-op.
+            self._reopen_ledger_after_defer(task)
         self._record_defer(task, reason)
+
+    def _reopen_ledger_after_defer(self, task: StoryTask) -> None:
+        """Undo mode-owned ledger closes after a defer discarded their code.
+
+        No-op on the base path; only ``SweepEngine`` writes reopenable bundle
+        closes. This is reached on the in-place branch after a reset was attempted
+        and the ledger was restored. An isolated defer returns earlier because the
+        unit worktree, including its close, is discarded without merging.
+        """
+        return
 
     def _carry_isolated_ledger_writes(self, task: StoryTask) -> None:
         """Apply Engine-owned ledger writes that an isolated merge may omit."""
