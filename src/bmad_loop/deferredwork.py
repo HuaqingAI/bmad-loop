@@ -302,7 +302,21 @@ def _require_canonical_status(status: str) -> None:
     raise ValueError(f"status must be 'open' or 'done YYYY-MM-DD': {status!r}")
 
 
-def _apply_done(text: str, dw_id: str, date: str, note: str) -> str | None:
+def _operation_digest(operation_id: str) -> str:
+    """Encode a stable close-operation id as one ledger-safe token."""
+    if not operation_id:
+        raise ValueError("operation_id must not be empty")
+    return hashlib.sha256(operation_id.encode("utf-8")).hexdigest()
+
+
+def _apply_done(
+    text: str,
+    dw_id: str,
+    date: str,
+    note: str,
+    *,
+    undo_owner: str | None = None,
+) -> str | None:
     """Flip one entry to `status: done <date>` + a resolution note *within* `text`.
     None when the entry is missing or not open. The entry is re-located after the
     status rewrite because that edit shifts every later span offset.
@@ -320,10 +334,52 @@ def _apply_done(text: str, dw_id: str, date: str, note: str) -> str | None:
     assert status_m is not None  # open implies a status line
     start = entry.span[0] + status_m.start()
     end = entry.span[0] + status_m.end()
-    text = text[:start] + f"status: done {date}" + text[end:]
+    previous_status_line = status_m.group(0)
+    if undo_owner is not None and LINE_BREAK_RE.search(previous_status_line):
+        # An undo marker must never preserve a value that becomes more than one line
+        # under the ledger readers' shared splitlines semantics. Standard closes
+        # retain their existing behavior; the undo-capable path refuses the mark.
+        return None
+    done_status_line = f"status: done {date}"
+    text = text[:start] + done_status_line + text[end:]
     entry = _find_entry(text, dw_id)
     assert entry is not None
-    return _insert_after_status(text, entry, f"resolution: {note}")
+    tail = f"resolution: {note}"
+    if undo_owner is not None:
+        # The owner digest makes this close distinguishable from an earlier run
+        # that reused its human-readable note. The encoded prior line makes the
+        # undo lossless for parser-accepted spacing and annotations. Hex keeps
+        # every payload on one ASCII line, including Unicode annotations.
+        previous_status_hex = previous_status_line.encode("utf-8").hex()
+        tail += f"\nresolution-undo: {undo_owner} {date} {previous_status_hex}"
+    return _insert_after_status(text, entry, tail)
+
+
+def _mark_done_many(
+    path: Path,
+    dw_ids: Sequence[str],
+    date: str,
+    note: str,
+    *,
+    operation_id: str | None = None,
+) -> list[str]:
+    """Shared atomic implementation for the public close operations."""
+    _require_iso_date(date)
+    undo_owner = _operation_digest(operation_id) if operation_id is not None else None
+    if not path.is_file():
+        return []
+    text = path.read_text(encoding="utf-8")
+    marked: list[str] = []
+    for dw_id in dw_ids:
+        updated = _apply_done(text, dw_id, date, note, undo_owner=undo_owner)
+        if updated is None:
+            continue
+        text = updated
+        marked.append(dw_id)
+    if not marked:
+        return []
+    atomic_write_text(path, text)
+    return marked
 
 
 def mark_done_many(path: Path, dw_ids: Sequence[str], date: str, note: str) -> list[str]:
@@ -345,21 +401,28 @@ def mark_done_many(path: Path, dw_ids: Sequence[str], date: str, note: str) -> l
     ``date`` is validated before the ``is_file`` short-circuit so a programmer bug
     fails the same way whether or not a ledger happens to exist — a guard that
     only fires when the file is present is one an absent fixture hides."""
-    _require_iso_date(date)
-    if not path.is_file():
-        return []
-    text = path.read_text(encoding="utf-8")
-    marked: list[str] = []
-    for dw_id in dw_ids:
-        updated = _apply_done(text, dw_id, date, note)
-        if updated is None:
-            continue
-        text = updated
-        marked.append(dw_id)
-    if not marked:
-        return []
-    atomic_write_text(path, text)
-    return marked
+    return _mark_done_many(path, dw_ids, date, note)
+
+
+def mark_done_many_reopenable(
+    path: Path,
+    dw_ids: Sequence[str],
+    date: str,
+    note: str,
+    operation_id: str,
+) -> list[str]:
+    """Close entries atomically with a durable, operation-specific undo marker.
+
+    ``operation_id`` must be stable and recomputable across crash/replay from
+    already-persisted identity (for example ``run_id`` + ``story_key``), never an
+    ephemeral random value. Only entries actually flipped receive its marker;
+    skipped, already-done ids therefore cannot be reopened by this operation.
+
+    The ordinary :func:`mark_done_many` deliberately emits no marker and retains
+    its existing ledger format. Use this variant only for a transaction with a
+    later rollback leg.
+    """
+    return _mark_done_many(path, dw_ids, date, note, operation_id=operation_id)
 
 
 def mark_done(path: Path, dw_id: str, date: str, note: str) -> bool:
@@ -368,16 +431,22 @@ def mark_done(path: Path, dw_id: str, date: str, note: str) -> bool:
     return bool(mark_done_many(path, [dw_id], date, note))
 
 
-_MARK_DONE_TAIL_RE = re.compile(r"\nresolution:[ \t]*(.*)$", re.MULTILINE)
+_MARK_DONE_TAIL_RE = re.compile(
+    r"\nresolution:[ \t]*(.*)"
+    r"\nresolution-undo:[ \t]*([0-9a-f]{64})[ \t]+"
+    r"([0-9]{4}-[0-9]{2}-[0-9]{2})[ \t]+([0-9a-f]+)$",
+    re.MULTILINE,
+)
 
 
-def mark_open(path: Path, dw_id: str, note: str) -> bool:
-    """Undo one specific :func:`mark_done` operation.
+def mark_open(path: Path, dw_id: str, note: str, operation_id: str) -> bool:
+    """Undo one close written by :func:`mark_done_many_reopenable`.
 
-    The entry must be closed and the line immediately below its status must be
-    the resolution note this caller identifies. A close from another run, the
-    legacy writer, or a human is never reopened by resemblance alone.
+    The entry must still carry the operation's adjacent resolution and undo-marker
+    lines. A standard or earlier close has no matching marker and cannot be
+    reopened merely because it reused the same human-readable note.
     """
+    undo_owner = _operation_digest(operation_id)
     if not path.is_file():
         return False
     text = path.read_text(encoding="utf-8")
@@ -397,11 +466,25 @@ def mark_open(path: Path, dw_id: str, note: str) -> bool:
         # Preserve malformed or human-authored statuses for validation/reporting.
         return False
     res_m = _MARK_DONE_TAIL_RE.match(entry.body, status_m.end())
-    if res_m is None or res_m.group(1).strip() != _one_line(note).strip():
+    if res_m is None:
+        return False
+    if res_m.group(1).strip() != _one_line(note).strip() or res_m.group(2) != undo_owner:
+        return False
+    if status_m.group(0) != f"status: done {res_m.group(3)}":
+        return False
+    try:
+        previous_status_line = bytes.fromhex(res_m.group(4)).decode("utf-8")
+    except (UnicodeDecodeError, ValueError):
+        return False
+    if LINE_BREAK_RE.search(previous_status_line):
+        return False
+    previous_status_m = STATUS_RE.fullmatch(previous_status_line)
+    previous_status = previous_status_m.group(1).strip() if previous_status_m else ""
+    if not previous_status or previous_status.split()[0] != "open":
         return False
     start = entry.span[0] + status_m.start()
     end = entry.span[0] + res_m.end()
-    atomic_write_text(path, text[:start] + "status: open" + text[end:])
+    atomic_write_text(path, text[:start] + previous_status_line + text[end:])
     return True
 
 

@@ -1498,6 +1498,19 @@ def test_parse_deferred_findings_rejects_collection_valued_text_fields(field, co
     assert malformed == [f"item 1: `{field}` is not a scalar (got {type(collection).__name__})"]
 
 
+@pytest.mark.parametrize("field", ["summary", "evidence", "location"])
+@pytest.mark.parametrize("value", ["before\0after", "x" * 1001 + "\0"])
+def test_parse_deferred_findings_rejects_embedded_nul_in_text_fields(field, value):
+    """Reject before clamping too, so a late NUL cannot evade the stated schema."""
+    malformed_item = {"summary": "bad item", field: value}
+    findings, malformed = devcontract.parse_deferred_findings(
+        {"deferred": [malformed_item, {"summary": "good sibling"}]}
+    )
+
+    assert [finding.summary for finding in findings] == ["good sibling"]
+    assert malformed == [f"item 1: `{field}` contains a NUL character"]
+
+
 def test_parse_deferred_findings_normalizes_known_severity_and_drops_unknown(tmp_path):
     fm = _deferred_spec(
         tmp_path / "spec.md",
@@ -1596,6 +1609,12 @@ def test_harvest_fingerprint_is_stable_and_nul_separates_parts():
     assert devcontract.harvest_fingerprint("a", "b") == "4a3dec2d1f82"
     assert devcontract.harvest_fingerprint("ab", "c") != devcontract.harvest_fingerprint("a", "bc")
     assert len(devcontract.harvest_fingerprint("a", "b")) == 12
+
+
+@pytest.mark.parametrize("parts", [("a\0b", "c"), ("a", "b\0c")])
+def test_harvest_fingerprint_refuses_ambiguous_embedded_nul(parts):
+    with pytest.raises(ValueError, match="must not contain NUL"):
+        devcontract.harvest_fingerprint(*parts)
 
 
 def test_harvest_fingerprint_marks_sha1_as_non_security_use(monkeypatch):

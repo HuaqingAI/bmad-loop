@@ -212,7 +212,15 @@ class DeferredFinding:
 
 
 def harvest_fingerprint(*parts: str) -> str:
-    """Return a stable short identity over NUL-separated ledger values."""
+    """Return a stable short identity over NUL-separated ledger values.
+
+    A NUL inside a value is indistinguishable from the separator, so refuse it
+    rather than assigning two distinct findings the same structural identity.
+    The frontmatter parser reports such values as malformed before calling this
+    helper; the guard also keeps direct callers from creating an ambiguous key.
+    """
+    if any("\0" in part for part in parts):
+        raise ValueError("fingerprint parts must not contain NUL characters")
     return hashlib.sha1(
         "\0".join(parts).encode("utf-8"),
         usedforsecurity=False,
@@ -238,14 +246,21 @@ def _is_yaml_scalar(value: Any) -> bool:
     return isinstance(value, (str, bytes)) or not isinstance(value, (Mapping, Sequence, Set))
 
 
+def _contains_nul(value: Any) -> bool:
+    """Whether a YAML text scalar contains a NUL before normalization/clamping."""
+    return (isinstance(value, str) and "\0" in value) or (
+        isinstance(value, bytes) and b"\0" in value
+    )
+
+
 def parse_deferred_findings(fm: dict[str, Any]) -> tuple[list[DeferredFinding], list[str]]:
     """Parse a frontmatter ``deferred:`` list into findings and malformed notes.
 
     Missing, null, and empty lists mean no findings. Malformed items cost only
     themselves; well-formed siblings still parse. Text fields accept YAML
     scalars (numeric and boolean scalars are string-normalized), never
-    collections. This observation path never raises for the YAML shapes it
-    accepts.
+    collections or embedded NULs. This observation path never raises for the
+    YAML shapes it accepts.
     """
     raw = fm.get(DEFERRED_FIELD)
     if raw is None:
@@ -265,10 +280,6 @@ def parse_deferred_findings(fm: dict[str, Any]) -> tuple[list[DeferredFinding], 
                 f"item {i}: `summary` is not a scalar (got {type(summary_raw).__name__})"
             )
             continue
-        summary = _flatten(summary_raw, _SUMMARY_LIMIT)
-        if not summary:
-            malformed.append(f"item {i}: no usable `summary`")
-            continue
         bad_optional = next(
             (field for field in ("evidence", "location") if not _is_yaml_scalar(item.get(field))),
             None,
@@ -279,11 +290,27 @@ def parse_deferred_findings(fm: dict[str, Any]) -> tuple[list[DeferredFinding], 
                 f"item {i}: `{bad_optional}` is not a scalar (got {type(value).__name__})"
             )
             continue
+        raw_text_values = {
+            "summary": summary_raw,
+            "evidence": item.get("evidence"),
+            "location": item.get("location"),
+        }
+        bad_nul = next(
+            (field for field, value in raw_text_values.items() if _contains_nul(value)), None
+        )
+        if bad_nul is not None:
+            malformed.append(f"item {i}: `{bad_nul}` contains a NUL character")
+            continue
+        summary = _flatten(summary_raw, _SUMMARY_LIMIT)
+        if not summary:
+            malformed.append(f"item {i}: no usable `summary`")
+            continue
+        evidence = _flatten(item.get("evidence"), _EVIDENCE_LIMIT)
         location = _flatten(item.get("location"), _LOCATION_LIMIT)
         findings.append(
             DeferredFinding(
                 summary=summary,
-                evidence=_flatten(item.get("evidence"), _EVIDENCE_LIMIT),
+                evidence=evidence,
                 location=location,
                 severity=deferredwork.SEVERITY_ALIASES.get(
                     str(item.get("severity", "")).strip().lower(), ""
