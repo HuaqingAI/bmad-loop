@@ -86,7 +86,14 @@ def _make_flow(
 ):
     """Build a WorktreeFlow wired to recording stubs. The returned flow carries a
     ``.calls`` namespace tallying the injected callbacks for assertions."""
-    calls = SimpleNamespace(saves=0, emits=[], gates=[], pauses=[], workspaces=[workspace])
+    calls = SimpleNamespace(
+        saves=0,
+        emits=[],
+        gates=[],
+        carries=[],
+        pauses=[],
+        workspaces=[workspace],
+    )
 
     def _save() -> None:
         calls.saves += 1
@@ -98,6 +105,9 @@ def _make_flow(
     def _gate_unit(task) -> bool:
         calls.gates.append(task)
         return True
+
+    def _carry(task) -> None:
+        calls.carries.append(task)
 
     def _pause(reason, story_key="", *, cause=None):
         calls.pauses.append((reason, story_key))
@@ -129,6 +139,7 @@ def _make_flow(
         emit=_emit,
         save=_save,
         gate_unit=_gate_unit,
+        carry_isolated_ledger_writes=_carry,
         escalation_pause=_pause,
         workspace_get=lambda: calls.workspaces[-1],
         workspace_set=lambda ws: calls.workspaces.append(ws),

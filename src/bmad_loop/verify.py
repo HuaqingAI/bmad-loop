@@ -308,6 +308,36 @@ def has_changes_since(
     return bool(created)
 
 
+def path_changed_since(
+    repo: Path,
+    baseline: str,
+    rel: str,
+    *,
+    baseline_untracked: list[str] | None = None,
+) -> bool:
+    """Whether one literal repo-relative path changed since ``baseline``.
+
+    This is the single-path form of :func:`has_changes_since`: tracked content
+    is compared to the recorded commit, while an ordinary untracked path counts
+    only when the attempt's baseline snapshot did not already contain it.
+    ``baseline_untracked=None`` keeps the proof gate's legacy behavior of
+    counting every ordinary untracked path. Ignored paths are absent from
+    :func:`untracked_files` and therefore cannot become proof of work here.
+
+    Any non-zero diff result fails open toward "changed", matching the
+    authoritative :func:`has_changes_since` gate. The literal pathspec is
+    required for operator-configured ledger paths containing Git wildmatch
+    characters.
+    """
+    rc, _ = _git(repo, "diff", "--quiet", baseline, "--", f":(literal){rel}")
+    if rc != 0:
+        return True
+    untracked = untracked_files(repo)
+    if rel not in untracked:
+        return False
+    return baseline_untracked is None or rel not in set(baseline_untracked)
+
+
 def attempt_dirty(
     repo: Path,
     baseline: str,
@@ -1048,7 +1078,12 @@ def _tree_dirty_vs_head(repo: Path) -> bool:
 
 
 def merge_branch(
-    repo: Path, branch: str, *, strategy: str = "merge", message: str | None = None
+    repo: Path,
+    branch: str,
+    *,
+    strategy: str = "merge",
+    message: str | None = None,
+    allow_empty_squash: bool = False,
 ) -> None:
     """Merge `branch` into the branch currently checked out in `repo`.
 
@@ -1059,6 +1094,11 @@ def merge_branch(
     Editor-induced dirt first via `clean_incoming_collisions`. When git refuses
     a merge at pre-flight (no MERGE_HEAD created) the tree was never touched, so
     no abort/reset is attempted and the raw git error is raised verbatim.
+
+    ``allow_empty_squash`` is recovery-only: re-running a squash that committed
+    before a host loss stages nothing because the target already has the merged
+    tree. That clean result confirms the replay without manufacturing an empty
+    commit; ordinary squash calls keep commit failures strict.
     """
     if strategy == "ff":
         rc, out = _git(repo, "merge", "--ff-only", branch)
@@ -1087,6 +1127,8 @@ def merge_branch(
                 if reset_rc != 0:
                     detail += f"; AND git reset --hard HEAD failed (tree not restored): {reset_out}"
             raise GitError(detail)
+        if allow_empty_squash and not _tree_dirty_vs_head(repo):
+            return
         msg = message or f"Squash-merge branch '{branch}'"
         rc, out = _git(repo, "commit", "-m", msg)
         if rc != 0:
@@ -1436,6 +1478,7 @@ def verify_dev(
     review_enabled: bool = True,
     *,
     operator_park: bool = False,
+    engine_written: tuple[str, ...] = (),
 ) -> VerifyOutcome:
     """Verify a dev session's on-disk artifacts against its result.json claims.
 
@@ -1454,6 +1497,11 @@ def verify_dev(
     state and to a non-empty action list. Off by policy, the token is simply not
     a terminal the gate knows, so it fails the ordinary status check and the
     session is retried with that mismatch as feedback.
+
+    ``engine_written`` names project-relative paths the orchestrator itself
+    wrote above this gate during the attempt. They compose with the mode's normal
+    proof-of-work exclusions so engine bookkeeping cannot masquerade as session
+    work; see :meth:`Engine._harvest_gate_exclude`.
     """
     rj = result_json or {}
     spec_file = rj.get("spec_file")
@@ -1483,7 +1531,7 @@ def verify_dev(
         expected_status=(
             AWAITING_OPERATOR if parked else ("in-review" if review_enabled else "done")
         ),
-        extra_exclude=(),
+        extra_exclude=engine_written,
         fm=fm,
     )
     if gate is not None:
@@ -1505,13 +1553,17 @@ def verify_dev_bundle(
     paths: ProjectPaths,
     result_json: dict[str, Any] | None,
     review_enabled: bool = True,
+    *,
+    engine_written: tuple[str, ...] = (),
 ) -> VerifyOutcome:
     """verify_dev for a deferred-work bundle: bundles have no sprint-status
     entry. The orchestrator owns the bundle→dw-id binding (``task.dw_ids``,
     marked done by ``SweepEngine``'s ledger sync); the generic ``bmad-dev-auto``
     primitive never authors dw ids. So the dw_ids cross-check is enforced only
     when the session actually claims them — an empty/absent claim is the normal
-    generic path and passes."""
+    generic path and passes.
+
+    ``engine_written`` has the same contract as :func:`verify_dev`."""
     rj = result_json or {}
     spec_file = rj.get("spec_file")
     if not spec_file:
@@ -1529,7 +1581,7 @@ def verify_dev_bundle(
         task,
         paths,
         expected_status="in-review" if review_enabled else "done",
-        extra_exclude=(),
+        extra_exclude=engine_written,
         allow_ancestor_baseline=True,
     )
     if gate is not None:
@@ -1561,6 +1613,7 @@ def verify_dev_stories(
     spec_folder: Path,
     review_enabled: bool = True,
     plan_halt: bool = False,
+    engine_written: tuple[str, ...] = (),
 ) -> VerifyOutcome:
     """verify_dev for stories mode: the story spec lives at the id-keyed path
     ``<spec-folder>/stories/<id>-<slug>.md`` and there is no sprint-status entry.
@@ -1632,14 +1685,18 @@ def verify_dev_stories(
     # Otherwise stories mode adds the spec folder's stories/ subdir + stories.yaml
     # on top of the gate's own file-granular exclude — NOT the whole-folder
     # artifact_relpaths, so a story whose entire authorized scope is ledger/spec
-    # reconciliation doesn't register as a false "no changes".
+    # reconciliation doesn't register as a false "no changes". Engine-written
+    # paths compose only on that live-gate leg; ``None`` must remain ``None`` for
+    # plan halt rather than being combined with a tuple.
     gate = _verify_shared_gates(
         spec_path,
         rj,
         task,
         paths,
         expected_status=expected,
-        extra_exclude=(None if plan_halt else _stories_relpaths(paths.project, spec_folder)),
+        extra_exclude=(
+            None if plan_halt else _stories_relpaths(paths.project, spec_folder) + engine_written
+        ),
     )
     if gate is not None:
         return gate

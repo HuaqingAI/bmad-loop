@@ -102,6 +102,33 @@ def test_attempt_dirty_none_snapshot_ignores_untracked(project):
     assert verify.attempt_dirty(project.project, baseline, None) is True
 
 
+def test_path_changed_since_detects_one_tracked_path(project):
+    baseline = verify.rev_parse_head(project.project)
+
+    assert verify.path_changed_since(project.project, baseline, "src.txt") is False
+
+    (project.project / "src.txt").write_text("changed\n", encoding="utf-8")
+    assert verify.path_changed_since(project.project, baseline, "src.txt") is True
+
+
+def test_path_changed_since_respects_the_untracked_baseline(project):
+    baseline = verify.rev_parse_head(project.project)
+    (project.project / "ledger[1].md").write_text("finding\n", encoding="utf-8")
+
+    assert verify.path_changed_since(
+        project.project,
+        baseline,
+        "ledger[1].md",
+        baseline_untracked=[],
+    )
+    assert not verify.path_changed_since(
+        project.project,
+        baseline,
+        "ledger[1].md",
+        baseline_untracked=["ledger[1].md"],
+    )
+
+
 def test_attempt_dirty_excludes_untracked_artifact(project):
     """A new untracked spec under an orchestrator-owned artifact folder is not the
     dev attempt's dirtiness when that folder is excluded — but counts otherwise."""
@@ -3190,3 +3217,13 @@ def test_snapshot_worktree_unknown_baseline_skips_untracked(project):
     tree = git(repo, "ls-tree", "-r", "--name-only", ref)
     assert "src.txt" in tree  # tracked edit captured
     assert "user_untracked.txt" not in tree  # unknown-baseline untracked left untouched
+
+
+def test_engine_written_is_keyword_only_on_all_dev_verifiers():
+    """The three mode gates share one call contract; stories was positional in 0.9.x."""
+    import inspect
+
+    for fn in (verify.verify_dev, verify.verify_dev_bundle, verify.verify_dev_stories):
+        parameter = inspect.signature(fn).parameters["engine_written"]
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert "operator_park" in inspect.signature(verify.verify_dev).parameters

@@ -515,6 +515,7 @@ def write_spec(
     prose_status: str | None = None,
     closes_deferred: object = None,
     operator_actions: object = None,
+    deferred=None,
 ) -> None:
     """Write a spec the way the real bmad-dev-auto skill does. The skill's step-03
     stamps `baseline_revision` and NEVER `baseline_commit` (that name exists only
@@ -532,7 +533,13 @@ def write_spec(
     reads back — so the reading under test is the one production sees. A non-list
     renders as a scalar, which is the wrong-container mistake for this field
     too (a bare string is iterable, so a lenient reader would turn one
-    instruction into a list of characters)."""
+    instruction into a list of characters).
+
+    ``deferred`` adds the post-#2640 frontmatter list using
+    :func:`render_deferred`. ``None`` omits the field entirely (the pre-#2640
+    shape); ``[]`` emits an explicit empty list. It is rendered last so adding
+    this fixture capability does not reorder either pre-existing declaration.
+    """
     declare = ""
     if isinstance(closes_deferred, list):
         declare = f"closes_deferred: [{', '.join(closes_deferred)}]\n"
@@ -543,6 +550,8 @@ def write_spec(
         declare += f"operator_actions:\n{rendered}" if rendered else "operator_actions: []\n"
     elif operator_actions is not None:
         declare += f"operator_actions: {operator_actions}\n"
+    if deferred is not None:
+        declare += render_deferred(deferred)
     body = (
         f"---\ntitle: 'test'\ntype: 'feature'\nstatus: '{status}'\n"
         f"baseline_revision: '{baseline}'\n{declare}---\n\n## Intent\n\ntest spec\n"
@@ -628,6 +637,7 @@ def dev_effect(
     write_src: bool = True,
     closes_deferred: object = None,
     operator_actions: object = None,
+    deferred=None,
 ):
     """Simulate a successful bmad-dev-auto session: it self-finalizes the spec
     (no in-review handoff — always straight to ``done``) but never touches the
@@ -650,7 +660,10 @@ def dev_effect(
     patch-restore tests assert the re-driven session ran against the RESTORED diff.
     ``write_src=False`` then keeps the session from appending its own line, so what
     lands in the tree is exactly what the restore laid down (the applied patch is
-    the session's proof of work; a second edit would muddy the assertion)."""
+    the session's proof of work; a second edit would muddy the assertion).
+
+    ``deferred`` records post-#2640 review findings in the spec frontmatter; the
+    simulated session still never writes the deferred-work ledger itself."""
 
     def effect(spec: SessionSpec) -> SessionResult:
         baseline = rev_parse_head(paths.project)
@@ -667,6 +680,7 @@ def dev_effect(
             prose_status=prose_status,
             closes_deferred=closes_deferred,
             operator_actions=operator_actions,
+            deferred=deferred,
         )
         # deliberately NO set_sprint: the dev skill does not write sprint-status
         return SessionResult(
@@ -828,6 +842,8 @@ def bundle_dev_effect(
     followup_review: bool = True,
     final_status: str = "done",
     prose_status: str | None = None,
+    deferred=None,
+    write_src: bool = True,
 ):
     """Simulate a bmad-dev-auto bundle dev session: edits code and self-finalizes
     the bundle spec to ``done`` (no in-review handoff). On the decoupled path the
@@ -835,16 +851,19 @@ def bundle_dev_effect(
     ``mark_ledger=True`` is kept only for the legacy-marking path in older tests.
     ``followup_review`` mirrors `followup_review_recommended` — defaults True so
     the bundle review runs under the default trigger = "recommended". ``final_status``
-    / ``prose_status`` mirror ``dev_effect``: pair a non-terminal ``final_status``
-    with ``prose_status="done"`` to reproduce the skill finalizing in prose only."""
+    / ``prose_status`` / ``deferred`` / ``write_src`` mirror ``dev_effect``: pair
+    a non-terminal ``final_status`` with ``prose_status="done"`` to reproduce the
+    skill finalizing in prose only; ``write_src=False`` expresses a session whose
+    only post-baseline diff comes from orchestrator ledger bookkeeping."""
 
     def effect(spec: SessionSpec) -> SessionResult:
         baseline = rev_parse_head(paths.project)
         source = paths.project / "src.txt"
-        source.write_text(source.read_text() + f"change for dw-{name}\n")
+        if write_src:
+            source.write_text(source.read_text() + f"change for dw-{name}\n")
         sp = bundle_spec_path(paths, name)
         # mirror the skill: always self-finalize the bundle spec straight to done
-        write_spec(sp, final_status, baseline, prose_status=prose_status)
+        write_spec(sp, final_status, baseline, prose_status=prose_status, deferred=deferred)
         if mark_ledger:
             mark_ledger_done(paths, dw_ids)
         return SessionResult(

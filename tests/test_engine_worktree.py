@@ -27,9 +27,10 @@ from conftest import (
     write_sprint,
 )
 
-from bmad_loop import verify, worktree_flow
+from bmad_loop import sprintstatus, verify, worktree_flow
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
+from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.engine import Engine
 from bmad_loop.install import (
     BMAD_SCRIPTS_SEED_REL,
@@ -73,8 +74,10 @@ def wt_dev_effect(
     *,
     final_status="done",
     followup_review=True,
+    write_src=True,
     closes_deferred=None,
     operator_actions=None,
+    deferred=None,
 ):
     """Dev session running inside the unit worktree (spec.cwd). Mirrors the
     bmad-dev-auto skill: self-finalizes the spec to done, never writes the sprint
@@ -86,8 +89,9 @@ def wt_dev_effect(
         cwd = spec.cwd
         wt = project.rebased(cwd)
         baseline = rev_parse_head(cwd)
-        src = cwd / "src.txt"
-        src.write_text(src.read_text() + f"change for {story_key}\n")
+        if write_src:
+            src = cwd / "src.txt"
+            src.write_text(src.read_text() + f"change for {story_key}\n")
         sp = wt.implementation_artifacts / f"spec-{story_key}.md"
         write_spec(
             sp,
@@ -95,6 +99,7 @@ def wt_dev_effect(
             baseline,
             closes_deferred=closes_deferred,
             operator_actions=operator_actions,
+            deferred=deferred,
         )
         # NO set_sprint: the orchestrator is the single sprint-status writer
         return SessionResult(
@@ -144,7 +149,7 @@ def wt_bad_dev(project, story_key):
     return effect
 
 
-def wt_review_effect(project, story_key, clean: bool, patched: int = 0):
+def wt_review_effect(project, story_key, clean: bool, patched: int = 0, deferred=None):
     """Follow-up review pass in a worktree — a bmad-dev-auto re-invocation on the
     done spec. ``clean=True`` converges; ``clean=False`` keeps recommending."""
 
@@ -153,7 +158,7 @@ def wt_review_effect(project, story_key, clean: bool, patched: int = 0):
         wt = project.rebased(cwd)
         sp = wt.implementation_artifacts / f"spec-{story_key}.md"
         baseline = _spec_baseline(sp)
-        write_spec(sp, "done", baseline)
+        write_spec(sp, "done", baseline, deferred=deferred)
         set_sprint(wt, story_key, "done")
         return SessionResult(
             status="completed",
@@ -611,6 +616,918 @@ def test_worktree_defer_without_keep_drops_worktree_but_saves_patch(project):
     # in the run dir is the only surviving artifact.
     attention = (engine.run_dir / "ATTENTION").read_text()
     assert "story deferred: 1-1-a" in attention and "kept on branch" not in attention
+
+
+_HARVEST_CARRY = {
+    "summary": "Retry loop has no ceiling",
+    "evidence": "the backoff doubles forever with no cap",
+    "location": "src/retry.py:88",
+    "severity": "medium",
+}
+
+_HARVEST_CARRY_LATER = {
+    "summary": "Timeout path drops the cancellation reason",
+    "evidence": "the timeout handler replaces the original exception",
+    "location": "src/timeout.py:41",
+    "severity": "high",
+}
+
+
+def _harvest_record(finding=None):
+    finding = finding or _HARVEST_CARRY
+    return {
+        "origin": "spec-deferred abc123",
+        "title": finding["summary"],
+        "reason": finding["evidence"],
+        "location": finding["location"],
+        "severity": finding["severity"],
+        "source_spec": "spec-1-1-a.md",
+    }
+
+
+def _main_harvest_entries(project):
+    from bmad_loop import deferredwork
+
+    text = project.deferred_work.read_text(encoding="utf-8")
+    return deferredwork.parse_ledger(text)
+
+
+def _harvest_carry_events(engine):
+    return [entry for entry in engine.journal.entries() if entry["kind"] == "harvest-carried"]
+
+
+def test_deferred_isolated_unit_carries_harvest_before_terminal_save(project):
+    """A dropped failed worktree cannot be the only durable home of its finding."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    script = [wt_dev_effect(project, "1-1-a", deferred=[_HARVEST_CARRY])] + [
+        wt_review_effect(project, "1-1-a", clean=False, patched=1) for _ in range(3)
+    ]
+    engine, _ = make_engine(
+        project,
+        script,
+        policy=wt_policy(keep_failed=False, limits=_NO_DAMP),
+    )
+    terminal_saves: list[bool] = []
+    real_save = engine._save
+
+    def observe_terminal_save() -> None:
+        task = engine.state.tasks.get("1-1-a")
+        if task is not None and task.phase == Phase.DEFERRED:
+            terminal_saves.append(project.deferred_work.is_file())
+        real_save()
+
+    engine._save = observe_terminal_save
+    summary = engine.run()
+
+    assert summary.deferred == 1 and not summary.paused and not summary.crashed
+    assert terminal_saves and terminal_saves[0] is True
+    assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
+    assert [path.resolve() for path in worktree_list(project.project)] == [
+        project.project.resolve()
+    ]
+    assert not branch_exists(project.project, "bmad-loop/test-run/1-1-a")
+
+
+def test_deferred_carry_commit_failure_resumes_before_terminal_integration(project, monkeypatch):
+    """A carry fault cannot strand a terminal task before defer teardown."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    script = [wt_dev_effect(project, "1-1-a", deferred=[_HARVEST_CARRY])] + [
+        wt_review_effect(project, "1-1-a", clean=False, patched=1) for _ in range(3)
+    ]
+    engine, _ = make_engine(
+        project,
+        script,
+        policy=wt_policy(keep_failed=False, limits=_NO_DAMP),
+    )
+    real_commit = verify.commit_paths
+    failures = 0
+
+    def commit_fails_once(*args, **kwargs):
+        nonlocal failures
+        failures += 1
+        if failures == 1:
+            raise verify.GitError("commit hook rejects deferred carry")
+        return real_commit(*args, **kwargs)
+
+    monkeypatch.setattr(verify, "commit_paths", commit_fails_once)
+
+    assert engine.run().crashed
+
+    failed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert failed.phase == Phase.REVIEW_VERIFY
+    assert failed.harvest_carry_commit_pending is True
+    assert Path(failed.worktree_path).is_dir()
+    assert "story-deferred" not in journal_kinds(engine)
+    assert "unit-closed" not in journal_kinds(engine)
+
+    state = load_state(engine.run_dir)
+    state.clear_pause()
+    adapter = MockAdapter([])
+    resumed = Engine(
+        paths=project,
+        policy=engine.policy,
+        adapter=adapter,
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=state,
+    )
+    summary = resumed.run()
+
+    restored = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert summary.deferred == 1 and not summary.crashed and not summary.paused
+    assert restored.phase == Phase.DEFERRED
+    assert restored.harvest_carry_commit_pending is False
+    assert adapter.sessions == []
+    assert "story-deferred" in journal_kinds(resumed)
+    assert "unit-closed" in journal_kinds(resumed)
+    assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
+    assert [path.resolve() for path in worktree_list(project.project)] == [
+        project.project.resolve()
+    ]
+    assert not branch_exists(project.project, failed.branch)
+    assert worktree_clean(project.project)
+
+
+def test_dev_defer_carry_failure_resumes_the_rejected_decision(project, monkeypatch):
+    """A carry fault cannot turn a rejected dev result into a verified spec."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            wt_dev_effect(
+                project,
+                "1-1-a",
+                followup_review=False,
+                write_src=False,
+                deferred=[_HARVEST_CARRY],
+            )
+        ],
+        policy=wt_policy(keep_failed=False, limits=LimitsPolicy(max_dev_attempts=1)),
+    )
+    real_commit = verify.commit_paths
+    failures = 0
+
+    def commit_fails_once(*args, **kwargs):
+        nonlocal failures
+        message = str(args[1]) if len(args) > 1 else str(kwargs.get("message", ""))
+        if message.startswith("chore(deferred-work): carry harvested findings") and failures == 0:
+            failures += 1
+            raise verify.GitError("commit hook rejects deferred carry")
+        return real_commit(*args, **kwargs)
+
+    monkeypatch.setattr(verify, "commit_paths", commit_fails_once)
+
+    assert engine.run().crashed
+
+    failed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert failed.phase == Phase.DEV_VERIFY
+    assert failed.spec_file
+    assert failed.harvest_carry_commit_pending is True
+    assert "no changes" in (failed.defer_reason or "")
+    assert Path(failed.worktree_path).is_dir()
+    assert "story-deferred" not in journal_kinds(engine)
+    assert "unit-closed" not in journal_kinds(engine)
+
+    state = load_state(engine.run_dir)
+    state.clear_pause()
+    adapter = MockAdapter([])
+    resumed = Engine(
+        paths=project,
+        policy=engine.policy,
+        adapter=adapter,
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=state,
+    )
+    summary = resumed.run()
+
+    restored = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert summary.deferred == 1 and not summary.done
+    assert not summary.crashed and not summary.paused
+    assert restored.phase == Phase.DEFERRED
+    assert restored.harvest_carry_commit_pending is False
+    assert adapter.sessions == []
+    decisions = [event for event in resumed.journal.entries() if event["kind"] == "dev-decision"]
+    assert len(decisions) == 1 and decisions[0]["action"] == "defer"
+    assert "resume-defer" in journal_kinds(resumed)
+    assert "resume-review" not in journal_kinds(resumed)
+    assert "story-deferred" in journal_kinds(resumed)
+    assert "unit-closed" in journal_kinds(resumed)
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "ready-for-dev"
+    assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
+    assert [path.resolve() for path in worktree_list(project.project)] == [
+        project.project.resolve()
+    ]
+    assert not branch_exists(project.project, failed.branch)
+    assert worktree_clean(project.project)
+
+
+def test_done_isolated_unit_carries_a_gitignored_harvest_after_merge(project):
+    ignore_before_commit(project, "deferred-work.md")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            wt_dev_effect(
+                project,
+                "1-1-a",
+                followup_review=False,
+                deferred=[_HARVEST_CARRY],
+            )
+        ],
+    )
+
+    summary = engine.run()
+
+    task = engine.state.tasks["1-1-a"]
+    assert summary.done == 1 and task.phase == Phase.DONE
+    assert task.isolated_ledger_carried
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+    assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
+    assert [event["dw_ids"] for event in _harvest_carry_events(engine)] == [["DW-1"]]
+    uncommitted = [
+        entry for entry in engine.journal.entries() if entry["kind"] == "harvest-carry-uncommitted"
+    ]
+    assert len(uncommitted) == 1 and uncommitted[0]["dw_ids"] == ["DW-1"]
+    assert [path.resolve() for path in worktree_list(project.project)] == [
+        project.project.resolve()
+    ]
+
+
+def test_done_isolated_unit_carries_gitignored_harvests_from_every_successful_pass(project):
+    """A later review payload cannot erase a retained dev finding before carry."""
+    ignore_before_commit(project, "deferred-work.md")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            wt_dev_effect(project, "1-1-a", deferred=[_HARVEST_CARRY]),
+            wt_review_effect(
+                project,
+                "1-1-a",
+                clean=True,
+                deferred=[_HARVEST_CARRY_LATER],
+            ),
+        ],
+    )
+
+    summary = engine.run()
+
+    task = engine.state.tasks["1-1-a"]
+    expected = [_HARVEST_CARRY["summary"], _HARVEST_CARRY_LATER["summary"]]
+    assert summary.done == 1 and not summary.crashed and not summary.paused
+    assert [item["title"] for item in task.harvested_deferrals] == expected
+    assert [entry.title for entry in _main_harvest_entries(project)] == expected
+    assert [event["dw_ids"] for event in _harvest_carry_events(engine)] == [["DW-1", "DW-2"]]
+
+
+def test_tracked_harvest_carry_commit_failure_propagates(project, monkeypatch):
+    """A tracked ledger persistence fault cannot be reported as a completed carry."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        harvested_deferrals=[_harvest_record()],
+    )
+    engine.state.tasks[task.story_key] = task
+
+    def commit_fails(*args, **kwargs):
+        raise verify.GitError("index lock blocks tracked ledger carry")
+
+    monkeypatch.setattr(verify, "commit_paths", commit_fails)
+
+    with pytest.raises(verify.GitError, match="index lock"):
+        engine._carry_harvested_deferrals(task)
+
+    assert "harvest-carried" not in journal_kinds(engine)
+    assert "harvest-carry-uncommitted" not in journal_kinds(engine)
+    assert load_state(engine.run_dir).tasks[task.story_key].harvest_carry_commit_pending
+
+
+def test_untracked_nonignored_harvest_carry_commit_failure_propagates(project, monkeypatch):
+    """An ordinary new ledger is committable, so its git failure is fatal too."""
+    engine, _ = make_engine(project, [])
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        harvested_deferrals=[_harvest_record()],
+    )
+    engine.state.tasks[task.story_key] = task
+
+    def commit_fails(*args, **kwargs):
+        raise verify.GitError("status fails for untracked ledger carry")
+
+    monkeypatch.setattr(verify, "commit_paths", commit_fails)
+
+    with pytest.raises(verify.GitError, match="untracked ledger"):
+        engine._carry_harvested_deferrals(task)
+
+    rel = project.deferred_work.relative_to(project.project).as_posix()
+    assert rel in verify.untracked_files(project.project)
+    assert load_state(engine.run_dir).tasks[task.story_key].harvest_carry_commit_pending
+    assert "harvest-carry-uncommitted" not in journal_kinds(engine)
+
+
+def test_external_harvest_carry_commit_failure_degrades(project, tmp_path, monkeypatch):
+    """A configured external ledger remains an advisory, non-git artifact."""
+    external_paths = ProjectPaths(
+        project=project.project,
+        implementation_artifacts=tmp_path / "external-artifacts",
+        planning_artifacts=project.planning_artifacts,
+        output_folder=project.output_folder,
+        repo_root=project.repo_root,
+    )
+    engine, _ = make_engine(external_paths, [])
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        harvested_deferrals=[_harvest_record()],
+    )
+    engine.state.tasks[task.story_key] = task
+
+    def commit_fails(*args, **kwargs):
+        raise verify.GitError("external ledger cannot be committed")
+
+    monkeypatch.setattr(verify, "commit_paths", commit_fails)
+
+    engine._carry_harvested_deferrals(task)
+
+    restored = load_state(engine.run_dir).tasks[task.story_key]
+    assert restored.harvest_carry_commit_pending is False
+    assert [entry.title for entry in _main_harvest_entries(external_paths)] == [
+        _HARVEST_CARRY["summary"]
+    ]
+    uncommitted = [
+        event for event in engine.journal.entries() if event["kind"] == "harvest-carry-uncommitted"
+    ]
+    assert len(uncommitted) == 1 and uncommitted[0]["dw_ids"] == ["DW-1"]
+
+
+def test_host_loss_after_harvest_append_replays_the_pending_commit(project, monkeypatch):
+    """The commit intent is durable before append_entry can mutate the ledger."""
+    from bmad_loop import deferredwork
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    engine.state.target_branch = "main"
+    worktree = engine.run_dir / "worktrees" / "1-1-a"
+    worktree.mkdir(parents=True)
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=Phase.DONE,
+        worktree_path=str(worktree),
+        branch="bmad-loop/test-run/1-1-a",
+        harvested_deferrals=[_harvest_record()],
+    )
+    engine.state.tasks[task.story_key] = task
+    engine.journal.append(
+        "unit-merged",
+        story_key=task.story_key,
+        branch=task.branch,
+        target="main",
+    )
+    real_append = deferredwork.append_entry
+
+    def append_then_host_dies(*args, **kwargs):
+        real_append(*args, **kwargs)
+        raise SystemExit("host died after ledger append")
+
+    monkeypatch.setattr(deferredwork, "append_entry", append_then_host_dies)
+    with pytest.raises(SystemExit, match="host died"):
+        engine._carry_harvested_deferrals(task)
+
+    failed = load_state(engine.run_dir).tasks[task.story_key]
+    assert failed.harvest_carry_commit_pending is True
+    assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
+
+    monkeypatch.setattr(deferredwork, "append_entry", real_append)
+    failed_state = load_state(engine.run_dir)
+    resumed = Engine(
+        paths=project,
+        policy=engine.policy,
+        adapter=MockAdapter([]),
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=failed_state,
+    )
+    after_story: list[str] = []
+    monkeypatch.setattr(
+        resumed,
+        "_after_story",
+        lambda restored_task: after_story.append(restored_task.story_key),
+    )
+    resumed._replay_unlatched_ledger_carries()
+
+    restored = load_state(resumed.run_dir).tasks[task.story_key]
+    assert failed_state.tasks[task.story_key].isolated_ledger_carried is True
+    assert restored.harvest_carry_commit_pending is False
+    assert restored.isolated_ledger_carried is True
+    assert after_story == [task.story_key]
+    assert worktree_clean(project.project)
+    assert "carry harvested findings from 1-1-a" in git(project.project, "log", "-1", "--format=%s")
+
+
+@pytest.mark.parametrize("phase", [Phase.DONE, Phase.AWAITING_OPERATOR, Phase.DEFERRED])
+def test_tracked_harvest_carry_commit_failure_retries_its_pending_commit(
+    project, monkeypatch, phase
+):
+    """A failed commit remains replayable after provenance dedupes its append."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    engine.state.target_branch = "main"
+    worktree = engine.run_dir / "worktrees" / "1-1-a"
+    worktree.mkdir(parents=True)
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=phase,
+        worktree_path=str(worktree),
+        branch="bmad-loop/test-run/1-1-a",
+        harvested_deferrals=[_harvest_record()],
+    )
+    engine.state.tasks[task.story_key] = task
+    if phase in (Phase.DONE, Phase.AWAITING_OPERATOR):
+        engine.journal.append(
+            "unit-merged",
+            story_key=task.story_key,
+            branch=task.branch,
+            target="main",
+        )
+    real_commit = verify.commit_paths
+
+    def commit_fails(*args, **kwargs):
+        raise verify.GitError("commit hook rejects tracked carry")
+
+    monkeypatch.setattr(verify, "commit_paths", commit_fails)
+    with pytest.raises(verify.GitError, match="commit hook"):
+        engine._carry_harvested_deferrals(task)
+
+    failed = load_state(engine.run_dir).tasks[task.story_key]
+    assert failed.harvest_carry_commit_pending is True
+    assert failed.isolated_ledger_carried is False
+
+    monkeypatch.setattr(verify, "commit_paths", real_commit)
+    resumed = Engine(
+        paths=project,
+        policy=engine.policy,
+        adapter=MockAdapter([]),
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=load_state(engine.run_dir),
+    )
+    resumed._replay_unlatched_ledger_carries()
+
+    restored = load_state(resumed.run_dir).tasks[task.story_key]
+    assert restored.harvest_carry_commit_pending is False
+    assert restored.isolated_ledger_carried is (phase != Phase.DEFERRED)
+    assert "resume-ledger-carry" in journal_kinds(resumed)
+    assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
+    assert "carry harvested findings from 1-1-a" in git(project.project, "log", "-1", "--format=%s")
+
+
+def test_unmerged_terminal_unit_does_not_replay_harvest_carry(project):
+    """A terminal phase and live directory alone are not durable merge evidence."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    engine.state.target_branch = "main"
+    worktree = engine.run_dir / "worktrees" / "1-1-a"
+    worktree.mkdir(parents=True)
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=Phase.DONE,
+        worktree_path=str(worktree),
+        branch="bmad-loop/test-run/1-1-a",
+        harvested_deferrals=[_harvest_record()],
+    )
+    engine.state.tasks[task.story_key] = task
+
+    engine._replay_unlatched_ledger_carries()
+
+    assert not project.deferred_work.exists()
+    assert task.isolated_ledger_carried is False
+    assert "resume-ledger-carry" not in journal_kinds(engine)
+
+
+def test_started_merge_replay_failure_does_not_carry_harvest(project, monkeypatch):
+    """Write-ahead merge intent cannot stand in for successful merge proof."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    engine.state.target_branch = "main"
+    worktree = engine.run_dir / "worktrees" / "1-1-a"
+    worktree.mkdir(parents=True)
+    source = rev_parse_head(project.project)
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=Phase.DONE,
+        worktree_path=str(worktree),
+        branch="bmad-loop/test-run/1-1-a",
+        commit_sha=source,
+        harvested_deferrals=[_harvest_record()],
+    )
+    engine.state.tasks[task.story_key] = task
+    engine.journal.append(
+        "unit-merge-started",
+        story_key=task.story_key,
+        branch=task.branch,
+        target="main",
+        strategy="merge",
+        source=source,
+    )
+
+    def replay_fails(*args, **kwargs):
+        raise verify.GitError("replayed merge still conflicts")
+
+    monkeypatch.setattr(engine, "_merge_local", replay_fails)
+
+    with pytest.raises(verify.GitError, match="still conflicts"):
+        engine._replay_unlatched_ledger_carries()
+
+    assert not project.deferred_work.exists()
+    assert task.isolated_ledger_carried is False
+    assert "resume-unit-merge" in journal_kinds(engine)
+    assert "resume-ledger-carry" not in journal_kinds(engine)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("story_key", "1-2-other"),
+        ("branch", "bmad-loop/test-run/other-branch"),
+        ("target", "release"),
+    ],
+)
+def test_mismatched_unit_merge_evidence_does_not_replay_harvest_carry(project, field, value):
+    """Replay requires the merged story, unit branch, and target to all match."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    engine.state.target_branch = "main"
+    worktree = engine.run_dir / "worktrees" / "1-1-a"
+    worktree.mkdir(parents=True)
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=Phase.DONE,
+        worktree_path=str(worktree),
+        branch="bmad-loop/test-run/1-1-a",
+        harvested_deferrals=[_harvest_record()],
+    )
+    engine.state.tasks[task.story_key] = task
+    evidence = {
+        "story_key": task.story_key,
+        "branch": task.branch,
+        "target": "main",
+    }
+    evidence[field] = value
+    engine.journal.append("unit-merged", **evidence)
+
+    engine._replay_unlatched_ledger_carries()
+
+    assert not project.deferred_work.exists()
+    assert task.isolated_ledger_carried is False
+    assert "resume-ledger-carry" not in journal_kinds(engine)
+
+
+def test_done_isolated_unit_dedupes_a_tracked_closed_harvest_after_merge(project):
+    from bmad_loop import deferredwork
+
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    head_before = rev_parse_head(project.project)
+
+    def close_harvest_then_review(spec):
+        wt = project.rebased(spec.cwd)
+        assert deferredwork.mark_done(
+            wt.deferred_work,
+            "DW-1",
+            "2026-08-03",
+            "fixed before the unit merged",
+        )
+        return wt_review_effect(project, "1-1-a", clean=True)(spec)
+
+    engine, _ = make_engine(
+        project,
+        [
+            wt_dev_effect(project, "1-1-a", deferred=[_HARVEST_CARRY]),
+            close_harvest_then_review,
+        ],
+    )
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    entries = _main_harvest_entries(project)
+    assert len(entries) == 1 and entries[0].title == _HARVEST_CARRY["summary"]
+    assert not entries[0].open
+    assert [event["dw_ids"] for event in _harvest_carry_events(engine)] == [[]]
+    subjects = git(project.project, "log", "--format=%s", f"{head_before}..HEAD").splitlines()
+    assert not [
+        subject
+        for subject in subjects
+        if subject.startswith("chore(deferred-work): carry harvested findings")
+    ]
+
+
+def test_awaiting_operator_isolated_unit_carries_a_gitignored_harvest(project):
+    ignore_before_commit(project, "deferred-work.md")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            wt_dev_effect(
+                project,
+                "1-1-a",
+                final_status="awaiting-operator",
+                followup_review=False,
+                operator_actions=["publish the DNS record"],
+                deferred=[_HARVEST_CARRY],
+            )
+        ],
+    )
+
+    summary = engine.run()
+
+    task = engine.state.tasks["1-1-a"]
+    assert summary.awaiting_operator == 1 and task.phase == Phase.AWAITING_OPERATOR
+    assert task.isolated_ledger_carried
+    assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
+    assert [event["dw_ids"] for event in _harvest_carry_events(engine)] == [["DW-1"]]
+
+
+@pytest.mark.parametrize(
+    ("merge_strategy", "resumed_strategy"),
+    [("merge", "ff"), ("ff", "squash"), ("squash", "merge")],
+)
+def test_host_loss_after_merge_before_evidence_replays_gitignored_harvest(
+    project, monkeypatch, merge_strategy, resumed_strategy
+):
+    """Replay uses durable merge intent even when the live policy changed."""
+    ignore_before_commit(project, "deferred-work.md")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            wt_dev_effect(
+                project,
+                "1-1-a",
+                followup_review=False,
+                deferred=[_HARVEST_CARRY],
+            )
+        ],
+        policy=wt_policy(merge_strategy=merge_strategy),
+    )
+    real_append = engine.journal.append
+
+    def host_dies_before_merge_evidence(kind, **fields):
+        if kind == "unit-merged":
+            raise SystemExit("host died before merge evidence")
+        return real_append(kind, **fields)
+
+    monkeypatch.setattr(engine.journal, "append", host_dies_before_merge_evidence)
+    with pytest.raises(SystemExit, match="host died before merge evidence"):
+        engine.run()
+
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    landed_head = rev_parse_head(project.project)
+    assert crashed.phase == Phase.DONE and not crashed.isolated_ledger_carried
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+    assert Path(crashed.worktree_path).is_dir()
+    assert not project.deferred_work.exists()
+    assert "unit-merged" not in journal_kinds(engine)
+
+    monkeypatch.setattr(engine.journal, "append", real_append)
+    replay_collision_refs: list[str] = []
+    replay_merge_refs: list[str] = []
+    replay_strategies: list[str] = []
+    real_clean = verify.clean_incoming_collisions
+    real_merge = verify.merge_branch
+
+    def record_collision_ref(repo, target, merge_ref):
+        replay_collision_refs.append(merge_ref)
+        return real_clean(repo, target, merge_ref)
+
+    def record_merge_ref(repo, merge_ref, **kwargs):
+        replay_merge_refs.append(merge_ref)
+        replay_strategies.append(kwargs["strategy"])
+        return real_merge(repo, merge_ref, **kwargs)
+
+    monkeypatch.setattr(verify, "clean_incoming_collisions", record_collision_ref)
+    monkeypatch.setattr(verify, "merge_branch", record_merge_ref)
+    resumed = Engine(
+        paths=project,
+        policy=wt_policy(merge_strategy=resumed_strategy),
+        adapter=MockAdapter([]),
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=load_state(engine.run_dir),
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.crashed and not summary.paused
+    assert rev_parse_head(project.project) == landed_head
+    assert replay_collision_refs == [crashed.commit_sha]
+    assert replay_merge_refs == [crashed.commit_sha]
+    assert replay_strategies == [merge_strategy]
+    assert "unit-merge-started" in journal_kinds(resumed)
+    assert "unit-merged" in journal_kinds(resumed)
+    assert [
+        (entry["strategy"], entry["source"])
+        for entry in resumed.journal.entries()
+        if entry["kind"] == "resume-unit-merge"
+    ] == [(merge_strategy, crashed.commit_sha)]
+    assert [
+        (entry["strategy"], entry["source"])
+        for entry in resumed.journal.entries()
+        if entry["kind"] == "unit-merged"
+    ] == [(merge_strategy, crashed.commit_sha)]
+    assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
+    assert load_state(resumed.run_dir).tasks["1-1-a"].isolated_ledger_carried
+
+
+@pytest.mark.parametrize("merge_strategy", ["merge", "ff", "squash"])
+def test_merge_replay_rejects_a_unit_branch_advanced_after_recorded_source(
+    project, monkeypatch, merge_strategy
+):
+    """Recovery preserves and refuses commits outside the completed session."""
+    ignore_before_commit(project, "deferred-work.md")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            wt_dev_effect(
+                project,
+                "1-1-a",
+                followup_review=False,
+                deferred=[_HARVEST_CARRY],
+            )
+        ],
+        policy=wt_policy(merge_strategy=merge_strategy),
+    )
+    real_append = engine.journal.append
+
+    def host_dies_before_merge_evidence(kind, **fields):
+        if kind == "unit-merged":
+            raise SystemExit("host died before merge evidence")
+        return real_append(kind, **fields)
+
+    monkeypatch.setattr(engine.journal, "append", host_dies_before_merge_evidence)
+    with pytest.raises(SystemExit, match="host died before merge evidence"):
+        engine.run()
+
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    landed_head = rev_parse_head(project.project)
+    unit_path = Path(crashed.worktree_path)
+    (unit_path / "late.txt").write_text("not part of the completed session\n", encoding="utf-8")
+    git(unit_path, "add", "late.txt")
+    git(unit_path, "commit", "-q", "-m", "late unverified commit")
+    advanced_head = rev_parse_head(unit_path)
+    assert advanced_head != crashed.commit_sha
+
+    monkeypatch.setattr(engine.journal, "append", real_append)
+    resumed = Engine(
+        paths=project,
+        policy=engine.policy,
+        adapter=MockAdapter([]),
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=load_state(engine.run_dir),
+    )
+    summary = resumed.run()
+
+    assert summary.paused and summary.escalated == 1 and not summary.crashed
+    assert rev_parse_head(project.project) == landed_head
+    assert not (project.project / "late.txt").exists()
+    assert unit_path.is_dir()
+    assert branch_exists(project.project, crashed.branch)
+    assert rev_parse_head(unit_path) == advanced_head
+    assert "unit-merged" not in journal_kinds(resumed)
+    assert not project.deferred_work.exists()
+    restored = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert restored.phase == Phase.ESCALATED
+    assert not restored.isolated_ledger_carried
+
+
+def test_crashed_post_merge_harvest_carry_replays_and_persists_its_latch(project):
+    ignore_before_commit(project, "deferred-work.md")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            wt_dev_effect(
+                project,
+                "1-1-a",
+                followup_review=False,
+                deferred=[_HARVEST_CARRY],
+            )
+        ],
+    )
+
+    def crash_before_carry(_task) -> None:
+        raise RuntimeError("host died after merge and teardown")
+
+    # The WorktreeFlow callback must look this method up when invoked, not capture
+    # the original bound method at Engine construction time.
+    engine._carry_isolated_ledger_writes = crash_before_carry
+    assert engine.run().crashed
+
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed.phase == Phase.DONE and not crashed.isolated_ledger_carried
+    assert crashed.harvested_deferrals
+    assert not Path(crashed.worktree_path).exists()
+    assert not project.deferred_work.exists()
+
+    state = load_state(engine.run_dir)
+    state.clear_pause()
+    adapter = MockAdapter([])
+    resumed = Engine(
+        paths=project,
+        policy=engine.policy,
+        adapter=adapter,
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=state,
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.crashed and not summary.paused
+    assert adapter.sessions == []
+    assert "resume-ledger-carry" in journal_kinds(resumed)
+    assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
+    assert load_state(resumed.run_dir).tasks["1-1-a"].isolated_ledger_carried
+
+
+def test_crashed_post_merge_harvest_carry_replays_when_teardown_leaves_directory(
+    project, monkeypatch
+):
+    """A stale teardown directory is not evidence that the merge never landed."""
+    import bmad_loop.workspace as workspace_mod
+
+    ignore_before_commit(project, "deferred-work.md")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            wt_dev_effect(
+                project,
+                "1-1-a",
+                followup_review=False,
+                deferred=[_HARVEST_CARRY],
+            )
+        ],
+    )
+    real_remove = verify.worktree_remove
+    real_rmtree = workspace_mod._rmtree_confined
+
+    def teardown_fails(*args, **kwargs):
+        raise verify.GitError("worktree teardown blocked")
+
+    def leave_directory(*args, **kwargs):
+        return True
+
+    def crash_before_carry(_task) -> None:
+        raise RuntimeError("host died after degraded teardown")
+
+    monkeypatch.setattr(verify, "worktree_remove", teardown_fails)
+    monkeypatch.setattr(workspace_mod, "_rmtree_confined", leave_directory)
+    engine._carry_isolated_ledger_writes = crash_before_carry
+    assert engine.run().crashed
+
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed.phase == Phase.DONE and not crashed.isolated_ledger_carried
+    assert Path(crashed.worktree_path).is_dir()
+    assert "unit-merged" in journal_kinds(engine)
+    assert "worktree-teardown-degraded" in journal_kinds(engine)
+    assert not project.deferred_work.exists()
+
+    monkeypatch.setattr(verify, "worktree_remove", real_remove)
+    monkeypatch.setattr(workspace_mod, "_rmtree_confined", real_rmtree)
+    state = load_state(engine.run_dir)
+    state.clear_pause()
+    adapter = MockAdapter([])
+    resumed = Engine(
+        paths=project,
+        policy=engine.policy,
+        adapter=adapter,
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=state,
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.crashed and not summary.paused
+    assert adapter.sessions == []
+    assert "resume-ledger-carry" in journal_kinds(resumed)
+    assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
+    assert load_state(resumed.run_dir).tasks["1-1-a"].isolated_ledger_carried
 
 
 def test_worktree_defer_then_next_story_succeeds(project):

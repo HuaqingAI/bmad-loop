@@ -2583,3 +2583,98 @@ def test_bundle_dispatch_does_not_pin_expected_spec(project, tmp_path):
     assert str(intent) in prompt and task.spec_file not in prompt
     engine._run_session(task, role="dev", prompt=prompt, seq=1)
     assert adapter.sessions[-1].expected_spec is None
+
+
+# ---------------- frontmatter `deferred:` harvest parity (BMAD-METHOD #2640)
+
+SWEEP_FINDING = {
+    "summary": "The retry cap should be configurable",
+    "evidence": "hardcoded while fixing DW-1",
+    "location": "src/retry.py:88",
+    "severity": "low",
+}
+
+
+def _harvest_bundle_policy(*, attempts: int = 3) -> Policy:
+    return Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        limits=LimitsPolicy(max_dev_attempts=attempts),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+
+
+def test_generic_bundle_harvests_new_spec_deferrals_alongside_its_ids(project):
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    plan = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[{"name": "fix-things", "dw_ids": ["DW-1", "DW-2"], "intent": "fix both"}],
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(
+                project,
+                "fix-things",
+                ["DW-1", "DW-2"],
+                mark_ledger=False,
+                followup_review=False,
+                deferred=[SWEEP_FINDING],
+            ),
+        ],
+        policy=_harvest_bundle_policy(),
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused
+    assert engine.state.tasks["dw-fix-things"].phase == Phase.DONE
+    entries = ledger_entries(project)
+    assert entries["DW-1"].status.startswith("done")
+    assert entries["DW-2"].status.startswith("done")
+    assert entries["DW-3"].open
+    assert entries["DW-3"].title == SWEEP_FINDING["summary"]
+    assert "origin: spec-deferred " in entries["DW-3"].body
+    assert "location: src/retry.py:88" in entries["DW-3"].body
+    assert "source_spec: `spec-dw-fix-things.md`" in entries["DW-3"].body
+    assert engine.state.tasks["dw-fix-things"].dw_ids == ["DW-1", "DW-2"]
+    harvested = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert len(harvested) == 1 and harvested[0]["dw_ids"] == ["DW-3"]
+
+
+def test_bundle_harvest_alone_is_not_proof_of_work(project):
+    """Scope this 6J witness to the gate action; 6L moves bundle close timing."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"],
+        bundles=[{"name": "fix-things", "dw_ids": ["DW-1"], "intent": "fix it"}],
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(
+                project,
+                "fix-things",
+                ["DW-1"],
+                mark_ledger=False,
+                followup_review=False,
+                deferred=[SWEEP_FINDING],
+                write_src=False,
+            ),
+        ],
+        policy=_harvest_bundle_policy(attempts=1),
+    )
+
+    summary = engine.run()
+
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert [decision["action"] for decision in decisions] == ["defer"]
+    assert "no changes" in decisions[0]["reason"]
+    assert summary.deferred == 1
+    assert engine.state.tasks["dw-fix-things"].phase == Phase.DEFERRED
+    harvested = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert len(harvested) == 1 and harvested[0]["dw_ids"] == ["DW-2"]

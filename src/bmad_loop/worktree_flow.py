@@ -5,7 +5,8 @@ Extracted from :class:`bmad_loop.engine.Engine` (issue #244, findings F-3/F-9a):
 state machine. It lives here as a collaborator built from narrow dependencies
 (repo paths, the policy, run state, journal, plugin registry, loaded adapters)
 plus a handful of engine callbacks (emit a plugin hook, save state, run the
-per-unit ready gate, escalate-pause, and get/set the engine's active workspace).
+per-unit ready gate, carry isolated ledger writes, escalate-pause, and get/set
+the engine's active workspace).
 The collaborator never receives the whole ``Engine`` — it cannot reach engine
 internals beyond those callables.
 
@@ -633,10 +634,11 @@ class WorktreeFlow:
     only structural changes are that engine-owned effects go through injected
     callables: ``emit`` fires a plugin hook (late-bound so a monkeypatched
     ``Engine._emit`` still wins), ``save`` persists run state, ``gate_unit`` runs
-    the per-unit ready gate, ``workspace_get``/``workspace_set`` read and swap the
-    engine's active workspace, and ``escalation_pause`` raises the engine's
-    ``RunPaused`` (injected so this module need not import ``engine`` — that would
-    reintroduce a runtime<->engine import cycle)."""
+    the per-unit ready gate, ``carry_isolated_ledger_writes`` applies Engine-owned
+    ledger bookkeeping after a successful merge, ``workspace_get``/``workspace_set``
+    read and swap the engine's active workspace, and ``escalation_pause`` raises the
+    engine's ``RunPaused`` (injected so this module need not import ``engine`` — that
+    would reintroduce a runtime<->engine import cycle)."""
 
     def __init__(
         self,
@@ -652,6 +654,7 @@ class WorktreeFlow:
         emit: Callable[..., object],
         save: Callable[[], None],
         gate_unit: Callable[[StoryTask], bool],
+        carry_isolated_ledger_writes: Callable[[StoryTask], None],
         escalation_pause: Callable[..., NoReturn],
         workspace_get: Callable[[], Workspace],
         workspace_set: Callable[[Workspace], None],
@@ -671,6 +674,7 @@ class WorktreeFlow:
         self._emit = emit
         self._save = save
         self._gate_unit = gate_unit
+        self._carry_isolated_ledger_writes = carry_isolated_ledger_writes
         self._pause = escalation_pause
         self._workspace_get = workspace_get
         self._workspace_set = workspace_set
@@ -971,6 +975,17 @@ class WorktreeFlow:
             # ourselves by hand once the branch has landed; the orchestrator only
             # commits the worktree onto the selected target.
             self.merge_local(task, unit)
+            # Engine-authored ledger writes normally ride the unit commit, but a
+            # gitignored ledger is omitted by finalize_commit's `git add -A` and
+            # would otherwise disappear with successful teardown. Carry only after
+            # merge: a tracked ledger reaches the target through the merge first,
+            # where Engine's all-status provenance scan can deduplicate it.
+            self._carry_isolated_ledger_writes(task)
+            # Phase is already terminal and persisted before integration, so make
+            # the carry completion durable here. Engine replays an unlatched carry
+            # after a crash in the merge-to-carry window.
+            task.isolated_ledger_carried = True
+            self._save()
         else:  # DEFERRED — capture the diff, keep or drop per keep_failed
             patch = close_unit_workspace(
                 unit,
@@ -993,19 +1008,45 @@ class WorktreeFlow:
                 patch=str(patch) if patch else None,
             )
 
-    def merge_local(self, task: StoryTask, unit: UnitWorkspace) -> None:
+    def merge_local(
+        self,
+        task: StoryTask,
+        unit: UnitWorkspace,
+        *,
+        replay: bool = False,
+        replay_strategy: str | None = None,
+    ) -> None:
         """Merge a DONE unit's branch into the target branch from the main repo."""
-        self._emit("pre_merge", task)
+        if not replay:
+            self._emit("pre_merge", task)
         scm = self.policy.scm
+        merge_strategy = scm.merge_strategy if replay_strategy is None else replay_strategy
         repo = self.paths.repo_root
         target = self.state.target_branch
+        source = task.commit_sha or verify.rev_parse_head(unit.path)
+        merge_ref = unit.branch
+        if replay:
+            current_source = verify.rev_parse_head(unit.path)
+            if current_source != source:
+                reason = (
+                    f"merge replay of {unit.branch} into {target} blocked: the unit "
+                    f"branch advanced from recorded source {source} to {current_source}; "
+                    "the later commits were not produced or verified by the completed "
+                    "session and the branch was preserved for manual recovery"
+                )
+                self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
+                return
+            # Pin both the collision allowlist and the merge operand to the
+            # write-ahead SHA. The branch can move after the check; replay must
+            # integrate only the commit the completed session actually proved.
+            merge_ref = source
         # A per_worktree Unity Editor can leak asset writes into the *main*
         # checkout (see the unity plugin's worktree setup), dirtying the target with the very
         # files this branch already committed. Reconcile that first: clean only
         # the leaked copies of incoming files; refuse (escalate) if anything dirty
         # falls outside this branch's path set — that may be real operator work.
         try:
-            cleaned = verify.clean_incoming_collisions(repo, target, unit.branch)
+            cleaned = verify.clean_incoming_collisions(repo, target, merge_ref)
         except (verify.GitError, OSError) as e:
             # OSError joins GitError because clean_incoming_collisions mutates the
             # checkout directly (unlink/iterdir/rmdir) — a non-spawn FS fault the
@@ -1036,12 +1077,26 @@ class WorktreeFlow:
                 branch=unit.branch,
                 paths=cleaned,
             )
+        if not replay:
+            # The task is already terminal and durable here. Record integration
+            # intent immediately before git so a host loss after merge success but
+            # before `unit-merged` can safely re-run the merge instead of losing a
+            # gitignored ledger when the stale worktree is reclaimed.
+            self.journal.append(
+                "unit-merge-started",
+                story_key=task.story_key,
+                branch=unit.branch,
+                target=target,
+                strategy=merge_strategy,
+                source=source,
+            )
         try:
             verify.merge_branch(
                 repo,
-                unit.branch,
-                strategy=scm.merge_strategy,
+                merge_ref,
+                strategy=merge_strategy,
                 message=self.merge_message(task),
+                allow_empty_squash=replay,
             )
         except verify.GitError as e:
             # genuine content conflict against the target: keep the branch for
@@ -1058,6 +1113,8 @@ class WorktreeFlow:
             story_key=task.story_key,
             branch=unit.branch,
             target=self.state.target_branch,
+            strategy=merge_strategy,
+            source=source,
         )
         self._emit("post_merge", task)
         close_unit_workspace(

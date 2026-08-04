@@ -76,6 +76,7 @@ def stories_dev_effect(
     prose_status: str | None = None,
     closes_deferred: object = None,
     write_src: bool = True,
+    deferred=None,
 ):
     """Simulate a bmad-dev-auto folder+id dispatch: read the story id + spec
     folder from the session env (as the real adapter does), write the id-keyed
@@ -83,7 +84,8 @@ def stories_dev_effect(
 
     ``write_src=False`` skips the code change, so the proof-of-work gate fails and
     the story defers with its spec still finalized — the shape a story-declared
-    ledger closure must survive without claiming anything resolved."""
+    ledger closure must survive without claiming anything resolved. ``deferred``
+    writes the post-#2640 finding list into that spec."""
 
     def effect(spec) -> SessionResult:
         story_id = spec.env["BMAD_LOOP_STORY_KEY"]
@@ -96,7 +98,12 @@ def stories_dev_effect(
         if write_src:
             src.write_text(src.read_text() + f"work for {story_id}\n")
         write_spec(
-            sp, final_status, baseline, prose_status=prose_status, closes_deferred=closes_deferred
+            sp,
+            final_status,
+            baseline,
+            prose_status=prose_status,
+            closes_deferred=closes_deferred,
+            deferred=deferred,
         )
         return SessionResult(
             status="completed",
@@ -116,7 +123,7 @@ def stories_dev_effect(
     return effect
 
 
-def stories_checkpoint_effect():
+def stories_checkpoint_effect(*, deferred=None):
     """Simulate bmad-dev-auto honoring `Halt after planning.`: on a plan-halt leg
     (BMAD_LOOP_PLAN_HALT set by the engine) write the id-keyed spec at
     ready-for-dev with NO code change — the plan is just the spec — and mark the
@@ -139,14 +146,14 @@ def stories_checkpoint_effect():
             "escalations": [],
         }
         if spec.env.get("BMAD_LOOP_PLAN_HALT"):
-            write_spec(sp, "ready-for-dev", baseline)
+            write_spec(sp, "ready-for-dev", baseline, deferred=deferred)
             return SessionResult(
                 status="completed",
                 result_json={**common, "status": "ready-for-dev", "plan_halt": True},
             )
         src = Path(spec.cwd) / "src.txt"
         src.write_text(src.read_text() + f"work for {story_id}\n")
-        write_spec(sp, "done", baseline)
+        write_spec(sp, "done", baseline, deferred=deferred)
         return SessionResult(
             status="completed",
             result_json={**common, "status": "done", "followup_review_recommended": False},
@@ -1539,3 +1546,114 @@ def test_stories_mode_unknown_id_is_journaled_not_fatal(project):
     assert project.deferred_work.read_bytes() == before
     unmatched = _kinds(engine.journal, "deferred-close-unmatched")
     assert len(unmatched) == 1 and unmatched[0]["dw_ids"] == ["DW-99"]
+
+
+# ---------------- frontmatter `deferred:` harvest parity (BMAD-METHOD #2640)
+
+STORY_FINDING = {
+    "summary": "The id-keyed spec loader rescans on every call",
+    "evidence": "resolve_story_spec globs the folder each time",
+    "location": "src/bmad_loop/stories.py:120",
+    "severity": "low",
+}
+
+
+def test_stories_mode_harvests_spec_deferrals_into_the_ledger(project):
+    from bmad_loop import deferredwork
+
+    setup_stories(project, [entry("1")])
+    engine, _ = make_engine(project, [stories_dev_effect(deferred=[STORY_FINDING])])
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    entries = deferredwork.parse_ledger(project.deferred_work.read_text(encoding="utf-8"))
+    assert len(entries) == 1 and entries[0].open
+    assert entries[0].title == STORY_FINDING["summary"]
+    assert "location: src/bmad_loop/stories.py:120" in entries[0].body
+    assert "source_spec: `1-slug.md`" in entries[0].body
+    assert _kinds(engine.journal, "spec-deferrals-harvested")[0]["dw_ids"] == ["DW-1"]
+
+
+def test_stories_mode_harvests_id_resolved_spec_not_reported_sibling(project):
+    """The harvest and verifier must consume the same story-id-keyed artifact.
+
+    A session-reported sibling is untrusted in stories mode: harvesting it before
+    ``verify_dev_stories`` resolves the real spec can file another story's finding
+    even though only the id-keyed spec is subsequently accepted and committed.
+    """
+    from bmad_loop import deferredwork
+
+    sibling_finding = {
+        "summary": "A stale sibling must not drive the harvest",
+        "evidence": "The session reported an unrelated spec path",
+        "location": "src/unrelated.py:1",
+        "severity": "high",
+    }
+    write_id_spec = stories_dev_effect(deferred=[STORY_FINDING])
+
+    def report_sibling(spec):
+        result = write_id_spec(spec)
+        result_json = dict(result.result_json or {})
+        sibling = Path(spec.cwd) / SPEC_FOLDER / "stories" / "stale-sibling.md"
+        write_spec(
+            sibling,
+            "done",
+            result_json["baseline_commit"],
+            deferred=[sibling_finding],
+        )
+        result_json["spec_file"] = str(sibling)
+        return SessionResult(status="completed", result_json=result_json)
+
+    setup_stories(project, [entry("1")])
+    engine, _ = make_engine(project, [report_sibling])
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    entries = deferredwork.parse_ledger(project.deferred_work.read_text(encoding="utf-8"))
+    assert [item.title for item in entries] == [STORY_FINDING["summary"]]
+    assert "source_spec: `1-slug.md`" in entries[0].body
+
+
+def test_plan_halt_leg_does_not_harvest_then_implement_leg_does(project):
+    from bmad_loop import deferredwork
+
+    setup_stories(project, [entry("1", spec_checkpoint=True)])
+    engine, _ = make_engine(project, [stories_checkpoint_effect(deferred=[STORY_FINDING])])
+
+    summary = engine.run()
+
+    assert summary.paused and summary.done == 0
+    assert status_of(read_frontmatter(story_spec(project, "1"))) == "ready-for-dev"
+    assert not project.deferred_work.exists()
+    assert not _kinds(engine.journal, "spec-deferrals-harvested")
+
+    resumed, _ = resume_engine(
+        project, engine, [stories_checkpoint_effect(deferred=[STORY_FINDING])]
+    )
+    resumed_summary = resumed.run()
+
+    assert resumed_summary.done == 1
+    entries = deferredwork.parse_ledger(project.deferred_work.read_text(encoding="utf-8"))
+    assert len(entries) == 1 and entries[0].open
+    assert _kinds(resumed.journal, "spec-deferrals-harvested")[0]["dw_ids"] == ["DW-1"]
+
+
+def test_stories_harvest_alone_is_not_proof_of_work(project):
+    setup_stories(project, [entry("1")])
+    engine, _ = make_engine(
+        project,
+        [
+            stories_dev_effect(write_src=False, deferred=[STORY_FINDING]),
+            stories_dev_effect(),
+        ],
+    )
+
+    summary = engine.run()
+
+    decisions = _kinds(engine.journal, "dev-decision")
+    assert [decision["action"] for decision in decisions] == ["retry", "proceed"]
+    assert "no changes" in decisions[0]["reason"]
+    assert _kinds(engine.journal, "spec-deferrals-harvested")[0]["dw_ids"] == ["DW-1"]
+    assert summary.done == 1

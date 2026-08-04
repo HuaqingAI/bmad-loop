@@ -11,7 +11,8 @@ mtime-scan, no shared mutable board.
 Like ``SweepEngine``, this is a thin override layer over the mature story
 pipeline: only the story source (``_pick_next``), the dispatch prompt
 (``_dev_prompt``), the (absent) bookkeeping sync (``_post_dev_state_sync``), the
-artifact verification (``_verify_dev_artifacts``), the session env
+deferral-harvest source (``_harvest_spec_path``), artifact verification
+(``_verify_dev_artifacts``), the session env
 (``_extra_session_env``), and the HITL checkpoints differ. Everything else —
 dev/verify/review/commit, crash resume, worktree isolation, gates — is inherited
 unchanged.
@@ -416,6 +417,13 @@ class StoriesEngine(Engine):
 
     # ---------------------------------------------------------- sync + verify
 
+    def _harvest_spec_path(self, task: StoryTask, result_json: dict | None) -> Path | None:
+        """Resolve the same id-keyed story spec that verification will accept."""
+        if not (result_json or {}).get("spec_file"):
+            return None
+        state = stories.resolve_story_spec(self._stories_folder(), task.story_key)
+        return state.path if state.kind == stories.KIND_PRESENT else None
+
     def _post_dev_state_sync(self, task: StoryTask, result_json: dict | None) -> None:
         """No-op: stories mode has no sprint board. Honors the contract's "the
         orchestrator writes nothing" on the happy path — the dev skill is the sole
@@ -482,6 +490,7 @@ class StoriesEngine(Engine):
             spec_folder=folder,
             review_enabled=self._dev_review_enabled(),
             plan_halt=plan_halt,
+            engine_written=self._harvest_gate_exclude(task),
         )
 
     def _run_verify_commands_after_dev(self, task: StoryTask, result_json: dict | None) -> bool:
