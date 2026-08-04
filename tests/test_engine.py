@@ -8592,6 +8592,64 @@ def test_spec_deferrals_transient_missing_probe_returns_retry_without_harvest(pr
     assert [entry.title for entry in _harvest_entries(project)] == [HARVEST_A["summary"]]
 
 
+def test_spec_deferrals_transient_inner_missing_probe_returns_retry(project, monkeypatch):
+    """The reader's own file probe must not collapse a race to a clean no-op."""
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    sp = spec_path(project, "1-1-a")
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(sp, "done", "abc123", deferred=[HARVEST_A])
+    real_is_file = Path.is_file
+    probes = 0
+
+    def transient_inner_missing(path, *args, **kwargs):
+        nonlocal probes
+        if path == sp:
+            probes += 1
+            if probes == 2:
+                return False
+        return real_is_file(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "is_file", transient_inner_missing)
+    task = StoryTask(story_key="1-1-a", epic=1)
+
+    outcome = engine._harvest_spec_deferrals(task, {"spec_file": str(sp)})
+
+    assert outcome is not None and outcome.retryable and not outcome.fixable
+    assert "empty or invalid frontmatter" in outcome.reason
+    assert not project.deferred_work.exists()
+
+    assert engine._harvest_spec_deferrals(task, {"spec_file": str(sp)}) is None
+    assert [entry.title for entry in _harvest_entries(project)] == [HARVEST_A["summary"]]
+
+
+@pytest.mark.parametrize(
+    "broken_frontmatter",
+    [
+        b"\xff\xfe\x00\x00",
+        b"---\nstatus: done\ndeferred: [unterminated\n---\nbody\n",
+    ],
+    ids=["invalid-utf8", "invalid-yaml"],
+)
+def test_spec_deferrals_degraded_frontmatter_returns_retry_then_recovers(
+    project, broken_frontmatter
+):
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    sp = spec_path(project, "1-1-a")
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    sp.write_bytes(broken_frontmatter)
+    task = StoryTask(story_key="1-1-a", epic=1)
+
+    outcome = engine._harvest_spec_deferrals(task, {"spec_file": str(sp)})
+
+    assert outcome is not None and outcome.retryable and not outcome.fixable
+    assert "empty or invalid frontmatter" in outcome.reason
+    assert not project.deferred_work.exists()
+
+    write_spec(sp, "done", "abc123", deferred=[HARVEST_A])
+    assert engine._harvest_spec_deferrals(task, {"spec_file": str(sp)}) is None
+    assert [entry.title for entry in _harvest_entries(project)] == [HARVEST_A["summary"]]
+
+
 def test_spec_deferrals_stat_failure_returns_retry_without_harvest(project, monkeypatch):
     engine, _ = make_engine(project, [], policy=_harvest_policy())
     sp = spec_path(project, "1-1-a")
@@ -8943,6 +9001,72 @@ def test_retry_replay_recovers_session_ledger_attribution_after_prior_harvest(pr
     assert [entry.title for entry in _harvest_entries(project)] == [
         "Session's own ledger work",
         HARVEST_B["summary"],
+    ]
+
+
+def test_retry_replay_persists_post_session_hook_ledger_attribution(project, tmp_path):
+    """A hook-only repair remains visible across the post-session crash window."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    marker = tmp_path / "repair-complete"
+    engine, _ = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A]),
+            _repairing_effect(
+                project,
+                marker,
+                dev_effect(project, "1-1-a", followup_review=False, write_src=False),
+            ),
+        ],
+        policy=_fixable_harvest_policy(marker),
+    )
+    original_emit = engine._emit
+    post_sessions = 0
+
+    def append_from_second_post_session(stage, *args, **kwargs):
+        nonlocal post_sessions
+        if stage == "post_session":
+            post_sessions += 1
+            if post_sessions == 2:
+                deferredwork.append_entry(
+                    project.deferred_work,
+                    title="Repair hook's ledger work",
+                    origin="post-session repair hook",
+                    source_spec="spec-1-1-a.md",
+                    reason="the retained repair recorded its only work here",
+                )
+        return original_emit(stage, *args, **kwargs)
+
+    engine._emit = append_from_second_post_session
+    original_run_session = engine._run_session
+
+    def crash_after_second_session_checkpoint(*args, **kwargs):
+        result = original_run_session(*args, **kwargs)
+        if kwargs.get("seq") == 2:
+            raise RuntimeError("host died after post-session hooks")
+        return result
+
+    engine._run_session = crash_after_second_session_checkpoint
+
+    assert engine.run().crashed
+
+    crashed_task = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed_task.phase == Phase.DEV_RUNNING
+    assert crashed_task.attempt == 2
+    assert crashed_task.sessions[-1].status == "completed"
+    assert crashed_task.harvest_wrote_ledger is True
+    assert crashed_task.ledger_changed_before_harvest is True
+
+    resumed, adapter = resume_engine(project, engine, [])
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.crashed and not summary.paused
+    assert adapter.sessions == []
+    decisions = [e for e in resumed.journal.entries() if e["kind"] == "dev-decision"]
+    assert [decision["action"] for decision in decisions] == ["retry", "proceed"]
+    assert [entry.title for entry in _harvest_entries(project)] == [
+        HARVEST_A["summary"],
+        "Repair hook's ledger work",
     ]
 
 

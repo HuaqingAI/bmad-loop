@@ -2626,6 +2626,25 @@ class Engine:
                 "spec unreadable while harvesting deferrals "
                 f"({e.__class__.__name__}: {e}): {spec_path}"
             )
+        # The shared observation reader deliberately collapses a second missing-
+        # file probe, invalid UTF-8, malformed YAML, and a non-mapping document to
+        # `{}`. That is safe for status observation, whose verifier re-reads and
+        # retries, but not for this required repair input: a later clean verifier
+        # read could otherwise accept the session after the harvest silently
+        # skipped every recorded finding. A successful spec always has at least a
+        # status mapping, so this does not reject the valid pre-`deferred:` era.
+        if not fm:
+            self.journal.append(
+                "spec-read-failed",
+                story_key=task.story_key,
+                spec=str(spec_path),
+                site="spec-deferrals",
+                error="empty or invalid frontmatter",
+            )
+            return VerifyOutcome.retry(
+                "spec unreadable while harvesting deferrals "
+                f"(empty or invalid frontmatter): {spec_path}"
+            )
         if devcontract.DEFERRED_FIELD not in fm:
             return
         status = verify.status_of(fm)
@@ -3551,6 +3570,24 @@ class Engine:
             session_status=result.status,  # pyright: ignore[reportOptionalMemberAccess]
             result_json=result.result_json,  # pyright: ignore[reportOptionalMemberAccess]
         )
+        # A post-session hook may be the session's last writer. The completed
+        # result was checkpointed before hooks so it is replayable, but a retained
+        # retry can already carry `harvest_wrote_ledger=True`; replay then
+        # deliberately preserves the saved attribution instead of comparing an
+        # engine-modified ledger again. Close that crash window immediately after
+        # hooks finish. Save only when the comparison changed, keeping the
+        # zero-plugin/no-ledger-change path free of a redundant state rewrite.
+        if (
+            resumable
+            and role == "dev"
+            and result.status == "completed"  # pyright: ignore[reportOptionalMemberAccess]
+            and result.result_json is not None  # pyright: ignore[reportOptionalMemberAccess]
+            and task.baseline_ledger_digest is not None
+        ):
+            ledger_changed = self._ledger_digest() != task.baseline_ledger_digest
+            if ledger_changed != task.ledger_changed_before_harvest:
+                task.ledger_changed_before_harvest = ledger_changed
+                self._save()
         return result  # pyright: ignore[reportReturnType]
 
     def _note_story_token_budget(self, task: StoryTask) -> None:
