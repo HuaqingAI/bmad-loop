@@ -1135,10 +1135,10 @@ that rode the same window. Both skill eras are supported; the rename itself need
   edits outright — on a pre-BMAD-METHOD#2640 skill there is no frontmatter to harvest and the
   session's own append is the finding's only record — and still forbids rewriting existing entries.
 
-- **A transient harvest read cannot silently drop recorded findings (#405).** An unreadable spec
-  at the harvest step now follows the existing bounded retry paths for dev, review, and timeout
-  salvage instead of letting a later successful verifier read accept and commit without the ledger
-  repair.
+- **A transient harvest read cannot silently drop recorded findings (#405).** An unreadable or
+  momentarily missing spec at the harvest step now follows the existing bounded retry paths for
+  dev, review, and timeout salvage instead of letting a later successful verifier read accept and
+  commit without the ledger repair.
 
 - **A harvested deferral is reverted when its attempt rolls back (#405).** The harvest keys on
   the spec's status and runs before the artifact gate, so a session that finalized its spec and

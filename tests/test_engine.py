@@ -8447,6 +8447,59 @@ def test_spec_deferrals_unreadable_spec_returns_retry_without_harvest(project, m
     assert len(failures) == 1 and failures[0]["site"] == "spec-deferrals"
 
 
+def test_spec_deferrals_transient_missing_probe_returns_retry_without_harvest(project, monkeypatch):
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    sp = spec_path(project, "1-1-a")
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(sp, "done", "abc123", deferred=[HARVEST_A])
+    real_is_file = Path.is_file
+    first_probe = True
+
+    def transient_missing(path, *args, **kwargs):
+        nonlocal first_probe
+        if path == sp and first_probe:
+            first_probe = False
+            return False
+        return real_is_file(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "is_file", transient_missing)
+    task = StoryTask(story_key="1-1-a", epic=1)
+
+    outcome = engine._harvest_spec_deferrals(task, {"spec_file": str(sp)})
+
+    assert not project.deferred_work.exists()
+    assert outcome is not None and outcome.retryable and not outcome.fixable
+    assert "spec missing while harvesting deferrals" in outcome.reason
+
+    assert engine._harvest_spec_deferrals(task, {"spec_file": str(sp)}) is None
+    assert [entry.title for entry in _harvest_entries(project)] == [HARVEST_A["summary"]]
+
+
+def test_spec_deferrals_stat_failure_returns_retry_without_harvest(project, monkeypatch):
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    sp = spec_path(project, "1-1-a")
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(sp, "done", "abc123", deferred=[HARVEST_A])
+    real_is_file = Path.is_file
+
+    def fault_is_file(path, *args, **kwargs):
+        if path == sp:
+            raise PermissionError("transient stat fault")
+        return real_is_file(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "is_file", fault_is_file)
+
+    outcome = engine._harvest_spec_deferrals(
+        StoryTask(story_key="1-1-a", epic=1), {"spec_file": str(sp)}
+    )
+
+    assert not project.deferred_work.exists()
+    assert outcome is not None and outcome.retryable and not outcome.fixable
+    assert "spec unreadable while harvesting deferrals" in outcome.reason
+    failures = [e for e in engine.journal.entries() if e["kind"] == "spec-read-failed"]
+    assert len(failures) == 1 and failures[0]["site"] == "spec-deferrals"
+
+
 def test_dev_harvest_read_failure_retries_before_accepting(project, monkeypatch):
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     engine, adapter = make_engine(

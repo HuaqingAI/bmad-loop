@@ -2546,11 +2546,11 @@ class Engine:
         status. The spec frontmatter is never mutated; the ledger watermark is
         sufficient and avoids unsafe YAML block-scalar surgery.
 
-        Reading the finding source is part of this required repair. A transient
-        read failure returns a retry outcome rather than degrading like optional
-        bookkeeping observation: a later verify read must not accept the session
-        while silently dropping its recorded work. Ledger writes remain unguarded
-        so a failed repair write raises.
+        Reading the finding source is part of this required repair. A transiently
+        missing or unreadable source returns a retry outcome rather than degrading
+        like optional bookkeeping observation: a later verify read must not accept
+        the session while silently dropping its recorded work. Ledger writes remain
+        unguarded so a failed repair write raises.
         """
         if not self._generic_dev():
             return
@@ -2558,8 +2558,6 @@ class Engine:
         if not spec_file:
             return
         spec_path = verify.resolve_spec_path(str(spec_file), self.workspace.paths)
-        if not spec_path.is_file():
-            return
         # A session supplies `spec_file`; like reconcile, marker repair, and
         # declared closes, harvesting must not let an arbitrary readable path
         # outside the orchestrator-owned roots steer a ledger write.
@@ -2576,6 +2574,16 @@ class Engine:
                 spec=str(spec_path),
             )
             return
+        try:
+            is_file = spec_path.is_file()
+        except OSError as e:
+            self._journal_spec_read_failed(spec_path, task.story_key, "spec-deferrals", e)
+            return VerifyOutcome.retry(
+                "spec unreadable while harvesting deferrals "
+                f"({e.__class__.__name__}: {e}): {spec_path}"
+            )
+        if not is_file:
+            return VerifyOutcome.retry(f"spec missing while harvesting deferrals: {spec_path}")
         try:
             fm = verify.read_frontmatter(spec_path)
         except OSError as e:
