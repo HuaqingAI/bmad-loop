@@ -8221,6 +8221,43 @@ def test_spec_deferral_provenance_is_durable_before_append_for_crash_replay(proj
     assert resumed._harvest_gate_exclude(saved_task) == (rel,)
 
 
+def test_expanded_harvest_records_are_durable_before_a_later_append(project, monkeypatch):
+    """A prior ledger-write latch cannot suppress the stable-union checkpoint."""
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_VERIFY)
+    engine.state.tasks[task.story_key] = task
+    sp = spec_path(project, task.story_key)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    result_json = {"spec_file": str(sp)}
+    write_spec(sp, "done", "abc123", deferred=[HARVEST_A])
+    engine._harvest_spec_deferrals(task, result_json)
+    assert task.harvest_wrote_ledger is True
+
+    write_spec(sp, "done", "abc123", deferred=[HARVEST_A, HARVEST_B])
+    real_append = deferredwork.append_entry
+
+    class PowerLoss(BaseException):
+        pass
+
+    def append_then_die(*args, **kwargs):
+        real_append(*args, **kwargs)
+        raise PowerLoss
+
+    monkeypatch.setattr(deferredwork, "append_entry", append_then_die)
+    with pytest.raises(PowerLoss):
+        engine._harvest_spec_deferrals(task, result_json)
+
+    assert [entry.title for entry in _harvest_entries(project)] == [
+        HARVEST_A["summary"],
+        HARVEST_B["summary"],
+    ]
+    saved_task = load_state(engine.run_dir).tasks[task.story_key]
+    assert [record["title"] for record in saved_task.harvested_deferrals] == [
+        HARVEST_A["summary"],
+        HARVEST_B["summary"],
+    ]
+
+
 def test_spec_deferrals_dedup_sees_already_done_entries(project):
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     engine, _ = make_engine(
@@ -8482,7 +8519,7 @@ def test_fix_harvest_read_failure_retries_before_rereview(project, monkeypatch):
 
     def fix_with_deferral(spec):
         marker.write_text("ok\n", encoding="utf-8")
-        return dev_effect(project, "1-1-a", deferred=[HARVEST_A])(spec)
+        return dev_effect(project, "1-1-a", deferred=[HARVEST_A, HARVEST_B])(spec)
 
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     policy = dataclasses.replace(
@@ -8495,7 +8532,6 @@ def test_fix_harvest_read_failure_retries_before_rereview(project, monkeypatch):
             dev_with_marker,
             breaking_review,
             fix_with_deferral,
-            fix_with_deferral,
             review_effect(project, "1-1-a", clean=True),
         ],
         policy=policy,
@@ -8505,16 +8541,75 @@ def test_fix_harvest_read_failure_retries_before_rereview(project, monkeypatch):
     summary = engine.run()
 
     assert summary.done == 1 and not summary.crashed and not summary.paused
-    assert [session.role for session in adapter.sessions] == [
-        "dev",
-        "review",
-        "dev",
-        "dev",
-        "review",
-    ]
+    assert [session.role for session in adapter.sessions] == ["dev", "review", "dev", "review"]
     decisions = [e for e in engine.journal.entries() if e["kind"] == "fix-decision"]
-    assert [decision["ok"] for decision in decisions] == [False, True]
-    assert [entry.title for entry in _harvest_entries(project)] == [HARVEST_A["summary"]]
+    assert [decision["ok"] for decision in decisions] == [True]
+    failures = [e for e in engine.journal.entries() if e["kind"] == "fix-harvest-failed"]
+    assert [event["harvest_attempt"] for event in failures] == [1]
+    assert [entry.title for entry in _harvest_entries(project)] == [
+        HARVEST_A["summary"],
+        HARVEST_B["summary"],
+    ]
+
+
+def test_persistent_fix_harvest_failure_defers_without_replacement_session(project, monkeypatch):
+    marker = project.project / "fixed.marker"
+
+    def dev_with_marker(spec):
+        marker.write_text("ok\n", encoding="utf-8")
+        return dev_effect(project, "1-1-a")(spec)
+
+    def breaking_review(spec):
+        marker.unlink()
+        return review_effect(project, "1-1-a", clean=True)(spec)
+
+    def fix_with_findings(spec):
+        marker.write_text("ok\n", encoding="utf-8")
+        return dev_effect(project, "1-1-a", deferred=[HARVEST_A, HARVEST_B])(spec)
+
+    def replacement_fix(spec):
+        marker.write_text("ok\n", encoding="utf-8")
+        return dev_effect(project, "1-1-a", deferred=[HARVEST_A])(spec)
+
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    policy = dataclasses.replace(
+        _harvest_policy(review=True),
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker),)),
+    )
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_with_marker,
+            breaking_review,
+            fix_with_findings,
+            replacement_fix,
+            review_effect(project, "1-1-a", clean=True),
+        ],
+        policy=policy,
+    )
+    real_harvest = engine._harvest_spec_deferrals
+    calls = 0
+
+    def fail_fix_pair(task, result_json):
+        nonlocal calls
+        calls += 1
+        if calls in (3, 4):
+            return VerifyOutcome.retry(
+                "spec unreadable while harvesting deferrals (PermissionError: persistent)"
+            )
+        return real_harvest(task, result_json)
+
+    monkeypatch.setattr(engine, "_harvest_spec_deferrals", fail_fix_pair)
+
+    summary = engine.run()
+
+    assert summary.deferred == 1 and not summary.done and not summary.crashed
+    assert [session.role for session in adapter.sessions] == ["dev", "review", "dev"]
+    assert calls == 4
+    failures = [e for e in engine.journal.entries() if e["kind"] == "fix-harvest-failed"]
+    assert [event["harvest_attempt"] for event in failures] == [1, 2]
+    task = engine.state.tasks["1-1-a"]
+    assert "harvest remained unreadable after 2 attempts" in task.defer_reason
 
 
 def test_spec_deferrals_malformed_siblings_file_valid_and_one_aggregated_entry(project):
@@ -8811,13 +8906,13 @@ def test_timeout_salvage_harvest_read_failure_falls_back_before_commit(project, 
         return SessionResult(status="timeout")
 
     write_sprint(project, {"1-1-a": "ready-for-dev"})
-    review_with_findings = _review_with_deferrals(project, [HARVEST_A, HARVEST_B])
+    replacement_review = _review_with_deferrals(project, [HARVEST_A])
     engine, adapter = make_engine(
         project,
         [
             dev_effect(project, "1-1-a", deferred=[HARVEST_A]),
             timeout_with_findings,
-            review_with_findings,
+            replacement_review,
         ],
         policy=_salvage_policy(),
     )
@@ -8828,12 +8923,59 @@ def test_timeout_salvage_harvest_read_failure_falls_back_before_commit(project, 
     failures = [e for e in engine.journal.entries() if e["kind"] == "review-timeout-salvage-failed"]
     assert len(failures) == 1
     assert "spec unreadable while harvesting deferrals" in failures[0]["reason"]
-    assert [session.role for session in adapter.sessions] == ["dev", "review", "review"]
-    assert [entry.title for entry in _harvest_entries(project)] == [
+    assert failures[0]["harvest_attempt"] == 1
+    assert [session.role for session in adapter.sessions] == ["dev", "review"]
+    harvested = [
+        entry
+        for entry in _harvest_entries(project)
+        if re.search(r"^origin: spec-deferred [0-9a-f]{12}$", entry.body, re.M)
+    ]
+    assert [entry.title for entry in harvested] == [
         HARVEST_A["summary"],
         HARVEST_B["summary"],
     ]
     assert summary.done == 1 and not summary.crashed and not summary.paused
+
+
+def test_persistent_timeout_salvage_harvest_failure_defers_without_reviewer(project, monkeypatch):
+    def timeout_with_findings(_spec):
+        sp = spec_path(project, "1-1-a")
+        write_spec(sp, "in-review", _spec_baseline(sp), deferred=[HARVEST_A, HARVEST_B])
+        return SessionResult(status="timeout")
+
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a", deferred=[HARVEST_A]),
+            timeout_with_findings,
+            _review_with_deferrals(project, [HARVEST_A]),
+        ],
+        policy=_salvage_policy(),
+    )
+    real_harvest = engine._harvest_spec_deferrals
+    calls = 0
+
+    def fail_salvage_pair(task, result_json):
+        nonlocal calls
+        calls += 1
+        if calls in (2, 3):
+            return VerifyOutcome.retry(
+                "spec unreadable while harvesting deferrals (PermissionError: persistent)"
+            )
+        return real_harvest(task, result_json)
+
+    monkeypatch.setattr(engine, "_harvest_spec_deferrals", fail_salvage_pair)
+
+    summary = engine.run()
+
+    assert summary.deferred == 1 and not summary.done and not summary.crashed
+    assert [session.role for session in adapter.sessions] == ["dev", "review"]
+    assert calls == 3
+    failures = [e for e in engine.journal.entries() if e["kind"] == "review-timeout-salvage-failed"]
+    assert [event["harvest_attempt"] for event in failures] == [1, 2]
+    task = engine.state.tasks["1-1-a"]
+    assert "harvest remained unreadable after 2 attempts" in task.defer_reason
 
 
 def test_harvest_alone_is_not_proof_of_work(project):

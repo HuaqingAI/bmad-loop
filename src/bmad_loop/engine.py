@@ -26,6 +26,7 @@ from .adapters.base import CodingCLIAdapter, SessionResult, SessionSpec, SpecSna
 from .bmadconfig import ProjectPaths
 from .escalation import (
     Action,
+    Decision,
     critical_escalations,
     decide_dev,
     decide_review_session,
@@ -71,8 +72,8 @@ if TYPE_CHECKING:
 # the dedup key and must never be reworded; `<prefix>-malformed <fingerprint>`
 # marks the aggregated unparseable-items meta-entry.
 HARVEST_ORIGIN = "spec-deferred"
-# A completed review owns the spec bytes it just wrote. Give a transient repair
-# read one immediate retry, but never dispatch a new reviewer over an unread
+# A completed session owns the spec bytes it just wrote. Give a transient repair
+# read one immediate retry, but never dispatch another session over an unread
 # source: that later pass is allowed to replace the frontmatter list.
 HARVEST_REPAIR_READ_ATTEMPTS = 2
 
@@ -1746,8 +1747,14 @@ class Engine:
                     # re-review of the same tree cannot make them pass. Repair
                     # with the failing output as feedback, then re-review. This
                     # verify-repair round never spends the damping cap.
-                    if not self._fix_phase(task, outcome.reason):
-                        self._defer(task, "verify commands kept failing after clean review")
+                    fix = self._fix_phase(task, outcome.reason)
+                    if fix.action == Action.PAUSE:
+                        self._escalate(task, fix.reason)
+                    if fix.action == Action.DEFER:
+                        self._defer(
+                            task,
+                            fix.reason or "verify commands kept failing after clean review",
+                        )
                         return
                 continue
             if refileable_followup:
@@ -1836,11 +1843,11 @@ class Engine:
     def _salvage_review_timeout(self, task: StoryTask, result: SessionResult) -> bool:
         """``review.on_timeout = "salvage-if-done"`` (#271): try to converge a
         timed-out review by committing the already-finalized dev product instead
-        of burning another review cycle. Returns True when the story committed;
-        False means salvage was not applicable and the caller falls back to the
-        default retry/exhaust routing. The cycle the timed-out session charged is
-        deliberately not refunded — salvage changes what the *next* cycle costs,
-        not what this one did.
+        of burning another review cycle. Returns True when salvage either committed
+        or terminally routed an unreadable harvest; False means salvage was not
+        applicable and the caller falls back to the default retry/exhaust routing.
+        The cycle the timed-out session charged is deliberately not refunded —
+        salvage changes what the *next* cycle costs, not what this one did.
 
         Applicability, all deterministic: not worktree-isolated (a defer there
         already keeps the unit's worktree + diff, and committing into the main
@@ -1877,8 +1884,33 @@ class Engine:
         # A timed-out review can still have recorded new frontmatter findings.
         # Normalize first so the success-status gate sees `done`, then mirror the
         # normal review path before deterministic verification and commit.
-        harvest_outcome = self._harvest_spec_deferrals(task, {"spec_file": str(spec_path)})
-        outcome = harvest_outcome or self._verify_review(task)
+        harvest_outcome = None
+        for harvest_attempt in range(1, HARVEST_REPAIR_READ_ATTEMPTS + 1):
+            harvest_outcome = self._harvest_spec_deferrals(task, {"spec_file": str(spec_path)})
+            if harvest_outcome is None:
+                break
+            self.journal.append(
+                "review-timeout-salvage-failed",
+                story_key=task.story_key,
+                cycle=task.review_cycle,
+                reason=harvest_outcome.reason,
+                env_fault=harvest_outcome.env_fault,
+                harvest_attempt=harvest_attempt,
+            )
+            if not harvest_outcome.retryable:
+                self._escalate(task, harvest_outcome.reason)
+        if harvest_outcome is not None:
+            exhausted = review_exhausted(
+                task,
+                "review timeout deferral harvest remained unreadable after "
+                f"{HARVEST_REPAIR_READ_ATTEMPTS} attempts: {harvest_outcome.reason}",
+            )
+            if exhausted.action == Action.PAUSE:
+                self._escalate(task, exhausted.reason)
+            self._defer(task, exhausted.reason)
+            return True
+
+        outcome = self._verify_review(task)
         if not outcome.ok:
             self.journal.append(
                 "review-timeout-salvage-failed",
@@ -1984,7 +2016,16 @@ class Engine:
         and the journal says which."""
         self.journal.append(kind, story_key=task.story_key)
         outcome = self._verify_review(task)
-        if not outcome.ok and outcome.fixable and self._fix_phase(task, outcome.reason):
+        if not outcome.ok and outcome.fixable:
+            fix = self._fix_phase(task, outcome.reason)
+            if fix.action == Action.PAUSE:
+                self._escalate(task, fix.reason)
+            if fix.action == Action.DEFER:
+                self._defer(
+                    task,
+                    fix.reason or f"verify failed with review disabled: {outcome.reason}",
+                )
+                return
             outcome = self._verify_review(task)
         if not outcome.ok:
             # same event kind as the review-enabled loop so journal consumers
@@ -2749,11 +2790,19 @@ class Engine:
             (str(item.get("origin", "")), str(item.get("source_spec", "")))
             for item in task.harvested_deferrals
         }
+        records_changed = False
         for record in current_records:
             key = (str(record["origin"]), str(record["source_spec"]))
             if key not in known:
                 task.harvested_deferrals.append(record)
                 known.add(key)
+                records_changed = True
+        if records_changed:
+            # The isolation carry reads only persisted records after a hard
+            # loss. Checkpoint every stable-union expansion before a ledger
+            # append, including later passes where harvest_wrote_ledger is
+            # already latched and its separate pre-write save will be skipped.
+            self._save()
 
         ledger = self.workspace.paths.deferred_work
         text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
@@ -3895,10 +3944,10 @@ class Engine:
         )
         return path
 
-    def _fix_phase(self, task: StoryTask, reason: str) -> bool:
+    def _fix_phase(self, task: StoryTask, reason: str) -> Decision:
         """Feedback-driven repair after a clean review whose verify commands
-        failed. Consumes the story's dev-attempt budget; returns True once the
-        commands pass so the review loop can re-review the repaired tree."""
+        failed. Consumes the story's dev-attempt budget; returns PROCEED once
+        commands pass, or terminal review routing when repair cannot continue."""
         while task.attempt < self.policy.limits.max_dev_attempts:
             task.attempt += 1
             feedback = self._write_feedback(task, reason)
@@ -3917,6 +3966,7 @@ class Engine:
                 details = "; ".join(str(e.get("detail", e.get("type", "?"))) for e in crits)
                 self._escalate(task, f"CRITICAL escalation from fix session: {details}")
             outcome = None
+            terminal = None
             if result.status == "completed":
                 # A repair is another generic dev-primitive pass: it can leave
                 # terminal prose ahead of frontmatter and record fresh deferred
@@ -3924,7 +3974,31 @@ class Engine:
                 # and harvest before accepting its verify-green tree, because the
                 # next review pass may replace the frontmatter list.
                 self._reconcile_generic_terminal_status(task, result.result_json)
-                harvest_outcome = self._harvest_spec_deferrals(task, result.result_json)
+                harvest_outcome = None
+                for harvest_attempt in range(1, HARVEST_REPAIR_READ_ATTEMPTS + 1):
+                    harvest_outcome = self._harvest_spec_deferrals(task, result.result_json)
+                    if harvest_outcome is None:
+                        break
+                    self.journal.append(
+                        "fix-harvest-failed",
+                        story_key=task.story_key,
+                        attempt=task.attempt,
+                        reason=harvest_outcome.reason,
+                        env_fault=harvest_outcome.env_fault,
+                        harvest_attempt=harvest_attempt,
+                    )
+                    if not harvest_outcome.retryable:
+                        break
+                if harvest_outcome is not None and harvest_outcome.retryable:
+                    outcome = harvest_outcome
+                    terminal = review_exhausted(
+                        task,
+                        "fix-session deferral harvest remained unreadable after "
+                        f"{HARVEST_REPAIR_READ_ATTEMPTS} attempts: "
+                        f"{harvest_outcome.reason}",
+                    )
+                else:
+                    terminal = None
                 outcome = harvest_outcome or verify.verify_commands_outcome(
                     self.policy, self.workspace.root
                 )
@@ -3955,9 +4029,11 @@ class Engine:
                 # dev budget and pause for a human instead
                 self._escalate(task, outcome.reason)
             self._save()
+            if terminal is not None:
+                return terminal
             if ok:
-                return True
-        return False
+                return Decision(Action.PROCEED)
+        return Decision(Action.DEFER)
 
     def _record_review_budget_followup(self, task: StoryTask, damped: bool = False) -> None:
         """A *finalized, verify-green* story that the review pass kept recommending

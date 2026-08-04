@@ -1015,13 +1015,30 @@ class WorktreeFlow:
         scm = self.policy.scm
         repo = self.paths.repo_root
         target = self.state.target_branch
+        source = task.commit_sha or verify.rev_parse_head(unit.path)
+        merge_ref = unit.branch
+        if replay:
+            current_source = verify.rev_parse_head(unit.path)
+            if current_source != source:
+                reason = (
+                    f"merge replay of {unit.branch} into {target} blocked: the unit "
+                    f"branch advanced from recorded source {source} to {current_source}; "
+                    "the later commits were not produced or verified by the completed "
+                    "session and the branch was preserved for manual recovery"
+                )
+                self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
+                return
+            # Pin both the collision allowlist and the merge operand to the
+            # write-ahead SHA. The branch can move after the check; replay must
+            # integrate only the commit the completed session actually proved.
+            merge_ref = source
         # A per_worktree Unity Editor can leak asset writes into the *main*
         # checkout (see the unity plugin's worktree setup), dirtying the target with the very
         # files this branch already committed. Reconcile that first: clean only
         # the leaked copies of incoming files; refuse (escalate) if anything dirty
         # falls outside this branch's path set — that may be real operator work.
         try:
-            cleaned = verify.clean_incoming_collisions(repo, target, unit.branch)
+            cleaned = verify.clean_incoming_collisions(repo, target, merge_ref)
         except (verify.GitError, OSError) as e:
             # OSError joins GitError because clean_incoming_collisions mutates the
             # checkout directly (unlink/iterdir/rmdir) — a non-spawn FS fault the
@@ -1052,7 +1069,6 @@ class WorktreeFlow:
                 branch=unit.branch,
                 paths=cleaned,
             )
-        source = task.commit_sha or verify.rev_parse_head(unit.path)
         if not replay:
             # The task is already terminal and durable here. Record integration
             # intent immediately before git so a host loss after merge success but
@@ -1069,7 +1085,7 @@ class WorktreeFlow:
         try:
             verify.merge_branch(
                 repo,
-                unit.branch,
+                merge_ref,
                 strategy=scm.merge_strategy,
                 message=self.merge_message(task),
                 allow_empty_squash=replay,

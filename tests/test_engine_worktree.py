@@ -1224,6 +1224,21 @@ def test_host_loss_after_merge_before_evidence_replays_gitignored_harvest(
     assert "unit-merged" not in journal_kinds(engine)
 
     monkeypatch.setattr(engine.journal, "append", real_append)
+    replay_collision_refs: list[str] = []
+    replay_merge_refs: list[str] = []
+    real_clean = verify.clean_incoming_collisions
+    real_merge = verify.merge_branch
+
+    def record_collision_ref(repo, target, merge_ref):
+        replay_collision_refs.append(merge_ref)
+        return real_clean(repo, target, merge_ref)
+
+    def record_merge_ref(repo, merge_ref, **kwargs):
+        replay_merge_refs.append(merge_ref)
+        return real_merge(repo, merge_ref, **kwargs)
+
+    monkeypatch.setattr(verify, "clean_incoming_collisions", record_collision_ref)
+    monkeypatch.setattr(verify, "merge_branch", record_merge_ref)
     resumed = Engine(
         paths=project,
         policy=engine.policy,
@@ -1236,10 +1251,75 @@ def test_host_loss_after_merge_before_evidence_replays_gitignored_harvest(
 
     assert summary.done == 1 and not summary.crashed and not summary.paused
     assert rev_parse_head(project.project) == landed_head
+    assert replay_collision_refs == [crashed.commit_sha]
+    assert replay_merge_refs == [crashed.commit_sha]
     assert "unit-merge-started" in journal_kinds(resumed)
     assert "unit-merged" in journal_kinds(resumed)
     assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
     assert load_state(resumed.run_dir).tasks["1-1-a"].isolated_ledger_carried
+
+
+@pytest.mark.parametrize("merge_strategy", ["merge", "ff", "squash"])
+def test_merge_replay_rejects_a_unit_branch_advanced_after_recorded_source(
+    project, monkeypatch, merge_strategy
+):
+    """Recovery preserves and refuses commits outside the completed session."""
+    ignore_before_commit(project, "deferred-work.md")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            wt_dev_effect(
+                project,
+                "1-1-a",
+                followup_review=False,
+                deferred=[_HARVEST_CARRY],
+            )
+        ],
+        policy=wt_policy(merge_strategy=merge_strategy),
+    )
+    real_append = engine.journal.append
+
+    def host_dies_before_merge_evidence(kind, **fields):
+        if kind == "unit-merged":
+            raise SystemExit("host died before merge evidence")
+        return real_append(kind, **fields)
+
+    monkeypatch.setattr(engine.journal, "append", host_dies_before_merge_evidence)
+    with pytest.raises(SystemExit, match="host died before merge evidence"):
+        engine.run()
+
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    landed_head = rev_parse_head(project.project)
+    unit_path = Path(crashed.worktree_path)
+    (unit_path / "late.txt").write_text("not part of the completed session\n", encoding="utf-8")
+    git(unit_path, "add", "late.txt")
+    git(unit_path, "commit", "-q", "-m", "late unverified commit")
+    advanced_head = rev_parse_head(unit_path)
+    assert advanced_head != crashed.commit_sha
+
+    monkeypatch.setattr(engine.journal, "append", real_append)
+    resumed = Engine(
+        paths=project,
+        policy=engine.policy,
+        adapter=MockAdapter([]),
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=load_state(engine.run_dir),
+    )
+    summary = resumed.run()
+
+    assert summary.paused and summary.escalated == 1 and not summary.crashed
+    assert rev_parse_head(project.project) == landed_head
+    assert not (project.project / "late.txt").exists()
+    assert unit_path.is_dir()
+    assert branch_exists(project.project, crashed.branch)
+    assert rev_parse_head(unit_path) == advanced_head
+    assert "unit-merged" not in journal_kinds(resumed)
+    assert not project.deferred_work.exists()
+    restored = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert restored.phase == Phase.ESCALATED
+    assert not restored.isolated_ledger_carried
 
 
 def test_crashed_post_merge_harvest_carry_replays_and_persists_its_latch(project):
