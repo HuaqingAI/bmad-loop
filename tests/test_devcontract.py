@@ -1482,6 +1482,22 @@ def test_parse_deferred_findings_defaults_optional_fields_and_coerces_scalars():
     ]
 
 
+@pytest.mark.parametrize("field", ["summary", "evidence", "location"])
+@pytest.mark.parametrize("collection", [["nested", "values"], {"nested": "value"}])
+def test_parse_deferred_findings_rejects_collection_valued_text_fields(field, collection):
+    """A malformed optional field costs its whole item too: silently dropping
+    it would harvest only part of an authored finding, while stringifying it
+    would persist Python container repr in the ledger. Scalar siblings remain
+    harvestable, including the numeric/bool normalization pinned above."""
+    malformed_item = {"summary": "bad item", field: collection}
+    findings, malformed = devcontract.parse_deferred_findings(
+        {"deferred": [malformed_item, {"summary": "good sibling"}]}
+    )
+
+    assert [finding.summary for finding in findings] == ["good sibling"]
+    assert malformed == [f"item 1: `{field}` is not a scalar (got {type(collection).__name__})"]
+
+
 def test_parse_deferred_findings_normalizes_known_severity_and_drops_unknown(tmp_path):
     fm = _deferred_spec(
         tmp_path / "spec.md",

@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -407,7 +408,7 @@ class StoryTask:
             pre_harvest_ledger_captured=bool(d.get("pre_harvest_ledger_captured", False)),
             harvest_wrote_ledger=bool(d.get("harvest_wrote_ledger", False)),
             ledger_changed_before_harvest=bool(d.get("ledger_changed_before_harvest", False)),
-            harvested_deferrals=[dict(item) for item in d.get("harvested_deferrals", [])],
+            harvested_deferrals=[deepcopy(dict(item)) for item in d.get("harvested_deferrals", [])],
             bundle_closes_intended=[str(i) for i in d.get("bundle_closes_intended", [])],
             isolated_ledger_carried=bool(d.get("isolated_ledger_carried", False)),
             spec_file=d.get("spec_file"),

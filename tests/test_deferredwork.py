@@ -181,6 +181,17 @@ def test_mark_open_refuses_a_status_less_entry(tmp_path):
     assert path.read_text(encoding="utf-8") == snapshot
 
 
+@pytest.mark.parametrize("status", ["malformed", "done someday", "done 2026-02-30"])
+def test_mark_open_refuses_a_noncanonical_status(tmp_path, status):
+    path = write_ledger(
+        tmp_path,
+        f"### DW-1: malformed but tolerated\n\nstatus: {status}\nresolution: by dw-a\n",
+    )
+    snapshot = path.read_text(encoding="utf-8")
+    assert not mark_open(path, "DW-1", "by dw-a")
+    assert path.read_text(encoding="utf-8") == snapshot
+
+
 def test_mark_open_refuses_a_closed_entry_without_a_resolution(tmp_path):
     path = write_ledger(tmp_path)
     snapshot = path.read_text(encoding="utf-8")

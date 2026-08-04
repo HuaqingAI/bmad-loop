@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence, Set
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -231,12 +231,21 @@ def _flatten(value: Any, limit: int) -> str:
     return " ".join(str(value).split())[:limit].strip()
 
 
+def _is_yaml_scalar(value: Any) -> bool:
+    """Whether PyYAML's loaded value came from a scalar-shaped node."""
+    # str/bytes are Sequences in Python but scalar values in YAML. SafeLoader's
+    # collection nodes otherwise become mappings, sequences, or sets.
+    return isinstance(value, (str, bytes)) or not isinstance(value, (Mapping, Sequence, Set))
+
+
 def parse_deferred_findings(fm: dict[str, Any]) -> tuple[list[DeferredFinding], list[str]]:
     """Parse a frontmatter ``deferred:`` list into findings and malformed notes.
 
     Missing, null, and empty lists mean no findings. Malformed items cost only
-    themselves; well-formed siblings still parse. This observation path never
-    raises for the YAML shapes it accepts.
+    themselves; well-formed siblings still parse. Text fields accept YAML
+    scalars (numeric and boolean scalars are string-normalized), never
+    collections. This observation path never raises for the YAML shapes it
+    accepts.
     """
     raw = fm.get(DEFERRED_FIELD)
     if raw is None:
@@ -250,9 +259,25 @@ def parse_deferred_findings(fm: dict[str, Any]) -> tuple[list[DeferredFinding], 
         if not isinstance(item, dict):
             malformed.append(f"item {i}: not a mapping (got {type(item).__name__})")
             continue
-        summary = _flatten(item.get("summary"), _SUMMARY_LIMIT)
+        summary_raw = item.get("summary")
+        if not _is_yaml_scalar(summary_raw):
+            malformed.append(
+                f"item {i}: `summary` is not a scalar (got {type(summary_raw).__name__})"
+            )
+            continue
+        summary = _flatten(summary_raw, _SUMMARY_LIMIT)
         if not summary:
             malformed.append(f"item {i}: no usable `summary`")
+            continue
+        bad_optional = next(
+            (field for field in ("evidence", "location") if not _is_yaml_scalar(item.get(field))),
+            None,
+        )
+        if bad_optional is not None:
+            value = item[bad_optional]
+            malformed.append(
+                f"item {i}: `{bad_optional}` is not a scalar (got {type(value).__name__})"
+            )
             continue
         location = _flatten(item.get("location"), _LOCATION_LIMIT)
         findings.append(

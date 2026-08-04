@@ -237,13 +237,18 @@ def test_deferred_work_state_containers_do_not_alias_the_persisted_doc():
     doc = StoryTask(
         story_key="1-1-a",
         epic=1,
-        harvested_deferrals=[{"title": "original"}],
+        harvested_deferrals=[
+            {"title": "original", "metadata": {"labels": ["review"]}},
+        ],
         bundle_closes_intended=["DW-1"],
     ).to_dict()
     restored = StoryTask.from_dict(doc)
     restored.harvested_deferrals[0]["title"] = "mutated"
+    restored.harvested_deferrals[0]["metadata"]["labels"].append("follow-up")
     restored.bundle_closes_intended.append("DW-2")
-    assert doc["harvested_deferrals"] == [{"title": "original"}]
+    assert doc["harvested_deferrals"] == [
+        {"title": "original", "metadata": {"labels": ["review"]}},
+    ]
     assert doc["bundle_closes_intended"] == ["DW-1"]
 
 

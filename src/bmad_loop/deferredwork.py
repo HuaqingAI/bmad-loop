@@ -390,6 +390,12 @@ def mark_open(path: Path, dw_id: str, note: str) -> bool:
         # is later called from _defer, where an AttributeError would crash the run
         # instead of completing the deferral.
         return False
+    try:
+        _require_canonical_status(entry.status)
+    except ValueError:
+        # Only a canonical status written by mark_done is eligible for undo.
+        # Preserve malformed or human-authored statuses for validation/reporting.
+        return False
     res_m = _MARK_DONE_TAIL_RE.match(entry.body, status_m.end())
     if res_m is None or res_m.group(1).strip() != _one_line(note).strip():
         return False
