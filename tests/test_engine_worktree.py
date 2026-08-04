@@ -27,7 +27,7 @@ from conftest import (
     write_sprint,
 )
 
-from bmad_loop import verify, worktree_flow
+from bmad_loop import sprintstatus, verify, worktree_flow
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.bmadconfig import ProjectPaths
@@ -74,6 +74,7 @@ def wt_dev_effect(
     *,
     final_status="done",
     followup_review=True,
+    write_src=True,
     closes_deferred=None,
     operator_actions=None,
     deferred=None,
@@ -88,8 +89,9 @@ def wt_dev_effect(
         cwd = spec.cwd
         wt = project.rebased(cwd)
         baseline = rev_parse_head(cwd)
-        src = cwd / "src.txt"
-        src.write_text(src.read_text() + f"change for {story_key}\n")
+        if write_src:
+            src = cwd / "src.txt"
+            src.write_text(src.read_text() + f"change for {story_key}\n")
         sp = wt.implementation_artifacts / f"spec-{story_key}.md"
         write_spec(
             sp,
@@ -738,6 +740,82 @@ def test_deferred_carry_commit_failure_resumes_before_terminal_integration(proje
     assert adapter.sessions == []
     assert "story-deferred" in journal_kinds(resumed)
     assert "unit-closed" in journal_kinds(resumed)
+    assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
+    assert [path.resolve() for path in worktree_list(project.project)] == [
+        project.project.resolve()
+    ]
+    assert not branch_exists(project.project, failed.branch)
+    assert worktree_clean(project.project)
+
+
+def test_dev_defer_carry_failure_resumes_the_rejected_decision(project, monkeypatch):
+    """A carry fault cannot turn a rejected dev result into a verified spec."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            wt_dev_effect(
+                project,
+                "1-1-a",
+                followup_review=False,
+                write_src=False,
+                deferred=[_HARVEST_CARRY],
+            )
+        ],
+        policy=wt_policy(keep_failed=False, limits=LimitsPolicy(max_dev_attempts=1)),
+    )
+    real_commit = verify.commit_paths
+    failures = 0
+
+    def commit_fails_once(*args, **kwargs):
+        nonlocal failures
+        message = str(args[1]) if len(args) > 1 else str(kwargs.get("message", ""))
+        if message.startswith("chore(deferred-work): carry harvested findings") and failures == 0:
+            failures += 1
+            raise verify.GitError("commit hook rejects deferred carry")
+        return real_commit(*args, **kwargs)
+
+    monkeypatch.setattr(verify, "commit_paths", commit_fails_once)
+
+    assert engine.run().crashed
+
+    failed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert failed.phase == Phase.DEV_VERIFY
+    assert failed.spec_file
+    assert failed.harvest_carry_commit_pending is True
+    assert "no changes" in (failed.defer_reason or "")
+    assert Path(failed.worktree_path).is_dir()
+    assert "story-deferred" not in journal_kinds(engine)
+    assert "unit-closed" not in journal_kinds(engine)
+
+    state = load_state(engine.run_dir)
+    state.clear_pause()
+    adapter = MockAdapter([])
+    resumed = Engine(
+        paths=project,
+        policy=engine.policy,
+        adapter=adapter,
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=state,
+    )
+    summary = resumed.run()
+
+    restored = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert summary.deferred == 1 and not summary.done
+    assert not summary.crashed and not summary.paused
+    assert restored.phase == Phase.DEFERRED
+    assert restored.harvest_carry_commit_pending is False
+    assert adapter.sessions == []
+    decisions = [event for event in resumed.journal.entries() if event["kind"] == "dev-decision"]
+    assert len(decisions) == 1 and decisions[0]["action"] == "defer"
+    assert "resume-defer" in journal_kinds(resumed)
+    assert "resume-review" not in journal_kinds(resumed)
+    assert "story-deferred" in journal_kinds(resumed)
+    assert "unit-closed" in journal_kinds(resumed)
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "ready-for-dev"
     assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
     assert [path.resolve() for path in worktree_list(project.project)] == [
         project.project.resolve()

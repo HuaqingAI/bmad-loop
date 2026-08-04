@@ -915,7 +915,23 @@ class Engine:
             if task.terminal:
                 continue
             isolated = self._isolated and task.worktree_path
-            if task.phase == Phase.DEV_VERIFY and task.spec_file:
+            if isolated and task.defer_reason is not None:
+                # _defer records its reason before carrying harvested findings.
+                # A read/commit fault (or host loss before the terminal advance)
+                # can therefore leave a rejected result in the same DEV_VERIFY +
+                # spec_file shape as a verified spec-approval pause. A persisted
+                # defer reason on a nonterminal isolated task is that interrupted
+                # decision's intent; finish it before any session-replay arm.
+                self.journal.append("resume-defer", story_key=task.story_key)
+                unit = self._reopen_unit(task)
+                prev = self.workspace
+                self.workspace = unit.workspace
+                try:
+                    self._defer(task, task.defer_reason)
+                finally:
+                    self.workspace = prev
+                self._integrate_unit(task, unit)
+            elif task.phase == Phase.DEV_VERIFY and task.spec_file:
                 # paused at the spec-approval gate (or, in stories mode, a
                 # plan-checkpoint awaiting implementation — _resume_after_dev_verify
                 # dispatches the right leg): dev verified on disk.
@@ -1017,9 +1033,10 @@ class Engine:
         returns None and the caller falls through to resume-restart (#100: that
         restart used to discard a completed-``done`` attempt's commits).
 
-        DEV_VERIFY reaches this matcher only when ``task.spec_file`` is empty
-        (verify did not fully pass before the death): _finish_inflight checks
-        the spec-approval-gate arm first, so a DEV_VERIFY task WITH a verified
+        DEV_VERIFY reaches this matcher only when no persisted defer identifies
+        an interrupted decision and ``task.spec_file`` is empty (verify did not
+        fully pass before the death): _finish_inflight checks the defer-replay
+        and spec-approval-gate arms first, so a DEV_VERIFY task WITH a verified
         spec keeps its _resume_after_dev_verify recovery."""
         if task.phase in (Phase.DEV_RUNNING, Phase.DEV_VERIFY):
             role, seq = "dev", task.attempt
