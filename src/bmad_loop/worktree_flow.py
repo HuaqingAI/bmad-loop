@@ -1008,9 +1008,10 @@ class WorktreeFlow:
                 patch=str(patch) if patch else None,
             )
 
-    def merge_local(self, task: StoryTask, unit: UnitWorkspace) -> None:
+    def merge_local(self, task: StoryTask, unit: UnitWorkspace, *, replay: bool = False) -> None:
         """Merge a DONE unit's branch into the target branch from the main repo."""
-        self._emit("pre_merge", task)
+        if not replay:
+            self._emit("pre_merge", task)
         scm = self.policy.scm
         repo = self.paths.repo_root
         target = self.state.target_branch
@@ -1051,12 +1052,27 @@ class WorktreeFlow:
                 branch=unit.branch,
                 paths=cleaned,
             )
+        source = task.commit_sha or verify.rev_parse_head(unit.path)
+        if not replay:
+            # The task is already terminal and durable here. Record integration
+            # intent immediately before git so a host loss after merge success but
+            # before `unit-merged` can safely re-run the merge instead of losing a
+            # gitignored ledger when the stale worktree is reclaimed.
+            self.journal.append(
+                "unit-merge-started",
+                story_key=task.story_key,
+                branch=unit.branch,
+                target=target,
+                strategy=scm.merge_strategy,
+                source=source,
+            )
         try:
             verify.merge_branch(
                 repo,
                 unit.branch,
                 strategy=scm.merge_strategy,
                 message=self.merge_message(task),
+                allow_empty_squash=replay,
             )
         except verify.GitError as e:
             # genuine content conflict against the target: keep the branch for
@@ -1073,6 +1089,8 @@ class WorktreeFlow:
             story_key=task.story_key,
             branch=unit.branch,
             target=self.state.target_branch,
+            strategy=scm.merge_strategy,
+            source=source,
         )
         self._emit("post_merge", task)
         close_unit_workspace(

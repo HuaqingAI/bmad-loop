@@ -1039,6 +1039,47 @@ def test_unmerged_terminal_unit_does_not_replay_harvest_carry(project):
     assert "resume-ledger-carry" not in journal_kinds(engine)
 
 
+def test_started_merge_replay_failure_does_not_carry_harvest(project, monkeypatch):
+    """Write-ahead merge intent cannot stand in for successful merge proof."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    engine.state.target_branch = "main"
+    worktree = engine.run_dir / "worktrees" / "1-1-a"
+    worktree.mkdir(parents=True)
+    source = rev_parse_head(project.project)
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=Phase.DONE,
+        worktree_path=str(worktree),
+        branch="bmad-loop/test-run/1-1-a",
+        commit_sha=source,
+        harvested_deferrals=[_harvest_record()],
+    )
+    engine.state.tasks[task.story_key] = task
+    engine.journal.append(
+        "unit-merge-started",
+        story_key=task.story_key,
+        branch=task.branch,
+        target="main",
+        strategy="merge",
+        source=source,
+    )
+
+    def replay_fails(*args, **kwargs):
+        raise verify.GitError("replayed merge still conflicts")
+
+    monkeypatch.setattr(engine, "_merge_local", replay_fails)
+
+    with pytest.raises(verify.GitError, match="still conflicts"):
+        engine._replay_unlatched_ledger_carries()
+
+    assert not project.deferred_work.exists()
+    assert task.isolated_ledger_carried is False
+    assert "resume-unit-merge" in journal_kinds(engine)
+    assert "resume-ledger-carry" not in journal_kinds(engine)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -1142,6 +1183,63 @@ def test_awaiting_operator_isolated_unit_carries_a_gitignored_harvest(project):
     assert task.isolated_ledger_carried
     assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
     assert [event["dw_ids"] for event in _harvest_carry_events(engine)] == [["DW-1"]]
+
+
+@pytest.mark.parametrize("merge_strategy", ["merge", "ff", "squash"])
+def test_host_loss_after_merge_before_evidence_replays_gitignored_harvest(
+    project, monkeypatch, merge_strategy
+):
+    """A landed branch remains recoverable before `unit-merged` is journaled."""
+    ignore_before_commit(project, "deferred-work.md")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            wt_dev_effect(
+                project,
+                "1-1-a",
+                followup_review=False,
+                deferred=[_HARVEST_CARRY],
+            )
+        ],
+        policy=wt_policy(merge_strategy=merge_strategy),
+    )
+    real_append = engine.journal.append
+
+    def host_dies_before_merge_evidence(kind, **fields):
+        if kind == "unit-merged":
+            raise SystemExit("host died before merge evidence")
+        return real_append(kind, **fields)
+
+    monkeypatch.setattr(engine.journal, "append", host_dies_before_merge_evidence)
+    with pytest.raises(SystemExit, match="host died before merge evidence"):
+        engine.run()
+
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    landed_head = rev_parse_head(project.project)
+    assert crashed.phase == Phase.DONE and not crashed.isolated_ledger_carried
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+    assert Path(crashed.worktree_path).is_dir()
+    assert not project.deferred_work.exists()
+    assert "unit-merged" not in journal_kinds(engine)
+
+    monkeypatch.setattr(engine.journal, "append", real_append)
+    resumed = Engine(
+        paths=project,
+        policy=engine.policy,
+        adapter=MockAdapter([]),
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=load_state(engine.run_dir),
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.crashed and not summary.paused
+    assert rev_parse_head(project.project) == landed_head
+    assert "unit-merge-started" in journal_kinds(resumed)
+    assert "unit-merged" in journal_kinds(resumed)
+    assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
+    assert load_state(resumed.run_dir).tasks["1-1-a"].isolated_ledger_carried
 
 
 def test_crashed_post_merge_harvest_carry_replays_and_persists_its_latch(project):

@@ -1048,7 +1048,12 @@ def _tree_dirty_vs_head(repo: Path) -> bool:
 
 
 def merge_branch(
-    repo: Path, branch: str, *, strategy: str = "merge", message: str | None = None
+    repo: Path,
+    branch: str,
+    *,
+    strategy: str = "merge",
+    message: str | None = None,
+    allow_empty_squash: bool = False,
 ) -> None:
     """Merge `branch` into the branch currently checked out in `repo`.
 
@@ -1059,6 +1064,11 @@ def merge_branch(
     Editor-induced dirt first via `clean_incoming_collisions`. When git refuses
     a merge at pre-flight (no MERGE_HEAD created) the tree was never touched, so
     no abort/reset is attempted and the raw git error is raised verbatim.
+
+    ``allow_empty_squash`` is recovery-only: re-running a squash that committed
+    before a host loss stages nothing because the target already has the merged
+    tree. That clean result confirms the replay without manufacturing an empty
+    commit; ordinary squash calls keep commit failures strict.
     """
     if strategy == "ff":
         rc, out = _git(repo, "merge", "--ff-only", branch)
@@ -1087,6 +1097,8 @@ def merge_branch(
                 if reset_rc != 0:
                     detail += f"; AND git reset --hard HEAD failed (tree not restored): {reset_out}"
             raise GitError(detail)
+        if allow_empty_squash and not _tree_dirty_vs_head(repo):
+            return
         msg = message or f"Squash-merge branch '{branch}'"
         rc, out = _git(repo, "commit", "-m", msg)
         if rc != 0:

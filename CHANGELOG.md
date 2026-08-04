@@ -1168,6 +1168,8 @@ that rode the same window. Both skill eras are supported; the rename itself need
   snapshot — except when that retry pauses, which the next bullet covers. A defer still
   keeps its harvested entries: on the in-place path `_stash_deferred_artifacts` has already moved
   the spec out of the artifacts dir, so the ledger entry is the finding's only surviving record.
+  Restoring a non-empty snapshot publishes through the atomic ledger writer, so a second host or
+  filesystem failure during rollback leaves the current ledger intact rather than truncating it.
 
 - **The pre-harvest snapshot is spent by a stop-and-wait pause instead of riding it (#405).**
   `rollback_on_failure = off` is the default and does not roll back: it hands the tree to a human
@@ -1347,6 +1349,10 @@ that rode the same window. Both skill eras are supported; the rename itself need
   replay into a duplicate. Skipped without a matching durable `unit-merged` journal record, on
   the in-place path, and on any phase but DONE or AWAITING_OPERATOR. Directory disappearance is
   not evidence: teardown may degrade after a successful merge and leave the directory behind.
+  The merge itself now writes intent immediately before invoking git. If the host dies after git
+  succeeds but before `unit-merged` lands, resume re-runs that exact merge and carries only after
+  success; merge and ff are naturally idempotent, while squash accepts a clean no-op only on this
+  recovery path. Intent alone is never treated as proof that the branch landed.
   The sweep half is the sharper one: a lost close leaves ids open, the
   suppression filter does not cover DONE, and every later sweep re-drives already-merged work
   into a non-fixable retry that pauses the run.

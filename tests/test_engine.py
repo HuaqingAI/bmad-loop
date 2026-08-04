@@ -8274,6 +8274,26 @@ def test_review_pass_deferrals_harvested_and_deduped_across_both_sites(project):
     assert events[-1]["deduped"] == 1
 
 
+def test_pre_harvest_ledger_restore_is_atomic_on_publication_failure(project, monkeypatch):
+    """A failed rollback publish leaves the current ledger byte-intact."""
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    current = "# Deferred Work\n\ncurrent harvested row\n"
+    project.deferred_work.write_text(current, encoding="utf-8")
+
+    def publication_fails(*args, **kwargs):
+        raise OSError("atomic replace blocked")
+
+    monkeypatch.setattr(platform_util, "atomic_replace", publication_fails)
+
+    with pytest.raises(OSError, match="atomic replace blocked"):
+        engine._restore_ledger(task, "# Deferred Work\n\npre-harvest snapshot\n")
+
+    assert project.deferred_work.read_text(encoding="utf-8") == current
+    assert list(project.deferred_work.parent.glob("deferred-work.md.*.tmp")) == []
+
+
 def test_nonfixable_retry_reverts_harvest_before_the_next_attempt(project):
     """A rejected attempt's finding is removed and the retry files it afresh."""
     ledger_present_at_retry: list[bool] = []

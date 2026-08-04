@@ -626,8 +626,8 @@ class Engine:
     def _integrate_unit(self, task: StoryTask, unit: UnitWorkspace) -> None:
         self._worktree_flow.integrate_unit(task, unit)
 
-    def _merge_local(self, task: StoryTask, unit: UnitWorkspace) -> None:
-        self._worktree_flow.merge_local(task, unit)
+    def _merge_local(self, task: StoryTask, unit: UnitWorkspace, *, replay: bool = False) -> None:
+        self._worktree_flow.merge_local(task, unit, replay=replay)
 
     def _keep_branch_and_escalate(self, task: StoryTask, unit: UnitWorkspace, reason: str) -> None:
         self._worktree_flow.keep_branch_and_escalate(task, unit, reason)
@@ -820,14 +820,26 @@ class Engine:
 
     def _replay_unlatched_ledger_carries(self) -> None:
         """Replay a successful isolated unit's carry after merge-time host loss."""
+        entries = self.journal.entries()
         merged_units = {
             (
                 str(entry.get("story_key", "")),
                 str(entry.get("branch", "")),
                 str(entry.get("target", "")),
             )
-            for entry in self.journal.entries()
+            for entry in entries
             if entry.get("kind") == "unit-merged"
+        }
+        started_units = {
+            (
+                str(entry.get("story_key", "")),
+                str(entry.get("branch", "")),
+                str(entry.get("target", "")),
+                str(entry.get("strategy", "")),
+                str(entry.get("source", "")),
+            )
+            for entry in entries
+            if entry.get("kind") == "unit-merge-started"
         }
         for task in list(self.state.tasks.values()):
             if (
@@ -844,10 +856,32 @@ class Engine:
             ):
                 continue
             merged_key = (task.story_key, task.branch, self.state.target_branch)
-            if not task.worktree_path or merged_key not in merged_units:
+            if not task.worktree_path or not task.harvested_deferrals:
                 continue
-            if not task.harvested_deferrals:
-                continue
+            if merged_key not in merged_units:
+                source = task.commit_sha or ""
+                started_key = (
+                    *merged_key,
+                    self.policy.scm.merge_strategy,
+                    source,
+                )
+                if not source or started_key not in started_units:
+                    continue
+                # The write-ahead record is intent, never merge proof. Re-run the
+                # exact merge and latch completion only after git confirms it;
+                # merge/ff are naturally idempotent, while squash enables its
+                # recovery-only clean-tree success arm.
+                self.journal.append(
+                    "resume-unit-merge",
+                    story_key=task.story_key,
+                    branch=task.branch,
+                    target=self.state.target_branch,
+                    strategy=self.policy.scm.merge_strategy,
+                    source=source,
+                )
+                unit = self._reopen_unit(task)
+                self._merge_local(task, unit, replay=True)
+                merged_units.add(merged_key)
             self.journal.append("resume-ledger-carry", story_key=task.story_key)
             self._carry_isolated_ledger_writes(task)
             task.isolated_ledger_carried = True
@@ -3067,7 +3101,7 @@ class Engine:
                 ledger.unlink(missing_ok=True)
             return
         ledger.parent.mkdir(parents=True, exist_ok=True)
-        ledger.write_text(snapshot, encoding="utf-8")
+        atomic_write_text(ledger, snapshot)
 
     def _restore_persisted_ledger(self, task: StoryTask, *, replayed: bool) -> None:
         """Restore the snapshot durably armed before this attempt's engine writes."""
