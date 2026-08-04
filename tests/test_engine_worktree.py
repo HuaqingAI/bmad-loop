@@ -75,6 +75,7 @@ def wt_dev_effect(
     followup_review=True,
     closes_deferred=None,
     operator_actions=None,
+    deferred=None,
 ):
     """Dev session running inside the unit worktree (spec.cwd). Mirrors the
     bmad-dev-auto skill: self-finalizes the spec to done, never writes the sprint
@@ -95,6 +96,7 @@ def wt_dev_effect(
             baseline,
             closes_deferred=closes_deferred,
             operator_actions=operator_actions,
+            deferred=deferred,
         )
         # NO set_sprint: the orchestrator is the single sprint-status writer
         return SessionResult(
@@ -611,6 +613,204 @@ def test_worktree_defer_without_keep_drops_worktree_but_saves_patch(project):
     # in the run dir is the only surviving artifact.
     attention = (engine.run_dir / "ATTENTION").read_text()
     assert "story deferred: 1-1-a" in attention and "kept on branch" not in attention
+
+
+_HARVEST_CARRY = {
+    "summary": "Retry loop has no ceiling",
+    "evidence": "the backoff doubles forever with no cap",
+    "location": "src/retry.py:88",
+    "severity": "medium",
+}
+
+
+def _main_harvest_entries(project):
+    from bmad_loop import deferredwork
+
+    text = project.deferred_work.read_text(encoding="utf-8")
+    return deferredwork.parse_ledger(text)
+
+
+def _harvest_carry_events(engine):
+    return [entry for entry in engine.journal.entries() if entry["kind"] == "harvest-carried"]
+
+
+def test_deferred_isolated_unit_carries_harvest_before_terminal_save(project):
+    """A dropped failed worktree cannot be the only durable home of its finding."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    script = [wt_dev_effect(project, "1-1-a", deferred=[_HARVEST_CARRY])] + [
+        wt_review_effect(project, "1-1-a", clean=False, patched=1) for _ in range(3)
+    ]
+    engine, _ = make_engine(
+        project,
+        script,
+        policy=wt_policy(keep_failed=False, limits=_NO_DAMP),
+    )
+    terminal_saves: list[bool] = []
+    real_save = engine._save
+
+    def observe_terminal_save() -> None:
+        task = engine.state.tasks.get("1-1-a")
+        if task is not None and task.phase == Phase.DEFERRED:
+            terminal_saves.append(project.deferred_work.is_file())
+        real_save()
+
+    engine._save = observe_terminal_save
+    summary = engine.run()
+
+    assert summary.deferred == 1 and not summary.paused and not summary.crashed
+    assert terminal_saves and terminal_saves[0] is True
+    assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
+    assert [path.resolve() for path in worktree_list(project.project)] == [
+        project.project.resolve()
+    ]
+    assert not branch_exists(project.project, "bmad-loop/test-run/1-1-a")
+
+
+def test_done_isolated_unit_carries_a_gitignored_harvest_after_merge(project):
+    ignore_before_commit(project, "deferred-work.md")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            wt_dev_effect(
+                project,
+                "1-1-a",
+                followup_review=False,
+                deferred=[_HARVEST_CARRY],
+            )
+        ],
+    )
+
+    summary = engine.run()
+
+    task = engine.state.tasks["1-1-a"]
+    assert summary.done == 1 and task.phase == Phase.DONE
+    assert task.isolated_ledger_carried
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+    assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
+    assert [event["dw_ids"] for event in _harvest_carry_events(engine)] == [["DW-1"]]
+    uncommitted = [
+        entry for entry in engine.journal.entries() if entry["kind"] == "harvest-carry-uncommitted"
+    ]
+    assert len(uncommitted) == 1 and uncommitted[0]["dw_ids"] == ["DW-1"]
+    assert [path.resolve() for path in worktree_list(project.project)] == [
+        project.project.resolve()
+    ]
+
+
+def test_done_isolated_unit_dedupes_a_tracked_closed_harvest_after_merge(project):
+    from bmad_loop import deferredwork
+
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    head_before = rev_parse_head(project.project)
+
+    def close_harvest_then_review(spec):
+        wt = project.rebased(spec.cwd)
+        assert deferredwork.mark_done(
+            wt.deferred_work,
+            "DW-1",
+            "2026-08-03",
+            "fixed before the unit merged",
+        )
+        return wt_review_effect(project, "1-1-a", clean=True)(spec)
+
+    engine, _ = make_engine(
+        project,
+        [
+            wt_dev_effect(project, "1-1-a", deferred=[_HARVEST_CARRY]),
+            close_harvest_then_review,
+        ],
+    )
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    entries = _main_harvest_entries(project)
+    assert len(entries) == 1 and entries[0].title == _HARVEST_CARRY["summary"]
+    assert not entries[0].open
+    assert [event["dw_ids"] for event in _harvest_carry_events(engine)] == [[]]
+    subjects = git(project.project, "log", "--format=%s", f"{head_before}..HEAD").splitlines()
+    assert not [
+        subject
+        for subject in subjects
+        if subject.startswith("chore(deferred-work): carry harvested findings")
+    ]
+
+
+def test_awaiting_operator_isolated_unit_carries_a_gitignored_harvest(project):
+    ignore_before_commit(project, "deferred-work.md")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            wt_dev_effect(
+                project,
+                "1-1-a",
+                final_status="awaiting-operator",
+                followup_review=False,
+                operator_actions=["publish the DNS record"],
+                deferred=[_HARVEST_CARRY],
+            )
+        ],
+    )
+
+    summary = engine.run()
+
+    task = engine.state.tasks["1-1-a"]
+    assert summary.awaiting_operator == 1 and task.phase == Phase.AWAITING_OPERATOR
+    assert task.isolated_ledger_carried
+    assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
+    assert [event["dw_ids"] for event in _harvest_carry_events(engine)] == [["DW-1"]]
+
+
+def test_crashed_post_merge_harvest_carry_replays_and_persists_its_latch(project):
+    ignore_before_commit(project, "deferred-work.md")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            wt_dev_effect(
+                project,
+                "1-1-a",
+                followup_review=False,
+                deferred=[_HARVEST_CARRY],
+            )
+        ],
+    )
+
+    def crash_before_carry(_task) -> None:
+        raise RuntimeError("host died after merge and teardown")
+
+    # The WorktreeFlow callback must look this method up when invoked, not capture
+    # the original bound method at Engine construction time.
+    engine._carry_isolated_ledger_writes = crash_before_carry
+    assert engine.run().crashed
+
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed.phase == Phase.DONE and not crashed.isolated_ledger_carried
+    assert crashed.harvested_deferrals
+    assert not Path(crashed.worktree_path).exists()
+    assert not project.deferred_work.exists()
+
+    state = load_state(engine.run_dir)
+    state.clear_pause()
+    adapter = MockAdapter([])
+    resumed = Engine(
+        paths=project,
+        policy=engine.policy,
+        adapter=adapter,
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=state,
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.crashed and not summary.paused
+    assert adapter.sessions == []
+    assert "resume-ledger-carry" in journal_kinds(resumed)
+    assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
+    assert load_state(resumed.run_dir).tasks["1-1-a"].isolated_ledger_carried
 
 
 def test_worktree_defer_then_next_story_succeeds(project):

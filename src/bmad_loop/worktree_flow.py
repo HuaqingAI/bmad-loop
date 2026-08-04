@@ -5,7 +5,8 @@ Extracted from :class:`bmad_loop.engine.Engine` (issue #244, findings F-3/F-9a):
 state machine. It lives here as a collaborator built from narrow dependencies
 (repo paths, the policy, run state, journal, plugin registry, loaded adapters)
 plus a handful of engine callbacks (emit a plugin hook, save state, run the
-per-unit ready gate, escalate-pause, and get/set the engine's active workspace).
+per-unit ready gate, carry isolated ledger writes, escalate-pause, and get/set
+the engine's active workspace).
 The collaborator never receives the whole ``Engine`` — it cannot reach engine
 internals beyond those callables.
 
@@ -633,10 +634,11 @@ class WorktreeFlow:
     only structural changes are that engine-owned effects go through injected
     callables: ``emit`` fires a plugin hook (late-bound so a monkeypatched
     ``Engine._emit`` still wins), ``save`` persists run state, ``gate_unit`` runs
-    the per-unit ready gate, ``workspace_get``/``workspace_set`` read and swap the
-    engine's active workspace, and ``escalation_pause`` raises the engine's
-    ``RunPaused`` (injected so this module need not import ``engine`` — that would
-    reintroduce a runtime<->engine import cycle)."""
+    the per-unit ready gate, ``carry_isolated_ledger_writes`` applies Engine-owned
+    ledger bookkeeping after a successful merge, ``workspace_get``/``workspace_set``
+    read and swap the engine's active workspace, and ``escalation_pause`` raises the
+    engine's ``RunPaused`` (injected so this module need not import ``engine`` — that
+    would reintroduce a runtime<->engine import cycle)."""
 
     def __init__(
         self,
@@ -652,6 +654,7 @@ class WorktreeFlow:
         emit: Callable[..., object],
         save: Callable[[], None],
         gate_unit: Callable[[StoryTask], bool],
+        carry_isolated_ledger_writes: Callable[[StoryTask], None],
         escalation_pause: Callable[..., NoReturn],
         workspace_get: Callable[[], Workspace],
         workspace_set: Callable[[Workspace], None],
@@ -671,6 +674,7 @@ class WorktreeFlow:
         self._emit = emit
         self._save = save
         self._gate_unit = gate_unit
+        self._carry_isolated_ledger_writes = carry_isolated_ledger_writes
         self._pause = escalation_pause
         self._workspace_get = workspace_get
         self._workspace_set = workspace_set
@@ -971,6 +975,17 @@ class WorktreeFlow:
             # ourselves by hand once the branch has landed; the orchestrator only
             # commits the worktree onto the selected target.
             self.merge_local(task, unit)
+            # Engine-authored ledger writes normally ride the unit commit, but a
+            # gitignored ledger is omitted by finalize_commit's `git add -A` and
+            # would otherwise disappear with successful teardown. Carry only after
+            # merge: a tracked ledger reaches the target through the merge first,
+            # where Engine's all-status provenance scan can deduplicate it.
+            self._carry_isolated_ledger_writes(task)
+            # Phase is already terminal and persisted before integration, so make
+            # the carry completion durable here. Engine replays an unlatched carry
+            # after a crash in the merge-to-carry window.
+            task.isolated_ledger_carried = True
+            self._save()
         else:  # DEFERRED — capture the diff, keep or drop per keep_failed
             patch = close_unit_workspace(
                 unit,

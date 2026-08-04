@@ -71,6 +71,11 @@ if TYPE_CHECKING:
 HARVEST_ORIGIN = "spec-deferred"
 
 
+def _digest_of(text: str | None) -> str:
+    """Hash ledger text for attribution; absent and empty are equivalent."""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
 class RunPaused(Exception):
     def __init__(self, reason: str, stage: str, story_key: str | None = None):
         super().__init__(reason)
@@ -304,6 +309,7 @@ class Engine:
             emit=lambda *a, **k: self._emit(*a, **k),
             save=self._save,
             gate_unit=self._gate_unit,
+            carry_isolated_ledger_writes=lambda task: self._carry_isolated_ledger_writes(task),
             escalation_pause=self._escalation_pause,
             workspace_get=lambda: self.workspace,
             workspace_set=lambda ws: setattr(self, "workspace", ws),
@@ -390,6 +396,7 @@ class Engine:
                 self._emit_run_boundary("pre_run")
                 self._ensure_target_branch()
                 self._prune_preserve_refs()
+                self._replay_unlatched_ledger_carries()
                 self._loop()
                 self.state.finished = True
                 self._gc_run_worktrees()
@@ -810,6 +817,24 @@ class Engine:
             snapshot_failed=snapshot_failed,
         )
 
+    def _replay_unlatched_ledger_carries(self) -> None:
+        """Replay a successful isolated unit's carry after merge-time host loss."""
+        for task in list(self.state.tasks.values()):
+            if task.isolated_ledger_carried or task.phase not in (
+                Phase.DONE,
+                Phase.AWAITING_OPERATOR,
+            ):
+                continue
+            wt = task.worktree_path
+            if not wt or Path(wt).is_dir():
+                continue
+            if not task.harvested_deferrals:
+                continue
+            self.journal.append("resume-ledger-carry", story_key=task.story_key)
+            self._carry_isolated_ledger_writes(task)
+            task.isolated_ledger_carried = True
+            self._save()
+
     def _finish_inflight(self) -> None:
         """Complete or roll back tasks interrupted by a pause or crash."""
         for task in list(self.state.tasks.values()):
@@ -1183,6 +1208,10 @@ class Engine:
         self._review_and_commit(task)
 
     def _dev_phase(self, task: StoryTask, resume_result: SessionResult | None = None) -> bool:
+        if resume_result is None:
+            # A fresh invocation cannot consume a snapshot armed by an earlier,
+            # non-replayable invocation. Keep crash replay's snapshot intact.
+            self._disarm_ledger_snapshot(task)
         if self._vetoed(self._emit("pre_dev_phase", task), task):
             return False
         if resume_result is None:
@@ -1199,11 +1228,6 @@ class Engine:
             # never hidden along with the orchestrator's own append. A fixable
             # retry rebases it onto the tree that retry deliberately keeps.
             task.baseline_ledger_digest = self._ledger_digest()
-            # A new phase invocation owns no prior harvest. Retries stay inside
-            # this invocation and preserve the flag while their ledger writes
-            # remain on disk; a crash replay enters with `resume_result` and must
-            # preserve the dead attempt's persisted authorship too.
-            task.harvest_wrote_ledger = False
         feedback: Path | None = None
         while True:
             replayed = resume_result is not None
@@ -1213,6 +1237,12 @@ class Engine:
                 # advance; a second host death then still finds the record and
                 # re-enters this continuation instead of falling back to restart.
                 task.attempt += 1
+                # A genuinely new attempt starts from a rolled-back tree and owes
+                # nothing to the rejected attempt's harvest. A fixable retry keeps
+                # that tree and ledger intentionally, so preserve its payload for a
+                # later isolated carry. Crash replay never enters this branch.
+                if feedback is None:
+                    task.harvested_deferrals = []
             advance(task, Phase.DEV_RUNNING)
             self._save()
             if resume_result is not None:
@@ -1241,20 +1271,31 @@ class Engine:
             outcome = None
             if result.status == "completed":
                 # Everything below this point that appends to the ledger is the
-                # orchestrator, not the session. Retry-chain provenance carries
-                # across both a fixable retry's kept tree and, until Phase 6K, a
-                # non-fixable retry's protected ledger. Preserve it on a crash
-                # replay too: the replayed harvest dedupes against the dead
-                # attempt's on-disk append.
+                # orchestrator, not the session. Preserve attribution on crash
+                # replay: the replayed harvest dedupes against the dead attempt's
+                # on-disk append.
                 # Before the first harvest write, a replay can still reconstruct
                 # session authorship from the persisted baseline digest. Once an
                 # engine write is latched, the current ledger includes that write
                 # and replay must preserve the attribution saved before harvest.
+                if not replayed and feedback is None:
+                    task.harvest_wrote_ledger = False
                 if not replayed or not task.harvest_wrote_ledger:
                     if task.baseline_ledger_digest is not None:
                         task.ledger_changed_before_harvest = (
                             self._ledger_digest() != task.baseline_ledger_digest
                         )
+                    self._save()
+                # Snapshot after the session has finished, preserving any ledger
+                # edits it authored, and before reconcile/state-sync/harvest can
+                # write on the engine's behalf. Keep the chain's first snapshot
+                # across fixable retries because a later non-fixable reset returns
+                # all the way to the phase baseline. An unarmed replay may safely
+                # arm from disk; an armed replay must retain the dead attempt's
+                # pre-harvest bytes.
+                if (not replayed and feedback is None) or not task.pre_harvest_ledger_captured:
+                    task.pre_harvest_ledger = self._ledger_text()
+                    task.pre_harvest_ledger_captured = True
                     self._save()
                 # bmad-dev-auto sometimes finalizes the spec in prose (## Auto Run
                 # Result: Status done) but leaves the frontmatter status at the
@@ -1310,6 +1351,11 @@ class Engine:
             )
             self._save()
             if decision.action == Action.PROCEED:
+                # The attempt is accepted; no later path may restore its snapshot.
+                # Persist now because a crash can resume directly into review and
+                # never re-enter this method.
+                self._disarm_ledger_snapshot(task)
+                self._save()
                 self._emit("post_dev_phase", task)
                 if self._run_workflows("post_dev_phase", task, task.attempt):
                     return False
@@ -1326,13 +1372,35 @@ class Engine:
                     task.baseline_ledger_digest = self._ledger_digest()
                 else:
                     feedback = None
-                    self._rollback_or_pause(task)
-                    # The rollback resets code/spec bookkeeping but the artifact
-                    # shield preserves today's harvested ledger (Phase 6K will
-                    # restore it). Rebase onto that accounted-for engine state so
-                    # it cannot masquerade as the next session's ledger edit.
-                    task.baseline_ledger_digest = self._ledger_digest()
+                    paused = False
+                    try:
+                        self._rollback_or_pause(task)
+                    except RunPaused:
+                        paused = True
+                        raise
+                    finally:
+                        # Recovery resets code/spec state but protects artifact
+                        # directories, so an untracked or ignored harvest-created
+                        # ledger survives unless restored explicitly. Run this for
+                        # stop-and-wait too: the operator's eventual reset would not
+                        # remove such a file either.
+                        self._restore_persisted_ledger(task, replayed=replayed)
+                        # Rebase from the snapshot already in hand so a filesystem
+                        # fault cannot replace a RunPaused while unwinding.
+                        if task.pre_harvest_ledger_captured:
+                            task.baseline_ledger_digest = _digest_of(task.pre_harvest_ledger)
+                        if paused:
+                            # Do not carry the snapshot across a human-scale pause;
+                            # resume re-arms from the operator's then-current ledger.
+                            self._disarm_ledger_snapshot(task)
+                            self._save()
+                    # The completed rollback spent the chain snapshot. The next
+                    # genuinely new attempt will arm its own after its session.
+                    self._disarm_ledger_snapshot(task)
                 continue
+            # DEFER and escalation preserve their current tree/knowledge rather
+            # than rejecting the attempt, so neither may later consume this arm.
+            self._disarm_ledger_snapshot(task)
             if decision.action == Action.DEFER:
                 self._record_dev_spec(task, result.result_json)
                 self._defer(task, decision.reason)
@@ -2876,6 +2944,11 @@ class Engine:
         unit is merged before the run stops."""
         return
 
+    def _ledger_text(self) -> str | None:
+        """Return the active workspace ledger text, preserving absence."""
+        ledger = self.workspace.paths.deferred_work
+        return ledger.read_text(encoding="utf-8") if ledger.is_file() else None
+
     def _ledger_digest(self) -> str:
         """Digest the current ledger text for proof-of-work attribution.
 
@@ -2884,9 +2957,70 @@ class Engine:
         Reads stay fail-loud because guessing either equality answer can misjudge
         the session's work.
         """
+        return _digest_of(self._ledger_text())
+
+    def _ledger_is_gits_to_restore(self, task: StoryTask) -> bool:
+        """Whether git owns the active ledger and reset is responsible for it.
+
+        Probe failures degrade toward keeping the file: uncertainty must never
+        authorize deleting a tracked ledger that ``reset --hard`` restored.
+        """
         ledger = self.workspace.paths.deferred_work
-        text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
-        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+        root = self.workspace.root
+        try:
+            rel = ledger.relative_to(root).as_posix()
+        except ValueError:
+            try:
+                rel = ledger.resolve().relative_to(root.resolve()).as_posix()
+            except (OSError, RuntimeError) as e:
+                self.journal.append(
+                    "ledger-scope-probe-failed",
+                    story_key=task.story_key,
+                    error=str(e),
+                )
+                return True
+            except ValueError:
+                # An external ledger was outside the reset's reach. A None
+                # snapshot means this harvest created it, so it remains ours to
+                # unlink.
+                return False
+        try:
+            return verify.path_tracked(root, rel)
+        except (verify.GitError, OSError, RuntimeError) as e:
+            self.journal.append(
+                "ledger-tracked-probe-failed",
+                story_key=task.story_key,
+                error=str(e),
+            )
+            return True
+
+    def _restore_ledger(self, task: StoryTask, snapshot: str | None) -> None:
+        """Restore the active ledger to a pre-harvest filesystem snapshot."""
+        ledger = self.workspace.paths.deferred_work
+        if self._ledger_text() == snapshot:
+            return
+        if snapshot is None:
+            # The harvest created an untracked/ignored ledger. A tracked ledger
+            # absent at snapshot time is different: reset restored its committed
+            # bytes, which must never be deleted here.
+            if not self._ledger_is_gits_to_restore(task):
+                ledger.unlink(missing_ok=True)
+            return
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.write_text(snapshot, encoding="utf-8")
+
+    def _restore_persisted_ledger(self, task: StoryTask, *, replayed: bool) -> None:
+        """Restore the snapshot durably armed before this attempt's engine writes."""
+        if not task.pre_harvest_ledger_captured:
+            if replayed:
+                self.journal.append("ledger-snapshot-missing", story_key=task.story_key)
+            return
+        self._restore_ledger(task, task.pre_harvest_ledger)
+
+    def _disarm_ledger_snapshot(self, task: StoryTask) -> None:
+        """Drop the chain-scoped pre-harvest ledger snapshot."""
+        task.pre_harvest_ledger = None
+        task.pre_harvest_ledger_captured = False
 
     def _harvest_gate_exclude(self, task: StoryTask) -> tuple[str, ...]:
         """Exclude only this attempt's engine-authored ledger append from proof of work.
@@ -3785,6 +3919,9 @@ class Engine:
             # the failed work lives in the unit's worktree; the diff is captured
             # and the worktree kept/dropped by _integrate_unit. Don't touch the
             # tree here (no reset into the main repo — there's nothing to undo).
+            # Harvested findings are the exception: re-file them into the main
+            # checkout before the terminal save makes this defer durable.
+            self._carry_harvested_deferrals(task)
             self._record_defer(task, reason)
             return
         if task.baseline_commit:
@@ -3822,6 +3959,58 @@ class Engine:
                     deferred_work.parent.mkdir(parents=True, exist_ok=True)
                     deferred_work.write_text(snapshot, encoding="utf-8")
         self._record_defer(task, reason)
+
+    def _carry_isolated_ledger_writes(self, task: StoryTask) -> None:
+        """Apply Engine-owned ledger writes that an isolated merge may omit."""
+        self._carry_harvested_deferrals(task)
+
+    def _carry_harvested_deferrals(self, task: StoryTask) -> None:
+        """Re-file an isolated unit's harvested findings into the main ledger."""
+        if not task.harvested_deferrals:
+            return
+        ledger = self.paths.deferred_work
+        text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+        seen = deferredwork.parse_ledger(text)
+        carried: list[str] = []
+        for item in task.harvested_deferrals:
+            origin = str(item["origin"])
+            source_spec = str(item["source_spec"])
+            if any(
+                deferredwork.field_line_present(entry.body, "origin", origin)
+                and deferredwork.field_line_present(entry.body, "source_spec", source_spec)
+                for entry in seen
+            ):
+                continue
+            location = item.get("location")
+            severity = item.get("severity")
+            dw_id = deferredwork.append_entry(
+                ledger,
+                title=str(item["title"]),
+                origin=origin,
+                location=str(location) if location else "n/a",
+                source_spec=source_spec,
+                reason=str(item["reason"]),
+                severity=str(severity) if severity else None,
+            )
+            if dw_id:
+                carried.append(dw_id)
+                # Keep the same-call dedupe status-agnostic too.
+                seen = deferredwork.parse_ledger(ledger.read_text(encoding="utf-8"))
+        if carried:
+            try:
+                verify.commit_paths(
+                    self.paths.repo_root,
+                    f"chore(deferred-work): carry harvested findings from {task.story_key}",
+                    [ledger],
+                )
+            except verify.GitError as e:
+                self.journal.append(
+                    "harvest-carry-uncommitted",
+                    story_key=task.story_key,
+                    dw_ids=carried,
+                    error=str(e),
+                )
+        self.journal.append("harvest-carried", story_key=task.story_key, dw_ids=carried)
 
     def _stash_deferred_artifacts(self, task: StoryTask) -> None:
         """Move the deferred story's spec out of the artifacts dir into the run

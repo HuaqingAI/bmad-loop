@@ -8250,12 +8250,19 @@ def test_review_pass_deferrals_harvested_and_deduped_across_both_sites(project):
     assert events[-1]["deduped"] == 1
 
 
-def test_nonfixable_retry_kept_harvest_is_not_the_next_sessions_work(project):
-    """Until 6K, rollback preserves a harvest under the artifact shield.
+def test_nonfixable_retry_reverts_harvest_before_the_next_attempt(project):
+    """A rejected attempt's finding is removed and the retry files it afresh."""
+    ledger_present_at_retry: list[bool] = []
 
-    The retained engine write remains excluded on the next attempt; only the
-    third session's source edit is proof of work.
-    """
+    def retry_with_the_same_finding(spec):
+        ledger_present_at_retry.append(project.deferred_work.exists())
+        return dev_effect(
+            project,
+            "1-1-a",
+            followup_review=False,
+            deferred=[HARVEST_A],
+        )(spec)
+
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     engine, adapter = make_engine(
         project,
@@ -8267,19 +8274,21 @@ def test_nonfixable_retry_kept_harvest_is_not_the_next_sessions_work(project):
                 write_src=False,
                 deferred=[HARVEST_A],
             ),
-            dev_effect(project, "1-1-a", followup_review=False, write_src=False),
-            dev_effect(project, "1-1-a", followup_review=False),
+            retry_with_the_same_finding,
         ],
-        policy=_harvest_policy(attempts=3),
+        policy=_harvest_policy(attempts=2),
     )
 
     summary = engine.run()
 
     decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
-    assert [decision["action"] for decision in decisions] == ["retry", "retry", "proceed"]
+    assert [decision["action"] for decision in decisions] == ["retry", "proceed"]
     assert "no changes" in decisions[0]["reason"]
-    assert "no changes" in decisions[1]["reason"]
-    assert len(adapter.sessions) == 3
+    harvests = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert [event["dw_ids"] for event in harvests] == [["DW-1"], ["DW-1"]]
+    assert ledger_present_at_retry == [False]
+    assert [entry.title for entry in _harvest_entries(project)] == [HARVEST_A["summary"]]
+    assert len(adapter.sessions) == 2
     assert summary.done == 1 and not summary.crashed and not summary.paused
 
 
@@ -8570,9 +8579,11 @@ def test_replay_before_harvest_recovers_session_ledger_attribution(project):
 
 
 def test_retry_replay_recovers_session_ledger_attribution_after_prior_harvest(project):
-    """A prior attempt's harvest latch survives rollback. Attempt 2's completed
-    result must persist its own attribution before replay can consume it, rather
-    than mistaking the old latch for proof that attempt 2 already harvested.
+    """A rejected harvest is reverted but its stale latch survives until attempt 2.
+
+    Attempt 2's completed result must persist its own attribution before replay
+    can consume it, rather than mistaking the old latch for proof that attempt 2
+    already harvested.
     """
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     engine, _ = make_engine(
@@ -8619,7 +8630,6 @@ def test_retry_replay_recovers_session_ledger_attribution_after_prior_harvest(pr
     decisions = [e for e in resumed.journal.entries() if e["kind"] == "dev-decision"]
     assert [decision["action"] for decision in decisions] == ["retry", "proceed"]
     assert [entry.title for entry in _harvest_entries(project)] == [
-        HARVEST_A["summary"],
         "Session's own ledger work",
         HARVEST_B["summary"],
     ]
