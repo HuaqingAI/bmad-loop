@@ -8250,6 +8250,91 @@ def test_review_pass_deferrals_harvested_and_deduped_across_both_sites(project):
     assert events[-1]["deduped"] == 1
 
 
+def test_nonfixable_retry_kept_harvest_is_not_the_next_sessions_work(project):
+    """Until 6K, rollback preserves a harvest under the artifact shield.
+
+    The retained engine write remains excluded on the next attempt; only the
+    third session's source edit is proof of work.
+    """
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(
+                project,
+                "1-1-a",
+                followup_review=False,
+                write_src=False,
+                deferred=[HARVEST_A],
+            ),
+            dev_effect(project, "1-1-a", followup_review=False, write_src=False),
+            dev_effect(project, "1-1-a", followup_review=False),
+        ],
+        policy=_harvest_policy(attempts=3),
+    )
+
+    summary = engine.run()
+
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert [decision["action"] for decision in decisions] == ["retry", "retry", "proceed"]
+    assert "no changes" in decisions[1]["reason"]
+    assert len(adapter.sessions) == 3
+    assert summary.done == 1 and not summary.crashed and not summary.paused
+
+
+def test_awaiting_operator_spec_deferrals_are_harvested_before_park(project):
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            generic_dev_effect(
+                project,
+                "1-1-a",
+                final_status="awaiting-operator",
+                operator_actions=ACTIONS,
+                deferred=[HARVEST_A],
+            )
+        ],
+        policy=_park_policy(),
+    )
+
+    summary = engine.run()
+
+    assert summary.awaiting_operator == 1 and summary.done == 0
+    assert [entry.title for entry in _harvest_entries(project)] == [HARVEST_A["summary"]]
+    assert engine.state.tasks["1-1-a"].phase == Phase.AWAITING_OPERATOR
+
+
+def test_review_timeout_salvage_harvests_new_frontmatter_deferrals(project):
+    def timeout_with_new_deferral(_spec):
+        sp = spec_path(project, "1-1-a")
+        write_spec(sp, "in-review", _spec_baseline(sp), deferred=[HARVEST_A, HARVEST_B])
+        return SessionResult(status="timeout")
+
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a", deferred=[HARVEST_A]),
+            timeout_with_new_deferral,
+        ],
+        policy=_salvage_policy(),
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1 and summary.deferred == 0
+    harvested = [
+        entry
+        for entry in _harvest_entries(project)
+        if re.search(r"^origin: spec-deferred [0-9a-f]{12}$", entry.body, re.M)
+    ]
+    assert [entry.title for entry in harvested] == [HARVEST_A["summary"], HARVEST_B["summary"]]
+    events = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert [event["deduped"] for event in events] == [0, 1]
+    assert events[-1]["dw_ids"] == [harvested[-1].id]
+
+
 def test_spec_deferrals_malformed_siblings_file_valid_and_one_aggregated_entry(project):
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     engine, _ = make_engine(

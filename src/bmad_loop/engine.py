@@ -1199,6 +1199,11 @@ class Engine:
             # never hidden along with the orchestrator's own append. A fixable
             # retry rebases it onto the tree that retry deliberately keeps.
             task.baseline_ledger_digest = self._ledger_digest()
+            # A new phase invocation owns no prior harvest. Retries stay inside
+            # this invocation and preserve the flag while their ledger writes
+            # remain on disk; a crash replay enters with `resume_result` and must
+            # preserve the dead attempt's persisted authorship too.
+            task.harvest_wrote_ledger = False
         feedback: Path | None = None
         while True:
             replayed = resume_result is not None
@@ -1236,14 +1241,12 @@ class Engine:
             outcome = None
             if result.status == "completed":
                 # Everything below this point that appends to the ledger is the
-                # orchestrator, not the session. Reset the write flag only when
-                # this attempt starts from a reset tree. A fixable retry keeps the
-                # prior attempt's tree and harvest, so that provenance must carry
-                # into its repair session. Preserve it on a crash replay too: the
-                # replayed harvest dedupes against the dead attempt's on-disk append.
+                # orchestrator, not the session. Retry-chain provenance carries
+                # across both a fixable retry's kept tree and, until Phase 6K, a
+                # non-fixable retry's protected ledger. Preserve it on a crash
+                # replay too: the replayed harvest dedupes against the dead
+                # attempt's on-disk append.
                 if not replayed:
-                    if feedback is None:
-                        task.harvest_wrote_ledger = False
                     if task.baseline_ledger_digest is not None:
                         task.ledger_changed_before_harvest = (
                             self._ledger_digest() != task.baseline_ledger_digest
@@ -1320,6 +1323,11 @@ class Engine:
                 else:
                     feedback = None
                     self._rollback_or_pause(task)
+                    # The rollback resets code/spec bookkeeping but the artifact
+                    # shield preserves today's harvested ledger (Phase 6K will
+                    # restore it). Rebase onto that accounted-for engine state so
+                    # it cannot masquerade as the next session's ledger edit.
+                    task.baseline_ledger_digest = self._ledger_digest()
                 continue
             if decision.action == Action.DEFER:
                 self._record_dev_spec(task, result.result_json)
@@ -1690,6 +1698,10 @@ class Engine:
             reset_from = fm_status
             devcontract.reset_spec_status(spec_path, "done")
             devcontract.strip_auto_run_result(spec_path)
+        # A timed-out review can still have recorded new frontmatter findings.
+        # Normalize first so the success-status gate sees `done`, then mirror the
+        # normal review path before deterministic verification and commit.
+        self._harvest_spec_deferrals(task, {"spec_file": str(spec_path)})
         outcome = self._verify_review(task)
         if not outcome.ok:
             self.journal.append(
@@ -2460,8 +2472,10 @@ class Engine:
         fm = self._observed_frontmatter(spec_path, task.story_key, "spec-deferrals")
         if fm is None or devcontract.DEFERRED_FIELD not in fm:
             return
+        status = verify.status_of(fm)
         success_status = "in-review" if self._dev_review_enabled() else "done"
-        if verify.status_of(fm) != success_status:
+        parked = self._operator_park_enabled() and status == verify.AWAITING_OPERATOR
+        if status != success_status and not parked:
             return
         findings, malformed = devcontract.parse_deferred_findings(fm)
         if not findings and not malformed:
