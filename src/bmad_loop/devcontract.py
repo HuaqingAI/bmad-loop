@@ -20,12 +20,14 @@ match) still runs in verify.py against actual on-disk state.
 
 from __future__ import annotations
 
+import hashlib
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence, Set
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import deferredwork
 from .frontmatter import _edit_frontmatter_block, status_of
 from .platform_util import atomic_replace
 from .verify import DEV_WORKFLOW, operator_actions_of, read_frontmatter
@@ -185,6 +187,138 @@ def parse_auto_run_result(text: str) -> AutoRunResult:
     status_m = STATUS_LINE_RE.search(body)
     status = status_m.group(1).strip().lower() if status_m else ""
     return AutoRunResult(present=True, status=status, detail=body.strip())
+
+
+# ------------------------------------------------ deferred review findings
+#
+# Since BMAD-METHOD #2640 the dev primitive records findings triaged as `defer`
+# in its spec's frontmatter. The parser stays content-keyed so an older skill
+# (field absent) and a newer skill with no findings are indistinguishable.
+DEFERRED_FIELD = "deferred"
+_SUMMARY_LIMIT = 200
+_EVIDENCE_LIMIT = 1000
+_LOCATION_LIMIT = 200
+
+
+@dataclass(frozen=True)
+class DeferredFinding:
+    """One well-formed deferred finding, normalized for a ledger entry."""
+
+    summary: str
+    evidence: str
+    location: str
+    severity: str
+    fingerprint: str
+
+
+def harvest_fingerprint(*parts: str) -> str:
+    """Return a stable short identity over NUL-separated ledger values.
+
+    A NUL inside a value is indistinguishable from the separator, so refuse it
+    rather than assigning two distinct findings the same structural identity.
+    The frontmatter parser reports such values as malformed before calling this
+    helper; the guard also keeps direct callers from creating an ambiguous key.
+    """
+    if any("\0" in part for part in parts):
+        raise ValueError("fingerprint parts must not contain NUL characters")
+    return hashlib.sha1(
+        "\0".join(parts).encode("utf-8"),
+        usedforsecurity=False,
+    ).hexdigest()[:12]
+
+
+def _flatten(value: Any, limit: int) -> str:
+    """Collapse a YAML scalar to one clamped line.
+
+    Strip after clamping because the cut can land on a join space. Keeping that
+    cleanup here makes the value written to the ledger and the value used in its
+    fingerprint identical.
+    """
+    if value is None:
+        return ""
+    return " ".join(str(value).split())[:limit].strip()
+
+
+def _is_yaml_scalar(value: Any) -> bool:
+    """Whether PyYAML's loaded value came from a scalar-shaped node."""
+    # str/bytes are Sequences in Python but scalar values in YAML. SafeLoader's
+    # collection nodes otherwise become mappings, sequences, or sets.
+    return isinstance(value, (str, bytes)) or not isinstance(value, (Mapping, Sequence, Set))
+
+
+def _contains_nul(value: Any) -> bool:
+    """Whether a YAML text scalar contains a NUL before normalization/clamping."""
+    return (isinstance(value, str) and "\0" in value) or (
+        isinstance(value, bytes) and b"\0" in value
+    )
+
+
+def parse_deferred_findings(fm: dict[str, Any]) -> tuple[list[DeferredFinding], list[str]]:
+    """Parse a frontmatter ``deferred:`` list into findings and malformed notes.
+
+    Missing, null, and empty lists mean no findings. Malformed items cost only
+    themselves; well-formed siblings still parse. Text fields accept YAML
+    scalars (numeric and boolean scalars are string-normalized), never
+    collections or embedded NULs. This observation path never raises for the
+    YAML shapes it accepts.
+    """
+    raw = fm.get(DEFERRED_FIELD)
+    if raw is None:
+        return [], []
+    if not isinstance(raw, list):
+        return [], [f"`{DEFERRED_FIELD}:` is not a list (got {type(raw).__name__})"]
+
+    findings: list[DeferredFinding] = []
+    malformed: list[str] = []
+    for i, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            malformed.append(f"item {i}: not a mapping (got {type(item).__name__})")
+            continue
+        summary_raw = item.get("summary")
+        if not _is_yaml_scalar(summary_raw):
+            malformed.append(
+                f"item {i}: `summary` is not a scalar (got {type(summary_raw).__name__})"
+            )
+            continue
+        bad_optional = next(
+            (field for field in ("evidence", "location") if not _is_yaml_scalar(item.get(field))),
+            None,
+        )
+        if bad_optional is not None:
+            value = item[bad_optional]
+            malformed.append(
+                f"item {i}: `{bad_optional}` is not a scalar (got {type(value).__name__})"
+            )
+            continue
+        raw_text_values = {
+            "summary": summary_raw,
+            "evidence": item.get("evidence"),
+            "location": item.get("location"),
+        }
+        bad_nul = next(
+            (field for field, value in raw_text_values.items() if _contains_nul(value)), None
+        )
+        if bad_nul is not None:
+            malformed.append(f"item {i}: `{bad_nul}` contains a NUL character")
+            continue
+        summary = _flatten(summary_raw, _SUMMARY_LIMIT)
+        if not summary:
+            malformed.append(f"item {i}: no usable `summary`")
+            continue
+        evidence = _flatten(item.get("evidence"), _EVIDENCE_LIMIT)
+        location = _flatten(item.get("location"), _LOCATION_LIMIT)
+        findings.append(
+            DeferredFinding(
+                summary=summary,
+                evidence=evidence,
+                location=location,
+                severity=deferredwork.SEVERITY_ALIASES.get(
+                    str(item.get("severity", "")).strip().lower(), ""
+                ),
+                fingerprint=harvest_fingerprint(summary, location),
+            )
+        )
+    return findings, malformed
 
 
 @dataclass(frozen=True)

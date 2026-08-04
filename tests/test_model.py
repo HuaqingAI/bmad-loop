@@ -1,5 +1,7 @@
 """RunState serialization + lifecycle-flag tests."""
 
+import json
+
 import pytest
 
 from bmad_loop.model import Phase, RunState, SessionRecord, StoryTask, TokenUsage
@@ -158,6 +160,105 @@ def test_sentinel_kind_defaults_empty_for_legacy_state():
     doc = StoryTask(story_key="1", epic=0).to_dict()
     del doc["sentinel_kind"]  # state.json from before the field existed
     assert StoryTask.from_dict(doc).sentinel_kind == ""
+
+
+_DEFERRED_STATE_KEYS = (
+    "baseline_ledger_digest",
+    "pre_harvest_ledger",
+    "pre_harvest_ledger_captured",
+    "harvest_wrote_ledger",
+    "ledger_changed_before_harvest",
+    "harvested_deferrals",
+    "bundle_closes_intended",
+    "isolated_ledger_carried",
+)
+
+
+def test_deferred_work_state_fields_round_trip_through_json():
+    """All eight fields are hand-enumerated in both serializers. Non-default
+    values make a missing line on either side observable, while the JSON leg pins
+    the on-disk container shape rather than only an in-memory dataclass copy."""
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        baseline_ledger_digest="a" * 64,
+        pre_harvest_ledger="",
+        pre_harvest_ledger_captured=True,
+        harvest_wrote_ledger=True,
+        ledger_changed_before_harvest=True,
+        harvested_deferrals=[{"origin": "spec-deferred abc", "title": "finding"}],
+        bundle_closes_intended=["DW-3", "DW-7"],
+        isolated_ledger_carried=True,
+    )
+    restored = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+
+    assert restored.baseline_ledger_digest == "a" * 64
+    assert restored.pre_harvest_ledger == ""
+    assert restored.pre_harvest_ledger is not None
+    assert restored.pre_harvest_ledger_captured is True
+    assert restored.harvest_wrote_ledger is True
+    assert restored.ledger_changed_before_harvest is True
+    assert restored.harvested_deferrals == [{"origin": "spec-deferred abc", "title": "finding"}]
+    assert restored.bundle_closes_intended == ["DW-3", "DW-7"]
+    assert restored.isolated_ledger_carried is True
+
+
+def test_deferred_work_state_fields_default_for_one_old_state_dict():
+    """A state.json written before this package has none of the eight keys.
+    Every load must use ``d.get`` so resume reaches the old behavior instead of
+    raising KeyError; one shared old document prevents testing only a subset."""
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    for key in _DEFERRED_STATE_KEYS:
+        del doc[key]
+
+    restored = StoryTask.from_dict(doc)
+    assert restored.baseline_ledger_digest is None
+    assert restored.pre_harvest_ledger is None
+    assert restored.pre_harvest_ledger_captured is False
+    assert restored.harvest_wrote_ledger is False
+    assert restored.ledger_changed_before_harvest is False
+    assert restored.harvested_deferrals == []
+    assert restored.bundle_closes_intended == []
+    assert restored.isolated_ledger_carried is False
+
+
+def test_pre_harvest_ledger_preserves_absent_empty_and_text_states():
+    """Empty text means an existing empty ledger; None means no file. Collapsing
+    them would turn the common empty-ledger restore into an unlink."""
+    for value in (None, "", "# Deferred Work\n"):
+        restored = StoryTask.from_dict(
+            StoryTask(story_key="1-1-a", epic=1, pre_harvest_ledger=value).to_dict()
+        ).pre_harvest_ledger
+        assert restored == value
+        assert (restored is None) is (value is None)
+
+
+def test_deferred_work_state_containers_do_not_alias_the_persisted_doc():
+    doc = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        harvested_deferrals=[
+            {"title": "original", "metadata": {"labels": ["review"]}},
+        ],
+        bundle_closes_intended=["DW-1"],
+    ).to_dict()
+    restored = StoryTask.from_dict(doc)
+    restored.harvested_deferrals[0]["title"] = "mutated"
+    restored.harvested_deferrals[0]["metadata"]["labels"].append("follow-up")
+    restored.bundle_closes_intended.append("DW-2")
+    assert doc["harvested_deferrals"] == [
+        {"title": "original", "metadata": {"labels": ["review"]}},
+    ]
+    assert doc["bundle_closes_intended"] == ["DW-1"]
+
+
+def test_deferred_work_state_container_defaults_are_not_shared():
+    one = StoryTask(story_key="1-1-a", epic=1)
+    other = StoryTask(story_key="1-2-b", epic=1)
+    one.harvested_deferrals.append({"title": "one"})
+    one.bundle_closes_intended.append("DW-1")
+    assert other.harvested_deferrals == []
+    assert other.bundle_closes_intended == []
 
 
 def test_restore_patch_round_trips():

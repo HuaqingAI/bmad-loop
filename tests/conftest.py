@@ -100,6 +100,19 @@ def _file_exists_cmd(path) -> str:
     return f'test -f "{path}"'
 
 
+def passes_once(marker) -> str:
+    """Return a host-shell command that succeeds once, then fails.
+
+    ``marker`` must be an explicit absolute path outside the worktree. Verify
+    commands receive no ``BMAD_LOOP_RUN_DIR`` environment variable, and a marker
+    inside the worktree can be removed by rollback between the two executions.
+    """
+    if sys.platform == "win32":
+        win = str(marker).replace("/", "\\")
+        return f'if exist "{win}" (exit 1) else (type nul > "{win}")'
+    return f'test ! -f "{marker}" && touch "{marker}"'
+
+
 # A tool no host has: sh exits 127, cmd exits 1 with "is not recognized" (#302).
 # Both classify as verify environment faults — the point of the tests using it.
 MISSING_TOOL_CMD = "definitely-not-a-real-cmd-302"
@@ -457,6 +470,41 @@ def set_sprint(paths: ProjectPaths, key: str, status: str) -> None:
     doc = yaml.safe_load(paths.sprint_status.read_text())
     doc["development_status"][key] = status
     paths.sprint_status.write_text(yaml.safe_dump(doc, sort_keys=False))
+
+
+def render_deferred(items) -> str:
+    """Render the post-#2640 ``deferred:`` frontmatter shape.
+
+    Free-form values use the real YAML block scalars: ``>-`` for folded
+    summary/location and ``|-`` for literal evidence. A non-dict list item and a
+    dict missing ``summary`` intentionally remain expressible for malformed-item
+    tests.
+    """
+    if not items:
+        return "deferred: []\n"
+    lines = ["deferred:"]
+    for item in items:
+        if not isinstance(item, dict):
+            lines.append(f"  - {item}")
+            continue
+        rendered = False
+        for key in ("summary", "evidence", "location", "severity"):
+            if key not in item:
+                continue
+            lead = "    " if rendered else "  - "
+            rendered = True
+            value = str(item[key])
+            if not value:
+                lines.append(f"{lead}{key}: ''")
+            elif key == "severity":
+                lines.append(f"{lead}{key}: {value}")
+            else:
+                style = "|-" if key == "evidence" else ">-"
+                lines.append(f"{lead}{key}: {style}")
+                lines.extend(f"      {line}" for line in value.splitlines())
+        if not rendered:
+            lines.append("  - {}")
+    return "\n".join(lines) + "\n"
 
 
 def write_spec(

@@ -1,6 +1,7 @@
 """Tests for the generic bmad-dev-auto -> result.json translation shim."""
 
 import os
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
@@ -1394,3 +1395,236 @@ def test_auto_run_marker_is_not_read_as_an_operator_confirmation(tmp_path):
     sp = _write(tmp_path, "spec-a.md", _PARKED)
     devcontract.append_auto_run_result(sp, "done")
     assert devcontract.has_operator_confirmation(sp) is False
+
+
+# ---------------------------------------- frontmatter `deferred:` harvest (#2640)
+
+
+def _deferred_spec(path: Path, items) -> dict:
+    """Read the real block-scalar serialization through the production parser."""
+    from conftest import render_deferred
+
+    path.write_text(
+        f"---\nstatus: done\n{render_deferred(items)}---\n\n## Intent\n\ntest\n",
+        encoding="utf-8",
+    )
+    return verify.read_frontmatter(path)
+
+
+def test_parse_deferred_findings_absent_null_and_empty_are_empty(tmp_path):
+    path = tmp_path / "absent.md"
+    path.write_text("---\nstatus: done\n---\n\nbody\n", encoding="utf-8")
+    assert "deferred" not in verify.read_frontmatter(path)
+    assert devcontract.parse_deferred_findings(verify.read_frontmatter(path)) == ([], [])
+    assert devcontract.parse_deferred_findings({"deferred": None}) == ([], [])
+    assert devcontract.parse_deferred_findings(_deferred_spec(tmp_path / "empty.md", [])) == (
+        [],
+        [],
+    )
+
+
+def test_parse_deferred_findings_reads_real_block_scalar_shape(tmp_path):
+    fm = _deferred_spec(
+        tmp_path / "spec.md",
+        [
+            {
+                "summary": "Retry loop can spin: no ceiling # really",
+                "evidence": "first line\nsecond line: still evidence # data",
+                "location": "src/retry.py:88",
+                "severity": "medium",
+            }
+        ],
+    )
+    findings, malformed = devcontract.parse_deferred_findings(fm)
+    assert malformed == []
+    assert findings == [
+        devcontract.DeferredFinding(
+            summary="Retry loop can spin: no ceiling # really",
+            evidence="first line second line: still evidence # data",
+            location="src/retry.py:88",
+            severity="medium",
+            fingerprint=devcontract.harvest_fingerprint(
+                "Retry loop can spin: no ceiling # really", "src/retry.py:88"
+            ),
+        )
+    ]
+
+
+def test_deferred_finding_is_frozen():
+    finding = devcontract.DeferredFinding("summary", "evidence", "location", "high", "abc")
+    with pytest.raises(FrozenInstanceError):
+        setattr(finding, "summary", "changed")
+
+
+def test_parse_deferred_findings_keeps_item_order(tmp_path):
+    fm = _deferred_spec(
+        tmp_path / "spec.md",
+        [
+            {"summary": "first", "evidence": "e1"},
+            {"summary": "second", "evidence": "e2"},
+            {"summary": "third", "evidence": "e3"},
+        ],
+    )
+    findings, malformed = devcontract.parse_deferred_findings(fm)
+    assert malformed == []
+    assert [finding.summary for finding in findings] == ["first", "second", "third"]
+    assert len({finding.fingerprint for finding in findings}) == 3
+
+
+def test_parse_deferred_findings_defaults_optional_fields_and_coerces_scalars():
+    findings, malformed = devcontract.parse_deferred_findings(
+        {"deferred": [{"summary": 42}, {"summary": True, "evidence": False}]}
+    )
+    assert malformed == []
+    assert [(f.summary, f.evidence, f.location, f.severity) for f in findings] == [
+        ("42", "", "", ""),
+        ("True", "False", "", ""),
+    ]
+
+
+@pytest.mark.parametrize("field", ["summary", "evidence", "location"])
+@pytest.mark.parametrize("collection", [["nested", "values"], {"nested": "value"}])
+def test_parse_deferred_findings_rejects_collection_valued_text_fields(field, collection):
+    """A malformed optional field costs its whole item too: silently dropping
+    it would harvest only part of an authored finding, while stringifying it
+    would persist Python container repr in the ledger. Scalar siblings remain
+    harvestable, including the numeric/bool normalization pinned above."""
+    malformed_item = {"summary": "bad item", field: collection}
+    findings, malformed = devcontract.parse_deferred_findings(
+        {"deferred": [malformed_item, {"summary": "good sibling"}]}
+    )
+
+    assert [finding.summary for finding in findings] == ["good sibling"]
+    assert malformed == [f"item 1: `{field}` is not a scalar (got {type(collection).__name__})"]
+
+
+@pytest.mark.parametrize("field", ["summary", "evidence", "location"])
+@pytest.mark.parametrize("value", ["before\0after", "x" * 1001 + "\0"])
+def test_parse_deferred_findings_rejects_embedded_nul_in_text_fields(field, value):
+    """Reject before clamping too, so a late NUL cannot evade the stated schema."""
+    malformed_item = {"summary": "bad item", field: value}
+    findings, malformed = devcontract.parse_deferred_findings(
+        {"deferred": [malformed_item, {"summary": "good sibling"}]}
+    )
+
+    assert [finding.summary for finding in findings] == ["good sibling"]
+    assert malformed == [f"item 1: `{field}` contains a NUL character"]
+
+
+def test_parse_deferred_findings_normalizes_known_severity_and_drops_unknown(tmp_path):
+    fm = _deferred_spec(
+        tmp_path / "spec.md",
+        [
+            {"summary": "a", "severity": "blocker"},
+            {"summary": "b", "severity": "Major"},
+            {"summary": "c", "severity": "spicy"},
+        ],
+    )
+    findings, malformed = devcontract.parse_deferred_findings(fm)
+    assert malformed == []
+    assert [finding.severity for finding in findings] == ["critical", "high", ""]
+
+
+def test_parse_deferred_findings_isolates_each_malformed_item(tmp_path):
+    fm = _deferred_spec(
+        tmp_path / "spec.md",
+        [
+            {"summary": "good one", "evidence": "e"},
+            "bare-scalar",
+            {"evidence": "missing summary"},
+            {"summary": "   ", "evidence": "blank summary"},
+            {"summary": "good two", "evidence": "e"},
+        ],
+    )
+    findings, malformed = devcontract.parse_deferred_findings(fm)
+    assert [finding.summary for finding in findings] == ["good one", "good two"]
+    assert malformed == [
+        "item 2: not a mapping (got str)",
+        "item 3: no usable `summary`",
+        "item 4: no usable `summary`",
+    ]
+
+
+@pytest.mark.parametrize("raw", ["one finding", {"summary": "x"}, 3, True])
+def test_parse_deferred_findings_reports_a_non_list_container(raw):
+    findings, malformed = devcontract.parse_deferred_findings({"deferred": raw})
+    assert findings == []
+    assert malformed == [f"`deferred:` is not a list (got {type(raw).__name__})"]
+
+
+def test_parse_deferred_findings_clamps_every_ledger_value(tmp_path):
+    findings, malformed = devcontract.parse_deferred_findings(
+        _deferred_spec(
+            tmp_path / "spec.md",
+            [{"summary": "s" * 500, "evidence": "e" * 4000, "location": "l" * 500}],
+        )
+    )
+    assert malformed == []
+    assert len(findings[0].summary) == 200
+    assert len(findings[0].evidence) == 1000
+    assert len(findings[0].location) == 200
+
+
+def test_flatten_strips_a_join_space_at_the_clamp_boundary(tmp_path):
+    padded = " ".join(["a" * 9] * 30)
+    assert padded[:200].endswith(" ")
+    assert devcontract._flatten(padded, 200) == padded[:200].strip()
+
+    findings, _ = devcontract.parse_deferred_findings(
+        _deferred_spec(tmp_path / "spec.md", [{"summary": "s", "location": padded}])
+    )
+    finding = findings[0]
+    assert not finding.location.endswith(" ")
+    assert finding.fingerprint == devcontract.harvest_fingerprint("s", finding.location)
+
+
+def test_deferred_fingerprint_ignores_evidence_but_tracks_location(tmp_path):
+    def fingerprint(path: Path, evidence: str, location: str) -> str:
+        findings, _ = devcontract.parse_deferred_findings(
+            _deferred_spec(
+                path,
+                [{"summary": "same finding", "evidence": evidence, "location": location}],
+            )
+        )
+        return findings[0].fingerprint
+
+    first = fingerprint(tmp_path / "a.md", "e1", "f.py:1")
+    assert fingerprint(tmp_path / "b.md", "REWORDED", "f.py:1") == first
+    assert fingerprint(tmp_path / "c.md", "e1", "f.py:2") != first
+
+
+def test_deferred_fingerprint_uses_clamped_rendered_values(tmp_path):
+    a, _ = devcontract.parse_deferred_findings(
+        _deferred_spec(tmp_path / "a.md", [{"summary": "x" * 300 + "AAA"}])
+    )
+    b, _ = devcontract.parse_deferred_findings(
+        _deferred_spec(tmp_path / "b.md", [{"summary": "x" * 300 + "BBB"}])
+    )
+    assert a[0].summary == b[0].summary
+    assert a[0].fingerprint == b[0].fingerprint
+
+
+def test_harvest_fingerprint_is_stable_and_nul_separates_parts():
+    # Exact value pins SHA-1, NUL joining, and the 12-character truncation.
+    assert devcontract.harvest_fingerprint("a", "b") == "4a3dec2d1f82"
+    assert devcontract.harvest_fingerprint("ab", "c") != devcontract.harvest_fingerprint("a", "bc")
+    assert len(devcontract.harvest_fingerprint("a", "b")) == 12
+
+
+@pytest.mark.parametrize("parts", [("a\0b", "c"), ("a", "b\0c")])
+def test_harvest_fingerprint_refuses_ambiguous_embedded_nul(parts):
+    with pytest.raises(ValueError, match="must not contain NUL"):
+        devcontract.harvest_fingerprint(*parts)
+
+
+def test_harvest_fingerprint_marks_sha1_as_non_security_use(monkeypatch):
+    real_sha1 = devcontract.hashlib.sha1
+    seen = []
+
+    def recording_sha1(payload, *, usedforsecurity):
+        seen.append(usedforsecurity)
+        return real_sha1(payload, usedforsecurity=usedforsecurity)
+
+    monkeypatch.setattr(devcontract.hashlib, "sha1", recording_sha1)
+    assert devcontract.harvest_fingerprint("a", "b") == "4a3dec2d1f82"
+    assert seen == [False]
