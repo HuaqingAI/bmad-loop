@@ -1138,11 +1138,16 @@ that rode the same window. Both skill eras are supported; the rename itself need
 - **A transient harvest read cannot silently drop recorded findings (#405).** An unreadable,
   momentarily missing, undecodable, or temporarily malformed spec at the harvest step now follows
   the existing bounded retry paths for dev, repair, review, and timeout salvage instead of letting
-  a later successful verifier read accept and commit without the ledger repair.
+  a later successful verifier read accept and commit without the ledger repair. A completed review
+  retries that deterministic read against its own result before any later reviewer can replace the
+  source list; a persistent fault defers with the artifacts preserved for recovery, or re-escalates
+  an active human-resolved CRITICAL re-drive.
 
 - **Post-session ledger work keeps its proof attribution across crash replay (#405).** The
   completed-session checkpoint is refreshed after hooks return, so a retained retry cannot hide a
-  hook-authored ledger repair behind an earlier harvest's engine-written exclusion.
+  hook-authored ledger repair behind an earlier harvest's engine-written exclusion. A pre-feature
+  checkpoint with no ledger digest reconstructs path-scoped attribution from its Git baseline, so
+  a legitimate ledger-only session still resumes while the new harvest remains excluded from proof.
 
 - **A harvested deferral is reverted when its attempt rolls back (#405).** The harvest keys on
   the spec's status and runs before the artifact gate, so a session that finalized its spec and

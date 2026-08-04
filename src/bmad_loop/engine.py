@@ -31,6 +31,7 @@ from .escalation import (
     decide_review_session,
     env_fault_pause_reason,
     preference_escalations,
+    review_exhausted,
     review_retry_or_exhaust,
 )
 from .install import dev_primitive_or_default
@@ -70,6 +71,10 @@ if TYPE_CHECKING:
 # the dedup key and must never be reworded; `<prefix>-malformed <fingerprint>`
 # marks the aggregated unparseable-items meta-entry.
 HARVEST_ORIGIN = "spec-deferred"
+# A completed review owns the spec bytes it just wrote. Give a transient repair
+# read one immediate retry, but never dispatch a new reviewer over an unread
+# source: that later pass is allowed to replace the frontmatter list.
+HARVEST_REPAIR_READ_ATTEMPTS = 2
 
 
 def _digest_of(text: str | None) -> str:
@@ -1335,7 +1340,22 @@ class Engine:
                 # and replay must preserve the attribution saved before harvest.
                 if not replayed and feedback is None:
                     task.harvest_wrote_ledger = False
-                if not replayed or not task.harvest_wrote_ledger:
+                if (
+                    replayed
+                    and task.baseline_ledger_digest is None
+                    and not task.harvest_wrote_ledger
+                ):
+                    # A state written before ledger attribution has no digest to
+                    # compare, but it still has the attempt's Git baseline. Use
+                    # the pre-harvest path diff to preserve legitimate ledger-only
+                    # session work without letting the append below become its
+                    # own proof. A later replay with harvest_wrote_ledger already
+                    # latched preserves the attribution saved by this first one.
+                    task.ledger_changed_before_harvest = self._legacy_ledger_changed_before_harvest(
+                        task
+                    )
+                    self._save()
+                elif not replayed or not task.harvest_wrote_ledger:
                     if task.baseline_ledger_digest is not None:
                         task.ledger_changed_before_harvest = (
                             self._ledger_digest() != task.baseline_ledger_digest
@@ -1640,18 +1660,36 @@ class Engine:
             # A follow-up review is another full dev-primitive pass and may add
             # findings to the same frontmatter list. Harvest after reconciliation
             # makes a prose-finalized pass visible; the dev-leg entries dedupe.
-            harvest_outcome = self._harvest_spec_deferrals(task, rj)
-            if harvest_outcome is not None:
+            harvest_outcome = None
+            for harvest_attempt in range(1, HARVEST_REPAIR_READ_ATTEMPTS + 1):
+                harvest_outcome = self._harvest_spec_deferrals(task, rj)
+                if harvest_outcome is None:
+                    break
                 self.journal.append(
                     "review-verify-failed",
                     story_key=task.story_key,
                     reason=harvest_outcome.reason,
                     env_fault=harvest_outcome.env_fault,
                     contradiction=harvest_outcome.contradiction,
+                    harvest_attempt=harvest_attempt,
                 )
                 if not harvest_outcome.retryable:
                     self._escalate(task, harvest_outcome.reason)
-                continue
+            if harvest_outcome is not None:
+                # The bounded deterministic retry could not recover the source.
+                # Do not launch another reviewer: a new pass may replace the
+                # unread `deferred:` list and silently erase a finding. Route as
+                # exhausted without spending a session so a resolved CRITICAL
+                # re-drive re-escalates instead of being downgraded to a defer.
+                exhausted = review_exhausted(
+                    task,
+                    "review deferral harvest remained unreadable after "
+                    f"{HARVEST_REPAIR_READ_ATTEMPTS} attempts: {harvest_outcome.reason}",
+                )
+                if exhausted.action == Action.PAUSE:
+                    self._escalate(task, exhausted.reason)
+                self._defer(task, exhausted.reason)
+                return
             status = str(rj.get("status", "")).strip()
             last_status = status  # remember the last completed pass for the defer reason
             followup = bool(rj.get("followup_review_recommended", False))
@@ -3071,6 +3109,44 @@ class Engine:
         the session's work.
         """
         return _digest_of(self._ledger_text())
+
+    def _legacy_ledger_changed_before_harvest(self, task: StoryTask) -> bool:
+        """Recover pre-feature ledger attribution from the attempt's Git baseline.
+
+        Old resumable state has no ``baseline_ledger_digest``. The completed
+        session can still have authored ledger-only work, and path-granular Git
+        evidence distinguishes that existing diff from the engine harvest about
+        to run. External ledgers cannot satisfy the project proof gate. An
+        attribution probe that raises keeps the path excluded, so uncertainty
+        never credits the engine's own append as session work.
+        """
+        if not task.baseline_commit:
+            return False
+        ledger = self.workspace.paths.deferred_work
+        root = self.workspace.root
+        try:
+            rel = ledger.resolve().relative_to(root.resolve()).as_posix()
+        except (OSError, RuntimeError):
+            try:
+                rel = ledger.relative_to(root).as_posix()
+            except ValueError:
+                return False
+        except ValueError:
+            return False
+        try:
+            return verify.path_changed_since(
+                root,
+                task.baseline_commit,
+                rel,
+                baseline_untracked=task.baseline_untracked,
+            )
+        except (verify.GitError, OSError, RuntimeError) as e:
+            self.journal.append(
+                "legacy-ledger-attribution-failed",
+                story_key=task.story_key,
+                error=str(e),
+            )
+            return False
 
     def _ledger_is_gits_to_restore(self, task: StoryTask) -> bool:
         """Whether git owns the active ledger and reset is responsible for it.

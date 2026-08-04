@@ -158,6 +158,16 @@ def review_retry_or_exhaust(task: StoryTask, policy: Policy, reason: str) -> Dec
     not to be applicable (#271)."""
     if task.review_cycle < policy.limits.max_review_cycles:
         return Decision(Action.RETRY, reason)
+    return review_exhausted(task, reason)
+
+
+def review_exhausted(task: StoryTask, reason: str) -> Decision:
+    """Terminal review-side failure routing without spending another session.
+
+    Used when a deterministic post-review repair has exhausted its own local
+    retry bound and launching another reviewer would be unsafe. It preserves the
+    same resolved-CRITICAL re-drive rule as ordinary review-budget exhaustion.
+    """
     return Decision(_exhausted_action(task), _exhaust_reason(task, reason))
 
 

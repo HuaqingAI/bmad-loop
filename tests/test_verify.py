@@ -102,6 +102,33 @@ def test_attempt_dirty_none_snapshot_ignores_untracked(project):
     assert verify.attempt_dirty(project.project, baseline, None) is True
 
 
+def test_path_changed_since_detects_one_tracked_path(project):
+    baseline = verify.rev_parse_head(project.project)
+
+    assert verify.path_changed_since(project.project, baseline, "src.txt") is False
+
+    (project.project / "src.txt").write_text("changed\n", encoding="utf-8")
+    assert verify.path_changed_since(project.project, baseline, "src.txt") is True
+
+
+def test_path_changed_since_respects_the_untracked_baseline(project):
+    baseline = verify.rev_parse_head(project.project)
+    (project.project / "ledger[1].md").write_text("finding\n", encoding="utf-8")
+
+    assert verify.path_changed_since(
+        project.project,
+        baseline,
+        "ledger[1].md",
+        baseline_untracked=[],
+    )
+    assert not verify.path_changed_since(
+        project.project,
+        baseline,
+        "ledger[1].md",
+        baseline_untracked=["ledger[1].md"],
+    )
+
+
 def test_attempt_dirty_excludes_untracked_artifact(project):
     """A new untracked spec under an orchestrator-owned artifact folder is not the
     dev attempt's dirtiness when that folder is excluded — but counts otherwise."""

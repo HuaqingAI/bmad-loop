@@ -308,6 +308,36 @@ def has_changes_since(
     return bool(created)
 
 
+def path_changed_since(
+    repo: Path,
+    baseline: str,
+    rel: str,
+    *,
+    baseline_untracked: list[str] | None = None,
+) -> bool:
+    """Whether one literal repo-relative path changed since ``baseline``.
+
+    This is the single-path form of :func:`has_changes_since`: tracked content
+    is compared to the recorded commit, while an ordinary untracked path counts
+    only when the attempt's baseline snapshot did not already contain it.
+    ``baseline_untracked=None`` keeps the proof gate's legacy behavior of
+    counting every ordinary untracked path. Ignored paths are absent from
+    :func:`untracked_files` and therefore cannot become proof of work here.
+
+    Any non-zero diff result fails open toward "changed", matching the
+    authoritative :func:`has_changes_since` gate. The literal pathspec is
+    required for operator-configured ledger paths containing Git wildmatch
+    characters.
+    """
+    rc, _ = _git(repo, "diff", "--quiet", baseline, "--", f":(literal){rel}")
+    if rc != 0:
+        return True
+    untracked = untracked_files(repo)
+    if rel not in untracked:
+        return False
+    return baseline_untracked is None or rel not in set(baseline_untracked)
+
+
 def attempt_dirty(
     repo: Path,
     baseline: str,
