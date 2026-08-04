@@ -8289,6 +8289,70 @@ def test_spec_deferrals_not_harvested_when_spec_is_short_of_success(project):
     assert not [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
 
 
+def test_spec_deferrals_reconcile_same_result_after_observation_fault(project, monkeypatch):
+    """A recovered strict harvest read finishes the same session's reconcile.
+
+    Otherwise a transient failure in the preceding observation leaves the spec at
+    ``in-progress``; harvest mistakes that for a legitimate no-op, and a later
+    attempt can replace the completed session's unfiled findings.
+    """
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(
+                project,
+                "1-1-a",
+                final_status="in-progress",
+                followup_review=False,
+                prose_status="done",
+                deferred=[HARVEST_A],
+            )
+        ],
+        policy=_harvest_policy(attempts=2),
+    )
+    observed = engine._observed_frontmatter
+    failed = False
+
+    def fail_first_reconcile(path, story_key, site):
+        nonlocal failed
+        if site == "reconcile" and not failed:
+            failed = True
+            engine._journal_spec_read_failed(
+                path, story_key, site, PermissionError(13, "transient")
+            )
+            return None
+        return observed(path, story_key, site)
+
+    monkeypatch.setattr(engine, "_observed_frontmatter", fail_first_reconcile)
+
+    summary = engine.run()
+
+    sp = spec_path(project, "1-1-a")
+    assert failed and summary.done == 1 and not summary.deferred and not summary.crashed
+    assert [session.role for session in adapter.sessions] == ["dev"]
+    assert verify.status_of(verify.read_frontmatter(sp)) == "done"
+    assert [entry.title for entry in _harvest_entries(project)] == [HARVEST_A["summary"]]
+    failures = [event for event in engine.journal.entries() if event["kind"] == "spec-read-failed"]
+    assert len(failures) == 1 and failures[0]["site"] == "reconcile"
+
+
+def test_spec_deferrals_retry_unproven_reconcilable_status(project):
+    """A nonterminal spec with findings is never a successful harvest no-op."""
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    sp = spec_path(project, task.story_key)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(sp, "in-review", "abc123", deferred=[HARVEST_A])
+
+    outcome = engine._harvest_spec_deferrals(task, {"spec_file": str(sp)})
+
+    assert outcome is not None and outcome.retryable and not outcome.fixable
+    assert "reconcilable nonterminal status 'in-review'" in outcome.reason
+    assert not project.deferred_work.exists()
+    assert task.harvested_deferrals == []
+
+
 def test_review_pass_deferrals_harvested_and_deduped_across_both_sites(project):
     review_with_b = _review_with_deferrals(project, [HARVEST_A, HARVEST_B])
 

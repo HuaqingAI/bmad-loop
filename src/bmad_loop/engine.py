@@ -1392,15 +1392,18 @@ class Engine:
                 # the sync below, verify_dev, and the review-verify gate all key
                 # off the on-disk frontmatter status.
                 self._reconcile_generic_terminal_status(task, result.result_json)
+                # Harvest the session's frontmatter `deferred:` findings into the
+                # ledger before the artifact gate so an accepted attempt carries
+                # them in its story commit. `_harvest_gate_exclude` keeps this
+                # engine-authored append from becoming proof of session work. This
+                # strict read can also finish a reconciliation whose preceding
+                # observation faulted, so state sync follows it and sees the
+                # repaired terminal status.
+                harvest_outcome = self._harvest_spec_deferrals(task, result.result_json)
                 # generic-path single-writer for the bookkeeping the decoupled
                 # skill never touches (sprint-status for stories, the deferred-work
                 # ledger for sweep bundles), before verify reads that state.
                 self._post_dev_state_sync(task, result.result_json)
-                # Harvest the session's frontmatter `deferred:` findings into the
-                # ledger before the artifact gate so an accepted attempt carries
-                # them in its story commit. `_harvest_gate_exclude` keeps this
-                # engine-authored append from becoming proof of session work.
-                harvest_outcome = self._harvest_spec_deferrals(task, result.result_json)
                 # carry the skill's follow-up-review recommendation (PR #2505)
                 # onto the task so _review_and_commit can gate the review loop.
                 # A present key is authoritative (folded from the frontmatter, or
@@ -2452,10 +2455,27 @@ class Engine:
                 spec=str(spec_path),
             )
             return
-        success_status = "in-review" if self._dev_review_enabled() else "done"
         fm = self._observed_frontmatter(spec_path, task.story_key, "reconcile")
         if fm is None:
             return
+        self._reconcile_generic_terminal_frontmatter(task, result_json, spec_path, fm)
+
+    def _reconcile_generic_terminal_frontmatter(
+        self,
+        task: StoryTask,
+        result_json: dict | None,
+        spec_path: Path,
+        fm: dict,
+    ) -> str:
+        """Apply generic terminal reconciliation from an already-read mapping.
+
+        The bookkeeping path supplies an observed mapping; required deferral
+        harvesting supplies a strict one. Sharing the decision/write step lets a
+        recovered harvest read finish a reconciliation whose earlier observation
+        faulted, without trusting result JSON or launching a replacement session
+        over the first session's findings. Returns the effective status.
+        """
+        success_status = "in-review" if self._dev_review_enabled() else "done"
         # A blank `status:` reads "" here (status_of normalizes YAML-null), so the
         # blank-status template shape reconciles like a missing key does.
         fm_status = verify.status_of(fm)
@@ -2478,22 +2498,22 @@ class Engine:
                     result_json["followup_review_recommended"] = bool(
                         fm.get("followup_review_recommended")
                     )
-            return
+            return success_status
         if fm_status not in devcontract.RECONCILABLE_FROM:
-            return  # blocked / unknown custom status: never override a deliberate one
+            return fm_status  # blocked / unknown custom status: never override a deliberate one
         try:
             text = spec_path.read_text(encoding="utf-8")
         except OSError as e:
             self._journal_spec_read_failed(spec_path, task.story_key, "reconcile-prose", e)
-            return
+            return fm_status
         arr = devcontract.parse_auto_run_result(text)
         if not arr.present or arr.status != devcontract.DONE:
-            return  # no terminal prose, or a blocked outcome: leave for the escalation path
+            return fm_status  # no terminal prose, or blocked: leave for escalation
         # Repair-write doctrine: the False arm is "nothing to change" only. A status
         # the reader can see but no line edit can move raises instead, and that raise
         # is deliberately left uncaught (see _reset_spec_for_repair).
         if not devcontract.reset_spec_status(spec_path, success_status):
-            return
+            return fm_status
         # Keep the in-place result_json the rest of _dev_phase reads consistent with
         # the now-reconciled spec (the followup flag is only carried on a done exit).
         # `reset_spec_status` rewrites only the status line, so `fm` (read above)
@@ -2512,6 +2532,7 @@ class Engine:
             frm=fm_status,
             to=success_status,
         )
+        return success_status
 
     def _repair_spec_marker(self, task: StoryTask, rj: dict) -> None:
         """Append the ``## Auto Run Result`` marker a missing-marker synthesis
@@ -2743,7 +2764,28 @@ class Engine:
         success_status = "in-review" if self._dev_review_enabled() else "done"
         parked = self._operator_park_enabled() and status == verify.AWAITING_OPERATOR
         if status != success_status and not parked:
-            return
+            # Stories mode's explicit plan checkpoint is a verified terminal for
+            # that leg, not a half-finalized implementation. Its deferred notes
+            # remain in the spec until the post-checkpoint implementation pass.
+            if (
+                status == devcontract.PLAN_HALT_STATUS
+                and (result_json or {}).get("plan_halt") is True
+            ):
+                return
+            if status not in devcontract.RECONCILABLE_FROM:
+                return
+            # Reconcile's preceding bookkeeping observation may have faulted even
+            # though this required read recovered. Reuse the strict mapping to
+            # finish the same session's terminal-prose repair before any later
+            # session can replace its `deferred:` list.
+            status = self._reconcile_generic_terminal_frontmatter(task, result_json, spec_path, fm)
+            parked = self._operator_park_enabled() and status == verify.AWAITING_OPERATOR
+            if status != success_status and not parked:
+                shown_status = status or "<blank>"
+                return VerifyOutcome.retry(
+                    "spec remained at reconcilable nonterminal status "
+                    f"{shown_status!r} while harvesting deferrals: {spec_path}"
+                )
         findings, malformed = devcontract.parse_deferred_findings(fm)
         if not findings and not malformed:
             return
