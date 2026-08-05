@@ -1374,9 +1374,9 @@ async def test_start_sweep_and_checkpoint_buttons_reachable(project):
 async def test_short_confirm_modal_stays_compact(project):
     """The bounded modals keep BaseDialog #dialog at height: auto on purpose, so a
     short body sizes to content instead of filling the screen. Guards the compact
-    tier against the #280 CodeRabbit suggestion of a definite `#dialog` height: on
-    a tall terminal a one-line confirm must stay a handful of rows, not balloon to
-    the 90% cap (a definite height took this from 7 → 23 rows when measured)."""
+    tier against a definite `#dialog` height (#280): on a tall terminal a one-line
+    confirm must stay a handful of rows, not balloon to the 90% cap — a definite
+    height takes this modal from 7 rows to 23."""
     app = BmadLoopApp(project.project)
     async with app.run_test(size=(64, 40)) as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
