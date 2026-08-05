@@ -153,481 +153,198 @@ which has not been released since 0.9.0 and does not descend from v0.9.1.
 
 - **An isolated sweep bundle can land when the deferred-work ledger is gitignored (#426).**
   `git worktree add` checks out tracked files only, so a project that gitignores its ledger — the
-  default shape, since the ledger's home is the BMAD artifacts dir — gave the unit worktree no
-  ledger at all. The orchestrator is that ledger's single writer on the generic dev path and writes
-  through the worktree's missing copy: `mark_done` returns False on an absent file,
-  `verify_review_bundle` then reads the same absent file and never sees the ids `done`, and the
-  bundle deferred on a fixable retry every run — so `open_ids` re-bundled the same work for ever.
-  No DONE-leg carry could rescue it, because the unit never reached DONE. Provisioning now seeds the
-  ledger when the checkout cannot deliver it, which moves the failure onto a leg that has a carry;
-  measured, the same run then lands. Three exclusions, each measured: a ledger the worktree already
-  holds, one the main checkout does not carry (much the commonest — the first harvest is what
-  creates it), and one resolving outside the project tree. The copy is not what delivers the close.
-  Every seeded rel is shielded from the unit's `git add -A` by the worktree-scoped exclude (#384),
-  so the flip made in the worktree still never rides the merge and the carry below stays the
-  delivery path — which is why a landing bundle still journals
-  `sweep-bundle-close-carry-uncommitted`. An in-repo ledger symlinked to an untracked target is
-  seeded to the wrong path and still hits this, which is #462.
+  default — gave the unit worktree none: `mark_done` returned False, `verify_review_bundle` never
+  saw the ids `done`, and the bundle deferred on a fixable retry for ever. Provisioning now seeds it
+  when the checkout cannot deliver one, moving the failure onto a leg the carry below can rescue. A
+  ledger symlinked to an untracked target is seeded to the wrong path and still hits this (#462).
 
-- **Every ledger write an isolated unit makes now reaches the main checkout (#425, #458).** Four
-  producers write the deferred-work ledger from inside a unit worktree — the harvest, a sweep
-  bundle's closes, a damped review round refiling its outstanding follow-up recommendation, and a
-  story's declared `closes_deferred:` flips — and the last two still died with the worktree. Each
-  wrote the unit's ledger, `finalize_commit`'s `git add -A` skipped the gitignored path in silence,
-  and the merge brought nothing back. Both now re-file into the main checkout after the unit merges,
-  journaled `review-followup-carried` and `story-deferred-close-carried`, committing on the same
-  terms as their siblings and degrading to `review-followup-carry-uncommitted` /
-  `story-deferred-close-carry-uncommitted` only when git provably cannot own the path. The
-  follow-up's record is persisted before its ledger append, so a crash between the two replays the
-  carry rather than losing the finding; and a re-drive that abandons the round clears that record,
-  so a carry cannot re-file a recommendation nothing owes any more.
+- **Every ledger write an isolated unit makes now reaches the main checkout (#425, #458).** Of the
+  four producers that write the deferred-work ledger from inside a unit worktree, a damped review
+  round's refiled follow-up and a story's `closes_deferred:` flips died with it —
+  `finalize_commit`'s `git add -A` skips the gitignored path in silence. Both now re-file after the
+  merge (`review-followup-carried`, `story-deferred-close-carried`, with `-carry-uncommitted`
+  variants), and the follow-up's record is persisted before its append so a crash replays the carry.
 
-- **A sweep bundle running in a worktree no longer loses its ledger closures, so later sweeps stop
-  re-driving work that already landed.** With the deferred-work ledger gitignored — the default
-  shape, and one provisioning now seeds into the unit itself (above), where it once needed an
-  `scm.worktree_seed` entry — the orchestrator's closure lands in the unit worktree,
-  `finalize_commit`'s `git add -A` skips the ignored path in silence, and the merge brings nothing
-  back: the entries stay `open`, triage re-bundles them, and every later sweep re-drives resolved
-  work — an unbounded loop rather than a one-time drop. The closure is now re-applied to the main
-  checkout after the unit merges, alongside the other ledger carries that run there, and journaled
-  `sweep-bundle-close-carried`. The flips are unguarded because losing them is the hazard; the
-  commit is best effort (`git add` refuses an explicitly named ignored path) and records
-  `sweep-bundle-close-carry-uncommitted` instead of costing the run its integration.
+- **A sweep bundle running in a worktree no longer loses its ledger closures.** The closure landed
+  in the unit worktree, `git add -A` skipped the gitignored path, and the merge brought nothing
+  back: the entries stayed `open`, triage re-bundled them, and every later sweep re-drove work that
+  had already landed — an unbounded loop, not a one-time drop. The closure is now re-applied to the
+  main checkout after the merge (`sweep-bundle-close-carried`), best effort, recording
+  `sweep-bundle-close-carry-uncommitted` rather than costing the run its integration.
 
 - **A host lost in the merge-to-carry window replays a carry that filed no findings.** The resume
   pre-pass only replayed units carrying harvested findings, so a unit whose sole ledger payload was
-  something else — a bundle's closures, a damped review follow-up, a story's declared
-  `closes_deferred:` flips — was skipped and that write stranded. Replay eligibility now names every
-  payload the carry hook delivers. It runs before the sweep's loop reads the open set, so a replayed
-  closure leaves that set before triage can re-bundle it.
+  a bundle's closures, a damped review follow-up or a story's `closes_deferred:` flips was skipped
+  and that write stranded. Replay eligibility now names every payload the carry hook delivers, and
+  runs before the sweep reads the open set so a replayed closure leaves it before triage re-bundles.
 
 - **A deferred bundle's closure is no longer carried by the resume replay.** The deferral path
-  deliberately re-files the harvest and withholds the closure — a defer discarded the code the
+  deliberately re-files the harvest and withholds the closure — a defer discarded the code that
   closure claims to have resolved — but the replay routed through the shared hook, which now also
-  carries closures. Since `open_ids` re-bundles only `open` entries, a wrongly `done` entry is
+  carries closures, and `open_ids` re-bundles only `open` entries, so a wrongly `done` entry is
   invisible to every later sweep. The replay now mirrors the deferral exactly: harvest only.
 
 - **A sweep bundle's ledger closes are withheld until its attempt is accepted (#433).** The
-  orchestrator marks a bundle's deferred-work ids `done` itself, and did so above the dev artifact
-  gate — so an attempt that finalized its spec and then failed a non-fixable check was discarded
-  with the ledger already claiming its work resolved. A surviving close is worse than a surviving
-  finding: `open_ids` only ever re-bundles open entries, so no later sweep looks at that id again
-  and the work is silently lost rather than mis-recorded. The close now runs below the gate, for a
-  PROCEED decision only — which also excludes a CRITICAL escalation, since that preempts even a
-  passing outcome, and a failing `[verify] commands` run — and a review-leg defer re-opens the ids
-  it closed itself. That undo is keyed on a durable per-operation marker written beside the close, a
-  SHA-256 over the run id and the story key, so it can only ever revoke a close its own run wrote: a
-  close from an earlier run of the same bundle, from the legacy path where the session edits the
-  ledger, or from a human is out of reach by construction rather than by a note comparison. One
-  deliberate consequence — the close no longer counts toward the gate's proof-of-work diff, so a
-  bundle session that changed no code now fails the gate instead of passing on the orchestrator's
-  own bookkeeping. Resume replays an accepted state sync and an accepted repair session, so a host
-  lost just after acceptance no longer re-drives them.
+  orchestrator marked a bundle's ids `done` above the dev artifact gate, so an attempt that failed a
+  non-fixable check was discarded with the ledger already claiming its work resolved — and since
+  `open_ids` re-bundles only open entries, no later sweep looks at that id again. The close now runs
+  below the gate on a PROCEED decision only, and a review-leg defer re-opens the ids it closed
+  itself. One consequence: a bundle session that changed no code now fails the gate.
 
-- **A harvested deferral is reverted when its attempt rolls back (#420).** The harvest keys on the
-  spec's status and runs before the artifact gate, so a session that finalized its spec and then
-  failed a non-fixable check left its ledger entry behind, describing code the rollback had just
-  discarded. The reset alone does not remove it: the ledger sits under a protected artifact folder,
-  which `_safe_reset`'s `keep` shields from the untracked-file cleanup, and `git reset --hard`
-  reverts a ledger only when git tracks it. The dev phase now snapshots the ledger **before every**
-  engine-side write in that window — so one growing inside the status reconcile or the state sync is
-  covered by construction, not just the harvest's own — and restores it around the rollback, on the
-  stop-and-wait path too. Lossless, because the spec's `deferred:` frontmatter is never mutated and
-  the next attempt re-harvests from it.
-
-  The snapshot is persisted with the attempt rather than held in a local, so a host death between
-  the harvest and the rollback no longer loses it; the nullable text and a separate captured flag
-  are what keep "no ledger existed" distinguishable from "no snapshot was taken", so a pre-existing
-  untracked or gitignored ledger is restored rather than deleted. It is scoped to the retry _chain_
-  — a fixable retry neither re-arms nor spends it — so a later non-fixable failure reverts as far
-  back as the reset it accompanies. The disarm now also runs when the rollback raises something
-  other than the pause it is written for, which previously skipped it and left a spent snapshot
-  armed for the next attempt to write back. The restore never unlinks a ledger git tracks: that one
-  is the reset's to restore, and deleting it would hand the next `git add -A` a deletion to commit.
-  A ledger outside the workspace reads as **not** git's, since a reset inside the workspace cannot
-  reach it. Every probe failure degrades toward keeping the file (`ledger-scope-probe-failed`,
-  `ledger-tracked-probe-failed`), the write publishes through the atomic ledger writer so a second
-  fault leaves the current ledger intact rather than truncated, and the arm is spent on the pause
-  leg too — a resume that replays the attempt must not write stale bytes back over what the operator
-  did during the human-scale wait (`ledger-snapshot-missing` records a replay that reached the
-  restore with no arm).
+- **A harvested deferral is reverted when its attempt rolls back (#420).** The harvest runs before
+  the artifact gate, so a session that failed a non-fixable check left a ledger entry describing
+  code the rollback had just discarded, and the reset cannot remove it: the ledger sits under a
+  `keep`-protected artifact folder, and `git reset --hard` reverts a ledger only when git tracks it.
+  The dev phase now snapshots the ledger before every engine-side write in that window, persists the
+  snapshot with the attempt, and restores it around the rollback; a failed probe keeps the file.
 
 - **The harvest's own ledger write is no longer the session's proof of work (#433).** The harvest
   runs above the dev artifact gate, and that gate deliberately does not exclude the ledger — a story
-  whose whole authorized scope is ledger reconciliation has to register as real work — so the gate
-  could not tell the orchestrator's write from the session's: a session that finalized its spec,
-  changed no code and recorded one `deferred:` finding proceeded on the strength of the line the
+  whose whole scope is ledger reconciliation must register as real work — so a session that
+  finalized its spec, changed no code and recorded one `deferred:` finding proceeded on the line the
   engine had just written for it. The gate now excludes the ledger relpath on exactly the attempts
-  whose harvest filed into it, through a new `engine_written` argument that composes with each
-  mode's own proof-of-work exclusions. All three dev legs pass it — sprint story, sweep bundle and
-  folder+id stories; the bundle leg is the costlier one, since an attempt let through there marks
-  real ids `done` and `open_ids` re-bundles only `open` entries. The key is a flag latched **and
-  persisted before** the first append, never re-derived: a crash replay re-runs the harvest, which
-  dedupes against the dead attempt's entries and so reports filing nothing while those entries are
-  still in the tree. Pre-latching is the conservative direction — excluding an unchanged path cannot
-  manufacture proof of work — and a ledger outside the project needs no exclusion at all, since the
-  gate never sees it.
+  whose harvest filed into it, keyed on a flag latched and persisted before the first append.
 
-- **…and a session's own ledger edit on that same attempt still is (#433).** The exclusion is
-  path-granular — it hides the whole ledger relpath, not the harvest's lines — so on an attempt
-  where both authors wrote, the session's edit would go out with the orchestrator's, and the
-  non-fixable retry that follows _pauses the whole run_ under the default
-  `scm.rollback_on_failure = false`. The gate now stands down whenever the ledger had already moved
-  off the attempt's attribution reference by the time the harvest ran: its diff is then provably not
-  the harvest's alone, and the gate judges the tree in full, which is the direction that sees more
-  of the diff rather than less. The reference is a SHA-256 digest persisted beside `baseline_commit`
-  (an absent and an empty ledger hash alike), compared as soon as the session completes and again
-  once `post_session` hooks return, since a hook can be the session's last writer. Persisting it is
-  the point: a resumed dev phase deliberately does not re-capture its baselines. A state file
-  predating the digest falls back to path-granular git evidence against the attempt's commit
-  baseline, where every probe failure keeps the path excluded
-  (`legacy-ledger-attribution-failed`) so uncertainty never credits the engine's append as session
-  work. A fixable retry rebases the reference onto the tree it deliberately keeps, so the retained
-  harvest is accounted for while a fresh session-authored edit still stands the exclusion down; a
-  rollback rebases it back onto the restored snapshot.
+- **A session's own ledger edit on that same attempt still counts as proof of work (#433).** The
+  exclusion is path-granular — it hides the whole ledger relpath, not the harvest's lines — so where
+  both wrote, the session's edit went out with the orchestrator's and the non-fixable retry that
+  follows paused the whole run under the default `scm.rollback_on_failure = false`. The gate now
+  stands down whenever the ledger moved off a digest persisted beside `baseline_commit`, re-checked
+  once `post_session` hooks return, since a hook can be the session's last writer.
 
 - **A worktree that could not be given its required upstream skills now pauses instead of stalling
-  (#433).** `provision_worktree` copies the BMad Method skills from the main repo behind a
-  containment guard and skips anything resolving outside it — which is exactly what a skill tree
-  symlinked to a shared machine-wide BMad install does. The run-start preflight stats through that
-  symlink and passes, so an isolated run was dispatched into a worktree holding none of its skills
-  and every session stalled on `Unknown command` having written nothing. Provisioning now reports
-  what it could not deliver through the existing `worktree-seed-skipped` journal channel, and the
-  engine re-probes disk and escalates before dispatch, naming the rels — the same environment-fault
-  treatment the renderer surface gets, since the seed reads the same repo for every story. The
-  re-probe is what arms the gate, never the copy bookkeeping, so a user-authored `worktree_seed`
-  entry that happens to spell a skill rel cannot forge a pause.
+  (#433).** Provisioning skips a skill tree resolving outside the repo — exactly what a symlink to a
+  shared machine-wide BMad install is — while the run-start preflight stats through that symlink and
+  passes, so an isolated run was dispatched into a worktree holding none of its skills and every
+  session stalled on `Unknown command`. Undelivered rels are journaled `worktree-seed-skipped`, and
+  the engine re-probes disk — never the copy bookkeeping — and escalates before dispatch.
 
-  What is fatal is the deterministic contract, not the directory listing. The gate asks the same
-  question the run-start preflight does: the resolved dev primitive plus the review skills this
-  project's own `customize.toml` layers require (an unreadable review shape falls back to a present
-  merged `bmad-review`, else the two standalone hunters). Within those, a reviewer owes its
-  `SKILL.md`; the primitive additionally owes `step-04-review.md`, `customize.toml`, and any
-  renderer source its worktree copy resolves — `workflow.md` plus every `[[bmad-snapshot:…]]` target
-  a source names. Everything else in the catalogue — the other primitive era, an advisory layer,
-  `bmad-review-verification-gap`, a repo-only `README.md` — is still copied best-effort but can
-  never pause a run, because its absence does not prove the session writes nothing. Measured on this
-  project's own install: of the six skills offered to the copier, exactly one can pause a run.
+- **Only the deterministic skill contract can pause that run (#433).** The gate asks what the
+  run-start preflight does: the resolved dev primitive plus the review skills this project's
+  `customize.toml` requires. A reviewer owes its `SKILL.md`; the primitive additionally owes
+  `step-04-review.md`, `customize.toml` and every renderer source its worktree copy resolves.
+  Everything else in the catalogue is copied best-effort and can never pause a run.
 
-  One behavior change falls out, and it can pause a setup that previously worked: containment is now
-  checked per FILE, where it used to be checked only on the skill DIRECTORY. A child symlinked to a
-  shared install outside the repo was followed by `shutil.copy2` and its bytes landed in the
-  worktree — silently, and the configuration worked. Provisioning refuses to read through it now,
-  and where the refused file is one of the required contract files above, the run PAUSES rather than
-  dispatches. Measured: an escaping `customize.toml` pauses; an escaping `README.md` is dropped in
-  silence and pauses nothing. The remedy is named in the escalation — commit the file, or point the
-  link inside the repo.
+- **Skill-tree containment is checked per file — a behavior change (#433).** It used to be checked
+  on the skill directory alone, so a child symlinked to a shared install outside the repo was
+  followed by `shutil.copy2` and its bytes landed silently, and the configuration worked.
+  Provisioning refuses to read through it now, and where the refused file is one of the contract
+  files above the run pauses, naming the remedy: commit the file, or point the link inside the repo.
 
-  Stories mode re-runs its own stricter check against the mounted worktree, because a folder+id
-  dispatch needs `step-01-clarify-and-route.md` to carry the `folder+id dispatch` marker: a step-01
-  through-link can pass in the main checkout and still be refused during copying, and a
-  tracked-but-stale worktree copy shows that existence alone is not enough. Both shapes name the
-  file; the stale one also names the marker it lacks.
+- **Worktree isolation carries the `_bmad/` config surface (#433).** The renderer-era dev primitive
+  (BMAD-METHOD#2601) takes the worktree as its project root and hard-fails when that root has no
+  `_bmad/` — there is no walk-up — so on a project that gitignores it (most do) every isolated
+  session HALTed with nothing written. Provisioning now merge-copies the repo's `_bmad/` per file,
+  copy-when-absent; the generated `_bmad/render/` is never seeded and is git-excluded inside the
+  worktree through its OWN private exclude (#384), never the shared `.git/info/exclude`.
 
-- **Worktree isolation carries the `_bmad/` config surface, and a seed the worktree never got is
-  reported (#433).** The renderer-era dev primitive (BMAD-METHOD#2601) is handed the worktree as its
-  project root and hard-fails when that root has no `_bmad/` — there is no walk-up — so on a project
-  that gitignores it (most do, this one included) every isolated session HALTed with nothing
-  written. `provision_worktree` now merge-copies the repo's `_bmad/` per file, copy-when-absent, so
-  a checkout that commits it keeps every tracked file and only the gitignored layers are filled in;
-  the generated `_bmad/render/` is the one top-level entry never seeded. This replaces the narrower
-  `_bmad/custom/` seed that carried the review-layer overrides alone.
+- **A short `_bmad/` seed pauses the run rather than driving the backlog into HALTs (#433).** The
+  pause fires only for the two surfaces whose absence is a proven HALT — `_bmad/config.toml` and the
+  renderer's own script unit under `_bmad/scripts` — and only when the resolved dev primitive is a
+  content-confirmed renderer stub, so a pre-BMAD-METHOD#2601 inline `SKILL.md` project still
+  proceeds. The realistic trigger is a symlinked `_bmad/`; it escalates once with the worktree left
+  mounted for inspection, which `worktree-opened` now names, since it fires at mount.
 
-  A short seed pauses the run — but only for the two surfaces whose absence is a proven HALT, and
-  only when the resolved dev primitive is a content-confirmed renderer stub, so a
-  pre-BMAD-METHOD#2601 inline `SKILL.md` project that happens to carry the same paths still
-  proceeds. The sentinels are `_bmad/scripts` and `_bmad/config.toml`, and `_bmad/scripts` is asked
-  the renderer preflight's own content-keyed question rather than walked whole:
-  `_bmad/scripts/render_skill.py` always, and `_bmad/scripts/config_utils.py` only while the
-  installed script still imports it. Measured: with `render_skill.py` symlinked out of the repo the
-  run pauses; with an arbitrary sibling `helper.py` symlinked out it does not, because a script the
-  renderer never loads cannot prove the session will HALT. The realistic trigger is a symlinked
-  `_bmad/`, which is how a shared BMad install is wired — every story would drive the same
-  incomplete seed into the same result-less Stop, so it escalates once with the worktree left
-  mounted for inspection rather than dispatching the whole backlog and reporting `0 done`. Neither
-  sentinel can be forged: a `worktree_seed` entry spelling one is stripped from the no-op report
-  before the disk predicates run.
+- **A seed entry the worktree never got is reported (#433).** The seed loops dropped an entry with a
+  bare `continue` when the containment guard refused it, so a config the repo carries as a symlink
+  _out_ of itself delivered nothing and said nothing. Drops are now journaled
+  `worktree-seed-dropped`, re-probed against the trees on disk and required to arrive whole; the
+  per-CLI hook config — the only default seed for gemini, copilot and antigravity — is asked about
+  its source and symlinks rather than answering with the bytes it writes after both loops.
 
-  Separately, the two explicit seed loops used to drop an entry with a bare `continue` when the
-  resolve-and-contain guard refused it, so a config the repo carries as a symlink _out_ of itself —
-  a dotfile-managed `.claude/settings.json`, a shared MCP config — delivered nothing and said
-  nothing: `worktree-seed-skipped` reports only the opposite case, an entry whose destination
-  already exists. Provisioning's result is now re-probed against the repo and the drops journaled as
-  `worktree-seed-dropped`, asking the two trees on disk rather than the loops' bookkeeping. A
-  directory entry has to arrive WHOLE: a partially delivered tree, or a nested source that escapes
-  the repo, names the entry rather than passing on the top-level path merely existing. Journaled and
-  never escalated, unlike the two gates above — those name files the orchestrator dispatches or the
-  renderer HALTs on, while a seed entry is arbitrary user config whose canonical trigger is an
-  ordinary working setup, so pausing would refuse every run of such a project over a guard doing its
-  job. The report stops trusting the destination for the one rel that cannot answer for itself: the
-  per-CLI hook step writes `profile.hooks.config_path` after both seed loops, and for gemini,
-  copilot and antigravity that path is the profile's only default seed, so the false green was the
-  gate's entire answer. Those rels are asked instead whether the source escapes the repo, the
-  destination is a symlink, or the destination escapes the worktree. `worktree-opened` is journaled
-  as soon as the worktree is mounted rather than after every provisioning gate has passed, so the
-  escalations that leave a half-provisioned worktree mounted for inspection now say where it is.
+- **Worktree provisioning survives a filesystem it cannot fully read (#422).** It ran with no `try`
+  around it, so a single unreadable file, dangling link, symlink cycle or FIFO in the repo's skill
+  trees or seed sources ended the whole run with a traceback where a named, resumable escalation
+  belonged. Every probe and copy the isolated seed makes is now total, on one shared walk that
+  descends symlinked source directories — which the renderer's `rglob` does not — without looping;
+  a dangling _destination_ symlink counts as occupied. Only provisioning degrades.
 
-  `_bmad/render/` is git-excluded inside the worktree so the renderer's in-session rewrite of it
-  cannot be swept into a story commit. That line lands in the worktree's OWN private exclude (#384)
-  — never the shared `.git/info/exclude` — so it is transient, dies with the worktree, and costs the
-  operator's repo nothing; it is added without consulting whether the worktree has a `_bmad/` yet,
-  so the shield does not depend on provisioning order. The one suppression is structural: when the
-  blanket `/_bmad` line is already going in, git prunes that directory before descending, so a
-  `/_bmad/render/` sibling could provably never be consulted.
+- **A worktree's hook config is never registered through a symlink (#421).** The registration loop
+  took `worktree / profile.hooks.config_path` at face value, so a checkout carrying its per-CLI
+  settings file as a symlink out of the tree had the merge read the _outside_ file and the write
+  land there — mutating the operator's real dotfile while the worktree, left with no Stop hook,
+  never reported completion. The loop now refuses the whole profile unless the raw path is inside
+  the worktree, no component up to the worktree root is a symlink, and `resolve()` changes nothing.
 
-- **Worktree provisioning survives a filesystem it cannot fully read (#422).** `provision_worktree`
-  runs inside the engine's isolated-run path with no `try` around it, so a single unreadable file,
-  dangling link, symlink cycle or FIFO anywhere in the repo's skill trees or seed sources ended the
-  whole run with a traceback where a named, resumable escalation belonged. Every probe and every
-  copy the isolated seed makes is now total. The recursive copier is rebuilt on one shared
-  Traversable walk that yields deterministic POSIX rels; supplying the worktree turns on mandatory
-  no-clobber, destination containment and per-entry degradation, so an entry that cannot be read or
-  written is skipped and its siblings still land. A directory the filesystem refuses to list is
-  yielded as a named leaf instead of raising, and materialization happens strictly after
-  enumeration, so an unreadable source directory never leaves an empty destination behind. The walk
-  descends symlinked source directories — unlike the renderer's `rglob` — so it carries a
-  branch-local real-path set that terminates a cycle such as `_bmad/scripts/loop -> ..` without
-  dropping a second sibling link pointing at the same shared tree. Passing the repo root
-  additionally refuses a real source entry resolving outside the main checkout, per entry rather
-  than per root — the per-FILE containment whose consequences the skills bullet above describes. A
-  dangling _destination_ symlink now counts as occupied, because writing through one landed the
-  bytes at the link's target, outside the slot the seed named. A FIFO is classified as neither file
-  nor directory and is dropped before `shutil.copy2` can see it — the copier's `SpecialFileError`
-  was asserted in prose only and is now witnessed on both the reader and the copier side, as a
-  filter rather than as a crash.
-
-  Totality alone is not enough, because the probes do not read the same on every interpreter this
-  project supports: `is_file()`, `is_dir()` and `exists()` raise `PermissionError` for an entry
-  below a listable-but-unsearchable parent on Python 3.11, 3.12 and 3.13, and answer `False` on
-  3.14 — where `False` is the silent drop, not the cautious reading. A false `is_dir()` is therefore
-  re-asked of `stat()`, which still raises on all four, and refusal reads as "there may be content
-  down there" rather than as absence; the file probe folds refusal and absence together, since both
-  mean there are no bytes to promise. The split is classified by errno, plus the three Windows error
-  codes that mean absence without mapping onto a POSIX errno (`ERROR_NOT_READY`,
-  `ERROR_INVALID_NAME`, `ERROR_CANT_RESOLVE_FILENAME`), so an unavailable drive letter or a broken
-  self-referential link on Windows reads as absent rather than as a directory worth walking into.
-  Only provisioning degrades: `bmad-loop init`'s own skill copy still raises, which is right for a
-  foreground command.
-
-- **A worktree's hook config is never registered through a symlink (#421).** Every other write
-  provisioning makes was guarded, but the per-CLI hook-registration loop was not: it took
-  `worktree / profile.hooks.config_path` at face value, so a checkout carrying
-  `.claude/settings.json` (or `.gemini/settings.json`, `.github/copilot/settings.json`,
-  `.agents/hooks.json`) as a symlink out of the tree — an ordinary dotfiles arrangement — had its
-  merge read the _outside_ file and its write land there too. The registrations are
-  worktree-specific and name an absolute per-run relay path, so that mutated the operator's real
-  dotfile with one run's content while the worktree that was supposed to receive them got nothing —
-  and a worktree with no Stop hook does not fail loudly, it simply never reports completion, which
-  is the exact failure the completion-signal invariant exists to prevent. A dangling link was the
-  other half: the file probe answered "absent" and the write landed at the target anyway. The loop
-  now refuses before it mkdirs, reads or writes anything, and refuses the whole profile rather than
-  degrading. Three guards, because no one of them is sufficient: the raw path must sit inside the
-  worktree (catching an absolute or `..`-bearing profile), every component from the config path up
-  to the worktree root is asked `is_symlink()` outright, and the resolved path must equal the raw
-  one and still be inside the worktree. The component walk is what catches a symlink _cycle_, whose
-  non-strict `resolve()` leaves the path textually unchanged on Python 3.13 and 3.14 and raises
-  `RuntimeError` on 3.11 and 3.12 — both readings refuse. `_worktree_local_exclude` still writes
-  unguarded; it targets the git common dir by design and is deliberately out of scope.
-
-- **A renderer-backed dev skill that cannot compose its prompt now fails the preflight (#410).**
-  Since BMAD-METHOD#2601 an upstream skill's `SKILL.md` can be a _stub_ that shells out to a
-  project-local `_bmad/scripts/render_skill.py` to build the real prompt. When that renderer cannot
-  run it writes `HALT: …` and the session Stops having produced no spec — and the cause is a fact
-  about the install, not about the story, so every story after it does the same and a run spends its
-  whole backlog on result-less Stops. Three new `problem` findings refuse it up front, so `validate`
-  exits 1 and `run`, `sweep`, `resume` and `resolve`'s re-arm abort before spawning anything:
-  `skills.dev-renderer`, when the resolved stub's script unit is short —
-  `_bmad/scripts/render_skill.py`, or the `_bmad/scripts/config_utils.py` it imports at module
-  scope; `skills.dev-renderer-config`, when a stub resolved but `_bmad/config.toml` is absent, the
-  only required layer of the renderer's central config; and `skills.dev-renderer-sources`, when the
-  skill's own render sources are short — no `workflow.md` entry document, or a
-  `[[bmad-snapshot:…]]` token naming something the renderer will not enumerate as a source.
-
-  Every leg is gated on the installed `SKILL.md`'s own content rather than on the skill's name or
-  era, so a pre-renderer inline install sees byte-identical behavior and none of this can fire on
-  it. The sibling helper is required only while the installed `render_skill.py` still names that
-  import, and the source check asks what the install itself declares — save the `workflow.md` entry
-  name, which upstream hardcodes too — so a later renderer that inlines the helper or reorganizes
-  its step files is not refused. The snapshot grammar is a byte-for-byte mirror of upstream's own
-  token regex: loosening it invents failures the renderer ignores, tightening it misses a real HALT.
-  The source walk deliberately uses `rglob`, mirroring upstream's enumeration, and must not be
-  unified with the copier's `iterdir` recursion — `rglob` does not descend a symlinked
-  sub-directory and the copier does, so borrowing the copier's walk here would credit sources the
-  renderer never loads and turn a guaranteed HALT green. These block rather than warn because only a
-  green is untrustworthy — whether `uv` is on the _session's_ PATH is deliberately never probed,
-  since a validate-host probe cannot answer it — while a red is conclusive. The config finding is
-  emitted once per project and only when a stub actually resolved; the other two are per skill tree,
-  and a damaged primitive can earn them alongside the ordinary marker findings. `run --dry-run`
-  names all three under its "NOT runnable as-is" banner, which reads the same problem-severity list
-  the real gate does.
+- **A renderer stub that cannot compose its prompt now fails the preflight (#410).** A stub
+  `SKILL.md` (BMAD-METHOD#2601) shells out to `_bmad/scripts/render_skill.py`; when that renderer
+  cannot run it writes `HALT: …` and the session Stops with no spec — a fact about the install, so
+  every story does the same. Three `problem` findings refuse it: `skills.dev-renderer` for a short
+  script unit, `skills.dev-renderer-config` for an absent `_bmad/config.toml` (its only required
+  layer), and `skills.dev-renderer-sources` for a missing `workflow.md` or snapshot target.
 
 - **`init` gitignores the renderer's output, and `validate` says when it is already committed
-  (#409).** Renderer output under `_bmad/render/` is regenerated with checkout-absolute paths: each
-  snapshot directory is named for a hash of the absolute project root plus a generation hash over
-  the renderer, its sources and the resolved config, so a committed tree grows a directory per
-  checkout path and per upstream renderer bump. `bmad-loop init` now writes `_bmad/render/` into
-  `.gitignore` alongside the three `.bmad-loop/` lines it already adds, idempotently. That only
-  helps going forward — a tracked path ignores `.gitignore` entirely — so `validate` also reports
-  `git.render-tracked` when the path already has index entries, naming the one-time
-  `git rm -r --cached _bmad/render`. A warning, not a problem: tracked output causes churn but never
-  stops a session, so it rides alongside the ok lines and leaves the exit code alone. The probe goes
-  through the shared `verify.path_tracked` chokepoint and stays silent when git cannot answer,
-  rather than fabricating an ok; the check and the `.gitignore` line spell the path from one
-  constant, so the report cannot drift from the shield it reports on.
+  (#409).** `_bmad/render/` is regenerated with checkout-absolute paths, so a committed tree grows a
+  directory per checkout path and per renderer bump. `init` now writes `_bmad/render/` into
+  `.gitignore` idempotently; since that cannot help a path already tracked, `validate` warns
+  `git.render-tracked`, naming the one-time `git rm -r --cached _bmad/render`.
 
-- **Refuse `isolation = "worktree"` combined with a `repo_root` override (#414).** The pair
-  previously produced a green preflight and then an isolated session with no dev primitive, no
-  result, and nothing journaled naming the cause. `validate` now reports it; `run`, `sweep`,
-  `resume` and the auto-triggered child sweep refuse to start; the dry-run banner names it first;
-  the TUI toasts it ahead of its clean-tree gate. Plumbing `project` through provisioning so both
-  work together is #443.
+- **Refuse `isolation = "worktree"` combined with a `repo_root` override (#414).** The pair produced
+  a green preflight and then an isolated session with no dev primitive, no result, and nothing
+  journaled naming the cause. `validate` now reports it; `run`, `sweep`, `resume` and the child
+  sweep refuse to start; the dry-run banner names it first; the TUI toasts it ahead of its
+  clean-tree gate. Plumbing `project` through provisioning so both work together is #443.
 
 - **A configured path carrying `[`, `]`, `*` or `?` no longer makes git act on the wrong files
-  (#423).** `implementation_artifacts` reaches git verbatim out of the operator's
-  `_bmad/bmm/config.yaml`, and git reads a positional operand as a _pathspec_, not a path — so such
-  a name matched a wider set than the one it named, always on the over-match side. `commit_paths`
-  broke its own "commit exactly these paths (and nothing else)" promise, staging an unrelated
-  sibling's edit under a story's name; with the ledger gitignored it could also exit clean having
-  committed nothing, where the fixed form leaves a record. `has_changes_since` and `attempt_dirty`
-  excluded a sibling tree along with the artifacts dir and reported a changed attempt as CLEAN, and
-  their git half disagreed with the Python half about what "under the artifact dir" means.
-  `safe_rollback`'s preserve restore reached siblings too, handing back a change the reset had just
-  discarded. Every operand is now literal, and the two halves agree.
+  (#423).** `implementation_artifacts` reaches git verbatim out of `_bmad/bmm/config.yaml`, and git
+  reads a positional operand as a _pathspec_ — so such a name always matched wider than it named:
+  `commit_paths` staged an unrelated sibling under a story's name, `has_changes_since` and
+  `attempt_dirty` reported a changed attempt as CLEAN, and `safe_rollback`'s preserve restore handed
+  back a change the reset had just discarded. Every operand is now literal.
 
 - **A noisy git config no longer makes a pristine tree read as dirty.** `worktree_clean` compared
   git's stdout and stderr merged, so `status` exiting 0 while warning about an unexecutable
   `core.fsmonitor` hook or an unknown `core.fsyncMethod` was indistinguishable from a porcelain
-  record. Seven callers gate on it and three of them refuse the command outright, so such a host
-  could never start a run — and the message named no file. Only stdout is read now; the error path
-  still reports both.
+  record — and callers that refuse the command outright meant such a host could never start a run.
+  Only stdout is read now; the error path still reports both.
 
 - **An undecodable `policy.toml` or `_bmad/bmm/config.yaml` is reported, not a crash.**
-  `UnicodeDecodeError` is a `ValueError`, not an `OSError`, so a config file saved in UTF-16 or
-  latin-1 escaped every `except (PolicyError, OSError)` handler in the codebase — and those handlers
-  are the ones whose whole job is to degrade to defaults rather than take the process down. It hit
-  `_configure_mux`, which runs before argument dispatch on **every** command, and the TUI dashboard's
-  constructor, which runs before the app can draw anything. `policy.load` and `bmadconfig.load_paths`
-  convert it to their own typed errors, so `validate` names the file under its `policy` /
-  `bmad-config` finding and the TUI degrades to defaults.
+  `UnicodeDecodeError` is a `ValueError`, not an `OSError`, so a config saved in UTF-16 or latin-1
+  escaped every `except (PolicyError, OSError)` handler — the ones whose whole job is to degrade to
+  defaults. It hit `_configure_mux`, which runs before argument dispatch on **every** command, and
+  the TUI's constructor. Both loaders now convert it to their own typed errors instead.
 
 - **`diagnose` pseudonymizes the spec name, and gives one spec one alias.** A journal record's
-  `spec` field carries the customer's feature name; a bare basename is identifier-shaped, so the
-  scrub fallback shipped it verbatim in a dump, and the egress backstop could not rescue it — it
-  only repairs values already in the legend. `spec` is now aliased in a namespace of its own, not
-  `story`, where a filename would render as an epic-less `story-<hex>` indistinguishable from a
-  story key whose epic could not be resolved. The value is reduced to its basename first, because
-  the producers disagree on shape — `engine.py` journals an absolute path, `stories_engine.py` the
-  worktree-relative one — so without it a single spec drew two aliases in one dump and an absolute
-  home path landed in the local `--legend` file. The split handles both separators, so a journal
-  written on Windows normalizes when it is diagnosed on POSIX.
+  `spec` field carries the customer's feature name, and a bare basename is identifier-shaped, so the
+  scrub fallback shipped it verbatim. `spec` now has an alias namespace of its own and the value is
+  reduced to its basename first — the producers disagree on shape, so without it one spec drew two
+  aliases and an absolute home path landed in the local `--legend` file. Either separator splits.
 
-- **The upstream `bmad-dev-auto` → `bmad-build-auto` rename no longer breaks a project (#393).**
-  The dev primitive is resolved on disk — `bmad-build-auto` preferred, a marker-complete
-  `bmad-dev-auto` accepted — so `validate`/`run`/`sweep`/`resume` pass on either era with no
-  `policy.toml` edit. The forwarding shim upstream left behind is refused as marker-incomplete
-  (`skills.base-shim`) — no step files, no `customize.toml`, which is also what a truncated
-  install looks like, so the message names both causes: the shim is a valid slash command, and where
-  a legacy `_bmad/custom/bmad-dev-auto*.toml` still sits beside it, it HALTs an unattended session
-  on its interactive migration gate having written nothing. Every session prompt spells
-  the resolved name, per skill tree, so a run mixing `.claude/skills` and `.agents/skills` at
-  different eras gets the right one per role; the no-spec fallback result marker is matched under
-  both prefixes. The name is resolved against the **workspace**, so a run resumed into an existing
-  worktree spells the era that worktree actually carries: resume re-mounts a worktree without
-  re-provisioning it, and a main checkout upgraded across the pause would otherwise dispatch a
-  command that worktree does not have, halting the session having written nothing. On a project
-  mid-upgrade, with a different era in each tree, the orphaned-override warning says to **copy**
-  `_bmad/custom/bmad-dev-auto.toml` rather than rename it — the legacy tree still applies it, so a
-  rename would move the customization between trees instead of migrating it. `--dry-run` now says
-  on stderr when its preview is not runnable rather than
-  printing a plausible schedule for an install that would abort at preflight (exit code stays 0,
-  stdout untouched). The skills preflight also stopped gating a triage-only CLI's skill tree — a
-  hard FAIL, with no `--force`, over skills no triage session ever dispatches. `[dev] skill` stays
-  `bmad-dev-auto`: it is the adapter discriminator, not the invoked name.
+- **The upstream `bmad-dev-auto` → `bmad-build-auto` rename no longer breaks a project (#393).** The
+  dev primitive is resolved on disk — `bmad-build-auto` preferred, a marker-complete `bmad-dev-auto`
+  accepted — so `validate`/`run`/`sweep`/`resume` pass on either era with no `policy.toml` edit.
+  `skills.base-shim` refuses the forwarding shim as marker-incomplete: it is a valid slash command,
+  and where a legacy `_bmad/custom/bmad-dev-auto*.toml` sits beside it, it HALTs an unattended
+  session on its interactive migration gate. `[dev] skill` stays `bmad-dev-auto`, the discriminator.
 
-- **The worktree git-add shield no longer hides new files in your own checkout (#384).** Worktree
-  provisioning shielded the tool files it writes (`.claude/skills`, the per-CLI hook config, seeded
-  configs) by appending to `.git/info/exclude` — a file shared with the main checkout and every
-  sibling worktree, permanent, and unversioned. Those paths are ones projects legitimately track, so
-  every **new** file under them silently stopped being staged by `git add -A` in the operator's own
-  checkout, long after the run: one report lost 51 files and three whole skills across two upgrade
-  commits, with nothing in either diff able to reveal why. The shield now writes a private exclude in
-  the worktree's own gitdir, activated with a worktree-scoped `core.excludesFile`, so it applies to
-  that unit alone and `git worktree remove` deletes it along with the worktree. The operator's
-  `core.excludesFile` is copied in **byte for byte** when the private file is created, since the
-  worktree-scoped key shadows it and git never concatenates across config scopes — so the copy has
-  to survive an exclude file in any legacy encoding at all (its patterns are paths, and POSIX paths
-  are arbitrary bytes). Relative values — of that key, or of an `XDG_CONFIG_HOME`
-  git falls back through — are resolved against the worktree, the way git does, rather
-  than against wherever the orchestrator was launched. Paths are read NUL-terminated, so an
-  excludes file whose path begins or ends in whitespace is copied rather than mangled. An excludes
-  file that **exists but cannot be read** — or a **git that will not say which file applies** (a
-  timeout, a failed spawn, or any answer to that query other than a definite "there is no such
-  key") — skips the shield with a journaled reason instead:
-  activating over patterns that could not be copied would shadow them exactly as an empty copy did,
-  and not knowing whether there is anything to copy has the same standing as failing to read it.
-  Only a definite **absent** answer stays a silent no-op — there is nothing to shadow. The skip is
-  also **notified**, not just journaled, since skipping is only defensible if you find out. The same
-  rule governs the pair of `rev-parse` probes that identify the repository: only a failure of the
-  first is the expected silent skip (a plain directory, no git at all); once git has answered it, a
-  fault on the second is journaled rather than swallowed. An
-  **explicitly empty** `core.excludesFile` is an answer too, and not the same one as unset: git
-  honors it as "no excludes file at all" and does **not** fall back to `$XDG_CONFIG_HOME/git/ignore`,
-  so patterns you switched off are no longer copied into the private file and switched back on inside
-  the worktree — the mirror image of the same file-loss bug, over-ignoring instead of under-ignoring.
-  Concurrent runs against one repository are **serialized** on a lock in `.git/`, and a failed
-  activation never rolls the repo-format flag back while another worktree's `config.worktree` still
-  depends on it: without either, one run's failed shield silently switched off a sibling run's
-  working one mid-story. A repository configured as **shared between OS users**
-  (`core.sharedRepository`) is refused with a journaled reason rather than shielded — but only
-  where the value really grants peer access: `umask`, a false boolean, and an octal filemode with
-  no group or other bits (`0600`, `0700`, `0711`) leave the repository private to you, and it is
-  shielded normally.
-  Five caveats: this enables `extensions.worktreeConfig`, a **permanent**
-  repo-format flag that is never removed — written at the last possible moment, so a run that
-  degrades away **above** it leaves your repo's format untouched, and wherever it could be left set
-  without a working shield (the enable failing, the activation failing, or the activation succeeding
-  without taking effect) the flag is rolled back. It outlives a failed shield only where the rollback was declined because a sibling
-  worktree depends on the flag, or could not be made at all — and both are named in the reason — the
-  lock leaves a
-  zero-length `.git/bmad-loop-shield.lock` behind (inside `.git`, so never in your working tree and
-  never stageable) — and where git requires that flag's
-  prerequisites be moved by hand first (`core.bare = true` or `core.worktree` in the shared config)
-  the shield is skipped with a journaled reason rather than widened back. It also needs **git 2.20**,
-  the release that introduced the flag and `git config --worktree`; below that the shield is skipped
-  and no repo-format change is made, since git that old refuses a repository carrying the flag. Lines
-  an older bmad-loop already wrote into `.git/info/exclude` are **not** removed for you — delete them
-  by hand.
-- **The git-add shield's patterns survive an inherited negation (#384).** A pattern the seeded
-  excludes already carried was treated as done — but gitignore's rule is last match wins, so a
-  `!` line below it cancelled the shield's own pattern and the provisioned tool files stayed
-  stageable, with nothing reported because nothing had failed. A pattern is now re-appended
-  unless it already sits after the last negation in the file.
-- **The git-add shield checks that it actually applies (#384).** Writing the worktree-scoped
-  `core.excludesFile` proved only that the value was stored, not that git reads it: config supplied
-  through the environment (`GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`) outranks the worktree scope,
-  so an operator carrying an ambient `core.excludesFile` got a shield that reported success and never
-  applied — the provisioned tool files stayed stageable, with nothing reported because nothing had
-  failed. The shield now asks git which excludes file it resolves and skips with a journaled reason
-  when that is not the one it just wrote.
-- **The git-add shield finds the same global ignore file git does, on Windows too (#384).** With
-  `core.excludesFile` and `XDG_CONFIG_HOME` both unset, git falls back to `$HOME/.config/git/ignore`
-  — and it locates that with `HOME` on every platform, while Python's `Path.home()` reads
-  `USERPROFILE` on Windows and never consults `HOME` at all. Git for Windows derives `HOME` itself,
-  preferring a `HOMEDRIVE`+`HOMEPATH` home share over `USERPROFILE`, so the two disagreed for anyone
-  whose shell sets `HOME` (Git Bash and MSYS2 do) or whose home directory is a network drive. The
-  wrong path is simply not a file, so the copy came back empty and the shield then shadowed the very
-  global ignores it exists to preserve — silently, since nothing had failed. The shield now asks git
-  where its home is rather than guessing, and a home git will not resolve skips the shield with a
-  journaled reason instead of being assumed to mean "there is no ignore file".
-- **The git-add shield no longer opens its own safety gates when git cannot answer (#384).** The
-  three probes that ask whether enabling `extensions.worktreeConfig` is safe read every non-zero
-  exit code as "that key is not set", so a git that could not answer — rather than one answering
-  "absent" — let a repository that really sets `core.worktree` cross the gate and take a permanent,
-  irreversible repo-format change. Only exit code 1 means "no such key" now; anything else skips the
-  shield with a reason. Separately, the write that enables the flag handled git _refusing_ but not
-  git _failing to reply_, so a timeout landing after the config was already replaced left the flag
-  set with no shield ever activated; that path now rolls the flag back too. A rollback of a flag
-  that was already absent is no longer reported as a rollback that failed.
+- **Every session prompt spells the resolved primitive, per skill tree (#393).** A run mixing
+  `.claude/skills` and `.agents/skills` at different eras gets the right name per role, resolved
+  against the **workspace** so a run resumed into an existing worktree spells the era that worktree
+  carries. Mid-upgrade, the orphaned-override warning says to **copy** the legacy
+  `_bmad/custom/bmad-dev-auto.toml`, never rename it; `--dry-run` says on stderr when its preview is
+  not runnable; and the skills preflight stopped gating a triage-only CLI's skill tree.
+
+- **The worktree git-add shield no longer hides new files in your own checkout (#384).** It appended
+  to `.git/info/exclude` — shared with the main checkout and every sibling worktree, permanent,
+  unversioned — over paths projects legitimately track, so every **new** file under them silently
+  stopped being staged by `git add -A` in your own checkout, long after the run. It now writes a
+  private exclude in the worktree's own gitdir, activated with a worktree-scoped `core.excludesFile`
+  that dies with `git worktree remove`, copying your existing excludes file into it byte for byte.
+
+- **The shield now proves it applies, or skips with a reason (#384).** Storing the worktree-scoped
+  key proved only that the value was stored, and a `!` line below a copied pattern cancelled it —
+  either way the tool files stayed stageable with nothing reported. It now asks git which excludes
+  file actually resolves, re-appends past any inherited negation, and honors an **explicitly empty**
+  `core.excludesFile` as "no excludes file at all". An unreadable file, an unresolvable git home, a
+  peer-accessible `core.sharedRepository` or an unanswerable probe skips it — journaled, notified.
+
+- **Caveats for the worktree shield (#384).** It enables `extensions.worktreeConfig`, a
+  **permanent** repo-format flag git never removes. It is rolled back wherever it could be left set
+  without a working shield, outliving a failed shield only where a sibling worktree still depends on
+  it or the rollback itself failed — both named in the reason. It needs **git 2.20**, below which
+  the shield is skipped and no repo-format change is made. Concurrent runs serialize on a `.git`
+  lock, and lines an older bmad-loop wrote into `.git/info/exclude` stay — delete them by hand.
+
 - **The git-add shield's git calls run on the shared chokepoint (#389).** They were the last bare
   `git` spawns outside `verify._run_git`, so they missed its `LC_ALL=C` pin — leaving a degrade
   reason that quotes git's stderr in whatever language the box speaks — and used a hardcoded 120s
