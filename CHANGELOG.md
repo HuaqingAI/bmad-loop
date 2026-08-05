@@ -7,214 +7,90 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
-Much of this section is the `release/0.9.x` hotfix line brought forward onto `main` (tracked as
-#433): the upstream `bmad-dev-auto` → `bmad-build-auto` rename, the renderer-backed dev skill and
-its preflight, worktree provisioning and seeding, and the deferred-work harvest with its isolation
-carries all shipped first in [0.9.1]. **Upgrading from 0.9.1, you already have those fixes** — the
-entries below re-state them for `main`, whose seams had diverged enough that several ports needed a
-different fix, and they close holes 0.9.1 left open. `main` itself has not been released since
-0.9.0, and v0.9.1 is not one of its ancestors.
+Much of this section is the `release/0.9.x` hotfix line brought forward onto `main` (#433).
+**Upgrading from 0.9.1, you already have those fixes** — the entries below re-state them for `main`,
+which has not been released since 0.9.0 and does not descend from v0.9.1.
 
 ### Added
 
-- **Deferred review findings are harvested out of the spec's frontmatter (#433).**
-  BMAD-METHOD#2640 moved `defer`-triaged findings out of `deferred-work.md` and into the spec's own
-  `deferred:` list, silently starving every ledger reader downstream: nothing filed the finding, so
-  no sweep ever triaged it. A successful dev, review, repair or review-timeout-salvage pass now
-  files each finding into the ledger as a canonical `### DW-<n>` entry carrying its `location:` and
-  `severity:`, and journals `spec-deferrals-harvested`. The spec's frontmatter is never rewritten —
-  the ledger entry is the record, and rewriting a YAML block scalar in place is exactly the surgery
-  the writers refuse elsewhere — so the source list stays intact for a later attempt to re-harvest
-  from.
-
-  The entry's `origin:` is the dedup key: `spec-deferred` plus a 12-hex SHA-1 over the summary and
-  location joined by a NUL. `evidence` is deliberately outside it, so re-wording a recorded
-  finding's evidence does not re-file it; a NUL inside a value is refused rather than handed two
-  findings one identity. Values are clamped to 200/1000/200 characters for
-  summary/evidence/location and stripped after the clamp in the producer, so the bytes written into
-  the entry and the bytes hashed into its identity are the same string — a clamp landing on a word
-  break cannot split them. The pre-scan matches `origin:` and `source_spec:` across entries of
-  every status, where `append_entry`'s own guard only ever looks at open ones, so a fixable retry, a
-  crash replay or a second review pass never re-files a finding a sweep has already marked done.
-  Malformed items cost only themselves: the loss is journaled `spec-deferrals-malformed` and filed
-  as one aggregated entry at `severity: low` naming the spec to re-file by hand, so a bad sibling
-  neither suppresses a well-formed one nor vanishes.
-
-  The gate is the field's presence and the generic-dev seam, never the installed skill name, so a
-  pre-BMAD-METHOD#2640 spec takes the no-op path on either era. A `spec_file` resolving outside the
-  orchestrator-owned roots is refused (`spec-deferrals-skipped-out-of-tree`) like every other path
-  that could steer a ledger write, and stories mode re-resolves the id-keyed story spec rather than
-  trusting the session's value; its `plan_halt` checkpoint is exempt, since a verified plan is not a
-  half-finalized implementation. The review prompt no longer also asks the session to file the
-  finding itself — that produced two entries per finding which could never dedup, an agent-written
-  one carrying neither the fingerprinted `origin:` nor a `source_spec:` line. It stays neutral
-  rather than banning ledger edits outright, because on a pre-BMAD-METHOD#2640 skill the session's
-  own append is the finding's only record, and still forbids rewriting existing entries.
+- **Deferred review findings are harvested out of the spec's frontmatter (#433).** BMAD-METHOD#2640
+  moved `defer`-triaged findings into the spec's own `deferred:` list, where nothing filed them and
+  no sweep triaged them. Dev, review, repair and review-timeout-salvage passes now file each as a
+  canonical `### DW-<n>` ledger entry (`spec-deferrals-harvested`), keyed on a fingerprinted
+  `origin:` so a retry or replay never re-files, and leave the spec's list intact. Malformed items
+  are filed as one aggregated `severity: low` entry naming the spec (`spec-deferrals-malformed`).
 
 - **A park travels with its story's commit, so `bmad-loop confirm` works from any clone (#356).**
-  Each parked story now writes one committed JSON record to `.bmad-loop/operator/<key>.json`, inside
-  the story's own commit window, so the record rides the park's commit — through the worktree
-  merge-back, under every merge strategy — and reaches every clone the commit does. A teammate,
-  fresh clone, or CI can `confirm --list` and `confirm <key>` a story parked on another machine.
-  The machine-local index (`.bmad-loop/operator-actions.json`) is retired: still read and pruned so
-  an in-flight park from an older version stays confirmable where it was written, never written
-  again. The record carries no commit sha (it cannot name the commit it rides); provenance is
-  derived from the record's own git history, and an uncommitted record renders without one. A
-  failed record write never blocks the story — it parks recordless, journaled and reported by
-  `validate` — and a failed commit restores the record as found. Confirming commits the record's
-  deletion together with the spec+board flip, and a legacy-only park still gets that commit.
-  `validate` reports a board parked with no record under its own id, `operator.park-record-missing`:
-  no longer the fresh-clone norm, but evidence of a failed record write, a pre-upgrade park, a
-  checkout that lacks the branch carrying the park commit (pull it), or a deleted record.
+  Each parked story writes one JSON record to `.bmad-loop/operator/<key>.json` inside the story's
+  own commit window, so it rides the park's commit — worktree merge-back included — into every
+  clone. The machine-local `.bmad-loop/operator-actions.json` index is retired: still read and
+  pruned, never written. `validate` reports a park with no record as `operator.park-record-missing`
+  — a failed write, a pre-upgrade park, or a checkout lacking the park commit's branch (pull it).
 
-- **`bmad-loop confirm` completes a parked story (#335, part 3 of 4).** Once you have carried out the
-  external actions a story owed, `bmad-loop confirm <story-key>` walks you through them one at a time
+- **`bmad-loop confirm` completes a parked story (#335, part 3 of 4).** Once you have carried out
+  the external actions a story owed, `bmad-loop confirm <story-key>` walks them one at a time
   (`--yes` skips the prompts), writes the spec's `## Operator Confirmation` audit section, advances
-  the spec and the board to `done` through the sole writer, and commits the pair. Nothing is
-  re-driven: the agent-doable work was committed at park time. `--reverify` re-runs the project's
-  `[verify]` commands first and blocks the confirmation if they fail — the external action may have
-  changed what the tests see. `--list` shows every parked story and what each owes; `--json` emits
-  the same set as a schema-versioned document.
-
-  Every write has to answer for itself: the audit append and the spec status are both checked, and
-  the spec is read BACK from disk rather than trusted, so a story is never declared done over a
-  write that did not land. A confirmation interrupted between its spec writes and its board write
-  (the board file in a shape its line writer cannot rewrite, or an IO failure) leaves a signed-off
-  spec at `done` with the park entry still pointing at it — re-running `confirm` now **finishes**
-  that instead of refusing it as stale drift: it advances the board, drops the entry and commits,
-  with no second prompt and no second audit section. It resumes equally from a board a human already
-  fixed by hand, since that is what the failure message asks them to do. `--list`, `--json`
-  (`resumable`, `confirmation_recorded`) and `validate` (`operator.confirm-interrupted`) all report
-  the state under its own name rather than calling it stale. `validate` also no longer drops a board
-  disagreement that co-occurs with an unreadable action list — the two have different remedies, and
-  only the first was ever reported.
-
-  Parks are recorded at park time along with a notification naming the actions and the command
-  that ends them — as committed per-story records since #356 (above), which is what lets a clone
-  that never ran the story confirm it. The committed truth stays the spec and the board: `confirm`
-  refuses a record that disagrees with them, and `validate` reports the drift in both directions
-  (`operator.registry-stale`, `operator.actions-malformed`).
+  the spec and board to `done`, and commits the pair. Nothing is re-driven. `--reverify` re-runs the
+  project's `[verify]` commands first and blocks on failure; `--list`/`--json` show every parked
+  story and what it owes. An interrupted confirmation resumes (`operator.confirm-interrupted`).
 
 - **Stories can park at `awaiting-operator` (#335, part 2 of 4).** A dev session whose story needs
-  an action only a human can take outside the repo — buy a domain, publish a DNS record, grant an
-  API key — now finishes and **commits** everything an agent can do, records what is owed in the
-  spec's `operator_actions:` frontmatter, and parks. The run moves on to the next story instead of
-  stopping, and the board advances to `awaiting-operator` (a forward move; nothing regresses).
-  Previously such a story had only two dishonest outcomes: `done`, which hides the outstanding work
-  behind a green board, or `blocked`, which halts the whole run.
+  an action only a human can take outside the repo — publish a DNS record, grant an API key — now
+  commits everything an agent can do, records what is owed in the spec's `operator_actions:`
+  frontmatter, and parks. The run moves on and the board advances, in place of the old dishonest
+  pair: `done`, which hid the work behind a green board, or `blocked`, which halted the run. A park
+  clears the gates a `done` story clears and skips review; `[operator] enabled = false` reverts.
 
-  A park clears the same deterministic gates a `done` story clears — the spec/board pair, the
-  project's verify commands, and a non-empty action list — and skips only the review loop, which has
-  nothing in the diff to converge on. A park with no readable actions is refused and repaired, not
-  committed. Under worktree isolation the unit merges like a `done` one. Setting
-  `[operator] enabled = false` restores the old two-outcome behavior.
+- **`awaiting-operator` vocabulary, no writer yet (#335, part 1 of 4).** Names the state at every
+  layer: `Phase.AWAITING_OPERATOR` (terminal, reachable only from `COMMITTING`), a sprint-status
+  token ordered immediately before `done`, `operator_actions` on each task, and the matching
+  run-summary count, `status` output and TUI glyphs. A `state.json` carrying the new phase is
+  forward-only — an older binary rejects it. Because the token is now ordered rather than unknown, a
+  review session writing it onto a `done` board escalates as a sign-off regression (#334).
 
-  `bmad-loop confirm` and the park entries it reads arrived in part 3, above.
+- **Defer notifications name where the work survives (#333).** A deferred story's rollback parks the
+  attempt on an `attempt-preserve/*` branch (or a `refs/attempt-preserve-dirty/*` snapshot), but the
+  ref only ever reached `journal.jsonl`, leaving the operator to hunt with `git log --all`. The
+  notice now names the ref and the `git merge --ff-only` that restores it — commits-only when the
+  dirty snapshot could not be captured. New `preserve_ref` on each task, projected into `status` and
+  `--json` (additive; schema stays 1) from run state, so a ref `scm.preserve_keep` pruned is named.
 
-- **`awaiting-operator` vocabulary, no writer yet (#335, part 1 of 4).** Names, at every layer, the
-  state a story reaches when its agent-doable work is finished and committed but its acceptance
-  criteria include external actions only a human can perform: `Phase.AWAITING_OPERATOR` (terminal,
-  reachable only from `COMMITTING`), an `awaiting-operator` sprint-status token ordered immediately
-  before `done` and deliberately not actionable, `operator_actions` on each task, and the matching
-  run-summary count, `status` output and TUI glyphs. Nothing writes any of it yet — the park path
-  is part 2 — so no run can currently reach the phase.
-
-  Two consequences worth knowing. A `state.json` carrying the new phase is forward-only: an older
-  binary rejects it, as with every phase addition. And because the sprint token is now _ordered_
-  rather than unknown, a review session writing `awaiting-operator` onto a board the orchestrator
-  had already advanced to `done` is classified as a deliberate sign-off regression and escalates
-  (#334), where it previously fell through to a retry.
-
-- **Defer notifications name where the work survives (#333).** A deferred story's rollback parked
-  the attempt on an `attempt-preserve/*` branch (or a `refs/attempt-preserve-dirty/*` snapshot),
-  but the ref only ever reached `journal.jsonl` — the notification carried a bare reason, leaving
-  the operator to find their work with `git log --all`. The notice now names the ref and the
-  `git merge --ff-only` command that restores it — downgraded to commits-only when the dirty
-  snapshot could not be captured; an isolated unit's notice names its kept-failed branch and any
-  earlier rolled-back attempt's ref. New `preserve_ref` on each task, projected into `bmad-loop status` and
-  `--json` (additive; schema stays 1). Reported verbatim from run state — `status` never runs
-  git, so a ref since pruned by `scm.preserve_keep` is still named.
-
-- **Stories can close deferred-work entries (#234).** The ledger was one-way: entries are filed
-  automatically but were only ever marked resolved by hand. A story can now declare the entries
-  its work closes — `closes_deferred: [DW-5, DW-6]`, on its `stories.yaml` entry (stories mode)
-  or in the story spec's frontmatter, the two unioned — and when the story commits, the
-  orchestrator flips each declared entry to `status: done <date>` plus the
-  `resolution: resolved by story <id>` line, the same annotation a sweep bundle writes. Both sprint
-  and stories mode.
-
-  Advisory by contract: the annotation is written at the commit boundary — behind every verify
-  gate, checkpoint and review cycle, just before the squash — so an in-repo ledger carries it in
-  the story's own commit (worktree isolation included) and a story that fails, is rejected by
-  review, or escalates closes nothing; a commit that then fails takes the annotation back with
-  it. The declaration is re-read at that boundary, so a late edit counts in both directions, and
-  an id already `done` is a silent no-op across a resume. Nothing about it can fail a story:
-  unknown ids, duplicate ids, unreadable entry statuses, an unreadable ledger location and a
-  non-list spec declaration are journaled warnings (a non-list `closes_deferred` in `stories.yaml`
-  is a manifest schema error like any other). A ledger outside the repo is written at the same
-  moment; its annotation is part of no commit, which is journaled
-  (`deferred-close-external-ledger`).
-
-  `bmad-loop validate` warns up front in both queue modes (`deferred.closes-unknown`,
-  `deferred.closes-malformed`, `deferred.closes-entry-unreadable`, `deferred.ledger-unreadable`);
-  warnings never change the exit code. The field is human-authored, like `spec_checkpoint` — no
-  upstream skill emits it yet (BMAD-METHOD#2619 proposes it at breakdown), and re-deriving
-  `stories.yaml` drops it unless the intent is logged in `.memlog.md`.
+- **Stories can close deferred-work entries (#234).** A story can now declare what its work closes —
+  `closes_deferred: [DW-5, DW-6]` on its `stories.yaml` entry or in the spec's frontmatter, the two
+  unioned — and on commit the orchestrator flips each entry to `status: done <date>` plus a
+  `resolution: resolved by story <id>` line. No upstream skill emits the field yet
+  (BMAD-METHOD#2619). Advisory and applied at the commit boundary: a failed or escalated story
+  closes nothing, and bad ids only warn — `validate` reports those up front under `deferred.*`.
 
 - **Readable run logs for `opencode-http` (#306).** Contributed by
-  [@jackmcintyre](https://github.com/jackmcintyre). The HTTP adapter has no tmux pane to replay,
-  so a finished opencode run left `logs/<task-id>.log` holding nothing but the server's own INFO
-  stdout. Per-session logs now split three ways, rendered off the SSE stream the adapter already
-  reads for completion:
-  - `<task-id>.log` — curated transcript: role-prefixed agent/user prose plus `[bmad]` marker
-    lines for tool calls, slash commands, file edits, permission asks/replies and session errors.
-  - `<task-id>.server.out` — the server's own stdout, no longer mixed into the transcript.
-  - `<task-id>.sse.jsonl` — structured trace of the raw SSE frames for post-hoc debugging.
+  [@jackmcintyre](https://github.com/jackmcintyre). The HTTP adapter has no tmux pane to replay, so
+  a finished opencode run left `logs/<task-id>.log` holding nothing but the server's own INFO
+  stdout. Per-session logs now split three ways off the SSE stream the adapter already reads:
+  `<task-id>.log`, a curated role-prefixed transcript with `[bmad]` marker lines for tool calls,
+  edits, permission asks and errors; `<task-id>.server.out`; and `<task-id>.sse.jsonl`, a raw trace.
 
-- **`review.on_timeout` policy knob (#271).** A timeout-like review verdict (`timeout` /
-  `stalled` / `over_budget`) previously always burned a review cycle (RETRY) until
-  `max_review_cycles`, then deferred — even when the dev product was already finalized and
-  verify-green. New modes: `"retry"` (default, unchanged), `"salvage-if-done"` (commit the
-  verified dev product, reset a mid-review `in-review` interrupt forward, refile the outstanding
-  follow-up recommendation to deferred work — origin `review-timeout-salvage` — and journal
-  `review-timeout-salvage` instead of burning another pass), and `"defer"` (give up on the first
-  timeout-like verdict). A salvaged timeout never re-arms `followup_review_recommended` nor
-  spends a damping grant; env-fault (#194) and `crashed` verdicts keep their own routing in
-  every mode.
+- **`review.on_timeout` policy knob (#271).** A timeout-like review verdict (`timeout` / `stalled` /
+  `over_budget`) always burned a review cycle until `max_review_cycles` and then deferred — even
+  when the dev product was already finalized and verify-green. Beside the default `"retry"`:
+  `"salvage-if-done"` commits the verified dev product, refiles the outstanding follow-up
+  recommendation to deferred work and journals `review-timeout-salvage`; `"defer"` gives up on the
+  first timeout-like verdict. Env-fault (#194) and `crashed` verdicts keep their own routing.
 
-- **Transport failures pause instead of burning attempts (#194).** A session whose coding CLI
-  lost its API connection stays alive but idle, printing `API Error: Unable to connect …` while it
-  idles out the session clock — indistinguishable from a real wall-clock timeout, so two such
-  outages exhausted `max_dev_attempts` and deferred the story with zero real work attempted.
-  bmad-loop now classifies these post-mortem and pauses for a human (re-arm restores the budget),
-  exactly as verify environment faults (`rc 126/127`) already do:
-  - Adapters classify a non-completed (`timeout`/`stalled`/`crashed`) session as an _environment
-    fault_ by matching per-profile `env_fault_patterns` regexes against the ANSI-stripped tail of
-    the pane log. `SessionResult` gains `env_fault` / `env_fault_evidence`; the generic tmux
-    adapter reads the log tail once after the verdict and reconcile settle (last match wins,
-    `over_budget`/`completed` excluded), drops an `env-fault-classified` breadcrumb, and the
-    `claude` profile ships a seed pattern requiring an `API Error` line _and_ a connection-level
-    cause on the same line (so prose "API Error" test output does not trip it). Patterns must be a
-    list of strings and are matched with the `regex` module under a per-pattern timeout (a
-    pathological pattern can't hang a teardown), and the pane log is reset when a re-armed run reuses
-    a task id so a prior cycle's line can't misclassify a later session.
-  - The dev, review, and fix phases PAUSE on a classified session (evidence in the reason, worktree
-    preserved) instead of charging the attempt/cycle; the `dev-decision` / `fix-decision` /
-    `session-end` journal entries carry the flag and evidence.
-  - Blocking plugin workflows escalate rather than defer the story on a classified session
-    (non-blocking workflows keep continuing, journaled only); the sweep migration and triage loops
-    escalate before charging a retry, and the sweep's existing escalation-resume restores their
-    budget.
+- **Transport failures pause instead of burning attempts (#194).** A session whose coding CLI lost
+  its API connection stays alive but idle, printing `API Error: Unable to connect …` until it idles
+  out the session clock — indistinguishable from a real wall-clock timeout, so two outages could
+  exhaust `max_dev_attempts` and defer the story with no work attempted. Adapters now classify such
+  a session as an environment fault from per-profile `env_fault_patterns`, and the dev, review and
+  fix phases pause for a human (re-arm restores the budget), as `rc 126/127` verify faults do.
 
-- **Documented the `BMAD_LOOP_*` environment variables (#246).** The three runtime override
-  vars — `BMAD_LOOP_MUX_BACKEND`, `BMAD_LOOP_PROCESS_HOST`, `BMAD_LOOP_SESSION_TIMEOUT_S` — now
-  have a reference table in the README. Behavior is unchanged; they are read through a single
-  `bmad_loop.envvars` registry so the supported knobs are discoverable in one place.
+- **Documented the `BMAD_LOOP_*` environment variables (#246).** The three runtime override vars —
+  `BMAD_LOOP_MUX_BACKEND`, `BMAD_LOOP_PROCESS_HOST`, `BMAD_LOOP_SESSION_TIMEOUT_S` — now have a
+  reference table in the README, and are read through one `bmad_loop.envvars` registry so the
+  supported knobs are discoverable in one place. Behavior is unchanged.
 
-- **`python -m bmad_loop` (#240).** The package is now runnable as a module
-  (`python -m bmad_loop …`), mirroring the installed `bmad-loop` console script via a thin
-  `__main__.py`. Subprocess smoke tests exercise the module entry, and characterization tests
-  pin the current CLI exit codes (typed errors and the broad backstop → 1, argparse usage → 2).
+- **`python -m bmad_loop` (#240).** The package is now runnable as a module, mirroring the installed
+  `bmad-loop` console script via a thin `__main__.py`. Characterization tests pin the current CLI
+  exit codes (typed errors and the broad backstop → 1, argparse usage → 2).
 
 ### Changed
 
