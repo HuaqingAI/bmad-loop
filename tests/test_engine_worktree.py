@@ -21,6 +21,7 @@ from conftest import (
     _touch_run,
     attach_profile,
     git,
+    ignore_before_commit,
     install_build_auto_skill,
     set_sprint,
     write_spec,
@@ -194,13 +195,6 @@ def make_engine(project, script, policy=None, run_id="test-run", **kwargs):
 
 def journal_kinds(engine):
     return [e["kind"] for e in engine.journal.entries()]
-
-
-def ignore_before_commit(project, *patterns):
-    gitignore = project.project / ".gitignore"
-    existing = gitignore.read_text(encoding="utf-8")
-    prefix = existing if not existing or existing.endswith("\n") else existing + "\n"
-    gitignore.write_text(prefix + "".join(f"{pattern}\n" for pattern in patterns), encoding="utf-8")
 
 
 # ----------------------------------------------------------------- happy path

@@ -260,6 +260,28 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 
 ### Fixed
 
+- **A sweep bundle running in a worktree no longer loses its ledger closures, so later sweeps stop
+  re-driving work that already landed.** With the deferred-work ledger gitignored and named in
+  `scm.worktree_seed`, the orchestrator's closure lands in the unit worktree, `finalize_commit`'s
+  `git add -A` skips the ignored path in silence, and the merge brings nothing back: the entries
+  stay `open`, triage re-bundles them, and every later sweep re-drives resolved work — an unbounded
+  loop rather than a one-time drop. The closure is now re-applied to the main checkout after the
+  unit merges, alongside the harvest carry that already ran there, and journaled
+  `sweep-bundle-close-carried`. The flips are unguarded because losing them is the hazard; the
+  commit is best effort (`git add` refuses an explicitly named ignored path) and records
+  `sweep-bundle-close-carry-uncommitted` instead of costing the run its integration.
+
+- **A host lost in the merge-to-carry window replays a closure-only carry.** The resume pre-pass
+  only replayed units carrying harvested findings, so a bundle whose sole ledger payload was its
+  closures was skipped and the closure stranded. It runs before the sweep's loop reads the open set,
+  so the replayed closure leaves that set before triage can re-bundle it.
+
+- **A deferred bundle's closure is no longer carried by the resume replay.** The deferral path
+  deliberately re-files the harvest and withholds the closure — a defer discarded the code the
+  closure claims to have resolved — but the replay routed through the shared hook, which now also
+  carries closures. Since `open_ids` re-bundles only `open` entries, a wrongly `done` entry is
+  invisible to every later sweep. The replay now mirrors the deferral exactly: harvest only.
+
 - **Refuse `isolation = "worktree"` combined with a `repo_root` override (#414).** The pair
   previously produced a green preflight and then an isolated session with no dev primitive, no
   result, and nothing journaled naming the cause. `validate` now reports it; `run`, `sweep`,
