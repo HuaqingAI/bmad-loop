@@ -118,11 +118,12 @@ def _is_unset(args):
     """Does this `git_bytes` argv unset a key, in ANY of git's spellings?
 
     A PREFIX test rather than `"--unset" in args`, and the reason is a trap this
-    suite walked into: `args` is a tuple, so membership is exact-token, and round
-    10's switch from `--unset` to `--unset-all` silently stopped four fakes from
-    matching. Two were assertions and failed loudly; the other two were TRIPWIRES,
-    which simply went quiet — a tripwire that no longer matches passes exactly like
-    a gate that works, and it takes the ablations built on it down with it.
+    suite walked into: `args` is a tuple, so membership is exact-token, and switching
+    the production spelling from `--unset` to `--unset-all` silently stopped four
+    fakes from matching. Two were assertions and failed loudly; the other two were
+    TRIPWIRES, which simply went quiet — a tripwire that no longer matches passes
+    exactly like a gate that works, and it takes the ablations built on it down with
+    it.
     """
     return any(a.startswith("--unset") for a in args)
 
@@ -2858,13 +2859,12 @@ def test_shield_degrades_when_a_command_scope_excludesfile_outranks_it(
     ambient `core.excludesFile` got a shield that reported success and never applied:
     the provisioned tool files stayed stageable, with no reason to journal.
 
-    Round 17 was "a pattern PRESENT in the file is not EFFECTIVE"; this is that gap one
-    level up — WRITTEN is not EFFECTIVE.
+    A pattern PRESENT in the file is not EFFECTIVE; this is that gap one level up —
+    WRITTEN is not EFFECTIVE.
 
-    PARAMETRIZED BECAUSE THE ENUMERATION FIX WOULD PASS ONE AND FAIL THE OTHER, which
-    is the whole argument for verifying the post-condition instead of detecting the
-    override's origin. Measured end to end on real linked worktrees at both ends of the
-    supported range:
+    PARAMETRIZED BECAUSE THE ENUMERATION FIX WOULD PASS ONE AND FAIL THE OTHER, which is
+    the whole argument for verifying the post-condition instead of detecting the
+    override's origin. The channels themselves differ across the supported git range:
 
                                         git 2.20.4        git 2.55.0
         GIT_CONFIG_COUNT/KEY_n/VALUE_n  inert (2.31)      shield defeated
@@ -2880,10 +2880,10 @@ def test_shield_degrades_when_a_command_scope_excludesfile_outranks_it(
     `'k=v'` is the encoding used below because it is the only one honored at BOTH ends;
     the newer `'k'='v'` form is `fatal: bogus format in GIT_CONFIG_PARAMETERS` at 2.20.4.
 
-    The reason string is the discriminator here, and deliberately so — unlike round 17,
-    where it could not bite. `git status` shows the tool file with the bug AND with the
-    fix; what changes is whether the operator is told. Non-vacuity is pinned separately,
-    by asserting the override really is in force before trusting the degrade.
+    The reason string is the discriminator here, and deliberately so: `git status` shows
+    the tool file with the bug AND with the fix; what changes is whether the operator is
+    told. Non-vacuity is pinned separately, by asserting the override really is in force
+    before trusting the degrade.
 
     The sibling that keeps this from being a blanket refusal already exists:
     `test_shield_seeds_users_excludesfile` sets `core.excludesFile` at LOCAL scope and
@@ -2943,11 +2943,11 @@ def test_shield_outranked_degrade_leaves_no_permanent_repo_format_change(
     worktree-scoped `core.excludesFile` is really there in `config.worktree`.
 
     Two claims, and they are separate: the permanent flag must be gone, and the key the
-    activation did land must be harmless. Measured rather than assumed — unsetting
-    `extensions.worktreeConfig` makes git stop reading `config.worktree` at all, so the
-    leftover key is inert and needs no second `--unset`. That is why this arm has one
-    rollback rather than two; a second write would be a second failure shape and a
-    second rollback site, which is the enumeration this block exists to avoid.
+    activation did land must be harmless. Unsetting `extensions.worktreeConfig` makes git
+    stop reading `config.worktree` at all, so the leftover key is inert and needs no
+    second `--unset`. That is why this arm has one rollback rather than two; a second
+    write would be a second failure shape and a second rollback site, which is the
+    enumeration this block exists to avoid.
 
     Ablation: drop the `needs_enable` rollback and the first assertion fails —
     `worktreeConfig` survives a degrade that shielded nothing."""
@@ -3172,12 +3172,12 @@ def test_shield_refuses_a_repository_shared_between_os_users(project, tmp_path):
     """A repository configured as shared between OS users is not supported (#384), and
     is refused UP FRONT rather than shielded — loudly, and identically for every user.
 
-    The refusal sits ABOVE the shield's lock, which is why the last four assertions
-    matter more than the first. A reason string alone cannot distinguish a clean
-    refusal from one that left state behind: that is exactly the gap that let round 7's
-    defect sit under a passing fault-injection test for two review rounds. So this pins
-    that NOTHING was created — no lock file for a peer's run to meet, no permanent
-    repo-format change, no private exclude, and the repository-wide exclude untouched.
+    The refusal sits ABOVE the shield's lock, which is why the last four assertions matter
+    more than the first. A reason string alone cannot distinguish a clean refusal from one
+    that left state behind: that is exactly the gap a fault-injection test asserting only
+    the reason string leaves open. So this pins that NOTHING was created — no lock file
+    for a peer's run to meet, no permanent repo-format change, no private exclude, and the
+    repository-wide exclude untouched.
 
     Set after the worktree is mounted, as the `core.bare` sibling above is: git honors
     the key for files it creates, and nothing here needs it applied during the mount.
@@ -3217,10 +3217,9 @@ def test_shield_runs_in_a_repository_that_is_not_shared(project, tmp_path):
     being PRESENT is not the refusal — being present with a value git resolves to
     something other than "private" is.
 
-    `umask` rather than `false` on purpose. Measured at git 2.20.4 and 2.55.0, git
-    compares this keyword with strcmp while it compares the booleans with strcasecmp,
-    so the two sides of the accept test are separate code paths and this is the one a
-    bool-only reading would drop.
+    `umask` rather than `false` on purpose: git compares this keyword with strcmp while it
+    compares the booleans with strcasecmp, so the two sides of the accept test are
+    separate code paths and this is the one a bool-only reading would drop.
 
     Ablation: refuse whenever the key is present (drop the value test) and this
     fails — an ordinary repository stops being shielded."""
@@ -3301,11 +3300,10 @@ def test_shield_runs_in_a_repository_that_is_not_shared(project, tmp_path):
 def test_shared_repository_private_verdicts(value, private):
     """git's `core.sharedRepository` verdicts, mirrored value by value.
 
-    The pure-core layer for the octal support: `0600` is an owner-only filemode, not
-    a shared repository, so refusing it skipped the shield for a single-user repo
-    (#384, Codex round 20). Every row was measured at git 2.20.4 AND 2.55.0 —
-    byte-identical at both ends — by the mode of a loose object git writes under
-    `umask 077`, which is git's own answer rather than a reading of `setup.c`.
+    The pure-core layer for the octal support: `0600` is an owner-only filemode, not a
+    shared repository, so refusing it skipped the shield for a single-user repo (#384).
+    Every row is git's own answer — the mode of a loose object git writes under `umask
+    077` — rather than a reading of `setup.c`, and holds across the supported git range.
 
     Ablation, per row group: restore the old literal accept set
     (`value in ("umask", "0") or value.lower() in ("false", "no", "off")`) and the
@@ -3319,7 +3317,7 @@ def test_shared_repository_private_verdicts(value, private):
 def test_shield_runs_in_a_repository_with_an_owner_only_octal_mode(project, tmp_path):
     """`core.sharedRepository = 0600` is a filemode granting no peer access at all —
     a repository private to its owner, not one shared between OS users — so the
-    shield runs (#384, Codex round 20).
+    shield runs (#384).
 
     The refusal is deliberately coarse everywhere else in this gate, but it may not
     be coarse HERE: an owner-only octal mode is exactly the shape the refusal exists
@@ -3352,8 +3350,8 @@ def test_shield_runs_in_a_repository_with_an_owner_only_octal_mode(project, tmp_
 
 def test_shield_refuses_a_group_readable_octal_mode(project, tmp_path):
     """`core.sharedRepository = 0640` is a filemode granting GROUP access, so it is
-    refused exactly like the `group` keyword — the octal support added for round 20
-    accepts owner-only modes and must not widen past them.
+    refused exactly like the `group` keyword — the octal support accepts owner-only
+    modes and must not widen past them.
 
     `0640` rather than `0666` on purpose: it is the row immediately across the
     boundary from the accepted `0600`, so it fails first if the mask is loosened.
@@ -3377,9 +3375,9 @@ def test_shield_refuses_a_group_readable_octal_mode(project, tmp_path):
 def test_shield_refuses_a_valueless_shared_repository_key(project, tmp_path):
     """`sharedRepository` with NO value is git's `PERM_GROUP` — a shared repository —
     and `--get` answers it rc 0 with a lone newline, byte-identical to an explicitly
-    EMPTY value, which git reads as `PERM_UMASK`, i.e. private. Measured at 2.20.4 and
-    2.55.0 by the mode of a loose object git writes under `umask 077`: valueless gives
-    `r--r-----`, empty gives `r--------`.
+    EMPTY value, which git reads as `PERM_UMASK`, i.e. private. The mode of a loose
+    object git writes under `umask 077` is the oracle: valueless gives `r--r-----`,
+    empty gives `r--------`.
 
     git exposes nothing that separates the two answers, so the gate refuses the
     ambiguous one. That is the deliberate direction of error — a false refusal is a
@@ -3416,9 +3414,9 @@ def test_shield_refuses_a_valueless_shared_repository_key(project, tmp_path):
 
 def test_shield_reads_shared_repository_without_stripping_it(project, tmp_path):
     """The gate removes `--get`'s TERMINATOR and nothing else. `git config --get`
-    returns edge whitespace VERBATIM (measured at 2.20.4 and 2.55.0: a quoted
-    `" umask"` comes back as b" umask\\n"), so `.strip()` would widen a value into the
-    accept set — round 15's defect at a second site in this same function, and live
+    returns edge whitespace VERBATIM (a quoted `" umask"` comes back as
+    b" umask\\n"), so `.strip()` would widen a value into the accept set — the same
+    defect at a second site in this same function, and live
     rather than defensive: `rev-parse --absolute-git-dir` answers rc 0 for such a
     repository, so the gate really is reached with this value in hand.
 
@@ -3433,7 +3431,7 @@ def test_shield_reads_shared_repository_without_stripping_it(project, tmp_path):
 
     Ablation: use `.strip()` instead of `removesuffix("\\n")` and this fails — but NOT
     in the shape the obvious note would claim, which is why the assertions below are
-    written the way they are. Measured with the ablation applied: the value reads as
+    written the way they are. With the ablation applied the value reads as
     `umask`, the gate lets it through, the shield takes the lock and then degrades one
     step later with git's OWN rejection of the value ("could not enable
     extensions.worktreeConfig ... fatal: bad boolean config value ' umask' for
@@ -3467,22 +3465,21 @@ def test_shield_reads_shared_repository_without_stripping_it(project, tmp_path):
 @pytest.mark.skipif(sys.platform == "win32", reason="a trailing space is not a legal Windows path")
 def test_shield_keeps_edge_whitespace_in_the_common_dir(tmp_path):
     """`rev-parse` terminates its answer with one newline; every other byte belongs to
-    the path — so the parse may remove only that terminator (#384, Codex round 15).
+    the path — so the parse may remove only that terminator (#384).
 
     A comment here used to justify `.strip()` on the grounds that "a final component is
     `.git` or `worktrees/<id>`". True for a NON-bare repo, false for a BARE one, whose
-    common dir IS the repository directory. Measured at 2.55.0, a worktree of a bare
-    repo at `…/common ` answers `--git-common-dir` = `…/common `, while
-    `--absolute-git-dir` stays safe at `…/common /worktrees/<id>` because git sanitizes
-    the admin id — so exactly ONE of the two answers was exposed.
+    common dir IS the repository directory: a worktree of a bare repo at `…/common `
+    answers `--git-common-dir` = `…/common `, while `--absolute-git-dir` stays safe at
+    `…/common /worktrees/<id>` because git sanitizes the admin id — so exactly ONE of the
+    two answers was exposed.
 
-    THE HARM IS A DEFEATED SAFETY GATE, which is why this is a P1 and not a cosmetic
-    path bug: stripped, every later step points at `…/common`, which does not exist,
-    and `config --file <that>/config --get core.bare` answers rc 1 — ABSENT, not
-    "unreadable" (round 10). So `core.bare = true` is MISSED and the shield proceeds to
-    make its permanent repo-format change on a bare repository. The lock's own
-    `mkdir(parents=True)` then creates the stripped directory as a side effect, which
-    is the visible symptom.
+    THE HARM IS A DEFEATED SAFETY GATE, not a cosmetic path bug: stripped, every later
+    step points at `…/common`, which does not exist, and `config --file <that>/config
+    --get core.bare` answers rc 1 — ABSENT, not "unreadable". So `core.bare = true` is
+    MISSED and the shield proceeds to make its permanent repo-format change on a bare
+    repository. The lock's own `mkdir(parents=True)` then creates the stripped directory
+    as a side effect, which is the visible symptom.
 
     The three assertions are one per consequence, and the sibling-directory one is what
     makes the others non-vacuous: a refusal for the WRONG reason would still satisfy
@@ -3556,17 +3553,15 @@ def test_shield_refuses_when_the_core_worktree_probe_cannot_answer(project, tmp_
     `extensions.worktreeConfig` drops the exception confining `core.worktree` to the
     main worktree, after which it applies to every linked one (git-worktree(1)).
 
-    THE ANSWER IS INJECTED, NOT THE ILLNESS — round 9's lesson, and the reason this
-    fixture is not a repo with a broken config. A genuinely malformed `.git/config`
-    fatals the caller's own earlier `rev-parse --absolute-git-dir` (measured 128 at
-    both 2.20.4 and 2.55.0), which takes the SILENT-SKIP arm above this branch, so
-    such a fixture would be vacuous. Keeping git healthy is also what leaves the harm
-    assertable through git itself once the gate is ablated.
+    THE ANSWER IS INJECTED, NOT THE ILLNESS, which is why this fixture is not a repo with
+    a broken config. A genuinely malformed `.git/config` fatals the caller's own earlier
+    `rev-parse --absolute-git-dir` at rc 128, which takes the SILENT-SKIP arm above this
+    branch, so such a fixture would be vacuous. Keeping git healthy is also what leaves
+    the harm assertable through git itself once the gate is ablated.
 
-    rc 128 is what git really answers for a config it cannot parse (measured at 2.20.4
-    and 2.55.0); git-config(1) documents that case as ret=3 and prefaces its whole list
-    with "Some exit codes are:", so neither the docs nor the behavior support treating
-    every non-1 rc as an absence.
+    rc 128 is what git really answers for a config it cannot parse; git-config(1)
+    documents that case as ret=3 and prefaces its whole list with "Some exit codes are:",
+    so neither the docs nor the behavior support treating every non-1 rc as an absence.
 
     Ablation: in `_shield_shared_config`, replace the raise with `return None` (the old
     `else` semantics) and this fails — the gate opens and `extensions.worktreeConfig`
@@ -3741,9 +3736,9 @@ def test_shield_degrade_leaves_no_permanent_repo_format_change(project, tmp_path
     the operator's repo marked forever for a shield that never applied. It now only
     PROBES; the write happens one line above the activation.
 
-    Driven through the seed fault the round-5 GitError fix introduced, because that
-    is the degrade path this reordering exists for — a fault the old code could not
-    even reach, since it swallowed instead of degrading.
+    Driven through the seed fault, because that is the degrade path this reordering exists
+    for — a fault the old code could not even reach, since it swallowed instead of
+    degrading.
 
     Read as TEXT rather than via `git config --get`, for the reason the sibling
     refusal tests give: conftest's git() is check=True and an unset key exits 1.
@@ -3797,17 +3792,15 @@ def test_shield_enables_the_extension_on_the_path_that_activates(project, tmp_pa
 
 def test_shield_rolls_back_the_extension_when_activation_fails(project, tmp_path, monkeypatch):
     """One of the two degrades that can still have made a permanent repo-format
-    change: the ACTIVATION's own failure, which happens one line after the enable.
-    Round 5 moved the enable down to close every path above it; Codex then pointed out
-    this one, and it is real — read-only `.git` and a lock on `config.worktree` both
-    reach it. So the arm rolls the flag back. (This docstring said "the one degrade
-    left" until round 10, which found the other: the ENABLE's own raise, covered by
-    `test_shield_rolls_back_an_enable_whose_git_faulted`.)
+    change: the ACTIVATION's own failure, which happens one line after the enable. The
+    enable sits as far down as it can, which closes every path above it; this one is
+    real — read-only `.git` and a lock on `config.worktree` both reach it — so the arm
+    rolls the flag back. The other such degrade is the ENABLE's own raise, covered by
+    `test_shield_rolls_back_an_enable_whose_git_faulted`.
 
-    Measured, not assumed: `--unset` removes the key *and* the now-empty
-    `[extensions]` section, and `git config --worktree` refuses again afterwards, so
-    the repo is genuinely returned to the state we found rather than cosmetically
-    tidied.
+    `--unset` removes the key *and* the now-empty `[extensions]` section, and `git config
+    --worktree` refuses again afterwards, so the repo is genuinely returned to the state
+    we found rather than cosmetically tidied.
 
     Only `--worktree` writes are failed, so the enable itself succeeds — which is
     what makes this the enable-then-fail ordering rather than a short-circuit.
@@ -3913,25 +3906,24 @@ def test_shield_reports_a_rollback_whose_own_git_faulted(project, tmp_path, monk
 
 @pytest.mark.parametrize("fault", [verify.GitError, verify.GitSpawnError])
 def test_shield_rolls_back_an_enable_whose_git_faulted(project, tmp_path, monkeypatch, fault):
-    """The ENABLE's own raise, which is round 10 (#384, Codex P2). `git_bytes` fails
+    """The ENABLE's own raise (#384). `git_bytes` fails
     two ways and this call handled only the rc, so a fault left the permanent
     repo-format change in place with no shield ever activated: the raise went to the
     caller's tail, which returns a reason and cannot roll anything back.
 
-    THE FAKE PERFORMS THE WRITE AND THEN RAISES, and that is the whole difference
-    between this test and a vacuous one. `git config` can be killed after it has
-    renamed the new config into place — the write landed, we never learned it — so
-    without the pass-through the flag would never have been set, "the flag is absent
-    afterwards" would hold trivially, and the assertion below would prove nothing.
-    That is the exact failure mode round 7 recorded, where a fault-injection test
-    asserting only the reason string sat on a live defect for two rounds.
+    THE FAKE PERFORMS THE WRITE AND THEN RAISES, and that is the whole difference between
+    this test and a vacuous one. `git config` can be killed after it has renamed the new
+    config into place — the write landed, we never learned it — so without the
+    pass-through the flag would never have been set, "the flag is absent afterwards" would
+    hold trivially, and the assertion below would prove nothing. That is the failure mode
+    of a fault-injection test that asserts only the reason string: it sits on a live
+    defect and cannot see it.
 
     The `--unset-all` is deliberately let through to the real git, so the rollback
     asserted here is the real one rather than the fake's.
 
-    Ordering matters as much as the outcome: round 9 found that hoisting a rollback
-    out of the `with` passed all 53 shield tests, so the rollback is pinned INSIDE
-    the lock here too.
+    Ordering matters as much as the outcome: hoisting a rollback out of the `with` passes
+    every other shield test, so the rollback is pinned INSIDE the lock here too.
 
     Parametrized over both classes because they enter differently — a timeout as
     `GitError`, a spawn failure as the `GitSpawnError` subclass. The message says
@@ -3993,19 +3985,17 @@ def test_shield_rolls_back_an_enable_whose_git_faulted(project, tmp_path, monkey
 
 def test_shield_rollback_treats_an_absent_flag_as_completed(project, tmp_path):
     """`--unset-all` of a key that is not there exits 5, and that is a COMPLETED
-    rollback, not a failed one. Round 10 made this reachable for the first time: the
-    enable's raise routes into the rollback without knowing whether anything was
-    written, so "nothing was" is now an ordinary outcome rather than an impossible
-    one, and reporting it as a failure would tell the operator their repository keeps
-    a format change it does not have.
+    rollback, not a failed one. The enable's raise made this reachable: it routes into
+    the rollback without knowing whether anything was written, so "nothing was" is now
+    an ordinary outcome rather than an impossible one, and reporting it as a failure
+    would tell the operator their repository keeps a format change it does not have.
 
     `--unset-all` rather than `--unset`, and the spelling is load-bearing because
     git-config(1) gives rc 5 TWO meanings — "unset an option which does not exist" and
-    "unset/set an option for which multiple lines match". Measured at 2.20.4 and
-    2.55.0, identical at both: `--unset` against a DOUBLED key exits 5 and removes
-    nothing, while `--unset-all` exits 0 and removes both lines. So under `--unset`,
-    "treat 5 as success" would have reported a clean rollback for a key that survived;
-    under `--unset-all` rc 5 can only mean "no line matched".
+    "unset/set an option for which multiple lines match": `--unset` against a DOUBLED key
+    exits 5 and removes nothing, while `--unset-all` exits 0 and removes both lines. So
+    under `--unset`, "treat 5 as success" would have reported a clean rollback for a key
+    that survived; under `--unset-all` rc 5 can only mean "no line matched".
 
     Driven directly rather than through the shield: the caller reaches this state only
     via an injected fault, and the claim under test is about the helper's own contract.
@@ -4071,7 +4061,7 @@ def test_shield_hedges_a_rollback_it_could_not_make_after_an_uncertain_enable(
 ):
     """When the ENABLE raised and the rollback then also failed, the reason may not
     assert that this shield set the flag — because nothing may have been written at
-    all. That is the double fault round 10 introduced a path to: a spawn failure kills
+    all. That is the double fault: a spawn failure kills
     the enable, so we never learn whether the config was replaced, and if the unset
     fails too the operator is handed a clause about a format change that may not exist.
 
@@ -4122,7 +4112,7 @@ def test_shield_does_not_claim_a_format_change_it_never_made(project, tmp_path, 
     """The message-honesty half of the same fix. A spawn failure can kill the enable
     before anything is written at all, and the rollback then finds nothing to undo —
     so the reason must not tell the operator their repository keeps a permanent format
-    change. Before round 10 this path rendered as "extensions.worktreeConfig was
+    change. This path used to render as "extensions.worktreeConfig was
     enabled for this shield and could NOT be rolled back (git exited 5)": a claim that
     was false twice over, about a flag that was never set and a rollback that in fact
     completed.
@@ -4203,7 +4193,7 @@ def test_shield_never_unsets_an_extension_the_repo_already_carried(project, tmp_
 def test_shield_never_unsets_an_extension_a_sibling_worktree_depends_on(
     project, tmp_path, monkeypatch
 ):
-    """`needs_enable` is necessary and NOT sufficient (#384, Codex round 8). It records
+    """`needs_enable` is necessary and NOT sufficient (#384). It records
     what the PROBE saw, and the enable is an idempotent rc-0 no-op against a flag that
     is already `true` — so two concurrent provisionings in one repository both read an
     absent flag and both believe they own it. Whichever one's activation then fails
@@ -4213,7 +4203,7 @@ def test_shield_never_unsets_an_extension_a_sibling_worktree_depends_on(
     `config.worktree` that is not ours exists.
 
     THE FIRST TEST IN THIS SUITE WITH TWO WORKTREES IN ONE REPOSITORY, which is why the
-    finding survived eight rounds: the flag is repo-wide state, and a single-worktree
+    finding stayed hidden so long: the flag is repo-wide state, and a single-worktree
     fixture cannot express a dependent.
 
     The interleaving is reproduced rather than mimed. The sibling's shield is run for
@@ -4323,14 +4313,13 @@ def test_shield_rolls_back_despite_its_own_partial_config_worktree(project, tmp_
 def test_shield_rollback_scan_fault_is_reported_not_raised(project, tmp_path, monkeypatch):
     """`_shield_undo_extension` is contracted never to raise — every caller is already
     reporting a degrade, and a raise escaping it would replace the activation fault
-    AND the retained-flag disclosure with the caller's generic tail reason, losing
-    exactly what rounds 6 and 7 added.
+    AND the retained-flag disclosure with the caller's generic tail reason.
 
-    The dependents scan added in round 8 broke that promise for two fault shapes its
-    `except OSError` did not name (#384, CodeRabbit round 9). On the 3.11/3.12 floor
-    `Path.resolve()` raises `RuntimeError` for a symlink loop rather than `OSError` —
-    the caller's own tail already carries `RuntimeError` for precisely that reason, so
-    the gap was internally inconsistent as well as wrong.
+    The dependents scan broke that promise for two fault shapes its `except OSError` did
+    not name (#384). On the 3.11/3.12 floor `Path.resolve()` raises `RuntimeError` for a
+    symlink loop rather than `OSError` — the caller's own tail already carries
+    `RuntimeError` for precisely that reason, so the gap was internally inconsistent as
+    well as wrong.
 
     Driven at the helper rather than through `_worktree_local_exclude`, which is the
     lowest layer that can catch this regression: the shield resolves its own `git_dir`
@@ -4368,13 +4357,12 @@ def test_shield_rolls_back_inside_the_lock(project, tmp_path, monkeypatch):
     """The ROLLBACK has to happen while the lock is still held, and that placement is
     load-bearing rather than incidental: released first, a second run probes in the
     gap, sees the flag this run is about to unset, skips its own enable as redundant,
-    activates against it — and then this run's `--unset` lands. That is the round-8
-    race rebuilt out of the fix for it.
+    activates against it — and then this run's `--unset` lands. That is the same race,
+    rebuilt out of the fix for it.
 
-    The sibling lock test cannot pin this: its activation SUCCEEDS, so no rollback
-    ever runs and `activation < lock_exit` is all it can show. Ablation proved the gap
-    was real — hoisting the rollback out of the `with` passed all 53 shield tests
-    (#384, CodeRabbit round 9).
+    The sibling lock test cannot pin this: its activation SUCCEEDS, so no rollback ever
+    runs and `activation < lock_exit` is all it can show. Ablation proved the gap was real
+    — hoisting the rollback out of the `with` passed every other shield test (#384).
 
     Ablation: move the rollback below the `with` block and this fails — the rollback
     is recorded after the lock's exit."""
@@ -4435,13 +4423,13 @@ def test_shield_takes_the_repo_scoped_lock(project, tmp_path, monkeypatch):
     - it is taken BEFORE the extension probe and held past the ACTIVATION, since the
       race is the window between the probe's answer and the activation's outcome.
 
-    That third bullet is the whole span only in company: this test's activation
-    SUCCEEDS, so no rollback runs in it and `activation < lock-exit` is the strongest
-    ordering it can witness. The rollback half — released only after the `--unset` —
-    is a separate property with its own test, `test_shield_rolls_back_inside_the_lock`,
-    which had to exist because hoisting the rollback out of the `with` passed all 53
-    shield tests including this one (#384, CodeRabbit round 9). A success-path ordering
-    test cannot pin a rollback-path ordering property.
+    That third bullet is the whole span only in company: this test's activation SUCCEEDS,
+    so no rollback runs in it and `activation < lock-exit` is the strongest ordering it
+    can witness. The rollback half — released only after the `--unset` — is a separate
+    property with its own test, `test_shield_rolls_back_inside_the_lock`, which had to
+    exist because hoisting the rollback out of the `with` passed every other shield test
+    including this one (#384). A success-path ordering test cannot pin a rollback-path
+    ordering property.
 
     Ordering is recorded from the calls themselves rather than asserted on the lock's
     existence: a lock taken after the probe, or released before the activation, leaves
@@ -4633,14 +4621,13 @@ def test_shield_seeds_users_excludesfile(project, tmp_path):
     sys.platform == "win32", reason="POSIX-only: Windows strips a trailing space from a filename"
 )
 def test_shield_seeds_an_excludesfile_whose_path_has_edge_whitespace(project, tmp_path):
-    """Round 5 (#384, Codex P2): the same leak as the encoding bug, through the PATH
-    rather than the content. A `.strip()` on git's answer destroyed a legal POSIX
-    path — `git config --type=path --get` returns leading and trailing whitespace
-    VERBATIM (git writes such a value quoted, so it round-trips; measured at 2.20.4
-    and 2.55.0) — so the stripped path read absent via `is_file()`, the seed came
-    back empty, and the activation then SHADOWED the excludes it had failed to copy.
-    Silent: `_shield_inherited_excludes` returned empty rather than raising, and the
-    caller only journals a non-None reason.
+    """The same leak as the encoding bug (#384), through the PATH rather than the
+    content. A `.strip()` on git's answer destroyed a legal POSIX path — `git config
+    --type=path --get` returns leading and trailing whitespace VERBATIM (git writes
+    such a value quoted, so it round-trips) — so the stripped path read absent via
+    `is_file()`, the seed came back empty, and the activation then SHADOWED the
+    excludes it had failed to copy. Silent: `_shield_inherited_excludes` returned empty
+    rather than raising, and the caller only journals a non-None reason.
 
     `-z` is the fix: it terminates the value with NUL, so the path survives whatever
     whitespace it carries.
@@ -4676,8 +4663,8 @@ def test_shield_seeds_an_excludesfile_whose_path_has_edge_whitespace(project, tm
     sys.platform == "win32", reason="POSIX-only: a 0xff byte cannot be a Windows filename"
 )
 def test_shield_preserves_a_non_utf8_excludesfile(project, tmp_path):
-    """THE round-4 regression (#384, Codex P1): the seed is a VERBATIM BYTE COPY, so
-    an operator's excludes file that is not UTF-8 survives it intact.
+    """The regression the bytes conversion fixed (#384): the seed is a VERBATIM BYTE
+    COPY, so an operator's excludes file that is not UTF-8 survives it intact.
 
     A `read_text(encoding="utf-8")` inside a handler naming `UnicodeError` made one
     non-UTF-8 byte anywhere in their file collapse the WHOLE seed to empty — and the
@@ -4715,7 +4702,7 @@ def test_shield_degrades_when_the_users_excludesfile_cannot_be_read(project, tmp
     activate over patterns it never copied. Absent is silent (the common case, and
     there is nothing to shadow); unreadable is a degrade, because the shadow is real.
 
-    The other half of the round-4 fix, and untested in either direction before it:
+    The other half of the bytes conversion, and untested in either direction before it:
     `OSError` was swallowed beside the decode fault, so an EACCES/EIO on their file
     produced the identical silent empty seed — and then the shadow.
 
@@ -4797,11 +4784,11 @@ def test_shield_reseeds_after_an_interrupted_creation(project, tmp_path, monkeyp
     def boom(*a, **kw):
         raise OSError("no space left on device")
 
-    # patched at install's OWN binding, as everywhere else in this file: the write
-    # goes through atomic_write_bytes (#375, #384 round 4) on an mkstemp fd via
-    # os.fdopen, so a Path.write_bytes patch never fires and would pass vacuously.
-    # The NAME matters as much as the binding — left pointing at atomic_write_text
-    # this patch became a silent no-op and the test failed on the degrade assertion.
+    # patched at install's OWN binding, as everywhere else in this file: the write goes
+    # through atomic_write_bytes (#375, #384) on an mkstemp fd via os.fdopen, so a
+    # Path.write_bytes patch never fires and would pass vacuously. The NAME matters as
+    # much as the binding — left pointing at atomic_write_text this patch became a silent
+    # no-op and the test failed on the degrade assertion.
     monkeypatch.setattr(install_mod, "atomic_write_bytes", boom)
     assert _worktree_local_exclude(wt, ["/probe-384"]) is not None
     monkeypatch.undo()  # the assertions below do their own file and git I/O
@@ -4819,8 +4806,8 @@ def test_shield_reprovision_does_not_duplicate_patterns(project, tmp_path):
     """Provisioning the SAME worktree twice must leave the private exclude
     byte-identical. The dedupe is what makes that true, and it compares the
     already-present lines against the patterns being added — so both sides have to
-    be the same type. Left as `str` against a `bytes` set (the shape the round-4
-    bytes conversion invites), every pattern reads as absent and is re-appended on
+    be the same type. Left as `str` against a `bytes` set — the shape the bytes
+    conversion invites — every pattern reads as absent and is re-appended on
     every single re-provision, growing the file without bound.
 
     Nothing pinned this before: `test_shield_reseeds_after_an_interrupted_creation`
@@ -4850,7 +4837,7 @@ def test_shield_reprovision_does_not_duplicate_patterns(project, tmp_path):
 
 def test_shield_dedupe_does_not_split_on_non_git_line_breaks(project, tmp_path):
     """The dedupe splits the existing content into lines the way GIT does, which is
-    the second thing the bytes conversion bought (#384 round 4).
+    the second thing the bytes conversion bought (#384).
 
     `str.splitlines()` breaks on `\\x0b`, `\\x0c`, `\\x1c`, `\\x1d`, `\\x1e` and
     `\\x85` as well as on newlines; git treats none of those as a line boundary, and
@@ -4881,22 +4868,21 @@ def test_shield_dedupe_does_not_split_on_non_git_line_breaks(project, tmp_path):
 
 def test_shield_appends_a_pattern_an_inherited_negation_would_cancel(project, tmp_path):
     """A pattern the file already CONTAINS can still be ineffective: gitignore's rule
-    is LAST MATCH WINS, so a `!` line below it cancels it (#384, Codex round 17).
+    is LAST MATCH WINS, so a `!` line below it cancels it (#384).
 
-    The plain set-membership dedupe therefore declined to append the shield's own
-    pattern, and the provisioned tool files stayed stageable — SILENTLY, because
-    nothing failed. That is why the assertions here go through git rather than through
-    the return value: `_worktree_local_exclude` answers None both with the bug and
-    with the fix, so a `reason` assertion cannot bite at all. Same shape as the
-    fault-injection test that sat on a live defect for two rounds by asserting only
-    the reason string.
+    The plain set-membership dedupe therefore declined to append the shield's own pattern,
+    and the provisioned tool files stayed stageable — SILENTLY, because nothing failed.
+    That is why the assertions here go through git rather than through the return value:
+    `_worktree_local_exclude` answers None both with the bug and with the fix, so a
+    `reason` assertion cannot bite at all — the same shape as a fault-injection test that
+    asserts only the reason string.
 
-    Measured, the negation need not repeat the positive's spelling — `!.claude/skills`
-    cancels `/.claude/skills` too. What does NOT cancel it is a negation leaving the
-    directory itself excluded (`!*.md` below it, or `!/.claude`, which re-includes only
-    the parent): git never descends into an excluded directory. The fix is deliberately
-    conservative across that line, appending a harmless duplicate in those cases rather
-    than reimplementing git's matcher, so this test pins the defeating shape only.
+    The negation need not repeat the positive's spelling — `!.claude/skills` cancels
+    `/.claude/skills` too. What does NOT cancel it is a negation leaving the directory
+    itself excluded (`!*.md` below it, or `!/.claude`, which re-includes only the parent):
+    git never descends into an excluded directory. The fix is deliberately conservative
+    across that line, appending a harmless duplicate in those cases rather than
+    reimplementing git's matcher, so this test pins the defeating shape only.
 
     Ablation (run): restore `settled = set(existing.splitlines())` and this fails at the
     status assertion with `?? .claude/skills/tool.md`."""
@@ -5087,9 +5073,9 @@ def test_shield_degrades_when_git_will_not_resolve_its_home_directory(
 
     def fail_home_probe(worktree, *args):
         # A PREFIX predicate, not tuple membership: the key travels both as the `-c`
-        # assignment and as the bare `--get` argument (#384, round 10's de-fanged
-        # fakes). Recording it is what proves this faulted the probe and not the
-        # seed read, whose argv is otherwise byte-identical.
+        # assignment and as the bare `--get` argument (#384). Recording it is what proves
+        # this faulted the probe and not the seed read, whose argv is otherwise
+        # byte-identical.
         if any(a.startswith("bmadloop.xdghomeprobe") for a in args):
             seen.append(args)
             return subprocess.CompletedProcess(
@@ -5118,16 +5104,15 @@ def test_shield_degrades_when_git_will_not_resolve_its_home_directory(
 
 def test_shield_seeds_a_relative_xdg_config_home_resolved_like_git(project, tmp_path, monkeypatch):
     """The relative-path defect of the `core.excludesFile` branch, at the XDG fallback
-    branch (#384, Codex round 12). This branch exists to REPRODUCE git's fallback, so
+    branch (#384). This branch exists to REPRODUCE git's fallback, so
     it has to reproduce git's resolution too.
 
-    A relative `XDG_CONFIG_HOME` is invalid per the XDG base-directory spec, which says
-    an implementation "should consider the path invalid and ignore it". Git does not
-    ignore it. Measured at 2.20.4 and 2.55.0: git honors the value and resolves it
-    against the worktree's TOP LEVEL — and measured from a SUBDIR to separate
-    top-level from cwd, `git -C <wt>/sub` with `XDG_CONFIG_HOME=rel` read
-    `<wt>/rel/git/ignore` rather than `<wt>/sub/rel/git/ignore`. So "git ignores an
-    invalid value" is the plausible guess this test exists to refute.
+    A relative `XDG_CONFIG_HOME` is invalid per the XDG base-directory spec, which says an
+    implementation "should consider the path invalid and ignore it". Git does not ignore
+    it: git honors the value and resolves it against the worktree's TOP LEVEL rather than
+    cwd — from a SUBDIR, `git -C <wt>/sub` with `XDG_CONFIG_HOME=rel` reads
+    `<wt>/rel/git/ignore`, not `<wt>/sub/rel/git/ignore`. So "git ignores an invalid
+    value" is the plausible guess this test exists to refute.
 
     `monkeypatch.chdir` is load-bearing here for the same reason as in the
     `core.excludesFile` sibling: run from inside the worktree, the unfixed code
@@ -5169,21 +5154,21 @@ def test_shield_honors_an_explicitly_empty_excludesfile(project, tmp_path, monke
     """An EXPLICITLY EMPTY `core.excludesFile` is an ANSWER, not an unset key: it is the
     operator saying "no excludes file at all", and git honors that literally — no
     patterns, and NO fallback to `$XDG_CONFIG_HOME/git/ignore`. Reading it as unset
-    (#384, Codex round 8) imported the XDG file's patterns and ACTIVATED them, which is
+    (#384) imported the XDG file's patterns and ACTIVATED them, which is
     the mirror image of every other finding in this family: instead of shadowing
     patterns it failed to copy it OVER-ignores, so session-created files the operator
     deliberately stopped ignoring go silently missing from the unit's `git add -A` and
     from the story's commit. Same silent-file-loss class as #384 itself, inverted.
 
-    Measured at git 2.55.0 on a fixture built for exactly this: `-z --type=path --get`
-    answers rc 0 with a lone NUL, `git check-ignore -v` then exits 1 against a name the
-    XDG file lists, and `git status` shows it untracked. The mechanism is in git's
-    source rather than inferred — `dir.c::setup_standard_excludes` guards the XDG
-    fallback on `if (!excludes_file)`, a NULL POINTER, while an empty value resolves
-    through `interpolate_path("")` to a non-NULL empty string. Byte-identical guard at
-    v2.20.0, this shield's floor, and at master. It is undocumented: `core.adoc` says
-    only "Defaults to $XDG_CONFIG_HOME/git/ignore" — the same standing as the relative-
-    value behavior the sibling test above pins.
+    On a fixture built for exactly this, `-z --type=path --get` answers rc 0 with a lone
+    NUL, `git check-ignore -v` then exits 1 against a name the XDG file lists, and `git
+    status` shows it untracked. The mechanism is in git's source rather than inferred —
+    `dir.c::setup_standard_excludes` guards the XDG fallback on `if (!excludes_file)`, a
+    NULL POINTER, while an empty value resolves through `interpolate_path("")` to a
+    non-NULL empty string, and that guard is unchanged from this shield's 2.20 floor to
+    current. It is undocumented: `core.adoc` says only "Defaults to
+    $XDG_CONFIG_HOME/git/ignore" — the same standing as the relative- value behavior the
+    sibling test above pins.
 
     `GIT_CONFIG_NOSYSTEM` is deliberately NOT pinned, unlike the XDG sibling: a
     repo-LOCAL key already outranks a global one, so there is nothing to suppress, and
@@ -5192,7 +5177,7 @@ def test_shield_honors_an_explicitly_empty_excludesfile(project, tmp_path, monke
     demanding whole-worktree cleanliness.
 
     Ablation: restore `and raw` on the rc branch of `_shield_inherited_excludes` (the
-    pre-round-8 condition) and this fails — `xdg-ignored.tmp` is seeded into the private
+    old condition) and this fails — `xdg-ignored.tmp` is seeded into the private
     exclude and disappears from git's status. Deleting the `if not raw:` arm alone does
     NOT reproduce the bug: `os.fsdecode(b"")` makes `Path(".")`, which resolves to the
     worktree directory and reads `is_file()` false, so the seed comes back empty
@@ -5391,10 +5376,10 @@ def test_worktree_local_exclude_degrades_on_write_fault(project, tmp_path, monke
     def boom(*a, **kw):
         raise OSError("read-only .git")
 
-    # patched at install's OWN binding: the exclude write goes through
-    # atomic_write_bytes (#375, #384 round 4), which writes via os.fdopen on an
-    # mkstemp fd, so a Path.write_bytes/Path.open patch never fires and would pass
-    # vacuously — and so would a patch left on the atomic_write_TEXT this replaced.
+    # patched at install's OWN binding: the exclude write goes through atomic_write_bytes
+    # (#375, #384), which writes via os.fdopen on an mkstemp fd, so a
+    # Path.write_bytes/Path.open patch never fires and would pass vacuously — and so would
+    # a patch left on the atomic_write_TEXT this replaced.
     monkeypatch.setattr(install_mod, "atomic_write_bytes", boom)
 
     reason = _worktree_local_exclude(wt, ["/probe-359"])
@@ -5403,7 +5388,7 @@ def test_worktree_local_exclude_degrades_on_write_fault(project, tmp_path, monke
 
 
 def test_worktree_local_exclude_appends_to_a_non_utf8_private_exclude(project, tmp_path):
-    """REPURPOSED, and the reversal is the fix (#384 review round 4). This case used
+    """REPURPOSED, and the reversal is the fix (#384). This case used
     to assert that a private exclude which is not UTF-8 DEGRADES the shield away,
     because `read_text` raised UnicodeDecodeError on it. The payload is bytes
     end-to-end now, so those bytes survive untouched *and* the shield still applies
@@ -5434,7 +5419,7 @@ def test_worktree_local_exclude_appends_to_a_non_utf8_private_exclude(project, t
     reason="fsencode uses utf-8/surrogatepass on Windows, which encodes any surrogate",
 )
 def test_worktree_local_exclude_degrades_on_unencodable_pattern(project, tmp_path):
-    """RE-POINTED (#384 review round 4) at the one shape that still raises. The
+    """RE-POINTED (#384) at the one shape that still raises. The
     encode fault used to be reachable from a real filename: `provision_worktree`
     builds a `seed_globs` pattern via `rel.as_posix()`, a non-UTF-8 name arrived
     surrogate-escaped, and `write_text` could not encode it back. The payload is
@@ -5567,12 +5552,12 @@ def test_worktree_local_exclude_undecodable_git_output_degrades(tmp_path, monkey
     root = os.fsencode(str(tmp_path)) + b"/repo-\377-name/.git"
     gitdir = root + b"/worktrees/wt"  # distinct from the common dir: a LINKED worktree
 
-    # SINGLE-QUOTED into the script. Unquoted, a temp root carrying whitespace
-    # (TMPDIR, --basetemp, a username with a space) word-splits into a second
-    # printf argument, and `printf '%s\n'` repeats its format per argument — so
-    # the helper is handed a path with an embedded NEWLINE and mkdir(parents=True)s
-    # it as a sibling of the basetemp pytest reaps. Measured with a spaced
-    # --basetemp: it leaked such a directory and the test still passed.
+    # SINGLE-QUOTED into the script. Unquoted, a temp root carrying whitespace (TMPDIR,
+    # --basetemp, a username with a space) word-splits into a second printf argument, and
+    # `printf '%s\n'` repeats its format per argument — so the helper is handed a path
+    # with an embedded NEWLINE and mkdir(parents=True)s it as a sibling of the basetemp
+    # pytest reaps — with a spaced --basetemp it leaks such a directory while every
+    # assertion still passes.
     def sq(raw):
         return b"'" + raw.replace(b"'", b"'\\''") + b"'"
 
@@ -5633,13 +5618,12 @@ def test_worktree_local_exclude_undecodable_git_output_degrades(tmp_path, monkey
     reason = _worktree_local_exclude(tmp_path / "wt", ["/probe-374"])
 
     assert reason is None or "could not update" in reason
-    # The tail actually RAN, against the decoded path. Not decoration: without
-    # it this test is vacuous whenever the stub cannot exec — a noexec temp dir
-    # (ordinary CI hardening), no /bin/sh, a filesystem that drops the exec bit.
-    # subprocess.run then raises OSError, the git-query arm swallows it as the
-    # expected skip it is, `reason is None` holds, and the ablation above
-    # evaporates with it. Measured: at mode 0644 the stub never runs and every
-    # assertion above still passes.
+    # The tail actually RAN, against the decoded path. Not decoration: without it this
+    # test is vacuous whenever the stub cannot exec — a noexec temp dir (ordinary CI
+    # hardening), no /bin/sh, a filesystem that drops the exec bit. subprocess.run then
+    # raises OSError, the git-query arm swallows it as the expected skip it is, `reason is
+    # None` holds, and the ablation above evaporates with it: at mode 0644 the stub never
+    # runs and every assertion above still passes.
     #
     # This also pins containment better than globbing shared /tmp for a leak:
     # that glob is non-recursive and tmp_path sits three levels down, so it
@@ -5744,10 +5728,10 @@ def test_provision_worktree_exclude_fault_reports_on_degraded(project, tmp_path,
     def boom(*a, **kw):
         raise OSError("read-only .git")
 
-    # patched at install's OWN binding: the exclude write goes through
-    # atomic_write_bytes (#375, #384 round 4), which writes via os.fdopen on an
-    # mkstemp fd, so a Path.write_bytes/Path.open patch never fires and would pass
-    # vacuously — and so would a patch left on the atomic_write_TEXT this replaced.
+    # patched at install's OWN binding: the exclude write goes through atomic_write_bytes
+    # (#375, #384), which writes via os.fdopen on an mkstemp fd, so a
+    # Path.write_bytes/Path.open patch never fires and would pass vacuously — and so would
+    # a patch left on the atomic_write_TEXT this replaced.
     monkeypatch.setattr(install_mod, "atomic_write_bytes", boom)
     msgs: list[str] = []
 
@@ -5824,20 +5808,20 @@ def test_worktree_local_exclude_common_dir_probe_rc_degrades(project, tmp_path, 
     on_degraded rather than swallowed") already specified the fix; only the code
     disagreed.
 
-    Name-filtered onto `--git-common-dir` alone, so `--absolute-git-dir` answers for
-    real and this pins the boundary BETWEEN the two arms rather than the first arm.
-    If the production flag ever changes, this filter stops matching, the shield
-    succeeds, and `reason is not None` fails loudly — the opposite polarity to a
-    tripwire that goes quiet (round 10).
+    Name-filtered onto `--git-common-dir` alone, so `--absolute-git-dir` answers for real
+    and this pins the boundary BETWEEN the two arms rather than the first arm. If the
+    production flag ever changes, this filter stops matching, the shield succeeds, and
+    `reason is not None` fails loudly — the opposite polarity to a tripwire that goes
+    quiet.
 
     The stderr detail is asserted, not just non-None: deleting the new arm lets the
     empty stdout fall through to the `could not read this worktree's git dirs` guard,
     which ALSO returns a reason. Asserting only `is not None` would pass against the
     bug.
 
-    Ablation: replace this arm's `return (...)` with `return None` — the round-8 rule
-    that a gate whose deletion does not reproduce the bug must be ablated by restoring
-    the OLD behavior, since deleting it lands on that other guard instead."""
+    Ablation: replace this arm's `return (...)` with `return None`, per the rule that a
+    gate whose deletion does not reproduce the bug must be ablated by restoring the OLD
+    behavior — deleting it lands on that other guard instead."""
     repo = project.project
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
@@ -5869,22 +5853,21 @@ def test_worktree_local_exclude_common_dir_probe_raise_degrades(
     """The raise half of the same boundary, which is the shape that is actually
     reachable.
 
-    A non-zero rc from `--git-common-dir` after `--absolute-git-dir` answered rc 0 has
-    no static occupant — measured at 2.20.4 and 2.55.0, a healthy linked worktree
-    answers both rc 0, and an unknown flag is ECHOED at rc 0 rather than refused, so
-    "a git too old for the flag" cannot land there either. What reaches this boundary
-    is a TRANSIENT fault on the second spawn: the two probes are two separate
-    processes, each bounded by `limits.git_timeout_s`. Same standing round 9 accepted
-    one function away, and the reason it is worth a guard at all.
+    A non-zero rc from `--git-common-dir` after `--absolute-git-dir` answered rc 0 has no
+    static occupant — a healthy linked worktree answers both rc 0, and an unknown flag is
+    ECHOED at rc 0 rather than refused, so "a git too old for the flag" cannot land there
+    either. What reaches this boundary is a TRANSIENT fault on the second spawn: the two
+    probes are two separate processes, each bounded by `limits.git_timeout_s`. Same
+    standing as the guard one function away, and the reason it is worth a guard at all.
 
-    Both classes, because they enter differently — a timeout raises `GitError`
-    itself, a spawn failure the `GitSpawnError` subclass. Neither is caught locally:
-    the call sits inside the tail's `try`, so the raise is funnelled into a reason
-    there rather than by an `except` of its own (round 7 — enumerating one failure
-    shape per round is what cost this PR three of them).
+    Both classes, because they enter differently — a timeout raises `GitError` itself, a
+    spawn failure the `GitSpawnError` subclass. Neither is caught locally: the call sits
+    inside the tail's `try`, so the raise is funnelled into a reason there rather than by
+    an `except` of its own — enumerating one failure shape at a time is what leaves the
+    next one live.
 
     Ablation: wrap the `--git-common-dir` call in `try: ... except GitError: return
-    None`, restoring the pre-round-11 structure — both cases then return None."""
+    None`, restoring the earlier structure — both cases then return None."""
     repo = project.project
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
@@ -5914,18 +5897,17 @@ def test_worktree_local_exclude_git_fault_after_answering_degrades(
     Name-filtered onto the activation so everything before it runs for real; that
     is also what makes this the SECOND arm rather than the first.
 
-    THE FLAG ASSERTION IS THE POINT OF THE SECOND HALF. This test injected exactly
-    the raised activation fault for two review rounds while asserting only the
-    returned reason — so it sat directly on top of a live defect and could not see
-    it: the enable one line above had already made a permanent repo-format change,
-    and the raise bypassed the rollback that the non-zero-rc arm had. Codex found it
-    by reading this test rather than the code. A degrade assertion that stops at the
-    reason string cannot tell a clean degrade from one that left state behind.
+    THE FLAG ASSERTION IS THE POINT OF THE SECOND HALF. This test injected exactly the
+    raised activation fault while asserting only the returned reason — so it sat directly
+    on top of a live defect and could not see it: the enable one line above had already
+    made a permanent repo-format change, and the raise bypassed the rollback that the
+    non-zero-rc arm had. A degrade assertion that stops at the reason string cannot tell a
+    clean degrade from one that left state behind.
 
     Name-filtering on `--worktree` is what keeps this pinned to the ACTIVATION. The
-    enable's own raise is a different degrade with its own rollback (round 10) — see
-    `test_shield_rolls_back_an_enable_whose_git_faulted` — so this test no longer
-    covers "every way the flag can be left behind", only this one.
+    enable's own raise is a different degrade with its own rollback — see
+    `test_shield_rolls_back_an_enable_whose_git_faulted` — so this test no longer covers
+    "every way the flag can be left behind", only this one.
 
     Parametrized over both classes because they enter differently — a timeout is
     raised as `GitError` itself, a spawn failure as the `GitSpawnError` subclass.
@@ -5963,19 +5945,19 @@ def test_shield_degrades_when_git_will_not_say_what_the_users_excludes_are(
     """A git fault reading `core.excludesFile` means we did NOT FIND OUT which file
     applies — and that must skip the shield, not activate over it.
 
-    THIS TEST REVERSES what it asserted before round 5. It used to pin the swallow,
-    on the premise that "git unqueryable ⇒ no key to resolve ⇒ nothing to copy" and
-    that skipping was "strictly worse than losing the seed". Both halves were wrong:
+    THIS TEST REVERSES what it once asserted. It used to pin the swallow, on the premise
+    that "git unqueryable ⇒ no key to resolve ⇒ nothing to copy" and that skipping was
+    "strictly worse than losing the seed". Both halves were wrong:
 
     - The premise is a false inference. It holds for `rc != 0`, which is an ANSWER
       (an unset key exits 1, and that arm is still correctly silent). A raised fault
       is not an answer, so the code mapped UNKNOWN onto ABSENT.
     - The outcome was never "a lost seed". It was a lost seed PLUS a worktree-scoped
-      key that SHADOWS the file the seed failed to read — the compound harm round 4
-      named as the bug. Skipping stages a bounded, journaled set of bmad-loop's own
-      files; continuing silently un-ignores whatever the operator's personal excludes
-      cover, which is by definition what their `.gitignore` does not, and merges it
-      back into their checkout as tracked content.
+      key that SHADOWS the file the seed failed to read — the compound harm that is the
+      bug. Skipping stages a bounded, journaled set of bmad-loop's own files; continuing
+      silently un-ignores whatever the operator's personal excludes cover, which is by
+      definition what their `.gitignore` does not, and merges it back into their checkout
+      as tracked content.
 
     Assertion 3 is the harm and is why the operator's excludes are planted FIRST: the
     version of this test that pinned the swallow planted none at all, so it could not
@@ -6028,25 +6010,23 @@ def test_shield_degrades_when_the_excludes_read_answers_with_a_fault_rc(
 ):
     """The sibling above is UNKNOWN arriving as a RAISE; this is UNKNOWN arriving as an
     rc. They are one funnel deliberately: `git_bytes` has exactly these two failure
-    shapes, and this PR's activation arm took three review rounds precisely because
-    each fix enumerated the shape it had just been shown.
+    shapes, and a fix that enumerates only the shape it was just shown leaves the
+    other live.
 
-    rc 1 is the ONLY non-zero rc that means "no such key". Every other one is git
-    saying it could not answer, and the `else:` used to route all of them into the XDG
-    fallback — seeding ignore patterns the operator never chose for this repository and
-    then ACTIVATING them over the file it had failed to read (#384, CodeRabbit round 9).
+    rc 1 is the ONLY non-zero rc that means "no such key". Every other one is git saying
+    it could not answer, and the `else:` used to route all of them into the XDG fallback —
+    seeding ignore patterns the operator never chose for this repository and then
+    ACTIVATING them over the file it had failed to read (#384).
 
-    INJECTED rather than provoked from a config value, and the measurement behind that
-    is why this docstring is long, because the plausible version is wrong.
-    `core.excludesFile = ~nosuchuser/ignore` really does make this read exit 128
-    (`fatal: failed to expand user dir`) — but git expands that same value while
-    parsing core config for any command that sets the repository up, so
-    `rev-parse --absolute-git-dir` in the caller fatals identically and the shield
-    silently skips ABOVE this branch. Measured at git 2.20.4 and 2.55.0, both ends of
-    the supported range. Nothing static reaches this arm; its occupants appear between
-    that rev-parse and this read, and the repo-scoped lock in between — `flock`, which
-    blocks indefinitely on POSIX — is what makes the window wide enough to hold a
-    dotfile sync or an NSS/LDAP hiccup.
+    INJECTED rather than provoked from a config value, because the plausible version is
+    wrong. `core.excludesFile = ~nosuchuser/ignore` really does make this read exit 128
+    (`fatal: failed to expand user dir`) — but git expands that same value while parsing
+    core config for any command that sets the repository up, so `rev-parse
+    --absolute-git-dir` in the caller fatals identically and the shield silently skips
+    ABOVE this branch. Nothing static reaches this arm; its occupants appear between that
+    rev-parse and this read, and the repo-scoped lock in between — `flock`, which blocks
+    indefinitely on POSIX — is what makes the window wide enough to hold a dotfile sync or
+    an NSS/LDAP hiccup.
 
     Injecting the ANSWER rather than breaking the repository is also what lets the harm
     be asserted through git's own status: the fault clears, the activation does not, so
@@ -6122,10 +6102,10 @@ def test_shield_git_calls_carry_the_locale_pin(project, tmp_path, monkeypatch):
     bin_dir.mkdir()
     seen = tmp_path / "locale-seen"
     stub = bin_dir / "git"
-    # shlex.quote, for the reason the `sq()` helper further up exists: unquoted, a
-    # temp root carrying whitespace (a spaced `--basetemp`, or TMPDIR) word-splits
-    # this redirect, so the stub appends to the wrong path and leaks a stray file
-    # outside the basetemp pytest reaps (#384, CodeRabbit at round 15).
+    # shlex.quote, for the reason the `sq()` helper further up exists: unquoted, a temp
+    # root carrying whitespace (a spaced `--basetemp`, or TMPDIR) word-splits this
+    # redirect, so the stub appends to the wrong path and leaks a stray file outside the
+    # basetemp pytest reaps (#384).
     stub.write_text(
         f'#!/bin/sh\nprintf "%s\\n" "${{LC_ALL-<unset>}}" >> {shlex.quote(str(seen))}\nexit 1\n',
         encoding="utf-8",
@@ -6179,8 +6159,8 @@ def test_provision_worktree_hookless_skips_hook_merge(tmp_path):
 def test_provision_worktree_hookless_exclude_has_no_bare_slash(project, tmp_path):
     """A hookless profile has config_path == "", which must not reach the exclude
     as a bare "/". That pattern is INERT rather than dangerous — git strips the
-    trailing slash to a zero-length pattern matching nothing, measured on 2.55.0
-    against "/*" and "*", which do blanket — so what this pins is that a profile
+    trailing slash to a zero-length pattern matching nothing, unlike "/*" or "*",
+    which do blanket — so what this pins is that a profile
     with nothing to shield contributes no line at all. Only the skill tree is
     shielded."""
     repo = project.project
