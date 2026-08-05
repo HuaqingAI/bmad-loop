@@ -142,10 +142,10 @@ which has not been released since 0.9.0 and does not descend from v0.9.1.
 
 ### Removed
 
-- **The `bmad-auto` → `bmad-loop` rename compatibility is gone.** The rename shipped in 0.8.0 and
-  no pre-rename installs remain in the wild, so `init` no longer strips `bmad_auto`-marked hooks,
+- **The `bmad-auto` → `bmad-loop` rename compatibility is gone.** The rename shipped in 0.8.0 and no
+  pre-rename installs remain in the wild, so `init` no longer strips `bmad_auto`-marked hooks,
   deletes `bmad-auto-*` skill dirs, carries `.automator/policy.toml` over to `.bmad-loop/`, or
-  prints the leftover-`.automator/` note. `bmad-loop-setup` drops its migration section with them.
+  prints the leftover-`.automator/` note; `bmad-loop-setup` drops its migration section with them.
   A project still on `bmad-auto` should migrate on 0.9.1 — the last release carrying the shims —
   before upgrading past it.
 
