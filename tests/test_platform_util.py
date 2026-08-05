@@ -208,7 +208,7 @@ def test_atomic_write_text_fsyncs_before_it_publishes(tmp_path, monkeypatch):
     page cache, so the rename can be durable while the data is not, and the new
     name comes back pointing at a zero-length file. An empty ledger *parses* — as
     no entries — so the failure reads as every hand-written entry having vanished
-    rather than as corruption (CodeRabbit, review round 3)."""
+    rather than as corruption."""
     order = []
     real_fsync, real_replace = os.fsync, os.replace
     monkeypatch.setattr(
@@ -294,10 +294,10 @@ def test_atomic_write_bytes_replaces_contents(tmp_path):
 
 
 def test_atomic_write_bytes_writes_bytes_no_codec_can_decode(tmp_path):
-    """The reason this variant exists (#384 review round 4): the payload is an
-    operator's git exclude file, whose patterns are POSIX paths and therefore
-    arbitrary bytes. `atomic_write_text` would have to encode, and a strict UTF-8
-    encode of a legacy-encoded file's content raises."""
+    """The reason this variant exists (#384): the payload is an operator's git
+    exclude file, whose patterns are POSIX paths and therefore arbitrary bytes.
+    `atomic_write_text` would have to encode, and a strict UTF-8 encode of a
+    legacy-encoded file's content raises."""
     target = tmp_path / "exclude"
     target.write_bytes(b"before\n")
 
@@ -443,8 +443,8 @@ def test_atomic_write_bytes_stages_in_the_targets_own_directory(tmp_path, monkey
 
     Recorded from `os.replace`'s source argument, because the pre-existing
     "leaves no temp behind" assertion cannot see this: it lists the TARGET's
-    directory, which a temp staged in `/tmp` is trivially absent from. Measured —
-    with `dir=` dropped, that test passed."""
+    directory, which a temp staged in `/tmp` is trivially absent from — with
+    `dir=` dropped, that assertion still passes."""
     target = tmp_path / "sub" / "exclude"
     target.parent.mkdir()
     target.write_bytes(b"before")
