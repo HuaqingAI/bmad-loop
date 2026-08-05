@@ -195,6 +195,10 @@ class StoryTask:
     # JSON-native containers only; callers persist these through state.json.
     harvested_deferrals: list[dict[str, Any]] = field(default_factory=list)
     bundle_closes_intended: list[str] = field(default_factory=list)
+    # Index of the append-only primary dev SessionRecord whose decision durably
+    # returned PROCEED. Attempt numbers can be reused after a human re-arm, so the
+    # exact record occurrence is the acceptance identity; None is legacy/unarmed.
+    accepted_dev_session_index: int | None = None
     harvest_carry_commit_pending: bool = False
     isolated_ledger_carried: bool = False
     spec_file: str | None = None
@@ -344,6 +348,7 @@ class StoryTask:
             "ledger_changed_before_harvest": self.ledger_changed_before_harvest,
             "harvested_deferrals": self.harvested_deferrals,
             "bundle_closes_intended": self.bundle_closes_intended,
+            "accepted_dev_session_index": self.accepted_dev_session_index,
             "harvest_carry_commit_pending": self.harvest_carry_commit_pending,
             "isolated_ledger_carried": self.isolated_ledger_carried,
             "spec_file": self._serialized_spec_file(),
@@ -412,6 +417,11 @@ class StoryTask:
             ledger_changed_before_harvest=bool(d.get("ledger_changed_before_harvest", False)),
             harvested_deferrals=[deepcopy(dict(item)) for item in d.get("harvested_deferrals", [])],
             bundle_closes_intended=[str(i) for i in d.get("bundle_closes_intended", [])],
+            accepted_dev_session_index=(
+                int(d["accepted_dev_session_index"])
+                if d.get("accepted_dev_session_index") is not None
+                else None
+            ),
             harvest_carry_commit_pending=bool(d.get("harvest_carry_commit_pending", False)),
             isolated_ledger_carried=bool(d.get("isolated_ledger_carried", False)),
             spec_file=d.get("spec_file"),

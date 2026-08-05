@@ -612,6 +612,62 @@ def test_generic_skill_bundle_orchestrator_closes_ledger(project):
     assert saved.bundle_closes_intended == ["DW-1", "DW-2"]
 
 
+def test_resume_dev_verify_bundle_replays_accepted_sync_before_review(project, monkeypatch):
+    """A persisted PROCEED decision must finish accepted bookkeeping before review."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
+    )
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=True, trigger="always"),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "fix", ["DW-1"], mark_ledger=False),
+        ],
+        policy=pol,
+    )
+
+    def crash_before_accepted_sync(task, result_json):
+        persisted = load_state(engine.run_dir).tasks[task.story_key]
+        assert persisted.accepted_dev_session_index == len(task.sessions) - 1
+        raise RuntimeError("host died before accepted sync")
+
+    monkeypatch.setattr(engine, "_post_dev_accepted_sync", crash_before_accepted_sync)
+    assert engine.run().crashed
+
+    crashed = load_state(engine.run_dir).tasks["dw-fix"]
+    assert crashed.phase == Phase.DEV_VERIFY and crashed.spec_file
+    assert crashed.accepted_dev_session_index == len(crashed.sessions) - 1
+    assert crashed.pre_harvest_ledger_captured is True
+    assert ledger_entries(project)["DW-1"].open
+
+    seen_at_review = []
+    review = bundle_review_effect(project, "fix")
+
+    def review_after_sync(spec):
+        seen_at_review.append(ledger_entries(project)["DW-1"].status)
+        return review(spec)
+
+    resumed, adapter = resume_sweep(project, engine, [review_after_sync])
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert [s.role for s in adapter.sessions] == ["review"]
+    assert seen_at_review[0].startswith("done")
+    saved = load_state(engine.run_dir).tasks["dw-fix"]
+    assert saved.bundle_closes_intended == ["DW-1"]
+    accepted = saved.accepted_dev_session_index
+    assert accepted is not None and saved.sessions[accepted].role == "dev"
+    assert saved.pre_harvest_ledger_captured is False
+
+
 def test_bundle_ledger_close_withheld_on_a_non_fixable_retry(project):
     """A rejected attempt must not close the ids whose code it rolls back."""
     write_ledger(project, {"DW-1": "open"})

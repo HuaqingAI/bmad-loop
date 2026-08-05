@@ -619,9 +619,11 @@ class SweepEngine(Engine):
         human-resolved escalation is protected through every reset (mirrors
         engine.py:1163-1169).
 
-        Returns True when the dev-verified arm carried the bundle all the way
-        through review and commit — the caller is done. Returns False once the
-        task has been reset to PENDING, leaving the caller to dispatch it.
+        Returns True when the persisted PROCEED receipt carried the bundle all
+        the way through accepted sync, review, and commit — the caller is done.
+        Returns False once the task has been reset to PENDING, leaving the caller
+        to dispatch it. A bare DEV_VERIFY + spec_file shape is insufficient: the
+        pre-action decision save has the same shape for rejected decisions.
 
         Deliberately narrower than the base _finish_inflight: no
         `_resumable_session` arm, so a bundle whose host died in the
@@ -648,19 +650,23 @@ class SweepEngine(Engine):
                 self._finalize_commit_phase(task)
             return True
         self.journal.append("resume-restart", story_key=task.story_key, phase=str(task.phase))
-        if task.phase == Phase.DEV_VERIFY and task.spec_file:
+        if (
+            task.phase == Phase.DEV_VERIFY
+            and task.spec_file
+            and self._accepted_dev_session_matches(task)
+        ):
             self._save()
             if isolated:
                 unit = self._reopen_unit(task)
                 prev = self.workspace
                 self.workspace = unit.workspace
                 try:
-                    self._review_and_commit(task)
+                    self._resume_after_dev_verify(task)
                 finally:
                     self.workspace = prev
                 self._integrate_unit(task, unit)
             else:
-                self._review_and_commit(task)
+                self._resume_after_dev_verify(task)
             return True
         if isolated:
             # drop the half-built worktree; _run_story mounts a fresh one

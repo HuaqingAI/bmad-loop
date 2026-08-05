@@ -1058,6 +1058,19 @@ class Engine:
             )
         return None
 
+    def _current_dev_session_index(self, task: StoryTask) -> int | None:
+        """Index of the newest primary dev record for the current attempt."""
+        task_id = _session_task_id(task.story_key, "dev", task.attempt)
+        for index in range(len(task.sessions) - 1, -1, -1):
+            if task.sessions[index].task_id == task_id:
+                return index
+        return None
+
+    def _accepted_dev_session_matches(self, task: StoryTask) -> bool:
+        """Whether the current primary dev record owns the PROCEED receipt."""
+        accepted = task.accepted_dev_session_index
+        return accepted is not None and accepted == self._current_dev_session_index(task)
+
     # ------------------------------------------------------------- per story
 
     def _gate_unit(self, task: StoryTask) -> bool:
@@ -1462,16 +1475,20 @@ class Engine:
                 # the latter, so the fall-through below preserves the worktree.
                 env_fault=bool((outcome is not None and outcome.env_fault) or result.env_fault),
             )
+            if decision.action == Action.PROCEED:
+                # DEV_VERIFY + spec_file is not itself proof of acceptance: this
+                # save also precedes every rejecting decision branch. Persist an
+                # explicit transaction latch so recovery may replay accepted-only
+                # bookkeeping without closing work from a PAUSE/RETRY/DEFER.
+                accepted_index = self._current_dev_session_index(task)
+                if accepted_index is None:
+                    raise RuntimeError(
+                        f"accepted dev decision for {task.story_key} has no session record"
+                    )
+                task.accepted_dev_session_index = accepted_index
             self._save()
             if decision.action == Action.PROCEED:
-                # Every gate that can reject this dev attempt has passed, including
-                # verify commands and CRITICAL-escalation preemption in decide_dev.
-                self._post_dev_accepted_sync(task, result.result_json)
-                # The attempt is accepted; no later path may restore its snapshot.
-                # Persist now because a crash can resume directly into review and
-                # never re-enter this method.
-                self._disarm_ledger_snapshot(task)
-                self._save()
+                self._finish_post_dev_accepted_sync(task, result.result_json)
                 self._emit("post_dev_phase", task)
                 if self._run_workflows("post_dev_phase", task, task.attempt):
                     return False
@@ -2755,6 +2772,27 @@ class Engine:
         """
         return
 
+    def _finish_post_dev_accepted_sync(
+        self, task: StoryTask, result_json: dict | None = None
+    ) -> None:
+        """Finish and durably acknowledge accepted-only bookkeeping.
+
+        ``accepted_dev_session_index`` is persisted only for a PROCEED decision. A
+        crash before or during the mode-owned write therefore replays this
+        transaction without mistaking an arbitrary DEV_VERIFY park for an accepted
+        attempt. The append-only record index prevents a reused attempt number from
+        authorizing a later re-arm. Mode writes must be idempotent; the sweep close
+        uses a stable run/task operation identity for exactly this replay.
+        """
+        if not self._accepted_dev_session_matches(task):
+            return
+        if result_json is None and task.spec_file:
+            result_json = {"spec_file": task.spec_file}
+        self._post_dev_accepted_sync(task, result_json)
+        # The attempt is accepted; no later path may restore its snapshot.
+        self._disarm_ledger_snapshot(task)
+        self._save()
+
     def _harvest_spec_path(self, task: StoryTask, result_json: dict | None) -> Path | None:
         """Resolve the spec whose frontmatter this mode may harvest."""
         spec_file = (result_json or {}).get("spec_file")
@@ -3279,6 +3317,7 @@ class Engine:
         StoriesEngine overrides this to re-drive the implement leg of a
         plan-checkpoint-paused story (leg-2) instead."""
         self.journal.append("resume-review", story_key=task.story_key)
+        self._finish_post_dev_accepted_sync(task)
         self._review_and_commit(task)
 
     def _after_story(self, task: StoryTask) -> None:
