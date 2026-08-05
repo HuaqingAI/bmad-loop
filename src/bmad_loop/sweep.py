@@ -1264,6 +1264,10 @@ class SweepEngine(Engine):
         """Stable identity for a close and its possible defer-time undo."""
         return f"{self.state.run_id}/{task.story_key}"
 
+    def _bundle_close_note(self, task: StoryTask) -> str:
+        """Resolution note shared by a bundle close and its possible undo."""
+        return f"resolved by sweep bundle {task.story_key}"
+
     def _close_declared_deferred(
         self, task: StoryTask, snapshot: list[tuple[Path, str]] | None = None
     ) -> None:
@@ -1290,7 +1294,7 @@ class SweepEngine(Engine):
         if verify.status_of(fm) != success_status:
             return
         ledger = self.workspace.paths.deferred_work
-        note = f"resolved by sweep bundle {task.story_key}"
+        note = self._bundle_close_note(task)
         # Record the intended ids, never only `marked`. This method is called once
         # after accepted dev and again by the review-leg reclose. The second call
         # normally finds every entry already done, so `marked` is empty; deriving
@@ -1316,7 +1320,7 @@ class SweepEngine(Engine):
         run closures remain untouched. Replaying this method is idempotent.
         """
         ledger = self.workspace.paths.deferred_work
-        note = f"resolved by sweep bundle {task.story_key}"
+        note = self._bundle_close_note(task)
         operation_id = self._bundle_close_operation_id(task)
         reopened = [i for i in task.dw_ids if deferredwork.mark_open(ledger, i, note, operation_id)]
         if reopened:
