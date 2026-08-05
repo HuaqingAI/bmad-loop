@@ -761,6 +761,65 @@ class WorktreeFlow:
                 ids.append(agent)
         return ids
 
+    def _ledger_seed(self, worktree: Path) -> tuple[str, ...]:
+        """The deferred-work ledger, when a worktree checkout cannot deliver it.
+
+        A `git worktree add` checks out TRACKED files only, so a project that
+        gitignores its ledger — the default shape, since the ledger's home is the
+        BMAD artifacts dir and this repo's own is gitignored — gets a unit
+        worktree with no ledger at all. The orchestrator is the ledger's single
+        writer under the generic dev path and writes through
+        ``self.workspace.paths``, i.e. that missing copy: ``mark_done`` returns
+        False on an absent file, and ``verify_review_bundle`` then reads the same
+        absent file and never sees the ids `done`. Measured on the default
+        config, the bundle DEFERS on a fixable retry every run, so `open_ids`
+        re-bundles the same work for ever (#426).
+
+        No DONE-leg carry can rescue that: the unit never reaches DONE. Seeding
+        is what moves the failure onto a leg that has one — measured, the same
+        run then lands, and ``SweepEngine._carry_isolated_ledger_writes`` (which
+        until now only ran for an operator who had named the ledger in
+        ``scm.worktree_seed``) applies the close to the main checkout.
+
+        The copy is not what carries the close home. Every seeded rel is shielded
+        from the unit's ``git add -A`` by a worktree-scoped exclude, so the flip
+        made in the worktree still never rides the merge — the seeded ledger
+        exists so the GATE can read the orchestrator's own write, and the carry
+        remains the delivery path. That is why the landing run still journals
+        ``sweep-bundle-close-carry-uncommitted``: `git add -- <ignored path>`
+        refuses with rc 1, as it did before.
+
+        Three exclusions, each measured:
+
+        * **Already in the checkout** — the copy would be a no-op the seed loop
+          reports as ``worktree-seed-skipped``, i.e. a diagnostic that means "a
+          seed you asked for did nothing" fired on every isolated unit of every
+          ordinary tracked-ledger project. Asked of the worktree rather than of
+          git because that is the question the seed loop itself decides on, and
+          it costs no subprocess and cannot raise.
+        * **Absent from the main checkout** — nothing to copy. The seed loop
+          drops a non-existent source silently (no ``worktree-seed-skipped``, no
+          ``worktree-seed-dropped``), so an entry here would be invisible rather
+          than merely inert. The commonest case by far: the first harvest is what
+          CREATES `deferred-work.md`.
+        * **Configured outside the project tree** — ``ProjectPaths.rebased``
+          leaves an out-of-tree artifacts dir unmoved, so the worktree already
+          reads the very same file and there is nothing to deliver. `relative_to`
+          is the test, and it is also the containment the seed loop requires.
+
+        Deduped against ``scm.worktree_seed`` by the caller, so an operator who
+        already named the ledger keeps exactly one entry.
+        """
+        ledger = self.paths.deferred_work
+        repo = self.paths.repo_root
+        try:
+            rel = ledger.resolve().relative_to(repo.resolve()).as_posix()
+        except (OSError, RuntimeError, ValueError):
+            return ()
+        if not _is_file(ledger) or _is_file(worktree / rel):
+            return ()
+        return (rel,)
+
     def run_isolated(self, task: StoryTask, drive: Callable[[StoryTask], None]) -> None:
         """Run one unit's `drive` body in a fresh per-unit worktree, then merge
         it back into the target branch. `drive` either returns (DONE/DEFERRED →
@@ -815,6 +874,7 @@ class WorktreeFlow:
             for profile in profiles:
                 seeds.extend(profile.seed_files)
         seeds.extend(scm.worktree_seed)
+        seeds.extend(self._ledger_seed(unit.path))
         # plugins (e.g. the Unity engine) may prime an isolated checkout with
         # gitignored paths they need — e.g. an MCP-generated skill tree + client
         # config so the worktree's Editor MCP is reachable. Aggregate every loaded
