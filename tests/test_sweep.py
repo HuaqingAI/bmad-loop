@@ -793,7 +793,7 @@ def test_bundle_close_carry_is_a_no_op_when_no_close_was_recorded(project):
     write_ledger(project, {"DW-1": "open"})
     before = project.deferred_work.read_text(encoding="utf-8")
     engine, _ = make_sweep(project, [], policy=isolated_seeded_policy(project))
-    task = StoryTask(story_key="dw-fix", epic="deferred-work")
+    task = StoryTask(story_key="dw-fix", epic=0)
     task.dw_ids = ["DW-1"]  # ids the bundle owns, but no close was ever recorded
 
     engine._carry_isolated_ledger_writes(task)
@@ -810,7 +810,7 @@ def test_deferred_bundle_replay_carries_the_harvest_without_closing_its_ids(proj
     from every later sweep."""
     write_ledger(project, {"DW-1": "open"})
     engine, _ = make_sweep(project, [], policy=isolated_seeded_policy(project))
-    task = StoryTask(story_key="dw-fix", epic="deferred-work")
+    task = StoryTask(story_key="dw-fix", epic=0)
     task.phase = Phase.DEFERRED
     task.worktree_path = str(project.project / ".bmad-loop" / "worktrees" / "dw-fix")
     task.dw_ids = ["DW-1"]
