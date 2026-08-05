@@ -108,11 +108,15 @@ seams of a full OS port are in
   answers on the drop — and record what the measure cannot see in your
   degradation ledger (psmux's `Residue:` note: a switch _within_ one session
   moves no client count, so it reads as no effect). Where no measure is
-  available, answer `False`. `tui.launch.return_attached_client` maps the two
-  answers to `ATTENDED` and `UNREACHABLE`; an attended sweep keeps prompting on
-  the first and goes unattended on the second. Failing to `False` is therefore
-  conformant — it costs a prompt — while a vacuous `True` strands a human at a
-  prompt in a window nobody is viewing, which is #227.
+  available, answer `False` and record that gap in the ledger too.
+  `tui.launch.return_attached_client` reads a failed `switch_client` as
+  `ATTENDED` — the client never left this window, so an attended sweep keeps
+  prompting — and a failed `detach_client` as `UNREACHABLE`, which is evidence of
+  nothing, so the sweep goes unattended and defers this cycle's decisions to
+  `bmad-loop decisions`. `False` is the safe answer either way; a vacuous `True`
+  is the one answer no backend may give — it announces a hand-back that never
+  happened and sends the sweep unattended with the human still sitting there
+  (#227).
 
 **Window targets.** The target-taking methods (`kill_window`, `select_window`,
 the window-option trio, `attach_target_argv`, `switch_client`) receive one of two

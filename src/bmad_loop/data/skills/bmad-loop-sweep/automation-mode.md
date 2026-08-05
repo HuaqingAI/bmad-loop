@@ -68,7 +68,8 @@ field-by-field, and will kill this session after your final turn.
 - Write `already_resolved[].evidence` and an option's `label` and `resolution`
   as a **single line** — each is copied onto one line of the line-oriented
   deferred-work ledger. This is guidance, not a validation rule: a break is
-  collapsed to a space rather than rejected. Both `intent` fields are exempt —
+  collapsed to a space rather than rejected, so it costs nothing but reads
+  worse. Both `intent` fields are exempt —
   keep them at the 2-6 sentences asked for above, newlines and all.
 
 - **Migration sessions** (`--migrate`, see `./migration-mode.md`) use this
