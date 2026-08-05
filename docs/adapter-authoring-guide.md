@@ -96,40 +96,27 @@ seams of a full OS port are in
   trailer; concrete default = the native pane id, so most backends inherit it —
   override only when your ids do not resolve from another session's context,
   as psmux does to emit `=session:%N`), `detach_client` / `switch_client` (with
-  an optional last-client fallback — both answer a bool the parked-window
-  return path trusts: report **effect**, not that the command was dispatched,
-  so a backend with no real detach returns `False`. If your CLI's exit code
-  already means "a client moved" you are done (tmux: `detach-client` fails with
-  _no current client_). If it does not, **measure** — psmux is the worked
-  example: every arm of its `detach-client` / `switch-client` exits 0 whether or
-  not a client moved, so the backend counts the session's attached clients
-  across the call and answers on the drop. Match the measure to what the verb is
-  meant to change, and record what it cannot see: that count reaches a detach,
-  and reaches the switch the return path normally performs — the recorded target
-  is a pane in the session the client came _from_, so a real switch leaves this
-  session — but a switch _within_ this session moves the client between windows
-  without moving the count, and so reads as no effect. Failing that way is
-  conformant: the caller keeps prompting, which is the safe direction. psmux
-  carries exactly that blind spot, in its `Residue:` note. Where even a measure
-  is unavailable, answer `False` and record the gap in your degradation ledger;
-  a vacuous `True` is the one answer that strands a human),
+  an optional last-client fallback — see the rule below),
   `available` (is this backend usable on the current host).
 
-  The caller's two failures are not symmetric, which is what makes the rule
-  worth the round-trip. A failed `switch_client` is positive evidence: the
-  client is still in the window it was already in, so someone may well be
-  watching. A failed `detach_client` is not evidence of anything — `False` there
-  means only "no verified hand-back", and covers all three of nothing was
-  attached (tmux says so outright), the effect could not be observed, and the
-  backend has no detach verb at all (herdr, whose client only a manual chord
-  releases). `tui.launch.return_attached_client` reports the two as `ATTENDED`
-  and `UNREACHABLE`, and an attended sweep keeps prompting on the first but goes
-  unattended on the second. `UNREACHABLE` is therefore the caller's _policy_ for
-  an unverified detach rather than a claim the window is empty: assuming a human
-  is still there costs a `--repeat` cycle blocked forever on `input()` in a
-  window nobody may be viewing, which is the worse way to be wrong. What no
-  backend may do is answer `True` when nothing happened — that collapses both
-  failures into "the human has their terminal back", which is #227.
+  **Both client verbs report effect, not dispatch.** They answer a bool the
+  parked-window return path trusts, so a backend with no real detach (herdr —
+  only a manual chord releases its client) answers `False`. If your CLI's exit
+  code already means "a client moved" you are done (tmux: `detach-client` fails
+  with _no current client_); if it does not, **measure** what the verb is meant
+  to change — psmux counts the session's attached clients across the call and
+  answers on the drop — and record what the measure cannot see in your
+  degradation ledger (psmux's `Residue:` note: a switch _within_ one session
+  moves no client count, so it reads as no effect). Where no measure is
+  available, answer `False` and record that gap in the ledger too.
+  `tui.launch.return_attached_client` reads a failed `switch_client` as
+  `ATTENDED` — the client never left this window, so an attended sweep keeps
+  prompting — and a failed `detach_client` as `UNREACHABLE`, which is evidence of
+  nothing, so the sweep goes unattended and defers this cycle's decisions to
+  `bmad-loop decisions`. `False` is the safe answer either way; a vacuous `True`
+  is the one answer no backend may give — it announces a hand-back that never
+  happened and sends the sweep unattended with the human still sitting there
+  (#227).
 
 **Window targets.** The target-taking methods (`kill_window`, `select_window`,
 the window-option trio, `attach_target_argv`, `switch_client`) receive one of two
