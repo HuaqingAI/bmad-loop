@@ -549,8 +549,8 @@ def test_worktree_squash_merge_linear_history(project):
 def _defer_script(project, key):
     """Dev succeeds, then review never converges → plateau defer. Consumers must
     pin ``limits=LimitsPolicy(max_followup_reviews=99)`` so the default damping cap
-    (1) doesn't force-converge round 2 — this script tests the exhaustion/defer
-    plateau, not damping."""
+    (1) doesn't force-converge the second review pass — this script tests the
+    exhaustion/defer plateau, not damping."""
     return [wt_dev_effect(project, key)] + [
         wt_review_effect(project, key, clean=False, patched=1) for _ in range(3)
     ]
@@ -1633,9 +1633,9 @@ def test_gitignored_damped_followup_reaches_the_main_ledger(project):
     under isolation is the unit worktree's ledger. `finalize_commit`'s `git add -A`
     skips a gitignored path in silence, the merge brings nothing over, and
     `close_unit_workspace(success=True)` then deletes the worktree — the DONE leg
-    takes no `capture_diff`, so not even a `changes.patch` survives. Measured
-    before the carry: the run journals `refiled: DW-1` and the main checkout has no
-    ledger at all.
+    takes no `capture_diff`, so not even a `changes.patch` survives. Without the
+    carry the run journals `refiled: DW-1` while the main checkout has no ledger at
+    all.
 
     `check-ignore` is the oracle, not the presence of the rule: a row that reads
     the tracked-ledger shape by accident is the vacuity this whole block exists to
@@ -2886,16 +2886,12 @@ def test_isolated_exclude_degrade_is_journaled_and_notified(project, monkeypatch
     (worktree_flow.py:35) — patching `install._worktree_local_exclude` would not be
     seen here.
 
-    BOTH CHANNELS, and round 5 added the second. This was journal-only, on the
-    reasoning that the run is unharmed and continues — so it matched
-    `worktree-teardown-degraded` rather than the notify-worthy
-    `worktree-open-failed`. What that missed is that the shield's entire degrade
-    policy is to SKIP rather than widen (activating over patterns it could not copy
-    would shadow the operator's own excludes), and a skip is only defensible if the
-    operator finds out. Round 5 also turned a swallowed `GitError` into a degrade,
-    so the path is now reachable from a transient git fault rather than only from a
-    write fault. A journal line nobody reads is how the provisioned tool files reach
-    a story's merge unnoticed.
+    BOTH CHANNELS are asserted. A journal line alone will not do: the shield's
+    degrade policy is to SKIP rather than widen (activating over patterns it could
+    not copy would shadow the operator's own excludes), and a skip is only
+    defensible if the operator finds out — a journal line nobody reads is how the
+    provisioned tool files reach a story's merge unnoticed. The path is reachable
+    from a transient `GitError` as well as from a write fault.
 
     Ablations, one per channel: delete the `on_degraded=` lambda at the
     `provision_worktree` call in `run_isolated` and both assertions fail; drop the
@@ -3125,34 +3121,13 @@ def test_gitignored_declared_closure_reaches_the_main_ledger(project):
     in `_carry_isolated_ledger_writes` carries it: that hook owns the harvest and
     the review-budget follow-up, both APPENDS, and a declared close is neither.
 
-    Measured on this commit (`628fe54`), verbatim.
-
-    The unit worktree's ledger at the moment of the close::
-
-        ### DW-1: item DW-1
-
-        origin: test, 2026-06-01
-        location: src.txt:1
-        reason: test entry.
-        status: done 2026-08-05
-        resolution: resolved by story 1-1-a
-
-    The main checkout's ledger after the run — unchanged::
-
-        ### DW-1: item DW-1
-
-        origin: test, 2026-06-01
-        location: src.txt:1
-        reason: test entry.
-        status: open
-
-    …and the journal carries `story-deferred-closed dw_ids=['DW-1']` with no
-    `deferred-close-unmatched`. That is the false success: `f798c1b` seeds the
-    ledger a worktree checkout cannot deliver, so the close now finds a file to
-    write and reports itself done. Ablating that seed (`_ledger_seed` -> `()`)
-    puts the pre-seed behavior back — the worktree ledger is ABSENT, `classify`
-    reports the id unmatched, and the run journals `deferred-close-unmatched
-    dw_ids=['DW-1']`. Louder, equally lost.
+    The fixture encodes that false success: the worktree ledger ends `status: done`
+    with the resolution annotation, the main checkout's ledger still reads
+    `status: open`, and the journal carries `story-deferred-closed dw_ids=['DW-1']`
+    with no `deferred-close-unmatched` — the run reports a close it never delivered.
+    Ablating the seed (`_ledger_seed` -> `()`) puts the pre-seed behavior back: the
+    worktree ledger is ABSENT, `classify` reports the id unmatched, and the run
+    journals `deferred-close-unmatched dw_ids=['DW-1']`. Louder, equally lost.
 
     Tracked is the contrast, not a second defect: the sibling above measures the
     same story against a TRACKED ledger and the close rides the unit commit into
