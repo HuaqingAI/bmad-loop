@@ -4319,16 +4319,38 @@ class Engine:
                 "reason": reason,
                 "severity": "low",
             }
-            refiled = deferredwork.append_entry(ledger, **entry)
-            if refiled:
-                # This wrote the ACTIVE workspace's ledger, so under isolation the
-                # row is inside a unit worktree that `close_unit_workspace` deletes,
-                # and a gitignored one is skipped by `finalize_commit`'s `git add -A`
-                # in silence — the run journals `refiled: DW-n` having filed nothing
-                # a later sweep can reach (#425). Record the intent for the DONE-leg
-                # carry; `append_entry`'s open-entry dedupe makes replaying it into a
-                # ledger that DID merge normally a no-op.
+            # Persist the intent BEFORE the write, never after it succeeds. This
+            # writes the ACTIVE workspace's ledger, so under isolation the row is
+            # inside a unit worktree that `close_unit_workspace` deletes, and a
+            # gitignored one is skipped by `finalize_commit`'s `git add -A` in
+            # silence — the run journals `refiled: DW-n` having filed nothing a
+            # later sweep can reach (#425). The DONE-leg carry is the delivery
+            # path, and it reads only PERSISTED records.
+            #
+            # Recording after the append instead loses the row outright on a hard
+            # host loss: nothing saves between here and `_commit`'s COMMITTING
+            # save, and that window spans every blocking `pre_commit_gate`
+            # workflow (the shipped TEA plugin binds three, each a live session).
+            # The resumed run replays this same review result in the same
+            # worktree, `append_entry` dedupes the already-open row to None, the
+            # record is never made, and the carry finds an empty payload.
+            #
+            # Keyed dedupe, not an `if refiled:` gate, for the same reason
+            # `_harvest_spec_deferrals` keeps a stable union: a replay must not
+            # append a second copy, but it must not need a NEW id to record
+            # authorship either. Safe to pre-latch — `refiled_followups` is a
+            # record, not a suppression bit: both consumers (replay eligibility,
+            # the carry) only ever make the engine do more, and `append_entry`
+            # dedupes an already-open row, so recording an append that then fails
+            # costs at most a carry that files the row the operator was owed.
+            known = {
+                (str(item.get("origin", "")), str(item.get("source_spec", "")))
+                for item in task.refiled_followups
+            }
+            if (entry["origin"], entry["source_spec"]) not in known:
                 task.refiled_followups.append(entry)
+                self._save()
+            refiled = deferredwork.append_entry(ledger, **entry)
         if damped:
             self.journal.append(
                 "review-followup-damped",
@@ -4610,6 +4632,13 @@ class Engine:
         arrived through the merge yields an empty ``carried`` and no commit. An
         already-CLOSED row with that provenance is deliberately not deduped against
         — a later recurrence earns a fresh entry, exactly as it does in place.
+
+        That idempotence is what lets the producer record its intent BEFORE its own
+        append, which durability requires (see ``_record_review_budget_followup``).
+        So a payload here does NOT imply a row was newly filed upstream: a producer
+        whose append deduped still records, and this then carries it to an empty
+        ``carried``. ``review-followup-carried`` with ``dw_ids == []`` is therefore
+        an ordinary outcome, not a sign the carry ran on nothing.
 
         The commit is best effort, like ``SweepEngine``'s close and unlike
         ``_carry_harvested_deferrals``: that method's re-raise is backed by

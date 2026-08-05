@@ -1685,11 +1685,13 @@ def test_tracked_damped_followup_is_not_refiled_twice_by_the_carry(project):
     assert len(carried) == 1 and carried[0]["dw_ids"] == []
 
 
-def test_a_deduped_followup_records_nothing_to_carry(project):
-    """The producer records only what it actually filed. A story whose follow-up
-    was already open in the ledger appends nothing, and recording it anyway would
-    journal a carry that carried nothing — indistinguishable from a real one that
-    deduped, which is the report this pair exists to keep honest."""
+def test_a_deduped_followup_is_still_recorded_for_the_carry(project):
+    """The record is the INTENT, not a receipt for a new id. A story whose
+    follow-up was already open appends nothing, and the producer still records it,
+    because the record has to be durable before the append that may dedupe it —
+    otherwise a replay after a host loss can never reconstruct authorship. The
+    carry then dedupes in turn and journals an empty `dw_ids`, which the tracked
+    path already produces routinely."""
     write_ledger(project, {})
     deferredwork.append_entry(
         project.deferred_work,
@@ -1709,8 +1711,108 @@ def test_a_deduped_followup_records_nothing_to_carry(project):
     assert summary.done == 1 and not summary.paused
     damped = [e for e in engine.journal.entries() if e["kind"] == "review-followup-damped"]
     assert len(damped) == 1 and damped[0]["refiled"] is None
-    assert not engine.state.tasks["1-1-a"].refiled_followups
-    assert "review-followup-carried" not in journal_kinds(engine)
+    assert len(engine.state.tasks["1-1-a"].refiled_followups) == 1
+    carried = [e for e in engine.journal.entries() if e["kind"] == "review-followup-carried"]
+    assert len(carried) == 1 and carried[0]["dw_ids"] == []
+    # no duplicate: the pre-existing open row is the only one
+    assert len(_refiled_followups(project)) == 1
+
+
+def _host_loss_before_the_commit_save(engine, snap):
+    """A host loss inside `_commit`, before its `advance(COMMITTING)` + `_save()`.
+
+    `snap` captures the bytes that were DURABLE at that instant. Restoring them
+    over whatever `run()`'s unwind-`finally` wrote is what makes this a SIGKILL
+    rather than a SIGINT: the engine's own teardown save would otherwise persist
+    the very record whose durability is under test, and the row would arrive for
+    a reason the fix has nothing to do with.
+    """
+
+    def commit_with_host_loss(_task):
+        snap["state"] = (engine.run_dir / "state.json").read_bytes()
+        raise RuntimeError("host died between the ledger write and the COMMITTING save")
+
+    engine._commit = commit_with_host_loss
+
+
+def test_host_loss_before_the_commit_save_still_carries_the_followup(project):
+    """The producer's record must be persisted BEFORE its ledger append.
+
+    Nothing saves between `_record_review_budget_followup` and `_commit`'s
+    COMMITTING save, and that window spans every blocking `pre_commit_gate`
+    workflow — the shipped TEA plugin binds three, each a live session. Recording
+    after a successful append loses the row for good: the resumed run replays the
+    same review result in the same worktree, `append_entry` dedupes the row it
+    already wrote there to None, so the record is never made, the carry finds an
+    empty payload, and `close_unit_workspace` deletes the worktree holding the
+    only copy.
+    """
+    ignore_before_commit(project, "deferred-work.md")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, _damping_script(project))
+    snap: dict = {}
+    _host_loss_before_the_commit_save(engine, snap)
+
+    assert engine.run().crashed
+
+    worktree = Path(engine.state.tasks["1-1-a"].worktree_path)
+    # the row exists, but only inside the unit worktree's gitignored ledger
+    assert [e.id for e in _refiled_followups(project.rebased(worktree))] == ["DW-1"]
+    assert not project.deferred_work.exists()
+
+    (engine.run_dir / "state.json").write_bytes(snap["state"])
+    durable = load_state(engine.run_dir).tasks["1-1-a"]
+    assert durable.phase == Phase.REVIEW_VERIFY
+    assert durable.refiled_followups
+
+    state = load_state(engine.run_dir)
+    state.clear_pause()
+    adapter = MockAdapter([])
+    resumed = Engine(
+        paths=project,
+        policy=engine.policy,
+        adapter=adapter,
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=state,
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.crashed and not summary.paused
+    assert not worktree.is_dir()
+    assert [e.title for e in _refiled_followups(project)] == [
+        "Follow-up review still recommended for 1-1-a after the damping cap was spent"
+    ]
+
+
+def test_a_replayed_review_result_records_the_followup_once(project):
+    """The record is keyed on `origin:` + `source_spec:`, so the replay that
+    re-enters the damped path with the record already persisted appends no second
+    copy — and files no second ledger row."""
+    ignore_before_commit(project, "deferred-work.md")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, _damping_script(project))
+    _host_loss_before_the_commit_save(engine, {})
+
+    assert engine.run().crashed
+    # the unwind-finally persisted the record, so the replay re-enters the damped
+    # path with it already in hand — the case the keyed dedupe exists for
+    assert len(load_state(engine.run_dir).tasks["1-1-a"].refiled_followups) == 1
+
+    state = load_state(engine.run_dir)
+    state.clear_pause()
+    resumed = Engine(
+        paths=project,
+        policy=engine.policy,
+        adapter=MockAdapter([]),
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=state,
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.crashed
+    assert len(resumed.state.tasks["1-1-a"].refiled_followups) == 1
     assert len(_refiled_followups(project)) == 1
 
 
