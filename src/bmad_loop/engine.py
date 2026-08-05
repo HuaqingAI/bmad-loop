@@ -4646,10 +4646,25 @@ class Engine:
         dedupe empties its list. This carry has no such latch, so a raise would buy
         a replay that can only find its row already filed — at the cost of the
         run's ``integrate_unit``. The row on disk is the value; the commit is
-        bookkeeping. Do NOT read that as "the commit cannot fail on a git-ownable
-        ledger": an untracked-but-not-ignored ledger reaches it and succeeds, and a
-        seeded one is shielded from the unit's ``git add -A`` regardless of what
-        the main checkout ignores.
+        bookkeeping.
+
+        It is best effort because it can only ever FAIL here, not because failure
+        is rare. Measured over all three shapes the main ledger can take:
+
+        * TRACKED -- an exclude never masks a tracked file's MODIFICATION, so the
+          unit's write always rides the merge and ``append_entry`` dedupes it
+          here. ``carried`` is empty and no commit is attempted.
+        * UNTRACKED, NOT IGNORED -- this frame is never reached at all.
+          ``_merge_local`` runs ``verify.clean_incoming_collisions`` before every
+          unit merge, and it refuses a target checkout dirtied outside the
+          branch's incoming set, so the unit escalates and the DONE leg with it.
+        * GITIGNORED -- the only shape that appends here, and ``git add`` refuses
+          an ignored path with rc 1 every time.
+
+        So a commit-pending latch would only retry a ``git add`` that refuses
+        identically, which is why this carry does not carry one (asked for in
+        #457's review). It also cannot leave the tree dirty for a later run to
+        trip on: the one shape it writes is the one git does not see.
         """
         if not task.refiled_followups:
             return
