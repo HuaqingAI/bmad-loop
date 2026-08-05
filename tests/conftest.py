@@ -770,6 +770,62 @@ def _spec_baseline(path: Path) -> str:
     return ""
 
 
+def ignore_before_commit(project: ProjectPaths, *patterns: str) -> None:
+    """Append gitignore patterns, leaving the file staged for a later commit.
+
+    Appends rather than rewrites: the sandbox template ships `.bmad-loop/runs/`,
+    and clobbering it leaves the run dir tracked, so `worktree_clean()` then fails
+    for a reason that has nothing to do with the test. Leaving the change
+    UNCOMMITTED is what lets a following `write_ledger(..., commit=True)` succeed —
+    once the rule is committed, `git add -A` stages nothing for the now-ignored
+    ledger and the commit fails on an empty index.
+    """
+    gitignore = project.project / ".gitignore"
+    existing = gitignore.read_text(encoding="utf-8")
+    prefix = existing if not existing or existing.endswith("\n") else existing + "\n"
+    gitignore.write_text(prefix + "".join(f"{pattern}\n" for pattern in patterns), encoding="utf-8")
+
+
+def crash_at_merge_back(engine, *, after: str = "merge") -> None:
+    """Kill the host inside the isolated DONE arm, in one of its two windows.
+
+    `WorktreeFlow.integrate_unit`'s DONE arm runs merge -> carry -> latch, and each
+    gap has its own recovery contract:
+
+    - ``"merge"``: after `merge_local`, before `_carry_isolated_ledger_writes`. The
+      branch landed and the worktree is gone; no ledger write happened.
+    - ``"carry"``: after the whole carry, before `isolated_ledger_carried` is set
+      and saved. This is the window that pins call-site latching — a latch moved
+      inside the base hook is already durable here, so the resume finds the task
+      latched and never replays.
+
+    `_emit("post_merge")` cannot stand in for either: it fires above the teardown,
+    so the crash would land outside the window under test.
+
+    Replaces a method on the engine INSTANCE rather than monkeypatching the class.
+    `WorktreeFlow` is handed `carry_isolated_ledger_writes=lambda task:
+    self._carry_isolated_ledger_writes(task)`, a late-binding lambda, so instance
+    assignment is what the callback sees.
+    """
+    if after not in ("merge", "carry"):
+        raise ValueError(f"unknown crash window: {after!r}")
+    if after == "merge":
+
+        def crash_before_carry(_task) -> None:
+            raise RuntimeError("host died after merge, before the ledger carry")
+
+        engine._carry_isolated_ledger_writes = crash_before_carry
+        return
+
+    original = engine._carry_isolated_ledger_writes
+
+    def crash_after_carry(task) -> None:
+        original(task)
+        raise RuntimeError("host died after the ledger carry, before its latch")
+
+    engine._carry_isolated_ledger_writes = crash_after_carry
+
+
 # ----------------------------------------------------------- sweep helpers
 
 

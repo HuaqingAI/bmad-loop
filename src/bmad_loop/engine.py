@@ -837,7 +837,14 @@ class Engine:
         )
 
     def _replay_unlatched_ledger_carries(self) -> None:
-        """Replay a successful isolated unit's carry after merge-time host loss."""
+        """Replay a successful isolated unit's carry after merge-time host loss.
+
+        Called from ``run()`` and required to PRECEDE ``_loop``. ``SweepEngine``
+        replaces ``_loop`` wholesale and does not override ``run()``, so this frame
+        is the only one both engines share — and a replayed bundle close has to
+        leave the open set before ``_loop`` reads ``deferredwork.open_ids``, or the
+        resumed sweep re-triages and re-drives work that already landed.
+        """
         entries = self.journal.entries()
         merged_units = {
             (
@@ -865,7 +872,13 @@ class Engine:
                 and task.harvest_carry_commit_pending
             ):
                 self.journal.append("resume-ledger-carry", story_key=task.story_key)
-                self._carry_isolated_ledger_writes(task)
+                # The HARVEST alone, exactly as `_defer`'s isolated arm calls it.
+                # Replaying a defer through the composite hook would let a mode
+                # override carry writes the defer deliberately withheld — a sweep
+                # bundle's close names work whose code this defer discarded, and
+                # `open_ids` re-bundles only `open` entries, so a wrong `done` is
+                # invisible to every later sweep.
+                self._carry_harvested_deferrals(task)
                 continue
             if task.isolated_ledger_carried or task.phase not in (
                 Phase.DONE,
@@ -873,7 +886,17 @@ class Engine:
             ):
                 continue
             merged_key = (task.story_key, task.branch, self.state.target_branch)
-            if not task.worktree_path or not task.harvested_deferrals:
+            # `not task.worktree_path` is the in-place guard, and a truthiness test
+            # is the whole of it: an in-place task carries "", and `Path("")` is
+            # `PosixPath(".")` whose `is_dir()` is True, so any probe placed ahead of
+            # this one absorbs the in-place case and leaves it unfalsifiable. Merge
+            # evidence comes from the journal below, never from a mounted worktree.
+            # A close-only payload replays too: a sweep bundle whose ledger writes
+            # are all closures has an empty `harvested_deferrals`, and skipping it
+            # here would strand the close and re-triage resolved work for ever.
+            if not task.worktree_path or not (
+                task.harvested_deferrals or task.bundle_closes_intended
+            ):
                 continue
             if merged_key not in merged_units:
                 source = task.commit_sha or ""
