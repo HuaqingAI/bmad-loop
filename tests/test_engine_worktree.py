@@ -20,15 +20,17 @@ from conftest import (
     _spec_baseline,
     _touch_run,
     attach_profile,
+    crash_at_merge_back,
     git,
     ignore_before_commit,
     install_build_auto_skill,
     set_sprint,
+    write_ledger,
     write_spec,
     write_sprint,
 )
 
-from bmad_loop import sprintstatus, verify, worktree_flow
+from bmad_loop import deferredwork, sprintstatus, verify, worktree_flow
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.bmadconfig import ProjectPaths
@@ -1598,6 +1600,155 @@ def test_worktree_followup_damped_commits_and_integrates(project):
         if e.open and "origin: review-budget-followup" in e.body
     ]
     assert len(open_refiled) == 1
+
+
+# --------------------------------------------- review-budget follow-up carry (#425)
+#
+# The third producer in the `git add -A` family. Every row here GITIGNORES the
+# ledger: with a tracked one the entry rides the unit commit and the merge
+# delivers it, which is why `test_worktree_followup_damped_commits_and_integrates`
+# passed all along while the reported defect was live.
+
+
+def _refiled_followups(project):
+    """Open `review-budget-followup` rows in the MAIN checkout's ledger."""
+    if not project.deferred_work.is_file():
+        return []
+    return [
+        entry
+        for entry in deferredwork.parse_ledger(project.deferred_work.read_text(encoding="utf-8"))
+        if entry.open and "origin: review-budget-followup" in entry.body
+    ]
+
+
+def _damping_script(project, story_key="1-1-a"):
+    """Dev, then three passes that keep recommending — the default cap 1 damps."""
+    return [wt_dev_effect(project, story_key)] + [
+        wt_review_effect(project, story_key, clean=False) for _ in range(3)
+    ]
+
+
+def test_gitignored_damped_followup_reaches_the_main_ledger(project):
+    """#425: `_record_review_budget_followup` writes `self.workspace.paths`, which
+    under isolation is the unit worktree's ledger. `finalize_commit`'s `git add -A`
+    skips a gitignored path in silence, the merge brings nothing over, and
+    `close_unit_workspace(success=True)` then deletes the worktree — the DONE leg
+    takes no `capture_diff`, so not even a `changes.patch` survives. Measured
+    before the carry: the run journals `refiled: DW-1` and the main checkout has no
+    ledger at all.
+
+    `check-ignore` is the oracle, not the presence of the rule: a row that reads
+    the tracked-ledger shape by accident is the vacuity this whole block exists to
+    avoid."""
+    ignore_before_commit(project, "deferred-work.md")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, _damping_script(project))
+
+    summary = engine.run()
+
+    assert summary.done == 1 and summary.deferred == 0 and not summary.paused
+    rel = project.deferred_work.relative_to(project.project).as_posix()
+    assert git(project.project, "check-ignore", rel).strip() == rel
+    assert not verify.path_tracked(project.project, rel)
+    damped = [e for e in engine.journal.entries() if e["kind"] == "review-followup-damped"]
+    assert len(damped) == 1 and damped[0]["refiled"]
+    assert [e.title for e in _refiled_followups(project)] == [
+        "Follow-up review still recommended for 1-1-a after the damping cap was spent"
+    ]
+    carried = [e for e in engine.journal.entries() if e["kind"] == "review-followup-carried"]
+    assert len(carried) == 1 and carried[0]["dw_ids"] == [_refiled_followups(project)[0].id]
+    # `git add -- <ignored path>` refuses with rc 1: the row lands, the commit
+    # cannot, and that is recorded rather than raised.
+    uncommitted = [
+        e for e in engine.journal.entries() if e["kind"] == "review-followup-carry-uncommitted"
+    ]
+    assert len(uncommitted) == 1
+
+
+def test_tracked_damped_followup_is_not_refiled_twice_by_the_carry(project):
+    """A tracked ledger delivers the row through the merge, so the carry re-reads
+    its own provenance and appends nothing. `append_entry` dedupes on `origin:` +
+    `source_spec:` against OPEN entries, which is what makes running the carry
+    unconditionally safe rather than needing a tracked/ignored predicate."""
+    write_ledger(project, {})
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, _damping_script(project))
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    assert verify.path_tracked(
+        project.project, project.deferred_work.relative_to(project.project).as_posix()
+    )
+    assert len(_refiled_followups(project)) == 1
+    carried = [e for e in engine.journal.entries() if e["kind"] == "review-followup-carried"]
+    assert len(carried) == 1 and carried[0]["dw_ids"] == []
+
+
+def test_a_deduped_followup_records_nothing_to_carry(project):
+    """The producer records only what it actually filed. A story whose follow-up
+    was already open in the ledger appends nothing, and recording it anyway would
+    journal a carry that carried nothing — indistinguishable from a real one that
+    deduped, which is the report this pair exists to keep honest."""
+    write_ledger(project, {})
+    deferredwork.append_entry(
+        project.deferred_work,
+        title="already recommended",
+        origin="review-budget-followup",
+        source_spec="spec-1-1-a.md",
+        reason="filed by an earlier run",
+        severity="low",
+    )
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "prior follow-up")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, _damping_script(project))
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    damped = [e for e in engine.journal.entries() if e["kind"] == "review-followup-damped"]
+    assert len(damped) == 1 and damped[0]["refiled"] is None
+    assert not engine.state.tasks["1-1-a"].refiled_followups
+    assert "review-followup-carried" not in journal_kinds(engine)
+    assert len(_refiled_followups(project)) == 1
+
+
+def test_crashed_post_merge_followup_carry_replays_from_its_record(project):
+    """A story whose ONLY ledger write is a damped follow-up has both other carry
+    payloads empty, so the resume pass has to name this one to reach it: crash in
+    the merge-to-latch window and the row is otherwise stranded in a worktree that
+    is already gone."""
+    ignore_before_commit(project, "deferred-work.md")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, _damping_script(project))
+    crash_at_merge_back(engine, after="merge")
+
+    assert engine.run().crashed
+
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed.phase == Phase.DONE and not crashed.isolated_ledger_carried
+    assert crashed.refiled_followups and not crashed.harvested_deferrals
+    assert not project.deferred_work.exists()
+
+    state = load_state(engine.run_dir)
+    state.clear_pause()
+    adapter = MockAdapter([])
+    resumed = Engine(
+        paths=project,
+        policy=engine.policy,
+        adapter=adapter,
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=state,
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.crashed and not summary.paused
+    assert adapter.sessions == []
+    assert "resume-ledger-carry" in journal_kinds(resumed)
+    assert len(_refiled_followups(project)) == 1
+    assert load_state(resumed.run_dir).tasks["1-1-a"].isolated_ledger_carried
 
 
 # ----------------------------------------------------------------- configured target
