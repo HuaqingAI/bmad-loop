@@ -195,9 +195,10 @@ class StoryTask:
     # JSON-native containers only; callers persist these through state.json.
     harvested_deferrals: list[dict[str, Any]] = field(default_factory=list)
     bundle_closes_intended: list[str] = field(default_factory=list)
-    # Index of the append-only primary dev SessionRecord whose decision durably
-    # returned PROCEED. Attempt numbers can be reused after a human re-arm, so the
-    # exact record occurrence is the acceptance identity; None is legacy/unarmed.
+    # Index of the append-only primary dev SessionRecord whose initial decision or
+    # later verify-repair result durably returned PROCEED. Attempt numbers can be
+    # reused after a human re-arm, so the exact record occurrence is the acceptance
+    # identity; None is legacy/unarmed.
     accepted_dev_session_index: int | None = None
     harvest_carry_commit_pending: bool = False
     isolated_ledger_carried: bool = False

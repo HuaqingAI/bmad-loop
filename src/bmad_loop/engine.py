@@ -1066,6 +1066,13 @@ class Engine:
                 return index
         return None
 
+    def _accept_current_dev_session(self, task: StoryTask) -> None:
+        """Latch the current dev or repair record as the accepted tree owner."""
+        accepted_index = self._current_dev_session_index(task)
+        if accepted_index is None:
+            raise RuntimeError(f"accepted dev decision for {task.story_key} has no session record")
+        task.accepted_dev_session_index = accepted_index
+
     def _accepted_dev_session_matches(self, task: StoryTask) -> bool:
         """Whether the current primary dev record owns the PROCEED receipt."""
         accepted = task.accepted_dev_session_index
@@ -1480,12 +1487,7 @@ class Engine:
                 # save also precedes every rejecting decision branch. Persist an
                 # explicit transaction latch so recovery may replay accepted-only
                 # bookkeeping without closing work from a PAUSE/RETRY/DEFER.
-                accepted_index = self._current_dev_session_index(task)
-                if accepted_index is None:
-                    raise RuntimeError(
-                        f"accepted dev decision for {task.story_key} has no session record"
-                    )
-                task.accepted_dev_session_index = accepted_index
+                self._accept_current_dev_session(task)
             self._save()
             if decision.action == Action.PROCEED:
                 self._finish_post_dev_accepted_sync(task, result.result_json)
@@ -4212,6 +4214,12 @@ class Engine:
                 # session cannot fix the run environment — stop spending the
                 # dev budget and pause for a human instead
                 self._escalate(task, outcome.reason)
+            if ok:
+                # A verify-green repair supersedes the original accepted dev
+                # record as the owner of the tree now parked at DEV_VERIFY. Make
+                # that receipt durable in the same save as the fix decision so a
+                # sweep crash resumes the repaired tree instead of restarting it.
+                self._accept_current_dev_session(task)
             self._save()
             if terminal is not None:
                 return terminal

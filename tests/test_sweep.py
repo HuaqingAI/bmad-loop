@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from conftest import (
+    _file_exists_cmd,
     attach_profile,
     bundle_dev_effect,
     bundle_dev_escalates,
@@ -666,6 +667,92 @@ def test_resume_dev_verify_bundle_replays_accepted_sync_before_review(project, m
     accepted = saved.accepted_dev_session_index
     assert accepted is not None and saved.sessions[accepted].role == "dev"
     assert saved.pre_harvest_ledger_captured is False
+
+
+def test_resume_dev_verify_bundle_after_repair_preserves_acceptance(project, monkeypatch):
+    """A verify-green repair remains accepted across a DEV_VERIFY crash."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
+    )
+    marker = project.project / "verify-green"
+    dev = bundle_dev_effect(project, "fix", ["DW-1"], mark_ledger=False)
+    review = bundle_review_effect(project, "fix")
+
+    def dev_with_marker(spec):
+        result = dev(spec)
+        marker.write_text("ok\n", encoding="utf-8")
+        return result
+
+    def breaking_review(spec):
+        marker.unlink()
+        return review(spec)
+
+    def repair(spec):
+        marker.write_text("repaired\n", encoding="utf-8")
+        return SessionResult(
+            status="completed", result_json={"workflow": "auto-dev", "escalations": []}
+        )
+
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=True, trigger="always"),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker),)),
+    )
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(plan), dev_with_marker, breaking_review, repair],
+        policy=pol,
+    )
+    original_save = engine._save
+    crashed = False
+
+    def crash_after_repair_dev_verify_save():
+        nonlocal crashed
+        original_save()
+        task = engine.state.tasks.get("dw-fix")
+        if (
+            not crashed
+            and task is not None
+            and task.phase == Phase.DEV_VERIFY
+            and task.attempt == 2
+            and task.sessions[-1].role == "dev"
+        ):
+            crashed = True
+            raise RuntimeError("host died after repair DEV_VERIFY save")
+
+    monkeypatch.setattr(engine, "_save", crash_after_repair_dev_verify_save)
+    assert engine.run().crashed
+
+    persisted = load_state(engine.run_dir).tasks["dw-fix"]
+    assert persisted.phase == Phase.DEV_VERIFY
+    assert persisted.attempt == 2 and persisted.review_cycle == 1
+    assert [session.role for session in persisted.sessions] == ["dev", "review", "dev"]
+    assert persisted.accepted_dev_session_index == len(persisted.sessions) - 1
+    assert persisted.sessions[-1].task_id.endswith("-dev-2")
+    assert ledger_entries(project)["DW-1"].status.startswith("done")
+    fix_decisions = [e for e in engine.journal.entries() if e["kind"] == "fix-decision"]
+    assert fix_decisions[-1]["ok"] is True
+
+    seen_at_review = []
+    final_review = bundle_review_effect(project, "fix")
+
+    def review_repaired_tree(spec):
+        seen_at_review.append(marker.read_text(encoding="utf-8"))
+        return final_review(spec)
+
+    resumed, adapter = resume_sweep(project, engine, [review_repaired_tree])
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert [session.role for session in adapter.sessions] == ["review"]
+    assert seen_at_review == ["repaired\n"]
+    saved = load_state(engine.run_dir).tasks["dw-fix"]
+    assert saved.phase == Phase.DONE
+    assert saved.accepted_dev_session_index == len(persisted.sessions) - 1
 
 
 def test_bundle_ledger_close_withheld_on_a_non_fixable_retry(project):
