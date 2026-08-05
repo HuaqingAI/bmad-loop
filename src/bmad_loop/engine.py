@@ -894,8 +894,15 @@ class Engine:
             # A close-only payload replays too: a sweep bundle whose ledger writes
             # are all closures has an empty `harvested_deferrals`, and skipping it
             # here would strand the close and re-triage resolved work for ever.
+            # Every payload the hook carries has to be named here — a story whose
+            # only ledger write was a damped review-budget follow-up, or a declared
+            # `closes_deferred:` flip, has every other list empty, and omitting it
+            # strands that write in a deleted worktree.
             if not task.worktree_path or not (
-                task.harvested_deferrals or task.bundle_closes_intended
+                task.harvested_deferrals
+                or task.bundle_closes_intended
+                or task.refiled_followups
+                or task.story_closes_intended
             ):
                 continue
             if merged_key not in merged_units:
@@ -1377,6 +1384,24 @@ class Engine:
                 # later isolated carry. Crash replay never enters this branch.
                 if feedback is None:
                     task.harvested_deferrals = []
+                    # Same rule, and the abandoned attempt's ledger row is already
+                    # gone: an escalation leaves the unit worktree mounted and
+                    # unmerged, and the re-drive that reaches here discarded it
+                    # (`_finish_inflight`'s resume-restart arm), taking the only
+                    # copy of that row. Carrying the record anyway files a
+                    # follow-up against the attempt that COMMITTED, whose review
+                    # recommended none — and `append_entry` has nothing to dedupe
+                    # it against, so a tracked ledger commits the wrong row rather
+                    # than absorbing it (#457's review). `rearm_escalation` already
+                    # voids the history behind the record by resetting
+                    # `followup_reviews_spent` for a fresh damping budget.
+                    #
+                    # The fixable-retry exemption above is inherited, not reasoned:
+                    # this field's one producer fires on a finalized, verify-green
+                    # story immediately before `_commit`, and no path leads from
+                    # there back into a `feedback is not None` iteration, so such an
+                    # iteration can never hold a record to preserve.
+                    task.refiled_followups = []
             advance(task, Phase.DEV_RUNNING)
             self._save()
             if resume_result is not None:
@@ -3141,11 +3166,21 @@ class Engine:
         verification, the verify commands, every checkpoint, the review loop,
         the ``pre_commit_gate`` workflows and the ``pre_commit`` veto — and
         still before ``finalize_commit``, whose ``git add -A`` stages an
-        in-repo annotation into the story's own commit (worktree isolation
-        included: the unit's ledger rides the unit commit and reaches the
-        target branch with the ordinary merge). Marking at dev-sync time
-        instead let a story that later failed verification or review leave the
-        ledger permanently claiming its work resolved.
+        in-repo annotation into the story's own commit. Marking at dev-sync
+        time instead let a story that later failed verification or review leave
+        the ledger permanently claiming its work resolved.
+
+        **In-repo is not stageable, and under isolation that is the difference
+        between a delivered close and a lost one (#458).** This paragraph used
+        to promise the opposite — "worktree isolation included: the unit's
+        ledger rides the unit commit and reaches the target branch with the
+        ordinary merge" — which holds only for a TRACKED ledger. A gitignored
+        one (the default shape, since the ledger lives under the BMAD artifacts
+        dir) is skipped by that ``git add -A`` in silence, brings nothing over
+        with the merge, and dies with the worktree, while this method has
+        already journaled ``story-deferred-closed``. ``story_closes_intended``
+        + ``_carry_story_deferred_closes`` is the delivery path; ``_ledger_in_repo``
+        below is a containment test and answers a different question.
 
         A ledger outside the repo (``ProjectPaths.rebased`` deliberately
         shares an external artifact dir between worktrees) is written at the
@@ -3164,6 +3199,16 @@ class Engine:
         freely — ids are classified against the ledger text, and an entry
         already ``done`` is a satisfied declaration, not an unmatched one."""
         ids = self._declared_deferred_ids(task)
+        # Reset before the early return, never after it. This method is the sole
+        # producer of the record and runs unconditionally at every commit boundary,
+        # and DONE/AWAITING_OPERATOR are reachable only through the caller — so a
+        # re-drive that reaches the carry has always re-entered here first, and this
+        # assignment IS the staleness guard (a `_dev_phase` clear like
+        # `refiled_followups`' would be a second branch saying the same thing, which
+        # no test could redden). The live read is authoritative: a resolve session
+        # that WITHDREW `closes_deferred:` must not have the abandoned attempt's
+        # declaration carried on its behalf.
+        task.story_closes_intended = []
         if not ids:
             return
         ledger = self.workspace.paths.deferred_work
@@ -3189,6 +3234,20 @@ class Engine:
             return
         if snapshot is not None:
             snapshot.append((ledger, text))
+        # The DECLARED set, never `marked` — the transposed lesson of `e88776a`. A
+        # host loss in this window resumes into `_finalize_commit_phase` again, and
+        # by then the worktree ledger already reads `done`, so `classify` returns
+        # every id as `already_done` and `marked` is EMPTY. A record derived from it
+        # would never be made on that replay, and the carry would find nothing while
+        # `close_unit_workspace` deletes the only copy. Recorded after the snapshot
+        # arm so the degraded read paths above, which write nothing, record nothing.
+        #
+        # No `_save()` here, unlike the follow-up producer: every crash path re-enters
+        # this method, which re-derives the ids from the spec and the manifest. A
+        # persisted record would instead SURVIVE a declaration edited across the
+        # crash, which is the stale snapshot `_declared_deferred_ids` reads live to
+        # avoid.
+        task.story_closes_intended = list(ids)
         marked = self._apply_deferred_closes(task, ids, ledger, text)
         if snapshot is not None and not marked:
             # `mark_done_many` writes only when it marks: the ledger is
@@ -3276,6 +3335,11 @@ class Engine:
                 "deferred-close-rolled-back", story_key=task.story_key, ledger=str(ledger)
             )
 
+    def _story_close_note(self, task: StoryTask) -> str:
+        """Resolution note shared by the commit-boundary close and its isolation
+        carry, so a carried row cannot drift from one the merge delivered."""
+        return f"resolved by story {task.story_key}"
+
     def _apply_deferred_closes(
         self, task: StoryTask, ids: Sequence[str], ledger: Path, text: str
     ) -> list[str]:
@@ -3288,7 +3352,7 @@ class Engine:
         underneath them."""
         declared = deferredwork.classify(text, ids)
         marked = deferredwork.mark_done_many(
-            ledger, declared.open_ids, self._today(), f"resolved by story {task.story_key}"
+            ledger, declared.open_ids, self._today(), self._story_close_note(task)
         )
         if marked:
             self.journal.append("story-deferred-closed", story_key=task.story_key, dw_ids=marked)
@@ -4309,14 +4373,45 @@ class Engine:
         if not re_review:
             tail = "the damping cap was spent" if damped else "the review budget was exhausted"
             title = f"Follow-up review still recommended for {task.story_key} after {tail}"
-            refiled = deferredwork.append_entry(
-                ledger,
-                title=title,
-                origin="review-budget-followup",  # verbatim: re-review cap + replay dedupe key on it
-                source_spec=spec,
-                reason=reason,
-                severity="low",
-            )
+            entry = {
+                "title": title,
+                "origin": "review-budget-followup",  # verbatim: re-review cap + replay dedupe key
+                "source_spec": spec,
+                "reason": reason,
+                "severity": "low",
+            }
+            # Persist the intent BEFORE the write, never after it succeeds. This
+            # writes the ACTIVE workspace's ledger, so under isolation the row is
+            # inside a unit worktree that `close_unit_workspace` deletes, and a
+            # gitignored one is skipped by `finalize_commit`'s `git add -A` in
+            # silence — the run journals `refiled: DW-n` having filed nothing a
+            # later sweep can reach (#425). The DONE-leg carry is the delivery
+            # path, and it reads only PERSISTED records.
+            #
+            # Recording after the append instead loses the row outright on a hard
+            # host loss: nothing saves between here and `_commit`'s COMMITTING
+            # save, and that window spans every blocking `pre_commit_gate`
+            # workflow (the shipped TEA plugin binds three, each a live session).
+            # The resumed run replays this same review result in the same
+            # worktree, `append_entry` dedupes the already-open row to None, the
+            # record is never made, and the carry finds an empty payload.
+            #
+            # Keyed dedupe, not an `if refiled:` gate, for the same reason
+            # `_harvest_spec_deferrals` keeps a stable union: a replay must not
+            # append a second copy, but it must not need a NEW id to record
+            # authorship either. Safe to pre-latch — `refiled_followups` is a
+            # record, not a suppression bit: both consumers (replay eligibility,
+            # the carry) only ever make the engine do more, and `append_entry`
+            # dedupes an already-open row, so recording an append that then fails
+            # costs at most a carry that files the row the operator was owed.
+            known = {
+                (str(item.get("origin", "")), str(item.get("source_spec", "")))
+                for item in task.refiled_followups
+            }
+            if (entry["origin"], entry["source_spec"]) not in known:
+                task.refiled_followups.append(entry)
+                self._save()
+            refiled = deferredwork.append_entry(ledger, **entry)
         if damped:
             self.journal.append(
                 "review-followup-damped",
@@ -4487,8 +4582,27 @@ class Engine:
         return
 
     def _carry_isolated_ledger_writes(self, task: StoryTask) -> None:
-        """Apply Engine-owned ledger writes that an isolated merge may omit."""
+        """Apply Engine-owned ledger writes that an isolated merge may omit.
+
+        APPENDS FIRST, THEN CLOSES — the ordering is a correctness contract, not a
+        style. ``append_entry``'s idempotence scan is open-only, so a close that
+        ran first would hide an already-filed row from it and mint a duplicate
+        under a fresh id. That is why the two appends lead, why the story close
+        below trails them, and why ``SweepEngine``'s override runs its bundle
+        close strictly after ``super()``.
+
+        The collision is reachable, not theoretical: a story may declare
+        ``closes_deferred:`` on the very ``review-budget-followup`` row that
+        ``_carry_review_budget_followups`` is about to dedupe against. Close it
+        first and the follow-up is re-filed as a second entry.
+
+        The two closes never coexist on one task — ``SweepEngine`` overrides the
+        story producer to a no-op, and a story run has no bundle — so their
+        relative order is unobservable.
+        """
         self._carry_harvested_deferrals(task)
+        self._carry_review_budget_followups(task)
+        self._carry_story_deferred_closes(task)
 
     def _harvest_carry_commit_may_degrade(self, ledger: Path) -> bool:
         """Whether a carry may remain uncommitted because git cannot own its path."""
@@ -4566,6 +4680,175 @@ class Engine:
             task.harvest_carry_commit_pending = False
             self._save()
         self.journal.append("harvest-carried", story_key=task.story_key, dw_ids=carried)
+
+    def _carry_review_budget_followups(self, task: StoryTask) -> None:
+        """Re-file an isolated unit's review-budget follow-ups into the main ledger.
+
+        The third producer in the ``git add -A`` family, and the last one left
+        uncovered (#425). ``_record_review_budget_followup`` runs on a finalized,
+        verify-green story that the review pass would not stop recommending a
+        follow-up for, and it is CORRECT for it to run under isolation — the
+        damped caller force-converges work that is being committed, not rescued,
+        so the ``not self._isolated`` its exhaustion counterpart carries guards
+        that rescue and not this write. The defect is only that the write can be
+        silently dropped, which is why this extends the carry rather than adding a
+        guard: a guard would suppress a legitimate entry on every isolated run,
+        including the tracked-ledger runs where it works today.
+
+        No ``_isolated`` predicate here either: ``refiled_followups`` is populated
+        by that one producer and this hook is reached only from the isolated DONE
+        leg and its replay, so the record IS the guard — the same reasoning as
+        ``SweepEngine._carry_isolated_ledger_writes``'s missing ``_generic_dev()``.
+
+        Unconditional and idempotent: ``append_entry`` dedupes an OPEN row with the
+        same ``origin:`` + ``source_spec:``, so a tracked ledger whose row already
+        arrived through the merge yields an empty ``carried`` and no commit. An
+        already-CLOSED row with that provenance is deliberately not deduped against
+        — a later recurrence earns a fresh entry, exactly as it does in place.
+
+        That idempotence is what lets the producer record its intent BEFORE its own
+        append, which durability requires (see ``_record_review_budget_followup``).
+        So a payload here does NOT imply a row was newly filed upstream: a producer
+        whose append deduped still records, and this then carries it to an empty
+        ``carried``. ``review-followup-carried`` with ``dw_ids == []`` is therefore
+        an ordinary outcome, not a sign the carry ran on nothing.
+
+        The commit is best effort, like ``SweepEngine``'s close and unlike
+        ``_carry_harvested_deferrals``: that method's re-raise is backed by
+        ``harvest_carry_commit_pending``, so a replay still owes the commit after
+        dedupe empties its list. This carry has no such latch, so a raise would buy
+        a replay that can only find its row already filed — at the cost of the
+        run's ``integrate_unit``. The row on disk is the value; the commit is
+        bookkeeping.
+
+        It is best effort because it can only ever FAIL here, not because failure
+        is rare. Measured over all three shapes the main ledger can take, and all
+        three rest on a premise ``_dev_phase`` enforces rather than one this frame
+        can check: every record belongs to the attempt now being committed. A
+        record left over from an ABANDONED attempt breaks the tracked row below --
+        that attempt's own write died with its discarded worktree, so nothing is
+        upstream to dedupe against and the carry appends AND commits a row about
+        work that never landed. That is why the fresh-attempt clear beside
+        ``harvested_deferrals`` is load-bearing for this docstring, not only for
+        the ledger (#457's review).
+
+        * TRACKED -- an exclude never masks a tracked file's MODIFICATION, so the
+          unit's write always rides the merge and ``append_entry`` dedupes it
+          here. ``carried`` is empty and no commit is attempted.
+        * UNTRACKED, NOT IGNORED -- this frame is never reached at all.
+          ``_merge_local`` runs ``verify.clean_incoming_collisions`` before every
+          unit merge, and it refuses a target checkout dirtied outside the
+          branch's incoming set, so the unit escalates and the DONE leg with it.
+        * GITIGNORED -- the only shape that appends here, and ``git add`` refuses
+          an ignored path with rc 1 every time.
+
+        So a commit-pending latch would only retry a ``git add`` that refuses
+        identically, which is why this carry does not carry one (asked for in
+        #457's review). It also cannot leave the tree dirty for a later run to
+        trip on: the one shape it writes is the one git does not see.
+        """
+        if not task.refiled_followups:
+            return
+        ledger = self.paths.deferred_work
+        carried: list[str] = []
+        for item in task.refiled_followups:
+            severity = item.get("severity")
+            dw_id = deferredwork.append_entry(
+                ledger,
+                title=str(item["title"]),
+                origin=str(item["origin"]),
+                source_spec=str(item["source_spec"]),
+                reason=str(item["reason"]),
+                severity=str(severity) if severity else None,
+            )
+            if dw_id:
+                carried.append(dw_id)
+        if carried:
+            try:
+                verify.commit_paths(
+                    self.paths.repo_root,
+                    f"chore(deferred-work): carry {task.story_key}'s review follow-up",
+                    [ledger],
+                )
+            except verify.GitError as e:
+                self.journal.append(
+                    "review-followup-carry-uncommitted",
+                    story_key=task.story_key,
+                    dw_ids=carried,
+                    error=str(e),
+                )
+        self.journal.append("review-followup-carried", story_key=task.story_key, dw_ids=carried)
+
+    def _carry_story_deferred_closes(self, task: StoryTask) -> None:
+        """Re-apply a story's declared ledger CLOSES to the main checkout (#458).
+
+        The fourth and last producer in the ``git add -A`` family.
+        ``_close_declared_deferred`` writes the ACTIVE workspace's ledger, so under
+        isolation a gitignored one is flipped inside a unit worktree, skipped by
+        ``finalize_commit``'s ``git add -A`` in silence, and deleted with the
+        worktree — while the run has already journaled ``story-deferred-closed``.
+        Left uncarried the entry stays ``open``, so ``deferredwork.open_ids``
+        re-bundles resolved work on every later sweep: unbounded re-triage, not a
+        one-time drop.
+
+        ``mark_done_many``, NOT the reopenable variant ``SweepEngine`` uses: a story
+        close carries no operation id and no ``resolution-undo:`` line, so this is
+        what keeps a carried row byte-identical to one the merge delivered. The note
+        goes through ``_story_close_note`` for the same reason. Only the date can
+        differ, and only across a midnight boundary — the same accepted drift the
+        park record carries.
+
+        Unconditional and idempotent, with no tracked/ignored predicate. Idempotence
+        here is stronger than the appends': ``_apply_done`` returns None for a row
+        that is absent OR already ``done``, and ``_mark_done_many`` then writes
+        nothing at all — not even a byte-identical rewrite. So a tracked ledger,
+        whose close rode the merge, yields an empty ``carried`` and no commit, and a
+        replay re-applying a landed carry is a no-op. ``story-deferred-close-carried``
+        with ``dw_ids == []`` is an ordinary outcome.
+
+        Best effort, like ``SweepEngine``'s close and unlike
+        ``_carry_harvested_deferrals`` — and, as with
+        ``_carry_review_budget_followups``, because the commit can only ever FAIL
+        here rather than because failure is rare. Of the three shapes the main
+        ledger can take, only a gitignored one reaches ``commit_paths`` at all: a
+        tracked one is already closed by the merge, and an untracked-but-not-ignored
+        one never reaches this frame because ``clean_incoming_collisions`` refuses
+        the merge first. ``git add`` then refuses that ignored path with rc 1 every
+        time, so a commit-pending latch would only retry a refusal.
+
+        ``self.paths``, not ``self.workspace.paths``, states the intent — the MAIN
+        checkout's ledger. Measured, the two are the same path at every call site
+        that reaches here: the workspace is swapped back before
+        ``integrate_unit`` runs the hook, and before the resume replay does. So no
+        test can tell the two apart, and none pretends to; the explicit form is
+        kept because the intent stops being obvious the moment that stops holding.
+        """
+        if not task.story_closes_intended:
+            return
+        ledger = self.paths.deferred_work
+        carried = deferredwork.mark_done_many(
+            ledger,
+            task.story_closes_intended,
+            self._today(),
+            self._story_close_note(task),
+        )
+        if carried:
+            try:
+                verify.commit_paths(
+                    self.paths.repo_root,
+                    f"chore(deferred-work): close {task.story_key}'s declared ids",
+                    [ledger],
+                )
+            except verify.GitError as e:
+                self.journal.append(
+                    "story-deferred-close-carry-uncommitted",
+                    story_key=task.story_key,
+                    dw_ids=carried,
+                    error=str(e),
+                )
+        self.journal.append(
+            "story-deferred-close-carried", story_key=task.story_key, dw_ids=carried
+        )
 
     def _stash_deferred_artifacts(self, task: StoryTask) -> None:
         """Move the deferred story's spec out of the artifacts dir into the run

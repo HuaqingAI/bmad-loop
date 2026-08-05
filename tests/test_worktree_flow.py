@@ -15,6 +15,7 @@ import pytest
 from conftest import git
 
 from bmad_loop import verify
+from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.gates import ATTENTION_FILE
 from bmad_loop.install import provision_worktree as install_provision_worktree
 from bmad_loop.model import Phase, StoryTask
@@ -169,6 +170,85 @@ def test_merge_message_format(tmp_path):
     task = StoryTask(story_key="1-1", epic=1)
     task.branch = "bmad-loop/1-1"
     assert flow.merge_message(task) == "Merge bmad-loop/1-1 into main (bmad-loop)"
+
+
+# ------------------------------------------------------------------- ledger seed
+#
+# `_ledger_seed` decides, per unit, whether the deferred-work ledger has to be
+# copied into the checkout because git will not carry it there (#426). Unit-level
+# because each exclusion has a distinct reason a run-level assertion blurs: two of
+# them are silent in the journal by design.
+
+
+def _ledger_flow(tmp_path, *, artifacts: Path | None = None) -> WorktreeFlow:
+    repo = tmp_path / "repo"
+    (repo / "_bmad-output" / "implementation-artifacts").mkdir(parents=True)
+    paths = ProjectPaths(
+        project=repo,
+        implementation_artifacts=(
+            artifacts
+            if artifacts is not None
+            else repo / "_bmad-output" / "implementation-artifacts"
+        ),
+        planning_artifacts=repo / "_bmad-output" / "planning-artifacts",
+    )
+    return _make_flow(tmp_path, paths=paths, policy=_policy(isolation="worktree"))
+
+
+def test_ledger_seed_names_a_ledger_the_checkout_cannot_deliver(tmp_path):
+    """The default shape: a gitignored ledger is absent from a tracked-only
+    checkout, so the orchestrator's own close would be written to — and read back
+    from — a file that does not exist."""
+    flow = _ledger_flow(tmp_path)
+    flow.paths.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    assert flow._ledger_seed(worktree) == (
+        "_bmad-output/implementation-artifacts/deferred-work.md",
+    )
+
+
+def test_ledger_seed_skips_a_ledger_the_checkout_already_has(tmp_path):
+    """A tracked ledger is delivered by `git worktree add`. Seeding it anyway
+    copies nothing and journals `worktree-seed-skipped` — a diagnostic meaning "a
+    seed you asked for did nothing" — on every isolated unit of every ordinary
+    project."""
+    flow = _ledger_flow(tmp_path)
+    flow.paths.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    worktree = tmp_path / "wt"
+    delivered = worktree / "_bmad-output" / "implementation-artifacts" / "deferred-work.md"
+    delivered.parent.mkdir(parents=True)
+    delivered.write_text("# Deferred Work\n", encoding="utf-8")
+
+    assert flow._ledger_seed(worktree) == ()
+
+
+def test_ledger_seed_skips_an_absent_ledger(tmp_path):
+    """No ledger yet is the commonest state — the first harvest is what creates
+    it. A seed entry naming a non-existent source is dropped by the seed loop
+    without `worktree-seed-skipped` OR `worktree-seed-dropped`, so it would be
+    invisible rather than merely inert."""
+    flow = _ledger_flow(tmp_path)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    assert not flow.paths.deferred_work.exists()
+    assert flow._ledger_seed(worktree) == ()
+
+
+def test_ledger_seed_skips_a_ledger_outside_the_project_tree(tmp_path):
+    """`ProjectPaths.rebased` leaves an out-of-tree artifacts dir unmoved, so the
+    worktree already reads this very file and there is nothing to deliver."""
+    shared = tmp_path / "shared-artifacts"
+    shared.mkdir()
+    flow = _ledger_flow(tmp_path, artifacts=shared)
+    flow.paths.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    assert flow.paths.rebased(worktree).deferred_work == flow.paths.deferred_work
+    assert flow._ledger_seed(worktree) == ()
 
 
 # --------------------------------------------------------------- profiles / agents

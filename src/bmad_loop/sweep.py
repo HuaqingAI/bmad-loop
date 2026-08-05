@@ -1340,7 +1340,11 @@ class SweepEngine(Engine):
         ``super()`` runs FIRST, and that is a contract rather than a style choice.
         ``deferredwork.append_entry``'s idempotence scan is OPEN-ONLY, so a close
         applied ahead of the harvest hides an already-filed row from it and mints a
-        duplicate under a fresh id. ``_carry_harvested_deferrals`` defends the same
+        duplicate under a fresh id. The base hook now ends with a CLOSE of its own
+        (``_carry_story_deferred_closes``, #458) and still satisfies the rule, since
+        both of its appends precede it; the two closes never coexist on one task,
+        because ``_close_declared_deferred`` is a no-op here and a story run has no
+        bundle. ``_carry_harvested_deferrals`` defends the same
         hazard a second time with its own status-agnostic pre-scan, which is exactly
         why the order is pinned by a test: with that second line of defence in place
         a reversal is silent today and would only surface if the pre-scan were ever

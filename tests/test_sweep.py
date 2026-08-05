@@ -579,6 +579,11 @@ def wt_bundle_dev(project, name="fix", dw_ids=("DW-1",), deferred=None):
         src = cwd / "src.txt"
         src.write_text(src.read_text() + f"change for dw-{name}\n")
         sp = wt.implementation_artifacts / f"spec-dw-{name}.md"
+        # A real dev session creates its artifacts dir. A worktree that seeds
+        # nothing into it has none — git does not track the template's empty one —
+        # so without this the session dies on the spec write and no test of the
+        # unseeded shape could reach the gate it is about.
+        sp.parent.mkdir(parents=True, exist_ok=True)
         # mirror bmad-dev-auto: self-finalize the spec, leave the ledger to the
         # orchestrator (single writer, marking inside the worktree)
         write_spec(sp, "done", baseline, deferred=deferred)
@@ -606,6 +611,86 @@ def bundle_plan(dw_ids=("DW-1",), name="fix"):
         list(dw_ids),
         bundles=[{"name": name, "dw_ids": list(dw_ids), "intent": "fix it"}],
     )
+
+
+def isolated_policy(**scm) -> Policy:
+    """`isolated_seeded_policy` without the seed — the SHIPPED default, since
+    `scm.worktree_seed` defaults to `()`."""
+    return Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="worktree", **scm),
+    )
+
+
+def test_isolated_bundle_lands_when_the_gitignored_ledger_was_never_seeded(project):
+    """#426, the default configuration: `worktree_seed` defaults to `()` and the
+    ledger's home is the artifacts dir, so a project that gitignores it gets a unit
+    worktree with NO ledger. The orchestrator writes the close through
+    `self.workspace.paths` — that absent file — `mark_done` returns False, and
+    `verify_review_bundle` reads the same absent file and fails `fixable=True`.
+    Measured before the auto-seed: `phase=deferred`, `DW-1` still `open`, a
+    `review-verify-failed` naming the worktree's path, and `open_ids` re-bundling
+    the same work on every later sweep.
+
+    No DONE-leg carry can rescue that — the unit never reaches DONE — so the fix
+    is upstream of the carry: seed the ledger the checkout cannot deliver, which
+    moves the failure onto the leg 6M's carry already covers.
+
+    The extra dev effects are the repair round the gate's `fixable=True` buys.
+    They go unused on the fixed path; without them a regression would exhaust the
+    script and fail as a crash rather than as the defer it actually is."""
+    ignored_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    plan = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "fix it"}],
+        skip=[{"id": "DW-2", "reason": "moot"}],
+    )
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(plan)] + [wt_bundle_dev(project)] * 6,
+        policy=isolated_policy(),
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed and summary.deferred == 0
+    task = engine.state.tasks["dw-fix"]
+    assert task.phase == Phase.DONE and task.isolated_ledger_carried
+    entries = ledger_entries(project)
+    assert entries["DW-1"].status.startswith("done")
+    assert entries["DW-2"].open
+    assert "review-verify-failed" not in journal_kinds(engine)
+    # The seeded copy is shielded from the unit's `git add -A` like every other
+    # seed, so the close still does not ride the merge: the carry is what lands
+    # it, and `git add -- <ignored path>` still refuses with rc 1.
+    carried = [e for e in engine.journal.entries() if e["kind"] == "sweep-bundle-close-carried"]
+    assert [e["dw_ids"] for e in carried] == [["DW-1"]]
+    uncommitted = [
+        e for e in engine.journal.entries() if e["kind"] == "sweep-bundle-close-carry-uncommitted"
+    ]
+    assert len(uncommitted) == 1 and uncommitted[0]["dw_ids"] == ["DW-1"]
+    assert worktree_clean(project.project)
+
+
+def test_isolated_bundle_with_a_tracked_ledger_seeds_nothing(project):
+    """A tracked ledger is delivered by the checkout, so auto-seeding it would
+    report `worktree-seed-skipped` — "a seed you asked for did nothing" — on every
+    isolated unit of every ordinary project, burying the real ones."""
+    write_ledger(project, {"DW-1": "open"})
+    assert verify.path_tracked(project.project, ledger_rel(project))
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan(["DW-1"]))] + [wt_bundle_dev(project)] * 6,
+        policy=isolated_policy(),
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed
+    assert engine.state.tasks["dw-fix"].phase == Phase.DONE
+    assert ledger_entries(project)["DW-1"].status.startswith("done")
+    assert "worktree-seed-skipped" not in journal_kinds(engine)
 
 
 def test_isolated_bundle_carries_its_gitignored_ledger_close_to_the_main_checkout(project):
