@@ -346,466 +346,281 @@ which has not been released since 0.9.0 and does not descend from v0.9.1.
   lock, and lines an older bmad-loop wrote into `.git/info/exclude` stay — delete them by hand.
 
 - **The git-add shield's git calls run on the shared chokepoint (#389).** They were the last bare
-  `git` spawns outside `verify._run_git`, so they missed its `LC_ALL=C` pin — leaving a degrade
-  reason that quotes git's stderr in whatever language the box speaks — and used a hardcoded 120s
-  timeout instead of the configured `[limits] git_timeout_s`. Both now apply.
+  `git` spawns outside `verify._run_git`, so they missed its `LC_ALL=C` pin and used a hardcoded
+  120s timeout instead of the configured `[limits] git_timeout_s`. Both now apply.
+
 - **A non-UTF-8 filename no longer crashes the run past every git guard (#377).** `verify._run_git`
-  is the sole git spawn point and exists to give git's faults a type the `except GitError` guards
-  throughout the codebase can catch, but it decoded git's output strictly and translated only a
-  timeout and a spawn
-  `OSError`. `UnicodeDecodeError` is a third fault raised before any return code exists, and being a
-  `ValueError` it matched neither arm — so one file whose name is not valid in the run's encoding
-  (POSIX filenames are arbitrary bytes) escaped untyped. Reachable wherever git's own quoting is
-  off: the `-z` callers (merge pre-flight collision detection), `worktree list --porcelain` — which
-  crashed the unguarded stale-run reconcile at every run and sweep start — and `git diff`, whose
-  content is verbatim, so a failed unit's forensic capture bypassed the valve that preserves its
-  uncaptured work. Such output is now a `GitError` like any other git failure. Making those paths
-  usable rather than merely non-fatal is a separate change.
+  decoded git's output strictly, and `UnicodeDecodeError` — a `ValueError` raised before any return
+  code exists — matched neither its timeout nor its spawn-`OSError` arm, so it escaped untyped past
+  every `except GitError`: the `-z` merge pre-flight, `worktree list --porcelain` (crashing the
+  stale-run reconcile at every run and sweep start), and `git diff`, whose failure bypassed the
+  valve that preserves a failed unit's work. Now a `GitError` like any other git failure.
 
 - **One undecodable byte of verify output no longer crashes the run (#378).** Verify commands are
-  arbitrary operator tools, and their captured output was decoded strictly — a child emitting bytes
+  arbitrary operator tools and their captured output was decoded strictly, so a child emitting bytes
   invalid in the run's encoding raised `UnicodeDecodeError` out of `run_verify_commands`, losing
-  every command's result and crashing the dev phase instead of classifying the failure. Output now
-  decodes with `errors="replace"`: the tail is display-only feedback for a human or repair session,
-  so a replacement character costs nothing, while exit codes and the rest of the tail keep driving
-  classification.
+  every command's result instead of classifying the failure. Output now decodes with
+  `errors="replace"`; the tail is display-only, while exit codes still drive classification.
 
-- **A short write no longer truncates the worktree exclude (#375).** The exclude update is a
-  read-modify-rewrite, and `write_text` truncates before writing, so a fault partway through (ENOSPC,
-  EIO) left the operator's own excludes cut mid-content while the degrade reason still reported that
-  nothing had been written. The surviving tail still parses as valid git patterns, so nothing
-  reports the damage: the shield lines that were cut off simply stop shielding, and the unit's
-  `git add -A` then stages the provisioned skill trees and tool configs into the story's merge —
-  while a cut landing on a path boundary widens a surviving pattern over a whole subtree. Now
-  written to a scratch file and moved into place, so the exclude is either fully updated or untouched.
+- **A short write no longer truncates the worktree exclude (#375).** The update is a
+  read-modify-rewrite and `write_text` truncates before writing, so an ENOSPC or EIO partway through
+  cut the operator's own excludes mid-content while the degrade reason still reported nothing
+  written. The surviving tail parses as valid patterns, so nothing reported the damage: cut shield
+  lines simply stop shielding, and a cut landing on a path boundary widens a surviving pattern over
+  a whole subtree. Now written to a scratch file and moved into place — fully updated or untouched.
 
 - **The exclude's git query no longer crashes on a non-UTF-8 repo path (#374).** POSIX filenames are
-  bytes, and `git rev-parse --git-common-dir` was decoded strictly, so a repo path carrying bytes
-  invalid in the locale encoding raised `UnicodeDecodeError` — a type neither arm of the helper
-  caught, out of a function documented as best-effort. Git's output is captured as bytes and decoded
-  with the filesystem codec inside the guarded tail, so such a path round-trips instead of faulting.
+  bytes and `git rev-parse --git-common-dir` was decoded strictly, so a repo path carrying bytes
+  invalid in the locale encoding raised a `UnicodeDecodeError` that neither arm of a
+  documented-best-effort helper caught. Git's output is now captured as bytes and decoded with the
+  filesystem codec inside the guarded tail.
 
 - **A worktree's local git exclude really is best-effort now (#359).** `_worktree_local_exclude`
-  guarded only its `git rev-parse` call; the filesystem tail behind it (resolve, mkdir, read, write)
-  crashed the run — a symlink loop raises `RuntimeError` on 3.11/3.12, a read-only `.git` raises
-  `OSError`, and the codec faults of the day raised `UnicodeError` (an exclude file that is not UTF-8
-  on the way in, a seeded path whose filename is not UTF-8 on the way back out — both since removed
-  as fault modes, because the exclude payload is now read, deduped and written as bytes). The tail is guarded and
-  degrades to a reason string, and provisioning journals it as `worktree-exclude-degraded` on the
-  story rather than swallowing it: without the exclude the unit's `git add -A` would commit the
-  provisioned skill trees and tool configs into the story's merge. Git being unqueryable at all
-  (not a repo, no git) stays a silent, expected skip.
+  guarded only its `git rev-parse`; the filesystem tail behind it crashed the run on a symlink loop
+  or a read-only `.git`. It now degrades to a reason string, journaled as
+  `worktree-exclude-degraded` on the story — without the exclude the unit's `git add -A` would
+  commit the provisioned skill trees and tool configs into the story's merge. Git being unqueryable
+  at all (not a repo, no git) stays a silent, expected skip.
 
-- **A finished session whose spec left `status:` blank is rescued again (#369).** The second copy of
-  the #358 stringification lived in `devcontract.synthesize_result`, which that fix did not reach: a
-  present-but-blank `status:` read as the truthy token `"none"`, so the prose `## Auto Run Result`
-  fallback never fired and the synthesis was flagged inconsistent. `status_consistent` gates the
-  post-kill rescue (#61), so a session that finished real work but lost its final Stop event was
-  discarded as `stalled`/`timeout` — for exactly the template shape that gate's docstring names as
-  rescuable. Both readers now go through `frontmatter.status_of`. A blank frontmatter with prose
-  `blocked` or `awaiting-operator` also gets a truthful status label; routing for those is unchanged.
+- **A finished session whose spec left `status:` blank is rescued again (#369).** A second copy of
+  the #358 stringification lived in `devcontract.synthesize_result`: a present-but-blank `status:`
+  read as the truthy token `"none"`, so the prose `## Auto Run Result` fallback never fired and the
+  synthesis was flagged inconsistent. `status_consistent` gates the post-kill rescue (#61), so a
+  session that finished real work but lost its final Stop was discarded as `stalled`/`timeout`. Both
+  readers now go through `frontmatter.status_of`; routing is unchanged.
 
 - **A blank frontmatter `status:` reads as blank, not as the token `none` (#358).** YAML parses a
-  bare `status:` line as null, and `status_of` stringified it — so every status gate saw `"none"`, a
-  token nothing in the project writes. The allowlist that decides whether a half-finalized generic
-  spec may be reconciled forward (`devcontract.RECONCILABLE_FROM`) therefore treated it as a
-  deliberate custom status and left the spec untouched, contradicting both its own comment and the
-  writer side, which fills exactly that shape. A YAML-null status now reads `""`, the same as a
-  missing key; a literal `status: none` is still the string `"none"`, so a hand-written token keeps
-  its meaning. The engine's local workaround at the reconcile is retired. Two renderings change with
-  it: `confirm`'s drift line says `status: (blank)` instead of trailing off, and the stories-mode
-  board (`status`, `dry-run`) labels a bare-status story `present` — its documented fallback —
-  instead of `none`, which was never a documented value.
+  bare `status:` line as null and `status_of` stringified it, so every gate saw `"none"`, a token
+  nothing in the project writes: `devcontract.RECONCILABLE_FROM` read it as a deliberate custom
+  status and left a half-finalized generic spec untouched. A YAML-null status now reads `""`, the
+  same as a missing key, while a literal `status: none` stays the string. `confirm` renders
+  `status: (blank)`; the stories-mode board reads `present`.
 
 - **A trailing inline comment on a spec's `status:` line survives the write (#357, part 2).**
   `set_frontmatter_status` and `set_frontmatter_field` kept everything through the colon and dropped
-  the rest, so `status: draft  # set by hand` came back as `status: done` — the last part of
-  "formatting and comments survive" the writers did not honor. The comment and its separating
-  whitespace now carry through whenever a conservative token pattern can certify where the scalar
-  ends; a value it cannot read as a bare token (a quoted `#`, a `#` abutting the value) falls back to
-  today's full drop rather than guessing. The verified-edit oracle is only a backstop here: it strips
-  comments before it compares, so it cannot see a fabricated one. The value's own quotes are still
-  dropped — deliberately, and pinned.
+  the rest, so `status: draft  # set by hand` came back as `status: done`. The comment and its
+  separating whitespace now carry through whenever a conservative token pattern can certify where
+  the scalar ends; anything it cannot read as a bare token falls back to the full drop. The value's
+  own quotes are still dropped, deliberately.
 
 - **Spec writers no longer relay a spec's line endings (#357, part 1).** `set_frontmatter_status`,
-  `set_frontmatter_field`, `reset_spec_status`, and `strip_auto_run_result` read specs through
-  `read_text`, whose universal-newline translation handed each writer an all-LF copy of a CRLF spec —
-  so a write contracted to move one value rewrote every line ending in the file (to LF everywhere, and
-  to CRLF for an all-LF spec on Windows). All four now read bytes and decode; the two
-  frontmatter-field writers write bytes too, and a replaced line carries its own terminator instead
-  of a flat `\n`.
-  A CRLF spec stays CRLF, a mixed-ending spec keeps each line's ending, and only the value moves.
-  One pinned delta: a CR-only spec — never authored by a BMAD tool — is now a clean no-op through
-  `reset_spec_status` / `strip_auto_run_result`, whose patterns are line-oriented on `\r?\n`.
+  `set_frontmatter_field`, `reset_spec_status` and `strip_auto_run_result` read specs through
+  `read_text`, whose universal-newline translation handed each writer an all-LF copy of a CRLF spec
+  — so a write meant to move one value rewrote every line ending in the file. All four now read
+  bytes, and a replaced line carries its own terminator, so each line keeps the ending it had. A
+  CR-only spec is now a clean no-op through the two strippers.
 
 - **A spec status the writer cannot rewrite is no longer a silent no-op.** `set_frontmatter_status`
   found the line with `lstrip().startswith("status:")` while every reader parses the block as YAML,
-  so the two disagreed in both directions: a quoted key (`"status": x`), a space before the colon,
-  or a flow mapping wrote nothing and returned `False`, while a block scalar, a value continued on
-  the next line, a nested `status:` under another key, or one quoted inside another key's literal
-  block were rewritten into corruption — `status: done awaiting-operator`, or the wrong key
-  entirely. Nothing verified what the edit meant, and no caller read the return value.
+  so a quoted key, a space before the colon or a flow mapping wrote nothing and returned `False` —
+  which no caller read — while a block scalar, a continued value or a nested `status:` was rewritten
+  into corruption. The edit is now re-parsed with `yaml.safe_load` as an oracle and kept only if the
+  block still parses as a mapping, its `status` is the target, and every other key is unchanged.
 
-  The edit is now made, re-parsed with `yaml.safe_load` as an _oracle_, and kept only if the block
-  still parses as a mapping, its top-level `status` is exactly the target, and **every other key is
-  unchanged** — so the formatting-preserving single-line edit survives while shapes nobody
-  enumerated are rejected too. `False` now means "nothing to change" and only that; a status the
-  reader can see but no line edit can safely move raises `FrontmatterWriteError`, per the
-  observe-degrade / repair-raise rule. `verify.set_frontmatter_field` (which also appended a
-  duplicate key on a scan miss) and `devcontract.reset_spec_status` are on the same verified edit.
-  `runs.rearm_escalation` translates the raise to `RearmError` and aborts before persisting
-  anything, so a re-driven story can no longer be routed to the wrong step by a write that never
-  landed. One deliberate behavior change: `set_frontmatter_status(spec, "done")` over an already-
-  `done` status returns `False` without rewriting, where it used to rewrite and return `True`.
+- **A status no line edit can safely move now raises instead of reporting success.** It raises
+  `FrontmatterWriteError`, and `False` now means "nothing to change" — so
+  `set_frontmatter_status(spec, "done")` over an already-`done` status returns `False` without
+  rewriting. `runs.rearm_escalation` translates it to `RearmError` and aborts before persisting, so
+  a re-drive is not routed to the wrong step. `verify.set_frontmatter_field`, which also appended a
+  duplicate key on a scan miss, shares the edit with `devcontract.reset_spec_status`.
 
 - **A symlink-loop fault at park no longer loses the run's park (#335).** `_park_spec_relpath`
-  guarded its `resolve()` with `(OSError, ValueError)` and the park-index writer — then
-  `_index_park`, since superseded by the committed per-story record of #356 above — guarded its call
-  with `except OSError`, but below Python 3.13 `Path.resolve` reports a symlink loop as
-  `RuntimeError` — neither. That writer then ran outside every `try` in `_finalize_commit_phase` and
-  after the phase advance, so an escape skipped the park notification, the `post_commit` hook and
-  **the state save**, over an index write that is best-effort by design. Both guards now hold the
-  type: the path helper keeps its documented verbatim fallback so the entry still lands, and the
-  writer degrades to the `operator-index-failed` journal line its `OSError` sibling always did.
+  guarded its `resolve()` with `(OSError, ValueError)` and the park-index writer — since superseded
+  by #356's record — with `except OSError`, but below Python 3.13 `Path.resolve` reports a symlink
+  loop as `RuntimeError`, neither. That writer ran outside every `try` in `_finalize_commit_phase`,
+  so an escape skipped the park notification, the `post_commit` hook and the state save. Both guards
+  now hold the type, and the writer degrades to its `operator-index-failed` journal line.
 
 - **An unwritable `ATTENTION` file can no longer crash a run.** `gates.notify` promised "never
   raises", but only its desktop half was guarded — the `ATTENTION` append was bare IO, so an
   unwritable run dir turned an advisory notice into a run crash at every site that journals a
   decision and then announces it (defer, escalate, plugin veto, manual-recovery pause, budget
-  warnings). The file sink now degrades like the desktop one, matching the observe-degrade rule the
-  adapter budget guards already applied to the same call. The journal entry each caller writes
+  warnings). The file sink now degrades like the desktop one; the journal entry each caller writes
   first remains the durable record.
 
 - **`limits.max_tokens_per_story` is validated like its per-session sibling.** It was parsed with a
-  bare `int()`, so `true` silently became a 1-token story cap and `0` was accepted — both against
-  the documented `int >= 1`. Non-integers and values below 1 now raise `PolicyError` at load, the
-  same rule `max_tokens_per_session` has always used. Note this rejects a `policy.toml` that
-  previously loaded; there is no `0 = off` semantic (set the cap high instead — it only warns).
+  bare `int()`, so `true` silently became a 1-token story cap and `0` was accepted, both against the
+  documented `int >= 1`. Non-integers and values below 1 now raise `PolicyError` at load. Note this
+  rejects a `policy.toml` that previously loaded; there is no `0 = off` semantic — set the cap high
+  instead, it only warns.
 
 - **A pause inside a defer's rollback no longer loses the defer record (#342).** `_defer` advanced
   the task to terminal DEFERRED before recovering the tree, so a rollback that paused instead
   (rollback OFF — the default — or a preserve/snapshot failure) unwound past the tail forever: no
   `story-deferred` journal entry, no defer notification, an under-counted diagnose `defer_count`.
-  The record is now emitted before the pause re-raises; its notice points at the ACTION REQUIRED
+  The record is now emitted before the pause re-raises, and its notice points at the ACTION REQUIRED
   manual-recovery notice instead of describing a rollback that never ran.
 
-- **Spawn-level `OSError` is translated at the git chokepoint (#343).** `_run_git` translated only
-  a timeout, so an EMFILE/ENOMEM/ENOENT out of `subprocess.run` bypassed every OSError-blind
-  `except GitError` guard and crashed the run — under exactly the resource pressure the recovery
-  paths owning those guards exist for. Spawn faults now raise `GitSpawnError` (a `GitError`), so
-  every guard holds as written; the errno stays on `__cause__`. A spawn fault while opening a unit
-  worktree now pauses the run instead of marching the queue into DEFERRED, and an FS or spawn
-  fault during merge-target reconciliation keeps the unit branch and escalates instead of
-  crashing — naming the fault rather than claiming stray uncommitted files to clean.
+- **Spawn-level `OSError` is translated at the git chokepoint (#343).** `_run_git` translated only a
+  timeout, so an EMFILE/ENOMEM/ENOENT out of `subprocess.run` bypassed every OSError-blind
+  `except GitError` guard and crashed the run — under exactly the resource pressure those guards
+  exist for. Spawn faults now raise `GitSpawnError` (a `GitError`) with the errno on `__cause__`: a
+  fault opening a unit worktree pauses instead of marching the queue into DEFERRED, and one during
+  merge-target reconciliation keeps the unit branch and escalates.
 
 - **`safe_rollback` no longer swallows a failed `git stash create`.** The empty snapshot silently
   disabled the whole `preserve` restore, so the hard reset reverted exactly the paths the caller
   asked to keep — a resolved re-drive's corrected spec — with no error anywhere. It now raises
   before the reset, and only when a restore was actually requested, so the no-`preserve` callers
-  (both sweep sites) degrade as before.
+  degrade as before.
 
-- **A spawn-level `OSError` during the attempt snapshot no longer crashes the run.** `_run_git`
-  translates only a timeout, so an EMFILE/ENOMEM from `subprocess.run` escaped untyped out of the
-  middle of a rollback. Preservation is observation rather than a repair write, so it now degrades
-  into the same journal-and-decide path a `GitError` takes, keeping the errno as the breadcrumb;
-  `safe_reset` still raises.
+- **A spawn-level `OSError` during the attempt snapshot no longer crashes the run.** An EMFILE or
+  ENOMEM from `subprocess.run` escaped untyped out of the middle of a rollback. Preservation is
+  observation rather than a repair write, so it now degrades into the same journal-and-decide path a
+  `GitError` takes, keeping the errno as the breadcrumb; `safe_reset` still raises.
 
 - **A git fault while counting the attempt's commits no longer crashes the rollback (#343).**
   `preserve_attempt_commits` enumerated the range above baseline with no guard at all, so an
-  ordinary git _timeout_ — already translated and treated as routine everywhere else — took the
-  run down mid-rollback; a spawn-level `OSError` did the same, there and at the ref write. An
-  un-determinable range now reads as "there may be work above baseline" and refuses the reset
-  (pausing for manual recovery, or journalling on a re-drive), never the clean-tree early return.
-  Journals `attempt-preserve-enumerate-failed`, distinct from `attempt-preserve-failed`, so a
-  post-mortem can tell "could not count the work" from "counted it but could not park it". The
-  rollback's dirty check degrades on an `OSError` for the same reason, and a restore-patch apply
-  that fails with one now escalates instead of crashing past its own escalation — closing every
-  such guard in the recovery collaborator.
+  ordinary git timeout or a spawn `OSError` took the run down mid-rollback. An un-determinable range
+  now reads as "there may be work above baseline" and refuses the reset instead of taking the
+  clean-tree early return, journalling `attempt-preserve-enumerate-failed` apart from
+  `attempt-preserve-failed`; the dirty check and a failing restore-patch apply degrade likewise.
 
 - **The orchestrator's ledger writers no longer inject lines from a multiline value (#305).** Found
   by [@Haven2026](https://github.com/Haven2026) in #274. The deferred-work ledger is line-oriented,
-  but `deferredwork`'s mutators interpolated their arguments verbatim: a resolution note of
-  `fixed\n### DW-99: fake\nstatus: open` minted a phantom entry, a note containing `\n- source_spec:`
-  truncated the entry's span and re-surfaced its tail as a phantom legacy item, and a mid-note break
-  left one entry carrying two `status:` lines. The writers now collapse line breaks in free text to a
-  space. They sanitize rather than raise — the sweep's close paths call them bare, so a `ValueError`
-  would end the run as crashed — and nothing upstream rejects on a break either: a formatting defect
-  must not cost a triage attempt. The break set is `str.splitlines()`'s, not `\n` alone, since
-  `parse_legacy` scans with it. A value that never carried a break is written byte-for-byte as
-  before, and a title that sanitizes away is named rather than left blank.
+  but `deferredwork`'s mutators interpolated their arguments verbatim: a note could mint a phantom
+  entry, truncate an entry's span and re-surface its tail as a phantom legacy item, or leave one
+  entry carrying two `status:` lines. Line breaks in free text now collapse to a space — sanitized
+  rather than rejected, because a formatting defect must not cost a triage attempt.
 
-  **New exception paths.** The orchestrator-owned fields are now validated where they never were:
-  `mark_done`, `mark_done_many`, `append_decision` and `append_entry` raise `ValueError` on a `date`
-  that is not ISO `YYYY-MM-DD`, and `append_entry` on a `status` outside `open`/`done <date>` or a
-  `severity` outside `critical|high|medium|low`. All four previously accepted anything and wrote it.
-  A bad value there is a programmer bug, not model output.
-
-  This covers the orchestrator's writers only. Two producers still write ledger markdown directly and
-  bypass them: the inner dev session's flat appends, and the sweep's migration session, which rewrites
-  the whole file (its validation checks legacy leftovers, duplicate ids, statuses and numbering — not
-  breaks inside a field value). Sanitizing also makes a break inert, not the text around it: a
-  `DW-<n>` token surviving as prose still counts toward `next_seq`. The sweep skill now states the
-  single-line expectation as guidance; an existing install picks it up on
-  `bmad-loop init --force-skills` (a plain `init` keeps skills that already exist).
+- **Ledger writers validate the orchestrator-owned fields (#305).** `mark_done`, `mark_done_many`,
+  `append_decision` and `append_entry` raise `ValueError` on a non-ISO `date`, and `append_entry` on
+  a `status` outside `open`/`done <date>` or a `severity` outside `critical|high|medium|low`. The
+  inner dev session and the sweep's migration session still write ledger markdown directly, and a
+  `DW-<n>` token surviving a sanitized break counts toward `next_seq`. The sweep skill now states
+  the single-line expectation, picked up on `bmad-loop init --force-skills`.
 
 - **A deferred finding appended after the last ledger entry is no longer lost (#304).** Found and
   first fixed by [@Haven2026](https://github.com/Haven2026) in #274. The inner dev session appends
-  each review defer as a flat `- source_spec:` / `summary:` / `evidence:` block; landing after the
-  last canonical `### DW-<n>` entry, it was absorbed into that entry's span, and `parse_legacy()`
-  masks canonical spans before scanning — so the block was invisible to the sweep's migration
-  trigger and leftovers read, to `bmad-loop sweep --dry-run`, and to the TUI's legacy view. The session
-  did its job and recorded the defer; nothing downstream could ever see it. Canonical spans now end
-  at a flat block.
+  each defer as a flat `- source_spec:` block, which the last canonical `### DW-<n>` entry's span
+  absorbed while `parse_legacy()` masks canonical spans before scanning — so it was invisible to the
+  sweep, to `--dry-run` and to the TUI's legacy view. Spans now end at a flat block, and
+  `append_entry` writes the documented `location:` field it had been omitting.
 
-  The boundary recognizes the flat shape exactly as the legacy parser does — the opening line
-  alone, either bullet marker, whatever `summary:`/`evidence:` lines follow — because a stricter
-  boundary silently leaves the bug in place for the partial blocks that parser accepts. It is
-  searched from the entry's own `status:` line and never above it: truncating over the status would
-  leave the entry reading as neither open nor done, trading a lost flat block for a lost tracked
-  entry.
+- **`return_attached_client` no longer claims a return that never happened (#227).** It answered
+  `True` unconditionally, discarding `switch_client`'s result, so a failed switch plus a failed `-l`
+  fallback still journaled the return and sent the sweep unattended. `RETURN_OPTION` is now cleared
+  only on a real return, a failed one being left for the parked window's trailer, and the failures
+  report apart: `ATTENDED` (a human is still there) versus `UNREACHABLE` (no client at all), which
+  journals `sweep-return-no-client`.
 
-  `append_entry` also now writes the `location:` field (defaulting to `n/a`, as the orchestrator's
-  own refiles take it), which the canonical format documents and the writer had been omitting.
+- **Both mux client verbs now owe effect, not dispatch (#317).** `TerminalMultiplexer.detach_client`
+  widens from `None` to `bool`. tmux reads the effect off the exit code; psmux cannot — every arm of
+  its `detach-client`/`switch-client` exits 0 whether or not a client moved — so it measures the
+  session's attached-client count across the call and answers on the drop, degrading to `False`
+  rather than a vacuous `True` when that is unobservable. Out-of-tree backends still returning
+  `None` read as "nothing detached" — degraded, not broken.
 
-- **`return_attached_client` no longer claims a return that never happened (#227).** It discarded
-  `switch_client`'s result and answered `True` unconditionally, so a failed switch plus a failed
-  `-l` fallback still journaled the return and sent the sweep unattended while the human sat in
-  the sweep window with their terminal never handed back. `RETURN_OPTION` is now cleared only on a
-  real return — a failed one is left for the parked window's trailer, which is a second chance if
-  someone dismisses the park prompt, not a rescue for an unattended window.
-
-  The two failures are reported apart, because they point opposite ways: a failed switch leaves
-  the client in this window with a human in front of it (`ATTENDED` — an attended sweep keeps
-  prompting, which is the fix), while a failed detach means there was no client to detach at all
-  (`UNREACHABLE` — the sweep goes unattended, or a `--repeat` cycle blocks forever on a prompt no
-  one can see). Announcing it stays tied to a real return; `UNREACHABLE` journals
-  `sweep-return-no-client` and prints nothing.
-
-  `TerminalMultiplexer.detach_client` widens from `None` to `bool` to carry that, and both client
-  verbs now owe **effect, not dispatch**. tmux reads it off the exit code. psmux cannot — every arm
-  of its `detach-client` / `switch-client` exits 0 whether or not a client moved — so it measures
-  the session's attached-client count across the call and answers on the drop; unobservable
-  degrades to `False`, never a vacuous `True` (#317). That path went live with the option channel
-  in #310, so on Windows the return was reachable and dishonest at the same time. Out-of-tree
-  backends still returning `None` read as "nothing detached" — degraded, not broken.
-
-- **Give psmux a working per-window option channel (#310).** psmux keeps one user-option scope
-  per server and returns `''` for every `-w` read of an `@`-prefixed name, so both mechanisms
-  riding per-window options were broken. The ctl-window project tag read the same bled value for
-  every `list-windows` row, letting a prune in one project `kill-window` another project's
-  window; the parked-return option always read empty, so an attached client was never handed
-  back to its origin. The window-option verbs, the `@`-prefixed columns of `list_windows` and the
-  parked trailer now use a session-scoped option whose key carries the window id
-  (`@bmad_project_@3` for window `@3` — the `_@` shape keeps foreign config options out of the
-  cleanup sweeps), routed with an explicit `-t <session>` (the in-pane parked trailer rides
-  `$TMUX` instead). Values that cannot survive psmux's
-  control-line transport verbatim are refused with a warning instead of stored corrupted. Keys are
-  freed on `kill_window` and reconciled at parked-window launch; the return move itself is restored
-  for the detach leg, while the `switch-client` leg stays inert on psmux builds predating the
-  psmux/psmux#483 fix — still inert at 3.3.7. Builtin window options keep the `-w` path; tmux is
-  untouched.
+- **Give psmux a working per-window option channel (#310).** psmux keeps one user-option scope per
+  server and answers `''` to any `-w` read of an `@`-prefixed name, so the ctl-window project tag
+  bled across rows — letting a prune in one project `kill-window` another's — and the parked-return
+  option always read empty. Both now use a session-scoped key carrying the window id
+  (`@bmad_project_@3`), routed with `-t <session>` and freed on `kill_window`; the `switch-client`
+  leg stays inert on builds predating psmux/psmux#483 — still inert at 3.3.7.
 
 - **Session-qualify the psmux TUI-side window ids (#291).** #254 covered the engine seam but left
-  the launcher's surfaces bare, and that process usually runs _outside_ any pane — where a bare
-  `@N` resolves through psmux's most-recent-session fallback, not the session that minted it. The
-  ctl-window prune replayed such ids as `kill-window` targets and could close another server's
-  identically-numbered window with rc 0. `new_parked_window`, the `window_id` columns of
-  `list_windows`, and `current_window_id` now emit `session:@N`; the prune compares the last two,
-  so they qualify together or a prune kills the window it runs in. `select_window` resolves the id
-  to an index first — psmux validates a scoped target's window part CLI-side against window
-  index/name only. tmux is untouched (its ids are server-global).
+  the launcher's surfaces bare, and that process usually runs outside any pane — where a bare `@N`
+  resolves through psmux's most-recent-session fallback, not the session that minted it, so the
+  ctl-window prune could `kill-window` another server's identically-numbered window with rc 0.
+  `new_parked_window`, the `window_id` columns of `list_windows` and `current_window_id` now emit
+  `session:@N`, and `select_window` resolves the id to an index first.
 
-- **Verify environment faults are classified per shell, so Windows stops burning dev attempts on a
-  broken tree (#302).** `ENV_FAULT_RCS = {126, 127}` is `sh`'s launcher convention, but verify
-  commands run through the host shell — and `cmd` has no equivalent: a missing tool exits `1`,
-  indistinguishable by exit code from the ordinary "tests failed" that _should_ route to a repair
-  session (9009 exists only as `%ERRORLEVEL%` inside a batch file, so it reaches the orchestrator
-  only through a `.cmd`/`.bat` wrapper). The env-fault arm therefore never fired on win32 and the
-  charged-attempt regression #130 fixed on POSIX was still live there. The win32 arm now classifies
-  on three independent signals: `rc 9009`, `cmd`'s own `is not recognized` / `access is denied`
-  closing the command's output, and a resolvability probe of the command's leading token
-  (`shutil.which`, skipping `cmd`'s internal commands). The probe also closes a second hole: a
-  verify command naming a file `cmd` cannot execute — a `.sh`, anything outside `PATHEXT` — is
-  handed to the file association and exits `0` without running, so verify reported **passed** for a
-  check that never happened; that now escalates too. POSIX classification is unchanged, and the
-  three engine tests that were `skipif(win32)` for exactly this gap now run on both platforms.
+- **Verify environment faults are classified per shell, so Windows stops burning dev attempts
+  (#302).** `ENV_FAULT_RCS = {126, 127}` is `sh`'s convention; `cmd` has no equivalent — a missing
+  tool exits `1`, like the "tests failed" that should route to repair — so the arm never fired on
+  win32, leaving #130's charged-attempt regression live there. It now classifies on rc 9009, `cmd`'s
+  `is not recognized` / `access is denied`, and a `shutil.which` probe that also catches a file
+  outside `PATHEXT` exiting `0` unrun — a pass verify never earned.
 
-- **psmux window ids are now session-qualified (#254).** psmux mints window ids per server (one
-  server per session), so the bare `@N` the backend returned from `new_window` routed by the
-  caller's `$TMUX` when replayed as a `-t` target — from a `bmad-loop-ctl` pane that is the ctl
-  server, not the agent's. The log sink then bound to the engine's own window (empty run logs,
-  dead activity signal), stop/stall nudges were typed into the engine's own pane, and session
-  teardown harvested and killed the engine's window instead of the agent's. `new_window` and
-  `list_window_ids` now emit the `session:@N` form symmetrically (endorsed in psmux/psmux#483 as
-  the permanent model boundary), so every target the engine replays — `pipe_pane`, `send_text`,
-  `kill_window`, `window_pane_pids` — routes to the owning server unambiguously, and the
-  `window_alive` membership check keeps matching the minted form. Degrades to the bare id when
-  the session name contains `:` (the #221 rule); the tmux backend is untouched (its ids are
-  server-global).
+- **psmux window ids are now session-qualified (#254).** psmux mints window ids per server, so the
+  bare `@N` returned from `new_window` routed by the caller's `$TMUX` when replayed as a `-t` target
+  — from a `bmad-loop-ctl` pane, the ctl server rather than the agent's. The log sink then bound to
+  the engine's own window (empty run logs), nudges went to the engine's pane, and teardown killed it
+  instead of the agent's. Both verbs now emit `session:@N`, degrading to the bare id when the
+  session name contains `:` (#221).
 
 - **A session's read-back could adopt another story's spec (#261).** The generic dev/review
-  read-back located "the artifact this session produced" by scanning the implementation-artifacts
-  dir for the most-recently-modified qualifying `*.md`, with nothing tying the match to the story
-  being driven. That dir is shared: under worktree isolation the search also covers the main
-  checkout's copy, and with `isolation="none"` it _is_ that copy. A foreign story's spec landing
-  there after launch — a concurrent run's merge-back, a human edit, a sweep — won on mtime and
-  became this session's result, so a review that produced nothing was scored `completed:done`
-  (merging unreviewed code) and, on the dev leg, its `followup_review_recommended: false` skipped
-  the review entirely. Unlike most of this family (#127/#160/#224) it failed toward
-  _landing_ unverified work. Two fixes, both in the adapter:
-  - **Authoritative-path read-back.** Where the orchestrator has pointed the session at the spec it
-    owes — every review leg, every dev repair, every patch-restore re-drive — `SessionSpec.expected_spec`
-    pins the read-back to that one file and the directory scan is never reached. The pin is taken only
-    when the dispatched prompt names the path: a from-scratch re-drive after an escalation or deferral
-    has a recorded `StoryTask.spec_file` but dispatches a bare story key, and pinning there would poll a
-    stale path while the re-drive's real output went unread. This closes the asymmetry with stories mode,
-    which already resolved by id rather than by mtime, and covers the #224 missing-marker fallback (a
-    second mtime-only scan of the same shared dir) through the same seam. Deliberately not a filename
-    rule: spec names come from an LLM-derived slug, so a prefix check risks trading this unsafe
-    failure for a lossy one — and a pinned path needs no exemption for the `bmad-dev-auto-result-*`
-    fallback or for sweep bundles, which legitimately adopt a differently-named story spec (#161).
-    A dev attempt 1 has no recorded spec yet and keeps the scan. Relatedly, the skill's no-spec
-    fallback marker is no longer recorded as a story's spec at all — it is not one, and every
-    consumer of `task.spec_file` misroutes on it.
-  - **Proof-of-work gate.** A read-back artifact may no longer upgrade a dead session to
-    `completed` when that session shows no evidence it ran at all — no turn ever ended _and_ its
-    pane log never grew past a small floor. The two signals are ORed because each has a blind spot
-    (a misbound pane sink still ends turns; a hook-less profile still logs). The hook signal is a
-    `Stop` event specifically: `SessionStart` and `SessionEnd` are emitted by a CLI that launched
-    and wedged, so reading either as work would leave the gate satisfied in exactly the case it is
-    for. For the same reason the pane log is created empty at launch, so a window that dies before
-    the tee attaches reports "rendered nothing" rather than "no pane signal here". Scoped to the
-    shared-directory read-back: a task-scoped `result.json` is unique to its session and cleared at
-    launch, so it stays authoritative. Applies to both the crash path and `_post_kill_reconcile`,
-    and journals `readback-refused-no-proof-of-work`.
+  read-back picked its artifact by mtime from the shared implementation-artifacts dir, which under
+  worktree isolation also covers the main checkout's copy. A foreign spec landing there after launch
+  won, so a review that produced nothing scored `completed:done` and a dev leg's
+  `followup_review_recommended: false` skipped review. Unlike the rest of this family
+  (#127/#160/#224) it failed toward _landing_ unverified work.
 
-- **`validate` requires the review skills your `bmad-dev-auto` actually invokes (#260).** The
-  preflight held every project to a fixed catalog that included `bmad-review-verification-gap`,
-  which no tagged BMAD-METHOD release ships (absent from v6.10.0; on current sources only a
-  forwarder to the merged `bmad-review`), and misdiagnosed it as "install the BMad Method (bmm)
-  module" on projects where bmm _was_ installed — so `validate`/`run`/`resume`/`sweep` could not
-  pass on a stock install. The required reviewers are now read from the installed skill itself:
-  its `customize.toml` `[[workflow.review_layers]]` when present (honoring disabled layers and
-  `_bmad/custom/bmad-dev-auto.toml` overrides), else the reviewers `step-04-review.md` names
-  inline. A merged-`bmad-review` install needs only `bmad-review`; a v6.10.0 install needs the
-  two hunters it names; and a tree whose configured layers reference a skill it does not have is
-  now caught by a new `skills.review-layer-missing` problem instead of passing and then failing
-  on every dev run. Unreadable configs fall back to the previous static requirement, and all
-  messages name the real remedy (install/update bmm, BMAD-METHOD >= 6.10.0).
+- **The read-back is pinned to the spec the orchestrator named (#261).** Wherever the dispatched
+  prompt names the path — every review leg, dev repair and patch-restore —
+  `SessionSpec.expected_spec` pins the read-back and the directory scan is never reached; the #224
+  missing-marker fallback rides the same seam, and a sweep bundle's differently-named spec (#161)
+  needs no exemption. A bare-story-key re-drive and a dev attempt 1 keep the scan. The skill's
+  no-spec fallback marker is no longer recorded as a story's spec.
 
-  Derivation is held to what the run really resolves:
-  - Override merging matches BMAD's own resolver (`resolve_customization.py`) exactly — arrays of
-    tables opt into keyed merge only when _every_ combined item carries the same identifier, and
-    `code` is checked before `id`; anything mixed or key-less appends. Keying on `id` alone
-    silently dropped base layers in one direction and kept superseded ones in the other.
-  - An override that is not valid TOML no longer abandons derivation: the resolver skips a broken
-    layer and carries on, so the preflight does too, reporting the file as a
-    `skills.customize-unreadable` warning.
-  - A `customize.toml` whose `workflow` key is valid TOML of the wrong _shape_ (a string, list or
-    number) no longer raises `AttributeError` out of `validate`/`run`/`resume`/`sweep`.
-  - Disabling every review layer is reported as `skills.review-layers-empty` rather than passing:
-    `step-04-review.md` HALTs blocked with `no active review layers`.
-  - Layers that cannot be resolved statically — gated by a `when` condition the model evaluates at
-    run time, or naming a skill in a phrasing this check cannot confirm is a handoff — are reported
-    as `skills.review-layer-unresolved` **warnings** and never block. `validate` and the run
-    preflight now branch on severity, so an advisory can no longer abort a run.
-  - Isolated worktrees get what was validated: `provision_worktree` copies the review skills the
-    project's own layers name (not just the fixed base catalog) and seeds `_bmad/custom/`, whose
-    `*.user.toml` layer the upstream installer gitignores — without it the preflight resolved one
-    layer set from the main checkout while the worktree run resolved another.
+- **A dead session with no evidence it ran can no longer be upgraded to `completed` (#261).** A
+  read-back artifact is refused unless a turn ended — a `Stop` event specifically — or the pane log
+  grew past a small floor; the two are ORed because each has a blind spot, and the log is created
+  empty at launch so a window dying before the tee attaches reports "rendered nothing". Scoped to
+  the shared-directory read-back; a task-scoped `result.json` stays authoritative. Applies to the
+  crash path and `_post_kill_reconcile`, journalling `readback-refused-no-proof-of-work`.
 
-- **`notify.desktop` works on macOS/Windows, and warns when it can't (#231).** The desktop
-  notification channel was `notify-send`-only, so on macOS and Windows `notify.desktop` (default
-  `true`) was silently inert — every "a human is needed" path (escalations, deferrals,
-  worktree-open failures) reached no one, leaving only the untailed `ATTENTION` file. `gates.notify`
-  now dispatches natively per platform: `osascript` (macOS), a best-effort WinRT PowerShell toast
-  (Windows), `notify-send` (Linux); the untrusted title/message are handed to `osascript`/PowerShell
-  through environment variables and to `notify-send` as argv — never interpolated into the command
-  string. When `notify.desktop` is set but no
-  notifier exists on the platform, `validate` emits a `notify.desktop-unavailable` warning and the
-  run start prints a one-time stderr warning plus a `notify-desktop-unavailable` journal event.
-  Note: headless CI cannot observe a real toast/notification (there is no macOS job), so the
-  unit tests assert command construction only. To verify visual delivery, set
-  `notify.desktop = true` and trigger a notify path on each OS (macOS/Windows/Linux) — or call
-  `gates.notify` directly — and confirm a notification appears.
+- **`validate` requires the review skills your `bmad-dev-auto` really invokes (#260).** The
+  preflight held every project to a catalog naming `bmad-review-verification-gap`, which no tagged
+  BMAD-METHOD release ships, misdiagnosing it as a missing bmm module even where bmm was installed —
+  so `validate`/`run`/`resume`/`sweep` all failed on a stock install. The reviewers now come from
+  the installed skill: its `customize.toml` `[[workflow.review_layers]]`, else what
+  `step-04-review.md` names inline, overrides merged as BMAD's resolver does (`code` before `id`).
+
+- **New `skills.*` findings for a review-layer config (#260).** A configured layer naming a skill
+  the tree lacks is a `skills.review-layer-missing` problem instead of passing and then failing on
+  every dev run; disabling every layer is `skills.review-layers-empty`; an unreadable override is a
+  `skills.customize-unreadable` warning; a layer gated by a run-time `when` is
+  `skills.review-layer-unresolved`. `validate` and the run preflight branch on severity, so an
+  advisory can no longer abort a run; a `workflow` key of the wrong TOML shape no longer raises.
+
+- **Isolated worktrees get the review skills that were validated (#260).** `provision_worktree`
+  copies the skills the project's own layers name, not just the fixed base catalog, and seeds
+  `_bmad/custom/` — whose `*.user.toml` layer the upstream installer gitignores — so the preflight
+  and the worktree run no longer resolve different layer sets.
+
+- **`notify.desktop` works on macOS/Windows, and warns when it can't (#231).** The channel was
+  `notify-send`-only, so on macOS and Windows `notify.desktop` (default `true`) was inert and every
+  "a human is needed" path reached no one. It now dispatches natively (`osascript`, a WinRT
+  PowerShell toast, `notify-send`), passing untrusted text through the environment or argv, never a
+  command string; with none available, `validate` warns `notify.desktop-unavailable` and the run
+  start prints one, journalling `notify-desktop-unavailable`.
 
 - **Scrollable modal dialogs (#275).** The decision, escalation, confirm, sweep-options and
-  story-checkpoint TUI dialogs now scroll their bodies and dock their action buttons, so the
-  choose/action buttons stay reachable with long content down to the dialog's minimum frame
-  height (previously the lowest button could be clipped off-screen with no scrollbar). Safety
-  warnings that gate an enabled Resume/Re-arm are docked with the buttons so they cannot scroll
-  out of view, and the Resume confirm re-checks engine liveness at click time.
+  story-checkpoint TUI dialogs now scroll their bodies and dock their action buttons, so the buttons
+  stay reachable with long content down to the dialog's minimum frame height. Safety warnings that
+  gate an enabled Resume/Re-arm dock with them, and the Resume confirm re-checks engine liveness at
+  click time.
 
-- **A finished story whose session omitted `## Auto Run Result` no longer livelocks and
-  DEFER-drops (#224).** The review HALT intermittently finalizes the spec's frontmatter to
-  `status: done` without appending the terminal marker the harvest scan keys on; every Stop
-  then read `no-artifact`, stall nudges re-invoked an already-exited workflow (#149), and after
-  `max_review_cycles` the finished, verify-passing work was rolled back. The scan path now
-  synthesizes the result from the authoritative terminal frontmatter (exactly as stories mode
-  already did) once the spec's (path, mtime, status) fingerprint holds stable across two
-  resultless Stops — several candidates refuse to guess — and the post-kill reconcile applies
-  the same fallback on a single sighting once the window is provably dead. Synthesized results
-  carry `synthesized_from_frontmatter` and journal `session-synthesized-from-frontmatter`;
-  new resultless-stop breadcrumb verdicts `terminal-frontmatter-pending` and
-  `ambiguous-frontmatter` record the fingerprint's progress.
+- **A finished story whose session omitted `## Auto Run Result` no longer livelocks and DEFER-drops
+  (#224).** The review HALT intermittently finalizes the spec to `status: done` without the terminal
+  marker the harvest scan keys on, so every Stop read `no-artifact`, stall nudges re-invoked an
+  already-exited workflow (#149), and after `max_review_cycles` the finished, verify-passing work
+  was rolled back.
 
-- **Deterministic missing-marker catch + repair (#276).** Hardens the #224 missing-marker
-  fallback, whose attribution was heuristic (a 2-stable-Stops fingerprint, or a single sighting
-  post-kill) and left the spec non-compliant on disk:
-  - _Launch-state snapshot + content-hash gate._ Before every review launch the engine now
-    captures a `SpecSnapshot` (content hash, mtime, frontmatter status) of the spec immediately
-    after the #160 marker strip and threads it onto the review `SessionSpec`. The fallback
-    deterministically refuses to synthesize from a candidate whose bytes still hash equal to that
-    snapshot — the spec is provably untouched by this session (a `done` spec re-opened for review,
-    never re-written) — in **every** mode, including the dead-window post-kill reconcile. This kills
-    the documented dead-window false positive (a review killed after an mtime-only bump but before
-    the `in-review` flip, previously scored `done` without having run). New resultless-stop verdict
-    `unmodified-since-launch` and dead-window lifecycle crumb `frontmatter-unmodified-refused`
-    record each refusal. The snapshot is process-transient (a crash-resume degrades to the
-    conservative 2-observation path), and the review-launch frontmatter `status` is never
-    mutated — it remains load-bearing skill routing. The same launch-snapshot decision (M1 hash +
-    M2 transition, a single shared `_snapshot_verdict`) also guards the stories-mode folder+id
-    read-back, closing the identical false completion on that path; snapshot/candidate identity is
-    by resolved filesystem path, not raw string spelling.
-  - _Mid-session status-transition observation._ On each heartbeat tick the generic (and
-    OpenCode) dev adapter now samples the snapshotted spec's frontmatter and records the first
-    status it observes this session drive off its launch state to a live, non-terminal value
-    (in practice `in-review`), with a `spec-status-transition-observed` lifecycle crumb. A
-    recorded transition is deterministic proof the terminal frontmatter the spec later carries
-    is this session's own write, so the fallback synthesizes on a single terminal sighting —
-    live or dead window — instead of the 2-observation fingerprint (the synthesized crumb gains
-    a `transition` flag). A recorded transition now **outranks** the content-hash gate: a clean
-    review can round-trip `done → in-review → done` back to the launch bytes while still omitting
-    its marker, and the observed `in-review` proves it ran, so the hash gate refuses only when no
-    transition was seen. A transition that flips entirely between two ticks is missed and falls
-    back to the conservative fingerprint path.
-  - _Artifact repair._ When the fallback synthesizes a result the engine now appends the
-    `## Auto Run Result` marker the skill owed onto the on-disk spec (new
-    `devcontract.append_auto_run_result`, the inverse of the #160 strip), so the once-invisible
-    spec re-enters the normal marker scan and the next review launch strips it exactly like a
-    skill-written marker. Best-effort at the `session-synthesized-from-frontmatter` site (covers
-    live-Stop, crash-path, and post-kill synthesis): guarded to the generic path, refused for a
-    spec resolved outside the orchestrator-owned roots or whose fresh frontmatter no longer agrees
-    with the synthesized status (journal `spec-marker-repaired` / `spec-marker-repair-failed` /
-    `spec-marker-repair-skipped`), so it can never author a marker that disagrees with the
-    frontmatter. The append and the #160 strip/reset now rewrite the spec atomically (temp +
-    `atomic_replace`), so an interrupted or disk-full repair leaves the original spec intact rather
-    than truncated, and a spec ending in a bare `\r` no longer receives an invisible (unparsed)
-    heading.
-  - _Targeted contract nudge_ (`limits.dev_contract_nudge`, default `true`). On the first
-    `terminal-frontmatter-pending` Stop — a marker-less terminal spec that is not the hash-gate
-    refusal and whose transition is not yet proven — the dev adapter sends one tmux nudge asking
-    the skill to append the `## Auto Run Result` section it owed and end its turn, repairing the
-    omission at its source; a compliant append is then harvested by the ordinary marker scan (no
-    synthesis, no `synthesized_from_frontmatter` flag). It fires exactly once per session — marked
-    before the send (a raising transport still counts), never refilled, and touching no stall
-    counters, so an mtime bump that resets the observation counter can never re-nudge (the #149
-    refill hazard structurally cannot apply). `contract-nudge-sent` lifecycle crumb; set
-    `dev_contract_nudge = false` to rely on harness-side synthesis alone.
+- **The harvest scan synthesizes a result from terminal frontmatter (#224).** It fires once the
+  spec's (path, mtime, status) fingerprint holds stable across two resultless Stops, and the
+  post-kill reconcile applies it on a single sighting once the window is provably dead. Synthesized
+  results carry `synthesized_from_frontmatter` and journal `session-synthesized-from-frontmatter`;
+  the verdicts `terminal-frontmatter-pending` and `ambiguous-frontmatter` record the fingerprint's
+  progress.
 
-  Together these hold one HARD CONSTRAINT: the spec's `status:` at review launch is load-bearing
-  routing input to the upstream skill, so the frontmatter is **never** mutated at review launch —
-  every mechanism is observation or a prose-append, never a status write.
+- **Deterministic missing-marker catch and repair (#276).** The #224 fallback was heuristic: a
+  review killed after an mtime bump but before its `in-review` flip could score `done` without
+  running. The engine now snapshots the spec at review launch and refuses a candidate still hashing
+  equal to it (`unmodified-since-launch`, crumb `frontmatter-unmodified-refused`); a mid-session
+  status transition (`spec-status-transition-observed`) proves the session ran and outranks that
+  gate, collapsing the two-Stop fingerprint to one sighting.
+
+- **A synthesized result repairs the spec (#276).** `devcontract.append_auto_run_result` writes back
+  the marker the skill owed, refused outside the orchestrator-owned roots or when the fresh
+  frontmatter disagrees (`spec-marker-repaired`, `spec-marker-repair-failed`,
+  `spec-marker-repair-skipped`); it and the #160 strip rewrite the spec atomically. The launch
+  `status:` is **never** mutated: it is load-bearing routing input to the upstream skill.
+
+- **`limits.dev_contract_nudge` (default `true`) asks the skill to repair its own omission (#276).**
+  On the first `terminal-frontmatter-pending` Stop the dev adapter sends one nudge, once per session
+  (`contract-nudge-sent`); set it `false` to rely on harness-side synthesis alone.
 
 ## [0.9.1] — 2026-08-02
 
