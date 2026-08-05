@@ -100,8 +100,8 @@ seams of a full OS port are in
   `available` (is this backend usable on the current host).
 
   **Both client verbs report effect, not dispatch.** They answer a bool the
-  parked-window return path trusts, so a backend with no real detach (herdr,
-  whose client only a manual chord releases) answers `False`. If your CLI's exit
+  parked-window return path trusts, so a backend with no real detach (herdr —
+  only a manual chord releases its client) answers `False`. If your CLI's exit
   code already means "a client moved" you are done (tmux: `detach-client` fails
   with _no current client_); if it does not, **measure** what the verb is meant
   to change — psmux counts the session's attached clients across the call and

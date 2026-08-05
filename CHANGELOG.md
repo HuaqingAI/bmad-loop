@@ -136,10 +136,10 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 - **Ctrl+C outside a run now exits `130` cleanly (#241).** A `KeyboardInterrupt` escaping `main()`
   outside `engine.run()` (config load, engine construction) now prints a one-line `interrupted` to
-  stderr and returns the new `ExitCode.INTERRUPTED` (`130` = 128 + SIGINT). The exit code is
-  **unchanged** — uncaught, CPython already ended the process at `130` — but previously as a bare
-  traceback dumped after any partial `--json` stdout; a Python caller reading
-  `subprocess.returncode` now sees `130` rather than `-2`. A Ctrl+C _during_ a run is unchanged.
+  stderr and returns the new `ExitCode.INTERRUPTED` (`130` = 128 + SIGINT). The shell exit code is
+  **unchanged** — uncaught, CPython re-raised SIGINT and died at `130` — but previously as a bare
+  traceback dumped after any partial `--json` stdout; it is now a clean exit, so a Python caller's
+  `subprocess.returncode` shows `130` rather than `-2`. A Ctrl+C _during_ a run is unchanged.
 
 ### Removed
 
