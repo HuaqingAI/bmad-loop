@@ -14,13 +14,12 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Added
 
-- **Deferred review findings are harvested out of the spec's frontmatter (#433).** BMAD-METHOD#2640
-  moved `defer`-triaged findings into the spec's own `deferred:` list, where nothing filed them and
-  no sweep triaged them. A successful dev, review, repair or review-timeout-salvage pass now files
-  each as a `### DW-<n>` ledger entry (`spec-deferrals-harvested`), keyed on a fingerprinted
-  `origin:` so a retry or replay never re-files, and leaves the spec's list intact. Malformed items
-  aggregate into one `severity: low` entry (`spec-deferrals-malformed`); a `spec_file` resolving
-  outside the orchestrator-owned roots is refused (`spec-deferrals-skipped-out-of-tree`).
+- **Deferred review findings are harvested from spec frontmatter (#433).** BMAD-METHOD#2640 moved
+  `defer`-triaged findings into the spec's unfiled `deferred:` list. A successful dev, review,
+  repair or review-timeout-salvage pass now files each as `### DW-<n>` (`spec-deferrals-harvested`),
+  keyed on a fingerprinted `origin:` so a retry or replay never re-files; the spec's list is
+  untouched. Malformed items become one `severity: low` entry (`spec-deferrals-malformed`); a
+  `spec_file` outside the orchestrator's roots is refused (`spec-deferrals-skipped-out-of-tree`).
 
 - **A park travels with its story's commit, so `bmad-loop confirm` works from any clone (#356).**
   Each parked story writes one JSON record to `.bmad-loop/operator/<key>.json` inside the story's
@@ -57,12 +56,11 @@ whose seams had diverged enough that several ports needed a different fix, and t
   dirty snapshot could not be captured. New `preserve_ref` on each task, projected into `status` and
   `--json` (additive; schema stays 1) from run state, so a ref `scm.preserve_keep` pruned is named.
 
-- **Stories can close deferred-work entries (#234).** A story can now declare what its work closes —
-  `closes_deferred: [DW-5, DW-6]` on its `stories.yaml` entry or in the spec's frontmatter, the two
-  unioned — and on commit the orchestrator flips each entry to `status: done <date>` plus a
-  `resolution: resolved by story <id>` line. No upstream skill emits the field yet
-  (BMAD-METHOD#2619). Advisory and applied at the commit boundary: a failed or escalated story
-  closes nothing, and bad ids only warn — `validate` reports them up front
+- **Stories can close deferred-work entries (#234).** A story can declare what it closes —
+  `closes_deferred: [DW-5, DW-6]` on its `stories.yaml` entry or in the spec's frontmatter, unioned
+  — and on commit each flips to `status: done <date>` plus `resolution: resolved by story <id>`. No
+  upstream skill emits the field yet (BMAD-METHOD#2619). Advisory, at the commit boundary: a failed
+  or escalated story closes nothing, and bad ids only warn, reported up front by `validate`
   (`deferred.closes-unknown` / `-malformed` / `-entry-unreadable`, `deferred.ledger-unreadable`).
 
 - **Readable run logs for `opencode-http` (#306).** Contributed by
@@ -79,14 +77,12 @@ whose seams had diverged enough that several ports needed a different fix, and t
   recommendation to deferred work and journals `review-timeout-salvage`; `"defer"` gives up on the
   first timeout-like verdict. Env-fault (#194) and `crashed` verdicts keep their own routing.
 
-- **Transport failures pause instead of burning attempts (#194).** A session whose coding CLI lost
-  its API connection stays alive but idle, printing `API Error: Unable to connect …` until it idles
-  out the session clock — indistinguishable from a real wall-clock timeout, so two outages could
-  exhaust `max_dev_attempts` and defer the story with no work attempted. Adapters now classify such
-  a session as an environment fault from per-profile `env_fault_patterns`, and the dev, review and
-  fix phases pause for a human (re-arm restores the budget), as `rc 126/127` verify faults do. Under
-  a blocking plugin workflow a classified session escalates instead, and the sweep's migration and
-  triage loops escalate before charging a retry.
+- **Transport failures pause instead of burning attempts (#194).** A session whose CLI lost its API
+  connection stayed alive but idle, printing `API Error: Unable to connect …` until the session
+  clock ran out — indistinguishable from a timeout, so two outages exhausted `max_dev_attempts` and
+  deferred it untouched. Adapters classify it from per-profile `env_fault_patterns`; dev, review and
+  fix pause like an `rc 126/127` verify fault; re-arm restores the budget. A blocking plugin
+  workflow and the sweep's migration and triage loops escalate instead, before charging a retry.
 
 - **Documented the `BMAD_LOOP_*` environment variables (#246).** The three runtime override vars —
   `BMAD_LOOP_MUX_BACKEND`, `BMAD_LOOP_PROCESS_HOST`, `BMAD_LOOP_SESSION_TIMEOUT_S` — now have a
@@ -111,29 +107,25 @@ whose seams had diverged enough that several ports needed a different fix, and t
   change.
 
 - **The story token budget is checked while the story runs (#336).** `max_tokens_per_story` was read
-  once, after the story had already been marked done, so an overrun was reported only after every
-  token was spent — and a story that deferred or escalated was never checked at all. The cumulative
-  weighted spend is now re-checked at every session boundary, and the first crossing raises an
-  ATTENTION plus a desktop notice naming the spend and the cap; latched per story and persisted, so
-  a resume does not re-notify. Still advisory — nothing is terminated; the session-ending cap
-  remains `limits.max_tokens_per_session`.
+  once, after the story was marked done, so an overrun surfaced only after every token was spent —
+  and a story that deferred or escalated went unchecked. Cumulative weighted spend is now re-checked
+  at every session boundary; the first crossing raises an ATTENTION plus a desktop notice naming
+  spend and cap, latched per story and persisted so a resume does not re-warn. Still advisory —
+  nothing is terminated; `limits.max_tokens_per_session` remains the session-ending cap.
 
-- **A failed worktree snapshot now blocks the rollback reset (#340).** The two preserve steps were
-  asymmetric: an auto-rollback refused to reset past commits it could not park, but a failed
-  _uncommitted_-work snapshot was journaled and the `reset --hard` ran anyway — destroying the
-  tracked edits and run-created untracked files the snapshot existed to capture. Both paths now
-  refuse on the same terms, pausing with rescue instructions that name the tree. A capture failure
-  over a fully committed tree still resets; a resolved re-drive stays pause-free (#338). Inert under
-  the shipped defaults — it bites `scm.rollback_on_failure = true` and in-worktree dev retries.
+- **A failed snapshot now blocks the rollback reset (#340).** An auto-rollback refused to reset past
+  commits it could not park, yet journaled a failed _uncommitted_-work snapshot and reset anyway —
+  destroying the tracked edits and run-created untracked files it existed to capture. Both preserve
+  steps now refuse alike, pausing with rescue instructions naming the tree. A capture failure over a
+  fully committed tree still resets; a resolved re-drive stays pause-free (#338). Inert under
+  shipped defaults; it bites `scm.rollback_on_failure = true` and in-worktree retries.
 
-- **A review that revokes the sprint sign-off escalates instead of burning cycles (#334).** The
-  orchestrator advances `sprint-status` to `done` at dev time; a review session that writes the
-  board back to an earlier stage contradicts that, and nothing re-advances it — so the remaining
-  cycles re-read the same failure and the story deferred with its work rolled back. The
-  review-verify gate now pauses, naming both sides and the two ways out: finish the work and
-  re-arm, or accept the story and advance the board. Keys on `sprint-status` only: `status: blocked`
-  stays the sanctioned hand-back channel. New `[review] on_status_contradiction`, default
-  `escalate`; `retry` restores the previous behavior.
+- **A review revoking the sprint sign-off now escalates (#334).** `sprint-status` is advanced to
+  `done` at dev time; a review session writing it back contradicts that, and nothing re-advances it
+  — the remaining cycles re-read the same failure and the story deferred, work rolled back. The
+  review-verify gate now pauses with the two ways out: finish and re-arm, or accept and advance the
+  board. Keys on `sprint-status` alone; `status: blocked` stays the hand-back channel. New
+  `[review] on_status_contradiction` (default `escalate`; `retry` restores the old behavior).
 
 - **`bmad-loop-setup` stops registering BMAD config; the installer owns it (#258).** The skill wrote
   the pre-v6.10 `_bmad/config.yaml` layout, which BMAD's own resolver never reads. Since v6.10.0
@@ -168,10 +160,9 @@ whose seams had diverged enough that several ports needed a different fix, and t
   ledger symlinked to an untracked target is seeded to the wrong path and still hits this (#462).
 
 - **Every ledger write an isolated unit makes now reaches the main checkout (#425, #458).** Of the
-  producers writing the deferred-work ledger from inside a unit worktree, a damped review
-  round's refiled follow-up and a story's `closes_deferred:` flips died with it, because
-  `finalize_commit`'s `git add -A` skips the gitignored path in silence. Both now re-file after
-  the merge, journaled
+  producers writing the deferred-work ledger from inside a unit worktree, a damped review round's
+  refiled follow-up and a story's `closes_deferred:` flips died with it: `finalize_commit`'s
+  `git add -A` skips the gitignored path in silence. Both now re-file after the merge, journaled
   `review-followup-carried` / `review-followup-carry-uncommitted` and `story-deferred-close-carried`
   / `story-deferred-close-carry-uncommitted`; the follow-up's record is persisted before its append.
 
@@ -203,14 +194,16 @@ whose seams had diverged enough that several ports needed a different fix, and t
   itself. One consequence: a bundle session that changed no code now fails the gate.
 
 - **A harvested deferral is reverted when its attempt rolls back (#420).** The harvest runs before
-  the artifact gate, so a session that failed a non-fixable check left a ledger entry describing
-  code the rollback had just discarded, and the reset cannot remove it: the ledger sits under a
-  `keep`-protected artifact folder, and `git reset --hard` reverts a ledger only when git tracks it.
-  The dev phase now snapshots the ledger before every engine-side write in that window, persists the
-  snapshot with the attempt, and restores it around the rollback; a failed probe keeps the file
-  (`ledger-scope-probe-failed`, `ledger-tracked-probe-failed`) and reaching the restore unarmed
-  records `ledger-snapshot-missing`. Lossless: the spec's `deferred:` frontmatter is never mutated,
-  so the next attempt re-harvests from it.
+  the artifact gate, so a session failing a non-fixable check left a ledger entry describing
+  discarded code — unremovable by the reset, since the ledger sits under a `keep`-protected artifact
+  folder and git reverts a ledger only when it tracks it. The dev phase now snapshots the ledger
+  before every engine-side write in that window, persists it with the attempt, and restores it
+  around the rollback.
+
+- **The ledger snapshot degrades loudly (#420).** A scope or tracked probe that cannot answer keeps
+  the file (`ledger-scope-probe-failed`, `ledger-tracked-probe-failed`), and reaching the restore
+  unarmed records `ledger-snapshot-missing`. The revert is lossless either way: the spec's
+  `deferred:` frontmatter is never mutated, so the next attempt re-harvests from it.
 
 - **The harvest's own ledger write is no longer the session's proof of work (#433).** The harvest
   runs above the dev artifact gate, and that gate deliberately does not exclude the ledger — a story
@@ -219,14 +212,15 @@ whose seams had diverged enough that several ports needed a different fix, and t
   engine had just written for it. The gate now excludes the ledger relpath on exactly the attempts
   whose harvest filed into it, keyed on a flag latched and persisted before the first append.
 
-- **A session's own ledger edit on that same attempt still counts as proof of work (#433).** The
-  exclusion is path-granular — it hides the whole ledger relpath, not the harvest's lines — so where
-  both wrote, the session's edit went out with the orchestrator's and the non-fixable retry that
-  follows paused the whole run under the default `scm.rollback_on_failure = false`. The gate now
-  stands down whenever the ledger moved off a digest persisted beside `baseline_commit`, re-checked
-  once `post_session` hooks return, since a hook can be the session's last writer. A state file
-  predating the digest falls back to git evidence, where a failed probe keeps the path excluded
-  (`legacy-ledger-attribution-failed`).
+- **A session's own ledger edit on that attempt is still proof of work (#433).** The exclusion is
+  path-granular — the whole ledger relpath, not the harvest's lines — so where both wrote, the
+  session's edit went out with the orchestrator's and the following non-fixable retry paused the run
+  under the default `scm.rollback_on_failure = false`. The gate now stands down whenever the ledger
+  moved off a digest persisted beside `baseline_commit`, re-checked after `post_session` hooks
+  return — a hook can be the session's last writer.
+
+- **A state file predating that digest falls back to git evidence (#433).** A failed probe there
+  keeps the path excluded (`legacy-ledger-attribution-failed`).
 
 - **A worktree that could not be given its required upstream skills now pauses instead of stalling
   (#433).** Provisioning skips a skill tree resolving outside the repo — exactly what a symlink to a
@@ -341,13 +335,12 @@ whose seams had diverged enough that several ports needed a different fix, and t
   `_bmad/custom/bmad-dev-auto.toml`, never rename it; `--dry-run` says on stderr when its preview is
   not runnable; and the skills preflight stopped gating a triage-only CLI's skill tree.
 
-- **The worktree git-add shield no longer hides new files in your own checkout (#384).** It appended
-  the tool files it writes (`.claude/skills`, the per-CLI hook config, seeded configs) to
-  `.git/info/exclude` — shared with the main checkout and every sibling worktree, permanent,
-  unversioned — paths projects legitimately track, so every **new** file under them silently
-  stopped being staged by `git add -A` in your own checkout, long after the run. It now writes a
-  private exclude in the worktree's own gitdir, activated with a worktree-scoped `core.excludesFile`
-  that dies with `git worktree remove`, copying your existing excludes file into it byte for byte.
+- **The git-add shield no longer hides new files in your own checkout (#384).** It appended the tool
+  files it writes (skill trees, hook config, seeded configs) to `.git/info/exclude` — shared with
+  the main checkout and every sibling worktree, permanent, unversioned — and projects legitimately
+  track those paths, so every **new** file under them silently stopped being staged by `git add -A`.
+  It now writes a private exclude in the worktree's gitdir, activated by a worktree-scoped
+  `core.excludesFile` that dies with `git worktree remove`, copying yours in byte for byte.
 
 - **The shield now proves it applies, or skips with a reason (#384).** Storing the worktree-scoped
   key proved only that the value was stored, and a `!` line below a copied pattern cancelled it —
@@ -357,12 +350,11 @@ whose seams had diverged enough that several ports needed a different fix, and t
   peer-accessible `core.sharedRepository` or an unanswerable probe skips it — journaled, notified.
 
 - **Caveats for the worktree shield (#384).** It enables `extensions.worktreeConfig`, a
-  **permanent** repo-format flag git never removes. It is rolled back wherever it could be left set
-  without a working shield, outliving a failed shield only where a sibling worktree still depends on
-  it or the rollback itself failed — both named in the reason. It needs **git 2.20**, below which
-  the shield is skipped and no repo-format change is made — git that old refuses a repo carrying
-  the flag. Concurrent runs serialize on a `.git`
-  lock, and lines an older bmad-loop wrote into `.git/info/exclude` stay — delete them by hand.
+  **permanent** repo-format flag; it is rolled back wherever it could be left set without a working
+  shield, surviving only where a sibling worktree depends on it or the rollback itself failed — the
+  reason says which. It needs **git 2.20**: below that the shield is skipped and no repo-format
+  change is made, since git that old refuses a repo carrying it. Concurrent runs serialize on a
+  `.git` lock; lines an older bmad-loop wrote into `.git/info/exclude` stay — delete them by hand.
 
 - **The git-add shield's git calls run on the shared chokepoint (#389).** They were the last bare
   `git` spawns outside `verify._run_git`, so they missed its `LC_ALL=C` pin and used a hardcoded
@@ -394,22 +386,19 @@ whose seams had diverged enough that several ports needed a different fix, and t
   documented-best-effort helper caught. Git's output is now captured as bytes and decoded with the
   filesystem codec inside the guarded tail.
 
-- **A worktree's local git exclude really is best-effort now (#359).** `_worktree_local_exclude`
-  guarded only its `git rev-parse`; the filesystem tail behind it crashed the run on a symlink loop,
-  a read-only `.git`, or an exclude file or seeded path that was not UTF-8 — the payload is now
-  read, deduped and written as bytes, so those codec faults are gone as fault modes. It degrades
-  to a reason string, journaled as
-  `worktree-exclude-degraded` on the story — without the exclude the unit's `git add -A` would
-  commit the provisioned skill trees and tool configs into the story's merge. Git being unqueryable
-  at all (not a repo, no git) stays a silent, expected skip.
+- **The worktree's local git exclude is best-effort now (#359).** `_worktree_local_exclude` guarded
+  only its `git rev-parse`; the filesystem tail crashed the run on a symlink loop, a read-only
+  `.git`, or a non-UTF-8 exclude file or seed path — the payload is now read, deduped and written as
+  bytes, so the codec faults are gone. It degrades to a journaled `worktree-exclude-degraded`
+  reason; without the exclude the unit's `git add -A` would commit the provisioned skill trees and
+  tool configs into the merge. Git unqueryable at all stays a silent, expected skip.
 
-- **A finished session whose spec left `status:` blank is rescued again (#369).** A second copy of
-  the #358 stringification lived in `devcontract.synthesize_result`: a present-but-blank `status:`
-  read as the truthy token `"none"`, so the prose `## Auto Run Result` fallback never fired and the
-  synthesis was flagged inconsistent. `status_consistent` gates the post-kill rescue (#61), so a
-  session that finished real work but lost its final Stop was discarded as `stalled`/`timeout`. Both
-  readers now go through `frontmatter.status_of`. A blank frontmatter with a prose `blocked` or
-  `awaiting-operator` gets a truthful label too, and routing for those is unchanged.
+- **A spec left with a blank `status:` is rescued again (#369).** `devcontract.synthesize_result`
+  carried a second #358 stringification: a blank-but-present `status:` read as the truthy token
+  `"none"`, so the prose `## Auto Run Result` fallback never fired and synthesis read inconsistent —
+  and since `status_consistent` gates the post-kill rescue (#61), a session that lost only its final
+  Stop was discarded as `stalled`/`timeout`. Both now use `frontmatter.status_of`; blank frontmatter
+  with prose `blocked`/`awaiting-operator` gets a truthful label too, routing unchanged.
 
 - **A blank frontmatter `status:` reads as blank, not as the token `none` (#358).** YAML parses a
   bare `status:` line as null and `status_of` stringified it, so every gate saw `"none"`, a token
@@ -562,12 +551,11 @@ whose seams had diverged enough that several ports needed a different fix, and t
   session name contains `:` (#221). tmux ids are server-global and untouched.
 
 - **A session's read-back could adopt another story's spec (#261).** The generic dev/review
-  read-back picked its artifact by mtime from the shared implementation-artifacts dir, which under
-  worktree isolation also covers the main checkout's copy and under `isolation="none"` _is_ that
-  copy. A foreign spec landing there after launch
-  won, so a review that produced nothing scored `completed:done` and a dev leg's
-  `followup_review_recommended: false` skipped review. Unlike the rest of this family
-  (#127/#160/#224) it failed toward _landing_ unverified work.
+  read-back picked its artifact by mtime from the shared implementation-artifacts dir — which under
+  worktree isolation also covers the main checkout's copy, and under `isolation="none"` _is_ that
+  copy. A foreign spec landing there after launch won, so a review that produced nothing scored
+  `completed:done` and a dev leg's `followup_review_recommended: false` skipped review. Unlike the
+  rest of this family (#127/#160/#224) it failed toward _landing_ unverified work.
 
 - **The read-back is pinned to the spec the orchestrator named (#261).** Wherever the dispatched
   prompt names the path — every review leg, dev repair and patch-restore —
@@ -606,9 +594,8 @@ whose seams had diverged enough that several ports needed a different fix, and t
   `notify-send`-only, so on macOS and Windows `notify.desktop` (default `true`) was inert and every
   "a human is needed" path reached no one. It now dispatches natively (`osascript`, a best-effort
   WinRT PowerShell toast, `notify-send`), passing untrusted text through the environment or argv,
-  never a
-  command string; with none available, `validate` warns `notify.desktop-unavailable` and the run
-  start prints one, journalling `notify-desktop-unavailable`.
+  never a command string. With none available, `validate` warns `notify.desktop-unavailable` and the
+  run start prints one, journalling `notify-desktop-unavailable`.
 
 - **Scrollable modal dialogs (#275).** The decision, escalation, confirm, sweep-options and
   story-checkpoint TUI dialogs now scroll their bodies and dock their action buttons, so the buttons
@@ -683,14 +670,16 @@ that rode the same window. Both skill eras are supported; the rename itself need
   escalates before dispatch.
   The seed also merges per _file_, and checks each file for containment — a behaviour change.
 
-- **A renderer stub that cannot compose a prompt fails the preflight (#405).** Three new checks
-  block `validate`/`run`/`sweep`/`resume` when the resolved `SKILL.md` is the renderer stub
+- **A renderer stub that cannot compose a prompt fails preflight (#405).** Three new checks block
+  `validate`/`run`/`sweep`/`resume` when the resolved `SKILL.md` is the renderer stub
   (BMAD-METHOD#2601): `skills.dev-renderer` for an incomplete script unit,
-  `skills.dev-renderer-config` for an absent `_bmad/config.toml` (the only required layer of the
-  renderer's central config), and `skills.dev-renderer-sources` for a missing `workflow.md` or an
-  unloadable `[[bmad-snapshot:…]]` token. `skills.customize-legacy` warns when an override still
-  sits at `_bmad/custom/bmad-dev-auto[.user].toml`, where it no longer applies — the session runs,
-  unstyled.
+  `skills.dev-renderer-config` for an absent `_bmad/config.toml` (the renderer's only required
+  config layer), and `skills.dev-renderer-sources` for a missing `workflow.md` or an unloadable
+  `[[bmad-snapshot:…]]` token.
+
+- **A stale customization override is reported, not obeyed (#405).** `skills.customize-legacy` warns
+  when an override still sits at `_bmad/custom/bmad-dev-auto[.user].toml`, where it no longer
+  applies — the session runs, unstyled.
 
 - **Worktree isolation carries the `_bmad/` config surface (#405).** The renderer-era primitive
   takes the worktree as its project root and hard-fails when that root has no `_bmad/` — there is
@@ -731,11 +720,13 @@ that rode the same window. Both skill eras are supported; the rename itself need
   `_bmad/bmm/config.yaml` sets `repo_root` — the documented monorepo knob — decouples the git root
   from the project dir. Provisioning seeds every surface off `repo_root` while `init`, `validate`
   and the run preflight write and probe them under `project`, so the preflight approved a surface
-  the isolated run never received and every story ended as a result-less Stop. `validate` reports
-  `policy.isolation-repo-root`, and `run`, `sweep`, `resume`, `resolve` and the child sweep — which
-  raises rather than declining quietly, so a mid-run flip is journaled `sweep-auto-failed` — refuse:
-  drop the override, or set
-  `isolation = "none"`. Plumbing `project` through provisioning stays open as #414, tracked as #443.
+  the isolated run never received and every story ended as a result-less Stop.
+
+- **The `repo_root` refusal covers every entry point (#405).** `validate` reports
+  `policy.isolation-repo-root`, and `run`, `sweep`, `resume`, `resolve` and the child sweep all
+  refuse — drop the override, or set `isolation = "none"`. The child raises rather than declining
+  quietly, so a mid-run flip is journaled `sweep-auto-failed`. Plumbing `project` through
+  provisioning stays open as #414 and #443.
 
 - **`worktree_clean` and `path_tracked` no longer read their answer out of git's stderr (#405).**
   `ls-files` and `status` exit 0 while still writing to stderr, and that chatter was
@@ -747,13 +738,12 @@ that rode the same window. Both skill eras are supported; the rename itself need
   `except (PolicyError, OSError)` handler — the TUI could not open and the CLI died at startup on a
   raw codec message naming no file. Both loaders now raise typed errors; `validate` names the file.
 
-- **Deferred review findings are harvested out of the spec's frontmatter (#405).**
-  BMAD-METHOD#2640 moved `defer`-triaged findings from `deferred-work.md` into the spec's own
-  `deferred:` list, silently starving the sweep pipeline. A successful dev, repair or review
-  session now files each into the ledger with its `location` and `severity`
-  (`spec-deferrals-harvested`), deduped on a fingerprint of its summary and location; the
-  frontmatter is never rewritten, so a revert is lossless. The review prompt no longer files the
-  finding itself, which double-filed it.
+- **Deferred review findings are harvested out of the spec's frontmatter (#405).** BMAD-METHOD#2640
+  moved `defer`-triaged findings from `deferred-work.md` into the spec's own `deferred:` list,
+  silently starving the sweep pipeline. A successful dev, repair or review session now files each
+  into the ledger with its `location` and `severity` (`spec-deferrals-harvested`), deduped on a
+  fingerprint of its summary and location; the frontmatter is never rewritten, so a revert is
+  lossless. The review prompt no longer files the finding itself, which double-filed it.
 
 - **A transient harvest read cannot silently drop recorded findings (#405).** An unreadable,
   missing, undecodable or temporarily malformed spec at the harvest step now follows the existing
@@ -768,12 +758,14 @@ that rode the same window. Both skill eras are supported; the rename itself need
 
 - **A harvested deferral is reverted when its attempt rolls back (#405).** The harvest runs above
   the artifact gate, so a session that finalized its spec and then failed a non-fixable check left
-  an entry describing discarded code, which the reset cannot remove — the ledger sits under a
-  `keep`-shielded artifacts folder. The dev phase now snapshots it and restores around the
-  rollback; the snapshot is persisted with the attempt, and never unlinks a ledger git tracks. On
-  the `rollback_on_failure = off` default the restore reverts the whole chain's ledger writes, not
-  just the last attempt's — matching the `git reset --hard <baseline_commit>` the pause notice tells
-  the operator to run — and reaching the restore unarmed still records `ledger-snapshot-missing`.
+  an entry describing discarded code the reset cannot remove — the ledger sits under a
+  `keep`-shielded artifacts folder. The dev phase now snapshots it and restores around the rollback,
+  persisting the snapshot with the attempt and never unlinking a ledger git tracks.
+
+- **That restore spans the whole retry chain (#405).** On the `rollback_on_failure = off` default it
+  reverts every attempt's ledger writes, not just the last — matching the
+  `git reset --hard <baseline_commit>` the pause notice tells the operator to run. Reaching the
+  restore unarmed still records `ledger-snapshot-missing`.
 
 - **The pre-harvest snapshot is spent by a stop-and-wait pause, and scoped to the retry chain
   (#405).** Under the default `rollback_on_failure = off` the operator may append to the ledger
@@ -795,21 +787,21 @@ that rode the same window. Both skill eras are supported; the rename itself need
   and stands down again when the ledger had already moved off the dev phase's baseline.
 
 - **Both of those answers span a fixable retry (#405).** A fixable retry keeps the harvest's ledger
-  line with its tree on purpose, so the repair session was judged against a baseline predating that
-  line and an attempt that merely reverted the offending change passed the gate on the
-  orchestrator's own write, and a stalled attempt deferred with an empty record of what the harvest
-  meant to file. Both records now survive the continuation and the ledger baseline is
-  re-based to match — forward onto the kept tree, back onto the restored snapshot if the chain
-  later rolls back. (A gitignored ledger is invisible to the gate either way.)
+  line with its tree by design, so the repair session met a stale baseline: an attempt that merely
+  reverted the offending change passed on the orchestrator's own write, and a stalled attempt
+  deferred with an empty record of the harvest's intent. Both records now survive the continuation,
+  and the ledger baseline re-bases: forward onto the kept tree, back onto the restored snapshot on a
+  rollback. (A gitignored ledger is invisible to the gate either way.)
 
-- **A sweep bundle's ledger closes are withheld until its attempt is accepted, and taken back by a
-  review-leg defer (#405).** The orchestrator marked a bundle's ids `done` above the artifact gate,
-  so a discarded attempt left the ledger claiming its work resolved, and `open_ids` re-bundles only
-  open entries. The close now runs below the gate, for a PROCEED decision only; and a defer after
-  acceptance — every route, the stock `trigger = "recommended"` included — re-opens the ids it
-  closed itself, since `_defer` writes its post-close snapshot over the reset that reverted them.
-  One deliberate consequence: a bundle session that changed no code now fails the gate instead of
-  passing on the orchestrator's own bookkeeping.
+- **A sweep bundle's ledger closes are withheld until its attempt is accepted (#405).** The
+  orchestrator marked a bundle's ids `done` above the artifact gate, so a discarded attempt left the
+  ledger claiming its work resolved, and `open_ids` re-bundles only open entries. The close now runs
+  below the gate, for a PROCEED decision only. One deliberate consequence: a bundle session that
+  changed no code now fails the gate rather than passing on the orchestrator's own bookkeeping.
+
+- **A review-leg defer takes those closes back (#405).** A defer after acceptance — every route, the
+  stock `trigger = "recommended"` included — re-opens the ids it closed itself, since `_defer`
+  writes its post-close snapshot over the reset that reverted them.
 
 - **An isolated unit's ledger writes reach the main checkout — findings and bundle closes alike
   (#405).** A defer drops the unit worktree unmerged, and a landing unit's ledger edit rides the
