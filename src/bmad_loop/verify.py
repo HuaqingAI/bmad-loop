@@ -477,10 +477,10 @@ def path_tracked(repo: Path, rel: str) -> bool:
     never authorize a delete. The message keeps the BARE ``rel``: the operator's path is
     its informative half and the magic prefix is our own plumbing.
 
-    Ships with no caller — `git.render-tracked` (`cmd_validate`) and
-    `_ledger_is_gits_to_restore` (the harvest revert) are its consumers and land in
-    later sub-phases of #433. Inert, not silent: neither ruff's `E4,E7,E9,F` set nor
-    pyright basic reports an unused module-level function."""
+    Three live callers, all reached through this one chokepoint: `git.render-tracked`
+    (`cmd_validate`), `_ledger_is_gits_to_restore` (the harvest revert) and
+    `_harvest_carry_commit_may_degrade` (the isolation carry). It shipped inert in an
+    earlier sub-phase of #433 and was wired up by later ones."""
     proc = _run_git(["git", "-C", str(repo), "ls-files", "--", *_literal_specs([rel])], repo)
     if proc.returncode != 0:
         merged = (proc.stdout + proc.stderr).strip()

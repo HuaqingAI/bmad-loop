@@ -568,8 +568,9 @@ def provision_worktree(
         raw_config_path = worktree / profile.hooks.config_path
         # Refuse before mkdir, read, or write: hook commands are worktree-specific
         # and must never mutate a shared dotfile through a live or dangling link.
-        # Inspect every component because Python 3.14's non-strict resolve leaves a
-        # symlink cycle unresolved (and therefore textually equal to the raw path).
+        # Inspect every component because on Python 3.13 and 3.14 a non-strict resolve
+        # leaves a symlink cycle unresolved (and therefore textually equal to the raw
+        # path); 3.11 and 3.12 raise RuntimeError instead, which the except below takes.
         # The resolved comparison additionally refuses ``..`` and absolute profiles.
         refused = not raw_config_path.is_relative_to(worktree)
         cursor = raw_config_path
@@ -607,8 +608,11 @@ def provision_worktree(
     # paths projects legitimately TRACK, so a repo-wide exclude here went on
     # hiding their new files from the operator's own checkout (#384).
     patterns = {f"/{p.skill_tree}" for p in profiles}
-    # hookless profiles have no config_path — and their empty string would render
-    # as the pattern "/", git-excluding the entire worktree.
+    # hookless profiles have no config_path, so there is nothing to shield: their
+    # empty string would render as a bare "/", which git strips to a zero-length
+    # pattern (the trailing slash becomes MUSTBEDIR) that matches nothing —
+    # measured on 2.55.0 against "/*" and "*", which do blanket. An inert junk
+    # line in a generated file, then, not a worktree-wide exclusion.
     patterns |= {f"/{p.hooks.config_path}" for p in profiles if not p.hookless}
     patterns |= {f"/{rel}" for rel in seeded}
     patterns |= {f"/{rel}" for rel in seeded_bmad}

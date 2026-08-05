@@ -2681,9 +2681,11 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
                 # read-modify-REWRITE carrying the operator's own excludes in
                 # `prefix` — so a short write (ENOSPC) left the file truncated
                 # mid-content while the degrade reason still said "could not update".
-                # Worse, the surviving tail is a valid git pattern and a prefix of the
-                # intended one: cut one char in and the last line is "/", which
-                # excludes the entire worktree.
+                # The harm runs the opposite way from a blanket exclusion: the cut
+                # loses shield lines, so the unit's `git add -A` stages the tool files
+                # provisioning wrote into the story's own commit. (A truncation landing
+                # on a bare "/" is inert — git strips it to a zero-length pattern that
+                # matches nothing; only the LOST lines matter.)
                 #
                 # The helper rather than a hand-rolled tmp+replace: it fsyncs before
                 # the replace and carries the target's mode over, which a bare replace

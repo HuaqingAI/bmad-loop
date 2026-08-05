@@ -5468,14 +5468,16 @@ def test_worktree_local_exclude_short_write_leaves_exclude_intact(project, tmp_p
     byte-identical, not truncated. `write_bytes` opens "wb" (truncate-then-write)
     and this is a read-modify-REWRITE carrying their content in `prefix`, so a
     direct write left the file cut mid-content while the reason still said
-    "could not update". The surviving tail is a valid git pattern and a prefix of
-    the intended one — cut one character in and the last line is `/`, which
-    excludes the whole worktree.
+    "could not update". The harm is the LOST lines, not the surviving tail: a cut
+    exclude stops shielding, so the unit's `git add -A` stages the tool files
+    provisioning wrote into the story's own commit. (A cut landing on a bare `/`
+    is inert — git strips the trailing slash to a zero-length pattern that matches
+    nothing, measured on 2.55.0 against `/*` and `*`, which do blanket.)
 
     Blast radius is smaller since #384 (the file is this worktree's own, not the
     main repo's shared exclude) but the fault is not: the content carried through
     `prefix` is the operator's global excludes, copied in when the private file was
-    created, and `/` still swallows the whole worktree.
+    created, and a truncation drops however many of them the short write cost.
 
     The fault is injected at `Path.open`, NOT at `Path.write_bytes`: patching
     write_bytes means the file is never opened, so the truncation cannot happen
@@ -6174,10 +6176,13 @@ def test_provision_worktree_hookless_skips_hook_merge(tmp_path):
     assert not (wt / ".bmad-loop").exists()
 
 
-def test_provision_worktree_hookless_exclude_never_blankets_worktree(project, tmp_path):
-    """A hookless profile has config_path == "", which must not become the git
-    exclude pattern "/" (that would exclude the entire worktree from the unit's
-    `git add -A` commit). Only the skill tree is shielded."""
+def test_provision_worktree_hookless_exclude_has_no_bare_slash(project, tmp_path):
+    """A hookless profile has config_path == "", which must not reach the exclude
+    as a bare "/". That pattern is INERT rather than dangerous — git strips the
+    trailing slash to a zero-length pattern matching nothing, measured on 2.55.0
+    against "/*" and "*", which do blanket — so what this pins is that a profile
+    with nothing to shield contributes no line at all. Only the skill tree is
+    shielded."""
     repo = project.project
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
