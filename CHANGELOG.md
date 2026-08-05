@@ -95,79 +95,50 @@ which has not been released since 0.9.0 and does not descend from v0.9.1.
 ### Changed
 
 - **Every spec-frontmatter status read goes through `status_of` (#358 follow-up).** Five inline
-  `str(… .get("status", ""))` copies remained in the engine and the generic adapter, each of which
-  read a blank `status:` as the token `none` — the defect #358 fixed at the shared reader. Three
-  were neutral (a blank is non-terminal either way); the pair that was not is the review-launch
-  snapshot and the mid-session status-transition tick, which compare against each other. One
-  behavior change falls out: a session that ERASES a previously-set status no longer records a
-  transition — a blank is not an observed live status.
+  status reads remained in the engine and the generic adapter, each reading a blank `status:` as the
+  token `none` — the defect #358 fixed at the shared reader. Three were neutral; the pair that was
+  not is the review-launch snapshot and the mid-session status-transition tick, which compare
+  against each other. One behavior change falls out: a session that ERASES a previously-set status
+  no longer records a transition — a blank is not an observed live status.
 
 - **`set_frontmatter_status`'s tests now live in `tests/test_frontmatter.py` (#357, part 3).** They
-  had stayed in `tests/test_resolve.py` next to `set_frontmatter_field`'s so parts 1 and 2 read as
-  changes rather than as a rename. Tests only — no behavior change.
+  had stayed in `tests/test_resolve.py` next to `set_frontmatter_field`'s. Tests only — no behavior
+  change.
 
-- **The story token budget is checked while the story runs (#336).** `max_tokens_per_story` was
-  read once, after the story had already been marked done — so an overrun was reported only after
-  every token was spent, and a story that deferred or escalated was never checked at all (one field
-  report burned 8.35M weighted against a 2M cap in silence). The cumulative weighted spend is now
-  re-checked at every session boundary, on every path a story can take, and the first crossing
-  raises an ATTENTION + desktop notice naming the spend and the cap. Latched per story and
-  persisted, so a resume does not re-notify. Still advisory: nothing is terminated — the
-  session-ending cap remains `limits.max_tokens_per_session`. The `token-budget-exceeded` journal
-  entry gains a `budget` field.
+- **The story token budget is checked while the story runs (#336).** `max_tokens_per_story` was read
+  once, after the story had already been marked done, so an overrun was reported only after every
+  token was spent — and a story that deferred or escalated was never checked at all. The cumulative
+  weighted spend is now re-checked at every session boundary, and the first crossing raises an
+  ATTENTION plus a desktop notice naming the spend and the cap; latched per story and persisted, so
+  a resume does not re-notify. Still advisory — nothing is terminated.
 
 - **A failed worktree snapshot now blocks the rollback reset (#340).** The two preserve steps were
   asymmetric: an auto-rollback refused to reset past commits it could not park, but a failed
   _uncommitted_-work snapshot was journaled and the `reset --hard` ran anyway — destroying the
-  tracked edits and run-created untracked files the snapshot existed to capture. That protected the
-  more recoverable half; orphaned commits stay reachable by reflog until `gc`, while a discarded
-  uncommitted edit is gone. Both paths now refuse on the same terms, pausing with rescue
-  instructions that name the tree (the mounted worktree when there is one) and offer a git-free
-  copy-out, since the fault that broke the snapshot may still be breaking git.
+  tracked edits and run-created untracked files the snapshot existed to capture. Both paths now
+  refuse on the same terms, pausing with rescue instructions that name the tree. A capture failure
+  over a fully committed tree still resets; a resolved re-drive stays pause-free (#338).
 
-  Gated on there being something left to lose: a capture failure over a tree whose content was all
-  committed still resets, so a git fault can't halt an unattended run over a harmless reset. A
-  resolved re-drive stays pause-free by contract — it journals, resets, and flags the park
-  commits-only (#338). Inert under the shipped defaults, where the snapshot is reached only on a
-  re-drive; it bites `scm.rollback_on_failure = true` and in-worktree dev retries.
+- **A review that revokes the sprint sign-off escalates instead of burning cycles (#334).** The
+  orchestrator advances `sprint-status` to `done` at dev time; a review session that writes the
+  board back to an earlier stage contradicts that, and nothing re-advances it — so the remaining
+  cycles re-read the same failure and the story deferred with its work rolled back. The
+  review-verify gate now pauses, naming both sides. Keys on `sprint-status` only: `status: blocked`
+  stays the sanctioned hand-back channel. New `[review] on_status_contradiction` (`retry` restores).
 
-- **A review that revokes the sprint sign-off now escalates instead of burning review cycles
-  (#334).** The orchestrator advances `sprint-status` to `done` at dev time; a review session that
-  judges the story unfinished and writes the board back to an earlier stage contradicts that — and
-  nothing in the review loop re-advances it, so every remaining cycle re-read the same failure and
-  the story ended deferred with its work rolled back. That regression is now detected at the
-  review-verify gate and pauses the run with both sides named and the two ways out (finish the work
-  and re-arm, or accept the story and advance the board). Keys on `sprint-status` only — the spec's
-  own frontmatter legitimately cycles, and `status: blocked` stays the sanctioned hand-back channel
-  — and stays conservative: without the orchestrator's own launch-time sign-off, or on a status
-  outside the known lifecycle, it falls back to the old retry. New knob
-  `[review] on_status_contradiction`, default `escalate`; `retry` restores the previous
-  burn-cycles-then-defer behavior verbatim. Review prompts are unchanged by design: forbidding the
-  revert would make a correct reviewer comply and the story would commit without sign-off.
+- **`bmad-loop-setup` stops registering BMAD config; the installer owns it (#258).** The skill wrote
+  the pre-v6.10 `_bmad/config.yaml` layout, which BMAD's own resolver never reads. Since v6.10.0
+  bmad-loop is an installer-installed module, so the installer already stages `_bmad/bmad-loop/`,
+  writes the manifests, rebuilds the help catalog and regenerates the central `config.toml`
+  wholesale, discarding outside writes. The three PEP 723 scripts are **removed**, closing the
+  bare-`python3` bug (#259); setup now writes one help CSV, installs the tool and preflights.
 
-- **`bmad-loop-setup` stops registering BMAD config; the installer owns it (#258).** The skill
-  wrote `_bmad/config.yaml`, `_bmad/config.user.yaml` and a root `_bmad/module-help.csv` — the
-  pre-v6.10 layout, which BMAD's own resolver never reads (it merges four TOML layers, and
-  `/bmad-help` reads a catalog assembled from per-module `_bmad/<module>/module-help.csv`). Since
-  v6.10.0 bmad-loop is an installer-installed module, so the BMAD installer already stages
-  `_bmad/bmad-loop/`, writes the manifests, and rebuilds the help catalog on every run — and
-  regenerates the central `config.toml` wholesale, discarding anything written there from outside.
-  The three PEP 723 scripts (`merge-config.py`, `merge-help-csv.py`, `cleanup-legacy.py`) are
-  **removed**; setup now writes exactly one file under `_bmad/`, the per-module
-  `_bmad/bmad-loop/module-help.csv`, and otherwise does only what the installer cannot: install
-  or upgrade the orchestrator tool, run `bmad-loop init`, and preflight with `validate`. It reads
-  the user's name and language through BMAD's own `resolve_config.py` instead of collecting them.
-  Dropping the scripts also closes the PEP 723 invocation bug (#259) — no inline-dependency script
-  is invoked with bare `python3` any more, because none ships.
-
-- **Ctrl+C outside a run now exits `130` cleanly (#241).** A `KeyboardInterrupt` escaping
-  `main()` outside `engine.run()` (config load, engine construction) now prints a one-line
-  `interrupted` to stderr and returns the new `ExitCode.INTERRUPTED` (`130` = 128 + SIGINT).
-  The exit code is **unchanged** — uncaught, CPython already ended the process at `130` by
-  re-raising SIGINT — but previously as a **bare traceback**, dumped after any partial `--json`
-  stdout. It is now a clean `exit(130)` with empty stdout (a Python caller reading
-  `subprocess.returncode` sees `130` rather than `-2`). A Ctrl+C _during_ a run is unchanged:
-  the engine still finalizes it as a resumable `stopped` run (rc `0`).
+- **Ctrl+C outside a run now exits `130` cleanly (#241).** A `KeyboardInterrupt` escaping `main()`
+  outside `engine.run()` (config load, engine construction) now prints a one-line `interrupted` to
+  stderr and returns the new `ExitCode.INTERRUPTED` (`130` = 128 + SIGINT). The exit code is
+  **unchanged** — uncaught, CPython already ended the process at `130` — but previously as a bare
+  traceback dumped after any partial `--json` stdout; a Python caller reading
+  `subprocess.returncode` now sees `130` rather than `-2`. A Ctrl+C _during_ a run is unchanged.
 
 ### Removed
 
