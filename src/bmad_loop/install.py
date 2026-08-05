@@ -1369,8 +1369,8 @@ _WORKTREE_CONFIG_GIT = (2, 20)
 _SHIELD_LOCK_NAME = "bmad-loop-shield.lock"
 
 # THE ALTERNATIVE ARCHITECTURE, EVALUATED AND REJECTED — recorded here the way the
-# `--includes` finding below is, so a later reader or bot round does not re-propose
-# it as a simplification of the whole block.
+# `--includes` note below is, so a later reader does not re-propose it as a
+# simplification of the whole block.
 #
 # Every finding in this family (an empty seed plus an activation that shadows what
 # the seed failed to copy) exists because the shield SHADOWS a config key. One
@@ -1671,7 +1671,8 @@ def _shield_enable_worktree_config(worktree: Path, common_dir: Path) -> tuple[st
     #
     # All of that is undocumented IMPLEMENTATION DETAIL, not a compatibility
     # contract: git has converted reads to respect includes before (2.39, protected
-    # config).
+    # config). Flag availability was never the question: `--includes` dates to git
+    # 1.7.10, far below the 2.20 floor the gate above enforces.
     shared = str(common_dir / "config")
     carried = _shield_shared_config(worktree, shared, "extensions.worktreeConfig", "--type=bool")
     if carried is not None and os.fsdecode(carried).strip() == "true":
@@ -1752,7 +1753,8 @@ def _shield_undo_extension(worktree: Path, git_dir: Path, common_dir: Path) -> s
         # The tuple mirrors the caller's tail minus `GitError` (nothing here spawns
         # git), and the members beyond `OSError` are what keeps the "never raises"
         # promise true: on the 3.11/3.12 floor `Path.resolve()` raises `RuntimeError`
-        # for a symlink loop rather than `OSError`.
+        # for a symlink loop rather than `OSError`, and `UnicodeError` covers the
+        # `fsdecode` of a worktree admin-dir name on Windows.
         dependent = f"the scan for sibling worktrees failed ({e})"
     if dependent is not None:
         return (
@@ -1849,7 +1851,10 @@ def _shield_inherited_excludes(worktree: Path) -> bytes:
 
     BYTES, never decoded text: exclude entries are path patterns, POSIX paths are
     arbitrary bytes, and one non-UTF-8 byte collapsed a `read_text` seed to empty —
-    after which the activation SHADOWED what it failed to copy.
+    after which the activation SHADOWED what it failed to copy. Copying verbatim
+    also keeps every pattern intact for the caller's dedupe; git reads the result
+    either way, stripping a trailing `\\r` from an exclude line and skipping a
+    UTF-8 BOM.
 
     FOUR outcomes (#384). The first two are silent; the other two RAISE, and the
     caller's tail turns that into the degrade reason that skips the activation.
@@ -2036,7 +2041,9 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
 
     - git unqueryable BEFORE GIT HAS ANSWERED AT ALL (not a repo, git missing, a
       timeout or spawn failure on the FIRST `rev-parse` — both `GitError`) is an
-      EXPECTED skip: returns None silently. That scope is the whole of it.
+      EXPECTED skip: returns None silently. That scope is the whole of it, and
+      nothing is DECODED in this arm — git's stdout stays bytes until the tail
+      below, because a decode fault is a degrade, not this arm's silent skip (#374).
     - anything AFTER git answered degrades to a returned reason string; only a
       definite ABSENT answer stays silent. Silence is not cosmetic: without the
       exclude the unit's `git add -A` commits the tool files just provisioned.
@@ -2075,6 +2082,7 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
         # `except` of its own: a non-zero rc returns the reason below, a raise lands in
         # this try's tail — which also catches the `UnicodeError` the `fsdecode` of
         # git's stderr can raise on Windows, hence that read sits inside the guard.
+        # #394 records that same decode escaping at a sibling block that lacks it.
         shared_answer = git_bytes(worktree, "rev-parse", "--git-common-dir")
         if shared_answer.returncode != 0:
             detail = (
@@ -2239,7 +2247,9 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
                 # "wb" TRUNCATES before writing, and this is a read-modify-REWRITE
                 # carrying the operator's own excludes in `prefix`, so a short write
                 # (ENOSPC) left the file truncated mid-content — losing shield lines —
-                # while the degrade reason still said "could not update". The helper
+                # while the degrade reason still said "could not update". A truncation
+                # landing on a bare "/" is inert: git strips it to a zero-length
+                # pattern that matches nothing, so only the LOST lines matter. The helper
                 # rather than a hand-rolled tmp+replace: it fsyncs before the replace
                 # and carries the target's mode over, which a bare replace resets.
                 # #381's interleaving race is moot here — the file is one worktree's

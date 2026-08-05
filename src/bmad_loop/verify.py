@@ -1731,7 +1731,7 @@ class CommandResult:
 # seeded worktrees that lost +x burned dev attempts on no-op repairs).
 ENV_FAULT_RCS = frozenset({126, 127})
 
-# cmd has no such convention (issue #302, measured on Windows 11): `cmd /c
+# cmd has no such convention (issue #302): `cmd /c
 # <missing tool>` exits 1 — the same code an ordinary test failure uses — and
 # 9009 surfaces only as %ERRORLEVEL% *inside* a batch file, so it reaches us
 # only when the verify command is itself a .cmd/.bat propagating it. Worse,

@@ -787,19 +787,26 @@ class WorktreeFlow:
         own write; the carry stays the delivery path, hence
         ``sweep-bundle-close-carry-uncommitted`` on a run that lands.
 
-        Excluded: a ledger already in the checkout (the copy is a no-op the seed
-        loop reports as ``worktree-seed-skipped``, on every tracked-ledger
-        project); one absent from the main checkout (dropped silently, so the
-        entry would be invisible rather than merely inert — the common case,
-        since the first harvest is what CREATES the file); and one resolving
-        outside the project tree, which for an out-of-tree artifacts DIR
-        ``ProjectPaths.rebased`` leaves unmoved, so the worktree already reads
-        it. A ledger that is itself a symlink keeps the dir in-tree: an in-repo
-        target is seeded to the WRONG path and still hits #426 (#462). Resolving
-        also names the target of a TRACKED ledger symlink whose target is
-        untracked — the only path the seed loop will write, since it refuses to
-        copy through a link. ``relative_to`` decides PLACEMENT; containment is
-        re-checked against both roots at the copy site.
+        Excluded: a ledger already in the checkout (without the exclusion the copy
+        would be a no-op the seed loop reports as ``worktree-seed-skipped`` on every
+        tracked-ledger project); one absent from the main checkout (dropped
+        silently, so the entry would be invisible rather than merely inert — the
+        common case, since the first harvest is what CREATES the file); and one
+        resolving outside the project tree, which for an out-of-tree artifacts DIR
+        ``ProjectPaths.rebased`` leaves unmoved, so the worktree already reads it.
+        Presence is asked of the WORKTREE, not of git: that is the predicate the
+        seed loop itself decides on, and unlike ``verify.path_tracked`` it costs no
+        subprocess and cannot raise.
+
+        A ledger that is itself a symlink keeps the dir in-tree, so ``rebased``
+        moves it and the worktree path does not exist: the exclusion is still right
+        for an out-of-repo target (``provision_worktree`` refuses that source
+        whatever rel it is handed), but an in-repo target is seeded to the WRONG
+        path and still hits #426 (#462). Resolving also names the target of a
+        TRACKED ledger symlink whose target is untracked — the only path the seed
+        loop will write, since it refuses to copy through a link. ``relative_to``
+        decides PLACEMENT; containment is re-checked against both roots at the copy
+        site.
 
         Deduped against ``scm.worktree_seed`` by the caller.
         """

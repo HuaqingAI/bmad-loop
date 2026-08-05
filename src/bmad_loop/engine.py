@@ -1392,7 +1392,7 @@ class Engine:
                     # follow-up against the attempt that COMMITTED, whose review
                     # recommended none — and `append_entry` has nothing to dedupe
                     # it against, so a tracked ledger commits the wrong row rather
-                    # than absorbing it (#457's review). `rearm_escalation` already
+                    # than absorbing it (#457). `rearm_escalation` already
                     # voids the history behind the record by resetting
                     # `followup_reviews_spent` for a fresh damping budget.
                     #
@@ -4703,6 +4703,11 @@ class Engine:
         ``dw_ids == []`` is an ordinary outcome and not a carry that ran on
         nothing.
 
+        A TRACKED ledger is safe unconditionally: no exclude or ignore rule masks a
+        tracked file's MODIFICATION, so the unit's own write always rides the merge
+        and its row arrives already deduped — yielding an empty ``carried`` and no
+        commit.
+
         The commit is best effort — unlike ``_carry_harvested_deferrals``, whose
         re-raise is backed by ``harvest_carry_commit_pending`` — because it can
         only ever FAIL: the sole ledger shape that reaches it is a gitignored one,
@@ -4713,10 +4718,10 @@ class Engine:
 
         Every record must belong to the attempt now being committed — a premise
         ``_dev_phase`` enforces, not this frame. A record left over from an
-        ABANDONED attempt has nothing upstream to dedupe against, so the carry
-        would append AND commit a row about work that never landed; the
-        fresh-attempt clear beside ``harvested_deferrals`` is what prevents that
-        (#457).
+        ABANDONED attempt died with its discarded worktree, so it has nothing
+        upstream to dedupe against and the carry would append AND commit a row
+        about work that never landed; the fresh-attempt clear beside
+        ``harvested_deferrals`` is what prevents that (#457).
         """
         if not task.refiled_followups:
             return

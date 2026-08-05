@@ -3184,9 +3184,9 @@ def test_shield_refuses_a_repository_shared_between_os_users(project, tmp_path):
 
     Ablation: delete the `_shield_shared_repository` call in `_worktree_local_exclude`
     and this fails. What the deletion falls through to was checked by RUNNING the
-    ablated helper rather than inferred from the first failing assertion, because
-    twice on this PR a deleted arm landed on an adjacent guard that also returned a
-    reason: it falls through to a clean SUCCESS — `reason is None`, the lock file
+    ablated helper rather than inferred from the first failing assertion, because a
+    deleted arm can land on an adjacent guard that also returns a reason: it falls
+    through to a clean SUCCESS — `reason is None`, the lock file
     created, `worktreeConfig` written — so every assertion below is load-bearing and
     none of them can pass against the bug."""
     repo = project.project
@@ -3387,8 +3387,8 @@ def test_shield_refuses_a_valueless_shared_repository_key(project, tmp_path):
 
     Hand-written because `git config` cannot express a key with no value. Appended as
     a fresh `[core]` section rather than edited into the existing one: a repeated
-    section is legal in git config, and it carries no path, so none of this PR's
-    Windows fixture hazards (a backslash is a config ESCAPE) apply.
+    section is legal in git config, and it carries no path, so the Windows fixture
+    hazard (a backslash is a config ESCAPE) does not apply.
 
     Ablation: add "" to the accepted values and this fails — the shield proceeds."""
     repo = project.project
@@ -3415,8 +3415,9 @@ def test_shield_refuses_a_valueless_shared_repository_key(project, tmp_path):
 def test_shield_reads_shared_repository_without_stripping_it(project, tmp_path):
     """The gate removes `--get`'s TERMINATOR and nothing else. `git config --get`
     returns edge whitespace VERBATIM (a quoted `" umask"` comes back as
-    b" umask\\n"), so `.strip()` would widen a value into the accept set — the same
-    defect at a second site in this same function, and live
+    b" umask\\n"), so `.strip()` would widen a value into the accept set — the defect
+    `test_shield_keeps_edge_whitespace_in_the_common_dir` pins in the common-dir
+    parse, at a second site in this same function, and live
     rather than defensive: `rev-parse --absolute-git-dir` answers rc 0 for such a
     repository, so the gate really is reached with this value in hand.
 
@@ -3426,8 +3427,8 @@ def test_shield_reads_shared_repository_without_stripping_it(project, tmp_path):
     verdict on that value.
 
     No Windows skip: the fixture is a config value, not a path, and it carries no
-    backslash — the escape that made a hand-written config fixture unparseable on
-    Windows CI earlier in this PR.
+    backslash — the escape that makes a hand-written config fixture unparseable on
+    Windows.
 
     Ablation: use `.strip()` instead of `removesuffix("\\n")` and this fails — but NOT
     in the shape the obvious note would claim, which is why the assertions below are
@@ -3602,9 +3603,10 @@ def test_shield_refuses_when_the_core_bare_probe_cannot_answer(project, tmp_path
     both, and a fix applied to one arm only would leave this one open.
 
     `--type=bool` gives this probe a second way to fail that the plain read has not:
-    measured at 2.20.4 and 2.55.0, `--type=bool` over a non-bool value exits 128
-    (2.20.4 words it "bad numeric config value", 2.55.0 "bad boolean config value" —
-    same rc). Note that no STATIC config value can reach that: a repo whose
+    across the supported git range, `--type=bool` over a non-bool value exits 128
+    (the wording differs by version — "bad numeric config value" at the floor, "bad
+    boolean config value" at current — same rc). Note that no STATIC config value
+    can reach that: a repo whose
     `core.bare` is a non-bool fatals the caller's earlier `rev-parse` first (measured
     128 at both). What reaches here is a transient fault inside the caller's lock.
 
@@ -3730,7 +3732,7 @@ def test_shield_refuses_to_enable_extension_over_old_git(project, tmp_path, monk
 
 def test_shield_degrade_leaves_no_permanent_repo_format_change(project, tmp_path, monkeypatch):
     """`extensions.worktreeConfig` is a PERMANENT repo-format change bmad-loop never
-    reverses, so it must not be paid for a shield that then degrades away. Round 5:
+    reverses, so it must not be paid for a shield that then degrades away.
     `_shield_enable_worktree_config` used to perform the enable itself, ahead of the
     seed, the mkdir, the write and the activation — so every degrade below it left
     the operator's repo marked forever for a shield that never applied. It now only
@@ -4019,7 +4021,7 @@ def test_shield_rollback_treats_an_absent_flag_as_completed(project, tmp_path):
 def test_shield_rollback_removes_every_line_of_a_doubled_flag(project, tmp_path):
     """The other half of the `--unset-all` decision, and the one that makes the
     spelling load-bearing rather than cosmetic. git-config(1) gives rc 5 two meanings,
-    and a key written on TWO lines is the second: measured at 2.20.4 and 2.55.0,
+    and a key written on TWO lines is the second: across the supported git range,
     `--unset` against it exits 5 and removes NOTHING, while `--unset-all` exits 0 and
     removes both.
 
@@ -4899,8 +4901,8 @@ def test_shield_appends_a_pattern_an_inherited_negation_would_cancel(project, tm
     # fixture expresses the scenario rather than merely naming it
     assert b"!/.claude/skills\n" in _wt_private_exclude(wt).read_bytes()
     # THE HARM, through git's own answer. A substring rather than whole-worktree
-    # cleanliness: that form has already failed on Windows CI in this PR over unrelated
-    # CRLF churn, and the subject here is this one path.
+    # cleanliness: that form is fragile on Windows CI over unrelated CRLF churn,
+    # and the subject here is this one path.
     (wt / ".claude" / "skills").mkdir(parents=True, exist_ok=True)
     (wt / ".claude" / "skills" / "tool.md").write_text("generated\n", encoding="utf-8")
     assert "tool.md" not in git(wt, "status", "--porcelain", "-uall")
@@ -5167,8 +5169,8 @@ def test_shield_honors_an_explicitly_empty_excludesfile(project, tmp_path, monke
     NULL POINTER, while an empty value resolves through `interpolate_path("")` to a
     non-NULL empty string, and that guard is unchanged from this shield's 2.20 floor to
     current. It is undocumented: `core.adoc` says only "Defaults to
-    $XDG_CONFIG_HOME/git/ignore" — the same standing as the relative- value behavior the
-    sibling test above pins.
+    $XDG_CONFIG_HOME/git/ignore" — the same standing as the relative-value behavior
+    the sibling test above pins.
 
     `GIT_CONFIG_NOSYSTEM` is deliberately NOT pinned, unlike the XDG sibling: a
     repo-LOCAL key already outranks a global one, so there is nothing to suppress, and
@@ -5276,8 +5278,8 @@ def test_shield_survives_a_newline_in_the_repository_path(tmp_path):
 
     `git rev-parse` separates its answers with a newline, so asking ONE call for both
     `--absolute-git-dir` and `--git-common-dir` read a legal path byte as a record
-    delimiter: measured on git 2.55, the two answers below split into FOUR entries and
-    the helper returned a degrade instead. Degrading is not a safe default here —
+    delimiter: the two answers below split into FOUR entries and the helper returned
+    a degrade instead. Degrading is not a safe default here —
     `provision_worktree` has already copied the tool files by the time the shield runs,
     so the unit's `git add -A` commits them into the story's merge.
 
@@ -5457,7 +5459,7 @@ def test_worktree_local_exclude_short_write_leaves_exclude_intact(project, tmp_p
     exclude stops shielding, so the unit's `git add -A` stages the tool files
     provisioning wrote into the story's own commit. (A cut landing on a bare `/`
     is inert — git strips the trailing slash to a zero-length pattern that matches
-    nothing, measured on 2.55.0 against `/*` and `*`, which do blanket.)
+    nothing, unlike `/*` and `*`, which do blanket.)
 
     Blast radius is smaller since #384 (the file is this worktree's own, not the
     main repo's shared exclude) but the fault is not: the content carried through
@@ -5799,8 +5801,8 @@ def test_worktree_local_exclude_common_dir_probe_rc_degrades(project, tmp_path, 
     """The SECOND `rev-parse` is past the silent arm: `--absolute-git-dir` has already
     answered, so git has identified the repository and a failure here is a degrade.
 
-    Round 3 split one combined `rev-parse` into two calls (a newline is a legal byte
-    in a POSIX path), and the second call inherited the FIRST call's silent arm. That
+    Splitting one combined `rev-parse` into two calls (a newline is a legal byte in a
+    POSIX path) let the second call inherit the FIRST call's silent arm. That
     left a shield that was owed, did not happen, and said nothing — after provisioning
     had already copied the files it exists to hide. Both the function's own docstring
     ("a timeout or spawn failure on the FIRST rev-parse ... that scope is the whole of

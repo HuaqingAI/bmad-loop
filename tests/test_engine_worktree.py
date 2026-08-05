@@ -3122,12 +3122,12 @@ def test_gitignored_declared_closure_reaches_the_main_ledger(project):
     the review-budget follow-up, both APPENDS, and a declared close is neither.
 
     The fixture encodes that false success: the worktree ledger ends `status: done`
-    with the resolution annotation, the main checkout's ledger still reads
-    `status: open`, and the journal carries `story-deferred-closed dw_ids=['DW-1']`
-    with no `deferred-close-unmatched` — the run reports a close it never delivered.
-    Ablating the seed (`_ledger_seed` -> `()`) puts the pre-seed behavior back: the
-    worktree ledger is ABSENT, `classify` reports the id unmatched, and the run
-    journals `deferred-close-unmatched dw_ids=['DW-1']`. Louder, equally lost.
+    with the resolution annotation, and the journal carries `story-deferred-closed
+    dw_ids=['DW-1']` with no `deferred-close-unmatched`. Without the carry the main
+    checkout's ledger still reads `status: open` — the run reports a close it never
+    delivered. Ablating the seed (`_ledger_seed` -> `()`) puts the pre-seed behavior
+    back: the worktree ledger is ABSENT, `classify` reports the id unmatched, and the
+    run journals `deferred-close-unmatched dw_ids=['DW-1']`. Louder, equally lost.
 
     Tracked is the contrast, not a second defect: the sibling above measures the
     same story against a TRACKED ledger and the close rides the unit commit into
