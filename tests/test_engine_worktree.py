@@ -3100,3 +3100,264 @@ def test_worktree_in_repo_ledger_closure_reaches_the_target_branch(project):
     assert entry.status.startswith("done") and not entry.open
     assert "resolution: resolved by story 1-1-a" in entry.body
     assert worktree_clean(project.project)
+    # #458's carry runs here too, and finds nothing to do: `_apply_done` returns
+    # None for a row that is already `done`, so `mark_done_many` writes nothing at
+    # all and no commit is attempted. That is what lets the carry be unconditional
+    # rather than needing a tracked/ignored predicate.
+    carried = [e for e in engine.journal.entries() if e["kind"] == "story-deferred-close-carried"]
+    assert [e["dw_ids"] for e in carried] == [[]]
+    assert "story-deferred-close-carry-uncommitted" not in journal_kinds(engine)
+    # exactly one annotation — a second close would append a second resolution line
+    assert entry.body.count("resolution:") == 1
+    assert "resolution-undo:" not in entry.body
+
+
+def test_gitignored_declared_closure_reaches_the_main_ledger(project):
+    """#458 — the fourth producer in the `git add -A` family, and the one whose
+    failure now reads as a SUCCESS.
+
+    `_close_declared_deferred` writes `self.workspace.paths.deferred_work`, which
+    under isolation is the unit worktree's ledger. With the ledger GITIGNORED —
+    the default shape, since the ledger lives in the BMAD artifacts dir — the flip
+    lands in the worktree, is skipped in silence by `finalize_commit`'s `git add
+    -A` (a worktree-scoped exclude shields every seeded rel), brings nothing over
+    with the merge, and dies with the worktree at `close_unit_workspace`. Nothing
+    in `_carry_isolated_ledger_writes` carries it: that hook owns the harvest and
+    the review-budget follow-up, both APPENDS, and a declared close is neither.
+
+    Measured on this commit (`628fe54`), verbatim.
+
+    The unit worktree's ledger at the moment of the close::
+
+        ### DW-1: item DW-1
+
+        origin: test, 2026-06-01
+        location: src.txt:1
+        reason: test entry.
+        status: done 2026-08-05
+        resolution: resolved by story 1-1-a
+
+    The main checkout's ledger after the run — unchanged::
+
+        ### DW-1: item DW-1
+
+        origin: test, 2026-06-01
+        location: src.txt:1
+        reason: test entry.
+        status: open
+
+    …and the journal carries `story-deferred-closed dw_ids=['DW-1']` with no
+    `deferred-close-unmatched`. That is the false success: `f798c1b` seeds the
+    ledger a worktree checkout cannot deliver, so the close now finds a file to
+    write and reports itself done. Ablating that seed (`_ledger_seed` -> `()`)
+    puts the pre-seed behavior back — the worktree ledger is ABSENT, `classify`
+    reports the id unmatched, and the run journals `deferred-close-unmatched
+    dw_ids=['DW-1']`. Louder, equally lost.
+
+    Tracked is the contrast, not a second defect: the sibling above measures the
+    same story against a TRACKED ledger and the close rides the unit commit into
+    the merge — no seed is made, so no exclude shields it. The fix therefore needs
+    no tracked/ignored predicate, only an idempotent carry (re-applying a close
+    the merge already delivered is a no-op, exactly as
+    `test_tracked_damped_followup_is_not_refiled_twice_by_the_carry` relies on).
+
+    RED here is the last three assertions: the main checkout must end up with the
+    annotation the worktree got. Everything above them holds today and must keep
+    holding — the fix delivers the close, it does not stop reporting one.
+    """
+    ignore_before_commit(project, "deferred-work.md")
+    write_ledger(project, {"DW-1": "open"})
+    rel = project.deferred_work.relative_to(project.project).as_posix()
+    # `check-ignore` is the oracle: a rule that is present is not necessarily
+    # effective, and a row that reads the tracked shape by accident is vacuous.
+    assert git(project.project, "check-ignore", rel).strip() == rel
+    assert not verify.path_tracked(project.project, rel)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a", followup_review=False, closes_deferred=["DW-1"])],
+    )
+
+    summary = engine.run()
+
+    # the false success, in the order an operator meets it
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    closed = [e for e in engine.journal.entries() if e["kind"] == "story-deferred-closed"]
+    assert [e["dw_ids"] for e in closed] == [["DW-1"]]
+    assert "deferred-close-unmatched" not in journal_kinds(engine)
+    # the only checkout that ever held the flip is gone
+    assert [p.resolve() for p in worktree_list(project.project)] == [project.project.resolve()]
+    entry = _ledger_entry(project, "DW-1")
+    assert entry.status.startswith("done") and not entry.open
+    assert "resolution: resolved by story 1-1-a" in entry.body
+
+
+def test_crashed_post_merge_story_close_replays_from_its_record(project):
+    """A story whose ONLY ledger write is a declared close has every other carry
+    payload empty, so the resume pass has to name this one to reach it — the same
+    reachability the damped follow-up needed, for the fourth producer."""
+    ignore_before_commit(project, "deferred-work.md")
+    write_ledger(project, {"DW-1": "open"})
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a", followup_review=False, closes_deferred=["DW-1"])],
+    )
+    crash_at_merge_back(engine, after="merge")
+
+    assert engine.run().crashed
+
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed.phase == Phase.DONE and not crashed.isolated_ledger_carried
+    # only the new disjunct can reach the carry
+    assert crashed.story_closes_intended == ["DW-1"]
+    assert not crashed.harvested_deferrals and not crashed.refiled_followups
+    assert _ledger_entry(project, "DW-1").open
+
+    state = load_state(engine.run_dir)
+    state.clear_pause()
+    adapter = MockAdapter([])
+    resumed = Engine(
+        paths=project,
+        policy=engine.policy,
+        adapter=adapter,
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=state,
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.crashed and not summary.paused
+    assert adapter.sessions == []
+    assert "resume-ledger-carry" in journal_kinds(resumed)
+    entry = _ledger_entry(project, "DW-1")
+    assert entry.status.startswith("done") and not entry.open
+    assert load_state(resumed.run_dir).tasks["1-1-a"].isolated_ledger_carried
+
+
+def test_a_re_armed_story_does_not_carry_a_withdrawn_declaration(project, monkeypatch):
+    """The record is re-derived at every commit boundary, and that is the whole of
+    its staleness guard.
+
+    `_close_declared_deferred` reads `closes_deferred:` LIVE and reassigns
+    `story_closes_intended` before its own early return, so it needs no
+    `_dev_phase` clear the way `refiled_followups` does: DONE is reachable only
+    through `_finalize_commit_phase`, which always re-enters the producer. A human
+    who resolves an escalation by WITHDRAWING the declaration must not have the
+    abandoned attempt's ids closed on their behalf — the exact stale-snapshot case
+    `_declared_deferred_ids` reads live to avoid.
+    """
+    ignore_before_commit(project, "deferred-work.md")
+    write_ledger(project, {"DW-1": "open"})
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a", followup_review=False, closes_deferred=["DW-1"])],
+    )
+    real_finalize = verify.finalize_commit
+
+    def commit_fails(*_a, **_k):
+        raise verify.GitError("simulated commit failure")
+
+    monkeypatch.setattr(verify, "finalize_commit", commit_fails)
+
+    assert engine.run().paused
+
+    escalated = load_state(engine.run_dir).tasks["1-1-a"]
+    assert escalated.phase == Phase.ESCALATED
+    assert escalated.story_closes_intended == ["DW-1"]  # recorded, and now stale
+    # `_restore_deferred_closes` put the worktree ledger back; main never had it
+    assert _ledger_entry(project, "DW-1").open
+
+    monkeypatch.setattr(verify, "finalize_commit", real_finalize)
+    assert runs.rearm_escalation(engine.run_dir, "1-1-a") == "1-1-a"
+
+    state = load_state(engine.run_dir)
+    state.clear_pause()
+    resumed = Engine(
+        paths=project,
+        policy=engine.policy,
+        adapter=MockAdapter(
+            # the resolve outcome: the story no longer claims to close anything
+            [wt_dev_effect(project, "1-1-a", followup_review=False)]
+        ),
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=state,
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    assert _ledger_entry(project, "DW-1").open  # the withdrawn id stays open
+    assert not resumed.state.tasks["1-1-a"].story_closes_intended
+    carried = [e for e in resumed.journal.entries() if e["kind"] == "story-deferred-close-carried"]
+    assert [e["dw_ids"] for e in carried] == []
+
+
+def test_a_replayed_commit_still_records_the_story_close(project, monkeypatch):
+    """Record the DECLARED ids, never the ones `mark_done_many` actually flipped.
+
+    A host loss after `_close_declared_deferred` wrote the close but before the
+    DONE save leaves the phase at the COMMITTING that was already persisted, and
+    the resume arm re-enters `_finalize_commit_phase` — which re-runs the producer
+    against a worktree ledger that ALREADY reads `done`. `classify` then reports
+    every id `already_done` and `marked` is EMPTY. A record derived from `marked`
+    is therefore never made on that replay, the carry finds an empty payload, and
+    `close_unit_workspace` deletes the only copy — the exact defect `e88776a`
+    fixed for the damped follow-up, arriving through a different door.
+
+    Non-unwinding is the whole point: `_restore_deferred_closes` is neutralised
+    (a SIGKILL runs no except arm) so the close survives on disk, and the durable
+    state.json is put back over whatever `run()`'s unwind-`finally` wrote.
+    """
+    ignore_before_commit(project, "deferred-work.md")
+    write_ledger(project, {"DW-1": "open"})
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a", followup_review=False, closes_deferred=["DW-1"])],
+    )
+    snap: dict = {}
+
+    def host_loss(*_a, **_k):
+        # nothing has saved since the COMMITTING advance, so these bytes ARE the
+        # durable state at the instant of the kill — the record is memory-only
+        snap["state"] = (engine.run_dir / "state.json").read_bytes()
+        raise RuntimeError("host died after the declared close, before the DONE save")
+
+    monkeypatch.setattr(verify, "finalize_commit", host_loss)
+    monkeypatch.setattr(type(engine), "_restore_deferred_closes", lambda self, task, s: None)
+
+    assert engine.run().crashed
+
+    monkeypatch.undo()  # the host is back: the resume commits and unwinds normally
+
+    worktree = Path(engine.state.tasks["1-1-a"].worktree_path)
+    # the close exists, but only inside the unit worktree's gitignored ledger
+    assert not _ledger_entry(project.rebased(worktree), "DW-1").open
+    assert _ledger_entry(project, "DW-1").open
+
+    (engine.run_dir / "state.json").write_bytes(snap["state"])
+    durable = load_state(engine.run_dir).tasks["1-1-a"]
+    assert durable.phase == Phase.COMMITTING
+    assert not durable.story_closes_intended  # never reached disk — the replay re-derives it
+
+    state = load_state(engine.run_dir)
+    state.clear_pause()
+    resumed = Engine(
+        paths=project,
+        policy=engine.policy,
+        adapter=MockAdapter([]),
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=state,
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.crashed and not summary.paused
+    # the replay's own close flipped nothing (already done in the worktree) and the
+    # carry still delivered, because the record is the declaration, not the receipt
+    assert not worktree.is_dir()
+    entry = _ledger_entry(project, "DW-1")
+    assert entry.status.startswith("done") and not entry.open
+    assert "resolution: resolved by story 1-1-a" in entry.body

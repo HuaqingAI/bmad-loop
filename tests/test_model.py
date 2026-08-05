@@ -171,6 +171,7 @@ _DEFERRED_STATE_KEYS = (
     "harvested_deferrals",
     "bundle_closes_intended",
     "refiled_followups",
+    "story_closes_intended",
     "accepted_dev_session_index",
     "harvest_carry_commit_pending",
     "isolated_ledger_carried",
@@ -178,7 +179,7 @@ _DEFERRED_STATE_KEYS = (
 
 
 def test_deferred_work_state_fields_round_trip_through_json():
-    """All eleven fields are hand-enumerated in both serializers. Non-default
+    """All twelve fields are hand-enumerated in both serializers. Non-default
     values make a missing line on either side observable, while the JSON leg pins
     the on-disk container shape rather than only an in-memory dataclass copy."""
     task = StoryTask(
@@ -192,6 +193,7 @@ def test_deferred_work_state_fields_round_trip_through_json():
         harvested_deferrals=[{"origin": "spec-deferred abc", "title": "finding"}],
         bundle_closes_intended=["DW-3", "DW-7"],
         refiled_followups=[{"origin": "review-budget-followup", "title": "follow-up"}],
+        story_closes_intended=["DW-4"],
         accepted_dev_session_index=3,
         harvest_carry_commit_pending=True,
         isolated_ledger_carried=True,
@@ -209,13 +211,14 @@ def test_deferred_work_state_fields_round_trip_through_json():
     assert restored.refiled_followups == [
         {"origin": "review-budget-followup", "title": "follow-up"}
     ]
+    assert restored.story_closes_intended == ["DW-4"]
     assert restored.accepted_dev_session_index == 3
     assert restored.harvest_carry_commit_pending is True
     assert restored.isolated_ledger_carried is True
 
 
 def test_deferred_work_state_fields_default_for_one_old_state_dict():
-    """A state.json written before this package has none of the eleven keys.
+    """A state.json written before this package has none of the twelve keys.
     Every load must use ``d.get`` so resume reaches the old behavior instead of
     raising KeyError; one shared old document prevents testing only a subset."""
     doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
@@ -231,6 +234,7 @@ def test_deferred_work_state_fields_default_for_one_old_state_dict():
     assert restored.harvested_deferrals == []
     assert restored.bundle_closes_intended == []
     assert restored.refiled_followups == []
+    assert restored.story_closes_intended == []
     assert restored.accepted_dev_session_index is None
     assert restored.harvest_carry_commit_pending is False
     assert restored.isolated_ledger_carried is False

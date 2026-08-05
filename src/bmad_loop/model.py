@@ -198,6 +198,10 @@ class StoryTask:
     # `append_entry` kwargs for review-budget follow-ups this task filed into the
     # ACTIVE workspace's ledger, which under isolation is the unit worktree's.
     refiled_followups: list[dict[str, Any]] = field(default_factory=list)
+    # Deferred-work ids a story DECLARED it closes (`closes_deferred:`), recorded at
+    # the commit boundary. Same ledger, same isolation problem: a gitignored path
+    # never merges out of the unit worktree, so the flip has to be re-applied.
+    story_closes_intended: list[str] = field(default_factory=list)
     # Index of the append-only primary dev SessionRecord whose initial decision or
     # later verify-repair result durably returned PROCEED. Attempt numbers can be
     # reused after a human re-arm, so the exact record occurrence is the acceptance
@@ -353,6 +357,7 @@ class StoryTask:
             "harvested_deferrals": self.harvested_deferrals,
             "bundle_closes_intended": self.bundle_closes_intended,
             "refiled_followups": self.refiled_followups,
+            "story_closes_intended": self.story_closes_intended,
             "accepted_dev_session_index": self.accepted_dev_session_index,
             "harvest_carry_commit_pending": self.harvest_carry_commit_pending,
             "isolated_ledger_carried": self.isolated_ledger_carried,
@@ -423,6 +428,7 @@ class StoryTask:
             harvested_deferrals=[deepcopy(dict(item)) for item in d.get("harvested_deferrals", [])],
             bundle_closes_intended=[str(i) for i in d.get("bundle_closes_intended", [])],
             refiled_followups=[deepcopy(dict(item)) for item in d.get("refiled_followups", [])],
+            story_closes_intended=[str(i) for i in d.get("story_closes_intended", [])],
             accepted_dev_session_index=(
                 int(d["accepted_dev_session_index"])
                 if d.get("accepted_dev_session_index") is not None
