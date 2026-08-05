@@ -1380,6 +1380,24 @@ class Engine:
                 # later isolated carry. Crash replay never enters this branch.
                 if feedback is None:
                     task.harvested_deferrals = []
+                    # Same rule, and the abandoned attempt's ledger row is already
+                    # gone: an escalation leaves the unit worktree mounted and
+                    # unmerged, and the re-drive that reaches here discarded it
+                    # (`_finish_inflight`'s resume-restart arm), taking the only
+                    # copy of that row. Carrying the record anyway files a
+                    # follow-up against the attempt that COMMITTED, whose review
+                    # recommended none — and `append_entry` has nothing to dedupe
+                    # it against, so a tracked ledger commits the wrong row rather
+                    # than absorbing it (#457's review). `rearm_escalation` already
+                    # voids the history behind the record by resetting
+                    # `followup_reviews_spent` for a fresh damping budget.
+                    #
+                    # The fixable-retry exemption above is inherited, not reasoned:
+                    # this field's one producer fires on a finalized, verify-green
+                    # story immediately before `_commit`, and no path leads from
+                    # there back into a `feedback is not None` iteration, so such an
+                    # iteration can never hold a record to preserve.
+                    task.refiled_followups = []
             advance(task, Phase.DEV_RUNNING)
             self._save()
             if resume_result is not None:
@@ -4649,7 +4667,15 @@ class Engine:
         bookkeeping.
 
         It is best effort because it can only ever FAIL here, not because failure
-        is rare. Measured over all three shapes the main ledger can take:
+        is rare. Measured over all three shapes the main ledger can take, and all
+        three rest on a premise ``_dev_phase`` enforces rather than one this frame
+        can check: every record belongs to the attempt now being committed. A
+        record left over from an ABANDONED attempt breaks the tracked row below --
+        that attempt's own write died with its discarded worktree, so nothing is
+        upstream to dedupe against and the carry appends AND commits a row about
+        work that never landed. That is why the fresh-attempt clear beside
+        ``harvested_deferrals`` is load-bearing for this docstring, not only for
+        the ledger (#457's review).
 
         * TRACKED -- an exclude never masks a tracked file's MODIFICATION, so the
           unit's write always rides the merge and ``append_entry`` dedupes it

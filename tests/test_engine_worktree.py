@@ -30,7 +30,7 @@ from conftest import (
     write_sprint,
 )
 
-from bmad_loop import deferredwork, sprintstatus, verify, worktree_flow
+from bmad_loop import deferredwork, runs, sprintstatus, verify, worktree_flow
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.bmadconfig import ProjectPaths
@@ -1851,6 +1851,67 @@ def test_crashed_post_merge_followup_carry_replays_from_its_record(project):
     assert "resume-ledger-carry" in journal_kinds(resumed)
     assert len(_refiled_followups(project)) == 1
     assert load_state(resumed.run_dir).tasks["1-1-a"].isolated_ledger_carried
+
+
+def test_a_re_armed_story_does_not_carry_the_abandoned_attempt_s_followup(project, monkeypatch):
+    """The record is scoped to the attempt that made it, and `_dev_phase`'s
+    fresh-attempt clear is what enforces that.
+
+    An escalation between the damped record and the commit leaves the unit
+    worktree mounted and unmerged; the re-drive then DISCARDS it, taking the only
+    copy of the row with it. Without the clear the record outlives its attempt,
+    and the next attempt's DONE leg files a follow-up against the commit that
+    actually landed — one whose review recommended nothing. `rearm_escalation`
+    already resets `followup_reviews_spent` for a fresh damping budget, so keeping
+    the record contradicts the re-arm on its own terms.
+
+    Nothing upstream absorbs it either: the abandoned attempt's ledger write never
+    reached the main checkout, so `append_entry` has no open row to dedupe against
+    and a TRACKED ledger would commit the stale row rather than swallow it.
+    """
+    ignore_before_commit(project, "deferred-work.md")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, _damping_script(project))
+
+    real_finalize = verify.finalize_commit
+
+    def commit_fails(*_a, **_k):
+        raise verify.GitError("simulated commit failure")
+
+    monkeypatch.setattr(verify, "finalize_commit", commit_fails)
+
+    assert engine.run().paused
+
+    escalated = load_state(engine.run_dir).tasks["1-1-a"]
+    assert escalated.phase == Phase.ESCALATED
+    assert escalated.refiled_followups  # persisted by the producer, pre-append
+    assert not project.deferred_work.exists()  # the row is only in the doomed worktree
+
+    monkeypatch.setattr(verify, "finalize_commit", real_finalize)
+    assert runs.rearm_escalation(engine.run_dir, "1-1-a") == "1-1-a"
+
+    state = load_state(engine.run_dir)
+    state.clear_pause()
+    resumed = Engine(
+        paths=project,
+        policy=engine.policy,
+        adapter=MockAdapter(
+            [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)]
+        ),
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=state,
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    # the re-drive converged on its own review: only the ABANDONED attempt damped
+    assert journal_kinds(resumed).count("review-followup-damped") == 1
+    # the harm, asserted before its cause: no follow-up row for the commit that
+    # landed, and no carry claiming to have filed one
+    assert [e.title for e in _refiled_followups(project)] == []
+    assert "review-followup-carried" not in journal_kinds(resumed)
+    assert not resumed.state.tasks["1-1-a"].refiled_followups
 
 
 # ----------------------------------------------------------------- configured target
