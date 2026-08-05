@@ -802,10 +802,23 @@ class WorktreeFlow:
           ``worktree-seed-dropped``), so an entry here would be invisible rather
           than merely inert. The commonest case by far: the first harvest is what
           CREATES `deferred-work.md`.
-        * **Configured outside the project tree** — ``ProjectPaths.rebased``
-          leaves an out-of-tree artifacts dir unmoved, so the worktree already
-          reads the very same file and there is nothing to deliver. `relative_to`
-          is the test, and it is also the containment the seed loop requires.
+        * **Resolving outside the project tree** — for an out-of-tree artifacts
+          *dir* ``ProjectPaths.rebased`` leaves the path unmoved, so the worktree
+          already reads the very same file and there is nothing to deliver.
+
+        That last rationale covers the DIRECTORY only. When ``deferred-work.md``
+        is itself a symlink the dir stays in-tree, ``rebased`` moves it, and the
+        worktree path the workspace reads does not exist — so the exclusion is
+        not "the worktree already reads it". It is still the right call for an
+        out-of-repo target, because ``provision_worktree`` refuses an out-of-repo
+        resolved source whatever rel it is handed; an in-repo target, though, is
+        seeded to the WRONG path and still hits #426 (#462). Resolving is
+        load-bearing the other way too: when the checkout delivers a TRACKED
+        ledger symlink whose target is untracked, the resolved rel names that
+        target — the only path the seed loop will write, since it never copies
+        through a link. ``relative_to`` here decides PLACEMENT, not the seed
+        loop's containment; that is re-checked against both roots at the copy
+        site.
 
         Deduped against ``scm.worktree_seed`` by the caller, so an operator who
         already named the ledger keeps exactly one entry.
