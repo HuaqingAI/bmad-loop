@@ -64,8 +64,8 @@ breaking changes may land in a minor release.
   A park clears the same deterministic gates a `done` story clears — the spec/board pair, the
   project's verify commands, and a non-empty action list — and skips only the review loop, which has
   nothing in the diff to converge on. A park with no readable actions is refused and repaired, not
-  committed. Under worktree isolation the unit merges like a `done` one. `[operator] enabled =
-false` restores the old two-outcome behavior.
+  committed. Under worktree isolation the unit merges like a `done` one. Setting
+  `[operator] enabled = false` restores the old two-outcome behavior.
 
   `bmad-loop confirm` and the park entries it reads arrived in part 3, above.
 
@@ -97,8 +97,9 @@ false` restores the old two-outcome behavior.
   automatically but were only ever marked resolved by hand. A story can now declare the entries
   its work closes — `closes_deferred: [DW-5, DW-6]`, on its `stories.yaml` entry (stories mode)
   or in the story spec's frontmatter, the two unioned — and when the story commits, the
-  orchestrator flips each declared entry to `status: done <date>` + `resolution: resolved by
-story <id>`, the same annotation a sweep bundle writes. Both sprint and stories mode.
+  orchestrator flips each declared entry to `status: done <date>` plus the
+  `resolution: resolved by story <id>` line, the same annotation a sweep bundle writes. Both sprint
+  and stories mode.
 
   Advisory by contract: the annotation is written at the commit boundary — behind every verify
   gate, checkpoint and review cycle, just before the squash — so an in-repo ledger carries it in
@@ -176,12 +177,12 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 ### Changed
 
 - **Every spec-frontmatter status read goes through `status_of` (#358 follow-up).** Five inline
-  `str(fm.get("status", ""))` copies remained in the engine and the generic adapter, each of which
-  read a blank `status:` as the token `none` — the defect #358 fixed at the shared reader. Four were
-  neutral (a blank is non-terminal either way); the pair that was not is the review-launch snapshot
-  and the mid-session status-transition tick, which compare against each other. One behavior change
-  falls out: a session that ERASES a previously-set status no longer records a transition — a blank
-  is not an observed live status.
+  `str(… .get("status", ""))` copies remained in the engine and the generic adapter, each of which
+  read a blank `status:` as the token `none` — the defect #358 fixed at the shared reader. Three
+  were neutral (a blank is non-terminal either way); the pair that was not is the review-launch
+  snapshot and the mid-session status-transition tick, which compare against each other. One
+  behavior change falls out: a session that ERASES a previously-set status no longer records a
+  transition — a blank is not an observed live status.
 
 - **`set_frontmatter_status`'s tests now live in `tests/test_frontmatter.py` (#357, part 3).** They
   had stayed in `tests/test_resolve.py` next to `set_frontmatter_field`'s so parts 1 and 2 read as
@@ -256,7 +257,8 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   no pre-rename installs remain in the wild, so `init` no longer strips `bmad_auto`-marked hooks,
   deletes `bmad-auto-*` skill dirs, carries `.automator/policy.toml` over to `.bmad-loop/`, or
   prints the leftover-`.automator/` note. `bmad-loop-setup` drops its migration section with them.
-  A project still on `bmad-auto` should migrate on 0.9.0 before upgrading past it.
+  A project still on `bmad-auto` should migrate on 0.9.1 — the last release carrying the shims —
+  before upgrading past it.
 
 ### Fixed
 
@@ -333,9 +335,9 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   `bmad-dev-auto` accepted — so `validate`/`run`/`sweep`/`resume` pass on either era with no
   `policy.toml` edit. The forwarding shim upstream left behind is refused as marker-incomplete
   (`skills.base-shim`) — no step files, no `customize.toml`, which is also what a truncated
-  install looks like, so the message names both causes: the shim is a valid slash command, so an
-  unattended session dispatched into it would HALT on its interactive migration gate having
-  written nothing. Every session prompt spells
+  install looks like, so the message names both causes: the shim is a valid slash command, and where
+  a legacy `_bmad/custom/bmad-dev-auto*.toml` still sits beside it, it HALTs an unattended session
+  on its interactive migration gate having written nothing. Every session prompt spells
   the resolved name, per skill tree, so a run mixing `.claude/skills` and `.agents/skills` at
   different eras gets the right one per role; the no-spec fallback result marker is matched under
   both prefixes. The name is resolved against the **workspace**, so a run resumed into an existing
@@ -389,7 +391,7 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   where the value really grants peer access: `umask`, a false boolean, and an octal filemode with
   no group or other bits (`0600`, `0700`, `0711`) leave the repository private to you, and it is
   shielded normally.
-  Three caveats: this enables `extensions.worktreeConfig`, a **permanent**
+  Five caveats: this enables `extensions.worktreeConfig`, a **permanent**
   repo-format flag that is never removed — written at the last possible moment, so a run that
   degrades away **above** it leaves your repo's format untouched, and wherever it could be left set
   without a working shield (the enable failing, the activation failing, or the activation succeeding
@@ -403,7 +405,7 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   the release that introduced the flag and `git config --worktree`; below that the shield is skipped
   and no repo-format change is made, since git that old refuses a repository carrying the flag. Lines
   an older bmad-loop already wrote into `.git/info/exclude` are **not** removed for you — delete them
-  by hand (a `validate` warning lands separately).
+  by hand.
 - **The git-add shield's patterns survive an inherited negation (#384).** A pattern the seeded
   excludes already carried was treated as done — but gitignore's rule is last match wins, so a
   `!` line below it cancelled the shield's own pattern and the provisioned tool files stayed
@@ -440,8 +442,9 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   reason that quotes git's stderr in whatever language the box speaks — and used a hardcoded 120s
   timeout instead of the configured `[limits] git_timeout_s`. Both now apply.
 - **A non-UTF-8 filename no longer crashes the run past every git guard (#377).** `verify._run_git`
-  is the sole git spawn point and exists to give git's faults a type its ~50 `except GitError`
-  guards can catch, but it decoded git's output strictly and translated only a timeout and a spawn
+  is the sole git spawn point and exists to give git's faults a type the `except GitError` guards
+  throughout the codebase can catch, but it decoded git's output strictly and translated only a
+  timeout and a spawn
   `OSError`. `UnicodeDecodeError` is a third fault raised before any return code exists, and being a
   `ValueError` it matched neither arm — so one file whose name is not valid in the run's encoding
   (POSIX filenames are arbitrary bytes) escaped untyped. Reachable wherever git's own quoting is
@@ -462,9 +465,10 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
 - **A short write no longer truncates the worktree exclude (#375).** The exclude update is a
   read-modify-rewrite, and `write_text` truncates before writing, so a fault partway through (ENOSPC,
   EIO) left the operator's own excludes cut mid-content while the degrade reason still reported that
-  nothing had been written. Worse, the surviving tail parses as a valid git pattern and is a prefix
-  of the intended one — cut a character in and the last line is `/`, excluding the whole worktree —
-  and a linked worktree's common dir is the MAIN repo's `.git`, so the damage was repo-wide. Now
+  nothing had been written. The surviving tail still parses as valid git patterns, so nothing
+  reports the damage: the shield lines that were cut off simply stop shielding, and the unit's
+  `git add -A` then stages the provisioned skill trees and tool configs into the story's merge —
+  while a cut landing on a path boundary widens a surviving pattern over a whole subtree. Now
   written to a scratch file and moved into place, so the exclude is either fully updated or untouched.
 
 - **The exclude's git query no longer crashes on a non-UTF-8 repo path (#374).** POSIX filenames are
@@ -519,8 +523,9 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   `set_frontmatter_field`, `reset_spec_status`, and `strip_auto_run_result` read specs through
   `read_text`, whose universal-newline translation handed each writer an all-LF copy of a CRLF spec —
   so a write contracted to move one value rewrote every line ending in the file (to LF everywhere, and
-  to CRLF for an all-LF spec on Windows). All four now read bytes and decode; the two `frontmatter`
-  writers write bytes too, and a replaced line carries its own terminator instead of a flat `\n`.
+  to CRLF for an all-LF spec on Windows). All four now read bytes and decode; the two
+  frontmatter-field writers write bytes too, and a replaced line carries its own terminator instead
+  of a flat `\n`.
   A CRLF spec stays CRLF, a mixed-ending spec keeps each line's ending, and only the value moves.
   One pinned delta: a CR-only spec — never authored by a BMAD tool — is now a clean no-op through
   `reset_spec_status` / `strip_auto_run_result`, whose patterns are line-oriented on `\r?\n`.
@@ -546,13 +551,14 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   `done` status returns `False` without rewriting, where it used to rewrite and return `True`.
 
 - **A symlink-loop fault at park no longer loses the run's park (#335).** `_park_spec_relpath`
-  guarded its `resolve()` with `(OSError, ValueError)` and `_index_park` guarded its call with
-  `except OSError`, but below Python 3.13 `Path.resolve` reports a symlink loop as `RuntimeError` —
-  neither. `_index_park` runs outside every `try` in `_finalize_commit_phase` and after the phase
-  advance, so an escape skipped the park notification, the `post_commit` hook and **the state save**,
-  over an index write that is best-effort by design. Both guards now hold the type: the path helper
-  keeps its documented verbatim fallback so the index entry still lands, and the writer degrades to
-  the `operator-index-failed` journal line its `OSError` sibling always did.
+  guarded its `resolve()` with `(OSError, ValueError)` and the park-index writer — then
+  `_index_park`, since superseded by the committed per-story record of #356 above — guarded its call
+  with `except OSError`, but below Python 3.13 `Path.resolve` reports a symlink loop as
+  `RuntimeError` — neither. That writer then ran outside every `try` in `_finalize_commit_phase` and
+  after the phase advance, so an escape skipped the park notification, the `post_commit` hook and
+  **the state save**, over an index write that is best-effort by design. Both guards now hold the
+  type: the path helper keeps its documented verbatim fallback so the entry still lands, and the
+  writer degrades to the `operator-index-failed` journal line its `OSError` sibling always did.
 
 - **An unwritable `ATTENTION` file can no longer crash a run.** `gates.notify` promised "never
   raises", but only its desktop half was guarded — the `ATTENTION` append was bare IO, so an
@@ -576,8 +582,8 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   manual-recovery notice instead of describing a rollback that never ran.
 
 - **Spawn-level `OSError` is translated at the git chokepoint (#343).** `_run_git` translated only
-  a timeout, so an EMFILE/ENOMEM/ENOENT out of `subprocess.run` bypassed all 19 OSError-blind
-  `except GitError` guards and crashed the run — under exactly the resource pressure the recovery
+  a timeout, so an EMFILE/ENOMEM/ENOENT out of `subprocess.run` bypassed every OSError-blind
+  `except GitError` guard and crashed the run — under exactly the resource pressure the recovery
   paths owning those guards exist for. Spawn faults now raise `GitSpawnError` (a `GitError`), so
   every guard holds as written; the errno stays on `__cause__`. A spawn fault while opening a unit
   worktree now pauses the run instead of marching the queue into DEFERRED, and an FS or spawn
@@ -687,8 +693,9 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   `$TMUX` instead). Values that cannot survive psmux's
   control-line transport verbatim are refused with a warning instead of stored corrupted. Keys are
   freed on `kill_window` and reconciled at parked-window launch; the return move itself is restored
-  for the detach leg, while the `switch-client` leg stays inert until psmux/psmux#483 lands
-  upstream. Builtin window options keep the `-w` path; tmux is untouched.
+  for the detach leg, while the `switch-client` leg stays inert on psmux builds predating the
+  psmux/psmux#483 fix — still inert at 3.3.7. Builtin window options keep the `-w` path; tmux is
+  untouched.
 
 - **Session-qualify the psmux TUI-side window ids (#291).** #254 covered the engine seam but left
   the launcher's surfaces bare, and that process usually runs _outside_ any pane — where a bare
@@ -736,7 +743,7 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   there after launch — a concurrent run's merge-back, a human edit, a sweep — won on mtime and
   became this session's result, so a review that produced nothing was scored `completed:done`
   (merging unreviewed code) and, on the dev leg, its `followup_review_recommended: false` skipped
-  the review entirely. Unlike the rest of this family (#88/#127/#160/#224) it failed toward
+  the review entirely. Unlike most of this family (#127/#160/#224) it failed toward
   _landing_ unverified work. Two fixes, both in the adapter:
   - **Authoritative-path read-back.** Where the orchestrator has pointed the session at the spec it
     owes — every review leg, every dev repair, every patch-restore re-drive — `SessionSpec.expected_spec`
