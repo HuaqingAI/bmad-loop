@@ -1392,7 +1392,7 @@ class Engine:
                     # follow-up against the attempt that COMMITTED, whose review
                     # recommended none — and `append_entry` has nothing to dedupe
                     # it against, so a tracked ledger commits the wrong row rather
-                    # than absorbing it (#457's review). `rearm_escalation` already
+                    # than absorbing it (#457). `rearm_escalation` already
                     # voids the history behind the record by resetting
                     # `followup_reviews_spent` for a fresh damping budget.
                     #
@@ -4684,68 +4684,44 @@ class Engine:
     def _carry_review_budget_followups(self, task: StoryTask) -> None:
         """Re-file an isolated unit's review-budget follow-ups into the main ledger.
 
-        The third producer in the ``git add -A`` family, and the last one left
-        uncovered (#425). ``_record_review_budget_followup`` runs on a finalized,
-        verify-green story that the review pass would not stop recommending a
-        follow-up for, and it is CORRECT for it to run under isolation — the
-        damped caller force-converges work that is being committed, not rescued,
-        so the ``not self._isolated`` its exhaustion counterpart carries guards
-        that rescue and not this write. The defect is only that the write can be
-        silently dropped, which is why this extends the carry rather than adding a
-        guard: a guard would suppress a legitimate entry on every isolated run,
-        including the tracked-ledger runs where it works today.
+        The third producer in the ``git add -A`` family (#425).
+        ``_record_review_budget_followup`` runs on a finalized, verify-green story
+        the review pass would not stop recommending a follow-up for; under
+        isolation that write is correct but is silently dropped when the main
+        ledger is gitignored. Hence a carry rather than a guard, which would
+        suppress a legitimate entry on every isolated run.
 
-        No ``_isolated`` predicate here either: ``refiled_followups`` is populated
-        by that one producer and this hook is reached only from the isolated DONE
-        leg and its replay, so the record IS the guard — the same reasoning as
-        ``SweepEngine._carry_isolated_ledger_writes``'s missing ``_generic_dev()``.
+        No ``_isolated`` predicate: ``refiled_followups`` is populated by that one
+        producer and this hook is reached only from the isolated DONE leg and its
+        replay, so the record IS the guard.
 
-        Unconditional and idempotent: ``append_entry`` dedupes an OPEN row with the
-        same ``origin:`` + ``source_spec:``, so a tracked ledger whose row already
-        arrived through the merge yields an empty ``carried`` and no commit. An
-        already-CLOSED row with that provenance is deliberately not deduped against
-        — a later recurrence earns a fresh entry, exactly as it does in place.
+        Unconditional and idempotent — ``append_entry`` dedupes an OPEN row with
+        the same ``origin:`` + ``source_spec:``, while an already-CLOSED row with
+        that provenance earns a fresh entry, exactly as a recurrence does in
+        place. That is what lets the producer record its intent BEFORE its own
+        append, which durability requires, so ``review-followup-carried`` with
+        ``dw_ids == []`` is an ordinary outcome and not a carry that ran on
+        nothing.
 
-        That idempotence is what lets the producer record its intent BEFORE its own
-        append, which durability requires (see ``_record_review_budget_followup``).
-        So a payload here does NOT imply a row was newly filed upstream: a producer
-        whose append deduped still records, and this then carries it to an empty
-        ``carried``. ``review-followup-carried`` with ``dw_ids == []`` is therefore
-        an ordinary outcome, not a sign the carry ran on nothing.
+        A TRACKED ledger is safe unconditionally: no exclude or ignore rule masks a
+        tracked file's MODIFICATION, so the unit's own write always rides the merge
+        and its row arrives already deduped — yielding an empty ``carried`` and no
+        commit.
 
-        The commit is best effort, like ``SweepEngine``'s close and unlike
-        ``_carry_harvested_deferrals``: that method's re-raise is backed by
-        ``harvest_carry_commit_pending``, so a replay still owes the commit after
-        dedupe empties its list. This carry has no such latch, so a raise would buy
-        a replay that can only find its row already filed — at the cost of the
-        run's ``integrate_unit``. The row on disk is the value; the commit is
-        bookkeeping.
+        The commit is best effort — unlike ``_carry_harvested_deferrals``, whose
+        re-raise is backed by ``harvest_carry_commit_pending`` — because it can
+        only ever FAIL: the sole ledger shape that reaches it is a gitignored one,
+        and ``git add`` refuses an ignored path with rc 1 every time, so a
+        commit-pending latch would just retry a refusal. Nor can it leave the tree
+        dirty, the shape it writes being the one git does not see. The row on disk
+        is the value; the commit is bookkeeping.
 
-        It is best effort because it can only ever FAIL here, not because failure
-        is rare. Measured over all three shapes the main ledger can take, and all
-        three rest on a premise ``_dev_phase`` enforces rather than one this frame
-        can check: every record belongs to the attempt now being committed. A
-        record left over from an ABANDONED attempt breaks the tracked row below --
-        that attempt's own write died with its discarded worktree, so nothing is
-        upstream to dedupe against and the carry appends AND commits a row about
-        work that never landed. That is why the fresh-attempt clear beside
-        ``harvested_deferrals`` is load-bearing for this docstring, not only for
-        the ledger (#457's review).
-
-        * TRACKED -- an exclude never masks a tracked file's MODIFICATION, so the
-          unit's write always rides the merge and ``append_entry`` dedupes it
-          here. ``carried`` is empty and no commit is attempted.
-        * UNTRACKED, NOT IGNORED -- this frame is never reached at all.
-          ``_merge_local`` runs ``verify.clean_incoming_collisions`` before every
-          unit merge, and it refuses a target checkout dirtied outside the
-          branch's incoming set, so the unit escalates and the DONE leg with it.
-        * GITIGNORED -- the only shape that appends here, and ``git add`` refuses
-          an ignored path with rc 1 every time.
-
-        So a commit-pending latch would only retry a ``git add`` that refuses
-        identically, which is why this carry does not carry one (asked for in
-        #457's review). It also cannot leave the tree dirty for a later run to
-        trip on: the one shape it writes is the one git does not see.
+        Every record must belong to the attempt now being committed — a premise
+        ``_dev_phase`` enforces, not this frame. A record left over from an
+        ABANDONED attempt died with its discarded worktree, so it has nothing
+        upstream to dedupe against and the carry would append AND commit a row
+        about work that never landed; the fresh-attempt clear beside
+        ``harvested_deferrals`` is what prevents that (#457).
         """
         if not task.refiled_followups:
             return
@@ -4817,8 +4793,8 @@ class Engine:
         time, so a commit-pending latch would only retry a refusal.
 
         ``self.paths``, not ``self.workspace.paths``, states the intent — the MAIN
-        checkout's ledger. Measured, the two are the same path at every call site
-        that reaches here: the workspace is swapped back before
+        checkout's ledger. The two are the same path at every call site that
+        reaches here: the workspace is swapped back before
         ``integrate_unit`` runs the hook, and before the resume replay does. So no
         test can tell the two apart, and none pretends to; the explicit form is
         kept because the intent stops being obvious the moment that stops holding.

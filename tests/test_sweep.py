@@ -629,13 +629,13 @@ def test_isolated_bundle_lands_when_the_gitignored_ledger_was_never_seeded(proje
     worktree with NO ledger. The orchestrator writes the close through
     `self.workspace.paths` — that absent file — `mark_done` returns False, and
     `verify_review_bundle` reads the same absent file and fails `fixable=True`.
-    Measured before the auto-seed: `phase=deferred`, `DW-1` still `open`, a
+    Without the auto-seed that leaves `phase=deferred`, `DW-1` still `open`, a
     `review-verify-failed` naming the worktree's path, and `open_ids` re-bundling
     the same work on every later sweep.
 
     No DONE-leg carry can rescue that — the unit never reaches DONE — so the fix
     is upstream of the carry: seed the ledger the checkout cannot deliver, which
-    moves the failure onto the leg 6M's carry already covers.
+    moves the failure onto the leg `_carry_isolated_ledger_writes` already covers.
 
     The extra dev effects are the repair round the gate's `fixable=True` buys.
     They go unused on the fixed path; without them a regression would exhaust the
@@ -3416,7 +3416,10 @@ def test_generic_bundle_harvests_new_spec_deferrals_alongside_its_ids(project):
 
 
 def test_bundle_harvest_alone_is_not_proof_of_work(project):
-    """Scope this 6J witness to the gate action; 6L moves bundle close timing."""
+    """A bundle session that files a spec deferral but changes nothing still reads
+    as "no changes": the harvest's own ledger write is not the session's proof of
+    work. The harvest itself still lands, so what this pins is the gate's action,
+    not a lost harvest."""
     write_ledger(project, {"DW-1": "open"})
     plan = triage_result(
         ["DW-1"],

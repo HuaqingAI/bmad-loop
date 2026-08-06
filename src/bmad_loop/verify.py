@@ -391,13 +391,13 @@ def _exclude_specs(dirs: tuple[str, ...]) -> list[str]:
     `_path_under_any` already implements, which is why fixing the git half is the right
     direction and not a coin flip.
 
-    Measured, not read off the docs: only a `*` (which crosses `/`) reaches a sibling
-    DIRECTORY's contents; a same-length `[…]`/`?` collision reaches a sibling FILE
-    only, because the pathspec has to match the whole path. Both magic words go in ONE
-    comma-separated `:(...)` prefix — the global `--literal-pathspecs` /
-    `GIT_LITERAL_PATHSPECS` form would disarm the `:(exclude)` magic too and silently
-    stop excluding anything at all. Verified identical at git 2.20.4 (the floor
-    `install._WORKTREE_CONFIG_GIT` declares) and 2.55.0."""
+    `*` and `?` both cross `/` here — `FNM_PATHNAME` is opt-in via `:(glob)`, which this
+    never sets — but only a `*` reaches a sibling DIRECTORY's contents; a same-length
+    `[…]`/`?` collision reaches a sibling FILE only, because the pathspec has to match
+    the whole path. Both magic words go in ONE comma-separated `:(...)` prefix — the
+    global `--literal-pathspecs` / `GIT_LITERAL_PATHSPECS` form would disarm the
+    `:(exclude)` magic too and silently stop excluding anything at all. Stable from the
+    git 2.20 floor `install._WORKTREE_CONFIG_GIT` declares to current."""
     return [f":(exclude,literal){d}" for d in dirs]
 
 
@@ -467,10 +467,10 @@ def path_tracked(repo: Path, rel: str) -> bool:
     prefix, so `_bmad/render` still lists everything beneath it (`cmd_validate`'s
     render-tracked warning), and it additionally disarms a ``rel`` that itself begins
     with `:`, which git would otherwise parse as magic and answer the empty set for.
-    Measured identical at git 2.20.4 — the floor `install._WORKTREE_CONFIG_GIT`
-    declares — and at 2.55.0; below a version that understands the prefix it would read
-    as a literal FILENAME, match nothing and answer False, which is the one direction
-    that authorizes a delete.
+    Stable from the git 2.20 floor `install._WORKTREE_CONFIG_GIT` declares to current;
+    below a version that understands the prefix it would read as a literal FILENAME,
+    match nothing and answer False, which is the one direction that authorizes a
+    delete.
 
     Raises GitError like every other probe in this module. Callers inside a rollback
     `finally` catch it and degrade toward leaving the file alone: uncertainty must
@@ -479,8 +479,7 @@ def path_tracked(repo: Path, rel: str) -> bool:
 
     Three live callers, all reached through this one chokepoint: `git.render-tracked`
     (`cmd_validate`), `_ledger_is_gits_to_restore` (the harvest revert) and
-    `_harvest_carry_commit_may_degrade` (the isolation carry). It shipped inert in an
-    earlier sub-phase of #433 and was wired up by later ones."""
+    `_harvest_carry_commit_may_degrade` (the isolation carry)."""
     proc = _run_git(["git", "-C", str(repo), "ls-files", "--", *_literal_specs([rel])], repo)
     if proc.returncode != 0:
         merged = (proc.stdout + proc.stderr).strip()
@@ -1732,7 +1731,7 @@ class CommandResult:
 # seeded worktrees that lost +x burned dev attempts on no-op repairs).
 ENV_FAULT_RCS = frozenset({126, 127})
 
-# cmd has no such convention (issue #302, measured on Windows 11): `cmd /c
+# cmd has no such convention (issue #302): `cmd /c
 # <missing tool>` exits 1 — the same code an ordinary test failure uses — and
 # 9009 surfaces only as %ERRORLEVEL% *inside* a batch file, so it reaches us
 # only when the verify command is itself a .cmd/.bat propagating it. Worse,

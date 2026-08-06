@@ -568,10 +568,11 @@ def provision_worktree(
         raw_config_path = worktree / profile.hooks.config_path
         # Refuse before mkdir, read, or write: hook commands are worktree-specific
         # and must never mutate a shared dotfile through a live or dangling link.
-        # Inspect every component because on Python 3.13 and 3.14 a non-strict resolve
-        # leaves a symlink cycle unresolved (and therefore textually equal to the raw
-        # path); 3.11 and 3.12 raise RuntimeError instead, which the except below takes.
-        # The resolved comparison additionally refuses ``..`` and absolute profiles.
+        # Inspect every component: a non-strict resolve either leaves a symlink cycle
+        # unresolved — and so textually equal to the raw path — or raises RuntimeError,
+        # which the except below takes; which of the two happens is interpreter-version
+        # dependent. The resolved comparison additionally refuses ``..`` and absolute
+        # profiles.
         refused = not raw_config_path.is_relative_to(worktree)
         cursor = raw_config_path
         try:
@@ -610,9 +611,9 @@ def provision_worktree(
     patterns = {f"/{p.skill_tree}" for p in profiles}
     # hookless profiles have no config_path, so there is nothing to shield: their
     # empty string would render as a bare "/", which git strips to a zero-length
-    # pattern (the trailing slash becomes MUSTBEDIR) that matches nothing —
-    # measured on 2.55.0 against "/*" and "*", which do blanket. An inert junk
-    # line in a generated file, then, not a worktree-wide exclusion.
+    # pattern (the trailing slash becomes MUSTBEDIR) that matches nothing — inert,
+    # unlike "/*" or "*", which do blanket. A junk line in a generated file, then,
+    # not a worktree-wide exclusion.
     patterns |= {f"/{p.hooks.config_path}" for p in profiles if not p.hookless}
     patterns |= {f"/{rel}" for rel in seeded}
     patterns |= {f"/{rel}" for rel in seeded_bmad}
@@ -768,64 +769,46 @@ class WorktreeFlow:
     def _ledger_seed(self, worktree: Path) -> tuple[str, ...]:
         """The deferred-work ledger, when a worktree checkout cannot deliver it.
 
-        A `git worktree add` checks out TRACKED files only, so a project that
-        gitignores its ledger — the default shape, since the ledger's home is the
-        BMAD artifacts dir and this repo's own is gitignored — gets a unit
-        worktree with no ledger at all. The orchestrator is the ledger's single
-        writer under the generic dev path and writes through
-        ``self.workspace.paths``, i.e. that missing copy: ``mark_done`` returns
-        False on an absent file, and ``verify_review_bundle`` then reads the same
-        absent file and never sees the ids `done`. Measured on the default
-        config, the bundle DEFERS on a fixable retry every run, so `open_ids`
-        re-bundles the same work for ever (#426).
+        `git worktree add` checks out TRACKED files only, so a project that
+        gitignores its ledger — the default shape — gets a unit worktree with
+        none. The orchestrator is the ledger's single writer under the generic
+        dev path and writes through ``self.workspace.paths``, i.e. that missing
+        copy: ``mark_done`` returns False on an absent file,
+        ``verify_review_bundle`` reads the same absent file and never sees the
+        ids `done`, so the bundle defers on a fixable retry and `open_ids`
+        re-bundles the same work for ever (#426). No DONE-leg carry can rescue
+        that — the unit never reaches DONE. Seeding moves the failure onto a leg
+        that has one, where ``SweepEngine._carry_isolated_ledger_writes`` applies
+        the close to the main checkout.
 
-        No DONE-leg carry can rescue that: the unit never reaches DONE. Seeding
-        is what moves the failure onto a leg that has one — measured, the same
-        run then lands, and ``SweepEngine._carry_isolated_ledger_writes`` (which
-        until now only ran for an operator who had named the ledger in
-        ``scm.worktree_seed``) applies the close to the main checkout.
+        The copy is not what delivers the close: every seeded rel is shielded
+        from the unit's ``git add -A``, so the worktree's flip never rides the
+        merge. The seeded ledger exists so the GATE can read the orchestrator's
+        own write; the carry stays the delivery path, hence
+        ``sweep-bundle-close-carry-uncommitted`` on a run that lands.
 
-        The copy is not what carries the close home. Every seeded rel is shielded
-        from the unit's ``git add -A`` by a worktree-scoped exclude, so the flip
-        made in the worktree still never rides the merge — the seeded ledger
-        exists so the GATE can read the orchestrator's own write, and the carry
-        remains the delivery path. That is why the landing run still journals
-        ``sweep-bundle-close-carry-uncommitted``: `git add -- <ignored path>`
-        refuses with rc 1, as it did before.
+        Excluded: a ledger already in the checkout (without the exclusion the copy
+        would be a no-op the seed loop reports as ``worktree-seed-skipped`` on every
+        tracked-ledger project); one absent from the main checkout (dropped
+        silently, so the entry would be invisible rather than merely inert — the
+        common case, since the first harvest is what CREATES the file); and one
+        resolving outside the project tree, which for an out-of-tree artifacts DIR
+        ``ProjectPaths.rebased`` leaves unmoved, so the worktree already reads it.
+        Presence is asked of the WORKTREE, not of git: that is the predicate the
+        seed loop itself decides on, and unlike ``verify.path_tracked`` it costs no
+        subprocess and cannot raise.
 
-        Three exclusions, each measured:
-
-        * **Already in the checkout** — the copy would be a no-op the seed loop
-          reports as ``worktree-seed-skipped``, i.e. a diagnostic that means "a
-          seed you asked for did nothing" fired on every isolated unit of every
-          ordinary tracked-ledger project. Asked of the worktree rather than of
-          git because that is the question the seed loop itself decides on, and
-          it costs no subprocess and cannot raise.
-        * **Absent from the main checkout** — nothing to copy. The seed loop
-          drops a non-existent source silently (no ``worktree-seed-skipped``, no
-          ``worktree-seed-dropped``), so an entry here would be invisible rather
-          than merely inert. The commonest case by far: the first harvest is what
-          CREATES `deferred-work.md`.
-        * **Resolving outside the project tree** — for an out-of-tree artifacts
-          *dir* ``ProjectPaths.rebased`` leaves the path unmoved, so the worktree
-          already reads the very same file and there is nothing to deliver.
-
-        That last rationale covers the DIRECTORY only. When ``deferred-work.md``
-        is itself a symlink the dir stays in-tree, ``rebased`` moves it, and the
-        worktree path the workspace reads does not exist — so the exclusion is
-        not "the worktree already reads it". It is still the right call for an
-        out-of-repo target, because ``provision_worktree`` refuses an out-of-repo
-        resolved source whatever rel it is handed; an in-repo target, though, is
-        seeded to the WRONG path and still hits #426 (#462). Resolving is
-        load-bearing the other way too: when the checkout delivers a TRACKED
-        ledger symlink whose target is untracked, the resolved rel names that
-        target — the only path the seed loop will write, since it never copies
-        through a link. ``relative_to`` here decides PLACEMENT, not the seed
-        loop's containment; that is re-checked against both roots at the copy
+        A ledger that is itself a symlink keeps the dir in-tree, so ``rebased``
+        moves it and the worktree path does not exist: the exclusion is still right
+        for an out-of-repo target (``provision_worktree`` refuses that source
+        whatever rel it is handed), but an in-repo target is seeded to the WRONG
+        path and still hits #426 (#462). Resolving also names the target of a
+        TRACKED ledger symlink whose target is untracked — the only path the seed
+        loop will write, since it refuses to copy through a link. ``relative_to``
+        decides PLACEMENT; containment is re-checked against both roots at the copy
         site.
 
-        Deduped against ``scm.worktree_seed`` by the caller, so an operator who
-        already named the ledger keeps exactly one entry.
+        Deduped against ``scm.worktree_seed`` by the caller.
         """
         ledger = self.paths.deferred_work
         repo = self.paths.repo_root
