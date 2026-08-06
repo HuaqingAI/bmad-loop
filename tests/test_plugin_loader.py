@@ -267,6 +267,27 @@ def test_seed_list_shapes_rejected(key, value, match):
         load_manifest(body, "e/plugin.toml", "e")
 
 
+@pytest.mark.parametrize(
+    "tail",
+    [
+        'priority = "x"',  # int() -> ValueError
+        "priority = [1]",  # int() -> TypeError
+        '[hooks.pre_session]\ncmd = "true"\ntimeout_sec = "x"',  # int() -> ValueError
+        '[[settings]]\nkey = "k"\ntype = "select"\noptions = 5',  # iteration -> TypeError
+    ],
+)
+def test_malformed_field_values_raise_plugin_error(tail):
+    """TOML-legal values of the wrong TYPE hit raw conversions (`int()`, and
+    iteration over a setting's `options`) that `api_version`'s own guard shows
+    were only ever handled one field at a time. The `load_manifest` funnel turns
+    those bare ValueError/TypeError escapes into PluginError, which is what every
+    consumer's fault handling keys on. Ablation: drop the funnel arm and these
+    four raise the bare exception instead."""
+    body = f'[plugin]\nname = "e"\napi_version = 1\n{tail}\n'
+    with pytest.raises(PluginError, match="malformed field value"):
+        load_manifest(body, "e/plugin.toml", "e")
+
+
 def test_registry_orders_by_priority(tmp_path):
     write_plugin(tmp_path, "hi", '[plugin]\nname = "hi"\napi_version = 1\npriority = 10\n')
     write_plugin(tmp_path, "lo", '[plugin]\nname = "lo"\napi_version = 1\npriority = -5\n')
