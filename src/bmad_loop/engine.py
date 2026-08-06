@@ -12,6 +12,7 @@ import contextlib
 import contextvars
 import functools
 import hashlib
+import re
 import shutil
 import signal
 import sys
@@ -3610,17 +3611,52 @@ class Engine:
         )
 
     def _render_commit_template(self, task: StoryTask) -> str | None:
-        """The configured commit message template with {story_key}/{run_id}
-        substituted, or None when no template is set. Used by both the story and
-        sweep-bundle commit paths so a filled-out template wins everywhere."""
+        """The configured commit message template with {story_key}/{run_id}/
+        {story_title} substituted, or None when no template is set. Used by both
+        the story and sweep-bundle commit paths so a filled-out template wins
+        everywhere."""
         template = self.policy.scm.commit_message_template.strip()
         if not template:
             return None
         # literal substitution (not str.format) so stray braces in the
-        # template — e.g. a JSON trailer — don't raise.
+        # template — e.g. a JSON trailer — don't raise. {story_title} first:
+        # the spec read behind it is skipped entirely for templates that don't
+        # ask for it.
+        if "{story_title}" in template:
+            template = template.replace("{story_title}", self._story_title(task))
         return template.replace("{story_key}", task.story_key).replace(
             "{run_id}", self.state.run_id
         )
+
+    def _story_title(self, task: StoryTask) -> str:
+        """The story's human-readable title for {story_title}: the spec's first
+        markdown H1, with any leading ``Story <n.m>:`` label dropped (the
+        template already carries the key, so the label would just repeat it).
+        Falls back to the story key when there is no spec, no H1, or the spec is
+        unreadable — the placeholder must never render empty, and a commit-time
+        read failure must not fail the commit."""
+        if not task.spec_file:
+            return task.story_key
+        try:
+            lines = Path(task.spec_file).read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return task.story_key
+        # Skip a leading YAML frontmatter block (standalone --- delimiter lines,
+        # same rule as frontmatter._split_frontmatter) so a YAML comment inside
+        # it can't be mistaken for the H1.
+        start = 0
+        if lines and lines[0].rstrip() == "---":
+            for i in range(1, len(lines)):
+                if lines[i].rstrip() == "---":
+                    start = i + 1
+                    break
+        for line in lines[start:]:
+            if line.startswith("# "):
+                title = re.sub(r"^story\s+\S+:\s*", "", line[2:].strip(), flags=re.IGNORECASE)
+                if title:
+                    return title
+                break
+        return task.story_key
 
     def _commit_message(self, task: StoryTask) -> str:
         # The park suffix is appended to a rendered template too. The template

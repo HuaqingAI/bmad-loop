@@ -2211,6 +2211,48 @@ def test_commit_message_template_applied(project):
     assert "implemented" not in log  # built-in default was not used
 
 
+def test_commit_message_template_story_title(project):
+    """{story_title} renders the spec's first H1 with the "Story n.m:" label
+    dropped; a template without the placeholder never pays the spec read."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    review = wt_review_effect(project, "1-1-a", clean=True)
+
+    def review_with_h1(spec):
+        # the review pass is the spec's last writer, so the H1 the commit-time
+        # read sees must be appended after it
+        result = review(spec)
+        sp = project.rebased(spec.cwd).implementation_artifacts / "spec-1-1-a.md"
+        sp.write_text(sp.read_text() + "\n# Story 1.1: Wire the Frobnicator\n")
+        return result
+
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), review_with_h1],
+        policy=wt_policy(commit_message_template="chore(bmad): {story_key}\n\n{story_title}"),
+    )
+    summary = engine.run()
+    assert summary.done == 1
+    log = git(project.project, "log", "--format=%B")
+    assert "chore(bmad): 1-1-a" in log
+    assert "Wire the Frobnicator" in log
+    assert "Story 1.1:" not in log  # the label would just repeat the key
+
+
+def test_commit_message_template_story_title_falls_back_to_key(project):
+    """No H1 in the spec (the fixture writes only frontmatter + ## sections) →
+    the placeholder renders the story key, never an empty string."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+        policy=wt_policy(commit_message_template="chore(bmad): {story_title}"),
+    )
+    summary = engine.run()
+    assert summary.done == 1
+    log = git(project.project, "log", "--format=%s")
+    assert "chore(bmad): 1-1-a" in log
+
+
 # ------------------------------------------------ per_worktree engine plugin
 
 
