@@ -152,6 +152,24 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
+- **The worktree git-add shield no longer marks a project's tracked files as ignored (#392).** It
+  wrote a pattern for every path it shields, including a hook config or skill tree the project
+  legitimately tracks — and over a tracked file that pattern shields nothing, since git consults
+  ignore rules only for untracked paths. Its one effect was to make the file answer
+  `git ls-files -ci --exclude-standard`, the tracked-and-ignored state repo-hygiene gates reject:
+  a shield meant to keep the orchestrator's files out of a story commit blocked one instead.
+  Patterns naming a tracked **file** are now dropped as inert. A tracked **directory** keeps its
+  pattern — that one really does hide new children — so its tracked children still read as ignored;
+  no pattern shape avoids that, and the shield is worth more than the report. When git cannot
+  answer, the pattern is kept and the wide shield is journaled rather than left silent.
+
+- **A codex stage no longer runs without the project's hook config under worktree isolation (#471).**
+  The seed list and the shield list were built from two unreconciled sources and
+  `hooks.config_path` was only in the second, so whether a profile's hook config was seeded
+  depended on that profile naming the path twice — claude's `seed_files` carries its own
+  `config_path` and codex's does not. It is now derived from every non-hookless profile's resolved
+  `config_path`, so a new profile cannot regress the same way.
+
 - **An isolated sweep bundle can land when the deferred-work ledger is gitignored (#426).**
   `git worktree add` checks out tracked files only, so a project that gitignores its ledger — the
   default — gave the unit worktree none: `mark_done` returned False, `verify_review_bundle` never
