@@ -391,13 +391,13 @@ def _exclude_specs(dirs: tuple[str, ...]) -> list[str]:
     `_path_under_any` already implements, which is why fixing the git half is the right
     direction and not a coin flip.
 
-    Only a `*` (which crosses `/`) reaches a sibling DIRECTORY's contents; a
-    same-length `[…]`/`?` collision reaches a sibling FILE only, because the pathspec
-    has to match the whole path. Both magic words go in ONE comma-separated `:(...)`
-    prefix — the global `--literal-pathspecs` / `GIT_LITERAL_PATHSPECS` form would
-    disarm the `:(exclude)` magic too and silently stop excluding anything at all.
-    Stable from the git 2.20 floor `install._WORKTREE_CONFIG_GIT` declares to
-    current."""
+    `*` and `?` both cross `/` here — `FNM_PATHNAME` is opt-in via `:(glob)`, which this
+    never sets — but only a `*` reaches a sibling DIRECTORY's contents; a same-length
+    `[…]`/`?` collision reaches a sibling FILE only, because the pathspec has to match
+    the whole path. Both magic words go in ONE comma-separated `:(...)` prefix — the
+    global `--literal-pathspecs` / `GIT_LITERAL_PATHSPECS` form would disarm the
+    `:(exclude)` magic too and silently stop excluding anything at all. Stable from the
+    git 2.20 floor `install._WORKTREE_CONFIG_GIT` declares to current."""
     return [f":(exclude,literal){d}" for d in dirs]
 
 

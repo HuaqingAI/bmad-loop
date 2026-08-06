@@ -3800,14 +3800,14 @@ def test_shield_rolls_back_the_extension_when_activation_fails(project, tmp_path
     rolls the flag back. The other such degrade is the ENABLE's own raise, covered by
     `test_shield_rolls_back_an_enable_whose_git_faulted`.
 
-    `--unset` removes the key *and* the now-empty `[extensions]` section, and `git config
-    --worktree` refuses again afterwards, so the repo is genuinely returned to the state
-    we found rather than cosmetically tidied.
+    `--unset-all` removes the key *and* the now-empty `[extensions]` section, and `git
+    config --worktree` refuses again afterwards, so the repo is genuinely returned to the
+    state we found rather than cosmetically tidied.
 
     Only `--worktree` writes are failed, so the enable itself succeeds — which is
     what makes this the enable-then-fail ordering rather than a short-circuit.
 
-    Ablation: drop the `--unset` rollback and this fails — `worktreeConfig` is left
+    Ablation: drop the `--unset-all` rollback and this fails — `worktreeConfig` is left
     in the shared config after a degrade that shielded nothing."""
     repo = project.project
     wt = tmp_path / "wt"
