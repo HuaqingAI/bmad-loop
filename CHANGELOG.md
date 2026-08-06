@@ -152,6 +152,25 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
+- **A seed path naming the project root is refused at load, in every source that feeds it (#456).**
+  `""` made `provision_worktree`'s seed loop resolve source to the repo root and destination to the
+  worktree — both pass its containment checks — so it copied the whole project in, untracked files
+  included, then recursed into its own destination. `.`, `./` and `.\` are the same value and were
+  never rejected. `scm.worktree_seed`, a profile's `seed_files`, `skill_tree` and
+  `hooks.config_path`, and a plugin manifest's `seed_files`/`seed_globs` now refuse every spelling.
+  The seed lists are shape-checked too: a bare string iterated into per-character entries that each
+  passed the per-entry guard, and a scalar raised an untyped error out of the loader.
+  **Behavior change:** `worktree_seed = [1]` and an int plugin seed entry are now rejected rather
+  than silently `str()`-coerced.
+
+- **A wrongly-typed field in a profile or plugin TOML is reported, not crashed on.** `float()`,
+  `int()` and `.items()` over TOML-legal values of the wrong type raised bare
+  `ValueError`/`TypeError`/`AttributeError`, and `inf` or an oversized integer raised
+  `OverflowError`, past every consumer's `ProfileError`/`PluginError` handling — the command died
+  with one `error:` line naming neither the file nor the key. Both parsers now funnel at their load
+  boundary, over a fault set closed on the nine value types `tomllib` can yield. `policy.toml`'s own
+  conversions are still raw (#474).
+
 - **The worktree git-add shield no longer marks a project's tracked files as ignored (#392).**
   It wrote a pattern for every path it shields, including hook configs and skill trees a project
   tracks. Over a tracked file that pattern shields nothing — git applies ignore rules only to
