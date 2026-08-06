@@ -632,6 +632,43 @@ def test_scm_worktree_seed_settings(tmp_path):
     assert pol.scm.worktree_seed == (".mcp.json", ".envrc")
 
 
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "",  # the harmful one — see below
+        "/etc/passwd",  # POSIX-absolute
+        "C:\\secrets",  # Windows drive-absolute (rejected on POSIX too)
+        "../../etc",  # climbs out without being absolute
+    ],
+)
+def test_scm_worktree_seed_rejects_non_project_relative_entries(tmp_path, entry):
+    """`worktree_seed` was the only one of the three seed sources feeding
+    provision_worktree that arrived unvalidated — profiles and plugin manifests
+    both already apply this rule to their own entries.
+
+    The empty entry is the one that does damage rather than merely no-op: it makes
+    the seed loop resolve src to the repo ROOT and dst to the worktree, both of
+    which pass its containment checks, so the whole repo is copied in — and since a
+    worktree mounts under the repo, that copy recurses into itself until the path
+    length fails. The "/" it renders is inert (git strips a bare slash to a pattern
+    matching nothing), so none of the surplus is even shielded from `git add -A`."""
+    p = tmp_path / "policy.toml"
+    p.write_text(f"[scm]\nworktree_seed = [{entry!r}]\n".replace("'", '"'))
+
+    with pytest.raises(policy.PolicyError, match="worktree_seed entries must be project-relative"):
+        policy.load(p)
+
+
+def test_scm_worktree_seed_rejects_a_bad_entry_beside_good_ones(tmp_path):
+    """Every entry is checked, not just the first: a valid leading entry must not
+    let a later empty one through."""
+    p = tmp_path / "policy.toml"
+    p.write_text('[scm]\nworktree_seed = [".mcp.json", "", ".envrc"]\n')
+
+    with pytest.raises(policy.PolicyError, match="got ''"):
+        policy.load(p)
+
+
 def test_scm_override(tmp_path):
     p = tmp_path / "policy.toml"
     p.write_text(
