@@ -360,13 +360,14 @@ whose seams had diverged enough that several ports needed a different fix, and t
   Those versions appended the git-add shield's patterns to the shared `.git/info/exclude` of every
   project they provisioned worktrees in, and upgrading does not remove them — while a line stays,
   **new** files under the path it names silently never appear in `git status` or `git add -A` in
-  that checkout. To clean a repo once: open the file (`git rev-parse --git-path info/exclude` names
-  it from any checkout) and delete each line the shield wrote that you did not write yourself —
-  typically `/.claude/skills` or `/.agents/skills`, a hook config such as `/.claude/settings.json`,
-  the `/_bmad` family (`/_bmad`, `/_bmad/custom`, `/_bmad/render/`, or per-file `/_bmad/...`
-  lines), and any `[scm] worktree_seed` path rendered as `/<path>`. Then run `git status` and
-  review what reappears. `git check-ignore -v <path>` names the exact file and line hiding any
-  given path.
+  that checkout. Clean each affected repo once:
+  - Open the file — `git rev-parse --git-path info/exclude` names it from any checkout.
+  - Delete each line the shield wrote, not your own. Typically `/.claude/skills` or
+    `/.agents/skills`, a hook config such as `/.claude/settings.json`, the `/_bmad` family
+    (`/_bmad`, `/_bmad/custom`, `/_bmad/render/`, or per-file `/_bmad/...` lines), and any
+    `[scm] worktree_seed` path rendered as `/<path>`.
+  - Run `git status` and review what reappears. `git check-ignore -v <path>` names the exact file
+    and line still hiding a given path.
 
 - **The git-add shield's git calls run on the shared chokepoint (#389).** They were the last bare
   `git` spawns outside `verify._run_git`, so they missed its `LC_ALL=C` pin and used a hardcoded
