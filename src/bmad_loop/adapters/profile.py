@@ -223,7 +223,19 @@ def _load_toml(text: str, source: str) -> CLIProfile:
         doc = tomllib.loads(text)
     except tomllib.TOMLDecodeError as e:
         raise ProfileError(f"profile {source}: invalid TOML: {e}") from e
-    return _parse_profile(doc, source)
+    try:
+        return _parse_profile(doc, source)
+    except ProfileError:
+        raise
+    except (AttributeError, TypeError, ValueError) as e:
+        # A funnel, not per-field guards: `_parse_profile`'s raw conversions
+        # (`float()`, `int()`, `.items()`) raise bare conversion errors on
+        # TOML-legal values of the wrong type, and every consumer keys its
+        # fault handling on ProfileError — `validate`'s role loop reports an
+        # `adapter.profile` failure, `_require_base_skills` skips the one
+        # profile, `install` prints FAIL. A bare escape crashed `validate`
+        # before any document was printed.
+        raise ProfileError(f"profile {source}: malformed field value: {e}") from e
 
 
 def load_profiles(project: Path | None = None) -> dict[str, CLIProfile]:

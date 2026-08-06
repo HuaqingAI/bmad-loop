@@ -297,6 +297,27 @@ def test_user_profile_overlay(tmp_path):
             MINIMAL_PROFILE.replace("[hooks]", "stop_without_result_nudges = -2\n[hooks]"),
             "stop_without_result_nudges",
         ),
+        # TOML-legal values of the wrong TYPE hit raw conversions (`float()`,
+        # `int()`, `.items()`) — the `_load_toml` funnel turns those bare
+        # ValueError/TypeError/AttributeError escapes into ProfileError, which
+        # is what every consumer's fault handling keys on. Ablation: drop the
+        # funnel arm and these four raise the bare exception instead.
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'usage_grace_s = "invalid"\n[hooks]'),
+            "malformed field value",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", "usage_grace_s = [1]\n[hooks]"),
+            "malformed field value",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'stop_without_result_nudges = "x"\n[hooks]'),
+            "malformed field value",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'env = "invalid"\n[hooks]'),
+            "malformed field value",
+        ),
         # real dialects still hard-require config_path and events
         (
             MINIMAL_PROFILE.replace('config_path = ".mycli/settings.json"', ""),
