@@ -66,7 +66,7 @@ def validate_document(
     failure to produce one (see machine.py on parsing non-empty stdout whatever
     the exit code).
 
-    Three things a consumer has to know:
+    Four things a consumer has to know:
 
     - **``message`` is not contracted.** Several problems are a bare ``str(e)``
       from the config, policy, profile and sprint-status exceptions, so their
@@ -79,14 +79,16 @@ def validate_document(
     - **``mux.backends-detected`` is gated on more than one registered backend**,
       so a lone-tmux host carries no backend inventory. Same rule as above. The one
       exception to its ``ok`` severity is a detection failure, which reports under
-      the same id at ``warning`` with an empty inventory.
+      the same id at ``warning`` and carries no ``detail`` at all — read the
+      severity, never index ``detail["backends"]`` without a null check.
     - **``mux.selection`` is not gated on the reason.** It used to appear only for a
       forced ``env``/``policy`` choice and now names the reason wherever selection
-      resolves. It is absent whenever no backend row is *selected*, which has two
+      resolves. It is absent whenever no backend row is *selected*, which has three
       causes: a forced name matching no registered backend (``mux.preflight``
-      carries that failure) and ``_select`` bottoming out at its historical tmux
-      fallback with tmux unregistered (nothing else reports that — the inventory
-      simply holds no selected row). Same rule as above.
+      carries that failure), a detection failure (the ``warning`` above carries
+      it), and ``_select`` bottoming out at its historical tmux fallback with tmux
+      unregistered (nothing else reports that — the inventory simply holds no
+      selected row). Same rule as above.
 
     ``findings`` stays flat and in emission order rather than grouped by severity:
     grouping would destroy the cross-severity ordering (the order the gates ran)

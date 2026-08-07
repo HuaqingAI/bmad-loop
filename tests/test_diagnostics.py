@@ -213,12 +213,16 @@ def test_env_names_the_platform_and_the_win32_on_wsl_path_verdict(project, monke
     # on `sys.platform`; without these clears the patched window caches the Windows
     # pick for every later test in the worker.
     get_multiplexer.cache_clear()
-    monkeypatch.setattr(diagnostics.sys, "platform", "win32")
-    pseudo = sanitize.Pseudonymizer()
-    unc = Path("\\\\wsl.localhost\\Ubuntu-24.04\\home\\u\\p")
-    diag = diagnostics.collect([_seed_run(project.project)], pseudo=pseudo, project=unc)
-    monkeypatch.undo()
-    get_multiplexer.cache_clear()
+    try:
+        monkeypatch.setattr(diagnostics.sys, "platform", "win32")
+        pseudo = sanitize.Pseudonymizer()
+        unc = Path("\\\\wsl.localhost\\Ubuntu-24.04\\home\\u\\p")
+        diag = diagnostics.collect([_seed_run(project.project)], pseudo=pseudo, project=unc)
+    finally:
+        # pytest undoes the patch on its own, but only at teardown — a raise in
+        # `collect` would leave the Windows pick cached past this test without this.
+        monkeypatch.undo()
+        get_multiplexer.cache_clear()
     assert diag.env.sys_platform == "win32"
     assert diag.env.win32_on_wsl_path is True
     md = diagnostics.render_markdown(diag, pseudo=pseudo)
@@ -233,7 +237,14 @@ def test_env_names_the_platform_and_the_win32_on_wsl_path_verdict(project, monke
     # the boolean ships; the path it was derived from never does — the redactor
     # leaves the Linux username in a \\wsl.localhost\...\home\<user> path standing.
     assert str(unc) not in md
-    assert sanitize.assert_no_leak(diagnostics.render_json(diag, pseudo=pseudo)) == []
+    # the `--json` document is its own contract: pin the field names and values
+    # there too, not only the markdown labels.
+    js = diagnostics.render_json(diag, pseudo=pseudo)
+    payload = json.loads(js)
+    assert payload["env"]["sys_platform"] == "win32"
+    assert payload["env"]["win32_on_wsl_path"] is True
+    assert str(unc) not in js
+    assert sanitize.assert_no_leak(js) == []
 
 
 def test_env_win32_on_wsl_path_is_false_for_a_plain_project(project):
