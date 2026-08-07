@@ -253,8 +253,40 @@ def make_validate_document(findings, *, stories_on: bool = False, spec_folder: s
     return documents.validate_document(report, stories_on, spec_folder)
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _isolate_ambient_git_ignores(tmp_path_factory: pytest.TempPathFactory):
+    """Shadow the two ignore sources git reads from OUTSIDE the repo, for every test.
+
+    Developer boxes routinely carry `.claude/` or `.codex/` in a global gitignore —
+    ignoring your AI tooling everywhere is the obvious thing to do — and without this
+    the shield tests silently measure that instead of the shield. The failure is not
+    only a red: a global `.codex/` makes `git add -A` skip the hook config, so the
+    file the test believes it TRACKED is untracked, the tracked-file filter is never
+    reached, and `ls-files -ci --exclude-standard` answers "" because an untracked
+    file is not tracked-and-ignored. The test passes having exercised nothing.
+
+    Two sources, and both are needed: `core.excludesFile` from `~/.gitconfig`
+    (suppressed by pointing GIT_CONFIG_GLOBAL at a file that does not exist), and its
+    documented fallback `$XDG_CONFIG_HOME/git/ignore`, which still applies once the
+    key is unset. Session-scoped so `_project_template`'s own `add -A` is covered too.
+
+    `GIT_CONFIG_NOSYSTEM` is deliberately NOT set, for the reason
+    `test_shield_falls_back_to_home_when_xdg_is_relative` records: it would suppress
+    Git-for-Windows' system `core.autocrlf` and make unrelated tracked files read as
+    modified. A system-level excludes file therefore stays reachable — tests that
+    depend on a path really being tracked assert that as a precondition."""
+    env = tmp_path_factory.mktemp("git-env")
+    mp = pytest.MonkeyPatch()
+    mp.setenv("GIT_CONFIG_GLOBAL", str(env / "no-such-gitconfig"))
+    mp.setenv("XDG_CONFIG_HOME", str(env / "xdg"))
+    yield
+    mp.undo()
+
+
 @pytest.fixture(scope="session")
-def _project_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+def _project_template(
+    tmp_path_factory: pytest.TempPathFactory, _isolate_ambient_git_ignores: None
+) -> Path:
     """Master sandbox repo, built once per xdist worker. NEVER hand this path to
     a test — a mutation would poison every later test in the worker; tests get
     disposable copies via `project`. (Do not chmod it read-only either: copytree
