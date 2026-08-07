@@ -654,6 +654,52 @@ def test_injected_workflow_session_does_not_leak_story_spec_env(project):
     assert dev.env["BMAD_LOOP_SPEC_FOLDER"] == SPEC_FOLDER
 
 
+def test_injected_workflow_prompt_carries_no_board_section(project):
+    """#437 phase 3: `_run_session` appends a `## Sprint board` section to every
+    injected workflow prompt, gated on `_sprint_board_instruction`. This mode
+    empties that clause (no board exists), so the section must disappear with it
+    and the workflow prompt stays byte-identical to its pre-#437 shape: the
+    plugin's own text joined straight to the completion contract.
+
+    The base-class check is the ablation guard — without it every assertion here
+    passes for free the moment the clause is emptied for ALL modes."""
+    setup_stories(project, [entry("1")])
+    reg = PluginRegistry(
+        [
+            LoadedPlugin(
+                manifest=PluginManifest(
+                    name="tea",
+                    api_version=1,
+                    workflows=(
+                        WorkflowSpec(
+                            name="gate",
+                            stage="pre_commit_gate",
+                            role="review",
+                            prompt="/gate {story_key}",
+                            blocking=False,
+                        ),
+                    ),
+                )
+            )
+        ]
+    )
+    captured: list = []
+    engine, _ = make_engine(
+        project, [stories_dev_effect(), _workflow_capture(captured)], registry=reg
+    )
+    assert engine.run().done == 1
+    assert len(captured) == 1
+    prompt = captured[0].prompt
+
+    assert Engine._sprint_board_instruction(engine)  # the base clause is non-empty
+    assert engine._sprint_board_instruction() == ""
+    assert "sprint-status" not in prompt
+    assert "## Sprint board" not in prompt
+    # junction literal: the plugin's text joins the completion contract directly,
+    # with nothing (and no stray separator) between them
+    assert prompt.startswith("/gate 1\n\n## Completion signal (required)")
+
+
 def test_post_dev_state_sync_is_noop(project):
     setup_stories(project, [entry("1")])
     engine, _ = make_engine(project, [])
