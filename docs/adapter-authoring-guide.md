@@ -97,7 +97,9 @@ seams of a full OS port are in
   override only when your ids do not resolve from another session's context,
   as psmux does to emit `=session:%N`), `detach_client` / `switch_client` (with
   an optional last-client fallback — see the rule below),
-  `available` (is this backend usable on the current host).
+  `available` (is this backend usable on the current host), `version` (the
+  binary's version string or `None` — **one bounded line**, folded with
+  `fold_version()`; see [the porting guide](porting-to-a-new-os.md)).
 
   **Both client verbs report effect, not dispatch.** They answer a bool the
   parked-window return path trusts, so a backend with no real detach (herdr —

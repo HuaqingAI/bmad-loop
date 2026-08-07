@@ -338,7 +338,8 @@ def cmd_validate(args: argparse.Namespace) -> int:
         channel = (
             "the ATTENTION file in the run directory is the only alert channel left"
             if pol.notify.file
-            else "notify.file is also off, so no alert channel is configured — enable notify.file"
+            else "notify.file is also off, so no alert channel is configured — "
+            "enable notify.file"
         )
         report.warn(
             "notify.desktop-unavailable",
@@ -505,10 +506,8 @@ def cmd_mux(args: argparse.Namespace) -> int:
     stranded = [r.name for r in rows if r.available and not r.matches_platform and not r.selected]
     if stranded:
         print(
-            f"note: AVAILABLE yes but not selectable on {sys.platform}: {', '.join(stranded)} "
-            "— automatic selection only picks backends that match the platform, and AVAILABLE "
-            f"means the binary answers here, not that the backend supports {sys.platform}. "
-            "A forced choice bypasses the platform check"
+            "note: AVAILABLE means the binary answers here, not that the backend supports "
+            f"{sys.platform} — {', '.join(stranded)} can only be reached by forcing the choice"
         )
     # A failed external package is invisible in the table (it never registered),
     # so name it here — the one place an operator looks when a backend is missing.

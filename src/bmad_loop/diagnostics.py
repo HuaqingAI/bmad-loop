@@ -248,10 +248,14 @@ def collect_env() -> EnvInfo:
     try:
         backend = get_multiplexer()
         mux = type(backend).__name__
-        # Fold before the line cap: on a multi-line version scrub_text's
-        # "(N more lines redacted)" marker would re-introduce the newline.
-        raw = fold_version(backend.version())
-        tmux_v = sanitize.scrub_text(raw, max_lines=1) if raw else None
+        # fold_version both flattens and bounds (the seam's inline-render
+        # contract), so the max_lines=1 this used to carry is redundant — and it
+        # never held anyway: scrub_text's "(N more lines redacted)" marker is
+        # itself a new line, re-introducing exactly what the cap removed.
+        # Scrub first so the home/email redaction reads the whole probe rather
+        # than a tail the fold already cut.
+        raw = backend.version()
+        tmux_v = fold_version(sanitize.scrub_text(raw)) if raw else None
     except Exception:  # nosec B110 - env probe is best-effort; absent mux is fine
         pass
     return EnvInfo(

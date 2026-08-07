@@ -309,11 +309,12 @@ class TerminalMultiplexer(ABC):
         abstract: backends that can't report one inherit this default. The
         implementation owns the binary invocation so it stays behind the seam.
 
-        **Single line.** Consumers render this inline — the `bmad-loop mux`
+        **One bounded line.** Consumers render this inline — the `bmad-loop mux`
         table, `validate`'s preflight finding, the diagnostic dump, the
         forced-backend warning — so a binary whose `--version` prints several
         lines (psmux prints a `tmux X.Y.Z` compatibility line plus its own)
-        must fold them into one here rather than leave each caller to cope.
+        must fold them into one here rather than leave each caller to cope, and
+        a very long one line breaks the same surfaces a newline does.
         :func:`fold_version` is the canonical fold, and the inline consumers
         also apply it defensively: an out-of-tree backend can only be asked to
         keep this promise, not made to. The one caller that also *parses* this
@@ -330,15 +331,35 @@ class TerminalMultiplexer(ABC):
         return []
 
 
+# A version is rendered inline, and `bmad-loop mux` sizes every column off its
+# widest cell — so one 300-char version pads the VERSION column to 306 and the
+# row past 350, unreadable for the same reason an embedded newline was (#321).
+# Length is half the seam's promise, not a separate concern. 80 keeps the widest
+# cell inside a standard terminal with room to spare over the real probes, which
+# fold to ~44 (`tmux 3.3.7; psmux 3.3.7 (05cc5d4 2026-07-20)`).
+VERSION_MAX_CHARS = 80
+
+
 def fold_version(raw: str | None) -> str | None:
-    """Collapse a version string onto the single line the
+    """Collapse a version string onto the one bounded line the
     :meth:`TerminalMultiplexer.version` seam promises. Segments keep their
     order (the psmux version gate anchors a parse at the first) and are
-    stripped; an all-blank value folds to None — the seam's "no version"
-    sentinel — never to ``""``."""
+    stripped; a fold over :data:`VERSION_MAX_CHARS` is cut at the tail, which
+    that anchored parse never reads; an all-blank value folds to None — the
+    seam's "no version" sentinel — never to ``""``. Idempotent, so the seam's
+    own fold and each consumer's defensive one compose.
+
+    Line breaks only: a tab or an ANSI escape *inside* a segment survives and
+    can still misalign a table. Widening this to collapse all whitespace would
+    rewrite well-behaved single-line versions, which the seam promises not to
+    touch. And the fold is one-way — ``"; "`` is a plausible substring of a real
+    version banner, so a boundary is not recoverable by splitting on it."""
     if not raw:
         return None
-    return "; ".join(line.strip() for line in raw.splitlines() if line.strip()) or None
+    folded = "; ".join(line.strip() for line in raw.splitlines() if line.strip())
+    if len(folded) > VERSION_MAX_CHARS:
+        folded = folded[: VERSION_MAX_CHARS - 1] + "…"
+    return folded or None
 
 
 # (name, matches(platform) -> bool, factory() -> TerminalMultiplexer)

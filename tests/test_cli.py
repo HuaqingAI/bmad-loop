@@ -4413,6 +4413,31 @@ def test_mux_table_survives_a_multi_line_version(mux_registry, tmp_path, capsys)
     assert not any(line.startswith("psmux 3.3.7") for line in out.splitlines())
 
 
+def test_mux_table_survives_an_over_long_version(mux_registry, tmp_path, capsys):
+    # The other half of the same breakage (#321): widths come from len() of the
+    # widest cell and every row is ljust-ed to them, so one unbounded version
+    # pushes SELECTED hundreds of columns out — unreadable for the same reason
+    # the split row was. The fold bounds as well as flattens.
+    import sys as _sys
+
+    from bmad_loop.adapters.multiplexer import VERSION_MAX_CHARS
+
+    mux_registry.register_multiplexer(
+        "alpha",
+        lambda p: p == _sys.platform,
+        lambda: _MuxStub(avail=True, version="alpha 1.2 " + "x" * 300),
+    )
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+
+    row = next(line for line in out.splitlines() if line.startswith("alpha"))
+    assert "* first available platform match" in row
+    assert "…" in row  # cut, rather than silently dropping the tail
+    # Tied to the bound, not to a magic width: the version cell no longer
+    # dominates the row, which unbounded ran past 350 columns.
+    assert len(row) < 2 * VERSION_MAX_CHARS
+
+
 def test_mux_notes_an_available_backend_that_cannot_be_selected(mux_registry, tmp_path, capsys):
     # On Windows `tmux` is psmux's compatibility shim, so the tmux row reports
     # AVAILABLE yes and reads as a real tmux install. The column stays honest —
@@ -4422,16 +4447,20 @@ def test_mux_notes_an_available_backend_that_cannot_be_selected(mux_registry, tm
     mux_registry.register_multiplexer(
         "alpha", lambda p: p == _sys.platform, lambda: _MuxStub(avail=True, version="alpha 1.2")
     )
-    mux_registry.register_multiplexer("foreign", lambda p: False, lambda: _MuxStub(avail=True))
+    # Registered counter-alphabetically on purpose: with `foreign` first, a
+    # sorted() list and a registration-ordered one are indistinguishable, and
+    # the note claims the same order the table above it prints.
     mux_registry.register_multiplexer("zeta", lambda p: False, lambda: _MuxStub(avail=True))
+    mux_registry.register_multiplexer("foreign", lambda p: False, lambda: _MuxStub(avail=True))
     assert cli.main(["mux", "--project", str(tmp_path)]) == 0
     out = capsys.readouterr().out
 
     note = next(line for line in out.splitlines() if line.startswith("note: "))
-    assert "foreign, zeta" in note  # every stranded backend, registration order
-    assert "not selectable" in note and "bypasses the platform check" in note
-    # What AVAILABLE actually measures — the fact that makes the row make sense.
+    assert "zeta, foreign" in note  # every stranded backend, in registration order
+    # What AVAILABLE actually measures — the fact that makes the row make sense —
+    # and the one way an operator reaches a backend it excludes.
     assert "the binary answers here" in note
+    assert "forcing the choice" in note
     assert "alpha" not in note  # the local platform match is not named
 
 
@@ -4458,8 +4487,10 @@ def test_mux_does_not_call_a_forced_backend_unselectable(
 
 
 def test_mux_keeps_the_placeholder_for_a_blank_version(mux_registry, tmp_path, capsys):
-    # Blank but truthy: the fold must collapse it to the None sentinel, not to
-    # "" — an empty cell plus the trailing rstrip eats SELECTED with it.
+    # Blank but truthy: unfolded, the whitespace lands in the cell and the row's
+    # trailing rstrip eats SELECTED with it. This pins falsiness only — the cell
+    # is `r.version or "-"`, so it cannot tell None from "" (that distinction is
+    # the seam's, and test_backend_registry.test_fold_version_edges owns it).
     import sys as _sys
 
     mux_registry.register_multiplexer(
@@ -4504,6 +4535,46 @@ def test_platform_preflight_folds_a_multi_line_version(mux_registry):
     finding = next(f for f in cli._platform_preflight() if f.check == "mux.backend")
     assert finding.detail["version"] == "alpha 1.2; extra build line"
     assert "\n" not in finding.message
+
+
+def test_platform_preflight_bounds_an_over_long_version(mux_registry):
+    # The same string is a released `validate --json` detail, and nothing
+    # downstream of documents.py bounds it — so the fold has to.
+    import sys as _sys
+
+    from bmad_loop.adapters.multiplexer import VERSION_MAX_CHARS
+
+    mux_registry.register_multiplexer(
+        "alpha",
+        lambda p: p == _sys.platform,
+        lambda: _MuxStub(avail=True, version="alpha 1.2 " + "x" * 300),
+    )
+
+    finding = next(f for f in cli._platform_preflight() if f.check == "mux.backend")
+    assert len(finding.detail["version"]) == VERSION_MAX_CHARS
+    assert finding.detail["version"].endswith("…")
+
+
+def test_make_adapters_refusal_names_a_folded_version(project, monkeypatch):
+    # The refusal interpolates the version bare (no !r to escape a newline for
+    # it, unlike the forced-backend warning), so an out-of-tree backend that
+    # breaks the seam's promise would split the one message explaining why the
+    # run will not start.
+    install_bmad_config(project)
+    monkeypatch.delenv("BMAD_LOOP_MUX_BACKEND", raising=False)
+    monkeypatch.setattr(mux_mod, "_CONFIGURED", None)
+    monkeypatch.setattr(mux_mod, "_usable", lambda mux: False)
+    monkeypatch.setattr(
+        mux_mod, "get_multiplexer", lambda: _MuxStub(avail=False, version="alpha 1.2\nextra line")
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cli._make_adapters(
+            project.project, project.project / ".bmad-loop" / "runs" / "r", policy_mod.load(None)
+        )
+
+    assert "alpha 1.2; extra line" in str(exc.value)
+    assert "\n" not in str(exc.value)
 
 
 def test_mux_exits_1_on_forced_unknown_name(mux_registry, tmp_path, capsys, monkeypatch):

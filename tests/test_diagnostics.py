@@ -499,6 +499,45 @@ def test_env_tmux_version_folds_a_multi_line_probe(monkeypatch):
     assert env.multiplexer == "_TwoLineMux"
 
 
+def test_env_tmux_version_stays_bounded(monkeypatch):
+    """Nothing between here and the rendered dump bounds this field — asdict,
+    json.dumps and sanitize.guard all pass it through — and scrub_text's cap
+    only ever counted lines, so the fold owns the bound (#321)."""
+    from bmad_loop.adapters import multiplexer as mux_mod
+
+    class _ChattyMux:
+        def version(self):
+            return "tmux 3.3.7\n" + "\n".join("build detail " + "y" * 40 for _ in range(20))
+
+    monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _ChattyMux())
+
+    env = diagnostics.collect_env()
+    assert env.tmux_version is not None
+    assert len(env.tmux_version) == mux_mod.VERSION_MAX_CHARS
+    assert "\n" not in env.tmux_version
+    assert env.tmux_version.startswith("tmux 3.3.7")
+
+
+def test_env_tmux_version_is_redacted_before_it_is_cut(monkeypatch):
+    """The scrub runs on the whole probe, not on what survives the fold: a home
+    path past the bound must still be redacted rather than half-copied into the
+    dump by a truncation that lands mid-path."""
+    from bmad_loop.adapters import multiplexer as mux_mod
+
+    home = sanitize._home()  # the same source redact_home reads, so it can't drift
+
+    class _HomeyMux:
+        def version(self):
+            return f"tmux 3.3.7 built from {home}/src/tmux"
+
+    monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _HomeyMux())
+
+    env = diagnostics.collect_env()
+    assert env.tmux_version is not None
+    assert home not in env.tmux_version
+    assert "~" in env.tmux_version
+
+
 def test_non_ascii_survives_the_utf8_round_trip(tmp_path, monkeypatch):
     """ensure_ascii=False emits real non-ASCII, so confirm the document still
     round-trips through the encoding the CLI writes it with."""
