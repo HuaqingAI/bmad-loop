@@ -458,6 +458,15 @@ blocking = false           # true: a non-completed session defers the unit
   enters COMMITTING, so a _blocking_ workflow whose session doesn't complete
   still defers cleanly. Other stages lack a worktree or run after teardown.
 - **`prompt`** expands `{story_key}`, `{run_id}`, and `{scripts}`.
+- **The orchestrator appends two sections to what you write**, and appends them
+  _after_ the session gates fire, so a `pre_workflow_session` / `pre_session`
+  prompt rewrite cannot strip them: a **`## Sprint board`** prohibition — the
+  same one dev and review prompts carry, because a workflow session runs while
+  the orchestrator's own `sprint-status.yaml` advance is still uncommitted and
+  must not be "fixed" or reverted (#437) — and the **`## Completion signal`**
+  contract naming the marker file the session must write before ending its turn.
+  Write `prompt` as a self-contained instruction; do not restate either. (Stories
+  mode has no board, so the first section is absent there.)
 - The injected session is a **first-class session**: it fires `pre_workflow_session`
   → `pre_session` → `post_session`, is recorded on the task, and counts toward the
   token budget. Its journal entries are `workflow-start` / `workflow-end`.
