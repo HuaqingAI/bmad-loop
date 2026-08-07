@@ -185,11 +185,14 @@ def is_wsl_unc_path(value: str | Path) -> bool:
     coverage: measured on Windows 11 / CPython 3.13, ``Path.resolve()`` leaves both
     bridge spellings untouched, folds ``//wsl.localhost/...`` into the backslash form,
     and dereferences a mapped drive or ``subst`` alias back to the UNC spelling — so all
-    of those match. It does *not* strip a ``\\\\?\\UNC\\...`` prefix the input already
-    carried (``ntpath.realpath`` only strips one it added itself), and that spelling is
-    the one shape left unmatched. It falls back to the ``mux.selection`` line, which
-    names the platform regardless."""
-    return str(value).replace("/", "\\").lower().startswith(("\\\\wsl.localhost\\", "\\\\wsl$\\"))
+    of those match. An extended-length ``\\\\?\\UNC\\...`` prefix the input already
+    carried (``ntpath.realpath`` only strips one it added itself) is folded down to the
+    plain UNC form here, so that spelling matches too. A spelling this still misses
+    degrades gracefully: the ``mux.selection`` line names the platform regardless."""
+    text = str(value).replace("/", "\\").lower()
+    if text.startswith("\\\\?\\unc\\"):
+        text = "\\\\" + text[len("\\\\?\\unc\\") :]
+    return text.startswith(("\\\\wsl.localhost\\", "\\\\wsl$\\"))
 
 
 def _retry_on_sharing_violation(op: Callable[[], None]) -> None:

@@ -270,7 +270,7 @@ Windows host picked on Linux) is visible at a glance.
 There is no new code to write for this seam — it reads seams 1 and 2.
 
 The one `sys.platform` branch that does live here is not a port seam and is not a
-precedent for one: the `host.wsl-interop` check (#332) reports that the _interpreter
+precedent for one: the `host.win32-on-wsl-path` check (#332) reports that the _interpreter
 itself_ is the wrong build for the shell that launched it — a native-Windows
 `bmad-loop` reached from a WSL prompt. No registration can express that, because
 every seam is correctly selected for the interpreter that is running; what is wrong

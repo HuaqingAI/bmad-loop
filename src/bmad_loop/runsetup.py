@@ -310,23 +310,17 @@ def platform_preflight(project: Path) -> list[Finding]:
     except Exception as e:  # a bad BMAD_LOOP_PROCESS_HOST must report, not crash
         found.append(Finding("host.process", "problem", f"process host preflight failed: {e}"))
 
-    # A `warning`, never a `problem`: nothing here is broken from this interpreter's
-    # point of view — the selected backend is the right win32 pick and every seam above
-    # reports healthy — so the verdict and the exit code must not flip. What is wrong is
-    # the interpreter, and only the operator can swap it.
+    # A `warning`, never a `problem`: every seam above is healthy for this interpreter,
+    # so the verdict and the exit code must not flip — what is wrong is the interpreter,
+    # and only the operator can swap it.
     if sys.platform == "win32" and is_wsl_unc_path(project):
-        # State only what the evidence supports. A win32 interpreter on a distro path
-        # is NOT proof of a WSL shell: `cd \\wsl.localhost\...` from native PowerShell
-        # reaches the same condition, and nothing here can separate the two (the interop
-        # env markers do not survive the boundary — see `is_wsl_unc_path`). So the
-        # finding reports the mismatch it can actually see and leaves the WSL remedy
-        # conditional, rather than telling an operator where they are standing.
-        #
-        # The backend clause names what was *actually* chosen instead of assuming psmux
-        # — a forced `env`/`policy` choice would otherwise contradict the `mux.selection`
-        # line above — and is dropped entirely when selection failed (`chosen is None`,
-        # e.g. a forced unknown name), since there is no backend to name and inventing
-        # one is the exact failure this check exists to stop.
+        # State only what the evidence supports: win32 + a distro path is NOT proof of a
+        # WSL shell — `cd \\wsl.localhost\...` from native PowerShell reaches the same
+        # condition, and the interop env markers do not survive the boundary (see
+        # `is_wsl_unc_path`) — so the WSL remedy stays conditional. The backend clause
+        # names what was *actually* chosen (a forced choice would otherwise contradict
+        # `mux.selection` above) and is dropped when selection failed (`chosen is None`):
+        # inventing a backend is the exact failure this check exists to stop.
         picked = (
             f"{chosen.name} was selected and the distro's own tmux is invisible to it"
             if chosen
@@ -334,24 +328,15 @@ def platform_preflight(project: Path) -> list[Finding]:
         )
         found.append(
             Finding(
-                "host.wsl-interop",
+                "host.win32-on-wsl-path",
                 "warning",
                 "the native-Windows build (this interpreter reports win32) is working on a "
                 f"WSL distro path — {picked}; if you are running from a WSL shell, install "
                 "bmad-loop with the WSL/Linux Python instead",
-                # `project` is deliberately NOT carried here. `validate --json` is not a
+                # `project` is deliberately NOT carried here: `validate --json` is not a
                 # sanitized surface, and a distro path ends in the *Linux* username,
-                # which the egress redactor does not know (it compares against the
-                # Windows account). The caller passed the path in; it needs no echo.
-                #
-                # `selection_resolved` because a null backend has two causes a consumer
-                # would otherwise conflate: selection failed, or detection did (which
-                # `mux.backends-detected` reports at `warning`).
-                {
-                    "backend": chosen.name if chosen else None,
-                    "platform": sys.platform,
-                    "selection_resolved": chosen is not None,
-                },
+                # which the egress redactor does not know.
+                {"backend": chosen.name if chosen else None, "platform": sys.platform},
             )
         )
 

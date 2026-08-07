@@ -118,6 +118,12 @@ def test_names_tree_root_catches_the_win32_trim_aliases(value):
         "//wsl.localhost/Ubuntu/home/u/p",  # Windows accepts either separator
         "\\\\wsl.localhost/Ubuntu\\home",  # mixed separators
         Path("\\\\wsl.localhost\\Ubuntu\\home\\u\\p"),  # a Path, not just a str
+        "\\\\?\\UNC\\wsl.localhost\\Ubuntu\\home\\u\\p",  # extended-length UNC spelling
+        "\\\\?\\unc\\wsl$\\Ubuntu\\home\\u",  # extended-length, legacy host, lowercase
+        # not a shape Win32 accepts (a forward-slash device path addresses a host
+        # named `?`) — the separator fold over-matches it, which can only add the
+        # warning, never suppress it
+        "//?/UNC/wsl.localhost/Ubuntu/home/u",
     ],
 )
 def test_is_wsl_unc_path_matches_the_interop_bridge(value):
@@ -163,6 +169,8 @@ def test_names_tree_root_accepts_anything_naming_a_child(value):
         "\\\\wslfoo\\share\\p",  # host merely *starts* with wsl
         "\\\\wsl.localhost",  # no distro component at all
         "wsl.localhost\\Ubuntu\\home",  # not a UNC path
+        "\\\\?\\UNC\\fileserver\\share\\p",  # extended-length, but not a WSL host
+        "\\\\?\\C:\\p",  # extended-length drive path, not UNC at all
         "",
     ],
 )
@@ -185,6 +193,10 @@ def test_is_wsl_unc_path_is_platform_blind(monkeypatch):
         "\\\\wsl.localhost\\{d}\\home",
         "\\\\wsl$\\{d}\\home",
         "//wsl.localhost/{d}/home",
+        # resolve() must keep, not strip, an extended prefix the input carried —
+        # the premise the predicate's fold rests on; if a future CPython starts
+        # stripping it, the fold goes dead and only this row notices
+        "\\\\?\\UNC\\wsl.localhost\\{d}\\home",
     ],
 )
 def test_is_wsl_unc_path_survives_the_resolve_the_caller_applies(spelling):

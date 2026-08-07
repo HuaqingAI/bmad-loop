@@ -61,7 +61,7 @@ unaffected: it _is_ Linux and uses tmux — provided bmad-loop was installed wit
 distro's own Python. WSL appends the Windows `PATH` to its own, so a Windows-installed
 bmad-loop is reachable from the bash prompt; that process reports `win32` and takes the
 psmux default no matter how Linux the shell looks. `bmad-loop validate` names the
-selection reason on every host, and warns (`host.wsl-interop`) when a `win32` interpreter
+selection reason on every host, and warns (`host.win32-on-wsl-path`) when a `win32` interpreter
 is working on a `\\wsl.localhost\...` project (#332).
 
 Two model differences matter if you port a backend or read psmux argv. psmux runs one server

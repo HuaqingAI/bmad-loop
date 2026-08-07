@@ -158,12 +158,11 @@ class EnvInfo:
     # line; `win32_on_wsl_path` is the #332 condition itself. Named for exactly what it
     # observes — a win32 interpreter working a distro path — and NOT "wsl interop":
     # `cd \\wsl.localhost\...` from native PowerShell reaches the same state, so this
-    # must not claim where the operator is standing (the matching `host.wsl-interop`
-    # finding is worded to the same limit). `None` means the verdict was not checked,
-    # which is not the same answer as `False`. Additive fields — no SCHEMA_VERSION bump;
+    # must not claim where the operator is standing (the matching `host.win32-on-wsl-path`
+    # finding is worded to the same limit). Additive fields — no SCHEMA_VERSION bump;
     # `--json` evolution is additive-only, see the contract note in machine.py.
     sys_platform: str
-    win32_on_wsl_path: bool | None
+    win32_on_wsl_path: bool
 
 
 @dataclass
@@ -253,13 +252,14 @@ class Diagnostics:
 # ----------------------------------------------------------------- collectors
 
 
-def collect_env(project: Path | None) -> EnvInfo:
+def collect_env(project: Path) -> EnvInfo:
     """Host facts for the dump's Environment block.
 
-    ``project`` is used only for the #332 verdict, and is required — here *and* on
-    ``collect`` — so no caller can default the answer by omission: without a project
-    the verdict is ``None`` ("not checked"), which must stay distinguishable from a
-    checked ``False``. Rendering them alike is how a triager wrongly rules #332 out.
+    ``project`` feeds only the #332 verdict. It is required — here *and* on
+    ``collect`` — so a new caller must consciously supply the project it actually
+    diagnosed; the type cannot force that choice to be *right* (any ``Path``
+    yields a confident verdict), and the sole production caller, ``cmd_diagnose``,
+    passes the resolved project.
 
     The project *path* itself is never emitted: it is a redaction hazard — the
     redactor leaves the Linux username in a ``\\\\wsl.localhost\\...\\home\\<user>\\...``
@@ -293,9 +293,7 @@ def collect_env(project: Path | None) -> EnvInfo:
         multiplexer=mux,
         tmux_version=tmux_v,
         sys_platform=sys.platform,
-        win32_on_wsl_path=(
-            None if project is None else sys.platform == "win32" and is_wsl_unc_path(project)
-        ),
+        win32_on_wsl_path=sys.platform == "win32" and is_wsl_unc_path(project),
     )
 
 
@@ -553,7 +551,7 @@ def collect(
     pseudo: sanitize.Pseudonymizer,
     cap: int = DEFAULT_JOURNAL_CAP,
     generated_at: str | None = None,
-    project: Path | None,
+    project: Path,
 ) -> Diagnostics:
     runs: list[RunDiag] = []
     for run_dir in run_dirs:
@@ -660,14 +658,7 @@ def render_markdown(
     out.append(_fmt_kv("python", e.python_version))
     out.append(_fmt_kv("os", f"{e.os} {e.os_release}"))
     out.append(_fmt_kv("sys.platform", e.sys_platform))
-    # "—" for the unchecked verdict, the same spelling `tmux` uses below for absent:
-    # "no" would read as a checked negative and rule #332 out for a triager.
-    out.append(
-        _fmt_kv(
-            "win32 on WSL distro path",
-            "—" if e.win32_on_wsl_path is None else "yes" if e.win32_on_wsl_path else "no",
-        )
-    )
+    out.append(_fmt_kv("win32 on WSL distro path", "yes" if e.win32_on_wsl_path else "no"))
     out.append(_fmt_kv("multiplexer", e.multiplexer))
     out.append(_fmt_kv("tmux", e.tmux_version or "—"))
     out.append(_fmt_kv("schema / generated", f"v{d.schema_version} @ {d.generated_at}"))
