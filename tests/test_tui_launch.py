@@ -256,31 +256,58 @@ def test_session_exists(monkeypatch):
     assert fake.calls[0] == ["tmux", "has-session", "-t", "=bmad-loop-x"]
 
 
-def test_ctl_window_matches_run_id_suffix(monkeypatch):
+def test_ctl_window_id_matches_run_id_suffix(monkeypatch):
+    # The id, not the name: consumers replay the value as select/kill/option
+    # targets, where a by-name resolve can land on a duplicate.
     def fake(argv, **kwargs):
-        out = "run-AAAA\nsweep-RID\nresume-BBBB\n" if argv[1] == "list-windows" else ""
+        out = "@1\trun-AAAA\n@2\tsweep-RID\n@3\tresume-BBBB\n" if argv[1] == "list-windows" else ""
         return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
-    assert launch.ctl_window("RID") == "sweep-RID"
-    assert launch.ctl_window("CCCC") is None
+    assert launch.ctl_window_id("RID") == "@2"
+    assert launch.ctl_window_id("CCCC") is None
 
 
-def test_ctl_window_no_session_or_tmux(monkeypatch):
+def test_ctl_window_id_skips_empty_id_rows(monkeypatch):
+    # An empty id must never be returned as a target — an empty `-t` resolves
+    # against the current window. psmux's qualifier passes a falsy id through.
+    def fake(argv, **kwargs):
+        out = "\tsweep-RID\n@7\tsweep-RID\n" if argv[1] == "list-windows" else ""
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+    assert launch.ctl_window_id("RID") == "@7"
+
+
+def test_kill_ctl_window_kills_by_resolved_id_not_a_name_token(monkeypatch):
+    # The kill replays the id this listing resolved, never a `=session:name`
+    # token the backend would resolve again. Which of two same-named windows
+    # the scan picks is unchanged (first match, `@7`); what the id buys is that
+    # a rename or a new window between two verbs cannot re-point the second.
+    calls: list[list[str]] = []
+
+    def fake(argv, **kwargs):
+        calls.append(list(argv))
+        out = "@2\trun-x\n@7\tsweep-RID\n@9\tsweep-RID\n" if argv[1] == "list-windows" else ""
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+    launch.kill_ctl_window("RID")
+    assert ["tmux", "kill-window", "-t", "@7"] in calls
+
+
+def test_ctl_window_id_no_session_or_tmux(monkeypatch):
     def fake(argv, **kwargs):
         return subprocess.CompletedProcess(argv, 1, stdout="", stderr="no session")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
-    assert launch.ctl_window("RID") is None
+    assert launch.ctl_window_id("RID") is None
     monkeypatch.setattr(tmux_base.shutil, "which", lambda name: None)
-    assert launch.ctl_window("RID") is None  # no subprocess call attempted
-
-
-def test_select_ctl_window_argv(fake_run):
-    launch.select_ctl_window("sweep-RID")
-    assert fake_run.calls == [["tmux", "select-window", "-t", "=bmad-loop-ctl:sweep-RID"]]
+    assert launch.ctl_window_id("RID") is None  # no subprocess call attempted
 
 
 def test_set_return_pane_argv(fake_run):
@@ -603,31 +630,31 @@ def test_decision_pending_false_when_empty(tmp_path: Path):
 
 def test_attach_plan_prefers_ctl_when_decision_pending(monkeypatch):
     monkeypatch.delenv("TMUX", raising=False)
-    monkeypatch.setattr(launch, "ctl_window", lambda rid: "sweep-RID")
+    monkeypatch.setattr(launch, "ctl_window_id", lambda rid: "@2")
     monkeypatch.setattr(launch, "session_exists", lambda s: True)
     monkeypatch.setattr(launch, "decision_pending", lambda rd: True)
     selected: list[str] = []
-    monkeypatch.setattr(launch, "select_ctl_window", lambda w: selected.append(w))
+    monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: selected.append(w))
     argv, return_window = launch.attach_plan(Path("/proj"), "RID")
     assert argv == ["tmux", "attach", "-t", "=bmad-loop-ctl"]
-    assert return_window == "=bmad-loop-ctl:sweep-RID"
-    assert selected == ["sweep-RID"]
+    assert return_window == "@2"
+    assert selected == ["@2"]
 
 
 def test_attach_plan_prefers_ctl_when_no_agent_session(monkeypatch):
     monkeypatch.delenv("TMUX", raising=False)
-    monkeypatch.setattr(launch, "ctl_window", lambda rid: "sweep-RID")
+    monkeypatch.setattr(launch, "ctl_window_id", lambda rid: "@2")
     monkeypatch.setattr(launch, "session_exists", lambda s: False)
     monkeypatch.setattr(launch, "decision_pending", lambda rd: False)
-    monkeypatch.setattr(launch, "select_ctl_window", lambda w: None)
+    monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: None)
     argv, return_window = launch.attach_plan(Path("/proj"), "RID")
     assert argv == ["tmux", "attach", "-t", "=bmad-loop-ctl"]
-    assert return_window == "=bmad-loop-ctl:sweep-RID"
+    assert return_window == "@2"
 
 
 def test_attach_plan_agent_session_when_no_decision(monkeypatch):
     monkeypatch.delenv("TMUX", raising=False)
-    monkeypatch.setattr(launch, "ctl_window", lambda rid: None)
+    monkeypatch.setattr(launch, "ctl_window_id", lambda rid: None)
     monkeypatch.setattr(launch, "session_exists", lambda s: True)
     monkeypatch.setattr(launch, "decision_pending", lambda rd: False)
     assert launch.attach_plan(Path("/proj"), "RID") == (
@@ -637,7 +664,7 @@ def test_attach_plan_agent_session_when_no_decision(monkeypatch):
 
 
 def test_attach_plan_none_when_nothing_to_attach(monkeypatch):
-    monkeypatch.setattr(launch, "ctl_window", lambda rid: None)
+    monkeypatch.setattr(launch, "ctl_window_id", lambda rid: None)
     monkeypatch.setattr(launch, "session_exists", lambda s: False)
     monkeypatch.setattr(launch, "decision_pending", lambda rd: False)
     assert launch.attach_plan(Path("/proj"), "RID") is None

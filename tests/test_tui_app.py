@@ -2082,7 +2082,7 @@ async def test_attach_without_mux_notifies(project, monkeypatch):
 async def test_attach_without_agent_session_notifies(project, monkeypatch):
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "session_exists", lambda session: False)
-    monkeypatch.setattr(launch, "ctl_window", lambda run_id: None)
+    monkeypatch.setattr(launch, "ctl_window_id", lambda run_id: None)
     make_run(project.project, "20260611-100000-aaaa")
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
@@ -2099,7 +2099,7 @@ async def test_attach_multiplexer_error_notifies(project, monkeypatch):
     # TUI must surface the error as a toast, not crash the app.
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "session_exists", lambda session: True)
-    monkeypatch.setattr(launch, "ctl_window", lambda run_id: None)
+    monkeypatch.setattr(launch, "ctl_window_id", lambda run_id: None)
 
     def boom(_target):
         raise MultiplexerError("backend server not reachable")
@@ -2123,7 +2123,7 @@ async def test_attach_session_probe_error_notifies(project, monkeypatch):
     # torn down in between). action_attach routes it through _mux_guarded, so the
     # TUI toasts the error and aborts the attach instead of crashing the app.
     monkeypatch.setattr(launch, "mux_available", lambda: True)
-    monkeypatch.setattr(launch, "ctl_window", lambda run_id: None)
+    monkeypatch.setattr(launch, "ctl_window_id", lambda run_id: None)
 
     def boom(_session):
         raise MultiplexerError("session probe unreachable")
@@ -2214,8 +2214,8 @@ async def test_attach_targets_ctl_window_when_decision_pending(project, monkeypa
     selected: list[str] = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "session_exists", lambda session: True)  # agent up too
-    monkeypatch.setattr(launch, "ctl_window", lambda run_id: f"sweep-{run_id}")
-    monkeypatch.setattr(launch, "select_ctl_window", lambda w: selected.append(w))
+    monkeypatch.setattr(launch, "ctl_window_id", lambda run_id: "@5")
+    monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: selected.append(w))
     calls, stamps = _patch_attach_exec(monkeypatch)
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
@@ -2223,10 +2223,10 @@ async def test_attach_targets_ctl_window_when_decision_pending(project, monkeypa
         await until(pilot, lambda: dashboard(app).decision_pending is not None)
         await pilot.press("a")
         await until(pilot, lambda: bool(calls))
-    assert selected == ["sweep-20260611-100000-aaaa"]
+    assert selected == ["@5"]
     assert calls == [["tmux", "switch-client", "-t", "=bmad-loop-ctl"]]
     # the ctl window is stamped with our pane so it switches us back on exit
-    assert stamps == [("=bmad-loop-ctl:sweep-20260611-100000-aaaa", "=main:%9")]
+    assert stamps == [("@5", "=main:%9")]
 
 
 @pytest.mark.usefixtures("force_tmux_backend")  # pin tmux against win32-matching externals
@@ -2240,8 +2240,8 @@ async def test_attach_outside_tmux_stamps_detach(project, monkeypatch):
     stamps: list[tuple[str, str]] = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "session_exists", lambda session: True)
-    monkeypatch.setattr(launch, "ctl_window", lambda run_id: f"sweep-{run_id}")
-    monkeypatch.setattr(launch, "select_ctl_window", lambda w: None)
+    monkeypatch.setattr(launch, "ctl_window_id", lambda run_id: "@5")
+    monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: None)
     monkeypatch.setattr(launch, "set_return_pane", lambda w, p: stamps.append((w, p)))
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
@@ -2249,7 +2249,7 @@ async def test_attach_outside_tmux_stamps_detach(project, monkeypatch):
         await until(pilot, lambda: dashboard(app).decision_pending is not None)
         await pilot.press("a")
         await until(pilot, lambda: bool(stamps))
-    assert stamps == [("=bmad-loop-ctl:sweep-20260611-100000-aaaa", "detach")]
+    assert stamps == [("@5", "detach")]
 
 
 @pytest.mark.usefixtures("force_tmux_backend")  # pin tmux against win32-matching externals
@@ -2257,7 +2257,7 @@ async def test_attach_prefers_agent_session_without_decision(project, monkeypatc
     make_run(project.project, "20260611-100000-aaaa", alive=True)
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "session_exists", lambda session: True)
-    monkeypatch.setattr(launch, "ctl_window", lambda run_id: f"run-{run_id}")
+    monkeypatch.setattr(launch, "ctl_window_id", lambda run_id: "@5")
     calls, stamps = _patch_attach_exec(monkeypatch)
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
@@ -2276,8 +2276,8 @@ async def test_attach_falls_back_to_ctl_window(project, monkeypatch):
     selected: list[str] = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "session_exists", lambda session: False)
-    monkeypatch.setattr(launch, "ctl_window", lambda run_id: f"run-{run_id}")
-    monkeypatch.setattr(launch, "select_ctl_window", lambda w: selected.append(w))
+    monkeypatch.setattr(launch, "ctl_window_id", lambda run_id: "@5")
+    monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: selected.append(w))
     calls, stamps = _patch_attach_exec(monkeypatch)
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
@@ -2285,9 +2285,9 @@ async def test_attach_falls_back_to_ctl_window(project, monkeypatch):
         await until(pilot, lambda: dashboard(app).selected_run_id is not None)
         await pilot.press("a")
         await until(pilot, lambda: bool(calls))
-    assert selected == ["run-20260611-100000-aaaa"]
+    assert selected == ["@5"]
     assert calls == [["tmux", "switch-client", "-t", "=bmad-loop-ctl"]]
-    assert stamps == [("=bmad-loop-ctl:run-20260611-100000-aaaa", "=main:%9")]
+    assert stamps == [("@5", "=main:%9")]
 
 
 @pytest.mark.usefixtures("force_tmux_backend")  # pin tmux against win32-matching externals

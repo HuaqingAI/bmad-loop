@@ -144,7 +144,8 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             # A failed probe skips the return AND the key free; the orphan
             # sweep at a later parked-window launch reclaims the key once the
             # window is gone.
-            f"if ($wid) {{ $key = {_pwsh_quote(return_opt + '_')} + $wid; "
+            # $wid arrives as `@N` — it supplies _SCOPE_MARKER's trailing `@`.
+            f"if ($wid) {{ $key = {_pwsh_quote(return_opt + self._SCOPE_MARKER[:-1])} + $wid; "
             f"$ret = {read_key}; "
             f"if ($ret -eq '{PARKED_RETURN_DETACH}') {{ {mux} detach-client 2>$null }} "
             # The switch leg is still inert at 3.3.7 (psmux/psmux#483: the
@@ -311,8 +312,7 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             # captures stderr for the app's whole run (tui/app.py's run_tui
             # note) — the select_window precedent below, same deliberate ceiling.
             print(
-                f"warning: show-options listing failed on {session}; "
-                "option columns read as unset",
+                f"warning: show-options listing failed on {session}; option columns read as unset",
                 file=sys.stderr,
             )
         out: list[tuple[str, ...]] = []
@@ -345,21 +345,22 @@ class PsmuxMultiplexer(BaseTmuxBackend):
     # psmux/psmux#321 — a boundary to route around, not a bug to wait out.
     #
     # Substitute: a SESSION-scoped option whose key carries the window id
-    # (`@bmad_project_@3` for `@3`). Two rules keep it correct —
+    # (`@bmad_project__blw@3` for `@3`). Two rules keep it correct —
     #   - `-t <session>` on every out-of-pane write and read (the parked
     #     trailer runs in-pane and rides `$TMUX` instead — see
     #     `_parked_trailer`). psmux picks the server from the target, and
     #     without an explicit session it falls back to $TMUX / most-recent —
     #     i.e. some other server. The session comes from the qualified ids
     #     this backend already mints, which is why #310 lands after #291.
-    #   - the key ends with the full id (`_@3`, never bare digits): the ctl
-    #     server loads the user's psmux config, so the map is shared, and the
-    #     `_@` shape is what keeps foreign config options out of the generic
-    #     cleanup sweeps. Not airtight — psmux accepts any `@` name, so a
-    #     hand-written `@theme_@3` WOULD match — but no naming convention in
-    #     the tmux/psmux ecosystem puts `@` mid-name, and a bmad-owned prefix
-    #     guard would hardcode caller names into the backend. The session
-    #     stays out of the key; routing already carries it.
+    #   - the key carries the seam-owned `__blw@` marker plus the full id
+    #     (`__blw@3`, never bare digits): the ctl server loads the user's
+    #     psmux config, so the map is shared, and the generic cleanup sweeps
+    #     delete every key matching their suffix. No real-world naming
+    #     convention collides with the marker — a user option only matches by
+    #     deliberately imitating the seam (`@theme__blw@3` would; the old
+    #     hazard shapes `@theme_@3` / `@color_3` cannot) — and it keeps caller
+    #     names out of the backend (a bmad-owned prefix guard would hardcode
+    #     them). The session stays out of the key; routing already carries it.
     #
     # Builtin window options keep the base's `-w` argv — psmux accepts those
     # allowlisted names (only `automatic-rename` has true per-window storage;
@@ -368,7 +369,8 @@ class PsmuxMultiplexer(BaseTmuxBackend):
 
     # A window target as the seam composes it: `session:@N`, `=session:@N`, or
     # `=session:<window-name>`. Deliberately looser than _QUALIFIED_ID, which
-    # only admits the id form — set_return_pane passes a name token.
+    # only admits the id form — the seam's option/kill verbs accept name
+    # tokens even though today's launch.py callers all pass ids.
     _SESSION_WINDOW = re.compile(r"^(?P<session>[^:]+):(?P<window>.+)$")
 
     @staticmethod
@@ -402,14 +404,32 @@ class PsmuxMultiplexer(BaseTmuxBackend):
                 return win_id
         return None
 
+    # The seam-owned key marker ("bmad-loop window"): every key this channel
+    # mints ends in `<marker><digits>`, and both cleanup sweeps match keys by
+    # it — keep the mint (_scoped_option_key, _parked_trailer) and the matchers
+    # (_KEY_SUFFIX, kill_window) derived from this one literal (within this
+    # class: _KEY_SUFFIX binds at class-body time and _scoped_option_key is
+    # static, so a subclass rebinding the marker would split mint from match).
+    #
+    # No transition rule for the pre-marker `_@<digits>` keys, deliberately
+    # (#313 floated one): a sweep matching the old shape would delete the very
+    # `@theme_@3` the marker exists to protect. They just read as foreign. The
+    # channel is unreleased, so only a dev build holds any, and the cost falls
+    # on windows parked BEFORE the upgrade: their trailer is baked in at mint
+    # (tmux_base.new_parked_window) and still reads the old key, so their tag
+    # reads unset (the prune falls back to the run dir) and their return move
+    # stops firing. Restarting the ctl server clears the map.
+    _SCOPE_MARKER = "__blw@"
+
     @staticmethod
     def _scoped_option_key(option: str, digits: str) -> str:
-        return f"{option}_@{digits}"
+        return f"{option}{PsmuxMultiplexer._SCOPE_MARKER}{digits}"
 
-    # The channel's key suffix. Anchored: `@bmad_project_@13` must not read as
-    # a key of window `@3`, and a foreign `@color_3` (no `_@` shape) never
-    # matches (see the namespace note in the channel comment above).
-    _KEY_SUFFIX = re.compile(r"_@(\d+)$")
+    # The channel's key suffix. Anchored: `@bmad_project__blw@13` must not read
+    # as a key of window `@3`, and a key without the marker — `@color_3`, a
+    # hand-written `@theme_@3` — never matches (see the namespace note in the
+    # channel comment above).
+    _KEY_SUFFIX = re.compile(re.escape(_SCOPE_MARKER) + r"(\d+)$")
 
     def _read_scoped(self, session: str, option: str, digits: str) -> str | None:
         # No `-w`: the session-scoped read is the one that reaches the map.
@@ -617,11 +637,22 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             options[name] = rest
         return options
 
+    def _free_scoped_key(self, session: str, name: str) -> None:
+        # The one unset path both sweeps share, routed through the same warn-
+        # never-raise body as every other write. rc-0 is not proof the key is
+        # gone on psmux's write side, but a nonzero rc IS proof it is not —
+        # silence here would leak a key for the server's life with no signal.
+        # Delegating also contains a dead round-trip to its own key: the outer
+        # guard in either sweep would otherwise catch it and abandon the keys
+        # after it in the batch.
+        self._write_scoped(["set-option", "-u", "-t", session, name], f"{name} on {session}")
+
     def _sweep_orphan_keys(self, session: str) -> None:
-        # Free `_@N` keys whose window no longer exists (Enter-dismissed parked
-        # windows never pass through kill_window). The `_@` shape keeps foreign
-        # config options out of the sweep; window ids are never recycled within
-        # a server, so a swept key cannot belong to a future window.
+        # Free seam-minted (`__blw@N`) keys whose window no longer exists
+        # (Enter-dismissed parked windows never pass through kill_window). The
+        # marker keeps every foreign config option out of the sweep; window ids
+        # are never recycled within a server, so a swept key cannot belong to a
+        # future window.
         #
         # Order matters: keys are snapshotted BEFORE the live-window listing, so
         # a window minted-and-tagged between the two calls has its key outside
@@ -629,17 +660,33 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         try:
             options = self._scoped_options(session)
             if options is None:
+                # Transport failure, not "no keys": a sweep that silently fails
+                # every launch leaks keys with no signal anywhere.
+                print(
+                    f"warning: orphan-key sweep on {session} could not list "
+                    "options; orphaned keys unswept until the next launch",
+                    file=sys.stderr,
+                )
                 return
             live = set(super().list_window_ids(session))  # base = bare ids
             if not live:
                 # A session being swept just minted a window, so an empty live
                 # list is a failed probe, not an empty session — treating it as
-                # truth would sweep every key, live windows included.
+                # truth would sweep every key, live windows included. Warned for
+                # the same reason the listing failure above is, and this is the
+                # branch that actually fires: list_window_ids RAISES on a
+                # transport fault (caught below) and answers [] only on rc != 0,
+                # so silence here is a server failing every launch with no signal.
+                print(
+                    f"warning: orphan-key sweep on {session} could not list live "
+                    "windows; orphaned keys unswept until the next launch",
+                    file=sys.stderr,
+                )
                 return
             for name in options:
                 match = self._KEY_SUFFIX.search(name)
                 if match and f"@{match.group(1)}" not in live:
-                    self._run(["set-option", "-u", "-t", session, name], check=False)
+                    self._free_scoped_key(session, name)
         except (subprocess.SubprocessError, OSError, TmuxError) as exc:
             # Reconcile is opportunistic; the mint must never fail on it. But a
             # sweep that fails every launch leaks keys for the server's whole
@@ -647,28 +694,49 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             print(f"warning: orphan-key sweep failed on {session}: {exc}", file=sys.stderr)
 
     def kill_window(self, target: str) -> None:
-        # Free the window's id-keyed session options before the kill: the ctl
+        # Kill first, clean only once the window is verifiably gone: the ctl
         # session outlives every run, so a leaked key lives as long as the
-        # server. Discovery is generic by the `_@<digits>` suffix — the backend
-        # must not know which option names callers use. Best-effort throughout:
-        # cleanup failure never blocks the kill. Known ceiling, accepted: the
-        # kill itself is best-effort, so a kill that then fails leaves a live
-        # window without its keys — the prune's untagged run-dir fallback still
-        # scopes the retry, and a lost return key just parks the window as-is.
-        # Cost, accepted: one listing round-trip per kill, two for a name target
-        # (name-resolve, then keys; agent-window kills pay it too, for
-        # nothing); skip-by-session-name if that ever measures.
+        # server — but a kill that FAILS must leave the live window its keys
+        # (the project tag scopes the prune retry; the return key keeps the
+        # detach return armed — the switch leg is inert at 3.3.7 either way,
+        # see _parked_trailer). Scope resolves before the kill because a name
+        # token cannot be resolved once the window is dead. An empty liveness
+        # listing is ambiguous — a failed probe, or a session that died with
+        # its last window — so it degrades toward retaining the keys; the
+        # launch-time orphan sweep reclaims them once the window is provably
+        # gone. Discovery is generic by the seam's marker — the backend must
+        # not know which option names callers use. Best-effort throughout:
+        # cleanup failure warns (the sweep precedent) but never blocks or
+        # fails the kill.
+        # Cost, accepted: two listing round-trips per kill, three for a name
+        # target (name-resolve, liveness, then keys; agent-window kills pay it
+        # too, for nothing — and prune_ctl_windows fans it out once per stale
+        # window); skip-by-session-name if that ever measures.
         scope = self._option_scope(target)
-        if scope is not None:
-            session, digits = scope
-            suffix = f"_@{digits}"
-            try:
-                for name in self._scoped_options(session) or ():
-                    if name.endswith(suffix):
-                        self._run(["set-option", "-u", "-t", session, name], check=False)
-            except (subprocess.SubprocessError, OSError):
-                pass
         super().kill_window(target)
+        if scope is None:
+            return
+        session, digits = scope
+        try:
+            live = super().list_window_ids(session)  # base = bare ids
+            if not live or f"@{digits}" in live:
+                return
+            options = self._scoped_options(session)
+            if options is None:
+                # Transport failure, not "no keys" — the keys of a verified-
+                # dead window are now stranded until the orphan sweep.
+                print(
+                    f"warning: kill-window key cleanup on {session} could not "
+                    "list options; stranded keys await the orphan sweep",
+                    file=sys.stderr,
+                )
+                return
+            suffix = f"{self._SCOPE_MARKER}{digits}"
+            for name in options:
+                if name.endswith(suffix):
+                    self._free_scoped_key(session, name)
+        except (subprocess.SubprocessError, OSError, TmuxError) as exc:
+            print(f"warning: kill-window key cleanup failed on {session}: {exc}", file=sys.stderr)
 
     # What _qualified_window_id composes: `<session>:@<n>`. The session part
     # excludes `:` because that is exactly when qualification degrades to a bare
@@ -714,15 +782,14 @@ class PsmuxMultiplexer(BaseTmuxBackend):
                 # attach shows whichever window happens to be current. Guessing
                 # an index instead could focus an unrelated window, so warn and
                 # send: the pipe-pane sidecar precedent, but a weaker one, and
-                # deliberately not load-bearing. Today's only caller of the
-                # qualified-id path (select_ctl_window_id, from the TUI's resolve
-                # launch) runs inside the Textual app, which captures stderr for
-                # the app's whole run — see the run_tui note in tui/app.py, which
-                # pre-trips the forced-backend warning for exactly this reason —
-                # so this emission is invisible there. It is kept for the CLI-side
-                # callers tui/launch.py is textual-free to allow; a TUI-visible
-                # miss would need a return value, which is more seam than a
-                # best-effort focus change is worth.
+                # deliberately not load-bearing. The qualified-id path's callers
+                # (select_ctl_window_id) split by surface: under the Textual app
+                # this emission is invisible — the app captures stderr for its
+                # whole run, see the run_tui note in tui/app.py, which pre-trips
+                # the forced-backend warning for exactly this reason — while the
+                # textual-free CLI attach path (launch.attach_plan via cli.py)
+                # does show it. A TUI-visible miss would need a return value,
+                # which is more seam than a best-effort focus change is worth.
                 print(
                     f"warning: select-window could not resolve {target} to a "
                     "window index; the window will not be focused",

@@ -415,19 +415,16 @@ class BmadLoopApp(App[None]):
             self.notify("no run selected", severity="warning")
             return
         session = runs.session_name(run_id)
-        window = launch.ctl_window(run_id)
+        win_id = launch.ctl_window_id(run_id)
         ok, agent_live = self._mux_guarded(lambda: launch.session_exists(session))
         if not ok:
             return
         # A sweep blocked on a decision prompt has no agent session — the
         # human answers in the orchestrator's ctl window. Otherwise prefer the
         # live agent session, falling back to the ctl window between sessions.
-        if window is not None and (self._dashboard.decision_pending is not None or not agent_live):
-            launch.select_ctl_window(window)
-            self._attach_to_target(
-                launch.ctl_target(),
-                return_window=launch.ctl_target(window),
-            )
+        if win_id is not None and (self._dashboard.decision_pending is not None or not agent_live):
+            launch.select_ctl_window_id(win_id)
+            self._attach_to_target(launch.ctl_target(), return_window=win_id)
             return
         elif agent_live:
             target = runs.session_target(run_id)
