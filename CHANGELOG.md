@@ -153,27 +153,23 @@ whose seams had diverged enough that several ports needed a different fix, and t
 ### Fixed
 
 - **A seed path naming the project root is refused at load, in every source that feeds it (#456).**
-  `""` made `provision_worktree`'s seed loop resolve source to the repo root and destination to the
-  worktree — both pass its containment checks — so it copied the whole project in, untracked files
-  included, then recursed into its own destination. `.`, `./` and `.\` are the same value and were
-  never rejected. Neither were the Windows spellings: Win32 strips every trailing period and space
-  from a path's final component, so `". "`, `".. "`, `"..."` and `"   "` name the root there while
-  both pure pathlib flavours read them as ordinary child names. `scm.worktree_seed`, a profile's
+  A root-naming entry made `provision_worktree`'s seed loop resolve source to the repo root and
+  destination to the worktree — both pass its containment checks — so it copied the whole project
+  in, untracked files included, then recursed into its own destination. `""` was one spelling of
+  several: `.`, `./`, `.\`, and on Windows `". "`, `".. "`, `"..."` and `"   "`, which Win32 trims
+  to the root while pathlib reads them as ordinary child names. `scm.worktree_seed`, a profile's
   `seed_files`, `skill_tree` and `hooks.config_path`, a plugin manifest's `seed_files`/`seed_globs`
-  and its `[python] module`, and the Unity seeder's `scene_guard_dir` now refuse every spelling.
-  The seed lists are shape-checked too: a bare string iterated into per-character entries that each
-  passed the per-entry guard, and a scalar raised an untyped error out of the loader.
-  **Behavior change:** `worktree_seed = [1]` and an int plugin seed entry are now rejected rather
-  than silently `str()`-coerced.
+  and its `[python] module`, and the Unity seeder's `scene_guard_dir` now refuse every spelling, and
+  the seed lists are shape-checked. **Behavior change:** `worktree_seed = [1]` and an int plugin
+  seed entry are now rejected rather than silently `str()`-coerced.
 
-- **`init` no longer follows a config path that symlinks out of the project (#456).** The
-  profile/manifest guards are lexical and run at load, so a `skill_tree`, `hooks.config_path` or
-  plugin `[python] module` naming an ordinary project-relative directory passed all of them even
-  when that directory was a link out of the tree. `provision_worktree` already compared
-  resolved-vs-raw before writing; the `init` path reached mkdir/rmtree/write with no such check, and
-  `_copy_skills` supplied `_copy_traversable` neither containment root, so both of its legs were
-  inert there. Each now refuses after resolution — the plugin loader before `exec_module`, where a
-  slipped path is arbitrary code execution rather than a copy.
+- **`init` no longer follows a config path that leaves the project (#456).** The profile/manifest
+  guards are lexical, so a `skill_tree`, `hooks.config_path` or plugin `[python] module` naming an
+  ordinary project-relative directory passed them even when that directory linked out of the tree.
+  `provision_worktree` re-checked after resolution; `init` reached mkdir/rmtree/write with no such
+  check. Each now requires the target to resolve _strictly below_ the project — equality would
+  admit a link back to the root — and a refused skill tree fails the install instead of being
+  skipped past `init complete`.
 
 - **A wrongly-typed field in a profile or plugin TOML is reported, not crashed on.** `float()`,
   `int()` and `.items()` over TOML-legal values of the wrong type raised bare
