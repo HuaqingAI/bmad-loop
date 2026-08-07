@@ -1,9 +1,13 @@
 """The hook relay script runs as a real subprocess, like Claude Code runs it."""
 
 import json
+import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 SCRIPT = Path(__file__).parent.parent / "src" / "bmad_loop" / "data" / "bmad_loop_hook.py"
 
@@ -103,6 +107,38 @@ def test_tolerates_garbage_stdin(tmp_path):
     files = list((tmp_path / "events").glob("*.json"))
     assert len(files) == 1
     assert json.loads(files[0].read_text())["session_id"] is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_symlinked_events_dir_writes_nothing_and_exits_zero(tmp_path):
+    """#461 (Low): a driven session can write inside the run dir, so it can plant
+    `events/` as a symlink and redirect the orchestrator's control-plane event
+    stream — swallowing the Stop signal and stalling the run to timeout. The relay
+    must refuse the link and degrade to a no-op, never write through it."""
+    target = tmp_path / "attacker"
+    target.mkdir()
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "events").symlink_to(target, target_is_directory=True)
+
+    env = {"BMAD_LOOP_RUN_DIR": str(run_dir), "BMAD_LOOP_TASK_ID": "t1"}
+    proc = run_hook("Stop", env, {"session_id": "s1"})
+
+    assert proc.returncode == 0
+    assert list(target.iterdir()) == []
+    assert list((run_dir / "events").iterdir()) == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_event_file_mode_is_0600(tmp_path):
+    """Event files carry the orchestrator's control plane; nothing but the
+    operator running the loop needs to read them (narrowed from the umask-derived
+    0644 a plain `open()` produced)."""
+    env = {"BMAD_LOOP_RUN_DIR": str(tmp_path), "BMAD_LOOP_TASK_ID": "t1"}
+    proc = run_hook("Stop", env, {"session_id": "s1"})
+    assert proc.returncode == 0
+    written = next((tmp_path / "events").glob("*.json"))
+    assert stat.S_IMODE(written.stat().st_mode) == 0o600
 
 
 def test_installed_copy_matches_source(tmp_path):
