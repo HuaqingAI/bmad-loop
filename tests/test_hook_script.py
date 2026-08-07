@@ -205,6 +205,91 @@ def test_fallback_refuses_a_redirect_that_appears_mid_write(tmp_path, monkeypatc
     assert list(events.iterdir()) == []  # nothing published, no .tmp left behind
 
 
+@pytest.mark.skipif(os.name == "nt", reason="dir_fd is implemented with the POSIX *at() calls")
+def test_the_anchored_branch_is_actually_taken_on_posix(tmp_path, monkeypatch):
+    """The capability probe must resolve to True where the capability exists, or
+    the TOCTOU-closing layer ships dead while every other test stays green — the
+    `islink` refusal covers the same cases, so nothing else would redden.
+
+    This is not hypothetical: `os.replace` is NOT in `os.supports_dir_fd` on
+    Linux (only `os.rename` is) even though it accepts src_dir_fd/dst_dir_fd, so
+    probing `os.replace` — the function the code used to call — made the branch
+    unreachable on every platform. Observe the anchoring behaviorally rather
+    than re-deriving the probe, so editing the probe reddens this.
+
+    Ablation guard: change the probe to `os.replace` (or drop the branch) and
+    this fails; no other test notices."""
+    relay = _relay_module()
+    real_open, real_supports = os.open, os.supports_dir_fd
+    # The premise, asserted rather than assumed: were a future CPython to drop
+    # rename from the set, the branch would go dead and this says so directly.
+    assert {real_open, os.rename} <= real_supports
+    anchored = []
+
+    def spy(path, flags, mode=0o777, *, dir_fd=None):
+        anchored.append(dir_fd)
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", spy)
+    # The probe tests os.open by IDENTITY, so the spy has to be in the capability
+    # set too or the probe answers False and this measures the fallback instead
+    # of the branch it exists to pin — which is how it first went red.
+    monkeypatch.setattr(os, "supports_dir_fd", real_supports | {spy})
+    relay._write_event(str(tmp_path / "events"), "1-t1-Stop.json", {"event": "Stop"})
+    monkeypatch.undo()
+
+    assert any(fd is not None for fd in anchored), "the create was never anchored to a dir_fd"
+
+
+@pytest.mark.parametrize("forced_fallback", [False, True])
+def test_a_short_os_write_still_publishes_the_whole_payload(tmp_path, monkeypatch, forced_fallback):
+    """`os.write` may write FEWER bytes than asked and just return the count. The
+    buffered `open()` this replaced looped internally; the raw fd needed for
+    O_NOFOLLOW/dir_fd does not. A truncated event file is not retried but LOST:
+    `SignalWatcher.poll` adds a name to `_consumed` before parsing it, so
+    malformed JSON is skipped and never re-read — the Stop signal is gone and the
+    run waits out `session_timeout_min`.
+
+    Both branches are driven: the loop is shared, but the fallback is the only
+    path Windows takes and POSIX would otherwise never exercise it.
+
+    Ablation guard: collapsing `_write_all` back to a single `os.write` makes
+    this fail. Nothing else in the suite catches that — a real `os.write`
+    returns the full count, so the normal-path tests pass either way."""
+    relay = _relay_module()
+    events = tmp_path / "events"
+    real_write = os.write
+
+    def a_byte_at_a_time(fd, data):
+        return real_write(fd, bytes(data)[:1])  # a legal short write
+
+    if forced_fallback:
+        monkeypatch.setattr(os, "supports_dir_fd", frozenset())
+    event = {"event": "Stop", "task_id": "t1", "session_id": "s" * 300}
+    monkeypatch.setattr(os, "write", a_byte_at_a_time)
+    relay._write_event(str(events), "1-t1-Stop.json", event)
+    monkeypatch.undo()
+
+    published = list(events.glob("*.json"))
+    assert len(published) == 1
+    assert json.loads(published[0].read_text()) == event
+    assert list(events.glob("*.tmp")) == []
+
+
+def test_a_zero_length_write_raises_instead_of_spinning(tmp_path, monkeypatch):
+    """`_write_all` loops on short writes, so a descriptor that always accepts 0
+    bytes would spin forever. Refuse instead: the caller degrades to a no-op and
+    the run takes the timeout path, which beats a hook process that never exits.
+
+    Ablation guard: dropping the `written <= 0` arm hangs this test."""
+    relay = _relay_module()
+    monkeypatch.setattr(os, "write", lambda fd, data: 0)
+    with pytest.raises(OSError, match="short write"):
+        relay._write_event(str(tmp_path / "events"), "1-t1-Stop.json", {"event": "Stop"})
+
+
 @pytest.mark.skipif(os.name != "nt", reason="directory junctions are Windows-only")
 def test_junctioned_events_dir_writes_nothing_and_exits_zero(tmp_path):
     """The Windows half of the symlink test — Windows CI is its only oracle, a
