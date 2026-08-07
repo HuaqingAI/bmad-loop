@@ -525,6 +525,53 @@ def test_provision_worktree_does_not_clobber_existing_skill(tmp_path):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_copy_skills_refuses_a_skill_tree_symlinked_out_of_the_project(tmp_path, capsys):
+    # The `init` counterpart of the provision_* symlink refusals below. The profile
+    # guards are lexical and run at load, so `skill_tree` naming an ordinary
+    # project-relative directory passes all three even when that directory is a link
+    # out of the tree; only resolution sees it. This loop rmtree's under `force`, and
+    # its `_copy_traversable` call supplies neither containment root, so nothing
+    # downstream would have caught it.
+    project, outside = tmp_path / "proj", tmp_path / "outside"
+    project.mkdir()
+    outside.mkdir()
+    (project / "skills").symlink_to(outside, target_is_directory=True)
+
+    assert install_mod._copy_skills(project, ("skills",), False) is False
+
+    assert list(outside.iterdir()) == []  # nothing written through the link
+    assert "escapes the project" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_copy_skills_still_installs_into_an_ordinary_tree(tmp_path):
+    # the containment check must not cost the normal path — ablation partner for
+    # the refusal above, which would otherwise pass if _copy_skills refused always
+    project = tmp_path / "proj"
+    project.mkdir()
+
+    assert install_mod._copy_skills(project, ("skills",), False) is False
+
+    for skill in MODULE_SKILLS:
+        assert (project / "skills" / skill / "SKILL.md").is_file()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_register_hooks_refuses_a_config_path_symlinked_out_of_the_project(tmp_path, capsys):
+    project, outside = tmp_path / "proj", tmp_path / "outside"
+    claude = get_profile("claude")
+    (project / Path(claude.hooks.config_path).parent).mkdir(parents=True)
+    outside.write_text('{"env":{"KEEP":"BYTE-IDENTICAL"}}\n', encoding="utf-8")
+    before = outside.read_bytes()
+    (project / claude.hooks.config_path).symlink_to(outside)
+
+    assert install_mod._register_hooks(project, claude) == 1
+
+    assert outside.read_bytes() == before  # the escape target is untouched
+    assert "escapes the project" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
 def test_provision_refuses_a_live_hook_config_symlink(tmp_path):
     wt, repo = tmp_path / "wt", tmp_path / "repo"
     claude = get_profile("claude")
