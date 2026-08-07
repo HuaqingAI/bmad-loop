@@ -2333,6 +2333,93 @@ def test_provision_worktree_bmad_custom_shielded_in_local_exclude(project, tmp_p
     assert shared.read_bytes() == before
 
 
+def test_shield_tracked_hook_config_is_not_excluded(project, tmp_path):
+    """#392, reported from production: a project that TRACKS its hook config had that
+    path written into the shield, making it read as tracked-and-ignored, which the
+    project's own repo-hygiene gate rejected — blocking the story's commit.
+
+    The pattern was never doing anything: git consults ignore rules only for untracked
+    paths, so `git add -A` stages a modification to a tracked file regardless. Asserted
+    through git's own answer, not just the file's text, because that is the probe the
+    reporter's gate ran."""
+    repo = project.project
+    claude = get_profile("claude")
+    hook_rel = claude.hooks.config_path
+    (repo / hook_rel).parent.mkdir(parents=True, exist_ok=True)
+    (repo / hook_rel).write_text('{"hooks": {}}\n', encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "track the hook config")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [claude], repo)
+
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert f"/{hook_rel}" not in exclude
+    # The reporter's own probe, in the worktree where their gate ran.
+    assert git(wt, "ls-files", "-ci", "--exclude-standard") == ""
+    assert git(repo, "ls-files", "-ci", "--exclude-standard") == ""
+
+
+def test_shield_tracked_skill_tree_keeps_its_pattern(project, tmp_path):
+    """The other half of the same predicate, and the reason it is not simply "never
+    exclude a tracked path": a tracked DIRECTORY's pattern measurably DOES hide new
+    children, so dropping it would leak the orchestrator's seeded skills into the
+    story commit — the exact harm the shield exists to prevent.
+
+    Its tracked children still answer `ls-files -ci`, and no pattern shape avoids that
+    (measured: `dir/*`, `dir/**` and a trailing negation all behave like `dir`, since
+    gitignore cannot re-include under an excluded parent). That tradeoff is deliberate."""
+    repo = project.project
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    (repo / tree / "house-skill").mkdir(parents=True, exist_ok=True)
+    (repo / tree / "house-skill" / "SKILL.md").write_text("# tracked\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "track the skill tree")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [claude], repo)
+
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert f"/{tree}" in exclude
+    # The shield still does its job: a file provisioning wrote is not stageable.
+    git(wt, "add", "-A")
+    staged = git(wt, "diff", "--cached", "--name-only").splitlines()
+    assert not [p for p in staged if p.startswith(f"{tree}/")]
+
+
+def test_shield_keeps_patterns_when_tracked_probe_fails(project, tmp_path, monkeypatch):
+    """Uncertainty must keep the pattern, never drop it: a shield that stays too wide
+    is a cosmetic hygiene complaint, while one that drops a pattern on a fault leaks
+    seeded files into a story commit. The degrade is REPORTED so the wide shield is
+    not silent."""
+    repo = project.project
+    claude = get_profile("claude")
+    hook_rel = claude.hooks.config_path
+    (repo / hook_rel).parent.mkdir(parents=True, exist_ok=True)
+    (repo / hook_rel).write_text('{"hooks": {}}\n', encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "track the hook config")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    import bmad_loop.worktree_flow as wtf
+
+    def boom(_repo, _rel):
+        raise verify.GitError("ls-files timed out")
+
+    monkeypatch.setattr(wtf.verify, "path_tracked_file", boom)
+    msgs: list[str] = []
+
+    provision_worktree(wt, [claude], repo, on_degraded=msgs.append)
+
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert f"/{hook_rel}" in exclude
+    assert any("could not check whether these paths are tracked" in m for m in msgs)
+
+
 def test_missing_stories_support_findings_split_absent_from_stale(tmp_path):
     """#205: a half install and a too-old install are different conditions with
     different remediations, so they get different check ids — a script pinning a

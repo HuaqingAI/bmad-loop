@@ -487,6 +487,45 @@ def path_tracked(repo: Path, rel: str) -> bool:
     return bool(proc.stdout.strip())
 
 
+def path_tracked_file(repo: Path, rel: str) -> bool:
+    """True when repo-relative posix ``rel`` is tracked AND names a regular FILE rather
+    than a directory prefix.
+
+    The distinction :func:`path_tracked` deliberately does not draw. Its literal
+    pathspec matches a directory prefix too — that is load-bearing there, which is why
+    `_bmad/render` answers True for the whole tree beneath it — so a caller that must
+    know *which* of the two it holds cannot get it from that boolean.
+
+    The one caller is the worktree git-add shield, where the two cases want OPPOSITE
+    treatment (#392). Measured, git 2.55.0:
+
+    * An exclude pattern naming a tracked regular file suppresses NOTHING. git consults
+      ignore rules only for untracked paths, so `git add -A` stages a modification to it
+      regardless. The pattern's only effect is to make the file answer
+      `ls-files -ci --exclude-standard`, i.e. read as tracked-and-ignored — which is a
+      state repo-hygiene gates reject, and how a shield meant to keep the orchestrator's
+      files OUT of a story commit came to block one instead.
+    * The same pattern over a tracked DIRECTORY really does hide new children, so it
+      stays. There is no pattern shape that keeps that and clears the `-ci` report:
+      `dir/*`, `dir/**` and a trailing negation all measured identical to `dir`, because
+      gitignore cannot re-include anything under an excluded parent.
+
+    `-z` and the BYTES accessor, unlike the sibling above. This reads the output's TEXT
+    rather than only its emptiness, so the sibling's reason for never looking —
+    `core.quotePath` mangling non-ASCII names — becomes this function's problem instead.
+    NUL-delimited output is never quoted, and comparing `os.fsencode(rel)` keeps a POSIX
+    name that is undecodable in the locale codec comparable rather than raising (#377).
+
+    Raises GitError like every other probe in this module; the shield's caller degrades
+    by KEEPING the pattern, since a leaked seed file in a story commit is the worse of
+    the two failures."""
+    proc = git_bytes(repo, "ls-files", "-z", "--", *_literal_specs([rel]))
+    if proc.returncode != 0:
+        merged = (proc.stdout + proc.stderr).decode("utf-8", "replace").strip()
+        raise GitError(f"git ls-files -z -- {rel} failed in {repo}: {merged}")
+    return {entry for entry in proc.stdout.split(b"\0") if entry} == {os.fsencode(rel)}
+
+
 def commits_above(repo: Path, baseline: str) -> list[str]:
     """Commit shas reachable from HEAD but not from ``baseline`` — the commits an
     attempt added on top of its pre-attempt baseline, in ``git rev-list`` order (do

@@ -341,6 +341,59 @@ def test_undelivered_arbitrary_seed_is_journaled_never_escalated(project, tmp_pa
     assert "story-escalated" not in journal_kinds(engine)
 
 
+def test_hook_config_is_seeded_for_every_non_hookless_profile(project, monkeypatch):
+    """#471 — the seed list and the shield list were built from two unreconciled
+    sources, and `hooks.config_path` was only ever in the SHIELD one. Whether a
+    profile's hook config got seeded therefore depended on that profile happening to
+    name the path twice: claude's `seed_files` carries `.claude/settings.json`, which
+    is also its `config_path`, so claude worked by coincidence; codex's carries
+    `.codex/config.toml` and NOT `.codex/hooks.json`, so a codex stage ran without the
+    project's own hook config.
+
+    ⚠️ THE FIXTURE MUST BE CODEX, and this test ablated GREEN when it was written with
+    claude — claude's `config_path` is already one of its `seed_files`, so the new
+    derivation is a no-op there and the test could not tell the fix from the bug. The
+    coincidence #471 reports is the same thing that makes claude useless as a fixture.
+
+    Pinned on the resolved `config_path` rather than on a literal path, because the
+    point of deriving it is that a future profile cannot regress the same way.
+
+    Ablation: drop the `seeds.append(profile.hooks.config_path)` arm and the gitignored
+    hook config is absent from the worktree's seed set."""
+    from bmad_loop.adapters.profile import get_profile
+
+    codex = get_profile("codex")
+    hook_rel = codex.hooks.config_path
+    assert not codex.hookless and hook_rel
+    assert hook_rel not in codex.seed_files  # the precondition that makes this bite
+    ignore_before_commit(project, hook_rel)
+    (project.project / hook_rel).parent.mkdir(parents=True, exist_ok=True)
+    (project.project / hook_rel).write_text('{"marker": "from-the-main-repo"}\n', encoding="utf-8")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    seen: list[list[str]] = []
+    engine, adapter = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+        policy=wt_policy(),
+    )
+    # `worktree_profiles` reads `adapter.profile` and the mock has none, so the seed
+    # list would be empty for reasons unrelated to this behavior. Give it the real
+    # codex profile: the derivation under test is per-profile, so a profile is the
+    # fixture, not a mock of one.
+    monkeypatch.setattr(adapter, "profile", codex, raising=False)
+    real = worktree_flow.provision_worktree
+
+    def spy(worktree, profiles, repo_root, **kwargs):
+        seen.append(list(kwargs.get("seed_files") or ()))
+        return real(worktree, profiles, repo_root, **kwargs)
+
+    monkeypatch.setattr(worktree_flow, "provision_worktree", spy)
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert seen and all(hook_rel in seed_list for seed_list in seen)
+
+
 @pytest.mark.parametrize("merge_strategy", ["merge", "ff"])
 def test_worktree_parked_unit_merges_like_a_done_one(project, merge_strategy):
     """`integrate_unit` branches on DONE-vs-everything-else, and a park is the one
