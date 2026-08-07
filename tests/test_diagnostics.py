@@ -519,23 +519,37 @@ def test_env_tmux_version_stays_bounded(monkeypatch):
 
 
 def test_env_tmux_version_is_redacted_before_it_is_cut(monkeypatch):
-    """The scrub runs on the whole probe, not on what survives the fold: a home
-    path past the bound must still be redacted rather than half-copied into the
-    dump by a truncation that lands mid-path."""
+    """The scrub runs on the whole probe, not on what survives the fold.
+
+    The home path has to *straddle* the cut for this to mean anything: a probe
+    that fits under the bound passes whichever way round the two run. Padded so
+    the cut lands inside the path, folding first leaves a fragment `redact_home`
+    can no longer match — and its `~` never appears, which is what discriminates
+    the orders. `home not in ...` alone does not: the fragment isn't the whole
+    path either.
+    """
     from bmad_loop.adapters import multiplexer as mux_mod
 
-    home = sanitize._home()  # the same source redact_home reads, so it can't drift
+    # A fixed home, not the host's: the padding below is arithmetic against its
+    # length, and CI's home differs per runner. expanduser reads HOME on POSIX
+    # and USERPROFILE on Windows, so set both (tests/test_sanitize.py does too).
+    home = "/private/bmad-loop-home"
+    monkeypatch.setenv("HOME", home)
+    monkeypatch.setenv("USERPROFILE", home)
+    lead = "tmux 3.3.7 "
+    pad = lead + "x" * (mux_mod.VERSION_MAX_CHARS - len(lead) - 3)
 
     class _HomeyMux:
         def version(self):
-            return f"tmux 3.3.7 built from {home}/src/tmux"
+            return f"{pad}{home}/src/tmux"
 
     monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _HomeyMux())
 
     env = diagnostics.collect_env()
     assert env.tmux_version is not None
+    assert env.tmux_version.endswith("…")  # the cut really fired
     assert home not in env.tmux_version
-    assert "~" in env.tmux_version
+    assert "~" in env.tmux_version  # redaction saw the whole path, then the cut
 
 
 def test_non_ascii_survives_the_utf8_round_trip(tmp_path, monkeypatch):
