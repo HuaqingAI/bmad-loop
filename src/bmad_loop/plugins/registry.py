@@ -62,8 +62,11 @@ def _instantiate(manifest: PluginManifest, settings: dict) -> Plugin:
     # manifest load, but lexically: a project-relative name that is a symlink out of
     # the plugin resolves fine and would be exec'd. Re-check after resolution, since
     # what happens below is arbitrary code execution, not a copy.
+    # Strictly below, not merely inside: `is_relative_to` is true for equal paths,
+    # so a module resolving to the plugin dir itself would pass an inside-check.
     try:
-        contained = module_path.resolve().is_relative_to(scripts_dir.resolve())
+        resolved, base = module_path.resolve(), scripts_dir.resolve()
+        contained = resolved != base and resolved.is_relative_to(base)
     except (OSError, RuntimeError):
         contained = False
     if not contained:

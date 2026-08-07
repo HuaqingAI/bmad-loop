@@ -1110,7 +1110,7 @@ def merge_hooks(config: dict, registrations: dict[str, str], dialect: str) -> tu
 
 
 def _confined_to(target: Path, root: Path) -> bool:
-    """True if ``target`` resolves inside ``root``.
+    """True if ``target`` resolves *strictly below* ``root``.
 
     The profile/manifest guards (``names_tree_root``/``is_absolute_path``/
     ``has_parent_ref``) are lexical and run at load, so they cannot see a *link*:
@@ -1119,9 +1119,18 @@ def _confined_to(target: Path, root: Path) -> bool:
     is the resolve-time backstop the worktree side already had inline
     (``worktree_flow`` compares resolved-vs-raw before writing); the ``init`` path
     reached mkdir/rmtree/write with no such check. Refuses on OSError rather than
-    degrading: a slot that cannot be inspected is not safe to write through."""
+    degrading: a slot that cannot be inspected is not safe to write through.
+
+    Strictly below, not merely inside, because ``is_relative_to`` is true for
+    equal paths — the same "a path is relative to itself" hole this guard family
+    exists to close in `provision_worktree`'s seed loop. `skill_tree = "skills"`
+    where `project/skills` links back to `project` resolves to the root itself, and
+    an equality-inclusive check would hand `_copy_skills` the project root: the
+    bundled skill dirs land at top level, and `--force-skills` `rmtree`s any root
+    directory whose name collides with one of them."""
     try:
-        return target.resolve().is_relative_to(root.resolve())
+        resolved, base = target.resolve(), root.resolve()
+        return resolved != base and resolved.is_relative_to(base)
     except (OSError, RuntimeError):
         return False
 
@@ -2418,9 +2427,13 @@ def _copy_skills(project: Path, trees: Sequence[str], force: bool) -> bool:
         # into `_copy_traversable`'s own guards on purpose: passing `worktree=`
         # would also force no-clobber and switch per-entry OSError to degrade,
         # and `init` must fail loudly on a write it cannot complete.
+        #
+        # Raises rather than skipping: a skipped tree leaves the install missing
+        # the skills every later session dispatches, and an `init` that prints
+        # `init complete` and exits 0 over that is an unattended-setup trap. Same
+        # severity as `_register_hooks`' refusal, which already fails the install.
         if not _confined_to(tree_dir, project):
-            print(f"FAIL: skill tree escapes the project, skipping: {tree_dir}")
-            continue
+            raise ProfileError(f"skill tree does not resolve inside the project: {tree_dir}")
         installed: list[str] = []
         skipped: list[str] = []
         for skill in MODULE_SKILLS:
@@ -2509,7 +2522,11 @@ def install_into(
     skills_skipped = False
     if skills:
         trees = list(dict.fromkeys(p.skill_tree for p in profiles))
-        skills_skipped = _copy_skills(project, trees, force_skills)
+        try:
+            skills_skipped = _copy_skills(project, trees, force_skills)
+        except ProfileError as e:
+            print(f"FAIL: {e}")
+            return 1
 
     # 4. policy template
     policy_path = bmad_loop_dir / "policy.toml"
