@@ -284,7 +284,10 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # qualified — the prune replays those values as kill-window targets, and
         # a bare one can hit another server's identically-numbered window. An
         # `@` field never reaches psmux: `#{@name}` expands from the one
-        # per-server map, so every row would carry the same value. Probe the
+        # per-server map, so every row would carry the same value. That is a
+        # WINDOW-row problem only — one server holds many windows but exactly
+        # one session, so the same expansion in session_options' list-sessions
+        # is correct by construction (see set_session_option). Probe the
         # window id in its place and fill from the id-keyed options, fetched as
         # ONE full listing — a flat extra call per list_windows, regardless of
         # row or column count (#310).
@@ -485,7 +488,13 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         #
         # Refusing leaves the option UNSET, which is the correct degradation
         # and not the lesser evil: the prune's untagged path falls back to the
-        # run dir, claiming our own dead runs and skipping foreign ones.
+        # run dir, claiming our own dead runs and skipping foreign ones. State
+        # the bound rather than the slogan — that fallback proves ownership by
+        # run-id collision on disk, not by identity, so it skips a foreign
+        # session only while no run dir HERE shares its run id. Ids are
+        # timestamped plus two random bytes, but `--run-id` is caller-supplied,
+        # so untagged is weaker proof than a tag even though it beats a
+        # corrupted one. Both edges of that fallback are bounded in #419.
         #
         # The refusal frees the key rather than just returning. A session this
         # backend just created is NOT a blank map — the server loads the user's
@@ -505,11 +514,14 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         super().set_session_option(name, option, value)
 
     def _write_scoped(self, verb: list[str], key: str) -> None:
-        # Both mutating verbs, one body. A write that silently failed re-opens
-        # the mis-scoped prune this channel exists to close, and a silently
-        # failed `-u` leaves a live return key that replays the return move when
-        # the window's command exits — so failures are said out loud either way
-        # (the verbs stay best-effort: warn, never raise).
+        # Both window-channel mutating verbs, one body — plus the session-tag
+        # refusal's free above, which wants the same never-raise contract for
+        # the same reason. A write that silently failed re-opens the mis-scoped
+        # prune this channel exists to close, and a silently failed `-u` leaves
+        # a live return key that replays the return move when the window's
+        # command exits (or, at session scope, a pre-seeded foreign tag that
+        # strands the session) — so failures are said out loud either way (the
+        # verbs stay best-effort: warn, never raise).
         label = " ".join(verb[: verb.index("-t")])  # `set-option` / `set-option -u`
         try:
             proc = self._run(verb, check=False)
