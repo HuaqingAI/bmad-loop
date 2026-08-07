@@ -306,9 +306,20 @@ class TerminalMultiplexer(ABC):
 
     def version(self) -> str | None:
         """The backend binary's version string, or None when unavailable. Not
-        abstract: backends that can't report one inherit this default. Used by
-        the diagnostic dump; the implementation owns the binary invocation so it
-        stays behind the seam."""
+        abstract: backends that can't report one inherit this default. The
+        implementation owns the binary invocation so it stays behind the seam.
+
+        **One bounded line.** Consumers render this inline — the `bmad-loop mux`
+        table, `validate`'s preflight finding, the diagnostic dump, the
+        forced-backend warning — so a binary whose `--version` prints several
+        lines (psmux prints a `tmux X.Y.Z` compatibility line plus its own)
+        must fold them into one here rather than leave each caller to cope, and
+        a very long one line breaks the same surfaces a newline does.
+        :func:`fold_version` is the canonical fold, and the inline consumers
+        also apply it defensively: an out-of-tree backend can only be asked to
+        keep this promise, not made to. The one caller that also *parses* this
+        string (the psmux backend's version gate) anchors at its start, so a
+        folding backend keeps the identifying version in the first segment."""
         return None
 
     def window_pane_pids(self, target: str) -> list[int]:
@@ -318,6 +329,37 @@ class TerminalMultiplexer(ABC):
         callers must degrade (skip the pid-level escalation) and never read
         ``[]`` as "no processes". Must not raise."""
         return []
+
+
+# A version is rendered inline, and `bmad-loop mux` sizes every column off its
+# widest cell — so one 300-char version pads the VERSION column to 306 and the
+# row past 350, unreadable for the same reason an embedded newline was (#321).
+# Length is half the seam's promise, not a separate concern. 80 keeps the widest
+# cell inside a standard terminal with room to spare over the real probes, which
+# fold to ~44 (`tmux 3.3.7; psmux 3.3.7 (05cc5d4 2026-07-20)`).
+VERSION_MAX_CHARS = 80
+
+
+def fold_version(raw: str | None) -> str | None:
+    """Collapse a version string onto the one bounded line the
+    :meth:`TerminalMultiplexer.version` seam promises. Segments keep their
+    order (the psmux version gate anchors a parse at the first) and are
+    stripped; a fold over :data:`VERSION_MAX_CHARS` is cut at the tail, which
+    that anchored parse never reads; an all-blank value folds to None — the
+    seam's "no version" sentinel — never to ``""``. Idempotent, so the seam's
+    own fold and each consumer's defensive one compose.
+
+    Line breaks only: a tab or an ANSI escape *inside* a segment survives and
+    can still misalign a table. Widening this to collapse all whitespace would
+    rewrite well-behaved single-line versions, which the seam promises not to
+    touch. And the fold is one-way — ``"; "`` is a plausible substring of a real
+    version banner, so a boundary is not recoverable by splitting on it."""
+    if not raw:
+        return None
+    folded = "; ".join(line.strip() for line in raw.splitlines() if line.strip())
+    if len(folded) > VERSION_MAX_CHARS:
+        folded = folded[: VERSION_MAX_CHARS - 1] + "…"
+    return folded or None
 
 
 # (name, matches(platform) -> bool, factory() -> TerminalMultiplexer)
@@ -486,7 +528,7 @@ def mux_usable(backend: TerminalMultiplexer | None = None) -> bool:
     if not _FORCED_UNUSABLE_WARNED:
         _FORCED_UNUSABLE_WARNED = True
         try:
-            version = backend.version()
+            version = fold_version(backend.version())
         except Exception:  # a broken probe must not break the warning
             version = None
         print(
@@ -626,7 +668,7 @@ def detect_multiplexers() -> list[MuxBackendInfo]:
             # already-computed availability (a selected backend would
             # otherwise show a contradictory available=False row).
             try:
-                version = backend.version()
+                version = fold_version(backend.version())
             except Exception:
                 version = None
         selected = name == selected_name

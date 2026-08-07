@@ -31,7 +31,7 @@ import sys
 import time
 from pathlib import Path
 
-from .multiplexer import MultiplexerError, TerminalMultiplexer
+from .multiplexer import MultiplexerError, TerminalMultiplexer, fold_version
 
 TMUX_TIMEOUT_S = 30
 # Per-window option value (vs a pane target) telling the parked trailer to detach
@@ -459,6 +459,13 @@ class BaseTmuxBackend(TerminalMultiplexer):
         if not shutil.which(self._BINARY):
             return None
         try:
-            return self._tmux("-V")
+            raw = self._tmux("-V")
         except (MultiplexerError, subprocess.SubprocessError, OSError):
             return None
+        # The seam promises one line (TerminalMultiplexer.version). `-V` is one
+        # line on tmux, two on psmux (a `tmux X.Y.Z` compat line then its own),
+        # so fold rather than truncate — the tail is what names psmux as the
+        # answering binary. Order is load-bearing: PsmuxMultiplexer.available()
+        # parses the compat segment with an anchored match, so the first
+        # segment must stay first.
+        return fold_version(raw)

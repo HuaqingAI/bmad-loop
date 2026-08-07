@@ -29,6 +29,16 @@ The choice applies to the next invocation — switch between runs, not while one
 After switching, `bmad-loop validate` reports the selected backend's availability and
 version as part of the preflight.
 
+The `AVAILABLE` column answers "does this backend's binary answer on this host", not
+"can it be selected here". The two diverge when a foreign-platform binary shares a name
+with a local one — on Windows, `tmux` is psmux's compatibility shim, so the tmux row
+reads as a real tmux install. Only steps 3–5 above consult the platform, so `bmad-loop
+mux` prints a `note:` naming exactly the rows that are **available, foreign to this
+platform, and not the selected one** — the combination that looks like a contradiction.
+A forced choice (step 1 or 2) reaches those backends anyway, which is why the column is
+not gated instead; and a backend forced _into_ selection is left out of the note, since
+calling it unselectable would contradict its own `*` marker.
+
 ## tmux (the default)
 
 tmux is the reference backend: everything else in these docs — the `bmad-loop-<run-id>`

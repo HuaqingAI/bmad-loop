@@ -482,6 +482,76 @@ def test_non_ascii_sensitive_value_reaches_the_guard(monkeypatch):
     assert json.loads(rendered)["backstop_repairs"] == {f"story:{alias}": 1}
 
 
+def test_env_tmux_version_folds_a_multi_line_probe(monkeypatch):
+    """tmux_version is a scalar JSON field. Pre-fold (#321), a two-line probe
+    hit scrub_text's line cap, whose "(N more lines redacted)" marker line
+    re-introduced the very newline the cap was meant to remove."""
+    from bmad_loop.adapters import multiplexer as mux_mod
+
+    class _TwoLineMux:
+        def version(self):
+            return "tmux 3.3.7\npsmux 3.3.7"
+
+    monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _TwoLineMux())
+
+    env = diagnostics.collect_env()
+    assert env.tmux_version == "tmux 3.3.7; psmux 3.3.7"
+    assert env.multiplexer == "_TwoLineMux"
+
+
+def test_env_tmux_version_stays_bounded(monkeypatch):
+    """Nothing between here and the rendered dump bounds this field — asdict,
+    json.dumps and sanitize.guard all pass it through — and scrub_text's cap
+    only ever counted lines, so the fold owns the bound (#321)."""
+    from bmad_loop.adapters import multiplexer as mux_mod
+
+    class _ChattyMux:
+        def version(self):
+            return "tmux 3.3.7\n" + "\n".join("build detail " + "y" * 40 for _ in range(20))
+
+    monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _ChattyMux())
+
+    env = diagnostics.collect_env()
+    assert env.tmux_version is not None
+    assert len(env.tmux_version) == mux_mod.VERSION_MAX_CHARS
+    assert "\n" not in env.tmux_version
+    assert env.tmux_version.startswith("tmux 3.3.7")
+
+
+def test_env_tmux_version_is_redacted_before_it_is_cut(monkeypatch):
+    """The scrub runs on the whole probe, not on what survives the fold.
+
+    The home path has to *straddle* the cut for this to mean anything: a probe
+    that fits under the bound passes whichever way round the two run. Padded so
+    the cut lands inside the path, folding first leaves a fragment `redact_home`
+    can no longer match — and its `~` never appears, which is what discriminates
+    the orders. `home not in ...` alone does not: the fragment isn't the whole
+    path either.
+    """
+    from bmad_loop.adapters import multiplexer as mux_mod
+
+    # A fixed home, not the host's: the padding below is arithmetic against its
+    # length, and CI's home differs per runner. expanduser reads HOME on POSIX
+    # and USERPROFILE on Windows, so set both (tests/test_sanitize.py does too).
+    home = "/private/bmad-loop-home"
+    monkeypatch.setenv("HOME", home)
+    monkeypatch.setenv("USERPROFILE", home)
+    lead = "tmux 3.3.7 "
+    pad = lead + "x" * (mux_mod.VERSION_MAX_CHARS - len(lead) - 3)
+
+    class _HomeyMux:
+        def version(self):
+            return f"{pad}{home}/src/tmux"
+
+    monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _HomeyMux())
+
+    env = diagnostics.collect_env()
+    assert env.tmux_version is not None
+    assert env.tmux_version.endswith("…")  # the cut really fired
+    assert home not in env.tmux_version
+    assert "~" in env.tmux_version  # redaction saw the whole path, then the cut
+
+
 def test_non_ascii_survives_the_utf8_round_trip(tmp_path, monkeypatch):
     """ensure_ascii=False emits real non-ASCII, so confirm the document still
     round-trips through the encoding the CLI writes it with."""

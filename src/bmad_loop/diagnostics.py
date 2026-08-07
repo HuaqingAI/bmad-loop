@@ -241,15 +241,21 @@ class Diagnostics:
 
 
 def collect_env() -> EnvInfo:
-    from .adapters.multiplexer import get_multiplexer
+    from .adapters.multiplexer import fold_version, get_multiplexer
 
     mux = "none"
     tmux_v = None
     try:
         backend = get_multiplexer()
         mux = type(backend).__name__
+        # fold_version both flattens and bounds (the seam's inline-render
+        # contract), so the max_lines=1 this used to carry is redundant — and it
+        # never held anyway: scrub_text's "(N more lines redacted)" marker is
+        # itself a new line, re-introducing exactly what the cap removed.
+        # Scrub first so the home/email redaction reads the whole probe rather
+        # than a tail the fold already cut.
         raw = backend.version()
-        tmux_v = sanitize.scrub_text(raw, max_lines=1) if raw else None
+        tmux_v = fold_version(sanitize.scrub_text(raw)) if raw else None
     except Exception:  # nosec B110 - env probe is best-effort; absent mux is fine
         pass
     return EnvInfo(
