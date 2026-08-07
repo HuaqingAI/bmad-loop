@@ -152,6 +152,16 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
+- **Dispatched sessions are told the sprint board is orchestrator-owned (#437).** The board advances
+  at dev-verify time but the story commits only after the review loop, so a session dispatched in
+  between opens on an uncommitted, unattributed `sprint-status.yaml` change — one review reverted it
+  as a spec violation and #334 escalated a finished story. Story dev prompts and the review prompts
+  of sprint and sweep runs now carry the prohibition: never write the board, never revert it, and a
+  row at `done` or `awaiting-operator` is bookkeeping — not a defect to fix, and not proof the work
+  is verified. Review prompts alone add the way out (`status: blocked`, for a story that cannot be
+  finished without a human decision); dev prompts get none, since `blocked` halts the run. Stories
+  mode carries neither half.
+
 - **A seed path naming the project root is refused at load, in every source that feeds it (#456).**
   A root-naming entry made `provision_worktree`'s seed loop resolve source to the repo root and
   destination to the worktree — both pass its containment checks — so it copied the whole project

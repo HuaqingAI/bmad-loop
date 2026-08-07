@@ -2137,6 +2137,40 @@ def test_generic_bundle_prompt_restore_branch_points_at_spec(project):
     assert "Resume review of the in-review spec" not in fresh_prompt
 
 
+def test_bundle_dev_prompt_has_no_board_clause_but_the_review_prompt_does(project):
+    """A bundle has no sprint-status row, so the board-ownership clause the story dev
+    prompt carries is not appended here — `SweepEngine` overrides `_dev_prompt`, and
+    `_generic_bundle_prompt` never reaches the seam.
+
+    The inherited REVIEW prompt does carry it, both halves, and that is a decision
+    rather than an accident: a sweep runs inside a project whose sprint board exists
+    and is just as revertible from a bundle session as from a story one, so unlike
+    `StoriesEngine` — which has no board at all and empties the clause — `SweepEngine`
+    never overrides `_review_prompt`. Note the deliberate asymmetry with
+    `_operator_park_enabled`, which IS False here: the clause still names
+    `awaiting-operator`, because the row it defends was written by an earlier *story*
+    run, not by this bundle.
+
+    Coverage gap, deliberate: this asserts on `_dev_prompt`'s return value, so moving
+    the injection into `_run_session` would leave it green while bundle prompts
+    silently gained the clause. The builder is the correct layer today."""
+    engine, _ = make_sweep(project, [])
+    task = StoryTask(
+        story_key="dw-fix", epic=0, dw_ids=["DW-1"], bundle_file="/run/bundles/fix/intent.md"
+    )
+    assert engine._operator_park_enabled() is False
+
+    dev = engine._dev_prompt(task, None)
+    assert "sprint-status.yaml is owned by the orchestrator" not in dev
+    assert "status: blocked and say why" not in dev
+
+    task.spec_file = str(project.implementation_artifacts / "spec-dw-fix.md")
+    review = engine._review_prompt(task)
+    assert "sprint-status.yaml is owned by the orchestrator" in review
+    assert "done or awaiting-operator" in review
+    assert "status: blocked and say why" in review
+
+
 def test_generic_bundle_prompt_spells_the_post_rename_primitive(project):
     """All three bundle legs (restore, fresh implement, repair) spell the dev
     primitive resolved off the dev adapter's skill tree, not a hardcoded name —

@@ -3498,6 +3498,307 @@ def test_expected_spec_withheld_from_labeled_workflow_session(project):
     assert pinned is None
 
 
+# --------------------------------- orchestrator-owned sprint board in prompts (#437)
+
+# The board advance lands right after dev verifies; the story's single commit lands
+# only after the review loop — so every session dispatched in between opens on an
+# uncommitted, unattributed board change. One read it as a spec violation, reverted
+# it, and #334 escalated a story both sessions agreed was finished. These pin the
+# clause that names the owner, and its split: the prohibition rides dev prompts too,
+# the `blocked` hand-back rides review prompts ONLY (blocked → CRITICAL → run halt).
+#
+# EVERY presence, ordering and junction constant below is a test-local LITERAL,
+# never a call to the builder under test. `"" in s` is True and `s.index("")` is 0,
+# so `board in prompt` / `prompt.index(board) < …` / `f"{board} {park}" in prompt`
+# all pass vacuously under exactly the ablation they exist to catch. The three
+# junction literals each span the END of one clause and the START of the next —
+# that is the only shape that can detect a changed separator.
+
+BOARD_OWNED = "sprint-status.yaml is owned by the orchestrator"
+BLOCKED_INVITE = "status: blocked and say why"
+LEDGER_SENTENCE = (
+    "do NOT modify, re-open, or rewrite existing deferred-work ledger entries; "
+    "the orchestrator owns their status and resolution."
+)
+PARK_HEAD = "If this story's acceptance criteria include actions only a HUMAN"
+PARK_NEVER_BLOCKED = "Never use the blocked status"
+PARK_TAIL = "blocked halts the whole run, and this story is finished as far as you can take it."
+LEDGER_BOARD_JOIN = "their status and resolution. sprint-status.yaml is owned by the orchestrator"
+BOARD_REDIRECT_JOIN = "not proof that the work is verified. If the story cannot be finished"
+BOARD_PARK_JOIN = (
+    "not proof that the work is verified. If this story's acceptance criteria "
+    "include actions only a HUMAN"
+)
+
+
+def test_sprint_board_instruction_is_a_bare_backtick_free_prohibition(project):
+    """The backtick ban is load-bearing: the clause rides AFTER the repair prompt's
+    feedback-file pointer, and the last backtick-wrapped token in a dev prompt is by
+    convention that path (`_operator_park_instruction` docstring). Non-empty is the
+    ablation guard — an empty clause satisfies "no backticks", "no leading
+    separator" and every downstream `in prompt` check for entirely the wrong
+    reason."""
+    engine, _ = make_engine(project, [])
+    clause = engine._sprint_board_instruction()
+
+    assert clause.strip()
+    assert "`" not in clause
+    assert BOARD_OWNED in clause
+    # forbids both directions
+    assert "never write it" in clause and "never revert a change to it" in clause
+    # `_post_dev_state_sync` writes awaiting-operator too, so a clause defending only
+    # `done` would leave a parked row reading as an unattributed edit
+    assert "done or awaiting-operator" in clause
+    # bookkeeping, and explicitly NOT evidence: the row is written before
+    # `_verify_dev_artifacts` runs, and a repair session reads this prompt with a red
+    # tree under a `done` row
+    assert "not a defect to fix" in clause
+    assert "not proof that the work is verified" in clause
+    # the shared half never says the word: on a dev prompt an invitation to `blocked`
+    # would hand a repair session a run-halting early exit
+    assert "blocked" not in clause
+    # no leading separator — each call site supplies its own (em dash after a bare
+    # story key, plain space after a sentence)
+    assert clause == clause.strip()
+    # the whole-prompt ban at the review seam (`"append" not in prompt.lower()`)
+    assert "append" not in clause.lower()
+
+
+def test_board_handback_redirect_names_blocked_and_stays_a_bare_sentence(project):
+    """The review-only half. `blocked` is named on purpose: it is the one status that
+    both withholds the commit and reaches a human, where any other non-terminal status
+    retries until the budget exhausts into a defer that rolls the work back — and a
+    board revert is the #334 dead end itself. The trigger is deliberately narrow: a
+    review pass is itself a dev-primitive run whose job is to fix or defer what it
+    finds, so "looks unfinished" would be a run-halting early exit on cycle 1 of 3."""
+    engine, _ = make_engine(project, [])
+    redirect = engine._board_handback_redirect()
+
+    assert redirect.strip()
+    assert "`" not in redirect
+    assert BLOCKED_INVITE in redirect
+    assert "cannot be finished without a human decision" in redirect
+    assert "the board is not" in redirect
+    assert redirect == redirect.strip()
+    assert "append" not in redirect.lower()
+
+
+def test_board_handback_redirect_is_empty_when_there_is_no_board(project, monkeypatch):
+    """The gate lives inside the redirect, not in `_review_prompt`, so the invariant
+    "no board ⇒ no redirect away from it" is local and directly assertable rather than
+    an emergent property of one caller. `StoriesEngine` is the production instance of
+    this; the monkeypatch is the unit form."""
+    engine, _ = make_engine(project, [])
+    assert engine._board_handback_redirect().strip()  # else this passes for free
+
+    monkeypatch.setattr(engine, "_sprint_board_instruction", lambda: "")
+
+    assert engine._board_handback_redirect() == ""
+
+
+def test_review_prompt_carries_both_halves_and_keeps_the_ledger_sentence(project):
+    """A review session is the one that read the orchestrator's board write as a spec
+    violation. It now gets told, and told where to go instead. The deferred-work
+    sentence — the same shape of injected ownership clause — must survive verbatim in
+    its post-#433 neutral form, and the #261 pin still reads the path out of the
+    prompt."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    owed = str(spec_path(project, "1-1-a"))
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=owed)
+
+    prompt = engine._review_prompt(task)
+
+    assert prompt.startswith(f"/bmad-dev-auto {owed} — ")
+    assert LEDGER_SENTENCE in prompt
+    assert BOARD_OWNED in prompt
+    assert BLOCKED_INVITE in prompt
+    # prohibition first, redirect second: "never do X", then "do Y instead"
+    assert prompt.index(BOARD_OWNED) < prompt.index(BLOCKED_INVITE)
+    # #433 deleted the affirmative append instruction (the primitive files its own
+    # `defer` findings now); nothing injected here may reintroduce the substring
+    assert "append" not in prompt.lower()
+    assert _pin_probe(project, prompt, spec_file=owed) == owed
+
+
+def test_review_prompt_joins_both_halves_as_prose(project):
+    """Two separators live at this seam, not one — the caller-owned ledger↔board join
+    and the board↔redirect join — and every clause here ends in a full stop, so both
+    are plain spaces. The dev prompt's em dash in either slot would render
+    `...their status and resolution. — sprint-status.yaml is owned by...`, punctuation
+    noise in the one prompt this whole change exists for.
+
+    The junction literals are what make this load-bearing: `f"{LEDGER} {BOARD}"` built
+    from the builders survives an emptied clause AND survives a changed separator at
+    the *other* seam."""
+    engine, _ = make_engine(project, [])
+    owed = str(spec_path(project, "1-1-a"))
+
+    prompt = engine._review_prompt(StoryTask(story_key="1-1-a", epic=1, spec_file=owed))
+
+    assert LEDGER_BOARD_JOIN in prompt
+    assert BOARD_REDIRECT_JOIN in prompt
+    assert ". — " not in prompt
+    assert "  " not in prompt
+    assert prompt == prompt.strip()
+
+
+def test_stories_review_prompt_shape_is_reached_when_both_clauses_empty(project, monkeypatch):
+    """The `if tail else ""` guard on the REVIEW seam is live, not defensive:
+    `StoriesEngine` inherits `_review_prompt` and empties both clauses, so production
+    reaches the empty-tail branch. Pinned here too at the unit layer — an
+    unconditional `f" {tail}"` leaves a trailing space on every stories review
+    prompt."""
+    engine, _ = make_engine(project, [])
+    owed = str(spec_path(project, "1-1-a"))
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=owed)
+    assert BOARD_OWNED in engine._review_prompt(task)  # else the ablation is invisible
+
+    monkeypatch.setattr(engine, "_sprint_board_instruction", lambda: "")
+
+    prompt = engine._review_prompt(task)
+    assert prompt == (
+        f"/bmad-dev-auto {owed} — do NOT modify, re-open, or rewrite existing "
+        f"deferred-work ledger entries; the orchestrator owns their status and "
+        f"resolution."
+    )
+    assert prompt.endswith("their status and resolution.")
+
+
+def test_board_clause_rides_every_dev_leg_ahead_of_the_park_clause(project, tmp_path):
+    """All three `_generic_dev_prompt` legs carry the prohibition, and none of them
+    lets it displace the park contract from the end of the prompt or the feedback path
+    from the last backticked token. The fresh bare-key leg needs it as much as the
+    others: `rearm_escalation` never touches the board, so a story re-dispatched after
+    a resolved escalation re-enters that leg with its row still at `done`."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    write_spec(spec_path(project, "1-1-a"), "done", "abc123")  # the repair leg re-opens it
+    engine, _ = make_engine(project, [])
+    owed = str(spec_path(project, "1-1-a"))
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=owed)
+    assert engine._operator_park_instruction()  # else every ordering check is vacuous
+    feedback = tmp_path / "feedback.md"
+    feedback.write_text("verification evidence")
+
+    fresh = engine._dev_prompt(task, None)
+    restore = engine._dev_prompt(dataclasses.replace(task, restore_patch="/tmp/a.patch"), None)
+    repair = engine._dev_prompt(task, feedback)
+
+    # after a bare story key the em dash IS the right separator — the one seam
+    # neither sentence-joined leg nor the review prompt uses
+    assert fresh.startswith(f"/bmad-dev-auto 1-1-a — {BOARD_OWNED}")
+    for prompt in (fresh, restore, repair):
+        assert BOARD_OWNED in prompt
+        assert PARK_HEAD in prompt
+        assert prompt.index(BOARD_OWNED) < prompt.index(PARK_HEAD)
+        assert BOARD_PARK_JOIN in prompt  # the board→park separator itself
+        assert prompt.endswith(PARK_TAIL)  # nothing may be appended after the park
+        assert ". — " not in prompt
+        assert "  " not in prompt
+        assert prompt == prompt.strip()
+        assert "append" not in prompt.lower()
+    # the last backticked token stays the feedback path
+    assert re.findall(r"`([^`]*)`", repair)[-1] == str(feedback)
+    assert "`" not in engine._sprint_board_instruction()
+
+
+def test_no_dev_leg_invites_blocked(project, tmp_path):
+    """The redirect is review-only. `blocked` synthesizes a CRITICAL that halts the
+    whole run, so on a dev prompt it would hand a repair or `_fix_phase` session a
+    sanctioned early exit out of a run that otherwise retries or defers and keeps
+    going — and it would contradict the park clause's "Never use the blocked status
+    for this" a sentence later in the same prompt.
+
+    The literal is the primary assertion and is provably absent today: the park clause
+    says `status: awaiting-operator` and "the blocked status", never `status: blocked`.
+    The count is the backstop, and is derived on BOTH sides so it moves with any park
+    rewording rather than pinning it."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    write_spec(spec_path(project, "1-1-a"), "done", "abc123")
+    engine, _ = make_engine(project, [])
+    owed = str(spec_path(project, "1-1-a"))
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=owed)
+    park = engine._operator_park_instruction()
+    assert park.count("blocked") == 2  # else the count comparison below is vacuous
+    feedback = tmp_path / "feedback.md"
+    feedback.write_text("verification evidence")
+
+    for prompt in (
+        engine._dev_prompt(task, None),
+        engine._dev_prompt(dataclasses.replace(task, restore_patch="/tmp/a.patch"), None),
+        engine._dev_prompt(task, feedback),
+    ):
+        assert BOARD_OWNED in prompt  # the prohibition IS there — not an empty tail
+        assert "status: blocked" not in prompt
+        assert BLOCKED_INVITE not in prompt
+        # every surviving mention of the word is the park clause forbidding it
+        assert prompt.count("blocked") == park.count("blocked")
+
+
+def test_no_assembled_prompt_mixes_the_park_contract_with_the_blocked_redirect(project, tmp_path):
+    """Nothing structural stops a later edit from adding the park clause to
+    `_review_prompt` or the redirect to a dev leg, and the two flatly contradict each
+    other — park says never use `blocked`, the redirect points at it. Their triggers
+    overlap in vocabulary too ("a human decision" vs "actions only a HUMAN can
+    perform"), so the separation is worth an assertion of its own."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    write_spec(spec_path(project, "1-1-a"), "done", "abc123")
+    engine, _ = make_engine(project, [])
+    owed = str(spec_path(project, "1-1-a"))
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=owed)
+    feedback = tmp_path / "feedback.md"
+    feedback.write_text("verification evidence")
+
+    prompts = [
+        engine._review_prompt(task),
+        engine._dev_prompt(task, None),
+        engine._dev_prompt(dataclasses.replace(task, restore_patch="/tmp/a.patch"), None),
+        engine._dev_prompt(task, feedback),
+    ]
+
+    assert any(PARK_NEVER_BLOCKED in p for p in prompts)  # both halves exist somewhere
+    assert any(BLOCKED_INVITE in p for p in prompts)
+    for prompt in prompts:
+        assert not (PARK_NEVER_BLOCKED in prompt and BLOCKED_INVITE in prompt)
+
+
+def test_board_clause_stands_alone_when_parking_is_disabled(project):
+    """`[operator] enabled = false` empties the park clause; the prohibition is
+    unconditional and becomes the tail on its own — with no dangling separator where
+    the park clause used to start, and still no mention of `blocked` (the park clause
+    was the only thing that ever said the word on a dev prompt)."""
+    engine, _ = make_engine(
+        project, [], policy=_park_policy(operator=OperatorPolicy(enabled=False))
+    )
+
+    prompt = engine._dev_prompt(StoryTask(story_key="1-1-a", epic=1), None)
+
+    assert engine._operator_park_instruction() == ""
+    assert prompt.startswith(f"/bmad-dev-auto 1-1-a — {BOARD_OWNED}")
+    assert prompt.endswith("not proof that the work is verified.")
+    assert prompt == prompt.strip()  # no trailing space, no orphaned em dash
+    assert "  " not in prompt
+    assert "blocked" not in prompt
+
+
+def test_dev_prompt_carries_no_separator_when_every_clause_is_empty(project, monkeypatch):
+    """The `if tail else ""` guard on the DEV seam, pinned. Unlike the review seam's,
+    this branch is UNREACHABLE in production: `_generic_dev_prompt` has exactly one
+    caller (`Engine._dev_prompt`), both subclasses override `_dev_prompt`, and the
+    plugin seam rewrites `proposed_prompt` rather than overriding the method — so on
+    the one class that reaches here the prohibition is unconditionally non-empty and
+    `tail` is never falsy. `[operator] enabled = false` alone therefore proves nothing
+    about the guard; only emptying the board clause too reaches it."""
+    engine, _ = make_engine(
+        project, [], policy=_park_policy(operator=OperatorPolicy(enabled=False))
+    )
+    monkeypatch.setattr(engine, "_sprint_board_instruction", lambda: "")
+
+    prompt = engine._dev_prompt(StoryTask(story_key="1-1-a", epic=1), None)
+
+    assert prompt == "/bmad-dev-auto 1-1-a"
+
+
 @pytest.mark.parametrize("prefix", ["bmad-build-auto-result-", "bmad-dev-auto-result-"])
 def test_record_dev_spec_refuses_the_no_spec_fallback_marker(project, prefix):
     """`<primitive>-result-*` is the skill's "intent too unclear to even create a
