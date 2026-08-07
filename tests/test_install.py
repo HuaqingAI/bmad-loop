@@ -2470,6 +2470,13 @@ def test_shield_tracked_hook_config_leaves_no_residue_after_teardown(project, tm
     (repo / hook_rel).write_text('{"hooks": {}}\n', encoding="utf-8")
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "track the hook config")
+    # The fixture's own precondition, asserted rather than assumed: an ambient ignore
+    # matching `.codex/` would make `add -A` skip this file, and every assertion below
+    # would then pass on an UNTRACKED path having exercised nothing — `-ci` reports
+    # tracked-and-ignored, so it answers "" for a file git never took. `conftest`
+    # shadows the two out-of-repo ignore sources; this catches the third (a system
+    # excludes file, which cannot be suppressed without breaking Windows autocrlf).
+    assert verify.path_tracked_file(repo, hook_rel)
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
     shared = repo / ".git" / "info" / "exclude"
