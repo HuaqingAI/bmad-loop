@@ -950,12 +950,24 @@ class WorktreeFlow:
                 # here, so whether it got seeded depended on a profile happening to name
                 # it twice: claude's `seed_files` carries `.claude/settings.json`, which
                 # is also its `config_path`, and codex's does not carry
-                # `.codex/hooks.json` (#471 — a codex stage stalls to timeout, silently,
-                # because the session emits no Stop). Deriving it from `config_path`
-                # rather than restating it per profile is what keeps a future profile
-                # from regressing the same way. Hookless profiles have no config to
-                # seed. The seed loop skips an occupied destination, so a project that
-                # TRACKS this path keeps its checked-out copy untouched.
+                # `.codex/hooks.json` (#471).
+                #
+                # What seeding fixes, stated only as far as it is measured: the hook
+                # step in `provision_worktree` creates and writes that config whether
+                # or not it was seeded (`merge_hooks` on an absent file returns
+                # changed=True), so bmad-loop's OWN Stop hook registers either way.
+                # What an unseeded worktree loses is the PROJECT's hook configuration —
+                # the session runs against a file holding the relay registrations alone.
+                # #471's reported stall is consistent with the CLI declining hooks from
+                # a config it has not trusted (codex.toml's `first_run_note`), but that
+                # mechanism is UNCONFIRMED and nothing here rests on it; the issue's own
+                # stated mechanism — the file being absent — is false at this line.
+                #
+                # Deriving it from `config_path` rather than restating it per profile is
+                # what keeps a future profile from regressing the same way. Hookless
+                # profiles have no config to seed. The seed loop skips an occupied
+                # destination, so a project that TRACKS this path keeps its checked-out
+                # copy untouched.
                 if not profile.hookless and profile.hooks.config_path:
                     seeds.append(profile.hooks.config_path)
         seeds.extend(scm.worktree_seed)
