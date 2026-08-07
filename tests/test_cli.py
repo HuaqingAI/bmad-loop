@@ -3901,6 +3901,35 @@ def test_validate_stories_mode_reports_missing_manifest(project, capsys):
     assert "sprint status" not in text
 
 
+def test_validate_flags_registered_hooks_with_missing_relay_script(project, capsys):
+    """#461 papercut: `hooks.registered` is a substring match on the hook config —
+    it stays green after the relay script itself is gone (branch switch, deleted
+    `.bmad-loop/`), while every hook event silently no-ops and the run stalls to
+    session_timeout_min. A distinct finding stats the artifact.
+
+    Ablation guard: deleting the `hooks.relay-present` block in cmd_validate makes
+    this FAIL on the first assertion."""
+    from bmad_loop import install as install_mod
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    assert cli.main(["init", "--project", str(project.project), "--no-skills"]) == 0
+    args = argparse.Namespace(project=str(project.project), spec=None)
+
+    cli.cmd_validate(args)
+    assert "hook relay script present" in _validate_output(capsys)
+
+    (project.project / install_mod.HOOK_SCRIPT_REL).unlink()
+
+    cli.cmd_validate(args)
+    text = _validate_output(capsys)
+    # The registration check is untouched — it still reads green, which is exactly
+    # the blind spot the new finding covers.
+    assert "hooks registered" in text
+    assert "relay script" in text and "missing" in text
+    assert "bmad-loop init" in text
+
+
 def test_validate_sprint_mode_still_gates_on_sprint_status(project, capsys):
     """Item 8 regression: the default (sprint) mode still requires sprint-status."""
     install_bmad_config(project)

@@ -356,6 +356,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
         else:
             report.fail("adapter.binary", f"{tool} not found on PATH", {"binary": tool})
 
+    any_hooks_registered = False
     for profile in profiles:
         if profile.hookless:
             report.ok(
@@ -394,6 +395,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     {"profile": profile.name, "config_path": str(hook_config)},
                 )
         if hooks_ok:
+            any_hooks_registered = True
             report.ok(
                 "hooks.registered",
                 f"bmad-loop hooks registered for {profile.name}",
@@ -405,6 +407,35 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 f"bmad-loop hooks not registered for {profile.name} — "
                 f"run `bmad-loop init --cli {profile.name}`",
                 {"profile": profile.name, "config_path": str(hook_config)},
+            )
+
+    # #461: `hooks.registered` above is a substring match on the config JSON — it
+    # never touches the artifact the registered command points AT. A branch switch
+    # (or a deleted .bmad-loop/) leaves the registration green while every hook
+    # event is a silent no-op and the run stalls to session_timeout_min, so stat
+    # the relay itself. Outside the per-profile loop on purpose: the relay is one
+    # shared artifact, and per-profile reporting would print the same line N times.
+    # A distinct id, not a repurposed `hooks.registered` — the two answer different
+    # questions and an operator needs to see which one failed.
+    #
+    # COUPLING (#461 Phase 2): Phase 2 moves the relay to
+    # `<abs-python> -m bmad_loop.hookrelay` and retires HOOK_SCRIPT_REL. It must
+    # RETARGET this check to stat the registered interpreter (`hooks.interpreter`),
+    # not drop it — the stall it guards against survives the move.
+    if any_hooks_registered:
+        relay = project / install.HOOK_SCRIPT_REL
+        if relay.is_file():
+            report.ok(
+                "hooks.relay-present",
+                f"hook relay script present: {relay}",
+                {"path": str(relay)},
+            )
+        else:
+            report.fail(
+                "hooks.relay-present",
+                f"hooks are registered but the relay script {relay} is missing — "
+                f"run `bmad-loop init`",
+                {"path": str(relay)},
             )
 
     # opencode config-file model ids are "provider/model" (see the opencode_http docstring);

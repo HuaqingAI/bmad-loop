@@ -152,6 +152,17 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
+- **The hook relay refuses a symlinked `events/` dir, and `validate` stats the relay (#461).** The
+  relay's event write followed a symlink — `os.makedirs(exist_ok=True)` `isdir()`-checks through a
+  link — so a driven session, which can write inside the run dir, could redirect the orchestrator's
+  control-plane event stream and stall the run to `session_timeout_min`. The write now refuses a
+  symlinked events dir before creating it (the whole defense on Windows), anchors the create+replace
+  to an `O_NOFOLLOW` dir_fd where the platform supports it, creates `O_EXCL` at `0o600` (was 0644),
+  and degrades to a no-op on any `OSError` rather than failing the session. Separately, validate's
+  `hooks.registered` was a substring match on the hook config that never touched the script it
+  points at, so a deleted `.bmad-loop/` (branch switch) read as green while every hook event
+  no-opped; a new `hooks.relay-present` finding stats the relay and says `run bmad-loop init`.
+
 - **Dispatched sessions are told the sprint board is orchestrator-owned (#437).** The board advances
   at dev-verify time but the story commits only after the review loop, so a session dispatched in
   between opens on an uncommitted, unattributed `sprint-status.yaml` change — one review reverted it
