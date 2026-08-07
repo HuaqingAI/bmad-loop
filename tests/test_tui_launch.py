@@ -270,8 +270,8 @@ def test_ctl_window_id_matches_run_id_suffix(monkeypatch):
 
 
 def test_ctl_window_id_skips_empty_id_rows(monkeypatch):
-    # The base pads short listing rows with "" — an empty id must never be
-    # returned as a target (an empty `-t` resolves against the current window).
+    # An empty id must never be returned as a target — an empty `-t` resolves
+    # against the current window. psmux's qualifier passes a falsy id through.
     def fake(argv, **kwargs):
         out = "\tsweep-RID\n@7\tsweep-RID\n" if argv[1] == "list-windows" else ""
         return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
@@ -281,10 +281,11 @@ def test_ctl_window_id_skips_empty_id_rows(monkeypatch):
     assert launch.ctl_window_id("RID") == "@7"
 
 
-def test_kill_ctl_window_kills_by_id_not_first_name_match(monkeypatch):
-    # Two ctl windows can share a name (kinds share a run_id); the kill must
-    # replay the id resolved from the listing, never re-resolve by name —
-    # a name token would land first-match on whichever duplicate lists first.
+def test_kill_ctl_window_kills_by_resolved_id_not_a_name_token(monkeypatch):
+    # The kill replays the id this listing resolved, never a `=session:name`
+    # token the backend would resolve again. Which of two same-named windows
+    # the scan picks is unchanged (first match, `@7`); what the id buys is that
+    # a rename or a new window between two verbs cannot re-point the second.
     calls: list[list[str]] = []
 
     def fake(argv, **kwargs):

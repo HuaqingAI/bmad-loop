@@ -47,16 +47,22 @@ def ctl_window_id(run_id: str) -> str | None:
     """Stable window id (bare `@N` on tmux, session-qualified on psmux) of the
     control-session window hosting this run's orchestrator process
     (start_detached names windows <kind>-<run_id>), or None when the run was
-    not launched from the TUI or the session is gone. An id, not a name:
-    window names collide when several kinds share a run_id, and every consumer
-    replays the value as a select/kill/option target, where re-resolving a
-    name first-match can land each verb on a different duplicate."""
+    not launched from the TUI or the session is gone.
+
+    An id, not a name, because every consumer replays the value as a
+    select/kill/option target: one resolve feeds all of them, so a rename or a
+    window minted between two verbs cannot send them to different windows, and
+    the value survives tmux's automatic-rename. It does NOT disambiguate the
+    run_id — `<kind>-<run_id>` is not unique (a resume launched over a still-
+    parked run window shares it), and this scan takes the first match, the
+    same window a by-name lookup returned."""
     if not mux_available():
         return None
     for win_id, name in get_multiplexer().list_windows(CTL_SESSION, ["window_id", "window_name"]):
-        # win_id can be "": the base pads short rows, and psmux's qualifier
-        # passes falsy ids through. An empty id must never become a target —
-        # an empty `-t` resolves against the *current* window.
+        # win_id can be "": psmux's qualifier passes a falsy id through. An
+        # empty id must never become a target — an empty `-t` resolves against
+        # the *current* window. (The base's short-row padding cannot produce it
+        # here: it fills TRAILING fields, and window_id is field 0 of 2.)
         if win_id and name.endswith(f"-{run_id}"):
             return win_id
     return None
@@ -106,8 +112,8 @@ def set_return_pane(window_target: str, target: str) -> None:
     return move on a control-session window, so its trailing shell sends the
     client back there when the window's command exits. `window_target` is any
     window spec the backend accepts; callers pass the id from
-    start_detached/ctl_window_id so the write cannot land on a
-    duplicate-named window."""
+    start_detached/ctl_window_id so the write lands on the window the caller
+    already resolved, not on whatever a fresh by-name lookup answers."""
     get_multiplexer().set_window_option(window_target, RETURN_OPTION, target)
 
 

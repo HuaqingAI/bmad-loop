@@ -606,11 +606,12 @@ whose seams had diverged enough that several ports needed a different fix, and t
   `kill_window` kills first and frees the keys only once a liveness listing proves the kill landed,
   so a failed kill no longer strips a live window's project tag and return key; a free that fails
   now warns instead of leaking silently. The launcher's ctl-window consumers resolve the window id
-  once and replay it, so duplicate-named ctl windows cannot take another's option write or kill
-  (`launch.ctl_window`/`select_ctl_window` fold into `ctl_window_id`/`select_ctl_window_id`), and a
-  Windows-local zero-token gate proves cross-project prune isolation on a real psmux server. Dev
-  builds only: pre-marker keys read as foreign and are never swept — restart the ctl psmux server
-  after upgrading.
+  once and replay it (`launch.ctl_window`/`select_ctl_window` fold into
+  `ctl_window_id`/`select_ctl_window_id`), so a rename or a window minted between two verbs can no
+  longer re-point the second, and a Windows-local zero-token gate proves cross-project prune
+  isolation on a real psmux server. Dev builds only: a window parked by a pre-marker build keeps
+  reading its old-format keys, so it reads as untagged (the prune falls back to the run dir) and its
+  return move stops firing — restart the ctl psmux server after upgrading.
 
 - **Gate the psmux session project tag on transportability (#320).** The session tag rode psmux's
   CLI→server control line ungated, which stores some project paths corrupted at rc 0 — and a
