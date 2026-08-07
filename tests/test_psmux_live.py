@@ -41,6 +41,7 @@ def test_prune_kills_only_the_owning_projects_window(tmp_path: Path, monkeypatch
     proj_b = tmp_path / "proj-b"
     proj_a.mkdir()
     proj_b.mkdir()
+    body_ok = False
     try:
         mux.new_session(session, tmp_path)
         win_a = mux.new_parked_window(session, "run-20260726-1", proj_a, PARKED_ARGV, "@r")
@@ -80,6 +81,7 @@ def test_prune_kills_only_the_owning_projects_window(tmp_path: Path, monkeypatch
         assert key_a not in options  # freed by the verified kill
         assert options.get(key_b) == runs.project_tag(proj_b)  # untouched
         assert options.get(foreign) == "user"  # foreign key survives every sweep
+        body_ok = True
     finally:
         # kill_session is a best-effort backstop; verify it worked so a real
         # server never leaks silently off a green (or already-failing) run.
@@ -89,7 +91,11 @@ def test_prune_kills_only_the_owning_projects_window(tmp_path: Path, monkeypatch
         except TmuxError:
             leaked = True
         if leaked:
-            print(
-                f"warning: live-gate session {session} survived teardown; kill it manually",
-                file=sys.stderr,
-            )
+            note = f"live-gate session {session} survived teardown; kill it manually"
+            # Only raise when the body passed. pytest.fail() here on an
+            # already-failing run replaces the real diagnostic — the leak takes
+            # over the summary line and the assertion drops to a chained
+            # "during handling" frame — so that run keeps the warning instead.
+            if body_ok:
+                pytest.fail(note)
+            print(f"warning: {note}", file=sys.stderr)
