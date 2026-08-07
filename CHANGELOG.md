@@ -155,12 +155,15 @@ whose seams had diverged enough that several ports needed a different fix, and t
 - **Dispatched sessions are told the sprint board is orchestrator-owned (#437).** The board advances
   at dev-verify time but the story commits only after the review loop, so a session dispatched in
   between opens on an uncommitted, unattributed `sprint-status.yaml` change — one review reverted it
-  as a spec violation and #334 escalated a finished story. Story dev prompts and the review prompts
-  of sprint and sweep runs now carry the prohibition: never write the board, never revert it, and a
-  row at `done` or `awaiting-operator` is bookkeeping — not a defect to fix, and not proof the work
-  is verified. Review prompts alone add the way out (`status: blocked`, for a story that cannot be
-  finished without a human decision); dev prompts get none, since `blocked` halts the run. Stories
-  mode carries neither half.
+  as a spec violation and #334 escalated a finished story. Story dev prompts, the review prompts of
+  sprint and sweep runs, and every injected plugin-workflow session (`post_dev_phase`,
+  `post_review_result`, `pre_commit_gate` — all dispatched inside that same window) now carry the
+  prohibition: never write the board, never revert it, and a row at `done` or `awaiting-operator` is
+  bookkeeping — not a defect to fix, and not proof the work is verified. The workflow copy is
+  appended after the session-gate hooks, so a plugin prompt rewrite cannot strip it. Review prompts
+  alone add the way out (`status: blocked`, for a story that cannot be finished without a human
+  decision); dev and workflow prompts get none, since `blocked` halts the run. Stories mode carries
+  none of it.
 
 - **A seed path naming the project root is refused at load, in every source that feeds it (#456).**
   A root-naming entry made `provision_worktree`'s seed loop resolve source to the repo root and

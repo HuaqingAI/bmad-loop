@@ -165,6 +165,36 @@ class RunSummary:
         return "\n".join(lines)
 
 
+# Appended to an injected plugin-workflow session prompt AHEAD of the completion
+# contract below, whenever the run has a sprint board (`_sprint_board_instruction`
+# non-empty; StoriesEngine empties it and this section disappears with it). Same
+# words as the dev/review seams inject, so the three surfaces cannot drift apart —
+# `{clause}` is that method's return value verbatim, not a second copy of it.
+#
+# A workflow session is dispatched in exactly the window `_sprint_board_instruction`
+# describes: post_dev_phase and post_review_result run after `_post_dev_state_sync`
+# has advanced sprint-status.yaml, pre_commit_gate runs before `finalize_commit`
+# lands the story's single commit — so all three open on the same uncommitted,
+# unattributed board change that #437's review session reverted.
+#
+# Carries the prohibition ONLY. The `blocked` hand-back redirect stays review-only
+# for the reason its own docstring gives: it synthesizes a CRITICAL that halts the
+# whole run, which is the wrong trade for a session that is not the sign-off
+# authority. A workflow that genuinely cannot proceed already has a channel — the
+# completion contract's own `status: blocked` marker, which the orchestrator reads
+# as a non-completion and routes through the blocking/advisory decision instead.
+#
+# A section rather than a bare sentence because a workflow prompt is plugin-authored
+# markdown of unknown shape; a trailing sentence would read as a clause of whatever
+# it happens to land after. The heading names the owner, matching the clause's
+# opening words.
+WORKFLOW_BOARD_CONTRACT = """
+
+## Sprint board (orchestrator-owned)
+
+{clause}"""
+
+
 # Appended to every injected plugin-workflow session prompt. The dev/review
 # skills carry their own result conventions, but a workflow prompt is arbitrary
 # text from a plugin manifest — without an explicit protocol the session has to
@@ -3753,13 +3783,28 @@ class Engine:
                 )
                 return SessionResult(status="vetoed")
         if label is not None:
-            # Injected workflow session: spell out the completion-marker protocol
-            # and bound its stall nudges (see WORKFLOW_COMPLETION_CONTRACT).
-            # Appended after the session-gate hooks so a pre_workflow_session /
-            # pre_session prompt rewrite cannot strip it. The marker path lands in
-            # the same implementation-artifacts dir the dev adapter already
-            # searches — correct in place and under worktree isolation alike,
-            # because spec.cwd is self.workspace.root either way.
+            # Injected workflow session: name the sprint board's owner, then spell
+            # out the completion-marker protocol and bound its stall nudges (see
+            # WORKFLOW_BOARD_CONTRACT / WORKFLOW_COMPLETION_CONTRACT).
+            #
+            # Both are appended after the session-gate hooks so a
+            # pre_workflow_session / pre_session prompt rewrite cannot strip them —
+            # the property the dev/review seams do NOT have, because there the
+            # orchestrator authors the whole prompt and the plugin body is the
+            # rewrite. Here the prompt IS plugin text, so post-gate is the only
+            # place the orchestrator can say anything at all.
+            #
+            # Board first, completion contract LAST: the marker protocol is the
+            # load-bearing tail (a session that ends its turn without the marker
+            # livelocks the orchestrator until session_timeout_min), and nothing may
+            # come between its "end your turn" imperative and the end of the prompt.
+            board_clause = self._sprint_board_instruction()
+            if board_clause:
+                prompt += WORKFLOW_BOARD_CONTRACT.format(clause=board_clause)
+
+            # The marker path lands in the same implementation-artifacts dir the
+            # dev adapter already searches — correct in place and under worktree
+            # isolation alike, because spec.cwd is self.workspace.root either way.
             # This is the PRODUCER of the marker name. ``role``, not the default:
             # a workflow declares its own role (WORKFLOW_ROLES = dev | review) and
             # runs on THAT adapter, whose skill tree can be a different one at a
@@ -4132,17 +4177,33 @@ class Engine:
         is. It says nothing about what a session should do *instead*; that half is
         `_board_handback_redirect`, and it rides the review prompt only.
 
-        Injection surface, exactly: story dev sessions (`_generic_dev_prompt`) and
-        the review sessions of sprint and sweep runs (both inherit
-        `_review_prompt`). `SweepEngine` and `StoriesEngine` override `_dev_prompt`,
-        so no bundle or stories dev prompt reaches this; `StoriesEngine` overrides
-        this method to "" as well, which drops it — and the redirect gated on it —
-        from that mode's review prompt too. Plugin workflow sessions and the
-        interactive resolve agent get nothing from this seam. For `resolve` that
-        costs nothing: `bmad-loop-resolve`'s own skill already forbids touching the
-        board outright. Plugin workflow sessions dispatched inside the same window
-        (`post_dev_phase`, `post_review_result`, `pre_commit_gate`) are a genuine
-        gap, left as follow-up work rather than widened into here.
+        Injection surface, exactly: story dev sessions (`_generic_dev_prompt`), the
+        review sessions of sprint and sweep runs (both inherit `_review_prompt`),
+        and every injected plugin-workflow session (`_run_session` wraps this in
+        `WORKFLOW_BOARD_CONTRACT` post-gate — those run in the same window, at
+        `post_dev_phase` / `post_review_result` / `pre_commit_gate`). `SweepEngine`
+        and `StoriesEngine` override `_dev_prompt`, so no bundle or stories dev
+        prompt reaches this; `StoriesEngine` overrides this method to "" as well,
+        which drops it — the redirect gated on it, and the workflow section — from
+        that mode's prompts too. Only the interactive resolve agent gets nothing
+        from this seam, which costs nothing: `bmad-loop-resolve`'s own skill already
+        forbids touching the board outright.
+
+        The three injection points deliberately share ONE wording, so a reviewer, a
+        dev session and a plugin workflow cannot be told three different things
+        about who owns the board.
+
+        They do NOT share unstrippability, and that asymmetry was weighed rather
+        than overlooked. The workflow section is post-gate because it has to be —
+        the prompt there is plugin text end to end, so there is no pre-gate string
+        to inject into. The dev/review injections stay pre-gate: moving only this
+        clause post-gate would assemble the review prompt in two files while the
+        deferred-work sentence it was written to sit beside stayed strippable, and
+        a plugin that rewrites `proposed_prompt` wholesale already discards the spec
+        path, the ledger sentence and the #261 `expected_spec` pin with it — the
+        codebase's existing reading is that such a rewrite means the plugin owns
+        that session. If unstrippability is ever wanted here, move the whole
+        orchestrator-authored appendix as one unit, not this sentence alone.
 
         `_post_dev_state_sync` advances sprint-status.yaml right after the dev
         session — to `done`, or to `awaiting-operator` on a park; those two values
