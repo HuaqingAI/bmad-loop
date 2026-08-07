@@ -192,6 +192,26 @@ def _reject_isolation_conflict(paths: bmadconfig.ProjectPaths, pol) -> int | Non
     return 1
 
 
+def _trusted_config_digest(pol, project: Path) -> str:
+    """The launch-time integrity baseline the auto-sweep child is held to (#461
+    point 4). Thin wrapper over :func:`runsetup.config_digest` for the two
+    human-initiated entrypoints that stamp one (`cmd_run`, `_resume_paused_run`)
+    plus `_start_sweep`.
+
+    Its only job is the error contract: `config_digest` resolves profiles, so an
+    unknown `[adapter] name` now fails a few frames EARLIER than it used to.
+    `make_adapters` renders that as `error: unknown CLI profile ...` and exits 1,
+    so re-raise it in the same shape rather than letting a `ProfileError`
+    traceback escape a misconfigured `run`. The child-sweep gate deliberately does
+    NOT go through here — there a raise is the point."""
+    from .adapters.profile import ProfileError
+
+    try:
+        return runsetup.config_digest(pol, project)
+    except ProfileError as e:
+        raise SystemExit(f"error: {e}") from e
+
+
 def _reconcile_stale(project: Path, paths: bmadconfig.ProjectPaths, pol) -> None:
     """Tear down worktrees leaked by a prior run that stopped mid-flight, before
     starting a new run/sweep — the clean-finish GC never reached them. Gated on
@@ -1174,6 +1194,11 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     _reconcile_stale(project, paths, pol)
 
+    # The launch baseline for the auto-sweep child's config re-read (#461 point 4).
+    # Taken ONCE, from the same `pol` the engine is about to freeze, and used for
+    # both the factory's gate and the RunState stamp so the two cannot disagree.
+    trusted_digest = _trusted_config_digest(pol, project)
+
     # The composition (run dir + state + pid + adapters + engine) lives in
     # runsetup; cmd_run stays parse -> compose -> render. Engine/StoriesEngine and
     # _make_adapters are handed in from this module's namespace so the test suite's
@@ -1188,10 +1213,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         max_stories=args.max_stories,
         stories_on=stories_on,
         spec_folder=spec_folder,
-        sweep_factory=_sweep_factory(project, paths),
+        sweep_factory=_sweep_factory(project, paths, trusted_digest),
         make_adapters=_make_adapters,
         engine_cls=Engine,
         stories_engine_cls=StoriesEngine,
+        trusted_config_digest=trusted_digest,
     )
     print(f"run {composed.run_id} starting (attach: bmad-loop attach)")
     summary = composed.engine.run()
@@ -1367,6 +1393,7 @@ def _start_sweep(
         trigger=trigger,
         make_adapters=_make_adapters,
         sweep_engine_cls=SweepEngine,
+        trusted_config_digest=_trusted_config_digest(pol, project),
     )
     print(f"sweep {composed.run_id} starting (attach: bmad-loop attach)")
     summary = composed.engine.run()
@@ -1374,12 +1401,37 @@ def _start_sweep(
     return 0
 
 
-def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths):
+def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest: str):
     """Child-sweep launcher injected into story-run engines. Auto-triggered
-    sweeps are unattended: never prompt, never run decision bundles."""
+    sweeps are unattended: never prompt, never run decision bundles.
+
+    ``trusted_digest`` is the caller's launch-time :func:`runsetup.config_digest`
+    — the integrity pin for the config this factory re-reads from disk below.
+    Required, with no default: an omitted baseline would silently disable the
+    refusal, which is the failure mode a security gate can least afford."""
 
     def factory(trigger: str) -> None:
         pol = policy_mod.load(_policy_path(project))
+        # #461 point 4. This reload is the ONE path where a mid-run rewrite of the
+        # agent-writable config reaches host code execution with no human
+        # initiating the change: the driven sessions can write policy.toml and
+        # profiles/*.toml, and this factory re-reads both (here, and through
+        # make_adapters -> get_profile) on a trigger the engine raised, not an
+        # operator. The parent loop is already safe — it froze its Policy at launch
+        # — and the two documented human-present mid-run edits (the TUI live-edit,
+        # resume-to-fix-a-setting) stay trusted; resume only warns. So refuse here
+        # and only here.
+        #
+        # ABLATION GUARDS: deleting this block must fail
+        # test_auto_sweep_refuses_a_rewritten_verify_command,
+        # test_auto_sweep_refuses_a_rewritten_profile_binary, and
+        # test_auto_sweep_refuses_a_widened_plugin_allowlist in tests/test_cli.py.
+        if runsetup.config_digest(pol, project) != trusted_digest:
+            raise RuntimeError(
+                "policy.toml/profiles changed under a running loop before an auto-sweep"
+                " — refusing the child sweep; no human initiated this config change."
+                " Run `bmad-loop sweep` yourself to proceed under the new config."
+            )
         # Raise rather than return the rc the other three sites return. By the time
         # the engine calls this it has already latched the trigger and journaled
         # `sweep-auto-trigger`, and it reads a plain return as success — so a bare
@@ -1497,7 +1549,22 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     # diagnose scrubs unknown fields with scrub_json, NOT the key-aware
     # _scrub_policy that reduces adapter.env and plugins.settings.
     new_snapshot = pol.to_dict()
+    new_digest = _trusted_config_digest(pol, project)
+    # #461 point 4, human-present half. A resume IS a deliberate human choice, so
+    # the on-disk config is re-blessed (new_digest is re-stamped below) and the run
+    # proceeds — the auto-sweep child is the only path that refuses. But the issue's
+    # real complaint is that the change is SILENT, so say it out loud: a session may
+    # have rewritten the verify commands / launch binary / plugin allowlist while
+    # the operator was away, and `resume` is the moment they can still look.
+    # Deliberately no --allow-config-change flag: a refuse-by-default gate here
+    # would break resume-to-fix-a-setting, which is a supported workflow.
+    security_config_changed = bool(state.trusted_config_digest) and (
+        new_digest != state.trusted_config_digest
+    )
     fields: dict[str, object] = {
+        # Scalars only, per the note above: a bool records THAT the pinned surface
+        # moved without journaling a command, a binary path or a plugin name.
+        "security_config_changed": security_config_changed,
         "was_paused": state.paused_reason,
         "cache_read_weight": pol.limits.cache_read_weight,
         # Compare JSON-normalized, the way save_state persists it: to_dict()
@@ -1512,6 +1579,19 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     if prior_weight != pol.limits.cache_read_weight:
         fields["cache_read_weight_was"] = prior_weight
     journal.append("run-resume", **fields)
+    if security_config_changed:
+        # STATIC category names — the ones config_digest covers. A single sha256
+        # cannot say which of them moved, and naming the actual old/new values is
+        # exactly what this must not do (the mutation is attacker-controlled text
+        # headed for an operator's terminal).
+        print(
+            f"warning: run {run_dir.name}: the host-exec config pinned at launch has"
+            " changed — one or more of: verify commands, launch binary/args/env,"
+            " plugin allowlist. Resuming trusts the config now on disk; re-read"
+            " .bmad-loop/policy.toml and .bmad-loop/profiles/ first if you did not"
+            " make that edit.",
+            file=sys.stderr,
+        )
     # Re-stamp: the snapshot must describe the policy THIS process enforces, for
     # its whole lifetime (Policy is loaded once here and frozen — the engine never
     # re-reads policy.toml). Enforcement already reads the reloaded `pol` (the
@@ -1524,6 +1604,12 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     # a policy edit mid-run cannot switch a live run's mode or scope. The snapshot
     # can therefore disagree with those fields; that is correct, not a bug.
     state.policy_snapshot = new_snapshot
+    # Re-baseline the integrity pin for the same reason and at the same moment: a
+    # human typed `resume`, which re-blesses the config on disk, and the engine
+    # this process is about to arm re-reads it from there. Leaving the launch
+    # digest would make every auto-sweep after a legitimate resume-to-fix-a-setting
+    # refuse — and would make the warning above fire forever, on every later resume.
+    state.trusted_config_digest = new_digest
     state.clear_pause()
     # A resume is fresh user intent: discard any graceful-stop request left over from
     # a prior stopped-gracefully run so the re-armed engine does not consume it at the
@@ -1553,7 +1639,7 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
         state=state,
         policy=pol,
         journal=journal,
-        sweep_factory=_sweep_factory(project, paths),
+        sweep_factory=_sweep_factory(project, paths, new_digest),
         make_adapters=_make_adapters,
         engine_cls=Engine,
         stories_engine_cls=StoriesEngine,

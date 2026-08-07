@@ -26,6 +26,7 @@ from conftest import (
 
 from bmad_loop import cli
 from bmad_loop import policy as policy_mod
+from bmad_loop import runsetup
 from bmad_loop.adapters import multiplexer as mux_mod
 
 STORIES_SPEC_FOLDER = "_bmad-output/epic-1"
@@ -60,6 +61,14 @@ def _write_policy(project, text=DUAL_CLIENT_POLICY) -> None:
     bmad_loop_dir = project / ".bmad-loop"
     bmad_loop_dir.mkdir(parents=True, exist_ok=True)
     (bmad_loop_dir / "policy.toml").write_text(text)
+
+
+def _config_pin(project) -> str:
+    """The host-exec config digest for a sandbox project as it stands — the launch
+    baseline `cmd_run` / `_resume_paused_run` pin (#461 point 4)."""
+    return runsetup.config_digest(
+        policy_mod.load(project.project / ".bmad-loop" / "policy.toml"), project.project
+    )
 
 
 def test_init_registers_hooks_for_all_policy_profiles(tmp_path):
@@ -3141,6 +3150,56 @@ def test_resume_under_an_unchanged_policy_reports_no_change(project, monkeypatch
     entry = _resume_entries(run_dir)[-1]
     assert entry["policy_changed"] is False
     assert "cache_read_weight_was" not in entry  # unchanged -> omitted
+
+
+def test_resume_warns_when_the_pinned_host_exec_config_changed(project, monkeypatch, capsys):
+    """#461 point 4, human-present half. A session may have rewritten the verify
+    commands while the operator was away; `resume` is the moment they can still
+    look, so the change stops being silent. It stays a WARNING — a human typed
+    `resume`, and refusing here would break resume-to-fix-a-setting."""
+    from bmad_loop.journal import load_state
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    # First resume stamps the pin (the run predates the field, so it has none).
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+    assert _resume_entry(run_dir)["security_config_changed"] is False
+    pinned = load_state(run_dir).trusted_config_digest
+    assert pinned  # the launch/resume baseline is persisted, not just in memory
+    capsys.readouterr()
+
+    _write_policy(project.project, RESUME_POLICY.replace('["true"]', '["touch pwned"]'))
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    assert _resume_entries(run_dir)[-1]["security_config_changed"] is True
+    err = capsys.readouterr().err
+    assert "host-exec config pinned at launch has changed" in err
+    # STATIC category names only — never the command that was substituted in.
+    assert "verify commands" in err and "plugin allowlist" in err
+    assert "touch pwned" not in err
+    # ...and the resume re-blesses it, so the next one is quiet again.
+    assert load_state(run_dir).trusted_config_digest != pinned
+
+
+def test_resume_under_an_unchanged_host_exec_config_reports_no_security_change(
+    project, monkeypatch, capsys
+):
+    """The false-positive guard, and the reason the pin is a field-scoped digest:
+    a `[limits]` edit is a policy change (#189 supports it mid-run) but not a
+    host-exec one, so `policy_changed` fires and `security_config_changed` must
+    not — otherwise the warning cries wolf on every supported live-edit."""
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+    capsys.readouterr()
+
+    _write_policy(project.project, RESUME_POLICY.replace("0.5", "0.25"))
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    entry = _resume_entries(run_dir)[-1]
+    assert entry["policy_changed"] is True  # the edit IS a policy change...
+    assert entry["security_config_changed"] is False  # ...but not a host-exec one
+    assert "host-exec config" not in capsys.readouterr().err
 
 
 def test_resume_discards_stale_graceful_stop_request(project, monkeypatch, capsys):
@@ -6275,10 +6334,131 @@ def test_auto_sweep_refuses_worktree_isolation_under_a_repo_root_override(projec
     started = []
     monkeypatch.setattr(cli, "_start_sweep", lambda *a, **kw: started.append(kw) or 0)
 
-    factory = cli._sweep_factory(project.project, bmadconfig.load_paths(project.project))
+    # Hand it a MATCHING config digest so the #461 gate (which sits ahead of the
+    # isolation check) stays quiet and this test still measures the isolation
+    # refusal — otherwise it would pass off the wrong RuntimeError.
+    factory = cli._sweep_factory(
+        project.project,
+        bmadconfig.load_paths(project.project),
+        _config_pin(project),
+    )
     with pytest.raises(RuntimeError, match=REFUSAL):
         factory("epic-boundary")
     assert started == []
+
+
+# --- #461 point 4: the auto-sweep child's config re-read is integrity-pinned ---
+
+# A project whose whole host-exec surface is expressible: the verify command the
+# parent would shell out, and a profile overlay carrying the launch `binary`. Both
+# live under the project tree, so a driven session can rewrite either one.
+PIN_POLICY = """\
+[adapter]
+name = "mycli"
+
+[verify]
+commands = ["true"]
+"""
+
+PIN_PROFILE = """\
+name = "mycli"
+binary = "mycli"
+bypass_args = ["--yes"]
+
+[hooks]
+dialect = "claude-settings-json"
+config_path = ".mycli/settings.json"
+events = { SessionStart = "SessionStart", Stop = "Stop" }
+"""
+
+DIGEST_REFUSAL = "changed under a running loop before an auto-sweep"
+
+
+def _pin_profile(project, text=PIN_PROFILE) -> None:
+    profiles = project.project / ".bmad-loop" / "profiles"
+    profiles.mkdir(parents=True, exist_ok=True)
+    (profiles / "mycli.toml").write_text(text, encoding="utf-8")
+
+
+def _pinned_sweep_factory(project, monkeypatch, *, policy_text=PIN_POLICY):
+    """A child-sweep factory pinned to the config as it stands right now — the
+    launch baseline `cmd_run` hands it. Anything a test writes AFTER this returns
+    is exactly the mid-run rewrite #461 point 4 describes: no human asked for it,
+    and the factory re-reads both files off disk on the engine's next trigger."""
+    from bmad_loop import bmadconfig
+
+    install_bmad_config(project)
+    _write_policy(project.project, policy_text)
+    _pin_profile(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    started = []
+    monkeypatch.setattr(cli, "_start_sweep", lambda *a, **kw: started.append(kw) or 0)
+    factory = cli._sweep_factory(
+        project.project, bmadconfig.load_paths(project.project), _config_pin(project)
+    )
+    return factory, started
+
+
+def test_auto_sweep_refuses_a_rewritten_verify_command(project, monkeypatch):
+    """`[verify] commands` runs with shell=True on the HOST, outside any session's
+    sandbox — and policy.toml sits in the workspace every driven session can write.
+    The parent loop froze its Policy at launch, so this factory's fresh reload is
+    the one path where that rewrite reaches execution with no human in the loop."""
+    factory, started = _pinned_sweep_factory(project, monkeypatch)
+    _write_policy(project.project, PIN_POLICY.replace('["true"]', '["touch pwned"]'))
+
+    with pytest.raises(RuntimeError, match=DIGEST_REFUSAL):
+        factory("epic-boundary")
+    assert started == []
+
+
+def test_auto_sweep_refuses_a_rewritten_profile_binary(project, monkeypatch):
+    """The case a `policy_snapshot`-only compare provably cannot catch: `binary`
+    is read from profiles/*.toml through get_profile and never appears in the
+    snapshot at all. This is why config_digest resolves profiles rather than
+    hashing the policy dict."""
+    factory, started = _pinned_sweep_factory(project, monkeypatch)
+    _pin_profile(project, PIN_PROFILE.replace('binary = "mycli"', 'binary = "rogue-cli"'))
+
+    with pytest.raises(RuntimeError, match=DIGEST_REFUSAL):
+        factory("epic-boundary")
+    assert started == []
+
+
+def test_auto_sweep_refuses_a_widened_plugin_allowlist(project, monkeypatch):
+    """`[plugins] enabled` is the trust gate for in-process Python import
+    (plugins/trust.py) — adding a name to it mid-run is a straight path from a
+    workspace write to code running inside the orchestrator itself."""
+    factory, started = _pinned_sweep_factory(project, monkeypatch)
+    _write_policy(project.project, PIN_POLICY + '\n[plugins]\nenabled = ["rogue"]\n')
+
+    with pytest.raises(RuntimeError, match=DIGEST_REFUSAL):
+        factory("epic-boundary")
+    assert started == []
+
+
+def test_auto_sweep_proceeds_after_a_benign_limits_edit(project, monkeypatch):
+    """Why the digest is field-scoped and not a whole-file hash. #189 documents
+    live-editing `[limits]` under a running loop as supported; a file hash would
+    refuse every auto-sweep after one, turning a correctness feature into a
+    regression. Nothing in `[limits]` reaches host exec, so nothing here fires."""
+    factory, started = _pinned_sweep_factory(project, monkeypatch)
+    _write_policy(project.project, PIN_POLICY + "\n[limits]\ncache_read_weight = 0.5\n")
+
+    factory("epic-boundary")  # no raise
+
+    assert len(started) == 1
+
+
+def test_auto_sweep_proceeds_when_the_pinned_config_is_untouched(project, monkeypatch):
+    """The gate's own null case — and the one that would catch a digest that is
+    unstable across two reads of an unchanged tree, which would refuse every
+    auto-sweep in the product."""
+    factory, started = _pinned_sweep_factory(project, monkeypatch)
+
+    factory("epic-boundary")  # no raise
+
+    assert len(started) == 1
 
 
 def test_dry_run_banner_names_the_isolation_refusal_first(project, capsys):

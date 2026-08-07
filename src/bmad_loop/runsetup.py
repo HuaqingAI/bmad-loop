@@ -16,6 +16,8 @@ frontend (or a test) can compose a run directly:
 * :func:`compose_resume` — rebuilds the engine for a paused/interrupted run
   (``cmd_resume`` and ``resolve``'s re-arm), selecting the sweep/stories/plain
   variant from persisted run state.
+* :func:`config_digest` — the integrity pin over the agent-writable config that
+  reaches host code execution (issue #461 point 4).
 
 The engine class and the adapter factory are *injected* into :func:`compose_run`
 rather than referenced here directly: ``cli`` resolves ``Engine`` /
@@ -28,6 +30,7 @@ so those seams stay importable and monkeypatchable from ``cli``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import time
@@ -58,6 +61,58 @@ if TYPE_CHECKING:
 # actually builds them) and re-exported as ``cli.ROLES``, which `cmd_validate`
 # and the test suite resolve.
 ROLES = ("dev", "review", "triage")
+
+
+def config_digest(policy: Policy, project: Path) -> str:
+    """sha256 over the agent-writable config that reaches **host** code execution.
+
+    The driven sessions can write anywhere under the project tree, including
+    ``.bmad-loop/policy.toml`` and ``.bmad-loop/profiles/*.toml`` — so a session
+    can rewrite the commands ``verify`` runs (``shell=True``), the ``binary`` a
+    later session is launched from, or the ``[plugins] enabled`` allowlist that
+    gates in-process Python import (issue #461 point 4). A run freezes its
+    ``Policy`` at launch, so the parent loop is already pinned; this digest exists
+    for the one path that re-reads config mid-run with **no human present** — the
+    auto-triggered child sweep in ``cli._sweep_factory``.
+
+    Field-scoped on purpose. A whole-file hash would also fire on the benign
+    ``[limits]`` live-edits #189 documents as supported, so this covers exactly
+    the exec-reachable surface:
+
+    * ``verify.commands`` — order-preserved; they run in sequence.
+    * ``sorted(plugins.enabled)`` — set semantics, so order is not meaningful.
+    * each :data:`ROLES` profile's ``binary`` / ``launch_args`` / ``bypass_args`` /
+      ``env``, *resolved* through ``get_profile``. ``binary`` lives in
+      ``profiles/*.toml`` and never appears in ``policy_snapshot``, so a
+      snapshot-only compare cannot see it change at all.
+
+    Deliberately EXCLUDES ``hooks.config_path``: the relay is issue #461's points
+    1-3, hardened on its own track, and folding it in here would make the sweep
+    gate fire on an ordinary ``bmad-loop init`` re-registration.
+
+    Tuples are normalized to lists before ``json.dumps(sort_keys=True)`` for the
+    same reason ``cli._resume_paused_run``'s ``policy_changed`` compare does it:
+    the live policy carries TUPLES where a persisted round-trip yields lists, and
+    a raw compare then reports "changed" every single time. ``ProfileError``
+    propagates — an unresolvable profile already aborts at :func:`make_adapters`.
+    """
+    from .adapters.profile import get_profile
+
+    profiles: dict[str, dict[str, object]] = {}
+    for role in ROLES:
+        prof = get_profile(policy.adapter.resolved(role).name, project)
+        profiles[role] = {
+            "binary": prof.binary,
+            "launch_args": list(prof.launch_args),
+            "bypass_args": list(prof.bypass_args),
+            "env": dict(prof.env),
+        }
+    payload = {
+        "verify_commands": list(policy.verify.commands),
+        "plugins_enabled": sorted(policy.plugins.enabled),
+        "profiles": profiles,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def make_adapters(project: Path, run_dir: Path, policy) -> dict[str, CodingCLIAdapter]:
@@ -299,17 +354,24 @@ def build_run_state(
     max_stories: int | None,
     stories_on: bool,
     spec_folder: str,
+    trusted_config_digest: str = "",
 ) -> RunState:
     """Assemble the launch-time :class:`RunState` for a fresh run.
 
     ``policy_snapshot`` freezes ``policy`` at launch so every later display reads
     the weights the run actually launched under; ``source`` / ``spec_folder``
-    record which queue the run dispatches (a stories manifest vs sprint-status)."""
+    record which queue the run dispatches (a stories manifest vs sprint-status).
+
+    ``trusted_config_digest`` is passed in rather than derived from ``policy`` +
+    ``project`` here so the value stamped on the run is the same string the caller
+    handed the sweep factory — and so a broken profile still aborts where it always
+    did (``make_adapters``'s ``SystemExit``), not from inside this constructor."""
     return RunState(
         run_id=run_id,
         project=str(project),
         started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
         policy_snapshot=policy.to_dict(),
+        trusted_config_digest=trusted_config_digest,
         epic_filter=epic_filter,
         story_filter=story_filter,
         max_stories=max_stories,
@@ -350,6 +412,7 @@ def compose_run(
     make_adapters: Callable[[Path, Path, Policy], dict[str, CodingCLIAdapter]],
     engine_cls: type[Engine],
     stories_engine_cls: type[StoriesEngine],
+    trusted_config_digest: str = "",
 ) -> ComposedRun:
     """Stand up a run: allocate the run dir, persist state + pid, build the
     adapters, and wire the engine — everything ``cmd_run`` did inline between its
@@ -371,6 +434,7 @@ def compose_run(
         max_stories=max_stories,
         stories_on=stories_on,
         spec_folder=spec_folder,
+        trusted_config_digest=trusted_config_digest,
     )
     save_state(run_dir, state)
     runs.write_pid(run_dir)
@@ -418,6 +482,7 @@ def compose_sweep(
     trigger: str,
     make_adapters: Callable[[Path, Path, Policy], dict[str, CodingCLIAdapter]],
     sweep_engine_cls: type[SweepEngine],
+    trusted_config_digest: str = "",
 ) -> ComposedRun:
     """Stand up a sweep run: allocate the run dir, persist state + pid, record the
     sweep options, build the adapters, and wire the ``SweepEngine`` — everything
@@ -436,6 +501,7 @@ def compose_sweep(
         project=str(project),
         started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
         policy_snapshot=policy.to_dict(),
+        trusted_config_digest=trusted_config_digest,
         run_type="sweep",
     )
     save_state(run_dir, state)

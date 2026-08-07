@@ -464,6 +464,14 @@ class RunState:
     project: str
     started_at: str
     policy_snapshot: dict[str, Any] = field(default_factory=dict)
+    # runsetup.config_digest over the agent-writable config that reaches HOST code
+    # execution — verify commands, the resolved launch binary/args/env, the plugin
+    # allowlist (#461 point 4). Stamped at launch and re-stamped on resume, beside
+    # policy_snapshot. The auto-sweep gate compares against its own closure
+    # baseline, not this; the field is the audit record plus the baseline `resume`
+    # warns off. Empty on runs persisted before the field existed, which is why the
+    # resume compare is guarded on it being non-empty — no prior pin, no warning.
+    trusted_config_digest: str = ""
     current_epic: int | None = None
     # the run's story scope + cap, as passed on the launching CLI (`--epic`,
     # `--story`, `--max-stories`). Persisted so `resume` rebuilds the Engine with
@@ -551,6 +559,7 @@ class RunState:
             "project": self.project,
             "started_at": self.started_at,
             "policy_snapshot": self.policy_snapshot,
+            "trusted_config_digest": self.trusted_config_digest,
             "current_epic": self.current_epic,
             "epic_filter": self.epic_filter,
             "story_filter": self.story_filter,
@@ -579,6 +588,7 @@ class RunState:
             project=d["project"],
             started_at=d["started_at"],
             policy_snapshot=d.get("policy_snapshot", {}),
+            trusted_config_digest=str(d.get("trusted_config_digest", "")),
             current_epic=d.get("current_epic"),
             epic_filter=d.get("epic_filter"),
             story_filter=d.get("story_filter"),
