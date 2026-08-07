@@ -424,17 +424,39 @@ def cmd_validate(args: argparse.Namespace) -> int:
     # not drop it — the stall it guards against survives the move.
     if any_hooks_registered:
         relay = project / install.HOOK_SCRIPT_REL
-        if relay.is_file():
-            report.ok(
-                "hooks.relay-present",
-                f"hook relay script present: {relay}",
-                {"path": str(relay)},
-            )
-        else:
+        # Existence is not enough: `is_file()` stays True for a mode-000 file, and
+        # the registered command is `<interpreter> <relay> <Event>`, which has to
+        # READ the script — an unreadable relay exits 2 ("can't open file") and the
+        # run stalls exactly as if the relay were gone, which is the blind spot
+        # this whole check exists to remove. `os.access` uses the REAL uid/gid,
+        # which is what the operator's own `bmad-loop` invocation runs as, and it
+        # stays correct under root (who can read a 000 file) where a mode-bit test
+        # would false-fail. On Windows `chmod` can only toggle the read-only flag,
+        # so this arm is POSIX-effective and never makes the Windows path stricter.
+        if not relay.is_file():
             report.fail(
                 "hooks.relay-present",
                 f"hooks are registered but the relay script {relay} is missing — "
                 f"run `bmad-loop init`",
+                {"path": str(relay)},
+            )
+        elif not os.access(relay, os.R_OK):
+            # Deliberately NOT "run `bmad-loop init`": install_into writes this path
+            # with write_text(), which needs write access to the same file, so init
+            # raises PermissionError instead of repairing it. Sending the operator
+            # to a command that also fails is worse than saying nothing.
+            report.fail(
+                "hooks.relay-present",
+                f"hooks are registered but the relay script {relay} is not readable — "
+                f"the registered hook command cannot run it, so every hook event "
+                f"no-ops. Restore read permission (`chmod u+r`) or delete it and "
+                f"re-run `bmad-loop init`",
+                {"path": str(relay)},
+            )
+        else:
+            report.ok(
+                "hooks.relay-present",
+                f"hook relay script present: {relay}",
                 {"path": str(relay)},
             )
 
