@@ -17,8 +17,24 @@ normal interactive sessions are unaffected.
 
 import json
 import os
+import stat
 import sys
 import time
+
+# Windows reparse tags that make a directory entry REDIRECT somewhere else,
+# compared against os.lstat().st_reparse_tag (Windows, 3.8+). Deliberately not
+# os.path.isjunction(), which is 3.12+ — this relay runs under whatever
+# interpreter the host has, not under the orchestrator's. Deliberately not "any
+# reparse tag" either: cloud placeholders (OneDrive) and dedup stubs are reparse
+# points too, and refusing those would stall a legitimate run. Empty on POSIX.
+_LINK_REPARSE_TAGS = tuple(
+    tag
+    for tag in (
+        getattr(stat, "IO_REPARSE_TAG_SYMLINK", None),
+        getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", None),
+    )
+    if tag is not None
+)
 
 
 def _first_workspace(payload):
@@ -28,26 +44,64 @@ def _first_workspace(payload):
     return None
 
 
+def _is_link_like(path):
+    """True when `path` redirects elsewhere: a POSIX symlink, or a Windows
+    symlink OR DIRECTORY JUNCTION.
+
+    `os.path.islink()` is False for a junction — junctions are a distinct
+    reparse kind, which is why `os.path.isjunction()` exists at all. On Windows
+    the junction is the arm that matters: `mklink /J` needs no elevation, while
+    a directory symlink needs SeCreateSymbolicLinkPrivilege or Developer Mode —
+    so the unprivileged attack is exactly the one `islink()` misses.
+    """
+    if os.path.islink(path):
+        return True
+    try:
+        return getattr(os.lstat(path), "st_reparse_tag", 0) in _LINK_REPARSE_TAGS
+    except OSError:
+        return False
+
+
+def _write_all(fd, data):
+    """Write every byte of `data` to `fd`.
+
+    `os.write()` may write FEWER bytes than asked and simply return the count. A
+    truncated event file is not merely retried, it is lost: `SignalWatcher.poll`
+    adds a filename to its consumed set BEFORE parsing it (signals.py), so
+    malformed JSON is skipped and never re-read — the session's Stop signal is
+    gone for good and the run waits out `session_timeout_min`. The buffered
+    `open()` this replaced looped internally; the raw fd needed for
+    O_NOFOLLOW/dir_fd does not, so loop here.
+    """
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:  # not observed in practice; a spinning hook is worse
+            raise OSError("short write to the event file")
+        view = view[written:]
+
+
 def _write_event(events_dir, name, event):
-    """Write one event file into `events_dir`, refusing to follow a symlink.
+    """Write one event file into `events_dir`, refusing to follow a redirect.
 
     The events dir is the orchestrator's control plane. A driven session has
     write access to the project, so it could plant `<run_dir>/events` as a
-    symlink and redirect (or swallow) the completion signal — stalling the run
-    to `session_timeout_min` instead of completing. `os.makedirs(exist_ok=True)`
-    `isdir()`-checks THROUGH a link, so the refusal has to come before it; that
-    refusal works on every platform and is the whole defense on Windows, where
-    O_NOFOLLOW/O_DIRECTORY do not exist and `os.supports_dir_fd` is empty.
+    symlink (or, on Windows, a junction) and redirect — or swallow — the
+    completion signal, stalling the run to `session_timeout_min` instead of
+    completing. `os.makedirs(exist_ok=True)` `isdir()`-checks THROUGH such a
+    link, so the refusal has to come before it; that refusal works on every
+    platform and is the whole defense on Windows, where O_NOFOLLOW/O_DIRECTORY
+    do not exist and `os.supports_dir_fd` is empty.
 
     Where the platform has them, the create+replace is additionally anchored to
     a dir_fd opened O_NOFOLLOW, which closes the window between the check and
-    the write. Mode is 0o600 (narrowed from the umask-derived 0644 an ordinary
+    the write. Mode is 0o600 (narrowed from the umask-derived mode an ordinary
     `open()` produced): only the operator running the loop reads these.
 
     Raises OSError on any refusal or failure; the caller degrades to a no-op.
     """
-    if os.path.islink(events_dir):
-        raise OSError(f"refusing to write events into a symlinked directory: {events_dir}")
+    if _is_link_like(events_dir):
+        raise OSError(f"refusing to write events into a redirected directory: {events_dir}")
     os.makedirs(events_dir, exist_ok=True)
     data = json.dumps(event).encode("utf-8")
     tmp = name + ".tmp"
@@ -66,7 +120,7 @@ def _write_event(events_dir, name, event):
         try:
             fd = os.open(tmp, create, 0o600, dir_fd=dir_fd)
             try:
-                os.write(fd, data)
+                _write_all(fd, data)
             finally:
                 os.close(fd)
             os.rename(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
@@ -76,7 +130,7 @@ def _write_event(events_dir, name, event):
     tmp_path = os.path.join(events_dir, tmp)
     fd = os.open(tmp_path, create, 0o600)
     try:
-        os.write(fd, data)
+        _write_all(fd, data)
     finally:
         os.close(fd)
     os.replace(tmp_path, os.path.join(events_dir, name))

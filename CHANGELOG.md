@@ -152,16 +152,18 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
-- **The hook relay refuses a symlinked `events/` dir, and `validate` stats the relay (#461).** The
-  relay's event write followed a symlink — `os.makedirs(exist_ok=True)` `isdir()`-checks through a
-  link — so a driven session, which can write inside the run dir, could redirect the orchestrator's
-  control-plane event stream and stall the run to `session_timeout_min`. The write now refuses a
-  symlinked events dir before creating it (the whole defense on Windows), anchors the create+replace
-  to an `O_NOFOLLOW` dir_fd where the platform supports it, creates `O_EXCL` at `0o600` (was 0644),
-  and degrades to a no-op on any `OSError` rather than failing the session. Separately, validate's
-  `hooks.registered` was a substring match on the hook config that never touched the script it
-  points at, so a deleted `.bmad-loop/` (branch switch) read as green while every hook event
-  no-opped; a new `hooks.relay-present` finding stats the relay and says `run bmad-loop init`.
+- **The hook relay refuses a redirected `events/` dir, and `validate` stats the relay (#461).** The
+  relay's event write followed a symlink — or, on Windows, a directory junction, which
+  `os.path.islink` reports False for and which `mklink /J` creates without elevation — so a driven
+  session could redirect the orchestrator's control-plane event stream and stall the run to
+  `session_timeout_min`. The write now refuses a redirected events dir before creating it, anchors
+  the create+replace to an `O_NOFOLLOW` dir_fd where the platform supports it, creates `O_EXCL` at
+  `0o600`, writes the payload in full (a short `os.write` would publish truncated JSON, which
+  `SignalWatcher` drops permanently), and degrades to a no-op on `OSError` rather than failing the
+  session. Separately, `hooks.registered` was a substring match on the hook config that never
+  touched the script it points at, so a deleted `.bmad-loop/` (branch switch) read green while every
+  hook event no-opped; a new `hooks.relay-present` finding stats the relay and says
+  `run bmad-loop init`.
 
 - **Dispatched sessions are told the sprint board is orchestrator-owned (#437).** The board advances
   at dev-verify time but the story commits only after the review loop, so a session dispatched in

@@ -1,5 +1,6 @@
 """The hook relay script runs as a real subprocess, like Claude Code runs it."""
 
+import importlib.util
 import json
 import os
 import stat
@@ -10,6 +11,18 @@ from pathlib import Path
 import pytest
 
 SCRIPT = Path(__file__).parent.parent / "src" / "bmad_loop" / "data" / "bmad_loop_hook.py"
+
+
+def _relay_module():
+    """Import the relay by path. It ships as package DATA, not an importable
+    module (init copies it into the workspace), so the behavioral tests below
+    drive it as a subprocess — but the reparse-tag branch of `_is_link_like` is
+    reachable only on Windows, and shipping it unexercised is how a capability
+    check silently becomes dead code."""
+    spec = importlib.util.spec_from_file_location("_bmad_loop_hook_under_test", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def run_hook(event: str, env: dict, payload) -> subprocess.CompletedProcess:
@@ -127,6 +140,69 @@ def test_symlinked_events_dir_writes_nothing_and_exits_zero(tmp_path):
     assert proc.returncode == 0
     assert list(target.iterdir()) == []
     assert list((run_dir / "events").iterdir()) == []
+
+
+class _ReparseStat:
+    """Stand-in for the os.lstat() result of a Windows junction: a DIRECTORY
+    mode (which is why os.path.islink() answers False) carrying a reparse tag."""
+
+    st_mode = stat.S_IFDIR | 0o755
+    st_reparse_tag = 0xA0000003  # IO_REPARSE_TAG_MOUNT_POINT
+
+
+def test_is_link_like_refuses_a_reparse_tagged_dir(tmp_path, monkeypatch):
+    """A Windows directory junction is a reparse point but NOT a symlink, so
+    `os.path.islink` is False for it while `os.makedirs`/`os.open` follow it —
+    and `mklink /J` needs no elevation, unlike a directory symlink, so it is the
+    cheaper attack. The refusal keys on the reparse tag instead. That branch is
+    reachable only on Windows; drive its logic here so it is not shipped
+    unexercised (the `stat.IO_REPARSE_TAG_*` constants do not exist on POSIX,
+    hence the substituted tuple).
+
+    Ablation guard: dropping the `st_reparse_tag` arm of `_is_link_like` makes
+    the last assertion fail."""
+    relay = _relay_module()
+    plain = tmp_path / "events"
+    plain.mkdir()
+    assert relay._is_link_like(plain) is False
+
+    real_lstat = os.lstat
+    monkeypatch.setattr(relay, "_LINK_REPARSE_TAGS", (_ReparseStat.st_reparse_tag,))
+    monkeypatch.setattr(
+        os,
+        "lstat",
+        lambda p, *a, **k: _ReparseStat() if str(p) == str(plain) else real_lstat(p),
+    )
+    assert relay._is_link_like(plain) is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="directory junctions are Windows-only")
+def test_junctioned_events_dir_writes_nothing_and_exits_zero(tmp_path):
+    """The Windows half of the symlink test — Windows CI is its only oracle, a
+    junction cannot be created on POSIX."""
+    # If either tag constant were misnamed the tuple is empty and the refusal
+    # silently never fires. Assert it directly rather than inferring from below.
+    assert _relay_module()._LINK_REPARSE_TAGS
+
+    target = tmp_path / "attacker"
+    target.mkdir()
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(run_dir / "events"), str(target)],
+        check=True,
+        capture_output=True,
+    )
+    # The premise, asserted rather than assumed: were a future CPython to start
+    # reporting junctions as links, this says so directly instead of going green
+    # for the wrong reason.
+    assert os.path.islink(run_dir / "events") is False
+
+    env = {"BMAD_LOOP_RUN_DIR": str(run_dir), "BMAD_LOOP_TASK_ID": "t1"}
+    proc = run_hook("Stop", env, {"session_id": "s1"})
+
+    assert proc.returncode == 0
+    assert list(target.iterdir()) == []
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
