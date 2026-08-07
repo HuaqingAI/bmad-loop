@@ -3,6 +3,7 @@
 import argparse
 import io
 import json
+import os
 import sys
 
 import pytest
@@ -3899,6 +3900,78 @@ def test_validate_stories_mode_reports_missing_manifest(project, capsys):
     text = _validate_output(capsys)
     assert "no stories.yaml found" in text
     assert "sprint status" not in text
+
+
+def test_validate_flags_registered_hooks_with_missing_relay_script(project, capsys):
+    """#461 papercut: `hooks.registered` is a substring match on the hook config —
+    it stays green after the relay script itself is gone (branch switch, deleted
+    `.bmad-loop/`), while every hook event silently no-ops and the run stalls to
+    session_timeout_min. A distinct finding stats the artifact.
+
+    Ablation guard: deleting the `hooks.relay-present` block in cmd_validate makes
+    this FAIL on the first assertion."""
+    from bmad_loop import install as install_mod
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    assert cli.main(["init", "--project", str(project.project), "--no-skills"]) == 0
+    args = argparse.Namespace(project=str(project.project), spec=None)
+
+    cli.cmd_validate(args)
+    assert "hook relay script present" in _validate_output(capsys)
+
+    (project.project / install_mod.HOOK_SCRIPT_REL).unlink()
+
+    cli.cmd_validate(args)
+    text = _validate_output(capsys)
+    # The registration check is untouched — it still reads green, which is exactly
+    # the blind spot the new finding covers.
+    assert "hooks registered" in text
+    assert "relay script" in text and "missing" in text
+    assert "bmad-loop init" in text
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows chmod only toggles the read-only flag")
+@pytest.mark.skipif(
+    os.geteuid() == 0 if hasattr(os, "geteuid") else False, reason="root reads a 000 file"
+)
+def test_validate_flags_registered_hooks_with_an_unreadable_relay_script(project, capsys):
+    """A relay that exists but cannot be READ is the same stall as a missing one:
+    the registered command is `<interpreter> <relay> <Event>`, which exits 2
+    ("can't open file") and never writes the event, so the run waits out
+    session_timeout_min. `Path.is_file()` is True for a mode-000 file, so
+    existence alone left that green — the blind spot this check exists to remove.
+
+    The remediation differs from the missing case and is asserted here: `init`
+    writes the relay with `write_text()`, which needs write access to the same
+    file, so it raises PermissionError rather than repairing it.
+
+    Ablation guard: dropping the `os.access` branch makes this FAIL — validate
+    reports the relay present."""
+    from bmad_loop import install as install_mod
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    assert cli.main(["init", "--project", str(project.project), "--no-skills"]) == 0
+    args = argparse.Namespace(project=str(project.project), spec=None)
+
+    relay = project.project / install_mod.HOOK_SCRIPT_REL
+    cli.cmd_validate(args)
+    assert "hook relay script present" in _validate_output(capsys)
+
+    relay.chmod(0o000)
+    # The premise, asserted rather than assumed: existence still reads True, which
+    # is the whole reason readability needs its own check.
+    assert relay.is_file() and not os.access(relay, os.R_OK)
+
+    cli.cmd_validate(args)
+    text = _validate_output(capsys)
+    assert "hooks registered" in text  # registration is untouched, still green
+    assert "relay script" in text and "not readable" in text
+    # It must NOT tell the operator to run a command that also fails.
+    assert "chmod" in text
+
+    relay.chmod(0o644)  # so the sandbox tears down cleanly
 
 
 def test_validate_sprint_mode_still_gates_on_sprint_status(project, capsys):

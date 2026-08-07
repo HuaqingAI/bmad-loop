@@ -356,6 +356,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
         else:
             report.fail("adapter.binary", f"{tool} not found on PATH", {"binary": tool})
 
+    any_hooks_registered = False
     for profile in profiles:
         if profile.hookless:
             report.ok(
@@ -394,6 +395,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     {"profile": profile.name, "config_path": str(hook_config)},
                 )
         if hooks_ok:
+            any_hooks_registered = True
             report.ok(
                 "hooks.registered",
                 f"bmad-loop hooks registered for {profile.name}",
@@ -405,6 +407,57 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 f"bmad-loop hooks not registered for {profile.name} — "
                 f"run `bmad-loop init --cli {profile.name}`",
                 {"profile": profile.name, "config_path": str(hook_config)},
+            )
+
+    # #461: `hooks.registered` above is a substring match on the config JSON — it
+    # never touches the artifact the registered command points AT. A branch switch
+    # (or a deleted .bmad-loop/) leaves the registration green while every hook
+    # event is a silent no-op and the run stalls to session_timeout_min, so stat
+    # the relay itself. Outside the per-profile loop on purpose: the relay is one
+    # shared artifact, and per-profile reporting would print the same line N times.
+    # A distinct id, not a repurposed `hooks.registered` — the two answer different
+    # questions and an operator needs to see which one failed.
+    #
+    # COUPLING (#461 Phase 2): Phase 2 moves the relay to
+    # `<abs-python> -m bmad_loop.hookrelay` and retires HOOK_SCRIPT_REL. It must
+    # RETARGET this check to stat the registered interpreter (`hooks.interpreter`),
+    # not drop it — the stall it guards against survives the move.
+    if any_hooks_registered:
+        relay = project / install.HOOK_SCRIPT_REL
+        # Existence is not enough: `is_file()` stays True for a mode-000 file, and
+        # the registered command is `<interpreter> <relay> <Event>`, which has to
+        # READ the script — an unreadable relay exits 2 ("can't open file") and the
+        # run stalls exactly as if the relay were gone, which is the blind spot
+        # this whole check exists to remove. `os.access` uses the REAL uid/gid,
+        # which is what the operator's own `bmad-loop` invocation runs as, and it
+        # stays correct under root (who can read a 000 file) where a mode-bit test
+        # would false-fail. On Windows `chmod` can only toggle the read-only flag,
+        # so this arm is POSIX-effective and never makes the Windows path stricter.
+        if not relay.is_file():
+            report.fail(
+                "hooks.relay-present",
+                f"hooks are registered but the relay script {relay} is missing — "
+                f"run `bmad-loop init`",
+                {"path": str(relay)},
+            )
+        elif not os.access(relay, os.R_OK):
+            # Deliberately NOT "run `bmad-loop init`": install_into writes this path
+            # with write_text(), which needs write access to the same file, so init
+            # raises PermissionError instead of repairing it. Sending the operator
+            # to a command that also fails is worse than saying nothing.
+            report.fail(
+                "hooks.relay-present",
+                f"hooks are registered but the relay script {relay} is not readable — "
+                f"the registered hook command cannot run it, so every hook event "
+                f"no-ops. Restore read permission (`chmod u+r`) or delete it and "
+                f"re-run `bmad-loop init`",
+                {"path": str(relay)},
+            )
+        else:
+            report.ok(
+                "hooks.relay-present",
+                f"hook relay script present: {relay}",
+                {"path": str(relay)},
             )
 
     # opencode config-file model ids are "provider/model" (see the opencode_http docstring);
