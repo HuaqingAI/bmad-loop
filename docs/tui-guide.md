@@ -86,10 +86,11 @@ captured and shown in a scrollable modal instead of spawned in tmux.
 Three stacked panes; `tab` / `shift+tab` move focus between them, and their
 heights (like the sidebar width) are resizable — see [Resizing
 panes](#resizing-panes). The sprint and deferred panes read project-level files
-maintained by LLM sessions (`sprint-status.yaml`, `deferred-work.md`), so both
-parse forgivingly: a missing or malformed file shows a dim placeholder instead
-of an error, and the pane recovers on the next poll once the file is readable
-again.
+written outside the TUI — `sprint-status.yaml`, which the orchestrator writes
+while a run is in flight and your own BMAD skill runs generate and edit outside
+one, and `deferred-work.md` — so both parse forgivingly: a missing or malformed
+file shows a dim placeholder instead of an error, and the pane recovers on the
+next poll once the file is readable again.
 
 #### Run list (top)
 

@@ -12,6 +12,7 @@ from conftest import attach_profile, git, install_build_auto_skill, write_spec
 
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
+from bmad_loop.engine import Engine
 from bmad_loop.install import (
     DEV_PRIMITIVE_NEW,
     STORIES_PROBE_FILE,
@@ -492,6 +493,41 @@ def test_plan_halt_env_only_on_leg_one(project):
     assert engine._extra_session_env(task, "dev")["BMAD_LOOP_PLAN_HALT"] == "1"
     # review sessions never carry it
     assert "BMAD_LOOP_PLAN_HALT" not in engine._extra_session_env(task, "review")
+
+
+def test_review_prompt_carries_no_sprint_board_clause(project):
+    """Stories mode has no sprint-status.yaml — `_post_dev_state_sync` is a no-op and
+    `verify_review_stories` reads the id-keyed story spec alone — so the inherited
+    review prompt's board-ownership clause would assert ownership of a file this mode
+    never touches. One override empties it, and the `blocked` hand-back redirect goes
+    with it, because the redirect gates itself on that clause.
+
+    Asserted against the REVIEW prompt: `StoriesEngine` overrides `_dev_prompt`, so a
+    dev-prompt assertion here would be dead. The base-class check is the ablation
+    guard — without it every assertion below passes for free the moment the clause is
+    emptied for ALL modes. And this is the live half of the review seam's
+    `if tail else ""`: an unconditional separator leaves a trailing space here."""
+    setup_stories(project, [entry("1")])
+    engine, _ = make_engine(project, [])
+    spec = str(story_spec(project, "1"))
+    task = StoryTask(story_key="1", epic=0, spec_file=spec)
+
+    assert Engine._sprint_board_instruction(engine)  # the base clause is non-empty
+    assert engine._sprint_board_instruction() == ""
+    assert engine._board_handback_redirect() == ""
+
+    prompt = engine._review_prompt(task)
+
+    assert "sprint-status" not in prompt
+    assert "status: blocked" not in prompt
+    # byte-identical to the pre-#437 stories review prompt: the ledger sentence alone,
+    # with no trailing space where the clauses would have joined
+    assert prompt == (
+        f"/bmad-dev-auto {spec} — do NOT modify, re-open, or rewrite existing "
+        f"deferred-work ledger entries; the orchestrator owns their status and "
+        f"resolution."
+    )
+    assert prompt.endswith("the orchestrator owns their status and resolution.")
 
 
 def test_dev_prompt_repair_leg_is_explicit_spec_resume(project, tmp_path):
