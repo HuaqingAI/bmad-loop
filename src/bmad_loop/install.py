@@ -1109,11 +1109,40 @@ def merge_hooks(config: dict, registrations: dict[str, str], dialect: str) -> tu
     return config, changed
 
 
+def _confined_to(target: Path, root: Path) -> bool:
+    """True if ``target`` resolves *strictly below* ``root``.
+
+    The profile/manifest guards (``names_tree_root``/``is_absolute_path``/
+    ``has_parent_ref``) are lexical and run at load, so they cannot see a *link*:
+    a `skill_tree` or `hooks.config_path` naming a perfectly project-relative
+    directory that happens to be a symlink out of the tree passes all three. This
+    is the resolve-time backstop the worktree side already had inline
+    (``worktree_flow`` compares resolved-vs-raw before writing); the ``init`` path
+    reached mkdir/rmtree/write with no such check. Refuses on OSError rather than
+    degrading: a slot that cannot be inspected is not safe to write through.
+
+    Strictly below, not merely inside, because ``is_relative_to`` is true for
+    equal paths — the same "a path is relative to itself" hole this guard family
+    exists to close in `provision_worktree`'s seed loop. `skill_tree = "skills"`
+    where `project/skills` links back to `project` resolves to the root itself, and
+    an equality-inclusive check would hand `_copy_skills` the project root: the
+    bundled skill dirs land at top level, and `--force-skills` `rmtree`s any root
+    directory whose name collides with one of them."""
+    try:
+        resolved, base = target.resolve(), root.resolve()
+        return resolved != base and resolved.is_relative_to(base)
+    except (OSError, RuntimeError):
+        return False
+
+
 def _register_hooks(project: Path, profile: CLIProfile) -> int:
     if profile.hookless:
         print(f"  no hooks needed ({profile.name}): HTTP/SSE transport")
         return 0
     config_path = project / profile.hooks.config_path
+    if not _confined_to(config_path, project):
+        print(f"FAIL: hooks config_path escapes the project ({profile.name}): {config_path}")
+        return 1
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config: dict = {}
     if config_path.is_file():
@@ -2391,6 +2420,20 @@ def _copy_skills(project: Path, trees: Sequence[str], force: bool) -> bool:
     skipped_any = False
     for tree in trees:
         tree_dir = project / tree
+        # This loop rmtree's under `force` and writes unconditionally, and its
+        # `_copy_traversable` call passes neither `worktree` nor `repo_root`, so
+        # both of that helper's containment legs are inert here by construction.
+        # The containment check therefore has to live at this level. Not folded
+        # into `_copy_traversable`'s own guards on purpose: passing `worktree=`
+        # would also force no-clobber and switch per-entry OSError to degrade,
+        # and `init` must fail loudly on a write it cannot complete.
+        #
+        # Raises rather than skipping: a skipped tree leaves the install missing
+        # the skills every later session dispatches, and an `init` that prints
+        # `init complete` and exits 0 over that is an unattended-setup trap. Same
+        # severity as `_register_hooks`' refusal, which already fails the install.
+        if not _confined_to(tree_dir, project):
+            raise ProfileError(f"skill tree does not resolve inside the project: {tree_dir}")
         installed: list[str] = []
         skipped: list[str] = []
         for skill in MODULE_SKILLS:
@@ -2479,7 +2522,11 @@ def install_into(
     skills_skipped = False
     if skills:
         trees = list(dict.fromkeys(p.skill_tree for p in profiles))
-        skills_skipped = _copy_skills(project, trees, force_skills)
+        try:
+            skills_skipped = _copy_skills(project, trees, force_skills)
+        except ProfileError as e:
+            print(f"FAIL: {e}")
+            return 1
 
     # 4. policy template
     policy_path = bmad_loop_dir / "policy.toml"

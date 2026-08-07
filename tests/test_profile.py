@@ -231,6 +231,29 @@ def test_user_profile_overlay(tmp_path):
             ),
             "seed_files",
         ),
+        # A root-naming entry is the harmful one, and `""` is only one spelling of
+        # it: these feed provision_worktree's seed loop, where any of them resolves
+        # src to the repo root and dst to the worktree — both pass its containment
+        # checks, so the whole repo is copied in and the copy recurses into itself.
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'seed_files = ["."]\n[hooks]'),
+            "seed_files",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'seed_files = ["./"]\n[hooks]'),
+            "seed_files",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'skill_tree = "."\n[hooks]'),
+            "skill_tree",
+        ),
+        (
+            MINIMAL_PROFILE.replace(
+                'config_path = ".mycli/settings.json"',
+                'config_path = "."',
+            ),
+            "relative",
+        ),
         # an env_fault_patterns entry that is not a valid regex fails fast at parse
         (
             MINIMAL_PROFILE.replace(
@@ -274,6 +297,40 @@ def test_user_profile_overlay(tmp_path):
             MINIMAL_PROFILE.replace("[hooks]", "stop_without_result_nudges = -2\n[hooks]"),
             "stop_without_result_nudges",
         ),
+        # TOML-legal values of the wrong TYPE hit raw conversions (`float()`,
+        # `int()`, `.items()`) — the `_load_toml` funnel turns those bare
+        # ValueError/TypeError/AttributeError escapes into ProfileError, which
+        # is what every consumer's fault handling keys on. Ablation: drop the
+        # funnel arm and these four raise the bare exception instead.
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'usage_grace_s = "invalid"\n[hooks]'),
+            "malformed field value",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", "usage_grace_s = [1]\n[hooks]"),
+            "malformed field value",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'stop_without_result_nudges = "x"\n[hooks]'),
+            "malformed field value",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'env = "invalid"\n[hooks]'),
+            "malformed field value",
+        ),
+        # `inf` and an oversized int are legal TOML and raise OverflowError, a
+        # sibling of neither ValueError nor TypeError — the rows that show why
+        # the funnel has to be the CLOSED set for the tomllib domain rather than
+        # the types seen so far. Ablation: drop OverflowError from
+        # CONVERSION_FAULTS and exactly these two raise the bare exception.
+        (
+            MINIMAL_PROFILE.replace("[hooks]", "stop_without_result_nudges = inf\n[hooks]"),
+            "malformed field value",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", f"usage_grace_s = {'9' * 400}\n[hooks]"),
+            "malformed field value",
+        ),
         # real dialects still hard-require config_path and events
         (
             MINIMAL_PROFILE.replace('config_path = ".mycli/settings.json"', ""),
@@ -298,3 +355,46 @@ def test_invalid_profiles_rejected(tmp_path, mutation, match):
     (profiles_dir / "bad.toml").write_text(mutation)
     with pytest.raises(ProfileError, match=match):
         load_profiles(tmp_path)
+
+
+# every type `tomllib` can yield, plus the numeric spellings that are legal TOML
+# and hostile to a raw coercion
+TOML_VALUE_DOMAIN = [
+    '"x"',
+    "1",
+    "1.5",
+    "true",
+    "1979-05-27T07:32:00Z",
+    "1979-05-27",
+    "07:32:00",
+    "[1]",
+    "{ k = 1 }",
+    "inf",
+    "-inf",
+    "nan",
+    "9" * 400,  # tomllib keeps arbitrary precision; float() of this overflows
+]
+
+
+@pytest.mark.parametrize("value", TOML_VALUE_DOMAIN)
+@pytest.mark.parametrize("key", ["usage_grace_s", "stop_without_result_nudges"])
+def test_every_toml_value_type_parses_or_raises_profile_error(tmp_path, key, value):
+    """The closure pin behind `CONVERSION_FAULTS`: a profile field can hold any of
+    the nine types `tomllib` yields, and the contract is that each either parses or
+    raises the DOMAIN error — never a bare conversion fault out of a `float()`,
+    `int()` or `.items()`.
+
+    Both a float knob and an int knob, because they fault differently: `inf` is a
+    fine float and an OverflowError for `int()`, while a 400-digit integer is a
+    fine int and an OverflowError for `float()`. A per-type exception list cannot
+    promise this; two review rounds each added one type after a bot found a
+    spelling nobody had tried."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "probe.toml").write_text(
+        MINIMAL_PROFILE.replace("[hooks]", f"{key} = {value}\n[hooks]")
+    )
+    try:
+        load_profiles(tmp_path)
+    except ProfileError:
+        pass

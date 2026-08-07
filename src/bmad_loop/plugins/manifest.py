@@ -16,7 +16,7 @@ from __future__ import annotations
 import tomllib
 from typing import Any
 
-from ..platform_util import has_parent_ref, is_absolute_path
+from ..platform_util import has_parent_ref, is_absolute_path, names_tree_root
 from .model import (
     SETTING_TYPES,
     WORKFLOW_ROLES,
@@ -29,10 +29,35 @@ from .model import (
     WorkflowSpec,
 )
 
+# The CLOSED set of faults a raw coercion over a `tomllib` value can raise — see
+# `adapters/profile.py::CONVERSION_FAULTS` for the nine-type enumeration behind it
+# (the `inf`/`-inf` and oversized-int OverflowError rows are the ones a per-field
+# guard keeps missing). Restated here rather than imported: the plugin layer does
+# not otherwise depend on the adapter layer, and each module's own domain test
+# pins its copy.
+CONVERSION_FAULTS = (AttributeError, OverflowError, TypeError, ValueError)
+
+
+def _str_list(plugin_d: dict, key: str, fail) -> tuple[str, ...]:
+    # Shape before entries, the same rule the sibling seed sources apply to their
+    # own lists (policy.py `worktree_seed`, adapters/profile.py `str_list`): a
+    # bare string iterates into per-character entries that each pass the
+    # per-entry guard below, and a scalar raises a bare TypeError out of `loads`
+    # where every other malformed value here raises PluginError.
+    raw = plugin_d.get(key, ())
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple)):
+        raise fail(f"[plugin] {key} must be a list of paths: got {raw!r}")
+    if not all(isinstance(s, str) for s in raw):
+        raise fail(f"[plugin] {key} entries must be strings: got {list(raw)!r}")
+    return tuple(raw)
+
 
 def _check_relative_paths(values: tuple[str, ...], label: str, fail) -> None:
+    # `names_tree_root` subsumes the emptiness check it replaced: "", ".", "./" and
+    # ".\" all name the tree rather than anything in it, and a seed entry that names
+    # the tree root makes provision_worktree copy the whole repo into the worktree.
     for value in values:
-        if not value or is_absolute_path(value) or has_parent_ref(value):
+        if names_tree_root(value) or is_absolute_path(value) or has_parent_ref(value):
             raise fail(f"{label} entries must be project-relative paths: got {value!r}")
 
 
@@ -147,7 +172,7 @@ def _parse_python(python_d: Any, fail) -> PythonSpec | None:
     module = str(python_d.get("module", "")).strip()
     if not module:
         raise fail("[python] requires a 'module'")
-    if is_absolute_path(module) or has_parent_ref(module):
+    if names_tree_root(module) or is_absolute_path(module) or has_parent_ref(module):
         raise fail(f"[python] module must be a plugin-relative path: got {module!r}")
     return PythonSpec(module=module, cls=str(python_d.get("class", "Plugin")) or "Plugin")
 
@@ -171,12 +196,12 @@ def parse_manifest(
         raise fail("[plugin] 'api_version' is required")
     try:
         api_version = int(raw_api)
-    except (TypeError, ValueError):
+    except CONVERSION_FAULTS:
         raise fail(f"[plugin] api_version must be an integer: got {raw_api!r}") from None
 
-    seed_files = tuple(str(s) for s in plugin_d.get("seed_files", ()))
+    seed_files = _str_list(plugin_d, "seed_files", fail)
     _check_relative_paths(seed_files, "seed_files", fail)
-    seed_globs = tuple(str(s) for s in plugin_d.get("seed_globs", ()))
+    seed_globs = _str_list(plugin_d, "seed_globs", fail)
     _check_relative_paths(seed_globs, "seed_globs", fail)
 
     return PluginManifest(
@@ -204,4 +229,20 @@ def load_manifest(
         doc = tomllib.loads(text)
     except tomllib.TOMLDecodeError as e:
         raise PluginError(f"plugin {source}: invalid TOML: {e}") from e
-    return parse_manifest(doc, source, scripts_dir, origin)
+    try:
+        return parse_manifest(doc, source, scripts_dir, origin)
+    except PluginError:
+        raise  # intent: a domain error is never re-wrapped (it is not a CONVERSION_FAULT)
+    except CONVERSION_FAULTS as e:
+        # A funnel, not per-field guards — the `_load_toml` arm of
+        # adapters/profile.py, same reason: `parse_manifest`'s raw conversions
+        # (`int()` on `priority`, `api_version` and a hook's `timeout_sec`,
+        # iteration over a setting's `options`) raise bare conversion errors on
+        # TOML-legal values of the wrong type, and every consumer keys its fault
+        # handling on PluginError — the TUI's settings pane reports it beside a
+        # PolicyError, and `settings_schema`/`PluginRegistry.build` reach it
+        # through `load_plugins`. A bare escape crashed `validate` before any
+        # document was printed. The tuple is that module's CLOSED set for the
+        # `tomllib` value domain, shared so the two parsers cannot drift apart
+        # one exception type at a time.
+        raise PluginError(f"plugin {source}: malformed field value: {e}") from e

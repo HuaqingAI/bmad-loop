@@ -117,6 +117,49 @@ def has_parent_ref(value: str | Path) -> bool:
     return ".." in PurePosixPath(text).parts or ".." in PureWindowsPath(text).parts
 
 
+def names_tree_root(value: str | Path) -> bool:
+    """True if ``value`` names the tree it is relative to rather than anything
+    *inside* it: ``""``, ``"."``, ``"./"``, ``"./."`` all normalize to the root.
+
+    The third member of the "must be a path inside the project" family, and the
+    one a `not value` emptiness check misses. It exists because these guards feed
+    `provision_worktree`'s seed loop, where a root-naming entry resolves ``src``
+    to the repo root and ``dst`` to the worktree, both of which pass the loop's
+    ``is_relative_to`` containment checks — a path is relative to itself. Measured:
+    ``""`` and ``"."`` produce a byte-identical ``(src, raw, dst)`` triple there,
+    so a guard rejecting only the first is a guard against one spelling.
+
+    Both flavours are checked for the same reason :func:`is_absolute_path` checks
+    both: ``".\\"`` is a root ref Windows normalizes away and POSIX parsing keeps
+    as an ordinary one-segment name. Pair with the other two for a complete
+    "must stay inside the project, and must name something in it" guard.
+
+    The dot/space spellings are the same asymmetry one layer down. Win32 path
+    normalization strips *every* trailing period and space from a path's final
+    component, so ``". "``, ``".. "``, ``"..."`` and even ``"   "`` all name the
+    containing directory there, while both pure flavours keep them as ordinary
+    one-segment names (pathlib never applies that trim — only ``resolve()``, by
+    asking the OS, does). A component made solely of periods and spaces is
+    therefore root-naming, and that is the whole rule: ``"foo. "`` strips to
+    ``"foo"``, names a child, and is accepted.
+
+    ``".. "`` lands here rather than in :func:`has_parent_ref` because the trailing
+    space stops it matching the ``..`` relative component, so Win32 trims it to
+    empty instead of climbing — it names the root, not the parent. That reading is
+    Wine's conformance suite and Project Zero's write-up; Microsoft's own docs are
+    ambiguous on the trim-vs-relative-component ordering. Nothing rests on
+    resolving it: under the other reading ``".. "`` escapes the tree, and the
+    call sites that pair the two guards reject it either way. Plain ``".."`` is
+    unchanged and stays :func:`has_parent_ref`'s job."""
+    text = str(value)
+    if PurePosixPath(text) == PurePosixPath(".") or PureWindowsPath(text) == PureWindowsPath("."):
+        return True
+    # `/` separates on both platforms, `\` only on Windows — split on both so a
+    # value is judged by the same components Win32 would see.
+    parts = [part for part in text.replace("\\", "/").split("/") if part]
+    return bool(parts) and all(part.strip(" .") == "" and part != ".." for part in parts)
+
+
 def _retry_on_sharing_violation(op: Callable[[], None]) -> None:
     """Run ``op``, retrying the transient Windows sharing violation a concurrent
     handle on the file triggers (WinError 5/32). Gated to win32 so a real POSIX

@@ -23,7 +23,7 @@ from conftest import (
 
 import bmad_loop.install as install_mod
 from bmad_loop import verify
-from bmad_loop.adapters.profile import get_profile
+from bmad_loop.adapters.profile import ProfileError, get_profile
 from bmad_loop.install import (
     BASE_SKILLS,
     BMAD_DIR,
@@ -522,6 +522,93 @@ def test_provision_worktree_does_not_clobber_existing_skill(tmp_path):
     assert existing.read_text() == "COMMITTED"
     # a skill that was absent is still laid down
     assert (wt / claude.skill_tree / "bmad-loop-resolve" / "SKILL.md").is_file()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_copy_skills_refuses_a_skill_tree_symlinked_out_of_the_project(tmp_path):
+    # The `init` counterpart of the provision_* symlink refusals below. The profile
+    # guards are lexical and run at load, so `skill_tree` naming an ordinary
+    # project-relative directory passes all three even when that directory is a link
+    # out of the tree; only resolution sees it. This loop rmtree's under `force`, and
+    # its `_copy_traversable` call supplies neither containment root, so nothing
+    # downstream would have caught it.
+    project, outside = tmp_path / "proj", tmp_path / "outside"
+    project.mkdir()
+    outside.mkdir()
+    (project / "skills").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ProfileError, match="does not resolve inside the project"):
+        install_mod._copy_skills(project, ("skills",), False)
+
+    assert list(outside.iterdir()) == []  # nothing written through the link
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_copy_skills_refuses_a_skill_tree_that_resolves_to_the_project_root(tmp_path):
+    # `is_relative_to` is true for equal paths, so an inside-check passes a tree that
+    # resolves to the project ITSELF — the same "a path is relative to itself" hole
+    # this guard family exists to close in the seed loop. Left unguarded, the bundled
+    # skill dirs land at top level and --force-skills rmtree's any root directory
+    # whose name collides with one of them.
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "skills").symlink_to(project, target_is_directory=True)
+    decoy = project / MODULE_SKILLS[0]
+    decoy.mkdir()
+    (decoy / "PRECIOUS").write_text("KEEP", encoding="utf-8")
+
+    with pytest.raises(ProfileError, match="does not resolve inside the project"):
+        install_mod._copy_skills(project, ("skills",), True)  # force: the rmtree path
+
+    assert (decoy / "PRECIOUS").read_text() == "KEEP"  # never rmtree'd
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_init_fails_when_a_skill_tree_escapes_the_project(tmp_path, capsys):
+    # The refusal has to reach the exit code: a skipped tree leaves every later
+    # session without the skills it dispatches, and `init complete` + 0 over that is
+    # an unattended-setup trap.
+    claude = get_profile("claude")
+    # the escape target must sit outside the PROJECT, so the project cannot be
+    # tmp_path itself — a sibling under tmp_path would still resolve inside it
+    project, outside = tmp_path / "proj", tmp_path / "outside"
+    outside.mkdir()
+    (project / Path(claude.skill_tree).parent).mkdir(parents=True)
+    (project / claude.skill_tree).symlink_to(outside, target_is_directory=True)
+
+    assert install_into(project) == 1
+
+    out = capsys.readouterr().out
+    assert "does not resolve inside the project" in out
+    assert "init complete" not in out
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_copy_skills_still_installs_into_an_ordinary_tree(tmp_path):
+    # the containment check must not cost the normal path — ablation partner for
+    # the refusal above, which would otherwise pass if _copy_skills refused always
+    project = tmp_path / "proj"
+    project.mkdir()
+
+    assert install_mod._copy_skills(project, ("skills",), False) is False
+
+    for skill in MODULE_SKILLS:
+        assert (project / "skills" / skill / "SKILL.md").is_file()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_register_hooks_refuses_a_config_path_symlinked_out_of_the_project(tmp_path, capsys):
+    project, outside = tmp_path / "proj", tmp_path / "outside"
+    claude = get_profile("claude")
+    (project / Path(claude.hooks.config_path).parent).mkdir(parents=True)
+    outside.write_text('{"env":{"KEEP":"BYTE-IDENTICAL"}}\n', encoding="utf-8")
+    before = outside.read_bytes()
+    (project / claude.hooks.config_path).symlink_to(outside)
+
+    assert install_mod._register_hooks(project, claude) == 1
+
+    assert outside.read_bytes() == before  # the escape target is untouched
+    assert "escapes the project" in capsys.readouterr().out
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
