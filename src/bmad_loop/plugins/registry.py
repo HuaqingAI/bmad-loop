@@ -56,7 +56,18 @@ def _instantiate(manifest: PluginManifest, settings: dict) -> Plugin:
     ``exec_module``. Kept tiny so the registry's try/except wraps exactly the
     import + construct surface.
     """
-    module_path = Path(manifest.scripts_dir) / manifest.python.module  # type: ignore[union-attr]
+    scripts_dir = Path(manifest.scripts_dir)
+    module_path = scripts_dir / manifest.python.module  # type: ignore[union-attr]
+    # `_parse_python` rejects an absolute, parent-climbing or root-naming module at
+    # manifest load, but lexically: a project-relative name that is a symlink out of
+    # the plugin resolves fine and would be exec'd. Re-check after resolution, since
+    # what happens below is arbitrary code execution, not a copy.
+    try:
+        contained = module_path.resolve().is_relative_to(scripts_dir.resolve())
+    except (OSError, RuntimeError):
+        contained = False
+    if not contained:
+        raise ImportError(f"plugin module escapes its plugin directory: {module_path}")
     if not module_path.is_file():
         raise FileNotFoundError(f"plugin module not found: {module_path}")
     spec = importlib.util.spec_from_file_location(f"bmad_loop_plugin_{manifest.name}", module_path)

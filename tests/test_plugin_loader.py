@@ -185,6 +185,13 @@ def test_full_manifest_parses(tmp_path):
         ('[plugin]\nname = "e"\napi_version = 1\nseed_globs = ["."]\n', "seed_globs"),
         # absolute python module path
         ('[plugin]\nname = "e"\napi_version = 1\n[python]\nmodule = "/x.py"\n', "plugin-relative"),
+        # root-naming python module path. The value is `.strip()`ed before the guard,
+        # so the trailing-space spellings arrive as "." — but the trailing-DOT ones
+        # arrive intact, and Win32 trims those to the plugin dir just the same. What
+        # gets exec'd matters more than what gets copied, hence the whole family.
+        ('[plugin]\nname = "e"\napi_version = 1\n[python]\nmodule = "."\n', "plugin-relative"),
+        ('[plugin]\nname = "e"\napi_version = 1\n[python]\nmodule = "..."\n', "plugin-relative"),
+        ('[plugin]\nname = "e"\napi_version = 1\n[python]\nmodule = ". ."\n', "plugin-relative"),
         # hook with no cmd
         (
             '[plugin]\nname = "e"\napi_version = 1\n[hooks.pre_run]\nblocking = true\n',

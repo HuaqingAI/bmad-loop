@@ -10,6 +10,7 @@ misbehaving in-process plugin is isolated instead of crashing the run.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -186,6 +187,31 @@ def test_import_exception_disables_instance_run_survives(tmp_path):
     reg = PluginRegistry.build(tmp_path, policy=enable("badimport"), journal=journal)
     lp = reg.get("badimport")
     assert lp.instance is None and lp.disabled
+    assert "plugin-error" in journal.kinds()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_python_module_symlinked_out_of_the_plugin_is_never_executed(tmp_path):
+    # `_parse_python` rejects an absolute, parent-climbing or root-naming module
+    # lexically, at manifest load. A perfectly ordinary relative name that happens
+    # to be a LINK out of the plugin dir passes all three and used to reach
+    # exec_module — the one consumer where a slipped path is arbitrary code
+    # execution rather than a copy, so it re-checks after resolution.
+    pdir = write_py_plugin(tmp_path, "escapee")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    stray = outside / "evil.py"
+    stray.write_text(PY_MODULE.format(cls="Plugin"))
+    (pdir / "hooks.py").unlink()
+    (pdir / "hooks.py").symlink_to(stray)
+
+    journal = FakeJournal()
+    reg = PluginRegistry.build(tmp_path, policy=enable("escapee"), journal=journal)
+    lp = reg.get("escapee")
+
+    assert lp.instance is None and lp.disabled  # isolated, like any load failure
+    # the smoking gun: the linked module's import-time side effect never happened
+    assert not (pdir / "IMPORTED").exists()
     assert "plugin-error" in journal.kinds()
 
 

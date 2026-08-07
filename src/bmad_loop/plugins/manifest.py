@@ -172,7 +172,7 @@ def _parse_python(python_d: Any, fail) -> PythonSpec | None:
     module = str(python_d.get("module", "")).strip()
     if not module:
         raise fail("[python] requires a 'module'")
-    if is_absolute_path(module) or has_parent_ref(module):
+    if names_tree_root(module) or is_absolute_path(module) or has_parent_ref(module):
         raise fail(f"[python] module must be a plugin-relative path: got {module!r}")
     return PythonSpec(module=module, cls=str(python_d.get("class", "Plugin")) or "Plugin")
 
