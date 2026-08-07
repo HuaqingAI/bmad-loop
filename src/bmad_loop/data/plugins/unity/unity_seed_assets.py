@@ -70,6 +70,24 @@ def _has_parent_ref(value: str) -> bool:
     return ".." in PurePosixPath(value).parts or ".." in PureWindowsPath(value).parts
 
 
+def _names_tree_root(value: str) -> bool:
+    """True if ``value`` names the worktree rather than anything inside it
+    (mirrors ``bmad_loop.platform_util.names_tree_root``).
+
+    The third member of the family, and the one this script was missing. Win32
+    strips every trailing period and space from a path's final component, so
+    ``"..."`` names the worktree root there while both pure flavours read it as an
+    ordinary one-segment name. That mattered here: the caller `.strip()`s the env
+    var, which collapses the *space* spellings into ``"."`` and lets the existing
+    ``not rel.parts`` check catch them, but leaves the *dot* spellings intact —
+    and the asset-root probe below would then find the worktree itself, so the
+    payload landed in the worktree root instead of under ``Assets/``."""
+    if PurePosixPath(value) == PurePosixPath(".") or PureWindowsPath(value) == PureWindowsPath("."):
+        return True
+    parts = [part for part in value.replace("\\", "/").split("/") if part]
+    return bool(parts) and all(part.strip(" .") == "" and part != ".." for part in parts)
+
+
 def _truthy(value: str | None, default: bool) -> bool:
     if value is None or value.strip() == "":
         return default
@@ -166,10 +184,16 @@ def main() -> int:
 
     guard_dir = os.environ.get("BMAD_LOOP_UNITY_SCENE_GUARD_DIR", "").strip() or _DEFAULT_GUARD_DIR
     rel = Path(guard_dir)
-    # The install dir must stay inside the worktree: an absolute/drive-qualified
-    # path would make _install's relative_to() raise, and a ".." segment would
-    # let the copy escape the project tree.
-    if not rel.parts or _is_absolute(guard_dir) or _has_parent_ref(guard_dir):
+    # The install dir must stay inside the worktree AND name something in it: an
+    # absolute/drive-qualified path would make _install's relative_to() raise, a
+    # ".." segment would let the copy escape the project tree, and a root-naming
+    # spelling would scatter the payload across the worktree root itself.
+    if (
+        not rel.parts
+        or _names_tree_root(guard_dir)
+        or _is_absolute(guard_dir)
+        or _has_parent_ref(guard_dir)
+    ):
         print(f"unity_seed_assets: invalid scene guard dir {guard_dir!r}", file=sys.stderr)
         return 2
     target_dir = worktree / guard_dir

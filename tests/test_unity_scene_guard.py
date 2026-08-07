@@ -200,6 +200,22 @@ def test_seed_rejects_parent_traversal_guard_dir(tmp_path, monkeypatch):
     assert not (tmp_path / "escaped").exists()  # no write outside the worktree
 
 
+def test_seed_rejects_root_naming_guard_dir(tmp_path, monkeypatch):
+    mod = _load_seeder()
+    worktree = tmp_path / "wt"
+    (worktree / "Assets").mkdir(parents=True)
+    # `main()` `.strip()`s the env var, so the trailing-SPACE spellings collapse to
+    # "." and the pre-existing `not rel.parts` arm already caught them. These are
+    # the ones that survive that strip: on Windows each names the worktree itself,
+    # and the asset-root probe below the guard would then find the worktree (a real
+    # directory) and pass, scattering the payload across the worktree root.
+    for evil in ("...", "....", ". .", ".\\"):
+        _set_env(monkeypatch, worktree, guard_dir=evil)
+        assert mod.main() == 2, evil
+    assert not (worktree / mod._GUARD_CS).exists()  # payload never hit the root
+    assert not (worktree / "BmadLoop").exists()
+
+
 def test_seed_rejects_windows_flavored_escapes_on_any_platform(tmp_path, monkeypatch):
     mod = _load_seeder()
     (tmp_path / "Assets").mkdir()
