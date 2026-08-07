@@ -89,14 +89,23 @@ def _write_event(events_dir, name, event):
     symlink (or, on Windows, a junction) and redirect — or swallow — the
     completion signal, stalling the run to `session_timeout_min` instead of
     completing. `os.makedirs(exist_ok=True)` `isdir()`-checks THROUGH such a
-    link, so the refusal has to come before it; that refusal works on every
-    platform and is the whole defense on Windows, where O_NOFOLLOW/O_DIRECTORY
-    do not exist and `os.supports_dir_fd` is empty.
+    link, so the refusal has to come before it. That refusal works on every
+    platform.
 
-    Where the platform has them, the create+replace is additionally anchored to
-    a dir_fd opened O_NOFOLLOW, which closes the window between the check and
-    the write. Mode is 0o600 (narrowed from the umask-derived mode an ordinary
-    `open()` produced): only the operator running the loop reads these.
+    Where the platform has them, the create+replace is anchored to a dir_fd
+    opened O_NOFOLLOW: every later operation goes through that fd, so a swap
+    after the check cannot reach the write. Windows has neither
+    O_NOFOLLOW/O_DIRECTORY nor a handle-relative open (`os.supports_dir_fd` is
+    empty — dir_fd is implemented with the POSIX `*at` calls), so its fallback
+    re-resolves the path and the check-to-write window stays open there. It is
+    NARROWED, not closed: the redirect check runs again after the payload is
+    written and before it is published, so a swap still in place is refused and
+    the temp file removed. A swap-and-restore inside the window remains
+    undetectable from stdlib Python (#494), and degrades to the same timeout the
+    run would have hit anyway.
+
+    Mode is 0o600 (narrowed from the umask-derived mode an ordinary `open()`
+    produced): only the operator running the loop reads these.
 
     Raises OSError on any refusal or failure; the caller degrades to a no-op.
     """
@@ -127,12 +136,24 @@ def _write_event(events_dir, name, event):
         finally:
             os.close(dir_fd)
         return
+    # Fallback (Windows): no dir_fd to anchor to, so the create below re-resolves
+    # events_dir by path. A swap into a junction between the check above and this
+    # create would have put the temp file inside the attacker's directory. Check
+    # again before publishing, so a swap that is still in place is refused rather
+    # than followed — the realistic shape, since a junction has to persist to
+    # capture the events the attacker is after.
     tmp_path = os.path.join(events_dir, tmp)
     fd = os.open(tmp_path, create, 0o600)
     try:
         _write_all(fd, data)
     finally:
         os.close(fd)
+    if _is_link_like(events_dir):
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise OSError(f"events directory was redirected mid-write: {events_dir}")
     os.replace(tmp_path, os.path.join(events_dir, name))
 
 

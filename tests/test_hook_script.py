@@ -176,6 +176,35 @@ def test_is_link_like_refuses_a_reparse_tagged_dir(tmp_path, monkeypatch):
     assert relay._is_link_like(plain) is True
 
 
+def test_fallback_refuses_a_redirect_that_appears_mid_write(tmp_path, monkeypatch):
+    """The Windows fallback has no dir_fd to anchor to, so it re-resolves
+    `events_dir` by path and a swap between the check and the create lands the
+    temp file in the attacker's directory. The post-write re-check catches a
+    swap that is still in place. Driven here with the dir_fd branch disabled,
+    because on POSIX that branch is always taken and the fallback would ship
+    unexercised.
+
+    Ablation guard: deleting the post-write `_is_link_like` block makes this
+    fail — the event gets published instead of refused."""
+    relay = _relay_module()
+    events = tmp_path / "events"
+    calls = []
+    real = relay._is_link_like
+
+    def swapped_after_the_check(path):
+        calls.append(path)
+        return len(calls) > 1 and real(path) is False  # clean at check, dirty after
+
+    monkeypatch.setattr(os, "supports_dir_fd", frozenset())  # force the fallback
+    monkeypatch.setattr(relay, "_is_link_like", swapped_after_the_check)
+
+    with pytest.raises(OSError, match="redirected mid-write"):
+        relay._write_event(str(events), "1-t1-Stop.json", {"event": "Stop", "task_id": "t1"})
+
+    assert len(calls) == 2  # the check ran on both sides of the write
+    assert list(events.iterdir()) == []  # nothing published, no .tmp left behind
+
+
 @pytest.mark.skipif(os.name != "nt", reason="directory junctions are Windows-only")
 def test_junctioned_events_dir_writes_nothing_and_exits_zero(tmp_path):
     """The Windows half of the symlink test — Windows CI is its only oracle, a
