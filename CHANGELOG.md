@@ -156,12 +156,24 @@ whose seams had diverged enough that several ports needed a different fix, and t
   `""` made `provision_worktree`'s seed loop resolve source to the repo root and destination to the
   worktree — both pass its containment checks — so it copied the whole project in, untracked files
   included, then recursed into its own destination. `.`, `./` and `.\` are the same value and were
-  never rejected. `scm.worktree_seed`, a profile's `seed_files`, `skill_tree` and
-  `hooks.config_path`, and a plugin manifest's `seed_files`/`seed_globs` now refuse every spelling.
+  never rejected. Neither were the Windows spellings: Win32 strips every trailing period and space
+  from a path's final component, so `". "`, `".. "`, `"..."` and `"   "` name the root there while
+  both pure pathlib flavours read them as ordinary child names. `scm.worktree_seed`, a profile's
+  `seed_files`, `skill_tree` and `hooks.config_path`, a plugin manifest's `seed_files`/`seed_globs`
+  and its `[python] module`, and the Unity seeder's `scene_guard_dir` now refuse every spelling.
   The seed lists are shape-checked too: a bare string iterated into per-character entries that each
   passed the per-entry guard, and a scalar raised an untyped error out of the loader.
   **Behavior change:** `worktree_seed = [1]` and an int plugin seed entry are now rejected rather
   than silently `str()`-coerced.
+
+- **`init` no longer follows a config path that symlinks out of the project (#456).** The
+  profile/manifest guards are lexical and run at load, so a `skill_tree`, `hooks.config_path` or
+  plugin `[python] module` naming an ordinary project-relative directory passed all of them even
+  when that directory was a link out of the tree. `provision_worktree` already compared
+  resolved-vs-raw before writing; the `init` path reached mkdir/rmtree/write with no such check, and
+  `_copy_skills` supplied `_copy_traversable` neither containment root, so both of its legs were
+  inert there. Each now refuses after resolution — the plugin loader before `exec_module`, where a
+  slipped path is arbitrary code execution rather than a copy.
 
 - **A wrongly-typed field in a profile or plugin TOML is reported, not crashed on.** `float()`,
   `int()` and `.items()` over TOML-legal values of the wrong type raised bare
