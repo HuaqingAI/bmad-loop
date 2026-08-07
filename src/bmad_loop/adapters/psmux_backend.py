@@ -25,14 +25,18 @@ back to an index first. Per-window user options do not exist at all, so
 the window-option verbs, the ``@``-prefixed columns of ``list_windows``
 and the parked trailer route through a substitute channel — see the
 ``per-window option channel (#310)`` block below for the model and its
-rules. ``detach-client`` and ``switch-client`` report dispatch rather than
-effect — every arm exits 0 whether or not a client moved — so both seam
-booleans are measured against the session's attached-client count instead of
-read off the exit code; see the ``client verbs: observed effect (#317)``
-block. ``available()`` additionally gates on
-the reported version: psmux releases up to 3.3.6 kill recycled PIDs during
-pane/session teardown without a process-identity check, which can take down
-an unrelated long-lived process mid-run. The psmux behaviors cited in this
+rules. Session-scoped options need no such substitute — one server per
+session means that server's single map is the session's — but they cross
+the same lossy control line, so ``set_session_option`` gates its value on
+the same transportability rule (#320). ``detach-client`` and
+``switch-client`` report dispatch rather than effect — every arm exits 0
+whether or not a client moved — so both seam booleans are measured against
+the session's attached-client count instead of read off the exit code; see
+the ``client verbs: observed effect (#317)`` block. ``available()``
+additionally gates on the reported version: psmux releases up to 3.3.6 kill
+recycled PIDs during pane/session teardown without a process-identity check,
+which can take down an unrelated long-lived process mid-run. The psmux
+behaviors cited in this
 module were read from the psmux source at tag ``v3.3.7``. See
 :mod:`.multiplexer` for the contract.
 """
@@ -280,7 +284,10 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # qualified — the prune replays those values as kill-window targets, and
         # a bare one can hit another server's identically-numbered window. An
         # `@` field never reaches psmux: `#{@name}` expands from the one
-        # per-server map, so every row would carry the same value. Probe the
+        # per-server map, so every row would carry the same value. That is a
+        # WINDOW-row problem only — one server holds many windows but exactly
+        # one session, so the same expansion in session_options' list-sessions
+        # is correct by construction (see set_session_option). Probe the
         # window id in its place and fill from the id-keyed options, fetched as
         # ONE full listing — a flat extra call per list_windows, regardless of
         # row or column count (#310).
@@ -467,12 +474,54 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             return all(tok not in (";", "\\;") for tok in value.split())
         return not any(c in value for c in ";'\"")
 
+    def set_session_option(self, name: str, option: str, value: str) -> None:
+        # Session scope itself needs no substitute channel: psmux serves one
+        # session per server, so that server's single option map IS the
+        # session's map — the same model that makes per-window options unusable
+        # makes session options correct by construction (probed on 3.3.7: two
+        # sessions on two servers read back their own values). What it does
+        # share with the window channel is the lossy CLI->server control line,
+        # and this write was ungated (#320): a spaced value silently loses
+        # `\\`, a trailing `\`, and standalone `;` tokens at rc 0. A corrupted
+        # tag is non-empty and never equals the caller's tag again, so the
+        # prune skips that session forever.
+        #
+        # Refusing leaves the option UNSET, which is the correct degradation
+        # and not the lesser evil: the prune's untagged path falls back to the
+        # run dir, claiming our own dead runs and skipping foreign ones. State
+        # the bound rather than the slogan — that fallback proves ownership by
+        # run-id collision on disk, not by identity, so it skips a foreign
+        # session only while no run dir HERE shares its run id. Ids are
+        # timestamped plus two random bytes, but `--run-id` is caller-supplied,
+        # so untagged is weaker proof than a tag even though it beats a
+        # corrupted one. Both edges of that fallback are bounded in #419.
+        #
+        # The refusal frees the key rather than just returning. A session this
+        # backend just created is NOT a blank map — the server loads the user's
+        # psmux config (same shared-map basis as the option-channel block
+        # below), so this name can arrive pre-seeded. Leaving a foreign value
+        # in place would read back as a real non-matching tag and strand the
+        # session forever, which is exactly the failure the gate exists to stop.
+        if option.startswith("@") and not self._transportable(value):
+            print(
+                f"warning: set-option {option} skipped on session {name} — value does "
+                "not survive psmux's control-line transport verbatim; the key is freed "
+                "and ownership falls back to the run dir",
+                file=sys.stderr,
+            )
+            self._write_scoped(["set-option", "-u", "-t", name, option], option)
+            return
+        super().set_session_option(name, option, value)
+
     def _write_scoped(self, verb: list[str], key: str) -> None:
-        # Both mutating verbs, one body. A write that silently failed re-opens
-        # the mis-scoped prune this channel exists to close, and a silently
-        # failed `-u` leaves a live return key that replays the return move when
-        # the window's command exits — so failures are said out loud either way
-        # (the verbs stay best-effort: warn, never raise).
+        # Both window-channel mutating verbs, one body — plus the session-tag
+        # refusal's free above, which wants the same never-raise contract for
+        # the same reason. A write that silently failed re-opens the mis-scoped
+        # prune this channel exists to close, and a silently failed `-u` leaves
+        # a live return key that replays the return move when the window's
+        # command exits (or, at session scope, a pre-seeded foreign tag that
+        # strands the session) — so failures are said out loud either way (the
+        # verbs stay best-effort: warn, never raise).
         label = " ".join(verb[: verb.index("-t")])  # `set-option` / `set-option -u`
         try:
             proc = self._run(verb, check=False)

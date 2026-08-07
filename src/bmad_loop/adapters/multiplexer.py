@@ -118,7 +118,15 @@ class TerminalMultiplexer(ABC):
 
     @abstractmethod
     def set_session_option(self, name: str, option: str, value: str) -> None:
-        """Set a user option on the named session."""
+        """Set a user option on the named session. A transport failure raises
+        :class:`MultiplexerError` — unlike :meth:`set_window_option`, this write
+        is not best-effort.
+
+        A backend may still refuse a *value* it cannot carry to its server
+        verbatim (psmux does): it warns, leaves the option unset, and returns
+        without raising, because a value stored corrupted is worse than one
+        never stored. So read an unset option as "no answer" — never as proof
+        that nothing was ever written."""
 
     # ------------------------------------------------------------ windows
 
