@@ -1087,16 +1087,24 @@ def test_kill_window_unverifiable_liveness_retains_the_keys(monkeypatch):
 
 def test_failed_kill_leaves_ownership_readable_for_the_prune_retry(monkeypatch):
     # The retained key is not just unswept — it must still answer a read,
-    # because the prune retry re-identifies ownership through it.
+    # because the prune retry re-identifies ownership through it. The fake is
+    # STATEFUL on purpose: answering the read from a constant would pass even
+    # with the liveness guard deleted, since a listing that never offers the key
+    # leaves the cleanup nothing to free. `-qv` is the targeted read, bare `-q`
+    # the full listing the cleanup sweeps.
     key = "@bmad_project__blw@3"
+    store = {key: "tag-a"}
 
     def fake(argv, **kwargs):
+        out = ""
         if argv[1] == "list-windows":
             out = "@1\n@3\n"  # the kill did not land
-        elif argv[1] == "show-options" and argv[-1] == key:
-            out = "tag-a"
-        else:
-            out = ""
+        elif argv[1] == "set-option" and "-u" in argv:
+            store.pop(argv[-1], None)
+        elif argv[1] == "show-options" and "-qv" in argv:
+            out = store.get(argv[-1], "")
+        elif argv[1] == "show-options":
+            out = "".join(f'{k} "{v}"\n' for k, v in store.items())
         return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
@@ -1106,8 +1114,10 @@ def test_failed_kill_leaves_ownership_readable_for_the_prune_retry(monkeypatch):
 
 
 def test_stranded_keys_after_cleanup_crash_are_reclaimed_by_the_sweep(monkeypatch):
-    # The matrix sequence end to end: a landed kill whose key-free step dies
-    # strands the keys, and the next launch-time sweep actually claims them.
+    # The two halves of the strand-then-reclaim contract: a landed kill whose
+    # key-free step dies strands the keys, and a later sweep claims them. The
+    # sweep is driven directly here; new_parked_window's wiring to it is pinned
+    # by test_new_parked_window_sweeps_orphan_keys.
     key = "@bmad_project__blw@3"
     state = {"healed": False}
     freed = []
@@ -1457,10 +1467,12 @@ def test_sweep_unlistable_options_warns(monkeypatch, capsys):
     assert "orphan-key sweep on ctl could not list options" in capsys.readouterr().err
 
 
-def test_sweep_treats_empty_live_list_as_failed_probe(monkeypatch, tmp_path):
+def test_sweep_treats_empty_live_list_as_failed_probe(monkeypatch, tmp_path, capsys):
     # We just minted a window in this session, so an empty live listing is a
     # failed probe, not an empty session — believing it would sweep every key,
-    # live windows included.
+    # live windows included. It is also said out loud: list_window_ids raises on
+    # a transport fault and answers [] only on rc != 0, so this branch is a
+    # server failing every launch, and silence would leak keys with no signal.
     listing = '@bmad_project__blw@2 "live"\n@bmad_project__blw@7 "gone"\n'
     calls = []
 
@@ -1474,6 +1486,7 @@ def test_sweep_treats_empty_live_list_as_failed_probe(monkeypatch, tmp_path):
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     PsmuxMultiplexer().new_parked_window("ctl", "run-x", tmp_path, ["prog"], "@ret")
     assert not [c for c in calls if c[1] == "set-option"]
+    assert "orphan-key sweep on ctl could not list live windows" in capsys.readouterr().err
 
 
 def test_sweep_transport_exception_never_fails_the_mint(monkeypatch, tmp_path, capsys):

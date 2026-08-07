@@ -407,7 +407,18 @@ class PsmuxMultiplexer(BaseTmuxBackend):
     # The seam-owned key marker ("bmad-loop window"): every key this channel
     # mints ends in `<marker><digits>`, and both cleanup sweeps match keys by
     # it — keep the mint (_scoped_option_key, _parked_trailer) and the matchers
-    # (_KEY_SUFFIX, kill_window) derived from this one literal.
+    # (_KEY_SUFFIX, kill_window) derived from this one literal (within this
+    # class: _KEY_SUFFIX binds at class-body time and _scoped_option_key is
+    # static, so a subclass rebinding the marker would split mint from match).
+    #
+    # No transition rule for the pre-marker `_@<digits>` keys, deliberately
+    # (#313 floated one): a sweep matching the old shape would delete the very
+    # `@theme_@3` the marker exists to protect. They just read as foreign. The
+    # channel is unreleased, so only a dev build holds any, and the cost falls
+    # on windows parked BEFORE the upgrade: their trailer is baked in at mint
+    # (tmux_base.new_parked_window) and still reads the old key, so their tag
+    # reads unset (the prune falls back to the run dir) and their return move
+    # stops firing. Restarting the ctl server clears the map.
     _SCOPE_MARKER = "__blw@"
 
     @staticmethod
@@ -661,7 +672,16 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             if not live:
                 # A session being swept just minted a window, so an empty live
                 # list is a failed probe, not an empty session — treating it as
-                # truth would sweep every key, live windows included.
+                # truth would sweep every key, live windows included. Warned for
+                # the same reason the listing failure above is, and this is the
+                # branch that actually fires: list_window_ids RAISES on a
+                # transport fault (caught below) and answers [] only on rc != 0,
+                # so silence here is a server failing every launch with no signal.
+                print(
+                    f"warning: orphan-key sweep on {session} could not list live "
+                    "windows; orphaned keys unswept until the next launch",
+                    file=sys.stderr,
+                )
                 return
             for name in options:
                 match = self._KEY_SUFFIX.search(name)
