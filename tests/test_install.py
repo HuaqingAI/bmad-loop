@@ -2477,6 +2477,11 @@ def test_shield_tracked_hook_config_leaves_no_residue_after_teardown(project, tm
 
     provision_worktree(wt, [codex], repo)
 
+    # Checked HERE as well as after teardown, and the pair is not redundant: a shared
+    # write that teardown happens to remove would satisfy the post-teardown comparison
+    # alone. #384's harm is the window while the operator's checkout and every sibling
+    # worktree are live, which is this line, not only what survives the run.
+    assert shared.read_bytes() == before
     private = _wt_private_exclude(wt)
     assert private.is_file()  # the shield really ran: there is something to outlive
     gitdir = private.parent.parent
