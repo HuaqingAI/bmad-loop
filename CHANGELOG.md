@@ -600,16 +600,13 @@ whose seams had diverged enough that several ports needed a different fix, and t
   rather than a vacuous `True` when that is unobservable. Out-of-tree backends still returning
   `None` read as "nothing detached" — degraded, not broken.
 
-- **Gate the psmux session project tag on transportability (#320).** `_ensure_session` wrote the
-  resolved project path straight through `set_session_option`, and psmux's CLI→server control line
-  stores some shapes corrupted at rc 0 — a spaced value loses `\\`, a trailing `\` eats the closing
-  quote, and a standalone `;` token truncates the value and runs the remainder as a command. A
+- **Gate the psmux session project tag on transportability (#320).** The session tag rode psmux's
+  CLI→server control line ungated, which stores some project paths corrupted at rc 0 — and a
   corrupted tag never equals the caller's again, so the prune skipped that session forever.
-  `@`-prefixed session values now run through the same transport gate as the window channel: a
-  refusal warns, frees the key (the server loads the user's psmux config, so it can arrive
-  pre-seeded) and leaves the option unset, where the prune's run-dir fallback takes over — bounded
-  by #419. Accepted writes keep the base's raise-on-failure contract. The session tag does **not**
-  bleed across servers the way the window tag did: one server per session makes that map the
+  `@`-prefixed session values now take the same transport gate as the window channel: a refusal
+  warns, frees the key and leaves the option unset, where the prune's run-dir fallback takes over
+  (bounded by #419); accepted writes keep the base's raise-on-failure contract. Unlike the window
+  tag the session tag never bled across servers — one server per session makes that map the
   session's.
 
 - **Give psmux a working per-window option channel (#310).** psmux keeps one user-option scope per

@@ -30,13 +30,13 @@ session means that server's single map is the session's — but they cross
 the same lossy control line, so ``set_session_option`` gates its value on
 the same transportability rule (#320). ``detach-client`` and
 ``switch-client`` report dispatch rather than effect — every arm exits 0
-whether or not a client moved — so both seam
-booleans are measured against the session's attached-client count instead of
-read off the exit code; see the ``client verbs: observed effect (#317)``
-block. ``available()`` additionally gates on
-the reported version: psmux releases up to 3.3.6 kill recycled PIDs during
-pane/session teardown without a process-identity check, which can take down
-an unrelated long-lived process mid-run. The psmux behaviors cited in this
+whether or not a client moved — so both seam booleans are measured against
+the session's attached-client count instead of read off the exit code; see
+the ``client verbs: observed effect (#317)`` block. ``available()``
+additionally gates on the reported version: psmux releases up to 3.3.6 kill
+recycled PIDs during pane/session teardown without a process-identity check,
+which can take down an unrelated long-lived process mid-run. The psmux
+behaviors cited in this
 module were read from the psmux source at tag ``v3.3.7``. See
 :mod:`.multiplexer` for the contract.
 """
