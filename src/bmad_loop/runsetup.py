@@ -148,9 +148,12 @@ def config_digest(
       ``interactive_env`` and every token there traces back to one of
       ``binary`` / ``launch_args`` / ``bypass_args`` / ``model_flag`` /
       ``prompt_template`` / ``env`` on the *resolved* profile, or to
-      ``extra_args`` on the resolved adapter. The opencode-http ``_serve_argv``
-      reads the same two sources; its ``_session_env`` adds one *generated*
-      variable on top of them, which the ``skill_tree`` bullet below accounts for.
+      ``extra_args`` on the resolved adapter. The opencode-http builder reads a
+      strict SUBSET of those — ``_serve_argv`` takes ``binary`` and the adapter's
+      ``extra_args`` and nothing else, and ``_session_env`` layers
+      ``profile.env`` plus one *generated* variable, which the ``skill_tree``
+      bullet below accounts for. See the union paragraph on why the subset does
+      not narrow what is hashed.
     * ``hookless`` — the transport, because it decides *which of those two argv
       builders runs at all*. See the paragraph below on why a hard-coded token is
       not the same thing as a safe one.
@@ -186,6 +189,25 @@ def config_digest(
     is a literal, and the argv is still attacker-controlled — walking the consumer
     means asking what the *launched program* does with a token, not only where the
     token came from.
+
+    The payload is the UNION of those fields across transports, not the subset
+    the role's builder actually reads, and that costs a known false positive:
+    ``adapter.extra_args`` REPLACES ``bypass_args`` rather than extending it, so
+    for a role that sets it the hashed ``bypass_args`` is dead, and rewriting the
+    dead field alone moves this digest without moving one token of the launched
+    argv. Under ``hookless``, ``bypass_args`` / ``launch_args`` / ``model_flag``
+    are dead the same way. Hashing the effective projection instead means
+    restating two builders' precedence rules inside the control that polices
+    them, where drift is silent and lands in the UNDER-covering direction — the
+    failure this function has already made four times by reasoning from one
+    builder. Over-coverage fails the other way, loudly: ``sweep-auto-failed`` +
+    notify, with the message naming ``bmad-loop sweep`` as the human-present path.
+    Not free (the refusal burns the trigger for the life of the run, #501), but it
+    needs a writer, and nothing under ``src/`` writes ``.bmad-loop/profiles/*.toml``
+    at all — that overlay is hand-authored, and the TUI settings screen writes
+    ``policy.toml`` (``extra_args`` included). So a dead-field rewrite arriving
+    mid-run is a config change nobody automated made under a running loop, which
+    is the condition this gate reports rather than a false alarm to suppress.
 
     Deliberately EXCLUDED:
 
