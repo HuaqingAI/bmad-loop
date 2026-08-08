@@ -182,6 +182,20 @@ def config_digest(
       token, program, or variable enters through the flip. What it can do is
       strand a run on a transport its CLI does not speak, which is a denial the
       config writer already has by simply breaking this digest.
+    * ``usage_parser`` — and with it the rest of the token-budget surface. It
+      selects a read-only tally over a transcript the orchestrator opens anyway
+      and decides no program, flag, or variable. Rewriting it to ``"none"`` DOES
+      make the mid-session guard inert (``tokens.read_usage`` returns None for
+      anything it does not recognize, so ``_sample_weighted_usage`` never trips
+      and the session drops out of accounting) — but the guard's own controls are
+      ``limits.session_budget_mode`` / ``max_tokens_per_session`` /
+      ``cache_read_weight``, which sit in the ``[limits]`` excluded above and
+      which the child sweep re-reads fresh from disk. ``session_budget_mode =
+      "off"`` silences the guard in one line and more completely (it never
+      samples at all), so pinning the parser bolts a side door in a wall whose
+      main door is held open on purpose. Admitting it also widens the rule from
+      the launch surface to the launch surface *plus safety knobs*, which is
+      ``[limits]`` — the whole-file hash the second paragraph exists to reject.
     * ``[plugins.<name>]`` settings — an enabled plugin's resolved settings do
       reach exec (``bus.py`` exports each as ``BMAD_LOOP_SETTING_*`` into a
       ``shell=True`` hook, and the Unity plugin turns one into an ``--editor-path``
