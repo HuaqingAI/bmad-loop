@@ -189,6 +189,37 @@ def config_digest(
 
     Deliberately EXCLUDED:
 
+    * The *bytes* behind ``binary``/``launch_args`` — this pins the launch
+      target's SPELLING, not its content. A project-local target (``binary`` a
+      path into the tree, or ``python`` with the program in ``launch_args``) can
+      be rewritten in place with no config field moving. The gap is real and
+      unguarded: ``profile.py`` requires only a non-empty ``binary`` string, while
+      the three sibling path fields (``hooks.config_path``, ``skill_tree``,
+      ``seed_files``) all reject absolute and parent refs.
+
+      NOT excluded on "the parent execs it too" — that defence is false for the
+      ``triage`` role. Base ``Engine`` wires only dev+review; ``sweep.py`` holds
+      the only ``adapters["triage"]`` assignment and the only two ``role="triage"``
+      dispatches, so a ``[adapter.triage]`` profile override's target is exec'd by
+      a sweep and by nothing else. ``sweep.auto = "run-end"`` and worktree
+      isolation give two more shapes where the child is the uniquely exposed one.
+
+      Excluded because a hash cannot identify the target. Which ``launch_args``
+      token names a file is undecidable (``-i`` vs ``tools/agent.py``);
+      digest-time resolution is not the tmux shell's; and one indirection defeats
+      it — this repo's own ``write_script_launcher`` is a stub that execs an
+      interpreter on a sidecar, so hashing the stub misses the payload. Nor is
+      the target ours to pin: it is normally a third-party CLI that self-updates,
+      and a mid-run update would move a content hash and burn the auto-sweep
+      trigger for the life of the run (``_maybe_auto_sweep`` records the trigger
+      BEFORE calling the factory, and early-returns on it forever after).
+      Confinement is the instrument, not hashing — and as a ``validate`` warning
+      rather than a refusal, since "resolves inside the project" does not decide
+      it either: under an active project venv ``which("python")`` IS
+      ``<project>/.venv/bin/python``, and this repo's own zero-token E2E gate
+      configures ``binary`` at ``<sandbox>/.bmad-loop/fake-cli.sh``. Tracked as
+      #500, to land with #499's fix option 3; unreachable on stock config (all six
+      shipped profiles are bare PATH names).
     * ``hooks.config_path`` — the relay is issue #461's points 1-3, hardened on
       its own track; folding it in would fire on an ordinary ``bmad-loop init``.
     * ``adapter.model`` — it cannot introduce an argv token, only fill the value
@@ -199,18 +230,30 @@ def config_digest(
       ``cwd/skill_tree`` in that ``OPENCODE_CONFIG_CONTENT`` as ``skills.paths``,
       so a rewritten tree points the unattended child sweep at instructions of the
       writer's choosing. Excluded because the pointer is not the door — the
-      content is, and the content is writable in place. Nothing hashes or reseeds
-      a skill: ``_copy_skills`` skips an existing skill dir absent
-      ``--force-skills`` and both ``provision_worktree`` seeds are per-file
-      no-clobber (pinned by
-      ``test_provision_worktree_does_not_clobber_existing_skill``), while the
-      sweep's triage session runs at ``workspace.root`` — the main checkout, never
-      a unit worktree, since ``sweep.py`` swaps the workspace only around bundle
-      execution. So editing ``.claude/skills/bmad-loop-sweep/SKILL.md`` in place
-      reaches the same child with no config change at all, and therefore no digest
-      to move; pinning the redirect would close the costlier of two routes to one
-      door. Skill-content integrity is a real question and not one a config hash
-      can answer.
+      content is, and the content is reachable with no config change at all, so
+      there is no digest to move either way. The triage session that consumes
+      ``bmad-loop-sweep`` runs at ``workspace.root`` — the main checkout, never a
+      unit worktree, since ``sweep.py`` swaps the workspace only around bundle
+      execution — and a driven session can write that copy: worktrees mount under
+      ``.bmad-loop/runs/`` INSIDE the main checkout, and nothing confines a
+      session's writes to its cwd (this docstring's opening premise). Nothing
+      hashes or reseeds a skill in place: ``_copy_skills`` skips an existing skill
+      dir absent ``--force-skills``.
+
+      Be precise about the worktree case, because the obvious reading is wrong:
+      under ``isolation = "worktree"`` a session editing the skill tree *in its
+      own worktree* does NOT reach that child. A gitignored tree is absent from a
+      fresh ``git worktree add`` checkout, so ``provision_worktree`` seeds it from
+      the WHEEL (``resources.files("bmad_loop.data")``) — the per-file no-clobber
+      that ``test_provision_worktree_does_not_clobber_existing_skill`` pins only
+      preserves a file the destination already has, which is the *tracked*
+      skill-tree case that test's own docstring names. The two copies then never
+      share bytes: the worktree-local exclude blocks staging and ``git merge``
+      moves only tracked content. The route above (absolute path into the main
+      checkout) is what carries this bullet, not in-worktree editing.
+
+      Skill-content integrity is a real question and not one a config hash can
+      answer.
     * ``usage_parser`` — and with it the rest of the token-budget surface. It
       selects a read-only tally over a transcript the orchestrator opens anyway
       and decides no program, flag, or variable. Rewriting it to ``"none"`` DOES
