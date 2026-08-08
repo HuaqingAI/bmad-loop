@@ -31,6 +31,16 @@ if TYPE_CHECKING:
     from .workspace import Workspace
 
 
+# How many candidate `refs/attempt-preserve-dirty/*` names one rollback may probe
+# before giving up (the base name plus -r2..-r100). Deliberately not a policy
+# field: it is a runaway backstop, not a tuning knob — `scm.preserve_keep`
+# (default 20) already prunes this namespace at every run start, so needing even
+# a dozen candidates for ONE {slug}-{baseline}-{attempt} triple means something
+# upstream is wrong. The cost of the bound is one git spawn per candidate on a
+# path that only runs while a crashed attempt is being rolled back.
+PRESERVE_REF_PROBE_LIMIT = 100
+
+
 class RecoveryFlow:
     """Roll back or pause a stopped/abandoned attempt, parking any work it did on
     named recovery refs before the reset.
@@ -438,11 +448,41 @@ class RecoveryFlow:
         # Uncaught it would crash the rollback here — the one thing this handler
         # exists to prevent — so a probe that cannot run degrades into the same
         # "preservation is observation" path as a snapshot that cannot be written.
+        # The scan is BOUNDED: it terminates on its own (the ref set is finite and
+        # `serial` only climbs), but termination is not a bound — the iteration
+        # count is whatever the namespace happens to hold, one git spawn apiece, in
+        # the middle of a crash-recovery path. PROBE_LIMIT turns "trust the
+        # namespace is small" into an enforced invariant, and exhausting it raises
+        # rather than reusing the last candidate: falling through to an occupied
+        # name is the precise data loss this probe exists to prevent (#349).
+        #
+        # The probe is check-then-write, not atomic: `snapshot_worktree` finishes on a
+        # plain two-arg `update-ref`, which overwrites whatever is there rather than
+        # failing if the name were taken in between. Safe here because each name has
+        # exactly one possible writer, on two independent grounds — the control loop
+        # is sequential (nothing in this path threads, so one run never has two
+        # rollbacks in flight), and the name is keyed on `run_id`, so separate runs
+        # address disjoint namespaces. Only two processes driving the SAME run could
+        # collide, and they would already be racing on run state, worktrees and mux
+        # sessions; the remedy for that is run-level exclusion, not a compare-and-swap
+        # on this one ref.
         base_ref = f"refs/attempt-preserve-dirty/{slug}-{baseline[:8]}-{task.attempt}"
         ref = base_ref
         serial = 2
         try:
             while verify.ref_exists(workspace.root, ref):
+                if serial > PRESERVE_REF_PROBE_LIMIT:
+                    # Remedy has to hold at BOTH ends of the preserve_keep range:
+                    # "lower it" is impossible at 0, which is precisely the setting
+                    # (pruning disabled) that lets this namespace grow far enough to
+                    # exhaust the probe in the first place.
+                    raise verify.PreserveRefExhaustedError(
+                        f"no free snapshot refname for {base_ref}: "
+                        f"{PRESERVE_REF_PROBE_LIMIT} candidates through -r{serial - 1} "
+                        f"are all taken (prune refs/attempt-preserve-dirty/*, or set "
+                        f"scm.preserve_keep to a positive value below that limit — "
+                        f"0 disables pruning entirely)"
+                    )
                 ref = f"{base_ref}-r{serial}"
                 serial += 1
             parked = verify.snapshot_worktree(
