@@ -151,6 +151,9 @@ def config_digest(
       ``extra_args`` on the resolved adapter. The opencode-http ``_serve_argv``
       reads the same two sources; its ``_session_env`` adds one *generated*
       variable on top of them, which the ``skill_tree`` bullet below accounts for.
+    * ``hookless`` — the transport, because it decides *which of those two argv
+      builders runs at all*. See the paragraph below on why a hard-coded token is
+      not the same thing as a safe one.
 
     Three of those are easy to lose, and each was lost in an earlier cut of this
     function — which is why the rule above is stated rather than the list.
@@ -167,6 +170,23 @@ def config_digest(
     ``shlex.quote``\\ s it, which bounds it to ONE token — no word-splitting — but
     one token is enough for the ``--opt=value`` form.
 
+    ``hookless`` was the fourth, and it was excluded here on a reading that turned
+    out to be wrong, so the correction is worth keeping: *a hard-coded argv token
+    is not the same thing as a safe one.* Flipping ``hooks.dialect`` to ``"none"``
+    does not add a token — it swaps the whole builder, dropping ``launch_args``,
+    the prompt and the ``bypass_args`` fallback and putting the literal ``"serve"``
+    at argv[1], which ``_spawn_server`` then runs with ``cwd`` at the workspace
+    root. To a CLI that is a subcommand and a bad one dies in the health poll. To
+    an *interpreter* — a profile whose ``binary`` is ``python``/``sh``/``node``
+    with the real program in ``launch_args``, which nothing forbids — argv[1] is a
+    **script path resolved against the agent-writable tree**, and the exec happens
+    before the health poll it fails (three times: ``SPAWN_ATTEMPTS``). ``binary``
+    being pinned does not save it: the attacker inherits whichever binary the
+    project configured and only has to write a file named ``serve``. So the token
+    is a literal, and the argv is still attacker-controlled — walking the consumer
+    means asking what the *launched program* does with a token, not only where the
+    token came from.
+
     Deliberately EXCLUDED:
 
     * ``hooks.config_path`` — the relay is issue #461's points 1-3, hardened on
@@ -174,18 +194,6 @@ def config_digest(
     * ``adapter.model`` — it cannot introduce an argv token, only fill the value
       slot behind ``model_flag``, which IS pinned here. Pinning it would refuse an
       auto-sweep after a human's mid-run model change in the TUI.
-    * ``hooks.dialect`` (and so the ``hookless`` property derived from it) — it
-      selects the *transport*, not the launch surface. Flipping it moves
-      ``make_adapters`` between the multiplexer adapter and the HTTP/SSE one, but
-      ``opencode_http._serve_argv`` builds its argv from the same pinned
-      ``binary`` and ``extra_args`` plus tokens hard-coded in Python, so the flip
-      introduces no program and no flag. It is NOT env-neutral — ``_session_env``
-      layers the pinned ``profile.env`` and then adds ``OPENCODE_CONFIG_CONTENT``,
-      generated JSON carrying ``skill_tree`` and the model, both excluded below
-      and above on their own merits. What the flip can do is exec the pinned
-      ``binary`` in ``serve`` mode: a CLI that does not speak it dies in the
-      health poll, stranding the run — a denial the config writer already has by
-      simply breaking this digest.
     * ``skill_tree`` — the one profile field reaching a launched session's env
       without passing through argv. For a hookless role ``_config_content`` plants
       ``cwd/skill_tree`` in that ``OPENCODE_CONFIG_CONTENT`` as ``skills.paths``,
@@ -270,6 +278,11 @@ def config_digest(
             # template formatted, and it need not reference {prompt} at all.
             "prompt_template": prof.prompt_template,
             "env": dict(prof.env),
+            # The transport, because it rewrites the argv WHOLESALE rather than
+            # adding a token: hookless drops launch_args/prompt/bypass_args and
+            # substitutes `serve --port … --print-logs`, whose literal "serve" an
+            # interpreter binary reads as a cwd-relative script path.
+            "hookless": prof.hookless,
             # None (inherit profile.bypass_args) is NOT the same state as () (an
             # explicit override to no flags at all); json.dumps keeps them apart.
             "extra_args": None if cfg.extra_args is None else list(cfg.extra_args),

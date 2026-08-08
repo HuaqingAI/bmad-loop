@@ -155,7 +155,8 @@ whose seams had diverged enough that several ports needed a different fix, and t
 - **The auto-sweep child refuses config a session rewrote under the run (#461).** `policy.toml` and
   `profiles/*.toml` sit in the agent-writable workspace and reach host code execution — the
   `[verify] commands` run with `shell=True`, the resolved profile plus `adapter.extra_args` decide
-  the launch argv and env, and `[plugins] enabled` gates in-process Python import. A run freezes its
+  the launch argv and env, `hooks.dialect` decides which argv builder runs at all, and
+  `[plugins] enabled` gates in-process Python import. A run freezes its
   policy at launch, but the auto-triggered child sweep re-reads both from disk; it is now pinned to
   a launch-time digest of those fields and refuses on a mismatch (`sweep-auto-failed` + notify, the
   parent run continues). The config is read once and frozen, so the gate hashes the same bytes the

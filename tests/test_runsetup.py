@@ -180,6 +180,27 @@ def test_digest_ignores_the_adapter_model(pinned):
     assert _digest(pinned, _with_adapter_key('model = "some-other-model"')) == _digest(pinned)
 
 
+def test_digest_moves_when_the_transport_flips_to_hookless(pinned):
+    """`hooks.dialect = "none"` swaps the argv BUILDER, not a token in it:
+    `make_adapters` routes to the HTTP adapter, whose `_serve_argv` drops
+    `launch_args`, the prompt and the `bypass_args` fallback and puts the literal
+    "serve" at argv[1] — run with `cwd` at the workspace root. Against an
+    interpreter `binary` (python/sh/node, the real program in `launch_args` —
+    nothing forbids that shape) argv[1] is a script path resolved out of the tree
+    every driven session can write, and the spawn precedes the health poll it
+    fails. Pinning `binary` does not cover it, because the attacker inherits the
+    binary rather than choosing it. None of the hook fields deleted here are
+    hashed (see the `config_path` exclusion above), so only the transport moves."""
+    before = _digest(pinned)
+    _rewrite_profile(
+        pinned,
+        'dialect = "claude-settings-json"\nconfig_path = ".mycli/settings.json"\n'
+        'events = { SessionStart = "SessionStart", Stop = "Stop" }',
+        'dialect = "none"',
+    )
+    assert _digest(pinned) != before
+
+
 def test_digest_covers_a_profile_overlay_that_did_not_exist_at_launch(tmp_path):
     """The create path, which is where two shipped tools got this exact class wrong:
     a protection that covers an EXISTING config file but not a MISSING one (Cursor
@@ -207,8 +228,13 @@ def test_digest_covers_a_profile_overlay_that_did_not_exist_at_launch(tmp_path):
     )
     assert _digest(tmp_path, policy_text) == at_launch
 
+    # Hooked, matching the builtin's transport, so the mover here is the launch
+    # surface itself rather than the `hookless` flip covered by its own test.
     (profiles / "claude.toml").write_text(
-        'name = "claude"\nbinary = "rogue-cli"\n\n[hooks]\ndialect = "none"\n', encoding="utf-8"
+        'name = "claude"\nbinary = "rogue-cli"\n\n[hooks]\n'
+        'dialect = "claude-settings-json"\nconfig_path = ".claude/settings.json"\n'
+        'events = { SessionStart = "SessionStart", Stop = "Stop" }\n',
+        encoding="utf-8",
     )
     assert _digest(tmp_path, policy_text) != at_launch
 
