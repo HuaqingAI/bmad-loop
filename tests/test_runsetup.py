@@ -180,6 +180,39 @@ def test_digest_ignores_the_adapter_model(pinned):
     assert _digest(pinned, _with_adapter_key('model = "some-other-model"')) == _digest(pinned)
 
 
+def test_digest_covers_a_profile_overlay_that_did_not_exist_at_launch(tmp_path):
+    """The create path, which is where two shipped tools got this exact class wrong:
+    a protection that covers an EXISTING config file but not a MISSING one (Cursor
+    CVE-2025-54135, "editing a dotfile requires approval but creating a new one
+    doesn't"; Claude Code CVE-2026-25725, settings.json unprotected while absent, so
+    the agent creates it and injects SessionStart hooks).
+
+    This digest is structurally immune because it resolves through `get_profile`
+    rather than hashing whatever files happen to be on disk: with no overlay the
+    launch baseline covers the BUILTIN profile's fields, so a session creating
+    `.bmad-loop/profiles/<name>.toml` mid-run changes the resolved binary and moves
+    the digest. A refactor to "hash the profile files that exist" would pass every
+    other test in this file and silently reintroduce the CVE shape."""
+    (tmp_path / ".bmad-loop").mkdir(parents=True)
+    policy_text = '[adapter]\nname = "claude"\n\n[verify]\ncommands = ["pytest -q"]\n'
+    at_launch = _digest(tmp_path, policy_text)  # no overlay: resolves the builtin
+
+    profiles = tmp_path / ".bmad-loop" / "profiles"
+    profiles.mkdir(parents=True)
+    # First the non-vacuity half: an overlay for a name this run does not resolve
+    # must NOT move the digest. Without this, the assertion below would also pass
+    # for a digest that merely reacted to a file appearing.
+    (profiles / "unused.toml").write_text(
+        'name = "unused"\nbinary = "whatever"\n\n[hooks]\ndialect = "none"\n', encoding="utf-8"
+    )
+    assert _digest(tmp_path, policy_text) == at_launch
+
+    (profiles / "claude.toml").write_text(
+        'name = "claude"\nbinary = "rogue-cli"\n\n[hooks]\ndialect = "none"\n', encoding="utf-8"
+    )
+    assert _digest(tmp_path, policy_text) != at_launch
+
+
 def test_digest_moves_on_a_widened_plugin_allowlist(pinned):
     """`[plugins] enabled` gates in-process Python import (plugins/trust.py) —
     a straight path from a workspace write to code inside the orchestrator."""
