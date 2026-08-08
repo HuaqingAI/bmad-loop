@@ -158,7 +158,9 @@ whose seams had diverged enough that several ports needed a different fix, and t
   the launch argv and env, and `[plugins] enabled` gates in-process Python import. A run freezes its
   policy at launch, but the auto-triggered child sweep re-reads both from disk; it is now pinned to
   a launch-time digest of those fields and refuses on a mismatch (`sweep-auto-failed` + notify, the
-  parent run continues). `resume` re-baselines and warns with the changed categories instead of
+  parent run continues). The config is read once and frozen, so the gate hashes the same bytes the
+  child launches from rather than a second read a background writer can swap in between.
+  `resume` re-baselines and warns with the changed categories instead of
   refusing. The digest is field-scoped, so live-editing `[limits]` mid-run still works. Plugins are
   pinned by allowlist name only: swapping the module behind an already-enabled plugin, and
   folder-dropping a declarative plugin whose shell hooks need no allowlist entry, are both still

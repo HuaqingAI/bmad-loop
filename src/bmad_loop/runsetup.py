@@ -36,7 +36,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from . import bmadconfig
 from . import policy as policy_mod
@@ -51,10 +51,28 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from .adapters.base import CodingCLIAdapter
+    from .adapters.profile import CLIProfile
     from .engine import Engine
     from .policy import Policy
     from .stories_engine import StoriesEngine
     from .sweep import SweepEngine
+
+    class MakeAdapters(Protocol):
+        """Call shape of :func:`make_adapters`, which ``compose_*`` takes injected.
+
+        Spelled as a Protocol rather than a ``Callable`` alias only so the
+        keyword-only ``profiles`` freeze below is part of the injected contract:
+        a frontend that supplies its own factory has to accept the pre-resolved
+        profiles, or silently re-read them from disk."""
+
+        def __call__(
+            self,
+            project: Path,
+            run_dir: Path,
+            policy: Policy,
+            *,
+            profiles: dict[str, CLIProfile] | None = None,
+        ) -> dict[str, CodingCLIAdapter]: ...
 
 
 # The three adapter roles a run wires. Defined here (the composition layer that
@@ -63,7 +81,42 @@ if TYPE_CHECKING:
 ROLES = ("dev", "review", "triage")
 
 
-def config_digest(policy: Policy, project: Path) -> str:
+def resolve_profiles(policy: Policy, project: Path) -> dict[str, CLIProfile]:
+    """Resolve every role's :class:`CLIProfile` from disk **once**, as a mapping
+    the caller can then hand to both :func:`config_digest` and
+    :func:`make_adapters` so the two agree on the same bytes.
+
+    This exists for the child-sweep gate (#461 point 4). ``config_digest`` and
+    ``make_adapters`` each used to call ``get_profile`` on their own, which made
+    the gate a check-then-use over two *separate* reads of an agent-writable
+    file: a session that leaves a background writer flipping
+    ``.bmad-loop/profiles/*.toml`` between a benign and a hostile copy needs only
+    the digest's read to catch the benign one and the adapter's read to catch the
+    other. That race is cheap to retry — a lost round raises `sweep-auto-failed`,
+    which `_maybe_auto_sweep` swallows, and the next auto-sweep trigger deals
+    again — so "narrow window" is not a defense. Resolving once and threading the
+    result removes the second read rather than shrinking the window.
+
+    The policy half needs no equivalent: ``cli._sweep_factory`` already loads
+    ``policy.toml`` once and passes that one frozen ``Policy`` to both the gate
+    and the composition. Profiles were the only surface read twice.
+
+    Deduplicated by profile name, so the common single-CLI policy touches disk
+    once rather than three times. ``ProfileError`` propagates.
+    """
+    from .adapters.profile import get_profile
+
+    by_name: dict[str, CLIProfile] = {}
+    for role in ROLES:
+        name = policy.adapter.resolved(role).name
+        if name not in by_name:
+            by_name[name] = get_profile(name, project)
+    return {role: by_name[policy.adapter.resolved(role).name] for role in ROLES}
+
+
+def config_digest(
+    policy: Policy, project: Path, *, profiles: dict[str, CLIProfile] | None = None
+) -> str:
     """sha256 over the agent-writable config that reaches **host** code execution.
 
     The driven sessions can write anywhere under the project tree, including
@@ -112,6 +165,15 @@ def config_digest(policy: Policy, project: Path) -> str:
     * ``adapter.model`` — it cannot introduce an argv token, only fill the value
       slot behind ``model_flag``, which IS pinned here. Pinning it would refuse an
       auto-sweep after a human's mid-run model change in the TUI.
+    * ``hooks.dialect`` (and so the ``hookless`` property derived from it) — it
+      selects the *transport*, not the launch surface. Flipping it moves
+      ``make_adapters`` between the multiplexer adapter and the HTTP/SSE one, but
+      ``opencode_http._serve_argv`` builds its argv from the same pinned
+      ``binary`` and ``extra_args`` plus tokens hard-coded in Python, and
+      ``_session_env`` layers the same pinned ``profile.env``: no attacker-chosen
+      token, program, or variable enters through the flip. What it can do is
+      strand a run on a transport its CLI does not speak, which is a denial the
+      config writer already has by simply breaking this digest.
     * ``[plugins.<name>]`` settings — an enabled plugin's resolved settings do
       reach exec (``bus.py`` exports each as ``BMAD_LOOP_SETTING_*`` into a
       ``shell=True`` hook, and the Unity plugin turns one into an ``--editor-path``
@@ -141,13 +203,18 @@ def config_digest(policy: Policy, project: Path) -> str:
     the live policy carries TUPLES where a persisted round-trip yields lists, and
     a raw compare then reports "changed" every single time. ``ProfileError``
     propagates — an unresolvable profile already aborts at :func:`make_adapters`.
+
+    ``profiles`` is an already-resolved mapping from :func:`resolve_profiles`.
+    Pass it wherever the digest gates something that then *runs* under the same
+    config, so the bytes hashed here are the bytes launched rather than a second
+    read of a file the sessions can rewrite in between; omit it to resolve fresh.
     """
-    from .adapters.profile import get_profile
+    profiles = profiles if profiles is not None else resolve_profiles(policy, project)
 
     launch: dict[str, dict[str, object]] = {}
     for role in ROLES:
         cfg = policy.adapter.resolved(role)
-        prof = get_profile(cfg.name, project)
+        prof = profiles[role]
         launch[role] = {
             "binary": prof.binary,
             "launch_args": list(prof.launch_args),
@@ -169,7 +236,17 @@ def config_digest(policy: Policy, project: Path) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
-def make_adapters(project: Path, run_dir: Path, policy) -> dict[str, CodingCLIAdapter]:
+def make_adapters(
+    project: Path,
+    run_dir: Path,
+    policy,
+    *,
+    profiles: dict[str, CLIProfile] | None = None,
+) -> dict[str, CodingCLIAdapter]:
+    """Build the per-role adapters. ``profiles`` is an already-resolved mapping
+    from :func:`resolve_profiles`; when given, no profile is re-read from disk, so
+    a caller that gated on :func:`config_digest` launches the *same* bytes it
+    validated (#461 point 4). Omitted, each role resolves fresh as before."""
     from .adapters.generic import GenericAdapter, GenericDevAdapter
     from .adapters.multiplexer import fold_version, get_multiplexer, mux_usable
     from .adapters.profile import ProfileError, get_profile
@@ -192,10 +269,13 @@ def make_adapters(project: Path, run_dir: Path, policy) -> dict[str, CodingCLIAd
         synthesizes = role in ("dev", "review") and policy.dev.skill == "bmad-dev-auto"
         key = (cfg, synthesizes)
         if key not in by_cfg:
-            try:
-                profile = get_profile(cfg.name, project)
-            except ProfileError as e:
-                raise SystemExit(f"error: {e}") from e
+            if profiles is not None:
+                profile = profiles[role]
+            else:
+                try:
+                    profile = get_profile(cfg.name, project)
+                except ProfileError as e:
+                    raise SystemExit(f"error: {e}") from e
             if profile.hookless:
                 # Hookless profiles (opencode-http) are driven over HTTP/SSE —
                 # the tmux adapters below cannot host them.
@@ -534,13 +614,19 @@ def compose_sweep(
     repeat: bool | None,
     max_cycles: int | None,
     trigger: str,
-    make_adapters: Callable[[Path, Path, Policy], dict[str, CodingCLIAdapter]],
+    make_adapters: MakeAdapters,
     sweep_engine_cls: type[SweepEngine],
     trusted_config_digest: str,
+    profiles: dict[str, CLIProfile] | None = None,
 ) -> ComposedRun:
     """Stand up a sweep run: allocate the run dir, persist state + pid, record the
     sweep options, build the adapters, and wire the ``SweepEngine`` — everything
     ``cli._start_sweep`` did inline before ``engine.run()``.
+
+    ``profiles`` carries an already-resolved :func:`resolve_profiles` mapping down
+    to ``make_adapters``. The child-sweep factory passes the same one it gated on,
+    so the adapters are built from the validated bytes instead of a fresh read of
+    an agent-writable file (#461 point 4); ``cmd_sweep`` (human-present) omits it.
 
     ``sweep.json`` freezes the launch options so a resume rebuilds the same sweep
     (see :func:`compose_resume`). ``make_adapters`` and ``sweep_engine_cls`` are
@@ -575,7 +661,7 @@ def compose_sweep(
     sweep_tmp = sweep_path.with_suffix(".json.tmp")
     sweep_tmp.write_text(json.dumps(options, indent=2), encoding="utf-8")
     atomic_replace(sweep_tmp, sweep_path)
-    adapters = make_adapters(project, run_dir, policy)
+    adapters = make_adapters(project, run_dir, policy, profiles=profiles)
     journal.append("run-start", run_id=run_id, run_type="sweep", trigger=trigger)
     engine: Engine = sweep_engine_cls(
         paths=paths,

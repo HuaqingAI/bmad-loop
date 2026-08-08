@@ -192,7 +192,7 @@ def _reject_isolation_conflict(paths: bmadconfig.ProjectPaths, pol) -> int | Non
     return 1
 
 
-def _trusted_config_digest(pol, project: Path) -> str:
+def _trusted_config_digest(pol, project: Path, *, profiles=None) -> str:
     """The launch-time integrity baseline the auto-sweep child is held to (#461
     point 4). Thin wrapper over :func:`runsetup.config_digest` for the two
     human-initiated entrypoints that stamp one (`cmd_run`, `_resume_paused_run`)
@@ -203,11 +203,15 @@ def _trusted_config_digest(pol, project: Path) -> str:
     `make_adapters` renders that as `error: unknown CLI profile ...` and exits 1,
     so re-raise it in the same shape rather than letting a `ProfileError`
     traceback escape a misconfigured `run`. The child-sweep gate deliberately does
-    NOT go through here — there a raise is the point."""
+    NOT go through here — there a raise is the point.
+
+    `profiles` forwards an already-resolved `runsetup.resolve_profiles` mapping,
+    so the stamped pin is taken from the same resolution the caller gated on and
+    the adapters are built from — never a fresh read."""
     from .adapters.profile import ProfileError
 
     try:
-        return runsetup.config_digest(pol, project)
+        return runsetup.config_digest(pol, project, profiles=profiles)
     except ProfileError as e:
         raise SystemExit(f"error: {e}") from e
 
@@ -1375,11 +1379,17 @@ def _start_sweep(
     max_cycles: int | None = None,
     trigger: str,
     run_id: str | None = None,
+    profiles=None,
 ) -> int:
     # The composition (run dir + state + pid + sweep.json + adapters + engine)
     # lives in runsetup; this stays compose -> render. SweepEngine and
     # _make_adapters are handed in from this module's namespace so the test suite's
     # `monkeypatch.setattr(cli, "SweepEngine"/"_make_adapters", ...)` still applies.
+    #
+    # `profiles` is the auto-sweep gate's frozen resolution (#461 point 4) — it
+    # both stamps the pin and builds the adapters, so neither re-reads
+    # profiles/*.toml after the gate compared it. `cmd_sweep` passes None: a human
+    # started that one, so a fresh read is the point.
     composed = runsetup.compose_sweep(
         project=project,
         paths=paths,
@@ -1393,7 +1403,8 @@ def _start_sweep(
         trigger=trigger,
         make_adapters=_make_adapters,
         sweep_engine_cls=SweepEngine,
-        trusted_config_digest=_trusted_config_digest(pol, project),
+        trusted_config_digest=_trusted_config_digest(pol, project, profiles=profiles),
+        profiles=profiles,
     )
     print(f"sweep {composed.run_id} starting (attach: bmad-loop attach)")
     summary = composed.engine.run()
@@ -1408,25 +1419,36 @@ def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest
     ``trusted_digest`` is the caller's launch-time :func:`runsetup.config_digest`
     — the integrity pin for the config this factory re-reads from disk below.
     Required, with no default: an omitted baseline would silently disable the
-    refusal, which is the failure mode a security gate can least afford."""
+    refusal, which is the failure mode a security gate can least afford. The
+    re-read happens once and is frozen, so the gate validates the bytes the child
+    actually launches from rather than a separate read of the same files."""
 
     def factory(trigger: str) -> None:
         pol = policy_mod.load(_policy_path(project))
+        # Read the agent-writable config EXACTLY ONCE, here, and run the child off
+        # these two objects: `pol` and `profiles` are threaded through the gate
+        # below, the pin `_start_sweep` stamps, and `make_adapters`. Before this
+        # the gate hashed its own `get_profile` read while the adapters took a
+        # later one, so a session that leaves a background writer alternating a
+        # benign and a hostile profiles/*.toml only had to land the benign copy on
+        # the digest's read — and losing a round costs it nothing, since the
+        # refusal is swallowed by `_maybe_auto_sweep` and the next trigger deals
+        # again. Freezing the read is the fix; narrowing the window is not.
+        profiles = runsetup.resolve_profiles(pol, project)
         # #461 point 4. This reload is the ONE path where a mid-run rewrite of the
         # agent-writable config reaches host code execution with no human
         # initiating the change: the driven sessions can write policy.toml and
-        # profiles/*.toml, and this factory re-reads both (here, and through
-        # make_adapters -> get_profile) on a trigger the engine raised, not an
-        # operator. The parent loop is already safe — it froze its Policy at launch
-        # — and the two documented human-present mid-run edits (the TUI live-edit,
-        # resume-to-fix-a-setting) stay trusted; resume only warns. So refuse here
-        # and only here.
+        # profiles/*.toml, and this factory re-reads both on a trigger the engine
+        # raised, not an operator. The parent loop is already safe — it froze its
+        # Policy at launch — and the two documented human-present mid-run edits
+        # (the TUI live-edit, resume-to-fix-a-setting) stay trusted; resume only
+        # warns. So refuse here and only here.
         #
         # ABLATION GUARDS: deleting this block must fail
         # test_auto_sweep_refuses_a_rewritten_verify_command,
         # test_auto_sweep_refuses_a_rewritten_profile_binary, and
         # test_auto_sweep_refuses_a_widened_plugin_allowlist in tests/test_cli.py.
-        if runsetup.config_digest(pol, project) != trusted_digest:
+        if runsetup.config_digest(pol, project, profiles=profiles) != trusted_digest:
             raise RuntimeError(
                 "policy.toml/profiles changed under a running loop before an auto-sweep"
                 " — refusing the child sweep; no human initiated this config change."
@@ -1452,6 +1474,7 @@ def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest
             decisions_only=False,
             max_bundles=None,
             trigger=trigger,
+            profiles=profiles,
         )
 
     return factory

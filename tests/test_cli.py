@@ -5,6 +5,7 @@ import io
 import json
 import os
 import sys
+import types
 
 import pytest
 import yaml
@@ -6463,6 +6464,66 @@ def test_auto_sweep_proceeds_when_the_pinned_config_is_untouched(project, monkey
     factory("epic-boundary")  # no raise
 
     assert len(started) == 1
+
+
+def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monkeypatch):
+    """The gate is worth only as much as the read it protects: hashing one read of
+    profiles/*.toml and then launching from a *later* one is check-then-use over a
+    file the driven sessions can write. A session that leaves a background writer
+    behind swaps the overlay the instant the compare succeeds — modelled here by
+    flipping it from inside `config_digest`'s own return — and the window is not a
+    defense, because a lost round only raises `sweep-auto-failed`, which
+    `_maybe_auto_sweep` swallows before the next trigger deals again.
+
+    So `_sweep_factory` resolves the profiles ONCE and threads that mapping through
+    the gate, the pin it stamps, and `make_adapters`. Both assertions below are the
+    harm, not the plumbing: the adapter must carry the validated `binary`, and the
+    child must not re-baseline itself onto the swapped config.
+
+    ABLATION: drop `profiles=` from either `runsetup.make_adapters` or
+    `_trusted_config_digest` in `_start_sweep` and the matching assert fails."""
+    from bmad_loop import bmadconfig
+    from bmad_loop.adapters import profile as profile_mod
+
+    monkeypatch.setattr(mux_mod, "_usable", lambda mux: True)
+    install_bmad_config(project)
+    _write_policy(project.project, PIN_POLICY)
+    _pin_profile(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    pin = _config_pin(project)
+
+    real_digest = runsetup.config_digest
+
+    def digest_then_swap(*a, **kw):
+        digest = real_digest(*a, **kw)
+        # The writer wakes the moment the comparison has its answer.
+        _pin_profile(project, PIN_PROFILE.replace('binary = "mycli"', 'binary = "rogue-cli"'))
+        return digest
+
+    monkeypatch.setattr(runsetup, "config_digest", digest_then_swap)
+
+    captured: dict = {}
+
+    class _Recorder:
+        """Stands in for SweepEngine: records what compose_sweep wired, drives
+        nothing. `_start_sweep` renders the summary, so run() answers one."""
+
+        def __init__(self, **kw):
+            captured.update(kw)
+
+        def run(self):
+            return types.SimpleNamespace(render=lambda: "")
+
+    monkeypatch.setattr(cli, "SweepEngine", _Recorder)
+
+    factory = cli._sweep_factory(project.project, bmadconfig.load_paths(project.project), pin)
+    factory("epic-boundary")  # the gate saw the honest bytes and passed
+
+    assert (
+        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
+    ), "the swap must actually have landed on disk, or this test proves nothing"
+    assert captured["adapter"].profile.binary == "mycli"
+    assert captured["state"].trusted_config_digest == pin
 
 
 def test_dry_run_banner_names_the_isolation_refusal_first(project, capsys):
