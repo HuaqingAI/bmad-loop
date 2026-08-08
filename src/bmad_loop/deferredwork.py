@@ -47,11 +47,14 @@ GATE_RE = re.compile(r"^gate:[ \t]*(.*)$", re.MULTILINE)
 # separators are deliberately out — a token nothing can match is the same silent
 # no-op the field exists to end, so it is surfaced rather than dropped.
 GATE_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-# Line-start only. The prose convention this field replaces is a line that
-# *opens* with it; a sentence mentioning a hard gate mid-line ("the DW-1 HARD
-# GATE: wording predates the field") is discussion, and reading it as a
-# declaration would warn about every entry that talks about gating.
-HARD_GATE_PROSE_RE = re.compile(r"^HARD GATE:", re.MULTILINE)
+# The prose convention `gate:` replaces, matched anywhere on a line rather than
+# at its start: real ledgers hard-wrap their `reason:` prose, so the declaration
+# routinely lands mid-line and a line-anchored pattern misses exactly the entries
+# that have one. The quote lookbehind is what keeps that from over-firing — an
+# entry *citing* the phrase (`names a "HARD GATE: ..."`) is discussion, not a
+# declaration — and the colon does the rest of the work, since a sentence about
+# "this HARD GATE is textual only" never reaches the pattern at all.
+HARD_GATE_PROSE_RE = re.compile(r"""(?<!["'«])HARD GATE:""")
 # Everything `str.splitlines()` splits on, not `\n` alone (#305). The writers
 # below interpolate their arguments into a line-oriented file, so a break in a
 # value injects ledger lines. The C1/Unicode members are load-bearing rather
@@ -127,13 +130,22 @@ def open_ids(text: str) -> set[str]:
 class EntryGates:
     """One entry's ``gate:`` declaration, split by what a check can act on.
 
-    Both halves are reported by ``validate``, because a token that matches no
-    story key is not a weaker gate than a valid one — it is the prose gate again,
-    wearing the field's clothes, and silence about it is what let the story run.
+    Every shape that is not an enforceable token is reported by ``validate``,
+    because none of them is a *weaker* gate than a valid one — each is the prose
+    gate again wearing the field's clothes, and silence about it is what let the
+    story run. ``lines`` is what distinguishes "declared nothing usable" from
+    "declared nothing at all": an entry with no ``gate:`` line has made no claim,
+    while ``gate:`` with an empty value has made one and inertly.
     """
 
     tokens: tuple[str, ...] = ()
     malformed: tuple[str, ...] = ()
+    lines: int = 0
+
+    @property
+    def inert(self) -> bool:
+        """A ``gate:`` line that yielded no token at all — ``gate:`` or ``gate: ,``."""
+        return self.lines > 0 and not self.tokens and not self.malformed
 
 
 def gates(entry: DWEntry) -> EntryGates:
@@ -147,11 +159,14 @@ def gates(entry: DWEntry) -> EntryGates:
     finding out from a story that ran.
 
     Duplicates collapse (an id repeated across lines is one claim, not two);
-    empty items drop, so a trailing separator is not a token.
+    empty items drop, so a trailing separator is not a token — but the *line* is
+    still counted, which is how an all-empty declaration stays reportable.
     """
     tokens: list[str] = []
     malformed: list[str] = []
+    lines = 0
     for m in GATE_RE.finditer(entry.body):
+        lines += 1
         for raw in m.group(1).split(","):
             token = raw.strip()
             if not token:
@@ -159,19 +174,35 @@ def gates(entry: DWEntry) -> EntryGates:
             bucket = tokens if GATE_TOKEN_RE.match(token) else malformed
             if token not in bucket:
                 bucket.append(token)
-    return EntryGates(tokens=tuple(tokens), malformed=tuple(malformed))
+    return EntryGates(tokens=tuple(tokens), malformed=tuple(malformed), lines=lines)
 
 
 def gates_story(token: str, story_key: str) -> bool:
-    """Whether ``token`` gates ``story_key`` — equal, or its ``-``-delimited prefix.
+    """Whether ``token`` gates ``story_key``: equal, or its prefix at a key boundary.
 
-    The prefix arm is what lets one token reach both queues: stories mode keys on
+    The prefix arm is what lets one token reach both queues — stories mode keys on
     the bare id (``3-2``) while sprint mode keys on the full ``3-2-invite-link``,
     and an author gating "story 3-2" means the story, not the spelling. The
-    delimiter is required rather than a bare ``startswith`` so ``3-2`` cannot
-    sweep in its numeric neighbours — ``3-20-...`` is a different story.
+    boundary is required rather than a bare ``startswith`` so ``3-2`` cannot sweep
+    in its numeric neighbours: ``3-20-later`` is a different story.
+
+    Two boundaries count, because BMAD spells a story key two ways. The plain one
+    is ``-``. The other is a **split**: ``sprintstatus.STORY_RE`` lets an oversized
+    story become ``3-2a-...`` / ``3-2b-...`` at breakdown time, and a token that
+    only knew ``-`` would lose its gate the moment the gated story was split —
+    silently, which is the worst thing a gate can do. One lowercase ASCII letter
+    followed by ``-`` is therefore also a boundary. Exactly one letter, and the
+    ``-`` after it is required, so ``3-2ab-x`` and a bare ``3-2a`` are not swept in.
     """
-    return story_key == token or story_key.startswith(f"{token}-")
+    if story_key == token or story_key.startswith(f"{token}-"):
+        return True
+    # The `startswith` guard is load-bearing, not redundant with the slice below:
+    # `story_key[len(token):]` says nothing about what preceded it, so without it
+    # `3-2` would gate `9-9a-x` on the tail alone.
+    if not story_key.startswith(token):
+        return False
+    rest = story_key[len(token) :]
+    return len(rest) >= 2 and "a" <= rest[0] <= "z" and rest[1] == "-"
 
 
 def parse_declaration(raw: object) -> tuple[tuple[str, ...], str | None]:

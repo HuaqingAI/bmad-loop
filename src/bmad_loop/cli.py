@@ -1146,11 +1146,12 @@ def _report_unstructured_gate(
 ) -> None:
     """Warn about a hard gate the mechanical check cannot enforce.
 
-    Two causes, one id, because the remedy is the same line in the same file. A
-    ``HARD GATE:`` written as prose is the pre-``gate:`` convention still holding
-    nothing back; a token that cannot name a story key is that same nothing with
-    the field's syntax around it, which is worse — it reads, to anyone scanning
-    the entry, as a gate that is already in force.
+    Three causes, one id, because the remedy is the same line in the same file.
+    A ``HARD GATE:`` written as prose is the pre-``gate:`` convention still
+    holding nothing back. A token that cannot name a story key, and a ``gate:``
+    line with nothing after the colon, are that same nothing with the field's
+    syntax around it — worse, because to anyone scanning the entry they read as a
+    gate already in force.
 
     An entry carrying a valid token *and* a malformed one is still reported: the
     valid half gates what it names, and the operator's belief about the other half
@@ -1160,6 +1161,8 @@ def _report_unstructured_gate(
         reason = (
             f"declares `gate:` tokens that cannot name a story: {', '.join(entry_gates.malformed)}"
         )
+    elif entry_gates.inert:
+        reason = "declares an empty `gate:` line, which names no story"
     elif not entry_gates.tokens and deferredwork.HARD_GATE_PROSE_RE.search(entry.body):
         reason = "declares a `HARD GATE:` in prose but carries no `gate:` line"
     else:

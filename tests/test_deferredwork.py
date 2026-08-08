@@ -1549,6 +1549,19 @@ def test_gates_unions_every_line_and_splits_on_commas():
 
     assert g.tokens == ("3-2", "3-3", "4-1")
     assert g.malformed == ()
+    assert not g.inert
+
+
+@pytest.mark.parametrize("line", ["gate:", "gate: ", "gate: ,", "gate: , ,"])
+def test_gates_reports_a_line_that_names_nothing(line):
+    """`gate:` with nothing usable after it is a claim made inertly, and the
+    parse alone cannot tell it apart from an entry that never gated anything —
+    `lines` is what keeps it reportable. Left silent, it reads to anyone scanning
+    the entry as a gate already in force."""
+    g = _gated(line)
+
+    assert g.tokens == () and g.malformed == ()
+    assert g.inert
 
 
 def test_gates_reports_a_token_that_cannot_name_a_story():
@@ -1582,9 +1595,16 @@ def test_gates_stop_at_the_canonical_span_boundary():
         ("3-2", "3-2", True),  # stories-mode id: the token IS the key
         ("3-2", "3-2-invite-link-student-surface", True),  # sprint key: `-` prefix
         ("3-2", "3-20-later-story", False),  # the boundary the `-` buys
-        # a split story is its own key, so `gate: 3-2` does NOT cover 3-2a/3-2b —
-        # name the halves when a split is what is blocked
-        ("3-2", "3-2a-split-half", False),
+        # A split story is still the gated story. STORY_RE lets breakdown turn an
+        # oversized 3-2 into 3-2a/3-2b, and a token that only knew `-` would lose
+        # its gate at exactly that moment — silently, which is the one thing a
+        # gate must never do.
+        ("3-2", "3-2a-split-half", True),
+        ("3-2", "3-2b-other-half", True),
+        ("3-2", "3-2A-upper", False),  # the split suffix is lowercase ASCII
+        ("3-2", "3-2ab-two-letters", False),  # exactly one letter, or it is a slug
+        ("3-2", "3-2a", False),  # the `-` after the letter is required
+        ("3-2", "9-9a-elsewhere", False),  # the split arm still needs the prefix
         ("3", "3-2-invite-link", True),  # a whole epic is a legal token
         ("3-2-invite", "3-2-invite-link", True),
         ("3-2-invite", "3-2-invited", False),
@@ -1592,3 +1612,28 @@ def test_gates_stop_at_the_canonical_span_boundary():
 )
 def test_gates_story_matches_on_key_boundaries(token, story_key, gated):
     assert deferredwork.gates_story(token, story_key) is gated
+
+
+@pytest.mark.parametrize(
+    ("body", "declared"),
+    [
+        ("HARD GATE: must land before 3-2", True),  # the bare convention
+        ("reason: wired late. HARD GATE: must land before 3-2", True),  # hard-wrapped prose
+        ('reason: an entry naming a "HARD GATE: before X" is enforced by nothing', False),
+        ("reason: an entry naming a 'HARD GATE: before X'", False),
+        ("reason: «HARD GATE: before X» is only prose", False),
+        ("reason: this HARD GATE is textual only, nothing enforces it", False),
+        # KNOWN LIMIT, pinned rather than left to surprise someone: the lookbehind
+        # is one character wide, so a citation that spaces its opening quote off
+        # the phrase — the French convention, `«` + U+00A0 — still reads as a
+        # declaration. The remedy for such an entry is a `gate:` line, which
+        # silences the warning either way.
+        ("reason: « HARD GATE: before X » is only prose", True),
+    ],
+)
+def test_hard_gate_prose_detects_a_declaration_not_a_citation(body, declared):
+    """Matched anywhere on a line, because real ledgers hard-wrap `reason:` and the
+    declaration lands mid-line. The quote lookbehind is what keeps that honest — an
+    entry *citing* the phrase is discussion — and the colon excludes prose that
+    merely talks about a hard gate."""
+    assert bool(deferredwork.HARD_GATE_PROSE_RE.search(body)) is declared

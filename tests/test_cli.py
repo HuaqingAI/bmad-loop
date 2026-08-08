@@ -3978,23 +3978,23 @@ def test_validate_passes_when_the_gate_entry_is_closed(project, capsys):
 
 
 def test_validate_hard_gate_token_stops_at_the_key_boundary(project, capsys):
-    """`3-2` gates the story it names and not its numeric neighbours. A bare
-    `startswith` would sweep `3-20-...` in and block an unrelated story for as long
-    as the entry stayed open — the failure mode that makes an operator delete the
-    gate rather than trust it."""
+    """`3-2` gates the story it names and both halves of that story once breakdown
+    splits it, and not its numeric neighbours. A bare `startswith` would sweep
+    `3-20-...` in and block unrelated work; a `-`-only boundary would drop the gate
+    the moment 3-2 became 3-2a/3-2b, which is the same gate failing silently."""
     findings = _validate_gated_sprint(
         project,
         capsys,
         {
             "3-2-invite-link-student-surface": "ready-for-dev",
+            "3-2a-split-half": "ready-for-dev",
             "3-20-later-story": "ready-for-dev",
         },
         {"DW-1": ("open", ["gate: 3-2"])},
     )
 
-    gates = [f for f in findings if f["check"] == "deferred.hard-gate"]
-    assert len(gates) == 1
-    assert gates[0]["detail"]["story_key"] == "3-2-invite-link-student-surface"
+    gated = [f["detail"]["story_key"] for f in findings if f["check"] == "deferred.hard-gate"]
+    assert gated == ["3-2-invite-link-student-surface", "3-2a-split-half"]
 
 
 def test_validate_unions_multiple_gate_lines(project, capsys):
@@ -4031,18 +4031,54 @@ def test_validate_warns_on_a_prose_only_hard_gate(project, capsys):
     assert not [f for f in findings if f["check"] == "deferred.hard-gate"]
 
 
-def test_validate_ignores_a_mid_line_hard_gate_mention(project, capsys):
-    """Line-start only: an entry *discussing* a hard gate is not declaring one.
-    Matching anywhere in the body would warn about every entry whose reason
-    mentions the convention, which is the fastest way to make the warning noise."""
+def test_validate_warns_on_a_mid_line_hard_gate(project, capsys):
+    """Real ledgers hard-wrap their `reason:` prose, so a declaration routinely
+    lands mid-line. A line-anchored detector missed exactly the entries that had
+    one — which is the whole population this warning exists for."""
     findings = _validate_gated_sprint(
         project,
         capsys,
         {"3-2-invite-link": "ready-for-dev"},
-        {"DW-1": ("open", ["note: the old HARD GATE: wording predates the field."])},
+        {"DW-1": ("open", ["reason: wired late. HARD GATE: must land before 3-2."])},
+    )
+
+    unstructured = [f for f in findings if f["check"] == "deferred.hard-gate-unstructured"]
+    assert len(unstructured) == 1 and unstructured[0]["severity"] == "warning"
+
+
+def test_validate_ignores_an_entry_that_only_cites_a_hard_gate(project, capsys):
+    """An entry *about* the convention is not declaring one — the ledger's own
+    "no mechanical check enforces a HARD GATE" entry must not warn about itself.
+    The quote is what separates the two, and a colon-less mention never reaches
+    the pattern at all."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link": "ready-for-dev"},
+        {
+            "DW-1": ("open", ['reason: an entry naming a "HARD GATE: before X" binds nothing.']),
+            "DW-2": ("open", ["reason: this HARD GATE is textual only, nothing enforces it."]),
+        },
     )
 
     assert not [f for f in findings if f["check"].startswith("deferred.hard-gate")]
+
+
+def test_validate_warns_on_an_empty_gate_line(project, capsys):
+    """`gate:` with nothing after it is a claim made inertly. It reads, to anyone
+    scanning the entry, as a gate already in force, and silence would make it
+    indistinguishable from an entry that never gated anything."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link": "ready-for-dev"},
+        {"DW-1": ("open", ["gate:"])},
+    )
+
+    unstructured = [f for f in findings if f["check"] == "deferred.hard-gate-unstructured"]
+    assert len(unstructured) == 1 and unstructured[0]["severity"] == "warning"
+    assert "empty `gate:` line" in unstructured[0]["message"]
+    assert not [f for f in findings if f["check"] == "deferred.hard-gate"]
 
 
 def test_validate_warns_on_a_malformed_gate_token(project, capsys):
