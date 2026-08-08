@@ -242,16 +242,21 @@ def _session_task_id(story_key: str, part: str, seq: int) -> str:
 # eats the real title in "Story Points: Add estimates", while `\d+\.\d+` stops
 # matching the dash composites this project actually issues.
 _STORY_LABEL_RE = re.compile(r"^story\s+\d[\w.\-]*:\s*", re.IGNORECASE)
-# C0 controls + DEL. A NUL here is not cosmetic: this title reaches `git commit -m`
-# as an argv element, and `subprocess.run` rejects an embedded null with a plain
-# ValueError — which is NOT in `_run_git`'s translated set (TimeoutExpired,
-# UnicodeDecodeError, OSError), so it would escape as itself, hit
-# `_finalize_commit_phase`'s `except BaseException` re-raise, and crash the run
-# with the task already persisted as COMMITTING — wedging every later resume on
-# the same spec. YAML reaches it without any exotic file bytes: `title: "\0"` is
-# an ordinary double-quoted scalar. The rest of the class goes with it because a
-# newline or CR in a commit subject is mangling, not a title.
-_TITLE_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]+")
+# C0 controls + DEL + unpaired surrogates. Not cosmetic: this title reaches
+# `git commit -m` as an argv element, and both classes are unspawnable there —
+# `subprocess.run` rejects an embedded NUL with a plain ValueError, and a lone
+# surrogate has no UTF-8 encoding, so encoding the argv raises UnicodeEncodeError.
+# Neither is in `_run_git`'s translated set (TimeoutExpired, UnicodeDecodeError,
+# OSError — and UnicodeEncodeError is a sibling of the decode class, not a
+# subclass), so either escapes as itself, hits `_finalize_commit_phase`'s
+# `except BaseException` re-raise, and crashes the run with the task already
+# persisted as COMMITTING — wedging every later resume on the same spec. YAML
+# reaches both without any exotic file bytes: `title: "\0"` and `title: "\uD800"`
+# are ordinary double-quoted scalars that PyYAML hands back verbatim. The rest of
+# the control class goes along because a newline or CR in a commit subject is
+# mangling, not a title. Translating these at the `_run_git` chokepoint instead
+# of here is the general fix, tracked as #506.
+_TITLE_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f\ud800-\udfff]+")
 
 
 def _story_label_stripped(value: object) -> str:
@@ -3754,8 +3759,15 @@ class Engine:
                     start = i + 1
                     break
         for line in lines[start:]:
-            if line.startswith("# "):
-                title = _story_label_stripped(line[2:])
+            # CommonMark allows up to three spaces of indentation before an ATX
+            # heading; a fourth makes the line an indented code block, so that is
+            # the bound rather than a plain lstrip. Getting this wrong only ever
+            # costs a silent fall back to the story key, which is the same way
+            # the placeholder was inert on every canonical spec before it read
+            # `title:` — so the extraction stays as permissive as the syntax is.
+            head = line.lstrip(" ")
+            if len(line) - len(head) <= 3 and head.startswith("# "):
+                title = _story_label_stripped(head[2:])
                 if title:
                     return title
                 break

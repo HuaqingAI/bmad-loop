@@ -2325,6 +2325,38 @@ def test_commit_message_template_story_title_neutralizes_control_chars(project):
     assert "chore(bmad): Wire the Frobnicator" in git(project.project, "log", "--format=%s")
 
 
+def test_commit_message_template_story_title_neutralizes_surrogates(project):
+    """The other unspawnable class, and the one a C0/DEL-only filter misses. A
+    lone surrogate has no UTF-8 encoding, so `subprocess.run` raises
+    UnicodeEncodeError while encoding the argv — a ValueError, but *not* the
+    UnicodeDecodeError `_run_git` translates, so it wedges the run exactly as an
+    embedded NUL does. `title: "\\uD800"` is an ordinary YAML escape and PyYAML
+    hands the unpaired code point straight back.
+
+    Ablation target: drop `\\ud800-\\udfff` from `_TITLE_CONTROL_RE` and this
+    fails with `UnicodeEncodeError: surrogates not allowed` instead of
+    committing."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    review = wt_review_effect(project, "1-1-a", clean=True)
+
+    def review_surrogate_title(spec):
+        result = review(spec)
+        sp = project.rebased(spec.cwd).implementation_artifacts / "spec-1-1-a.md"
+        sp.write_text(
+            sp.read_text().replace("title: 'test'", 'title: "Wire\\uD800the Frobnicator"')
+        )
+        return result
+
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), review_surrogate_title],
+        policy=wt_policy(commit_message_template="chore(bmad): {story_title}"),
+    )
+    summary = engine.run()
+    assert summary.done == 1  # committed rather than wedged mid-COMMITTING
+    assert "chore(bmad): Wire the Frobnicator" in git(project.project, "log", "--format=%s")
+
+
 def test_commit_message_template_story_title_falls_back_to_h1(project):
     """A spec written without a `title:` — i.e. not from this project's
     template — still yields a title from a first markdown H1."""
@@ -2386,6 +2418,44 @@ def test_story_title_undecodable_spec_falls_back_to_key(project):
 
 
 @pytest.mark.parametrize(
+    ("indent", "expected"),
+    [
+        ("", "Indented Heading"),
+        ("   ", "Indented Heading"),  # CommonMark allows up to three
+        ("    ", "1-1-a"),  # a fourth space is an indented code block, not an H1
+    ],
+)
+def test_story_title_h1_indent_bound(project, indent, expected):
+    """The H1 fallback follows CommonMark's indentation rule, so a heading a
+    hand-authored spec indented still yields a title instead of silently
+    degrading to the story key — while a code block at four spaces stays a code
+    block."""
+    engine, _ = make_engine(project, [])
+    spec = project.implementation_artifacts / "spec-1-1-a.md"
+    spec.write_text(f"---\nstatus: done\n---\n\n{indent}# Indented Heading\n")
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.spec_file = str(spec)
+
+    assert engine._story_title(task) == expected
+
+
+def test_render_commit_template_without_placeholder_skips_the_spec_read(project, monkeypatch):
+    """A template that never names {story_title} must not pay the spec read —
+    the claim the policy docs and CHANGELOG both make. Pinned by making the read
+    itself fatal, so the assertion cannot pass just because the title happened to
+    go unused."""
+    engine, _ = make_engine(project, [])
+    monkeypatch.setattr(
+        Engine, "_story_title", lambda self, task: pytest.fail("spec read for a template without")
+    )
+    engine.policy = wt_policy(commit_message_template="chore(bmad): {story_key}")
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.spec_file = str(project.implementation_artifacts / "spec-1-1-a.md")
+
+    assert engine._render_commit_template(task) == "chore(bmad): 1-1-a"
+
+
+@pytest.mark.parametrize(
     ("raw", "expected"),
     [
         # A story id is a dash/dot composite here, so the label strip must survive
@@ -2416,6 +2486,12 @@ def test_story_title_undecodable_spec_falls_back_to_key(project):
         ("Wire the\x00Frobnicator", "Wire the Frobnicator"),
         ("Story 1.1:\x00Wire it", "Wire it"),
         ("Story\x001.1: Split label", "Split label"),
+        # Lone surrogates go with them: `title: "\uD800"` is the same ordinary
+        # YAML escape, and one in the argv raises UnicodeEncodeError out of
+        # subprocess — a ValueError _run_git does not translate either.
+        ("\ud800", ""),
+        ("Wire\ud800the Frobnicator", "Wire the Frobnicator"),
+        ("Story 1.1:\udfffWire it", "Wire it"),
         ("Two\nlines", "Two lines"),
         ("Tabbed\ttitle", "Tabbed title"),
         ("Collapse   the    runs", "Collapse the runs"),
