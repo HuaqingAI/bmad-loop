@@ -6526,6 +6526,134 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
     assert captured["state"].trusted_config_digest == pin
 
 
+def test_run_pins_the_profile_bytes_it_launches(project, monkeypatch):
+    """`cmd_run` STAMPS the baseline every later auto-sweep is held to. It used to
+    hash one read of profiles/*.toml and build its adapters from a second, so a
+    write landing between them pinned config this run never launched.
+
+    Deliberately NOT a security test — there is no attack here to refuse. At launch
+    the on-disk config IS the trust anchor, so a writer who can land in that gap
+    could just as well have written before it and been blessed with no timing at
+    all. The harm is over-refusal: the pin is the one baseline a session cannot
+    reach (`_sweep_factory` holds children to it from memory), so a pin over
+    unlaunched bytes makes those children refuse the config the parent is running —
+    and `engine._maybe_auto_sweep` records the trigger BEFORE calling the factory,
+    so the refusal burns it for the life of the run.
+
+    Asserts the invariant, not the plumbing: the stamp and the adapter agree.
+
+    The writer fires from inside `resolve_profiles`' own return — the instant a
+    read completes — rather than from `config_digest`'s, so BOTH threads are
+    load-bearing. Swapping at the digest boundary would leave the stamp assert
+    vacuous: disk is still honest when the baseline is taken, so the pin comes out
+    right whether or not it was handed the resolution.
+
+    ABLATION, both lanes bite: drop `profiles=` from `compose_run` and the adapter
+    assert fails (it re-reads the swapped overlay); drop it from
+    `_trusted_config_digest` and the stamp assert fails (the digest re-resolves
+    after the swap and pins config the run never launched)."""
+    from conftest import git, install_base_skills
+
+    from bmad_loop.adapters import profile as profile_mod
+
+    monkeypatch.setattr(mux_mod, "_usable", lambda mux: True)
+    install_bmad_config(project)
+    install_base_skills(project)
+    _write_policy(project.project, PIN_POLICY)
+    _pin_profile(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "setup")
+    pin = _config_pin(project)
+
+    real_resolve = runsetup.resolve_profiles
+
+    def resolve_then_swap(*a, **kw):
+        resolved = real_resolve(*a, **kw)
+        # A concurrent writer wakes the instant a read of the overlay completes.
+        _pin_profile(project, PIN_PROFILE.replace('binary = "mycli"', 'binary = "rogue-cli"'))
+        return resolved
+
+    monkeypatch.setattr(runsetup, "resolve_profiles", resolve_then_swap)
+
+    captured: dict = {}
+
+    class _Recorder:
+        """Stands in for Engine: records what compose_run wired, drives nothing."""
+
+        def __init__(self, **kw):
+            captured.update(kw)
+
+        def run(self):
+            return types.SimpleNamespace(render=lambda: "")
+
+    monkeypatch.setattr(cli, "Engine", _Recorder)
+
+    assert cli.main(["run", "--project", str(project.project)]) == 0
+
+    assert (
+        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
+    ), "the swap must actually have landed on disk, or this test proves nothing"
+    assert captured["adapter"].profile.binary == "mycli"
+    assert captured["state"].trusted_config_digest == pin
+
+
+def test_resume_pins_the_profile_bytes_it_launches(project, monkeypatch):
+    """The twin of `test_run_pins_the_profile_bytes_it_launches`, on the other
+    entrypoint that mints this baseline. A resume RE-stamps
+    `state.trusted_config_digest` and arms `_sweep_factory(..., new_digest)`, so
+    the children of a resumed run are held to a pin this function produced — the
+    same read-twice defect lands here, and fixing only `cmd_run` would leave one of
+    two identical call sites open.
+
+    ABLATION: drop `profiles=` from `_trusted_config_digest` or `compose_resume`
+    in `_resume_paused_run` and the matching assert fails."""
+    from conftest import install_base_skills
+
+    from bmad_loop import runs
+    from bmad_loop.adapters import profile as profile_mod
+
+    monkeypatch.setattr(mux_mod, "_usable", lambda mux: True)
+    install_bmad_config(project)
+    install_base_skills(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    _write_policy(project.project, PIN_POLICY)
+    _pin_profile(project)
+    pin = _config_pin(project)
+    run_dir = _make_run_with_state(
+        project.project,
+        "20990101-000000-beef",
+        paused_reason="escalation",
+        paused_stage="escalation",
+    )
+
+    real_resolve = runsetup.resolve_profiles
+
+    def resolve_then_swap(*a, **kw):
+        resolved = real_resolve(*a, **kw)
+        _pin_profile(project, PIN_PROFILE.replace('binary = "mycli"', 'binary = "rogue-cli"'))
+        return resolved
+
+    monkeypatch.setattr(runsetup, "resolve_profiles", resolve_then_swap)
+    monkeypatch.setattr(runs, "kill_session", lambda rid: None)
+
+    captured: dict = {}
+
+    class _Recorder(_StubEngine):
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(cli, "Engine", _Recorder)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    assert (
+        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
+    ), "the swap must actually have landed on disk, or this test proves nothing"
+    assert captured["adapter"].profile.binary == "mycli"
+    assert captured["state"].trusted_config_digest == pin
+
+
 def test_dry_run_banner_names_the_isolation_refusal_first(project, capsys):
     """The preview keeps rc 0 and still renders the schedule, but the banner has to
     name every refusal the dry-run's early return skips past — and in the order the

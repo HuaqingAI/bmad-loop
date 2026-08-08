@@ -192,6 +192,43 @@ def _reject_isolation_conflict(paths: bmadconfig.ProjectPaths, pol) -> int | Non
     return 1
 
 
+def _launch_profiles(pol, project: Path) -> dict[str, CLIProfile]:
+    """Resolve a run's profiles ONCE, for the two human-initiated entrypoints that
+    stamp an integrity baseline (`cmd_run`, `_resume_paused_run`).
+
+    The stamp and the adapters must describe the SAME bytes. Each used to read
+    `profiles/*.toml` on its own — the digest via `config_digest`, the adapters via
+    `make_adapters` — so a write landing between them stamped a baseline for config
+    the run never launched.
+
+    This is NOT the child gate's check-then-use, and must not be read as one: there
+    is no comparison here. At launch the on-disk config IS the trust anchor, so an
+    adversary who can write in that gap could equally have written BEFORE it and
+    been blessed outright, with no timing at all — the race grants no capability.
+    The defect runs the other way, toward over-refusal. This pin is the one
+    baseline a session cannot reach (`_sweep_factory` holds every later auto-sweep
+    to it from MEMORY, unlike resume's disk-backed advisory), so a pin describing
+    bytes the run did not launch makes those children refuse the config the parent
+    has been running all along. `engine._maybe_auto_sweep` appends the trigger to
+    `sweeps_triggered` BEFORE calling the factory and returns early on an
+    already-recorded one, so that refusal burns the trigger for the life of the run
+    — it is not retried, not even across a resume.
+
+    `cmd_sweep` deliberately keeps its fresh read: a human started it, and the pin
+    it stamps gates no child.
+
+    Same `ProfileError` -> `SystemExit` contract as `_trusted_config_digest`, for
+    the same reason — resolving here happens a few frames EARLIER than
+    `make_adapters` used to, and a misconfigured `[adapter] name` must still exit 1
+    as `error: unknown CLI profile ...` rather than escape as a traceback."""
+    from .adapters.profile import ProfileError
+
+    try:
+        return runsetup.resolve_profiles(pol, project)
+    except ProfileError as e:
+        raise SystemExit(f"error: {e}") from e
+
+
 def _trusted_config_digest(pol, project: Path, *, profiles=None) -> str:
     """The launch-time integrity baseline the auto-sweep child is held to (#461
     point 4). Thin wrapper over :func:`runsetup.config_digest` for the two
@@ -1201,7 +1238,15 @@ def cmd_run(args: argparse.Namespace) -> int:
     # The launch baseline for the auto-sweep child's config re-read (#461 point 4).
     # Taken ONCE, from the same `pol` the engine is about to freeze, and used for
     # both the factory's gate and the RunState stamp so the two cannot disagree.
-    trusted_digest = _trusted_config_digest(pol, project)
+    #
+    # `profiles` is resolved once here for the same reason and carried into
+    # compose_run: the digest and `make_adapters` each used to read
+    # profiles/*.toml separately, so the stamped baseline could describe bytes
+    # this run never launched — and every later auto-sweep is held to that
+    # baseline. See `_launch_profiles` for why this is an over-refusal fix and
+    # not the child gate's check-then-use.
+    profiles = _launch_profiles(pol, project)
+    trusted_digest = _trusted_config_digest(pol, project, profiles=profiles)
 
     # The composition (run dir + state + pid + adapters + engine) lives in
     # runsetup; cmd_run stays parse -> compose -> render. Engine/StoriesEngine and
@@ -1222,6 +1267,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         engine_cls=Engine,
         stories_engine_cls=StoriesEngine,
         trusted_config_digest=trusted_digest,
+        profiles=profiles,
     )
     print(f"run {composed.run_id} starting (attach: bmad-loop attach)")
     summary = composed.engine.run()
@@ -1572,7 +1618,12 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     # diagnose scrubs unknown fields with scrub_json, NOT the key-aware
     # _scrub_policy that reduces adapter.env and plugins.settings.
     new_snapshot = pol.to_dict()
-    new_digest = _trusted_config_digest(pol, project)
+    # Resolved once and carried into compose_resume below, so the re-stamped pin
+    # describes the bytes this resumed process actually launches (see
+    # `_launch_profiles`). A resume mints the same in-memory baseline `cmd_run`
+    # does — `_sweep_factory(..., new_digest)` — so the same reasoning applies.
+    profiles = _launch_profiles(pol, project)
+    new_digest = _trusted_config_digest(pol, project, profiles=profiles)
     # #461 point 4, human-present half. A resume IS a deliberate human choice, so
     # the on-disk config is re-blessed (new_digest is re-stamped below) and the run
     # proceeds — the auto-sweep child is the only path that refuses. But the issue's
@@ -1677,6 +1728,7 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
         engine_cls=Engine,
         stories_engine_cls=StoriesEngine,
         sweep_engine_cls=SweepEngine,
+        profiles=profiles,
     )
     summary = composed.engine.run()
     print(summary.render())

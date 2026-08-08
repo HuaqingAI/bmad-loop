@@ -97,6 +97,14 @@ def resolve_profiles(policy: Policy, project: Path) -> dict[str, CLIProfile]:
     again — so "narrow window" is not a defense. Resolving once and threading the
     result removes the second read rather than shrinking the window.
 
+    ``cmd_run`` and ``_resume_paused_run`` thread it too, for a DIFFERENT reason —
+    they stamp a baseline rather than compare against one, and at launch the
+    on-disk config is the trust anchor, so no race there grants an attacker
+    anything a plain pre-launch write does not. What the second read cost them was
+    accuracy: the pin they mint is what every later auto-sweep is held to, so a pin
+    over bytes the run did not launch makes those children refuse the config the
+    parent has been running all along. See ``cli._launch_profiles``.
+
     The policy half needs no equivalent: ``cli._sweep_factory`` already loads
     ``policy.toml`` once and passes that one frozen ``Policy`` to both the gate
     and the composition. Profiles were the only surface read twice.
@@ -205,10 +213,13 @@ def config_digest(
     propagates — an unresolvable profile already aborts at :func:`make_adapters`.
 
     ``profiles`` is an already-resolved mapping from :func:`resolve_profiles`.
-    Pass it wherever the digest gates something that then *runs* under the same
-    config, so the bytes hashed here are the bytes launched rather than a second
-    read of a file the sessions can rewrite in between; omit it to resolve fresh.
-    """
+    Pass it wherever the digest gates — or becomes the baseline for — something
+    that then *runs* under the same config, so the bytes hashed here are the bytes
+    launched rather than a second read of a file the sessions can rewrite in
+    between. Both halves of that rule have a caller: ``cli._sweep_factory`` gates,
+    ``cmd_run``/``_resume_paused_run`` baseline. Omit it to resolve fresh, which
+    ``cmd_sweep`` does deliberately — a human started that one, and the pin it
+    stamps gates no child."""
     profiles = profiles if profiles is not None else resolve_profiles(policy, project)
 
     launch: dict[str, dict[str, object]] = {}
@@ -543,14 +554,20 @@ def compose_run(
     stories_on: bool,
     spec_folder: str,
     sweep_factory: Callable[[str], None],
-    make_adapters: Callable[[Path, Path, Policy], dict[str, CodingCLIAdapter]],
+    make_adapters: MakeAdapters,
     engine_cls: type[Engine],
     stories_engine_cls: type[StoriesEngine],
     trusted_config_digest: str,
+    profiles: dict[str, CLIProfile] | None = None,
 ) -> ComposedRun:
     """Stand up a run: allocate the run dir, persist state + pid, build the
     adapters, and wire the engine — everything ``cmd_run`` did inline between its
     preflight gates and ``engine.run()``.
+
+    ``profiles`` carries ``cmd_run``'s single :func:`resolve_profiles` resolution —
+    the same one ``trusted_config_digest`` was computed from — so the stamped
+    baseline describes the bytes these adapters are built from rather than a second
+    read of an agent-writable file (#461 point 4). ``None`` resolves fresh.
 
     ``make_adapters`` and the engine classes are injected (rather than imported
     here) so ``cli`` supplies its own module-level names — keeping the test
@@ -572,7 +589,7 @@ def compose_run(
     )
     save_state(run_dir, state)
     runs.write_pid(run_dir)
-    adapters = make_adapters(project, run_dir, policy)
+    adapters = make_adapters(project, run_dir, policy, profiles=profiles)
     journal.append(
         "run-start",
         run_id=run_id,
@@ -690,10 +707,11 @@ def compose_resume(
     policy: Policy,
     journal: Journal,
     sweep_factory: Callable[[str], None],
-    make_adapters: Callable[[Path, Path, Policy], dict[str, CodingCLIAdapter]],
+    make_adapters: MakeAdapters,
     engine_cls: type[Engine],
     stories_engine_cls: type[StoriesEngine],
     sweep_engine_cls: type[SweepEngine],
+    profiles: dict[str, CLIProfile] | None = None,
 ) -> ComposedRun:
     """Rebuild the engine for a paused/interrupted run and return it ready to
     :meth:`run` — the adapter build + engine selection ``cli._resume_paused_run``
@@ -707,11 +725,17 @@ def compose_resume(
     otherwise ``source`` picks ``StoriesEngine`` vs ``Engine``, restoring the
     launching scope + cap so a resumed ``--epic N`` run keeps its filter. The engine
     classes and ``make_adapters`` are injected so ``cli``'s ``monkeypatch.setattr``
-    seams bite."""
+    seams bite.
+
+    ``profiles`` carries the caller's single :func:`resolve_profiles` resolution —
+    the one the re-stamped ``state.trusted_config_digest`` was computed from — so
+    the new baseline describes the bytes these adapters are built from rather than
+    a second read of an agent-writable file (#461 point 4). ``None`` resolves
+    fresh."""
     # drop any stale agent session so the run spins up a fresh one (a stopped or
     # interrupted run can leave a lingering bmad-loop-<id> session behind).
     runs.kill_session(run_dir.name)
-    adapters = make_adapters(project, run_dir, policy)
+    adapters = make_adapters(project, run_dir, policy, profiles=profiles)
     if state.run_type == "sweep":
         opts_path = run_dir / "sweep.json"
         try:
