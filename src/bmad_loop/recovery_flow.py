@@ -31,6 +31,16 @@ if TYPE_CHECKING:
     from .workspace import Workspace
 
 
+# How many candidate `refs/attempt-preserve-dirty/*` names one rollback may probe
+# before giving up (the base name plus -r2..-r100). Deliberately not a policy
+# field: it is a runaway backstop, not a tuning knob — `scm.preserve_keep`
+# (default 20) already prunes this namespace at every run start, so needing even
+# a dozen candidates for ONE {slug}-{baseline}-{attempt} triple means something
+# upstream is wrong. The cost of the bound is one git spawn per candidate on a
+# path that only runs while a crashed attempt is being rolled back.
+PRESERVE_REF_PROBE_LIMIT = 100
+
+
 class RecoveryFlow:
     """Roll back or pause a stopped/abandoned attempt, parking any work it did on
     named recovery refs before the reset.
@@ -438,11 +448,25 @@ class RecoveryFlow:
         # Uncaught it would crash the rollback here — the one thing this handler
         # exists to prevent — so a probe that cannot run degrades into the same
         # "preservation is observation" path as a snapshot that cannot be written.
+        # The scan is BOUNDED: it terminates on its own (the ref set is finite and
+        # `serial` only climbs), but termination is not a bound — the iteration
+        # count is whatever the namespace happens to hold, one git spawn apiece, in
+        # the middle of a crash-recovery path. PROBE_LIMIT turns "trust the
+        # namespace is small" into an enforced invariant, and exhausting it raises
+        # rather than reusing the last candidate: falling through to an occupied
+        # name is the precise data loss this probe exists to prevent (#349).
         base_ref = f"refs/attempt-preserve-dirty/{slug}-{baseline[:8]}-{task.attempt}"
         ref = base_ref
         serial = 2
         try:
             while verify.ref_exists(workspace.root, ref):
+                if serial > PRESERVE_REF_PROBE_LIMIT:
+                    raise verify.PreserveRefExhaustedError(
+                        f"no free snapshot refname for {base_ref}: "
+                        f"{PRESERVE_REF_PROBE_LIMIT} candidates through -r{serial - 1} "
+                        f"are all taken (prune refs/attempt-preserve-dirty/* or lower "
+                        f"scm.preserve_keep)"
+                    )
                 ref = f"{base_ref}-r{serial}"
                 serial += 1
             parked = verify.snapshot_worktree(

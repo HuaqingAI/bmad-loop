@@ -788,6 +788,17 @@ def snapshot_worktree(
     return ref_name
 
 
+class PreserveRefExhaustedError(GitError):
+    """Every candidate snapshot refname in a probe's bounded range was already
+    taken. A GitError so the preservation handlers that already guard
+    ``(GitError, OSError)`` degrade instead of crashing; a distinct type so the
+    caller can tell "the namespace is full" from "git said no" — the two want
+    opposite remedies (prune/raise ``scm.preserve_keep`` vs. fix the repo).
+
+    Raised rather than falling through to the last candidate on purpose: reusing
+    an occupied name is the exact data loss the probe exists to prevent (#349)."""
+
+
 def ref_exists(repo: Path, refname: str) -> bool:
     """Whether ``refname`` — a FULL refname, e.g. ``refs/attempt-preserve-dirty/…``
     — currently exists. Sibling of :func:`branch_exists`, which prepends

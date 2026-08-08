@@ -18,7 +18,7 @@ from bmad_loop import verify
 from bmad_loop.gates import ATTENTION_FILE
 from bmad_loop.model import Phase, StoryTask
 from bmad_loop.policy import GatesPolicy, LimitsPolicy, NotifyPolicy, Policy, ScmPolicy
-from bmad_loop.recovery_flow import RecoveryFlow
+from bmad_loop.recovery_flow import PRESERVE_REF_PROBE_LIMIT, RecoveryFlow
 from bmad_loop.verify import GitError, rev_parse_head
 from bmad_loop.workspace import Workspace
 
@@ -735,6 +735,57 @@ def test_ref_probe_git_fault_degrades_like_a_failed_snapshot(project, monkeypatc
 
     entry = flow.journal.fields("attempt-worktree-preserve-failed")
     assert "command not found" in entry["error"]
+    assert (repo / "src.txt").read_text() == "uncommitted work\n"  # work not reset away
+
+
+def test_ref_probe_is_bounded_and_refuses_to_reuse_an_occupied_name(project, monkeypatch):
+    """The probe terminates on its own — the ref set is finite and the serial only
+    climbs — but terminating is not the same as being bounded: without a cap the
+    iteration count is whatever the namespace happens to hold, one git spawn each,
+    inside a crash-recovery path. `PRESERVE_REF_PROBE_LIMIT` bounds the scan, and
+    exhausting it must RAISE rather than fall through to the last candidate;
+    reusing an occupied name is the exact data loss the probe exists to prevent
+    (#349). Exhaustion is a preservation fault like any other, so it degrades into
+    the typed pause instead of crashing the rollback.
+
+    `ref_exists` is answered True for a few calls PAST the limit, so removing the
+    cap makes this fail on the missing pause rather than hanging the suite.
+
+    Ablation target: delete the `serial > PRESERVE_REF_PROBE_LIMIT` raise and the
+    probe walks past the bound to a free name, the snapshot succeeds, and the
+    `pytest.raises(_Pause)` fails."""
+    repo = project.project
+    ws = Workspace.default(project)
+    flow = _make_flow(workspace=ws, policy=_policy(rollback_on_failure=True))
+    task = _task(repo)
+    (repo / "src.txt").write_text("uncommitted work\n")
+
+    probed: list[str] = []
+
+    def _occupied(_repo, refname: str) -> bool:
+        probed.append(refname)
+        return len(probed) <= PRESERVE_REF_PROBE_LIMIT + 5
+
+    snapshots: list[str] = []
+
+    def _snapshot(_repo, refname, **_k):
+        snapshots.append(refname)
+        return refname
+
+    monkeypatch.setattr(verify, "ref_exists", _occupied)
+    monkeypatch.setattr(verify, "snapshot_worktree", _snapshot)
+
+    with pytest.raises(_Pause):  # the typed pause, not a raw error and not a hang
+        flow.rollback_or_pause(task)
+
+    # The bound is the assertion: the base name plus -r2..-r<limit>, then stop.
+    assert len(probed) == PRESERVE_REF_PROBE_LIMIT
+    assert probed[-1].endswith(f"-r{PRESERVE_REF_PROBE_LIMIT}")
+    assert not snapshots  # never wrote over any of the names it found occupied
+
+    entry = flow.journal.fields("attempt-worktree-preserve-failed")
+    assert "no free snapshot refname" in entry["error"]  # names the exhaustion
+    assert "scm.preserve_keep" in entry["error"]  # and the operator's remedy
     assert (repo / "src.txt").read_text() == "uncommitted work\n"  # work not reset away
 
 
