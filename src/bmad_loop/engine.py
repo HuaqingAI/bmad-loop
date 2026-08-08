@@ -3639,7 +3639,12 @@ class Engine:
             return task.story_key
         try:
             lines = Path(task.spec_file).read_text(encoding="utf-8").splitlines()
-        except OSError:
+        except (OSError, UnicodeDecodeError):
+            # UnicodeDecodeError is a ValueError, not an OSError, so a spec torn
+            # mid-write through a multi-byte sequence would slip past an
+            # except-OSError guard. This render happens before
+            # _finalize_commit_phase's try, so an escape crashes the run rather
+            # than escalating the story.
             return task.story_key
         # Skip a leading YAML frontmatter block (standalone --- delimiter lines,
         # same rule as frontmatter._split_frontmatter) so a YAML comment inside

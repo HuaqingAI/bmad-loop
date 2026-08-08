@@ -93,6 +93,12 @@ whose seams had diverged enough that several ports needed a different fix, and t
   `bmad-loop` console script via a thin `__main__.py`. Characterization tests pin the current CLI
   exit codes (typed errors and the broad backstop → 1, argparse usage → 2).
 
+- **`{story_title}` in `scm.commit_message_template` (#475).** Renders the spec's first markdown H1,
+  minus any leading `Story <n.m>:` label, so a template can carry a readable subject. Falls back to
+  the story key when there is no spec, no H1, or the spec is unreadable or not valid UTF-8 — the
+  placeholder never renders empty, and a commit-time read failure never fails the commit. Templates
+  that do not name the placeholder skip the read.
+
 ### Changed
 
 - **Every spec-frontmatter status read goes through `status_of` (#358 follow-up).** Five inline

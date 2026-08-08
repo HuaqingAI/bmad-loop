@@ -2253,6 +2253,21 @@ def test_commit_message_template_story_title_falls_back_to_key(project):
     assert "chore(bmad): 1-1-a" in log
 
 
+def test_story_title_undecodable_spec_falls_back_to_key(project):
+    """A spec that is no longer valid UTF-8 takes the same fallback as an
+    unreadable one. Unit-level because the whole-file decode failure is masked
+    upstream on the normal path (read_frontmatter degrades it to a retry) but
+    live on the resume-into-COMMITTING arm, which renders the message without
+    re-reading frontmatter first."""
+    engine, _ = make_engine(project, [])
+    spec = project.implementation_artifacts / "spec-1-1-a.md"
+    spec.write_bytes(b"---\nstatus: done\n---\n\n# Story 1.1: caf\xe9 latte\n")
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.spec_file = str(spec)
+
+    assert engine._story_title(task) == "1-1-a"
+
+
 # ------------------------------------------------ per_worktree engine plugin
 
 
