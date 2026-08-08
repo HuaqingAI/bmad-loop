@@ -149,7 +149,8 @@ def config_digest(
       ``binary`` / ``launch_args`` / ``bypass_args`` / ``model_flag`` /
       ``prompt_template`` / ``env`` on the *resolved* profile, or to
       ``extra_args`` on the resolved adapter. The opencode-http ``_serve_argv``
-      reads the same two sources.
+      reads the same two sources; its ``_session_env`` adds one *generated*
+      variable on top of them, which the ``skill_tree`` bullet below accounts for.
 
     Three of those are easy to lose, and each was lost in an earlier cut of this
     function — which is why the rule above is stated rather than the list.
@@ -177,11 +178,31 @@ def config_digest(
       selects the *transport*, not the launch surface. Flipping it moves
       ``make_adapters`` between the multiplexer adapter and the HTTP/SSE one, but
       ``opencode_http._serve_argv`` builds its argv from the same pinned
-      ``binary`` and ``extra_args`` plus tokens hard-coded in Python, and
-      ``_session_env`` layers the same pinned ``profile.env``: no attacker-chosen
-      token, program, or variable enters through the flip. What it can do is
-      strand a run on a transport its CLI does not speak, which is a denial the
-      config writer already has by simply breaking this digest.
+      ``binary`` and ``extra_args`` plus tokens hard-coded in Python, so the flip
+      introduces no program and no flag. It is NOT env-neutral — ``_session_env``
+      layers the pinned ``profile.env`` and then adds ``OPENCODE_CONFIG_CONTENT``,
+      generated JSON carrying ``skill_tree`` and the model, both excluded below
+      and above on their own merits. What the flip can do is exec the pinned
+      ``binary`` in ``serve`` mode: a CLI that does not speak it dies in the
+      health poll, stranding the run — a denial the config writer already has by
+      simply breaking this digest.
+    * ``skill_tree`` — the one profile field reaching a launched session's env
+      without passing through argv. For a hookless role ``_config_content`` plants
+      ``cwd/skill_tree`` in that ``OPENCODE_CONFIG_CONTENT`` as ``skills.paths``,
+      so a rewritten tree points the unattended child sweep at instructions of the
+      writer's choosing. Excluded because the pointer is not the door — the
+      content is, and the content is writable in place. Nothing hashes or reseeds
+      a skill: ``_copy_skills`` skips an existing skill dir absent
+      ``--force-skills`` and both ``provision_worktree`` seeds are per-file
+      no-clobber (pinned by
+      ``test_provision_worktree_does_not_clobber_existing_skill``), while the
+      sweep's triage session runs at ``workspace.root`` — the main checkout, never
+      a unit worktree, since ``sweep.py`` swaps the workspace only around bundle
+      execution. So editing ``.claude/skills/bmad-loop-sweep/SKILL.md`` in place
+      reaches the same child with no config change at all, and therefore no digest
+      to move; pinning the redirect would close the costlier of two routes to one
+      door. Skill-content integrity is a real question and not one a config hash
+      can answer.
     * ``usage_parser`` — and with it the rest of the token-budget surface. It
       selects a read-only tally over a transcript the orchestrator opens anyway
       and decides no program, flag, or variable. Rewriting it to ``"none"`` DOES
