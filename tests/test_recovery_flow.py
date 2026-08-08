@@ -710,6 +710,34 @@ def test_snapshot_oserror_degrades_into_the_typed_path(project, monkeypatch):
     assert (repo / "src.txt").read_text() == "uncommitted work\n"
 
 
+def test_ref_probe_git_fault_degrades_like_a_failed_snapshot(project, monkeypatch):
+    """The free-refname probe spawns git before the snapshot does, so it is the
+    first place a spawn/timeout fault can surface. `ref_exists` deliberately does
+    not swallow those (mistaking "git could not run" for "the name is free" would
+    overwrite the very snapshot the probe exists to protect), so the probe has to
+    sit inside the handler that turns a preservation fault into a pause.
+
+    Ablation target: move the probe loop back above the `try` and this fails with
+    the raw GitSpawnError instead of the typed pause."""
+    repo = project.project
+    ws = Workspace.default(project)
+    flow = _make_flow(workspace=ws, policy=_policy(rollback_on_failure=True))
+    task = _task(repo)
+    (repo / "src.txt").write_text("uncommitted work\n")
+
+    def _fail(*_a, **_k):
+        raise verify.GitSpawnError("git: command not found")
+
+    monkeypatch.setattr(verify, "ref_exists", _fail)
+
+    with pytest.raises(_Pause):  # the typed pause, not the GitSpawnError
+        flow.rollback_or_pause(task)
+
+    entry = flow.journal.fields("attempt-worktree-preserve-failed")
+    assert "command not found" in entry["error"]
+    assert (repo / "src.txt").read_text() == "uncommitted work\n"  # work not reset away
+
+
 def test_notice_probe_oserror_does_not_swallow_the_pause(project, monkeypatch):
     """`pause_for_manual_recovery`'s advisory `commits_above` probe runs while the
     fault that broke the snapshot is still in force, so it is the likeliest place

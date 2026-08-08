@@ -425,10 +425,26 @@ class RecoveryFlow:
         slug = safe_ref_segment(self.state.run_id)
         # ``baseline_commit`` is fixed across the whole dev retry loop, so keying the
         # ref on the baseline alone would make a 2nd dirty rollback reuse the name and
-        # orphan the 1st attempt's snapshot. ``task.attempt`` only ever increments
-        # (never resets), so it uniquely discriminates each retry's recovery ref.
-        ref = f"refs/attempt-preserve-dirty/{slug}-{baseline[:8]}-{task.attempt}"
+        # orphan the 1st attempt's snapshot. ``task.attempt`` discriminates the
+        # retries of one arming but is NOT monotonic across the story's life:
+        # runs.rearm_escalation resets it to 0, and a resolve session that commits
+        # nothing leaves HEAD == baseline, so the post-resolve re-drive's rollback
+        # recomputes the exact {slug}-{baseline}-{attempt} name of the pre-resolve
+        # rollback and would overwrite that snapshot, destroying the only copy of
+        # the first attempt's work. Probe for a free name instead of trusting the
+        # counter: uniqueness is enforced against the refs that actually exist.
+        # The probe runs INSIDE the try: `ref_exists` spawns git, and a timeout or
+        # spawn fault arrives as GitError/GitSpawnError rather than a return code.
+        # Uncaught it would crash the rollback here — the one thing this handler
+        # exists to prevent — so a probe that cannot run degrades into the same
+        # "preservation is observation" path as a snapshot that cannot be written.
+        base_ref = f"refs/attempt-preserve-dirty/{slug}-{baseline[:8]}-{task.attempt}"
+        ref = base_ref
+        serial = 2
         try:
+            while verify.ref_exists(workspace.root, ref):
+                ref = f"{base_ref}-r{serial}"
+                serial += 1
             parked = verify.snapshot_worktree(
                 workspace.root, ref, baseline_untracked=task.baseline_untracked
             )
