@@ -153,14 +153,14 @@ whose seams had diverged enough that several ports needed a different fix, and t
 ### Fixed
 
 - **The auto-sweep child refuses config a session rewrote under the run (#461).** `policy.toml` and
-  `profiles/*.toml` sit in the agent-writable workspace, and both reach host code execution: the
-  `[verify] commands` run with `shell=True`, the resolved profile supplies the launch `binary`, and
-  `[plugins] enabled` gates in-process Python import. A run freezes its policy at launch, but the
-  auto-triggered child sweep re-reads both from disk — the one mid-run config change no human
-  initiates. It is now pinned to a launch-time digest of exactly those fields and refuses on a
-  mismatch (`sweep-auto-failed` + notify; the parent run is unaffected). Human-present paths stay
-  trusted: `resume` re-baselines and only warns, naming the changed categories, never the values.
-  The digest is field-scoped, so live-editing `[limits]` mid-run still works.
+  `profiles/*.toml` sit in the agent-writable workspace and reach host code execution — the
+  `[verify] commands` run with `shell=True`, the resolved profile plus `adapter.extra_args` decide
+  the launch argv and env, and `[plugins] enabled` gates in-process Python import. A run freezes its
+  policy at launch, but the auto-triggered child sweep re-reads both from disk; it is now pinned to
+  a launch-time digest of those fields and refuses on a mismatch (`sweep-auto-failed` + notify, the
+  parent run continues). `resume` re-baselines and warns with the changed categories instead of
+  refusing. The digest is field-scoped, so live-editing `[limits]` mid-run still works. Plugins are
+  pinned by name only — swapping the module behind an already-enabled plugin is not yet caught.
 
 - **The hook relay refuses a redirected `events/` dir, and `validate` stats the relay (#461).** The
   relay's event write followed a symlink — or, on Windows, a directory junction, which

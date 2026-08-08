@@ -46,7 +46,13 @@ PROFILE_REL = ".bmad-loop/profiles/mycli.toml"
 def pinned(tmp_path):
     """A project whose entire host-exec surface is expressible on disk: a policy
     naming the verify commands, and a profile overlay carrying the launch
-    binary/args/env."""
+    binary/args/env.
+
+    Deliberately `tmp_path` rather than the `project` conftest sandbox: this is a
+    pure-core unit test of `config_digest`, which reads only `.bmad-loop/`. It
+    needs no git repo, no BMAD artifact dirs and no sprint board, so the sandbox's
+    per-test copytree would buy nothing. The end-to-end gate behavior is tested on
+    the real sandbox in tests/test_cli.py."""
     profiles = tmp_path / ".bmad-loop" / "profiles"
     profiles.mkdir(parents=True)
     (profiles / "mycli.toml").write_text(PROFILE, encoding="utf-8")
@@ -55,6 +61,12 @@ def pinned(tmp_path):
 
 def _digest(project, policy_text=POLICY) -> str:
     return runsetup.config_digest(policy_mod.loads(policy_text), project)
+
+
+def _with_adapter_key(line: str) -> str:
+    """POLICY with one more key inside its EXISTING `[adapter]` table — appending a
+    second `[adapter]` header is a TOML redeclaration error, not an override."""
+    return POLICY.replace('name = "mycli"', f'name = "mycli"\n{line}', 1)
 
 
 def _rewrite_profile(project, old, new) -> None:
@@ -107,6 +119,11 @@ def test_digest_preserves_verify_command_order(pinned):
         pytest.param('launch_args = ["-i"]', 'launch_args = ["-i", "--evil"]', id="launch_args"),
         pytest.param('bypass_args = ["--yes"]', 'bypass_args = ["--all"]', id="bypass_args"),
         pytest.param('env = { FOO = "bar" }', 'env = { FOO = "evil" }', id="env"),
+        # model_flag is an argv FLAG, not a value: an overlay that turns "--model"
+        # into some other option changes what the CLI does with the model string.
+        pytest.param(
+            'binary = "mycli"', 'model_flag = "--exec"\nbinary = "mycli"', id="model_flag"
+        ),
     ],
 )
 def test_digest_moves_on_any_resolved_profile_launch_field(pinned, old, new):
@@ -117,6 +134,47 @@ def test_digest_moves_on_any_resolved_profile_launch_field(pinned, old, new):
     before = _digest(pinned)
     _rewrite_profile(pinned, old, new)
     assert _digest(pinned) != before
+
+
+def test_digest_moves_on_rewritten_adapter_extra_args(pinned):
+    """`extra_args` is the field that carries `--permission-mode bypassPermissions`,
+    and `GenericAdapter.interactive_argv` prefers it over `profile.bypass_args`
+    whenever it is set — so hashing the profile default alone leaves the flags the
+    host CLI is actually launched with unpinned. It lives in policy.toml, which
+    every driven session can write."""
+    assert _digest(pinned, _with_adapter_key('extra_args = ["--yolo"]')) != _digest(pinned)
+
+
+@pytest.mark.parametrize("role", ["dev", "review", "triage"])
+def test_digest_moves_on_rewritten_per_stage_extra_args(pinned, role):
+    """Per-stage `[adapter.<role>] extra_args` overrides the base for that role
+    only, so a digest reading just the base would miss a rewrite aimed at one
+    stage — and the review stage is the one that runs after the dev work lands."""
+    staged = POLICY + f'\n[adapter.{role}]\nextra_args = ["--yolo"]\n'
+    assert _digest(pinned, staged) != _digest(pinned)
+
+
+def test_digest_separates_absent_extra_args_from_an_empty_override(pinned):
+    """`None` means "fall back to profile.bypass_args"; `[]` means "launch with no
+    flags at all". Two different command lines, so they must not collide — a
+    canonical that coerced None to [] would let one be swapped for the other."""
+    inherit = _digest(pinned)  # extra_args absent entirely
+    explicit_none = _digest(pinned, _with_adapter_key("extra_args = []"))
+    assert inherit != explicit_none
+
+
+def test_digest_ignores_the_model_and_prompt_template(pinned):
+    """The documented exclusions, pinned so they stay deliberate. Neither can
+    introduce an argv token: `model` only fills the value slot behind `model_flag`
+    (itself pinned above), and `prompt_template` fills the prompt payload — data
+    for the driven LLM, not for the host. Including them would refuse an
+    auto-sweep after an operator's mid-run model change in the TUI."""
+    before = _digest(pinned)
+    assert _digest(pinned, _with_adapter_key('model = "some-other-model"')) == before
+    _rewrite_profile(
+        pinned, 'binary = "mycli"', 'prompt_template = "GO: {prompt}"\nbinary = "mycli"'
+    )
+    assert _digest(pinned) == before
 
 
 def test_digest_moves_on_a_widened_plugin_allowlist(pinned):

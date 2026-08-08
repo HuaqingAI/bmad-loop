@@ -81,14 +81,40 @@ def config_digest(policy: Policy, project: Path) -> str:
 
     * ``verify.commands`` — order-preserved; they run in sequence.
     * ``sorted(plugins.enabled)`` — set semantics, so order is not meaningful.
-    * each :data:`ROLES` profile's ``binary`` / ``launch_args`` / ``bypass_args`` /
-      ``env``, *resolved* through ``get_profile``. ``binary`` lives in
-      ``profiles/*.toml`` and never appears in ``policy_snapshot``, so a
-      snapshot-only compare cannot see it change at all.
+    * per :data:`ROLES`, every field that decides **which program runs and with
+      what flags and environment**. That rule, not a hand-picked list, is what
+      keeps this complete: walk ``GenericAdapter.interactive_argv`` and
+      ``interactive_env`` and every token there traces back to one of
+      ``binary`` / ``launch_args`` / ``bypass_args`` / ``model_flag`` / ``env``
+      on the *resolved* profile, or to ``extra_args`` on the resolved adapter.
+      The opencode-http ``_serve_argv`` reads the same two sources.
 
-    Deliberately EXCLUDES ``hooks.config_path``: the relay is issue #461's points
-    1-3, hardened on its own track, and folding it in here would make the sweep
-    gate fire on an ordinary ``bmad-loop init`` re-registration.
+    Two of those are easy to lose, and both were lost in the first cut of this
+    function: ``binary`` (and its siblings) live in ``profiles/*.toml`` and never
+    appear in ``policy_snapshot``, so a snapshot-only compare is blind to them;
+    and ``adapter.extra_args`` *replaces* ``profile.bypass_args`` when set — it is
+    the field that carries ``--permission-mode bypassPermissions`` — so hashing
+    the profile default alone leaves the flags actually launched unpinned. ``None``
+    there means "fall back to the profile", a different state from ``()``, and the
+    two are kept apart.
+
+    Deliberately EXCLUDED:
+
+    * ``hooks.config_path`` — the relay is issue #461's points 1-3, hardened on
+      its own track; folding it in would fire on an ordinary ``bmad-loop init``.
+    * ``adapter.model`` and ``prompt_template`` — neither can introduce an argv
+      token. ``model`` only ever fills the value slot behind ``model_flag``, which
+      IS pinned here, and ``prompt_template`` fills the prompt payload, which is
+      data for the driven LLM rather than for the host. Pinning them would refuse
+      an auto-sweep after a human's mid-run model change in the TUI.
+
+    Known gap, tracked separately: this pins the plugin allowlist by NAME only. A
+    project-origin ``.bmad-loop/plugins/<name>/`` overrides a same-named builtin
+    (``plugins/loader.py`` overlay precedence) and ``trust.require_enabled`` gates
+    on the name, so a session can swap the module behind an *already* enabled
+    plugin without moving this digest. Adding a plugin is caught; changing what an
+    enabled one runs is not. Closing that is a plugin-trust-model change rather
+    than a wider hash, so it does not belong here.
 
     Tuples are normalized to lists before ``json.dumps(sort_keys=True)`` for the
     same reason ``cli._resume_paused_run``'s ``policy_changed`` compare does it:
@@ -98,19 +124,24 @@ def config_digest(policy: Policy, project: Path) -> str:
     """
     from .adapters.profile import get_profile
 
-    profiles: dict[str, dict[str, object]] = {}
+    launch: dict[str, dict[str, object]] = {}
     for role in ROLES:
-        prof = get_profile(policy.adapter.resolved(role).name, project)
-        profiles[role] = {
+        cfg = policy.adapter.resolved(role)
+        prof = get_profile(cfg.name, project)
+        launch[role] = {
             "binary": prof.binary,
             "launch_args": list(prof.launch_args),
             "bypass_args": list(prof.bypass_args),
+            "model_flag": prof.model_flag,
             "env": dict(prof.env),
+            # None (inherit profile.bypass_args) is NOT the same state as () (an
+            # explicit override to no flags at all); json.dumps keeps them apart.
+            "extra_args": None if cfg.extra_args is None else list(cfg.extra_args),
         }
     payload = {
         "verify_commands": list(policy.verify.commands),
         "plugins_enabled": sorted(policy.plugins.enabled),
-        "profiles": profiles,
+        "profiles": launch,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -354,7 +385,7 @@ def build_run_state(
     max_stories: int | None,
     stories_on: bool,
     spec_folder: str,
-    trusted_config_digest: str = "",
+    trusted_config_digest: str,
 ) -> RunState:
     """Assemble the launch-time :class:`RunState` for a fresh run.
 
@@ -412,7 +443,7 @@ def compose_run(
     make_adapters: Callable[[Path, Path, Policy], dict[str, CodingCLIAdapter]],
     engine_cls: type[Engine],
     stories_engine_cls: type[StoriesEngine],
-    trusted_config_digest: str = "",
+    trusted_config_digest: str,
 ) -> ComposedRun:
     """Stand up a run: allocate the run dir, persist state + pid, build the
     adapters, and wire the engine — everything ``cmd_run`` did inline between its
@@ -482,7 +513,7 @@ def compose_sweep(
     trigger: str,
     make_adapters: Callable[[Path, Path, Policy], dict[str, CodingCLIAdapter]],
     sweep_engine_cls: type[SweepEngine],
-    trusted_config_digest: str = "",
+    trusted_config_digest: str,
 ) -> ComposedRun:
     """Stand up a sweep run: allocate the run dir, persist state + pid, record the
     sweep options, build the adapters, and wire the ``SweepEngine`` — everything

@@ -66,8 +66,12 @@ def _write_policy(project, text=DUAL_CLIENT_POLICY) -> None:
 def _config_pin(project) -> str:
     """The host-exec config digest for a sandbox project as it stands — the launch
     baseline `cmd_run` / `_resume_paused_run` pin (#461 point 4)."""
+    # Resolve the path the way the production baseline does. Hardcoding it would
+    # silently hand `policy_mod.load` a missing file (which returns all defaults)
+    # if that layout ever moved, turning every gate test below into a confusing
+    # digest mismatch instead of a pointer at the path.
     return runsetup.config_digest(
-        policy_mod.load(project.project / ".bmad-loop" / "policy.toml"), project.project
+        policy_mod.load(cli._policy_path(project.project)), project.project
     )
 
 
