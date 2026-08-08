@@ -455,17 +455,33 @@ class RecoveryFlow:
         # namespace is small" into an enforced invariant, and exhausting it raises
         # rather than reusing the last candidate: falling through to an occupied
         # name is the precise data loss this probe exists to prevent (#349).
+        #
+        # The probe is check-then-write, not atomic: `snapshot_worktree` finishes on a
+        # plain two-arg `update-ref`, which overwrites whatever is there rather than
+        # failing if the name were taken in between. Safe here because each name has
+        # exactly one possible writer, on two independent grounds — the control loop
+        # is sequential (nothing in this path threads, so one run never has two
+        # rollbacks in flight), and the name is keyed on `run_id`, so separate runs
+        # address disjoint namespaces. Only two processes driving the SAME run could
+        # collide, and they would already be racing on run state, worktrees and mux
+        # sessions; the remedy for that is run-level exclusion, not a compare-and-swap
+        # on this one ref.
         base_ref = f"refs/attempt-preserve-dirty/{slug}-{baseline[:8]}-{task.attempt}"
         ref = base_ref
         serial = 2
         try:
             while verify.ref_exists(workspace.root, ref):
                 if serial > PRESERVE_REF_PROBE_LIMIT:
+                    # Remedy has to hold at BOTH ends of the preserve_keep range:
+                    # "lower it" is impossible at 0, which is precisely the setting
+                    # (pruning disabled) that lets this namespace grow far enough to
+                    # exhaust the probe in the first place.
                     raise verify.PreserveRefExhaustedError(
                         f"no free snapshot refname for {base_ref}: "
                         f"{PRESERVE_REF_PROBE_LIMIT} candidates through -r{serial - 1} "
-                        f"are all taken (prune refs/attempt-preserve-dirty/* or lower "
-                        f"scm.preserve_keep)"
+                        f"are all taken (prune refs/attempt-preserve-dirty/*, or set "
+                        f"scm.preserve_keep to a positive value below that limit — "
+                        f"0 disables pruning entirely)"
                     )
                 ref = f"{base_ref}-r{serial}"
                 serial += 1

@@ -793,7 +793,10 @@ class PreserveRefExhaustedError(GitError):
     taken. A GitError so the preservation handlers that already guard
     ``(GitError, OSError)`` degrade instead of crashing; a distinct type so the
     caller can tell "the namespace is full" from "git said no" — the two want
-    opposite remedies (prune/raise ``scm.preserve_keep`` vs. fix the repo).
+    different remedies (prune the namespace, or re-enable pruning by setting
+    ``scm.preserve_keep`` to a positive value, vs. fix the repo). Note the
+    remedy is *not* "lower ``preserve_keep``": 0 means never prune, so the
+    setting most likely to exhaust a probe is the one that cannot go lower.
 
     Raised rather than falling through to the last candidate on purpose: reusing
     an occupied name is the exact data loss the probe exists to prevent (#349)."""
