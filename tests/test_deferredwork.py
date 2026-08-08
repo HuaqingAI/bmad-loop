@@ -1529,3 +1529,66 @@ def test_mark_done_many_skips_an_already_done_entry(tmp_path):
     assert again == []
     body = next(e for e in parse_ledger(p.read_text(encoding="utf-8")) if e.id == "DW-1").body
     assert body.count("resolution: resolved by story 1") == 1
+
+
+def _gated(*lines: str):
+    text = (
+        "# Deferred Work\n\n### DW-1: gated entry\n\n"
+        "origin: test\nlocation: n/a\nreason: test\nstatus: open\n"
+        + "".join(f"{x}\n" for x in lines)
+    )
+    (entry,) = parse_ledger(text)
+    return deferredwork.gates(entry)
+
+
+def test_gates_unions_every_line_and_splits_on_commas():
+    """Several `gate:` lines are one claim, not competing ones: a line-oriented
+    file gives an author no reason to prefer one line over three. Duplicates
+    collapse and a trailing separator is not a token."""
+    g = _gated("gate: 3-2, 3-3", "gate:\t4-1,3-2,")
+
+    assert g.tokens == ("3-2", "3-3", "4-1")
+    assert g.malformed == ()
+
+
+def test_gates_reports_a_token_that_cannot_name_a_story():
+    """The separator is a comma and only a comma. Reading `3-2 3-3` leniently
+    would guess at one the format never promised, so it lands in `malformed` —
+    surfaced by validate rather than silently gating nothing."""
+    g = _gated("gate: 3-2 3-3, ../etc, 4-1")
+
+    assert g.tokens == ("4-1",)
+    assert g.malformed == ("3-2 3-3", "../etc")
+
+
+def test_gates_stop_at_the_canonical_span_boundary():
+    """A `gate:` line below a flat-append bullet belongs to that block, not to the
+    entry above it — the same boundary `status:` is read within. Absorbing it would
+    let an unrelated appended finding block a story nobody gated."""
+    text = (
+        "# Deferred Work\n\n### DW-1: canonical\n\n"
+        "origin: test\nlocation: n/a\nreason: test\nstatus: open\n\n"
+        "- source_spec: `s.md`\n  summary: finding\ngate: 3-2\n"
+    )
+
+    (entry,) = parse_ledger(text)
+
+    assert deferredwork.gates(entry).tokens == ()
+
+
+@pytest.mark.parametrize(
+    ("token", "story_key", "gated"),
+    [
+        ("3-2", "3-2", True),  # stories-mode id: the token IS the key
+        ("3-2", "3-2-invite-link-student-surface", True),  # sprint key: `-` prefix
+        ("3-2", "3-20-later-story", False),  # the boundary the `-` buys
+        # a split story is its own key, so `gate: 3-2` does NOT cover 3-2a/3-2b —
+        # name the halves when a split is what is blocked
+        ("3-2", "3-2a-split-half", False),
+        ("3", "3-2-invite-link", True),  # a whole epic is a legal token
+        ("3-2-invite", "3-2-invite-link", True),
+        ("3-2-invite", "3-2-invited", False),
+    ],
+)
+def test_gates_story_matches_on_key_boundaries(token, story_key, gated):
+    assert deferredwork.gates_story(token, story_key) is gated

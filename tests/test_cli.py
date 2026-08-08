@@ -3884,6 +3884,235 @@ def test_validate_sprint_mode_silent_without_declarations(project, capsys):
     assert [f for f in doc["findings"] if f["check"].startswith("deferred.closes")] == []
 
 
+def write_gated_ledger(paths, entries) -> None:
+    """`write_ledger` plus the lines a hard gate is written on: `entries` maps a
+    DW id to `(status, extra_field_lines)`, appended verbatim after `status:` so a
+    test can spell a `gate:` line, a prose `HARD GATE:`, or a deliberately broken
+    one exactly as a human would."""
+    parts = ["# Deferred Work\n"]
+    for dw_id, (status, extra) in entries.items():
+        tail = "".join(f"{line}\n" for line in extra)
+        parts.append(
+            f"### {dw_id}: item {dw_id}\n\norigin: test, 2026-06-01\n"
+            f"location: src.txt:1\nreason: test entry.\nstatus: {status}\n{tail}"
+        )
+    paths.deferred_work.write_text("\n".join(parts), encoding="utf-8")
+
+
+def _hard_gate_findings(capsys, check="deferred.hard-gate"):
+    doc = json.loads(capsys.readouterr().out)
+    return [f for f in doc["findings"] if f["check"] == check]
+
+
+def _validate_gated_sprint(project, capsys, board, ledger):
+    """Run validate over a sprint project with `board` on the queue and `ledger`
+    (write_gated_ledger's shape) on disk; returns the parsed findings."""
+    install_bmad_config(project)
+    _write_policy(project.project)
+    write_sprint(project, board)
+    write_gated_ledger(project, ledger)
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)  # rc varies by host (binary/skills) — parse the document
+    return json.loads(capsys.readouterr().out)["findings"]
+
+
+def test_validate_fails_when_an_open_entry_gates_an_actionable_story(project, capsys):
+    """The gate the ledger could only ever *say* before: an entry whose prose read
+    "HARD GATE: must run before 3-2" stopped nothing, and `run` drove the story on
+    a leg nobody had wired. With `gate:` the claim is matchable, and unlike every
+    other deferred check this one is a problem — it describes work that must not
+    start, which is what a non-zero exit is for."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link-student-surface": "ready-for-dev"},
+        {"DW-1": ("open", ["gate: 3-2"])},
+    )
+
+    gates = [f for f in findings if f["check"] == "deferred.hard-gate"]
+    assert len(gates) == 1
+    assert gates[0]["severity"] == "problem"  # the one deferred check that gates
+    assert gates[0]["detail"] == {
+        "dw_id": "DW-1",
+        "title": "item DW-1",
+        "story_key": "3-2-invite-link-student-surface",
+        "tokens": ["3-2"],
+    }
+    # names the entry, the story, the token, and both ways out
+    assert "DW-1 (item DW-1)" in gates[0]["message"]
+    assert "3-2-invite-link-student-surface" in gates[0]["message"]
+    assert "gate: 3-2" in gates[0]["message"]
+    assert "status: done <date>" in gates[0]["message"]
+
+
+def test_validate_passes_when_the_gated_story_is_already_done(project, capsys):
+    """A gate is about work that must not *start*. A story the board has already
+    finished is past the point the entry was protecting, so it reports the passing
+    case rather than a refusal nobody can act on."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link-student-surface": "done"},
+        {"DW-1": ("open", ["gate: 3-2"])},
+    )
+
+    gates = [f for f in findings if f["check"] == "deferred.hard-gate"]
+    assert len(gates) == 1 and gates[0]["severity"] == "ok"
+    assert gates[0]["detail"] == {"open_gated_ids": ["DW-1"], "actionable": []}
+
+
+def test_validate_passes_when_the_gate_entry_is_closed(project, capsys):
+    """Closing the entry is the primary remedy the failure names, so it has to be
+    the one that clears it: the same board passes once DW-1 lands."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link-student-surface": "ready-for-dev"},
+        {"DW-1": ("done 2026-08-01", ["gate: 3-2"])},
+    )
+
+    gates = [f for f in findings if f["check"] == "deferred.hard-gate"]
+    assert len(gates) == 1 and gates[0]["severity"] == "ok"
+    assert gates[0]["detail"]["open_gated_ids"] == []
+
+
+def test_validate_hard_gate_token_stops_at_the_key_boundary(project, capsys):
+    """`3-2` gates the story it names and not its numeric neighbours. A bare
+    `startswith` would sweep `3-20-...` in and block an unrelated story for as long
+    as the entry stayed open — the failure mode that makes an operator delete the
+    gate rather than trust it."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {
+            "3-2-invite-link-student-surface": "ready-for-dev",
+            "3-20-later-story": "ready-for-dev",
+        },
+        {"DW-1": ("open", ["gate: 3-2"])},
+    )
+
+    gates = [f for f in findings if f["check"] == "deferred.hard-gate"]
+    assert len(gates) == 1
+    assert gates[0]["detail"]["story_key"] == "3-2-invite-link-student-surface"
+
+
+def test_validate_unions_multiple_gate_lines(project, capsys):
+    """One entry may block several stories, spelled across lines or on one line.
+    A line-oriented file gives an author no reason to prefer either, so both read
+    the same — and each gated story is its own refusal."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link": "ready-for-dev", "4-1-receipts": "backlog"},
+        {"DW-1": ("open", ["gate: 3-2", "gate: 4-1, 9-9"])},
+    )
+
+    gated = [f["detail"]["story_key"] for f in findings if f["check"] == "deferred.hard-gate"]
+    assert gated == ["3-2-invite-link", "4-1-receipts"]  # 9-9 is on no board
+
+
+def test_validate_warns_on_a_prose_only_hard_gate(project, capsys):
+    """The convention `gate:` replaces. A ledger that says HARD GATE in prose is
+    making a claim nothing enforces, so preflight names it — otherwise the entry
+    reads, to anyone scanning it, as a gate already in force."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link": "ready-for-dev"},
+        {"DW-1": ("open", ["HARD GATE: must land before story 3-2"])},
+    )
+
+    unstructured = [f for f in findings if f["check"] == "deferred.hard-gate-unstructured"]
+    assert len(unstructured) == 1 and unstructured[0]["severity"] == "warning"
+    assert unstructured[0]["detail"] == {"dw_id": "DW-1", "malformed": []}
+    assert "`gate:` line" in unstructured[0]["message"]
+    # nothing enforceable exists, so there is no passing gate to report either
+    assert not [f for f in findings if f["check"] == "deferred.hard-gate"]
+
+
+def test_validate_ignores_a_mid_line_hard_gate_mention(project, capsys):
+    """Line-start only: an entry *discussing* a hard gate is not declaring one.
+    Matching anywhere in the body would warn about every entry whose reason
+    mentions the convention, which is the fastest way to make the warning noise."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link": "ready-for-dev"},
+        {"DW-1": ("open", ["note: the old HARD GATE: wording predates the field."])},
+    )
+
+    assert not [f for f in findings if f["check"].startswith("deferred.hard-gate")]
+
+
+def test_validate_warns_on_a_malformed_gate_token(project, capsys):
+    """`gate: 3-2 3-3` looks like two tokens and is one that matches nothing.
+    Reading it leniently would guess at a separator the format never promised, so
+    it is surfaced instead — a token that gates nothing is the prose gate again,
+    wearing the field's syntax."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link": "ready-for-dev"},
+        {"DW-1": ("open", ["gate: 3-2 3-3"])},
+    )
+
+    unstructured = [f for f in findings if f["check"] == "deferred.hard-gate-unstructured"]
+    assert len(unstructured) == 1 and unstructured[0]["severity"] == "warning"
+    assert unstructured[0]["detail"] == {"dw_id": "DW-1", "malformed": ["3-2 3-3"]}
+    # and it is NOT reported as an enforced gate: nothing matched
+    assert not [f for f in findings if f["check"] == "deferred.hard-gate"]
+
+
+def test_validate_silent_when_the_ledger_declares_no_gate(project, capsys):
+    """Zero-config output stays byte-identical: a project that has never written a
+    `gate:` line gets no new lines at all, in either direction."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link": "ready-for-dev"},
+        {"DW-1": ("open", []), "DW-2": ("done 2026-08-01", [])},
+    )
+
+    assert not [f for f in findings if f["check"].startswith("deferred.hard-gate")]
+
+
+def test_validate_hard_gate_runs_in_stories_mode(project, capsys):
+    """Stories mode dispatches manifest ids rather than board keys, and the same
+    token has to reach both — an epic driven from stories.yaml is exactly where a
+    gated leg would otherwise be run first and discovered later."""
+    install_bmad_config(project)
+    _write_policy(project.project, STORIES_POLICY)
+    _setup_stories_fixture(project, [_stories_entry("1")])
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1"])})
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)
+
+    findings = _hard_gate_findings(capsys)
+    assert len(findings) == 1 and findings[0]["severity"] == "problem"
+    assert findings[0]["detail"]["story_key"] == "1"
+
+
+def test_validate_stories_mode_skips_a_done_story(project, capsys):
+    """The manifest carries no status — the story's own spec does. Without reading
+    it, a finished epic would fail validate forever over gates on work that already
+    landed, which is the sprint arm's ACTIONABLE_STATUSES line drawn twice."""
+    install_bmad_config(project)
+    _write_policy(project.project, STORIES_POLICY)
+    folder = _setup_stories_fixture(project, [_stories_entry("1")])
+    (folder / "stories" / "1-slug.md").write_text(
+        "---\ntitle: 'test'\nstatus: 'done'\n---\n\n## Intent\n\ntest\n", encoding="utf-8"
+    )
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1"])})
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)
+
+    findings = _hard_gate_findings(capsys)
+    assert len(findings) == 1 and findings[0]["severity"] == "ok"
+
+
 OPENCODE_QUALIFIED_POLICY = '[adapter]\nname = "opencode"\nmodel = "anthropic/claude-haiku-4-5"\n'
 
 
