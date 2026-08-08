@@ -6986,6 +6986,40 @@ def test_auto_sweep_failure_does_not_pause_parent(project):
     assert "sweep-auto-failed" in journal and "child sweep blew up" in journal
 
 
+def test_auto_sweep_config_digest_refusal_journals_and_spares_the_parent(project):
+    """#461 point 4, end to end through the REAL factory rather than a stand-in
+    exploder: the config-integrity gate's raise has to land on the same
+    `sweep-auto-failed` + notify path every other child-sweep failure takes, and
+    the parent story loop has to finish anyway.
+
+    Pinning it here rather than trusting the exploder test above is the point —
+    that one proves `_maybe_auto_sweep` catches *something*; this proves the gate
+    raises (rather than returning quietly, which the engine would record as
+    `sweep-auto-finished`: a child sweep that ran when none was ever launched)."""
+    from bmad_loop import cli
+
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    policy = Policy(gates=GatesPolicy(mode="none"), notify=QUIET, sweep=SweepPolicy(auto="run-end"))
+    # A baseline no on-disk config can match — the shape of "a session rewrote
+    # policy.toml/profiles between launch and this trigger".
+    factory = cli._sweep_factory(project.project, project, "not-the-launch-digest")
+
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=policy,
+        sweep_factory=factory,
+    )
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    assert engine.state.finished
+    journal = (engine.run_dir / "journal.jsonl").read_text()
+    assert "sweep-auto-failed" in journal
+    assert "changed under a running loop before an auto-sweep" in journal
+    assert "sweep-auto-finished" not in journal
+
+
 def test_no_auto_sweep_by_default(project):
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     calls = []
