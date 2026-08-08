@@ -162,7 +162,7 @@ whose seams had diverged enough that several ports needed a different fix, and t
   refusing. The digest is field-scoped, so live-editing `[limits]` mid-run still works. Plugins are
   pinned by allowlist name only: swapping the module behind an already-enabled plugin, and
   folder-dropping a declarative plugin whose shell hooks need no allowlist entry, are both still
-  uncaught (#496).
+  uncaught (#496, #497).
 
 - **The hook relay refuses a redirected `events/` dir, and `validate` stats the relay (#461).** The
   relay's event write followed a symlink — or, on Windows, a directory junction, which

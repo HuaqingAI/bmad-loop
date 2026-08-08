@@ -120,8 +120,8 @@ def config_digest(policy: Policy, project: Path) -> str:
       are inside an *already-enabled* plugin's blast radius — the trust boundary
       the gap below is about — rather than a way past the allowlist.
 
-    Known gaps, tracked separately (#496). This pins the plugin allowlist by NAME
-    only, and the allowlist is not the whole plugin exec surface:
+    Known gaps, tracked separately (#496, #497). This pins the plugin allowlist by
+    NAME only, and the allowlist is not the whole plugin exec surface:
 
     * A project-origin ``.bmad-loop/plugins/<name>/`` overrides a same-named
       builtin (``plugins/loader.py`` overlay precedence) and
