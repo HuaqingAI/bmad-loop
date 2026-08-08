@@ -152,6 +152,14 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
+- **A re-armed escalation no longer overwrites the previous attempt's dirty snapshot (#349).**
+  `refs/attempt-preserve-dirty/*` names were keyed on `task.attempt`, which `rearm_escalation`
+  resets to 0, so a post-resolve re-drive rolling back against the same baseline recomputed the
+  earlier rollback's refname and destroyed the only copy of that attempt's work. Probe for a free
+  name instead of trusting the counter, suffixing `-r2`, `-r3`, … The scan is bounded; exhausting
+  it refuses (`attempt-worktree-preserve-failed`, then the usual pause) rather than reusing an
+  occupied name. Prune the namespace or lower `scm.preserve_keep` if it ever fires.
+
 - **The auto-sweep child refuses config a session rewrote under the run (#461).** `policy.toml` and
   `profiles/*.toml` sit in the agent-writable workspace and reach host code execution — the
   `[verify] commands` run with `shell=True`, the resolved profile plus `adapter.extra_args` decide
