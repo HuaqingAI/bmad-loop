@@ -2294,6 +2294,37 @@ def test_commit_message_template_story_title(project):
     assert "Story 1.1:" not in log  # the label would just repeat the key
 
 
+def test_commit_message_template_story_title_neutralizes_control_chars(project):
+    """A NUL in the title reaches `git commit -m` as an argv element, where
+    `subprocess.run` raises a bare ValueError. `_run_git` translates
+    TimeoutExpired/UnicodeDecodeError/OSError but not that, so it would escape as
+    itself into `_finalize_commit_phase`'s `except BaseException`, which restores
+    and re-raises — crashing the run with the task already persisted as
+    COMMITTING, so every later resume re-renders the same title and re-crashes.
+    No exotic file bytes are needed to get there: `title: "\\0"` is an ordinary
+    double-quoted YAML scalar.
+
+    Ablation target: drop the `_TITLE_CONTROL_RE` substitution and this fails
+    with `ValueError: embedded null byte` instead of committing."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    review = wt_review_effect(project, "1-1-a", clean=True)
+
+    def review_nul_title(spec):
+        result = review(spec)
+        sp = project.rebased(spec.cwd).implementation_artifacts / "spec-1-1-a.md"
+        sp.write_text(sp.read_text().replace("title: 'test'", 'title: "Wire\\0the Frobnicator"'))
+        return result
+
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), review_nul_title],
+        policy=wt_policy(commit_message_template="chore(bmad): {story_title}"),
+    )
+    summary = engine.run()
+    assert summary.done == 1  # committed rather than wedged mid-COMMITTING
+    assert "chore(bmad): Wire the Frobnicator" in git(project.project, "log", "--format=%s")
+
+
 def test_commit_message_template_story_title_falls_back_to_h1(project):
     """A spec written without a `title:` — i.e. not from this project's
     template — still yields a title from a first markdown H1."""
@@ -2377,6 +2408,17 @@ def test_story_title_undecodable_spec_falls_back_to_key(project):
         ("Story 1.1:", ""),
         (True, ""),
         (1.1, "1.1"),
+        # Control characters are neutralized, not passed through: a NUL reaching
+        # `git commit -m` argv raises a bare ValueError out of subprocess, which
+        # _run_git does not translate — it would crash a task already persisted
+        # as COMMITTING and wedge every resume. `title: "\0"` is plain YAML.
+        ("\x00", ""),
+        ("Wire the\x00Frobnicator", "Wire the Frobnicator"),
+        ("Story 1.1:\x00Wire it", "Wire it"),
+        ("Story\x001.1: Split label", "Split label"),
+        ("Two\nlines", "Two lines"),
+        ("Tabbed\ttitle", "Tabbed title"),
+        ("Collapse   the    runs", "Collapse the runs"),
     ],
 )
 def test_story_label_stripped_cases(raw, expected):

@@ -242,12 +242,23 @@ def _session_task_id(story_key: str, part: str, seq: int) -> str:
 # eats the real title in "Story Points: Add estimates", while `\d+\.\d+` stops
 # matching the dash composites this project actually issues.
 _STORY_LABEL_RE = re.compile(r"^story\s+\d[\w.\-]*:\s*", re.IGNORECASE)
+# C0 controls + DEL. A NUL here is not cosmetic: this title reaches `git commit -m`
+# as an argv element, and `subprocess.run` rejects an embedded null with a plain
+# ValueError — which is NOT in `_run_git`'s translated set (TimeoutExpired,
+# UnicodeDecodeError, OSError), so it would escape as itself, hit
+# `_finalize_commit_phase`'s `except BaseException` re-raise, and crash the run
+# with the task already persisted as COMMITTING — wedging every later resume on
+# the same spec. YAML reaches it without any exotic file bytes: `title: "\0"` is
+# an ordinary double-quoted scalar. The rest of the class goes with it because a
+# newline or CR in a commit subject is mangling, not a title.
+_TITLE_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]+")
 
 
 def _story_label_stripped(value: object) -> str:
     """A commit-ready story title from a frontmatter value or heading text:
-    coerced to str, label dropped, whitespace trimmed. Returns "" for anything
-    that leaves no title behind, which is every caller's signal to fall back.
+    coerced to str, control characters neutralized, label dropped, whitespace
+    collapsed. Returns "" for anything that leaves no title behind, which is
+    every caller's signal to fall back.
 
     Coerces rather than type-checks because the value arrives from YAML, where
     an unquoted title parses to whatever it looks like — ``title: 2026-01-01``
@@ -256,7 +267,10 @@ def _story_label_stripped(value: object) -> str:
     "" and falls back, matching how `status_of` treats a null status."""
     if value is None or isinstance(value, bool):  # `title: yes` is a typo, not a title
         return ""
-    return _STORY_LABEL_RE.sub("", str(value).strip()).strip()
+    text = _TITLE_CONTROL_RE.sub(" ", str(value))
+    # Collapse after the label strip, so a label split by control characters
+    # ("Story\x001.1:") is still recognized rather than surviving into the subject.
+    return " ".join(_STORY_LABEL_RE.sub("", text.strip()).split())
 
 
 # Call-stack nesting depth for engine runs. A nested auto-sweep runs synchronously
