@@ -2439,6 +2439,43 @@ def test_story_title_h1_indent_bound(project, indent, expected):
     assert engine._story_title(task) == expected
 
 
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("# Wire the Frobnicator", "Wire the Frobnicator"),
+        # `#` may be followed by a tab as well as a space...
+        ("#\tWire the Frobnicator", "Wire the Frobnicator"),
+        # ...but by something else it is not a heading at all, and two hashes
+        # are an H2. Both fall back rather than yielding a title.
+        ("#Wire the Frobnicator", "1-1-a"),
+        ("## Wire the Frobnicator", "1-1-a"),
+        # A closing hash run is syntax, not title. This is the only one of these
+        # that would otherwise render a WRONG subject rather than fall back.
+        ("# Wire the Frobnicator ###", "Wire the Frobnicator"),
+        ("# Wire the Frobnicator #", "Wire the Frobnicator"),
+        # ...and it takes whitespace to make one, so a hash fused to the last
+        # word stays part of the title.
+        ("# Wire it in C#", "Wire it in C#"),
+        # Setext is a valid CommonMark H1 and is refused ON PURPOSE: accepting it
+        # would make any prose line above a `===` divider the commit subject,
+        # trading a safe fallback for a confidently wrong title.
+        ("Wire the Frobnicator\n===", "1-1-a"),
+        ("Some ordinary prose\n=====", "1-1-a"),
+    ],
+)
+def test_story_title_h1_atx_forms(project, body, expected):
+    """Which H1 spellings the fallback honors, and which it declines. The
+    declines are the load-bearing half: each is a documented narrowing, not an
+    oversight, so a later "conformance" patch has to argue with these cases."""
+    engine, _ = make_engine(project, [])
+    spec = project.implementation_artifacts / "spec-1-1-a.md"
+    spec.write_text(f"---\nstatus: done\n---\n\n{body}\n")
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.spec_file = str(spec)
+
+    assert engine._story_title(task) == expected
+
+
 def test_render_commit_template_without_placeholder_skips_the_spec_read(project, monkeypatch):
     """A template that never names {story_title} must not pay the spec read —
     the claim the policy docs and CHANGELOG both make. Pinned by making the read

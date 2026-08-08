@@ -257,6 +257,10 @@ _STORY_LABEL_RE = re.compile(r"^story\s+\d[\w.\-]*:\s*", re.IGNORECASE)
 # mangling, not a title. Translating these at the `_run_git` chokepoint instead
 # of here is the general fix, tracked as #506.
 _TITLE_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f\ud800-\udfff]+")
+# An ATX heading's optional closing hash run, which CommonMark requires to be
+# preceded by whitespace — so "# C#" keeps its trailing hash and "# Wire it ###"
+# does not.
+_ATX_CLOSING_RE = re.compile(r"[ \t]+#+[ \t]*$")
 
 
 def _story_label_stripped(value: object) -> str:
@@ -3717,7 +3721,7 @@ class Engine:
 
     def _story_title(self, task: StoryTask) -> str:
         """The story's human-readable title for {story_title}: the spec's
-        ``title:`` frontmatter, falling back to a first markdown H1, then to the
+        ``title:`` frontmatter, falling back to a first **ATX** H1, then to the
         story key. Any leading ``Story <id>:`` label is dropped either way (the
         template already carries the key, so the label would just repeat it).
 
@@ -3726,6 +3730,13 @@ class Engine:
         H1 at all. Keying on the heading alone left the placeholder inert on
         every canonical spec, silently rendering the story key in place of a
         title. The H1 branch stays for specs authored outside that template.
+
+        ATX only, deliberately: the setext form (a line underlined by ``===``)
+        is a valid CommonMark H1, but recognizing it would make *any* prose line
+        sitting above a ``===`` divider the commit subject. That trades this
+        method's one safe failure mode — falling back to the story key — for a
+        confidently wrong title, so the narrower contract is the right one and
+        this docstring is the place it is stated.
 
         Falls back to the story key when there is no spec, no title, or the spec
         is unreadable — the placeholder must never render empty, and a
@@ -3766,8 +3777,16 @@ class Engine:
             # the placeholder was inert on every canonical spec before it read
             # `title:` — so the extraction stays as permissive as the syntax is.
             head = line.lstrip(" ")
-            if len(line) - len(head) <= 3 and head.startswith("# "):
-                title = _story_label_stripped(head[2:])
+            # The opener is `#` followed by a space OR A TAB — `#Title` is not a
+            # heading at all, and `## Title` is an H2, so both stay rejected.
+            if len(line) - len(head) <= 3 and head[:1] == "#" and head[1:2] in (" ", "\t"):
+                # An ATX heading may carry an optional closing run of hashes,
+                # which is syntax rather than title ("# Wire it ###" is "Wire
+                # it"). Unlike the two misses above this one renders a *wrong*
+                # subject rather than falling back, so it is the one worth
+                # stripping. Whitespace before the run is what makes it a
+                # closing sequence; "# C#" keeps its hash.
+                title = _story_label_stripped(_ATX_CLOSING_RE.sub("", head[2:]))
                 if title:
                     return title
                 break

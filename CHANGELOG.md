@@ -95,7 +95,7 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 - **`{story_title}` in `scm.commit_message_template` (#475).** The placeholder renders the spec's
   `title:` frontmatter, minus any leading `Story <id>:` label, so a template can carry a readable
-  subject. Specs authored without that field fall back to a first markdown H1, then to the story
+  subject. Specs authored without that field fall back to a first `#` heading, then to the story
   key — as does a spec that is missing, unreadable or not valid UTF-8, so the placeholder never
   renders empty and a commit-time read failure never fails the commit. The rendered title is
   whitespace-collapsed, and characters `git commit -m` cannot take in an argv (control characters,

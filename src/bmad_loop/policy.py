@@ -520,7 +520,7 @@ class ScmPolicy:
     failed_diff_unlimited: bool = False
     # commit_message_template, when non-empty, is the commit message dev sessions
     # use for a story's commit (placeholders {story_key}, {run_id} and
-    # {story_title} — the spec's `title:` frontmatter, else a first H1, minus any
+    # {story_title} — the spec's `title:` frontmatter, else a first `#` heading, minus any
     # "Story <id>:" label, falling back to the key — are substituted). Empty = the
     # built-in default message.
     commit_message_template: str = ""
@@ -1257,7 +1257,7 @@ failed_diff_max_mb = 5       # per-file size cap (MB) for untracked files in a k
 failed_diff_unlimited = false # true = capture the failed-unit diff with no size cap (may produce very large patches; warns when active)
 # commit_message_template: when set, the commit message dev sessions use for a
 # story's commit. {story_key}, {run_id} and {story_title} (the spec's `title:`
-# frontmatter, else a first H1, minus any "Story <id>:" label; falls back to the
+# frontmatter, else a first `#` heading, minus any "Story <id>:" label; falls back to the
 # key) are substituted.
 # Empty = built-in default.
 commit_message_template = ""
