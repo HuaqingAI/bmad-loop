@@ -14,6 +14,17 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Added
 
+- **A deferred-work entry can block a story: `gate:`.** An entry that must land before specific
+  stories run could only say so in prose (`HARD GATE: must land before 3-2`), and prose stopped
+  nothing — `run` drove the story and the gate surfaced in a diff built on the missing leg. A
+  `gate: 3-2, 3-3` field line names the blocked story keys, and while the entry is `open`
+  `bmad-loop validate` FAILS (`deferred.hard-gate`) for every actionable story a token matches
+  (equal to the key, or its `-`-delimited prefix — `3-2` covers `3-2-invite-link` and never
+  `3-20-later`). Both queue modes. The only deferred check that gates rather than advises; cleared
+  by closing the entry or dropping the token. An open entry that opens a line with `HARD GATE:`
+  but declares no `gate:` line — or whose token cannot name a story key — is a warning
+  (`deferred.hard-gate-unstructured`). A ledger with no `gate:` line at all is silent as before.
+
 - **Deferred review findings are harvested from spec frontmatter (#433).** BMAD-METHOD#2640 moved
   `defer`-triaged findings into the spec's unfiled `deferred:` list. A successful dev, review,
   repair or review-timeout-salvage pass now files each as `### DW-<n>` (`spec-deferrals-harvested`),

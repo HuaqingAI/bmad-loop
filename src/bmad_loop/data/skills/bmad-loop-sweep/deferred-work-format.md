@@ -72,6 +72,43 @@ for polish and nice-to-haves.
 When a deferred item is later completed, set its `status:` to `done` with the
 date (e.g. `status: done 2026-06-20`) — do not delete the entry.
 
+## Hard gates: `gate:`
+
+Some entries are not merely deferred — they **block** specific stories. An
+infrastructure leg nobody has wired yet is not a nice-to-have for the first story
+that consumes it; that story must not run at all until the entry lands. Say so
+with a `gate:` line naming the blocked story keys:
+
+```markdown
+### DW-1: wire the blob-storage credentials
+
+status: open
+gate: 3-2, 3-3
+```
+
+`gate:` is optional and most entries have none. Its value is a **comma-separated**
+list of story-key tokens; several `gate:` lines in one entry union, so an entry
+blocking three stories may list them on one line or on three. A token matches a
+story key when it **is** that key or is its `-`-delimited prefix: `3-2` gates the
+sprint key `3-2-invite-link-student-surface` and the stories-mode id `3-2`, and
+never `3-20-later-story`.
+
+While the entry is `open`, `bmad-loop validate` **fails** (`deferred.hard-gate`)
+for every actionable story a token matches — sprint-status stories at `backlog` /
+`ready-for-dev`, or manifest entries whose spec is not yet `done`. Two things
+clear it: closing the entry (`status: done <date>`), or removing the token
+because it no longer blocks that work. This is the one deferred-work check that
+gates rather than advises: everything else here is traceability that may be
+wrong, while this is work that must not start.
+
+A token must look like a story key — `[A-Za-z0-9][A-Za-z0-9._-]*`, no spaces.
+Anything else matches nothing, so it is reported (`deferred.hard-gate-unstructured`)
+rather than dropped; note that this makes a space-separated `gate: 3-2 3-3` one
+bad token, not two good ones. The same warning covers an open entry whose body
+opens a line with `HARD GATE:` but carries no `gate:` line — the prose convention
+that predates this field, which reads like a gate already in force while holding
+nothing back. Add the `gate:` line to make it enforceable.
+
 ## Sweep annotations
 
 `bmad-loop sweep` runs (the orchestrator and its bundle dev sessions) add two
