@@ -3769,6 +3769,14 @@ class Engine:
                 if lines[i].rstrip() == "---":
                     start = i + 1
                     break
+        # Fenced blocks are skipped, because `#` opens a comment in most of the
+        # languages a spec quotes: a setup snippet whose first line is
+        # "# Install the dependencies" is not this story's heading, and taking it
+        # would render a confidently wrong commit subject rather than falling
+        # back. An unclosed fence deliberately swallows the rest of the file
+        # (CommonMark says it runs to EOF) — resetting at EOF to "rescue" a
+        # heading would resurrect exactly the bug this skip exists to prevent.
+        fence_char, fence_len = "", 0
         for line in lines[start:]:
             # CommonMark allows up to three spaces of indentation before an ATX
             # heading; a fourth makes the line an indented code block, so that is
@@ -3777,6 +3785,19 @@ class Engine:
             # the placeholder was inert on every canonical spec before it read
             # `title:` — so the extraction stays as permissive as the syntax is.
             head = line.lstrip(" ")
+            # A fence opens on 3+ backticks or tildes and closes only on a run of
+            # the SAME character, at least as long, with nothing but whitespace
+            # after it — so a ``` inside a ```` block does not close it early.
+            run = 0
+            if len(line) - len(head) <= 3 and head[:1] in ("`", "~"):
+                run = len(head) - len(head.lstrip(head[0]))
+            if fence_char:
+                if head[:1] == fence_char and run >= fence_len and not head[run:].strip():
+                    fence_char, fence_len = "", 0
+                continue
+            if run >= 3:
+                fence_char, fence_len = head[0], run
+                continue
             # The opener is `#` followed by a space OR A TAB — `#Title` is not a
             # heading at all, and `## Title` is an H2, so both stay rejected.
             if len(line) - len(head) <= 3 and head[:1] == "#" and head[1:2] in (" ", "\t"):

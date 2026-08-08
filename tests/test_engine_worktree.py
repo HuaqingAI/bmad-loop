@@ -2476,6 +2476,79 @@ def test_story_title_h1_atx_forms(project, body, expected):
     assert engine._story_title(task) == expected
 
 
+@pytest.mark.parametrize(
+    ("fence", "content"),
+    [
+        # The shape that makes this common: any fenced snippet whose first line
+        # is a comment. A spec showing setup steps before its heading is
+        # ordinary, and `#` opens a comment in sh, python, yaml, toml, ruby...
+        ("```bash", "# Install the dependencies"),
+        ("```python", "# TODO: wire this up"),
+        # ...and the documentation-flavored shape, where the fenced heading is
+        # a deliberate example of the very syntax being scanned for.
+        ("````markdown", "# Example Heading"),
+        # Tildes open a fence too, and a fence may be indented up to three.
+        ("~~~yaml", "# generated - do not edit"),
+        ("   ```sh", "# nested under a list item"),
+    ],
+)
+def test_story_title_h1_ignores_fenced_blocks(project, fence, content):
+    """A `#` line inside a fenced block is a comment or an example, not this
+    spec's heading — CommonMark agrees the first H1 here is the one after the
+    fence. Getting this wrong is the bad kind of wrong: it renders a
+    confidently incorrect commit subject rather than falling back to the key."""
+    engine, _ = make_engine(project, [])
+    spec = project.implementation_artifacts / "spec-1-1-a.md"
+    close = fence.lstrip(" ")[: 4 if fence.lstrip(" ").startswith("````") else 3]
+    spec.write_text(
+        f"---\nstatus: done\n---\n\n{fence}\n{content}\n{close}\n\n# Wire the Frobnicator\n"
+    )
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.spec_file = str(spec)
+
+    assert engine._story_title(task) == "Wire the Frobnicator"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # A shorter run of the same character does not close a longer fence —
+        # this is why a ```` block may quote ``` at all.
+        "````markdown\n```\n# Fenced Heading\n```\n````\n\n# Wire the Frobnicator\n",
+        # ...and neither does a run of the *other* fence character.
+        "```markdown\n~~~\n# Fenced Heading\n~~~\n```\n\n# Wire the Frobnicator\n",
+        # A closing run must have nothing but whitespace after it, so a fence
+        # line carrying an info string is an opener, never a close.
+        "~~~\n# Fenced Heading\n~~~ still-open\n~~~\n\n# Wire the Frobnicator\n",
+    ],
+)
+def test_story_title_h1_nested_fence_does_not_close_early(project, body):
+    """The closing rule is same-character, at-least-as-long, nothing after it.
+    Relax any of those three and an inner fence ends the block early, putting a
+    fenced `# ...` back in scope as the title — which is the whole bug."""
+    engine, _ = make_engine(project, [])
+    spec = project.implementation_artifacts / "spec-1-1-a.md"
+    spec.write_text(f"---\nstatus: done\n---\n\n{body}")
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.spec_file = str(spec)
+
+    assert engine._story_title(task) == "Wire the Frobnicator"
+
+
+def test_story_title_h1_unclosed_fence_falls_back(project):
+    """An unclosed fence swallows the rest of the file, so there is no heading
+    left to find and the story key is the answer. Pinned because the tempting
+    "reset at EOF" repair would resurrect exactly the comment-as-title bug this
+    scan exists to prevent."""
+    engine, _ = make_engine(project, [])
+    spec = project.implementation_artifacts / "spec-1-1-a.md"
+    spec.write_text("---\nstatus: done\n---\n\n```bash\n# Install the dependencies\n")
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.spec_file = str(spec)
+
+    assert engine._story_title(task) == "1-1-a"
+
+
 def test_render_commit_template_without_placeholder_skips_the_spec_read(project, monkeypatch):
     """A template that never names {story_title} must not pay the spec read —
     the claim the policy docs and CHANGELOG both make. Pinned by making the read
