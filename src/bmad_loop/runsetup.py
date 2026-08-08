@@ -85,36 +85,56 @@ def config_digest(policy: Policy, project: Path) -> str:
       what flags and environment**. That rule, not a hand-picked list, is what
       keeps this complete: walk ``GenericAdapter.interactive_argv`` and
       ``interactive_env`` and every token there traces back to one of
-      ``binary`` / ``launch_args`` / ``bypass_args`` / ``model_flag`` / ``env``
-      on the *resolved* profile, or to ``extra_args`` on the resolved adapter.
-      The opencode-http ``_serve_argv`` reads the same two sources.
+      ``binary`` / ``launch_args`` / ``bypass_args`` / ``model_flag`` /
+      ``prompt_template`` / ``env`` on the *resolved* profile, or to
+      ``extra_args`` on the resolved adapter. The opencode-http ``_serve_argv``
+      reads the same two sources.
 
-    Two of those are easy to lose, and both were lost in the first cut of this
-    function: ``binary`` (and its siblings) live in ``profiles/*.toml`` and never
-    appear in ``policy_snapshot``, so a snapshot-only compare is blind to them;
-    and ``adapter.extra_args`` *replaces* ``profile.bypass_args`` when set — it is
-    the field that carries ``--permission-mode bypassPermissions`` — so hashing
-    the profile default alone leaves the flags actually launched unpinned. ``None``
+    Three of those are easy to lose, and each was lost in an earlier cut of this
+    function — which is why the rule above is stated rather than the list.
+    ``binary`` (and its siblings) live in ``profiles/*.toml`` and never appear in
+    ``policy_snapshot``, so a snapshot-only compare is blind to them.
+    ``adapter.extra_args`` *replaces* ``profile.bypass_args`` when set — it is the
+    field that carries ``--permission-mode bypassPermissions`` — so hashing the
+    profile default alone leaves the flags actually launched unpinned; ``None``
     there means "fall back to the profile", a different state from ``()``, and the
-    two are kept apart.
+    two are kept apart. And ``prompt_template`` reads like prompt *payload* but is
+    not: ``interactive_argv`` places ``render_prompt(spec.prompt)`` in the argv
+    list, and the template need not contain ``{prompt}`` at all, so a rewritten
+    template is a verbatim attacker-chosen argv token. ``build_command``
+    ``shlex.quote``\\ s it, which bounds it to ONE token — no word-splitting — but
+    one token is enough for the ``--opt=value`` form.
 
     Deliberately EXCLUDED:
 
     * ``hooks.config_path`` — the relay is issue #461's points 1-3, hardened on
       its own track; folding it in would fire on an ordinary ``bmad-loop init``.
-    * ``adapter.model`` and ``prompt_template`` — neither can introduce an argv
-      token. ``model`` only ever fills the value slot behind ``model_flag``, which
-      IS pinned here, and ``prompt_template`` fills the prompt payload, which is
-      data for the driven LLM rather than for the host. Pinning them would refuse
-      an auto-sweep after a human's mid-run model change in the TUI.
+    * ``adapter.model`` — it cannot introduce an argv token, only fill the value
+      slot behind ``model_flag``, which IS pinned here. Pinning it would refuse an
+      auto-sweep after a human's mid-run model change in the TUI.
+    * ``[plugins.<name>]`` settings — an enabled plugin's resolved settings do
+      reach exec (``bus.py`` exports each as ``BMAD_LOOP_SETTING_*`` into a
+      ``shell=True`` hook, and the Unity plugin turns one into an ``--editor-path``
+      argv token), but the TUI settings screen writes those same tables, so
+      pinning them would refuse an auto-sweep after a supported human edit. They
+      are inside an *already-enabled* plugin's blast radius — the trust boundary
+      the gap below is about — rather than a way past the allowlist.
 
-    Known gap, tracked separately: this pins the plugin allowlist by NAME only. A
-    project-origin ``.bmad-loop/plugins/<name>/`` overrides a same-named builtin
-    (``plugins/loader.py`` overlay precedence) and ``trust.require_enabled`` gates
-    on the name, so a session can swap the module behind an *already* enabled
-    plugin without moving this digest. Adding a plugin is caught; changing what an
-    enabled one runs is not. Closing that is a plugin-trust-model change rather
-    than a wider hash, so it does not belong here.
+    Known gaps, tracked separately (#496). This pins the plugin allowlist by NAME
+    only, and the allowlist is not the whole plugin exec surface:
+
+    * A project-origin ``.bmad-loop/plugins/<name>/`` overrides a same-named
+      builtin (``plugins/loader.py`` overlay precedence) and
+      ``trust.require_enabled`` gates on the name, so a session can swap the module
+      behind an *already* enabled plugin without moving this digest.
+    * Adding a plugin is caught only for one that declares ``[python]``. A
+      *declarative* manifest (no ``[python]``) loads on folder-drop by design
+      (``plugins/trust.py``) and ``registry.hooks_for`` hands its ``[hooks.<stage>]
+      cmd`` to the bus, which runs it with ``shell=True`` — with no ``enabled``
+      entry, and from a directory this digest never reads.
+
+    Closing either is a plugin-trust-model change rather than a wider hash, so
+    neither belongs here.
 
     Tuples are normalized to lists before ``json.dumps(sort_keys=True)`` for the
     same reason ``cli._resume_paused_run``'s ``policy_changed`` compare does it:
@@ -133,6 +153,9 @@ def config_digest(policy: Policy, project: Path) -> str:
             "launch_args": list(prof.launch_args),
             "bypass_args": list(prof.bypass_args),
             "model_flag": prof.model_flag,
+            # An argv element, not prompt payload: render_prompt returns this
+            # template formatted, and it need not reference {prompt} at all.
+            "prompt_template": prof.prompt_template,
             "env": dict(prof.env),
             # None (inherit profile.bypass_args) is NOT the same state as () (an
             # explicit override to no flags at all); json.dumps keeps them apart.

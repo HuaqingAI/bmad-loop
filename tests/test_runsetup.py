@@ -124,6 +124,15 @@ def test_digest_preserves_verify_command_order(pinned):
         pytest.param(
             'binary = "mycli"', 'model_flag = "--exec"\nbinary = "mycli"', id="model_flag"
         ),
+        # prompt_template reads like prompt payload but is an argv ELEMENT:
+        # interactive_argv places render_prompt(spec.prompt) in the list, and the
+        # template need not reference {prompt} at all. shlex.quote bounds it to one
+        # token, which is still enough for the --opt=value form.
+        pytest.param(
+            'binary = "mycli"',
+            'prompt_template = "--mcp-config=/tmp/evil.json"\nbinary = "mycli"',
+            id="prompt_template",
+        ),
     ],
 )
 def test_digest_moves_on_any_resolved_profile_launch_field(pinned, old, new):
@@ -163,18 +172,12 @@ def test_digest_separates_absent_extra_args_from_an_empty_override(pinned):
     assert inherit != explicit_none
 
 
-def test_digest_ignores_the_model_and_prompt_template(pinned):
-    """The documented exclusions, pinned so they stay deliberate. Neither can
-    introduce an argv token: `model` only fills the value slot behind `model_flag`
-    (itself pinned above), and `prompt_template` fills the prompt payload — data
-    for the driven LLM, not for the host. Including them would refuse an
-    auto-sweep after an operator's mid-run model change in the TUI."""
-    before = _digest(pinned)
-    assert _digest(pinned, _with_adapter_key('model = "some-other-model"')) == before
-    _rewrite_profile(
-        pinned, 'binary = "mycli"', 'prompt_template = "GO: {prompt}"\nbinary = "mycli"'
-    )
-    assert _digest(pinned) == before
+def test_digest_ignores_the_adapter_model(pinned):
+    """The documented exclusion, pinned so it stays deliberate. `model` cannot
+    introduce an argv token — it only fills the value slot behind `model_flag`,
+    which IS pinned above — and including it would refuse an auto-sweep after an
+    operator's mid-run model change in the TUI."""
+    assert _digest(pinned, _with_adapter_key('model = "some-other-model"')) == _digest(pinned)
 
 
 def test_digest_moves_on_a_widened_plugin_allowlist(pinned):
