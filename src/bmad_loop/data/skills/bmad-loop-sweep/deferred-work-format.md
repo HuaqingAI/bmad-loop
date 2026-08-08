@@ -89,9 +89,12 @@ gate: 3-2, 3-3
 `gate:` is optional and most entries have none. Its value is a **comma-separated**
 list of story-key tokens; several `gate:` lines in one entry union, so an entry
 blocking three stories may list them on one line or on three. A token matches a
-story key when it **is** that key or is its `-`-delimited prefix: `3-2` gates the
-sprint key `3-2-invite-link-student-surface` and the stories-mode id `3-2`, and
-never `3-20-later-story`.
+story key when it **is** that key, or is its prefix at a key boundary — either a
+`-`, or the split-story suffix (one lowercase letter then `-`). So `3-2` gates the
+sprint key `3-2-invite-link-student-surface`, the stories-mode id `3-2`, and both
+halves of a split (`3-2a-…` / `3-2b-…`), but never `3-20-later-story`. The split
+arm matters because breakdown can split a story _after_ the gate was written, and
+a gate that quietly stops matching is worse than one that was never there.
 
 While the entry is `open`, `bmad-loop validate` **fails** (`deferred.hard-gate`)
 for every actionable story a token matches — sprint-status stories at `backlog` /
@@ -101,13 +104,21 @@ because it no longer blocks that work. This is the one deferred-work check that
 gates rather than advises: everything else here is traceability that may be
 wrong, while this is work that must not start.
 
-A token must look like a story key — `[A-Za-z0-9][A-Za-z0-9._-]*`, no spaces.
-Anything else matches nothing, so it is reported (`deferred.hard-gate-unstructured`)
-rather than dropped; note that this makes a space-separated `gate: 3-2 3-3` one
-bad token, not two good ones. The same warning covers an open entry whose body
-opens a line with `HARD GATE:` but carries no `gate:` line — the prose convention
-that predates this field, which reads like a gate already in force while holding
-nothing back. Add the `gate:` line to make it enforceable.
+Three shapes declare a gate that nothing can enforce, and all three are reported
+as `deferred.hard-gate-unstructured` on an open entry:
+
+- a token that does not look like a story key (`[A-Za-z0-9][A-Za-z0-9._-]*`, no
+  spaces) — note that this makes a space-separated `gate: 3-2 3-3` one bad token
+  rather than two good ones;
+- a `gate:` line with nothing usable after the colon (`gate:`, `gate: ,`);
+- prose declaring `HARD GATE:` — the convention that predates this field —
+  anywhere on a line of an entry that carries no `gate:` line. It is matched
+  mid-line because `reason:` prose is hard-wrapped, but never directly after a
+  quote character: an entry that merely _cites_ the phrase stays silent, as does
+  one that writes it without the colon.
+
+Each reads like a gate already in force while holding nothing back. Add or repair
+the `gate:` line to make it enforceable.
 
 ## Sweep annotations
 
