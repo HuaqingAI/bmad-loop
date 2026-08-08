@@ -113,6 +113,75 @@ def _required_worktree_skills(repo_root: Path, tree: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys((dev_primitive_or_default(repo_root, tree), *review_skills)))
 
 
+def _drop_inert_tracked_file_patterns(
+    worktree: Path, patterns: set[str]
+) -> tuple[set[str], str | None]:
+    """Drop shield patterns that name a TRACKED REGULAR FILE, keeping the rest.
+
+    Such a pattern shields nothing and costs something (#392, reported from production
+    by an external user whose repo-hygiene gate then blocked the story's commit).
+    Measured on git 2.55.0 with the shield's own private-exclude + worktree-scoped
+    `core.excludesFile` shape, a tracked `.codex/hooks.json`, and its pattern present:
+
+    * `git add -A` STAGES a modification to it anyway — ignore rules are consulted only
+      for untracked paths, so the pattern never did the job it is here for;
+    * `git ls-files -ci --exclude-standard` inside the worktree REPORTS it, which is the
+      tracked-and-ignored state hygiene gates reject.
+
+    So the pattern is pure cost and dropping it is free. This is the second half of #384
+    — its reporter proposed it as their option 3 ("skip any pattern whose path already
+    contains tracked files … costs nothing and removes the surprising case entirely");
+    PR #385 landed option 1 (scope + lifetime) and this half was dropped rather than
+    rejected, which is how a second reporter hit it.
+
+    A tracked DIRECTORY keeps its pattern: measured, that one really does hide new
+    children, which is the shield working. Its tracked children still answer `-ci`, and
+    no pattern shape avoids that — `dir/*`, `dir/**` and a trailing negation all
+    measured identical to `dir`, since gitignore cannot re-include under an excluded
+    parent, while the one shape that cleared the report leaked a new file into the
+    commit. Not a case this function can fix; the tradeoff favors the shield.
+
+    Patterns ending in `/` are directory-shaped by construction (`RENDER_DIR_REL`) and
+    are never probed.
+
+    Degrades by KEEPING every pattern when git cannot answer: the shield staying too
+    wide is cosmetic, while dropping a pattern on a guess can leak the orchestrator's
+    own seeded files into a story commit. Returns the surviving patterns and a reason
+    for the caller to journal, or None when nothing went wrong.
+
+    NOT-A-REPO IS SILENT, and it is the ordinary case rather than an edge one: many
+    callers provision plain non-repo directories, where there is no index, no shield and
+    no `git add -A` to be wrong about. The same `rev-parse --absolute-git-dir` gate
+    `_worktree_local_exclude` skips on is asked FIRST, so this cannot emit a degrade per
+    call and train operators past the one that matters. Only a repo that answers that
+    probe and then fails the per-path one is reported."""
+    try:
+        if verify.git_bytes(worktree, "rev-parse", "--absolute-git-dir").returncode != 0:
+            return patterns, None
+    except (verify.GitError, OSError):
+        return patterns, None
+    kept: set[str] = set()
+    unprobed: list[str] = []
+    for pattern in patterns:
+        rel = pattern.lstrip("/")
+        if not rel or pattern.endswith("/"):
+            kept.add(pattern)
+            continue
+        try:
+            if not verify.path_tracked_file(worktree, rel):
+                kept.add(pattern)
+        except (verify.GitError, OSError) as e:
+            kept.add(pattern)
+            unprobed.append(f"{rel} ({e})")
+    if unprobed:
+        return kept, (
+            "worktree git-add shield could not check whether these paths are tracked, "
+            "so their patterns were kept; a tracked file among them will read as "
+            f"ignored to repo-hygiene checks (#392): {'; '.join(sorted(unprobed))}"
+        )
+    return kept, None
+
+
 def _seed_bmad_tree(worktree: Path, repo_root: Path) -> list[str]:
     """Merge the repo's project-local BMAD surface into an isolated worktree.
 
@@ -625,6 +694,9 @@ def provision_worktree(
         # be consulted. Avoiding that inert sibling keeps the worktree-local exclude
         # precise; the file and its lines disappear with this worktree.
         patterns.add(f"/{RENDER_DIR_REL}/")
+    patterns, tracked_degrade = _drop_inert_tracked_file_patterns(worktree, patterns)
+    if tracked_degrade is not None and on_degraded is not None:
+        on_degraded(tracked_degrade)
     reason = _worktree_local_exclude(worktree, sorted(patterns))
     if reason is not None and on_degraded is not None:
         on_degraded(reason)
@@ -873,6 +945,31 @@ class WorktreeFlow:
         if scm.seed_adapter_defaults:
             for profile in profiles:
                 seeds.extend(profile.seed_files)
+                # The hook config is seeded from the SAME list that shields it. It was
+                # only ever in the shield set (`provision_worktree`'s `patterns`), never
+                # here, so whether it got seeded depended on a profile happening to name
+                # it twice: claude's `seed_files` carries `.claude/settings.json`, which
+                # is also its `config_path`, and codex's does not carry
+                # `.codex/hooks.json` (#471).
+                #
+                # What seeding fixes, stated only as far as it is measured: the hook
+                # step in `provision_worktree` creates and writes that config whether
+                # or not it was seeded (`merge_hooks` on an absent file returns
+                # changed=True), so bmad-loop's OWN Stop hook registers either way.
+                # What an unseeded worktree loses is the PROJECT's hook configuration —
+                # the session runs against a file holding the relay registrations alone.
+                # #471's reported stall is consistent with the CLI declining hooks from
+                # a config it has not trusted (codex.toml's `first_run_note`), but that
+                # mechanism is UNCONFIRMED and nothing here rests on it; the issue's own
+                # stated mechanism — the file being absent — is false at this line.
+                #
+                # Deriving it from `config_path` rather than restating it per profile is
+                # what keeps a future profile from regressing the same way. Hookless
+                # profiles have no config to seed. The seed loop skips an occupied
+                # destination, so a project that TRACKS this path keeps its checked-out
+                # copy untouched.
+                if not profile.hookless and profile.hooks.config_path:
+                    seeds.append(profile.hooks.config_path)
         seeds.extend(scm.worktree_seed)
         seeds.extend(self._ledger_seed(unit.path))
         # plugins (e.g. the Unity engine) may prime an isolated checkout with

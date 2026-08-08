@@ -14,7 +14,7 @@ import subprocess
 
 import pytest
 
-from bmad_loop.adapters import tmux_base
+from bmad_loop.adapters import multiplexer, tmux_base
 from bmad_loop.adapters.base import SessionSpec
 from bmad_loop.adapters.generic import GenericAdapter
 from bmad_loop.adapters.multiplexer import MultiplexerError, TerminalMultiplexer, parse_target
@@ -313,6 +313,85 @@ def test_tmux_window_pane_pids_degrades_to_empty(monkeypatch, outcome):
     mux = TmuxMultiplexer()
     monkeypatch.setattr(tmux_base.subprocess, "run", lambda argv, **k: outcome(argv))
     assert mux.window_pane_pids("@7") == []
+
+
+# -------------------------------- version() is one bounded line, always (#321)
+#
+# Consumers render version() inline (the `mux` table, validate's preflight
+# finding, the diagnostic dump), so the seam owes them a single line — and a
+# bounded one, since the table sizes its columns off the widest cell. psmux's
+# `-V` prints two lines — a `tmux X.Y.Z` compat line plus its own — and the base
+# folds them here so no consumer has to.
+
+
+def _version_stdout(monkeypatch, stdout: str):
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        tmux_base.subprocess,
+        "run",
+        lambda argv, **k: subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr=""),
+    )
+
+
+def test_version_folds_a_multi_line_probe_onto_one_line(monkeypatch):
+    _version_stdout(monkeypatch, "tmux 3.3.7\npsmux 3.3.7 (05cc5d4 2026-07-20)\n")
+
+    got = TmuxMultiplexer().version()
+
+    assert got is not None and "\n" not in got
+    # Folded, not truncated: dropping the tail would hide which binary runs.
+    assert got == "tmux 3.3.7; psmux 3.3.7 (05cc5d4 2026-07-20)"
+    # Order is load-bearing — PsmuxMultiplexer.available() anchors its version
+    # match at position 0, so the compat line must stay first.
+    assert got.startswith("tmux 3.3.7")
+
+
+def test_version_of_a_single_line_probe_is_unchanged(monkeypatch):
+    # The POSIX path must stay byte-identical: no separator, no reformatting.
+    _version_stdout(monkeypatch, "tmux 3.4\n")
+
+    assert TmuxMultiplexer().version() == "tmux 3.4"
+
+
+def test_version_drops_blank_segments_and_strips_the_rest(monkeypatch):
+    # A blank line would otherwise fold into a bare "; ; " run, and an indented
+    # continuation line into "tmux 3.3.7;   psmux ...".
+    _version_stdout(monkeypatch, "tmux 3.3.7\n\n   \n  psmux 3.3.7\n")
+
+    assert TmuxMultiplexer().version() == "tmux 3.3.7; psmux 3.3.7"
+
+
+def test_version_of_an_all_blank_probe_is_the_none_sentinel(monkeypatch):
+    # A probe that exits 0 printing nothing reports "no version" — the sentinel
+    # this method documents — not a version that happens to be empty.
+    _version_stdout(monkeypatch, "\n  \n")
+
+    assert TmuxMultiplexer().version() is None
+
+
+def test_version_is_bounded_not_just_flattened(monkeypatch):
+    # `mux` sizes every column off the widest cell, so an unbounded single line
+    # breaks the table exactly as the embedded newline did — length is half the
+    # seam's promise. The cut is at the tail, which the psmux gate's anchored
+    # parse never reads.
+    _version_stdout(monkeypatch, "tmux 3.4 " + "x" * 300)
+
+    got = TmuxMultiplexer().version()
+
+    assert got is not None
+    assert len(got) == multiplexer.VERSION_MAX_CHARS
+    assert got.startswith("tmux 3.4 ") and got.endswith("…")
+
+
+def test_version_of_a_real_probe_is_never_truncated(monkeypatch):
+    # The bound must clear the probes that actually exist by a wide margin —
+    # otherwise it trades one unreadable cell for a useless one.
+    _version_stdout(monkeypatch, "tmux 3.3.7\npsmux 3.3.7 (05cc5d4 2026-07-20)\n")
+
+    got = TmuxMultiplexer().version()
+
+    assert got == "tmux 3.3.7; psmux 3.3.7 (05cc5d4 2026-07-20)"
+    assert len(got) < multiplexer.VERSION_MAX_CHARS
 
 
 # ---------------------------------------------- _run seam: encoding + env (#40)

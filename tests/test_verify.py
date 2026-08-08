@@ -2005,6 +2005,77 @@ def test_path_tracked_still_matches_a_directory_prefix(project):
     assert verify.path_tracked(repo, "_bmad/render")
 
 
+def test_path_tracked_file_separates_a_file_from_a_directory_prefix(project):
+    """The whole reason this predicate exists next to its sibling: `path_tracked`
+    answers True for BOTH a tracked file and a tracked directory, and the worktree
+    shield needs opposite behaviour for the two (#392).
+
+    Ablation: return `bool(entries)` instead of comparing the set and the directory
+    assertion flips to True — i.e. the shield would start dropping a tracked skill
+    tree's pattern, which measurably DOES shield new children."""
+    repo = project.project
+    (repo / "_bmad" / "render").mkdir(parents=True, exist_ok=True)
+    (repo / "_bmad" / "render" / "render_skill.py").write_text("# renderer\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "render")
+
+    # The sibling cannot tell these apart; this one must.
+    assert verify.path_tracked(repo, "src.txt")
+    assert verify.path_tracked(repo, "_bmad/render")
+    assert verify.path_tracked_file(repo, "src.txt")
+    assert not verify.path_tracked_file(repo, "_bmad/render")
+    assert verify.path_tracked_file(repo, "_bmad/render/render_skill.py")
+
+
+def test_path_tracked_file_is_false_for_untracked_and_absent(project):
+    """An untracked file and a path git has never seen both answer False — the
+    shield keeps their patterns, which is the whole point of the shield."""
+    repo = project.project
+    (repo / "stray.txt").write_text("untracked\n")
+    assert not verify.path_tracked_file(repo, "stray.txt")
+    assert not verify.path_tracked_file(repo, "never_existed.txt")
+
+
+def test_path_tracked_file_reads_a_metachar_name_past_its_glob_neighbour(project):
+    """The literal-pathspec hazard, in the ONE direction this function can get wrong.
+
+    ⚠️ Written first as the sibling's assertion — an ABSENT metachar path must not read
+    as tracked — and that ablated GREEN, because the set comparison already refuses it
+    for a different reason: a glob match answers with the NEIGHBOUR'S name, which is not
+    the name asked for, so the set differs and the result is False regardless of the
+    pathspec. Emptiness-reading `path_tracked` needs `:(literal)` for that direction;
+    this one does not.
+
+    What it does need it for is the opposite direction. When the metachar path IS a
+    tracked file and its glob neighbour is tracked too, the bare pathspec returns BOTH
+    names, the set comparison fails, and a genuine tracked file reads False — the shield
+    then keeps an inert pattern and the #392 hygiene failure survives for any project
+    whose hook config or skill tree carries `[`, `*` or `?`.
+
+    Ablation: drop the `:(literal)` prefix and the first assertion flips to False."""
+    repo = project.project
+    _metachar_pair(repo, "docs[a]", "docsa")  # both committed, and the glob collides
+    assert verify.path_tracked_file(repo, "docs[a]/f.md")
+    assert verify.path_tracked_file(repo, "docsa/f.md")
+    # The absent-path direction still holds; it is just not what pins the pathspec.
+    git(repo, "rm", "-r", "-q", "--cached", "--", ":(literal)docs[a]")
+    assert not verify.path_tracked_file(repo, "docs[a]/f.md")
+
+
+def test_path_tracked_file_raises_on_git_failure(project, monkeypatch):
+    """Contracted to raise like every other probe here, so the shield's caller can
+    make its own keep-the-pattern decision rather than inherit a silent False —
+    which would drop a pattern on a fault and leak seeded files into a story commit."""
+    repo = project.project
+
+    def boom(_repo, *_args):
+        raise verify.GitError("ls-files exploded")
+
+    monkeypatch.setattr(verify, "git_bytes", boom)
+    with pytest.raises(verify.GitError):
+        verify.path_tracked_file(repo, "src.txt")
+
+
 @RESERVED_IN_WINDOWS_FILENAMES
 def test_path_tracked_reads_a_rel_beginning_with_a_colon(project):
     """A leading `:` is pathspec magic. Bare, git parses it as an (unknown) magic
@@ -3129,6 +3200,21 @@ def test_snapshot_worktree_survives_reset_and_gc(project):
     # (conftest `git` strips, so compare against the newline-free blob content)
     assert git(repo, "show", f"{ref}:src.txt") == "tracked edit"
     assert git(repo, "show", f"{ref}:new_test.txt") == "untracked new file"
+
+
+def test_ref_exists_sees_full_refnames_outside_heads(project):
+    """`ref_exists` must resolve FULL refnames in both families the engine probes:
+    the refs/attempt-preserve-dirty/* snapshots (outside refs/heads/, invisible to
+    `branch_exists`) and ordinary branches given as refs/heads/<name>. Absent refs
+    — and git failures, per the best-effort contract — read as False."""
+    repo = project.project
+    ref = "refs/attempt-preserve-dirty/run-abc12345-1"
+    assert verify.ref_exists(repo, ref) is False
+    git(repo, "update-ref", ref, "HEAD")
+    assert verify.ref_exists(repo, ref) is True
+    assert verify.ref_exists(repo, "refs/heads/main") is True
+    assert verify.ref_exists(repo, "refs/heads/no-such-branch") is False
+    assert verify.ref_exists(repo / "no-such-repo", ref) is False  # git failure -> absent
 
 
 def test_snapshot_worktree_noop_clean_tree(project):

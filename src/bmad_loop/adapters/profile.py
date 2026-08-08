@@ -20,7 +20,7 @@ from pathlib import Path
 
 import regex
 
-from ..platform_util import has_parent_ref, is_absolute_path
+from ..platform_util import has_parent_ref, is_absolute_path, names_tree_root
 
 USAGE_PARSERS = {"claude-jsonl", "codex-rollout", "gemini-chat", "copilot-events", "none"}
 HOOK_DIALECTS = {
@@ -42,6 +42,19 @@ ALIASES = {"claude-code-tmux": "claude", "opencode": "opencode-http"}
 
 class ProfileError(Exception):
     pass
+
+
+# Every fault a raw coercion over a `tomllib` value can raise — the set is CLOSED,
+# not a list of the ones seen so far, which is what makes funnelling on it a funnel
+# rather than another round of enumeration. `tomllib` yields exactly nine types
+# (str, int, float, bool, datetime, date, time, list, dict) and all nine were run
+# through this module's coercions: `int()`/`float()` answer TypeError for the five
+# non-numerics, ValueError for a non-numeric str and for `nan`, and **OverflowError**
+# for `inf`/`-inf` (int) and for an int too large to be a float — `tomllib` accepts
+# arbitrary-precision integers, so that second one is reachable from a config file.
+# Iteration and `.items()` add TypeError and AttributeError and nothing new.
+# `plugins/manifest.py` funnels on the same set for the same reason.
+CONVERSION_FAULTS = (AttributeError, OverflowError, TypeError, ValueError)
 
 
 @dataclass(frozen=True)
@@ -149,7 +162,11 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         events: dict[str, str] = {}
     else:
         config_path = str(hooks_d.get("config_path", ""))
-        if not config_path or is_absolute_path(config_path) or has_parent_ref(config_path):
+        if (
+            names_tree_root(config_path)
+            or is_absolute_path(config_path)
+            or has_parent_ref(config_path)
+        ):
             raise fail("hooks.config_path must be a project-relative path")
         events_d = hooks_d.get("events")
         if not isinstance(events_d, dict) or not events_d:
@@ -175,12 +192,16 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         raise fail(f"stop_without_result_nudges must be >= 0: got {stop_nudges}")
 
     skill_tree = str(doc.get("skill_tree", ".claude/skills"))
-    if not skill_tree or is_absolute_path(skill_tree) or has_parent_ref(skill_tree):
+    if names_tree_root(skill_tree) or is_absolute_path(skill_tree) or has_parent_ref(skill_tree):
         raise fail("skill_tree must be a project-relative path")
 
     seed_files = str_list("seed_files")
+    # `names_tree_root` subsumes the emptiness check it replaced. These entries feed
+    # provision_worktree's seed loop, where any spelling of the root ("", ".", "./",
+    # ".\") resolves src to the repo root and dst to the worktree — both pass the
+    # loop's containment checks, so the whole repo is copied in.
     for seed in seed_files:
-        if not seed or is_absolute_path(seed) or has_parent_ref(seed):
+        if names_tree_root(seed) or is_absolute_path(seed) or has_parent_ref(seed):
             raise fail(f"seed_files entries must be project-relative paths: got {seed!r}")
 
     env_fault_patterns = str_list("env_fault_patterns")
@@ -215,7 +236,19 @@ def _load_toml(text: str, source: str) -> CLIProfile:
         doc = tomllib.loads(text)
     except tomllib.TOMLDecodeError as e:
         raise ProfileError(f"profile {source}: invalid TOML: {e}") from e
-    return _parse_profile(doc, source)
+    try:
+        return _parse_profile(doc, source)
+    except ProfileError:
+        raise  # intent: a domain error is never re-wrapped (it is not a CONVERSION_FAULT)
+    except CONVERSION_FAULTS as e:
+        # A funnel, not per-field guards: `_parse_profile`'s raw conversions
+        # (`float()`, `int()`, `.items()`) raise bare conversion errors on
+        # TOML-legal values of the wrong type, and every consumer keys its
+        # fault handling on ProfileError — `validate`'s role loop reports an
+        # `adapter.profile` failure, `_require_base_skills` skips the one
+        # profile, `install` prints FAIL. A bare escape crashed `validate`
+        # before any document was printed.
+        raise ProfileError(f"profile {source}: malformed field value: {e}") from e
 
 
 def load_profiles(project: Path | None = None) -> dict[str, CLIProfile]:

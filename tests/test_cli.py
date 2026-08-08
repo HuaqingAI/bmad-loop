@@ -3,7 +3,9 @@
 import argparse
 import io
 import json
+import os
 import sys
+import types
 
 import pytest
 import yaml
@@ -25,6 +27,7 @@ from conftest import (
 
 from bmad_loop import cli
 from bmad_loop import policy as policy_mod
+from bmad_loop import runsetup
 from bmad_loop.adapters import multiplexer as mux_mod
 
 STORIES_SPEC_FOLDER = "_bmad-output/epic-1"
@@ -59,6 +62,18 @@ def _write_policy(project, text=DUAL_CLIENT_POLICY) -> None:
     bmad_loop_dir = project / ".bmad-loop"
     bmad_loop_dir.mkdir(parents=True, exist_ok=True)
     (bmad_loop_dir / "policy.toml").write_text(text)
+
+
+def _config_pin(project) -> str:
+    """The host-exec config digest for a sandbox project as it stands — the launch
+    baseline `cmd_run` / `_resume_paused_run` pin (#461 point 4)."""
+    # Resolve the path the way the production baseline does. Hardcoding it would
+    # silently hand `policy_mod.load` a missing file (which returns all defaults)
+    # if that layout ever moved, turning every gate test below into a confusing
+    # digest mismatch instead of a pointer at the path.
+    return runsetup.config_digest(
+        policy_mod.load(cli._policy_path(project.project)), project.project
+    )
 
 
 def test_init_registers_hooks_for_all_policy_profiles(tmp_path):
@@ -3142,6 +3157,56 @@ def test_resume_under_an_unchanged_policy_reports_no_change(project, monkeypatch
     assert "cache_read_weight_was" not in entry  # unchanged -> omitted
 
 
+def test_resume_warns_when_the_pinned_host_exec_config_changed(project, monkeypatch, capsys):
+    """#461 point 4, human-present half. A session may have rewritten the verify
+    commands while the operator was away; `resume` is the moment they can still
+    look, so the change stops being silent. It stays a WARNING — a human typed
+    `resume`, and refusing here would break resume-to-fix-a-setting."""
+    from bmad_loop.journal import load_state
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    # First resume stamps the pin (the run predates the field, so it has none).
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+    assert _resume_entry(run_dir)["security_config_changed"] is False
+    pinned = load_state(run_dir).trusted_config_digest
+    assert pinned  # the launch/resume baseline is persisted, not just in memory
+    capsys.readouterr()
+
+    _write_policy(project.project, RESUME_POLICY.replace('["true"]', '["touch pwned"]'))
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    assert _resume_entries(run_dir)[-1]["security_config_changed"] is True
+    err = capsys.readouterr().err
+    assert "host-exec config pinned at launch has changed" in err
+    # STATIC category names only — never the command that was substituted in.
+    assert "verify commands" in err and "plugin allowlist" in err
+    assert "touch pwned" not in err
+    # ...and the resume re-blesses it, so the next one is quiet again.
+    assert load_state(run_dir).trusted_config_digest != pinned
+
+
+def test_resume_under_an_unchanged_host_exec_config_reports_no_security_change(
+    project, monkeypatch, capsys
+):
+    """The false-positive guard, and the reason the pin is a field-scoped digest:
+    a `[limits]` edit is a policy change (#189 supports it mid-run) but not a
+    host-exec one, so `policy_changed` fires and `security_config_changed` must
+    not — otherwise the warning cries wolf on every supported live-edit."""
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+    capsys.readouterr()
+
+    _write_policy(project.project, RESUME_POLICY.replace("0.5", "0.25"))
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    entry = _resume_entries(run_dir)[-1]
+    assert entry["policy_changed"] is True  # the edit IS a policy change...
+    assert entry["security_config_changed"] is False  # ...but not a host-exec one
+    assert "host-exec config" not in capsys.readouterr().err
+
+
 def test_resume_discards_stale_graceful_stop_request(project, monkeypatch, capsys):
     """A resume is fresh user intent: a graceful-stop request left over from the
     prior stopped-gracefully run must be cleared before write_pid re-arms the
@@ -3901,6 +3966,78 @@ def test_validate_stories_mode_reports_missing_manifest(project, capsys):
     assert "sprint status" not in text
 
 
+def test_validate_flags_registered_hooks_with_missing_relay_script(project, capsys):
+    """#461 papercut: `hooks.registered` is a substring match on the hook config —
+    it stays green after the relay script itself is gone (branch switch, deleted
+    `.bmad-loop/`), while every hook event silently no-ops and the run stalls to
+    session_timeout_min. A distinct finding stats the artifact.
+
+    Ablation guard: deleting the `hooks.relay-present` block in cmd_validate makes
+    this FAIL on the first assertion."""
+    from bmad_loop import install as install_mod
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    assert cli.main(["init", "--project", str(project.project), "--no-skills"]) == 0
+    args = argparse.Namespace(project=str(project.project), spec=None)
+
+    cli.cmd_validate(args)
+    assert "hook relay script present" in _validate_output(capsys)
+
+    (project.project / install_mod.HOOK_SCRIPT_REL).unlink()
+
+    cli.cmd_validate(args)
+    text = _validate_output(capsys)
+    # The registration check is untouched — it still reads green, which is exactly
+    # the blind spot the new finding covers.
+    assert "hooks registered" in text
+    assert "relay script" in text and "missing" in text
+    assert "bmad-loop init" in text
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows chmod only toggles the read-only flag")
+@pytest.mark.skipif(
+    os.geteuid() == 0 if hasattr(os, "geteuid") else False, reason="root reads a 000 file"
+)
+def test_validate_flags_registered_hooks_with_an_unreadable_relay_script(project, capsys):
+    """A relay that exists but cannot be READ is the same stall as a missing one:
+    the registered command is `<interpreter> <relay> <Event>`, which exits 2
+    ("can't open file") and never writes the event, so the run waits out
+    session_timeout_min. `Path.is_file()` is True for a mode-000 file, so
+    existence alone left that green — the blind spot this check exists to remove.
+
+    The remediation differs from the missing case and is asserted here: `init`
+    writes the relay with `write_text()`, which needs write access to the same
+    file, so it raises PermissionError rather than repairing it.
+
+    Ablation guard: dropping the `os.access` branch makes this FAIL — validate
+    reports the relay present."""
+    from bmad_loop import install as install_mod
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    assert cli.main(["init", "--project", str(project.project), "--no-skills"]) == 0
+    args = argparse.Namespace(project=str(project.project), spec=None)
+
+    relay = project.project / install_mod.HOOK_SCRIPT_REL
+    cli.cmd_validate(args)
+    assert "hook relay script present" in _validate_output(capsys)
+
+    relay.chmod(0o000)
+    # The premise, asserted rather than assumed: existence still reads True, which
+    # is the whole reason readability needs its own check.
+    assert relay.is_file() and not os.access(relay, os.R_OK)
+
+    cli.cmd_validate(args)
+    text = _validate_output(capsys)
+    assert "hooks registered" in text  # registration is untouched, still green
+    assert "relay script" in text and "not readable" in text
+    # It must NOT tell the operator to run a command that also fails.
+    assert "chmod" in text
+
+    relay.chmod(0o644)  # so the sandbox tears down cleanly
+
+
 def test_validate_sprint_mode_still_gates_on_sprint_status(project, capsys):
     """Item 8 regression: the default (sprint) mode still requires sprint-status."""
     install_bmad_config(project)
@@ -4390,6 +4527,191 @@ def test_mux_lists_backends_and_selection(mux_registry, tmp_path, capsys):
     assert "beta" in out
     assert "selection: alpha (_MuxStub) — first available platform match" in out
     assert "bmad-loop mux set <name>" in out  # the no-prompt override hint
+
+
+def test_mux_table_survives_a_multi_line_version(mux_registry, tmp_path, capsys):
+    # _MuxStub is duck-typed, exactly like an out-of-tree backend: the seam's
+    # single-line promise (#321) is a docstring it never inherits, so
+    # detect_multiplexers folds defensively. An unfolded newline used to split
+    # the row and strand SELECTED on a line of its own.
+    import sys as _sys
+
+    mux_registry.register_multiplexer(
+        "alpha",
+        lambda p: p == _sys.platform,
+        lambda: _MuxStub(avail=True, version="tmux 3.3.7\npsmux 3.3.7 (05cc5d4)"),
+    )
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+
+    row = next(line for line in out.splitlines() if line.startswith("alpha"))
+    assert "tmux 3.3.7; psmux 3.3.7 (05cc5d4)" in row
+    assert "* first available platform match" in row  # SELECTED stayed on the row
+    assert not any(line.startswith("psmux 3.3.7") for line in out.splitlines())
+
+
+def test_mux_table_survives_an_over_long_version(mux_registry, tmp_path, capsys):
+    # The other half of the same breakage (#321): widths come from len() of the
+    # widest cell and every row is ljust-ed to them, so one unbounded version
+    # pushes SELECTED hundreds of columns out — unreadable for the same reason
+    # the split row was. The fold bounds as well as flattens.
+    import sys as _sys
+
+    from bmad_loop.adapters.multiplexer import VERSION_MAX_CHARS
+
+    mux_registry.register_multiplexer(
+        "alpha",
+        lambda p: p == _sys.platform,
+        lambda: _MuxStub(avail=True, version="alpha 1.2 " + "x" * 300),
+    )
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+
+    row = next(line for line in out.splitlines() if line.startswith("alpha"))
+    assert "* first available platform match" in row
+    assert "…" in row  # cut, rather than silently dropping the tail
+    # Tied to the bound, not to a magic width: the version cell no longer
+    # dominates the row, which unbounded ran past 350 columns.
+    assert len(row) < 2 * VERSION_MAX_CHARS
+
+
+def test_mux_notes_an_available_backend_that_cannot_be_selected(mux_registry, tmp_path, capsys):
+    # On Windows `tmux` is psmux's compatibility shim, so the tmux row reports
+    # AVAILABLE yes and reads as a real tmux install. The column stays honest —
+    # a forced choice does reach it — and a note explains the row instead.
+    import sys as _sys
+
+    mux_registry.register_multiplexer(
+        "alpha", lambda p: p == _sys.platform, lambda: _MuxStub(avail=True, version="alpha 1.2")
+    )
+    # Registered counter-alphabetically on purpose: with `foreign` first, a
+    # sorted() list and a registration-ordered one are indistinguishable, and
+    # the note claims the same order the table above it prints.
+    mux_registry.register_multiplexer("zeta", lambda p: False, lambda: _MuxStub(avail=True))
+    mux_registry.register_multiplexer("foreign", lambda p: False, lambda: _MuxStub(avail=True))
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+
+    note = next(line for line in out.splitlines() if line.startswith("note: "))
+    assert "zeta, foreign" in note  # every stranded backend, in registration order
+    # What AVAILABLE actually measures — the fact that makes the row make sense —
+    # and the one way an operator reaches a backend it excludes.
+    assert "the binary answers here" in note
+    assert "forcing the choice" in note
+    assert "alpha" not in note  # the local platform match is not named
+
+
+def test_mux_does_not_call_a_forced_backend_unselectable(
+    mux_registry, tmp_path, capsys, monkeypatch
+):
+    # The forced row carries the `*` marker, so naming it in the note would
+    # contradict the line right above it.
+    import sys as _sys
+
+    monkeypatch.setenv("BMAD_LOOP_MUX_BACKEND", "foreign")
+    mux_registry.register_multiplexer(
+        "alpha", lambda p: p == _sys.platform, lambda: _MuxStub(avail=True, version="alpha 1.2")
+    )
+    mux_registry.register_multiplexer(
+        "foreign", lambda p: False, lambda: _MuxStub(avail=True, version="foreign 9.9")
+    )
+    mux_registry.get_multiplexer.cache_clear()
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+
+    assert "* forced by BMAD_LOOP_MUX_BACKEND" in out
+    assert "note:" not in out
+
+
+def test_mux_keeps_the_placeholder_for_a_blank_version(mux_registry, tmp_path, capsys):
+    # Blank but truthy: unfolded, the whitespace lands in the cell and the row's
+    # trailing rstrip eats SELECTED with it. This pins falsiness only — the cell
+    # is `r.version or "-"`, so it cannot tell None from "" (that distinction is
+    # the seam's, and test_backend_registry.test_fold_version_edges owns it).
+    import sys as _sys
+
+    mux_registry.register_multiplexer(
+        "alpha", lambda p: p == _sys.platform, lambda: _MuxStub(avail=True, version="  \n \n")
+    )
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+
+    row = next(line for line in capsys.readouterr().out.splitlines() if line.startswith("alpha"))
+    assert "-" in row and "* first available platform match" in row
+
+
+def test_mux_omits_the_note_when_every_available_backend_matches(mux_registry, tmp_path, capsys):
+    import sys as _sys
+
+    mux_registry.register_multiplexer(
+        "alpha", lambda p: p == _sys.platform, lambda: _MuxStub(avail=True, version="alpha 1.2")
+    )
+    # Registered but unavailable, and foreign — the note is about the overlap.
+    mux_registry.register_multiplexer("beta", lambda p: False, lambda: _MuxStub(avail=False))
+    # Available + matching but unselected (alpha won first-match): still local,
+    # so the note must not name it either.
+    mux_registry.register_multiplexer(
+        "gamma", lambda p: p == _sys.platform, lambda: _MuxStub(avail=True)
+    )
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+
+    assert "note:" not in capsys.readouterr().out
+
+
+def test_platform_preflight_folds_a_multi_line_version(mux_registry):
+    # validate renders the version inline in its finding message and keeps it
+    # as a scalar --json detail; an out-of-tree backend that breaks the seam's
+    # single-line promise must not put a newline in either.
+    import sys as _sys
+
+    mux_registry.register_multiplexer(
+        "alpha",
+        lambda p: p == _sys.platform,
+        lambda: _MuxStub(avail=True, version="alpha 1.2\nextra build line"),
+    )
+
+    finding = next(f for f in cli._platform_preflight() if f.check == "mux.backend")
+    assert finding.detail["version"] == "alpha 1.2; extra build line"
+    assert "\n" not in finding.message
+
+
+def test_platform_preflight_bounds_an_over_long_version(mux_registry):
+    # The same string is a released `validate --json` detail, and nothing
+    # downstream of documents.py bounds it — so the fold has to.
+    import sys as _sys
+
+    from bmad_loop.adapters.multiplexer import VERSION_MAX_CHARS
+
+    mux_registry.register_multiplexer(
+        "alpha",
+        lambda p: p == _sys.platform,
+        lambda: _MuxStub(avail=True, version="alpha 1.2 " + "x" * 300),
+    )
+
+    finding = next(f for f in cli._platform_preflight() if f.check == "mux.backend")
+    assert len(finding.detail["version"]) == VERSION_MAX_CHARS
+    assert finding.detail["version"].endswith("…")
+
+
+def test_make_adapters_refusal_names_a_folded_version(project, monkeypatch):
+    # The refusal interpolates the version bare (no !r to escape a newline for
+    # it, unlike the forced-backend warning), so an out-of-tree backend that
+    # breaks the seam's promise would split the one message explaining why the
+    # run will not start.
+    install_bmad_config(project)
+    monkeypatch.delenv("BMAD_LOOP_MUX_BACKEND", raising=False)
+    monkeypatch.setattr(mux_mod, "_CONFIGURED", None)
+    monkeypatch.setattr(mux_mod, "_usable", lambda mux: False)
+    monkeypatch.setattr(
+        mux_mod, "get_multiplexer", lambda: _MuxStub(avail=False, version="alpha 1.2\nextra line")
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cli._make_adapters(
+            project.project, project.project / ".bmad-loop" / "runs" / "r", policy_mod.load(None)
+        )
+
+    assert "alpha 1.2; extra line" in str(exc.value)
+    assert "\n" not in str(exc.value)
 
 
 def test_mux_exits_1_on_forced_unknown_name(mux_registry, tmp_path, capsys, monkeypatch):
@@ -6017,10 +6339,319 @@ def test_auto_sweep_refuses_worktree_isolation_under_a_repo_root_override(projec
     started = []
     monkeypatch.setattr(cli, "_start_sweep", lambda *a, **kw: started.append(kw) or 0)
 
-    factory = cli._sweep_factory(project.project, bmadconfig.load_paths(project.project))
+    # Hand it a MATCHING config digest so the #461 gate (which sits ahead of the
+    # isolation check) stays quiet and this test still measures the isolation
+    # refusal — otherwise it would pass off the wrong RuntimeError.
+    factory = cli._sweep_factory(
+        project.project,
+        bmadconfig.load_paths(project.project),
+        _config_pin(project),
+    )
     with pytest.raises(RuntimeError, match=REFUSAL):
         factory("epic-boundary")
     assert started == []
+
+
+# --- #461 point 4: the auto-sweep child's config re-read is integrity-pinned ---
+
+# A project whose whole host-exec surface is expressible: the verify command the
+# parent would shell out, and a profile overlay carrying the launch `binary`. Both
+# live under the project tree, so a driven session can rewrite either one.
+PIN_POLICY = """\
+[adapter]
+name = "mycli"
+
+[verify]
+commands = ["true"]
+"""
+
+PIN_PROFILE = """\
+name = "mycli"
+binary = "mycli"
+bypass_args = ["--yes"]
+
+[hooks]
+dialect = "claude-settings-json"
+config_path = ".mycli/settings.json"
+events = { SessionStart = "SessionStart", Stop = "Stop" }
+"""
+
+DIGEST_REFUSAL = "changed under a running loop before an auto-sweep"
+
+
+def _pin_profile(project, text=PIN_PROFILE) -> None:
+    profiles = project.project / ".bmad-loop" / "profiles"
+    profiles.mkdir(parents=True, exist_ok=True)
+    (profiles / "mycli.toml").write_text(text, encoding="utf-8")
+
+
+def _pinned_sweep_factory(project, monkeypatch, *, policy_text=PIN_POLICY):
+    """A child-sweep factory pinned to the config as it stands right now — the
+    launch baseline `cmd_run` hands it. Anything a test writes AFTER this returns
+    is exactly the mid-run rewrite #461 point 4 describes: no human asked for it,
+    and the factory re-reads both files off disk on the engine's next trigger."""
+    from bmad_loop import bmadconfig
+
+    install_bmad_config(project)
+    _write_policy(project.project, policy_text)
+    _pin_profile(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    started = []
+    monkeypatch.setattr(cli, "_start_sweep", lambda *a, **kw: started.append(kw) or 0)
+    factory = cli._sweep_factory(
+        project.project, bmadconfig.load_paths(project.project), _config_pin(project)
+    )
+    return factory, started
+
+
+def test_auto_sweep_refuses_a_rewritten_verify_command(project, monkeypatch):
+    """`[verify] commands` runs with shell=True on the HOST, outside any session's
+    sandbox — and policy.toml sits in the workspace every driven session can write.
+    The parent loop froze its Policy at launch, so this factory's fresh reload is
+    the one path where that rewrite reaches execution with no human in the loop."""
+    factory, started = _pinned_sweep_factory(project, monkeypatch)
+    _write_policy(project.project, PIN_POLICY.replace('["true"]', '["touch pwned"]'))
+
+    with pytest.raises(RuntimeError, match=DIGEST_REFUSAL):
+        factory("epic-boundary")
+    assert started == []
+
+
+def test_auto_sweep_refuses_a_rewritten_profile_binary(project, monkeypatch):
+    """The case a `policy_snapshot`-only compare provably cannot catch: `binary`
+    is read from profiles/*.toml through get_profile and never appears in the
+    snapshot at all. This is why config_digest resolves profiles rather than
+    hashing the policy dict."""
+    factory, started = _pinned_sweep_factory(project, monkeypatch)
+    _pin_profile(project, PIN_PROFILE.replace('binary = "mycli"', 'binary = "rogue-cli"'))
+
+    with pytest.raises(RuntimeError, match=DIGEST_REFUSAL):
+        factory("epic-boundary")
+    assert started == []
+
+
+def test_auto_sweep_refuses_a_widened_plugin_allowlist(project, monkeypatch):
+    """`[plugins] enabled` is the trust gate for in-process Python import
+    (plugins/trust.py) — adding a name to it mid-run is a straight path from a
+    workspace write to code running inside the orchestrator itself."""
+    factory, started = _pinned_sweep_factory(project, monkeypatch)
+    _write_policy(project.project, PIN_POLICY + '\n[plugins]\nenabled = ["rogue"]\n')
+
+    with pytest.raises(RuntimeError, match=DIGEST_REFUSAL):
+        factory("epic-boundary")
+    assert started == []
+
+
+def test_auto_sweep_proceeds_after_a_benign_limits_edit(project, monkeypatch):
+    """Why the digest is field-scoped and not a whole-file hash. #189 documents
+    live-editing `[limits]` under a running loop as supported; a file hash would
+    refuse every auto-sweep after one, turning a correctness feature into a
+    regression. Nothing in `[limits]` reaches host exec, so nothing here fires."""
+    factory, started = _pinned_sweep_factory(project, monkeypatch)
+    _write_policy(project.project, PIN_POLICY + "\n[limits]\ncache_read_weight = 0.5\n")
+
+    factory("epic-boundary")  # no raise
+
+    assert len(started) == 1
+
+
+def test_auto_sweep_proceeds_when_the_pinned_config_is_untouched(project, monkeypatch):
+    """The gate's own null case — and the one that would catch a digest that is
+    unstable across two reads of an unchanged tree, which would refuse every
+    auto-sweep in the product."""
+    factory, started = _pinned_sweep_factory(project, monkeypatch)
+
+    factory("epic-boundary")  # no raise
+
+    assert len(started) == 1
+
+
+def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monkeypatch):
+    """The gate is worth only as much as the read it protects: hashing one read of
+    profiles/*.toml and then launching from a *later* one is check-then-use over a
+    file the driven sessions can write. A session that leaves a background writer
+    behind swaps the overlay the instant the compare succeeds — modelled here by
+    flipping it from inside `config_digest`'s own return — and the window is not a
+    defense, because a lost round only raises `sweep-auto-failed`, which
+    `_maybe_auto_sweep` swallows before the next trigger deals again.
+
+    So `_sweep_factory` resolves the profiles ONCE and threads that mapping through
+    the gate, the pin it stamps, and `make_adapters`. Both assertions below are the
+    harm, not the plumbing: the adapter must carry the validated `binary`, and the
+    child must not re-baseline itself onto the swapped config.
+
+    ABLATION: drop `profiles=` from either `runsetup.make_adapters` or
+    `_trusted_config_digest` in `_start_sweep` and the matching assert fails."""
+    from bmad_loop import bmadconfig
+    from bmad_loop.adapters import profile as profile_mod
+
+    monkeypatch.setattr(mux_mod, "_usable", lambda mux: True)
+    install_bmad_config(project)
+    _write_policy(project.project, PIN_POLICY)
+    _pin_profile(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    pin = _config_pin(project)
+
+    real_digest = runsetup.config_digest
+
+    def digest_then_swap(*a, **kw):
+        digest = real_digest(*a, **kw)
+        # The writer wakes the moment the comparison has its answer.
+        _pin_profile(project, PIN_PROFILE.replace('binary = "mycli"', 'binary = "rogue-cli"'))
+        return digest
+
+    monkeypatch.setattr(runsetup, "config_digest", digest_then_swap)
+
+    captured: dict = {}
+
+    class _Recorder:
+        """Stands in for SweepEngine: records what compose_sweep wired, drives
+        nothing. `_start_sweep` renders the summary, so run() answers one."""
+
+        def __init__(self, **kw):
+            captured.update(kw)
+
+        def run(self):
+            return types.SimpleNamespace(render=lambda: "")
+
+    monkeypatch.setattr(cli, "SweepEngine", _Recorder)
+
+    factory = cli._sweep_factory(project.project, bmadconfig.load_paths(project.project), pin)
+    factory("epic-boundary")  # the gate saw the honest bytes and passed
+
+    assert (
+        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
+    ), "the swap must actually have landed on disk, or this test proves nothing"
+    assert captured["adapter"].profile.binary == "mycli"
+    assert captured["state"].trusted_config_digest == pin
+
+
+def test_run_pins_the_profile_bytes_it_launches(project, monkeypatch):
+    """`cmd_run` STAMPS the baseline every later auto-sweep is held to. It used to
+    hash one read of profiles/*.toml and build its adapters from a second, so a
+    write landing between them pinned config this run never launched.
+
+    Deliberately NOT a security test — there is no attack here to refuse. At launch
+    the on-disk config IS the trust anchor, so a writer who can land in that gap
+    could just as well have written before it and been blessed with no timing at
+    all. The harm is over-refusal: the pin is the one baseline a session cannot
+    reach (`_sweep_factory` holds children to it from memory), so a pin over
+    unlaunched bytes makes those children refuse the config the parent is running —
+    and `engine._maybe_auto_sweep` records the trigger BEFORE calling the factory,
+    so the refusal burns it for the life of the run.
+
+    Asserts the invariant, not the plumbing: the stamp and the adapter agree.
+
+    The writer fires from inside `resolve_profiles`' own return — the instant a
+    read completes — rather than from `config_digest`'s, so BOTH threads are
+    load-bearing. Swapping at the digest boundary would leave the stamp assert
+    vacuous: disk is still honest when the baseline is taken, so the pin comes out
+    right whether or not it was handed the resolution.
+
+    ABLATION, both lanes bite: drop `profiles=` from `compose_run` and the adapter
+    assert fails (it re-reads the swapped overlay); drop it from
+    `_trusted_config_digest` and the stamp assert fails (the digest re-resolves
+    after the swap and pins config the run never launched)."""
+    from conftest import git, install_base_skills
+
+    from bmad_loop.adapters import profile as profile_mod
+
+    monkeypatch.setattr(mux_mod, "_usable", lambda mux: True)
+    install_bmad_config(project)
+    install_base_skills(project)
+    _write_policy(project.project, PIN_POLICY)
+    _pin_profile(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "setup")
+    pin = _config_pin(project)
+
+    real_resolve = runsetup.resolve_profiles
+
+    def resolve_then_swap(*a, **kw):
+        resolved = real_resolve(*a, **kw)
+        # A concurrent writer wakes the instant a read of the overlay completes.
+        _pin_profile(project, PIN_PROFILE.replace('binary = "mycli"', 'binary = "rogue-cli"'))
+        return resolved
+
+    monkeypatch.setattr(runsetup, "resolve_profiles", resolve_then_swap)
+
+    captured: dict = {}
+
+    class _Recorder:
+        """Stands in for Engine: records what compose_run wired, drives nothing."""
+
+        def __init__(self, **kw):
+            captured.update(kw)
+
+        def run(self):
+            return types.SimpleNamespace(render=lambda: "")
+
+    monkeypatch.setattr(cli, "Engine", _Recorder)
+
+    assert cli.main(["run", "--project", str(project.project)]) == 0
+
+    assert (
+        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
+    ), "the swap must actually have landed on disk, or this test proves nothing"
+    assert captured["adapter"].profile.binary == "mycli"
+    assert captured["state"].trusted_config_digest == pin
+
+
+def test_resume_pins_the_profile_bytes_it_launches(project, monkeypatch):
+    """The twin of `test_run_pins_the_profile_bytes_it_launches`, on the other
+    entrypoint that mints this baseline. A resume RE-stamps
+    `state.trusted_config_digest` and arms `_sweep_factory(..., new_digest)`, so
+    the children of a resumed run are held to a pin this function produced — the
+    same read-twice defect lands here, and fixing only `cmd_run` would leave one of
+    two identical call sites open.
+
+    ABLATION: drop `profiles=` from `_trusted_config_digest` or `compose_resume`
+    in `_resume_paused_run` and the matching assert fails."""
+    from conftest import install_base_skills
+
+    from bmad_loop import runs
+    from bmad_loop.adapters import profile as profile_mod
+
+    monkeypatch.setattr(mux_mod, "_usable", lambda mux: True)
+    install_bmad_config(project)
+    install_base_skills(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    _write_policy(project.project, PIN_POLICY)
+    _pin_profile(project)
+    pin = _config_pin(project)
+    run_dir = _make_run_with_state(
+        project.project,
+        "20990101-000000-beef",
+        paused_reason="escalation",
+        paused_stage="escalation",
+    )
+
+    real_resolve = runsetup.resolve_profiles
+
+    def resolve_then_swap(*a, **kw):
+        resolved = real_resolve(*a, **kw)
+        _pin_profile(project, PIN_PROFILE.replace('binary = "mycli"', 'binary = "rogue-cli"'))
+        return resolved
+
+    monkeypatch.setattr(runsetup, "resolve_profiles", resolve_then_swap)
+    monkeypatch.setattr(runs, "kill_session", lambda rid: None)
+
+    captured: dict = {}
+
+    class _Recorder(_StubEngine):
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(cli, "Engine", _Recorder)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    assert (
+        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
+    ), "the swap must actually have landed on disk, or this test proves nothing"
+    assert captured["adapter"].profile.binary == "mycli"
+    assert captured["state"].trusted_config_digest == pin
 
 
 def test_dry_run_banner_names_the_isolation_refusal_first(project, capsys):

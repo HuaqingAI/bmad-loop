@@ -166,6 +166,36 @@ class RunSummary:
         return "\n".join(lines)
 
 
+# Appended to an injected plugin-workflow session prompt AHEAD of the completion
+# contract below, whenever the run has a sprint board (`_sprint_board_instruction`
+# non-empty; StoriesEngine empties it and this section disappears with it). Same
+# words as the dev/review seams inject, so the three surfaces cannot drift apart —
+# `{clause}` is that method's return value verbatim, not a second copy of it.
+#
+# A workflow session is dispatched in exactly the window `_sprint_board_instruction`
+# describes: post_dev_phase and post_review_result run after `_post_dev_state_sync`
+# has advanced sprint-status.yaml, pre_commit_gate runs before `finalize_commit`
+# lands the story's single commit — so all three open on the same uncommitted,
+# unattributed board change that #437's review session reverted.
+#
+# Carries the prohibition ONLY. The `blocked` hand-back redirect stays review-only
+# for the reason its own docstring gives: it synthesizes a CRITICAL that halts the
+# whole run, which is the wrong trade for a session that is not the sign-off
+# authority. A workflow that genuinely cannot proceed already has a channel — the
+# completion contract's own `status: blocked` marker, which the orchestrator reads
+# as a non-completion and routes through the blocking/advisory decision instead.
+#
+# A section rather than a bare sentence because a workflow prompt is plugin-authored
+# markdown of unknown shape; a trailing sentence would read as a clause of whatever
+# it happens to land after. The heading names the owner, matching the clause's
+# opening words.
+WORKFLOW_BOARD_CONTRACT = """
+
+## Sprint board (orchestrator-owned)
+
+{clause}"""
+
+
 # Appended to every injected plugin-workflow session prompt. The dev/review
 # skills carry their own result conventions, but a workflow prompt is arbitrary
 # text from a plugin manifest — without an explicit protocol the session has to
@@ -3626,12 +3656,24 @@ class Engine:
         # findings in the spec frontmatter and `_harvest_spec_deferrals` files
         # them. An affirmative append instruction would therefore file each
         # finding twice. Keep this neutral for pre-#2640 skills, whose flat append
-        # may still be the only record.
+        # may still be the only record. `tests/test_engine.py` pins the ban as
+        # `"append" not in prompt.lower()` over the WHOLE assembled prompt, board
+        # clauses included — nothing injected below may spell that substring.
+        #
+        # Two separators live here, both plain spaces because every clause ends in
+        # a full stop and the dev seam's em dash would render a `. — `: the
+        # caller-owned one at the ledger↔board seam, and the join at the
+        # board↔redirect seam. The `if tail else ""` guard is live, not defensive —
+        # `StoriesEngine` inherits this method and empties both clauses.
+        clauses = [
+            c for c in (self._sprint_board_instruction(), self._board_handback_redirect()) if c
+        ]
+        tail = " ".join(clauses)
         return (
             f"/{self._dev_skill('review')} {task.spec_file} — do NOT modify, "
             f"re-open, or rewrite existing deferred-work ledger entries; the "
             f"orchestrator owns their status and resolution."
-        )
+        ) + (f" {tail}" if tail else "")
 
     def _render_commit_template(self, task: StoryTask) -> str | None:
         """The configured commit message template with {story_key}/{run_id}/
@@ -3824,13 +3866,28 @@ class Engine:
                 )
                 return SessionResult(status="vetoed")
         if label is not None:
-            # Injected workflow session: spell out the completion-marker protocol
-            # and bound its stall nudges (see WORKFLOW_COMPLETION_CONTRACT).
-            # Appended after the session-gate hooks so a pre_workflow_session /
-            # pre_session prompt rewrite cannot strip it. The marker path lands in
-            # the same implementation-artifacts dir the dev adapter already
-            # searches — correct in place and under worktree isolation alike,
-            # because spec.cwd is self.workspace.root either way.
+            # Injected workflow session: name the sprint board's owner, then spell
+            # out the completion-marker protocol and bound its stall nudges (see
+            # WORKFLOW_BOARD_CONTRACT / WORKFLOW_COMPLETION_CONTRACT).
+            #
+            # Both are appended after the session-gate hooks so a
+            # pre_workflow_session / pre_session prompt rewrite cannot strip them —
+            # the property the dev/review seams do NOT have, because there the
+            # orchestrator authors the whole prompt and the plugin body is the
+            # rewrite. Here the prompt IS plugin text, so post-gate is the only
+            # place the orchestrator can say anything at all.
+            #
+            # Board first, completion contract LAST: the marker protocol is the
+            # load-bearing tail (a session that ends its turn without the marker
+            # livelocks the orchestrator until session_timeout_min), and nothing may
+            # come between its "end your turn" imperative and the end of the prompt.
+            board_clause = self._sprint_board_instruction()
+            if board_clause:
+                prompt += WORKFLOW_BOARD_CONTRACT.format(clause=board_clause)
+
+            # The marker path lands in the same implementation-artifacts dir the
+            # dev adapter already searches — correct in place and under worktree
+            # isolation alike, because spec.cwd is self.workspace.root either way.
             # This is the PRODUCER of the marker name. ``role``, not the default:
             # a workflow declares its own role (WORKFLOW_ROLES = dev | review) and
             # runs on THAT adapter, whose skill tree can be a different one at a
@@ -4160,6 +4217,23 @@ class Engine:
         check, which would otherwise HALT `blocked` on the very diff
         `_restore_patch` just laid onto the tree. A bare story key takes the
         freeform/epic path instead, where that dirty-tree check runs first."""
+        # Both injected clauses ride every leg, in this order — the park clause
+        # stays LAST because its docstring's backtick argument depends on nothing
+        # following it. Both are bare sentences, so this seam owns every separator:
+        # an em dash after the bare story key (the one leg whose text carries no
+        # terminal punctuation), a plain space after a sentence. A full stop
+        # followed by an em dash is punctuation noise and must never be assembled.
+        #
+        # `if tail else ""` is unreachable on the one class that reaches here
+        # (`Engine`, whose prohibition is unconditional; both subclasses override
+        # `_dev_prompt`), unlike the live guard on the review seam. Kept for
+        # symmetry and pinned with a monkeypatch.
+        clauses = [
+            c for c in (self._sprint_board_instruction(), self._operator_park_instruction()) if c
+        ]
+        tail = " ".join(clauses)
+        after_sentence = f" {tail}" if tail else ""
+        after_key = f" — {tail}" if tail else ""
         if feedback is None:
             if task.restore_patch and task.spec_file:
                 return (
@@ -4167,8 +4241,8 @@ class Engine:
                     f"`{task.spec_file}`. The attempted change was restored onto "
                     f"the working tree after an intent-gap resolution; review it "
                     f"against the amended spec."
-                ) + self._operator_park_instruction()
-            return f"/{self._dev_skill()} {task.story_key}" + self._operator_park_instruction()
+                ) + after_sentence
+            return f"/{self._dev_skill()} {task.story_key}" + after_key
         self._reset_spec_for_repair(task)
         spec_ref = task.spec_file or task.story_key
         return (
@@ -4177,7 +4251,122 @@ class Engine:
             f"verification; repair the working tree so verification passes without "
             f"changing the spec's frozen intent contract. Verification evidence is "
             f"in `{feedback}`."
-        ) + self._operator_park_instruction()
+        ) + after_sentence
+
+    def _sprint_board_instruction(self) -> str:
+        """The board-ownership PROHIBITION — never write the board, never revert it
+        — injected into `_review_prompt` and `_generic_dev_prompt`, the two prompt
+        seams `Engine` itself builds, the way the deferred-work sentence beside it
+        is. It says nothing about what a session should do *instead*; that half is
+        `_board_handback_redirect`, and it rides the review prompt only.
+
+        Injection surface, exactly: story dev sessions (`_generic_dev_prompt`), the
+        review sessions of sprint and sweep runs (both inherit `_review_prompt`),
+        and every injected plugin-workflow session (`_run_session` wraps this in
+        `WORKFLOW_BOARD_CONTRACT` post-gate — those run in the same window, at
+        `post_dev_phase` / `post_review_result` / `pre_commit_gate`). `SweepEngine`
+        and `StoriesEngine` override `_dev_prompt`, so no bundle or stories dev
+        prompt reaches this; `StoriesEngine` overrides this method to "" as well,
+        which drops it — the redirect gated on it, and the workflow section — from
+        that mode's prompts too. Only the interactive resolve agent gets nothing
+        from this seam, which costs nothing: `bmad-loop-resolve`'s own skill already
+        forbids touching the board outright.
+
+        The three injection points deliberately share ONE wording, so a reviewer, a
+        dev session and a plugin workflow cannot be told three different things
+        about who owns the board.
+
+        They do NOT share unstrippability, and that asymmetry was weighed rather
+        than overlooked. The workflow section is post-gate because it has to be —
+        the prompt there is plugin text end to end, so there is no pre-gate string
+        to inject into. The dev/review injections stay pre-gate: moving only this
+        clause post-gate would assemble the review prompt in two files while the
+        deferred-work sentence it was written to sit beside stayed strippable, and
+        a plugin that rewrites `proposed_prompt` wholesale already discards the spec
+        path, the ledger sentence and the #261 `expected_spec` pin with it — the
+        codebase's existing reading is that such a rewrite means the plugin owns
+        that session. If unstrippability is ever wanted here, move the whole
+        orchestrator-authored appendix as one unit, not this sentence alone.
+
+        `_post_dev_state_sync` advances sprint-status.yaml right after the dev
+        session — to `done`, or to `awaiting-operator` on a park; those two values
+        are exhaustive there — but the story's single commit lands only after the
+        review loop, so every session dispatched in that window opens on an
+        uncommitted, unattributed board change with nothing in the repo naming its
+        author. A review session read the orchestrator's own write as a violation
+        of its spec's Boundaries section, reverted it, and the #334 contradiction
+        gate correctly escalated a story both sessions agreed was finished (#437).
+
+        The row is called BOOKKEEPING and explicitly NOT proof of verification,
+        because it is not: `_post_dev_state_sync` writes the board before
+        `_verify_dev_artifacts` runs, and a repair session is dispatched precisely
+        when that verification failed — it opens on a red tree under a `done` row.
+
+        This reverses the "#334: review prompts are unchanged by design" rationale,
+        which assumed forbidding the revert would let an unfinished story commit.
+        #334's own code refutes it: `verify.verify_review` gates the SPEC
+        frontmatter first and returns `retry` there, before it ever reads the
+        board. A reviewer withholding sign-off through the spec already blocks the
+        commit; the board revert was never the load-bearing channel.
+
+        Returned as a bare sentence with NO leading separator, because the call
+        sites need different ones. Deliberately backtick-free, for the reason
+        `_operator_park_instruction` documents, and injected BEFORE that clause so
+        the park contract stays the last thing a dev prompt says. Phrased as a
+        prohibition rather than a goal so the skill's intent-alignment auditor
+        cannot raise it as an `intent_gap`."""
+        return (
+            "sprint-status.yaml is owned by the orchestrator: never write it, and "
+            "never revert a change to it. A row at done or awaiting-operator is the "
+            "orchestrator's own bookkeeping — not a defect to fix, and not proof "
+            "that the work is verified."
+        )
+
+    def _board_handback_redirect(self) -> str:
+        """Where a review session that disagrees with the board should go instead.
+        Rides `_review_prompt` only, and only while the prohibition it follows is
+        non-empty — the gate lives HERE rather than in the caller so the invariant
+        is local and directly assertable (`StoriesEngine()._board_handback_redirect()
+        == ""`), and `_review_prompt` stays structurally identical to the dev seam.
+
+        `blocked` is named deliberately: it is the only spec status that both
+        withholds the commit and reaches a human (`devcontract` synthesizes a
+        CRITICAL from it and `decide_review_session` pauses). Any other non-terminal
+        status merely retries until the cycle budget exhausts and `_defer` rolls the
+        work back to baseline — honest dissent discarded in silence. "say why" is
+        load-bearing: the `## Auto Run Result` detail becomes the escalation text a
+        human reads.
+
+        The trigger is deliberately NARROW — "cannot be finished without a human
+        decision", not "looks unfinished". A review pass is itself a dev-primitive
+        run whose job is to fix what it finds or defer it; a broad trigger would
+        hand it a run-halting early exit on cycle 1 of 3.
+
+        Review-only for the same reason it exists: that CRITICAL halts the whole
+        run, which is the right trade for a review session and the wrong one for a
+        dev session, where it would flatly contradict `_operator_park_instruction`'s
+        "Never use the blocked status for this" a sentence later in the same prompt.
+
+        The vocabulary overlap with the park clause ("a human decision" vs "actions
+        only a HUMAN can perform outside the repo") was checked and is unreachable,
+        not merely unlikely: the two never co-occur because each rides a different
+        builder, and more strongly a parked story is never dispatched a review
+        session at all — `_review_and_commit` early-returns on `_park_awaiting_operator`.
+        The only residual is a story the dev pass should have parked and finalized
+        `done` instead, and there this opens no new path (`blocked` is the skill's
+        native escape) and displaces nothing better (park is dev-only, so a review
+        session cannot park either way). Pause-and-reach-a-human beats a false-green
+        `done`.
+
+        Bare sentence, no leading separator, backtick-free — same contract as the
+        clause it follows."""
+        if not self._sprint_board_instruction():
+            return ""
+        return (
+            "If the story cannot be finished without a human decision, finalize the "
+            "spec to status: blocked and say why. That is the hand-back channel; "
+            "the board is not."
+        )
 
     def _operator_park_instruction(self) -> str:
         """The park contract, injected into every dev prompt while
@@ -4198,11 +4387,15 @@ class Engine:
         Deliberately backtick-free. It is appended AFTER the repair prompt's
         feedback-file pointer, and the last backtick-wrapped token in a dev prompt
         is by convention that path — a backticked word here would quietly become
-        the "feedback file" to anything reading the prompt back."""
+        the "feedback file" to anything reading the prompt back.
+
+        Returned as a bare sentence with NO leading separator. The board clause now
+        always precedes it and ends in a full stop, where the em dash this used to
+        carry would render a `. — `; its sole caller owns every separator."""
         if not self._operator_park_enabled():
             return ""
         return (
-            " — If this story's acceptance criteria include actions only a HUMAN "
+            "If this story's acceptance criteria include actions only a HUMAN "
             "can perform outside the repo (buy a domain, publish a DNS record, "
             "grant an API key, click through a vendor console): complete every "
             "part an agent CAN do, commit it, then finalize the spec frontmatter "

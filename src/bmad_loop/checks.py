@@ -60,6 +60,7 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "git.render-tracked",
         "hooks.config-parse",
         "hooks.registered",
+        "hooks.relay-present",
         "mux.backend",
         "mux.preflight",
         "mux.backends-detected",

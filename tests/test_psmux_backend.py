@@ -15,6 +15,7 @@ from bmad_loop.adapters import psmux_backend, tmux_base
 from bmad_loop.adapters.multiplexer import MultiplexerError, get_multiplexer
 from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
 from bmad_loop.adapters.tmux_backend import TmuxMultiplexer
+from bmad_loop.adapters.tmux_base import TmuxError
 
 
 class _RecordRun:
@@ -406,7 +407,12 @@ def test_new_parked_window_composes_pwsh_source(rec, tmp_path):
         " '#{window_id}' 2>$null)\".Trim(); " in source
     )
     assert "if ($wid) { " in source
-    assert "$key = '%3_' + $wid; " in source
+    # Derived, not hardcoded: the trailer must compose the same key
+    # _scoped_option_key mints, and the splice only works because $wid (`@N`)
+    # supplies the marker's trailing `@` — pin both halves of that coupling.
+    marker = PsmuxMultiplexer._SCOPE_MARKER
+    assert marker.endswith("@")
+    assert f"$key = '%3{marker[:-1]}' + $wid; " in source
     assert '$ret = "$(psmux show-options -qv $key 2>$null)".Trim(); ' in source
     assert "if ($ret -eq 'detach') { psmux detach-client 2>$null }" in source
     assert "psmux switch-client -t $ret 2>$null" in source
@@ -517,6 +523,30 @@ def test_available_composes_real_version_probe(monkeypatch):
     assert rec.argv == ["psmux", "-V"]
 
 
+def test_available_parses_the_gate_out_of_a_real_two_line_probe(monkeypatch):
+    # psmux -V really prints two lines. version() folds them (#321), and the
+    # gate reads the compat segment out of the fold — if a future change ever
+    # puts psmux's own line first, this fails instead of silently reporting the
+    # backend unavailable and taking psmux off Windows with no diagnostic.
+    # One stub, not two: psmux_backend.shutil IS tmux_base.shutil (both plain
+    # `import shutil`), so a second setattr would silently replace the first and
+    # leave available()'s psmux+pwsh probe unexercised. This one answers for the
+    # three binaries both layers ask about and refuses everything else.
+    monkeypatch.setattr(
+        psmux_backend.shutil,
+        "which",
+        lambda name: f"C:\\bin\\{name}.exe" if name in ("psmux", "pwsh", "tmux") else None,
+    )
+
+    for release, expected in (("3.3.7", True), ("3.3.6", False)):
+        rec = _RecordRun(stdout=f"tmux {release}\npsmux {release} (05cc5d4 2026-07-20)\n")
+        monkeypatch.setattr(tmux_base.subprocess, "run", rec)
+        mux = PsmuxMultiplexer()
+        assert mux.available() is expected
+        # The fold reached the gate whole — both segments, one line.
+        assert mux.version() == f"tmux {release}; psmux {release} (05cc5d4 2026-07-20)"
+
+
 def test_available_caches_version_gate_per_instance(monkeypatch):
     monkeypatch.setattr(
         psmux_backend.shutil,
@@ -613,7 +643,7 @@ def test_list_windows_qualifies_only_the_window_id_column(monkeypatch):
 
 
 def test_list_windows_without_id_column_is_untouched(monkeypatch):
-    # ctl_window() asks for names only; nothing there may be rewritten.
+    # A names-only listing must pass through unrewritten.
     _rows_fake(monkeypatch, "shell\nrun-x\n")
     assert PsmuxMultiplexer().list_windows("ctl", ["window_name"]) == [("shell",), ("run-x",)]
 
@@ -790,7 +820,7 @@ def test_set_window_option_writes_id_keyed_session_option(monkeypatch):
     # with the window id in the KEY, routed by an explicit `-t <session>`.
     rec_ = _option_fake(monkeypatch)
     PsmuxMultiplexer().set_window_option("ctl:@3", "@bmad_project", "C:/p")
-    assert rec_.argv[1:] == ["set-option", "-t", "ctl", "@bmad_project_@3", "C:/p"]
+    assert rec_.argv[1:] == ["set-option", "-t", "ctl", "@bmad_project__blw@3", "C:/p"]
     assert "-w" not in rec_.argv
 
 
@@ -800,7 +830,7 @@ def test_set_window_option_resolves_a_name_token(monkeypatch):
     rec_ = _option_fake(monkeypatch, rows="@1\tshell\n@4\trun-abc\n")
     PsmuxMultiplexer().set_window_option("=ctl:run-abc", "@bmad_return_pane", "=ctl:%7")
     assert rec_.calls[0][0][1] == "list-windows"
-    assert rec_.argv[1:] == ["set-option", "-t", "ctl", "@bmad_return_pane_@4", "=ctl:%7"]
+    assert rec_.argv[1:] == ["set-option", "-t", "ctl", "@bmad_return_pane__blw@4", "=ctl:%7"]
 
 
 def test_set_window_option_value_with_spaces_stays_one_argv_element(monkeypatch):
@@ -813,7 +843,7 @@ def test_set_window_option_value_with_spaces_stays_one_argv_element(monkeypatch)
 def test_show_window_option_reads_the_id_keyed_session_option(monkeypatch):
     rec_ = _option_fake(monkeypatch, value="C:/p\n")
     assert PsmuxMultiplexer().show_window_option("ctl:@3", "@bmad_project") == "C:/p"
-    assert rec_.argv[1:] == ["show-options", "-qv", "-t", "ctl", "@bmad_project_@3"]
+    assert rec_.argv[1:] == ["show-options", "-qv", "-t", "ctl", "@bmad_project__blw@3"]
 
 
 def test_show_window_option_miss_reads_empty(monkeypatch, capsys):
@@ -846,7 +876,7 @@ def test_unset_window_option_frees_the_key(monkeypatch):
     # "unset" rather than an empty value that still occupies the map.
     rec_ = _option_fake(monkeypatch)
     PsmuxMultiplexer().unset_window_option("ctl:@3", "@bmad_return_pane")
-    assert rec_.argv[1:] == ["set-option", "-u", "-t", "ctl", "@bmad_return_pane_@3"]
+    assert rec_.argv[1:] == ["set-option", "-u", "-t", "ctl", "@bmad_return_pane__blw@3"]
 
 
 @pytest.mark.parametrize("target", ["@3", "", "run-abc"])
@@ -905,7 +935,7 @@ def test_list_windows_fills_option_columns_per_window(monkeypatch):
     # for it hands every row the same value and the prune cannot discriminate.
     # The column is filled per window id instead, from ONE full option listing
     # (a flat extra call however many rows or `@` columns there are).
-    listing = '@bmad_project_@2 "proj-b"\n@bmad_project_@3 "proj-a"\n'
+    listing = '@bmad_project__blw@2 "proj-b"\n@bmad_project__blw@3 "proj-a"\n'
     seen = []
 
     def fake(argv, **kwargs):
@@ -949,43 +979,241 @@ def test_tmux_backend_keeps_real_window_options(monkeypatch):
 
 
 def test_kill_window_frees_only_that_windows_keys(monkeypatch):
-    # Generic by `_@<digits>` suffix: both bmad keys of @3 go, @13's key (a
-    # suffix near-miss), @1's key and a foreign config option (`@color_3`, no
-    # `_@` shape) stay, and the kill itself still fires.
+    # Generic by the seam's `__blw@<digits>` marker: both bmad keys of @3 go;
+    # @13's key (a suffix near-miss), @1's key, a foreign config option
+    # (`@color_3`) and even a hand-written old-convention `@theme_@3` stay.
+    # Order is kill-then-verify-then-clean: the kill fires first, the liveness
+    # listing (without @3) proves it landed, then the keys are freed.
     listing = (
-        '@bmad_project_@3 "proj-a"\n'
-        '@bmad_return_pane_@3 "=ctl:%7"\n'
-        '@bmad_project_@13 "proj-b"\n'
-        '@bmad_project_@1 "proj-c"\n'
+        '@bmad_project__blw@3 "proj-a"\n'
+        '@bmad_return_pane__blw@3 "=ctl:%7"\n'
+        '@bmad_project__blw@13 "proj-b"\n'
+        '@bmad_project__blw@1 "proj-c"\n'
         '@color_3 "cfg"\n'
+        '@theme_@3 "user"\n'
         "mouse on\n"
     )
     recorder = _RecordRun()
 
     def fake(argv, **kwargs):
         recorder.calls.append((argv, kwargs))
-        out = listing if argv[1] == "show-options" else ""
+        out = {"show-options": listing, "list-windows": "@1\n@13\n"}.get(argv[1], "")
         return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     PsmuxMultiplexer().kill_window("ctl:@3")
+    assert recorder.calls[0][0][1:] == ["kill-window", "-t", "ctl:@3"]
     unset = [c[0][5] for c in recorder.calls if c[0][1] == "set-option"]
-    assert sorted(unset) == ["@bmad_project_@3", "@bmad_return_pane_@3"]
-    assert recorder.argv[1:] == ["kill-window", "-t", "ctl:@3"]
+    assert sorted(unset) == ["@bmad_project__blw@3", "@bmad_return_pane__blw@3"]
 
 
-def test_kill_window_cleanup_failure_never_blocks_the_kill(monkeypatch):
+def test_kill_window_name_target_resolves_scope_before_the_kill(monkeypatch):
+    # A name token is only resolvable while the window lives — the scope
+    # lookup must precede the kill, and the freed keys must be the resolved
+    # id's, not the name's.
+    calls = []
+
+    def fake(argv, **kwargs):
+        calls.append(argv)
+        if argv[1] == "list-windows":
+            # name-resolve asks for id+name; the liveness probe for ids only
+            out = "@3\trun-abc\n@1\tshell\n" if "#{window_name}" in argv[-1] else "@1\n"
+        elif argv[1] == "show-options":
+            out = '@bmad_project__blw@3 "proj"\n'
+        else:
+            out = ""
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    PsmuxMultiplexer().kill_window("=ctl:run-abc")
+    verbs = [c[1] for c in calls]
+    assert verbs[0] == "list-windows"  # the name resolve, before the kill
+    assert verbs[1] == "kill-window"
+    assert [c[5] for c in calls if c[1] == "set-option"] == ["@bmad_project__blw@3"]
+
+
+def test_kill_window_sends_the_kill_when_the_scope_lookup_dies(monkeypatch):
+    # Resolving a name target costs a listing round-trip, and it happens BEFORE
+    # the kill (a name is unresolvable once the window is dead) — so a dead
+    # probe there must not cost the kill. It cannot: the base list_windows
+    # swallows transport failures to [], so the scope degrades to None and the
+    # kill goes out unscoped, leaving the keys to the orphan sweep. Pinned
+    # because the ordering makes the opposite reading plausible on sight.
+    sent = []
+
+    def fake(argv, **kwargs):
+        if argv[1] == "list-windows":
+            raise subprocess.TimeoutExpired(argv, 1)
+        sent.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    PsmuxMultiplexer().kill_window("=ctl:run-abc")  # must not raise
+    assert [c[1] for c in sent] == ["kill-window"]
+
+
+def test_kill_window_failed_kill_retains_the_keys(monkeypatch):
+    # The containment flip: a kill that did not land (the window is still in
+    # the liveness listing) must leave the live window its keys — a key-less
+    # live window loses its project tag (prune retry degrades to the run-dir
+    # fallback) and its return key (an attached client parks with no way back).
+    recorder = _RecordRun()
+
+    def fake(argv, **kwargs):
+        recorder.calls.append((argv, kwargs))
+        out = "@1\n@3\n" if argv[1] == "list-windows" else ""
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    PsmuxMultiplexer().kill_window("ctl:@3")
+    assert not [c for c in recorder.calls if c[0][1] in ("set-option", "show-options")]
+
+
+def test_kill_window_unverifiable_liveness_retains_the_keys(monkeypatch):
+    # An empty liveness listing is a failed probe, not proof of death (the ctl
+    # session always keeps its shell window) — retaining beats freeing a live
+    # window's keys; the launch-time orphan sweep reclaims real orphans later.
+    recorder = _RecordRun()
+
+    def fake(argv, **kwargs):
+        recorder.calls.append((argv, kwargs))
+        rc = 1 if argv[1] == "list-windows" else 0
+        return subprocess.CompletedProcess(argv, rc, stdout="", stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    PsmuxMultiplexer().kill_window("ctl:@3")
+    assert [c[0][1] for c in recorder.calls] == ["kill-window", "list-windows"]
+
+
+def test_failed_kill_leaves_ownership_readable_for_the_prune_retry(monkeypatch):
+    # The retained key is not just unswept — it must still answer a read,
+    # because the prune retry re-identifies ownership through it. The fake is
+    # STATEFUL on purpose: answering the read from a constant would pass even
+    # with the liveness guard deleted, since a listing that never offers the key
+    # leaves the cleanup nothing to free. `-qv` is the targeted read, bare `-q`
+    # the full listing the cleanup sweeps.
+    key = "@bmad_project__blw@3"
+    store = {key: "tag-a"}
+
+    def fake(argv, **kwargs):
+        out = ""
+        if argv[1] == "list-windows":
+            out = "@1\n@3\n"  # the kill did not land
+        elif argv[1] == "set-option" and "-u" in argv:
+            store.pop(argv[-1], None)
+        elif argv[1] == "show-options" and "-qv" in argv:
+            out = store.get(argv[-1], "")
+        elif argv[1] == "show-options":
+            out = "".join(f'{k} "{v}"\n' for k, v in store.items())
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    mux = PsmuxMultiplexer()
+    mux.kill_window("ctl:@3")
+    assert mux.show_window_option("ctl:@3", "@bmad_project") == "tag-a"
+
+
+def test_stranded_keys_after_cleanup_crash_are_reclaimed_by_the_sweep(monkeypatch):
+    # The two halves of the strand-then-reclaim contract: a landed kill whose
+    # key-free step dies strands the keys, and a later sweep claims them. The
+    # sweep is driven directly here; new_parked_window's wiring to it is pinned
+    # by test_new_parked_window_sweeps_orphan_keys.
+    key = "@bmad_project__blw@3"
+    state = {"healed": False}
+    freed = []
+
+    def fake(argv, **kwargs):
+        if argv[1] == "show-options":
+            if not state["healed"]:
+                raise subprocess.TimeoutExpired(argv, 1)
+            return subprocess.CompletedProcess(argv, 0, stdout=f"{key} tag-a\n", stderr="")
+        if argv[1] == "list-windows":
+            return subprocess.CompletedProcess(argv, 0, stdout="@1\n", stderr="")
+        if argv[1] == "set-option" and "-u" in argv:
+            freed.append(argv[-1])
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    mux = PsmuxMultiplexer()
+    mux.kill_window("ctl:@3")  # kill lands, then the key listing dies
+    assert not freed
+    state["healed"] = True
+    mux._sweep_orphan_keys("ctl")
+    assert freed == [key]
+
+
+def test_kill_window_cleanup_failure_never_fails_the_kill(monkeypatch):
+    # The key listing dying after a landed kill must not raise; the orphan
+    # sweep reclaims the stranded keys at the next parked-window launch.
     sent = []
 
     def fake(argv, **kwargs):
         if argv[1] == "show-options":
             raise subprocess.TimeoutExpired(argv, 1)
         sent.append(argv)
-        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        out = "@1\n" if argv[1] == "list-windows" else ""
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     PsmuxMultiplexer().kill_window("ctl:@3")  # must not raise
-    assert sent and sent[-1][1:] == ["kill-window", "-t", "ctl:@3"]
+    assert sent[0][1:] == ["kill-window", "-t", "ctl:@3"]
+
+
+def test_kill_window_unlistable_options_warns_and_strands_the_keys(monkeypatch, capsys):
+    # show-options rc!=0 after a verified kill is a transport failure, not "no
+    # keys": nothing is freed, nothing raises, and the strand is visible.
+    recorder = _RecordRun()
+
+    def fake(argv, **kwargs):
+        recorder.calls.append((argv, kwargs))
+        rc = 1 if argv[1] == "show-options" else 0
+        out = "@1\n" if argv[1] == "list-windows" else ""
+        return subprocess.CompletedProcess(argv, rc, stdout=out, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    PsmuxMultiplexer().kill_window("ctl:@3")  # must not raise
+    assert not [c for c in recorder.calls if c[0][1] == "set-option"]
+    assert "stranded keys await the orphan sweep" in capsys.readouterr().err
+
+
+def test_kill_window_unfreeable_key_warns(monkeypatch, capsys):
+    # A nonzero rc from `set-option -u` IS proof the key was not freed —
+    # silence would leak it for the server's life with no signal.
+    def fake(argv, **kwargs):
+        rc = 1 if argv[1] == "set-option" else 0
+        out = {
+            "list-windows": "@1\n",
+            "show-options": '@bmad_project__blw@3 "proj"\n',
+        }.get(argv[1], "")
+        return subprocess.CompletedProcess(argv, rc, stdout=out, stderr="denied")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    PsmuxMultiplexer().kill_window("ctl:@3")  # must not raise
+    assert "set-option -u @bmad_project__blw@3 on ctl failed" in capsys.readouterr().err
+
+
+def test_a_dead_free_round_trip_does_not_abandon_the_rest_of_the_batch(monkeypatch, capsys):
+    # Every free is contained to its own key. A transport failure on key N used
+    # to escape to the sweep's outer guard, which warned once and left keys
+    # N+1..M stranded — one intermittent round-trip costing the whole batch.
+    attempted = []
+
+    def fake(argv, **kwargs):
+        if argv[1] == "show-options":
+            out = '@bmad_project__blw@7 "gone"\n@bmad_return_pane__blw@7 "%9"\n'
+            return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+        if argv[1] == "list-windows":
+            return subprocess.CompletedProcess(argv, 0, stdout="@1\n", stderr="")
+        if argv[1] == "set-option":
+            attempted.append(argv[-1])
+            if len(attempted) == 1:
+                raise subprocess.TimeoutExpired(argv, 1)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    PsmuxMultiplexer()._sweep_orphan_keys("ctl")
+    assert attempted == ["@bmad_project__blw@7", "@bmad_return_pane__blw@7"]
+    assert "set-option -u @bmad_project__blw@7 on ctl failed" in capsys.readouterr().err
 
 
 def test_kill_window_unroutable_target_skips_cleanup_but_kills(monkeypatch):
@@ -1049,6 +1277,80 @@ def test_set_window_option_write_failure_warns(monkeypatch, capsys):
     assert "failed" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "C:\\a ; b\\proj",  # live-probed: stores as `C:\a`, remainder EXECUTES
+        "C:\\projects\\my proj\\",  # live-probed: trailing `\` eats the closing quote
+        "\\\\srv\\share name\\proj",  # live-probed: spaced → `\\` collapses to `\`
+        "C:\\Users\\O'Brien\\proj",  # live-probed UNSPACED `'`: read back as `OBrien`
+        'C:\\a"b\\proj',  # live-probed unspaced `"`: read back as `ab`
+        "-flag",  # dropped as a flag server-side
+        "bad\nline",  # the control line is `\n`-terminated
+        "",  # an empty write is a silent server-side no-op
+    ],
+)
+def test_set_session_option_refuses_untransportable_values(monkeypatch, capsys, value):
+    # Same lossy CLI→server hop as the window channel, previously ungated on the
+    # session tag. The first three round-trips were measured on a live psmux
+    # 3.3.7 (sent → read back: `C:\a ; b\proj` → `C:\a`, `C:\projects\my proj\`
+    # → `C:\projects\my proj"`, `\\srv\share name\proj` → `\srv\share name\proj`).
+    # Refusing leaves the option unset, which the prune's run-dir fallback
+    # handles correctly — a corrupted tag would strand the session forever.
+    # The refusal FREES the key instead of just returning: the server loads the
+    # user's psmux config, so the name can arrive pre-seeded, and a surviving
+    # foreign value would read back as a real non-matching tag.
+    rec_ = _option_fake(monkeypatch)
+    PsmuxMultiplexer().set_session_option("bmad-loop-x", "@bmad_project", value)
+    assert [c[0][1:5] for c in rec_.calls] == [["set-option", "-u", "-t", "bmad-loop-x"]]
+    assert rec_.argv[-1] == "@bmad_project"  # the key, never the rejected value
+    assert "transport" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "C:\\my proj\\app",  # spaced but quote-safe
+        "C:\\app",  # unspaced
+        "\\\\srv\\share\\app",  # unspaced UNC rides verbatim (no client quoting)
+        "C:\\Users\\O'Brien Files\\proj",  # spaced `'` is literal inside the quotes
+    ],
+)
+def test_set_session_option_accepts_transportable_values(monkeypatch, value):
+    # All four were confirmed to round-trip unchanged on live psmux 3.3.7; a
+    # gate that refused them would untag ordinary Windows project paths.
+    rec_ = _option_fake(monkeypatch)
+    PsmuxMultiplexer().set_session_option("bmad-loop-x", "@bmad_project", value)
+    assert rec_.argv[1:] == ["set-option", "-t", "bmad-loop-x", "@bmad_project", value]
+
+
+def test_set_session_option_passes_builtin_options_through(monkeypatch):
+    # The gate is for `@` user options only. A builtin keeps the base path even
+    # with a value the `@` branch would refuse — narrowing it here would change
+    # a verb this backend has no evidence about.
+    rec_ = _option_fake(monkeypatch)
+    PsmuxMultiplexer().set_session_option("bmad-loop-x", "status-left", "-flag")
+    assert rec_.argv[1:] == ["set-option", "-t", "bmad-loop-x", "status-left", "-flag"]
+
+
+def test_set_session_option_refusal_free_failure_warns_not_raises(monkeypatch, capsys):
+    # The free is best-effort like every other write in this channel: a dead
+    # multiplexer must not abort session creation over a tag that is only an
+    # optimization — but it must not pass silently either.
+    _option_fake(monkeypatch, rc=1)
+    PsmuxMultiplexer().set_session_option("bmad-loop-x", "@bmad_project", "C:\\a ; b")
+    err = capsys.readouterr().err
+    assert "transport" in err and "failed" in err
+
+
+def test_set_session_option_write_failure_still_raises(monkeypatch):
+    # An accepted value keeps the base's strict contract: session tagging runs
+    # at session creation, where a dead multiplexer must not pass silently.
+    _option_fake(monkeypatch, rc=1)
+    with pytest.raises(TmuxError):
+        PsmuxMultiplexer().set_session_option("bmad-loop-x", "@bmad_project", "C:\\app")
+
+
 def test_list_windows_option_read_failure_degrades_to_unset_with_a_warning(monkeypatch, capsys):
     # A failed listing reads as "untagged", the same answer a genuinely untagged
     # window gives — safe because _ctl_window_candidates only claims an untagged
@@ -1087,9 +1389,16 @@ def test_list_windows_option_fill_declines_on_unroutable_session(monkeypatch):
 
 def test_new_parked_window_sweeps_orphan_keys(monkeypatch, tmp_path):
     # Enter-dismissing a parked window closes it without kill_window, so its
-    # keys outlive it; launch reconciles. `_@7` has no window → freed. `_@2` is
-    # live → kept. `@color_3` is a foreign config option (no `_@`) → untouched.
-    listing = '@bmad_project_@7 "gone"\n@bmad_project_@2 "live"\n@color_3 "cfg"\n'
+    # keys outlive it; launch reconciles. `__blw@7` has no window → freed.
+    # `__blw@2` is live → kept. Foreign options are untouched — `@color_3`,
+    # and even a hand-written `@theme_@3`, whose window `@3` is long gone: the
+    # sweep matches the seam's own marker, not a naming convention.
+    listing = (
+        '@bmad_project__blw@7 "gone"\n'
+        '@bmad_project__blw@2 "live"\n'
+        '@color_3 "cfg"\n'
+        '@theme_@3 "user"\n'
+    )
     calls = []
 
     def fake(argv, **kwargs):
@@ -1103,7 +1412,7 @@ def test_new_parked_window_sweeps_orphan_keys(monkeypatch, tmp_path):
     win = PsmuxMultiplexer().new_parked_window("ctl", "run-x", tmp_path, ["prog"], "@ret")
     assert win == "ctl:@2"
     unset = [c[5] for c in calls if c[1] == "set-option"]
-    assert unset == ["@bmad_project_@7"]
+    assert unset == ["@bmad_project__blw@7"]
 
 
 def test_tmux_backend_forwards_option_columns_to_format(monkeypatch):
@@ -1146,11 +1455,25 @@ def test_sweep_snapshots_keys_before_live_windows(monkeypatch, tmp_path):
     assert sweep == ["show-options", "list-windows"]
 
 
-def test_sweep_treats_empty_live_list_as_failed_probe(monkeypatch, tmp_path):
+def test_sweep_unlistable_options_warns(monkeypatch, capsys):
+    # show-options rc!=0 aborts the sweep: a sweep that silently fails every
+    # launch leaks keys for the server's whole life with no signal anywhere.
+    def fake(argv, **kwargs):
+        rc = 1 if argv[1] == "show-options" else 0
+        return subprocess.CompletedProcess(argv, rc, stdout="", stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    PsmuxMultiplexer()._sweep_orphan_keys("ctl")
+    assert "orphan-key sweep on ctl could not list options" in capsys.readouterr().err
+
+
+def test_sweep_treats_empty_live_list_as_failed_probe(monkeypatch, tmp_path, capsys):
     # We just minted a window in this session, so an empty live listing is a
     # failed probe, not an empty session — believing it would sweep every key,
-    # live windows included.
-    listing = '@bmad_project_@2 "live"\n@bmad_project_@7 "gone"\n'
+    # live windows included. It is also said out loud: list_window_ids raises on
+    # a transport fault and answers [] only on rc != 0, so this branch is a
+    # server failing every launch, and silence would leak keys with no signal.
+    listing = '@bmad_project__blw@2 "live"\n@bmad_project__blw@7 "gone"\n'
     calls = []
 
     def fake(argv, **kwargs):
@@ -1163,6 +1486,7 @@ def test_sweep_treats_empty_live_list_as_failed_probe(monkeypatch, tmp_path):
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     PsmuxMultiplexer().new_parked_window("ctl", "run-x", tmp_path, ["prog"], "@ret")
     assert not [c for c in calls if c[1] == "set-option"]
+    assert "orphan-key sweep on ctl could not list live windows" in capsys.readouterr().err
 
 
 def test_sweep_transport_exception_never_fails_the_mint(monkeypatch, tmp_path, capsys):
@@ -1172,7 +1496,9 @@ def test_sweep_transport_exception_never_fails_the_mint(monkeypatch, tmp_path, c
     def fake(argv, **kwargs):
         if argv[1] == "list-windows":
             raise subprocess.TimeoutExpired(argv, 1)
-        out = {"new-window": "@2\n", "show-options": '@bmad_project_@7 "gone"\n'}.get(argv[1], "")
+        out = {"new-window": "@2\n", "show-options": '@bmad_project__blw@7 "gone"\n'}.get(
+            argv[1], ""
+        )
         return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
@@ -1190,9 +1516,9 @@ def test_accepted_values_round_trip_through_the_listing_parse(monkeypatch, value
     # every accepted value must read back IDENTICAL from the `@key "value"`
     # listing shape psmux emits — else the prune's equality compare breaks.
     assert PsmuxMultiplexer._transportable(value)
-    _option_fake(monkeypatch, value=f'@bmad_project_@3 "{value}"\n')
+    _option_fake(monkeypatch, value=f'@bmad_project__blw@3 "{value}"\n')
     options = PsmuxMultiplexer()._scoped_options("ctl")
-    assert options == {"@bmad_project_@3": value}
+    assert options == {"@bmad_project__blw@3": value}
 
 
 def test_ctl_prune_scan_discriminates_projects_end_to_end(monkeypatch, tmp_path):
@@ -1203,7 +1529,7 @@ def test_ctl_prune_scan_discriminates_projects_end_to_end(monkeypatch, tmp_path)
     from bmad_loop.tui import launch
 
     mine = str(tmp_path.resolve())
-    listing = f'@bmad_project_@2 "{mine}"\n@bmad_project_@3 "C:/elsewhere"\n'
+    listing = f'@bmad_project__blw@2 "{mine}"\n@bmad_project__blw@3 "C:/elsewhere"\n'
 
     def fake(argv, **kwargs):
         if argv[1] == "list-windows":

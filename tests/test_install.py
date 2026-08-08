@@ -23,7 +23,7 @@ from conftest import (
 
 import bmad_loop.install as install_mod
 from bmad_loop import verify
-from bmad_loop.adapters.profile import get_profile
+from bmad_loop.adapters.profile import ProfileError, get_profile
 from bmad_loop.install import (
     BASE_SKILLS,
     BMAD_DIR,
@@ -522,6 +522,93 @@ def test_provision_worktree_does_not_clobber_existing_skill(tmp_path):
     assert existing.read_text() == "COMMITTED"
     # a skill that was absent is still laid down
     assert (wt / claude.skill_tree / "bmad-loop-resolve" / "SKILL.md").is_file()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_copy_skills_refuses_a_skill_tree_symlinked_out_of_the_project(tmp_path):
+    # The `init` counterpart of the provision_* symlink refusals below. The profile
+    # guards are lexical and run at load, so `skill_tree` naming an ordinary
+    # project-relative directory passes all three even when that directory is a link
+    # out of the tree; only resolution sees it. This loop rmtree's under `force`, and
+    # its `_copy_traversable` call supplies neither containment root, so nothing
+    # downstream would have caught it.
+    project, outside = tmp_path / "proj", tmp_path / "outside"
+    project.mkdir()
+    outside.mkdir()
+    (project / "skills").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ProfileError, match="does not resolve inside the project"):
+        install_mod._copy_skills(project, ("skills",), False)
+
+    assert list(outside.iterdir()) == []  # nothing written through the link
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_copy_skills_refuses_a_skill_tree_that_resolves_to_the_project_root(tmp_path):
+    # `is_relative_to` is true for equal paths, so an inside-check passes a tree that
+    # resolves to the project ITSELF — the same "a path is relative to itself" hole
+    # this guard family exists to close in the seed loop. Left unguarded, the bundled
+    # skill dirs land at top level and --force-skills rmtree's any root directory
+    # whose name collides with one of them.
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "skills").symlink_to(project, target_is_directory=True)
+    decoy = project / MODULE_SKILLS[0]
+    decoy.mkdir()
+    (decoy / "PRECIOUS").write_text("KEEP", encoding="utf-8")
+
+    with pytest.raises(ProfileError, match="does not resolve inside the project"):
+        install_mod._copy_skills(project, ("skills",), True)  # force: the rmtree path
+
+    assert (decoy / "PRECIOUS").read_text() == "KEEP"  # never rmtree'd
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_init_fails_when_a_skill_tree_escapes_the_project(tmp_path, capsys):
+    # The refusal has to reach the exit code: a skipped tree leaves every later
+    # session without the skills it dispatches, and `init complete` + 0 over that is
+    # an unattended-setup trap.
+    claude = get_profile("claude")
+    # the escape target must sit outside the PROJECT, so the project cannot be
+    # tmp_path itself — a sibling under tmp_path would still resolve inside it
+    project, outside = tmp_path / "proj", tmp_path / "outside"
+    outside.mkdir()
+    (project / Path(claude.skill_tree).parent).mkdir(parents=True)
+    (project / claude.skill_tree).symlink_to(outside, target_is_directory=True)
+
+    assert install_into(project) == 1
+
+    out = capsys.readouterr().out
+    assert "does not resolve inside the project" in out
+    assert "init complete" not in out
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_copy_skills_still_installs_into_an_ordinary_tree(tmp_path):
+    # the containment check must not cost the normal path — ablation partner for
+    # the refusal above, which would otherwise pass if _copy_skills refused always
+    project = tmp_path / "proj"
+    project.mkdir()
+
+    assert install_mod._copy_skills(project, ("skills",), False) is False
+
+    for skill in MODULE_SKILLS:
+        assert (project / "skills" / skill / "SKILL.md").is_file()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_register_hooks_refuses_a_config_path_symlinked_out_of_the_project(tmp_path, capsys):
+    project, outside = tmp_path / "proj", tmp_path / "outside"
+    claude = get_profile("claude")
+    (project / Path(claude.hooks.config_path).parent).mkdir(parents=True)
+    outside.write_text('{"env":{"KEEP":"BYTE-IDENTICAL"}}\n', encoding="utf-8")
+    before = outside.read_bytes()
+    (project / claude.hooks.config_path).symlink_to(outside)
+
+    assert install_mod._register_hooks(project, claude) == 1
+
+    assert outside.read_bytes() == before  # the escape target is untouched
+    assert "escapes the project" in capsys.readouterr().out
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
@@ -2331,6 +2418,157 @@ def test_provision_worktree_bmad_custom_shielded_in_local_exclude(project, tmp_p
     assert "/_bmad" in exclude.splitlines()
     assert "/_bmad/custom" not in exclude.splitlines()
     assert shared.read_bytes() == before
+
+
+def test_shield_tracked_hook_config_is_not_excluded(project, tmp_path):
+    """#392, reported from production: a project that TRACKS its hook config had that
+    path written into the shield, making it read as tracked-and-ignored, which the
+    project's own repo-hygiene gate rejected — blocking the story's commit.
+
+    The pattern was never doing anything: git consults ignore rules only for untracked
+    paths, so `git add -A` stages a modification to a tracked file regardless. Asserted
+    through git's own answer, not just the file's text, because that is the probe the
+    reporter's gate ran."""
+    repo = project.project
+    claude = get_profile("claude")
+    hook_rel = claude.hooks.config_path
+    (repo / hook_rel).parent.mkdir(parents=True, exist_ok=True)
+    (repo / hook_rel).write_text('{"hooks": {}}\n', encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "track the hook config")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [claude], repo)
+
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert f"/{hook_rel}" not in exclude
+    # The reporter's own probe, in the worktree where their gate ran.
+    assert git(wt, "ls-files", "-ci", "--exclude-standard") == ""
+    assert git(repo, "ls-files", "-ci", "--exclude-standard") == ""
+
+
+def test_shield_tracked_hook_config_leaves_no_residue_after_teardown(project, tmp_path):
+    """#392's fourth ask, end to end: track the hook config, provision, run the
+    reporter's probe in BOTH checkouts, tear the worktree down, and prove nothing the
+    shield wrote outlived it. Their report was one arc — the exclusion appeared during
+    provisioning and survived deleting the run — and no single test walked it.
+
+    codex is the faithful fixture. `.codex/hooks.json` is its `config_path` and is NOT
+    one of its `seed_files`, which is the reporter's exact shape; claude's `config_path`
+    doubles as a seed file (the coincidence #471 reports), so it cannot express it.
+
+    Complements `test_shield_dies_with_the_worktree`, which pins the same lifetime from
+    #384's angle — plain fixture, no tracked file, no `-ci` probe."""
+    repo = project.project
+    codex = get_profile("codex")
+    hook_rel = codex.hooks.config_path
+    # The preconditions that make this the reporter's case rather than claude's.
+    assert not codex.hookless and hook_rel
+    assert hook_rel not in codex.seed_files
+    (repo / hook_rel).parent.mkdir(parents=True, exist_ok=True)
+    (repo / hook_rel).write_text('{"hooks": {}}\n', encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "track the hook config")
+    # The fixture's own precondition, asserted rather than assumed: an ambient ignore
+    # matching `.codex/` would make `add -A` skip this file, and every assertion below
+    # would then pass on an UNTRACKED path having exercised nothing — `-ci` reports
+    # tracked-and-ignored, so it answers "" for a file git never took. `conftest`
+    # shadows the two out-of-repo ignore sources; this catches the third (a system
+    # excludes file, which cannot be suppressed without breaking Windows autocrlf).
+    assert verify.path_tracked_file(repo, hook_rel)
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    shared = repo / ".git" / "info" / "exclude"
+    before = shared.read_bytes()
+
+    provision_worktree(wt, [codex], repo)
+
+    # Checked HERE as well as after teardown, and the pair is not redundant: a shared
+    # write that teardown happens to remove would satisfy the post-teardown comparison
+    # alone. #384's harm is the window while the operator's checkout and every sibling
+    # worktree are live, which is this line, not only what survives the run.
+    assert shared.read_bytes() == before
+    private = _wt_private_exclude(wt)
+    assert private.is_file()  # the shield really ran: there is something to outlive
+    gitdir = private.parent.parent
+    assert git(wt, "ls-files", "-ci", "--exclude-standard") == ""
+    assert git(repo, "ls-files", "-ci", "--exclude-standard") == ""
+
+    # `force`: provisioning's hook step writes the now-tracked config, so the
+    # worktree is dirty and a bare remove would refuse.
+    verify.worktree_remove(repo, wt, force=True)
+
+    assert not private.exists()
+    assert not gitdir.exists()
+    assert shared.read_bytes() == before
+    # The residue the reporter cleaned up by hand would answer here. Defense in depth
+    # rather than an independent pin, and knowing which is which matters: no single
+    # ablation reddens this line alone, because every ignore source the main checkout
+    # can see after teardown is equally visible BEFORE it, so the probes above fail
+    # first. What it adds over the byte comparison is reach — a residue that is not
+    # the shared exclude's bytes (a `.gitignore` left in the tree, a surviving
+    # `core.excludesFile`) answers here and nowhere else in this test.
+    assert git(repo, "ls-files", "-ci", "--exclude-standard") == ""
+
+
+def test_shield_tracked_skill_tree_keeps_its_pattern(project, tmp_path):
+    """The other half of the same predicate, and the reason it is not simply "never
+    exclude a tracked path": a tracked DIRECTORY's pattern measurably DOES hide new
+    children, so dropping it would leak the orchestrator's seeded skills into the
+    story commit — the exact harm the shield exists to prevent.
+
+    Its tracked children still answer `ls-files -ci`, and no pattern shape avoids that
+    (measured: `dir/*`, `dir/**` and a trailing negation all behave like `dir`, since
+    gitignore cannot re-include under an excluded parent). That tradeoff is deliberate."""
+    repo = project.project
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    (repo / tree / "house-skill").mkdir(parents=True, exist_ok=True)
+    (repo / tree / "house-skill" / "SKILL.md").write_text("# tracked\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "track the skill tree")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [claude], repo)
+
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert f"/{tree}" in exclude
+    # The shield still does its job: a file provisioning wrote is not stageable.
+    git(wt, "add", "-A")
+    staged = git(wt, "diff", "--cached", "--name-only").splitlines()
+    assert not [p for p in staged if p.startswith(f"{tree}/")]
+
+
+def test_shield_keeps_patterns_when_tracked_probe_fails(project, tmp_path, monkeypatch):
+    """Uncertainty must keep the pattern, never drop it: a shield that stays too wide
+    is a cosmetic hygiene complaint, while one that drops a pattern on a fault leaks
+    seeded files into a story commit. The degrade is REPORTED so the wide shield is
+    not silent."""
+    repo = project.project
+    claude = get_profile("claude")
+    hook_rel = claude.hooks.config_path
+    (repo / hook_rel).parent.mkdir(parents=True, exist_ok=True)
+    (repo / hook_rel).write_text('{"hooks": {}}\n', encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "track the hook config")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    import bmad_loop.worktree_flow as wtf
+
+    def boom(_repo, _rel):
+        raise verify.GitError("ls-files timed out")
+
+    monkeypatch.setattr(wtf.verify, "path_tracked_file", boom)
+    msgs: list[str] = []
+
+    provision_worktree(wt, [claude], repo, on_degraded=msgs.append)
+
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert f"/{hook_rel}" in exclude
+    assert any("could not check whether these paths are tracked" in m for m in msgs)
 
 
 def test_missing_stories_support_findings_split_absent_from_stale(tmp_path):

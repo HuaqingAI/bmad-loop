@@ -6,6 +6,7 @@
 
 Plain Python drives the loop — **pick story → implement → adversarially review → verify → commit** — while LLMs do only the creative work, inside disposable, fresh-context coding-agent sessions you can attach to and watch.
 
+![Status: early open beta](https://img.shields.io/badge/status-early%20open%20beta-orange)
 [![CI](https://github.com/bmad-code-org/bmad-loop/actions/workflows/ci.yml/badge.svg)](https://github.com/bmad-code-org/bmad-loop/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%E2%80%933.14-blue)
 ![CLIs](https://img.shields.io/badge/agents-claude%20%C2%B7%20codex%20%C2%B7%20gemini%20%C2%B7%20copilot%20%C2%B7%20antigravity%20%C2%B7%20opencode-8a2be2)
@@ -23,6 +24,17 @@ Plain Python drives the loop — **pick story → implement → adversarially re
 </div>
 
 ---
+
+> ⚠️ **Early open beta — experimental, and moving fast.** bmad-loop is a young project that
+> only just started shipping publicly. Expect rough edges, docs that lag the code, and
+> **breaking changes in any release while it is pre-1.0** — CLI flags, policy keys, on-disk
+> run state, and skill contracts can all shift between versions. It also drives real coding
+> agents that write and commit in your repository, so point it at work you can review and
+> roll back (`[scm] isolation = "worktree"` keeps a failed attempt off your main checkout),
+> pin a release tag if you want a stable base, and read the [CHANGELOG](CHANGELOG.md) before
+> upgrading. Bug reports and feedback are what the beta is for — open an
+> [issue](https://github.com/bmad-code-org/bmad-loop/issues) with `bmad-loop diagnose` output
+> attached, or come talk to us on [Discord](https://discord.gg/gk8jAdXWmj).
 
 ## Why bmad-loop
 
@@ -297,7 +309,7 @@ The orchestrator drives the upstream dev primitive — `bmad-build-auto`, or `bm
 uv tool install "bmad-loop[tui] @ git+https://github.com/bmad-code-org/bmad-loop.git"
 
 # OR a pinned release tag (reproducible — recommended for day-to-day use):
-uv tool install "bmad-loop[tui] @ git+https://github.com/bmad-code-org/bmad-loop.git@v0.8.1"
+uv tool install "bmad-loop[tui] @ git+https://github.com/bmad-code-org/bmad-loop.git@v0.9.1"
 
 bmad-loop init --project /path/to/project --cli claude   # add --cli codex/gemini as needed
 claude "/bmad-loop-setup accept all defaults"            # installs the tool + wires the project
@@ -320,7 +332,7 @@ claude "/bmad-loop-setup upgrade"
 #    `uv tool upgrade` reuses the cached commit and won't pull new code.
 uv tool upgrade bmad-loop --reinstall                      # follows main or your pinned tag
 #    to move to a newer tag, re-run install with the new ref:
-#    uv tool install --force "bmad-loop[tui] @ git+https://github.com/bmad-code-org/bmad-loop.git@v0.8.1"
+#    uv tool install --force "bmad-loop[tui] @ git+https://github.com/bmad-code-org/bmad-loop.git@v0.9.1"
 
 # 2. re-lay the refreshed skills into EACH project that uses bmad-loop:
 bmad-loop init --project /path/to/project --force-skills

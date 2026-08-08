@@ -159,6 +159,96 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
+- **A re-armed escalation no longer overwrites the previous attempt's dirty snapshot (#349).**
+  `refs/attempt-preserve-dirty/*` names were keyed on `task.attempt`, which `rearm_escalation`
+  resets to 0, so a post-resolve re-drive rolling back against the same baseline recomputed the
+  earlier rollback's refname and destroyed the only copy of that attempt's work. Probe for a free
+  name instead of trusting the counter, suffixing `-r2`, `-r3`, … The scan is bounded; exhausting
+  it refuses (`attempt-worktree-preserve-failed`, then the usual pause) rather than reusing an
+  occupied name. Prune the namespace or lower `scm.preserve_keep` if it ever fires.
+
+- **The auto-sweep child refuses config a session rewrote under the run (#461).** `policy.toml` and
+  `profiles/*.toml` sit in the agent-writable workspace and reach host code execution — the
+  `[verify] commands` run with `shell=True`, the resolved profile plus `adapter.extra_args` decide
+  the launch argv and env, `hooks.dialect` decides which argv builder runs at all, and
+  `[plugins] enabled` gates in-process Python import. A run freezes its
+  policy at launch, but the auto-triggered child sweep re-reads both from disk; it is now pinned to
+  a launch-time digest of those fields and refuses on a mismatch (`sweep-auto-failed` + notify, the
+  parent run continues). The config is read once and frozen, so the gate hashes the same bytes the
+  child launches from rather than a second read a background writer can swap in between.
+  `resume` re-baselines and warns with the changed categories instead of
+  refusing. The digest is field-scoped, so live-editing `[limits]` mid-run still works. Plugins are
+  pinned by allowlist name only: swapping the module behind an already-enabled plugin, and
+  folder-dropping a declarative plugin whose shell hooks need no allowlist entry, are both still
+  uncaught (#496, #497).
+
+- **The hook relay refuses a redirected `events/` dir, and `validate` stats the relay (#461).** The
+  relay's event write followed a symlink — or, on Windows, a directory junction, which
+  `os.path.islink` reports False for and which `mklink /J` creates without elevation — so a driven
+  session could redirect the orchestrator's control-plane event stream and stall the run to
+  `session_timeout_min`. The write now refuses a redirected events dir before creating it, anchors
+  the create+replace to an `O_NOFOLLOW` dir_fd where the platform supports it, creates `O_EXCL` at
+  `0o600`, writes the payload in full (a short `os.write` would publish truncated JSON, which
+  `SignalWatcher` drops permanently), and degrades to a no-op on `OSError` rather than failing the
+  session. Separately, `hooks.registered` was a substring match on the hook config that never
+  touched the script it points at, so a deleted `.bmad-loop/` (branch switch) read green while every
+  hook event no-opped; a new `hooks.relay-present` finding stats the relay and says
+  `run bmad-loop init`.
+
+- **Dispatched sessions are told the sprint board is orchestrator-owned (#437).** The board advances
+  at dev-verify time but the story commits only after the review loop, so a session dispatched in
+  between opens on an uncommitted, unattributed `sprint-status.yaml` change — one review reverted it
+  as a spec violation and #334 escalated a finished story. Story dev prompts, the review prompts of
+  sprint and sweep runs, and every injected plugin-workflow session (`post_dev_phase`,
+  `post_review_result`, `pre_commit_gate` — all dispatched inside that same window) now carry the
+  prohibition: never write the board, never revert it, and a row at `done` or `awaiting-operator` is
+  bookkeeping — not a defect to fix, and not proof the work is verified. The workflow copy is
+  appended after the session-gate hooks, so a plugin prompt rewrite cannot strip it. Review prompts
+  alone add the way out (`status: blocked`, for a story that cannot be finished without a human
+  decision); dev and workflow prompts get none, since `blocked` halts the run. Stories mode carries
+  none of it.
+
+- **A seed path naming the project root is refused at load, in every source that feeds it (#456).**
+  A root-naming entry made `provision_worktree`'s seed loop resolve source to the repo root and
+  destination to the worktree — both pass its containment checks — so it copied the whole project
+  in, untracked files included, then recursed into its own destination. `""` was one spelling of
+  several: `.`, `./`, `.\`, and on Windows `". "`, `".. "`, `"..."` and `"   "`, which Win32 trims
+  to the root while pathlib reads them as ordinary child names. `scm.worktree_seed`, a profile's
+  `seed_files`, `skill_tree` and `hooks.config_path`, a plugin manifest's `seed_files`/`seed_globs`
+  and its `[python] module`, and the Unity seeder's `scene_guard_dir` now refuse every spelling, and
+  the seed lists are shape-checked. **Behavior change:** `worktree_seed = [1]` and an int plugin
+  seed entry are now rejected rather than silently `str()`-coerced.
+
+- **`init` no longer follows a config path that leaves the project (#456).** The profile/manifest
+  guards are lexical, so a `skill_tree`, `hooks.config_path` or plugin `[python] module` naming an
+  ordinary project-relative directory passed them even when that directory linked out of the tree.
+  `provision_worktree` re-checked after resolution; `init` reached mkdir/rmtree/write with no such
+  check. Each now requires the target to resolve _strictly below_ the project — equality would
+  admit a link back to the root — and a refused skill tree fails the install instead of being
+  skipped past `init complete`.
+
+- **A wrongly-typed field in a profile or plugin TOML is reported, not crashed on.** `float()`,
+  `int()` and `.items()` over TOML-legal values of the wrong type raised bare
+  `ValueError`/`TypeError`/`AttributeError`, and `inf` or an oversized integer raised
+  `OverflowError`, past every consumer's `ProfileError`/`PluginError` handling — the command died
+  with one `error:` line naming neither the file nor the key. Both parsers now funnel at their load
+  boundary, over a fault set closed on the nine value types `tomllib` can yield. `policy.toml`'s own
+  conversions are still raw (#474).
+
+- **The worktree git-add shield no longer marks a project's tracked files as ignored (#392).**
+  It wrote a pattern for every path it shields, including hook configs and skill trees a project
+  tracks. Over a tracked file that pattern shields nothing — git applies ignore rules only to
+  untracked paths — and its one effect was the tracked-and-ignored state repo-hygiene gates
+  reject, blocking the story commit it was meant to protect. Such patterns are now dropped.
+  A tracked **directory** keeps its pattern, since that one does hide new children, so its
+  tracked children still answer `git ls-files -ci --exclude-standard`.
+
+- **A codex stage no longer runs without the project's hook config under worktree isolation
+  (#471).** The seed list and the shield list came from two unreconciled sources and
+  `hooks.config_path` was only in the second, so a profile's hook config was seeded only if that
+  profile happened to name the path twice — claude's `seed_files` carries its own `config_path`,
+  codex's does not. Every non-hookless profile's resolved `config_path` is now seeded.
+
 - **An isolated sweep bundle can land when the deferred-work ledger is gitignored (#426).**
   `git worktree add` checks out tracked files only, so a project that gitignores its ledger — the
   default — gave the unit worktree none: `mark_done` returned False, `verify_review_bundle` never
@@ -363,6 +453,19 @@ whose seams had diverged enough that several ports needed a different fix, and t
   change is made, since git that old refuses a repo carrying it. Concurrent runs serialize on a
   `.git` lock; lines an older bmad-loop wrote into `.git/info/exclude` stay — delete them by hand.
 
+- **Upgrading from 0.9.1 or earlier: delete the shield lines left in `.git/info/exclude` (#384).**
+  Those versions appended the git-add shield's patterns to the shared `.git/info/exclude` of every
+  project they provisioned worktrees in, and upgrading does not remove them — while a line stays,
+  **new** files under the path it names silently never appear in `git status` or `git add -A` in
+  that checkout. Clean each affected repo once:
+  - Open the file — `git rev-parse --git-path info/exclude` names it from any checkout.
+  - Delete each line the shield wrote, not your own. Typically `/.claude/skills` or
+    `/.agents/skills`, a hook config such as `/.claude/settings.json`, the `/_bmad` family
+    (`/_bmad`, `/_bmad/custom`, `/_bmad/render/`, or per-file `/_bmad/...` lines), and any
+    `[scm] worktree_seed` path rendered as `/<path>`.
+  - Run `git status` and review what reappears. `git check-ignore -v <path>` names the exact file
+    and line still hiding a given path.
+
 - **The git-add shield's git calls run on the shared chokepoint (#389).** They were the last bare
   `git` spawns outside `verify._run_git`, so they missed its `LC_ALL=C` pin and used a hardcoded
   120s timeout instead of the configured `[limits] git_timeout_s`. Both now apply.
@@ -522,6 +625,30 @@ whose seams had diverged enough that several ports needed a different fix, and t
   report apart: `ATTENDED` (a human is still there) versus `UNREACHABLE` (no client at all), which
   journals `sweep-return-no-client`.
 
+- **`bmad-loop mux` renders a readable table whatever a backend reports as its version (#321).**
+  `psmux -V` prints two lines — a `tmux X.Y.Z` compat line plus its own — and the embedded newline
+  split every row, stranding SELECTED on a line of its own; a very long single line broke the same
+  table just as thoroughly, since the column widths are sized off the widest cell.
+  `TerminalMultiplexer.version()` now promises one bounded line. The tmux-family base folds the
+  probe with `"; "` rather than truncating (the tail is what names psmux as the answering binary),
+  keeps the compat segment first because psmux's own version gate parses it with an anchored match,
+  caps the result at 80 characters, and reports `None` — not `""` — for an all-blank probe. Every
+  inline consumer applies the same fold defensively, so an out-of-tree backend that breaks the
+  promise cannot split a row or a message: the `mux` table, the forced-backend warning, the
+  unusable-backend refusal, `validate`'s preflight finding, and `diagnose`'s `tmux_version` — where
+  the old line cap's "(N more lines redacted)" marker had been re-introducing the newline it
+  removed, in the markdown dump as well as the JSON one. On a psmux host the folded value
+  **replaces** the previously truncated `env.tmux_version` in `diagnose --json` and the `version`
+  details of `validate --json`'s `mux.backend` and `mux.backends-detected` findings; the field
+  shapes are unchanged.
+
+- **`bmad-loop mux` explains a row that is available but unselectable.** A backend reads AVAILABLE
+  because its binary answers here, which is not the same question as whether automatic selection
+  can pick it — on Windows `tmux` is psmux's compatibility shim, so the tmux row looks like a real
+  tmux install. Gating the column would be wrong (a forced choice does reach those backends), so
+  the listing now carries a `note:` naming them instead. A forced backend is exempt: it is selected,
+  and calling it unselectable would contradict the `*` marker one line above.
+
 - **Both mux client verbs now owe effect, not dispatch (#317).** `TerminalMultiplexer.detach_client`
   widens from `None` to `bool`. tmux reads the effect off the exit code; psmux cannot — every arm of
   its `detach-client`/`switch-client` exits 0 whether or not a client moved — so it measures the
@@ -529,11 +656,33 @@ whose seams had diverged enough that several ports needed a different fix, and t
   rather than a vacuous `True` when that is unobservable. Out-of-tree backends still returning
   `None` read as "nothing detached" — degraded, not broken.
 
+- **Harden the psmux option channel's safety core (#313).** The cleanup sweeps matched any
+  `<name>_@<digits>` key, so a hand-written `@theme_@3` died with window `@3`; keys now carry a
+  seam-owned marker (`@bmad_project__blw@3`) only a deliberate imitation collides with.
+  `kill_window` kills first and frees the keys only once a liveness listing proves the kill landed,
+  so a failed kill no longer strips a live window's project tag and return key; a free that fails
+  now warns instead of leaking silently. The launcher's ctl-window consumers resolve the window id
+  once and replay it (`launch.ctl_window`/`select_ctl_window` fold into
+  `ctl_window_id`/`select_ctl_window_id`), so a rename or a window minted between two verbs can no
+  longer re-point the second, and a Windows-local zero-token gate proves cross-project prune
+  isolation on a real psmux server. Dev builds only: a window parked by a pre-marker build keeps
+  reading its old-format keys, so it reads as untagged (the prune falls back to the run dir) and its
+  return move stops firing — restart the ctl psmux server after upgrading.
+
+- **Gate the psmux session project tag on transportability (#320).** The session tag rode psmux's
+  CLI→server control line ungated, which stores some project paths corrupted at rc 0 — and a
+  corrupted tag never equals the caller's again, so the prune skipped that session forever.
+  `@`-prefixed session values now take the same transport gate as the window channel: a refusal
+  warns, frees the key and leaves the option unset, where the prune's run-dir fallback takes over
+  (bounded by #419); accepted writes keep the base's raise-on-failure contract. Unlike the window
+  tag the session tag never bled across servers — one server per session makes that map the
+  session's.
+
 - **Give psmux a working per-window option channel (#310).** psmux keeps one user-option scope per
   server and answers `''` to any `-w` read of an `@`-prefixed name, so the ctl-window project tag
   bled across rows — letting a prune in one project `kill-window` another's — and the parked-return
   option always read empty. Both now use a session-scoped key carrying the window id
-  (`@bmad_project_@3`), routed with `-t <session>` and freed on `kill_window`; the `switch-client`
+  (`@bmad_project__blw@3`), routed with `-t <session>` and freed on `kill_window`; the `switch-client`
   leg stays inert on builds predating psmux/psmux#483 — still inert at 3.3.7.
 
 - **Session-qualify the psmux TUI-side window ids (#291).** #254 covered the engine seam but left

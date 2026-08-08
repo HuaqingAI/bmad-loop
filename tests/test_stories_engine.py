@@ -12,6 +12,7 @@ from conftest import attach_profile, git, install_build_auto_skill, write_spec
 
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
+from bmad_loop.engine import Engine
 from bmad_loop.install import (
     DEV_PRIMITIVE_NEW,
     STORIES_PROBE_FILE,
@@ -494,6 +495,41 @@ def test_plan_halt_env_only_on_leg_one(project):
     assert "BMAD_LOOP_PLAN_HALT" not in engine._extra_session_env(task, "review")
 
 
+def test_review_prompt_carries_no_sprint_board_clause(project):
+    """Stories mode has no sprint-status.yaml — `_post_dev_state_sync` is a no-op and
+    `verify_review_stories` reads the id-keyed story spec alone — so the inherited
+    review prompt's board-ownership clause would assert ownership of a file this mode
+    never touches. One override empties it, and the `blocked` hand-back redirect goes
+    with it, because the redirect gates itself on that clause.
+
+    Asserted against the REVIEW prompt: `StoriesEngine` overrides `_dev_prompt`, so a
+    dev-prompt assertion here would be dead. The base-class check is the ablation
+    guard — without it every assertion below passes for free the moment the clause is
+    emptied for ALL modes. And this is the live half of the review seam's
+    `if tail else ""`: an unconditional separator leaves a trailing space here."""
+    setup_stories(project, [entry("1")])
+    engine, _ = make_engine(project, [])
+    spec = str(story_spec(project, "1"))
+    task = StoryTask(story_key="1", epic=0, spec_file=spec)
+
+    assert Engine._sprint_board_instruction(engine)  # the base clause is non-empty
+    assert engine._sprint_board_instruction() == ""
+    assert engine._board_handback_redirect() == ""
+
+    prompt = engine._review_prompt(task)
+
+    assert "sprint-status" not in prompt
+    assert "status: blocked" not in prompt
+    # byte-identical to the pre-#437 stories review prompt: the ledger sentence alone,
+    # with no trailing space where the clauses would have joined
+    assert prompt == (
+        f"/bmad-dev-auto {spec} — do NOT modify, re-open, or rewrite existing "
+        f"deferred-work ledger entries; the orchestrator owns their status and "
+        f"resolution."
+    )
+    assert prompt.endswith("the orchestrator owns their status and resolution.")
+
+
 def test_dev_prompt_repair_leg_is_explicit_spec_resume(project, tmp_path):
     setup_stories(project, [entry("1")])
     engine, _ = make_engine(project, [])
@@ -616,6 +652,52 @@ def test_injected_workflow_session_does_not_leak_story_spec_env(project):
     # the primary dev session still carries it for id-keyed read-back
     dev = next(s for s in adapter.sessions if s.role == "dev" and "gate" not in s.task_id)
     assert dev.env["BMAD_LOOP_SPEC_FOLDER"] == SPEC_FOLDER
+
+
+def test_injected_workflow_prompt_carries_no_board_section(project):
+    """#437 phase 3: `_run_session` appends a `## Sprint board` section to every
+    injected workflow prompt, gated on `_sprint_board_instruction`. This mode
+    empties that clause (no board exists), so the section must disappear with it
+    and the workflow prompt stays byte-identical to its pre-#437 shape: the
+    plugin's own text joined straight to the completion contract.
+
+    The base-class check is the ablation guard — without it every assertion here
+    passes for free the moment the clause is emptied for ALL modes."""
+    setup_stories(project, [entry("1")])
+    reg = PluginRegistry(
+        [
+            LoadedPlugin(
+                manifest=PluginManifest(
+                    name="tea",
+                    api_version=1,
+                    workflows=(
+                        WorkflowSpec(
+                            name="gate",
+                            stage="pre_commit_gate",
+                            role="review",
+                            prompt="/gate {story_key}",
+                            blocking=False,
+                        ),
+                    ),
+                )
+            )
+        ]
+    )
+    captured: list = []
+    engine, _ = make_engine(
+        project, [stories_dev_effect(), _workflow_capture(captured)], registry=reg
+    )
+    assert engine.run().done == 1
+    assert len(captured) == 1
+    prompt = captured[0].prompt
+
+    assert Engine._sprint_board_instruction(engine)  # the base clause is non-empty
+    assert engine._sprint_board_instruction() == ""
+    assert "sprint-status" not in prompt
+    assert "## Sprint board" not in prompt
+    # junction literal: the plugin's text joins the completion contract directly,
+    # with nothing (and no stray separator) between them
+    assert prompt.startswith("/gate 1\n\n## Completion signal (required)")
 
 
 def test_post_dev_state_sync_is_noop(project):

@@ -29,6 +29,16 @@ The choice applies to the next invocation — switch between runs, not while one
 After switching, `bmad-loop validate` reports the selected backend's availability and
 version as part of the preflight.
 
+The `AVAILABLE` column answers "does this backend's binary answer on this host", not
+"can it be selected here". The two diverge when a foreign-platform binary shares a name
+with a local one — on Windows, `tmux` is psmux's compatibility shim, so the tmux row
+reads as a real tmux install. Only steps 3–5 above consult the platform, so `bmad-loop
+mux` prints a `note:` naming exactly the rows that are **available, foreign to this
+platform, and not the selected one** — the combination that looks like a contradiction.
+A forced choice (step 1 or 2) reaches those backends anyway, which is why the column is
+not gated instead; and a backend forced _into_ selection is left out of the note, since
+calling it unselectable would contradict its own `*` marker.
+
 ## tmux (the default)
 
 tmux is the reference backend: everything else in these docs — the `bmad-loop-<run-id>`
@@ -53,17 +63,25 @@ Two model differences matter if you port a backend or read psmux argv. psmux run
 per session, so window ids are minted per server and the backend session-qualifies every id it
 hands out (`session:@N`). And psmux has no per-window user options — one scope exists per
 server — so the window-option verbs and the `@`-prefixed columns of `list_windows` are served
-by a session-scoped option whose key carries the window id (`@bmad_project_@3` for window `@3`).
-Both are properties of psmux's model, not gaps awaiting an upstream release. Practical
-consequence: such a value is **not** readable via `psmux show-options -w` by hand — read it with
-`psmux show-options -qv -t <session> "@bmad_project_@N"` instead. One visible limit: a value
-that cannot survive psmux's control-line transport verbatim is refused with a stderr warning at
-every launch, and that project's windows stay untagged — the prune then scopes them through the
-run-dir fallback instead of the tag. Which paths those are is counter-intuitive, because the
-psmux client quotes a value only when it contains an ASCII space and `'` is literal inside those
-quotes: `C:\Users\O'Brien\dev` is **refused** while `C:\Users\O'Brien Files\dev` is accepted, and
-a spaced UNC path (`\\server\share\My Proj`) is refused while the spaceless `\\server\share\proj`
-is accepted.
+by a session-scoped option whose key carries a seam-owned marker plus the window id
+(`@bmad_project__blw@3` for window `@3`; no real-world naming convention collides with the
+marker, so the channel's cleanup sweeps stay off hand-written user options unless one
+deliberately imitates the seam). Both are properties of psmux's model, not gaps awaiting an
+upstream release. Practical consequence: such a value is **not** readable via
+`psmux show-options -w` by hand — read it with
+`psmux show-options -qv -t <session> "@bmad_project__blw@N"` instead. Session-scoped options need
+no such substitute — one server per session means that server's single map _is_ the session's —
+but they cross the same control line, so the session project tag is gated the same way. One
+visible limit: a value that cannot survive psmux's control-line transport verbatim is refused
+with a stderr warning at every launch, and that project's windows and agent sessions stay
+untagged — the prune then scopes them through the run-dir fallback instead of the tag. Which
+paths those are is counter-intuitive, because the psmux client quotes a value only when it
+contains an ASCII space and `'` is literal inside those quotes: `C:\Users\O'Brien\dev` is
+**refused** while `C:\Users\O'Brien Files\dev` is accepted, and a spaced UNC path
+(`\\server\share\My Proj`) is refused while the spaceless `\\server\share\proj` is accepted. The
+fallback that catches those refusals has a lifecycle ceiling
+([#419](https://github.com/bmad-code-org/bmad-loop/issues/419)): an untagged session whose run
+directory is later removed by `clean` or `archive` can no longer be pruned by any project.
 
 ## External backends
 

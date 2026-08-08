@@ -356,6 +356,58 @@ def test_detect_multiplexers_version_crash_keeps_availability(fresh_registry):
     assert rows["verless"].selected is True and rows["verless"].reason == "first-match"
 
 
+# ------------------------------------------------ fold_version, directly (#321)
+#
+# The seam folds and then every inline consumer folds again defensively, so the
+# helper's own edges have to hold on their own — and most of them are invisible
+# through any single consumer's rendering (`r.version or "-"` collapses "" and
+# None to the same cell, and the tmux-family probe strips its capture, so the
+# whitespace-only input is only reachable from a duck-typed backend at all).
+
+
+def test_fold_version_edges():
+    assert m.fold_version(None) is None  # the seam's own default version()
+    assert m.fold_version("") is None
+    # Truthy, but no segment survives: the sentinel this seam documents is None,
+    # not a version that happens to be empty.
+    assert m.fold_version("  \n \t \n") is None
+    assert m.fold_version("tmux 3.4") == "tmux 3.4"  # single line: byte-identical
+
+
+def test_fold_version_is_idempotent():
+    """Load-bearing, and nothing else asserts it: `version()` folds at the
+    tmux-family seam and detect_multiplexers / platform_preflight / collect_env /
+    mux_usable / make_adapters each fold that already-folded result again."""
+    for raw in ("tmux 3.4", "tmux 3.3.7\npsmux 3.3.7", "tmux 3.4 " + "x" * 300):
+        once = m.fold_version(raw)
+        assert m.fold_version(once) == once
+
+
+def test_fold_version_bounds_the_line_it_produces():
+    """`mux` sizes every column off the widest cell, so an unbounded single line
+    breaks the table exactly as an embedded newline did. The cut is at the tail,
+    which the one parser of this string (the psmux gate) never reads."""
+    folded = m.fold_version("tmux 3.4 " + "x" * 300)
+
+    assert folded is not None
+    assert len(folded) == m.VERSION_MAX_CHARS
+    assert folded.startswith("tmux 3.4 ") and folded.endswith("…")
+
+
+def test_forced_unusable_warning_folds_the_reported_version(fresh_registry, monkeypatch, capsys):
+    """The warning renders with `{version!r}`, which already escapes a newline —
+    so this fold buys readability, not safety. Assert the readable form, or the
+    site is indistinguishable from dead code."""
+    monkeypatch.setattr(fresh_registry, "_FORCED_UNUSABLE_WARNED", False)
+    monkeypatch.setenv("BMAD_LOOP_MUX_BACKEND", "alpha")
+    fresh_registry._BUILTINS_LOADED = True
+    fresh_registry.register_multiplexer("alpha", lambda p: True, lambda: _Stub(avail=False))
+
+    assert fresh_registry.mux_usable(_Stub(avail=False, version="alpha 1.2\nbuild 7")) is True
+
+    assert "version: 'alpha 1.2; build 7'" in capsys.readouterr().err
+
+
 # ---------------------------------------------------------------------------
 # Bundled-registry platform behavior. These exercise the REAL builtin load (they
 # leave `_BUILTINS_LOADED` False) and control the outcome by monkeypatching

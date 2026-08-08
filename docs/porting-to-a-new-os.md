@@ -135,8 +135,21 @@ out-of-tree adapter is
   [the adapter's operator guide](https://github.com/pbean/bmad-loop-adapter-herdr/blob/main/docs/adapter-multiplexer-herdr.md).)
 
 `available()` gates whether the backend is usable on the current host (e.g. its
-binary is on PATH); the optional `version()` feeds the diagnostic dump and the
-validate preflight (seam 4).
+binary is on PATH); the optional `version()` feeds `bmad-loop mux`, the diagnostic
+dump, and the validate preflight (seam 4).
+
+**`version()` returns one bounded line.** Every one of those consumers renders it
+inline — a table row whose width sets every other row's, a finding message, a
+scalar `--json` field — so a binary whose `--version` prints several lines (psmux
+prints a `tmux X.Y.Z` compatibility line plus its own) folds them in the backend,
+and a very long single line breaks the same surfaces a newline does. Use
+`fold_version()` from `adapters/multiplexer.py`: it joins the non-blank lines with
+`"; "` **in order**, caps the result at `VERSION_MAX_CHARS`, and returns `None` —
+the "no version" sentinel, never `""` — for an all-blank probe. Order is
+load-bearing wherever something parses the string: psmux's version gate anchors at
+the first segment, and the cap only ever cuts the tail. Core applies the same fold
+defensively at each consumer, so breaking the promise cannot split a `mux` row —
+but fold at the source, since only the backend knows which line identifies it.
 
 ### Availability discriminators (same-platform backends)
 
