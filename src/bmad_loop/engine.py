@@ -263,11 +263,18 @@ _TITLE_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f\ud800-\udfff]+")
 _ATX_CLOSING_RE = re.compile(r"[ \t]+#+[ \t]*$")
 
 
-def _story_label_stripped(value: object) -> str:
+def _story_label_stripped(value: object, story_key: str = "") -> str:
     """A commit-ready story title from a frontmatter value or heading text:
     coerced to str, control characters neutralized, label dropped, whitespace
     collapsed. Returns "" for anything that leaves no title behind, which is
     every caller's signal to fall back.
+
+    ``story_key`` is the task's own id, matched literally as a second way to
+    recognize the label. `StoriesEngine` inherits this renderer and `stories`
+    issues alphabetic ids ("auth", "oauth-setup") that the digit-led pattern
+    cannot see. It is an ADDITION to that pattern and not a replacement: a
+    sprint spec labels itself "Story 1.1:" while its key is "1-1-a", so keying
+    only off the task id would stop stripping the common case.
 
     Coerces rather than type-checks because the value arrives from YAML, where
     an unquoted title parses to whatever it looks like — ``title: 2026-01-01``
@@ -276,10 +283,15 @@ def _story_label_stripped(value: object) -> str:
     "" and falls back, matching how `status_of` treats a null status."""
     if value is None or isinstance(value, bool):  # `title: yes` is a typo, not a title
         return ""
-    text = _TITLE_CONTROL_RE.sub(" ", str(value))
+    text = _TITLE_CONTROL_RE.sub(" ", str(value)).strip()
+    stripped = _STORY_LABEL_RE.sub("", text)
+    if stripped == text and story_key:
+        # The id is escaped, so a key carrying regex metacharacters ("a.b") is
+        # matched literally rather than compiled into a wildcard.
+        stripped = re.sub(rf"^story\s+{re.escape(story_key)}\s*:\s*", "", text, flags=re.IGNORECASE)
     # Collapse after the label strip, so a label split by control characters
     # ("Story\x001.1:") is still recognized rather than surviving into the subject.
-    return " ".join(_STORY_LABEL_RE.sub("", text.strip()).split())
+    return " ".join(stripped.split())
 
 
 # Call-stack nesting depth for engine runs. A nested auto-sweep runs synchronously
@@ -3749,7 +3761,9 @@ class Engine:
             # malformed-YAML spec to {}; the guard below is for the reads that
             # still raise past it (EACCES here, a torn multi-byte spec in the
             # H1 fallback's own read_text).
-            title = _story_label_stripped(verify.read_frontmatter(spec).get("title"))
+            title = _story_label_stripped(
+                verify.read_frontmatter(spec).get("title"), task.story_key
+            )
             if title:
                 return title
             lines = spec.read_text(encoding="utf-8").splitlines()
@@ -3807,7 +3821,7 @@ class Engine:
                 # subject rather than falling back, so it is the one worth
                 # stripping. Whitespace before the run is what makes it a
                 # closing sequence; "# C#" keeps its hash.
-                title = _story_label_stripped(_ATX_CLOSING_RE.sub("", head[2:]))
+                title = _story_label_stripped(_ATX_CLOSING_RE.sub("", head[2:]), task.story_key)
                 if title:
                     return title
                 break

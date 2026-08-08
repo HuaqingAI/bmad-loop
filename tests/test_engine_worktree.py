@@ -2614,6 +2614,36 @@ def test_story_label_stripped_cases(raw, expected):
     assert _story_label_stripped(raw) == expected
 
 
+@pytest.mark.parametrize(
+    ("raw", "story_key", "expected"),
+    [
+        # stories.ID_RE admits alphabetic ids ("auth", "oauth-setup"), which the
+        # digit-led heuristic cannot recognize — so for the id we actually hold,
+        # match it exactly rather than guessing its shape.
+        ("Story auth: Add login", "auth", "Add login"),
+        ("Story oauth-setup: Wire the callback", "oauth-setup", "Wire the callback"),
+        ("story AUTH: case folds", "auth", "case folds"),
+        # The exact match is an ADDITION to the heuristic, never a replacement:
+        # a sprint spec labels itself "Story 1.1:" while its key is "1-1-a", so
+        # keying only off the task id would stop stripping the common case.
+        ("Story 1.1: Wire the Frobnicator", "1-1-a", "Wire the Frobnicator"),
+        # ...and it must not turn into a licence to eat real titles: a title
+        # whose first word merely follows "Story" is not this task's id.
+        ("Story Points: Add estimates", "auth", "Story Points: Add estimates"),
+        ("Story authentication: Add login", "auth", "Story authentication: Add login"),
+        # A key carrying regex metacharacters is matched literally, not compiled.
+        ("Story a.b: Escaped", "a.b", "Escaped"),
+        ("Story axb: Escaped", "a.b", "Story axb: Escaped"),
+    ],
+)
+def test_story_label_stripped_matches_the_task_id(raw, story_key, expected):
+    """Stories mode inherits this renderer and issues alphabetic ids, which the
+    digit-led pattern cannot match. Where the task's own id is known it is the
+    ground truth; the heuristic stays for the labels that do not repeat the key
+    verbatim."""
+    assert _story_label_stripped(raw, story_key) == expected
+
+
 # ------------------------------------------------ per_worktree engine plugin
 
 
