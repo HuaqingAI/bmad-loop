@@ -1558,6 +1558,16 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     # the operator was away, and `resume` is the moment they can still look.
     # Deliberately no --allow-config-change flag: a refuse-by-default gate here
     # would break resume-to-fix-a-setting, which is a supported workflow.
+    #
+    # ADVISORY, not a control, and the asymmetry with the gate is deliberate. The
+    # auto-sweep refusal in `_sweep_factory` baselines off a digest threaded in
+    # MEMORY from launch (see cmd_run/the compose_resume call below), which a
+    # session cannot reach. This comparison baselines off `state.trusted_config_digest`,
+    # which round-trips through <project>/.bmad-loop/runs/<id>/state.json — inside
+    # the same agent-writable tree the digest exists to police. A session that
+    # rewrites policy.toml can blank or re-stamp that field and silence the warning
+    # (blank suffices: the bool() guard reads "" as no prior pin). It catches the
+    # incidental change, not a deliberate one. Tracked in #498.
     security_config_changed = bool(state.trusted_config_digest) and (
         new_digest != state.trusted_config_digest
     )
