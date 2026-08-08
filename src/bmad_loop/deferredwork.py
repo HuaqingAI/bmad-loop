@@ -33,6 +33,25 @@ ANY_HEADING_RE = re.compile(r"^#{1,6} ", re.MULTILINE)
 _FLAT_SOURCE_BODY = r"source_spec:[ \t]"
 FLAT_ENTRY_RE = re.compile(rf"^[-*][ \t]+{_FLAT_SOURCE_BODY}", re.IGNORECASE | re.MULTILINE)
 STATUS_RE = re.compile(r"^status:[ \t]*(.*)$", re.MULTILINE)
+# The mechanical half of a hard gate. An entry could always *say* it blocked a
+# story — `HARD GATE: must land before 3-2` in the reason line — and saying it
+# stopped nothing: the queue picked the story up anyway, and the gate surfaced
+# afterwards in the diff of work built on a leg nobody had wired. `gate:` names
+# the blocked story keys in a form a check can match, so the claim can refuse.
+# Parsed exactly like `status:`: a field line, read inside `parse_ledger`'s
+# canonical span, so a line under a flat-append bullet belongs to that block and
+# not to the entry above it.
+GATE_RE = re.compile(r"^gate:[ \t]*(.*)$", re.MULTILINE)
+# A story key as either queue spells one: a sprint key (`3-2-invite-link`), the
+# stories-mode id it starts with (`3-2`), or a bare slug. Whitespace and
+# separators are deliberately out — a token nothing can match is the same silent
+# no-op the field exists to end, so it is surfaced rather than dropped.
+GATE_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+# Line-start only. The prose convention this field replaces is a line that
+# *opens* with it; a sentence mentioning a hard gate mid-line ("the DW-1 HARD
+# GATE: wording predates the field") is discussion, and reading it as a
+# declaration would warn about every entry that talks about gating.
+HARD_GATE_PROSE_RE = re.compile(r"^HARD GATE:", re.MULTILINE)
 # Everything `str.splitlines()` splits on, not `\n` alone (#305). The writers
 # below interpolate their arguments into a line-oriented file, so a break in a
 # value injects ledger lines. The C1/Unicode members are load-bearing rather
@@ -102,6 +121,57 @@ def parse_ledger(text: str) -> list[DWEntry]:
 
 def open_ids(text: str) -> set[str]:
     return {e.id for e in parse_ledger(text) if e.open}
+
+
+@dataclass(frozen=True)
+class EntryGates:
+    """One entry's ``gate:`` declaration, split by what a check can act on.
+
+    Both halves are reported by ``validate``, because a token that matches no
+    story key is not a weaker gate than a valid one — it is the prose gate again,
+    wearing the field's clothes, and silence about it is what let the story run.
+    """
+
+    tokens: tuple[str, ...] = ()
+    malformed: tuple[str, ...] = ()
+
+
+def gates(entry: DWEntry) -> EntryGates:
+    """Every ``gate:`` token in one entry's canonical span, order-preserving.
+
+    Multiple ``gate:`` lines union: an entry blocking three stories may list them
+    on one line or on three, and to a line-oriented file neither spelling is the
+    wrong one. Within a line the separator is a comma, and only a comma — a
+    space-separated ``gate: 3-2 3-3`` lands in ``malformed`` rather than being
+    read leniently, so the operator is told the spelling gated nothing instead of
+    finding out from a story that ran.
+
+    Duplicates collapse (an id repeated across lines is one claim, not two);
+    empty items drop, so a trailing separator is not a token.
+    """
+    tokens: list[str] = []
+    malformed: list[str] = []
+    for m in GATE_RE.finditer(entry.body):
+        for raw in m.group(1).split(","):
+            token = raw.strip()
+            if not token:
+                continue
+            bucket = tokens if GATE_TOKEN_RE.match(token) else malformed
+            if token not in bucket:
+                bucket.append(token)
+    return EntryGates(tokens=tuple(tokens), malformed=tuple(malformed))
+
+
+def gates_story(token: str, story_key: str) -> bool:
+    """Whether ``token`` gates ``story_key`` — equal, or its ``-``-delimited prefix.
+
+    The prefix arm is what lets one token reach both queues: stories mode keys on
+    the bare id (``3-2``) while sprint mode keys on the full ``3-2-invite-link``,
+    and an author gating "story 3-2" means the story, not the spelling. The
+    delimiter is required rather than a bare ``startswith`` so ``3-2`` cannot
+    sweep in its numeric neighbours — ``3-20-...`` is a different story.
+    """
+    return story_key == token or story_key.startswith(f"{token}-")
 
 
 def parse_declaration(raw: object) -> tuple[tuple[str, ...], str | None]:

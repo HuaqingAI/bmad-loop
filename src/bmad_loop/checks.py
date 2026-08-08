@@ -90,6 +90,8 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "deferred.closes-unknown",
         "deferred.closes-malformed",
         "deferred.closes-entry-unreadable",
+        "deferred.hard-gate",
+        "deferred.hard-gate-unstructured",
         "deferred.ledger-unreadable",
     }
 )

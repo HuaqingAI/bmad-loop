@@ -341,9 +341,9 @@ def cmd_validate(args: argparse.Namespace) -> int:
     if paths:
         if stories_on:
             _validate_stories_queue(project, paths, spec_folder, dev_trees, report)
-            _validate_closes_deferred(paths, report, spec_folder=spec_folder)
+            _validate_deferred_ledger(paths, report, spec_folder=spec_folder)
         else:
-            _validate_closes_deferred(paths, report)
+            _validate_deferred_ledger(paths, report)
             _validate_operator_registry(project, paths, report)
             try:
                 ss = sprintstatus.load(paths.sprint_status)
@@ -1034,8 +1034,181 @@ def _validate_operator_registry(
         )
 
 
+def _validate_deferred_ledger(
+    paths: bmadconfig.ProjectPaths,
+    report: ValidationReport,
+    *,
+    spec_folder: str | None = None,
+) -> None:
+    """Read the deferred-work ledger once, then run every check that needs it.
+
+    The read sits here rather than inside each check because an unreadable ledger
+    is one fault, not one per reader: two checks opening the same file would
+    report the same outage twice under two ids.
+
+    A ledger that cannot be read at all is reported. Staying quiet there is not
+    the same trade as staying quiet about an unparseable manifest: the manifest is
+    already reported by ``queue.stories-manifest``, while nothing else in
+    ``validate`` reads the ledger, so silence meant reporting success for
+    preflights that checked nothing.
+
+    The gate runs first — an operator who has both a blocked story and a stale
+    traceability field needs the refusal at the top, and ``_validate_closes_deferred``
+    returns early on an unreadable manifest, which must not swallow it.
+    """
+    ledger = paths.deferred_work
+    try:
+        text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+    except (OSError, UnicodeDecodeError) as e:
+        # Split from the manifest read in the checks below, which is silent for a
+        # good reason that does not apply here: nothing else in `validate` reads
+        # the ledger, so returning quietly reported success for preflights that
+        # checked nothing, against the very file the run's closure will fail on
+        # (#284 round-5 review, finding 6).
+        report.warn(
+            "deferred.ledger-unreadable",
+            f"{ledger} cannot be read ({e}) — closes_deferred declarations were not "
+            "checked against it, and the run's own closure will fail the same way",
+            {"ledger": str(ledger), "error": str(e)},
+        )
+        return
+    _validate_hard_gates(paths, text, report, spec_folder=spec_folder)
+    _validate_closes_deferred(paths, text, report, spec_folder=spec_folder)
+
+
+def _validate_hard_gates(
+    paths: bmadconfig.ProjectPaths,
+    text: str,
+    report: ValidationReport,
+    *,
+    spec_folder: str | None = None,
+) -> None:
+    """FAIL when the queue is about to dispatch a story an open ledger entry gates.
+
+    A ledger entry could always *say* it blocked a story — ``HARD GATE: must land
+    before 3-2`` in its reason — and saying it stopped nothing. ``run`` took the
+    story off the board and drove it, and the gate was discovered afterwards, in
+    the diff of work built on a leg nobody had wired. A ``gate:`` line makes the
+    claim matchable and this check makes it a refusal.
+
+    The only deferred check that is a gate rather than an advisory, and the
+    severity is the whole point: the ``closes-*`` siblings describe traceability
+    that is wrong, which must never block a run, while this one describes work
+    that must not start, which is exactly what a non-zero exit is for.
+
+    Silent on a ledger nobody has gated, so the zero-config output is unchanged.
+    Once a gate exists the passing case reports itself — a gate that only ever
+    speaks when it fires is indistinguishable, on the day it matters, from one
+    nobody remembered to write.
+    """
+    declared = [(entry, deferredwork.gates(entry)) for entry in deferredwork.parse_ledger(text)]
+    story_keys = _actionable_story_keys(paths, spec_folder)
+    gated = False
+    for entry, entry_gates in declared:
+        if not entry.open:
+            continue  # a landed entry gates nothing; that is what closing it means
+        _report_unstructured_gate(entry, entry_gates, report)
+        for story_key in story_keys:
+            hits = [t for t in entry_gates.tokens if deferredwork.gates_story(t, story_key)]
+            if not hits:
+                continue
+            gated = True
+            report.fail(
+                "deferred.hard-gate",
+                f"{entry.id} ({entry.title}) is open and gates {story_key} "
+                f"(gate: {', '.join(hits)}) — that story must not run until the entry "
+                f"lands. Close it in {paths.deferred_work.name} (`status: done <date>`), "
+                f"or drop the token from its `gate:` line if it no longer blocks this work",
+                {
+                    "dw_id": entry.id,
+                    "title": entry.title,
+                    "story_key": story_key,
+                    "tokens": hits,
+                },
+            )
+    # Keyed on enforceable tokens, not on `gate:` lines: a ledger whose only gate
+    # is malformed enforced nothing, and an `ok` there would be the same false
+    # all-clear the warning above exists to break.
+    if not gated and any(entry_gates.tokens for _, entry_gates in declared):
+        open_gated = [e.id for e, g in declared if e.open and g.tokens]
+        report.ok(
+            "deferred.hard-gate",
+            f"deferred-work gates OK: no actionable story is gated by an open entry "
+            f"({', '.join(open_gated) if open_gated else 'no open gated entries'})",
+            {"open_gated_ids": open_gated, "actionable": list(story_keys)},
+        )
+
+
+def _report_unstructured_gate(
+    entry: deferredwork.DWEntry,
+    entry_gates: deferredwork.EntryGates,
+    report: ValidationReport,
+) -> None:
+    """Warn about a hard gate the mechanical check cannot enforce.
+
+    Two causes, one id, because the remedy is the same line in the same file. A
+    ``HARD GATE:`` written as prose is the pre-``gate:`` convention still holding
+    nothing back; a token that cannot name a story key is that same nothing with
+    the field's syntax around it, which is worse — it reads, to anyone scanning
+    the entry, as a gate that is already in force.
+
+    An entry carrying a valid token *and* a malformed one is still reported: the
+    valid half gates what it names, and the operator's belief about the other half
+    is exactly the thing that goes wrong quietly.
+    """
+    if entry_gates.malformed:
+        reason = (
+            f"declares `gate:` tokens that cannot name a story: {', '.join(entry_gates.malformed)}"
+        )
+    elif not entry_gates.tokens and deferredwork.HARD_GATE_PROSE_RE.search(entry.body):
+        reason = "declares a `HARD GATE:` in prose but carries no `gate:` line"
+    else:
+        return
+    report.warn(
+        "deferred.hard-gate-unstructured",
+        f"{entry.id} ({entry.title}) {reason} — nothing holds the gated story back, so "
+        f"`bmad-loop run` will drive it while the entry is open; name the blocked stories "
+        f"on a `gate:` line (comma-separated) to make the gate enforceable",
+        {"dw_id": entry.id, "malformed": list(entry_gates.malformed)},
+    )
+
+
+def _actionable_story_keys(paths: bmadconfig.ProjectPaths, spec_folder: str | None) -> list[str]:
+    """The story keys this queue would dispatch, in queue order, in either mode.
+
+    Degrades to nothing rather than raising: ``queue.sprint-status`` and
+    ``queue.stories-manifest`` own queue readability, and a queue nothing can read
+    dispatches nothing for a gate to refuse.
+
+    Stories mode has no status column — the manifest is a flat schedule and the
+    story's own spec carries the status — so a story whose spec reads ``done`` is
+    dropped here. That is the same line ``ACTIONABLE_STATUSES`` draws on the
+    sprint board, and without it a finished epic would fail ``validate`` forever
+    over gates on work that already landed.
+    """
+    if spec_folder is not None:
+        try:
+            folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
+            entries = stories_mod.load_stories(folder).entries
+        except (OSError, UnicodeDecodeError, stories_mod.StoriesError):
+            return []
+        keys = []
+        for entry in entries:
+            state = stories_mod.resolve_story_spec(folder, entry.id)
+            if state.kind == stories_mod.KIND_PRESENT and state.status == stories_mod.DONE:
+                continue
+            keys.append(entry.id)
+        return keys
+    try:
+        ss = sprintstatus.load(paths.sprint_status)
+    except (sprintstatus.SprintStatusError, OSError, UnicodeDecodeError):
+        return []
+    return [s.key for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
+
+
 def _validate_closes_deferred(
     paths: bmadconfig.ProjectPaths,
+    text: str,
     report: ValidationReport,
     *,
     spec_folder: str | None = None,
@@ -1070,31 +1243,12 @@ def _validate_closes_deferred(
     close nothing and say nothing. Covering only two of the three left the third
     to be discovered in the journal after the run it should have preceded.
 
-    A ledger that cannot be read at all is reported as well. Staying quiet there
-    is not the same trade as staying quiet about an unparseable manifest: the
-    manifest is already reported by ``queue.stories-manifest``, while nothing
-    else in ``validate`` reads the ledger, so silence meant reporting success for
-    a preflight that checked nothing.
-
     Never a failure. The annotation is traceability, not a gate, so a stale
     reference must not be able to block a run that would otherwise start.
+    ``text`` is the ledger snapshot :func:`_validate_deferred_ledger` already
+    read; an unreadable ledger never reaches here.
     """
     ledger = paths.deferred_work
-    try:
-        text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
-    except (OSError, UnicodeDecodeError) as e:
-        # Split from the manifest read below, which is silent for a good reason
-        # that does not apply here: nothing else in `validate` reads the ledger, so
-        # returning quietly reported success for a preflight that checked nothing,
-        # against the very file the run's closure will fail on
-        # (#284 round-5 review, finding 6).
-        report.warn(
-            "deferred.ledger-unreadable",
-            f"{ledger} cannot be read ({e}) — closes_deferred declarations were not "
-            "checked against it, and the run's own closure will fail the same way",
-            {"ledger": str(ledger), "error": str(e)},
-        )
-        return
     try:
         sources = (
             _stories_declarations(paths, spec_folder)
