@@ -34,7 +34,7 @@ from bmad_loop import deferredwork, runs, sprintstatus, verify, worktree_flow
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.bmadconfig import ProjectPaths
-from bmad_loop.engine import Engine
+from bmad_loop.engine import Engine, _story_label_stripped
 from bmad_loop.install import (
     BMAD_SCRIPTS_SEED_REL,
     CENTRAL_CONFIG_REL,
@@ -2212,22 +2212,25 @@ def test_commit_message_template_applied(project):
 
 
 def test_commit_message_template_story_title(project):
-    """{story_title} renders the spec's first H1 with the "Story n.m:" label
-    dropped; a template without the placeholder never pays the spec read."""
+    """{story_title} renders the spec's `title:` frontmatter — where a bmad-loop
+    spec's title actually lives — with the "Story <id>:" label dropped; a
+    template without the placeholder never pays the spec read."""
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
     review = wt_review_effect(project, "1-1-a", clean=True)
 
-    def review_with_h1(spec):
-        # the review pass is the spec's last writer, so the H1 the commit-time
-        # read sees must be appended after it
+    def review_with_title(spec):
+        # the review pass is the spec's last writer, so the title the commit-time
+        # read sees must be stamped after it
         result = review(spec)
         sp = project.rebased(spec.cwd).implementation_artifacts / "spec-1-1-a.md"
-        sp.write_text(sp.read_text() + "\n# Story 1.1: Wire the Frobnicator\n")
+        sp.write_text(
+            sp.read_text().replace("title: 'test'", "title: 'Story 1.1: Wire the Frobnicator'")
+        )
         return result
 
     engine, _ = make_engine(
         project,
-        [wt_dev_effect(project, "1-1-a"), review_with_h1],
+        [wt_dev_effect(project, "1-1-a"), review_with_title],
         policy=wt_policy(commit_message_template="chore(bmad): {story_key}\n\n{story_title}"),
     )
     summary = engine.run()
@@ -2238,13 +2241,43 @@ def test_commit_message_template_story_title(project):
     assert "Story 1.1:" not in log  # the label would just repeat the key
 
 
-def test_commit_message_template_story_title_falls_back_to_key(project):
-    """No H1 in the spec (the fixture writes only frontmatter + ## sections) →
-    the placeholder renders the story key, never an empty string."""
+def test_commit_message_template_story_title_falls_back_to_h1(project):
+    """A spec written without a `title:` — i.e. not from this project's
+    template — still yields a title from a first markdown H1."""
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    review = wt_review_effect(project, "1-1-a", clean=True)
+
+    def review_h1_only(spec):
+        result = review(spec)
+        sp = project.rebased(spec.cwd).implementation_artifacts / "spec-1-1-a.md"
+        sp.write_text(sp.read_text().replace("title: 'test'\n", "") + "\n# Heading Sourced\n")
+        return result
+
     engine, _ = make_engine(
         project,
-        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+        [wt_dev_effect(project, "1-1-a"), review_h1_only],
+        policy=wt_policy(commit_message_template="chore(bmad): {story_title}"),
+    )
+    summary = engine.run()
+    assert summary.done == 1
+    assert "chore(bmad): Heading Sourced" in git(project.project, "log", "--format=%s")
+
+
+def test_commit_message_template_story_title_falls_back_to_key(project):
+    """Neither a `title:` nor an H1 → the placeholder renders the story key,
+    never an empty string."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    review = wt_review_effect(project, "1-1-a", clean=True)
+
+    def review_titleless(spec):
+        result = review(spec)
+        sp = project.rebased(spec.cwd).implementation_artifacts / "spec-1-1-a.md"
+        sp.write_text(sp.read_text().replace("title: 'test'\n", ""))
+        return result
+
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), review_titleless],
         policy=wt_policy(commit_message_template="chore(bmad): {story_title}"),
     )
     summary = engine.run()
@@ -2266,6 +2299,38 @@ def test_story_title_undecodable_spec_falls_back_to_key(project):
     task.spec_file = str(spec)
 
     assert engine._story_title(task) == "1-1-a"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # A story id is a dash/dot composite here, so the label strip must survive
+        # every shape this project actually issues...
+        ("Story 1.1: Wire the Frobnicator", "Wire the Frobnicator"),
+        ("Story 3-2: Dash composite", "Dash composite"),
+        ("Story 1-1-a: Trailing letter", "Trailing letter"),
+        ("story 1.1: lowercased label", "lowercased label"),
+        # ...while never eating a real title that merely opens with "Story".
+        # The label must start at a DIGIT: `\S+` would strip "Points:" here, and
+        # `\d+\.\d+` would stop matching the dash composites above.
+        ("Story Points: Add estimates", "Story Points: Add estimates"),
+        ("Storybook: Add a knob", "Storybook: Add a knob"),
+        ("  Plain title  ", "Plain title"),
+        # YAML hands back whatever an unquoted scalar looked like. A blank
+        # `title:` is None and must fall back; a bool is a typo, not a title; a
+        # number still beats rendering the bare story key.
+        (None, ""),
+        ("", ""),
+        ("Story 1.1:", ""),
+        (True, ""),
+        (1.1, "1.1"),
+    ],
+)
+def test_story_label_stripped_cases(raw, expected):
+    """The label strip sits between two wrong answers: too loose eats the title,
+    too tight stops matching this project's ids. Pinned per-case rather than
+    derived, so a regex retune has to restate its intent here."""
+    assert _story_label_stripped(raw) == expected
 
 
 # ------------------------------------------------ per_worktree engine plugin

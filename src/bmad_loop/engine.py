@@ -206,6 +206,29 @@ def _session_task_id(story_key: str, part: str, seq: int) -> str:
     return safe_segment(f"{story_key}-{part}-{seq}")
 
 
+# A story id in this repo is a dash/dot composite ("1.1", "3-2", "1-1-a"), so the
+# leading-label strip must start at a DIGIT and may then run on through letters.
+# Both looser and tighter patterns get this wrong in opposite directions: `\S+`
+# eats the real title in "Story Points: Add estimates", while `\d+\.\d+` stops
+# matching the dash composites this project actually issues.
+_STORY_LABEL_RE = re.compile(r"^story\s+\d[\w.\-]*:\s*", re.IGNORECASE)
+
+
+def _story_label_stripped(value: object) -> str:
+    """A commit-ready story title from a frontmatter value or heading text:
+    coerced to str, label dropped, whitespace trimmed. Returns "" for anything
+    that leaves no title behind, which is every caller's signal to fall back.
+
+    Coerces rather than type-checks because the value arrives from YAML, where
+    an unquoted title parses to whatever it looks like — ``title: 2026-01-01``
+    is a ``date``, ``title: 1.1`` a float — and a rendered date still beats
+    falling back to the bare story key. A ``None`` (blank ``title:``) coerces to
+    "" and falls back, matching how `status_of` treats a null status."""
+    if value is None or isinstance(value, bool):  # `title: yes` is a typo, not a title
+        return ""
+    return _STORY_LABEL_RE.sub("", str(value).strip()).strip()
+
+
 # Call-stack nesting depth for engine runs. A nested auto-sweep runs synchronously
 # in the same thread as its parent (see _maybe_auto_sweep), so a ContextVar carries
 # the parent's depth into the child. Tracked independently of signal ownership so an
@@ -3619,26 +3642,45 @@ class Engine:
         if not template:
             return None
         # literal substitution (not str.format) so stray braces in the
-        # template — e.g. a JSON trailer — don't raise. {story_title} first:
-        # the spec read behind it is skipped entirely for templates that don't
-        # ask for it.
-        if "{story_title}" in template:
-            template = template.replace("{story_title}", self._story_title(task))
-        return template.replace("{story_key}", task.story_key).replace(
-            "{run_id}", self.state.run_id
+        # template — e.g. a JSON trailer — don't raise. The spec read behind
+        # {story_title} is skipped entirely for templates that don't ask for it.
+        title = self._story_title(task) if "{story_title}" in template else ""
+        # {story_title} substituted LAST: it is the only value here drawn from
+        # agent-written spec prose, so a title that itself contains "{run_id}"
+        # must land in the message as written instead of being re-substituted.
+        return (
+            template.replace("{story_key}", task.story_key)
+            .replace("{run_id}", self.state.run_id)
+            .replace("{story_title}", title)
         )
 
     def _story_title(self, task: StoryTask) -> str:
-        """The story's human-readable title for {story_title}: the spec's first
-        markdown H1, with any leading ``Story <n.m>:`` label dropped (the
+        """The story's human-readable title for {story_title}: the spec's
+        ``title:`` frontmatter, falling back to a first markdown H1, then to the
+        story key. Any leading ``Story <id>:`` label is dropped either way (the
         template already carries the key, so the label would just repeat it).
-        Falls back to the story key when there is no spec, no H1, or the spec is
-        unreadable — the placeholder must never render empty, and a commit-time
-        read failure must not fail the commit."""
+
+        Frontmatter first because that is where a bmad-loop spec's title
+        actually lives — `spec-template.md` opens with ``title:`` and writes no
+        H1 at all. Keying on the heading alone left the placeholder inert on
+        every canonical spec, silently rendering the story key in place of a
+        title. The H1 branch stays for specs authored outside that template.
+
+        Falls back to the story key when there is no spec, no title, or the spec
+        is unreadable — the placeholder must never render empty, and a
+        commit-time read failure must not fail the commit."""
         if not task.spec_file:
             return task.story_key
+        spec = Path(task.spec_file)
         try:
-            lines = Path(task.spec_file).read_text(encoding="utf-8").splitlines()
+            # `read_frontmatter` already degrades a missing, undecodable or
+            # malformed-YAML spec to {}; the guard below is for the reads that
+            # still raise past it (EACCES here, a torn multi-byte spec in the
+            # H1 fallback's own read_text).
+            title = _story_label_stripped(verify.read_frontmatter(spec).get("title"))
+            if title:
+                return title
+            lines = spec.read_text(encoding="utf-8").splitlines()
         except (OSError, UnicodeDecodeError):
             # UnicodeDecodeError is a ValueError, not an OSError, so a spec torn
             # mid-write through a multi-byte sequence would slip past an
@@ -3657,7 +3699,7 @@ class Engine:
                     break
         for line in lines[start:]:
             if line.startswith("# "):
-                title = re.sub(r"^story\s+\S+:\s*", "", line[2:].strip(), flags=re.IGNORECASE)
+                title = _story_label_stripped(line[2:])
                 if title:
                     return title
                 break
