@@ -243,8 +243,43 @@ def test_env_names_the_platform_and_the_win32_on_wsl_path_verdict(project, monke
     payload = json.loads(js)
     assert payload["env"]["sys_platform"] == "win32"
     assert payload["env"]["win32_on_wsl_path"] is True
-    assert str(unc) not in js
-    assert sanitize.assert_no_leak(js) == []
+    # Assert over the *decoded* values, never the rendered bytes. Two independent
+    # reasons a substring scan of `js` cannot carry this guard, both measured:
+    #   - `json.dumps` doubles every backslash, so the raw `\\wsl.localhost\...`
+    #     spelling never appears in the rendered bytes it is compared against
+    #     (the same trap `cli.py` already names at its diagnose egress guard);
+    #   - `sanitize`'s absolute-path rules know POSIX `/home/`, `/Users/`, `/root/`
+    #     and `C:\Users\` — never a backslash `\home\` under a UNC host — and its
+    #     username rule compares the *Windows* account, so `assert_no_leak` returns
+    #     `[]` for this shape no matter what leaked.
+    # Ablation: adding a raw-path field to `EnvInfo` leaves both of those green and
+    # only the check below reddens.
+    assert all(str(unc) not in str(v) for v in payload["env"].values())
+    assert sanitize.assert_no_leak(js) == []  # general backstop; blind to this shape
+
+
+def test_env_win32_on_wsl_path_is_false_off_win32(project, monkeypatch):
+    """The *platform* half of the twin gate, pinned. What #332 names is a mismatched
+    interpreter, not a path shape: the very distro path a win32 interpreter warns about
+    is a perfectly ordinary mount for a Linux one. `runsetup`'s twin already carries
+    this row (`test_win32_on_wsl_path_stays_silent_off_the_shape`'s `linux` case);
+    without it here, deleting `sys.platform == "win32"` from `collect_env` reddens
+    nothing in this file — measured, which is why the row exists."""
+    from bmad_loop.adapters.multiplexer import get_multiplexer
+
+    # Same cache dance as the win32 test above, and for the same reason: `collect_env`
+    # reaches `get_multiplexer()`, whose lru_cache selects on the patched `sys.platform`.
+    get_multiplexer.cache_clear()
+    try:
+        monkeypatch.setattr(diagnostics.sys, "platform", "linux")
+        pseudo = sanitize.Pseudonymizer()
+        unc = Path("\\\\wsl.localhost\\Ubuntu-24.04\\home\\u\\p")
+        diag = diagnostics.collect([_seed_run(project.project)], pseudo=pseudo, project=unc)
+    finally:
+        monkeypatch.undo()
+        get_multiplexer.cache_clear()
+    assert diag.env.sys_platform == "linux"
+    assert diag.env.win32_on_wsl_path is False
 
 
 def test_env_win32_on_wsl_path_is_false_for_a_plain_project(project):
