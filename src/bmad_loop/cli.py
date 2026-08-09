@@ -1067,10 +1067,19 @@ def _validate_deferred_ledger(
         # the ledger, so returning quietly reported success for preflights that
         # checked nothing, against the very file the run's closure will fail on
         # (#284 round-5 review, finding 6).
+        # Severity is deliberately unchanged from when this read served only
+        # `closes_deferred`, but it is now load-bearing in a way it was not: the
+        # hard gate rides on the same bytes, so a warning lets `validate` exit 0
+        # having evaluated no gate at all. That is a fail-open on the one deferred
+        # check that is a refusal. Escalating a pre-existing id from warning to
+        # problem is a user-visible change and belongs with the dispatch-side
+        # enforcement work, not with this parse-and-check addition — until then the
+        # message at least names what went unchecked instead of implying the gate ran.
         report.warn(
             "deferred.ledger-unreadable",
-            f"{ledger} cannot be read ({e}) — closes_deferred declarations were not "
-            "checked against it, and the run's own closure will fail the same way",
+            f"{ledger} cannot be read ({e}) — neither closes_deferred declarations nor "
+            "`gate:` hard gates were checked against it, so an open entry could be "
+            "gating an actionable story unseen; the run's own closure will fail the same way",
             {"ledger": str(ledger), "error": str(e)},
         )
         return

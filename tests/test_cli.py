@@ -3848,8 +3848,13 @@ def test_validate_warns_when_the_ledger_itself_is_unreadable(project, capsys, mo
     assert len(findings) == 1
     assert findings[0]["severity"] == "warning"  # advisory: still never a gate
     assert findings[0]["detail"]["ledger"] == str(project.deferred_work)
+    # the same bytes now back the hard gate, so the message has to say the gate went
+    # unchecked too — a warning that names only closes_deferred reads as though the
+    # refusal had run and found nothing
+    assert "gate:" in findings[0]["message"] and "hard gates" in findings[0]["message"]
     # and the declaration checks it could not run stay quiet rather than guessing
     assert not [f for f in doc["findings"] if f["check"] == "deferred.closes-unknown"]
+    assert not [f for f in doc["findings"] if f["check"].startswith("deferred.hard-gate")]
 
 
 def test_validate_warns_on_a_malformed_closes_deferred_declaration(project, capsys):
