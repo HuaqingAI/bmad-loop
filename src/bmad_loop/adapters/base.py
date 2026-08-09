@@ -227,13 +227,14 @@ class CodingCLIAdapter(ABC):
         behavior: identity, like ``_post_kill_reconcile``, so an adapter with no
         session log at all (mock) stays inert.
 
-        Any adapter that writes ``logs/<task_id>.log`` should mix in
-        ``EnvFaultMixin``, which matches profile patterns against the log tail
-        here and stamps ``env_fault`` / ``env_fault_evidence`` onto the result.
-        That covers the tmux adapters (pane capture) and the opencode HTTP
-        adapter (the serve process's stdout/stderr, ``<task_id>.server.out``,
-        NOT its conversation transcript) alike — the signal is the
-        log, not the transport. This docstring used to say HTTP adapters had no
+        Any adapter that writes a per-task diagnostic log should mix in
+        ``EnvFaultMixin``, which matches profile patterns against the tail of the
+        file its ``ENV_FAULT_LOG_SUFFIX`` names and stamps ``env_fault`` /
+        ``env_fault_evidence`` onto the result. That covers the tmux adapters
+        (pane capture, ``<task_id>.log``) and the opencode HTTP adapter (the
+        serve process's stdout/stderr, ``<task_id>.server.out``, NOT its
+        conversation transcript) alike — the signal is the log, not the
+        transport. This docstring used to say HTTP adapters had no
         post-mortem signal; that stopped being true once opencode_http began
         teeing its server log, and the stale premise is why a provider quota
         outage went unclassified and burned three stories' retry budgets."""

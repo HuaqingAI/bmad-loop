@@ -132,10 +132,14 @@ ANCHOR_REACHING_BAIT = [
 # refusals are bare sentences, so every citation of them is indistinguishable.
 #
 # It is acceptable for opencode ONLY because of where that profile's log comes
-# from: logs/<task_id>.log is the `opencode serve` process's own stdout/stderr,
-# which the model cannot write to, so a citation cannot physically reach the
-# scanned bytes. If this adapter ever tees model output into the same file, these
-# lines become live false positives and the patterns must be withdrawn.
+# from: the file the classifier scans is logs/<task_id>.server.out — the
+# `opencode serve` process's own stdout/stderr, which the model cannot write to,
+# so a citation cannot physically reach the scanned bytes. NOT logs/<task_id>.log,
+# which is that adapter's curated `[bmad]` transcript and does carry the model's
+# words (the file is chosen by EnvFaultMixin.ENV_FAULT_LOG_SUFFIX). If the
+# classifier is ever repointed at the transcript, or the adapter tees model output
+# into the server log, these lines become live false positives and the patterns
+# must be withdrawn.
 #
 # Characterisation test — asserts they DO match, so the day that changes it shows.
 INSEPARABLE_VERBATIM_CITATIONS = [

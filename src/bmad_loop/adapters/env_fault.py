@@ -7,12 +7,15 @@ about the story. The engine routes that to a PAUSE (``env_fault_pause_reason``)
 instead of charging a dev attempt, and re-arming resets the budget.
 
 This lives in its own module rather than on one adapter because the signal is
-**transport-agnostic**: every adapter that writes ``logs/<task_id>.log`` can be
-classified from it, whatever produced the bytes. The tmux adapters tee a pane
-capture there (``mux.pipe_pane``); the opencode HTTP adapter redirects the
-``opencode serve`` process's own stdout/stderr there. Keeping the classifier
-attached to a single adapter is what let #194 ship covering only half the
-adapters, so the next sibling adapter inherits this instead of re-omitting it.
+**transport-agnostic**: every adapter that writes a per-task diagnostic log can
+be classified from it, whatever produced the bytes. Which file that is per
+adapter is named by ``ENV_FAULT_LOG_SUFFIX``: the tmux adapters tee a pane
+capture to ``logs/<task_id>.log`` (``mux.pipe_pane``); the opencode HTTP adapter
+redirects the ``opencode serve`` process's own stdout/stderr to
+``logs/<task_id>.server.out`` — NOT its ``.log``, which is a model-written
+conversation transcript. Keeping the classifier attached to a single adapter is
+what let #194 ship covering only half the adapters, so the next sibling adapter
+inherits this instead of re-omitting it.
 
 Host-class contract: ``self.profile`` (a ``CLIProfile``), ``self.logs_dir``, and
 ``_note_lifecycle`` (from ``_ResultFileMixin``). Mix in alongside that mixin.
@@ -83,8 +86,9 @@ _ANSI_RE = re.compile(
 class EnvFaultMixin:
     """Classify a dead session as an environment fault from its log tail (#194).
 
-    Mixed into every adapter that writes ``logs/<task_id>.log``. Inert for a
-    profile with no ``env_fault_patterns``, so mixing it in is always safe."""
+    Mixed into every adapter that writes a per-task diagnostic log; which file
+    is scanned is named by ``ENV_FAULT_LOG_SUFFIX``. Inert for a profile with no
+    ``env_fault_patterns``, so mixing it in is always safe."""
 
     # Set by the concrete adapter's __init__; bare annotations (no runtime effect)
     # tell the type checker which host attributes this mixin reads.

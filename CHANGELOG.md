@@ -160,6 +160,16 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
+- **Provider quota refusals are environment faults on `opencode-http` too (#323).** #194's classifier
+  lived on `GenericAdapter`, so its hookless HTTP sibling silently omitted it: a five-hour provider
+  usage limit read as three stalled stories and burned their retry budgets. The classifier now lives
+  in a shared `EnvFaultMixin` both adapters mix in, and the `opencode` profile seeds quota/rate-limit
+  and connection patterns anchored on the server's `error.error="AI_APICallError: …"` field. That
+  scan reads `logs/<task-id>.server.out`, the `opencode serve` process's own stdout — not the curated
+  `[bmad]` transcript, which carries the model's own words. Which file each adapter scans is named by
+  `ENV_FAULT_LOG_SUFFIX` and is part of the patterns' safety contract: a pattern is only sound
+  against a log the model cannot write to.
+
 - **A re-armed escalation no longer overwrites the previous attempt's dirty snapshot (#349).**
   `refs/attempt-preserve-dirty/*` names were keyed on `task.attempt`, which `rearm_escalation`
   resets to 0, so a post-resolve re-drive rolling back against the same baseline recomputed the
