@@ -182,26 +182,45 @@ class EnvFaultMixin:
             with self._env_fault_log_path(task_id).open("rb") as fh:
                 fh.seek(0, 2)  # SEEK_END
                 size = fh.tell()
-                truncated = size > ENV_FAULT_TAIL_BYTES
-                fh.seek(max(0, size - ENV_FAULT_TAIL_BYTES))
+                offset = max(0, size - ENV_FAULT_TAIL_BYTES)
+                if offset:
+                    # The byte immediately BEFORE the window, read on its own so it
+                    # enters neither `raw` nor the ENV_FAULT_TAIL_BYTES budget — it
+                    # only answers whether the window opens mid-line. Inspected raw,
+                    # ahead of the \r→\n normalization below: a pane capture is
+                    # CR-terminated, so a \r here ends a line just as a \n does.
+                    fh.seek(offset - 1)
+                    boundary = fh.read(1)
+                else:
+                    fh.seek(0)
+                    boundary = b"\n"  # not truncated: the window is the whole file
                 raw = fh.read()
         except OSError:
             return None
+        straddles = boundary not in (b"\n", b"\r")
         text = _ANSI_RE.sub("", raw.decode("utf-8", errors="replace").replace("\r", "\n"))
         lines = text.split("\n")
-        if truncated and len(lines) > 1:
-            # The seek lands on an arbitrary byte, so the first element is a
-            # fragment of whatever line straddled the window edge — not a line.
-            # Matching it would quote a half-line as evidence, and (because the
-            # cut can land mid-codepoint) its head may be a U+FFFD from the
-            # errors="replace" decode. Drop it: one lost line at the far end of a
-            # 64 KiB tail cannot matter, and a fabricated line can.
+        if straddles and any(lines[1:]):
+            # The window opened mid-line, so the first element is a fragment of
+            # whatever line straddled the edge — not a line. Matching it would quote
+            # a half-line as evidence, and (because the cut can land mid-codepoint)
+            # its head may be a U+FFFD from the errors="replace" decode. Drop it:
+            # one lost line at the far end of a 64 KiB tail cannot matter, and a
+            # fabricated line can.
             #
-            # `> 1`, not `and lines`: a truncated window with no newline in it at
-            # all is a single fragment, and dropping that leaves nothing to scan —
-            # trading a cosmetic half-line for a missed outage, which is the wrong
-            # way round. Degenerate (64 KiB without a newline), but silently
-            # classifying nothing is exactly the failure this change exists to fix.
+            # Both halves of the guard are load-bearing, and each was once wrong:
+            # * `straddles`, not "the read truncated": an offset that happens to
+            #   land on the first byte after a newline yields a COMPLETE first line.
+            #   Discarding that on truncation alone loses a whole line, and if it
+            #   was the only provider-error match in the tail the outage goes
+            #   unclassified and the run burns a story attempt for nothing.
+            # * `any(lines[1:])`, not `len(lines) > 1`: the guard means "do not
+            #   discard if that leaves nothing to scan", and the length test does
+            #   not say that. `split("\n")` always yields a trailing "", so a window
+            #   holding one >64 KiB newline-terminated line splits to
+            #   [fragment, ""] — length 2, dropped, leaving only "". Degenerate,
+            #   but silently classifying nothing is exactly the failure this
+            #   classifier exists to prevent.
             lines = lines[1:]
         match_line: str | None = None
         match_pos = 0

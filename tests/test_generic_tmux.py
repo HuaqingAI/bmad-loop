@@ -4419,6 +4419,42 @@ def test_classify_env_fault_drops_the_partial_line_at_the_tail_seek(tmp_path):
     assert result.env_fault_evidence is None
 
 
+def test_classify_env_fault_keeps_a_boundary_aligned_first_line(tmp_path):
+    """Sibling of the test above, and its counterexample: when the 64 KiB seek
+    happens to land on the first byte AFTER a newline, the first element is a
+    COMPLETE line, not a straddling fragment. Discarding it on "the read
+    truncated" alone loses a whole line — and if that line held the only
+    provider-error match in the tail, the outage goes unclassified and the run
+    burns a story attempt. The classifier looks at the byte before the window to
+    tell the two cases apart."""
+    adapter = make_adapter(tmp_path)
+    # As with the straddler test, the byte layout IS the test, so it is computed
+    # and then asserted: the seek must land exactly on len(prefix), i.e. one past
+    # the prefix's terminating newline, and the matching line must be the only
+    # match anywhere in the file.
+    prefix = b"P" * 50 + b"\n"  # 51 bytes, falls outside the window
+    match_line = b"J" * 10 + b"API Error: Connection refused\n"  # 40 bytes
+    filler = b"filler line\n"  # 12 bytes, matches nothing
+    fill = generic.ENV_FAULT_TAIL_BYTES - len(match_line)
+    assert fill % len(filler) == 0  # exact fill; the seek lands where we computed
+    _write_task_log(adapter, prefix + match_line + filler * (fill // len(filler)))
+
+    log = adapter.logs_dir / f"{_ENV_FAULT_TASK}.log"
+    body = log.read_bytes()
+    seek = len(body) - generic.ENV_FAULT_TAIL_BYTES
+    assert len(body) > generic.ENV_FAULT_TAIL_BYTES  # the tail read actually truncates
+    assert seek == len(prefix)  # window opens exactly on a line boundary...
+    assert body[seek - 1 : seek] == b"\n"  # ...one byte past the terminator
+    assert body[seek : seek + len(match_line)] == match_line  # whole line, not a fragment
+    assert body.count(b"API Error") == 1  # it is the ONLY match in the log
+
+    result = _classify(adapter, "timeout")
+    assert result.env_fault is True
+    # Equality, not containment: the surviving line is the whole line, so this
+    # also fails if the fix ever kept a fragment instead.
+    assert result.env_fault_evidence == "J" * 10 + "API Error: Connection refused"
+
+
 def test_classify_env_fault_scans_a_truncated_window_with_no_newline(tmp_path):
     """A >tail-window log containing NO newline is a single fragment. Dropping it
     as a straddler would leave nothing to scan — trading a cosmetic half-line for
@@ -4427,6 +4463,36 @@ def test_classify_env_fault_scans_a_truncated_window_with_no_newline(tmp_path):
     adapter = make_adapter(tmp_path)
     hit = b"API Error: Connection refused"
     _write_task_log(adapter, b"x" * (generic.ENV_FAULT_TAIL_BYTES + 10) + hit)
+    result = _classify(adapter, "timeout")
+    assert result.env_fault is True
+    assert result.env_fault_evidence.startswith("…")
+    assert "API Error: Connection refused" in result.env_fault_evidence
+
+
+@pytest.mark.parametrize("terminator", [b"\n", b"\r"], ids=["lf", "cr"])
+def test_classify_env_fault_scans_a_single_oversized_terminated_line(tmp_path, terminator):
+    """The same "leaves nothing to scan" case, one byte different — and the one
+    the length test got wrong. A >tail-window log that IS one line but ends with a
+    terminator splits to [fragment, ""], so a `len(lines) > 1` guard reads it as
+    "there is more to scan", drops the fragment, and scans only "". The window has
+    to be judged by whether anything SURVIVES the drop, not by how many pieces the
+    split produced. \\r counts: pane captures are CR-terminated and \\r is
+    normalized to \\n before the split."""
+    adapter = make_adapter(tmp_path)
+    hit = b"API Error: Connection refused"
+    _write_task_log(adapter, b"x" * (generic.ENV_FAULT_TAIL_BYTES + 10) + hit + terminator)
+
+    log = adapter.logs_dir / f"{_ENV_FAULT_TASK}.log"
+    body = log.read_bytes()
+    seek = len(body) - generic.ENV_FAULT_TAIL_BYTES
+    assert seek > 0  # the tail read actually truncates
+    window = body[seek:]
+    # The window is ONE line plus its terminator, so the split yields exactly
+    # [fragment, ""] — the layout that makes a length test the wrong question.
+    assert window.count(b"\n") + window.count(b"\r") == 1
+    assert window.endswith(terminator)
+    assert hit in window  # the only match survives the seek, and only as the fragment
+
     result = _classify(adapter, "timeout")
     assert result.env_fault is True
     assert result.env_fault_evidence.startswith("…")
