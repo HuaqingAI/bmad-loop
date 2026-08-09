@@ -1,4 +1,4 @@
-"""Live psmux gate: cross-project ctl-window prune isolation on a real server.
+"""Live psmux gate: cross-project prune isolation and selected workaround premises.
 
 The unit acceptance test (test_psmux_backend) proves the candidate scan with a
 faked subprocess; what no unit layer can prove is the transport half — a real
@@ -7,22 +7,31 @@ prune in one project, and the other project's window *and its option keys*
 surviving the kill. Same zero-token contract as test_opencode_live: parked
 windows run a plain `exit 0`, no coding CLI is ever launched.
 
+The `test_premise_*` probes observe upstream psmux behavior *directly* — raw argv, no
+backend verb under test — so the assumptions the workarounds in psmux_backend
+are built on stop being a human's reading of a changelog. These probes invert
+the usual failure semantics: a red probe is the intended signal, and it means
+the workaround its message names has become droppable, not that the suite
+broke. Each message says which one.
+
 Windows-local by construction (psmux registers for win32 only); skipped
 everywhere else, and when psmux is absent or an unsupported version.
 """
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import sys
+import time
 import uuid
 from pathlib import Path
 
 import pytest
 
 from bmad_loop import runs
-from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
+from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer, _pwsh_quote
 from bmad_loop.adapters.tmux_base import TmuxError
 from bmad_loop.tui import launch
 
@@ -99,3 +108,328 @@ def test_prune_kills_only_the_owning_projects_window(tmp_path: Path, monkeypatch
             if body_ok:
                 pytest.fail(note)
             print(f"warning: {note}", file=sys.stderr)
+
+
+# --------------------------------------------------------------- premise probes
+
+
+def _new_session_env() -> dict[str, str]:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not (
+            key.upper().startswith(("CLAUDE_CODE_", "CLAUDECODE"))
+            or key.upper() == "PSMUX_CLAUDE_TEAMMATE_MODE"
+        )
+    }
+    env["PSMUX_ALLOW_NESTING"] = "1"
+    return env
+
+
+def _plain_has_session(
+    mux: PsmuxMultiplexer, session: str, *, env: dict[str, str] | None = None
+) -> bool:
+    return mux._run(["has-session", "-t", session], check=False, env=env).returncode == 0
+
+
+def _raw_new_session(mux: PsmuxMultiplexer, session: str, cwd: Path) -> None:
+    created = mux._run(
+        ["new-session", "-d", "-s", session, "-c", str(cwd)],
+        check=False,
+        env=_new_session_env(),
+    )
+    assert created.returncode == 0, f"probe session creation failed: {created.stderr.strip()!r}"
+    assert _plain_has_session(mux, session), "probe session was not observable by plain name"
+
+
+def _mint_probe_window(mux: PsmuxMultiplexer, session: str, name: str, cwd: Path) -> str:
+    before = set(mux.list_window_ids(session))
+    mux.new_parked_window(session, name, cwd, PARKED_ARGV, "@r")
+    deadline = time.monotonic() + 5
+    created: set[str] = set()
+    while time.monotonic() < deadline:
+        created = set(mux.list_window_ids(session)) - before
+        if len(created) == 1:
+            break
+        time.sleep(0.1)
+    assert len(created) == 1, f"probe window mint was not observable: {sorted(created)}"
+    return created.pop()
+
+
+def _active_window(mux: PsmuxMultiplexer, session: str) -> str:
+    proc = mux._run(
+        ["list-windows", "-t", session, "-F", "#{window_id} #{window_active}"], check=False
+    )
+    assert proc.returncode == 0, f"active-window probe failed: {proc.stderr.strip()!r}"
+    active = [line.split()[0] for line in proc.stdout.splitlines() if line.endswith(" 1")]
+    assert len(active) == 1, f"expected one active window, got {active!r}"
+    return f"{session}:{active[0]}"
+
+
+@pytest.fixture(scope="module")
+def psmux_data_root(tmp_path_factory):
+    """Return an isolated registry root only when the installed build honors it."""
+    mux = PsmuxMultiplexer()
+    if not mux.available():
+        pytest.skip("psmux present but not an admitted version")
+    root = tmp_path_factory.mktemp("psmux-data")
+    session = f"bmad-loop-data-probe-{uuid.uuid4().hex[:8]}"
+    env = _new_session_env()
+    env["PSMUX_DATA_DIR"] = str(root)
+    try:
+        created = mux._run(
+            ["new-session", "-d", "-s", session, "-c", str(root)], check=False, env=env
+        )
+        if created.returncode != 0:
+            return None
+        isolated = _plain_has_session(mux, session, env=env)
+        default = _plain_has_session(mux, session)
+        return root if isolated and not default else None
+    finally:
+        mux._run(["kill-session", "-t", session], check=False, env=env)
+
+
+@pytest.fixture
+def probe(tmp_path, monkeypatch, psmux_data_root):
+    """Yield a throwaway session with two parked windows."""
+    mux = PsmuxMultiplexer()
+    if not mux.available():
+        pytest.skip("psmux present but not an admitted version")
+    if psmux_data_root is not None:
+        monkeypatch.setenv("PSMUX_DATA_DIR", str(psmux_data_root))
+    session = f"bmad-loop-test-{uuid.uuid4().hex[:8]}"
+    try:
+        _raw_new_session(mux, session, tmp_path)
+        windows = [_mint_probe_window(mux, session, f"probe-{n}", tmp_path) for n in (1, 2)]
+        yield mux, session, windows
+    finally:
+        mux.kill_session(session)
+        try:
+            leaked = _plain_has_session(mux, session)
+        except (OSError, TmuxError):
+            leaked = True
+        assert not leaked, f"probe session {session} survived teardown; kill it manually"
+
+
+def test_premise_version_leads_with_a_tmux_triple():
+    # Deliberately NOT gated on available(): that method applies this very regex
+    # and would skip the test on the failure it is here to catch, making the
+    # probe unable to go red. Module-level HAVE_PSMUX is the only guard.
+    # Raw `-V`, not version(): the seam collapses psmux's two-line banner to one
+    # line, and asserting on that would pin our normalization, not upstream's
+    # output — which is the one thing no probe here may do.
+    mux = PsmuxMultiplexer()
+    proc = mux._run(["-V"], check=False)
+    assert (
+        proc.returncode == 0
+    ), "psmux -V now fails — available() in psmux_backend rejects the installed build"
+    reported = proc.stdout.strip()
+    assert re.match(r"tmux \d+\.\d+", reported), (
+        f"psmux -V no longer leads with a tmux version triple ({reported!r}) — the "
+        "available() version gate in psmux_backend parses exactly that prefix and "
+        "now admits nothing"
+    )
+
+
+def test_premise_exact_match_prefix_resolves_for_has_session_but_not_kill(probe):
+    mux, session, _ = probe
+    found = mux._run(["has-session", "-t", f"={session}"], check=False)
+    assert found.returncode == 0, (
+        "psmux no longer resolves the `=name` exact-match form for has-session — "
+        "the post-create verification belt in new_session cannot confirm anything"
+    )
+    # Costs psmux's own 5s settle timeout: the = form routes to the right server
+    # but reaches the kill handler unstripped, so its name compare never matches
+    # and the client waits out its deadline (psmux/psmux#558).
+    mux._run(["kill-session", "-t", f"={session}"], check=False)
+    assert _plain_has_session(mux, session), (
+        "psmux now honors the `=name` form for kill-session (psmux/psmux#558) — "
+        "kill_session's deliberate plain-name target is no longer the only form "
+        "that works"
+    )
+
+
+def test_premise_select_window_does_not_focus_a_window_id_target(probe):
+    mux, session, windows = probe
+    other_index = mux._window_index(session, windows[1].rsplit(":", 1)[1])
+    assert other_index is not None, f"could not resolve a display index for {windows[1]}"
+    selected = mux._run(["select-window", "-t", f"{session}:{other_index}"], check=False)
+    assert (
+        selected.returncode == 0 and _active_window(mux, session) == windows[1]
+    ), "could not establish the select-window probe's starting focus"
+    mux._run(["select-window", "-t", windows[0]], check=False)
+    assert _active_window(mux, session) != windows[0], (
+        "psmux now focuses `select-window -t session:@N` — the select_window "
+        "override and _window_index in psmux_backend are droppable (psmux/psmux#497)"
+    )
+    # The index form is the escape hatch the override translates to; if this
+    # stopped working the override would be broken rather than merely redundant.
+    # Resolved, never hardcoded to 0: the server loads the user's config, and a
+    # `base-index 1` would turn a working install into a false red here.
+    index = mux._window_index(session, windows[0].rsplit(":", 1)[1])
+    assert index is not None, f"could not resolve a display index for {windows[0]}"
+    by_index = mux._run(["select-window", "-t", f"{session}:{index}"], check=False)
+    assert by_index.returncode == 0 and _active_window(mux, session) == windows[0], (
+        f"psmux rejects the window-index target too ({by_index.stderr.strip()!r}) — "
+        "select_window's override has no working form left to translate to"
+    )
+
+
+def test_premise_window_scoped_option_write_lands_at_session_scope(probe):
+    mux, session, windows = probe
+    written = mux._run(["set-option", "-w", "-t", windows[0], "@probe", "v"], check=False)
+    assert written.returncode == 0, "set-option -w no longer even accepts a window target"
+    read_back = mux._run(["show-options", "-wqv", "-t", windows[0], "@probe"], check=False)
+    # rc first: an empty stdout from a FAILED read would satisfy the emptiness
+    # assertion below and record the premise as observed when it was not.
+    assert read_back.returncode == 0, f"the -w read itself failed: {read_back.stderr.strip()!r}"
+    assert read_back.stdout.strip() == "", (
+        "psmux now has real per-window option storage — the @opt_@N scoped-option "
+        "channel in psmux_backend is droppable"
+    )
+    # Not merely unstored: the -w write silently landed in the session's single
+    # map. That misrouting is why the channel encodes the window id in the KEY.
+    at_session = mux._run(["show-options", "-qv", "-t", session, "@probe"], check=False)
+    assert at_session.returncode == 0, f"session-scope read failed: {at_session.stderr.strip()!r}"
+    assert at_session.stdout.strip() == "v", (
+        "the -w write no longer lands at session scope — the option channel's "
+        "premise about where a window-scoped write goes has changed"
+    )
+
+
+def test_premise_client_verbs_exit_zero_with_no_client_to_move(probe):
+    mux, session, windows = probe
+    attached = mux._run(
+        ["display-message", "-p", "-t", session, "#{session_attached}"], check=False
+    )
+    assert attached.returncode == 0, f"attached-count probe failed: {attached.stderr.strip()!r}"
+    assert attached.stdout.strip() == "0", "probe session unexpectedly has an attached client"
+    # `switch-client -l` has no target form and could move a developer's client
+    # when pytest itself runs inside psmux, so it is deliberately unobservable.
+    proc = mux._run(["switch-client", "-t", windows[0]], check=False)
+    assert proc.returncode == 0, (
+        "psmux now reports effect rather than dispatch for switch-client — the "
+        "#{session_attached} delta in _client_left can go back to trusting rc"
+    )
+
+
+def test_premise_option_values_corrupted_by_the_control_line(probe):
+    mux, session, _ = probe
+
+    def roundtrip(value: str) -> tuple[bool, str]:
+        written = mux._run(["set-option", "-t", session, "@rt", value], check=False)
+        if written.returncode != 0:
+            return False, ""
+        got = mux._run(["show-options", "-qv", "-t", session, "@rt"], check=False)
+        assert got.returncode == 0, f"show-options after {value!r} failed: {got.stderr.strip()!r}"
+        unset = mux._run(["set-option", "-u", "-t", session, "@rt"], check=False)
+        assert unset.returncode == 0, f"unset after {value!r} failed: {unset.stderr.strip()!r}"
+        return True, got.stdout.strip()
+
+    # The banned canaries may be corrupted or refused by the raw CLI.
+    corrupted = {
+        "a ; b": "the one-shot chain splitter is now quote-aware (psmux/psmux#499)",
+        "-lead": "a dash-leading value now survives the server tokenizer",
+        "a'b": "a bare apostrophe is no longer read as a quote opener",
+        "x\u00a0y": "non-ASCII whitespace no longer splits the value server-side",
+    }
+    for value, why in corrupted.items():
+        accepted, got = roundtrip(value)
+        assert not accepted or got != value, (
+            f"{why} — the matching branch of _transportable in psmux_backend now "
+            "refuses a value the wire carries intact"
+        )
+    # The permitted shapes: a refusal here would silently make windows unprunable.
+    for value in ("\\\\srv\\share", "C:/Program Files/x"):
+        accepted, got = roundtrip(value)
+        assert accepted and got == value, (
+            f"psmux no longer carries {value!r} verbatim — _transportable permits a "
+            "shape that now corrupts, so a tag reads back different from the prune's"
+        )
+
+
+def test_premise_pipe_pane_strips_dash_flag_tokens(probe, tmp_path):
+    mux, _, windows = probe
+    sidecar = tmp_path / "argprobe.ps1"
+    record = tmp_path / "argprobe.txt"
+    # The piped command is a bare double-quoted interpolation, exactly as
+    # pipe_pane composes it — and pipe_pane refuses these two characters rather
+    # than ship a path pwsh would expand. Match the production refusal.
+    if any(char in str(sidecar) for char in ("$", "`")):
+        pytest.skip("tmp path carries PowerShell interpolation syntax")
+    # Records the argv psmux actually handed it, then drains stdin so the child
+    # outlives the first chunk rather than racing the pane. -Encoding pins the
+    # bytes the reader below assumes rather than trusting a pwsh default.
+    sidecar.write_text(
+        f"Set-Content -Encoding utf8 -LiteralPath {_pwsh_quote(str(record))} "
+        "-Value ($args -join '|')\n"
+        "$in = [System.Console]::OpenStandardInput()\n"
+        "$buf = New-Object byte[] 4096\n"
+        "while (($n = $in.Read($buf, 0, $buf.Length)) -gt 0) { }\n",
+        encoding="utf-8",
+    )
+    piped = f'pwsh "{sidecar}" -flagcanary positional'
+    text = ""
+    for window in windows:
+        attached = mux._run(["pipe-pane", "-t", window, "-o", piped], check=False)
+        assert attached.returncode == 0, (
+            "raw pipe-pane failed — psmux_backend.pipe_pane's sidecar workaround "
+            f"premise went unobserved: {attached.stderr.strip()!r}"
+        )
+        for argv in (
+            ["send-keys", "-t", window, "-l", "echo hello"],
+            ["send-keys", "-t", window, "Enter"],
+        ):
+            sent = mux._run(argv, check=False)
+            assert (
+                sent.returncode == 0
+            ), f"{argv[0]} could not trigger pipe-pane output: {sent.stderr.strip()!r}"
+        deadline = time.monotonic() + 7.5
+        while time.monotonic() < deadline:
+            text = record.read_text(encoding="utf-8") if record.exists() else ""
+            if text.endswith("\n"):
+                break
+            time.sleep(0.25)
+        if text.endswith("\n"):
+            break
+    # An unobserved premise must fail, never pass: no file means the sidecar
+    # never spawned, which says nothing about flag stripping either way.
+    assert text.endswith("\n"), (
+        "pipe-pane sidecar never ran, so the dash-flag premise went unobserved — "
+        "psmux's first-pipe-after-new-window spawn race (psmux/psmux#482) is a "
+        "likelier cause than a premise change; re-run before reading anything into it"
+    )
+    recorded = text.strip().split("|")
+    assert "positional" in recorded, f"sidecar recorded an unexpected argv: {recorded!r}"
+    assert "-flagcanary" not in recorded, (
+        "psmux now passes dash-flag tokens through pipe-pane — pipe_pane's "
+        "positional sidecar .ps1 can go back to a flag transport (psmux/psmux#482)"
+    )
+
+
+def test_premise_unresolvable_kill_target_exits_zero_and_kills_a_live_window(probe):
+    # Destructive by construction and therefore last: on this premise the kill
+    # lands on the ACTIVE window (psmux/psmux#545), which is why every probe
+    # gets its own session rather than sharing one.
+    mux, session, _ = probe
+    before = set(mux.list_window_ids(session))
+    assert len(before) >= 2, f"probe session should hold the parked windows: {before}"
+    active = _active_window(mux, session)
+    proc = mux._run(["kill-window", "-t", f"{session}:@9999"], check=False)
+    after = set(mux.list_window_ids(session))
+    assert proc.returncode == 0, (
+        "psmux now reports a non-zero exit for an unresolvable kill-window target — "
+        "kill_window's check=False swallow in tmux_base can surface the failure"
+    )
+    # Exactly one window and the session still standing. `after < before` is a
+    # strict-subset test that ANY number of vanished windows satisfies — a
+    # collateral kill that took the session down answers [] through
+    # list_window_ids' non-zero leg and would pass while claiming something
+    # entirely different happened.
+    assert mux.has_session(
+        session
+    ), f"the unresolvable kill took the whole session down, not one window: {before}"
+    assert after < before and before - after == {active}, (
+        "an unresolvable kill-window target no longer destroys the active live "
+        f"window (psmux/psmux#545): {sorted(before)} -> {sorted(after)}"
+    )

@@ -14,6 +14,9 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Added
 
+- **Add raw psmux premise probes (#488).** The zero-token Windows live gate now flags droppable
+  workarounds, and ablation repairs two vacuous backend assertions.
+
 - **Deferred review findings are harvested from spec frontmatter (#433).** BMAD-METHOD#2640 moved
   `defer`-triaged findings into the spec's unfiled `deferred:` list. A successful dev, review,
   repair or review-timeout-salvage pass now files each as `### DW-<n>` (`spec-deferrals-harvested`),
