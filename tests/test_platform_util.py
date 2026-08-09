@@ -11,6 +11,7 @@ import os
 import stat
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -103,6 +104,32 @@ def test_names_tree_root_catches_the_win32_trim_aliases(value):
     assert platform_util.names_tree_root(value) is True
 
 
+# --------------------------------------------------------------- is_wsl_unc_path
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "\\\\wsl.localhost\\Ubuntu-24.04\\home\\u\\p",
+        "\\\\wsl$\\Ubuntu\\home\\u\\p",  # legacy prefix, still minted by older Windows
+        "\\\\WSL.LOCALHOST\\Ubuntu\\home\\u",  # UNC hosts are case-insensitive
+        "\\\\wsl$\\Ubuntu",  # distro root, no further path
+        "\\\\wsl.localhost\\Ubuntu\\",  # trailing separator, no path component
+        "//wsl.localhost/Ubuntu/home/u/p",  # Windows accepts either separator
+        "\\\\wsl.localhost/Ubuntu\\home",  # mixed separators
+        Path("\\\\wsl.localhost\\Ubuntu\\home\\u\\p"),  # a Path, not just a str
+        "\\\\?\\UNC\\wsl.localhost\\Ubuntu\\home\\u\\p",  # extended-length UNC spelling
+        "\\\\?\\unc\\wsl$\\Ubuntu\\home\\u",  # extended-length, legacy host, lowercase
+        # not a shape Win32 accepts (a forward-slash device path addresses a host
+        # named `?`) — the separator fold over-matches it, which can only add the
+        # warning, never suppress it
+        "//?/UNC/wsl.localhost/Ubuntu/home/u",
+    ],
+)
+def test_is_wsl_unc_path_matches_the_interop_bridge(value):
+    assert platform_util.is_wsl_unc_path(value) is True
+
+
 @pytest.mark.parametrize(
     "value",
     [
@@ -130,6 +157,56 @@ def test_names_tree_root_accepts_anything_naming_a_child(value):
     # boundary of the trim rule: a component only stops naming something once it is
     # *nothing but* periods and spaces.
     assert platform_util.names_tree_root(value) is False
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "C:\\projects\\p",  # a real Windows drive path — psmux is right for it
+        "C:/projects/p",
+        "/home/u/p",  # the same project seen from inside the distro
+        "\\\\fileserver\\share\\p",  # UNC, but not WSL: must not warn
+        "\\\\wslfoo\\share\\p",  # host merely *starts* with wsl
+        "\\\\wsl.localhost",  # no distro component at all
+        "wsl.localhost\\Ubuntu\\home",  # not a UNC path
+        "\\\\?\\UNC\\fileserver\\share\\p",  # extended-length, but not a WSL host
+        "\\\\?\\C:\\p",  # extended-length drive path, not UNC at all
+        "",
+    ],
+)
+def test_is_wsl_unc_path_ignores_everything_else(value):
+    assert platform_util.is_wsl_unc_path(value) is False
+
+
+def test_is_wsl_unc_path_is_platform_blind(monkeypatch):
+    """The predicate answers "is this path inside a distro", never "am I on Windows"
+    — the sys.platform half lives at the runsetup call site. Pinned so the two halves
+    stay separable and this truth table needs no platform monkeypatching."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert platform_util.is_wsl_unc_path("\\\\wsl.localhost\\Ubuntu\\home\\u") is True
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="UNC resolution is a Windows behavior")
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        "\\\\wsl.localhost\\{d}\\home",
+        "\\\\wsl$\\{d}\\home",
+        "//wsl.localhost/{d}/home",
+        # resolve() must keep, not strip, an extended prefix the input carried —
+        # the premise the predicate's fold rests on; if a future CPython starts
+        # stripping it, the fold goes dead and only this row notices
+        "\\\\?\\UNC\\wsl.localhost\\{d}\\home",
+    ],
+)
+def test_is_wsl_unc_path_survives_the_resolve_the_caller_applies(spelling):
+    """The one shape production actually sees. `cli._project` hands the preflight a
+    `Path(...).resolve()`, and every other test here passes an unresolved literal — so
+    a `Path.resolve()` semantics change (it has moved across 3.6/3.8/3.13) could
+    normalize the bridge prefix away and silently disable the whole #332 check with
+    this file still green. The distro need not exist: resolution is non-strict."""
+    raw = spelling.format(d="Ubuntu-24.04")
+    assert platform_util.is_wsl_unc_path(Path(raw).resolve()) is True
 
 
 # ---------------------------------------------------------------- atomic_replace

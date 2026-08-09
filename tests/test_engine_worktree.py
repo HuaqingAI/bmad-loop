@@ -34,7 +34,7 @@ from bmad_loop import deferredwork, runs, sprintstatus, verify, worktree_flow
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.bmadconfig import ProjectPaths
-from bmad_loop.engine import Engine
+from bmad_loop.engine import Engine, _story_label_stripped
 from bmad_loop.install import (
     BMAD_SCRIPTS_SEED_REL,
     CENTRAL_CONFIG_REL,
@@ -2262,6 +2262,386 @@ def test_commit_message_template_applied(project):
     log = git(project.project, "log", "--format=%s")
     assert "feat(1-1-a): via test-run" in log
     assert "implemented" not in log  # built-in default was not used
+
+
+def test_commit_message_template_story_title(project):
+    """{story_title} renders the spec's `title:` frontmatter — where a bmad-loop
+    spec's title actually lives — with the "Story <id>:" label dropped; a
+    template without the placeholder never pays the spec read."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    review = wt_review_effect(project, "1-1-a", clean=True)
+
+    def review_with_title(spec):
+        # the review pass is the spec's last writer, so the title the commit-time
+        # read sees must be stamped after it
+        result = review(spec)
+        sp = project.rebased(spec.cwd).implementation_artifacts / "spec-1-1-a.md"
+        sp.write_text(
+            sp.read_text().replace("title: 'test'", "title: 'Story 1.1: Wire the Frobnicator'")
+        )
+        return result
+
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), review_with_title],
+        policy=wt_policy(commit_message_template="chore(bmad): {story_key}\n\n{story_title}"),
+    )
+    summary = engine.run()
+    assert summary.done == 1
+    log = git(project.project, "log", "--format=%B")
+    assert "chore(bmad): 1-1-a" in log
+    assert "Wire the Frobnicator" in log
+    assert "Story 1.1:" not in log  # the label would just repeat the key
+
+
+def test_commit_message_template_story_title_neutralizes_control_chars(project):
+    """A NUL in the title reaches `git commit -m` as an argv element, where
+    `subprocess.run` raises a bare ValueError. `_run_git` translates
+    TimeoutExpired/UnicodeDecodeError/OSError but not that, so it would escape as
+    itself into `_finalize_commit_phase`'s `except BaseException`, which restores
+    and re-raises — crashing the run with the task already persisted as
+    COMMITTING, so every later resume re-renders the same title and re-crashes.
+    No exotic file bytes are needed to get there: `title: "\\0"` is an ordinary
+    double-quoted YAML scalar.
+
+    Ablation target: drop the `_TITLE_CONTROL_RE` substitution and this fails
+    with `ValueError: embedded null byte` instead of committing."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    review = wt_review_effect(project, "1-1-a", clean=True)
+
+    def review_nul_title(spec):
+        result = review(spec)
+        sp = project.rebased(spec.cwd).implementation_artifacts / "spec-1-1-a.md"
+        sp.write_text(sp.read_text().replace("title: 'test'", 'title: "Wire\\0the Frobnicator"'))
+        return result
+
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), review_nul_title],
+        policy=wt_policy(commit_message_template="chore(bmad): {story_title}"),
+    )
+    summary = engine.run()
+    assert summary.done == 1  # committed rather than wedged mid-COMMITTING
+    assert "chore(bmad): Wire the Frobnicator" in git(project.project, "log", "--format=%s")
+
+
+def test_commit_message_template_story_title_neutralizes_surrogates(project):
+    """The other unspawnable class, and the one a C0/DEL-only filter misses. A
+    lone surrogate has no UTF-8 encoding, so `subprocess.run` raises
+    UnicodeEncodeError while encoding the argv — a ValueError, but *not* the
+    UnicodeDecodeError `_run_git` translates, so it wedges the run exactly as an
+    embedded NUL does. `title: "\\uD800"` is an ordinary YAML escape and PyYAML
+    hands the unpaired code point straight back.
+
+    Ablation target: drop `\\ud800-\\udfff` from `_TITLE_CONTROL_RE` and this
+    fails with `UnicodeEncodeError: surrogates not allowed` instead of
+    committing."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    review = wt_review_effect(project, "1-1-a", clean=True)
+
+    def review_surrogate_title(spec):
+        result = review(spec)
+        sp = project.rebased(spec.cwd).implementation_artifacts / "spec-1-1-a.md"
+        sp.write_text(
+            sp.read_text().replace("title: 'test'", 'title: "Wire\\uD800the Frobnicator"')
+        )
+        return result
+
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), review_surrogate_title],
+        policy=wt_policy(commit_message_template="chore(bmad): {story_title}"),
+    )
+    summary = engine.run()
+    assert summary.done == 1  # committed rather than wedged mid-COMMITTING
+    assert "chore(bmad): Wire the Frobnicator" in git(project.project, "log", "--format=%s")
+
+
+def test_commit_message_template_story_title_falls_back_to_h1(project):
+    """A spec written without a `title:` — i.e. not from this project's
+    template — still yields a title from a first markdown H1."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    review = wt_review_effect(project, "1-1-a", clean=True)
+
+    def review_h1_only(spec):
+        result = review(spec)
+        sp = project.rebased(spec.cwd).implementation_artifacts / "spec-1-1-a.md"
+        sp.write_text(sp.read_text().replace("title: 'test'\n", "") + "\n# Heading Sourced\n")
+        return result
+
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), review_h1_only],
+        policy=wt_policy(commit_message_template="chore(bmad): {story_title}"),
+    )
+    summary = engine.run()
+    assert summary.done == 1
+    assert "chore(bmad): Heading Sourced" in git(project.project, "log", "--format=%s")
+
+
+def test_commit_message_template_story_title_falls_back_to_key(project):
+    """Neither a `title:` nor an H1 → the placeholder renders the story key,
+    never an empty string."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    review = wt_review_effect(project, "1-1-a", clean=True)
+
+    def review_titleless(spec):
+        result = review(spec)
+        sp = project.rebased(spec.cwd).implementation_artifacts / "spec-1-1-a.md"
+        sp.write_text(sp.read_text().replace("title: 'test'\n", ""))
+        return result
+
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), review_titleless],
+        policy=wt_policy(commit_message_template="chore(bmad): {story_title}"),
+    )
+    summary = engine.run()
+    assert summary.done == 1
+    log = git(project.project, "log", "--format=%s")
+    assert "chore(bmad): 1-1-a" in log
+
+
+def test_story_title_undecodable_spec_falls_back_to_key(project):
+    """A spec that is no longer valid UTF-8 takes the same fallback as an
+    unreadable one. Unit-level because the whole-file decode failure is masked
+    upstream on the normal path (read_frontmatter degrades it to a retry) but
+    live on the resume-into-COMMITTING arm, which renders the message without
+    re-reading frontmatter first."""
+    engine, _ = make_engine(project, [])
+    spec = project.implementation_artifacts / "spec-1-1-a.md"
+    spec.write_bytes(b"---\nstatus: done\n---\n\n# Story 1.1: caf\xe9 latte\n")
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.spec_file = str(spec)
+
+    assert engine._story_title(task) == "1-1-a"
+
+
+@pytest.mark.parametrize(
+    ("indent", "expected"),
+    [
+        ("", "Indented Heading"),
+        ("   ", "Indented Heading"),  # CommonMark allows up to three
+        ("    ", "1-1-a"),  # a fourth space is an indented code block, not an H1
+    ],
+)
+def test_story_title_h1_indent_bound(project, indent, expected):
+    """The H1 fallback follows CommonMark's indentation rule, so a heading a
+    hand-authored spec indented still yields a title instead of silently
+    degrading to the story key — while a code block at four spaces stays a code
+    block."""
+    engine, _ = make_engine(project, [])
+    spec = project.implementation_artifacts / "spec-1-1-a.md"
+    spec.write_text(f"---\nstatus: done\n---\n\n{indent}# Indented Heading\n")
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.spec_file = str(spec)
+
+    assert engine._story_title(task) == expected
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("# Wire the Frobnicator", "Wire the Frobnicator"),
+        # `#` may be followed by a tab as well as a space...
+        ("#\tWire the Frobnicator", "Wire the Frobnicator"),
+        # ...but by something else it is not a heading at all, and two hashes
+        # are an H2. Both fall back rather than yielding a title.
+        ("#Wire the Frobnicator", "1-1-a"),
+        ("## Wire the Frobnicator", "1-1-a"),
+        # A closing hash run is syntax, not title. This is the only one of these
+        # that would otherwise render a WRONG subject rather than fall back.
+        ("# Wire the Frobnicator ###", "Wire the Frobnicator"),
+        ("# Wire the Frobnicator #", "Wire the Frobnicator"),
+        # ...and it takes whitespace to make one, so a hash fused to the last
+        # word stays part of the title.
+        ("# Wire it in C#", "Wire it in C#"),
+        # Setext is a valid CommonMark H1 and is refused ON PURPOSE: accepting it
+        # would make any prose line above a `===` divider the commit subject,
+        # trading a safe fallback for a confidently wrong title.
+        ("Wire the Frobnicator\n===", "1-1-a"),
+        ("Some ordinary prose\n=====", "1-1-a"),
+    ],
+)
+def test_story_title_h1_atx_forms(project, body, expected):
+    """Which H1 spellings the fallback honors, and which it declines. The
+    declines are the load-bearing half: each is a documented narrowing, not an
+    oversight, so a later "conformance" patch has to argue with these cases."""
+    engine, _ = make_engine(project, [])
+    spec = project.implementation_artifacts / "spec-1-1-a.md"
+    spec.write_text(f"---\nstatus: done\n---\n\n{body}\n")
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.spec_file = str(spec)
+
+    assert engine._story_title(task) == expected
+
+
+@pytest.mark.parametrize(
+    ("fence", "content"),
+    [
+        # The shape that makes this common: any fenced snippet whose first line
+        # is a comment. A spec showing setup steps before its heading is
+        # ordinary, and `#` opens a comment in sh, python, yaml, toml, ruby...
+        ("```bash", "# Install the dependencies"),
+        ("```python", "# TODO: wire this up"),
+        # ...and the documentation-flavored shape, where the fenced heading is
+        # a deliberate example of the very syntax being scanned for.
+        ("````markdown", "# Example Heading"),
+        # Tildes open a fence too, and a fence may be indented up to three.
+        ("~~~yaml", "# generated - do not edit"),
+        ("   ```sh", "# nested under a list item"),
+    ],
+)
+def test_story_title_h1_ignores_fenced_blocks(project, fence, content):
+    """A `#` line inside a fenced block is a comment or an example, not this
+    spec's heading — CommonMark agrees the first H1 here is the one after the
+    fence. Getting this wrong is the bad kind of wrong: it renders a
+    confidently incorrect commit subject rather than falling back to the key."""
+    engine, _ = make_engine(project, [])
+    spec = project.implementation_artifacts / "spec-1-1-a.md"
+    close = fence.lstrip(" ")[: 4 if fence.lstrip(" ").startswith("````") else 3]
+    spec.write_text(
+        f"---\nstatus: done\n---\n\n{fence}\n{content}\n{close}\n\n# Wire the Frobnicator\n"
+    )
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.spec_file = str(spec)
+
+    assert engine._story_title(task) == "Wire the Frobnicator"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # A shorter run of the same character does not close a longer fence —
+        # this is why a ```` block may quote ``` at all.
+        "````markdown\n```\n# Fenced Heading\n```\n````\n\n# Wire the Frobnicator\n",
+        # ...and neither does a run of the *other* fence character.
+        "```markdown\n~~~\n# Fenced Heading\n~~~\n```\n\n# Wire the Frobnicator\n",
+        # A closing run must have nothing but whitespace after it, so a fence
+        # line carrying an info string is an opener, never a close.
+        "~~~\n# Fenced Heading\n~~~ still-open\n~~~\n\n# Wire the Frobnicator\n",
+    ],
+)
+def test_story_title_h1_nested_fence_does_not_close_early(project, body):
+    """The closing rule is same-character, at-least-as-long, nothing after it.
+    Relax any of those three and an inner fence ends the block early, putting a
+    fenced `# ...` back in scope as the title — which is the whole bug."""
+    engine, _ = make_engine(project, [])
+    spec = project.implementation_artifacts / "spec-1-1-a.md"
+    spec.write_text(f"---\nstatus: done\n---\n\n{body}")
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.spec_file = str(spec)
+
+    assert engine._story_title(task) == "Wire the Frobnicator"
+
+
+def test_story_title_h1_unclosed_fence_falls_back(project):
+    """An unclosed fence swallows the rest of the file, so there is no heading
+    left to find and the story key is the answer. Pinned because the tempting
+    "reset at EOF" repair would resurrect exactly the comment-as-title bug this
+    scan exists to prevent."""
+    engine, _ = make_engine(project, [])
+    spec = project.implementation_artifacts / "spec-1-1-a.md"
+    spec.write_text("---\nstatus: done\n---\n\n```bash\n# Install the dependencies\n")
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.spec_file = str(spec)
+
+    assert engine._story_title(task) == "1-1-a"
+
+
+def test_render_commit_template_without_placeholder_skips_the_spec_read(project, monkeypatch):
+    """A template that never names {story_title} must not pay the spec read —
+    the claim the policy docs and CHANGELOG both make. Pinned by making the read
+    itself fatal, so the assertion cannot pass just because the title happened to
+    go unused."""
+    engine, _ = make_engine(project, [])
+    monkeypatch.setattr(
+        Engine, "_story_title", lambda self, task: pytest.fail("spec read for a template without")
+    )
+    engine.policy = wt_policy(commit_message_template="chore(bmad): {story_key}")
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.spec_file = str(project.implementation_artifacts / "spec-1-1-a.md")
+
+    assert engine._render_commit_template(task) == "chore(bmad): 1-1-a"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # A story id is a dash/dot composite here, so the label strip must survive
+        # every shape this project actually issues...
+        ("Story 1.1: Wire the Frobnicator", "Wire the Frobnicator"),
+        ("Story 3-2: Dash composite", "Dash composite"),
+        ("Story 1-1-a: Trailing letter", "Trailing letter"),
+        ("story 1.1: lowercased label", "lowercased label"),
+        # ...while never eating a real title that merely opens with "Story".
+        # The label must start at a DIGIT: `\S+` would strip "Points:" here, and
+        # `\d+\.\d+` would stop matching the dash composites above.
+        ("Story Points: Add estimates", "Story Points: Add estimates"),
+        ("Storybook: Add a knob", "Storybook: Add a knob"),
+        ("  Plain title  ", "Plain title"),
+        # YAML hands back whatever an unquoted scalar looked like. A blank
+        # `title:` is None and must fall back; a bool is a typo, not a title; a
+        # number still beats rendering the bare story key.
+        (None, ""),
+        ("", ""),
+        ("Story 1.1:", ""),
+        (True, ""),
+        (1.1, "1.1"),
+        # Control characters are neutralized, not passed through: a NUL reaching
+        # `git commit -m` argv raises a bare ValueError out of subprocess, which
+        # _run_git does not translate — it would crash a task already persisted
+        # as COMMITTING and wedge every resume. `title: "\0"` is plain YAML.
+        ("\x00", ""),
+        ("Wire the\x00Frobnicator", "Wire the Frobnicator"),
+        ("Story 1.1:\x00Wire it", "Wire it"),
+        ("Story\x001.1: Split label", "Split label"),
+        # Lone surrogates go with them: `title: "\uD800"` is the same ordinary
+        # YAML escape, and one in the argv raises UnicodeEncodeError out of
+        # subprocess — a ValueError _run_git does not translate either.
+        ("\ud800", ""),
+        ("Wire\ud800the Frobnicator", "Wire the Frobnicator"),
+        ("Story 1.1:\udfffWire it", "Wire it"),
+        ("Two\nlines", "Two lines"),
+        ("Tabbed\ttitle", "Tabbed title"),
+        ("Collapse   the    runs", "Collapse the runs"),
+    ],
+)
+def test_story_label_stripped_cases(raw, expected):
+    """The label strip sits between two wrong answers: too loose eats the title,
+    too tight stops matching this project's ids. Pinned per-case rather than
+    derived, so a regex retune has to restate its intent here."""
+    assert _story_label_stripped(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "story_key", "expected"),
+    [
+        # stories.ID_RE admits alphabetic ids ("auth", "oauth-setup"), which the
+        # digit-led heuristic cannot recognize — so for the id we actually hold,
+        # match it exactly rather than guessing its shape.
+        ("Story auth: Add login", "auth", "Add login"),
+        ("Story oauth-setup: Wire the callback", "oauth-setup", "Wire the callback"),
+        ("story AUTH: case folds", "auth", "case folds"),
+        # The exact match is an ADDITION to the heuristic, never a replacement:
+        # a sprint spec labels itself "Story 1.1:" while its key is "1-1-a", so
+        # keying only off the task id would stop stripping the common case.
+        ("Story 1.1: Wire the Frobnicator", "1-1-a", "Wire the Frobnicator"),
+        # ...and it must not turn into a licence to eat real titles: a title
+        # whose first word merely follows "Story" is not this task's id.
+        ("Story Points: Add estimates", "auth", "Story Points: Add estimates"),
+        ("Story authentication: Add login", "auth", "Story authentication: Add login"),
+        # A key carrying regex metacharacters is matched literally, not compiled.
+        ("Story a.b: Escaped", "a.b", "Escaped"),
+        ("Story axb: Escaped", "a.b", "Story axb: Escaped"),
+    ],
+)
+def test_story_label_stripped_matches_the_task_id(raw, story_key, expected):
+    """Stories mode inherits this renderer and issues alphabetic ids, which the
+    digit-led pattern cannot match. Where the task's own id is known it is the
+    ground truth; the heuristic stays for the labels that do not repeat the key
+    verbatim."""
+    assert _story_label_stripped(raw, story_key) == expected
 
 
 # ------------------------------------------------ per_worktree engine plugin

@@ -11,12 +11,12 @@ The OS-specific work is quarantined behind four seams. Porting to a new OS is
 core `.py` modules or their call sites. Each seam selects its implementation by
 platform from a registry, with an env-var override for tests.
 
-| #   | Seam                 | Contract / registry                                     | Override env var                                        |
-| --- | -------------------- | ------------------------------------------------------- | ------------------------------------------------------- |
-| 1   | Terminal multiplexer | `TerminalMultiplexer` / `register_multiplexer`          | `BMAD_LOOP_MUX_BACKEND` (or `bmad-loop mux set <name>`) |
-| 2   | Process lifecycle    | `ProcessHost` / `register_process_host`                 | `BMAD_LOOP_PROCESS_HOST`                                |
-| 3   | Hook interpreter     | `ProcessHost.hook_interpreter()`                        | (rides on seam 2)                                       |
-| 4   | Validate preflight   | `_platform_preflight()` (no new code — reads seams 1–2) | —                                                       |
+| #   | Seam                 | Contract / registry                                            | Override env var                                        |
+| --- | -------------------- | -------------------------------------------------------------- | ------------------------------------------------------- |
+| 1   | Terminal multiplexer | `TerminalMultiplexer` / `register_multiplexer`                 | `BMAD_LOOP_MUX_BACKEND` (or `bmad-loop mux set <name>`) |
+| 2   | Process lifecycle    | `ProcessHost` / `register_process_host`                        | `BMAD_LOOP_PROCESS_HOST`                                |
+| 3   | Hook interpreter     | `ProcessHost.hook_interpreter()`                               | (rides on seam 2)                                       |
+| 4   | Validate preflight   | `_platform_preflight(project)` (no new code — reads seams 1–2) | —                                                       |
 
 The **one** bundled caveat: a backend you ship _in this repo_ needs its import
 added to the relevant `_load_builtin_*` loader so it self-registers (one line). An
@@ -260,14 +260,21 @@ A new OS overrides this on its `ProcessHost`; nothing else changes.
 
 ## Seam 4 — validate preflight
 
-`_platform_preflight()` (`src/bmad_loop/cli.py`, called from `cmd_validate`) asks
-the selected multiplexer for its `available()` / `version()` and names the selected
-process host. A new OS therefore surfaces its readiness in `bmad-loop validate`
-**by registering** (seams 1–2) — not by adding a `win32` block to `validate`. The
-process host is named in the output so a misselection (e.g. the Windows host picked
-on Linux) is visible at a glance.
+`_platform_preflight(project)` (`src/bmad_loop/cli.py`, called from `cmd_validate`)
+asks the selected multiplexer for its `available()` / `version()` and names the
+selected process host. A new OS therefore surfaces its readiness in `bmad-loop
+validate` **by registering** (seams 1–2) — not by adding a `win32` block to
+`validate`. The process host is named in the output so a misselection (e.g. the
+Windows host picked on Linux) is visible at a glance.
 
 There is no new code to write for this seam — it reads seams 1 and 2.
+
+The one `sys.platform` branch that does live here is not a port seam and is not a
+precedent for one: the `host.win32-on-wsl-path` check (#332) reports that the _interpreter
+itself_ is the wrong build for the shell that launched it — a native-Windows
+`bmad-loop` reached from a WSL prompt. No registration can express that, because
+every seam is correctly selected for the interpreter that is running; what is wrong
+is which interpreter the operator got. Readiness questions still register.
 
 ---
 

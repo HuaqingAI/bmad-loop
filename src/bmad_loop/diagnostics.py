@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import platform
 import re
+import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -151,6 +152,17 @@ class EnvInfo:
     package_version: str
     multiplexer: str
     tmux_version: str | None
+    # `platform.system()` above says "Windows" for both a native shell and a WSL
+    # interop launch. `sys_platform` carries the raw token instead, so a dump can be
+    # matched character-for-character against validate's `platform default for {token}`
+    # line; `win32_on_wsl_path` is the #332 condition itself. Named for exactly what it
+    # observes — a win32 interpreter working a distro path — and NOT "wsl interop":
+    # `cd \\wsl.localhost\...` from native PowerShell reaches the same state, so this
+    # must not claim where the operator is standing (the matching `host.win32-on-wsl-path`
+    # finding is worded to the same limit). Additive fields — no SCHEMA_VERSION bump;
+    # `--json` evolution is additive-only, see the contract note in machine.py.
+    sys_platform: str
+    win32_on_wsl_path: bool
 
 
 @dataclass
@@ -240,8 +252,23 @@ class Diagnostics:
 # ----------------------------------------------------------------- collectors
 
 
-def collect_env() -> EnvInfo:
+def collect_env(project: Path) -> EnvInfo:
+    """Host facts for the dump's Environment block.
+
+    ``project`` feeds only the #332 verdict. It is required — here *and* on
+    ``collect`` — so a new caller must consciously supply the project it actually
+    diagnosed; the type cannot force that choice to be *right* (any ``Path``
+    yields a confident verdict), and the sole production caller, ``cmd_diagnose``,
+    passes the resolved project.
+
+    The project *path* itself is never emitted: it is a redaction hazard — the
+    redactor leaves the Linux username in a ``\\\\wsl.localhost\\...\\home\\<user>\\...``
+    path standing (it compares against the *Windows* account), and ``collect_env``
+    has no pseudonymizer to alias it against — so the boolean is what ships. Same
+    reason ``sys.executable`` is absent despite naming the exact mismatch: the venv
+    path carries the project name past the redactor."""
     from .adapters.multiplexer import fold_version, get_multiplexer
+    from .platform_util import is_wsl_unc_path
 
     mux = "none"
     tmux_v = None
@@ -265,6 +292,8 @@ def collect_env() -> EnvInfo:
         package_version=__version__,
         multiplexer=mux,
         tmux_version=tmux_v,
+        sys_platform=sys.platform,
+        win32_on_wsl_path=sys.platform == "win32" and is_wsl_unc_path(project),
     )
 
 
@@ -522,6 +551,7 @@ def collect(
     pseudo: sanitize.Pseudonymizer,
     cap: int = DEFAULT_JOURNAL_CAP,
     generated_at: str | None = None,
+    project: Path,
 ) -> Diagnostics:
     runs: list[RunDiag] = []
     for run_dir in run_dirs:
@@ -533,7 +563,7 @@ def collect(
         schema_version=SCHEMA_VERSION,
         generated_at=generated_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         tool_version=__version__,
-        env=collect_env(),
+        env=collect_env(project),
         runs=runs,
     )
 
@@ -627,6 +657,8 @@ def render_markdown(
     out.append(_fmt_kv("bmad-loop version", e.package_version))
     out.append(_fmt_kv("python", e.python_version))
     out.append(_fmt_kv("os", f"{e.os} {e.os_release}"))
+    out.append(_fmt_kv("sys.platform", e.sys_platform))
+    out.append(_fmt_kv("win32 on WSL distro path", "yes" if e.win32_on_wsl_path else "no"))
     out.append(_fmt_kv("multiplexer", e.multiplexer))
     out.append(_fmt_kv("tmux", e.tmux_version or "—"))
     out.append(_fmt_kv("schema / generated", f"v{d.schema_version} @ {d.generated_at}"))

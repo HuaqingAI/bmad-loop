@@ -107,6 +107,14 @@ whose seams had diverged enough that several ports needed a different fix, and t
   `bmad-loop` console script via a thin `__main__.py`. Characterization tests pin the current CLI
   exit codes (typed errors and the broad backstop → 1, argparse usage → 2).
 
+- **`{story_title}` in `scm.commit_message_template` (#475).** The placeholder renders the spec's
+  `title:` frontmatter, minus any leading `Story <id>:` label, so a template can carry a readable
+  subject. Specs authored without that field fall back to a first `#` heading, then to the story
+  key — as does a spec that is missing, unreadable or not valid UTF-8, so the placeholder never
+  renders empty and a commit-time read failure never fails the commit. The rendered title is
+  whitespace-collapsed, and characters `git commit -m` cannot take in an argv (control characters,
+  unpaired surrogates) are dropped. Templates that do not name the placeholder skip the read.
+
 ### Changed
 
 - **Every spec-frontmatter status read goes through `status_of` (#358 follow-up).** Five inline
@@ -165,6 +173,45 @@ whose seams had diverged enough that several ports needed a different fix, and t
   before upgrading past it.
 
 ### Fixed
+
+- **A native-Windows install driven from a WSL shell now says so (#332).** WSL appends the Windows
+  `PATH` to its own, so a bash prompt can reach a Windows-installed `bmad-loop`: that interpreter
+  reports `win32`, takes the psmux platform default, and never sees the distro's tmux — while
+  `validate` printed a green `multiplexer PsmuxMultiplexer available` and nothing named the platform.
+  `validate` now reports the multiplexer selection reason for **every** host (it was emitted only for
+  a forced `BMAD_LOOP_MUX_BACKEND`/`[mux] backend` choice), so `platform default for win32` is on
+  screen wherever the mismatch happens; the same un-gating makes a `fallback` selection — no
+  available backend matches this platform — a warning rather than a green line. A `win32` interpreter
+  working on a `\\wsl.localhost\...` project additionally raises a `host.win32-on-wsl-path` **warning**
+  naming the fix (install with the WSL/Linux Python) and the backend it actually chose. That warning
+  covers the project-on-the-distro shape only; a project under `/mnt/c` gets a genuine Windows path
+  and no warning, and is covered by the selection line instead. Nothing changes which backend is
+  selected — psmux is correct for a `win32` interpreter — nor validate's exit code. `diagnose` gains
+  `sys.platform` and `win32 on WSL distro path` (`yes`/`no`) in its Environment block.
+
+- **A multiplexer-detection failure is reported instead of swallowed.** `validate` caught and
+  discarded any exception from backend detection, so `mux.selection` and the backend inventory
+  vanished with nothing said — while `mux.backend` above them, which comes from an independent
+  selection call, still printed a healthy backend. It now reports under `mux.backends-detected` at
+  **warning** carrying the error.
+
+- **Provider quota refusals are environment faults on `opencode-http` too (#323).** #194's classifier
+  lived on `GenericAdapter`, so its hookless HTTP sibling silently omitted it: a five-hour provider
+  usage limit read as three stalled stories and burned their retry budgets. The classifier now lives
+  in a shared `EnvFaultMixin` both adapters mix in, and the `opencode` profile seeds quota/rate-limit
+  and connection patterns anchored on the server's `error.error="AI_APICallError: …"` field. That
+  scan reads `logs/<task-id>.server.out`, the `opencode serve` process's own stdout — not the curated
+  `[bmad]` transcript, which carries the model's own words. Which file each adapter scans is named by
+  `ENV_FAULT_LOG_SUFFIX` and is part of the patterns' safety contract: a pattern is only sound
+  against a log the model cannot write to.
+
+- **A re-armed escalation no longer overwrites the previous attempt's dirty snapshot (#349).**
+  `refs/attempt-preserve-dirty/*` names were keyed on `task.attempt`, which `rearm_escalation`
+  resets to 0, so a post-resolve re-drive rolling back against the same baseline recomputed the
+  earlier rollback's refname and destroyed the only copy of that attempt's work. Probe for a free
+  name instead of trusting the counter, suffixing `-r2`, `-r3`, … The scan is bounded; exhausting
+  it refuses (`attempt-worktree-preserve-failed`, then the usual pause) rather than reusing an
+  occupied name. Prune the namespace or lower `scm.preserve_keep` if it ever fires.
 
 - **The auto-sweep child refuses config a session rewrote under the run (#461).** `policy.toml` and
   `profiles/*.toml` sit in the agent-writable workspace and reach host code execution — the

@@ -12,6 +12,7 @@ import contextlib
 import contextvars
 import functools
 import hashlib
+import re
 import shutil
 import signal
 import sys
@@ -233,6 +234,64 @@ def _session_task_id(story_key: str, part: str, seq: int) -> str:
     differs between the two orders. ``_resumable_session``'s resume match must
     be byte-identical to what ``_run_session`` stored, so both MUST call this."""
     return safe_segment(f"{story_key}-{part}-{seq}")
+
+
+# A story id in this repo is a dash/dot composite ("1.1", "3-2", "1-1-a"), so the
+# leading-label strip must start at a DIGIT and may then run on through letters.
+# Both looser and tighter patterns get this wrong in opposite directions: `\S+`
+# eats the real title in "Story Points: Add estimates", while `\d+\.\d+` stops
+# matching the dash composites this project actually issues.
+_STORY_LABEL_RE = re.compile(r"^story\s+\d[\w.\-]*:\s*", re.IGNORECASE)
+# C0 controls + DEL + unpaired surrogates. Not cosmetic: this title reaches
+# `git commit -m` as an argv element, and both classes are unspawnable there —
+# `subprocess.run` rejects an embedded NUL with a plain ValueError, and a lone
+# surrogate has no UTF-8 encoding, so encoding the argv raises UnicodeEncodeError.
+# Neither is in `_run_git`'s translated set (TimeoutExpired, UnicodeDecodeError,
+# OSError — and UnicodeEncodeError is a sibling of the decode class, not a
+# subclass), so either escapes as itself, hits `_finalize_commit_phase`'s
+# `except BaseException` re-raise, and crashes the run with the task already
+# persisted as COMMITTING — wedging every later resume on the same spec. YAML
+# reaches both without any exotic file bytes: `title: "\0"` and `title: "\uD800"`
+# are ordinary double-quoted scalars that PyYAML hands back verbatim. The rest of
+# the control class goes along because a newline or CR in a commit subject is
+# mangling, not a title. Translating these at the `_run_git` chokepoint instead
+# of here is the general fix, tracked as #506.
+_TITLE_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f\ud800-\udfff]+")
+# An ATX heading's optional closing hash run, which CommonMark requires to be
+# preceded by whitespace — so "# C#" keeps its trailing hash and "# Wire it ###"
+# does not.
+_ATX_CLOSING_RE = re.compile(r"[ \t]+#+[ \t]*$")
+
+
+def _story_label_stripped(value: object, story_key: str = "") -> str:
+    """A commit-ready story title from a frontmatter value or heading text:
+    coerced to str, control characters neutralized, label dropped, whitespace
+    collapsed. Returns "" for anything that leaves no title behind, which is
+    every caller's signal to fall back.
+
+    ``story_key`` is the task's own id, matched literally as a second way to
+    recognize the label. `StoriesEngine` inherits this renderer and `stories`
+    issues alphabetic ids ("auth", "oauth-setup") that the digit-led pattern
+    cannot see. It is an ADDITION to that pattern and not a replacement: a
+    sprint spec labels itself "Story 1.1:" while its key is "1-1-a", so keying
+    only off the task id would stop stripping the common case.
+
+    Coerces rather than type-checks because the value arrives from YAML, where
+    an unquoted title parses to whatever it looks like — ``title: 2026-01-01``
+    is a ``date``, ``title: 1.1`` a float — and a rendered date still beats
+    falling back to the bare story key. A ``None`` (blank ``title:``) coerces to
+    "" and falls back, matching how `status_of` treats a null status."""
+    if value is None or isinstance(value, bool):  # `title: yes` is a typo, not a title
+        return ""
+    text = _TITLE_CONTROL_RE.sub(" ", str(value)).strip()
+    stripped = _STORY_LABEL_RE.sub("", text)
+    if stripped == text and story_key:
+        # The id is escaped, so a key carrying regex metacharacters ("a.b") is
+        # matched literally rather than compiled into a wildcard.
+        stripped = re.sub(rf"^story\s+{re.escape(story_key)}\s*:\s*", "", text, flags=re.IGNORECASE)
+    # Collapse after the label strip, so a label split by control characters
+    # ("Story\x001.1:") is still recognized rather than surviving into the subject.
+    return " ".join(stripped.split())
 
 
 # Call-stack nesting depth for engine runs. A nested auto-sweep runs synchronously
@@ -3652,17 +3711,121 @@ class Engine:
         ) + (f" {tail}" if tail else "")
 
     def _render_commit_template(self, task: StoryTask) -> str | None:
-        """The configured commit message template with {story_key}/{run_id}
-        substituted, or None when no template is set. Used by both the story and
-        sweep-bundle commit paths so a filled-out template wins everywhere."""
+        """The configured commit message template with {story_key}/{run_id}/
+        {story_title} substituted, or None when no template is set. Used by both
+        the story and sweep-bundle commit paths so a filled-out template wins
+        everywhere."""
         template = self.policy.scm.commit_message_template.strip()
         if not template:
             return None
         # literal substitution (not str.format) so stray braces in the
-        # template — e.g. a JSON trailer — don't raise.
-        return template.replace("{story_key}", task.story_key).replace(
-            "{run_id}", self.state.run_id
+        # template — e.g. a JSON trailer — don't raise. The spec read behind
+        # {story_title} is skipped entirely for templates that don't ask for it.
+        title = self._story_title(task) if "{story_title}" in template else ""
+        # {story_title} substituted LAST: it is the only value here drawn from
+        # agent-written spec prose, so a title that itself contains "{run_id}"
+        # must land in the message as written instead of being re-substituted.
+        return (
+            template.replace("{story_key}", task.story_key)
+            .replace("{run_id}", self.state.run_id)
+            .replace("{story_title}", title)
         )
+
+    def _story_title(self, task: StoryTask) -> str:
+        """The story's human-readable title for {story_title}: the spec's
+        ``title:`` frontmatter, falling back to a first **ATX** H1, then to the
+        story key. Any leading ``Story <id>:`` label is dropped either way (the
+        template already carries the key, so the label would just repeat it).
+
+        Frontmatter first because that is where a bmad-loop spec's title
+        actually lives — `spec-template.md` opens with ``title:`` and writes no
+        H1 at all. Keying on the heading alone left the placeholder inert on
+        every canonical spec, silently rendering the story key in place of a
+        title. The H1 branch stays for specs authored outside that template.
+
+        ATX only, deliberately: the setext form (a line underlined by ``===``)
+        is a valid CommonMark H1, but recognizing it would make *any* prose line
+        sitting above a ``===`` divider the commit subject. That trades this
+        method's one safe failure mode — falling back to the story key — for a
+        confidently wrong title, so the narrower contract is the right one and
+        this docstring is the place it is stated.
+
+        Falls back to the story key when there is no spec, no title, or the spec
+        is unreadable — the placeholder must never render empty, and a
+        commit-time read failure must not fail the commit."""
+        if not task.spec_file:
+            return task.story_key
+        spec = Path(task.spec_file)
+        try:
+            # `read_frontmatter` already degrades a missing, undecodable or
+            # malformed-YAML spec to {}; the guard below is for the reads that
+            # still raise past it (EACCES here, a torn multi-byte spec in the
+            # H1 fallback's own read_text).
+            title = _story_label_stripped(
+                verify.read_frontmatter(spec).get("title"), task.story_key
+            )
+            if title:
+                return title
+            lines = spec.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            # UnicodeDecodeError is a ValueError, not an OSError, so a spec torn
+            # mid-write through a multi-byte sequence would slip past an
+            # except-OSError guard. This render happens before
+            # _finalize_commit_phase's try, so an escape crashes the run rather
+            # than escalating the story.
+            return task.story_key
+        # Skip a leading YAML frontmatter block (standalone --- delimiter lines,
+        # same rule as frontmatter._split_frontmatter) so a YAML comment inside
+        # it can't be mistaken for the H1.
+        start = 0
+        if lines and lines[0].rstrip() == "---":
+            for i in range(1, len(lines)):
+                if lines[i].rstrip() == "---":
+                    start = i + 1
+                    break
+        # Fenced blocks are skipped, because `#` opens a comment in most of the
+        # languages a spec quotes: a setup snippet whose first line is
+        # "# Install the dependencies" is not this story's heading, and taking it
+        # would render a confidently wrong commit subject rather than falling
+        # back. An unclosed fence deliberately swallows the rest of the file
+        # (CommonMark says it runs to EOF) — resetting at EOF to "rescue" a
+        # heading would resurrect exactly the bug this skip exists to prevent.
+        fence_char, fence_len = "", 0
+        for line in lines[start:]:
+            # CommonMark allows up to three spaces of indentation before an ATX
+            # heading; a fourth makes the line an indented code block, so that is
+            # the bound rather than a plain lstrip. Getting this wrong only ever
+            # costs a silent fall back to the story key, which is the same way
+            # the placeholder was inert on every canonical spec before it read
+            # `title:` — so the extraction stays as permissive as the syntax is.
+            head = line.lstrip(" ")
+            # A fence opens on 3+ backticks or tildes and closes only on a run of
+            # the SAME character, at least as long, with nothing but whitespace
+            # after it — so a ``` inside a ```` block does not close it early.
+            run = 0
+            if len(line) - len(head) <= 3 and head[:1] in ("`", "~"):
+                run = len(head) - len(head.lstrip(head[0]))
+            if fence_char:
+                if head[:1] == fence_char and run >= fence_len and not head[run:].strip():
+                    fence_char, fence_len = "", 0
+                continue
+            if run >= 3:
+                fence_char, fence_len = head[0], run
+                continue
+            # The opener is `#` followed by a space OR A TAB — `#Title` is not a
+            # heading at all, and `## Title` is an H2, so both stay rejected.
+            if len(line) - len(head) <= 3 and head[:1] == "#" and head[1:2] in (" ", "\t"):
+                # An ATX heading may carry an optional closing run of hashes,
+                # which is syntax rather than title ("# Wire it ###" is "Wire
+                # it"). Unlike the two misses above this one renders a *wrong*
+                # subject rather than falling back, so it is the one worth
+                # stripping. Whitespace before the run is what makes it a
+                # closing sequence; "# C#" keeps its hash.
+                title = _story_label_stripped(_ATX_CLOSING_RE.sub("", head[2:]), task.story_key)
+                if title:
+                    return title
+                break
+        return task.story_key
 
     def _commit_message(self, task: StoryTask) -> str:
         # The park suffix is appended to a rendered template too. The template

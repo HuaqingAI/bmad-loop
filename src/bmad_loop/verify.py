@@ -788,6 +788,35 @@ def snapshot_worktree(
     return ref_name
 
 
+class PreserveRefExhaustedError(GitError):
+    """Every candidate snapshot refname in a probe's bounded range was already
+    taken. A GitError so the preservation handlers that already guard
+    ``(GitError, OSError)`` degrade instead of crashing; a distinct type so the
+    caller can tell "the namespace is full" from "git said no" — the two want
+    different remedies (prune the namespace, or re-enable pruning by setting
+    ``scm.preserve_keep`` to a positive value, vs. fix the repo). Note the
+    remedy is *not* "lower ``preserve_keep``": 0 means never prune, so the
+    setting most likely to exhaust a probe is the one that cannot go lower.
+
+    Raised rather than falling through to the last candidate on purpose: reusing
+    an occupied name is the exact data loss the probe exists to prevent (#349)."""
+
+
+def ref_exists(repo: Path, refname: str) -> bool:
+    """Whether ``refname`` — a FULL refname, e.g. ``refs/attempt-preserve-dirty/…``
+    — currently exists. Sibling of :func:`branch_exists`, which prepends
+    ``refs/heads/`` and so cannot see the snapshot refs that live outside it.
+
+    A non-zero exit reads as "absent" — `show-ref --verify` returns 1 for both a
+    missing ref and a malformed name, and the caller's subsequent ref write
+    surfaces any real error. Spawn and timeout faults are NOT swallowed: they
+    arrive typed from `_run_git` as GitError/GitSpawnError and propagate, so a
+    caller that must not overwrite an existing ref cannot mistake "git could not
+    run" for "the name is free"."""
+    rc, _ = _git(repo, "show-ref", "--verify", "--quiet", refname)
+    return rc == 0
+
+
 def safe_rollback(
     repo: Path,
     baseline: str,
