@@ -137,16 +137,57 @@ class DWEntry:
         return self.status.split()[0] == "done" if self.status else False
 
 
+def _example(text: str, offset: int) -> bool:
+    """Whether ``offset`` sits in a fenced worked example rather than the ledger.
+
+    Asked at WHOLE-FILE scope, which is the whole point. A fence that opens above
+    a quoted ``### DW-n:`` heading is stranded in the *previous* entry once spans
+    are carved, so an entry-local query reads the example as live — a phantom
+    entry whose ``gate:`` refuses a story nobody deferred. `deferred-work-format.md`
+    ships exactly that shape (a complete entry inside a ```markdown fence), so
+    quoting it into a ledger is the expected trigger, not a corner case.
+
+    ``unclosed_hides_rest=False`` repeats the answer `gates()` gives one level
+    down, and here for a stronger reason: under ``True`` a single stray opener
+    would erase every heading below it, dropping real open work out of
+    ``open_ids()`` in silence. A phantom entry from an unterminated fence is
+    today's behaviour and is visible; a vanished ledger is neither.
+    """
+    return fenced(text, offset, unclosed_hides_rest=False)
+
+
+def _unfenced(pattern: re.Pattern[str], text: str, start: int, end: int) -> re.Match[str] | None:
+    """First match of ``pattern`` within ``text[start:end]`` that is not quoted.
+
+    Not `search()` plus a check: the first match may be the quoted one, and the
+    real boundary sits after it. Bounded by ``endpos`` so a match beyond the span
+    cannot claim it, while ``_example`` still reads fence state from offset 0.
+    """
+    for m in pattern.finditer(text, start, end):
+        if not _example(text, m.start()):
+            return m
+    return None
+
+
 def parse_ledger(text: str) -> list[DWEntry]:
     """Extract DW entries; non-conforming sections are skipped, an entry
-    without a status line parses with status "" (not open)."""
+    without a status line parses with status "" (not open).
+
+    Fenced matches are skipped by every scan below, not just the heading one: a
+    heading or flat bullet quoted inside an example must not start an entry, end
+    one, or bound a block out of one. Filtering only the headings would trade the
+    phantom entry for a truncation — a fenced ``## heading`` would still cut a
+    real entry short at its own boundary, and a `gate:` line below the example
+    would fall outside the span and stop gating, which is the failure this field
+    exists to end.
+    """
     entries = []
-    headings = list(HEADING_RE.finditer(text))
+    headings = [m for m in HEADING_RE.finditer(text) if not _example(text, m.start())]
     for i, m in enumerate(headings):
         end = headings[i + 1].start() if i + 1 < len(headings) else len(text)
         # an entry also ends at any intervening heading (e.g. a "## Deferred
         # from:" section header between freeform and DW-format content)
-        other = ANY_HEADING_RE.search(text, m.end(), end)
+        other = _unfenced(ANY_HEADING_RE, text, m.end(), end)
         if other:
             end = other.start()
         # ...and at a flat appender block, which belongs to no canonical entry
@@ -157,12 +198,16 @@ def parse_ledger(text: str) -> list[DWEntry]:
         # done (open_ids() drops it, classify() calls it malformed), which trades
         # one lost flat block for one lost tracked entry. An entry with no status
         # line has nothing to protect, so the whole span is fair game.
-        status_m = STATUS_RE.search(text, m.end(), end)
-        flat = FLAT_ENTRY_RE.search(text, status_m.end() if status_m else m.end(), end)
+        status_m = _unfenced(STATUS_RE, text, m.end(), end)
+        flat = _unfenced(FLAT_ENTRY_RE, text, status_m.end() if status_m else m.end(), end)
         if flat:
             end = flat.start()
         body = text[m.start() : end]
-        status_m = STATUS_RE.search(body)
+        # Re-read rather than reuse the probe above: `end` may have moved, and the
+        # status must be the one inside the final span. Searched over `text` at
+        # absolute offsets because `_example` reads fence state from the top of the
+        # file — a body slice cannot see an opener that sits above the heading.
+        status_m = _unfenced(STATUS_RE, text, m.start(), end)
         entries.append(
             DWEntry(
                 id=m.group(1),

@@ -1632,6 +1632,109 @@ def test_a_line_with_an_info_string_does_not_close_a_fence():
     assert g.tokens == ()
 
 
+def test_a_four_space_backtick_run_is_indented_code_and_cannot_silence_a_gate():
+    """CommonMark indents a fence up to three spaces; at four it is indented code,
+    not a delimiter. `FENCE_LINE_RE`'s ` {0,3}` is the only thing enforcing that,
+    and it enforces it in the fail-OPEN direction: were the run accepted, two such
+    lines would wrap a real column-0 `gate:` and mask it out of existence — a gate
+    lost in silence, the exact failure this field exists to end. The devcontract
+    half already reasoned this through (reviewer guard #53): the limit is safe
+    because fenced content in a list is co-indented and can never match a
+    column-0 anchor, so only the delimiter rule needs pinning."""
+    g = _gated("    ```", "gate: 4-1", "    ```")
+
+    assert g.tokens == ("4-1",)
+
+
+def test_a_fenced_worked_example_is_not_an_entry():
+    """A complete example — heading, status and gate inside one fence — is the
+    shape `deferred-work-format.md` ships for authors to copy, so a ledger quoting
+    it is expected rather than exotic. Read entry-locally it used to become a real
+    entry: `HEADING_RE` split the file first, stranding the opening fence in the
+    PREVIOUS entry, so the example's body saw no open fence and its `gate:` went
+    live — a phantom entry refusing a story nobody deferred."""
+    text = (
+        "# Deferred Work\n\n### DW-01: a real entry\nstatus: open\n\n"
+        "The format, for reference:\n\n"
+        "```markdown\n### DW-99: worked example\nstatus: open\ngate: 3-2\n```\n"
+    )
+
+    (entry,) = parse_ledger(text)
+
+    assert entry.id == "DW-01"
+    assert open_ids(text) == {"DW-01"}
+    assert deferredwork.gates(entry).tokens == ()
+
+
+def test_a_fenced_heading_does_not_bound_the_entry_that_quotes_it():
+    """The other half of skipping fenced headings, and the one that fails OPEN.
+    `ANY_HEADING_RE` ends an entry at any intervening heading; left fence-blind it
+    would end this one at the quoted `### DW-99`, dropping the real `gate:` below
+    the example out of the span entirely. Trading a phantom entry for a lost gate
+    would have been the worse of the two bugs."""
+    text = (
+        "# Deferred Work\n\n### DW-01: a real entry\nstatus: open\n\n"
+        "```markdown\n### DW-99: worked example\nstatus: done 2026-01-01\n```\n\n"
+        "gate: 3-2\n"
+    )
+
+    (entry,) = parse_ledger(text)
+
+    assert deferredwork.gates(entry).tokens == ("3-2",)
+
+
+def test_a_fenced_flat_bullet_does_not_bound_the_entry_that_quotes_it():
+    """Same failure through the #304 flat-appender boundary: a quoted bullet is an
+    example of the appender's shape, not an appended block, and bounding the entry
+    at it would again strand the `gate:` below. The real block must still be
+    bounded out — `test_flat_boundary_still_applies_after_a_quoted_block_inside_the_entry`
+    holds that end."""
+    text = (
+        "# Deferred Work\n\n### DW-01: a real entry\nstatus: open\n\n"
+        "```markdown\n- source_spec: `example.md`\n  summary: quoted\n"
+        "  evidence: e\n```\n\ngate: 3-2\n"
+    )
+
+    (entry,) = parse_ledger(text)
+
+    assert deferredwork.gates(entry).tokens == ("3-2",)
+
+
+def test_a_stray_unclosed_fence_does_not_erase_the_entries_below_it():
+    """Why `_example` asks with `unclosed_hides_rest=False`. Under the opposite
+    answer one unterminated fence would swallow every heading after it, and those
+    entries would vanish from `open_ids()` — real open work reported as landed, in
+    silence. A phantom entry from a stray opener is today's behaviour and is
+    visible on the page; a disappeared ledger is neither."""
+    text = (
+        "# Deferred Work\n\n### DW-01: oops\nstatus: open\n```\n\n"
+        "### DW-02: still real\nstatus: open\ngate: 3-2\n"
+    )
+
+    first, second = parse_ledger(text)
+
+    assert (first.id, second.id) == ("DW-01", "DW-02")
+    assert open_ids(text) == {"DW-01", "DW-02"}
+    assert deferredwork.gates(second).tokens == ("3-2",)
+
+
+def test_a_fenced_status_line_is_not_the_status_of_the_entry_quoting_it():
+    """Skipping fenced headings moves the example INSIDE the quoting entry instead
+    of splitting it off, which hands `STATUS_RE` a second candidate it never used
+    to see. An entry with no status of its own must not inherit the example's:
+    reading `done` there would drop live work out of `open_ids()` on the strength
+    of a quotation."""
+    text = (
+        "# Deferred Work\n\n### DW-01: no status of its own\n\norigin: test\n\n"
+        "```markdown\n### DW-99: worked example\nstatus: done 2026-01-01\n```\n"
+    )
+
+    (entry,) = parse_ledger(text)
+
+    assert entry.status == ""
+    assert not entry.done and not entry.open
+
+
 def test_gate_token_shape_copy_agrees_with_the_stories_id_it_mirrors():
     """`_STORIES_ID_RE` is a copy of `stories.ID_RE`, taken because `stories`
     imports this module and the reverse would cycle. Pinned to the original rather
