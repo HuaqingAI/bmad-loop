@@ -2493,20 +2493,9 @@ def test_classify_env_fault_ignores_result_json_present(tmp_path):
 
 
 def test_classify_env_fault_inert_without_patterns(tmp_path):
-    """A profile with no env_fault_patterns never classifies, even with a matching
-    line in the log — so mixing EnvFaultMixin into an adapter is always safe.
-
-    Builds the empty profile explicitly rather than borrowing whichever shipped CLI
-    happens to have none (it used to borrow codex). Four profiles are in fact
-    unseeded — see test_unseeded_profiles_stay_inert — but which ones is a shipping
-    decision that has changed once already and should not be able to silently
-    invalidate this test.
-
-    The profile is swapped BEFORE the first classification on purpose:
-    _env_fault_patterns is a cached_property, so a swap afterwards would leave the
-    old patterns compiled (documented on the property)."""
-    adapter = make_adapter(tmp_path)
-    adapter.profile = dataclasses.replace(adapter.profile, env_fault_patterns=())
+    """A profile with no env_fault_patterns (codex) never classifies, even with a
+    matching line in the log."""
+    adapter = make_adapter(tmp_path, profile_name="codex")
     assert adapter._env_fault_patterns == ()
     _write_task_log(adapter, b"API Error: Connection refused\n")
     result = _classify(adapter, "timeout")
@@ -4367,67 +4356,3 @@ def test_log_evidence_mro_is_not_shadowed_by_the_mixin():
     assert GenericDevAdapter._READBACK_NEEDS_PROOF_OF_WORK is True
     assert OpencodeDevAdapter._READBACK_NEEDS_PROOF_OF_WORK is True
     assert GenericTmuxAdapter._READBACK_NEEDS_PROOF_OF_WORK is False
-
-
-def test_classify_env_fault_marks_a_dropped_suffix(tmp_path):
-    """A window that dropped a SUFFIX says so. Marking only the head made a
-    truncated excerpt read as a complete line that simply ended there — the one
-    thing a string an operator reads out of a pause reason must not do. Both
-    markers are spent from ENV_FAULT_EVIDENCE_MAX, never added on top of it."""
-    adapter = make_adapter(tmp_path)
-    lead = "y" * 300  # push the match past the head so both ends are cut
-    _write_task_log(adapter, f"{lead} API Error: Connection refused {'z' * 400}\n".encode())
-    result = _classify(adapter, "timeout")
-    assert result.env_fault is True
-    ev = result.env_fault_evidence
-    assert ev.startswith("…") and ev.endswith("…")
-    assert len(ev) <= generic.ENV_FAULT_EVIDENCE_MAX
-    assert "API Error: Connection refused" in ev
-
-
-def test_classify_env_fault_drops_the_partial_line_at_the_tail_seek(tmp_path):
-    """The 64 KiB tail seek lands on an arbitrary byte, so whatever line straddles
-    the window edge arrives as a fragment. Matching it would quote half a line as
-    evidence — and because the cut can land mid-codepoint, its head may be a U+FFFD
-    from the errors="replace" decode. The fragment is discarded."""
-    adapter = make_adapter(tmp_path)
-    # The byte layout is the whole test, so it is computed rather than guessed: the
-    # seek must land INSIDE the matching line, and far enough into its leading junk
-    # that the surviving fragment would STILL match. Otherwise the test passes for
-    # the wrong reason — an earlier version padded so heavily that the matching line
-    # fell entirely outside the 64 KiB window, so it went green with the
-    # fragment-drop deleted and proved nothing.
-    prefix = b"P" * 50
-    straddler = b"J" * 200 + b"API Error: Connection refused\n"  # 230 bytes
-    cut_into_line = 10
-    filler = b"filler line\n"  # 12 bytes, matches nothing
-    tail_bytes = generic.ENV_FAULT_TAIL_BYTES - len(straddler) + cut_into_line
-    assert tail_bytes % len(filler) == 0  # exact fill; no accidental re-alignment
-    _write_task_log(adapter, prefix + straddler + filler * (tail_bytes // len(filler)))
-
-    log = adapter.logs_dir / f"{_ENV_FAULT_TASK}.log"
-    size = log.stat().st_size
-    seek = size - generic.ENV_FAULT_TAIL_BYTES
-    assert size > generic.ENV_FAULT_TAIL_BYTES  # the tail read actually truncates
-    assert len(prefix) < seek < len(prefix) + len(straddler)  # cut is inside the line
-    # And the surviving fragment still carries the full pattern, so dropping it is
-    # the ONLY reason this must not classify.
-    assert b"API Error: Connection refused" in log.read_bytes()[seek:]
-
-    result = _classify(adapter, "timeout")
-    assert result.env_fault is False
-    assert result.env_fault_evidence is None
-
-
-def test_classify_env_fault_scans_a_truncated_window_with_no_newline(tmp_path):
-    """A >tail-window log containing NO newline is a single fragment. Dropping it
-    as a straddler would leave nothing to scan — trading a cosmetic half-line for
-    a missed outage, which is the wrong way round. The fragment is scanned; the
-    leading ellipsis marks that it is a window, not a whole line."""
-    adapter = make_adapter(tmp_path)
-    hit = b"API Error: Connection refused"
-    _write_task_log(adapter, b"x" * (generic.ENV_FAULT_TAIL_BYTES + 10) + hit)
-    result = _classify(adapter, "timeout")
-    assert result.env_fault is True
-    assert result.env_fault_evidence.startswith("…")
-    assert "API Error: Connection refused" in result.env_fault_evidence

@@ -151,7 +151,6 @@ from ..model import TokenUsage
 from ..policy import Policy
 from ..process_host import ProcessHostError, get_process_host
 from .base import CodingCLIAdapter, SessionHandle, SessionResult, SessionSpec
-from .env_fault import EnvFaultMixin
 from .generic import (
     BUDGET_NUDGE_TEXT,
     HEARTBEAT_INTERVAL_S,
@@ -367,16 +366,7 @@ class _ServerSession:
     floor_ms: int = 0
 
 
-class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
-    # Env-fault classification scans the SERVER's own stdout/stderr, not
-    # <task_id>.log — that file is the curated `[bmad]` conversation transcript
-    # written by the SSE reader, so it carries the model's own words. Two reasons
-    # this must be .server.out: the provider's AI_APICallError logfmt lines only
-    # ever land there, and the profile's patterns are anchored on the assumption
-    # that a story quoting a provider error verbatim cannot reach the scanned
-    # bytes. Point this at the transcript and both properties break at once.
-    ENV_FAULT_LOG_SUFFIX = ".server.out"
-
+class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
     injection = "http"
     observation = "sse"
     state = "remote"
@@ -618,18 +608,6 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # A re-armed/resumed run reuses task_ids; drop any prior cycle's result
         # so a session that writes nothing can't be read as a stale completion.
         (task_dir / "result.json").unlink(missing_ok=True)
-        # Same hazard, same reason, for the file the #194 tail scan reads (mirrors
-        # GenericAdapter.start_session, which unlinks its pane tee here). This one
-        # bites hardest on the path the classifier exists to serve: an env fault
-        # PAUSEs the run, the operator re-arms and resumes, and the next session
-        # reusing this task_id would scan the PREVIOUS cycle's provider error and
-        # pause again — however healthy the new session's own log. A pause loop
-        # that survives every re-arm, off one stale line.
-        #
-        # Unlinked HERE and not in _spawn_server, which deliberately opens the file
-        # "ab" so a spawn retry (free-port collision) keeps its predecessor's
-        # diagnostics inside the SAME session.
-        self._env_fault_log_path(spec.task_id).unlink(missing_ok=True)
 
         launched_ns = time.time_ns()
         sess = self._spawn_server(spec)
