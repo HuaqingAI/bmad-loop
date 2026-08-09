@@ -1854,6 +1854,25 @@ def test_a_decision_lands_after_the_live_status_of_an_entry_that_quotes_an_examp
     assert "status: open\ndecision: 2026-06-11 keep — still worth doing" in text
 
 
+def test_the_example_index_answers_exactly_at_its_span_bounds():
+    """The binary search replaced a linear `any(s <= offset < e)` test, and the
+    whole suite passes with its upper bound moved by one character — no heading or
+    field line ever begins at that offset, so no behavioural test can reach it.
+    Pinned directly for the same reason a differential fuzz found it and the tests
+    did not: an index that is right about every real offset and wrong about the
+    boundary is one refactor away from being wrong about a real one."""
+    text = "before\n```\nquoted\n```\nafter\n"
+    examples = deferredwork._example_spans(text)
+
+    ((start, end),) = examples.spans
+    assert examples.covers(start - 1) is False
+    assert examples.covers(start) is True
+    assert examples.covers(end - 1) is True
+    assert examples.covers(end) is False
+    # and the index must not answer for a ledger that quotes nothing
+    assert deferredwork._example_spans("### DW-1: t\nstatus: open\n").covers(0) is False
+
+
 def test_parse_ledger_walks_the_fences_once_however_many_entries(monkeypatch):
     """Asserted as a call count, not a duration: the property is that the fence
     walk is hoisted out of the per-offset checks, and a timing threshold would
