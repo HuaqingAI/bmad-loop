@@ -18,7 +18,7 @@ from bmad_loop import verify
 from bmad_loop.gates import ATTENTION_FILE
 from bmad_loop.model import Phase, StoryTask
 from bmad_loop.policy import GatesPolicy, LimitsPolicy, NotifyPolicy, Policy, ScmPolicy
-from bmad_loop.recovery_flow import RecoveryFlow
+from bmad_loop.recovery_flow import PRESERVE_REF_PROBE_LIMIT, RecoveryFlow
 from bmad_loop.verify import GitError, rev_parse_head
 from bmad_loop.workspace import Workspace
 
@@ -708,6 +708,85 @@ def test_snapshot_oserror_degrades_into_the_typed_path(project, monkeypatch):
     entry = flow.journal.fields("attempt-worktree-preserve-failed")
     assert "Too many open files" in entry["error"]  # errno detail kept as a breadcrumb
     assert (repo / "src.txt").read_text() == "uncommitted work\n"
+
+
+def test_ref_probe_git_fault_degrades_like_a_failed_snapshot(project, monkeypatch):
+    """The free-refname probe spawns git before the snapshot does, so it is the
+    first place a spawn/timeout fault can surface. `ref_exists` deliberately does
+    not swallow those (mistaking "git could not run" for "the name is free" would
+    overwrite the very snapshot the probe exists to protect), so the probe has to
+    sit inside the handler that turns a preservation fault into a pause.
+
+    Ablation target: move the probe loop back above the `try` and this fails with
+    the raw GitSpawnError instead of the typed pause."""
+    repo = project.project
+    ws = Workspace.default(project)
+    flow = _make_flow(workspace=ws, policy=_policy(rollback_on_failure=True))
+    task = _task(repo)
+    (repo / "src.txt").write_text("uncommitted work\n")
+
+    def _fail(*_a, **_k):
+        raise verify.GitSpawnError("git: command not found")
+
+    monkeypatch.setattr(verify, "ref_exists", _fail)
+
+    with pytest.raises(_Pause):  # the typed pause, not the GitSpawnError
+        flow.rollback_or_pause(task)
+
+    entry = flow.journal.fields("attempt-worktree-preserve-failed")
+    assert "command not found" in entry["error"]
+    assert (repo / "src.txt").read_text() == "uncommitted work\n"  # work not reset away
+
+
+def test_ref_probe_is_bounded_and_refuses_to_reuse_an_occupied_name(project, monkeypatch):
+    """The probe terminates on its own — the ref set is finite and the serial only
+    climbs — but terminating is not the same as being bounded: without a cap the
+    iteration count is whatever the namespace happens to hold, one git spawn each,
+    inside a crash-recovery path. `PRESERVE_REF_PROBE_LIMIT` bounds the scan, and
+    exhausting it must RAISE rather than fall through to the last candidate;
+    reusing an occupied name is the exact data loss the probe exists to prevent
+    (#349). Exhaustion is a preservation fault like any other, so it degrades into
+    the typed pause instead of crashing the rollback.
+
+    `ref_exists` is answered True for a few calls PAST the limit, so removing the
+    cap makes this fail on the missing pause rather than hanging the suite.
+
+    Ablation target: delete the `serial > PRESERVE_REF_PROBE_LIMIT` raise and the
+    probe walks past the bound to a free name, the snapshot succeeds, and the
+    `pytest.raises(_Pause)` fails."""
+    repo = project.project
+    ws = Workspace.default(project)
+    flow = _make_flow(workspace=ws, policy=_policy(rollback_on_failure=True))
+    task = _task(repo)
+    (repo / "src.txt").write_text("uncommitted work\n")
+
+    probed: list[str] = []
+
+    def _occupied(_repo, refname: str) -> bool:
+        probed.append(refname)
+        return len(probed) <= PRESERVE_REF_PROBE_LIMIT + 5
+
+    snapshots: list[str] = []
+
+    def _snapshot(_repo, refname, **_k):
+        snapshots.append(refname)
+        return refname
+
+    monkeypatch.setattr(verify, "ref_exists", _occupied)
+    monkeypatch.setattr(verify, "snapshot_worktree", _snapshot)
+
+    with pytest.raises(_Pause):  # the typed pause, not a raw error and not a hang
+        flow.rollback_or_pause(task)
+
+    # The bound is the assertion: the base name plus -r2..-r<limit>, then stop.
+    assert len(probed) == PRESERVE_REF_PROBE_LIMIT
+    assert probed[-1].endswith(f"-r{PRESERVE_REF_PROBE_LIMIT}")
+    assert not snapshots  # never wrote over any of the names it found occupied
+
+    entry = flow.journal.fields("attempt-worktree-preserve-failed")
+    assert "no free snapshot refname" in entry["error"]  # names the exhaustion
+    assert "scm.preserve_keep" in entry["error"]  # and the operator's remedy
+    assert (repo / "src.txt").read_text() == "uncommitted work\n"  # work not reset away
 
 
 def test_notice_probe_oserror_does_not_swallow_the_pause(project, monkeypatch):

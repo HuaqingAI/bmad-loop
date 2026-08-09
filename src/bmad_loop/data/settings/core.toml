@@ -355,7 +355,7 @@ description = "worktree mode: additional project-relative gitignored files to co
 [[section.field]]
 key = "commit_message_template"
 kind = "str"
-placeholder = "blank = built-in default; {story_key} / {run_id} substituted"
+placeholder = "blank = built-in default; {story_key} / {run_id} / {story_title} substituted"
 label = "commit message template"
 description = "commit message dev sessions use for a story/bundle commit when set"
 [[section.field]]

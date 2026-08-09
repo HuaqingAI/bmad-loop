@@ -519,8 +519,10 @@ class ScmPolicy:
     failed_diff_max_mb: int = 5
     failed_diff_unlimited: bool = False
     # commit_message_template, when non-empty, is the commit message dev sessions
-    # use for a story's commit (placeholders {story_key} and {run_id} are
-    # substituted). Empty = the built-in default message.
+    # use for a story's commit (placeholders {story_key}, {run_id} and
+    # {story_title} — the spec's `title:` frontmatter, else a first `#` heading, minus any
+    # "Story <id>:" label, falling back to the key — are substituted). Empty = the
+    # built-in default message.
     commit_message_template: str = ""
     # max_parallel: units in flight at once. Parallel fan-out (Phase 5) is not
     # built yet, so any value > 1 is clamped to 1 in loads() — the knob exists
@@ -1254,7 +1256,10 @@ preserve_keep = 20           # attempt-preserve/* branches and attempt-preserve-
 failed_diff_max_mb = 5       # per-file size cap (MB) for untracked files in a kept-failed unit's changes.patch; oversized files are skipped with a marker
 failed_diff_unlimited = false # true = capture the failed-unit diff with no size cap (may produce very large patches; warns when active)
 # commit_message_template: when set, the commit message dev sessions use for a
-# story's commit. {story_key} and {run_id} are substituted. Empty = built-in default.
+# story's commit. {story_key}, {run_id} and {story_title} (the spec's `title:`
+# frontmatter, else a first `#` heading, minus any "Story <id>:" label; falls back to the
+# key) are substituted.
+# Empty = built-in default.
 commit_message_template = ""
 max_parallel = 1             # units in flight at once (parallel fan-out unbuilt; values > 1 clamp to 1)
 # A git worktree checks out tracked files only, so gitignored MCP/CLI configs are

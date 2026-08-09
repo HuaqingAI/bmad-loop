@@ -2448,6 +2448,70 @@ def test_shield_tracked_hook_config_is_not_excluded(project, tmp_path):
     assert git(repo, "ls-files", "-ci", "--exclude-standard") == ""
 
 
+def test_shield_tracked_hook_config_leaves_no_residue_after_teardown(project, tmp_path):
+    """#392's fourth ask, end to end: track the hook config, provision, run the
+    reporter's probe in BOTH checkouts, tear the worktree down, and prove nothing the
+    shield wrote outlived it. Their report was one arc — the exclusion appeared during
+    provisioning and survived deleting the run — and no single test walked it.
+
+    codex is the faithful fixture. `.codex/hooks.json` is its `config_path` and is NOT
+    one of its `seed_files`, which is the reporter's exact shape; claude's `config_path`
+    doubles as a seed file (the coincidence #471 reports), so it cannot express it.
+
+    Complements `test_shield_dies_with_the_worktree`, which pins the same lifetime from
+    #384's angle — plain fixture, no tracked file, no `-ci` probe."""
+    repo = project.project
+    codex = get_profile("codex")
+    hook_rel = codex.hooks.config_path
+    # The preconditions that make this the reporter's case rather than claude's.
+    assert not codex.hookless and hook_rel
+    assert hook_rel not in codex.seed_files
+    (repo / hook_rel).parent.mkdir(parents=True, exist_ok=True)
+    (repo / hook_rel).write_text('{"hooks": {}}\n', encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "track the hook config")
+    # The fixture's own precondition, asserted rather than assumed: an ambient ignore
+    # matching `.codex/` would make `add -A` skip this file, and every assertion below
+    # would then pass on an UNTRACKED path having exercised nothing — `-ci` reports
+    # tracked-and-ignored, so it answers "" for a file git never took. `conftest`
+    # shadows the two out-of-repo ignore sources; this catches the third (a system
+    # excludes file, which cannot be suppressed without breaking Windows autocrlf).
+    assert verify.path_tracked_file(repo, hook_rel)
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    shared = repo / ".git" / "info" / "exclude"
+    before = shared.read_bytes()
+
+    provision_worktree(wt, [codex], repo)
+
+    # Checked HERE as well as after teardown, and the pair is not redundant: a shared
+    # write that teardown happens to remove would satisfy the post-teardown comparison
+    # alone. #384's harm is the window while the operator's checkout and every sibling
+    # worktree are live, which is this line, not only what survives the run.
+    assert shared.read_bytes() == before
+    private = _wt_private_exclude(wt)
+    assert private.is_file()  # the shield really ran: there is something to outlive
+    gitdir = private.parent.parent
+    assert git(wt, "ls-files", "-ci", "--exclude-standard") == ""
+    assert git(repo, "ls-files", "-ci", "--exclude-standard") == ""
+
+    # `force`: provisioning's hook step writes the now-tracked config, so the
+    # worktree is dirty and a bare remove would refuse.
+    verify.worktree_remove(repo, wt, force=True)
+
+    assert not private.exists()
+    assert not gitdir.exists()
+    assert shared.read_bytes() == before
+    # The residue the reporter cleaned up by hand would answer here. Defense in depth
+    # rather than an independent pin, and knowing which is which matters: no single
+    # ablation reddens this line alone, because every ignore source the main checkout
+    # can see after teardown is equally visible BEFORE it, so the probes above fail
+    # first. What it adds over the byte comparison is reach — a residue that is not
+    # the shared exclude's bytes (a `.gitignore` left in the tree, a surviving
+    # `core.excludesFile`) answers here and nowhere else in this test.
+    assert git(repo, "ls-files", "-ci", "--exclude-standard") == ""
+
+
 def test_shield_tracked_skill_tree_keeps_its_pattern(project, tmp_path):
     """The other half of the same predicate, and the reason it is not simply "never
     exclude a tracked path": a tracked DIRECTORY's pattern measurably DOES hide new

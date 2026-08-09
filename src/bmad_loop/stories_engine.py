@@ -11,9 +11,12 @@ mtime-scan, no shared mutable board.
 Like ``SweepEngine``, this is a thin override layer over the mature story
 pipeline: only the story source (``_pick_next``), the dispatch prompt
 (``_dev_prompt``), the (absent) bookkeeping sync (``_post_dev_state_sync``), the
-deferral-harvest source (``_harvest_spec_path``), artifact verification
+deferral-harvest source (``_harvest_spec_path``), the board-ownership clause the
+inherited review and plugin-workflow prompts inject (``_sprint_board_instruction``,
+empty here — there is no board), artifact verification
 (``_verify_dev_artifacts``), the session env
-(``_extra_session_env``), and the HITL checkpoints differ. Everything else —
+(``_extra_session_env``), and the HITL checkpoints differ. (That list is
+illustrative and has run stale before — read the class, not it.) Everything else —
 dev/verify/review/commit, crash resume, worktree isolation, gates — is inherited
 unchanged.
 
@@ -503,6 +506,18 @@ class StoriesEngine(Engine):
         # Drop the sprint-status gate (stories mode has no board); the id-keyed
         # story spec's own `done` frontmatter is authoritative.
         return verify.verify_review_stories(task, self.workspace.paths, self.policy)
+
+    def _sprint_board_instruction(self) -> str:
+        # Stories mode has no sprint-status.yaml: `_post_dev_state_sync` is a no-op
+        # here and `verify_review_stories` reads the id-keyed story spec alone. The
+        # base clause would tell a session that a file it never sees is
+        # orchestrator-owned — a false claim, not a harmless one. Dropped for the
+        # same reason `_operator_park_enabled` is False below. This also drops the
+        # inherited review prompt's `blocked` hand-back redirect, which gates itself
+        # on this clause, and the `## Sprint board` section `_run_session` appends to
+        # an injected plugin-workflow prompt: the board they speak about does not
+        # exist here, so both stay byte-identical to their pre-#437 text in this mode.
+        return ""
 
     def _operator_park_enabled(self) -> bool:
         # Stories mode has no sprint board, so the (awaiting-operator,

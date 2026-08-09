@@ -12,6 +12,7 @@ import contextlib
 import contextvars
 import functools
 import hashlib
+import re
 import shutil
 import signal
 import sys
@@ -165,6 +166,36 @@ class RunSummary:
         return "\n".join(lines)
 
 
+# Appended to an injected plugin-workflow session prompt AHEAD of the completion
+# contract below, whenever the run has a sprint board (`_sprint_board_instruction`
+# non-empty; StoriesEngine empties it and this section disappears with it). Same
+# words as the dev/review seams inject, so the three surfaces cannot drift apart —
+# `{clause}` is that method's return value verbatim, not a second copy of it.
+#
+# A workflow session is dispatched in exactly the window `_sprint_board_instruction`
+# describes: post_dev_phase and post_review_result run after `_post_dev_state_sync`
+# has advanced sprint-status.yaml, pre_commit_gate runs before `finalize_commit`
+# lands the story's single commit — so all three open on the same uncommitted,
+# unattributed board change that #437's review session reverted.
+#
+# Carries the prohibition ONLY. The `blocked` hand-back redirect stays review-only
+# for the reason its own docstring gives: it synthesizes a CRITICAL that halts the
+# whole run, which is the wrong trade for a session that is not the sign-off
+# authority. A workflow that genuinely cannot proceed already has a channel — the
+# completion contract's own `status: blocked` marker, which the orchestrator reads
+# as a non-completion and routes through the blocking/advisory decision instead.
+#
+# A section rather than a bare sentence because a workflow prompt is plugin-authored
+# markdown of unknown shape; a trailing sentence would read as a clause of whatever
+# it happens to land after. The heading names the owner, matching the clause's
+# opening words.
+WORKFLOW_BOARD_CONTRACT = """
+
+## Sprint board (orchestrator-owned)
+
+{clause}"""
+
+
 # Appended to every injected plugin-workflow session prompt. The dev/review
 # skills carry their own result conventions, but a workflow prompt is arbitrary
 # text from a plugin manifest — without an explicit protocol the session has to
@@ -203,6 +234,64 @@ def _session_task_id(story_key: str, part: str, seq: int) -> str:
     differs between the two orders. ``_resumable_session``'s resume match must
     be byte-identical to what ``_run_session`` stored, so both MUST call this."""
     return safe_segment(f"{story_key}-{part}-{seq}")
+
+
+# A story id in this repo is a dash/dot composite ("1.1", "3-2", "1-1-a"), so the
+# leading-label strip must start at a DIGIT and may then run on through letters.
+# Both looser and tighter patterns get this wrong in opposite directions: `\S+`
+# eats the real title in "Story Points: Add estimates", while `\d+\.\d+` stops
+# matching the dash composites this project actually issues.
+_STORY_LABEL_RE = re.compile(r"^story\s+\d[\w.\-]*:\s*", re.IGNORECASE)
+# C0 controls + DEL + unpaired surrogates. Not cosmetic: this title reaches
+# `git commit -m` as an argv element, and both classes are unspawnable there —
+# `subprocess.run` rejects an embedded NUL with a plain ValueError, and a lone
+# surrogate has no UTF-8 encoding, so encoding the argv raises UnicodeEncodeError.
+# Neither is in `_run_git`'s translated set (TimeoutExpired, UnicodeDecodeError,
+# OSError — and UnicodeEncodeError is a sibling of the decode class, not a
+# subclass), so either escapes as itself, hits `_finalize_commit_phase`'s
+# `except BaseException` re-raise, and crashes the run with the task already
+# persisted as COMMITTING — wedging every later resume on the same spec. YAML
+# reaches both without any exotic file bytes: `title: "\0"` and `title: "\uD800"`
+# are ordinary double-quoted scalars that PyYAML hands back verbatim. The rest of
+# the control class goes along because a newline or CR in a commit subject is
+# mangling, not a title. Translating these at the `_run_git` chokepoint instead
+# of here is the general fix, tracked as #506.
+_TITLE_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f\ud800-\udfff]+")
+# An ATX heading's optional closing hash run, which CommonMark requires to be
+# preceded by whitespace — so "# C#" keeps its trailing hash and "# Wire it ###"
+# does not.
+_ATX_CLOSING_RE = re.compile(r"[ \t]+#+[ \t]*$")
+
+
+def _story_label_stripped(value: object, story_key: str = "") -> str:
+    """A commit-ready story title from a frontmatter value or heading text:
+    coerced to str, control characters neutralized, label dropped, whitespace
+    collapsed. Returns "" for anything that leaves no title behind, which is
+    every caller's signal to fall back.
+
+    ``story_key`` is the task's own id, matched literally as a second way to
+    recognize the label. `StoriesEngine` inherits this renderer and `stories`
+    issues alphabetic ids ("auth", "oauth-setup") that the digit-led pattern
+    cannot see. It is an ADDITION to that pattern and not a replacement: a
+    sprint spec labels itself "Story 1.1:" while its key is "1-1-a", so keying
+    only off the task id would stop stripping the common case.
+
+    Coerces rather than type-checks because the value arrives from YAML, where
+    an unquoted title parses to whatever it looks like — ``title: 2026-01-01``
+    is a ``date``, ``title: 1.1`` a float — and a rendered date still beats
+    falling back to the bare story key. A ``None`` (blank ``title:``) coerces to
+    "" and falls back, matching how `status_of` treats a null status."""
+    if value is None or isinstance(value, bool):  # `title: yes` is a typo, not a title
+        return ""
+    text = _TITLE_CONTROL_RE.sub(" ", str(value)).strip()
+    stripped = _STORY_LABEL_RE.sub("", text)
+    if stripped == text and story_key:
+        # The id is escaped, so a key carrying regex metacharacters ("a.b") is
+        # matched literally rather than compiled into a wildcard.
+        stripped = re.sub(rf"^story\s+{re.escape(story_key)}\s*:\s*", "", text, flags=re.IGNORECASE)
+    # Collapse after the label strip, so a label split by control characters
+    # ("Story\x001.1:") is still recognized rather than surviving into the subject.
+    return " ".join(stripped.split())
 
 
 # Call-stack nesting depth for engine runs. A nested auto-sweep runs synchronously
@@ -3602,25 +3691,141 @@ class Engine:
         # findings in the spec frontmatter and `_harvest_spec_deferrals` files
         # them. An affirmative append instruction would therefore file each
         # finding twice. Keep this neutral for pre-#2640 skills, whose flat append
-        # may still be the only record.
+        # may still be the only record. `tests/test_engine.py` pins the ban as
+        # `"append" not in prompt.lower()` over the WHOLE assembled prompt, board
+        # clauses included — nothing injected below may spell that substring.
+        #
+        # Two separators live here, both plain spaces because every clause ends in
+        # a full stop and the dev seam's em dash would render a `. — `: the
+        # caller-owned one at the ledger↔board seam, and the join at the
+        # board↔redirect seam. The `if tail else ""` guard is live, not defensive —
+        # `StoriesEngine` inherits this method and empties both clauses.
+        clauses = [
+            c for c in (self._sprint_board_instruction(), self._board_handback_redirect()) if c
+        ]
+        tail = " ".join(clauses)
         return (
             f"/{self._dev_skill('review')} {task.spec_file} — do NOT modify, "
             f"re-open, or rewrite existing deferred-work ledger entries; the "
             f"orchestrator owns their status and resolution."
-        )
+        ) + (f" {tail}" if tail else "")
 
     def _render_commit_template(self, task: StoryTask) -> str | None:
-        """The configured commit message template with {story_key}/{run_id}
-        substituted, or None when no template is set. Used by both the story and
-        sweep-bundle commit paths so a filled-out template wins everywhere."""
+        """The configured commit message template with {story_key}/{run_id}/
+        {story_title} substituted, or None when no template is set. Used by both
+        the story and sweep-bundle commit paths so a filled-out template wins
+        everywhere."""
         template = self.policy.scm.commit_message_template.strip()
         if not template:
             return None
         # literal substitution (not str.format) so stray braces in the
-        # template — e.g. a JSON trailer — don't raise.
-        return template.replace("{story_key}", task.story_key).replace(
-            "{run_id}", self.state.run_id
+        # template — e.g. a JSON trailer — don't raise. The spec read behind
+        # {story_title} is skipped entirely for templates that don't ask for it.
+        title = self._story_title(task) if "{story_title}" in template else ""
+        # {story_title} substituted LAST: it is the only value here drawn from
+        # agent-written spec prose, so a title that itself contains "{run_id}"
+        # must land in the message as written instead of being re-substituted.
+        return (
+            template.replace("{story_key}", task.story_key)
+            .replace("{run_id}", self.state.run_id)
+            .replace("{story_title}", title)
         )
+
+    def _story_title(self, task: StoryTask) -> str:
+        """The story's human-readable title for {story_title}: the spec's
+        ``title:`` frontmatter, falling back to a first **ATX** H1, then to the
+        story key. Any leading ``Story <id>:`` label is dropped either way (the
+        template already carries the key, so the label would just repeat it).
+
+        Frontmatter first because that is where a bmad-loop spec's title
+        actually lives — `spec-template.md` opens with ``title:`` and writes no
+        H1 at all. Keying on the heading alone left the placeholder inert on
+        every canonical spec, silently rendering the story key in place of a
+        title. The H1 branch stays for specs authored outside that template.
+
+        ATX only, deliberately: the setext form (a line underlined by ``===``)
+        is a valid CommonMark H1, but recognizing it would make *any* prose line
+        sitting above a ``===`` divider the commit subject. That trades this
+        method's one safe failure mode — falling back to the story key — for a
+        confidently wrong title, so the narrower contract is the right one and
+        this docstring is the place it is stated.
+
+        Falls back to the story key when there is no spec, no title, or the spec
+        is unreadable — the placeholder must never render empty, and a
+        commit-time read failure must not fail the commit."""
+        if not task.spec_file:
+            return task.story_key
+        spec = Path(task.spec_file)
+        try:
+            # `read_frontmatter` already degrades a missing, undecodable or
+            # malformed-YAML spec to {}; the guard below is for the reads that
+            # still raise past it (EACCES here, a torn multi-byte spec in the
+            # H1 fallback's own read_text).
+            title = _story_label_stripped(
+                verify.read_frontmatter(spec).get("title"), task.story_key
+            )
+            if title:
+                return title
+            lines = spec.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            # UnicodeDecodeError is a ValueError, not an OSError, so a spec torn
+            # mid-write through a multi-byte sequence would slip past an
+            # except-OSError guard. This render happens before
+            # _finalize_commit_phase's try, so an escape crashes the run rather
+            # than escalating the story.
+            return task.story_key
+        # Skip a leading YAML frontmatter block (standalone --- delimiter lines,
+        # same rule as frontmatter._split_frontmatter) so a YAML comment inside
+        # it can't be mistaken for the H1.
+        start = 0
+        if lines and lines[0].rstrip() == "---":
+            for i in range(1, len(lines)):
+                if lines[i].rstrip() == "---":
+                    start = i + 1
+                    break
+        # Fenced blocks are skipped, because `#` opens a comment in most of the
+        # languages a spec quotes: a setup snippet whose first line is
+        # "# Install the dependencies" is not this story's heading, and taking it
+        # would render a confidently wrong commit subject rather than falling
+        # back. An unclosed fence deliberately swallows the rest of the file
+        # (CommonMark says it runs to EOF) — resetting at EOF to "rescue" a
+        # heading would resurrect exactly the bug this skip exists to prevent.
+        fence_char, fence_len = "", 0
+        for line in lines[start:]:
+            # CommonMark allows up to three spaces of indentation before an ATX
+            # heading; a fourth makes the line an indented code block, so that is
+            # the bound rather than a plain lstrip. Getting this wrong only ever
+            # costs a silent fall back to the story key, which is the same way
+            # the placeholder was inert on every canonical spec before it read
+            # `title:` — so the extraction stays as permissive as the syntax is.
+            head = line.lstrip(" ")
+            # A fence opens on 3+ backticks or tildes and closes only on a run of
+            # the SAME character, at least as long, with nothing but whitespace
+            # after it — so a ``` inside a ```` block does not close it early.
+            run = 0
+            if len(line) - len(head) <= 3 and head[:1] in ("`", "~"):
+                run = len(head) - len(head.lstrip(head[0]))
+            if fence_char:
+                if head[:1] == fence_char and run >= fence_len and not head[run:].strip():
+                    fence_char, fence_len = "", 0
+                continue
+            if run >= 3:
+                fence_char, fence_len = head[0], run
+                continue
+            # The opener is `#` followed by a space OR A TAB — `#Title` is not a
+            # heading at all, and `## Title` is an H2, so both stay rejected.
+            if len(line) - len(head) <= 3 and head[:1] == "#" and head[1:2] in (" ", "\t"):
+                # An ATX heading may carry an optional closing run of hashes,
+                # which is syntax rather than title ("# Wire it ###" is "Wire
+                # it"). Unlike the two misses above this one renders a *wrong*
+                # subject rather than falling back, so it is the one worth
+                # stripping. Whitespace before the run is what makes it a
+                # closing sequence; "# C#" keeps its hash.
+                title = _story_label_stripped(_ATX_CLOSING_RE.sub("", head[2:]), task.story_key)
+                if title:
+                    return title
+                break
+        return task.story_key
 
     def _commit_message(self, task: StoryTask) -> str:
         # The park suffix is appended to a rendered template too. The template
@@ -3741,13 +3946,28 @@ class Engine:
                 )
                 return SessionResult(status="vetoed")
         if label is not None:
-            # Injected workflow session: spell out the completion-marker protocol
-            # and bound its stall nudges (see WORKFLOW_COMPLETION_CONTRACT).
-            # Appended after the session-gate hooks so a pre_workflow_session /
-            # pre_session prompt rewrite cannot strip it. The marker path lands in
-            # the same implementation-artifacts dir the dev adapter already
-            # searches — correct in place and under worktree isolation alike,
-            # because spec.cwd is self.workspace.root either way.
+            # Injected workflow session: name the sprint board's owner, then spell
+            # out the completion-marker protocol and bound its stall nudges (see
+            # WORKFLOW_BOARD_CONTRACT / WORKFLOW_COMPLETION_CONTRACT).
+            #
+            # Both are appended after the session-gate hooks so a
+            # pre_workflow_session / pre_session prompt rewrite cannot strip them —
+            # the property the dev/review seams do NOT have, because there the
+            # orchestrator authors the whole prompt and the plugin body is the
+            # rewrite. Here the prompt IS plugin text, so post-gate is the only
+            # place the orchestrator can say anything at all.
+            #
+            # Board first, completion contract LAST: the marker protocol is the
+            # load-bearing tail (a session that ends its turn without the marker
+            # livelocks the orchestrator until session_timeout_min), and nothing may
+            # come between its "end your turn" imperative and the end of the prompt.
+            board_clause = self._sprint_board_instruction()
+            if board_clause:
+                prompt += WORKFLOW_BOARD_CONTRACT.format(clause=board_clause)
+
+            # The marker path lands in the same implementation-artifacts dir the
+            # dev adapter already searches — correct in place and under worktree
+            # isolation alike, because spec.cwd is self.workspace.root either way.
             # This is the PRODUCER of the marker name. ``role``, not the default:
             # a workflow declares its own role (WORKFLOW_ROLES = dev | review) and
             # runs on THAT adapter, whose skill tree can be a different one at a
@@ -4077,6 +4297,23 @@ class Engine:
         check, which would otherwise HALT `blocked` on the very diff
         `_restore_patch` just laid onto the tree. A bare story key takes the
         freeform/epic path instead, where that dirty-tree check runs first."""
+        # Both injected clauses ride every leg, in this order — the park clause
+        # stays LAST because its docstring's backtick argument depends on nothing
+        # following it. Both are bare sentences, so this seam owns every separator:
+        # an em dash after the bare story key (the one leg whose text carries no
+        # terminal punctuation), a plain space after a sentence. A full stop
+        # followed by an em dash is punctuation noise and must never be assembled.
+        #
+        # `if tail else ""` is unreachable on the one class that reaches here
+        # (`Engine`, whose prohibition is unconditional; both subclasses override
+        # `_dev_prompt`), unlike the live guard on the review seam. Kept for
+        # symmetry and pinned with a monkeypatch.
+        clauses = [
+            c for c in (self._sprint_board_instruction(), self._operator_park_instruction()) if c
+        ]
+        tail = " ".join(clauses)
+        after_sentence = f" {tail}" if tail else ""
+        after_key = f" — {tail}" if tail else ""
         if feedback is None:
             if task.restore_patch and task.spec_file:
                 return (
@@ -4084,8 +4321,8 @@ class Engine:
                     f"`{task.spec_file}`. The attempted change was restored onto "
                     f"the working tree after an intent-gap resolution; review it "
                     f"against the amended spec."
-                ) + self._operator_park_instruction()
-            return f"/{self._dev_skill()} {task.story_key}" + self._operator_park_instruction()
+                ) + after_sentence
+            return f"/{self._dev_skill()} {task.story_key}" + after_key
         self._reset_spec_for_repair(task)
         spec_ref = task.spec_file or task.story_key
         return (
@@ -4094,7 +4331,122 @@ class Engine:
             f"verification; repair the working tree so verification passes without "
             f"changing the spec's frozen intent contract. Verification evidence is "
             f"in `{feedback}`."
-        ) + self._operator_park_instruction()
+        ) + after_sentence
+
+    def _sprint_board_instruction(self) -> str:
+        """The board-ownership PROHIBITION — never write the board, never revert it
+        — injected into `_review_prompt` and `_generic_dev_prompt`, the two prompt
+        seams `Engine` itself builds, the way the deferred-work sentence beside it
+        is. It says nothing about what a session should do *instead*; that half is
+        `_board_handback_redirect`, and it rides the review prompt only.
+
+        Injection surface, exactly: story dev sessions (`_generic_dev_prompt`), the
+        review sessions of sprint and sweep runs (both inherit `_review_prompt`),
+        and every injected plugin-workflow session (`_run_session` wraps this in
+        `WORKFLOW_BOARD_CONTRACT` post-gate — those run in the same window, at
+        `post_dev_phase` / `post_review_result` / `pre_commit_gate`). `SweepEngine`
+        and `StoriesEngine` override `_dev_prompt`, so no bundle or stories dev
+        prompt reaches this; `StoriesEngine` overrides this method to "" as well,
+        which drops it — the redirect gated on it, and the workflow section — from
+        that mode's prompts too. Only the interactive resolve agent gets nothing
+        from this seam, which costs nothing: `bmad-loop-resolve`'s own skill already
+        forbids touching the board outright.
+
+        The three injection points deliberately share ONE wording, so a reviewer, a
+        dev session and a plugin workflow cannot be told three different things
+        about who owns the board.
+
+        They do NOT share unstrippability, and that asymmetry was weighed rather
+        than overlooked. The workflow section is post-gate because it has to be —
+        the prompt there is plugin text end to end, so there is no pre-gate string
+        to inject into. The dev/review injections stay pre-gate: moving only this
+        clause post-gate would assemble the review prompt in two files while the
+        deferred-work sentence it was written to sit beside stayed strippable, and
+        a plugin that rewrites `proposed_prompt` wholesale already discards the spec
+        path, the ledger sentence and the #261 `expected_spec` pin with it — the
+        codebase's existing reading is that such a rewrite means the plugin owns
+        that session. If unstrippability is ever wanted here, move the whole
+        orchestrator-authored appendix as one unit, not this sentence alone.
+
+        `_post_dev_state_sync` advances sprint-status.yaml right after the dev
+        session — to `done`, or to `awaiting-operator` on a park; those two values
+        are exhaustive there — but the story's single commit lands only after the
+        review loop, so every session dispatched in that window opens on an
+        uncommitted, unattributed board change with nothing in the repo naming its
+        author. A review session read the orchestrator's own write as a violation
+        of its spec's Boundaries section, reverted it, and the #334 contradiction
+        gate correctly escalated a story both sessions agreed was finished (#437).
+
+        The row is called BOOKKEEPING and explicitly NOT proof of verification,
+        because it is not: `_post_dev_state_sync` writes the board before
+        `_verify_dev_artifacts` runs, and a repair session is dispatched precisely
+        when that verification failed — it opens on a red tree under a `done` row.
+
+        This reverses the "#334: review prompts are unchanged by design" rationale,
+        which assumed forbidding the revert would let an unfinished story commit.
+        #334's own code refutes it: `verify.verify_review` gates the SPEC
+        frontmatter first and returns `retry` there, before it ever reads the
+        board. A reviewer withholding sign-off through the spec already blocks the
+        commit; the board revert was never the load-bearing channel.
+
+        Returned as a bare sentence with NO leading separator, because the call
+        sites need different ones. Deliberately backtick-free, for the reason
+        `_operator_park_instruction` documents, and injected BEFORE that clause so
+        the park contract stays the last thing a dev prompt says. Phrased as a
+        prohibition rather than a goal so the skill's intent-alignment auditor
+        cannot raise it as an `intent_gap`."""
+        return (
+            "sprint-status.yaml is owned by the orchestrator: never write it, and "
+            "never revert a change to it. A row at done or awaiting-operator is the "
+            "orchestrator's own bookkeeping — not a defect to fix, and not proof "
+            "that the work is verified."
+        )
+
+    def _board_handback_redirect(self) -> str:
+        """Where a review session that disagrees with the board should go instead.
+        Rides `_review_prompt` only, and only while the prohibition it follows is
+        non-empty — the gate lives HERE rather than in the caller so the invariant
+        is local and directly assertable (`StoriesEngine()._board_handback_redirect()
+        == ""`), and `_review_prompt` stays structurally identical to the dev seam.
+
+        `blocked` is named deliberately: it is the only spec status that both
+        withholds the commit and reaches a human (`devcontract` synthesizes a
+        CRITICAL from it and `decide_review_session` pauses). Any other non-terminal
+        status merely retries until the cycle budget exhausts and `_defer` rolls the
+        work back to baseline — honest dissent discarded in silence. "say why" is
+        load-bearing: the `## Auto Run Result` detail becomes the escalation text a
+        human reads.
+
+        The trigger is deliberately NARROW — "cannot be finished without a human
+        decision", not "looks unfinished". A review pass is itself a dev-primitive
+        run whose job is to fix what it finds or defer it; a broad trigger would
+        hand it a run-halting early exit on cycle 1 of 3.
+
+        Review-only for the same reason it exists: that CRITICAL halts the whole
+        run, which is the right trade for a review session and the wrong one for a
+        dev session, where it would flatly contradict `_operator_park_instruction`'s
+        "Never use the blocked status for this" a sentence later in the same prompt.
+
+        The vocabulary overlap with the park clause ("a human decision" vs "actions
+        only a HUMAN can perform outside the repo") was checked and is unreachable,
+        not merely unlikely: the two never co-occur because each rides a different
+        builder, and more strongly a parked story is never dispatched a review
+        session at all — `_review_and_commit` early-returns on `_park_awaiting_operator`.
+        The only residual is a story the dev pass should have parked and finalized
+        `done` instead, and there this opens no new path (`blocked` is the skill's
+        native escape) and displaces nothing better (park is dev-only, so a review
+        session cannot park either way). Pause-and-reach-a-human beats a false-green
+        `done`.
+
+        Bare sentence, no leading separator, backtick-free — same contract as the
+        clause it follows."""
+        if not self._sprint_board_instruction():
+            return ""
+        return (
+            "If the story cannot be finished without a human decision, finalize the "
+            "spec to status: blocked and say why. That is the hand-back channel; "
+            "the board is not."
+        )
 
     def _operator_park_instruction(self) -> str:
         """The park contract, injected into every dev prompt while
@@ -4115,11 +4467,15 @@ class Engine:
         Deliberately backtick-free. It is appended AFTER the repair prompt's
         feedback-file pointer, and the last backtick-wrapped token in a dev prompt
         is by convention that path — a backticked word here would quietly become
-        the "feedback file" to anything reading the prompt back."""
+        the "feedback file" to anything reading the prompt back.
+
+        Returned as a bare sentence with NO leading separator. The board clause now
+        always precedes it and ends in a full stop, where the em dash this used to
+        carry would render a `. — `; its sole caller owns every separator."""
         if not self._operator_park_enabled():
             return ""
         return (
-            " — If this story's acceptance criteria include actions only a HUMAN "
+            "If this story's acceptance criteria include actions only a HUMAN "
             "can perform outside the repo (buy a domain, publish a DNS record, "
             "grant an API key, click through a vendor console): complete every "
             "part an agent CAN do, commit it, then finalize the spec frontmatter "

@@ -93,6 +93,14 @@ whose seams had diverged enough that several ports needed a different fix, and t
   `bmad-loop` console script via a thin `__main__.py`. Characterization tests pin the current CLI
   exit codes (typed errors and the broad backstop → 1, argparse usage → 2).
 
+- **`{story_title}` in `scm.commit_message_template` (#475).** The placeholder renders the spec's
+  `title:` frontmatter, minus any leading `Story <id>:` label, so a template can carry a readable
+  subject. Specs authored without that field fall back to a first `#` heading, then to the story
+  key — as does a spec that is missing, unreadable or not valid UTF-8, so the placeholder never
+  renders empty and a commit-time read failure never fails the commit. The rendered title is
+  whitespace-collapsed, and characters `git commit -m` cannot take in an argv (control characters,
+  unpaired surrogates) are dropped. Templates that do not name the placeholder skip the read.
+
 ### Changed
 
 - **Every spec-frontmatter status read goes through `status_of` (#358 follow-up).** Five inline
@@ -166,11 +174,71 @@ whose seams had diverged enough that several ports needed a different fix, and t
   and no warning, and is covered by the selection line instead. Nothing changes which backend is
   selected — psmux is correct for a `win32` interpreter — nor validate's exit code. `diagnose` gains
   `sys.platform` and `win32 on WSL distro path` (`yes`/`no`) in its Environment block.
+
 - **A multiplexer-detection failure is reported instead of swallowed.** `validate` caught and
   discarded any exception from backend detection, so `mux.selection` and the backend inventory
   vanished with nothing said — while `mux.backend` above them, which comes from an independent
   selection call, still printed a healthy backend. It now reports under `mux.backends-detected` at
   **warning** carrying the error.
+
+- **Provider quota refusals are environment faults on `opencode-http` too (#323).** #194's classifier
+  lived on `GenericAdapter`, so its hookless HTTP sibling silently omitted it: a five-hour provider
+  usage limit read as three stalled stories and burned their retry budgets. The classifier now lives
+  in a shared `EnvFaultMixin` both adapters mix in, and the `opencode` profile seeds quota/rate-limit
+  and connection patterns anchored on the server's `error.error="AI_APICallError: …"` field. That
+  scan reads `logs/<task-id>.server.out`, the `opencode serve` process's own stdout — not the curated
+  `[bmad]` transcript, which carries the model's own words. Which file each adapter scans is named by
+  `ENV_FAULT_LOG_SUFFIX` and is part of the patterns' safety contract: a pattern is only sound
+  against a log the model cannot write to.
+
+- **A re-armed escalation no longer overwrites the previous attempt's dirty snapshot (#349).**
+  `refs/attempt-preserve-dirty/*` names were keyed on `task.attempt`, which `rearm_escalation`
+  resets to 0, so a post-resolve re-drive rolling back against the same baseline recomputed the
+  earlier rollback's refname and destroyed the only copy of that attempt's work. Probe for a free
+  name instead of trusting the counter, suffixing `-r2`, `-r3`, … The scan is bounded; exhausting
+  it refuses (`attempt-worktree-preserve-failed`, then the usual pause) rather than reusing an
+  occupied name. Prune the namespace or lower `scm.preserve_keep` if it ever fires.
+
+- **The auto-sweep child refuses config a session rewrote under the run (#461).** `policy.toml` and
+  `profiles/*.toml` sit in the agent-writable workspace and reach host code execution — the
+  `[verify] commands` run with `shell=True`, the resolved profile plus `adapter.extra_args` decide
+  the launch argv and env, `hooks.dialect` decides which argv builder runs at all, and
+  `[plugins] enabled` gates in-process Python import. A run freezes its
+  policy at launch, but the auto-triggered child sweep re-reads both from disk; it is now pinned to
+  a launch-time digest of those fields and refuses on a mismatch (`sweep-auto-failed` + notify, the
+  parent run continues). The config is read once and frozen, so the gate hashes the same bytes the
+  child launches from rather than a second read a background writer can swap in between.
+  `resume` re-baselines and warns with the changed categories instead of
+  refusing. The digest is field-scoped, so live-editing `[limits]` mid-run still works. Plugins are
+  pinned by allowlist name only: swapping the module behind an already-enabled plugin, and
+  folder-dropping a declarative plugin whose shell hooks need no allowlist entry, are both still
+  uncaught (#496, #497).
+
+- **The hook relay refuses a redirected `events/` dir, and `validate` stats the relay (#461).** The
+  relay's event write followed a symlink — or, on Windows, a directory junction, which
+  `os.path.islink` reports False for and which `mklink /J` creates without elevation — so a driven
+  session could redirect the orchestrator's control-plane event stream and stall the run to
+  `session_timeout_min`. The write now refuses a redirected events dir before creating it, anchors
+  the create+replace to an `O_NOFOLLOW` dir_fd where the platform supports it, creates `O_EXCL` at
+  `0o600`, writes the payload in full (a short `os.write` would publish truncated JSON, which
+  `SignalWatcher` drops permanently), and degrades to a no-op on `OSError` rather than failing the
+  session. Separately, `hooks.registered` was a substring match on the hook config that never
+  touched the script it points at, so a deleted `.bmad-loop/` (branch switch) read green while every
+  hook event no-opped; a new `hooks.relay-present` finding stats the relay and says
+  `run bmad-loop init`.
+
+- **Dispatched sessions are told the sprint board is orchestrator-owned (#437).** The board advances
+  at dev-verify time but the story commits only after the review loop, so a session dispatched in
+  between opens on an uncommitted, unattributed `sprint-status.yaml` change — one review reverted it
+  as a spec violation and #334 escalated a finished story. Story dev prompts, the review prompts of
+  sprint and sweep runs, and every injected plugin-workflow session (`post_dev_phase`,
+  `post_review_result`, `pre_commit_gate` — all dispatched inside that same window) now carry the
+  prohibition: never write the board, never revert it, and a row at `done` or `awaiting-operator` is
+  bookkeeping — not a defect to fix, and not proof the work is verified. The workflow copy is
+  appended after the session-gate hooks, so a plugin prompt rewrite cannot strip it. Review prompts
+  alone add the way out (`status: blocked`, for a story that cannot be finished without a human
+  decision); dev and workflow prompts get none, since `blocked` halts the run. Stories mode carries
+  none of it.
 
 - **A seed path naming the project root is refused at load, in every source that feeds it (#456).**
   A root-naming entry made `provision_worktree`'s seed loop resolve source to the repo root and
