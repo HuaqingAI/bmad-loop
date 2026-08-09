@@ -21,6 +21,7 @@ from pathlib import Path
 from .. import runs
 from ..adapters.multiplexer import MultiplexerError, get_multiplexer, mux_usable
 from ..journal import Journal
+from ..platform_util import retrying_unlink
 
 CTL_SESSION = "bmad-loop-ctl"
 
@@ -43,7 +44,74 @@ def session_exists(session: str) -> bool:
     return get_multiplexer().has_session(session)
 
 
-def ctl_window_id(run_id: str) -> str | None:
+# Run-dir sidecar naming the ctl-session window start_detached minted last for
+# this run. `<kind>-<run_id>` is not unique across the four kinds, so the window
+# listing alone cannot tell a live resume window from the parked run window it
+# superseded — this file names the one we actually created. A hint, never a
+# target on its own: ctl_window_id re-proves it against the live listing.
+_CTL_WINDOW_FILE = "ctl-window"
+
+
+def _read_ctl_window(project: Path, run_id: str) -> str | None:
+    """The window id recorded by the run's last launch, or None when there is
+    none / it cannot be read. Never raises, and that includes decoding: a torn
+    or hand-edited record raises UnicodeDecodeError, a ValueError rather than an
+    OSError, and it would escape into action_attach and _stop_run_worker, whose
+    excepts do not cover it. An unreadable hint is not an error — it just leaves
+    the caller with the name scan.
+
+    The file is the only channel on purpose: `bmad-loop attach` resolves the same
+    run from its own process, and one resolve feeding every consumer is the
+    property ctl_window_id sells. A per-process memo of what this process last
+    minted would answer a different window than the CLI does."""
+    try:
+        text = (runs.run_dir_for(project, run_id) / _CTL_WINDOW_FILE).read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None
+    return text.strip() or None
+
+
+def _forget_ctl_window(project: Path, run_id: str) -> None:
+    """Drop the record. A launch that cannot name the window it just minted must
+    not leave the *previous* launch's id authoritative — that id now names a
+    superseded window, and the honest answer is no record at all, which puts the
+    lookup back on the name scan.
+
+    Ceiling: when the removal itself fails too, the superseded id survives on
+    disk. It still has to pass ctl_window_id's re-prove, so the worst it can
+    answer is a live window carrying this run's name — the pre-fix by-name
+    result, never a wilder target."""
+    try:
+        retrying_unlink(runs.run_dir_for(project, run_id) / _CTL_WINDOW_FILE)
+    except OSError:
+        pass  # nothing recorded, or a removal we cannot force — see the ceiling
+
+
+def _record_ctl_window(project: Path, run_id: str, win_id: str) -> None:
+    """Record the window a launch just minted, so ctl_window_id can prefer it
+    over an older window sharing the run id.
+
+    Best-effort on purpose. The window is already running by the time this
+    writes, so a failed write must not fail the launch — the lookup degrades to
+    the name scan, i.e. to the behaviour before this record existed. A failure
+    forgets the previous record rather than leaving it: degrading to the scan is
+    the intended fallback, answering a superseded window is not.
+
+    Skipped when there is no run yet: a fresh `run`/`sweep` mints the only
+    window carrying its run id (nothing to disambiguate), the run dir is created
+    by the detached child, and a record must not conjure a directory that
+    runs.is_run then reports as not a run.
+    """
+    run_dir = runs.run_dir_for(project, run_id)
+    if not runs.is_run(run_dir):
+        return
+    try:
+        (run_dir / _CTL_WINDOW_FILE).write_text(win_id, encoding="utf-8")
+    except OSError:
+        _forget_ctl_window(project, run_id)
+
+
+def ctl_window_id(project: Path, run_id: str) -> str | None:
     """Stable window id (bare `@N` on tmux, session-qualified on psmux) of the
     control-session window hosting this run's orchestrator process
     (start_detached names windows <kind>-<run_id>), or None when the run was
@@ -52,20 +120,36 @@ def ctl_window_id(run_id: str) -> str | None:
     An id, not a name, because every consumer replays the value as a
     select/kill/option target: one resolve feeds all of them, so a rename or a
     window minted between two verbs cannot send them to different windows, and
-    the value survives tmux's automatic-rename. It does NOT disambiguate the
-    run_id — `<kind>-<run_id>` is not unique (a resume launched over a still-
-    parked run window shares it), and this scan takes the first match, the
-    same window a by-name lookup returned."""
+    the value survives tmux's automatic-rename.
+
+    `<kind>-<run_id>` is not unique — a resume launched over a still-parked run
+    window shares the run id, and nothing reaps the parked one in between — so
+    the name scan alone answers whichever match the listing emits first (tmux
+    orders by window *index*, and it gives a new window the lowest free index,
+    so a superseded window usually but not always sorts ahead of the live one).
+    The id the run's last launch minted is recorded in the run dir and wins
+    whenever the listing still shows it under this run id. A record that is gone
+    (killed, pruned) or now carries another run's name is ignored rather than
+    replayed: a target that no longer resolves is the dangerous kind of stale,
+    because an unresolvable `-t` lands on the *active* window. With no record at
+    all the answer is the first match, exactly as before."""
     if not mux_available():
         return None
+    matches: list[str] = []
     for win_id, name in get_multiplexer().list_windows(CTL_SESSION, ["window_id", "window_name"]):
         # win_id can be "": psmux's qualifier passes a falsy id through. An
         # empty id must never become a target — an empty `-t` resolves against
         # the *current* window. (The base's short-row padding cannot produce it
         # here: it fills TRAILING fields, and window_id is field 0 of 2.)
         if win_id and name.endswith(f"-{run_id}"):
-            return win_id
-    return None
+            matches.append(win_id)
+    if not matches:
+        return None
+    # Membership in `matches`, not mere presence in the listing: it re-proves the
+    # name too, so a backend that reuses a freed window id cannot hand back a
+    # different run's window.
+    recorded = _read_ctl_window(project, run_id)
+    return recorded if recorded in matches else matches[0]
 
 
 def ctl_target() -> str:
@@ -230,7 +314,7 @@ def attach_plan(project: Path, run_id: str) -> tuple[list[str], str | None] | No
     live agent session. Returns (tmux argv, return_window) or None when there is
     nothing to attach to."""
     session = runs.session_name(run_id)
-    win_id = ctl_window_id(run_id)
+    win_id = ctl_window_id(project, run_id)
     agent_live = session_exists(session)
     if win_id is not None and (
         decision_pending(runs.run_dir_for(project, run_id)) or not agent_live
@@ -242,10 +326,10 @@ def attach_plan(project: Path, run_id: str) -> tuple[list[str], str | None] | No
     return None
 
 
-def kill_ctl_window(run_id: str) -> None:
+def kill_ctl_window(project: Path, run_id: str) -> None:
     """Kill the control-session window hosting this run's orchestrator process,
     if any. A no-op when the run was not launched from the TUI or tmux is gone."""
-    win_id = ctl_window_id(run_id)
+    win_id = ctl_window_id(project, run_id)
     if win_id is not None:
         get_multiplexer().kill_window(win_id)
 
@@ -341,7 +425,9 @@ def start_detached(project: Path, argv_tail: list[str], run_id: str, kind: str) 
 
     Returns the new window's stable backend id (bare `@N` on tmux,
     session-qualified on psmux) so callers can target it unambiguously (window
-    names collide when several kinds share a run_id).
+    names collide when several kinds share a run_id). The same id is recorded in
+    the run dir so ctl_window_id answers this window rather than an older one
+    under the same run id — see _record_ctl_window.
     """
     mux = get_multiplexer()
     if not mux_usable(mux):
@@ -364,9 +450,18 @@ def start_detached(project: Path, argv_tail: list[str], run_id: str, kind: str) 
     except MultiplexerError as e:
         raise LaunchError(f"multiplexer new-window failed: {e}") from e
     if win_id:
+        # Record before tagging: set_window_option sits outside the try above and
+        # can still raise, and a window minted but unrecorded puts the lookup back
+        # on the ambiguous scan — while an *untagged* window already has a
+        # documented fallback in _ctl_window_candidates.
+        _record_ctl_window(project, run_id, win_id)
         # Tag the window with its project so a cleanup in another project never
         # closes it (the ctl session is shared across projects).
         mux.set_window_option(win_id, runs.PROJECT_OPTION, runs.project_tag(project))
+    else:
+        # No id to record: the backend did not capture one. Whatever the previous
+        # launch recorded now names a superseded window, so drop it.
+        _forget_ctl_window(project, run_id)
     return win_id
 
 

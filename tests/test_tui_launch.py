@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from bmad_loop import runs
 from bmad_loop.adapters import tmux_base
 from bmad_loop.adapters.multiplexer import get_multiplexer
 from bmad_loop.tui import launch
@@ -256,58 +257,135 @@ def test_session_exists(monkeypatch):
     assert fake.calls[0] == ["tmux", "has-session", "-t", "=bmad-loop-x"]
 
 
-def test_ctl_window_id_matches_run_id_suffix(monkeypatch):
-    # The id, not the name: consumers replay the value as select/kill/option
-    # targets, where a by-name resolve can land on a duplicate.
-    def fake(argv, **kwargs):
-        out = "@1\trun-AAAA\n@2\tsweep-RID\n@3\tresume-BBBB\n" if argv[1] == "list-windows" else ""
-        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
-
-    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
-    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
-    assert launch.ctl_window_id("RID") == "@2"
-    assert launch.ctl_window_id("CCCC") is None
-
-
-def test_ctl_window_id_skips_empty_id_rows(monkeypatch):
-    # An empty id must never be returned as a target — an empty `-t` resolves
-    # against the current window. psmux's qualifier passes a falsy id through.
-    def fake(argv, **kwargs):
-        out = "\tsweep-RID\n@7\tsweep-RID\n" if argv[1] == "list-windows" else ""
-        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
-
-    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
-    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
-    assert launch.ctl_window_id("RID") == "@7"
-
-
-def test_kill_ctl_window_kills_by_resolved_id_not_a_name_token(monkeypatch):
-    # The kill replays the id this listing resolved, never a `=session:name`
-    # token the backend would resolve again. Which of two same-named windows
-    # the scan picks is unchanged (first match, `@7`); what the id buys is that
-    # a rename or a new window between two verbs cannot re-point the second.
+def _ctl_listing(monkeypatch, rows: str) -> list[list[str]]:
+    """Script the ctl-session window listing; returns the recorded argv."""
     calls: list[list[str]] = []
 
     def fake(argv, **kwargs):
         calls.append(list(argv))
-        out = "@2\trun-x\n@7\tsweep-RID\n@9\tsweep-RID\n" if argv[1] == "list-windows" else ""
+        out = rows if argv[1] == "list-windows" else ""
         return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
-    launch.kill_ctl_window("RID")
+    return calls
+
+
+def _write_record(project: Path, run_id: str, win_id: str) -> Path:
+    """Stand in for a launch having minted `win_id` for this run."""
+    run_dir = runs.run_dir_for(project, run_id)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    record = run_dir / launch._CTL_WINDOW_FILE
+    record.write_text(win_id, encoding="utf-8")
+    return record
+
+
+def test_ctl_window_id_matches_run_id_suffix(monkeypatch, tmp_path: Path):
+    # The id, not the name: consumers replay the value as select/kill/option
+    # targets, where a by-name resolve can land on a duplicate. With no record
+    # of what the run's last launch minted, the answer is the first match.
+    _ctl_listing(monkeypatch, "@1\trun-AAAA\n@2\tsweep-RID\n@3\tresume-BBBB\n")
+    assert launch.ctl_window_id(tmp_path, "RID") == "@2"
+    assert launch.ctl_window_id(tmp_path, "CCCC") is None
+
+
+def test_ctl_window_id_prefers_the_window_the_last_launch_minted(monkeypatch, tmp_path: Path):
+    # #482: `e` over a parked run leaves `run-RID` in front of the live
+    # `resume-RID`, and the scan alone answers the parked corpse. The recorded
+    # id names the window we actually created.
+    _ctl_listing(monkeypatch, "@1\trun-RID\n@2\tresume-RID\n")
+    _write_record(tmp_path, "RID", "@2")
+    assert launch.ctl_window_id(tmp_path, "RID") == "@2"
+
+
+def test_ctl_window_id_ignores_a_record_the_listing_no_longer_shows(monkeypatch, tmp_path: Path):
+    # The recorded window was killed (`x`) or pruned. Replaying a target that no
+    # longer resolves is the dangerous kind of stale — an unresolvable `-t`
+    # lands on the *active* window — so fall back to a window that exists.
+    _ctl_listing(monkeypatch, "@1\trun-RID\n")
+    _write_record(tmp_path, "RID", "@2")
+    assert launch.ctl_window_id(tmp_path, "RID") == "@1"
+
+
+def test_ctl_window_id_ignores_a_record_that_now_names_another_run(monkeypatch, tmp_path: Path):
+    # A backend that reuses a freed window id must not let a stale record hand
+    # back a foreign run's window: the record is re-proved against the name too.
+    _ctl_listing(monkeypatch, "@2\trun-OTHER\n@5\tresume-RID\n")
+    _write_record(tmp_path, "RID", "@2")
+    assert launch.ctl_window_id(tmp_path, "RID") == "@5"
+
+
+def test_ctl_window_id_none_when_no_window_carries_the_run_id(monkeypatch, tmp_path: Path):
+    # A record can never resurrect a run whose windows are all gone.
+    _ctl_listing(monkeypatch, "@1\trun-OTHER\n@3\tshell\n")
+    _write_record(tmp_path, "RID", "@1")
+    assert launch.ctl_window_id(tmp_path, "RID") is None
+
+
+def test_ctl_window_id_unreadable_record_falls_back(monkeypatch, tmp_path: Path):
+    # An unreadable hint is not an error — it just leaves the name scan.
+    _ctl_listing(monkeypatch, "@1\trun-RID\n@2\tresume-RID\n")
+    run_dir = runs.run_dir_for(tmp_path, "RID")
+    (run_dir / launch._CTL_WINDOW_FILE).mkdir(parents=True)  # a dir, not a file
+    assert launch.ctl_window_id(tmp_path, "RID") == "@1"
+
+
+def test_ctl_window_id_invalid_utf8_record_falls_back(monkeypatch, tmp_path: Path):
+    _ctl_listing(monkeypatch, "@1\trun-RID\n@2\tresume-RID\n")
+    record = _write_record(tmp_path, "RID", "@2")
+    record.write_bytes(b"\xff")
+    assert launch.ctl_window_id(tmp_path, "RID") == "@1"
+
+
+def test_ctl_window_id_skips_empty_id_rows(monkeypatch, tmp_path: Path):
+    # An empty id must never be returned as a target — an empty `-t` resolves
+    # against the current window. psmux's qualifier passes a falsy id through.
+    _ctl_listing(monkeypatch, "\tsweep-RID\n@7\tsweep-RID\n")
+    assert launch.ctl_window_id(tmp_path, "RID") == "@7"
+
+
+def test_kill_ctl_window_kills_by_resolved_id_not_a_name_token(monkeypatch, tmp_path: Path):
+    # The kill replays the id this listing resolved, never a `=session:name`
+    # token the backend would resolve again. With no record the scan picks the
+    # first match (`@7`); what the id buys is that a rename or a new window
+    # between two verbs cannot re-point the second.
+    calls = _ctl_listing(monkeypatch, "@2\trun-x\n@7\tsweep-RID\n@9\tsweep-RID\n")
+    launch.kill_ctl_window(tmp_path, "RID")
     assert ["tmux", "kill-window", "-t", "@7"] in calls
 
 
-def test_ctl_window_id_no_session_or_tmux(monkeypatch):
+def test_attach_plan_selects_and_returns_the_recorded_window(monkeypatch, tmp_path: Path):
+    # #482's first two consequences: the window the attach lands on, and the one
+    # its return_window stamps @bmad_return_pane on, are the same live window.
+    calls = _ctl_listing(monkeypatch, "@1\trun-RID\n@2\tresume-RID\n")
+    _write_record(tmp_path, "RID", "@2")
+    monkeypatch.setattr(launch, "session_exists", lambda s: False)
+    monkeypatch.setattr(launch, "decision_pending", lambda rd: False)
+    plan = launch.attach_plan(tmp_path, "RID")
+    assert plan is not None
+    _argv, return_window = plan
+    assert return_window == "@2"
+    assert ["tmux", "select-window", "-t", "@2"] in calls
+
+
+def test_kill_ctl_window_follows_the_record(monkeypatch, tmp_path: Path):
+    # #482's third consequence: `x` must not close the parked window and leave
+    # the live one running.
+    calls = _ctl_listing(monkeypatch, "@1\trun-RID\n@2\tresume-RID\n")
+    _write_record(tmp_path, "RID", "@2")
+    launch.kill_ctl_window(tmp_path, "RID")
+    assert ["tmux", "kill-window", "-t", "@2"] in calls
+
+
+def test_ctl_window_id_no_session_or_tmux(monkeypatch, tmp_path: Path):
     def fake(argv, **kwargs):
         return subprocess.CompletedProcess(argv, 1, stdout="", stderr="no session")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
-    assert launch.ctl_window_id("RID") is None
+    assert launch.ctl_window_id(tmp_path, "RID") is None
     monkeypatch.setattr(tmux_base.shutil, "which", lambda name: None)
-    assert launch.ctl_window_id("RID") is None  # no subprocess call attempted
+    assert launch.ctl_window_id(tmp_path, "RID") is None  # no subprocess call attempted
 
 
 def test_set_return_pane_argv(fake_run):
@@ -368,6 +446,79 @@ def test_current_return_target_none_on_empty_pane(monkeypatch):
 
 def test_start_detached_returns_window_id(fake_run, tmp_path: Path):
     assert launch.start_resolve_detached(tmp_path, "RID") == "@7"
+
+
+def _make_run(project: Path, run_id: str = "RID") -> Path:
+    """A run dir runs.is_run accepts — the state a resume/resolve launches over."""
+    run_dir = runs.run_dir_for(project, run_id)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "state.json").write_text("{}", encoding="utf-8")
+    return run_dir
+
+
+def test_start_detached_records_the_window_it_minted(fake_run, tmp_path: Path):
+    run_dir = _make_run(tmp_path)
+    launch.resume_detached(tmp_path, "RID")
+    assert (run_dir / launch._CTL_WINDOW_FILE).read_text(encoding="utf-8") == "@7"
+
+
+def test_start_detached_records_nothing_without_a_run(fake_run, tmp_path: Path):
+    # A fresh `run` mints the only window carrying its run id — nothing to
+    # disambiguate — and the record must never conjure a directory that
+    # runs.is_run would then report as not a run. The explicit skip keeps this
+    # expected case out of the OSError swallow; this test pins the outcome.
+    launch.start_run_detached(tmp_path, "RID")
+    assert not runs.run_dir_for(tmp_path, "RID").exists()
+
+
+def test_start_detached_survives_an_unwritable_record(fake_run, tmp_path: Path):
+    # The window is already running by the time the record is written, so a
+    # failed write degrades to the name scan rather than failing the launch.
+    run_dir = _make_run(tmp_path)
+    (run_dir / launch._CTL_WINDOW_FILE).mkdir()  # a dir, not a file
+    assert launch.start_resolve_detached(tmp_path, "RID") == "@7"
+
+
+def test_failed_record_forgets_the_previous_one(fake_run, tmp_path: Path, monkeypatch):
+    # A launch that cannot record the window it minted must not leave the
+    # *previous* launch's id authoritative — that id names a window this launch
+    # just superseded, so the honest state is no record at all.
+    run_dir = _make_run(tmp_path)
+    _write_record(tmp_path, "RID", "@2")
+
+    def boom(*_a, **_k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Path, "write_text", boom)
+    launch.resume_detached(tmp_path, "RID")
+    assert not (run_dir / launch._CTL_WINDOW_FILE).exists()
+
+
+def test_uncaptured_window_id_forgets_the_previous_record(monkeypatch, tmp_path: Path):
+    # new-window answered no id: nothing to record, and the stale record must go.
+    run_dir = _make_run(tmp_path)
+    _write_record(tmp_path, "RID", "@2")
+
+    def fake(argv, **kwargs):
+        rc = 0 if argv[1] == "has-session" else 0
+        return subprocess.CompletedProcess(argv, rc, stdout="", stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+    assert launch.start_resolve_detached(tmp_path, "RID") is None
+    assert not (run_dir / launch._CTL_WINDOW_FILE).exists()
+
+
+def test_record_round_trips_a_session_qualified_id(monkeypatch, tmp_path: Path):
+    # psmux qualifies both the parked id it mints and the window_id column, so
+    # the re-prove is a string match on the qualified form (multiplexer's
+    # symmetry note). Pinned here because the two shapes only differ off tmux.
+    _ctl_listing(
+        monkeypatch,
+        "=bmad-loop-ctl:@1\trun-RID\n=bmad-loop-ctl:@2\tresume-RID\n",
+    )
+    _write_record(tmp_path, "RID", "=bmad-loop-ctl:@2")
+    assert launch.ctl_window_id(tmp_path, "RID") == "=bmad-loop-ctl:@2"
 
 
 def test_prune_ctl_windows(monkeypatch, tmp_path: Path):
@@ -630,7 +781,7 @@ def test_decision_pending_false_when_empty(tmp_path: Path):
 
 def test_attach_plan_prefers_ctl_when_decision_pending(monkeypatch):
     monkeypatch.delenv("TMUX", raising=False)
-    monkeypatch.setattr(launch, "ctl_window_id", lambda rid: "@2")
+    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, rid: "@2")
     monkeypatch.setattr(launch, "session_exists", lambda s: True)
     monkeypatch.setattr(launch, "decision_pending", lambda rd: True)
     selected: list[str] = []
@@ -643,7 +794,7 @@ def test_attach_plan_prefers_ctl_when_decision_pending(monkeypatch):
 
 def test_attach_plan_prefers_ctl_when_no_agent_session(monkeypatch):
     monkeypatch.delenv("TMUX", raising=False)
-    monkeypatch.setattr(launch, "ctl_window_id", lambda rid: "@2")
+    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, rid: "@2")
     monkeypatch.setattr(launch, "session_exists", lambda s: False)
     monkeypatch.setattr(launch, "decision_pending", lambda rd: False)
     monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: None)
@@ -654,7 +805,7 @@ def test_attach_plan_prefers_ctl_when_no_agent_session(monkeypatch):
 
 def test_attach_plan_agent_session_when_no_decision(monkeypatch):
     monkeypatch.delenv("TMUX", raising=False)
-    monkeypatch.setattr(launch, "ctl_window_id", lambda rid: None)
+    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, rid: None)
     monkeypatch.setattr(launch, "session_exists", lambda s: True)
     monkeypatch.setattr(launch, "decision_pending", lambda rd: False)
     assert launch.attach_plan(Path("/proj"), "RID") == (
@@ -664,7 +815,7 @@ def test_attach_plan_agent_session_when_no_decision(monkeypatch):
 
 
 def test_attach_plan_none_when_nothing_to_attach(monkeypatch):
-    monkeypatch.setattr(launch, "ctl_window_id", lambda rid: None)
+    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, rid: None)
     monkeypatch.setattr(launch, "session_exists", lambda s: False)
     monkeypatch.setattr(launch, "decision_pending", lambda rd: False)
     assert launch.attach_plan(Path("/proj"), "RID") is None

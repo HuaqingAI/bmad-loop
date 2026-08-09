@@ -415,7 +415,7 @@ class BmadLoopApp(App[None]):
             self.notify("no run selected", severity="warning")
             return
         session = runs.session_name(run_id)
-        win_id = launch.ctl_window_id(run_id)
+        win_id = launch.ctl_window_id(self.project, run_id)
         ok, agent_live = self._mux_guarded(lambda: launch.session_exists(session))
         if not ok:
             return
@@ -874,7 +874,7 @@ class BmadLoopApp(App[None]):
     def _stop_run_worker(self, run_id: str, run_dir: Path) -> None:
         try:
             runs.stop_run(run_dir)
-            launch.kill_ctl_window(run_id)
+            launch.kill_ctl_window(self.project, run_id)
         except (OSError, StopRunError, ProcessHostError) as e:
             self.call_from_thread(self.notify, f"stop failed: {e}", severity="error")
             return

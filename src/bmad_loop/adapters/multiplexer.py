@@ -172,10 +172,11 @@ class TerminalMultiplexer(ABC):
         server per session), so a bare ``@N`` replayed as a ``-t`` target
         routes by the *caller's* server instead of the owning one.
 
-        :meth:`new_parked_window` is *outside* the rule — nothing
-        membership-tests a parked id, it is only replayed as a ``-t`` target by
-        the TUI — so a backend MAY mint it in a form this list never carries
-        (psmux happens to qualify it too, #291).
+        :meth:`new_parked_window` is outside *this* list's rule. To preserve
+        #482's unambiguous lookup, however, its id must match the ``window_id``
+        column of :meth:`list_windows` (psmux qualifies both, #291). A backend
+        that diverges remains usable, but falls back to the ambiguous by-name
+        lookup whenever several kinds share a run id.
 
         Raises :class:`MultiplexerError` if the transport itself fails (timeout /
         missing binary): an empty list means "no windows" and must not be
