@@ -6496,11 +6496,34 @@ def test_dispatch_refuses_a_story_an_unlanded_entry_gates(project):
     assert "DW-1" in saved.paused_reason and "bmad-loop sweep" in saved.paused_reason
 
 
+def test_the_gate_still_holds_when_a_resume_has_not_closed_the_entry(project):
+    """A resume that fixed nothing must not get the story through.
+
+    This is what the placement buys, stated as behavior. Recording the task before
+    the check — the obvious placement, next to `_run_story` — leaves a non-terminal
+    task behind, and `_finish_inflight` runs *before* the loop and drives exactly
+    those: the resume would dispatch the gated story without ever consulting the
+    ledger again. Refusing before the story is recorded is what makes the gate a
+    standing condition rather than a one-shot speed bump.
+    """
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1-1"])})
+    engine, _ = make_engine(project, [])
+    assert engine.run().paused
+
+    resumed, adapter = resume_engine(project, engine, [dev_effect(project, "1-1-a")])
+    summary = resumed.run()
+
+    assert summary.paused and summary.done == 0
+    assert adapter.sessions == []  # the entry is still open; nothing may run
+    assert load_state(resumed.run_dir).paused_stage == PAUSE_STORY_GATE
+
+
 def test_a_gated_story_runs_once_the_entry_lands(project):
-    """The other half of the placement above: because the pause left no task
-    behind, a resume re-picks the story and re-reads the ledger. Closing the entry
-    is the primary remedy the pause names, so it has to be the one that clears
-    it — a gate nobody can get past is a wedge, not a gate."""
+    """Closing the entry is the primary remedy the pause names, so it has to be
+    the one that clears it — a gate nobody can get past is a wedge, not a gate.
+    (That the refusal survives a resume which changed nothing is the test above;
+    this one is the release.)"""
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     write_gated_ledger(project, {"DW-1": ("open", ["gate: 1-1"])})
     engine, _ = make_engine(project, [])
