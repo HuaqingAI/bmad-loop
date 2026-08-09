@@ -1602,6 +1602,36 @@ def test_a_fenced_example_is_not_a_gate_declaration(fence):
     assert g.tokens == () and g.near_miss == 0 and g.lines == 0
 
 
+@pytest.mark.parametrize(("outer", "inner"), [("```", "~~~"), ("~~~", "```")])
+def test_a_stray_opener_above_the_heading_does_not_mask_a_live_gate(outer, inner):
+    """The two views of the same line, and the reason `_quoted` asks at FILE scope.
+
+    The stray `outer` opener never closes (`inner` is the other fence char and
+    cannot close it), and at whole-file scope `unclosed_hides_rest=False` reads it
+    as ordinary text — which is why the heading below it still carves an entry. A
+    body slice starts at that heading, cannot see the opener, and so reads the
+    matched `inner` pair as a real fence, masking the `gate:` between them into an
+    example. That drops a live gate in silence, which is the failure the field
+    exists to end; `parse_ledger` already reads headings and `status:` at file
+    scope for exactly this reason. Found by differential fuzz against the
+    whole-file predicate, not by inspection."""
+    text = f"# Deferred Work\n\n{outer}\n### DW-2: title\n{inner}\ngate: 3-2\n{inner}\n"
+
+    (entry,) = parse_ledger(text)
+
+    assert deferredwork.gates(entry).tokens == ("3-2",)
+
+
+def test_a_stray_opener_above_the_heading_does_not_mask_a_prose_gate():
+    """The prose scan shares `_quoted`, so it shares the file-scope question too —
+    pinned separately because the two scans reach it by different call paths."""
+    text = "# Deferred Work\n\n```\n### DW-2: title\n~~~\nHARD GATE: before 3-2\n~~~\n"
+
+    (entry,) = parse_ledger(text)
+
+    assert deferredwork.declares_prose_gate(entry) is True
+
+
 def test_a_fence_hides_only_itself():
     """The mask must not reach past the block. A real declaration on either side of
     a quoted example still gates — otherwise the fix for a false refusal would have

@@ -20,7 +20,7 @@ from datetime import date as calendar_date
 from pathlib import Path
 
 from . import sprintstatus
-from .fences import fenced, fenced_spans
+from .fences import fenced_spans
 from .platform_util import atomic_write_text
 
 HEADING_RE = re.compile(r"^### (DW-\d+): (.+?)\s*$", re.MULTILINE)
@@ -131,6 +131,15 @@ class DWEntry:
     # `gate:` it carries — stayed open forever. No default: `parse_ledger` is the
     # only constructor, and a fallback here would silently restore that split.
     status_span: tuple[int, int] | None
+    # The whole-file fence index the entry was carved with, so the gate scans can
+    # ask the question the heading and status reads already ask at file scope. A
+    # body slice cannot see a fence opened above the heading, and the two views
+    # disagree: under a stray unclosed ``` above the heading, whole-file scope
+    # treats the opener as text (so this entry EXISTS) while the body sees a later
+    # matched `~~~` pair as a real fence and reads a live `gate:` as an example.
+    # That direction loses a gate in silence, which is what the field exists to
+    # end. No default, for `status_span`'s reason: the fallback IS the bug.
+    examples: _Examples
 
     @property
     def open(self) -> bool:
@@ -277,6 +286,7 @@ def parse_ledger(text: str) -> list[DWEntry]:
                 status_span=(
                     (status_m.start() - m.start(), status_m.end() - m.start()) if status_m else None
                 ),
+                examples=examples,
             )
         )
     return entries
@@ -317,8 +327,8 @@ class EntryGates:
         return self.lines > 0 and not self.tokens and not self.malformed
 
 
-def _quoted(body: str, offset: int) -> bool:
-    """Whether ``offset`` sits in a fenced example inside one entry's body.
+def _quoted(entry: DWEntry, offset: int) -> bool:
+    """Whether a BODY-relative ``offset`` sits in a fenced example.
 
     The single rule every gate scan in this module reads through, so that a fence
     means the same thing to all of them: an entry documenting the field quotes it,
@@ -328,10 +338,16 @@ def _quoted(body: str, offset: int) -> bool:
     an inline citation only, so an entry explaining the old convention in a fenced
     block was told to convert a gate it was not declaring.
 
-    ``unclosed_hides_rest=False`` because a stray unterminated fence must not be
-    able to silence a real ``gate:`` line below it (see :func:`fences.fenced`).
+    Asked at FILE scope, like the heading and status reads in :func:`parse_ledger`
+    and for the same reason: a body slice cannot see a fence opened above the
+    heading, so the two views can disagree about the same line. They disagree in
+    the direction that matters — a stray unclosed ``` above the heading leaves the
+    entry standing at file scope while the body reads a later matched ``~~~`` pair
+    as a real fence, masking a live ``gate:`` into an example. A gate lost in
+    silence is the failure this field exists to end; a spurious refusal in an entry
+    whose markdown is already malformed is the cheaper wrong answer.
     """
-    return fenced(body, offset, unclosed_hides_rest=False)
+    return entry.examples.covers(entry.span[0] + offset)
 
 
 def declares_prose_gate(entry: DWEntry) -> bool:
@@ -343,7 +359,7 @@ def declares_prose_gate(entry: DWEntry) -> bool:
     reaching for the bare pattern would reintroduce exactly the half-applied rule
     this replaced.
     """
-    return any(not _quoted(entry.body, m.start()) for m in HARD_GATE_PROSE_RE.finditer(entry.body))
+    return any(not _quoted(entry, m.start()) for m in HARD_GATE_PROSE_RE.finditer(entry.body))
 
 
 def gates(entry: DWEntry) -> EntryGates:
@@ -375,7 +391,7 @@ def gates(entry: DWEntry) -> EntryGates:
     # it, and a quoted example is not a declaration — a fenced `gate: 3-2` sits in
     # column 0, right where the anchor looks, and the answer here is a *refusal*.
     for m in GATE_RE.finditer(entry.body):
-        if _quoted(entry.body, m.start()):
+        if _quoted(entry, m.start()):
             continue
         lines += 1
         named = False
@@ -395,7 +411,7 @@ def gates(entry: DWEntry) -> EntryGates:
         # already counted above — without re-running the anchor against a slice.
         not entry.body.startswith("gate:", m.start())
         for m in _GATE_NEAR_RE.finditer(entry.body)
-        if not _quoted(entry.body, m.start())
+        if not _quoted(entry, m.start())
     )
     return EntryGates(
         tokens=tuple(tokens),
