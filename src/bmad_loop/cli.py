@@ -1243,7 +1243,7 @@ def _report_unstructured_gate(
             f"read (the field is a lowercase `gate:` at the very start of a line)"
         )
     prose_only = not entry_gates.tokens and not reasons
-    if prose_only and deferredwork.HARD_GATE_PROSE_RE.search(entry.body):
+    if prose_only and deferredwork.declares_prose_gate(entry):
         reasons.append("declares a `HARD GATE:` in prose but carries no `gate:` line")
     if not reasons:
         return

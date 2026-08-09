@@ -2055,3 +2055,40 @@ def test_hard_gate_prose_detects_a_declaration_not_a_citation(body, declared):
     entry *citing* the phrase is discussion — and the colon excludes prose that
     merely talks about a hard gate."""
     assert bool(deferredwork.HARD_GATE_PROSE_RE.search(body)) is declared
+
+
+def _prose_gated(*lines: str) -> bool:
+    text = (
+        "# Deferred Work\n\n### DW-1: gated entry\n\n"
+        "origin: test\nlocation: n/a\nreason: test\nstatus: open\n"
+        + "".join(f"{x}\n" for x in lines)
+    )
+    (entry,) = parse_ledger(text)
+    return deferredwork.declares_prose_gate(entry)
+
+
+@pytest.mark.parametrize("fence", ["```markdown", "```", "~~~"])
+def test_a_fenced_prose_gate_is_not_a_declaration(fence):
+    """The block form of the citation the quote lookbehind already handles inline.
+    Nothing precedes a line inside a fence, so an entry documenting the old
+    convention in an example was told to convert a gate it was not declaring —
+    the same rule `gates()` applies to `gate:`, left half-applied."""
+    close = "```" if fence.startswith("`") else "~~~"
+    body = f"{fence}\nHARD GATE: must land before 3-2\n{close}\n"
+
+    # the pattern itself still matches: the mask is what answers, not a lucky miss
+    assert deferredwork.HARD_GATE_PROSE_RE.search(body)
+    assert _prose_gated(fence, "HARD GATE: must land before 3-2", close) is False
+
+
+def test_a_fence_hides_only_the_prose_gate_it_quotes():
+    """Masking must not reach past the block, or the fix for a spurious warning
+    would buy a missed one — an entry that both explains the convention and uses
+    it is exactly the entry this warning is for."""
+    assert _prose_gated("```", "HARD GATE: an example", "```", "HARD GATE: for real") is True
+
+
+def test_an_unclosed_fence_swallows_no_prose_gate():
+    """Parity with `gates()`: `unclosed_hides_rest=False`, so one stray ``` cannot
+    silence every declaration below it."""
+    assert _prose_gated("```", "an example nobody closed", "HARD GATE: for real") is True

@@ -4150,6 +4150,26 @@ def test_validate_warns_on_a_mid_line_hard_gate(project, capsys):
     assert len(unstructured) == 1 and unstructured[0]["severity"] == "warning"
 
 
+def test_validate_ignores_a_hard_gate_quoted_in_a_fenced_example(project, capsys):
+    """The citation an author writes as a block rather than inline. `gates()`
+    already masks a fenced `gate:` out of the refusal; leaving the prose scan on
+    the raw body made the entry documenting the migration — the one place both
+    spellings appear together — warn about its own example."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link": "ready-for-dev"},
+        {
+            "DW-1": (
+                "open",
+                ["reason: documents the old convention:", "```", "HARD GATE: before 3-2", "```"],
+            )
+        },
+    )
+
+    assert not [f for f in findings if f["check"].startswith("deferred.hard-gate")]
+
+
 def test_validate_ignores_an_entry_that_only_cites_a_hard_gate(project, capsys):
     """An entry *about* the convention is not declaring one — the ledger's own
     "no mechanical check enforces a HARD GATE" entry must not warn about itself.

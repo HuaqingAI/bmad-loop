@@ -94,6 +94,9 @@ _GATE_NEAR_RE = re.compile(r"^[ \t]*gate[ \t]*:", re.IGNORECASE | re.MULTILINE)
 # a ledger is markdown, so `HARD GATE:` is the citation form an author reaches for
 # first, and an LLM-written entry curls its quotes. Missing them made the warning
 # fire on entries documenting the convention — including this repo's own docs.
+# The lookbehind only reaches an *inline* citation, though; the block form of the
+# same quoting is a fence, and no character precedes a line inside one. Callers
+# read this through `declares_prose_gate`, which masks those out.
 HARD_GATE_PROSE_RE = re.compile(r"""(?<!["'`«“”‘’])HARD GATE:""")
 # Everything `str.splitlines()` splits on, not `\n` alone (#305). The writers
 # below interpolate their arguments into a line-oriented file, so a break in a
@@ -314,6 +317,35 @@ class EntryGates:
         return self.lines > 0 and not self.tokens and not self.malformed
 
 
+def _quoted(body: str, offset: int) -> bool:
+    """Whether ``offset`` sits in a fenced example inside one entry's body.
+
+    The single rule every gate scan in this module reads through, so that a fence
+    means the same thing to all of them: an entry documenting the field quotes it,
+    and a quoted example is not a declaration. Sharing it is the point — the prose
+    scan was left on the raw body once, on the reasoning that a warning is cheap
+    and its quote lookbehind was guard enough. It is not: that lookbehind reaches
+    an inline citation only, so an entry explaining the old convention in a fenced
+    block was told to convert a gate it was not declaring.
+
+    ``unclosed_hides_rest=False`` because a stray unterminated fence must not be
+    able to silence a real ``gate:`` line below it (see :func:`fences.fenced`).
+    """
+    return fenced(body, offset, unclosed_hides_rest=False)
+
+
+def declares_prose_gate(entry: DWEntry) -> bool:
+    """Whether the entry declares a gate in the pre-``gate:`` prose convention.
+
+    :data:`HARD_GATE_PROSE_RE` filtered the way every other gate scan here is
+    filtered. Lives beside them rather than at the caller so the fence rule has
+    one implementation: ``validate`` is the only reader today, and a second one
+    reaching for the bare pattern would reintroduce exactly the half-applied rule
+    this replaced.
+    """
+    return any(not _quoted(entry.body, m.start()) for m in HARD_GATE_PROSE_RE.finditer(entry.body))
+
+
 def gates(entry: DWEntry) -> EntryGates:
     """Every ``gate:`` token in one entry's canonical span, order-preserving.
 
@@ -342,15 +374,8 @@ def gates(entry: DWEntry) -> EntryGates:
     # Both scans below skip fenced matches: an entry documenting this field quotes
     # it, and a quoted example is not a declaration — a fenced `gate: 3-2` sits in
     # column 0, right where the anchor looks, and the answer here is a *refusal*.
-    # `unclosed_hides_rest=False` because a stray unterminated fence must not be
-    # able to silence a real `gate:` line below it (see `fences.fenced`). Only the
-    # two `gate:` scans are filtered — `HARD_GATE_PROSE_RE` deliberately still
-    # reads the raw body: it warns rather than refuses, and carries a quote guard.
-    def _quoted(offset: int) -> bool:
-        return fenced(entry.body, offset, unclosed_hides_rest=False)
-
     for m in GATE_RE.finditer(entry.body):
-        if _quoted(m.start()):
+        if _quoted(entry.body, m.start()):
             continue
         lines += 1
         named = False
@@ -370,7 +395,7 @@ def gates(entry: DWEntry) -> EntryGates:
         # already counted above — without re-running the anchor against a slice.
         not entry.body.startswith("gate:", m.start())
         for m in _GATE_NEAR_RE.finditer(entry.body)
-        if not _quoted(m.start())
+        if not _quoted(entry.body, m.start())
     )
     return EntryGates(
         tokens=tuple(tokens),
