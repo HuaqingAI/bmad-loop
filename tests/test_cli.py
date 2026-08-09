@@ -4322,12 +4322,39 @@ def test_validate_reports_no_gate_all_clear_when_the_queue_is_unreadable(project
 def test_validate_stories_mode_skips_a_done_story(project, capsys):
     """The manifest carries no status — the story's own spec does. Without reading
     it, a finished epic would fail validate forever over gates on work that already
-    landed, which is the sprint arm's ACTIONABLE_STATUSES line drawn twice."""
+    landed. `done` is only the clearest case of the general rule the sibling test
+    pins: actionability is `stories._classify`, not "anything but done"."""
     install_bmad_config(project)
     _write_policy(project.project, STORIES_POLICY)
     folder = _setup_stories_fixture(project, [_stories_entry("1")])
     (folder / "stories" / "1-slug.md").write_text(
         "---\ntitle: 'test'\nstatus: 'done'\n---\n\n## Intent\n\ntest\n", encoding="utf-8"
+    )
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1"])}, commit=False)
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)
+
+    findings = _hard_gate_findings(capsys)
+    assert len(findings) == 1 and findings[0]["severity"] == "ok"
+
+
+@pytest.mark.parametrize("status", ["blocked", "opne"])
+def test_validate_stories_mode_skips_a_story_the_scheduler_would_wedge(project, capsys, status):
+    """A gate only means something for a story the queue can dispatch. `blocked`
+    and an unrecognized status both STOP the stories scan (`SCHEDULE_WEDGED`), so
+    refusing over them made `validate` exit nonzero about a story that could not
+    move, and made the two queue modes disagree — the sprint arm's
+    `ACTIONABLE_STATUSES` is a two-element allowlist that already excludes both.
+
+    Parametrized over the two arms `_classify` reaches "wedged" by: a status it
+    knows and refuses, and one it cannot read at all. A single case would let the
+    other regress, since only the second depends on the unknown-status branch."""
+    install_bmad_config(project)
+    _write_policy(project.project, STORIES_POLICY)
+    folder = _setup_stories_fixture(project, [_stories_entry("1")])
+    (folder / "stories" / "1-slug.md").write_text(
+        f"---\ntitle: 'test'\nstatus: '{status}'\n---\n\n## Intent\n\ntest\n", encoding="utf-8"
     )
     write_gated_ledger(project, {"DW-1": ("open", ["gate: 1"])}, commit=False)
     args = argparse.Namespace(project=str(project.project), spec=None, json=True)

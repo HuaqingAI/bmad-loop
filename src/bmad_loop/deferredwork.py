@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from bisect import bisect_right
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date as calendar_date
@@ -147,10 +148,30 @@ class DWEntry:
         return self.status.split()[0] == "done" if self.status else False
 
 
-def _example(text: str, offset: int) -> bool:
-    """Whether ``offset`` sits in a fenced worked example rather than the ledger.
+@dataclass(frozen=True)
+class _Examples:
+    """The ledger's fenced worked examples, indexed for repeated offset queries.
 
-    Asked at WHOLE-FILE scope, which is the whole point. A fence that opens above
+    ``fenced_spans`` returns its ranges in increasing order and non-overlapping (a
+    fence cannot open inside an open one), so a query is a binary search for the
+    last span starting at or before the offset. Kept as an index rather than a bare
+    list because both scales are in play at once: a parse asks once per heading and
+    several times per entry, so a linear membership test would leave the parse
+    quadratic whenever a ledger's examples grow with its entries.
+    """
+
+    spans: tuple[tuple[int, int], ...]
+    starts: tuple[int, ...]
+
+    def covers(self, offset: int) -> bool:
+        i = bisect_right(self.starts, offset)
+        return i > 0 and offset < self.spans[i - 1][1]
+
+
+def _example_spans(text: str) -> _Examples:
+    """The ledger's fenced worked examples, as offset ranges.
+
+    Read at WHOLE-FILE scope, which is the whole point. A fence that opens above
     a quoted ``### DW-n:`` heading is stranded in the *previous* entry once spans
     are carved, so an entry-local query reads the example as live — a phantom
     entry whose ``gate:`` refuses a story nobody deferred. `deferred-work-format.md`
@@ -162,19 +183,41 @@ def _example(text: str, offset: int) -> bool:
     would erase every heading below it, dropping real open work out of
     ``open_ids()`` in silence. A phantom entry from an unterminated fence is
     today's behaviour and is visible; a vanished ledger is neither.
+
+    Walked once per :func:`parse_ledger` and passed down to the offset checks. The
+    walk covers the whole file, so recomputing it per offset made the parse
+    quadratic in the number of entries — and `Engine._refuse_gated_story` re-parses
+    before every story dispatch, so a mature ledger paid it on the dispatch path.
     """
-    return fenced(text, offset, unclosed_hides_rest=False)
+    spans = tuple(fenced_spans(text, unclosed_hides_rest=False))
+    return _Examples(spans=spans, starts=tuple(s for s, _ in spans))
 
 
-def _unfenced(pattern: re.Pattern[str], text: str, start: int, end: int) -> re.Match[str] | None:
+def _example(examples: _Examples, offset: int) -> bool:
+    """Whether ``offset`` sits in a fenced worked example rather than the ledger.
+
+    Takes the index rather than the text: the answer must come from the same
+    whole-file walk for every offset in one parse, and a signature that re-derived
+    it per call is what made that expensive enough to matter.
+    """
+    return examples.covers(offset)
+
+
+def _unfenced(
+    pattern: re.Pattern[str],
+    text: str,
+    start: int,
+    end: int,
+    examples: _Examples,
+) -> re.Match[str] | None:
     """First match of ``pattern`` within ``text[start:end]`` that is not quoted.
 
     Not `search()` plus a check: the first match may be the quoted one, and the
     real boundary sits after it. Bounded by ``endpos`` so a match beyond the span
-    cannot claim it, while ``_example`` still reads fence state from offset 0.
+    cannot claim it, while ``examples`` still describes fence state from offset 0.
     """
     for m in pattern.finditer(text, start, end):
-        if not _example(text, m.start()):
+        if not _example(examples, m.start()):
             return m
     return None
 
@@ -192,12 +235,13 @@ def parse_ledger(text: str) -> list[DWEntry]:
     exists to end.
     """
     entries = []
-    headings = [m for m in HEADING_RE.finditer(text) if not _example(text, m.start())]
+    examples = _example_spans(text)
+    headings = [m for m in HEADING_RE.finditer(text) if not _example(examples, m.start())]
     for i, m in enumerate(headings):
         end = headings[i + 1].start() if i + 1 < len(headings) else len(text)
         # an entry also ends at any intervening heading (e.g. a "## Deferred
         # from:" section header between freeform and DW-format content)
-        other = _unfenced(ANY_HEADING_RE, text, m.end(), end)
+        other = _unfenced(ANY_HEADING_RE, text, m.end(), end, examples)
         if other:
             end = other.start()
         # ...and at a flat appender block, which belongs to no canonical entry
@@ -208,8 +252,10 @@ def parse_ledger(text: str) -> list[DWEntry]:
         # done (open_ids() drops it, classify() calls it malformed), which trades
         # one lost flat block for one lost tracked entry. An entry with no status
         # line has nothing to protect, so the whole span is fair game.
-        status_m = _unfenced(STATUS_RE, text, m.end(), end)
-        flat = _unfenced(FLAT_ENTRY_RE, text, status_m.end() if status_m else m.end(), end)
+        status_m = _unfenced(STATUS_RE, text, m.end(), end, examples)
+        flat = _unfenced(
+            FLAT_ENTRY_RE, text, status_m.end() if status_m else m.end(), end, examples
+        )
         if flat:
             end = flat.start()
         body = text[m.start() : end]
@@ -217,7 +263,7 @@ def parse_ledger(text: str) -> list[DWEntry]:
         # status must be the one inside the final span. Searched over `text` at
         # absolute offsets because `_example` reads fence state from the top of the
         # file — a body slice cannot see an opener that sits above the heading.
-        status_m = _unfenced(STATUS_RE, text, m.start(), end)
+        status_m = _unfenced(STATUS_RE, text, m.start(), end, examples)
         entries.append(
             DWEntry(
                 id=m.group(1),

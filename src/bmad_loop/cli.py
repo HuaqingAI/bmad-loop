@@ -1275,10 +1275,16 @@ def _actionable_story_keys(
     outside turned a degraded check into a traceback out of ``validate``.
 
     Stories mode has no status column — the manifest is a flat schedule and the
-    story's own spec carries the status — so a story whose spec reads ``done`` is
-    dropped here. That is the same line ``ACTIONABLE_STATUSES`` draws on the
-    sprint board, and without it a finished epic would fail ``validate`` forever
-    over gates on work that already landed.
+    story's own spec carries the status — so actionability comes from
+    :func:`stories._classify`, the predicate the scheduler itself picks with.
+    Dropping only ``done`` is not the same line the sprint board draws:
+    ``ACTIONABLE_STATUSES`` is a two-element allowlist, so ``blocked`` and the
+    rest are already out on that side. In stories mode a ``blocked``, sentinel,
+    ambiguous or unknown-status entry STOPS the scan (``SCHEDULE_WEDGED``) instead
+    of dispatching, so treating every non-``done`` state as actionable made
+    ``validate`` exit nonzero over a gate on a story the queue could not run — and
+    made the two queue modes disagree about what a gate refuses. Sharing the
+    scheduler's predicate is what keeps preflight and dispatch answering alike.
     """
     if spec_folder is not None:
         keys: list[str] = []
@@ -1286,7 +1292,7 @@ def _actionable_story_keys(
             folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
             for entry in stories_mod.load_stories(folder).entries:
                 state = stories_mod.resolve_story_spec(folder, entry.id)
-                if state.kind == stories_mod.KIND_PRESENT and state.status == stories_mod.DONE:
+                if stories_mod._classify(state) != "actionable":
                     continue
                 keys.append(entry.id)
         except (OSError, UnicodeDecodeError, stories_mod.StoriesError):

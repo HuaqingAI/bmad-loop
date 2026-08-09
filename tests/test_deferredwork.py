@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from bmad_loop import deferredwork
+from bmad_loop import deferredwork, fences
 from bmad_loop.deferredwork import (
     _ISO_DATE_RE,
     LINE_BREAK_RE,
@@ -1852,6 +1852,34 @@ def test_a_decision_lands_after_the_live_status_of_an_entry_that_quotes_an_examp
     text = path.read_text(encoding="utf-8")
     assert "```\nstatus: open\n```" in text
     assert "status: open\ndecision: 2026-06-11 keep — still worth doing" in text
+
+
+def test_parse_ledger_walks_the_fences_once_however_many_entries(monkeypatch):
+    """Asserted as a call count, not a duration: the property is that the fence
+    walk is hoisted out of the per-offset checks, and a timing threshold would
+    both flake and stop meaning that. Reading fence state per offset made
+    `parse_ledger` quadratic in entries, and `Engine._refuse_gated_story` re-parses
+    before every story dispatch, so a mature ledger paid it on the dispatch path.
+
+    Both bindings are patched because the module imported the name at import time
+    (`from .fences import fenced_spans`), so patching only `fences` would miss the
+    direct call and only `deferredwork` would miss any walk reached via
+    `fences.fenced`."""
+    walks: list[int] = []
+    real = fences.fenced_spans
+
+    def counting(text: str, **kw: object):
+        walks.append(len(text))
+        return real(text, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(fences, "fenced_spans", counting)
+    monkeypatch.setattr(deferredwork, "fenced_spans", counting)
+    text = "# Deferred Work\n" + "".join(
+        f"\n### DW-{i}: entry {i}\n\norigin: o\nreason: r\nstatus: open\n" for i in range(1, 26)
+    )
+
+    assert len(parse_ledger(text)) == 25
+    assert len(walks) == 1
 
 
 def test_gate_token_shape_copy_agrees_with_the_stories_id_it_mirrors():
