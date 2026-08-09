@@ -122,9 +122,14 @@ deadlock the gate against its own remedy.
 
 **Quoting the field is safe.** A `gate:` line inside a fenced code block is an
 example, not a declaration, so an entry that documents this convention gates
-nothing. One exception worth knowing when you write an entry: a fence you open
-and never close is not treated as a fence at all, because swallowing the rest of
-the entry could silently disable a real `gate:` line below it. Close your fences.
+nothing. This holds for a whole quoted entry too — heading, `status:` and `gate:`
+inside one fence, the shape shown above: the fenced heading starts no entry, and
+a quoted heading or bullet does not end the entry that quotes it, so a real
+`gate:` below the example keeps gating. One exception worth knowing when you
+write an entry: a fence you open and never close is not treated as a fence at
+all, because swallowing the rest of the entry could silently disable a real
+`gate:` line below it — and, at file scope, hide every entry after it. Close your
+fences.
 
 Four shapes declare a gate that nothing can enforce, and all four are reported as
 `deferred.hard-gate-unstructured` while the entry is unlanded:
