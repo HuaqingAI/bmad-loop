@@ -217,24 +217,14 @@ class CodingCLIAdapter(ABC):
         self, handle: SessionHandle, spec: SessionSpec, result: SessionResult
     ) -> SessionResult:
         """Last-chance post-mortem: label a non-completed session an environment
-        fault (#194) when the CLI never got usable work out of the provider —
-        connection lost, or quota/rate limit refused — and idled out the session
-        clock rather than doing real work.
+        fault (#194) when the CLI lost its API connection and idled out the
+        session clock rather than doing real work.
 
         Runs LAST in ``run()`` — after ``_post_kill_reconcile`` — so a reconcile
         upgrade to ``completed`` is never re-classified, and only a genuinely
         non-completed verdict (``result_json is None``) is ever inspected. Base
-        behavior: identity, like ``_post_kill_reconcile``, so an adapter with no
-        session log at all (mock) stays inert.
-
-        Any adapter that writes ``logs/<task_id>.log`` should mix in
-        ``EnvFaultMixin``, which matches profile patterns against the log tail
-        here and stamps ``env_fault`` / ``env_fault_evidence`` onto the result.
-        That covers the tmux adapters (pane capture) and the opencode HTTP
-        adapter (the serve process's stdout/stderr, ``<task_id>.server.out``,
-        NOT its conversation transcript) alike — the signal is the
-        log, not the transport. This docstring used to say HTTP adapters had no
-        post-mortem signal; that stopped being true once opencode_http began
-        teeing its server log, and the stale premise is why a provider quota
-        outage went unclassified and burned three stories' retry budgets."""
+        behavior: identity, like ``_post_kill_reconcile``, so adapters with no
+        post-mortem signal (HTTP/mock) stay inert. Adapters that tee the pane
+        (see GenericAdapter) may match profile patterns against the log tail here
+        and stamp ``env_fault`` / ``env_fault_evidence`` onto the result."""
         return result
