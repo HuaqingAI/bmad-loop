@@ -4060,6 +4060,22 @@ def test_validate_does_not_report_an_all_clear_for_an_unmatchable_token(project,
     assert not [f for f in findings if f["check"] == "deferred.hard-gate"]
 
 
+def test_validate_does_not_refuse_a_story_over_a_quoted_gate_example(project, capsys):
+    """End to end: an entry documenting the field must not refuse the story its
+    example names. A false refusal wedges a run, which is the one way this check
+    can be worse than the prose gate it replaced — and the entry most likely to
+    carry a quoted `gate:` is the one written to explain `gate:`."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link": "ready-for-dev"},
+        {"DW-1": ("open", ["```markdown", "gate: 3-2", "```"])},
+    )
+
+    assert not [f for f in findings if f["check"] == "deferred.hard-gate"]
+    assert not [f for f in findings if f["check"] == "deferred.hard-gate-unstructured"]
+
+
 def test_validate_hard_gate_token_stops_at_the_key_boundary(project, capsys):
     """`3-2` gates the story it names and both halves of that story once breakdown
     splits it, and not its numeric neighbours. A bare `startswith` would sweep

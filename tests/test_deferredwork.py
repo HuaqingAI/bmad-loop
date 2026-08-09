@@ -1588,6 +1588,47 @@ def test_gates_reports_a_token_that_cannot_name_a_story():
     assert g.malformed == ("3-2 3-3", "../etc")
 
 
+@pytest.mark.parametrize("fence", ["```markdown", "```", "~~~"])
+def test_a_fenced_example_is_not_a_gate_declaration(fence):
+    """An entry whose subject IS this field quotes it, and a quoted example sits in
+    column 0 — right where the strict field anchor looks. The sibling
+    `HARD_GATE_PROSE_RE` already needed quote guards for exactly this (its comment
+    records the warning firing on entries documenting the convention, this repo's
+    own docs included), and `gate:` is worse off: the answer here is a refusal, so
+    an entry explaining the field would fail validate and pause a run."""
+    close = "```" if fence.startswith("`") else "~~~"
+    g = _gated(fence, "gate: 3-2", close)
+
+    assert g.tokens == () and g.near_miss == 0 and g.lines == 0
+
+
+def test_a_fence_hides_only_itself():
+    """The mask must not reach past the block. A real declaration on either side of
+    a quoted example still gates — otherwise the fix for a false refusal would have
+    bought a lost gate, which is the worse of the two."""
+    g = _gated("gate: 4-1", "```", "gate: 3-2", "```", "gate: 5-1")
+
+    assert g.tokens == ("4-1", "5-1")
+
+
+def test_an_unclosed_fence_swallows_no_gate():
+    """The deliberate asymmetry. Masking an unterminated fence to end-of-entry
+    would let one stray ``` silently disable every gate below it — the exact
+    silent miss this field exists to end. A malformed-markdown entry keeping a
+    readable gate is the cheaper wrong answer."""
+    g = _gated("```", "an example nobody closed", "gate: 4-1")
+
+    assert g.tokens == ("4-1",)
+
+
+def test_a_longer_fence_is_not_closed_by_an_info_string_line():
+    """A closer carries no info string (CommonMark). Without that rule an inner
+    ```python would end the outer block early and re-expose the lines it hid."""
+    g = _gated("````", "```python", "gate: 3-2", "````")
+
+    assert g.tokens == ()
+
+
 def test_gate_token_shape_copy_agrees_with_the_stories_id_it_mirrors():
     """`_STORIES_ID_RE` is a copy of `stories.ID_RE`, taken because `stories`
     imports this module and the reverse would cycle. Pinned to the original rather
