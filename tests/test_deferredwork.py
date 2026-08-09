@@ -1621,10 +1621,13 @@ def test_an_unclosed_fence_swallows_no_gate():
     assert g.tokens == ("4-1",)
 
 
-def test_a_longer_fence_is_not_closed_by_an_info_string_line():
-    """A closer carries no info string (CommonMark). Without that rule an inner
-    ```python would end the outer block early and re-expose the lines it hid."""
-    g = _gated("````", "```python", "gate: 3-2", "````")
+def test_a_line_with_an_info_string_does_not_close_a_fence():
+    """A closer carries no info string (CommonMark), and the rule has to be tested
+    at EQUAL fence length or the length rule answers first and the assertion
+    measures nothing. Here every line is a 3-backtick run: without the
+    info-string requirement, the ```python would close the block early, re-expose
+    `gate: 4-1`, and leave the trailing ``` opening an unclosed fence."""
+    g = _gated("```", "gate: 3-2", "```python", "gate: 4-1", "```")
 
     assert g.tokens == ()
 
