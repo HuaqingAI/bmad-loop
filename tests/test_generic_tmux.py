@@ -23,7 +23,7 @@ import pytest
 import regex
 
 from bmad_loop import devcontract
-from bmad_loop.adapters import generic, tmux_base
+from bmad_loop.adapters import env_fault, generic, tmux_base
 from bmad_loop.adapters.base import SessionHandle, SessionResult, SessionSpec, SpecSnapshot
 from bmad_loop.adapters.generic import GenericDevAdapter, GenericTmuxAdapter
 from bmad_loop.adapters.multiplexer import MultiplexerError
@@ -2645,11 +2645,29 @@ def test_start_session_resets_reused_task_log(tmp_path):
 
 def test_classify_env_fault_bounds_pathological_pattern(tmp_path, monkeypatch):
     """A pathological operator regex can't hang run() teardown: each match is bounded
-    by ENV_FAULT_MATCH_TIMEOUT_S, and exceeding it declines to classify (best-effort,
-    like an unreadable log) rather than backtracking forever on a long tail line."""
+    by ENV_FAULT_MATCH_TIMEOUT_S, and exceeding it aborts the WHOLE scan and declines
+    to classify (best-effort, like an unreadable log) rather than backtracking forever
+    on a long tail line.
+
+    Two details keep this test honest, and it was vacuous without both:
+
+    * The patch targets ``env_fault``, the module that DEFINES the constant and reads
+      it at ``pat.search`` time. Patching ``generic`` — which only re-exports the name,
+      copying the object binding — never reaches the classifier, so the scan silently
+      ran at the 2.0s default.
+    * The second, trivially-matching pattern is what makes "declined because a match
+      timed out" distinguishable from "found nothing". With a lone non-matching
+      backtracker, ``evidence is None`` holds for BOTH reasons, so the assertions
+      passed with the timeout gate deleted outright. Here, any scan that is not cut
+      short reaches ``!$``, matches, and reddens every assertion below — which is
+      also what catches the patch being repointed at a non-authoritative module,
+      since the 2.0s default lets the backtracker run to completion."""
     adapter = make_adapter(tmp_path)
-    adapter._env_fault_patterns = (regex.compile(r"(a+)+$"),)  # catastrophic backtracker
-    monkeypatch.setattr(generic, "ENV_FAULT_MATCH_TIMEOUT_S", 0.1)
+    adapter._env_fault_patterns = (
+        regex.compile(r"(a+)+$"),  # catastrophic backtracker, never matches
+        regex.compile(r"!$"),  # trips instantly IF the scan is allowed to get here
+    )
+    monkeypatch.setattr(env_fault, "ENV_FAULT_MATCH_TIMEOUT_S", 0.1)
     _write_task_log(adapter, b"a" * 1000 + b"!\n")  # long non-matching line -> deep backtrack
     start = time.monotonic()
     result = _classify(adapter, "timeout")

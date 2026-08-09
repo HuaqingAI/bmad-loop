@@ -47,6 +47,13 @@ from .base import CodingCLIAdapter, SessionHandle, SessionResult, SessionSpec, S
 # these are deliberate pass-throughs, without an `__all__` that would read as a
 # statement of this module's public API and understate it (callers also import
 # GenericTmuxAdapter, the *_NUDGE_TEXT constants and HEARTBEAT_INTERVAL_S).
+#
+# READ-ONLY. An import copies the object binding, so these names are aliases, not
+# a window onto env_fault's globals: reading them is exact, but REBINDING one here
+# (`monkeypatch.setattr(generic, "ENV_FAULT_MATCH_TIMEOUT_S", ...)`) is invisible to
+# the classifier, which resolves the constant from its own module at call time. That
+# is not hypothetical — it silently defused the pathological-regex test the split
+# inherited. Override at the definition site (`env_fault.<NAME>`) instead.
 from .env_fault import _ANSI_RE as _ANSI_RE
 from .env_fault import ENV_FAULT_EVIDENCE_MAX as ENV_FAULT_EVIDENCE_MAX
 from .env_fault import ENV_FAULT_MATCH_TIMEOUT_S as ENV_FAULT_MATCH_TIMEOUT_S
