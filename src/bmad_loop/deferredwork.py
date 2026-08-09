@@ -241,7 +241,7 @@ def gates(entry: DWEntry) -> EntryGates:
             if not token:
                 continue
             named = True
-            bucket = tokens if matchable_token(token) else malformed
+            bucket = tokens if _matchable_token(token) else malformed
             if token not in bucket:
                 bucket.append(token)
         if not named:
@@ -262,7 +262,7 @@ def gates(entry: DWEntry) -> EntryGates:
     )
 
 
-def matchable_token(token: str) -> bool:
+def _matchable_token(token: str) -> bool:
     """Whether ``token`` could gate any legal story key — the test that decides
     :attr:`EntryGates.tokens` vs :attr:`EntryGates.malformed`.
 
