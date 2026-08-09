@@ -158,7 +158,8 @@ class TerminalMultiplexer(ABC):
         """Create a window that runs ``argv`` then *parks* — waiting on a key so
         the exit status stays inspectable instead of the window closing the moment
         the process exits — and finally returns an attached client to its origin
-        (keyed by the per-window ``return_opt``). Returns the native window id."""
+        (keyed by the per-window ``return_opt``). Returns the native window id;
+        for its required form see :meth:`list_window_ids`'s note on #482."""
 
     @abstractmethod
     def list_window_ids(self, session: str) -> list[str]:

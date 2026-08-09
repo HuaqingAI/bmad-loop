@@ -709,10 +709,19 @@ class BmadLoopApp(App[None]):
             self.notify(f"run {run_id} may still be live — stop it first", severity="warning")
             return
         try:
-            launch.resume_detached(self.project, run_id)
+            win_id = launch.resume_detached(self.project, run_id)
         except launch.LaunchError as e:
             self.notify(str(e), severity="error")
             return
+        if not win_id:
+            # The resume itself is running; only the disambiguation record is
+            # lost, so `a`/`x` may target an older same-run_id window (#482's
+            # symptom). Warn instead of masking it behind the success toast.
+            self.notify(
+                "resume launched but its window id was not captured — "
+                "attach/stop may target an older window for this run",
+                severity="warning",
+            )
         self.notify(f"resume of {run_id} launched (control session {launch.CTL_SESSION})")
 
     def _do_replan(self, run_id: str, spec_path: Path) -> None:

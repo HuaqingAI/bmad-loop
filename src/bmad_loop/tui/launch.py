@@ -21,7 +21,7 @@ from pathlib import Path
 from .. import runs
 from ..adapters.multiplexer import MultiplexerError, get_multiplexer, mux_usable
 from ..journal import Journal
-from ..platform_util import retrying_unlink
+from ..platform_util import atomic_write_text
 
 CTL_SESSION = "bmad-loop-ctl"
 
@@ -55,18 +55,19 @@ _CTL_WINDOW_FILE = "ctl-window"
 def _read_ctl_window(project: Path, run_id: str) -> str | None:
     """The window id recorded by the run's last launch, or None when there is
     none / it cannot be read. Never raises, and that includes decoding: a torn
-    or hand-edited record raises UnicodeDecodeError, a ValueError rather than an
-    OSError, and it would escape into action_attach and _stop_run_worker, whose
-    excepts do not cover it. An unreadable hint is not an error — it just leaves
-    the caller with the name scan.
+    record can raise UnicodeDecodeError, a ValueError rather than an OSError,
+    which action_attach (no covering except at all) and _stop_run_worker (whose
+    except does not include it) would let escape. An unreadable hint is not an
+    error — it just leaves the caller with the name scan.
 
     The file is the only channel on purpose: `bmad-loop attach` resolves the same
     run from its own process, and one resolve feeding every consumer is the
     property ctl_window_id sells. A per-process memo of what this process last
     minted would answer a different window than the CLI does."""
+    record = runs.run_dir_for(project, run_id) / _CTL_WINDOW_FILE
     try:
-        text = (runs.run_dir_for(project, run_id) / _CTL_WINDOW_FILE).read_text(encoding="utf-8")
-    except (OSError, ValueError):
+        text = record.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
         return None
     return text.strip() or None
 
@@ -80,11 +81,15 @@ def _forget_ctl_window(project: Path, run_id: str) -> None:
     Ceiling: when the removal itself fails too, the superseded id survives on
     disk. It still has to pass ctl_window_id's re-prove, so the worst it can
     answer is a live window carrying this run's name — the pre-fix by-name
-    result, never a wilder target."""
+    result, never a wilder target.
+
+    A plain unlink, not retrying_unlink: launches run on the Textual event
+    loop, and dropping a best-effort hint is not worth ~5s of blocked win32
+    backoff — the ceiling above already covers the miss."""
     try:
-        retrying_unlink(runs.run_dir_for(project, run_id) / _CTL_WINDOW_FILE)
+        (runs.run_dir_for(project, run_id) / _CTL_WINDOW_FILE).unlink(missing_ok=True)
     except OSError:
-        pass  # nothing recorded, or a removal we cannot force — see the ceiling
+        pass  # a removal we cannot force — see the ceiling
 
 
 def _record_ctl_window(project: Path, run_id: str, win_id: str) -> None:
@@ -98,15 +103,22 @@ def _record_ctl_window(project: Path, run_id: str, win_id: str) -> None:
     the intended fallback, answering a superseded window is not.
 
     Skipped when there is no run yet: a fresh `run`/`sweep` mints the only
-    window carrying its run id (nothing to disambiguate), the run dir is created
-    by the detached child, and a record must not conjure a directory that
-    runs.is_run then reports as not a run.
+    window carrying its run id (nothing to disambiguate), and the run dir is
+    created by the detached child — this record deliberately never mkdirs one,
+    and must not be written into a run-dir-shaped directory (pruned, partial)
+    that runs.is_run reports as not a run.
+
+    Atomic, not a bare write_text: the record is read cross-process (`bmad-loop
+    attach`), and on win32 an AV/indexer holding the previous record open fails
+    a plain overwrite with a transient sharing violation — which would swallow
+    into the forget path and quietly degrade the lookup. atomic_replace retries
+    exactly that violation, turning most real-world failures into successes.
     """
     run_dir = runs.run_dir_for(project, run_id)
     if not runs.is_run(run_dir):
         return
     try:
-        (run_dir / _CTL_WINDOW_FILE).write_text(win_id, encoding="utf-8")
+        atomic_write_text(run_dir / _CTL_WINDOW_FILE, win_id)
     except OSError:
         _forget_ctl_window(project, run_id)
 
@@ -130,9 +142,11 @@ def ctl_window_id(project: Path, run_id: str) -> str | None:
     The id the run's last launch minted is recorded in the run dir and wins
     whenever the listing still shows it under this run id. A record that is gone
     (killed, pruned) or now carries another run's name is ignored rather than
-    replayed: a target that no longer resolves is the dangerous kind of stale,
-    because an unresolvable `-t` lands on the *active* window. With no record at
-    all the answer is the first match, exactly as before."""
+    replayed: a target that no longer resolves is the dangerous kind of stale —
+    on psmux an unresolvable `-t` lands on the *active* window (psmux/psmux#545;
+    tmux merely errors, which the best-effort consumers turn into a silent
+    no-op). With no record at all the answer is the first match, exactly as
+    before."""
     if not mux_available():
         return None
     matches: list[str] = []
@@ -450,10 +464,11 @@ def start_detached(project: Path, argv_tail: list[str], run_id: str, kind: str) 
     except MultiplexerError as e:
         raise LaunchError(f"multiplexer new-window failed: {e}") from e
     if win_id:
-        # Record before tagging: set_window_option sits outside the try above and
-        # can still raise, and a window minted but unrecorded puts the lookup back
-        # on the ambiguous scan — while an *untagged* window already has a
-        # documented fallback in _ctl_window_candidates.
+        # Record before tagging: a window minted but unrecorded puts the lookup
+        # back on the ambiguous scan, while an *untagged* window already has a
+        # documented fallback in _ctl_window_candidates — so even a
+        # non-conforming backend raising from the (contractually best-effort)
+        # set_window_option must not cost the record.
         _record_ctl_window(project, run_id, win_id)
         # Tag the window with its project so a cleanup in another project never
         # closes it (the ctl session is shared across projects).
@@ -504,8 +519,12 @@ def start_sweep_detached(
     start_detached(project, tail, run_id, "sweep")
 
 
-def resume_detached(project: Path, run_id: str) -> None:
-    start_detached(project, ["resume", "--project", str(project), run_id], run_id, "resume")
+def resume_detached(project: Path, run_id: str) -> str | None:
+    """Resume in a ctl-session window; returns the window id (None when the
+    backend did not capture one — the caller should warn: resume is the launch
+    that mints a second window under the run id, so an uncaptured id degrades
+    the lookup to the ambiguous scan while the launch itself succeeded)."""
+    return start_detached(project, ["resume", "--project", str(project), run_id], run_id, "resume")
 
 
 def start_resolve_detached(project: Path, run_id: str) -> str | None:

@@ -169,10 +169,12 @@ whose seams had diverged enough that several ports needed a different fix, and t
   records the window id it minted in the run dir, and the lookup prefers that id — but only after
   re-proving it against the live listing: a record that was killed or pruned, or whose id now carries
   another run's name, is ignored rather than replayed as a target that no longer resolves. Runs with
-  no record answer exactly as before. **Adapter authors:** the re-prove pairs `new_parked_window`'s id
-  with the `window_id` column of `list_windows`, which the seam previously left free to diverge —
-  both bundled backends already agree; one that does not degrades to the ambiguous by-name resolve
-  rather than mistargeting.
+  no record answer exactly as before. The record is written atomically (a torn or overwrite-blocked
+  record would silently degrade the lookup), and a resume whose window id was not captured now warns
+  instead of hiding the degraded lookup behind the success toast. **Adapter authors:** the re-prove
+  pairs `new_parked_window`'s id with the `window_id` column of `list_windows`, which the seam
+  previously left free to diverge — both bundled backends already agree; one that does not degrades
+  to the ambiguous by-name resolve rather than mistargeting.
 
 - **A native-Windows install driven from a WSL shell now says so (#332).** WSL appends the Windows
   `PATH` to its own, so a bash prompt can reach a Windows-installed `bmad-loop`: that interpreter

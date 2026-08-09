@@ -19,7 +19,7 @@ import pytest
 
 from bmad_loop import runs
 from bmad_loop.adapters import tmux_base
-from bmad_loop.adapters.multiplexer import get_multiplexer
+from bmad_loop.adapters.multiplexer import MultiplexerError, get_multiplexer
 from bmad_loop.tui import launch
 
 # Every test here asserts tmux-specific argv/behaviour through the multiplexer
@@ -471,11 +471,27 @@ def test_start_detached_records_nothing_without_a_run(fake_run, tmp_path: Path):
     assert not runs.run_dir_for(tmp_path, "RID").exists()
 
 
-def test_start_detached_survives_an_unwritable_record(fake_run, tmp_path: Path):
+def test_no_record_into_a_dir_that_is_not_a_run(fake_run, tmp_path: Path):
+    # The case the is_run guard actually gates (the missing-dir sibling above is
+    # also covered by the OSError swallow — deleting the guard leaves it green):
+    # a run-dir-shaped directory without state.json (pruned, partial). Here the
+    # write would *succeed*, so only the guard keeps the sidecar out.
+    run_dir = runs.run_dir_for(tmp_path, "RID")
+    run_dir.mkdir(parents=True)
+    launch.resume_detached(tmp_path, "RID")
+    assert not (run_dir / launch._CTL_WINDOW_FILE).exists()
+
+
+def test_start_detached_survives_an_unwritable_record(fake_run, tmp_path: Path, monkeypatch):
     # The window is already running by the time the record is written, so a
     # failed write degrades to the name scan rather than failing the launch.
+    from bmad_loop import platform_util
+
     run_dir = _make_run(tmp_path)
     (run_dir / launch._CTL_WINDOW_FILE).mkdir()  # a dir, not a file
+    # On win32 the replace-over-a-directory denial looks like the transient
+    # sharing violation atomic_replace retries; skip the ~5s backoff.
+    monkeypatch.setattr(platform_util, "_REPLACE_ATTEMPTS", 1)
     assert launch.start_resolve_detached(tmp_path, "RID") == "@7"
 
 
@@ -489,9 +505,24 @@ def test_failed_record_forgets_the_previous_one(fake_run, tmp_path: Path, monkey
     def boom(*_a, **_k):
         raise OSError("disk full")
 
-    monkeypatch.setattr(Path, "write_text", boom)
+    monkeypatch.setattr(launch, "atomic_write_text", boom)
     launch.resume_detached(tmp_path, "RID")
     assert not (run_dir / launch._CTL_WINDOW_FILE).exists()
+
+
+def test_record_survives_a_raising_window_tag(fake_run, tmp_path: Path, monkeypatch):
+    # Record-before-tag ordering: the seam declares set_window_option
+    # best-effort, but a non-conforming backend raising from it must not cost
+    # the record — swap the two calls in start_detached and this fails.
+    run_dir = _make_run(tmp_path)
+
+    def boom(self, *_a, **_k):
+        raise MultiplexerError("tag failed")
+
+    monkeypatch.setattr(type(get_multiplexer()), "set_window_option", boom)
+    with pytest.raises(MultiplexerError):
+        launch.resume_detached(tmp_path, "RID")
+    assert (run_dir / launch._CTL_WINDOW_FILE).read_text(encoding="utf-8") == "@7"
 
 
 def test_uncaptured_window_id_forgets_the_previous_record(monkeypatch, tmp_path: Path):
@@ -510,15 +541,23 @@ def test_uncaptured_window_id_forgets_the_previous_record(monkeypatch, tmp_path:
 
 
 def test_record_round_trips_a_session_qualified_id(monkeypatch, tmp_path: Path):
-    # psmux qualifies both the parked id it mints and the window_id column, so
-    # the re-prove is a string match on the qualified form (multiplexer's
-    # symmetry note). Pinned here because the two shapes only differ off tmux.
+    # The re-prove is a pure string match, so any qualified form works as long
+    # as the mint and the window_id column agree (multiplexer's symmetry note);
+    # `session:@N` is the shape psmux actually emits on both sides.
     _ctl_listing(
         monkeypatch,
-        "=bmad-loop-ctl:@1\trun-RID\n=bmad-loop-ctl:@2\tresume-RID\n",
+        "bmad-loop-ctl:@1\trun-RID\nbmad-loop-ctl:@2\tresume-RID\n",
     )
-    _write_record(tmp_path, "RID", "=bmad-loop-ctl:@2")
-    assert launch.ctl_window_id(tmp_path, "RID") == "=bmad-loop-ctl:@2"
+    _write_record(tmp_path, "RID", "bmad-loop-ctl:@2")
+    assert launch.ctl_window_id(tmp_path, "RID") == "bmad-loop-ctl:@2"
+
+
+def test_record_with_trailing_newline_still_matches(monkeypatch, tmp_path: Path):
+    # A newline-terminated record (hand-edited, foreign writer) must not fail
+    # the `recorded in matches` check and silently answer the parked corpse.
+    _ctl_listing(monkeypatch, "@1\trun-RID\n@2\tresume-RID\n")
+    _write_record(tmp_path, "RID", "@2\n")
+    assert launch.ctl_window_id(tmp_path, "RID") == "@2"
 
 
 def test_prune_ctl_windows(monkeypatch, tmp_path: Path):

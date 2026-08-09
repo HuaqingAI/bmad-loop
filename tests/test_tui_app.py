@@ -1960,6 +1960,31 @@ async def test_resume_confirm_launches(project, monkeypatch):
         await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
 
 
+async def test_resume_uncaptured_window_id_warns(project, monkeypatch):
+    # The resume itself is running; only the #482 disambiguation record is lost,
+    # so attach/stop may target an older same-run_id window. The success toast
+    # must not mask that (the resolve path already errors on this condition).
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: None)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    make_run(
+        project.project,
+        "20260611-100000-aaaa",
+        paused_stage="DEV_VERIFY",
+        paused_reason="verify failed",
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: dashboard(app).selected_run_id is not None)
+        await pilot.press("e")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmResumeModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(
+            pilot, lambda: any("window id was not captured" in m for m in notifications(app))
+        )
+
+
 async def test_resume_unknown_pid_warns(project, monkeypatch):
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(data, "liveness", lambda run_dir: "unknown")
