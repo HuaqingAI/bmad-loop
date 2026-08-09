@@ -19,6 +19,7 @@ from datetime import date as calendar_date
 from pathlib import Path
 
 from . import sprintstatus
+from .fences import fenced
 from .platform_util import atomic_write_text
 
 HEADING_RE = re.compile(r"^### (DW-\d+): (.+?)\s*$", re.MULTILINE)
@@ -81,16 +82,6 @@ _STORIES_ID_RE = re.compile(r"^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$")
 # rather than *accepted*, because accepting an indented line would read a fenced
 # example inside an entry as a live gate and refuse a story nobody meant to block.
 _GATE_NEAR_RE = re.compile(r"^[ \t]*gate[ \t]*:", re.IGNORECASE | re.MULTILINE)
-# A fenced code block's delimiter, with its info string. The ledger is markdown,
-# and an entry whose whole subject is this field quotes it — the sibling
-# `HARD_GATE_PROSE_RE` needed quote guards for exactly that reason, and its
-# comment records the warning firing on entries documenting the convention,
-# including this repo's own docs. `gate:` is worse off than that detector was: a
-# fenced example sits in column 0, so the strict field anchor reads it as a live
-# declaration, and the answer is now a *refusal* — `validate` fails and the run
-# pauses on a story nobody meant to block. A false refusal wedges a run, which is
-# the one way this check can be worse than the prose it replaced.
-_FENCE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})(.*)$")
 # The prose convention `gate:` replaces, matched anywhere on a line rather than
 # at its start: real ledgers hard-wrap their `reason:` prose, so the declaration
 # routinely lands mid-line and a line-anchored pattern misses exactly the entries
@@ -243,13 +234,20 @@ def gates(entry: DWEntry) -> EntryGates:
     malformed: list[str] = []
     lines = 0
     empty = 0
-    # Both scans below run against the fence-masked body, never `entry.body`: an
-    # entry documenting this field quotes it, and a quoted example is not a
-    # declaration. Only the two `gate:` scans are masked — `HARD_GATE_PROSE_RE`
-    # is left reading the raw body deliberately, because it produces a warning
-    # rather than a refusal and already carries its own quote guard.
-    body = _mask_fenced_blocks(entry.body)
-    for m in GATE_RE.finditer(body):
+
+    # Both scans below skip fenced matches: an entry documenting this field quotes
+    # it, and a quoted example is not a declaration — a fenced `gate: 3-2` sits in
+    # column 0, right where the anchor looks, and the answer here is a *refusal*.
+    # `unclosed_hides_rest=False` because a stray unterminated fence must not be
+    # able to silence a real `gate:` line below it (see `fences.fenced`). Only the
+    # two `gate:` scans are filtered — `HARD_GATE_PROSE_RE` deliberately still
+    # reads the raw body: it warns rather than refuses, and carries a quote guard.
+    def _quoted(offset: int) -> bool:
+        return fenced(entry.body, offset, unclosed_hides_rest=False)
+
+    for m in GATE_RE.finditer(entry.body):
+        if _quoted(m.start()):
+            continue
         lines += 1
         named = False
         for raw in m.group(1).split(","):
@@ -266,8 +264,9 @@ def gates(entry: DWEntry) -> EntryGates:
         # `^` puts every match at a line start, so this asks whether the same line
         # would have satisfied `GATE_RE` — i.e. whether it is the canonical spelling
         # already counted above — without re-running the anchor against a slice.
-        not body.startswith("gate:", m.start())
-        for m in _GATE_NEAR_RE.finditer(body)
+        not entry.body.startswith("gate:", m.start())
+        for m in _GATE_NEAR_RE.finditer(entry.body)
+        if not _quoted(m.start())
     )
     return EntryGates(
         tokens=tuple(tokens),
@@ -276,53 +275,6 @@ def gates(entry: DWEntry) -> EntryGates:
         empty=empty,
         near_miss=near_miss,
     )
-
-
-def _mask_fenced_blocks(body: str) -> str:
-    """Blank the contents of fenced code blocks, preserving every offset.
-
-    Length-preserving (spaces in, newlines kept) so a caller can keep matching
-    against the masked text and still index into it — :func:`gates` relies on that
-    for its near-miss test.
-
-    Splits on ``\\n`` alone, deliberately, because that is exactly where
-    ``re.MULTILINE``'s ``^`` matches. Using ``str.splitlines()`` would split on
-    U+2028 and friends as well, and the mask would then disagree with the very
-    patterns it is masking for — the same two-readers-disagree trap
-    :data:`LINE_BREAK_RE` exists to document.
-
-    **An unclosed fence masks nothing.** Masking to end-of-entry would let one
-    stray ``` swallow a real ``gate:`` line below it — a gate lost in silence,
-    which is precisely the failure this field exists to end. Between the two
-    directions, a fenced example that is never closed staying readable is the
-    cheaper wrong answer: it costs a spurious refusal only in an entry that is
-    already malformed markdown, while the greedy reading costs a lost gate in an
-    entry that is merely long.
-    """
-    lines = body.split("\n")
-    masked = list(lines)
-    opener: int | None = None
-    marker = ""
-    for i, line in enumerate(lines):
-        m = _FENCE_RE.match(line)
-        if opener is None:
-            if m:
-                opener, marker = i, m.group(1)
-            continue
-        # A closer is the same character, at least as long, and carries no info
-        # string (CommonMark). Requiring that is what keeps ```` ```python ````
-        # inside a ```` ``` ```` block from ending it early and re-exposing the
-        # lines the fence was hiding.
-        if (
-            m
-            and m.group(1)[0] == marker[0]
-            and len(m.group(1)) >= len(marker)
-            and not m.group(2).strip()
-        ):
-            for j in range(opener, i + 1):
-                masked[j] = " " * len(lines[j])
-            opener = None
-    return "\n".join(masked)
 
 
 def _matchable_token(token: str) -> bool:

@@ -120,6 +120,12 @@ A sweep is never gated by the ledger it is draining, whatever any entry's `gate:
 says: closing the gating entry is what a sweep is for, so gating it would
 deadlock the gate against its own remedy.
 
+**Quoting the field is safe.** A `gate:` line inside a fenced code block is an
+example, not a declaration, so an entry that documents this convention gates
+nothing. One exception worth knowing when you write an entry: a fence you open
+and never close is not treated as a fence at all, because swallowing the rest of
+the entry could silently disable a real `gate:` line below it. Close your fences.
+
 Four shapes declare a gate that nothing can enforce, and all four are reported as
 `deferred.hard-gate-unstructured` while the entry is unlanded:
 
@@ -133,9 +139,9 @@ Four shapes declare a gate that nothing can enforce, and all four are reported a
   such line is reported, including one sitting beside a line that does name a
   story, since the half that names nothing is the half you are wrong about;
 - a `gate:` that is not lowercase at the very start of its line — `Gate: 3-2`, or
-  a line that indents `gate: 3-2`. These are reported rather than read as declarations,
-  because accepting an indented one would turn a fenced example quoted inside an
-  entry into a refusal of a story nobody meant to block;
+  a line that indents `gate: 3-2`. These are reported rather than read as
+  declarations: the field is a fixed spelling, and guessing at near-misses is how
+  a line that was never meant to gate ends up refusing a story;
 - prose declaring `HARD GATE:` — the convention that predates this field —
   anywhere on a line of an entry that carries no `gate:` line. It is matched
   mid-line because `reason:` prose is hard-wrapped, but never directly after a
