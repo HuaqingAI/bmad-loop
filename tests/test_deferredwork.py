@@ -1777,10 +1777,10 @@ def test_a_fenced_example_is_not_a_legacy_finding_either():
 
 
 def test_a_stray_unclosed_fence_does_not_hide_legacy_findings_below_it():
-    """`_quoted_line_spans` asks with `unclosed_hides_rest=False` for the reason
-    the canonical side does: under the opposite answer one unterminated fence
-    would blank every finding after it out of the ledger, and a lost legacy item
-    is as silent as a lost entry."""
+    """`parse_legacy` asks `fences.fenced_spans` with `unclosed_hides_rest=False`
+    for the reason the canonical side does: under the opposite answer one
+    unterminated fence would blank every finding after it out of the ledger, and
+    a lost legacy item is as silent as a lost entry."""
     text = "# Deferred Work\n\n```\n\n- source_spec: `real.md`\n  summary: real finding\n  evidence: e\n"
 
     (legacy,) = parse_legacy(text)
