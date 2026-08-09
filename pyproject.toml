@@ -14,7 +14,7 @@ requires-python = ">=3.11"
 dependencies = [
   "pyyaml>=6.0",
   # stdlib `re` has no match timeout; the #194 env-fault classifier runs
-  # operator-supplied profile regexes over pane logs, so it matches with the
+  # operator-supplied profile regexes over session logs, so it matches with the
   # `regex` module's per-call timeout= to keep a pathological pattern from
   # hanging a session teardown. Core (all-platform) — classification is on the
   # main pipeline path.

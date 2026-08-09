@@ -102,12 +102,21 @@ class CLIProfile:
     # that a `git worktree add` checkout omits; provision_worktree copies them in
     # from the main repo so isolated dev/review sessions can reach the MCP server.
     seed_files: tuple[str, ...] = ()
-    # Python `re` patterns matched line-by-line against the ANSI-stripped tail of
-    # a non-completed session's pane log to classify a transport/API *environment
-    # fault* (#194) — e.g. an "API Error … Connection refused" the CLI printed
-    # while idling out the session clock. Compiled and validated at parse time
-    # (an invalid regex is a profile error). Seeded only for `claude`; empty =
-    # inert. Override/extend via a project profile in .bmad-loop/profiles/.
+    # Patterns matched line-by-line against the ANSI-stripped tail of a
+    # non-completed session's log to classify a provider/transport *environment
+    # fault* (#194) — an "API Error … Connection refused" or a "usage limit
+    # reached" the CLI printed while idling out the session clock. Which log is
+    # scanned is per-adapter, named by EnvFaultMixin.ENV_FAULT_LOG_SUFFIX: the
+    # tmux adapters' pane capture logs/<task_id>.log, or logs/<task_id>.server.out
+    # for opencode-http (whose .log is a model-written transcript). Compiled and
+    # validated at parse time (an invalid regex is a profile error); empty = inert.
+    #
+    # Write them anchored: require an error-shaped token AND a cause on the SAME
+    # line. A pane capture contains the model's own output, so a bare `quota` or
+    # `429` matches a story that merely *implements* rate limiting and would
+    # pause a healthy run — a pattern is only sound against a log the model
+    # cannot write to. Override/extend via a project profile in
+    # .bmad-loop/profiles/.
     env_fault_patterns: tuple[str, ...] = ()
 
     @property
