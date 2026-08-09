@@ -1735,6 +1735,59 @@ def test_a_fenced_status_line_is_not_the_status_of_the_entry_quoting_it():
     assert not entry.done and not entry.open
 
 
+def test_a_backtick_run_carrying_backticks_is_inline_code_not_a_fence():
+    """CommonMark forbids a backtick anywhere in a BACKTICK fence's info string,
+    exactly so a line of inline code does not open a block. Without the rule this
+    line opens one, the trailing ``` closes it, and the `gate:` between them reads
+    as a quoted example — a gate lost in silence, which is the failure this field
+    exists to end, not the spurious refusal the fenced path is allowed to make."""
+    g = _gated("```gate:``` is the field name.", "gate: 3-2", "```")
+
+    assert g.tokens == ("3-2",)
+
+
+def test_a_tilde_fence_may_carry_backticks_in_its_info_string():
+    """The other arm of the same rule, and the reason it is not simply "no
+    backticks in an info string": the restriction is backtick-only, because a
+    tilde run cannot appear in inline code. Dropping the fence-char test would
+    leave this example live and refuse a story the entry only documented."""
+    g = _gated("~~~ `inline`", "gate: 3-2", "~~~")
+
+    assert g.tokens == ()
+
+
+def test_a_fenced_example_is_not_a_legacy_finding_either():
+    """The far side of skipping fenced headings (#514). While `parse_ledger` read a
+    quoted example as a phantom canonical entry, that entry's span masked the
+    quotation out of this reader by accident; removing the phantom removed the
+    accident, and the same bullet surfaced here as a legacy finding instead. The
+    real block below must still parse — over-masking would lose a tracked item,
+    which is the failure `parse_legacy` exists to prevent."""
+    text = (
+        "# Deferred Work\n\nThe format, for reference:\n\n"
+        "```markdown\n### DW-1: wire the blob-storage credentials\nstatus: open\n"
+        "gate: 3-2\n- source_spec: `example.md`\n  summary: quoted\n  evidence: e\n```\n\n"
+        "- source_spec: `real.md`\n  summary: real finding\n  evidence: e\n"
+    )
+
+    (legacy,) = parse_legacy(text)
+
+    assert legacy.title == "real finding"
+    assert parse_ledger(text) == []
+
+
+def test_a_stray_unclosed_fence_does_not_hide_legacy_findings_below_it():
+    """`_quoted_line_spans` asks with `unclosed_hides_rest=False` for the reason
+    the canonical side does: under the opposite answer one unterminated fence
+    would blank every finding after it out of the ledger, and a lost legacy item
+    is as silent as a lost entry."""
+    text = "# Deferred Work\n\n```\n\n- source_spec: `real.md`\n  summary: real finding\n  evidence: e\n"
+
+    (legacy,) = parse_legacy(text)
+
+    assert legacy.title == "real finding"
+
+
 def test_gate_token_shape_copy_agrees_with_the_stories_id_it_mirrors():
     """`_STORIES_ID_RE` is a copy of `stories.ID_RE`, taken because `stories`
     imports this module and the reverse would cycle. Pinned to the original rather

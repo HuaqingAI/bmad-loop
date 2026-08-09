@@ -19,7 +19,7 @@ from datetime import date as calendar_date
 from pathlib import Path
 
 from . import sprintstatus
-from .fences import fenced
+from .fences import fenced, fenced_spans
 from .platform_util import atomic_write_text
 
 HEADING_RE = re.compile(r"^### (DW-\d+): (.+?)\s*$", re.MULTILINE)
@@ -1065,11 +1065,23 @@ def _heading_entry(struck: bool, hid: str, rest: str, body: str, section: str) -
 
 
 def parse_legacy(text: str) -> list[LegacyEntry]:
-    """Extract legacy (non-DW) deferred items. Canonical DW entries are
-    masked out first, so mixed ledgers parse both ways without overlap."""
+    """Extract legacy (non-DW) deferred items. Canonical DW entries and fenced
+    examples are masked out first, so mixed ledgers parse both ways without
+    overlap and a quoted example contributes nothing to either reading.
+
+    The fenced half is not symmetry for its own sake. `parse_ledger` used to hand
+    a quoted example over as a phantom canonical entry, whose span masked the
+    example here by accident; once it stopped doing that, the same quotation
+    surfaced on this side instead — a bullet or `### DW-n:` heading inside a fence
+    read as a legacy finding (#514).
+    """
     masked = text
-    for e in parse_ledger(text):
-        s, t = e.span
+    # `unclosed_hides_rest=False` for the reason the canonical side uses it: one
+    # stray opener must not blank every legacy finding below it out of view. The
+    # delimiter lines survive as a lone backtick or tilde plus spaces, which no
+    # pattern below can start an item on — masking them too made no test disagree.
+    spans = [e.span for e in parse_ledger(text)] + fenced_spans(text, unclosed_hides_rest=False)
+    for s, t in spans:
         masked = masked[:s] + re.sub(r"[^\n]", " ", masked[s:t]) + masked[t:]
 
     found: list[tuple[dict, tuple[int, int]]] = []

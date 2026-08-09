@@ -20,6 +20,23 @@ import re
 FENCE_LINE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})([^\n]*)$", re.MULTILINE)
 
 
+def _delimits(marker: str, rest: str) -> bool:
+    """Whether a matched line delimits a fence at all, or is ordinary text.
+
+    CommonMark forbids a backtick anywhere in the info string of a BACKTICK fence,
+    and only there — the rule exists so that inline code is not read as opening a
+    block. Tilde fences carry no such restriction. Checked here rather than folded
+    into `FENCE_LINE_RE` so the pattern stays one readable alternation instead of
+    two near-identical arms with different info-string classes.
+
+    The miss runs the wrong way for `deferredwork`: a line of prose quoting a
+    fence opens a block CommonMark never opens, and a real `gate:` above the next
+    closing run is then read as an example and silently stops gating — the lost
+    gate the field exists to prevent, not the spurious refusal it tolerates.
+    """
+    return marker[0] == "~" or "`" not in rest
+
+
 def fenced(text: str, offset: int, *, unclosed_hides_rest: bool = True) -> bool:
     """True when ``offset`` falls inside a ``` / ~~~ fenced code block.
 
@@ -45,30 +62,42 @@ def fenced(text: str, offset: int, *, unclosed_hides_rest: bool = True) -> bool:
       exact failure that field exists to end; a spurious refusal in an entry whose
       markdown is already malformed is the cheaper wrong answer.
     """
-    open_marker: str | None = None
-    for m in FENCE_LINE_RE.finditer(text):
-        if m.start() >= offset:
-            break
-        marker, rest = m.group(1), m.group(2)
-        if open_marker is None:
-            open_marker = marker  # opening fence — an info string is allowed
-        elif marker[0] == open_marker[0] and len(marker) >= len(open_marker) and not rest.strip():
-            open_marker = None  # valid closing fence
-        # else: a shorter / mismatched / info-bearing fence line — literal content
-    if open_marker is None:
-        return False
-    return unclosed_hides_rest or _closes_later(text, offset, open_marker)
+    return any(
+        s <= offset < e for s, e in fenced_spans(text, unclosed_hides_rest=unclosed_hides_rest)
+    )
 
 
-def _closes_later(text: str, offset: int, open_marker: str) -> bool:
-    """Whether the fence open at ``offset`` is ever validly closed after it.
+def fenced_spans(text: str, *, unclosed_hides_rest: bool = True) -> list[tuple[int, int]]:
+    """Half-open ``[start, end)`` ranges of ``text`` that sit inside a fenced block.
 
-    Only consulted under ``unclosed_hides_rest=False``, and only when the offset
-    is inside an open fence — so the walk above has already paid for the prefix
-    and this pays for the remainder exactly once per query.
+    The walk itself, which `fenced()` reduces to one offset and
+    `deferredwork.parse_legacy` blanks out wholesale before scanning line by line.
+    Keeping it here is the point of the module: a reader that needs the ranges and
+    a reader that needs one answer must not disagree about where a block ends.
+
+    The bounds follow the delimiters' roles rather than their extents. A span opens
+    one character past the opener's line start, so the opener itself reads as
+    outside the block — it is markup that a scanner may still want to see. It ends
+    one character past the closer's line start, which puts the closer *inside*: the
+    scanners this serves anchor at column 0, and a closing delimiter is the one
+    line of a block that can never be mistaken for the content it terminates.
     """
-    for m in FENCE_LINE_RE.finditer(text, offset):
+    spans: list[tuple[int, int]] = []
+    open_marker: str | None = None
+    start = 0
+    for m in FENCE_LINE_RE.finditer(text):
         marker, rest = m.group(1), m.group(2)
-        if marker[0] == open_marker[0] and len(marker) >= len(open_marker) and not rest.strip():
-            return True
-    return False
+        if not _delimits(marker, rest):
+            continue  # inline code, not a fence line
+        if open_marker is None:
+            open_marker, start = marker, m.start() + 1  # opener — an info string is allowed
+        elif marker[0] == open_marker[0] and len(marker) >= len(open_marker) and not rest.strip():
+            spans.append((start, m.start() + 1))  # valid closing fence
+            open_marker = None
+        # else: a shorter / mismatched / info-bearing fence line — literal content
+    if open_marker is not None and unclosed_hides_rest:
+        # Past the last offset, not up to it: an unclosed fence has no end, and
+        # `fenced()` answered True for an offset at or beyond `len(text)` before
+        # these ranges existed. Slicing clamps, so a mask is unaffected either way.
+        spans.append((start, len(text) + 1))
+    return spans
