@@ -26,6 +26,7 @@ from conftest import (
     review_effect,
     set_sprint,
     spec_path,
+    write_gated_ledger,
     write_ledger,
     write_spec,
     write_sprint,
@@ -6450,23 +6451,6 @@ def test_critical_escalation_pauses_and_resume_continues(project):
     summary2 = resumed.run()
     assert summary2.done == 1 and not summary2.paused
     assert resumed.state.finished
-
-
-def write_gated_ledger(paths, entries, commit=True) -> None:
-    """`write_ledger` plus the `gate:` lines a hard gate is written on: `entries`
-    maps a DW id to `(status, extra_field_lines)`, appended verbatim after
-    `status:`. Committed by default — the engine's own paths assume a clean tree."""
-    parts = ["# Deferred Work\n"]
-    for dw_id, (status, extra) in entries.items():
-        tail = "".join(f"{line}\n" for line in extra)
-        parts.append(
-            f"### {dw_id}: item {dw_id}\n\norigin: test, 2026-06-01\n"
-            f"location: src.txt:1\nreason: test entry.\nstatus: {status}\n{tail}"
-        )
-    paths.deferred_work.write_text("\n".join(parts), encoding="utf-8")
-    if commit:
-        git(paths.project, "add", "-A")
-        git(paths.project, "commit", "-q", "-m", "ledger")
 
 
 def test_dispatch_refuses_a_story_an_unlanded_entry_gates(project):

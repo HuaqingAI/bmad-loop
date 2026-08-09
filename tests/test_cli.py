@@ -21,6 +21,7 @@ from conftest import (
     machine_json,
     mark_ledger_done,
     spec_path,
+    write_gated_ledger,
     write_ledger,
     write_spec,
     write_sprint,
@@ -3900,21 +3901,6 @@ def test_validate_sprint_mode_silent_without_declarations(project, capsys):
     assert [f for f in doc["findings"] if f["check"].startswith("deferred.closes")] == []
 
 
-def write_gated_ledger(paths, entries) -> None:
-    """`write_ledger` plus the lines a hard gate is written on: `entries` maps a
-    DW id to `(status, extra_field_lines)`, appended verbatim after `status:` so a
-    test can spell a `gate:` line, a prose `HARD GATE:`, or a deliberately broken
-    one exactly as a human would."""
-    parts = ["# Deferred Work\n"]
-    for dw_id, (status, extra) in entries.items():
-        tail = "".join(f"{line}\n" for line in extra)
-        parts.append(
-            f"### {dw_id}: item {dw_id}\n\norigin: test, 2026-06-01\n"
-            f"location: src.txt:1\nreason: test entry.\nstatus: {status}\n{tail}"
-        )
-    paths.deferred_work.write_text("\n".join(parts), encoding="utf-8")
-
-
 def _hard_gate_findings(capsys, check="deferred.hard-gate"):
     doc = json.loads(capsys.readouterr().out)
     return [f for f in doc["findings"] if f["check"] == check]
@@ -3926,7 +3912,7 @@ def _validate_gated_sprint(project, capsys, board, ledger):
     install_bmad_config(project)
     _write_policy(project.project)
     write_sprint(project, board)
-    write_gated_ledger(project, ledger)
+    write_gated_ledger(project, ledger, commit=False)
     args = argparse.Namespace(project=str(project.project), spec=None, json=True)
 
     cli.cmd_validate(args)  # rc varies by host (binary/skills) — parse the document
@@ -4240,7 +4226,7 @@ def test_validate_does_not_gate_a_word_id_that_merely_shares_a_prefix(project, c
     install_bmad_config(project)
     _write_policy(project.project, STORIES_POLICY)
     _setup_stories_fixture(project, [_stories_entry("authz-login")])
-    write_gated_ledger(project, {"DW-1": ("open", ["gate: auth"])})
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: auth"])}, commit=False)
     args = argparse.Namespace(project=str(project.project), spec=None, json=True)
 
     cli.cmd_validate(args)
@@ -4269,7 +4255,7 @@ def test_validate_hard_gate_runs_in_stories_mode(project, capsys):
     install_bmad_config(project)
     _write_policy(project.project, STORIES_POLICY)
     _setup_stories_fixture(project, [_stories_entry("1")])
-    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1"])})
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1"])}, commit=False)
     args = argparse.Namespace(project=str(project.project), spec=None, json=True)
 
     cli.cmd_validate(args)
@@ -4287,7 +4273,7 @@ def test_validate_survives_an_unreadable_story_spec_in_stories_mode(project, cap
     install_bmad_config(project)
     _write_policy(project.project, STORIES_POLICY)
     _setup_stories_fixture(project, [_stories_entry("1")])
-    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1"])})
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1"])}, commit=False)
     monkeypatch.setattr(
         cli.stories_mod,
         "resolve_story_spec",
@@ -4309,7 +4295,7 @@ def test_validate_reports_no_gate_all_clear_when_the_queue_is_unreadable(project
     install_bmad_config(project)
     _write_policy(project.project)
     project.sprint_status.write_text("development_status: [oh no\n", encoding="utf-8")
-    write_gated_ledger(project, {"DW-1": ("open", ["gate: 3-2"])})
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 3-2"])}, commit=False)
     args = argparse.Namespace(project=str(project.project), spec=None, json=True)
 
     cli.cmd_validate(args)
@@ -4327,7 +4313,7 @@ def test_validate_stories_mode_skips_a_done_story(project, capsys):
     (folder / "stories" / "1-slug.md").write_text(
         "---\ntitle: 'test'\nstatus: 'done'\n---\n\n## Intent\n\ntest\n", encoding="utf-8"
     )
-    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1"])})
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1"])}, commit=False)
     args = argparse.Namespace(project=str(project.project), spec=None, json=True)
 
     cli.cmd_validate(args)
