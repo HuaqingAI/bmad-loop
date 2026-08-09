@@ -103,9 +103,14 @@ otherwise touched: removing it un-gates the story silently, which is the exact
 failure this field exists to prevent.
 
 Until the entry lands, the gate is enforced twice. `bmad-loop validate` **fails**
-(`deferred.hard-gate`) for every actionable story a token matches — sprint-status
-stories at `backlog` / `ready-for-dev`, or manifest entries whose spec is not yet
-`done` — and a `run` that never called `validate` **pauses** (`story-gate`) rather
+(`deferred.hard-gate`) for every story a token matches that the queue would
+actually dispatch — sprint-status stories at `backlog` / `ready-for-dev`, or
+manifest entries whose spec is not yet written or sits at `draft` /
+`ready-for-dev` / `in-progress` / `in-review`. A `blocked` manifest entry is not
+gated, nor is one the scheduler would stop on anyway (two specs matching one id,
+or a skeletal sentinel from a failed planning halt): the queue cannot reach that
+story, so a gate refusing it would report work held back that was never going to
+run. A `run` that never called `validate` **pauses** (`story-gate`) rather
 than dispatch a gated story. Two things clear it: closing the entry
 (`status: done <date>`), or removing the token because it no longer blocks that
 work. This is the one deferred-work check that gates rather than advises:
