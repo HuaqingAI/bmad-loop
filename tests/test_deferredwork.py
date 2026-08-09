@@ -1562,6 +1562,20 @@ def test_gates_reports_a_line_that_names_nothing(line):
 
     assert g.tokens == () and g.malformed == ()
     assert g.inert
+    assert g.empty == 1
+
+
+def test_gates_counts_an_empty_line_beside_a_valid_one():
+    """An entry can gate one story and name nothing on the next line. `inert` is an
+    entry-wide verdict and answers False here — the entry does have a token — so the
+    empty line needs its own count or the operator who wrote it is never told the
+    second gate holds nothing back."""
+    g = _gated("gate: 3-2", "gate:")
+
+    assert g.tokens == ("3-2",)
+    assert g.lines == 2
+    assert not g.inert  # the entry-wide verdict cannot express this case...
+    assert g.empty == 1  # ...which is why the per-line count exists
 
 
 def test_gates_reports_a_token_that_cannot_name_a_story():
@@ -1608,6 +1622,16 @@ def test_gates_stop_at_the_canonical_span_boundary():
         ("3", "3-2-invite-link", True),  # a whole epic is a legal token
         ("3-2-invite", "3-2-invite-link", True),
         ("3-2-invite", "3-2-invited", False),
+        # The split arm needs the token to end at a story NUMBER, because that is
+        # the only place STORY_RE can attach a split letter. `stories.ID_RE` admits
+        # word ids, so without the digit guard the arm read the `z` of `authz` as a
+        # split and FAILED validate for a story nobody gated — the one way this
+        # check can be worse than the prose it replaced.
+        ("auth", "authz-login", False),
+        ("api", "apis-v2", False),
+        ("3-2a", "3-2ab-x", False),  # a token already carrying a split letter
+        ("3-2a", "3-2a-x", True),  # ...still gates its own `-` boundary
+        ("", "a-b", False),  # an empty token names nothing, so it gates nothing
     ],
 )
 def test_gates_story_matches_on_key_boundaries(token, story_key, gated):
@@ -1623,12 +1647,18 @@ def test_gates_story_matches_on_key_boundaries(token, story_key, gated):
         ("reason: an entry naming a 'HARD GATE: before X'", False),
         ("reason: «HARD GATE: before X» is only prose", False),
         ("reason: this HARD GATE is textual only, nothing enforces it", False),
+        # A ledger is markdown, so the backtick is the citation form an author
+        # reaches for first, and an LLM-written entry curls its quotes. Both used
+        # to warn, so an entry documenting the convention accused itself.
+        ("reason: a `HARD GATE:` is prose only", False),
+        ("reason: cites “HARD GATE: before X” only", False),
+        ("reason: cites ‘HARD GATE: before X’ only", False),
         # KNOWN LIMIT, pinned rather than left to surprise someone: the lookbehind
         # is one character wide, so a citation that spaces its opening quote off
         # the phrase — the French convention, `«` + U+00A0 — still reads as a
         # declaration. The remedy for such an entry is a `gate:` line, which
         # silences the warning either way.
-        ("reason: « HARD GATE: before X » is only prose", True),
+        ("reason: «\u00a0HARD GATE: before X\u00a0» is only prose", True),
     ],
 )
 def test_hard_gate_prose_detects_a_declaration_not_a_citation(body, declared):

@@ -54,7 +54,11 @@ GATE_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 # entry *citing* the phrase (`names a "HARD GATE: ..."`) is discussion, not a
 # declaration — and the colon does the rest of the work, since a sentence about
 # "this HARD GATE is textual only" never reaches the pattern at all.
-HARD_GATE_PROSE_RE = re.compile(r"""(?<!["'«])HARD GATE:""")
+# The class covers the backtick and the curly quotes as well as the ASCII pair:
+# a ledger is markdown, so `HARD GATE:` is the citation form an author reaches for
+# first, and an LLM-written entry curls its quotes. Missing them made the warning
+# fire on entries documenting the convention — including this repo's own docs.
+HARD_GATE_PROSE_RE = re.compile(r"""(?<!["'`«“”‘’])HARD GATE:""")
 # Everything `str.splitlines()` splits on, not `\n` alone (#305). The writers
 # below interpolate their arguments into a line-oriented file, so a break in a
 # value injects ledger lines. The C1/Unicode members are load-bearing rather
@@ -136,15 +140,23 @@ class EntryGates:
     story run. ``lines`` is what distinguishes "declared nothing usable" from
     "declared nothing at all": an entry with no ``gate:`` line has made no claim,
     while ``gate:`` with an empty value has made one and inertly.
+
+    ``empty`` counts those inert lines individually rather than folding them into
+    an entry-wide verdict, because the two coexist: ``gate: 3-2`` followed by a
+    bare ``gate:`` has both a gate in force and a line that names nothing, and an
+    aggregate answer can only report one of them. Reporting the tokens and
+    swallowing the empty line is the worse half to lose — the operator who wrote
+    it believes a second story is held back.
     """
 
     tokens: tuple[str, ...] = ()
     malformed: tuple[str, ...] = ()
     lines: int = 0
+    empty: int = 0
 
     @property
     def inert(self) -> bool:
-        """A ``gate:`` line that yielded no token at all — ``gate:`` or ``gate: ,``."""
+        """Every ``gate:`` line named nothing — ``gate:`` or ``gate: ,`` and no others."""
         return self.lines > 0 and not self.tokens and not self.malformed
 
 
@@ -165,16 +177,21 @@ def gates(entry: DWEntry) -> EntryGates:
     tokens: list[str] = []
     malformed: list[str] = []
     lines = 0
+    empty = 0
     for m in GATE_RE.finditer(entry.body):
         lines += 1
+        named = False
         for raw in m.group(1).split(","):
             token = raw.strip()
             if not token:
                 continue
+            named = True
             bucket = tokens if GATE_TOKEN_RE.match(token) else malformed
             if token not in bucket:
                 bucket.append(token)
-    return EntryGates(tokens=tuple(tokens), malformed=tuple(malformed), lines=lines)
+        if not named:
+            empty += 1
+    return EntryGates(tokens=tuple(tokens), malformed=tuple(malformed), lines=lines, empty=empty)
 
 
 def gates_story(token: str, story_key: str) -> bool:
@@ -193,13 +210,20 @@ def gates_story(token: str, story_key: str) -> bool:
     silently, which is the worst thing a gate can do. One lowercase ASCII letter
     followed by ``-`` is therefore also a boundary. Exactly one letter, and the
     ``-`` after it is required, so ``3-2ab-x`` and a bare ``3-2a`` are not swept in.
+
+    The split arm applies only to a token ending in a digit, because that is the
+    only place a split letter can attach: ``STORY_RE`` puts it straight after the
+    story *number*. Without that guard the arm reads any trailing letter as a
+    split and gates a story nobody named — ``stories.ID_RE`` admits word ids, so
+    ``gate: auth`` refused ``authz-login``, and a hard failure on an unrelated
+    story is the one way this check can be worse than the prose it replaced.
     """
     if story_key == token or story_key.startswith(f"{token}-"):
         return True
     # The `startswith` guard is load-bearing, not redundant with the slice below:
     # `story_key[len(token):]` says nothing about what preceded it, so without it
     # `3-2` would gate `9-9a-x` on the tail alone.
-    if not story_key.startswith(token):
+    if not story_key.startswith(token) or not token[-1:].isascii() or not token[-1:].isdigit():
         return False
     rest = story_key[len(token) :]
     return len(rest) >= 2 and "a" <= rest[0] <= "z" and rest[1] == "-"

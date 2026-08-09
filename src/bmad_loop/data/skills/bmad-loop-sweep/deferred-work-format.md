@@ -94,7 +94,13 @@ story key when it **is** that key, or is its prefix at a key boundary — either
 sprint key `3-2-invite-link-student-surface`, the stories-mode id `3-2`, and both
 halves of a split (`3-2a-…` / `3-2b-…`), but never `3-20-later-story`. The split
 arm matters because breakdown can split a story _after_ the gate was written, and
-a gate that quietly stops matching is worse than one that was never there.
+a gate that quietly stops matching is worse than one that was never there. The
+prefix must end at a story **number** for the split arm to apply, so a word id
+like `auth` does not gate `authz-login`.
+
+Like `source_spec:`, a `gate:` line is never edited or dropped when an entry is
+otherwise touched: removing it un-gates the story silently, which is the exact
+failure this field exists to prevent.
 
 While the entry is `open`, `bmad-loop validate` **fails** (`deferred.hard-gate`)
 for every actionable story a token matches — sprint-status stories at `backlog` /
@@ -110,12 +116,14 @@ as `deferred.hard-gate-unstructured` on an open entry:
 - a token that does not look like a story key (`[A-Za-z0-9][A-Za-z0-9._-]*`, no
   spaces) — note that this makes a space-separated `gate: 3-2 3-3` one bad token
   rather than two good ones;
-- a `gate:` line with nothing usable after the colon (`gate:`, `gate: ,`);
+- a `gate:` line with nothing usable after the colon (`gate:`, `gate: ,`) — each
+  such line is reported, including one sitting beside a line that does name a
+  story, since the half that names nothing is the half you are wrong about;
 - prose declaring `HARD GATE:` — the convention that predates this field —
   anywhere on a line of an entry that carries no `gate:` line. It is matched
   mid-line because `reason:` prose is hard-wrapped, but never directly after a
-  quote character: an entry that merely _cites_ the phrase stays silent, as does
-  one that writes it without the colon.
+  quote character (`"`, `'`, `` ` ``, `«`, or a curly quote): an entry that merely
+  _cites_ the phrase stays silent, as does one that writes it without the colon.
 
 Each reads like a gate already in force while holding nothing back. Add or repair
 the `gate:` line to make it enforceable.

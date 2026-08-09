@@ -16,17 +16,12 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 - **A deferred-work entry can block a story: `gate:`.** An entry that must land before specific
   stories run could only say so in prose (`HARD GATE: must land before 3-2`), and prose stopped
-  nothing — `run` drove the story and the gate surfaced in a diff built on the missing leg. A
-  `gate: 3-2, 3-3` field line names the blocked story keys, and while the entry is `open`
-  `bmad-loop validate` FAILS (`deferred.hard-gate`) for every actionable story a token matches —
-  the key itself, or its prefix at a key boundary (`-`, or a split-story suffix), so `3-2` covers
-  `3-2-invite-link` and both halves of a `3-2a`/`3-2b` split but never `3-20-later`. Both queue
-  modes. The only deferred check that gates rather than advises; cleared by closing the entry or
-  dropping the token. Three inert shapes warn instead (`deferred.hard-gate-unstructured`): a token
-  that cannot name a story key, an empty `gate:` line, and prose declaring `HARD GATE:` on an entry
-  with no `gate:` line — matched anywhere on a line, since `reason:` prose wraps, but not straight
-  after a quote character, so an entry citing the phrase stays silent. A ledger with no `gate:`
-  line at all is silent as before.
+  nothing — `run` drove the story anyway. A `gate: 3-2, 3-3` line names the blocked story keys, and
+  while the entry is `open` `bmad-loop validate` fails (`deferred.hard-gate`) for every actionable
+  story a token matches, in both queue modes. The only deferred check that gates rather than
+  advises; cleared by closing the entry or dropping the token. A gate that can enforce nothing —
+  an unusable token, an empty `gate:` line, or a prose-only `HARD GATE:` — warns instead
+  (`deferred.hard-gate-unstructured`). Silent on a ledger that gates nothing, as before.
 
 - **Deferred review findings are harvested from spec frontmatter (#433).** BMAD-METHOD#2640 moved
   `defer`-triaged findings into the spec's unfiled `deferred:` list. A successful dev, review,

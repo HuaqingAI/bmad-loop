@@ -1052,9 +1052,11 @@ def _validate_deferred_ledger(
     ``validate`` reads the ledger, so silence meant reporting success for
     preflights that checked nothing.
 
-    The gate runs first — an operator who has both a blocked story and a stale
-    traceability field needs the refusal at the top, and ``_validate_closes_deferred``
-    returns early on an unreadable manifest, which must not swallow it.
+    The gate runs first for one reason only: an operator who has both a blocked
+    story and a stale traceability field should meet the refusal before the
+    advisory. Presentation, nothing more — ``_validate_closes_deferred``'s early
+    return leaves *that function*, so it could never have skipped a sibling call
+    here, and swapping the two lines changes no severity and no exit code.
     """
     ledger = paths.deferred_work
     try:
@@ -1083,7 +1085,13 @@ def _validate_hard_gates(
     *,
     spec_folder: str | None = None,
 ) -> None:
-    """FAIL when the queue is about to dispatch a story an open ledger entry gates.
+    """FAIL when the queue would dispatch a story an open ledger entry gates.
+
+    Preflight only, and the scope is worth stating plainly: this refuses at
+    ``bmad-loop validate``, not at dispatch. ``Engine._loop`` selects a story from
+    the board alone and never reads the ledger, so a ``run`` that skipped the
+    preflight is still unguarded. Wiring the same check into dispatch is follow-on
+    work; until it lands, the refusal is only as strong as the operator's habit.
 
     A ledger entry could always *say* it blocked a story — ``HARD GATE: must land
     before 3-2`` in its reason — and saying it stopped nothing. ``run`` took the
@@ -1102,12 +1110,29 @@ def _validate_hard_gates(
     nobody remembered to write.
     """
     declared = [(entry, deferredwork.gates(entry)) for entry in deferredwork.parse_ledger(text)]
-    story_keys = _actionable_story_keys(paths, spec_folder)
-    gated = False
     for entry, entry_gates in declared:
         if not entry.open:
             continue  # a landed entry gates nothing; that is what closing it means
         _report_unstructured_gate(entry, entry_gates, report)
+    # Keyed on enforceable tokens, not on `gate:` lines: a ledger whose only gate is
+    # malformed enforced nothing, and an `ok` there would be the same false all-clear
+    # the warning above exists to break. Closed entries still count, deliberately —
+    # the passing case has to keep speaking after the gate lands, or `ok` and "nobody
+    # ever wrote a gate" become the same silence. Reading the queue sits behind this
+    # test so a project that gates nothing pays neither the walk nor its failure modes.
+    if not any(entry_gates.tokens for _, entry_gates in declared):
+        return
+    story_keys = _actionable_story_keys(paths, spec_folder)
+    if story_keys is None:
+        # The queue could not be read, so nothing was compared. `queue.sprint-status`
+        # and `queue.stories-manifest` already fail for it; adding an `ok` here would
+        # say "no story is gated" about a queue this check never saw.
+        return
+    open_gated = [e.id for e, g in declared if e.open and g.tokens]
+    gated = False
+    for entry, entry_gates in declared:
+        if not entry.open:
+            continue
         for story_key in story_keys:
             hits = [t for t in entry_gates.tokens if deferredwork.gates_story(t, story_key)]
             if not hits:
@@ -1126,11 +1151,7 @@ def _validate_hard_gates(
                     "tokens": hits,
                 },
             )
-    # Keyed on enforceable tokens, not on `gate:` lines: a ledger whose only gate
-    # is malformed enforced nothing, and an `ok` there would be the same false
-    # all-clear the warning above exists to break.
-    if not gated and any(entry_gates.tokens for _, entry_gates in declared):
-        open_gated = [e.id for e, g in declared if e.open and g.tokens]
+    if not gated:
         report.ok(
             "deferred.hard-gate",
             f"deferred-work gates OK: no actionable story is gated by an open entry "
@@ -1153,35 +1174,52 @@ def _report_unstructured_gate(
     syntax around it — worse, because to anyone scanning the entry they read as a
     gate already in force.
 
-    An entry carrying a valid token *and* a malformed one is still reported: the
+    An entry carrying a valid token *and* an unenforceable one is still reported,
+    and each cause is reported on its own rather than the first one winning: the
     valid half gates what it names, and the operator's belief about the other half
-    is exactly the thing that goes wrong quietly.
+    is exactly the thing that goes wrong quietly. That applies to an empty line as
+    much as to a malformed token — ``gate: 3-2`` followed by a bare ``gate:`` used
+    to report neither, because the entry had tokens and so read as fully gated.
     """
+    reasons: list[str] = []
     if entry_gates.malformed:
-        reason = (
+        reasons.append(
             f"declares `gate:` tokens that cannot name a story: {', '.join(entry_gates.malformed)}"
         )
-    elif entry_gates.inert:
-        reason = "declares an empty `gate:` line, which names no story"
-    elif not entry_gates.tokens and deferredwork.HARD_GATE_PROSE_RE.search(entry.body):
-        reason = "declares a `HARD GATE:` in prose but carries no `gate:` line"
-    else:
+    if entry_gates.empty == 1:
+        reasons.append("declares an empty `gate:` line, which names no story")
+    elif entry_gates.empty:
+        reasons.append(f"declares {entry_gates.empty} empty `gate:` lines, which name no story")
+    prose_only = not entry_gates.tokens and not reasons
+    if prose_only and deferredwork.HARD_GATE_PROSE_RE.search(entry.body):
+        reasons.append("declares a `HARD GATE:` in prose but carries no `gate:` line")
+    if not reasons:
         return
     report.warn(
         "deferred.hard-gate-unstructured",
-        f"{entry.id} ({entry.title}) {reason} — nothing holds the gated story back, so "
-        f"`bmad-loop run` will drive it while the entry is open; name the blocked stories "
-        f"on a `gate:` line (comma-separated) to make the gate enforceable",
-        {"dw_id": entry.id, "malformed": list(entry_gates.malformed)},
+        f"{entry.id} ({entry.title}) {' and '.join(reasons)} — so `validate` cannot refuse "
+        f"the gated story and nothing holds it back; name the blocked stories on a `gate:` "
+        f"line (comma-separated) to make the gate enforceable",
+        {
+            "dw_id": entry.id,
+            "malformed": list(entry_gates.malformed),
+            "empty": entry_gates.empty,
+        },
     )
 
 
-def _actionable_story_keys(paths: bmadconfig.ProjectPaths, spec_folder: str | None) -> list[str]:
+def _actionable_story_keys(
+    paths: bmadconfig.ProjectPaths, spec_folder: str | None
+) -> list[str] | None:
     """The story keys this queue would dispatch, in queue order, in either mode.
 
-    Degrades to nothing rather than raising: ``queue.sprint-status`` and
-    ``queue.stories-manifest`` own queue readability, and a queue nothing can read
-    dispatches nothing for a gate to refuse.
+    ``None`` when the queue could not be read, which is not the same answer as an
+    empty list: ``queue.sprint-status`` and ``queue.stories-manifest`` own queue
+    readability, so this check stays quiet rather than raising — but a caller that
+    read ``[]`` as "nothing is gated" would report an all-clear about a queue it
+    never saw. The whole walk is inside the guard for the same reason: the
+    per-story ``resolve_story_spec`` globs the filesystem too, and leaving it
+    outside turned a degraded check into a traceback out of ``validate``.
 
     Stories mode has no status column — the manifest is a flat schedule and the
     story's own spec carries the status — so a story whose spec reads ``done`` is
@@ -1190,22 +1228,21 @@ def _actionable_story_keys(paths: bmadconfig.ProjectPaths, spec_folder: str | No
     over gates on work that already landed.
     """
     if spec_folder is not None:
+        keys: list[str] = []
         try:
             folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
-            entries = stories_mod.load_stories(folder).entries
+            for entry in stories_mod.load_stories(folder).entries:
+                state = stories_mod.resolve_story_spec(folder, entry.id)
+                if state.kind == stories_mod.KIND_PRESENT and state.status == stories_mod.DONE:
+                    continue
+                keys.append(entry.id)
         except (OSError, UnicodeDecodeError, stories_mod.StoriesError):
-            return []
-        keys = []
-        for entry in entries:
-            state = stories_mod.resolve_story_spec(folder, entry.id)
-            if state.kind == stories_mod.KIND_PRESENT and state.status == stories_mod.DONE:
-                continue
-            keys.append(entry.id)
+            return None
         return keys
     try:
         ss = sprintstatus.load(paths.sprint_status)
     except (sprintstatus.SprintStatusError, OSError, UnicodeDecodeError):
-        return []
+        return None
     return [s.key for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
 
 

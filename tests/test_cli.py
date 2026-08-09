@@ -3981,6 +3981,24 @@ def test_validate_passes_when_the_gate_entry_is_closed(project, capsys):
     assert gates[0]["detail"]["open_gated_ids"] == []
 
 
+def test_validate_ignores_an_unstructured_gate_on_a_closed_entry(project, capsys):
+    """The `entry.open` skip guards the warning as well as the refusal, and only the
+    refusal half was pinned — an ablation of the skip left every closed entry
+    warning about gates that already landed, with nothing red."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link": "ready-for-dev"},
+        {
+            "DW-1": ("done 2026-08-01", ["gate: 3-2 3-3"]),
+            "DW-2": ("done 2026-08-01", ["HARD GATE: must land before 3-2"]),
+            "DW-3": ("done 2026-08-01", ["gate:"]),
+        },
+    )
+
+    assert not [f for f in findings if f["check"] == "deferred.hard-gate-unstructured"]
+
+
 def test_validate_hard_gate_token_stops_at_the_key_boundary(project, capsys):
     """`3-2` gates the story it names and both halves of that story once breakdown
     splits it, and not its numeric neighbours. A bare `startswith` would sweep
@@ -4029,7 +4047,7 @@ def test_validate_warns_on_a_prose_only_hard_gate(project, capsys):
 
     unstructured = [f for f in findings if f["check"] == "deferred.hard-gate-unstructured"]
     assert len(unstructured) == 1 and unstructured[0]["severity"] == "warning"
-    assert unstructured[0]["detail"] == {"dw_id": "DW-1", "malformed": []}
+    assert unstructured[0]["detail"] == {"dw_id": "DW-1", "malformed": [], "empty": 0}
     assert "`gate:` line" in unstructured[0]["message"]
     # nothing enforceable exists, so there is no passing gate to report either
     assert not [f for f in findings if f["check"] == "deferred.hard-gate"]
@@ -4099,9 +4117,47 @@ def test_validate_warns_on_a_malformed_gate_token(project, capsys):
 
     unstructured = [f for f in findings if f["check"] == "deferred.hard-gate-unstructured"]
     assert len(unstructured) == 1 and unstructured[0]["severity"] == "warning"
-    assert unstructured[0]["detail"] == {"dw_id": "DW-1", "malformed": ["3-2 3-3"]}
+    assert unstructured[0]["detail"] == {"dw_id": "DW-1", "malformed": ["3-2 3-3"], "empty": 0}
     # and it is NOT reported as an enforced gate: nothing matched
     assert not [f for f in findings if f["check"] == "deferred.hard-gate"]
+
+
+def test_validate_warns_on_an_empty_gate_line_beside_an_enforced_one(project, capsys):
+    """The entry gates 3-2 and names nothing on its second line. Reporting only the
+    token would leave the operator believing both lines hold — the belief the field
+    exists to end — so the empty line is reported even though the entry is gating."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link": "ready-for-dev", "4-1-billing": "ready-for-dev"},
+        {"DW-1": ("open", ["gate: 3-2", "gate:"])},
+    )
+
+    unstructured = [f for f in findings if f["check"] == "deferred.hard-gate-unstructured"]
+    assert len(unstructured) == 1 and unstructured[0]["severity"] == "warning"
+    assert "empty `gate:` line" in unstructured[0]["message"]
+    assert unstructured[0]["detail"]["empty"] == 1
+    # the valid half still gates, so this is additive to the refusal, not instead of it
+    gated = [f for f in findings if f["check"] == "deferred.hard-gate"]
+    assert [f["severity"] for f in gated] == ["problem"]
+    assert gated[0]["detail"]["story_key"] == "3-2-invite-link"
+
+
+def test_validate_does_not_gate_a_word_id_that_merely_shares_a_prefix(project, capsys):
+    """`stories.ID_RE` admits word ids, and the split-story arm used to read the `z`
+    of `authz-login` as a split letter — FAILING validate for a story nobody gated.
+    A false refusal wedges a run, which is worse than the prose gate it replaced."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link": "ready-for-dev"},
+        {"DW-1": ("open", ["gate: auth"])},
+    )
+
+    assert not [f for f in findings if f["check"] == "deferred.hard-gate-unstructured"]
+    assert not [
+        f for f in findings if f["check"] == "deferred.hard-gate" and f["severity"] == "problem"
+    ]
 
 
 def test_validate_silent_when_the_ledger_declares_no_gate(project, capsys):
@@ -4132,6 +4188,44 @@ def test_validate_hard_gate_runs_in_stories_mode(project, capsys):
     findings = _hard_gate_findings(capsys)
     assert len(findings) == 1 and findings[0]["severity"] == "problem"
     assert findings[0]["detail"]["story_key"] == "1"
+
+
+def test_validate_survives_an_unreadable_story_spec_in_stories_mode(project, capsys, monkeypatch):
+    """`resolve_story_spec` globs the filesystem per story, so it has to sit inside
+    the same guard as the manifest read. Outside it, a gated stories-mode project on
+    a mount that raises turned a degraded advisory into a traceback out of
+    `validate` — no findings, no JSON, which is worse than the check being skipped."""
+    install_bmad_config(project)
+    _write_policy(project.project, STORIES_POLICY)
+    _setup_stories_fixture(project, [_stories_entry("1")])
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1"])})
+    monkeypatch.setattr(
+        cli.stories_mod,
+        "resolve_story_spec",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("EIO")),
+    )
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)  # must not raise
+
+    # the queue was never read, so the check says nothing rather than an all-clear
+    assert _hard_gate_findings(capsys) == []
+
+
+def test_validate_reports_no_gate_all_clear_when_the_queue_is_unreadable(project, capsys):
+    """`_actionable_story_keys` degrades on an unreadable queue, and an empty list
+    read as "nothing is gated" produced an `ok` naming the very entry it claimed was
+    clear. `queue.*` owns the outage; this check must not answer for a queue it
+    never saw."""
+    install_bmad_config(project)
+    _write_policy(project.project)
+    project.sprint_status.write_text("development_status: [oh no\n", encoding="utf-8")
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 3-2"])})
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)
+
+    assert _hard_gate_findings(capsys) == []
 
 
 def test_validate_stories_mode_skips_a_done_story(project, capsys):
