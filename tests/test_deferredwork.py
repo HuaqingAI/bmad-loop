@@ -1788,6 +1788,72 @@ def test_a_stray_unclosed_fence_does_not_hide_legacy_findings_below_it():
     assert legacy.title == "real finding"
 
 
+QUOTED_STATUS_LEDGER = """\
+# Deferred Work
+
+### DW-1: an entry that quotes the format in an example
+
+summary: shows an operator what an entry looks like
+evidence: e
+
+```
+status: open
+```
+
+status: open
+gate: 3-2
+"""
+
+
+def test_a_close_rewrites_the_live_status_and_not_a_quoted_one(tmp_path):
+    """The reader picks the status with a fence-aware lookup, so a writer that ran
+    `STATUS_RE.search(body)` again would pick the *first* raw match — the quoted
+    one. That split is worse than either half alone: `mark_done_many` reports the
+    id as closed while `open_ids` still lists it, so a sweep or story close can
+    never actually close the entry, and a `gate:` it carries refuses its story on
+    every following pass. Asserted on `open_ids` rather than on the return value,
+    because the return value is exactly what the bug got right."""
+    path = write_ledger(tmp_path, QUOTED_STATUS_LEDGER)
+
+    assert mark_done_many(path, ["DW-1"], "2026-06-11", "fixed") == ["DW-1"]
+
+    text = path.read_text(encoding="utf-8")
+    assert open_ids(text) == set()
+    (entry,) = parse_ledger(text)
+    assert entry.status == "done 2026-06-11"
+    # the quoted example is documentation, and a close must not edit it
+    assert "```\nstatus: open\n```" in text
+
+
+def test_a_reopen_restores_the_live_status_of_an_entry_that_quotes_an_example(tmp_path):
+    """The undo path reads its marker at an offset taken from the status line, so
+    it has to start from the same line the close wrote. Round-tripped rather than
+    asserted field-by-field: the close and the reopen must agree about *which*
+    line they own, and only the round trip pins that they do."""
+    path = write_ledger(tmp_path, QUOTED_STATUS_LEDGER)
+    close_reopenable(path, "DW-1", "fixed")
+    assert open_ids(path.read_text(encoding="utf-8")) == set()
+
+    assert mark_open(path, "DW-1", "fixed", OPERATION_ID) is True
+
+    assert path.read_text(encoding="utf-8") == QUOTED_STATUS_LEDGER
+
+
+def test_a_decision_lands_after_the_live_status_of_an_entry_that_quotes_an_example(
+    tmp_path,
+):
+    """`_insert_after_status` is the third writer that used to re-derive the status
+    line. Inserting after the quoted one would bury the decision inside the fenced
+    example, where every reader — the parser and the human — treats it as prose."""
+    path = write_ledger(tmp_path, QUOTED_STATUS_LEDGER)
+
+    assert append_decision(path, "DW-1", "2026-06-11", "keep", "still worth doing") is True
+
+    text = path.read_text(encoding="utf-8")
+    assert "```\nstatus: open\n```" in text
+    assert "status: open\ndecision: 2026-06-11 keep — still worth doing" in text
+
+
 def test_gate_token_shape_copy_agrees_with_the_stories_id_it_mirrors():
     """`_STORIES_ID_RE` is a copy of `stories.ID_RE`, taken because `stories`
     imports this module and the reverse would cycle. Pinned to the original rather

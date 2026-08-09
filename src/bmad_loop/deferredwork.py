@@ -117,6 +117,16 @@ class DWEntry:
     status: str  # the status field value, "" when the line is missing
     body: str  # full entry text including the heading
     span: tuple[int, int]  # char offsets of the entry in the ledger text
+    # Body-relative offsets of the line `status` was read from; None when the
+    # entry has no status line. Carried rather than re-derived because the reader
+    # picks the status with a fence-aware lookup at file scope, and a writer that
+    # ran `STATUS_RE.search(body)` again would pick the *first* raw match instead.
+    # Those differ exactly when an entry quotes an example above its live status:
+    # the writer rewrote the quoted line, the reader kept reporting the real
+    # `status: open`, and the close reported success while the entry — and any
+    # `gate:` it carries — stayed open forever. No default: `parse_ledger` is the
+    # only constructor, and a fallback here would silently restore that split.
+    status_span: tuple[int, int] | None
 
     @property
     def open(self) -> bool:
@@ -215,6 +225,9 @@ def parse_ledger(text: str) -> list[DWEntry]:
                 status=status_m.group(1).strip() if status_m else "",
                 body=body,
                 span=(m.start(), end),
+                status_span=(
+                    (status_m.start() - m.start(), status_m.end() - m.start()) if status_m else None
+                ),
             )
         )
     return entries
@@ -476,9 +489,8 @@ def _find_entry(text: str, dw_id: str) -> DWEntry | None:
 def _insert_after_status(text: str, entry: DWEntry, line: str) -> str:
     """Insert a field line right after the entry's status line (or at the end
     of the entry when no status line exists)."""
-    status_m = STATUS_RE.search(entry.body)
-    if status_m:
-        pos = entry.span[0] + status_m.end()
+    if entry.status_span:
+        pos = entry.span[0] + entry.status_span[1]
         return text[:pos] + "\n" + line + text[pos:]
     insert_at = entry.span[0] + len(entry.body.rstrip())
     return text[:insert_at] + "\n" + line + text[insert_at:]
@@ -596,11 +608,10 @@ def _apply_done(
     entry = _find_entry(text, dw_id)
     if entry is None or not entry.open:
         return None
-    status_m = STATUS_RE.search(entry.body)
-    assert status_m is not None  # open implies a status line
-    start = entry.span[0] + status_m.start()
-    end = entry.span[0] + status_m.end()
-    previous_status_line = status_m.group(0)
+    assert entry.status_span is not None  # open implies a status line
+    start = entry.span[0] + entry.status_span[0]
+    end = entry.span[0] + entry.status_span[1]
+    previous_status_line = entry.body[entry.status_span[0] : entry.status_span[1]]
     if undo_owner is not None and LINE_BREAK_RE.search(previous_status_line):
         # An undo marker must never preserve a value that becomes more than one line
         # under the ledger readers' shared splitlines semantics. Standard closes
@@ -719,24 +730,24 @@ def mark_open(path: Path, dw_id: str, note: str, operation_id: str) -> bool:
     entry = _find_entry(text, dw_id)
     if entry is None or entry.open:
         return False
-    status_m = STATUS_RE.search(entry.body)
-    if status_m is None:
+    if entry.status_span is None:
         # parse_ledger deliberately tolerates status-less entries. This primitive
         # is later called from _defer, where an AttributeError would crash the run
         # instead of completing the deferral.
         return False
+    status_line = entry.body[entry.status_span[0] : entry.status_span[1]]
     try:
         _require_canonical_status(entry.status)
     except ValueError:
         # Only a canonical status written by mark_done is eligible for undo.
         # Preserve malformed or human-authored statuses for validation/reporting.
         return False
-    res_m = _MARK_DONE_TAIL_RE.match(entry.body, status_m.end())
+    res_m = _MARK_DONE_TAIL_RE.match(entry.body, entry.status_span[1])
     if res_m is None:
         return False
     if res_m.group(1).strip() != _one_line(note).strip() or res_m.group(2) != undo_owner:
         return False
-    if status_m.group(0) != f"status: done {res_m.group(3)}":
+    if status_line != f"status: done {res_m.group(3)}":
         return False
     try:
         previous_status_line = bytes.fromhex(res_m.group(4)).decode("utf-8")
@@ -748,7 +759,7 @@ def mark_open(path: Path, dw_id: str, note: str, operation_id: str) -> bool:
     previous_status = previous_status_m.group(1).strip() if previous_status_m else ""
     if not previous_status or previous_status.split()[0] != "open":
         return False
-    start = entry.span[0] + status_m.start()
+    start = entry.span[0] + entry.status_span[0]
     end = entry.span[0] + res_m.end()
     atomic_write_text(path, text[:start] + previous_status_line + text[end:])
     return True
