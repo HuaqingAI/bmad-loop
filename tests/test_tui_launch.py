@@ -531,8 +531,9 @@ def test_uncaptured_window_id_forgets_the_previous_record(monkeypatch, tmp_path:
     _write_record(tmp_path, "RID", "@2")
 
     def fake(argv, **kwargs):
-        rc = 0 if argv[1] == "has-session" else 0
-        return subprocess.CompletedProcess(argv, rc, stdout="", stderr="")
+        # rc 0 throughout, incl. has-session: the ctl session exists, and
+        # new-window succeeds but answers no id on stdout.
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")

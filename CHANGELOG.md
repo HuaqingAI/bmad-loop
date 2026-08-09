@@ -161,20 +161,15 @@ whose seams had diverged enough that several ports needed a different fix, and t
 ### Fixed
 
 - **Attach, return-stamp and kill follow the run's live control window, not an older one (#482).**
-  Control-session windows are named `<kind>-<run_id>` over four kinds, so the name is not unique and
-  the lookup returned the first match — on tmux the lowest-index one. Resuming a parked run (`e`)
-  minted `resume-<rid>` while the dead `run-<rid>` window still sat in front of it, so `a` attached to
-  the parked corpse, the return pane was stamped on it (leaving the live window with no way back to
-  the operator's origin pane), and `x` killed it while the live one kept running. Each launch now
-  records the window id it minted in the run dir, and the lookup prefers that id — but only after
-  re-proving it against the live listing: a record that was killed or pruned, or whose id now carries
-  another run's name, is ignored rather than replayed as a target that no longer resolves. Runs with
-  no record answer exactly as before. The record is written atomically (a torn or overwrite-blocked
-  record would silently degrade the lookup), and a resume whose window id was not captured now warns
-  instead of hiding the degraded lookup behind the success toast. **Adapter authors:** the re-prove
-  pairs `new_parked_window`'s id with the `window_id` column of `list_windows`, which the seam
-  previously left free to diverge — both bundled backends already agree; one that does not degrades
-  to the ambiguous by-name resolve rather than mistargeting.
+  `<kind>-<run_id>` window names are not unique, so the lookup answered the first match: resuming a
+  parked run left `a` attaching to the dead `run-<rid>` window, the return pane stamped on it (so the
+  live window had no way back to the operator's origin pane), and `x` killing it while the live one
+  ran on. Each launch now records the window id it minted in the run dir and the lookup prefers it,
+  but only while the live listing still shows that id under this run id; with no record the answer is
+  unchanged. A resume whose window id was not captured warns instead of reporting plain success.
+  **Adapter authors:** the re-prove pairs `new_parked_window`'s id with the `window_id` column of
+  `list_windows`, which the seam previously left free to diverge — both bundled backends agree; one
+  that does not degrades to the ambiguous by-name resolve rather than mistargeting.
 
 - **A native-Windows install driven from a WSL shell now says so (#332).** WSL appends the Windows
   `PATH` to its own, so a bash prompt can reach a Windows-installed `bmad-loop`: that interpreter
