@@ -93,6 +93,14 @@ whose seams had diverged enough that several ports needed a different fix, and t
   `bmad-loop` console script via a thin `__main__.py`. Characterization tests pin the current CLI
   exit codes (typed errors and the broad backstop → 1, argparse usage → 2).
 
+- **`{story_title}` in `scm.commit_message_template` (#475).** The placeholder renders the spec's
+  `title:` frontmatter, minus any leading `Story <id>:` label, so a template can carry a readable
+  subject. Specs authored without that field fall back to a first `#` heading, then to the story
+  key — as does a spec that is missing, unreadable or not valid UTF-8, so the placeholder never
+  renders empty and a commit-time read failure never fails the commit. The rendered title is
+  whitespace-collapsed, and characters `git commit -m` cannot take in an argv (control characters,
+  unpaired surrogates) are dropped. Templates that do not name the placeholder skip the read.
+
 ### Changed
 
 - **Every spec-frontmatter status read goes through `status_of` (#358 follow-up).** Five inline
