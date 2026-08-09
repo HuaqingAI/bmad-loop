@@ -133,7 +133,7 @@ Four shapes declare a gate that nothing can enforce, and all four are reported a
   such line is reported, including one sitting beside a line that does name a
   story, since the half that names nothing is the half you are wrong about;
 - a `gate:` that is not lowercase at the very start of its line — `Gate: 3-2`, or
-  an indented `  gate: 3-2`. These are reported rather than read as declarations,
+  a line that indents `gate: 3-2`. These are reported rather than read as declarations,
   because accepting an indented one would turn a fenced example quoted inside an
   entry into a refusal of a story nobody meant to block;
 - prose declaring `HARD GATE:` — the convention that predates this field —
