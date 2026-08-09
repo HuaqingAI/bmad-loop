@@ -160,6 +160,27 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
+- **A native-Windows install driven from a WSL shell now says so (#332).** WSL appends the Windows
+  `PATH` to its own, so a bash prompt can reach a Windows-installed `bmad-loop`: that interpreter
+  reports `win32`, takes the psmux platform default, and never sees the distro's tmux — while
+  `validate` printed a green `multiplexer PsmuxMultiplexer available` and nothing named the platform.
+  `validate` now reports the multiplexer selection reason for **every** host (it was emitted only for
+  a forced `BMAD_LOOP_MUX_BACKEND`/`[mux] backend` choice), so `platform default for win32` is on
+  screen wherever the mismatch happens; the same un-gating makes a `fallback` selection — no
+  available backend matches this platform — a warning rather than a green line. A `win32` interpreter
+  working on a `\\wsl.localhost\...` project additionally raises a `host.win32-on-wsl-path` **warning**
+  naming the fix (install with the WSL/Linux Python) and the backend it actually chose. That warning
+  covers the project-on-the-distro shape only; a project under `/mnt/c` gets a genuine Windows path
+  and no warning, and is covered by the selection line instead. Nothing changes which backend is
+  selected — psmux is correct for a `win32` interpreter — nor validate's exit code. `diagnose` gains
+  `sys.platform` and `win32 on WSL distro path` (`yes`/`no`) in its Environment block.
+
+- **A multiplexer-detection failure is reported instead of swallowed.** `validate` caught and
+  discarded any exception from backend detection, so `mux.selection` and the backend inventory
+  vanished with nothing said — while `mux.backend` above them, which comes from an independent
+  selection call, still printed a healthy backend. It now reports under `mux.backends-detected` at
+  **warning** carrying the error.
+
 - **Provider quota refusals are environment faults on `opencode-http` too (#323).** #194's classifier
   lived on `GenericAdapter`, so its hookless HTTP sibling silently omitted it: a five-hour provider
   usage limit read as three stalled stories and burned their retry budgets. The classifier now lives

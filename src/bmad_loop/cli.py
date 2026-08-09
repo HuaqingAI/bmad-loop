@@ -387,7 +387,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
     except verify.GitError:
         pass
 
-    report.extend(_platform_preflight())
+    report.extend(_platform_preflight(project))
 
     # #231: notify.desktop defaults to true but only fires when a platform notifier
     # exists (osascript/PowerShell/notify-send). When none does, the setting is
@@ -2992,7 +2992,9 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
         return 1
 
     pseudo = sanitize.Pseudonymizer()
-    diag = diagnostics.collect(run_dirs, pseudo=pseudo, cap=args.max_journal_entries)
+    diag = diagnostics.collect(
+        run_dirs, pseudo=pseudo, cap=args.max_journal_entries, project=project
+    )
     repairs: list[tuple[str, int]] = []
     fail_rules: list[str] | None = None
     report = ""

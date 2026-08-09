@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import re
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -168,9 +170,14 @@ def _seed_run(root, run_id="20260627-120000-aaaa", *, extra_journal=None, sweeps
     return run_dir
 
 
+# a plain relative project for tests that are about run payloads, not the #332
+# verdict — any non-WSL path yields the same checked `False`
+ANY_PROJECT = Path("p")
+
+
 def _render_all(run_dirs):
     pseudo = sanitize.Pseudonymizer()
-    diag = diagnostics.collect(run_dirs, pseudo=pseudo)
+    diag = diagnostics.collect(run_dirs, pseudo=pseudo, project=ANY_PROJECT)
     md = diagnostics.render_markdown(diag, pseudo=pseudo)
     js = diagnostics.render_json(diag, pseudo=pseudo)
     return diag, pseudo, md + "\n" + js
@@ -194,6 +201,94 @@ def test_known_safe_values_survive(project):
     assert "20260627-120000-aaaa" in combined  # run id is opaque/safe
     assert "escalated" in combined  # phase enum survives
     assert "input_tokens" in combined  # token count keys survive
+
+
+def test_env_names_the_platform_and_the_win32_on_wsl_path_verdict(project, monkeypatch):
+    """#332: `platform.system()` says "Windows" for both a native shell and a WSL
+    interop launch, so the raw sys.platform token plus the verdict are what explain
+    which backend default the run took."""
+    from bmad_loop.adapters.multiplexer import get_multiplexer
+
+    # `collect_env` reaches `get_multiplexer()`, an lru_cache(maxsize=1) that selects
+    # on `sys.platform`; without these clears the patched window caches the Windows
+    # pick for every later test in the worker.
+    get_multiplexer.cache_clear()
+    try:
+        monkeypatch.setattr(diagnostics.sys, "platform", "win32")
+        pseudo = sanitize.Pseudonymizer()
+        unc = Path("\\\\wsl.localhost\\Ubuntu-24.04\\home\\u\\p")
+        diag = diagnostics.collect([_seed_run(project.project)], pseudo=pseudo, project=unc)
+    finally:
+        # pytest undoes the patch on its own, but only at teardown — a raise in
+        # `collect` would leave the Windows pick cached past this test without this.
+        monkeypatch.undo()
+        get_multiplexer.cache_clear()
+    assert diag.env.sys_platform == "win32"
+    assert diag.env.win32_on_wsl_path is True
+    md = diagnostics.render_markdown(diag, pseudo=pseudo)
+    # the rendered *value*, not just the label: asserting the label alone passes
+    # equally for the "no" verdict, which is the answer this test exists to reject.
+    assert "**sys.platform:** win32" in md
+    assert "**win32 on WSL distro path:** yes" in md
+    # The label must not claim a WSL *shell*: `cd \\wsl.localhost\...` from native
+    # PowerShell reaches this same state, and the sibling `host.win32-on-wsl-path`
+    # finding is worded to that limit — the two surfaces must make the same claim.
+    assert "wsl interop" not in md.lower()
+    # the boolean ships; the path it was derived from never does — the redactor
+    # leaves the Linux username in a \\wsl.localhost\...\home\<user> path standing.
+    assert str(unc) not in md
+    # the `--json` document is its own contract: pin the field names and values
+    # there too, not only the markdown labels.
+    js = diagnostics.render_json(diag, pseudo=pseudo)
+    payload = json.loads(js)
+    assert payload["env"]["sys_platform"] == "win32"
+    assert payload["env"]["win32_on_wsl_path"] is True
+    # Assert over the *decoded* values, never the rendered bytes. Two independent
+    # reasons a substring scan of `js` cannot carry this guard, both measured:
+    #   - `json.dumps` doubles every backslash, so the raw `\\wsl.localhost\...`
+    #     spelling never appears in the rendered bytes it is compared against
+    #     (the same trap `cli.py` already names at its diagnose egress guard);
+    #   - `sanitize`'s absolute-path rules know POSIX `/home/`, `/Users/`, `/root/`
+    #     and `C:\Users\` — never a backslash `\home\` under a UNC host — and its
+    #     username rule compares the *Windows* account, so `assert_no_leak` returns
+    #     `[]` for this shape no matter what leaked.
+    # Ablation: adding a raw-path field to `EnvInfo` leaves both of those green and
+    # only the check below reddens.
+    assert all(str(unc) not in str(v) for v in payload["env"].values())
+    assert sanitize.assert_no_leak(js) == []  # general backstop; blind to this shape
+
+
+def test_env_win32_on_wsl_path_is_false_off_win32(project, monkeypatch):
+    """The *platform* half of the twin gate, pinned. What #332 names is a mismatched
+    interpreter, not a path shape: the very distro path a win32 interpreter warns about
+    is a perfectly ordinary mount for a Linux one. `runsetup`'s twin already carries
+    this row (`test_win32_on_wsl_path_stays_silent_off_the_shape`'s `linux` case);
+    without it here, deleting `sys.platform == "win32"` from `collect_env` reddens
+    nothing in this file — measured, which is why the row exists."""
+    from bmad_loop.adapters.multiplexer import get_multiplexer
+
+    # Same cache dance as the win32 test above, and for the same reason: `collect_env`
+    # reaches `get_multiplexer()`, whose lru_cache selects on the patched `sys.platform`.
+    get_multiplexer.cache_clear()
+    try:
+        monkeypatch.setattr(diagnostics.sys, "platform", "linux")
+        pseudo = sanitize.Pseudonymizer()
+        unc = Path("\\\\wsl.localhost\\Ubuntu-24.04\\home\\u\\p")
+        diag = diagnostics.collect([_seed_run(project.project)], pseudo=pseudo, project=unc)
+    finally:
+        monkeypatch.undo()
+        get_multiplexer.cache_clear()
+    assert diag.env.sys_platform == "linux"
+    assert diag.env.win32_on_wsl_path is False
+
+
+def test_env_win32_on_wsl_path_is_false_for_a_plain_project(project):
+    """Both new fields render for every host, not only the interop one."""
+    pseudo = sanitize.Pseudonymizer()
+    diag = diagnostics.collect([_seed_run(project.project)], pseudo=pseudo, project=project.project)
+    assert diag.env.win32_on_wsl_path is False
+    assert diag.env.sys_platform == sys.platform
+    assert "**win32 on WSL distro path:** no" in diagnostics.render_markdown(diag, pseudo=pseudo)
 
 
 def test_pseudonymization_is_stable_and_correlates(project):
@@ -335,7 +430,7 @@ def test_all_runs_scope(project):
 def test_legend_reverses_locally_but_never_ships(project):
     run_dir = _seed_run(project.project)
     pseudo = sanitize.Pseudonymizer()
-    diag = diagnostics.collect([run_dir], pseudo=pseudo)
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=ANY_PROJECT)
     combined = diagnostics.render_markdown(diag, pseudo=pseudo) + diagnostics.render_json(
         diag, pseudo=pseudo
     )
@@ -352,7 +447,7 @@ def test_unreadable_run_does_not_crash(project):
     run_dir.mkdir(parents=True)
     (run_dir / "state.json").write_text("{ this is not valid json")
     pseudo = sanitize.Pseudonymizer()
-    diag = diagnostics.collect([run_dir], pseudo=pseudo)
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=ANY_PROJECT)
     assert len(diag.runs) == 1
     assert diag.runs[0].warnings  # flagged as unreadable
     # still renders without raising
@@ -375,7 +470,7 @@ def _seed_routing_gap(project):
 def test_routing_gap_is_repaired_end_to_end(project):
     run_dir = _seed_routing_gap(project)
     pseudo = sanitize.Pseudonymizer()
-    diag = diagnostics.collect([run_dir], pseudo=pseudo)
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=ANY_PROJECT)
     reps: list[tuple[str, int]] = []
     js = diagnostics.render_json(diag, pseudo=pseudo, repairs=reps)  # must not raise
     alias = next(a for ns, orig, a in pseudo.entries() if orig == STORY_KEY)
@@ -394,7 +489,8 @@ def test_render_json_keys_are_sorted(project):
     round-trip cannot detect the flag being dropped."""
     run_dir = _seed_run(project.project)
     pseudo = sanitize.Pseudonymizer()
-    js = diagnostics.render_json(diagnostics.collect([run_dir], pseudo=pseudo), pseudo=pseudo)
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=ANY_PROJECT)
+    js = diagnostics.render_json(diag, pseudo=pseudo)
 
     def hook(pairs):
         keys = [k for k, _ in pairs]
@@ -409,7 +505,7 @@ def test_no_repairs_on_fully_routed_run(project):
     silently normalize a new per-field routing gap (CI keeps catching them)."""
     run_dir = _seed_run(project.project)
     pseudo = sanitize.Pseudonymizer()
-    diag = diagnostics.collect([run_dir], pseudo=pseudo)
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=ANY_PROJECT)
     reps: list[tuple[str, int]] = []
     md = diagnostics.render_markdown(diag, pseudo=pseudo, repairs=reps)
     js = diagnostics.render_json(diag, pseudo=pseudo, repairs=reps)
@@ -429,7 +525,7 @@ def test_repair_note_is_inside_verified_bytes(project):
     """The disclosure appended after repair is itself covered by the self-check."""
     run_dir = _seed_routing_gap(project)
     pseudo = sanitize.Pseudonymizer()
-    diag = diagnostics.collect([run_dir], pseudo=pseudo)
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=ANY_PROJECT)
     js = diagnostics.render_json(diag, pseudo=pseudo)
     extras = [(orig, f"{ns}:{alias}") for ns, orig, alias in pseudo.entries()]
     assert sanitize.assert_no_leak(js, extra=extras) == []
@@ -494,7 +590,7 @@ def test_env_tmux_version_folds_a_multi_line_probe(monkeypatch):
 
     monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _TwoLineMux())
 
-    env = diagnostics.collect_env()
+    env = diagnostics.collect_env(ANY_PROJECT)
     assert env.tmux_version == "tmux 3.3.7; psmux 3.3.7"
     assert env.multiplexer == "_TwoLineMux"
 
@@ -511,7 +607,7 @@ def test_env_tmux_version_stays_bounded(monkeypatch):
 
     monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _ChattyMux())
 
-    env = diagnostics.collect_env()
+    env = diagnostics.collect_env(ANY_PROJECT)
     assert env.tmux_version is not None
     assert len(env.tmux_version) == mux_mod.VERSION_MAX_CHARS
     assert "\n" not in env.tmux_version
@@ -545,7 +641,7 @@ def test_env_tmux_version_is_redacted_before_it_is_cut(monkeypatch):
 
     monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _HomeyMux())
 
-    env = diagnostics.collect_env()
+    env = diagnostics.collect_env(ANY_PROJECT)
     assert env.tmux_version is not None
     assert env.tmux_version.endswith("…")  # the cut really fired
     assert home not in env.tmux_version
