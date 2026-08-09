@@ -1067,15 +1067,18 @@ def _validate_deferred_ledger(
         # the ledger, so returning quietly reported success for preflights that
         # checked nothing, against the very file the run's closure will fail on
         # (#284 round-5 review, finding 6).
-        # Severity is deliberately unchanged from when this read served only
-        # `closes_deferred`, but it is now load-bearing in a way it was not: the
-        # hard gate rides on the same bytes, so a warning lets `validate` exit 0
-        # having evaluated no gate at all. That is a fail-open on the one deferred
-        # check that is a refusal. Escalating a pre-existing id from warning to
-        # problem is a user-visible change and belongs with the dispatch-side
-        # enforcement work, not with this parse-and-check addition — until then the
-        # message at least names what went unchecked instead of implying the gate ran.
-        report.warn(
+        #
+        # A problem rather than a warning, escalated from the severity this id
+        # carried while the read served only `closes_deferred`. The hard gate now
+        # rides on the same bytes, and a warning exits 0 having evaluated no gate
+        # at all — a fail-open on the one deferred check that is a refusal, and one
+        # that cannot be narrowed by asking whether the project uses gates, because
+        # the file that would answer is the unreadable one. `Engine._loop` refuses
+        # the same way for the same reason, so preflight and dispatch agree about
+        # this file instead of `validate` reporting a run that then pauses at its
+        # first story. Nothing is lost by failing early: the message's last clause
+        # is literal — the run's own closure reads this file too.
+        report.fail(
             "deferred.ledger-unreadable",
             f"{ledger} cannot be read ({e}) — neither closes_deferred declarations nor "
             "`gate:` hard gates were checked against it, so an open entry could be "
@@ -1094,13 +1097,18 @@ def _validate_hard_gates(
     *,
     spec_folder: str | None = None,
 ) -> None:
-    """FAIL when the queue would dispatch a story an open ledger entry gates.
+    """FAIL when the queue would dispatch a story an unlanded ledger entry gates.
 
-    Preflight only, and the scope is worth stating plainly: this refuses at
-    ``bmad-loop validate``, not at dispatch. ``Engine._loop`` selects a story from
-    the board alone and never reads the ledger, so a ``run`` that skipped the
-    preflight is still unguarded. Wiring the same check into dispatch is follow-on
-    work; until it lands, the refusal is only as strong as the operator's habit.
+    The preflight half of a two-sided refusal: ``Engine._refuse_gated_story``
+    enforces the same gate at dispatch, so a ``run`` that skipped ``validate``
+    pauses instead of proceeding. This side exists to move the answer earlier —
+    the operator learns before the run starts, and learns about *every* gated
+    story on the queue rather than just the first one picked.
+
+    The two must keep agreeing about what "unlanded" means (only an explicit
+    ``done`` retires a gate) and about an unreadable ledger (both refuse); a
+    ``validate`` that passed a run which then paused at its first story would
+    teach operators to trust neither.
 
     A ledger entry could always *say* it blocked a story — ``HARD GATE: must land
     before 3-2`` in its reason — and saying it stopped nothing. ``run`` took the
@@ -1120,7 +1128,7 @@ def _validate_hard_gates(
     """
     declared = [(entry, deferredwork.gates(entry)) for entry in deferredwork.parse_ledger(text)]
     for entry, entry_gates in declared:
-        if not entry.open:
+        if entry.done:
             continue  # a landed entry gates nothing; that is what closing it means
         _report_unstructured_gate(entry, entry_gates, report)
     # Keyed on enforceable tokens, not on `gate:` lines: a ledger whose only gate is
@@ -1137,10 +1145,15 @@ def _validate_hard_gates(
         # and `queue.stories-manifest` already fail for it; adding an `ok` here would
         # say "no story is gated" about a queue this check never saw.
         return
-    open_gated = [e.id for e, g in declared if e.open and g.tokens]
+    gating = [e.id for e, g in declared if not e.done and g.tokens]
     gated = False
     for entry, entry_gates in declared:
-        if not entry.open:
+        # `done`, not `not open` — the tri-state is the whole point. An entry whose
+        # status the format cannot read (`status: opne`, or no status line) is not
+        # evidence the work landed, and skipping it let one typo disable the gate
+        # *and* emit an `ok` naming the entry as clear. Only an explicit `done`
+        # retires a gate; everything else holds until someone writes that word.
+        if entry.done:
             continue
         for story_key in story_keys:
             hits = [t for t in entry_gates.tokens if deferredwork.gates_story(t, story_key)]
@@ -1149,10 +1162,11 @@ def _validate_hard_gates(
             gated = True
             report.fail(
                 "deferred.hard-gate",
-                f"{entry.id} ({entry.title}) is open and gates {story_key} "
-                f"(gate: {', '.join(hits)}) — that story must not run until the entry "
-                f"lands. Close it in {paths.deferred_work.name} (`status: done <date>`), "
-                f"or drop the token from its `gate:` line if it no longer blocks this work",
+                f"{entry.id} ({entry.title}) {_gate_status_clause(entry)} and gates "
+                f"{story_key} (gate: {', '.join(hits)}) — that story must not run until "
+                f"the entry lands. Close it in {paths.deferred_work.name} "
+                f"(`status: done <date>`), or drop the token from its `gate:` line if it "
+                f"no longer blocks this work",
                 {
                     "dw_id": entry.id,
                     "title": entry.title,
@@ -1163,10 +1177,26 @@ def _validate_hard_gates(
     if not gated:
         report.ok(
             "deferred.hard-gate",
-            f"deferred-work gates OK: no actionable story is gated by an open entry "
-            f"({', '.join(open_gated) if open_gated else 'no open gated entries'})",
-            {"open_gated_ids": open_gated, "actionable": list(story_keys)},
+            f"deferred-work gates OK: no actionable story is gated by an unlanded entry "
+            f"({', '.join(gating) if gating else 'no unlanded gated entries'})",
+            {"gating_ids": gating, "actionable": list(story_keys)},
         )
+
+
+def _gate_status_clause(entry: deferredwork.DWEntry) -> str:
+    """How the failure names *why* this entry still gates.
+
+    An unreadable status is reported as what it is rather than folded into "is
+    open": the remedy differs — the operator with a typo fixes the `status:` line,
+    and telling them the entry "is open" sends them to close work that may already
+    have landed. Naming the offending value is what makes a one-character typo
+    findable in a ledger of fifty entries.
+    """
+    if entry.open:
+        return "is open"
+    if not entry.status:
+        return "has no `status:` line, so it cannot be read as landed"
+    return f"has an unreadable status (`{entry.status}`), so it cannot be read as landed"
 
 
 def _report_unstructured_gate(
@@ -1189,6 +1219,14 @@ def _report_unstructured_gate(
     is exactly the thing that goes wrong quietly. That applies to an empty line as
     much as to a malformed token — ``gate: 3-2`` followed by a bare ``gate:`` used
     to report neither, because the entry had tokens and so read as fully gated.
+
+    A fourth cause, and the only one that is about a line the parser never saw: a
+    ``gate:`` the strict field anchor misses (``Gate:``, or indented). It is a
+    warning rather than an accepted gate on purpose — see :data:`_GATE_NEAR_RE`.
+
+    Runs for every entry that is not ``done``, which is the same set the refusal
+    holds against. Keying it on ``open`` instead would have left an entry with an
+    unreadable status silent about a malformed token as well as about its gate.
     """
     reasons: list[str] = []
     if entry_gates.malformed:
@@ -1199,6 +1237,11 @@ def _report_unstructured_gate(
         reasons.append("declares an empty `gate:` line, which names no story")
     elif entry_gates.empty:
         reasons.append(f"declares {entry_gates.empty} empty `gate:` lines, which name no story")
+    if entry_gates.near_miss:
+        reasons.append(
+            f"spells {entry_gates.near_miss} `gate:` line(s) in a form the field does not "
+            f"read (the field is a lowercase `gate:` at the very start of a line)"
+        )
     prose_only = not entry_gates.tokens and not reasons
     if prose_only and deferredwork.HARD_GATE_PROSE_RE.search(entry.body):
         reasons.append("declares a `HARD GATE:` in prose but carries no `gate:` line")
@@ -1213,6 +1256,7 @@ def _report_unstructured_gate(
             "dw_id": entry.id,
             "malformed": list(entry_gates.malformed),
             "empty": entry_gates.empty,
+            "near_miss": entry_gates.near_miss,
         },
     )
 

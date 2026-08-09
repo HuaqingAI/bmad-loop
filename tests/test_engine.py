@@ -40,6 +40,7 @@ from bmad_loop.model import (
     PAUSE_EPIC_BOUNDARY,
     PAUSE_ESCALATION,
     PAUSE_SPEC_APPROVAL,
+    PAUSE_STORY_GATE,
     Phase,
     RunState,
     SessionRecord,
@@ -6449,6 +6450,120 @@ def test_critical_escalation_pauses_and_resume_continues(project):
     summary2 = resumed.run()
     assert summary2.done == 1 and not summary2.paused
     assert resumed.state.finished
+
+
+def write_gated_ledger(paths, entries, commit=True) -> None:
+    """`write_ledger` plus the `gate:` lines a hard gate is written on: `entries`
+    maps a DW id to `(status, extra_field_lines)`, appended verbatim after
+    `status:`. Committed by default — the engine's own paths assume a clean tree."""
+    parts = ["# Deferred Work\n"]
+    for dw_id, (status, extra) in entries.items():
+        tail = "".join(f"{line}\n" for line in extra)
+        parts.append(
+            f"### {dw_id}: item {dw_id}\n\norigin: test, 2026-06-01\n"
+            f"location: src.txt:1\nreason: test entry.\nstatus: {status}\n{tail}"
+        )
+    paths.deferred_work.write_text("\n".join(parts), encoding="utf-8")
+    if commit:
+        git(paths.project, "add", "-A")
+        git(paths.project, "commit", "-q", "-m", "ledger")
+
+
+def test_dispatch_refuses_a_story_an_unlanded_entry_gates(project):
+    """The enforcing half of `gate:`. Before this, `_pick_next` read the board
+    alone: the ledger could say a story was blocked and `run` drove it anyway, and
+    the gate was discovered afterwards in the diff of work built on a leg nobody
+    had wired. `validate` refuses the same story, but only if someone ran it."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1-1"])})
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")])
+
+    summary = engine.run()
+
+    assert summary.paused
+    saved = load_state(engine.run_dir)
+    assert saved.paused_stage == PAUSE_STORY_GATE
+    assert saved.paused_story_key == "1-1-a"
+    # the refusal has to precede the work, not follow it
+    assert adapter.sessions == []
+    # ...and precede the *record* of the work: the story is deliberately NOT in
+    # state.tasks, which is what `_pick_next`'s base_skip keys on. Registering it
+    # first would fire the gate once and then retire the story for this run and
+    # every resume of it — a gate that drops the work it was protecting.
+    assert saved.tasks == {}
+    events = [e for e in engine.journal.entries() if e["kind"] == "story-gated"]
+    assert len(events) == 1 and events[0]["dw_ids"] == ["DW-1"]
+    assert "DW-1" in saved.paused_reason and "bmad-loop sweep" in saved.paused_reason
+
+
+def test_a_gated_story_runs_once_the_entry_lands(project):
+    """The other half of the placement above: because the pause left no task
+    behind, a resume re-picks the story and re-reads the ledger. Closing the entry
+    is the primary remedy the pause names, so it has to be the one that clears
+    it — a gate nobody can get past is a wedge, not a gate."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1-1"])})
+    engine, _ = make_engine(project, [])
+    assert engine.run().paused
+
+    write_gated_ledger(project, {"DW-1": ("done 2026-08-01", ["gate: 1-1"])})
+    resumed, _ = resume_engine(
+        project,
+        engine,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.paused
+
+
+def test_dispatch_gate_holds_on_a_status_the_format_cannot_read(project):
+    """`status: opne` is not evidence the work landed. The check keys on an
+    explicit `done` rather than on `not open` precisely so a one-character typo
+    cannot disable the gate — the silent no-op the whole field exists to end."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_gated_ledger(project, {"DW-1": ("opne", ["gate: 1-1"])})
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")])
+
+    summary = engine.run()
+
+    assert summary.paused
+    assert load_state(engine.run_dir).paused_stage == PAUSE_STORY_GATE
+    assert adapter.sessions == []
+
+
+def test_dispatch_gate_does_not_fire_for_a_story_it_does_not_name(project):
+    """A false refusal wedges a run, which is worse than the prose gate this
+    replaced. An entry gating 2-1 must let 1-1-a through untouched."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 2-1"])})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+
+
+def test_dispatch_pauses_when_the_ledger_cannot_be_read(project, monkeypatch):
+    """Degrading to "not gated" would let a broken file disable the one deferred
+    check that refuses, and "does this project use gates?" is answerable only from
+    the file that will not open. `validate` reports the same fault as a problem."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 9-9"])})
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")])
+    fault_read_text(monkeypatch, project.deferred_work)
+
+    summary = engine.run()
+
+    assert summary.paused
+    saved = load_state(engine.run_dir)
+    assert saved.paused_stage == PAUSE_STORY_GATE
+    assert adapter.sessions == []
+    assert "cannot be read" in saved.paused_reason
+    assert [e["kind"] for e in engine.journal.entries()].count("story-gate-unreadable") == 1
 
 
 def test_epic_boundary_gate_pause_and_resume(project):

@@ -102,23 +102,40 @@ Like `source_spec:`, a `gate:` line is never edited or dropped when an entry is
 otherwise touched: removing it un-gates the story silently, which is the exact
 failure this field exists to prevent.
 
-While the entry is `open`, `bmad-loop validate` **fails** (`deferred.hard-gate`)
-for every actionable story a token matches — sprint-status stories at `backlog` /
-`ready-for-dev`, or manifest entries whose spec is not yet `done`. Two things
-clear it: closing the entry (`status: done <date>`), or removing the token
-because it no longer blocks that work. This is the one deferred-work check that
-gates rather than advises: everything else here is traceability that may be
-wrong, while this is work that must not start.
+Until the entry lands, the gate is enforced twice. `bmad-loop validate` **fails**
+(`deferred.hard-gate`) for every actionable story a token matches — sprint-status
+stories at `backlog` / `ready-for-dev`, or manifest entries whose spec is not yet
+`done` — and a `run` that never called `validate` **pauses** (`story-gate`) rather
+than dispatch a gated story. Two things clear it: closing the entry
+(`status: done <date>`), or removing the token because it no longer blocks that
+work. This is the one deferred-work check that gates rather than advises:
+everything else here is traceability that may be wrong, while this is work that
+must not start.
 
-Three shapes declare a gate that nothing can enforce, and all three are reported
-as `deferred.hard-gate-unstructured` on an open entry:
+**Only an explicit `done` retires a gate.** A status the format cannot read —
+`status: opne`, or an entry with no `status:` line — is not evidence the work
+landed, so the gate still holds. Write the status word exactly.
 
-- a token that does not look like a story key (`[A-Za-z0-9][A-Za-z0-9._-]*`, no
-  spaces) — note that this makes a space-separated `gate: 3-2 3-3` one bad token
-  rather than two good ones;
+A sweep is never gated by the ledger it is draining, whatever any entry's `gate:`
+says: closing the gating entry is what a sweep is for, so gating it would
+deadlock the gate against its own remedy.
+
+Four shapes declare a gate that nothing can enforce, and all four are reported as
+`deferred.hard-gate-unstructured` while the entry is unlanded:
+
+- a token nothing can match. It must look like a story key
+  (`[A-Za-z0-9][A-Za-z0-9._-]*`, no spaces) **and** be a shape a key can actually
+  take — alphanumeric segments joined by `-`, or a full sprint key. So a
+  space-separated `gate: 3-2 3-3` is one bad token rather than two good ones, and
+  `gate: 3.2` / `gate: 3_2` are rejected: no key spells its numbers that way.
+  Inside a sprint slug those characters are fine — `gate: 3-2-a_b` is a real gate;
 - a `gate:` line with nothing usable after the colon (`gate:`, `gate: ,`) — each
   such line is reported, including one sitting beside a line that does name a
   story, since the half that names nothing is the half you are wrong about;
+- a `gate:` that is not lowercase at the very start of its line — `Gate: 3-2`, or
+  an indented `  gate: 3-2`. These are reported rather than read as declarations,
+  because accepting an indented one would turn a fenced example quoted inside an
+  entry into a refusal of a story nobody meant to block;
 - prose declaring `HARD GATE:` — the convention that predates this field —
   anywhere on a line of an entry that carries no `gate:` line. It is matched
   mid-line because `reason:` prose is hard-wrapped, but never directly after a

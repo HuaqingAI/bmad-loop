@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from datetime import date as calendar_date
 from pathlib import Path
 
+from . import sprintstatus
 from .platform_util import atomic_write_text
 
 HEADING_RE = re.compile(r"^### (DW-\d+): (.+?)\s*$", re.MULTILINE)
@@ -47,6 +48,39 @@ GATE_RE = re.compile(r"^gate:[ \t]*(.*)$", re.MULTILINE)
 # separators are deliberately out — a token nothing can match is the same silent
 # no-op the field exists to end, so it is surfaced rather than dropped.
 GATE_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+# The second half of "can this token gate anything", and a different miss from the
+# one above: `GATE_TOKEN_RE` rejects the spellings a *line* cannot carry (a space,
+# a bare separator), this rejects the ones no *key* can carry. `gate: 3.2` passes
+# the first and can never match `gates_story` against any legal key, so it used to
+# report a green `ok` while gating nothing — the field's own silent no-op, one
+# keystroke away from the shape that works.
+#
+# Two arms, because BMAD spells a story key two ways and they are NOT
+# interchangeable. A stories-mode id is alphanumeric segments joined by single
+# dashes (`_STORIES_ID_RE`), so `3.2` and `3_2` are out. A sprint key's slug is
+# unconstrained (`sprintstatus.STORY_RE`'s trailing group), so `3-2-foo.bar` and
+# `3-2-a_b` are LEGAL keys that gate correctly — which is why this is a
+# whole-token shape test and not a ban on `.`/`_`. Only those characters in the
+# *number* prefix are unmatchable; banning them outright would refuse real gates.
+#
+# Sound in the direction that matters: a token matching either arm is itself a
+# legal key, so a story it could gate can exist. `gates_story`'s prefix and split
+# arms only ever extend a key rightward past a `-`, and every such prefix of a
+# legal key matches one of these arms too.
+#
+# `sprintstatus` is imported for its regex; `stories.ID_RE` is copied rather than
+# imported because `stories` imports *this* module (a cycle). The copy is pinned
+# to the original by a drift test rather than to a comment.
+_STORIES_ID_RE = re.compile(r"^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$")
+# A `gate:` line the strict field pattern above will never see. `GATE_RE` is
+# anchored to a lowercase `gate:` in column 0, exactly like `status:`, and that
+# strictness fails in opposite directions for the two fields: a missed `status:`
+# leaves an entry unresolved, which now gates conservatively, while a missed
+# `gate:` leaves no gate at all. `Gate: 3-2` and an indented `  gate: 3-2` are
+# therefore surfaced as unenforceable rather than silently absent — and surfaced
+# rather than *accepted*, because accepting an indented line would read a fenced
+# example inside an entry as a live gate and refuse a story nobody meant to block.
+_GATE_NEAR_RE = re.compile(r"^[ \t]*gate[ \t]*:", re.IGNORECASE | re.MULTILINE)
 # The prose convention `gate:` replaces, matched anywhere on a line rather than
 # at its start: real ledgers hard-wrap their `reason:` prose, so the declaration
 # routinely lands mid-line and a line-anchored pattern misses exactly the entries
@@ -86,6 +120,20 @@ class DWEntry:
     @property
     def open(self) -> bool:
         return self.status.split()[0] == "open" if self.status else False
+
+    @property
+    def done(self) -> bool:
+        """Whether the entry has landed.
+
+        Deliberately NOT ``not open``. A status line the format does not
+        understand — ``status: opne``, or no status line at all — is neither open
+        nor done, and the readers that ask want *opposite* answers about it:
+        :func:`open_ids` drops it (it may already be finished), while a gate on it
+        has to hold (it may not be). Deriving one from the other is what let
+        ``gate:`` fail open on a one-character typo — the entry read as closed, so
+        the gate was skipped and ``validate`` reported an all-clear naming it.
+        """
+        return self.status.split()[0] == "done" if self.status else False
 
 
 def parse_ledger(text: str) -> list[DWEntry]:
@@ -153,6 +201,7 @@ class EntryGates:
     malformed: tuple[str, ...] = ()
     lines: int = 0
     empty: int = 0
+    near_miss: int = 0
 
     @property
     def inert(self) -> bool:
@@ -173,6 +222,12 @@ def gates(entry: DWEntry) -> EntryGates:
     Duplicates collapse (an id repeated across lines is one claim, not two);
     empty items drop, so a trailing separator is not a token — but the *line* is
     still counted, which is how an all-empty declaration stays reportable.
+
+    ``near_miss`` counts the lines this function deliberately did NOT read as a
+    declaration: a `gate:` the strict field anchor misses (see
+    :data:`_GATE_NEAR_RE`). They are counted rather than parsed so the operator is
+    told the spelling gated nothing — the same trade the space-separated token
+    makes, one level up.
     """
     tokens: list[str] = []
     malformed: list[str] = []
@@ -186,12 +241,38 @@ def gates(entry: DWEntry) -> EntryGates:
             if not token:
                 continue
             named = True
-            bucket = tokens if GATE_TOKEN_RE.match(token) else malformed
+            bucket = tokens if matchable_token(token) else malformed
             if token not in bucket:
                 bucket.append(token)
         if not named:
             empty += 1
-    return EntryGates(tokens=tuple(tokens), malformed=tuple(malformed), lines=lines, empty=empty)
+    near_miss = sum(
+        # `^` puts every match at a line start, so this asks whether the same line
+        # would have satisfied `GATE_RE` — i.e. whether it is the canonical spelling
+        # already counted above — without re-running the anchor against a slice.
+        not entry.body.startswith("gate:", m.start())
+        for m in _GATE_NEAR_RE.finditer(entry.body)
+    )
+    return EntryGates(
+        tokens=tuple(tokens),
+        malformed=tuple(malformed),
+        lines=lines,
+        empty=empty,
+        near_miss=near_miss,
+    )
+
+
+def matchable_token(token: str) -> bool:
+    """Whether ``token`` could gate any legal story key — the test that decides
+    :attr:`EntryGates.tokens` vs :attr:`EntryGates.malformed`.
+
+    Both halves are required and neither implies the other: ``GATE_TOKEN_RE``
+    alone admits ``3.2``, which nothing can match, and the key shapes alone admit
+    ``3-2 3-3`` via the sprint slug, which is one token pretending to be two.
+    """
+    if not GATE_TOKEN_RE.match(token):
+        return False
+    return bool(_STORIES_ID_RE.match(token) or sprintstatus.STORY_RE.match(token))
 
 
 def gates_story(token: str, story_key: str) -> bool:

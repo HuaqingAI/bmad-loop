@@ -1588,6 +1588,81 @@ def test_gates_reports_a_token_that_cannot_name_a_story():
     assert g.malformed == ("3-2 3-3", "../etc")
 
 
+def test_gate_token_shape_copy_agrees_with_the_stories_id_it_mirrors():
+    """`_STORIES_ID_RE` is a copy of `stories.ID_RE`, taken because `stories`
+    imports this module and the reverse would cycle. Pinned to the original rather
+    than to a comment: if the manifest ever admits a new id shape, a gate on one
+    would start reporting `malformed` and refuse nothing."""
+    from bmad_loop import stories
+
+    assert deferredwork._STORIES_ID_RE.pattern == stories.ID_RE.pattern
+
+
+@pytest.mark.parametrize("token", ["3.2", "3_2", "3.2-invite", "3_2-invite"])
+def test_gates_reject_a_token_no_story_key_can_carry(token):
+    """Shape-valid and unmatchable. `GATE_TOKEN_RE` admits `.` and `_` because a
+    sprint slug may contain them, so `gate: 3.2` used to land in `tokens` — where
+    it matched nothing, gated nothing, and reported a green `ok` for doing so.
+    A `.`/`_` in the *number* prefix is what no legal key can carry."""
+    g = _gated(f"gate: {token}")
+
+    assert g.tokens == ()
+    assert g.malformed == (token,)
+
+
+@pytest.mark.parametrize("token", ["3-2-foo.bar", "3-2-a_b", "authz-login", "3"])
+def test_gates_keep_a_token_a_sprint_slug_can_actually_spell(token):
+    """The trap in the fix above: `sprintstatus.STORY_RE`'s slug is unconstrained,
+    so `3-2-foo.bar` and `3-2-a_b` are LEGAL keys that gate correctly. Banning `.`
+    and `_` outright — the obvious reading of "reject 3.2" — would refuse real
+    gates, turning a fail-open into a false refusal."""
+    g = _gated(f"gate: {token}")
+
+    assert g.tokens == (token,)
+    assert g.malformed == ()
+
+
+@pytest.mark.parametrize("line", ["Gate: 3-2", "GATE: 3-2", "  gate: 3-2", "\tgate: 3-2"])
+def test_gates_count_a_line_the_field_anchor_will_never_read(line):
+    """`GATE_RE` is a lowercase `gate:` in column 0. Every other spelling produced
+    ZERO findings — no gate, no warning, nothing — which is the field failing open,
+    where a missed `status:` now fails closed. Counted, not parsed: accepting an
+    indented line would read a fenced example inside an entry as a live gate."""
+    g = _gated(line)
+
+    assert g.tokens == ()  # deliberately NOT enforced...
+    assert g.near_miss == 1  # ...but no longer silent
+    assert g.lines == 0
+
+
+def test_gates_do_not_count_the_canonical_spelling_as_a_near_miss():
+    """The near-miss pattern is a superset of the field pattern, so the canonical
+    line matches both. Counting it would warn about every gate that works."""
+    g = _gated("gate: 3-2")
+
+    assert g.tokens == ("3-2",) and g.near_miss == 0
+
+
+@pytest.mark.parametrize(
+    ("status", "is_open", "is_done"),
+    [
+        ("open", True, False),
+        ("done 2026-08-01", False, True),
+        ("opne", False, False),  # a typo is neither, and must not read as landed
+        ("", False, False),  # no status line at all
+    ],
+)
+def test_entry_status_is_a_tri_state_not_a_boolean(status, is_open, is_done):
+    """`done` is deliberately not `not open`. The readers want opposite answers
+    about an unreadable status — `open_ids` drops it, a gate on it has to hold —
+    and deriving one from the other let `status: opne` disable a gate silently."""
+    line = f"status: {status}\n" if status else ""
+    (entry,) = parse_ledger(f"# DW\n\n### DW-1: t\n\norigin: t\nreason: t\n{line}")
+
+    assert entry.open is is_open
+    assert entry.done is is_done
+
+
 def test_gates_stop_at_the_canonical_span_boundary():
     """A `gate:` line below a flat-append bullet belongs to that block, not to the
     entry above it — the same boundary `status:` is read within. Absorbing it would

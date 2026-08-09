@@ -3826,13 +3826,20 @@ def test_validate_warns_on_unknown_closes_deferred_in_sprint_mode(project, capsy
     assert findings[0]["detail"] == {"source": "spec spec-1-1-a.md", "unknown_ids": ["DW-99"]}
 
 
-def test_validate_warns_when_the_ledger_itself_is_unreadable(project, capsys, monkeypatch):
+def test_validate_fails_when_the_ledger_itself_is_unreadable(project, capsys, monkeypatch):
     """The ledger read shared a `try` with the manifest read, and that arm returns
     silently — correctly for the manifest, which `queue.stories-manifest` already
     reports, but nothing else in `validate` reads the ledger. So an unreadable one
     produced no finding at all: preflight reported success for a check that
     examined nothing, against the very file the run's closure will fail on
-    (#284 round-5 review, finding 6)."""
+    (#284 round-5 review, finding 6).
+
+    A problem, not a warning. A warning exits 0 with the hard gate never evaluated,
+    which is a fail-open on the one deferred check that refuses — and it cannot be
+    narrowed by asking whether the project gates anything, because the file that
+    would answer is the unreadable one. `Engine._refuse_gated_story` pauses on the
+    same fault, and the two surfaces have to give the same verdict about the same
+    file."""
     install_bmad_config(project)
     _write_policy(project.project)
     write_sprint(project, {"1-1-a": "ready-for-dev"})
@@ -3846,7 +3853,7 @@ def test_validate_warns_when_the_ledger_itself_is_unreadable(project, capsys, mo
     doc = json.loads(capsys.readouterr().out)
     findings = [f for f in doc["findings"] if f["check"] == "deferred.ledger-unreadable"]
     assert len(findings) == 1
-    assert findings[0]["severity"] == "warning"  # advisory: still never a gate
+    assert findings[0]["severity"] == "problem"  # the gate rode on these bytes
     assert findings[0]["detail"]["ledger"] == str(project.deferred_work)
     # the same bytes now back the hard gate, so the message has to say the gate went
     # unchecked too — a warning that names only closes_deferred reads as though the
@@ -3968,7 +3975,7 @@ def test_validate_passes_when_the_gated_story_is_already_done(project, capsys):
 
     gates = [f for f in findings if f["check"] == "deferred.hard-gate"]
     assert len(gates) == 1 and gates[0]["severity"] == "ok"
-    assert gates[0]["detail"] == {"open_gated_ids": ["DW-1"], "actionable": []}
+    assert gates[0]["detail"] == {"gating_ids": ["DW-1"], "actionable": []}
 
 
 def test_validate_passes_when_the_gate_entry_is_closed(project, capsys):
@@ -3983,7 +3990,7 @@ def test_validate_passes_when_the_gate_entry_is_closed(project, capsys):
 
     gates = [f for f in findings if f["check"] == "deferred.hard-gate"]
     assert len(gates) == 1 and gates[0]["severity"] == "ok"
-    assert gates[0]["detail"]["open_gated_ids"] == []
+    assert gates[0]["detail"]["gating_ids"] == []
 
 
 def test_validate_ignores_an_unstructured_gate_on_a_closed_entry(project, capsys):
@@ -4002,6 +4009,69 @@ def test_validate_ignores_an_unstructured_gate_on_a_closed_entry(project, capsys
     )
 
     assert not [f for f in findings if f["check"] == "deferred.hard-gate-unstructured"]
+
+
+@pytest.mark.parametrize("status", ["opne", "opened", "in progress", ""])
+def test_validate_hard_gate_holds_on_a_status_the_format_cannot_read(project, capsys, status):
+    """`entry.open` is False for a typo'd status, so the entry was skipped — the
+    gate silently did not apply, AND the check went on to emit an `ok` naming the
+    board as clear. One character disabled the refusal and replaced it with an
+    all-clear, which is the exact silent miss `gate:` exists to end.
+
+    Only an explicit `done` retires a gate; a status the format cannot read is not
+    evidence the work landed."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link": "ready-for-dev"},
+        {"DW-1": (status, ["gate: 3-2"])},
+    )
+
+    gates = [f for f in findings if f["check"] == "deferred.hard-gate"]
+    assert len(gates) == 1 and gates[0]["severity"] == "problem"
+    assert gates[0]["detail"]["story_key"] == "3-2-invite-link"
+    # and the message sends the operator to the `status:` line rather than telling
+    # them to close work that may already have landed
+    assert "cannot be read as landed" in gates[0]["message"]
+    if status:
+        assert f"`{status}`" in gates[0]["message"]
+
+
+def test_validate_warns_on_a_gate_line_the_field_anchor_cannot_read(project, capsys):
+    """`Gate: 3-2` and an indented `  gate: 3-2` produced no finding of any kind —
+    the field failing open, where a missed `status:` fails closed. Surfaced rather
+    than accepted: reading an indented line as a declaration would turn a fenced
+    example inside an entry into a refusal of a story nobody meant to block."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link": "ready-for-dev"},
+        {"DW-1": ("open", ["Gate: 3-2", "  gate: 3-3"])},
+    )
+
+    unstructured = [f for f in findings if f["check"] == "deferred.hard-gate-unstructured"]
+    assert len(unstructured) == 1 and unstructured[0]["severity"] == "warning"
+    assert unstructured[0]["detail"]["near_miss"] == 2
+    assert "the very start of a line" in unstructured[0]["message"]
+    # nothing enforceable was declared, so there is no passing gate to report either
+    assert not [f for f in findings if f["check"] == "deferred.hard-gate"]
+
+
+def test_validate_does_not_report_an_all_clear_for_an_unmatchable_token(project, capsys):
+    """`gate: 3.2` is one keystroke from the shape that works and can never match
+    any key. It used to land in `tokens`, which made the ledger "gated", and the
+    check then reported a green `ok` — an all-clear earned by a gate that held
+    nothing. It is a malformed token now, so the operator is told."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link": "ready-for-dev"},
+        {"DW-1": ("open", ["gate: 3.2"])},
+    )
+
+    unstructured = [f for f in findings if f["check"] == "deferred.hard-gate-unstructured"]
+    assert len(unstructured) == 1 and unstructured[0]["detail"]["malformed"] == ["3.2"]
+    assert not [f for f in findings if f["check"] == "deferred.hard-gate"]
 
 
 def test_validate_hard_gate_token_stops_at_the_key_boundary(project, capsys):
@@ -4052,7 +4122,12 @@ def test_validate_warns_on_a_prose_only_hard_gate(project, capsys):
 
     unstructured = [f for f in findings if f["check"] == "deferred.hard-gate-unstructured"]
     assert len(unstructured) == 1 and unstructured[0]["severity"] == "warning"
-    assert unstructured[0]["detail"] == {"dw_id": "DW-1", "malformed": [], "empty": 0}
+    assert unstructured[0]["detail"] == {
+        "dw_id": "DW-1",
+        "malformed": [],
+        "empty": 0,
+        "near_miss": 0,
+    }
     assert "`gate:` line" in unstructured[0]["message"]
     # nothing enforceable exists, so there is no passing gate to report either
     assert not [f for f in findings if f["check"] == "deferred.hard-gate"]
@@ -4122,7 +4197,12 @@ def test_validate_warns_on_a_malformed_gate_token(project, capsys):
 
     unstructured = [f for f in findings if f["check"] == "deferred.hard-gate-unstructured"]
     assert len(unstructured) == 1 and unstructured[0]["severity"] == "warning"
-    assert unstructured[0]["detail"] == {"dw_id": "DW-1", "malformed": ["3-2 3-3"], "empty": 0}
+    assert unstructured[0]["detail"] == {
+        "dw_id": "DW-1",
+        "malformed": ["3-2 3-3"],
+        "empty": 0,
+        "near_miss": 0,
+    }
     # and it is NOT reported as an enforced gate: nothing matched
     assert not [f for f in findings if f["check"] == "deferred.hard-gate"]
 

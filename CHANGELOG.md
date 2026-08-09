@@ -17,10 +17,14 @@ whose seams had diverged enough that several ports needed a different fix, and t
 - **A deferred-work entry can block a story: `gate:`.** An entry that must land before specific
   stories run could only say so in prose (`HARD GATE: must land before 3-2`), and prose stopped
   nothing — `run` drove the story anyway. A `gate: 3-2, 3-3` line names the blocked story keys, and
-  while the entry is `open` `bmad-loop validate` fails (`deferred.hard-gate`) for every actionable
-  story a token matches, in both queue modes. The only deferred check that gates rather than
-  advises; cleared by closing the entry or dropping the token. A gate that can enforce nothing —
-  an unusable token, an empty `gate:` line, or a prose-only `HARD GATE:` — warns instead
+  it is enforced on both sides: `bmad-loop validate` fails (`deferred.hard-gate`) for every
+  actionable story a token matches, in both queue modes, and `run` pauses (`story-gate`) rather
+  than dispatch a gated story — so the refusal no longer depends on remembering to run the
+  preflight. The pause happens before the story is recorded, so closing the entry and resuming
+  runs it. Sweeps are exempt: they are what closes the gating entry. The only deferred check that
+  gates rather than advises; cleared by closing the entry or dropping the token. A gate that can
+  enforce nothing — an unusable token, an empty `gate:` line, a `gate:` not written lowercase at
+  the start of a line, or a prose-only `HARD GATE:` — warns instead
   (`deferred.hard-gate-unstructured`). Silent on a ledger that gates nothing, as before.
 
 - **Deferred review findings are harvested from spec frontmatter (#433).** BMAD-METHOD#2640 moved
@@ -111,6 +115,12 @@ whose seams had diverged enough that several ports needed a different fix, and t
   unpaired surrogates) are dropped. Templates that do not name the placeholder skip the read.
 
 ### Changed
+
+- **An unreadable deferred-work ledger fails `validate` instead of warning
+  (`deferred.ledger-unreadable`).** The hard gate rides on the same bytes, so a warning exited 0
+  with the gate never evaluated — a fail-open on the one deferred check that refuses, and one that
+  cannot be narrowed by asking whether the project uses gates, because the file that would answer
+  is the unreadable one. `run` pauses on the same fault, so preflight and dispatch now agree.
 
 - **Every spec-frontmatter status read goes through `status_of` (#358 follow-up).** Five inline
   status reads remained in the engine and the generic adapter, each reading a blank `status:` as the
