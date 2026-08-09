@@ -4146,18 +4146,22 @@ def test_validate_warns_on_an_empty_gate_line_beside_an_enforced_one(project, ca
 def test_validate_does_not_gate_a_word_id_that_merely_shares_a_prefix(project, capsys):
     """`stories.ID_RE` admits word ids, and the split-story arm used to read the `z`
     of `authz-login` as a split letter — FAILING validate for a story nobody gated.
-    A false refusal wedges a run, which is worse than the prose gate it replaced."""
-    findings = _validate_gated_sprint(
-        project,
-        capsys,
-        {"3-2-invite-link": "ready-for-dev"},
-        {"DW-1": ("open", ["gate: auth"])},
-    )
+    A false refusal wedges a run, which is worse than the prose gate it replaced.
 
-    assert not [f for f in findings if f["check"] == "deferred.hard-gate-unstructured"]
-    assert not [
-        f for f in findings if f["check"] == "deferred.hard-gate" and f["severity"] == "problem"
-    ]
+    Stories mode deliberately: a sprint board cannot express this. `authz-login`
+    does not match `sprintstatus.STORY_RE`, so it never reaches `ss.stories`, and a
+    sprint fixture stays green with the digit guard ablated — which is exactly how
+    the first version of this test was written, and it measured nothing."""
+    install_bmad_config(project)
+    _write_policy(project.project, STORIES_POLICY)
+    _setup_stories_fixture(project, [_stories_entry("authz-login")])
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: auth"])})
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)
+
+    findings = _hard_gate_findings(capsys)
+    assert [f["severity"] for f in findings] == ["ok"]
 
 
 def test_validate_silent_when_the_ledger_declares_no_gate(project, capsys):
