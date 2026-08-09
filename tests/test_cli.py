@@ -4385,6 +4385,30 @@ def test_validate_stories_mode_skips_a_story_the_scheduler_would_wedge(project, 
     assert len(findings) == 1 and findings[0]["severity"] == "ok"
 
 
+def test_validate_stories_mode_still_gates_a_story_behind_a_wedged_one(project, capsys):
+    """The deliberate half of the parity, pinned so it is not "fixed" into a
+    `break`. `schedule()` gives up at the first wedged entry, but preflight shares
+    its per-entry predicate and NOT its stop rule: story 2 is reachable right now
+    via `run --story 2`, which scans that entry alone, and `validate` takes no
+    story selector so it cannot know which run is coming. Stopping here would also
+    let one blocked entry at the top of a manifest silence the gate check for
+    every story below it — the silent miss this field exists to end."""
+    install_bmad_config(project)
+    _write_policy(project.project, STORIES_POLICY)
+    folder = _setup_stories_fixture(project, [_stories_entry("1"), _stories_entry("2")])
+    (folder / "stories" / "1-slug.md").write_text(
+        "---\ntitle: 'test'\nstatus: 'blocked'\n---\n\n## Intent\n\ntest\n", encoding="utf-8"
+    )
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 2"])}, commit=False)
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)
+
+    findings = _hard_gate_findings(capsys)
+    assert len(findings) == 1 and findings[0]["severity"] == "problem"
+    assert findings[0]["detail"]["story_key"] == "2"
+
+
 OPENCODE_QUALIFIED_POLICY = '[adapter]\nname = "opencode"\nmodel = "anthropic/claude-haiku-4-5"\n'
 
 

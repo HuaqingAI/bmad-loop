@@ -1264,7 +1264,7 @@ def _report_unstructured_gate(
 def _actionable_story_keys(
     paths: bmadconfig.ProjectPaths, spec_folder: str | None
 ) -> list[str] | None:
-    """The story keys this queue would dispatch, in queue order, in either mode.
+    """The story keys this queue could dispatch, in queue order, in either mode.
 
     ``None`` when the queue could not be read, which is not the same answer as an
     empty list: ``queue.sprint-status`` and ``queue.stories-manifest`` own queue
@@ -1280,11 +1280,24 @@ def _actionable_story_keys(
     Dropping only ``done`` is not the same line the sprint board draws:
     ``ACTIONABLE_STATUSES`` is a two-element allowlist, so ``blocked`` and the
     rest are already out on that side. In stories mode a ``blocked``, sentinel,
-    ambiguous or unknown-status entry STOPS the scan (``SCHEDULE_WEDGED``) instead
-    of dispatching, so treating every non-``done`` state as actionable made
-    ``validate`` exit nonzero over a gate on a story the queue could not run — and
-    made the two queue modes disagree about what a gate refuses. Sharing the
-    scheduler's predicate is what keeps preflight and dispatch answering alike.
+    ambiguous or unknown-status entry is one :func:`stories.schedule` refuses to
+    dispatch (``SCHEDULE_WEDGED``), so treating every non-``done`` state as
+    actionable made ``validate`` exit nonzero over a gate on a story the queue
+    could not run — and made the two queue modes disagree about what a gate
+    refuses.
+
+    What is shared is that per-entry predicate and deliberately NOT the scan's
+    stop rule: ``schedule`` gives up at the FIRST wedged entry, and mirroring that
+    here would drop every later story from this list. Two reasons not to. A wedge
+    is a property of some *other* story, and ``run --story <id>`` scans that entry
+    alone (``selector``), so a later story really is reachable while the wedge
+    stands — while ``validate`` takes no story selector and so cannot know which
+    run is coming. And stopping would let one blocked entry near the top of a
+    manifest silence the gate check for everything below it, which is the failure
+    this check exists to prevent, arriving by a quieter route than the one it
+    fixed. Over-reporting a real gate on a story that needs an unrelated
+    resolution first is the cheaper wrong answer, and dispatch still refuses
+    independently.
     """
     if spec_folder is not None:
         keys: list[str] = []
