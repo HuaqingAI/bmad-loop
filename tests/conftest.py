@@ -876,6 +876,30 @@ def write_ledger(paths: ProjectPaths, statuses: dict[str, str], commit: bool = T
         git(paths.project, "commit", "-q", "-m", "ledger")
 
 
+def write_gated_ledger(paths: ProjectPaths, entries, commit: bool = True) -> None:
+    """`write_ledger` plus the lines a hard gate is written on: `entries` maps a
+    DW id to `(status, extra_field_lines)`, appended verbatim after `status:` so a
+    test can spell a `gate:` line, a prose `HARD GATE:`, or a deliberately broken
+    one exactly as a human would.
+
+    Committed by default, like `write_ledger` and for the same reason: the engine
+    paths that dispatch a story need a clean tree. `validate` reads the file
+    directly and never looks at git, so its callers pass `commit=False` and skip
+    the git round-trip.
+    """
+    parts = ["# Deferred Work\n"]
+    for dw_id, (status, extra) in entries.items():
+        tail = "".join(f"{line}\n" for line in extra)
+        parts.append(
+            f"### {dw_id}: item {dw_id}\n\norigin: test, 2026-06-01\n"
+            f"location: src.txt:1\nreason: test entry.\nstatus: {status}\n{tail}"
+        )
+    paths.deferred_work.write_text("\n".join(parts), encoding="utf-8")
+    if commit:
+        git(paths.project, "add", "-A")
+        git(paths.project, "commit", "-q", "-m", "ledger")
+
+
 def mark_ledger_done(paths: ProjectPaths, dw_ids, date: str = "2026-06-11") -> None:
     from bmad_loop import deferredwork
 
