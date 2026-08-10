@@ -717,8 +717,11 @@ class BmadLoopApp(App[None]):
             # The resume itself is running; only the disambiguation record is
             # lost, so `a`/`x` may target an older same-run_id window (#482's
             # symptom). Warn instead of masking it behind the success toast.
+            # "not recorded", not "not captured": resume_detached reports the
+            # uncaptured id and the unwritten record through this one signal
+            # because they leave the operator in the same place.
             self.notify(
-                "resume launched but its window id was not captured — "
+                "resume launched but its window id was not recorded — "
                 "attach/stop may target an older window for this run",
                 severity="warning",
             )

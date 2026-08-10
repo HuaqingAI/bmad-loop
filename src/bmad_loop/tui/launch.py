@@ -122,40 +122,29 @@ def _record_ctl_window(project: Path, run_id: str, win_id: str) -> None:
     rollback (`Engine._restore_deferred_closes`). `Exception` and not
     `BaseException`, so a genuine KeyboardInterrupt still gets out.
 
-    A *symlink* at the path is refused rather than written through. Following one
-    is `atomic_write_text`'s documented contract ("a ledger symlinked into the
-    repo keeps being a symlink"), and it is the right contract there — for a
-    user-curated ledger. This sidecar is the opposite: machine-minted, per-run,
-    disposable, and living under the project root that every coding session can
-    write. Honouring a link here would let a session aim a *host-side* write at
-    any path the user can write — reach the adapters that confine a session to
-    the workspace otherwise deny it. The payload is only a window id, so the
-    primitive is truncation rather than injection, which bounds the damage
-    without making it acceptable. Same refusal shape, and the same reason, as
-    the session-supplied worktree config path in `worktree_flow`.
+    `follow_symlinks=False`, so a symlink at the path is replaced rather than
+    written through. Following one is the helper's default contract ("a ledger
+    symlinked into the repo keeps being a symlink"), and it is right there — for
+    an operator-curated ledger. This sidecar is the opposite: machine-minted,
+    per-run, disposable, and living under the project root that every coding
+    session can write. Honouring a link here would let a session aim a
+    *host-side* write at any path the user can write — reach that the adapters
+    confining a session to the workspace otherwise deny it. The payload is only
+    a window id, so the primitive is truncation rather than injection, which
+    bounds the damage without making it acceptable.
 
-    Dropping the link (`Path.unlink` never follows one, so the target is
-    untouched) is what `_forget_ctl_window` already does, and it is also the
-    honest state: no record, back to the name scan. It leaves nothing for the
-    next launch to inherit. A probe that cannot answer counts as a link — the
-    fallback costs a scan, guessing wrong costs the redirect. What stays open is
-    the race, not the standing redirect: a session that re-plants between the
-    probe and the replace still wins, and closing that needs an O_NOFOLLOW
-    write, which is not portable to the win32 leg this record is atomic for.
+    Replacing rather than refusing, and no preflight `is_symlink` check: a check
+    leaves the window between itself and the write, which a session that
+    re-plants the link wins. `os.replace` does not dereference its destination,
+    so the link is clobbered whenever it was planted. That also self-heals — the
+    record ends up a plain file again — where a refusal would leave the planted
+    link in place for the next launch to trip over.
     """
     run_dir = runs.run_dir_for(project, run_id)
     if not runs.is_run(run_dir):
         return
-    record = run_dir / _CTL_WINDOW_FILE
     try:
-        redirected = record.is_symlink()
-    except OSError:
-        redirected = True
-    if redirected:
-        _forget_ctl_window(project, run_id)
-        return
-    try:
-        atomic_write_text(record, win_id)
+        atomic_write_text(run_dir / _CTL_WINDOW_FILE, win_id, follow_symlinks=False)
     except Exception:
         _forget_ctl_window(project, run_id)
 
@@ -557,11 +546,26 @@ def start_sweep_detached(
 
 
 def resume_detached(project: Path, run_id: str) -> str | None:
-    """Resume in a ctl-session window; returns the window id (None when the
-    backend did not capture one — the caller should warn: resume is the launch
-    that mints a second window under the run id, so an uncaptured id degrades
-    the lookup to the ambiguous scan while the launch itself succeeded)."""
-    return start_detached(project, ["resume", "--project", str(project), run_id], run_id, "resume")
+    """Resume in a ctl-session window; returns the window id, or None when the
+    lookup cannot name that window afterwards — the caller should warn, because
+    resume is the launch that mints a *second* window under the run id, so this
+    is exactly when the ambiguous scan starts answering the superseded one while
+    the launch itself succeeded.
+
+    Two ways to land there, one signal: the backend captured no id, or it did but
+    the record did not survive (refused, unwritable, run dir pruned mid-launch).
+    Both leave `ctl_window_id` on the scan, so reporting only the first would let
+    the rest degrade behind an unqualified success toast.
+
+    Verified by re-reading rather than by threading the write's outcome up: it
+    asks the question the consumers actually ask — will `ctl_window_id` prefer
+    this window — of the same file they will read, instead of a proxy for it."""
+    win_id = start_detached(
+        project, ["resume", "--project", str(project), run_id], run_id, "resume"
+    )
+    if win_id and _read_ctl_window(project, run_id) != win_id:
+        return None
+    return win_id
 
 
 def start_resolve_detached(project: Path, run_id: str) -> str | None:

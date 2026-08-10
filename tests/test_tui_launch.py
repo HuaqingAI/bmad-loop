@@ -496,12 +496,12 @@ def test_start_detached_survives_an_unwritable_record(fake_run, tmp_path: Path, 
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
-def test_symlinked_record_is_refused_not_followed(fake_run, tmp_path: Path):
-    # `atomic_write_text` follows a symlink by contract, and the run dir lives
-    # under the project root every coding session can write — so a session that
-    # plants a link here would aim this *host-side* write at any path the user
-    # can write, reach a workspace-confined adapter otherwise denies it. Refuse
-    # and drop the link; the write must never land on the target.
+def test_symlinked_record_is_replaced_not_followed(fake_run, tmp_path: Path):
+    # `atomic_write_text` follows a symlink under its default contract, and the
+    # run dir lives under the project root every coding session can write — so a
+    # session that plants a link here would aim this *host-side* write at any
+    # path the user can write, reach a workspace-confined adapter otherwise
+    # denies it. The write must land on the name, never on the link's target.
     run_dir = _make_run(tmp_path)
     outside = tmp_path / "pyproject.toml"
     outside.write_text("[project]\n", encoding="utf-8")
@@ -510,7 +510,31 @@ def test_symlinked_record_is_refused_not_followed(fake_run, tmp_path: Path):
 
     assert launch.resume_detached(tmp_path, "RID") == "@7"  # the launch still succeeds
     assert outside.read_text(encoding="utf-8") == "[project]\n"  # not redirected
-    assert not record.is_symlink() and not record.exists()  # and nothing left to inherit
+    # Clobbered, not refused: the record self-heals into a plain file, so the
+    # next launch does not trip over a link left in place.
+    assert not record.is_symlink()
+    assert record.read_text(encoding="utf-8") == "@7"
+
+
+def test_resume_reports_a_record_that_did_not_survive(fake_run, tmp_path: Path, monkeypatch):
+    # The window id was captured, so start_detached returns it — but the record
+    # did not land, which leaves ctl_window_id on the same ambiguous scan an
+    # uncaptured id does. One signal for both, or the rest of the degradation
+    # hides behind the success toast.
+    _make_run(tmp_path)
+
+    def boom(*_a, **_k):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(launch, "atomic_write_text", boom)
+    assert launch.resume_detached(tmp_path, "RID") is None
+
+
+def test_resume_returns_the_id_when_the_record_survives(fake_run, tmp_path: Path):
+    # The other half of the signal: a recorded window is reported plainly, so
+    # the warning stays specific to real degradation.
+    _make_run(tmp_path)
+    assert launch.resume_detached(tmp_path, "RID") == "@7"
 
 
 def test_failed_record_forgets_the_previous_one(fake_run, tmp_path: Path, monkeypatch):

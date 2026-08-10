@@ -1981,7 +1981,7 @@ async def test_resume_uncaptured_window_id_warns(project, monkeypatch):
         await until(pilot, lambda: isinstance(app.screen, ConfirmResumeModal))
         await pilot.click(await ready(pilot, "#ok"))
         await until(
-            pilot, lambda: any("window id was not captured" in m for m in notifications(app))
+            pilot, lambda: any("window id was not recorded" in m for m in notifications(app))
         )
 
 

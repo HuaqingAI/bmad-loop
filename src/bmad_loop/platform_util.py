@@ -242,7 +242,7 @@ def _copy_xattrs(src: Path, dst: Path) -> None:
             continue
 
 
-def atomic_write_text(path: Path, text: str) -> None:
+def atomic_write_text(path: Path, text: str, *, follow_symlinks: bool = True) -> None:
     """Replace ``path``'s contents with ``text`` atomically, preserving what the
     replacement would otherwise silently discard.
 
@@ -253,7 +253,11 @@ def atomic_write_text(path: Path, text: str) -> None:
     * **Symlinks are followed.** ``path.resolve()`` first, so a ledger symlinked
       into the repo keeps being a symlink and the real file is what gets rewritten
       — a replace against the link itself would turn it into a regular file and
-      orphan the target.
+      orphan the target. Pass ``follow_symlinks=False`` to invert that: the name
+      is replaced, whatever it points at. Right for a machine-minted file living
+      somewhere a less-trusted writer can reach, where honouring a planted link
+      would aim this write at a path of that writer's choosing; wrong for the
+      operator-curated ledgers this helper was built for, hence the default.
     * **Permission bits survive.** A ``0600`` file stays ``0600`` instead of
       becoming ``0644 & ~umask``, which on a shared artifact dir is the difference
       between "the group can still write this" and a silent lockout (or a
@@ -285,7 +289,7 @@ def atomic_write_text(path: Path, text: str) -> None:
     above and differ only in the ``os.fdopen`` mode. Text mode's *newline*
     default (translating) is deliberate here — it matches the ``Path.write_text``
     this replaced, so a ledger's line endings do not change under Windows."""
-    _atomic_write(path, text, mode="w", encoding="utf-8")
+    _atomic_write(path, text, mode="w", encoding="utf-8", follow_symlinks=follow_symlinks)
 
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -304,14 +308,29 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
     _atomic_write(path, data, mode="wb", encoding=None)
 
 
-def _atomic_write(path: Path, payload: str | bytes, *, mode: str, encoding: str | None) -> None:
+def _atomic_write(
+    path: Path,
+    payload: str | bytes,
+    *,
+    mode: str,
+    encoding: str | None,
+    follow_symlinks: bool = True,
+) -> None:
     """The shared body of the two public helpers above — see
     :func:`atomic_write_text` for the contract every step here implements.
 
     Written through ``os.fdopen`` rather than a raw ``os.write`` loop on purpose:
     it routes to ``io.open``, the one seam a test can inject a short write at for
-    both variants at once (tests/test_install.py's #375 case)."""
-    target = path.resolve()
+    both variants at once (tests/test_install.py's #375 case).
+
+    ``follow_symlinks=False`` skips the resolve, so the *name* is what gets
+    replaced. It needs no preflight ``is_symlink`` check to be safe, and that is
+    the reason to prefer it over one: ``os.replace`` does not dereference its
+    destination, so a link planted at any moment — including between a check and
+    this call — is overwritten rather than written through. Mode and xattrs are
+    then not inherited either: a name being replaced rather than updated should
+    carry nothing of whatever it used to point at."""
+    target = path.resolve() if follow_symlinks else path
     fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=target.name + ".", suffix=".tmp")
     tmp = Path(tmp_name)
     try:
@@ -319,7 +338,8 @@ def _atomic_write(path: Path, payload: str | bytes, *, mode: str, encoding: str 
             fh.write(payload)
             fh.flush()  # userspace buffer -> kernel, so there is something to sync
             os.fsync(fh.fileno())
-        if target.exists():
+        inherit = target.exists() if follow_symlinks else _is_plain_file(target)
+        if inherit:
             shutil.copymode(target, tmp)
             _copy_xattrs(target, tmp)
         atomic_replace(tmp, target)
@@ -327,6 +347,15 @@ def _atomic_write(path: Path, payload: str | bytes, *, mode: str, encoding: str 
         with suppress(OSError):
             tmp.unlink()
         raise
+
+
+def _is_plain_file(path: Path) -> bool:
+    """A regular file reached without traversing a final symlink. Both probes are
+    needed: ``is_file`` dereferences, so it answers True for a link *to* a file."""
+    try:
+        return path.is_file() and not path.is_symlink()
+    except OSError:
+        return False
 
 
 def retrying_unlink(path: Path) -> None:
