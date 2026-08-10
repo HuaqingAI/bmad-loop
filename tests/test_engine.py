@@ -6573,6 +6573,97 @@ def test_dispatch_pauses_when_the_ledger_cannot_be_read(project, monkeypatch):
     assert [e["kind"] for e in engine.journal.entries()].count("story-gate-unreadable") == 1
 
 
+def test_resume_re_gates_a_story_registered_but_never_started(project):
+    """`_loop` saves the task and *then* calls `_run_story`, so a host death in
+    that window — or anywhere before `_dev_phase`'s advance, which spans the
+    isolated worktree mount — persists a PENDING task no session ever touched.
+    `_pick_next` skips it (it is in `base_skip`), so only `_finish_inflight`
+    drives it, and its restart arm calls `_run_story` directly. A gate that
+    landed while the run was down would never be asked.
+
+    The exemption below is for work already *in flight*; this task is not. Its
+    state is byte-identical to one the loop would have re-picked and re-gated a
+    microsecond earlier, and the run's own crash is not a reason to skip it.
+    """
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    # exactly what _loop persists between `state.tasks[key] = task` and _run_story
+    engine.state.tasks["1-1-a"] = StoryTask(story_key="1-1-a", epic=1)
+    engine._save()
+    # the gate lands while the run is down
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1-1"])})
+
+    resumed, adapter = resume_engine(
+        project,
+        engine,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+    )
+    summary = resumed.run()
+
+    assert summary.paused and summary.done == 0
+    assert adapter.sessions == []
+    saved = load_state(resumed.run_dir)
+    assert saved.paused_stage == PAUSE_STORY_GATE
+    assert saved.paused_story_key == "1-1-a"
+
+
+def test_resume_still_finishes_a_story_that_was_already_in_flight(project):
+    """The other side of the line, and the exemption stated as behavior: a story
+    whose session already ran finishes even under a gate that landed mid-flight.
+    Gating here would strand half-done work — a live worktree, an unmerged
+    branch — behind an entry whose remedy is a *later* story. The gate stops work
+    from starting; it does not abandon work in progress."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_RUNNING, attempt=1)
+    engine.state.tasks["1-1-a"] = task
+    engine._save()
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1-1"])})
+
+    resumed, adapter = resume_engine(
+        project,
+        engine,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.paused
+    assert adapter.sessions  # the in-flight story ran to completion
+
+
+def test_resume_does_not_gate_a_human_armed_re_drive(project):
+    """`rearm_escalation` resets `attempt` to 0 on a task that has already run
+    sessions, so `attempt == 0` alone would read a human-resolved re-drive as a
+    first dispatch and refuse it. It stays exempt for the same reason every other
+    resume of started work does — and refusing here would be worse than a missed
+    gate: the operator resolved the escalation precisely to get this story moving,
+    and the entry gating it is the one the re-drive may be about to close."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    escalating = SessionResult(
+        status="completed",
+        result_json={
+            "workflow": "auto-dev",
+            "escalations": [{"type": "missing-config", "severity": "CRITICAL", "detail": "boom"}],
+        },
+    )
+    engine, _ = make_engine(project, [escalating])
+    assert engine.run().escalated == 1
+    rearm_escalation(engine.run_dir)  # the resolve workflow's re-arm step
+    assert load_state(engine.run_dir).tasks["1-1-a"].attempt == 0  # the confusable state
+    # a gate lands on the story while the operator is resolving it
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1-1"])})
+
+    resumed, adapter = resume_engine(
+        project,
+        engine,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.paused
+    assert adapter.sessions  # the re-drive ran
+
+
 def test_epic_boundary_gate_pause_and_resume(project):
     write_sprint(
         project,
