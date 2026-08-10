@@ -6607,6 +6607,35 @@ def test_resume_re_gates_a_story_registered_but_never_started(project):
     assert saved.paused_story_key == "1-1-a"
 
 
+def test_resume_re_gates_a_story_whose_attempt_never_reached_a_session(project):
+    """The second window, and why the arm asks unconditionally rather than testing
+    the attempt counter: `_dev_phase` persists `attempt == 1` with the DEV_RUNNING
+    advance, but the session does not launch until `adapter.run()` — past
+    `_restore_patch`, the prompt build and the pre_session plugin gate, any of which
+    can be slow or can pause. A host death in there records an attempt no session
+    ever backed, and the restart arm rolls the task back and re-runs it from
+    scratch, so this is a start too."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    # attempt counted, no session record: the state _dev_phase saves before launch
+    engine.state.tasks["1-1-a"] = StoryTask(
+        story_key="1-1-a", epic=1, phase=Phase.DEV_RUNNING, attempt=1
+    )
+    engine._save()
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1-1"])})
+
+    resumed, adapter = resume_engine(
+        project,
+        engine,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+    )
+    summary = resumed.run()
+
+    assert summary.paused and summary.done == 0
+    assert adapter.sessions == []
+    assert load_state(resumed.run_dir).paused_stage == PAUSE_STORY_GATE
+
+
 def test_resume_still_finishes_a_story_whose_session_already_completed(project):
     """The other side of the line, and the exemption stated as behavior. It belongs
     to `_finish_inflight`'s *finishing* arms, not to every non-terminal task: here
