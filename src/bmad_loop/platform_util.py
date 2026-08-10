@@ -327,9 +327,21 @@ def _atomic_write(
     replaced. It needs no preflight ``is_symlink`` check to be safe, and that is
     the reason to prefer it over one: ``os.replace`` does not dereference its
     destination, so a link planted at any moment — including between a check and
-    this call — is overwritten rather than written through. Mode and xattrs are
-    then not inherited either: a name being replaced rather than updated should
-    carry nothing of whatever it used to point at."""
+    this call — is overwritten rather than written through.
+
+    Mode and xattrs are then not inherited **at all**, and nothing is probed to
+    decide that. A name being replaced rather than updated should carry nothing
+    of whatever it used to point at, and in this mode there is no trustworthy
+    prior to carry over anyway: the caller asked for no-follow precisely because
+    a less-trusted writer can reach the name, so the mode found there is that
+    writer's choice as much as anyone's. Probing first and copying after would
+    also reopen by the back door the very window the paragraph above closes —
+    ``shutil.copymode`` re-resolves the path it is handed, so a link planted
+    between the probe and the copy hands the new record the mode of a file of
+    the planter's choosing (the contents stay safe; ``os.replace`` still does not
+    dereference). Taking no probe leaves no window to race, and ``mkstemp``'s
+    private ``0600`` is the right mode for the machine-minted file this mode
+    exists for."""
     target = path.resolve() if follow_symlinks else path
     fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=target.name + ".", suffix=".tmp")
     tmp = Path(tmp_name)
@@ -338,8 +350,7 @@ def _atomic_write(
             fh.write(payload)
             fh.flush()  # userspace buffer -> kernel, so there is something to sync
             os.fsync(fh.fileno())
-        inherit = target.exists() if follow_symlinks else _is_plain_file(target)
-        if inherit:
+        if follow_symlinks and target.exists():
             shutil.copymode(target, tmp)
             _copy_xattrs(target, tmp)
         atomic_replace(tmp, target)
@@ -347,15 +358,6 @@ def _atomic_write(
         with suppress(OSError):
             tmp.unlink()
         raise
-
-
-def _is_plain_file(path: Path) -> bool:
-    """A regular file reached without traversing a final symlink. Both probes are
-    needed: ``is_file`` dereferences, so it answers True for a link *to* a file."""
-    try:
-        return path.is_file() and not path.is_symlink()
-    except OSError:
-        return False
 
 
 def retrying_unlink(path: Path) -> None:

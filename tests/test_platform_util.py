@@ -353,6 +353,31 @@ def test_atomic_write_text_no_follow_does_not_inherit_a_link_targets_mode(tmp_pa
     assert stat.S_IMODE(link.stat().st_mode) == 0o600  # mkstemp's private default
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+def test_atomic_write_text_no_follow_does_not_inherit_a_plain_files_mode(tmp_path):
+    """No-follow inherits nothing, and takes no probe to decide it — the sibling
+    above covers the link; this covers the plain file, which is the case a probe
+    would have said yes to.
+
+    Inheriting here needs a shape check and then a `copymode`, and `copymode`
+    re-resolves: a writer who plants a link in that gap chooses the new record's
+    permissions. The probe is what makes that gap exist, so there is none. 0o640,
+    for the reason the follow-mode pins give — `mkstemp` already arrives at 0600,
+    so only a mode it does NOT arrive with can tell inheritance from its absence.
+
+    The pairing is the ablation: restore the probe-and-copy and this reddens
+    while the link sibling stays green, so it bites on inheritance itself rather
+    than on anything the no-follow path does incidentally."""
+    target = tmp_path / "record"
+    target.write_text("before", encoding="utf-8")
+    target.chmod(0o640)
+
+    platform_util.atomic_write_text(target, "after", follow_symlinks=False)
+
+    assert target.read_text(encoding="utf-8") == "after"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
 def test_atomic_write_text_preserves_extended_attributes(tmp_path):
     """`os.replace` swaps a fresh inode into place, so anything carried by the old
     inode rather than by its name is silently reset — xattrs included, which on a
