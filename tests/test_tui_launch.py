@@ -495,6 +495,24 @@ def test_start_detached_survives_an_unwritable_record(fake_run, tmp_path: Path, 
     assert launch.start_resolve_detached(tmp_path, "RID") == "@7"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_symlinked_record_is_refused_not_followed(fake_run, tmp_path: Path):
+    # `atomic_write_text` follows a symlink by contract, and the run dir lives
+    # under the project root every coding session can write — so a session that
+    # plants a link here would aim this *host-side* write at any path the user
+    # can write, reach a workspace-confined adapter otherwise denies it. Refuse
+    # and drop the link; the write must never land on the target.
+    run_dir = _make_run(tmp_path)
+    outside = tmp_path / "pyproject.toml"
+    outside.write_text("[project]\n", encoding="utf-8")
+    record = run_dir / launch._CTL_WINDOW_FILE
+    record.symlink_to(outside)
+
+    assert launch.resume_detached(tmp_path, "RID") == "@7"  # the launch still succeeds
+    assert outside.read_text(encoding="utf-8") == "[project]\n"  # not redirected
+    assert not record.is_symlink() and not record.exists()  # and nothing left to inherit
+
+
 def test_failed_record_forgets_the_previous_one(fake_run, tmp_path: Path, monkeypatch):
     # A launch that cannot record the window it minted must not leave the
     # *previous* launch's id authoritative — that id names a window this launch

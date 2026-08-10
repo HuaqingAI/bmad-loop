@@ -121,12 +121,41 @@ def _record_ctl_window(project: Path, run_id: str, win_id: str) -> None:
     3.11/3.12 legs run. Same widening, same reason, as the engine's deferred-close
     rollback (`Engine._restore_deferred_closes`). `Exception` and not
     `BaseException`, so a genuine KeyboardInterrupt still gets out.
+
+    A *symlink* at the path is refused rather than written through. Following one
+    is `atomic_write_text`'s documented contract ("a ledger symlinked into the
+    repo keeps being a symlink"), and it is the right contract there — for a
+    user-curated ledger. This sidecar is the opposite: machine-minted, per-run,
+    disposable, and living under the project root that every coding session can
+    write. Honouring a link here would let a session aim a *host-side* write at
+    any path the user can write — reach the adapters that confine a session to
+    the workspace otherwise deny it. The payload is only a window id, so the
+    primitive is truncation rather than injection, which bounds the damage
+    without making it acceptable. Same refusal shape, and the same reason, as
+    the session-supplied worktree config path in `worktree_flow`.
+
+    Dropping the link (`Path.unlink` never follows one, so the target is
+    untouched) is what `_forget_ctl_window` already does, and it is also the
+    honest state: no record, back to the name scan. It leaves nothing for the
+    next launch to inherit. A probe that cannot answer counts as a link — the
+    fallback costs a scan, guessing wrong costs the redirect. What stays open is
+    the race, not the standing redirect: a session that re-plants between the
+    probe and the replace still wins, and closing that needs an O_NOFOLLOW
+    write, which is not portable to the win32 leg this record is atomic for.
     """
     run_dir = runs.run_dir_for(project, run_id)
     if not runs.is_run(run_dir):
         return
+    record = run_dir / _CTL_WINDOW_FILE
     try:
-        atomic_write_text(run_dir / _CTL_WINDOW_FILE, win_id)
+        redirected = record.is_symlink()
+    except OSError:
+        redirected = True
+    if redirected:
+        _forget_ctl_window(project, run_id)
+        return
+    try:
+        atomic_write_text(record, win_id)
     except Exception:
         _forget_ctl_window(project, run_id)
 
