@@ -2391,6 +2391,7 @@ async def test_resolve_escalation_launches_and_attaches(project, monkeypatch):
     assert stamps == [("@7", "=main:%9")]
 
 
+@pytest.mark.usefixtures("force_tmux_backend")  # pin tmux against win32-matching externals
 async def test_resolve_warns_when_the_record_did_not_survive(project, monkeypatch):
     # The resolve path kept the captured id (it attaches with it) but never
     # asked whether the record landed, so a failed write left `a`/`x` on the
