@@ -6607,37 +6607,55 @@ def test_resume_re_gates_a_story_registered_but_never_started(project):
     assert saved.paused_story_key == "1-1-a"
 
 
-def test_resume_still_finishes_a_story_that_was_already_in_flight(project):
-    """The other side of the line, and the exemption stated as behavior: a story
-    whose session already ran finishes even under a gate that landed mid-flight.
-    Gating here would strand half-done work — a live worktree, an unmerged
-    branch — behind an entry whose remedy is a *later* story. The gate stops work
-    from starting; it does not abandon work in progress."""
+def test_resume_still_finishes_a_story_whose_session_already_completed(project):
+    """The other side of the line, and the exemption stated as behavior. It belongs
+    to `_finish_inflight`'s *finishing* arms, not to every non-terminal task: here
+    the review session completed and its result is on disk, so the resume replays
+    that record straight into the decision path. Gating it would abandon a verified
+    session's work over an entry whose remedy is a later story — and the story is
+    not starting, it is ending. The restart arm is the opposite case: it discards
+    the work and re-runs, so it re-asks (the tests above)."""
     write_sprint(project, {"1-1-a": "ready-for-dev"})
-    engine, _ = make_engine(project, [])
-    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_RUNNING, attempt=1)
-    engine.state.tasks["1-1-a"] = task
-    engine._save()
-    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1-1"])})
-
-    resumed, adapter = resume_engine(
+    engine, _ = make_engine(
         project,
-        engine,
         [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
     )
+    post_sessions = []
+    original_emit = engine._emit
+
+    def crashing_emit(stage, *args, **kwargs):
+        if stage == "post_session":
+            post_sessions.append(stage)
+            if len(post_sessions) == 2:  # the review session's post_session window
+                raise RuntimeError("host died in the post-session window")
+        return original_emit(stage, *args, **kwargs)
+
+    engine._emit = crashing_emit
+    assert engine.run().crashed
+    assert load_state(engine.run_dir).tasks["1-1-a"].phase == Phase.REVIEW_RUNNING
+    # the gate lands while the run is down, on a story whose work is already done
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1-1"])})
+
+    resumed, adapter = resume_engine(project, engine, [])
     summary = resumed.run()
 
     assert summary.done == 1 and not summary.paused
-    assert adapter.sessions  # the in-flight story ran to completion
+    assert adapter.sessions == []  # replayed the recorded result; nothing re-run
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "resume-verify" in kinds and "resume-restart" not in kinds
 
 
-def test_resume_does_not_gate_a_human_armed_re_drive(project):
-    """`rearm_escalation` resets `attempt` to 0 on a task that has already run
-    sessions, so `attempt == 0` alone would read a human-resolved re-drive as a
-    first dispatch and refuse it. It stays exempt for the same reason every other
-    resume of started work does — and refusing here would be worse than a missed
-    gate: the operator resolved the escalation precisely to get this story moving,
-    and the entry gating it is the one the re-drive may be about to close."""
+def test_resume_re_gates_a_human_armed_re_drive(project):
+    """A resolved escalation re-drives through the restart arm — the escalated
+    attempt is rolled back and the story re-runs from scratch — so it is a start,
+    and the gate is asked. Resolving an escalation is not evidence that the gating
+    entry landed, and `validate` refuses this story on the same ledger no matter
+    what its task record remembers; the two surfaces have to agree.
+
+    `rearmed` is also the signal a "has this story ever run a session?" test would
+    most want to trust, and it cannot be trusted: `StoriesEngine._pause_wedged`
+    reaches ESCALATED with `attempt == 0` and no session at all, so exempting
+    re-drives would wave through a wedged story's very first dispatch."""
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     escalating = SessionResult(
         status="completed",
@@ -6660,8 +6678,9 @@ def test_resume_does_not_gate_a_human_armed_re_drive(project):
     )
     summary = resumed.run()
 
-    assert summary.done == 1 and not summary.paused
-    assert adapter.sessions  # the re-drive ran
+    assert summary.paused and summary.done == 0
+    assert adapter.sessions == []  # the re-drive is a start, and it was refused
+    assert load_state(resumed.run_dir).paused_stage == PAUSE_STORY_GATE
 
 
 def test_epic_boundary_gate_pause_and_resume(project):

@@ -896,20 +896,25 @@ class Engine:
         never reaches this call — it must not, because the sweep is the only
         automated closer of the gating entry (``sweep.py`` `_close_resolved` /
         bundle close), and gating the sweep would deadlock the gate against its own
-        remedy. And a story whose session has already run finishes on resume rather
-        than stranding a half-done session with a live worktree; the gate applies to
-        work that must not *start*, which is the same line ``validate`` draws when
-        it passes a story the board has already finished.
+        remedy. And a resumed story *finishes* rather than stranding a half-done
+        session with a live worktree; the gate applies to work that must not
+        *start*, which is the same line ``validate`` draws when it passes a story
+        the board has already finished.
 
-        That second exemption is drawn by session, not by the presence of a task
-        record. ``_finish_inflight`` runs before the loop and drives every
-        non-terminal task, including one this loop registered and never started —
-        the window from ``_loop``'s task save through the worktree mount. Such a task
-        is a first dispatch wearing a resume's clothes, so the restart arm re-asks
-        this gate for it (``attempt == 0``); ``_pick_next`` cannot, having skipped
-        the key as touched. Without that, a gate landing while the run was down
-        would never be asked, and the one deferred check that refuses would be
-        disabled by the run's own crash.
+        That second exemption belongs to ``_finish_inflight``'s finishing arms —
+        the defer replay, the spec-approval continuation, the recorded-session
+        replay, the commit completion — and not to its restart arm, which finishes
+        nothing: it discards the worktree (or resets to baseline) and re-runs the
+        story from scratch. So the restart arm re-asks this gate, and
+        unconditionally. ``_pick_next`` cannot ask for it, having skipped the key as
+        touched, and the run's own crash must not be what disables the one deferred
+        check that refuses.
+
+        Deliberately no "but did a session really run?" test there. Every available
+        signal is wrong somewhere: ``attempt`` is bumped before the session launches,
+        ``sessions`` is written only after one returns, and ``rearmed`` covers a
+        stories-mode wedge (``StoriesEngine._pause_wedged``) that reaches ESCALATED
+        with no session at all. The arm's own unwinding is the stronger guarantee.
         """
         ledger = self.paths.deferred_work
         try:
@@ -1222,21 +1227,6 @@ class Engine:
                 else:
                     self._finalize_commit_phase(task)
             else:
-                # Is this a restart of work, or a first start wearing a task
-                # record? `_loop` saves the task and *then* calls `_run_story`,
-                # and nothing advances until `_dev_phase` bumps `attempt` in the
-                # same save as the DEV_RUNNING advance — so everything from that
-                # save through the isolated worktree mount and the pre_story
-                # hooks persists a task no session ever touched. `attempt == 0`
-                # is exactly that state. (Not `sessions`: a record is written
-                # after a session returns, so a host death *inside* a session
-                # leaves none, and that story is genuinely in flight.)
-                #
-                # `rearm_escalation` is the one other producer of a 0, on a task
-                # that has run sessions — a human-armed re-drive, which stays
-                # exempt like any other resume of started work. Read here,
-                # before the resets below clear `rearmed`.
-                never_dispatched = task.attempt == 0 and not task.rearmed
                 self.journal.append(
                     "resume-restart", story_key=task.story_key, phase=str(task.phase)
                 )
@@ -1255,12 +1245,21 @@ class Engine:
                 task.rearmed = False  # past rollback (only reached when not paused)
                 task.phase = Phase.PENDING  # deliberate reset, not a normal transition
                 self._save()
-                if never_dispatched:
-                    # Asked after the unwinding above and the save, so the task is
-                    # in the same shape `_loop` hands to `_run_story` — no worktree
-                    # to strand behind a pause that may last days, and the refusal
-                    # re-asks on every later resume until the entry lands.
-                    self._refuse_gated_story(task.story_key)
+                # This arm is the one that does not finish work: the lines above
+                # discarded the worktree or reset the tree to baseline, so the task
+                # now holds nothing a session produced and is about to be re-run
+                # from scratch — the same shape `_loop` hands to `_run_story`. That
+                # makes the gate question the same one `_loop` asks, and asking it
+                # unconditionally is what keeps it honest: any test for "did a
+                # session really run?" would be inferring what this arm has already
+                # guaranteed, and each such test is wrong somewhere. `attempt` is
+                # bumped before the session launches (so a death in between reads as
+                # started); `sessions` is written after one returns (so a death
+                # inside one reads as never started); `rearmed` covers a stories-mode
+                # wedge that escalated with no session at all. Placed after the
+                # unwinding and the save, so a refusal strands no worktree and the
+                # task re-asks on every later resume until the entry lands.
+                self._refuse_gated_story(task.story_key)
                 self._run_story(task)
             # a resumed story that just reached DONE gets the same post-story hook
             # the _loop path fires (e.g. the stories-mode done_checkpoint pause),
