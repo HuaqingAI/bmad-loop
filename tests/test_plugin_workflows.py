@@ -294,6 +294,26 @@ def test_blocking_workflow_env_fault_escalates_instead_of_deferring(project):
     assert "story-deferred" not in kinds  # escalated, not deferred
 
 
+def test_blocking_workflow_lost_session_says_so_in_the_defer_reason(project):
+    """#489 on the one path that DEFERS rather than retries: a blocking workflow
+    whose mux session was destroyed must not be filed as "the workflow ran and
+    failed". The defer reason an operator reads carries both which workflow died
+    and that the session went missing under it."""
+    setup_story(project)
+    reg = PluginRegistry([LoadedPlugin(manifest=wf_manifest("wf", blocking=True))])
+    script = [
+        dev_effect(project, "1-1-a"),
+        SessionResult(status="crashed", session_vanished=True),
+    ]
+    engine, _ = make_engine(project, script, reg)
+    summary = engine.run()
+
+    assert summary.deferred == 1
+    deferred = [e for e in engine.journal.entries() if e["kind"] == "story-deferred"][-1]
+    assert "blocking workflow 'doc' (wf)" in deferred["reason"]
+    assert "multiplexer no longer reports the session" in deferred["reason"]
+
+
 def test_nonblocking_workflow_failure_is_advisory(project):
     captured: list = []
     setup_story(project)

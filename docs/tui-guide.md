@@ -220,7 +220,8 @@ One row per story (or sweep bundle/triage task) in the selected run:
   (the guard's mid-session sample at trip time). The
   matching `tasks/<id>/` dir holds the forensic breadcrumbs the adapter wrote
   while the session ran: `session-lifecycle.jsonl` (timeout-fire,
-  budget-guard `budget-tripped` / `over-budget-fired`, kill-escalation, and the
+  budget-guard `budget-tripped` / `over-budget-fired`, kill-escalation,
+  `session-vanished` (the mux no longer reported the session during the run, #489), and the
   #276 missing-marker forensics `spec-status-transition-observed` /
   `frontmatter-unmodified-refused` / `contract-nudge-sent`),
   `heartbeat.json` (the wait loop's proof-of-life —

@@ -233,6 +233,19 @@ class _ResultFileMixin:
         tees a pane log."""
         return None
 
+    def _session_vanished(self) -> bool:
+        """Whether the whole multiplexer session is gone, asked only once a
+        crash verdict has already been reached (#489). Base: False — an adapter
+        with no session to lose (opencode-http) never vanishes. Overridden by
+        `GenericAdapter`.
+
+        Same failure convention as `_window_alive`: `MultiplexerError` is the
+        seam's declared "couldn't ask" and the override swallows it to False.
+        Anything else propagates, exactly as it does from the liveness probe —
+        this is a label on a verdict already made, so it degrades rather than
+        second-guessing the verdict, but it does not swallow unknown faults."""
+        return False
+
     def _final(
         self,
         handle: SessionHandle,
@@ -274,6 +287,29 @@ class _ResultFileMixin:
             )
             result_json = None
         status = "completed" if result_json is not None else fallback
+        # Diagnose the crash verdict only (#489) — see `_session_vanished`. A
+        # read-back upgrade to `completed` is deliberately not diagnosed: a
+        # session reaped AFTER flushing its result did produce something, and the
+        # verdict it earned is the honest one. `crashed` also covers the
+        # `SessionEnd` arm of `GenericAdapter.run()`, where the CLI announced
+        # its own exit rather than the window dying — the label stays truthful
+        # there because it reports what the mux answered, not how the window
+        # ended.
+        vanished = status == "crashed" and self._session_vanished()
+        if vanished:
+            # Evidence rides along like every neighbouring crumb: which session
+            # went missing (several runs share a host) and what verdict it lands.
+            # getattr because the mixin does not declare `session_name` (opencode-
+            # http has none) and only a mux-backed adapter can reach this branch
+            # (the base `_session_vanished` is a constant False). No default — an
+            # override on an adapter without a session name must fail loud here,
+            # not write evidence-free crumbs.
+            self._note_lifecycle(
+                handle.task_id,
+                "session-vanished",
+                session=getattr(self, "session_name"),
+                status=status,
+            )
         return SessionResult(
             status=status,
             result_json=result_json,
@@ -281,6 +317,7 @@ class _ResultFileMixin:
             transcript_path=transcript,
             budget_weighted=budget_weighted,
             stop_seen=stop_seen,
+            session_vanished=vanished,
         )
 
     def _result_path(self, task_id: str) -> Path:
@@ -913,6 +950,29 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
 
     def _window_alive(self, handle: SessionHandle) -> bool:
         return handle.native_id in self.mux.list_window_ids(self.session_name)
+
+    def _session_vanished(self) -> bool:
+        # The disambiguating probe (#489): `list_window_ids` returns [] for a
+        # dead window AND for a session that no longer exists, so a plain
+        # window-death verdict cannot tell an exited CLI from a session destroyed
+        # under the run. Only `has_session` separates them.
+        #
+        # The destroyer is NOT necessarily foreign. Candidates: an external
+        # reaper (psmux/psmux#546), a concurrent
+        # `runs.kill_session` from this tool's own prune/stop/crash paths or the
+        # TUI, an operator `kill-session`, a mux server crash, the host sleeping.
+        # The reason text stays neutral about which, because this probe cannot
+        # tell them apart — it reports that the mux no longer answers for the
+        # session, nothing more.
+        #
+        # Safe to ask this late: `run()`'s teardown kills the WINDOW, never the
+        # session, so our own kill cannot fake a vanishing, and a session once
+        # gone stays gone.
+        try:
+            return not self.mux.has_session(self.session_name)
+        except MultiplexerError:
+            # Unknown is not vanished — the same rule the liveness probe follows.
+            return False
 
     def send_text(self, handle: SessionHandle, text: str) -> None:
         self.mux.send_text(handle.native_id, text)
@@ -1771,8 +1831,8 @@ class _DevSynthesisMixin(_ResultFileMixin):
         # this rescue exists for a session that finished but lost its Stop, not for
         # one that never ran. A session that ended no turn and whose pane log never
         # grew produced nothing, so a qualifying artifact is not its output — keep
-        # the stall/timeout verdict. This is the call path the issue's second
-        # occurrence (story i-11) took.
+        # the stall/timeout verdict. This is the call path the incident's second
+        # occurrence took.
         if not self._produced_work(handle, result.stop_seen):
             self._note_lifecycle(
                 handle.task_id,

@@ -35,6 +35,7 @@ from .escalation import (
     preference_escalations,
     review_exhausted,
     review_retry_or_exhaust,
+    session_failure_reason,
 )
 from .install import dev_primitive_or_default
 from .journal import Journal, save_state
@@ -1397,7 +1398,7 @@ class Engine:
                     )
                 self._defer(
                     task,
-                    f"blocking workflow {wf.name!r} ({lp.name}) did not complete: {result.status}",
+                    session_failure_reason(f"blocking workflow {wf.name!r} ({lp.name})", result),
                 )
                 return True
         return False
@@ -1618,6 +1619,10 @@ class Engine:
                 # session-transport classification (#194); decide_dev PAUSEs on
                 # the latter, so the fall-through below preserves the worktree.
                 env_fault=bool((outcome is not None and outcome.env_fault) or result.env_fault),
+                # The all-roles greppable record rides session-end via
+                # `_session_end_extras` (#489); here the flag pairs the
+                # diagnosis with the decision it fed.
+                session_vanished=result.session_vanished,
             )
             if decision.action == Action.PROCEED:
                 # DEV_VERIFY + spec_file is not itself proof of acceptance: this
@@ -3871,6 +3876,15 @@ class Engine:
             extras["env_fault"] = True
             if result.env_fault_evidence:
                 extras["env_fault_evidence"] = result.env_fault_evidence
+        # lost-session diagnosis (#489): rides the same chokepoint so EVERY
+        # role — dev, review, fix, migration, triage, injected workflows —
+        # leaves the greppable record, not only the dev decision. The boolean
+        # inherits the probe's weak False (`TerminalMultiplexer.has_session`):
+        # a lookup the backend failed for any reason counts as vanished,
+        # accepted because the window-death verdict proved the transport
+        # healthy moments before the probe asked.
+        if result.session_vanished:
+            extras["session_vanished"] = True
         return extras
 
     @staticmethod
