@@ -203,12 +203,17 @@ def psmux_data_root(tmp_path_factory):
         default = _plain_has_session(mux, session)
         return root if isolated and not default else None
     finally:
-        mux._run(["kill-session", "-t", session], check=False, env=env)
         # The one session here that can land in the developer's real registry —
         # a build ignoring PSMUX_DATA_DIR is the very branch this fixture exists
         # to detect — so verify the kill in BOTH views rather than trusting a
         # best-effort call whose target may not be the registry it created in.
+        # The kill sits INSIDE the try, unlike the `probe` fixture's: this one
+        # needs `env=`, which only raw _run takes, and raw _run propagates a
+        # timeout even under check=False. A kill that hung is exactly when the
+        # session is most likely still standing, so it must reach the report
+        # below rather than escape with a bare TimeoutExpired.
         try:
+            mux._run(["kill-session", "-t", session], check=False, env=env)
             leaked = _plain_has_session(mux, session, env=env) or _plain_has_session(mux, session)
         except (OSError, TmuxError, subprocess.TimeoutExpired):
             leaked = True
@@ -237,7 +242,10 @@ def probe(tmp_path, monkeypatch, psmux_data_root):
         except (OSError, TmuxError, subprocess.TimeoutExpired):
             # TimeoutExpired too: _plain_has_session goes through raw _run, which
             # propagates a timeout even under check=False, so a hung psmux would
-            # otherwise escape this teardown instead of reporting the leak.
+            # otherwise escape this teardown instead of reporting the leak. The
+            # kill_session above needs no such cover — it swallows
+            # SubprocessError, and TimeoutExpired is one — which is why only the
+            # data-root fixture's raw-_run kill had to move inside its try.
             leaked = True
         assert (
             not leaked
