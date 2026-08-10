@@ -70,7 +70,21 @@ def test_prune_kills_only_the_owning_projects_window(tmp_path: Path, monkeypatch
         monkeypatch.setattr(mux, "current_window_id", lambda: None)
         monkeypatch.setattr(runs, "engine_alive", lambda _dir: False)
 
-        assert launch.prune_ctl_windows(proj_a) == ["run-20260726-1"]
+        # First with the kill suppressed: the candidate is provably still alive,
+        # so it must land in `survived`. This is the half that pins the id-form
+        # symmetry against a real server — a removal reads "gone" whether or not
+        # the candidate's qualified `session:@N` matches the liveness listing's
+        # form, but a SURVIVOR only reads "still there" when they do match, and
+        # psmux qualifies both sides (#254/#291). No kill is sent, so nothing
+        # here disturbs the verified-removal assertions below.
+        with monkeypatch.context() as no_kill:
+            no_kill.setattr(mux, "kill_window", lambda _t: None)
+            assert launch.prune_ctl_windows(proj_a) == ([], ["run-20260726-1"], [])
+        assert mux.window_alive(session, win_a)  # the suppressed kill really was a no-op
+
+        # Then for real: the kill lands, so the verdict is a verified removal
+        # with both other arms empty.
+        assert launch.prune_ctl_windows(proj_a) == (["run-20260726-1"], [], [])
 
         live = mux.list_window_ids(session)
         assert win_a not in live

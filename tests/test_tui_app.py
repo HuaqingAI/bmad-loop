@@ -2003,7 +2003,7 @@ async def test_cleanup_unknown_sessions_notifies(project, monkeypatch):
 
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(runs, "prune_sessions", lambda _p: (["odd-1"], [], {"odd-1"}))
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: [])
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
     make_run(project.project, "20260611-100000-aaaa")
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
@@ -2052,6 +2052,38 @@ async def test_cleanup_sessions_mux_error_notifies(project, monkeypatch):
         # guarantee this one has reached the message pump yet (Windows flake).
         await until(pilot, lambda: any("removed 1 session(s)" in m for m in notifications(app)))
         assert isinstance(app.screen, DashboardScreen)  # worker failed soft, no crash
+
+
+async def test_cleanup_warns_about_ctl_windows_that_survived_the_kill(project, monkeypatch):
+    # The summary counts only verified removals now (#435), so a window that
+    # outlived its kill would otherwise just be missing from the toast with
+    # nothing anywhere saying it is still there. Survived and unverifiable get
+    # separate toasts: one is evidence the window is still open, the other is the
+    # absence of evidence — merging them reports the first as the second.
+    from bmad_loop import runs
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p: ([], [], set()))
+    monkeypatch.setattr(
+        launch, "prune_ctl_windows", lambda _p: (["gone-1"], ["stuck-1"], ["dunno-1"])
+    )
+    make_run(project.project, "20260611-100000-aaaa")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("c")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(
+            pilot,
+            lambda: any("still open after the kill: stuck-1" in m for m in notifications(app)),
+        )
+        await until(
+            pilot, lambda: any("outcome unverifiable: dunno-1" in m for m in notifications(app))
+        )
+        await until(
+            pilot, lambda: any("removed 0 session(s), 1 window(s)" in m for m in notifications(app))
+        )
 
 
 async def test_resume_finished_run_refused(project, monkeypatch):

@@ -190,7 +190,13 @@ class TerminalMultiplexer(ABC):
         probe, so a sentinel is safe).
 
         A ``window_id`` column carries the same id form :meth:`current_window_id`
-        returns; core compares the two directly."""
+        AND :meth:`list_window_ids` return; core compares all three directly. The
+        second pairing is load-bearing for the ctl-window prune's kill verdict,
+        which is a membership test of this column against that listing
+        (:func:`bmad_loop.tui.launch.prune_ctl_windows`): a backend that
+        qualifies one side and not the other reports every killed window as
+        verifiably gone — silently, and in the optimistic direction the verdict
+        exists to remove (#435)."""
 
     @abstractmethod
     def window_alive(self, session: str, window_id: str) -> bool:
@@ -328,6 +334,27 @@ class TerminalMultiplexer(ABC):
         keep this promise, not made to. The one caller that also *parses* this
         string (the psmux backend's version gate) anchors at its start, so a
         folding backend keeps the identifying version in the first segment."""
+        return None
+
+    def version_error(self) -> str | None:
+        """Why the most recent :meth:`version` call answered None despite the
+        binary being there — a crashing probe, a hung server, an AV-blocked exe.
+        None when that call succeeded, when there was no binary to ask, when no
+        probe has run yet, or when the backend keeps no such record (the default
+        here, so an out-of-tree backend inherits silence rather than breaking).
+
+        This is a *diagnostic*, not a second contract: `version()` keeps its None
+        sentinel (observation may degrade) and this only recovers the identity of
+        the failure it dropped, which is otherwise indistinguishable from "the
+        binary reports no version" (#428). Must not raise.
+
+        It describes the LAST probe, so read it directly after :meth:`version`,
+        **on an instance you own** — nothing recomputes it, a later successful
+        probe clears it, and the record is unsynchronized per-instance state. The
+        process-wide :func:`get_multiplexer` backend is shared across the TUI's
+        worker threads, so a caller reading the accessor off THAT instance can be
+        handed another thread's probe. :func:`detect_multiplexers` is the one
+        in-tree reader and builds its own instance per row."""
         return None
 
     def window_pane_pids(self, target: str) -> list[int]:
@@ -638,6 +665,10 @@ class MuxBackendInfo:
     version: str | None
     selected: bool
     reason: str  # "" unless selected: env | policy | platform-default | first-match | fallback
+    # The diagnostic version() dropped, when it answered None with the binary
+    # present (TerminalMultiplexer.version_error). Defaulted so it is additive
+    # for anyone constructing this row positionally.
+    version_error: str | None = None
 
 
 def detect_multiplexers() -> list[MuxBackendInfo]:
@@ -666,6 +697,7 @@ def detect_multiplexers() -> list[MuxBackendInfo]:
         except Exception:
             matches_platform = False
         version: str | None = None
+        version_error: str | None = None
         try:
             backend = factory()
             available = _usable(backend)
@@ -679,6 +711,14 @@ def detect_multiplexers() -> list[MuxBackendInfo]:
                 version = fold_version(backend.version())
             except Exception:
                 version = None
+            if version is None:
+                # Read only after version(), which is what it describes, and
+                # only when there is a None to explain. Guarded like every other
+                # probe here — this function never raises.
+                try:
+                    version_error = backend.version_error()
+                except Exception:
+                    version_error = None
         selected = name == selected_name
         rows.append(
             MuxBackendInfo(
@@ -688,6 +728,7 @@ def detect_multiplexers() -> list[MuxBackendInfo]:
                 version=version,
                 selected=selected,
                 reason=reason if selected else "",
+                version_error=version_error,
             )
         )
     return rows

@@ -63,6 +63,15 @@ class BaseTmuxBackend(TerminalMultiplexer):
     #: the default strict handler; a Windows leaf sets ``"backslashreplace"`` so
     #: a stray non-UTF-8 byte degrades visibly instead of raising mid-capture.
     _ERRORS: str | None = None
+    #: Diagnostic from the last :meth:`version` probe (see
+    #: :meth:`TerminalMultiplexer.version_error`). A class-level default so an
+    #: instance that never probed answers None instead of AttributeError.
+    #: Per-instance and unsynchronized: only a caller that OWNS the instance may
+    #: read it back (``detect_multiplexers`` builds one per row). The
+    #: ``get_multiplexer()`` singleton is shared across the TUI's worker threads,
+    #: and ``mux_usable`` probes ``version()`` on it — a reader there can be
+    #: handed another thread's failure.
+    _version_error: str | None = None
 
     def _run(
         self,
@@ -456,11 +465,29 @@ class BaseTmuxBackend(TerminalMultiplexer):
         return shutil.which(self._BINARY) is not None
 
     def version(self) -> str | None:
+        # Every exit path rewrites the diagnostic, so it always describes THIS
+        # call (the seam's read-it-after-version rule) — a probe that recovers
+        # must not leave the old failure standing for `mux` to warn about.
+        self._version_error = None
         if not shutil.which(self._BINARY):
             return None
         try:
             raw = self._tmux("-V")
-        except (MultiplexerError, subprocess.SubprocessError, OSError):
+        # UnicodeError is in the list because _run decodes with the LOCALE codec
+        # and the strict handler on POSIX (_ENCODING/_ERRORS are None there;
+        # the Windows leaf sets utf-8/backslashreplace, so this arm is POSIX-
+        # only). A byte that codec cannot decode — UTF-8 in practice under PEP
+        # 538/540 — raises: a corrupt install, or a binary emitting text in
+        # another encoding, exactly what this diagnostic exists for. It is a
+        # ValueError, outside the SubprocessError/OSError family, so it escaped
+        # as a raw crash for every caller above to guard.
+        except (MultiplexerError, subprocess.SubprocessError, OSError, UnicodeError) as exc:
+            # None stays the seam's answer, but the identity of the failure is
+            # what separates a crashing binary from one that reports no version
+            # (#428). On the nonzero-exit arm _run has already folded the probe's
+            # stderr into the TmuxError text, so str(exc) carries it; the other
+            # arms carry only the failure itself, which is all there is to carry.
+            self._version_error = str(exc)
             return None
         # The seam promises one line (TerminalMultiplexer.version). `-V` is one
         # line on tmux, two on psmux (a `tmux X.Y.Z` compat line then its own),
@@ -469,3 +496,6 @@ class BaseTmuxBackend(TerminalMultiplexer):
         # parses the compat segment with an anchored match, so the first
         # segment must stay first.
         return fold_version(raw)
+
+    def version_error(self) -> str | None:
+        return self._version_error

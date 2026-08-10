@@ -383,6 +383,84 @@ def test_version_is_bounded_not_just_flattened(monkeypatch):
     assert got.startswith("tmux 3.4 ") and got.endswith("…")
 
 
+def test_version_error_records_the_probe_crash_version_swallows(monkeypatch):
+    """A binary on PATH that dies answering `-V` is the case version()'s None
+    cannot express (#428). None stays the seam's answer; the diagnostic keeps
+    the identity of the failure — including the probe's stderr, which _run
+    already folds into the error text."""
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        tmux_base.subprocess,
+        "run",
+        lambda argv, **k: subprocess.CompletedProcess(argv, 1, stdout="", stderr="Access denied"),
+    )
+    mux = TmuxMultiplexer()
+
+    assert mux.version() is None
+    error = mux.version_error()
+    assert error is not None and "Access denied" in error
+
+
+def test_version_error_records_undecodable_probe_output(monkeypatch):
+    """Pins the `UnicodeError` arm of version()'s catch. A strictly-decoding
+    _run (POSIX: _ENCODING/_ERRORS both None) raises UnicodeDecodeError out of
+    subprocess itself on a binary emitting an undecodable byte — a corrupt
+    install, the very case #428 is about — and it is a ValueError, outside the
+    SubprocessError/OSError family, so without the arm it escapes as a raw crash
+    that every guard above turns back into an unexplained None. The raise is
+    injected rather than decoded for real: this owns the except clause, not the
+    decoding (tmux_base documents that half)."""
+
+    def boom(argv, **k):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(tmux_base.subprocess, "run", boom)
+    mux = TmuxMultiplexer()
+
+    assert mux.version() is None
+    error = mux.version_error()
+    assert error is not None and "invalid start byte" in error
+
+
+def test_version_error_is_none_when_the_binary_is_simply_absent(monkeypatch):
+    """Nothing was asked, so there is no failure to report — a missing binary is
+    already legible from AVAILABLE and must not also raise a warning."""
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: None)
+    mux = TmuxMultiplexer()
+
+    assert mux.version() is None
+    assert mux.version_error() is None
+
+
+def test_version_error_never_outlives_the_probe_it_describes(monkeypatch):
+    """It describes the LAST call. A recovered probe that left the old failure
+    standing would have `mux` warning about a backend that just answered fine."""
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+    mux = TmuxMultiplexer()
+    monkeypatch.setattr(
+        tmux_base.subprocess,
+        "run",
+        lambda argv, **k: subprocess.CompletedProcess(argv, 1, stdout="", stderr="transient"),
+    )
+    assert mux.version() is None and mux.version_error() is not None
+
+    _version_stdout(monkeypatch, "tmux 3.4\n")
+
+    assert mux.version() == "tmux 3.4"
+    assert mux.version_error() is None
+
+
+def test_version_error_of_a_backend_that_keeps_no_record_is_none():
+    """The seam default: an out-of-tree backend inherits silence rather than an
+    AttributeError, so the accessor is safe to call on anything registered — and
+    non-abstract, so adding it does not break a backend that never heard of it.
+    Called unbound because the body reads no state (an ABC subclass cannot be
+    instantiated to hold any)."""
+    assert "version_error" not in multiplexer.TerminalMultiplexer.__abstractmethods__
+    assert multiplexer.TerminalMultiplexer.version_error(object()) is None  # type: ignore[arg-type]
+
+
 def test_version_of_a_real_probe_is_never_truncated(monkeypatch):
     # The bound must clear the probes that actually exist by a wide margin —
     # otherwise it trades one unreadable cell for a useless one.

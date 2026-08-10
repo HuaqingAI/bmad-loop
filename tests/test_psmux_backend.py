@@ -187,6 +187,22 @@ def test_list_window_ids_returns_session_qualified_ids(monkeypatch):
     assert PsmuxMultiplexer().list_window_ids("s") == ["s:@1", "s:@2"]
 
 
+def test_list_windows_id_column_is_findable_in_list_window_ids(monkeypatch):
+    """The ctl prune's kill verdict is a set membership ACROSS these two methods
+    (#435): candidates carry list_windows' `window_id` column, the post-kill
+    liveness check answers list_window_ids. Qualify one side only and every
+    candidate reads as removed — the optimism the verdict exists to remove, with
+    no error anywhere. The live gate (test_psmux_live) pins this too but needs
+    Windows + psmux and is a manual CI gate; this one runs everywhere."""
+    _window_fake(monkeypatch, listed="@1\t0\n@2\trun-x\n")
+    rows = PsmuxMultiplexer().list_windows("s", ["window_id", "window_name"])
+    assert [r[0] for r in rows] == ["s:@1", "s:@2"]  # guard: the column is populated
+
+    _window_fake(monkeypatch, listed="@1\n@2\n")
+    live = PsmuxMultiplexer().list_window_ids("s")
+    assert all(row[0] in live for row in rows)
+
+
 def test_qualification_degrades_to_bare_on_colon_session(monkeypatch, tmp_path):
     # A `:` in the session name would split the target at the wrong colon on
     # replay — both methods degrade to the bare id identically (the #221 rule).

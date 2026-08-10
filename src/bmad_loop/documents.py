@@ -365,7 +365,7 @@ def list_document(infos: list[RunInfo]) -> dict[str, object]:
     }
 
 
-CLEANUP_SCHEMA_VERSION = 1
+CLEANUP_SCHEMA_VERSION = 2
 
 
 def cleanup_document(
@@ -375,6 +375,8 @@ def cleanup_document(
     live: list[str],
     unknown: set[str],
     windows: list[str],
+    windows_survived: list[str],
+    windows_unverifiable: list[str],
 ) -> dict[str, object]:
     """The `cleanup --json` document: the multiplexer artifacts this invocation
     removed, or — under ``--dry-run`` — would remove.
@@ -390,6 +392,21 @@ def cleanup_document(
     empty. It never blocks cleanup: pruning kills the tmux session, never the
     engine pid. Nothing to clean up is a valid document of empty lists at
     exit 0, never an error.
+
+    `ctl_windows` is a three-way partition, disjoint by window id (the values
+    are names): `removed` was verified gone after the kill, `survived` was still
+    listed, and `unverifiable` is a kill whose outcome could not be probed at
+    all. Schema 2 narrowed `removed` from "a kill was attempted" to "the window
+    is verifiably gone" (#435) — a meaning change, hence the version bump rather
+    than a bare field addition. Under `--dry-run` nothing is killed, so `removed`
+    is the would-close plan and the other two are empty — the shared
+    plan/outcome shape holds, with `dry_run` still the field that says which one
+    you are holding.
+
+    `sessions.removed` did NOT get the same treatment and is still the pre-kill
+    prunable partition — an *attempted* kill, since `kill_session` is best-effort
+    and silent in exactly the way `kill_window` is. #435 narrowed the windows
+    half only; read the sessions half with that in mind.
     """
     return {
         "schema_version": CLEANUP_SCHEMA_VERSION,
@@ -399,7 +416,11 @@ def cleanup_document(
             "live": list(live),
             "unverifiable_pid": sorted(unknown),
         },
-        "ctl_windows": {"removed": list(windows)},
+        "ctl_windows": {
+            "removed": list(windows),
+            "survived": list(windows_survived),
+            "unverifiable": list(windows_unverifiable),
+        },
     }
 
 

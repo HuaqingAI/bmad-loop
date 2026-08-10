@@ -27,9 +27,10 @@ class _Stub:
     """Minimal backend double for selection tests: fixed availability/version.
     Selection only touches available()/version(), so the full ABC is overkill."""
 
-    def __init__(self, avail=True, version=None):
+    def __init__(self, avail=True, version=None, version_error=None):
         self._avail = avail
         self._version = version
+        self._version_error = version_error
 
     def available(self):
         if isinstance(self._avail, Exception):
@@ -40,6 +41,11 @@ class _Stub:
         if isinstance(self._version, Exception):
             raise self._version
         return self._version
+
+    def version_error(self):
+        if isinstance(self._version_error, Exception):
+            raise self._version_error
+        return self._version_error
 
 
 def _platform_default_name():
@@ -354,6 +360,66 @@ def test_detect_multiplexers_version_crash_keeps_availability(fresh_registry):
     assert rows["verless"].available is True
     assert rows["verless"].version is None
     assert rows["verless"].selected is True and rows["verless"].reason == "first-match"
+
+
+def test_detect_multiplexers_carries_the_dropped_version_diagnostic(fresh_registry):
+    """The row is what `bmad-loop mux` renders, so the diagnostic version() drops
+    has to survive the trip out of the backend (#428) — a VERSION cell of `-`
+    otherwise says the same thing for a crashed probe and a quiet binary."""
+    fresh_registry._BUILTINS_LOADED = True
+    fresh_registry.register_multiplexer(
+        "crasher",
+        lambda p: p == sys.platform,
+        lambda: _Stub(avail=True, version=None, version_error="tmux -V failed: killed"),
+    )
+    rows = {r.name: r for r in fresh_registry.detect_multiplexers()}
+    assert rows["crasher"].version is None
+    assert rows["crasher"].version_error == "tmux -V failed: killed"
+
+
+def test_detect_multiplexers_carries_the_diagnostic_off_an_unavailable_backend(fresh_registry):
+    """The flagship #428 shape. psmux's available() gates on its own version()
+    (psmux_backend), so an AV-blocked or corrupt binary reads available=False —
+    the row that most needs an explanation is the one where the availability
+    verdict already failed. The read hangs off the factory `try`, not off the
+    availability answer, and nothing else pins that."""
+    fresh_registry._BUILTINS_LOADED = True
+    fresh_registry.register_multiplexer(
+        "blocked",
+        lambda p: p == sys.platform,
+        lambda: _Stub(avail=False, version=None, version_error="psmux -V failed: [WinError 5]"),
+    )
+    rows = {r.name: r for r in fresh_registry.detect_multiplexers()}
+    assert rows["blocked"].available is False
+    assert rows["blocked"].version_error == "psmux -V failed: [WinError 5]"
+
+
+def test_detect_multiplexers_reads_no_diagnostic_off_a_working_version(fresh_registry):
+    """Only a None version has a failure to explain. Asking a backend that just
+    answered would report a stale error from some earlier probe — the accessor
+    describes the LAST call, and this one succeeded."""
+    fresh_registry._BUILTINS_LOADED = True
+    fresh_registry.register_multiplexer(
+        "fine",
+        lambda p: p == sys.platform,
+        lambda: _Stub(avail=True, version="fine 1.0", version_error="stale"),
+    )
+    rows = {r.name: r for r in fresh_registry.detect_multiplexers()}
+    assert rows["fine"].version == "fine 1.0"
+    assert rows["fine"].version_error is None
+
+
+def test_detect_multiplexers_guards_a_raising_version_error(fresh_registry):
+    """The never-raises contract covers the new probe too: a backend whose
+    version_error() blows up must still produce a row."""
+    fresh_registry._BUILTINS_LOADED = True
+    fresh_registry.register_multiplexer(
+        "rude",
+        lambda p: p == sys.platform,
+        lambda: _Stub(avail=True, version=None, version_error=RuntimeError("boom")),
+    )
+    rows = {r.name: r for r in fresh_registry.detect_multiplexers()}
+    assert rows["rude"].available is True and rows["rude"].version_error is None
 
 
 # ------------------------------------------------ fold_version, directly (#321)
