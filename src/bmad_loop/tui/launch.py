@@ -280,7 +280,16 @@ def ctl_window_id(project: Path, run_id: str) -> str | None:
         # the *current* window. (The base's short-row padding CAN produce an
         # empty *tag* — it fills trailing fields — which is exactly the untagged
         # case below; window_id stays field 0 of 3.)
-        if not win_id or not name.endswith(f"-{run_id}"):
+        if not win_id:
+            continue
+        # The whole run id, not a suffix of the name: RUN_ID_RE admits `-`, so
+        # `--run-id other-RID` mints `run-other-RID`, which ends with `-RID` and
+        # would answer a lookup for `RID` — and sorts ahead of it, so `x` kills
+        # the neighbour's LIVE orchestrator. Parsed with the same regex
+        # _ctl_window_candidates uses, which also confines a match to the four
+        # kinds start_detached mints rather than any name ending this way.
+        m = _CTL_WINDOW_RE.match(name)
+        if m is None or m.group(1) != run_id:
             continue
         if tag == mine:
             tagged.append(win_id)

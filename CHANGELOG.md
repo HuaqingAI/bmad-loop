@@ -160,6 +160,11 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
+- **A run id that is a suffix of another no longer resolves to the neighbour's control window.**
+  `--run-id` is caller-supplied and may contain `-`, so `run-other-RID` satisfied the lookup for
+  `RID` — and sorted ahead of it, so `x` could kill the neighbouring run's live orchestrator.
+  Window names are parsed and the run id compared whole, as the prune scan already did.
+
 - **Attach, return-stamp and kill follow the run's live control window, not an older one (#482).**
   `<kind>-<run_id>` window names are not unique, so the lookup answered the first match: resuming a
   parked run left `a` attaching to the dead `run-<rid>` window, the return pane stamped on it (so the

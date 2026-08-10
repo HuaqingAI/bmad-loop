@@ -321,6 +321,19 @@ def test_ctl_window_id_matches_run_id_suffix(monkeypatch, tmp_path: Path):
     assert launch.ctl_window_id(tmp_path, "CCCC") is None
 
 
+def test_ctl_window_id_requires_the_whole_run_id(monkeypatch, tmp_path: Path):
+    # `--run-id` is caller-supplied and RUN_ID_RE admits `-`, so one run id can
+    # be a suffix of another. A suffix test on `-RID` admits `run-other-RID`,
+    # which sorts first, so `x` would kill the LIVE other-RID orchestrator —
+    # the same wrong-window class as #482, one run over. The name is parsed and
+    # the captured id compared whole.
+    _ctl_listing(monkeypatch, "@1\trun-other-RID\n@2\tresume-RID\n", tmp_path)
+    assert launch.ctl_window_id(tmp_path, "RID") == "@2"
+    # Positive control: the neighbour is still reachable under its own id, so
+    # this pins whole-id matching rather than merely refusing the collision.
+    assert launch.ctl_window_id(tmp_path, "other-RID") == "@1"
+
+
 def test_ctl_window_id_prefers_the_window_the_last_launch_minted(monkeypatch, tmp_path: Path):
     # #482: `e` over a parked run leaves `run-RID` in front of the live
     # `resume-RID`, and the scan alone answers the parked corpse. The recorded
@@ -464,11 +477,16 @@ def test_read_record_rejects_a_fifo_that_already_has_data(tmp_path: Path):
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX device nodes")
 def test_read_record_rejects_a_non_regular_file(tmp_path: Path):
-    # The S_ISREG check on the opened descriptor, which O_NOFOLLOW alone does
-    # not give (a link is only one way to reach a device). `/dev/zero` is the
-    # case that bites hardest: an endless source raises MemoryError, which is
-    # not an OSError and so escapes this function's "never raises" promise
-    # entirely, out through action_attach, which has no handler at all.
+    # O_NOFOLLOW, against the worst target a link can name. An endless source
+    # is what bites hardest — reading one raises MemoryError, not an OSError, so
+    # it would escape this function's "never raises" promise out through
+    # action_attach, which has no handler at all — but the open refuses the link
+    # before any of that, so this pins the refusal rather than the cap.
+    #
+    # NOT the S_ISREG check, despite reaching a device: O_NOFOLLOW fails the
+    # open first, so the descriptor never exists to fstat. Ablating S_ISREG
+    # leaves this test green (verified) — the queued-FIFO case above is the one
+    # that pins it, because there the open succeeds.
     run_dir = runs.run_dir_for(tmp_path, "RID")
     run_dir.mkdir(parents=True)
     (run_dir / launch._CTL_WINDOW_FILE).symlink_to("/dev/zero")
