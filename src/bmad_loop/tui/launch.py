@@ -131,6 +131,42 @@ def _forget_ctl_window(project: Path, run_id: str) -> None:
         pass  # a removal we cannot force — see the ceiling
 
 
+def _run_dir_is_confined(project: Path, run_dir: Path) -> bool:
+    """Whether `run_dir` is reached from `project` without traversing a symlink.
+
+    `follow_symlinks=False` refuses a link at the *final* component only, which
+    leaves the ancestors: a session that replaces `.bmad-loop/runs/<run_id>`
+    with a link to an external directory holding a `state.json` passes
+    `runs.is_run` — it follows the link — and then `mkstemp`/`os.replace` land
+    the record inside the linked-to directory. The escape is narrower than the
+    final-component one (the name written is always `ctl-window`, so the reach
+    is another project's record rather than any file), but it is the same shape.
+
+    Every component below `project` is checked, and `project` itself is not: the
+    operator chooses where the project lives and may well keep it behind a link,
+    while everything under it is session-writable. `lstat`-based throughout, so
+    the check never resolves through what it is testing for.
+
+    A check, not a race-free open: the portable answer would be to walk the
+    components with `dir_fd`, which POSIX has and win32 does not, and this
+    record is atomic precisely for the win32 leg. So the standing redirect —
+    plant a link, wait for a launch — is what this removes; a session that
+    re-plants inside the window between check and write still wins. That
+    residual is bounded by the two facts above: same uid as the writer, and a
+    fixed filename carrying a window id."""
+    try:
+        if not run_dir.is_relative_to(project):
+            return False
+        cursor = run_dir
+        while cursor != project:
+            if cursor.is_symlink():
+                return False
+            cursor = cursor.parent
+    except OSError:
+        return False  # a component we cannot probe is one we cannot vouch for
+    return True
+
+
 def _record_ctl_window(project: Path, run_id: str, win_id: str) -> None:
     """Record the window a launch just minted, so ctl_window_id can prefer it
     over an older window sharing the run id.
@@ -180,7 +216,7 @@ def _record_ctl_window(project: Path, run_id: str, win_id: str) -> None:
     link in place for the next launch to trip over.
     """
     run_dir = runs.run_dir_for(project, run_id)
-    if not runs.is_run(run_dir):
+    if not runs.is_run(run_dir) or not _run_dir_is_confined(project, run_dir):
         return
     try:
         atomic_write_text(run_dir / _CTL_WINDOW_FILE, win_id, follow_symlinks=False)
@@ -220,12 +256,21 @@ def ctl_window_id(project: Path, run_id: str) -> str | None:
     here — for `x` that means killing a *live* orchestrator next door. An
     untagged window is admitted when this project has the run dir, which keeps a
     window whose (best-effort) tag write failed reachable by its own project
-    rather than by nobody."""
+    rather than by nobody.
+
+    Untagged is a *fallback*, not a peer: an untagged window proves nothing
+    about who owns it, so it is consulted only when nothing carries this
+    project's tag. Merged into one listing-ordered list they would compete on
+    index, and a neighbouring project's untagged window listed first would beat
+    this project's correctly tagged one — for `x`, killing next door's
+    orchestrator. That case is not hypothetical: the record cannot break the tie
+    for a fresh `run`, where recording is deliberately skipped."""
     if not mux_available():
         return None
     mine = runs.project_tag(project)
     local = runs.is_run(runs.run_dir_for(project, run_id))
-    matches: list[str] = []
+    tagged: list[str] = []
+    untagged: list[str] = []
     rows = get_multiplexer().list_windows(
         CTL_SESSION, ["window_id", "window_name", runs.PROJECT_OPTION]
     )
@@ -237,12 +282,13 @@ def ctl_window_id(project: Path, run_id: str) -> str | None:
         # case below; window_id stays field 0 of 3.)
         if not win_id or not name.endswith(f"-{run_id}"):
             continue
-        if tag:
-            if tag != mine:
-                continue  # another project's window
-        elif not local:
-            continue  # untagged and no run dir here — ownership unprovable
-        matches.append(win_id)
+        if tag == mine:
+            tagged.append(win_id)
+        elif not tag and local:
+            # untagged, and this project holds the run dir — ownership is
+            # plausible but unproven, so it only counts if nothing is tagged
+            untagged.append(win_id)
+    matches = tagged or untagged
     if not matches:
         return None
     # Membership in `matches`, not mere presence in the listing: it re-proves the

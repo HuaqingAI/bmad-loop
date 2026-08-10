@@ -385,6 +385,16 @@ def test_ctl_window_id_refuses_an_untagged_window_without_a_local_run(monkeypatc
     assert launch.ctl_window_id(tmp_path, "RID") is None
 
 
+def test_ctl_window_id_prefers_a_tagged_window_over_an_untagged_one(monkeypatch, tmp_path: Path):
+    # Untagged is a fallback, not a peer. Merged into one listing-ordered list,
+    # a neighbour's untagged window listed first beats this project's correctly
+    # tagged one — and for `x` that closes next door's orchestrator. The record
+    # cannot break the tie for a fresh `run`, where recording is skipped.
+    _ctl_listing(monkeypatch, "@1\trun-RID\t\n@2\trun-RID\n", tmp_path)
+    _make_run(tmp_path)  # local run dir: the untagged row is otherwise admitted
+    assert launch.ctl_window_id(tmp_path, "RID") == "@2"
+
+
 def test_ctl_window_id_none_when_no_window_carries_the_run_id(monkeypatch, tmp_path: Path):
     # A record can never resurrect a run whose windows are all gone.
     _ctl_listing(monkeypatch, "@1\trun-OTHER\n@3\tshell\n", tmp_path)
@@ -655,6 +665,27 @@ def test_start_detached_survives_an_unwritable_record(fake_run, tmp_path: Path, 
     # sharing violation atomic_replace retries; skip the ~5s backoff.
     monkeypatch.setattr(platform_util, "_REPLACE_ATTEMPTS", 1)
     assert launch.start_resolve_detached(tmp_path, "RID") == "@7"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_symlinked_run_dir_is_refused(fake_run, tmp_path: Path):
+    # follow_symlinks=False refuses a link at the FINAL component only. Swap an
+    # ancestor — the run dir itself — for a link to an external directory that
+    # holds a state.json, and runs.is_run follows it, then mkstemp/os.replace
+    # land the record inside the linked-to directory. Narrower than the
+    # final-component escape (the name written is always `ctl-window`) but the
+    # same shape, so the path has to be confined before the write.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "state.json").write_text("{}", encoding="utf-8")  # looks like a run
+    run_dir = runs.run_dir_for(tmp_path, "RID")
+    run_dir.parent.mkdir(parents=True)
+    run_dir.symlink_to(outside)
+
+    # The launch still succeeds, and the lookup is not warned about: only one
+    # window carries the run id, so the scan answers it correctly with no record.
+    assert launch.resume_detached(tmp_path, "RID") == "@7"
+    assert not (outside / launch._CTL_WINDOW_FILE).exists()  # nothing escaped
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
