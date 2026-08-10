@@ -834,7 +834,9 @@ def test_set_window_option_resolves_a_name_token(monkeypatch):
 
 
 def test_set_window_option_value_with_spaces_stays_one_argv_element(monkeypatch):
-    # project_tag() is an absolute path; on Windows it routinely holds spaces.
+    # The transport gate is the general contract for every `@` option value: a
+    # spaced value clears it via client quoting, and the channel must still pass
+    # it as one argv element.
     rec_ = _option_fake(monkeypatch)
     PsmuxMultiplexer().set_window_option("ctl:@2", "@bmad_project", r"C:\Users\Some User\p")
     assert rec_.argv[-1] == r"C:\Users\Some User\p"

@@ -412,6 +412,32 @@ def test_prune_ctl_windows(monkeypatch, tmp_path: Path):
     assert killed == [["tmux", "kill-window", "-t", "@3"]]
 
 
+def test_prune_ctl_windows_accepts_legacy_path_tag(monkeypatch, tmp_path: Path):
+    """A ctl window carrying a pre-digest tag remains owned after upgrade."""
+    from bmad_loop import runs
+
+    legacy = str(tmp_path.resolve())
+    windows = (
+        f"@2\trun-20260101-000000-dead\t{legacy}\n"  # our own pre-upgrade window — kill
+        "@3\trun-20260101-000000-alien\t/some/other/project\n"  # foreign — skip
+    )
+
+    def fake(argv, **kwargs):
+        verb = argv[1]
+        if verb == "list-windows":
+            return subprocess.CompletedProcess(argv, 0, stdout=windows, stderr="")
+        if verb == "display-message":
+            return subprocess.CompletedProcess(argv, 0, stdout="@9\n", stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,123,0")
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    assert launch.prunable_ctl_windows(tmp_path) == ["run-20260101-000000-dead"]
+    assert runs.project_tag(tmp_path) != legacy  # the shapes really are different
+
+
 def test_prune_ctl_windows_skips_invalid_run_ids(monkeypatch, tmp_path: Path):
     """A ctl-window name is untrusted input (anyone can rename a tmux window).
     Stripping the kind prefix off `run-../../x` would hand run_dir_for a

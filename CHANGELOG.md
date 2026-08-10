@@ -160,6 +160,10 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
+- **Keep psmux sessions and ctl windows on spaced UNC project paths tagged (#419).** Store project ownership as a
+  transportable digest and accept legacy path tags during pruning, preventing orphan leaks and
+  cross-project run-id collisions.
+
 - **A native-Windows install driven from a WSL shell now says so (#332).** WSL appends the Windows
   `PATH` to its own, so a bash prompt can reach a Windows-installed `bmad-loop`: that interpreter
   reports `win32`, takes the psmux platform default, and never sees the distro's tmux — while

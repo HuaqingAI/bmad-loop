@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -296,11 +297,25 @@ PROJECT_OPTION = "@bmad_project"
 
 
 def project_tag(project: Path) -> str:
-    """Canonical project identity stored in PROJECT_OPTION. The single source of
-    normalization: both the tagging (at session/window creation) and the prune
-    comparison must route through this so symlinks/relative paths can't make a
-    project look foreign to its own sessions."""
-    return str(project.resolve())
+    """Canonical project identity used by both tag writers and prune readers. The
+    single source of normalization: both sides must route through this so symlinks
+    and relative paths can't make a project look foreign to its own sessions.
+
+    Hashing the resolved path makes every value safe for psmux's control line;
+    16 hex characters are ample for one machine's project population (#419).
+    """
+    return hashlib.sha256(os.fsencode(str(project.resolve()))).hexdigest()[:16]
+
+
+def accepted_tags(project: Path) -> frozenset[str]:
+    """Current digest plus the legacy resolved-path tag accepted during pruning.
+
+    The legacy member is read-only compatibility for sessions and ctl windows that
+    survive an upgrade; remove it once no path-tagged multiplexer state can remain.
+    Returns the whole set rather than answering per tag so a read site resolves the
+    project once per prune instead of once per session.
+    """
+    return frozenset({project_tag(project), str(project.resolve())})
 
 
 def mux_sessions() -> list[str]:
@@ -324,16 +339,20 @@ def prunable_sessions(project: Path) -> tuple[list[str], list[str], set[str]]:
     The control session (bmad-loop-ctl) is never a candidate. Pruning is scoped
     to `project` via the PROJECT_OPTION tag set at session creation:
 
-    - tag == this project: ours — prunable unless a provably-alive engine pid is
-      running (covers finished/stopped/crashed *and* orphans whose run dir was
-      deleted, since engine_liveness reads 'dead' with no pid).
+    - tag proves this project (see accepted_tags): ours — prunable unless a
+      provably-alive engine pid is running (covers finished/stopped/crashed *and*
+      orphans whose run dir was deleted, since engine_liveness reads 'dead' with
+      no pid).
     - tag is another project: skipped — never touched.
-    - tag empty (pre-upgrade, untagged session): can't prove ownership, so fall
-      back to the run dir — prunable only when the dir exists under this project
-      and is dead; skipped when the dir is absent.
+    - tag empty (untagged session): can't prove ownership, so fall back to the run
+      dir — prunable only when the dir exists under this project and is dead;
+      skipped when the dir is absent. Reachable when the tag write failed, when
+      the option read degrades (session_options reads unset as "no answer", never
+      as proof nothing was written), or on a session predating a working tag
+      write — e.g. psmux path tags refused before the digest.
     """
     tags = session_project_tags()
-    mine = project_tag(project)
+    mine = accepted_tags(project)
     prunable: list[str] = []
     live: list[str] = []
     unknown: set[str] = set()
@@ -346,7 +365,7 @@ def prunable_sessions(project: Path) -> tuple[list[str], list[str], set[str]]:
         run_dir = run_dir_for(project, run_id)
         tag = tags.get(name, "")
         if tag:
-            if tag != mine:
+            if tag not in mine:
                 continue  # another project's session
         elif not is_run(run_dir):
             continue  # untagged and no run dir here — ownership unprovable

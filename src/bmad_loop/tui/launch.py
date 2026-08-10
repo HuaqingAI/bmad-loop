@@ -260,17 +260,16 @@ def _ctl_window_candidates(project: Path) -> list[tuple[str, str]]:
     the ctl session never targets itself; live runs and the session's own shell
     window are excluded too.
 
-    The control session is shared across projects, so pruning is scoped to
-    `project` via the per-window PROJECT_OPTION tag (mirrors runs.prunable_sessions):
-    a window tagged for another project is left alone; an untagged (pre-upgrade)
-    window is only a candidate when its run dir exists under this project.
+    The control session is shared across projects, so its per-window PROJECT_OPTION
+    accepts current and legacy project tags; untagged windows still require a run
+    directory under this project (mirrors runs.prunable_sessions).
     """
     mux = get_multiplexer()
     if not mux_usable(mux) or not session_exists(CTL_SESSION):
         return []
     current = mux.current_window_id()
     rows = mux.list_windows(CTL_SESSION, ["window_id", "window_name", runs.PROJECT_OPTION])
-    mine = runs.project_tag(project)
+    mine = runs.accepted_tags(project)
     candidates: list[tuple[str, str]] = []
     for win_id, name, tag in rows:
         if not win_id or win_id == current:
@@ -282,7 +281,7 @@ def _ctl_window_candidates(project: Path) -> list[tuple[str, str]]:
             continue  # a foreign/mangled window name must not steer a run-dir path
         run_dir = runs.run_dir_for(project, m.group(1))
         if tag:
-            if tag != mine:
+            if tag not in mine:
                 continue  # another project's window
         elif not runs.is_run(run_dir):
             continue  # untagged and no run dir here — ownership unprovable

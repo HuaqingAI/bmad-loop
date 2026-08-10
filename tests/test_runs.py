@@ -12,6 +12,7 @@ from conftest import escalated_run, git
 
 from bmad_loop import platform_util, runs, verify
 from bmad_loop.adapters import tmux_base
+from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
 from bmad_loop.journal import load_state, save_state
 from bmad_loop.model import RunState
 from bmad_loop.process_host import ProcessHost
@@ -663,6 +664,44 @@ def test_prunable_sessions_partitions(tmp_path, monkeypatch):
     assert sorted(prunable) == ["fin-1", "orphan-1", "untag-fin"]
     assert alive == ["live-1"]
     assert unknown == set()
+
+
+def test_project_tag_is_transportable_whatever_the_path(tmp_path):
+    """Tags have one safe shape even for paths psmux or UTF-8 cannot carry raw.
+
+    Assert the shape, not just that the gate accepts it: an ordinary spaced Windows
+    path clears the gate on its own, so only "hex whatever the input" fails when
+    project_tag returns a raw path.
+    """
+    assert not PsmuxMultiplexer._transportable(r"\\srv\share name\proj")  # the premise
+    project = tmp_path / "share name" / "proj"
+    project.mkdir(parents=True)
+    tag = runs.project_tag(project)
+    assert re.fullmatch("[0-9a-f]{16}", tag)
+    assert PsmuxMultiplexer._transportable(tag)
+    assert re.fullmatch("[0-9a-f]{16}", runs.project_tag(tmp_path / f"bad{chr(0xDC80)}"))
+    assert len({tag, runs.project_tag(tmp_path / "other")}) == 2
+
+
+def test_prunable_sessions_accepts_legacy_path_tag(tmp_path, monkeypatch):
+    """A pre-digest tag stays ours; another project's path or digest stays foreign."""
+    legacy = str(tmp_path.resolve())
+    fin = _make_state_run(tmp_path, "legacy-fin")
+    (fin / "engine.pid").write_text(str(_dead_pid()))
+    sessions = ["bmad-loop-legacy-fin", "bmad-loop-legacy-other", "bmad-loop-legacy-digest"]
+    monkeypatch.setattr(runs, "mux_sessions", lambda: sessions)
+    monkeypatch.setattr(
+        runs,
+        "session_project_tags",
+        lambda: {
+            "bmad-loop-legacy-fin": legacy,
+            "bmad-loop-legacy-other": "/some/other/project",
+            "bmad-loop-legacy-digest": runs.project_tag(tmp_path / "other"),
+        },
+    )
+    prunable, live, unknown = runs.prunable_sessions(tmp_path)
+    assert prunable == ["legacy-fin"]
+    assert live == [] and unknown == set()
 
 
 def test_prunable_sessions_skips_invalid_run_ids(tmp_path, monkeypatch):
