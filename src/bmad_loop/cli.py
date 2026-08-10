@@ -2662,6 +2662,7 @@ def cmd_archive(args: argparse.Namespace) -> int:
 
 
 def cmd_cleanup(args: argparse.Namespace) -> int:
+    from .adapters.multiplexer import MultiplexerError
     from .tui import launch  # pure stdlib; no textual import
 
     project = _project(args)
@@ -2675,12 +2676,26 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
             # holds after the fact too. In JSON mode this lives in the document
             # instead (sessions.unverifiable_pid), leaving stderr empty.
             print(f"run {run_id}: engine may still be live (unverifiable pid)", file=sys.stderr)
+    # The ctl-window half is raiser-side (its candidate scan probes has_session),
+    # and the sessions above are ALREADY killed by the time it runs. Letting the
+    # raise reach main()'s backstop prints an error and returns 1 with stdout
+    # empty — which in --json mode destroys the record of those kills, leaving a
+    # consumer unable to tell "killed nothing" from "killed three, lost the
+    # receipt". The repair succeeded; only the observation failed, and
+    # observation degrades. Mirrors what the TUI worker already does.
+    #
     # dry-run kills nothing, so there is no kill outcome to partition: the
     # candidate list IS the plan, and the other two arms stay empty.
-    if args.dry_run:
-        windows, survived, unverifiable = launch.prunable_ctl_windows(project), [], []
-    else:
-        windows, survived, unverifiable = launch.prune_ctl_windows(project)
+    try:
+        if args.dry_run:
+            windows, survived, unverifiable = launch.prunable_ctl_windows(project), [], []
+        else:
+            windows, survived, unverifiable = launch.prune_ctl_windows(project)
+    except MultiplexerError as e:
+        # Three empty lists is the honest answer: the raise comes from the
+        # candidate scan, so no window was killed or even chosen.
+        print(f"ctl window prune failed: {e}", file=sys.stderr)
+        windows, survived, unverifiable = [], [], []
     if args.json:
         machine.emit(
             cleanup_document(

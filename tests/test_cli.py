@@ -2876,6 +2876,57 @@ def test_cleanup_json_nothing_to_clean_up_is_a_valid_empty_document(tmp_path, mo
     assert doc["ctl_windows"] == {"removed": [], "survived": [], "unverifiable": []}
 
 
+def test_cleanup_json_still_emits_its_document_when_the_ctl_prune_raises(
+    tmp_path, monkeypatch, capsys
+):
+    """prune_sessions has already killed the sessions by the time the ctl half
+    runs, and the ctl half is raiser-side. An unguarded raise reaches main()'s
+    backstop, which leaves stdout EMPTY — so the record of those kills is gone
+    and a consumer cannot tell "killed nothing" from "killed one and lost the
+    receipt". The repair succeeded; only the observation failed."""
+    from bmad_loop import runs
+    from bmad_loop.adapters.multiplexer import MultiplexerError
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1"], [], set()))
+
+    def boom(_proj):
+        raise MultiplexerError("tmux has-session failed: server gone")
+
+    monkeypatch.setattr(launch, "prune_ctl_windows", boom)
+
+    # err_contains, not the strict empty-stderr default: the failure is chatter
+    # this command now documents, and stdout must still be the document alone.
+    doc = machine_json(
+        ["cleanup", "--project", str(tmp_path), "--json"],
+        capsys,
+        err_contains="ctl window prune failed",
+    )
+
+    assert doc["sessions"]["removed"] == ["fin-1"]  # the receipt survives
+    assert doc["ctl_windows"] == {"removed": [], "survived": [], "unverifiable": []}
+
+
+def test_cleanup_text_reports_a_raising_ctl_prune_without_losing_the_sessions(
+    tmp_path, monkeypatch, capsys
+):
+    from bmad_loop import runs
+    from bmad_loop.adapters.multiplexer import MultiplexerError
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1"], [], set()))
+
+    def boom(_proj):
+        raise MultiplexerError("tmux has-session failed: server gone")
+
+    monkeypatch.setattr(launch, "prune_ctl_windows", boom)
+
+    assert cli.main(["cleanup", "--project", str(tmp_path)]) == 0
+    captured = capsys.readouterr()
+    assert "removed 1 session(s), 0 ctl window(s)" in captured.out
+    assert "ctl window prune failed: tmux has-session failed" in captured.err
+
+
 def test_cleanup_schema_version_is_2_after_removed_narrowed(tmp_path, monkeypatch, capsys):
     """`ctl_windows.removed` changed meaning (attempted -> verifiably gone), which
     the contract says bumps the version rather than riding an additive field."""
