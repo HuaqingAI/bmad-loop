@@ -161,14 +161,11 @@ whose seams had diverged enough that several ports needed a different fix, and t
 ### Fixed
 
 - **`cleanup` no longer reports a surviving ctl window as removed (#435).** Killing a window is
-  best-effort and reports nothing, so the prune counted every _attempted_ kill as a removal — in the
-  text summary, the TUI toast and `cleanup --json`. The prune now takes one liveness listing after
-  its kills and partitions the result into removed / survived / unverifiable — a three-list tuple
-  like `prune_sessions`, though its arms answer a different question. `ctl_windows.removed` in the
-  document means _verifiably gone_ (under `--dry-run` it stays the would-close plan) and gains
-  `survived` / `unverifiable` siblings, so `CLEANUP_SCHEMA_VERSION` is **2**; text mode marks the
-  stdout count and names the two non-removed arms on stderr, still at exit 0. Survivors are retried
-  by the next `cleanup`, as before. `sessions.removed` is untouched and still an attempted kill.
+  best-effort and reports nothing, so the prune counted every _attempted_ kill as a removal. It now
+  verifies with one liveness listing and partitions into removed / survived / unverifiable.
+  `ctl_windows.removed` means _verifiably gone_ and gains `survived` / `unverifiable` siblings, so
+  `CLEANUP_SCHEMA_VERSION` is **2**; text mode names the two non-removed arms on stderr, still at
+  exit 0. `sessions.removed` is untouched and still an attempted kill.
 - **A crashed version probe is distinguishable from "reports no version" (#428).** A binary on
   `PATH` that dies answering `-V` — corrupt install, AV-blocked exe, hung server — collapsed to the
   same `None` a quiet binary returns, and its stderr was gone. `version()` keeps that contract, but
