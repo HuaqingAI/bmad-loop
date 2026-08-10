@@ -276,8 +276,21 @@ def test_session_exists(monkeypatch):
     assert fake.calls[0] == ["tmux", "has-session", "-t", "=bmad-loop-x"]
 
 
-def _ctl_listing(monkeypatch, rows: str) -> list[list[str]]:
-    """Script the ctl-session window listing; returns the recorded argv."""
+def _ctl_listing(monkeypatch, rows: str, project: Path | None = None) -> list[list[str]]:
+    """Script the ctl-session window listing; returns the recorded argv.
+
+    Rows are written as `<id>\\tab<name>`, and every row that does not already
+    carry a third field is tagged for `project` — the state start_detached
+    leaves behind, since it stamps PROJECT_OPTION on every window it mints. Pass
+    a row with its own third field to script another project's window (or an
+    empty one for the untagged, pre-tag-write case).
+    """
+    if project is not None:
+        tag = runs.project_tag(project)
+        rows = "".join(
+            (line if line.count("\t") >= 2 else f"{line}\t{tag}") + "\n"
+            for line in rows.splitlines()
+        )
     calls: list[list[str]] = []
 
     def fake(argv, **kwargs):
@@ -303,7 +316,7 @@ def test_ctl_window_id_matches_run_id_suffix(monkeypatch, tmp_path: Path):
     # The id, not the name: consumers replay the value as select/kill/option
     # targets, where a by-name resolve can land on a duplicate. With no record
     # of what the run's last launch minted, the answer is the first match.
-    _ctl_listing(monkeypatch, "@1\trun-AAAA\n@2\tsweep-RID\n@3\tresume-BBBB\n")
+    _ctl_listing(monkeypatch, "@1\trun-AAAA\n@2\tsweep-RID\n@3\tresume-BBBB\n", tmp_path)
     assert launch.ctl_window_id(tmp_path, "RID") == "@2"
     assert launch.ctl_window_id(tmp_path, "CCCC") is None
 
@@ -312,7 +325,7 @@ def test_ctl_window_id_prefers_the_window_the_last_launch_minted(monkeypatch, tm
     # #482: `e` over a parked run leaves `run-RID` in front of the live
     # `resume-RID`, and the scan alone answers the parked corpse. The recorded
     # id names the window we actually created.
-    _ctl_listing(monkeypatch, "@1\trun-RID\n@2\tresume-RID\n")
+    _ctl_listing(monkeypatch, "@1\trun-RID\n@2\tresume-RID\n", tmp_path)
     _write_record(tmp_path, "RID", "@2")
     assert launch.ctl_window_id(tmp_path, "RID") == "@2"
 
@@ -321,7 +334,7 @@ def test_ctl_window_id_ignores_a_record_the_listing_no_longer_shows(monkeypatch,
     # The recorded window was killed (`x`) or pruned. Replaying a target that no
     # longer resolves is the dangerous kind of stale — an unresolvable `-t`
     # lands on the *active* window — so fall back to a window that exists.
-    _ctl_listing(monkeypatch, "@1\trun-RID\n")
+    _ctl_listing(monkeypatch, "@1\trun-RID\n", tmp_path)
     _write_record(tmp_path, "RID", "@2")
     assert launch.ctl_window_id(tmp_path, "RID") == "@1"
 
@@ -329,21 +342,59 @@ def test_ctl_window_id_ignores_a_record_the_listing_no_longer_shows(monkeypatch,
 def test_ctl_window_id_ignores_a_record_that_now_names_another_run(monkeypatch, tmp_path: Path):
     # A backend that reuses a freed window id must not let a stale record hand
     # back a foreign run's window: the record is re-proved against the name too.
-    _ctl_listing(monkeypatch, "@2\trun-OTHER\n@5\tresume-RID\n")
+    _ctl_listing(monkeypatch, "@2\trun-OTHER\n@5\tresume-RID\n", tmp_path)
     _write_record(tmp_path, "RID", "@2")
     assert launch.ctl_window_id(tmp_path, "RID") == "@5"
 
 
+def test_ctl_window_id_ignores_another_projects_window(monkeypatch, tmp_path: Path):
+    # The ctl session is shared across projects and `--run-id` is caller-supplied,
+    # so the same run id can name a window next door. Matching on the name alone
+    # makes that a legal answer — and `x` would kill a LIVE orchestrator in the
+    # other project. Only this project's tag counts.
+    other = runs.project_tag(tmp_path / "elsewhere")
+    _ctl_listing(monkeypatch, f"@1\trun-RID\t{other}\n@2\tresume-RID\n", tmp_path)
+    assert launch.ctl_window_id(tmp_path, "RID") == "@2"
+
+
+def test_ctl_window_id_ignores_a_record_naming_another_projects_window(monkeypatch, tmp_path: Path):
+    # And the record cannot smuggle one back in: it is re-proved against the
+    # scoped matches, so a record naming the neighbour's window is ignored
+    # rather than replayed as a kill/select target.
+    other = runs.project_tag(tmp_path / "elsewhere")
+    _ctl_listing(monkeypatch, f"@1\trun-RID\t{other}\n@2\tresume-RID\n", tmp_path)
+    _write_record(tmp_path, "RID", "@1")
+    assert launch.ctl_window_id(tmp_path, "RID") == "@2"
+
+
+def test_ctl_window_id_admits_an_untagged_window_with_a_local_run(monkeypatch, tmp_path: Path):
+    # The tag is written by a best-effort set_window_option that can fail, and a
+    # window whose tag never landed must stay reachable by its own project
+    # rather than by nobody. Same rule as _ctl_window_candidates: untagged is
+    # admitted exactly when this project holds the run dir.
+    _ctl_listing(monkeypatch, "@4\tresume-RID\t\n", tmp_path)
+    _make_run(tmp_path)
+    assert launch.ctl_window_id(tmp_path, "RID") == "@4"
+
+
+def test_ctl_window_id_refuses_an_untagged_window_without_a_local_run(monkeypatch, tmp_path: Path):
+    # The other half: untagged and no run dir here means ownership is
+    # unprovable, so the window is not claimed. Delete the `elif` and this
+    # returns "@4" — a window that may belong to any project on the box.
+    _ctl_listing(monkeypatch, "@4\tresume-RID\t\n", tmp_path)
+    assert launch.ctl_window_id(tmp_path, "RID") is None
+
+
 def test_ctl_window_id_none_when_no_window_carries_the_run_id(monkeypatch, tmp_path: Path):
     # A record can never resurrect a run whose windows are all gone.
-    _ctl_listing(monkeypatch, "@1\trun-OTHER\n@3\tshell\n")
+    _ctl_listing(monkeypatch, "@1\trun-OTHER\n@3\tshell\n", tmp_path)
     _write_record(tmp_path, "RID", "@1")
     assert launch.ctl_window_id(tmp_path, "RID") is None
 
 
 def test_ctl_window_id_unreadable_record_falls_back(monkeypatch, tmp_path: Path):
     # An unreadable hint is not an error — it just leaves the name scan.
-    _ctl_listing(monkeypatch, "@1\trun-RID\n@2\tresume-RID\n")
+    _ctl_listing(monkeypatch, "@1\trun-RID\n@2\tresume-RID\n", tmp_path)
     run_dir = runs.run_dir_for(tmp_path, "RID")
     (run_dir / launch._CTL_WINDOW_FILE).mkdir(parents=True)  # a dir, not a file
     assert launch.ctl_window_id(tmp_path, "RID") == "@1"
@@ -442,7 +493,7 @@ def test_read_record_is_bounded(tmp_path: Path):
 
 
 def test_ctl_window_id_invalid_utf8_record_falls_back(monkeypatch, tmp_path: Path):
-    _ctl_listing(monkeypatch, "@1\trun-RID\n@2\tresume-RID\n")
+    _ctl_listing(monkeypatch, "@1\trun-RID\n@2\tresume-RID\n", tmp_path)
     record = _write_record(tmp_path, "RID", "@2")
     record.write_bytes(b"\xff")
     assert launch.ctl_window_id(tmp_path, "RID") == "@1"
@@ -451,7 +502,7 @@ def test_ctl_window_id_invalid_utf8_record_falls_back(monkeypatch, tmp_path: Pat
 def test_ctl_window_id_skips_empty_id_rows(monkeypatch, tmp_path: Path):
     # An empty id must never be returned as a target — an empty `-t` resolves
     # against the current window. psmux's qualifier passes a falsy id through.
-    _ctl_listing(monkeypatch, "\tsweep-RID\n@7\tsweep-RID\n")
+    _ctl_listing(monkeypatch, "\tsweep-RID\n@7\tsweep-RID\n", tmp_path)
     assert launch.ctl_window_id(tmp_path, "RID") == "@7"
 
 
@@ -460,7 +511,7 @@ def test_kill_ctl_window_kills_by_resolved_id_not_a_name_token(monkeypatch, tmp_
     # token the backend would resolve again. With no record the scan picks the
     # first match (`@7`); what the id buys is that a rename or a new window
     # between two verbs cannot re-point the second.
-    calls = _ctl_listing(monkeypatch, "@2\trun-x\n@7\tsweep-RID\n@9\tsweep-RID\n")
+    calls = _ctl_listing(monkeypatch, "@2\trun-x\n@7\tsweep-RID\n@9\tsweep-RID\n", tmp_path)
     launch.kill_ctl_window(tmp_path, "RID")
     assert ["tmux", "kill-window", "-t", "@7"] in calls
 
@@ -468,7 +519,7 @@ def test_kill_ctl_window_kills_by_resolved_id_not_a_name_token(monkeypatch, tmp_
 def test_attach_plan_selects_and_returns_the_recorded_window(monkeypatch, tmp_path: Path):
     # #482's first two consequences: the window the attach lands on, and the one
     # its return_window stamps @bmad_return_pane on, are the same live window.
-    calls = _ctl_listing(monkeypatch, "@1\trun-RID\n@2\tresume-RID\n")
+    calls = _ctl_listing(monkeypatch, "@1\trun-RID\n@2\tresume-RID\n", tmp_path)
     _write_record(tmp_path, "RID", "@2")
     monkeypatch.setattr(launch, "session_exists", lambda s: False)
     monkeypatch.setattr(launch, "decision_pending", lambda rd: False)
@@ -482,7 +533,7 @@ def test_attach_plan_selects_and_returns_the_recorded_window(monkeypatch, tmp_pa
 def test_kill_ctl_window_follows_the_record(monkeypatch, tmp_path: Path):
     # #482's third consequence: `x` must not close the parked window and leave
     # the live one running.
-    calls = _ctl_listing(monkeypatch, "@1\trun-RID\n@2\tresume-RID\n")
+    calls = _ctl_listing(monkeypatch, "@1\trun-RID\n@2\tresume-RID\n", tmp_path)
     _write_record(tmp_path, "RID", "@2")
     launch.kill_ctl_window(tmp_path, "RID")
     assert ["tmux", "kill-window", "-t", "@2"] in calls
@@ -772,6 +823,7 @@ def test_record_round_trips_a_session_qualified_id(monkeypatch, tmp_path: Path):
     _ctl_listing(
         monkeypatch,
         "bmad-loop-ctl:@1\trun-RID\nbmad-loop-ctl:@2\tresume-RID\n",
+        tmp_path,
     )
     _write_record(tmp_path, "RID", "bmad-loop-ctl:@2")
     assert launch.ctl_window_id(tmp_path, "RID") == "bmad-loop-ctl:@2"
@@ -780,7 +832,7 @@ def test_record_round_trips_a_session_qualified_id(monkeypatch, tmp_path: Path):
 def test_record_with_trailing_newline_still_matches(monkeypatch, tmp_path: Path):
     # A newline-terminated record (hand-edited, foreign writer) must not fail
     # the `recorded in matches` check and silently answer the parked corpse.
-    _ctl_listing(monkeypatch, "@1\trun-RID\n@2\tresume-RID\n")
+    _ctl_listing(monkeypatch, "@1\trun-RID\n@2\tresume-RID\n", tmp_path)
     _write_record(tmp_path, "RID", "@2\n")
     assert launch.ctl_window_id(tmp_path, "RID") == "@2"
 

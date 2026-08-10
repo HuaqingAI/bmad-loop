@@ -211,22 +211,43 @@ def ctl_window_id(project: Path, run_id: str) -> str | None:
     on psmux an unresolvable `-t` lands on the *active* window (psmux/psmux#545;
     tmux merely errors, which the best-effort consumers turn into a silent
     no-op). With no record at all the answer is the first match, exactly as
-    before."""
+    before.
+
+    Scoped to `project` by the PROJECT_OPTION tag, on the same rule as
+    _ctl_window_candidates: the control session is shared across projects, and a
+    run id is only unique within one (`--run-id` is caller-supplied), so a
+    same-id window belonging to another project would otherwise be a legal match
+    here — for `x` that means killing a *live* orchestrator next door. An
+    untagged window is admitted when this project has the run dir, which keeps a
+    window whose (best-effort) tag write failed reachable by its own project
+    rather than by nobody."""
     if not mux_available():
         return None
+    mine = runs.project_tag(project)
+    local = runs.is_run(runs.run_dir_for(project, run_id))
     matches: list[str] = []
-    for win_id, name in get_multiplexer().list_windows(CTL_SESSION, ["window_id", "window_name"]):
+    rows = get_multiplexer().list_windows(
+        CTL_SESSION, ["window_id", "window_name", runs.PROJECT_OPTION]
+    )
+    for win_id, name, tag in rows:
         # win_id can be "": psmux's qualifier passes a falsy id through. An
         # empty id must never become a target — an empty `-t` resolves against
-        # the *current* window. (The base's short-row padding cannot produce it
-        # here: it fills TRAILING fields, and window_id is field 0 of 2.)
-        if win_id and name.endswith(f"-{run_id}"):
-            matches.append(win_id)
+        # the *current* window. (The base's short-row padding CAN produce an
+        # empty *tag* — it fills trailing fields — which is exactly the untagged
+        # case below; window_id stays field 0 of 3.)
+        if not win_id or not name.endswith(f"-{run_id}"):
+            continue
+        if tag:
+            if tag != mine:
+                continue  # another project's window
+        elif not local:
+            continue  # untagged and no run dir here — ownership unprovable
+        matches.append(win_id)
     if not matches:
         return None
     # Membership in `matches`, not mere presence in the listing: it re-proves the
-    # name too, so a backend that reuses a freed window id cannot hand back a
-    # different run's window.
+    # name and the project too, so neither a backend that reuses a freed window
+    # id nor a record naming a neighbouring project's window can be replayed.
     recorded = _read_ctl_window(project, run_id)
     return recorded if recorded in matches else matches[0]
 
