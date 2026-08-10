@@ -6636,6 +6636,40 @@ def test_resume_re_gates_a_story_whose_attempt_never_reached_a_session(project):
     assert load_state(resumed.run_dir).paused_stage == PAUSE_STORY_GATE
 
 
+def test_restart_arm_gate_re_asks_until_the_entry_lands(project):
+    """The restart arm's refusal must be a standing condition, not a one-shot.
+
+    `_finish_inflight` drives every non-terminal task, and a refused task stays
+    non-terminal — so each resume re-reads the ledger, and closing the entry is
+    what releases it. Were the refusal to retire the story instead, the gate would
+    drop the very work it was protecting; that is the same property the `_loop`
+    side buys by refusing before it records the task."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    engine.state.tasks["1-1-a"] = StoryTask(story_key="1-1-a", epic=1)
+    engine._save()
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1-1"])})
+
+    first, adapter1 = resume_engine(project, engine, [dev_effect(project, "1-1-a")])
+    assert first.run().paused and adapter1.sessions == []
+
+    # a resume that changed nothing must not get the story through
+    second, adapter2 = resume_engine(project, first, [dev_effect(project, "1-1-a")])
+    assert second.run().paused and adapter2.sessions == []
+    assert load_state(second.run_dir).paused_stage == PAUSE_STORY_GATE
+
+    # ...and closing the entry releases it, so the gate is not a wedge
+    write_gated_ledger(project, {"DW-1": ("done 2026-08-01", ["gate: 1-1"])})
+    third, _ = resume_engine(
+        project,
+        second,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+    )
+    summary = third.run()
+
+    assert summary.done == 1 and not summary.paused
+
+
 def test_resume_reads_the_gate_before_the_restart_rollback_rewinds_the_ledger(project):
     """Order matters, not just placement. The restart arm's in-place rollback is
     `git reset --hard <baseline>`, and `keep=(".bmad-loop",)` guards only untracked
