@@ -2047,6 +2047,12 @@ def test_gates_stop_at_the_canonical_span_boundary():
         # check can be worse than the prose it replaced.
         ("auth", "authz-login", False),
         ("api", "apis-v2", False),
+        # ...and "ends in a digit" was that same guard written too loosely: the
+        # digit can belong to a slug, so the arm read a slug boundary as a split
+        # and refused keys the entry never named.
+        ("3-2-v2", "3-2-v2a-followup", False),  # `2` closes the slug `v2`, not a story
+        ("3", "3a-task", False),  # a distinct stories id, not a split of `3`
+        ("3-2-v2", "3-2-v2-followup", True),  # the plain `-` arm is untouched by that
         ("3-2a", "3-2ab-x", False),  # a token already carrying a split letter
         ("3-2a", "3-2a-x", True),  # ...still gates its own `-` boundary
         ("", "a-b", False),  # an empty token names nothing, so it gates nothing

@@ -74,6 +74,12 @@ GATE_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 # imported because `stories` imports *this* module (a cycle). The copy is pinned
 # to the original by a drift test rather than to a comment.
 _STORIES_ID_RE = re.compile(r"^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$")
+# The tokens `gates_story`'s split arm may fire for: a bare `<epic>-<story>`, both
+# numeric. `sprintstatus.STORY_RE` attaches the split letter straight after the
+# story *number*, so that is the only token a split can extend. "Ends in a digit"
+# is a weaker test that reads the same shape into a slug — `3-2-v2` would take the
+# arm and refuse `3-2-v2a-followup`, a different and legal key.
+_SPLITTABLE_TOKEN_RE = re.compile(r"^\d+-\d+$")
 # A `gate:` line the strict field pattern above will never see. `GATE_RE` is
 # anchored to a lowercase `gate:` in column 0, exactly like `status:`, and that
 # strictness fails in opposite directions for the two fields: a missed `status:`
@@ -452,19 +458,23 @@ def gates_story(token: str, story_key: str) -> bool:
     followed by ``-`` is therefore also a boundary. Exactly one letter, and the
     ``-`` after it is required, so ``3-2ab-x`` and a bare ``3-2a`` are not swept in.
 
-    The split arm applies only to a token ending in a digit, because that is the
-    only place a split letter can attach: ``STORY_RE`` puts it straight after the
-    story *number*. Without that guard the arm reads any trailing letter as a
-    split and gates a story nobody named — ``stories.ID_RE`` admits word ids, so
-    ``gate: auth`` refused ``authz-login``, and a hard failure on an unrelated
-    story is the one way this check can be worse than the prose it replaced.
+    The split arm applies only to a token that *is* a bare ``<epic>-<story>``,
+    because that is the only place a split letter can attach: ``STORY_RE`` puts it
+    straight after the story *number*. Without that guard the arm reads any
+    trailing letter as a split and gates a story nobody named — ``stories.ID_RE``
+    admits word ids, so ``gate: auth`` refused ``authz-login``, and a hard failure
+    on an unrelated story is the one way this check can be worse than the prose it
+    replaced. "Ends in a digit" is the same guard written too loosely: the digit
+    can belong to a *slug*, so ``gate: 3-2-v2`` took the arm and refused
+    ``3-2-v2a-followup`` — a different, legal key — and ``gate: 3`` refused the
+    distinct stories id ``3a-task``.
     """
     if story_key == token or story_key.startswith(f"{token}-"):
         return True
     # The `startswith` guard is load-bearing, not redundant with the slice below:
     # `story_key[len(token):]` says nothing about what preceded it, so without it
     # `3-2` would gate `9-9a-x` on the tail alone.
-    if not story_key.startswith(token) or not token[-1:].isascii() or not token[-1:].isdigit():
+    if not story_key.startswith(token) or not _SPLITTABLE_TOKEN_RE.match(token):
         return False
     rest = story_key[len(token) :]
     return len(rest) >= 2 and "a" <= rest[0] <= "z" and rest[1] == "-"
