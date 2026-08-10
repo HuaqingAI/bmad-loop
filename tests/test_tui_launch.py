@@ -510,6 +510,30 @@ def test_failed_record_forgets_the_previous_one(fake_run, tmp_path: Path, monkey
     assert not (run_dir / launch._CTL_WINDOW_FILE).exists()
 
 
+def test_failed_record_survives_a_non_oserror(fake_run, tmp_path: Path, monkeypatch):
+    """`OSError` was too narrow to keep the docstring's promise that a failed
+    write must not fail the launch. `atomic_write_text` resolves the path before
+    its own try, and below 3.13 `Path.resolve` reports a symlink loop as
+    `RuntimeError` — so a run dir reached through a looping link crashed the
+    launch of a window that is *already running*, on the 3.11/3.12 legs.
+
+    The fault is injected rather than built from a real symlink loop on purpose:
+    3.13+ resolves loops without raising, so a loop-based version would pass on
+    the interpreter this suite usually runs and only ever fail on the older legs
+    — green here, red in CI, for a guard that was never exercised. Same reasoning
+    as tests/test_engine.py's `test_failed_rollback_does_not_displace_the_commit_failure`.
+    """
+    run_dir = _make_run(tmp_path)
+    _write_record(tmp_path, "RID", "@2")
+
+    def boom(*_a, **_k):
+        raise RuntimeError("Symlink loop from '/x'")
+
+    monkeypatch.setattr(launch, "atomic_write_text", boom)
+    launch.resume_detached(tmp_path, "RID")  # must not raise
+    assert not (run_dir / launch._CTL_WINDOW_FILE).exists()
+
+
 def test_record_survives_a_raising_window_tag(fake_run, tmp_path: Path, monkeypatch):
     # Record-before-tag ordering: the seam declares set_window_option
     # best-effort, but a non-conforming backend raising from it must not cost

@@ -113,13 +113,21 @@ def _record_ctl_window(project: Path, run_id: str, win_id: str) -> None:
     a plain overwrite with a transient sharing violation — which would swallow
     into the forget path and quietly degrade the lookup. atomic_replace retries
     exactly that violation, turning most real-world failures into successes.
+
+    The guard is type-agnostic on purpose, and `OSError` is not wide enough to
+    hold it: `atomic_write_text` resolves the path before its own try, and below
+    3.13 `Path.resolve` reports a symlink loop as `RuntimeError` — which would
+    crash the launch this docstring promises to spare, on the interpreters the
+    3.11/3.12 legs run. Same widening, same reason, as the engine's deferred-close
+    rollback (`Engine._restore_deferred_closes`). `Exception` and not
+    `BaseException`, so a genuine KeyboardInterrupt still gets out.
     """
     run_dir = runs.run_dir_for(project, run_id)
     if not runs.is_run(run_dir):
         return
     try:
         atomic_write_text(run_dir / _CTL_WINDOW_FILE, win_id)
-    except OSError:
+    except Exception:
         _forget_ctl_window(project, run_id)
 
 
