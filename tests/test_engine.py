@@ -6636,6 +6636,41 @@ def test_resume_re_gates_a_story_whose_attempt_never_reached_a_session(project):
     assert load_state(resumed.run_dir).paused_stage == PAUSE_STORY_GATE
 
 
+def test_resume_reads_the_gate_before_the_restart_rollback_rewinds_the_ledger(project):
+    """Order matters, not just placement. The restart arm's in-place rollback is
+    `git reset --hard <baseline>`, and `keep=(".bmad-loop",)` guards only untracked
+    deletion — tracked content under it is reverted anyway, which is why
+    `verify.safe_rollback` restores `policy.toml` by hand. A tracked ledger has no
+    such rescue: a `gate:` committed while the run was down lives in a commit
+    *after* the baseline, so a rollback that ran first would rewind the ledger and
+    the gate would read a file the human never wrote. Ask before the arm mutates
+    anything — the same rule `_loop` follows."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "board")  # board predates the baseline
+    engine, _ = make_engine(project, [])  # default test policy: rollback_on_failure=True
+    baseline = rev_parse_head(project.project)
+    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_RUNNING, attempt=1)
+    task.baseline_commit = baseline
+    task.baseline_untracked = []
+    engine.state.tasks["1-1-a"] = task
+    engine._save()
+    # the gate is committed while the run is down — i.e. after the task's baseline
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1-1"])})
+    assert rev_parse_head(project.project) != baseline  # the gate is a later commit
+
+    resumed, adapter = resume_engine(
+        project,
+        engine,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+    )
+    summary = resumed.run()
+
+    assert summary.paused and summary.done == 0
+    assert adapter.sessions == []
+    assert load_state(resumed.run_dir).paused_stage == PAUSE_STORY_GATE
+
+
 def test_resume_still_finishes_a_story_whose_session_already_completed(project):
     """The other side of the line, and the exemption stated as behavior. It belongs
     to `_finish_inflight`'s *finishing* arms, not to every non-terminal task: here

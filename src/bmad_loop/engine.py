@@ -910,6 +910,12 @@ class Engine:
         touched, and the run's own crash must not be what disables the one deferred
         check that refuses.
 
+        Both call sites ask **before** their caller mutates anything, and that is
+        one rule rather than two coincidences. In ``_loop`` it keeps the refusal
+        re-askable; in the restart arm it keeps the ledger readable, because that
+        arm's in-place rollback is ``git reset --hard <baseline>`` and a gate
+        committed while the run was down is a commit *after* that baseline.
+
         Deliberately no "but did a session really run?" test there. Every available
         signal is wrong somewhere: ``attempt`` is bumped before the session launches,
         ``sessions`` is written only after one returns, and ``rearmed`` covers a
@@ -1227,6 +1233,30 @@ class Engine:
                 else:
                     self._finalize_commit_phase(task)
             else:
+                # This arm is the one that does not finish work: it discards the
+                # worktree or resets the tree to baseline and re-runs the story
+                # from scratch, so what follows is a *start* and gets the same
+                # question `_loop` asks. Unconditionally — any test for "did a
+                # session really run?" is wrong somewhere: `attempt` is bumped
+                # before the session launches, `sessions` is written only after one
+                # returns, and `rearmed` covers a stories-mode wedge that reached
+                # ESCALATED with no session at all.
+                #
+                # Asked BEFORE the unwinding below, for the same reason `_loop`
+                # asks before it registers the task: the in-place rollback is
+                # `git reset --hard <baseline>`, and a `gate:` committed while the
+                # run was down lives in a commit *after* that baseline. Rolling
+                # back first would rewind a tracked ledger and put the question to
+                # a file the human never wrote — `keep=(".bmad-loop",)` guards only
+                # untracked deletion, which is exactly why `verify.safe_rollback`
+                # has to restore `policy.toml` by hand. It also keeps the pause
+                # honest under the default `rollback_on_failure = false`, where
+                # `_rollback_or_pause` would otherwise pause for manual recovery
+                # and never reach the gate. The cost is that a refused isolated
+                # task keeps its half-built worktree mounted until a resume gets
+                # past the gate — the same thing an escalation pause does, and the
+                # cheaper of the two mistakes.
+                self._refuse_gated_story(task.story_key)
                 self.journal.append(
                     "resume-restart", story_key=task.story_key, phase=str(task.phase)
                 )
@@ -1245,21 +1275,6 @@ class Engine:
                 task.rearmed = False  # past rollback (only reached when not paused)
                 task.phase = Phase.PENDING  # deliberate reset, not a normal transition
                 self._save()
-                # This arm is the one that does not finish work: the lines above
-                # discarded the worktree or reset the tree to baseline, so the task
-                # now holds nothing a session produced and is about to be re-run
-                # from scratch — the same shape `_loop` hands to `_run_story`. That
-                # makes the gate question the same one `_loop` asks, and asking it
-                # unconditionally is what keeps it honest: any test for "did a
-                # session really run?" would be inferring what this arm has already
-                # guaranteed, and each such test is wrong somewhere. `attempt` is
-                # bumped before the session launches (so a death in between reads as
-                # started); `sessions` is written after one returns (so a death
-                # inside one reads as never started); `rearmed` covers a stories-mode
-                # wedge that escalated with no session at all. Placed after the
-                # unwinding and the save, so a refusal strands no worktree and the
-                # task re-asks on every later resume until the entry lands.
-                self._refuse_gated_story(task.story_key)
                 self._run_story(task)
             # a resumed story that just reached DONE gets the same post-story hook
             # the _loop path fires (e.g. the stories-mode done_checkpoint pause),
