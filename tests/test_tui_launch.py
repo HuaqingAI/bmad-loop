@@ -10,7 +10,9 @@ path still shells out from ``launch`` itself."""
 from __future__ import annotations
 
 import json
+import os
 import shlex
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -328,6 +330,98 @@ def test_ctl_window_id_unreadable_record_falls_back(monkeypatch, tmp_path: Path)
     run_dir = runs.run_dir_for(tmp_path, "RID")
     (run_dir / launch._CTL_WINDOW_FILE).mkdir(parents=True)  # a dir, not a file
     assert launch.ctl_window_id(tmp_path, "RID") == "@1"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX FIFOs")
+def test_read_record_does_not_block_on_a_fifo(tmp_path: Path):
+    # A session can replace its own workspace-writable record with a FIFO, and
+    # opening one for reading blocks until somebody writes. action_attach reads
+    # this on Textual's event loop, so that freezes the dashboard on a keypress.
+    # O_NONBLOCK returns immediately; the S_ISREG check on the opened descriptor
+    # then rejects it. Under an alarm because a regression here HANGS the suite —
+    # and with a handler that RAISES, so the ablation fails this test rather than
+    # letting the default SIGALRM disposition kill the whole pytest process.
+    run_dir = runs.run_dir_for(tmp_path, "RID")
+    run_dir.mkdir(parents=True)
+    os.mkfifo(run_dir / launch._CTL_WINDOW_FILE)
+
+    # NOT TimeoutError: that is a subclass of OSError, so _read_ctl_window's own
+    # `except OSError` swallows it and the ablated code still returns None — the
+    # first version of this test passed against the bug, five seconds slower.
+    class Blocked(Exception):
+        pass
+
+    def _blocked(_signum, _frame):
+        raise Blocked("_read_ctl_window blocked on a FIFO")
+
+    previous = signal.signal(signal.SIGALRM, _blocked)
+    signal.setitimer(signal.ITIMER_REAL, 5)
+    try:
+        assert launch._read_ctl_window(tmp_path, "RID") is None
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX FIFOs")
+def test_read_record_rejects_a_fifo_that_already_has_data(tmp_path: Path):
+    # The case only the S_ISREG check catches, and the reason it is not redundant
+    # with the other two guards: a writer holding the FIFO open with bytes queued
+    # means the open does not block (so O_NONBLOCK is not what refuses it) and
+    # the path is not a link (so O_NOFOLLOW is not either). Without the check the
+    # queued bytes are simply read, letting a session forge the record through a
+    # pipe it controls rather than a file. Ablate S_ISREG and this returns "@2".
+    run_dir = runs.run_dir_for(tmp_path, "RID")
+    run_dir.mkdir(parents=True)
+    fifo = run_dir / launch._CTL_WINDOW_FILE
+    os.mkfifo(fifo)
+
+    writer = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)  # RDWR: no peer needed
+    try:
+        os.write(writer, b"@2")
+        assert launch._read_ctl_window(tmp_path, "RID") is None
+    finally:
+        os.close(writer)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX device nodes")
+def test_read_record_rejects_a_non_regular_file(tmp_path: Path):
+    # The S_ISREG check on the opened descriptor, which O_NOFOLLOW alone does
+    # not give (a link is only one way to reach a device). `/dev/zero` is the
+    # case that bites hardest: an endless source raises MemoryError, which is
+    # not an OSError and so escapes this function's "never raises" promise
+    # entirely, out through action_attach, which has no handler at all.
+    run_dir = runs.run_dir_for(tmp_path, "RID")
+    run_dir.mkdir(parents=True)
+    (run_dir / launch._CTL_WINDOW_FILE).symlink_to("/dev/zero")
+
+    assert launch._read_ctl_window(tmp_path, "RID") is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_read_record_does_not_follow_a_symlink(tmp_path: Path):
+    # O_NOFOLLOW: the name is read, not wherever it points. The target here is a
+    # perfectly ordinary file holding a perfectly plausible window id, so every
+    # other guard passes it — only the no-follow refuses. Symmetry with the
+    # write side, which replaces the name rather than the link's target.
+    run_dir = runs.run_dir_for(tmp_path, "RID")
+    run_dir.mkdir(parents=True)
+    elsewhere = tmp_path / "somewhere-else"
+    elsewhere.write_text("@99", encoding="utf-8")
+    (run_dir / launch._CTL_WINDOW_FILE).symlink_to(elsewhere)
+
+    assert launch._read_ctl_window(tmp_path, "RID") is None
+
+
+def test_read_record_is_bounded(tmp_path: Path):
+    # The cap stands on its own, without the flags: a plain regular file can be
+    # arbitrarily large, and a hint is at most a window id either way.
+    run_dir = runs.run_dir_for(tmp_path, "RID")
+    run_dir.mkdir(parents=True)
+    (run_dir / launch._CTL_WINDOW_FILE).write_text("@" + "9" * 5_000_000, encoding="utf-8")
+
+    recorded = launch._read_ctl_window(tmp_path, "RID")
+    assert recorded is not None and len(recorded) <= launch._MAX_RECORD_BYTES
 
 
 def test_ctl_window_id_invalid_utf8_record_falls_back(monkeypatch, tmp_path: Path):

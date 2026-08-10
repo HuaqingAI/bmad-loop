@@ -522,6 +522,16 @@ class BmadLoopApp(App[None]):
         if not win_id:
             self.notify("resolve launched but its window id was not captured", severity="error")
             return
+        if not launch.ctl_window_recorded(self.project, run_id, win_id):
+            # Not an error and not a reason to abort: this attach targets the id
+            # in hand, so the resolve session itself is reached correctly. What
+            # is lost is the record *later* verbs read, so `a`/`x` after this
+            # window is minted may answer an older one (#482's symptom).
+            self.notify(
+                "resolve launched but its window id was not recorded — "
+                "later attach/stop may target an older window for this run",
+                severity="warning",
+            )
         launch.select_ctl_window_id(win_id)
         self._attach_to_target(launch.ctl_target(), return_window=win_id)
 

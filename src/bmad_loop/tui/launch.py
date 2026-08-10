@@ -12,7 +12,9 @@ subprocess for the captured read-only commands) and is unit-testable.
 
 from __future__ import annotations
 
+import os
 import re
+import stat
 import subprocess
 import sys
 from enum import StrEnum
@@ -52,6 +54,11 @@ def session_exists(session: str) -> bool:
 _CTL_WINDOW_FILE = "ctl-window"
 
 
+# Generous ceiling on the hint: the value is a window id (`@7`, or a
+# session-qualified `bmad-loop-ctl:@7`), and anything longer is already not one.
+_MAX_RECORD_BYTES = 256
+
+
 def _read_ctl_window(project: Path, run_id: str) -> str | None:
     """The window id recorded by the run's last launch, or None when there is
     none / it cannot be read. Never raises, and that includes decoding: a torn
@@ -63,13 +70,58 @@ def _read_ctl_window(project: Path, run_id: str) -> str | None:
     The file is the only channel on purpose: `bmad-loop attach` resolves the same
     run from its own process, and one resolve feeding every consumer is the
     property ctl_window_id sells. A per-process memo of what this process last
-    minted would answer a different window than the CLI does."""
+    minted would answer a different window than the CLI does.
+
+    Deliberately not `read_text`. The record sits under the project root every
+    coding session can write, and this read runs on Textual's event loop
+    (`action_attach` calls it directly), so the *shape* of what is at the path
+    has to be established before any bytes are consumed:
+
+    * `O_NONBLOCK` + an `S_ISREG` check on the opened descriptor. Opening a FIFO
+      for reading otherwise blocks until someone writes — indefinitely, freezing
+      the dashboard on a keypress.
+    * `O_NOFOLLOW`, so the name is read rather than wherever it points.
+    * At most `_MAX_RECORD_BYTES`. A record pointed at an endless source reads
+      forever otherwise, and it raises `MemoryError` rather than the OSError
+      this promises never to leak — `Exception` would catch that but also mask
+      real bugs, where a cap removes the condition instead of absorbing it.
+
+    The check is on the descriptor, not the path, so it cannot be raced: fstat
+    describes the object actually opened. The POSIX-only flags degrade to 0 on
+    win32, which has neither FIFOs at these paths nor O_NOFOLLOW; the size cap
+    and the regular-file check carry there on their own."""
     record = runs.run_dir_for(project, run_id) / _CTL_WINDOW_FILE
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_BINARY", 0)  # win32: no CRLF translation on the raw fd
     try:
-        text = record.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
+        fd = os.open(record, flags)
+    except OSError:
         return None
-    return text.strip() or None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        data = os.read(fd, _MAX_RECORD_BYTES)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    try:
+        return data.decode("utf-8").strip() or None
+    except UnicodeDecodeError:
+        return None
+
+
+def ctl_window_recorded(project: Path, run_id: str, win_id: str) -> bool:
+    """Whether `ctl_window_id` will now prefer `win_id` for this run — i.e.
+    whether the launch's disambiguation survived.
+
+    False means the launch itself succeeded but the lookup is back on the
+    ambiguous first-match scan, which is exactly #482's symptom and so is
+    operator-visible: every launcher that mints a second window under a run id
+    should report it rather than let an unqualified success toast imply the
+    targeting is sound. Split out from resume_detached's return so the resolve
+    path can warn while still keeping the captured id it attaches with."""
+    return _read_ctl_window(project, run_id) == win_id
 
 
 def _forget_ctl_window(project: Path, run_id: str) -> None:
@@ -559,11 +611,16 @@ def resume_detached(project: Path, run_id: str) -> str | None:
 
     Verified by re-reading rather than by threading the write's outcome up: it
     asks the question the consumers actually ask — will `ctl_window_id` prefer
-    this window — of the same file they will read, instead of a proxy for it."""
+    this window — of the same file they will read, instead of a proxy for it.
+
+    Folded into the return here, rather than reported alongside the id as the
+    resolve path does, because resume has no immediate use for a window it
+    cannot record: it launches and leaves, where resolve attaches to the window
+    it just minted and still needs that id to do so."""
     win_id = start_detached(
         project, ["resume", "--project", str(project), run_id], run_id, "resume"
     )
-    if win_id and _read_ctl_window(project, run_id) != win_id:
+    if win_id and not ctl_window_recorded(project, run_id, win_id):
         return None
     return win_id
 

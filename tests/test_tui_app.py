@@ -2365,12 +2365,14 @@ async def test_resolve_escalation_launches_and_attaches(project, monkeypatch):
     monkeypatch.setattr(launch, "start_resolve_detached", fake_start_resolve)
     monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: selected.append(w))
     calls, stamps = _patch_attach_exec(monkeypatch)
-    make_run(
+    run_dir = make_run(
         project.project,
         "20260611-100000-aaaa",
         paused_stage="escalation",
         paused_reason="CRITICAL escalation",
     )
+    # The healthy path: the launch recorded the window it minted, so no warning.
+    (run_dir / launch._CTL_WINDOW_FILE).write_text("@7", encoding="utf-8")
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
@@ -2379,11 +2381,41 @@ async def test_resolve_escalation_launches_and_attaches(project, monkeypatch):
         await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
         await pilot.click(await ready(pilot, "#ok"))
         await until(pilot, lambda: bool(calls))
+        assert not any("was not recorded" in m for m in notifications(app))
     assert launched == ["20260611-100000-aaaa"]
     assert selected == ["@7"]
     assert calls == [["tmux", "switch-client", "-t", "=bmad-loop-ctl"]]
     # resolve runs in the freshly launched ctl window (@7) — stamp it to return
     assert stamps == [("@7", "=main:%9")]
+
+
+async def test_resolve_warns_when_the_record_did_not_survive(project, monkeypatch):
+    # The resolve path kept the captured id (it attaches with it) but never
+    # asked whether the record landed, so a failed write left `a`/`x` on the
+    # ambiguous scan behind a clean attach. Warn, and attach anyway: this
+    # window is reached by the id in hand, only later verbs are degraded.
+    selected: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(launch, "start_resolve_detached", lambda proj, rid: "@7")
+    monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: selected.append(w))
+    calls, _stamps = _patch_attach_exec(monkeypatch)
+    make_run(
+        project.project,
+        "20260611-100000-aaaa",
+        paused_stage="escalation",
+        paused_reason="CRITICAL escalation",
+    )  # no record written: the write failed
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: dashboard(app).selected_run_id is not None)
+        await pilot.press("R")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: any("was not recorded" in m for m in notifications(app)))
+    assert selected == ["@7"]  # still attached to the window it minted
+    assert calls == [["tmux", "switch-client", "-t", "=bmad-loop-ctl"]]
 
 
 async def test_resolve_unknown_pid_refused(project, monkeypatch):
