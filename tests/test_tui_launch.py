@@ -32,16 +32,24 @@ pytestmark = pytest.mark.usefixtures("force_tmux_backend")
 
 
 class FakeRun:
-    """Records argv; scripts the returncode of `tmux has-session`."""
+    """Records argv; scripts the returncode of `tmux has-session` and the rows
+    `list-windows` answers. The listing defaults to showing the window
+    `new-window` just minted, which is what a real backend does — and what
+    ctl_window_recorded re-proves the record against."""
 
-    def __init__(self, has_session_rc: int = 1):
+    def __init__(self, has_session_rc: int = 1, windows: str = "@7\tresume-RID\n"):
         self.calls: list[list[str]] = []
         self.has_session_rc = has_session_rc
+        self.windows = windows
 
     def __call__(self, argv, **kwargs):
         self.calls.append(list(argv))
         rc = self.has_session_rc if argv[1] == "has-session" else 0
-        out = "@7\n" if argv[1] == "new-window" else ""
+        out = ""
+        if argv[1] == "new-window":
+            out = "@7\n"
+        elif argv[1] == "list-windows":
+            out = self.windows
         return subprocess.CompletedProcess(argv, rc, stdout=out, stderr="")
 
     def by_verb(self, verb: str) -> list[list[str]]:
@@ -192,7 +200,16 @@ def test_existing_ctl_session_reused(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
     launch.resume_detached(tmp_path, "RID")
-    assert [c[1] for c in fake.calls] == ["has-session", "new-window", "set-option"]
+    # No new-session: the ctl session already answered has-session. The trailing
+    # list-windows is resume's own check that the lookup now names the window it
+    # minted — the one launch that mints a second window under a run id pays for
+    # the answer it warns on.
+    assert [c[1] for c in fake.calls] == [
+        "has-session",
+        "new-window",
+        "set-option",
+        "list-windows",
+    ]
 
 
 def test_launch_without_mux_raises(monkeypatch, tmp_path: Path):
@@ -615,6 +632,11 @@ def test_resume_reports_a_record_that_did_not_survive(fake_run, tmp_path: Path, 
     # did not land, which leaves ctl_window_id on the same ambiguous scan an
     # uncaptured id does. One signal for both, or the rest of the degradation
     # hides behind the success toast.
+    #
+    # #482's actual shape, not a bare fake: the parked `run-RID` is still listed
+    # in front of the live `resume-RID`, so without the record the scan answers
+    # the corpse (`@1`) and the degradation is real rather than notional.
+    fake_run.windows = "@1\trun-RID\n@7\tresume-RID\n"
     _make_run(tmp_path)
 
     def boom(*_a, **_k):
@@ -625,10 +647,52 @@ def test_resume_reports_a_record_that_did_not_survive(fake_run, tmp_path: Path, 
 
 
 def test_resume_returns_the_id_when_the_record_survives(fake_run, tmp_path: Path):
-    # The other half of the signal: a recorded window is reported plainly, so
-    # the warning stays specific to real degradation.
+    # The other half of the signal: over the same two-window listing, a landed
+    # record makes the lookup answer the live window, so the launch is reported
+    # plainly and the warning stays specific to real degradation.
+    fake_run.windows = "@1\trun-RID\n@7\tresume-RID\n"
     _make_run(tmp_path)
     assert launch.resume_detached(tmp_path, "RID") == "@7"
+
+
+def test_resume_does_not_warn_when_the_scan_is_unambiguous(fake_run, tmp_path: Path, monkeypatch):
+    # No record, but only one window carries the run id, so the scan answers the
+    # right one anyway. The question is whether targeting is sound, not whether
+    # a file was written — warning here would cry wolf on every launch that has
+    # nothing to disambiguate.
+    fake_run.windows = "@7\tresume-RID\n"
+    _make_run(tmp_path)
+
+    def boom(*_a, **_k):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(launch, "atomic_write_text", boom)
+    assert launch.resume_detached(tmp_path, "RID") == "@7"
+
+
+def test_recorded_probe_degrades_when_the_listing_is_unreachable(tmp_path: Path, monkeypatch):
+    # The probe is observation, so it degrades rather than raising into the
+    # launchers — neither _do_resume nor _launch_resolve handles a
+    # MultiplexerError, so an uncaught one crashes the TUI after a launch that
+    # already succeeded. "Could not confirm" warns, matching the toast's hedge.
+    def boom(*_a, **_k):
+        raise MultiplexerError("backend server not reachable")
+
+    monkeypatch.setattr(launch, "ctl_window_id", boom)
+    assert launch.ctl_window_recorded(tmp_path, "RID", "@7") is False
+
+
+def test_resume_reports_a_record_the_listing_does_not_carry(fake_run, tmp_path: Path):
+    # The divergence the seam tolerates: a backend whose new_parked_window id is
+    # shaped differently from its list_windows window_id column. The record
+    # round-trips intact, so file equality would call this sound — but
+    # ctl_window_id rejects it against the listing and falls through to the
+    # first match, which is the ambiguity the warning exists for.
+    fake_run.windows = "@1\trun-RID\nctl:@7\tresume-RID\n"
+    _make_run(tmp_path)
+    assert launch.resume_detached(tmp_path, "RID") is None
+    # The record itself landed — the divergence is in the id's shape, not the write.
+    assert (runs.run_dir_for(tmp_path, "RID") / launch._CTL_WINDOW_FILE).read_text() == "@7"
 
 
 def test_failed_record_forgets_the_previous_one(fake_run, tmp_path: Path, monkeypatch):

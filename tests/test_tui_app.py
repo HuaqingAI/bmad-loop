@@ -2365,14 +2365,16 @@ async def test_resolve_escalation_launches_and_attaches(project, monkeypatch):
     monkeypatch.setattr(launch, "start_resolve_detached", fake_start_resolve)
     monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: selected.append(w))
     calls, stamps = _patch_attach_exec(monkeypatch)
-    run_dir = make_run(
+    # The healthy path: the lookup answers the window the launch minted, so no
+    # warning. Stubbed at the same seam every other attach test stubs — the
+    # helper's own listing/record logic is pinned in tests/test_tui_launch.py.
+    monkeypatch.setattr(launch, "ctl_window_recorded", lambda proj, rid, wid: True)
+    make_run(
         project.project,
         "20260611-100000-aaaa",
         paused_stage="escalation",
         paused_reason="CRITICAL escalation",
     )
-    # The healthy path: the launch recorded the window it minted, so no warning.
-    (run_dir / launch._CTL_WINDOW_FILE).write_text("@7", encoding="utf-8")
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
@@ -2398,6 +2400,7 @@ async def test_resolve_warns_when_the_record_did_not_survive(project, monkeypatc
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
     monkeypatch.setattr(launch, "start_resolve_detached", lambda proj, rid: "@7")
+    monkeypatch.setattr(launch, "ctl_window_recorded", lambda proj, rid, wid: False)
     monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: selected.append(w))
     calls, _stamps = _patch_attach_exec(monkeypatch)
     make_run(
@@ -2405,7 +2408,7 @@ async def test_resolve_warns_when_the_record_did_not_survive(project, monkeypatc
         "20260611-100000-aaaa",
         paused_stage="escalation",
         paused_reason="CRITICAL escalation",
-    )  # no record written: the write failed
+    )
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))

@@ -111,19 +111,6 @@ def _read_ctl_window(project: Path, run_id: str) -> str | None:
         return None
 
 
-def ctl_window_recorded(project: Path, run_id: str, win_id: str) -> bool:
-    """Whether `ctl_window_id` will now prefer `win_id` for this run — i.e.
-    whether the launch's disambiguation survived.
-
-    False means the launch itself succeeded but the lookup is back on the
-    ambiguous first-match scan, which is exactly #482's symptom and so is
-    operator-visible: every launcher that mints a second window under a run id
-    should report it rather than let an unqualified success toast imply the
-    targeting is sound. Split out from resume_detached's return so the resolve
-    path can warn while still keeping the captured id it attaches with."""
-    return _read_ctl_window(project, run_id) == win_id
-
-
 def _forget_ctl_window(project: Path, run_id: str) -> None:
     """Drop the record. A launch that cannot name the window it just minted must
     not leave the *previous* launch's id authoritative — that id now names a
@@ -242,6 +229,35 @@ def ctl_window_id(project: Path, run_id: str) -> str | None:
     # different run's window.
     recorded = _read_ctl_window(project, run_id)
     return recorded if recorded in matches else matches[0]
+
+
+def ctl_window_recorded(project: Path, run_id: str, win_id: str) -> bool:
+    """Whether `ctl_window_id` now answers `win_id` for this run — i.e. whether
+    the launch's disambiguation actually took.
+
+    False means the launch itself succeeded but the lookup is back on the
+    ambiguous first-match scan, which is exactly #482's symptom and so is
+    operator-visible: every launcher that mints a second window under a run id
+    should report it rather than let an unqualified success toast imply the
+    targeting is sound. Split out of resume_detached's return so the resolve
+    path can warn while still keeping the captured id it attaches with.
+
+    Asks `ctl_window_id` rather than comparing the record to `win_id`, because
+    a round-tripped record is not the same claim. A backend whose
+    `new_parked_window` id is shaped differently from its `list_windows`
+    `window_id` column — a divergence the seam explicitly tolerates — writes and
+    reads the record back intact while `ctl_window_id` rejects it against the
+    listing and falls through to the first match. File equality would report
+    that as sound; it is the precise case the warning exists for.
+
+    An unanswerable listing counts as not recorded. The probe is observation, so
+    it degrades rather than raising into the launchers (neither has a handler
+    for it), and "could not confirm" is closer to the warning's own hedge —
+    attach/stop *may* target an older window — than silence would be."""
+    try:
+        return ctl_window_id(project, run_id) == win_id
+    except MultiplexerError:
+        return False
 
 
 def ctl_target() -> str:
