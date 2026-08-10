@@ -14,6 +14,9 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Added
 
+- **Add raw psmux premise probes (#488).** The zero-token Windows live gate now flags droppable
+  workarounds, and ablation repairs two vacuous backend assertions.
+
 - **A deferred-work entry can block a story: `gate:`.** An entry that must land before specific
   stories run could only say so in prose (`HARD GATE: must land before 3-2`), and prose stopped
   nothing — `run` drove the story anyway. A `gate: 3-2, 3-3` line names the blocked story keys, and
