@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from conftest import attach_profile, git, install_build_auto_skill, write_spec
+from conftest import attach_profile, git, install_build_auto_skill, write_gated_ledger, write_spec
 
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
@@ -25,6 +25,7 @@ from bmad_loop.model import (
     PAUSE_PLAN_CHECKPOINT,
     PAUSE_SPEC_APPROVAL,
     PAUSE_STORY_CHECKPOINT,
+    PAUSE_STORY_GATE,
     Phase,
     RunState,
     StoryTask,
@@ -1100,6 +1101,43 @@ def test_blocked_resolve_rearm_then_redispatch_to_done(project):
         "/bmad-dev-auto Spec folder: _bmad-output/epic-1. Story id: 1.",
         "/bmad-dev-auto Spec folder: _bmad-output/epic-1. Story id: 2.",
     ]
+
+
+def test_resolved_wedge_is_still_gated_on_redispatch(project):
+    """The state that makes a "has this story ever run?" test unbuildable, and so
+    the reason `_finish_inflight`'s restart arm asks the gate unconditionally.
+
+    `_pause_wedged` records an ESCALATED task *before any session runs this pick*:
+    `attempt == 0`, no session records, and after `resolve` also `rearmed`. Every
+    signal that would exempt a re-drive is therefore set on a story whose first
+    dispatch has not happened — so exempting re-drives would wave a wedged story
+    straight past a gate that landed while the run was down. Story 1's re-dispatch
+    is a start like any other, and story 2 must not be leapfrogged either: the gate
+    pauses the run rather than skipping the story, exactly as `validate` fails the
+    whole preflight."""
+    from bmad_loop import runs
+
+    folder = setup_stories(project, [entry("1"), entry("2")])
+    write_spec(folder / "stories" / "1-slug.md", "blocked", rev_parse_head(project.project))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "story 1 blocked")
+
+    engine, _ = make_engine(project, [])
+    assert engine.run().paused
+    wedged = load_state(engine.run_dir).tasks["1"]
+    assert wedged.phase == Phase.ESCALATED and wedged.attempt == 0 and not wedged.sessions
+
+    runs.rearm_escalation(engine.run_dir, "1")  # human fixed the frozen spec
+    assert load_state(engine.run_dir).tasks["1"].rearmed  # ...and the re-drive is armed
+    # a gate on story 1 lands while the run is down
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1"])})
+
+    resumed, radapter = resume_engine(project, engine, [stories_dev_effect(), stories_dev_effect()])
+    summary = resumed.run()
+
+    assert summary.paused and summary.done == 0
+    assert radapter.sessions == []
+    assert load_state(resumed.run_dir).paused_stage == PAUSE_STORY_GATE
 
 
 def test_sentinel_rearm_deletes_by_recorded_verdict_e2e(project):

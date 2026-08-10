@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from bmad_loop import deferredwork
+from bmad_loop import deferredwork, fences
 from bmad_loop.deferredwork import (
     _ISO_DATE_RE,
     LINE_BREAK_RE,
@@ -1529,3 +1529,602 @@ def test_mark_done_many_skips_an_already_done_entry(tmp_path):
     assert again == []
     body = next(e for e in parse_ledger(p.read_text(encoding="utf-8")) if e.id == "DW-1").body
     assert body.count("resolution: resolved by story 1") == 1
+
+
+def _gated(*lines: str):
+    text = (
+        "# Deferred Work\n\n### DW-1: gated entry\n\n"
+        "origin: test\nlocation: n/a\nreason: test\nstatus: open\n"
+        + "".join(f"{x}\n" for x in lines)
+    )
+    (entry,) = parse_ledger(text)
+    return deferredwork.gates(entry)
+
+
+def test_gates_unions_every_line_and_splits_on_commas():
+    """Several `gate:` lines are one claim, not competing ones: a line-oriented
+    file gives an author no reason to prefer one line over three. Duplicates
+    collapse and a trailing separator is not a token."""
+    g = _gated("gate: 3-2, 3-3", "gate:\t4-1,3-2,")
+
+    assert g.tokens == ("3-2", "3-3", "4-1")
+    assert g.malformed == ()
+    assert not g.inert
+
+
+@pytest.mark.parametrize("line", ["gate:", "gate: ", "gate: ,", "gate: , ,"])
+def test_gates_reports_a_line_that_names_nothing(line):
+    """`gate:` with nothing usable after it is a claim made inertly, and the
+    parse alone cannot tell it apart from an entry that never gated anything —
+    `lines` is what keeps it reportable. Left silent, it reads to anyone scanning
+    the entry as a gate already in force."""
+    g = _gated(line)
+
+    assert g.tokens == () and g.malformed == ()
+    assert g.inert
+    assert g.empty == 1
+
+
+def test_gates_counts_an_empty_line_beside_a_valid_one():
+    """An entry can gate one story and name nothing on the next line. `inert` is an
+    entry-wide verdict and answers False here — the entry does have a token — so the
+    empty line needs its own count or the operator who wrote it is never told the
+    second gate holds nothing back."""
+    g = _gated("gate: 3-2", "gate:")
+
+    assert g.tokens == ("3-2",)
+    assert g.lines == 2
+    assert not g.inert  # the entry-wide verdict cannot express this case...
+    assert g.empty == 1  # ...which is why the per-line count exists
+
+
+def test_gates_reports_a_token_that_cannot_name_a_story():
+    """The separator is a comma and only a comma. Reading `3-2 3-3` leniently
+    would guess at one the format never promised, so it lands in `malformed` —
+    surfaced by validate rather than silently gating nothing."""
+    g = _gated("gate: 3-2 3-3, ../etc, 4-1")
+
+    assert g.tokens == ("4-1",)
+    assert g.malformed == ("3-2 3-3", "../etc")
+
+
+@pytest.mark.parametrize("fence", ["```markdown", "```", "~~~"])
+def test_a_fenced_example_is_not_a_gate_declaration(fence):
+    """An entry whose subject IS this field quotes it, and a quoted example sits in
+    column 0 — right where the strict field anchor looks. The sibling
+    `HARD_GATE_PROSE_RE` already needed quote guards for exactly this (its comment
+    records the warning firing on entries documenting the convention, this repo's
+    own docs included), and `gate:` is worse off: the answer here is a refusal, so
+    an entry explaining the field would fail validate and pause a run."""
+    close = "```" if fence.startswith("`") else "~~~"
+    g = _gated(fence, "gate: 3-2", close)
+
+    assert g.tokens == () and g.near_miss == 0 and g.lines == 0
+
+
+@pytest.mark.parametrize(("outer", "inner"), [("```", "~~~"), ("~~~", "```")])
+def test_a_stray_opener_above_the_heading_does_not_mask_a_live_gate(outer, inner):
+    """The two views of the same line, and the reason `_quoted` asks at FILE scope.
+
+    The stray `outer` opener never closes (`inner` is the other fence char and
+    cannot close it), and at whole-file scope `unclosed_hides_rest=False` reads it
+    as ordinary text — which is why the heading below it still carves an entry. A
+    body slice starts at that heading, cannot see the opener, and so reads the
+    matched `inner` pair as a real fence, masking the `gate:` between them into an
+    example. That drops a live gate in silence, which is the failure the field
+    exists to end; `parse_ledger` already reads headings and `status:` at file
+    scope for exactly this reason. Found by differential fuzz against the
+    whole-file predicate, not by inspection."""
+    text = f"# Deferred Work\n\n{outer}\n### DW-2: title\n{inner}\ngate: 3-2\n{inner}\n"
+
+    (entry,) = parse_ledger(text)
+
+    assert deferredwork.gates(entry).tokens == ("3-2",)
+
+
+def test_a_stray_opener_above_the_heading_does_not_mask_a_prose_gate():
+    """The prose scan shares `_quoted`, so it shares the file-scope question too —
+    pinned separately because the two scans reach it by different call paths."""
+    text = "# Deferred Work\n\n```\n### DW-2: title\n~~~\nHARD GATE: before 3-2\n~~~\n"
+
+    (entry,) = parse_ledger(text)
+
+    assert deferredwork.declares_prose_gate(entry) is True
+
+
+def test_a_fence_hides_only_itself():
+    """The mask must not reach past the block. A real declaration on either side of
+    a quoted example still gates — otherwise the fix for a false refusal would have
+    bought a lost gate, which is the worse of the two."""
+    g = _gated("gate: 4-1", "```", "gate: 3-2", "```", "gate: 5-1")
+
+    assert g.tokens == ("4-1", "5-1")
+
+
+def test_an_unclosed_fence_swallows_no_gate():
+    """The deliberate asymmetry. Masking an unterminated fence to end-of-entry
+    would let one stray ``` silently disable every gate below it — the exact
+    silent miss this field exists to end. A malformed-markdown entry keeping a
+    readable gate is the cheaper wrong answer."""
+    g = _gated("```", "an example nobody closed", "gate: 4-1")
+
+    assert g.tokens == ("4-1",)
+
+
+def test_a_line_with_an_info_string_does_not_close_a_fence():
+    """A closer carries no info string (CommonMark), and the rule has to be tested
+    at EQUAL fence length or the length rule answers first and the assertion
+    measures nothing. Here every line is a 3-backtick run: without the
+    info-string requirement, the ```python would close the block early, re-expose
+    `gate: 4-1`, and leave the trailing ``` opening an unclosed fence."""
+    g = _gated("```", "gate: 3-2", "```python", "gate: 4-1", "```")
+
+    assert g.tokens == ()
+
+
+def test_a_four_space_backtick_run_is_indented_code_and_cannot_silence_a_gate():
+    """CommonMark indents a fence up to three spaces; at four it is indented code,
+    not a delimiter. `FENCE_LINE_RE`'s ` {0,3}` is the only thing enforcing that,
+    and it enforces it in the fail-OPEN direction: were the run accepted, two such
+    lines would wrap a real column-0 `gate:` and mask it out of existence — a gate
+    lost in silence, the exact failure this field exists to end. The devcontract
+    half already reasoned this through (reviewer guard #53): the limit is safe
+    because fenced content in a list is co-indented and can never match a
+    column-0 anchor, so only the delimiter rule needs pinning."""
+    g = _gated("    ```", "gate: 4-1", "    ```")
+
+    assert g.tokens == ("4-1",)
+
+
+def test_a_fenced_worked_example_is_not_an_entry():
+    """A complete example — heading, status and gate inside one fence — is the
+    shape `deferred-work-format.md` ships for authors to copy, so a ledger quoting
+    it is expected rather than exotic. Read entry-locally it used to become a real
+    entry: `HEADING_RE` split the file first, stranding the opening fence in the
+    PREVIOUS entry, so the example's body saw no open fence and its `gate:` went
+    live — a phantom entry refusing a story nobody deferred."""
+    text = (
+        "# Deferred Work\n\n### DW-01: a real entry\nstatus: open\n\n"
+        "The format, for reference:\n\n"
+        "```markdown\n### DW-99: worked example\nstatus: open\ngate: 3-2\n```\n"
+    )
+
+    (entry,) = parse_ledger(text)
+
+    assert entry.id == "DW-01"
+    assert open_ids(text) == {"DW-01"}
+    assert deferredwork.gates(entry).tokens == ()
+
+
+def test_a_fenced_heading_does_not_bound_the_entry_that_quotes_it():
+    """The other half of skipping fenced headings, and the one that fails OPEN.
+    `ANY_HEADING_RE` ends an entry at any intervening heading; left fence-blind it
+    would end this one at the quoted `### DW-99`, dropping the real `gate:` below
+    the example out of the span entirely. Trading a phantom entry for a lost gate
+    would have been the worse of the two bugs."""
+    text = (
+        "# Deferred Work\n\n### DW-01: a real entry\nstatus: open\n\n"
+        "```markdown\n### DW-99: worked example\nstatus: done 2026-01-01\n```\n\n"
+        "gate: 3-2\n"
+    )
+
+    (entry,) = parse_ledger(text)
+
+    assert deferredwork.gates(entry).tokens == ("3-2",)
+
+
+def test_a_fenced_flat_bullet_does_not_bound_the_entry_that_quotes_it():
+    """Same failure through the #304 flat-appender boundary: a quoted bullet is an
+    example of the appender's shape, not an appended block, and bounding the entry
+    at it would again strand the `gate:` below. The real block must still be
+    bounded out — `test_flat_boundary_still_applies_after_a_quoted_block_inside_the_entry`
+    holds that end."""
+    text = (
+        "# Deferred Work\n\n### DW-01: a real entry\nstatus: open\n\n"
+        "```markdown\n- source_spec: `example.md`\n  summary: quoted\n"
+        "  evidence: e\n```\n\ngate: 3-2\n"
+    )
+
+    (entry,) = parse_ledger(text)
+
+    assert deferredwork.gates(entry).tokens == ("3-2",)
+
+
+def test_a_stray_unclosed_fence_does_not_erase_the_entries_below_it():
+    """Why `_example` asks with `unclosed_hides_rest=False`. Under the opposite
+    answer one unterminated fence would swallow every heading after it, and those
+    entries would vanish from `open_ids()` — real open work reported as landed, in
+    silence. A phantom entry from a stray opener is today's behaviour and is
+    visible on the page; a disappeared ledger is neither."""
+    text = (
+        "# Deferred Work\n\n### DW-01: oops\nstatus: open\n```\n\n"
+        "### DW-02: still real\nstatus: open\ngate: 3-2\n"
+    )
+
+    first, second = parse_ledger(text)
+
+    assert (first.id, second.id) == ("DW-01", "DW-02")
+    assert open_ids(text) == {"DW-01", "DW-02"}
+    assert deferredwork.gates(second).tokens == ("3-2",)
+
+
+def test_a_fenced_status_line_is_not_the_status_of_the_entry_quoting_it():
+    """Skipping fenced headings moves the example INSIDE the quoting entry instead
+    of splitting it off, which hands `STATUS_RE` a second candidate it never used
+    to see. An entry with no status of its own must not inherit the example's:
+    reading `done` there would drop live work out of `open_ids()` on the strength
+    of a quotation."""
+    text = (
+        "# Deferred Work\n\n### DW-01: no status of its own\n\norigin: test\n\n"
+        "```markdown\n### DW-99: worked example\nstatus: done 2026-01-01\n```\n"
+    )
+
+    (entry,) = parse_ledger(text)
+
+    assert entry.status == ""
+    assert not entry.done and not entry.open
+
+
+def test_a_backtick_run_carrying_backticks_is_inline_code_not_a_fence():
+    """CommonMark forbids a backtick anywhere in a BACKTICK fence's info string,
+    exactly so a line of inline code does not open a block. Without the rule this
+    line opens one, the trailing ``` closes it, and the `gate:` between them reads
+    as a quoted example — a gate lost in silence, which is the failure this field
+    exists to end, not the spurious refusal the fenced path is allowed to make."""
+    g = _gated("```gate:``` is the field name.", "gate: 3-2", "```")
+
+    assert g.tokens == ("3-2",)
+
+
+def test_a_tilde_fence_may_carry_backticks_in_its_info_string():
+    """The other arm of the same rule, and the reason it is not simply "no
+    backticks in an info string": the restriction is backtick-only, because a
+    tilde run cannot appear in inline code. Dropping the fence-char test would
+    leave this example live and refuse a story the entry only documented."""
+    g = _gated("~~~ `inline`", "gate: 3-2", "~~~")
+
+    assert g.tokens == ()
+
+
+def test_a_fenced_example_is_not_a_legacy_finding_either():
+    """The far side of skipping fenced headings (#514). While `parse_ledger` read a
+    quoted example as a phantom canonical entry, that entry's span masked the
+    quotation out of this reader by accident; removing the phantom removed the
+    accident, and the same bullet surfaced here as a legacy finding instead. The
+    real block below must still parse — over-masking would lose a tracked item,
+    which is the failure `parse_legacy` exists to prevent."""
+    text = (
+        "# Deferred Work\n\nThe format, for reference:\n\n"
+        "```markdown\n### DW-1: wire the blob-storage credentials\nstatus: open\n"
+        "gate: 3-2\n- source_spec: `example.md`\n  summary: quoted\n  evidence: e\n```\n\n"
+        "- source_spec: `real.md`\n  summary: real finding\n  evidence: e\n"
+    )
+
+    (legacy,) = parse_legacy(text)
+
+    assert legacy.title == "real finding"
+    assert parse_ledger(text) == []
+
+
+def test_a_stray_unclosed_fence_does_not_hide_legacy_findings_below_it():
+    """`parse_legacy` asks `fences.fenced_spans` with `unclosed_hides_rest=False`
+    for the reason the canonical side does: under the opposite answer one
+    unterminated fence would blank every finding after it out of the ledger, and
+    a lost legacy item is as silent as a lost entry."""
+    text = "# Deferred Work\n\n```\n\n- source_spec: `real.md`\n  summary: real finding\n  evidence: e\n"
+
+    (legacy,) = parse_legacy(text)
+
+    assert legacy.title == "real finding"
+
+
+QUOTED_STATUS_LEDGER = """\
+# Deferred Work
+
+### DW-1: an entry that quotes the format in an example
+
+summary: shows an operator what an entry looks like
+evidence: e
+
+```
+status: open
+```
+
+status: open
+gate: 3-2
+"""
+
+
+def test_a_close_rewrites_the_live_status_and_not_a_quoted_one(tmp_path):
+    """The reader picks the status with a fence-aware lookup, so a writer that ran
+    `STATUS_RE.search(body)` again would pick the *first* raw match — the quoted
+    one. That split is worse than either half alone: `mark_done_many` reports the
+    id as closed while `open_ids` still lists it, so a sweep or story close can
+    never actually close the entry, and a `gate:` it carries refuses its story on
+    every following pass. Asserted on `open_ids` rather than on the return value,
+    because the return value is exactly what the bug got right."""
+    path = write_ledger(tmp_path, QUOTED_STATUS_LEDGER)
+
+    assert mark_done_many(path, ["DW-1"], "2026-06-11", "fixed") == ["DW-1"]
+
+    text = path.read_text(encoding="utf-8")
+    assert open_ids(text) == set()
+    (entry,) = parse_ledger(text)
+    assert entry.status == "done 2026-06-11"
+    # the quoted example is documentation, and a close must not edit it
+    assert "```\nstatus: open\n```" in text
+
+
+def test_a_reopen_restores_the_live_status_of_an_entry_that_quotes_an_example(tmp_path):
+    """The undo path reads its marker at an offset taken from the status line, so
+    it has to start from the same line the close wrote. Round-tripped rather than
+    asserted field-by-field: the close and the reopen must agree about *which*
+    line they own, and only the round trip pins that they do."""
+    path = write_ledger(tmp_path, QUOTED_STATUS_LEDGER)
+    close_reopenable(path, "DW-1", "fixed")
+    assert open_ids(path.read_text(encoding="utf-8")) == set()
+
+    assert mark_open(path, "DW-1", "fixed", OPERATION_ID) is True
+
+    assert path.read_text(encoding="utf-8") == QUOTED_STATUS_LEDGER
+
+
+def test_a_decision_lands_after_the_live_status_of_an_entry_that_quotes_an_example(
+    tmp_path,
+):
+    """`_insert_after_status` is the third writer that used to re-derive the status
+    line. Inserting after the quoted one would bury the decision inside the fenced
+    example, where every reader — the parser and the human — treats it as prose."""
+    path = write_ledger(tmp_path, QUOTED_STATUS_LEDGER)
+
+    assert append_decision(path, "DW-1", "2026-06-11", "keep", "still worth doing") is True
+
+    text = path.read_text(encoding="utf-8")
+    assert "```\nstatus: open\n```" in text
+    assert "status: open\ndecision: 2026-06-11 keep — still worth doing" in text
+
+
+def test_the_example_index_answers_exactly_at_its_span_bounds():
+    """The binary search replaced a linear `any(s <= offset < e)` test, and the
+    whole suite passes with its upper bound moved by one character — no heading or
+    field line ever begins at that offset, so no behavioural test can reach it.
+    Pinned directly for the same reason a differential fuzz found it and the tests
+    did not: an index that is right about every real offset and wrong about the
+    boundary is one refactor away from being wrong about a real one."""
+    text = "before\n```\nquoted\n```\nafter\n"
+    examples = deferredwork._example_spans(text)
+
+    ((start, end),) = examples.spans
+    assert examples.covers(start - 1) is False
+    assert examples.covers(start) is True
+    assert examples.covers(end - 1) is True
+    assert examples.covers(end) is False
+    # and the index must not answer for a ledger that quotes nothing
+    assert deferredwork._example_spans("### DW-1: t\nstatus: open\n").covers(0) is False
+
+
+def test_parse_ledger_walks_the_fences_once_however_many_entries(monkeypatch):
+    """Asserted as a call count, not a duration: the property is that the fence
+    walk is hoisted out of the per-offset checks, and a timing threshold would
+    both flake and stop meaning that. Reading fence state per offset made
+    `parse_ledger` quadratic in entries, and `Engine._refuse_gated_story` re-parses
+    before every story dispatch, so a mature ledger paid it on the dispatch path.
+
+    Both bindings are patched because the module imported the name at import time
+    (`from .fences import fenced_spans`), so patching only `fences` would miss the
+    direct call and only `deferredwork` would miss any walk reached via
+    `fences.fenced`."""
+    walks: list[int] = []
+    real = fences.fenced_spans
+
+    def counting(text: str, **kw: object):
+        walks.append(len(text))
+        return real(text, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(fences, "fenced_spans", counting)
+    monkeypatch.setattr(deferredwork, "fenced_spans", counting)
+    text = "# Deferred Work\n" + "".join(
+        f"\n### DW-{i}: entry {i}\n\norigin: o\nreason: r\nstatus: open\n" for i in range(1, 26)
+    )
+
+    assert len(parse_ledger(text)) == 25
+    assert len(walks) == 1
+
+
+def test_gate_token_shape_copy_agrees_with_the_stories_id_it_mirrors():
+    """`_STORIES_ID_RE` is a copy of `stories.ID_RE`, taken because `stories`
+    imports this module and the reverse would cycle. Pinned to the original rather
+    than to a comment: if the manifest ever admits a new id shape, a gate on one
+    would start reporting `malformed` and refuse nothing."""
+    from bmad_loop import stories
+
+    assert deferredwork._STORIES_ID_RE.pattern == stories.ID_RE.pattern
+
+
+@pytest.mark.parametrize("token", ["3.2", "3_2", "3.2-invite", "3_2-invite"])
+def test_gates_reject_a_token_no_story_key_can_carry(token):
+    """Shape-valid and unmatchable. `GATE_TOKEN_RE` admits `.` and `_` because a
+    sprint slug may contain them, so `gate: 3.2` used to land in `tokens` — where
+    it matched nothing, gated nothing, and reported a green `ok` for doing so.
+    A `.`/`_` in the *number* prefix is what no legal key can carry."""
+    g = _gated(f"gate: {token}")
+
+    assert g.tokens == ()
+    assert g.malformed == (token,)
+
+
+@pytest.mark.parametrize("token", ["3-2-foo.bar", "3-2-a_b", "authz-login", "3"])
+def test_gates_keep_a_token_a_sprint_slug_can_actually_spell(token):
+    """The trap in the fix above: `sprintstatus.STORY_RE`'s slug is unconstrained,
+    so `3-2-foo.bar` and `3-2-a_b` are LEGAL keys that gate correctly. Banning `.`
+    and `_` outright — the obvious reading of "reject 3.2" — would refuse real
+    gates, turning a fail-open into a false refusal."""
+    g = _gated(f"gate: {token}")
+
+    assert g.tokens == (token,)
+    assert g.malformed == ()
+
+
+@pytest.mark.parametrize("line", ["Gate: 3-2", "GATE: 3-2", "  gate: 3-2", "\tgate: 3-2"])
+def test_gates_count_a_line_the_field_anchor_will_never_read(line):
+    """`GATE_RE` is a lowercase `gate:` in column 0. Every other spelling produced
+    ZERO findings — no gate, no warning, nothing — which is the field failing open,
+    where a missed `status:` now fails closed. Counted, not parsed: accepting an
+    indented line would read a fenced example inside an entry as a live gate."""
+    g = _gated(line)
+
+    assert g.tokens == ()  # deliberately NOT enforced...
+    assert g.near_miss == 1  # ...but no longer silent
+    assert g.lines == 0
+
+
+def test_gates_do_not_count_the_canonical_spelling_as_a_near_miss():
+    """The near-miss pattern is a superset of the field pattern, so the canonical
+    line matches both. Counting it would warn about every gate that works."""
+    g = _gated("gate: 3-2")
+
+    assert g.tokens == ("3-2",) and g.near_miss == 0
+
+
+@pytest.mark.parametrize(
+    ("status", "is_open", "is_done"),
+    [
+        ("open", True, False),
+        ("done 2026-08-01", False, True),
+        ("opne", False, False),  # a typo is neither, and must not read as landed
+        ("", False, False),  # no status line at all
+    ],
+)
+def test_entry_status_is_a_tri_state_not_a_boolean(status, is_open, is_done):
+    """`done` is deliberately not `not open`. The readers want opposite answers
+    about an unreadable status — `open_ids` drops it, a gate on it has to hold —
+    and deriving one from the other let `status: opne` disable a gate silently."""
+    line = f"status: {status}\n" if status else ""
+    (entry,) = parse_ledger(f"# DW\n\n### DW-1: t\n\norigin: t\nreason: t\n{line}")
+
+    assert entry.open is is_open
+    assert entry.done is is_done
+
+
+def test_gates_stop_at_the_canonical_span_boundary():
+    """A `gate:` line below a flat-append bullet belongs to that block, not to the
+    entry above it — the same boundary `status:` is read within. Absorbing it would
+    let an unrelated appended finding block a story nobody gated."""
+    text = (
+        "# Deferred Work\n\n### DW-1: canonical\n\n"
+        "origin: test\nlocation: n/a\nreason: test\nstatus: open\n\n"
+        "- source_spec: `s.md`\n  summary: finding\ngate: 3-2\n"
+    )
+
+    (entry,) = parse_ledger(text)
+
+    assert deferredwork.gates(entry).tokens == ()
+
+
+@pytest.mark.parametrize(
+    ("token", "story_key", "gated"),
+    [
+        ("3-2", "3-2", True),  # stories-mode id: the token IS the key
+        ("3-2", "3-2-invite-link-student-surface", True),  # sprint key: `-` prefix
+        ("3-2", "3-20-later-story", False),  # the boundary the `-` buys
+        # A split story is still the gated story. STORY_RE lets breakdown turn an
+        # oversized 3-2 into 3-2a/3-2b, and a token that only knew `-` would lose
+        # its gate at exactly that moment — silently, which is the one thing a
+        # gate must never do.
+        ("3-2", "3-2a-split-half", True),
+        ("3-2", "3-2b-other-half", True),
+        ("3-2", "3-2A-upper", False),  # the split suffix is lowercase ASCII
+        ("3-2", "3-2ab-two-letters", False),  # exactly one letter, or it is a slug
+        ("3-2", "3-2a", False),  # the `-` after the letter is required
+        ("3-2", "9-9a-elsewhere", False),  # the split arm still needs the prefix
+        ("3", "3-2-invite-link", True),  # a whole epic is a legal token
+        ("3-2-invite", "3-2-invite-link", True),
+        ("3-2-invite", "3-2-invited", False),
+        # The split arm needs the token to end at a story NUMBER, because that is
+        # the only place STORY_RE can attach a split letter. `stories.ID_RE` admits
+        # word ids, so without the digit guard the arm read the `z` of `authz` as a
+        # split and FAILED validate for a story nobody gated — the one way this
+        # check can be worse than the prose it replaced.
+        ("auth", "authz-login", False),
+        ("api", "apis-v2", False),
+        # ...and "ends in a digit" was that same guard written too loosely: the
+        # digit can belong to a slug, so the arm read a slug boundary as a split
+        # and refused keys the entry never named.
+        ("3-2-v2", "3-2-v2a-followup", False),  # `2` closes the slug `v2`, not a story
+        ("3", "3a-task", False),  # a distinct stories id, not a split of `3`
+        ("3-2-v2", "3-2-v2-followup", True),  # the plain `-` arm is untouched by that
+        ("3-2a", "3-2ab-x", False),  # a token already carrying a split letter
+        ("3-2a", "3-2a-x", True),  # ...still gates its own `-` boundary
+        ("", "a-b", False),  # an empty token names nothing, so it gates nothing
+    ],
+)
+def test_gates_story_matches_on_key_boundaries(token, story_key, gated):
+    assert deferredwork.gates_story(token, story_key) is gated
+
+
+@pytest.mark.parametrize(
+    ("body", "declared"),
+    [
+        ("HARD GATE: must land before 3-2", True),  # the bare convention
+        ("reason: wired late. HARD GATE: must land before 3-2", True),  # hard-wrapped prose
+        ('reason: an entry naming a "HARD GATE: before X" is enforced by nothing', False),
+        ("reason: an entry naming a 'HARD GATE: before X'", False),
+        ("reason: «HARD GATE: before X» is only prose", False),
+        ("reason: this HARD GATE is textual only, nothing enforces it", False),
+        # A ledger is markdown, so the backtick is the citation form an author
+        # reaches for first, and an LLM-written entry curls its quotes. Both used
+        # to warn, so an entry documenting the convention accused itself.
+        ("reason: a `HARD GATE:` is prose only", False),
+        ("reason: cites “HARD GATE: before X” only", False),
+        ("reason: cites ‘HARD GATE: before X’ only", False),
+        # KNOWN LIMIT, pinned rather than left to surprise someone: the lookbehind
+        # is one character wide, so a citation that spaces its opening quote off
+        # the phrase — the French convention, `«` + U+00A0 — still reads as a
+        # declaration. The remedy for such an entry is a `gate:` line, which
+        # silences the warning either way.
+        ("reason: «\u00a0HARD GATE: before X\u00a0» is only prose", True),
+    ],
+)
+def test_hard_gate_prose_detects_a_declaration_not_a_citation(body, declared):
+    """Matched anywhere on a line, because real ledgers hard-wrap `reason:` and the
+    declaration lands mid-line. The quote lookbehind is what keeps that honest — an
+    entry *citing* the phrase is discussion — and the colon excludes prose that
+    merely talks about a hard gate."""
+    assert bool(deferredwork.HARD_GATE_PROSE_RE.search(body)) is declared
+
+
+def _prose_gated(*lines: str) -> bool:
+    text = (
+        "# Deferred Work\n\n### DW-1: gated entry\n\n"
+        "origin: test\nlocation: n/a\nreason: test\nstatus: open\n"
+        + "".join(f"{x}\n" for x in lines)
+    )
+    (entry,) = parse_ledger(text)
+    return deferredwork.declares_prose_gate(entry)
+
+
+@pytest.mark.parametrize("fence", ["```markdown", "```", "~~~"])
+def test_a_fenced_prose_gate_is_not_a_declaration(fence):
+    """The block form of the citation the quote lookbehind already handles inline.
+    Nothing precedes a line inside a fence, so an entry documenting the old
+    convention in an example was told to convert a gate it was not declaring —
+    the same rule `gates()` applies to `gate:`, left half-applied."""
+    close = "```" if fence.startswith("`") else "~~~"
+    body = f"{fence}\nHARD GATE: must land before 3-2\n{close}\n"
+
+    # the pattern itself still matches: the mask is what answers, not a lucky miss
+    assert deferredwork.HARD_GATE_PROSE_RE.search(body)
+    assert _prose_gated(fence, "HARD GATE: must land before 3-2", close) is False
+
+
+def test_a_fence_hides_only_the_prose_gate_it_quotes():
+    """Masking must not reach past the block, or the fix for a spurious warning
+    would buy a missed one — an entry that both explains the convention and uses
+    it is exactly the entry this warning is for."""
+    assert _prose_gated("```", "HARD GATE: an example", "```", "HARD GATE: for real") is True
+
+
+def test_an_unclosed_fence_swallows_no_prose_gate():
+    """Parity with `gates()`: `unclosed_hides_rest=False`, so one stray ``` cannot
+    silence every declaration below it."""
+    assert _prose_gated("```", "an example nobody closed", "HARD GATE: for real") is True
