@@ -706,6 +706,58 @@ def test_symlinked_run_dir_is_refused(fake_run, tmp_path: Path):
     assert not (outside / launch._CTL_WINDOW_FILE).exists()  # nothing escaped
 
 
+@pytest.mark.skipif(not launch.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only")
+def test_record_write_is_anchored_against_an_ancestor_swap(fake_run, tmp_path, monkeypatch):
+    """The race a path check cannot close: the session re-plants the run dir as
+    a link *after* confinement is established. A preflight check answers about a
+    path and is stale the moment it returns, so the write follows the new link;
+    the descriptor `open_dir_confined` hands back is bound to the directory it
+    actually walked, so the swap renames something the write no longer consults.
+
+    The swap is forced rather than raced with threads: hooking the helper is the
+    exact interleaving an attacker who wins the window achieves, and it is
+    deterministic. The positive control is the second assertion — the record
+    must actually LAND (in the real, now-renamed-aside directory), so this
+    cannot pass by the write simply having failed."""
+    run_dir = _make_run(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    real_open = launch.open_dir_confined
+
+    def swap_after_the_walk(project: Path, target: Path):
+        fd = real_open(project, target)
+        # attacker wins: the name now points outside, the fd still points home
+        target.rename(tmp_path / "moved-aside")
+        target.symlink_to(outside)
+        return fd
+
+    monkeypatch.setattr(launch, "open_dir_confined", swap_after_the_walk)
+    launch.resume_detached(tmp_path, "RID")
+
+    assert not (outside / launch._CTL_WINDOW_FILE).exists()  # nothing escaped
+    landed = tmp_path / "moved-aside" / launch._CTL_WINDOW_FILE
+    assert landed.read_text(encoding="utf-8") == "@7"  # and the write did happen
+    assert run_dir.is_symlink()  # the swap really was in place for the write
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_record_falls_back_to_the_confinement_check_without_dir_fd(fake_run, tmp_path, monkeypatch):
+    # win32 has no *at() family to anchor against, so it keeps check-then-write.
+    # Exercised here from POSIX so the fallback is not left to the Windows legs
+    # alone: it still has to refuse an ancestor link, just with the weaker
+    # (racy, and documented as such) guarantee.
+    monkeypatch.setattr(launch, "DIR_FD_ANCHORED_WRITES", False)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "state.json").write_text("{}", encoding="utf-8")
+    run_dir = runs.run_dir_for(tmp_path, "RID")
+    run_dir.parent.mkdir(parents=True)
+    run_dir.symlink_to(outside)
+
+    assert launch.resume_detached(tmp_path, "RID") == "@7"
+    assert not (outside / launch._CTL_WINDOW_FILE).exists()
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_symlinked_record_is_replaced_not_followed(fake_run, tmp_path: Path):
     # `atomic_write_text` follows a symlink under its default contract, and the
@@ -727,6 +779,23 @@ def test_symlinked_record_is_replaced_not_followed(fake_run, tmp_path: Path):
     assert record.read_text(encoding="utf-8") == "@7"
 
 
+def _fail_the_record(monkeypatch, exc: BaseException) -> None:
+    """Make the record write raise, whichever writer this platform records with.
+
+    POSIX anchors the write at a directory descriptor (`atomic_write_text_at`)
+    and win32 falls back to the path-based `atomic_write_text`; patching both
+    keeps these tests about the degradation rather than about which branch ran.
+    Each caller writes a record FIRST and asserts it is gone afterwards, so a
+    patch that reached neither writer would leave that record in place and fail
+    — the assertions are not satisfiable by the write simply never happening."""
+
+    def boom(*_a, **_k):
+        raise exc
+
+    monkeypatch.setattr(launch, "atomic_write_text", boom)
+    monkeypatch.setattr(launch, "atomic_write_text_at", boom)
+
+
 def test_resume_reports_a_record_that_did_not_survive(fake_run, tmp_path: Path, monkeypatch):
     # The window id was captured, so start_detached returns it — but the record
     # did not land, which leaves ctl_window_id on the same ambiguous scan an
@@ -739,10 +808,7 @@ def test_resume_reports_a_record_that_did_not_survive(fake_run, tmp_path: Path, 
     fake_run.windows = "@1\trun-RID\n@7\tresume-RID\n"
     _make_run(tmp_path)
 
-    def boom(*_a, **_k):
-        raise OSError("read-only file system")
-
-    monkeypatch.setattr(launch, "atomic_write_text", boom)
+    _fail_the_record(monkeypatch, OSError("read-only file system"))
     assert launch.resume_detached(tmp_path, "RID") is None
 
 
@@ -802,10 +868,7 @@ def test_failed_record_forgets_the_previous_one(fake_run, tmp_path: Path, monkey
     run_dir = _make_run(tmp_path)
     _write_record(tmp_path, "RID", "@2")
 
-    def boom(*_a, **_k):
-        raise OSError("disk full")
-
-    monkeypatch.setattr(launch, "atomic_write_text", boom)
+    _fail_the_record(monkeypatch, OSError("disk full"))
     launch.resume_detached(tmp_path, "RID")
     assert not (run_dir / launch._CTL_WINDOW_FILE).exists()
 
@@ -826,10 +889,7 @@ def test_failed_record_survives_a_non_oserror(fake_run, tmp_path: Path, monkeypa
     run_dir = _make_run(tmp_path)
     _write_record(tmp_path, "RID", "@2")
 
-    def boom(*_a, **_k):
-        raise RuntimeError("Symlink loop from '/x'")
-
-    monkeypatch.setattr(launch, "atomic_write_text", boom)
+    _fail_the_record(monkeypatch, RuntimeError("Symlink loop from '/x'"))
     launch.resume_detached(tmp_path, "RID")  # must not raise
     assert not (run_dir / launch._CTL_WINDOW_FILE).exists()
 

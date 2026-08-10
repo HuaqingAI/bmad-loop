@@ -23,7 +23,12 @@ from pathlib import Path
 from .. import runs
 from ..adapters.multiplexer import MultiplexerError, get_multiplexer, mux_usable
 from ..journal import Journal
-from ..platform_util import atomic_write_text
+from ..platform_util import (
+    DIR_FD_ANCHORED_WRITES,
+    atomic_write_text,
+    atomic_write_text_at,
+    open_dir_confined,
+)
 
 CTL_SESSION = "bmad-loop-ctl"
 
@@ -214,12 +219,39 @@ def _record_ctl_window(project: Path, run_id: str, win_id: str) -> None:
     so the link is clobbered whenever it was planted. That also self-heals — the
     record ends up a plain file again — where a refusal would leave the planted
     link in place for the next launch to trip over.
+
+    Anchored at a directory descriptor where the platform has one. The final
+    component is covered by `follow_symlinks=False` above, but the *ancestors*
+    are not, and a path check over them (`_run_dir_is_confined`) is answered
+    about a path — stale the moment it returns, so a session that re-plants
+    `.bmad-loop/runs/<run_id>` between check and write still redirects the
+    record out of the workspace. `open_dir_confined` walks those components
+    `O_NOFOLLOW` and hands back the descriptor for the directory it reached, and
+    `atomic_write_text_at` then never names a path again — so a later swap
+    renames something this no longer consults, and there is no window to win.
+
+    win32 keeps the check-then-write path: it has no `*at()` family to anchor
+    against (its CPython config defines neither HAVE_RENAMEAT nor HAVE_OPENAT),
+    so the descriptor cannot be opened there at all. The residual is documented
+    on `_run_dir_is_confined` and bounded by the two facts it names — same uid
+    as the writer, and a fixed filename carrying a window id.
     """
     run_dir = runs.run_dir_for(project, run_id)
-    if not runs.is_run(run_dir) or not _run_dir_is_confined(project, run_dir):
+    if not runs.is_run(run_dir):
         return
     try:
-        atomic_write_text(run_dir / _CTL_WINDOW_FILE, win_id, follow_symlinks=False)
+        if DIR_FD_ANCHORED_WRITES:
+            dir_fd = open_dir_confined(project, run_dir)
+            if dir_fd is None:
+                return  # unconfined, or a component we cannot vouch for
+            try:
+                atomic_write_text_at(dir_fd, _CTL_WINDOW_FILE, win_id)
+            finally:
+                os.close(dir_fd)
+        else:
+            if not _run_dir_is_confined(project, run_dir):
+                return
+            atomic_write_text(run_dir / _CTL_WINDOW_FILE, win_id, follow_symlinks=False)
     except Exception:
         _forget_ctl_window(project, run_id)
 
