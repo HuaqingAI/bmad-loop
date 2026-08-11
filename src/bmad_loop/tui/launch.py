@@ -379,7 +379,7 @@ def ctl_window_id(project: Path, run_id: str) -> str | None:
     for a fresh `run`, where recording is deliberately skipped."""
     if not mux_available():
         return None
-    mine = runs.project_tag(project)
+    mine = runs.accepted_tags(project)
     local = runs.is_run(runs.run_dir_for(project, run_id))
     tagged: list[str] = []
     untagged: list[str] = []
@@ -403,12 +403,17 @@ def ctl_window_id(project: Path, run_id: str) -> str | None:
         m = _CTL_WINDOW_RE.match(name)
         if m is None or m.group(1) != run_id:
             continue
-        # An exact tag comparison, with no "the tag looks unsafe here" escape:
-        # runs.project_tag guarantees the value arrives as it was written, so a
-        # nonempty tag that is not ours belongs to another project and must not
-        # be a candidate — `x` resolves through here, and admitting a foreign
-        # row lets a stop cross a project boundary.
-        if tag == mine:
+        # Set membership, with no "the tag looks unsafe here" escape: the digest
+        # arrives as it was written, so a nonempty tag outside the accepted set
+        # belongs to another project and must not be a candidate — `x` resolves
+        # through here, and admitting a foreign row lets a stop cross a project
+        # boundary. The set is what keeps a window tagged by an earlier release
+        # reachable: the control session is long-lived and survives the upgrade
+        # that changes the tag's spelling, so comparing against the current
+        # digest alone would strand this project's own orchestrator — prunable
+        # by _ctl_window_candidates, which accepts the legacy tag, yet
+        # unreachable by `a` and `x`, which resolve through here.
+        if tag in mine:
             tagged.append(win_id)
         elif not tag and local:
             # untagged, and this project holds the run dir — ownership is

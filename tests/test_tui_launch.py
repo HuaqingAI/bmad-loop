@@ -381,6 +381,23 @@ def test_ctl_window_id_ignores_a_record_naming_another_projects_window(monkeypat
     assert launch.ctl_window_id(tmp_path, "RID") == "@2"
 
 
+def test_ctl_window_id_accepts_a_legacy_path_tag(monkeypatch, tmp_path: Path):
+    # The ctl session is long-lived and shared across projects, so it survives the
+    # upgrade that changes the tag's spelling from a path to a digest. Comparing
+    # against the current digest alone strands this project's OWN orchestrator:
+    # _ctl_window_candidates accepts the legacy tag and would prune the window,
+    # while `a` and `x` resolve through here and could no longer reach it.
+    legacy = str(tmp_path.resolve())
+    _ctl_listing(monkeypatch, f"@1\trun-RID\t{legacy}\n", tmp_path)
+    assert launch.ctl_window_id(tmp_path, "RID") == "@1"
+
+    # Still scoped: another project's legacy path tag stays foreign, so accepting
+    # the legacy spelling does not widen the boundary a stop must not cross.
+    other = str((tmp_path / "elsewhere").resolve())
+    _ctl_listing(monkeypatch, f"@1\trun-RID\t{other}\n", tmp_path)
+    assert launch.ctl_window_id(tmp_path, "RID") is None
+
+
 def test_ctl_window_id_admits_an_untagged_window_with_a_local_run(monkeypatch, tmp_path: Path):
     # The tag is written by a best-effort set_window_option that can fail, and a
     # window whose tag never landed must stay reachable by its own project
