@@ -140,7 +140,7 @@ compares them to skip its own window. To preserve unambiguous lookup,
 `new_parked_window` must agree with the `list_windows` column too; a backend that
 qualifies one side only remains usable but falls back to resolving parked
 windows by name, which is ambiguous whenever several kinds share a run id
-(#482).) tmux consumes the token natively (it coincides with tmux exact-match
+(#482). tmux consumes the token natively (it coincides with tmux exact-match
 syntax), so `BaseTmuxBackend` passes it straight through. A native-id backend
 calls `parse_target()` first — `None` means "already a native id, use as-is",
 otherwise resolve `(session, window)` yourself; the herdr adapter's

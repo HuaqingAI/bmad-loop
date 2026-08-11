@@ -412,6 +412,11 @@ def open_dir_confined(root: Path, target: Path) -> int | None:
     return fd
 
 
+# Draws before giving up on a unique temp name. O_EXCL makes a collision
+# harmless, so this only bounds a pathological loop.
+_TMP_NAME_ATTEMPTS = 100
+
+
 def atomic_write_text_at(dir_fd: int, name: str, text: str) -> None:
     """:func:`atomic_write_text`, anchored at an open directory descriptor.
 
@@ -456,11 +461,6 @@ def atomic_write_text_at(dir_fd: int, name: str, text: str) -> None:
         with suppress(OSError):
             os.unlink(tmp, dir_fd=dir_fd)
         raise
-
-
-# Draws before giving up on a unique temp name. O_EXCL makes a collision
-# harmless, so this only bounds a pathological loop.
-_TMP_NAME_ATTEMPTS = 100
 
 
 def retrying_unlink(path: Path) -> None:
