@@ -7119,6 +7119,7 @@ def test_lost_session_is_journaled_structurally_on_dev_decision(project):
     )
     engine.run()
 
+    assert len(adapter.sessions) == 2  # both attempts spent: the retry actually ran
     decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
     assert decisions and all(d["session_vanished"] is True for d in decisions)
     assert decisions[0]["action"] == "retry"  # diagnosis, not routing

@@ -1652,6 +1652,7 @@ def test_triage_lost_session_names_the_mux_in_its_errors(project):
     )
     engine.run()
 
+    assert len(adapter.sessions) == 2  # both attempts spent: the retry actually ran
     dec = [e for e in engine.journal.entries() if e["kind"] == "triage-decision"][-1]
     assert any("triage session crashed" in e for e in dec["errors"])
     assert any("multiplexer no longer reports the session" in e for e in dec["errors"])
@@ -1669,6 +1670,7 @@ def test_migration_lost_session_names_the_mux_in_its_errors(project):
     )
     engine.run()
 
+    assert len(adapter.sessions) == 2  # both attempts spent: the retry actually ran
     dec = [e for e in engine.journal.entries() if e["kind"] == "migrate-decision"][-1]
     assert any("migration session crashed" in e for e in dec["errors"])
     assert any("multiplexer no longer reports the session" in e for e in dec["errors"])
