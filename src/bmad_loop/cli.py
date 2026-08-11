@@ -2880,6 +2880,13 @@ def _stop_or_block_live_engine(run_dir: Path, run_id: str, force: bool) -> int |
         except (runs.StopRunError, ProcessHostError) as e:
             print(str(e), file=sys.stderr)
             return 1
+    if force:
+        # Beyond a live engine, --force also clears an *orphaned* agent session —
+        # engine dead, session alive — which the pid-keyed read above passes and
+        # runs.delete_run/archive_run then refuse (#419). Killing it satisfies that
+        # guard rather than bypassing it, so the run dir still never outlives the
+        # session; a no-op when the session is already gone (incl. after stop_run).
+        runs.kill_session(run_id)
     return None
 
 
@@ -2894,7 +2901,11 @@ def cmd_delete(args: argparse.Namespace) -> int:
     rc = _stop_or_block_live_engine(run_dir, args.run_id, args.force)
     if rc is not None:
         return rc
-    runs.delete_run(run_dir)
+    try:
+        runs.delete_run(run_dir)
+    except runs.LiveSessionError as e:
+        print(f"{e} (or pass --force)", file=sys.stderr)
+        return 1
     print(f"run {args.run_id} deleted")
     return 0
 
@@ -2910,7 +2921,11 @@ def cmd_archive(args: argparse.Namespace) -> int:
     rc = _stop_or_block_live_engine(run_dir, args.run_id, args.force)
     if rc is not None:
         return rc
-    dest = runs.archive_run(project, run_dir)
+    try:
+        dest = runs.archive_run(project, run_dir)
+    except runs.LiveSessionError as e:
+        print(f"{e} (or pass --force)", file=sys.stderr)
+        return 1
     print(f"run {args.run_id} archived to {dest}")
     return 0
 
@@ -3036,6 +3051,19 @@ def cmd_clean(args: argparse.Namespace) -> int:
             if not args.json:
                 print(f"{'would remove' if dry else 'removed'} worktree {wt}")
         if run_dir.name in past:
+            if runs.session_alive(run_dir.name):
+                # `reclaimable` is keyed on engine pid liveness, so an orphan — engine
+                # dead, agent session still live — passes it. Removing the dir there
+                # takes away the only ownership proof an untagged session has, and it
+                # leaks for the life of the machine (#419). Protect the run instead;
+                # `cleanup` kills the session, after which the next `clean` reclaims it.
+                protected.append(run_dir.name)
+                if not args.json:
+                    print(
+                        f"run {run_dir.name}: agent session still live — not removed",
+                        file=sys.stderr,
+                    )
+                continue
             freed += run_bytes
             runs.trim_run_dir(run_dir, dry_run=dry)  # shrink before archiving
             if args.hard or not pol.cleanup.archive_old:

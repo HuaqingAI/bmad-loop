@@ -2122,6 +2122,54 @@ def test_archive_force_stop_error_blocks(tmp_path, monkeypatch, capsys):
     assert run_dir.exists()
 
 
+def test_delete_refuses_an_orphaned_session_without_force(tmp_path, monkeypatch, capsys):
+    """Engine dead, agent session still live — the one state the pid-keyed guard
+    passes, and the one where the run dir is the only ownership proof an untagged
+    session has left (#419)."""
+    from bmad_loop import runs
+
+    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-r1"])
+    run_dir = _make_run_with_state(tmp_path, "r1")  # no pid -> engine reads dead
+    assert cli.main(["delete", "--project", str(tmp_path), "r1"]) == 1
+    err = capsys.readouterr().err
+    # the refusal surfaces as an exit code + message, never as a traceback, and the
+    # CLI adds the escape its own flag provides to what runs.py could say alone
+    assert "agent session is still live" in err and "bmad-loop cleanup" in err
+    assert "(or pass --force)" in err
+    assert run_dir.exists()
+
+
+def test_delete_force_kills_the_orphaned_session_then_removes(tmp_path, monkeypatch, capsys):
+    """--force means "make it not-live, then remove", exactly as it does for a live
+    engine (which routes through stop_run). It satisfies the run-dir guard by killing
+    the session rather than bypassing it, so the dir still never outlives the
+    session — hence the removal only succeeds because the kill landed first."""
+    from bmad_loop import runs
+
+    killed = []
+    monkeypatch.setattr(runs, "mux_sessions", lambda: [] if killed else ["bmad-loop-r1"])
+    monkeypatch.setattr(runs, "kill_session", lambda rid: killed.append(rid))
+    run_dir = _make_run_with_state(tmp_path, "r1")
+    assert cli.main(["delete", "--project", str(tmp_path), "r1", "--force"]) == 0
+    assert killed == ["r1"]
+    assert not run_dir.exists()
+
+
+def test_archive_refuses_an_orphaned_session_without_force(tmp_path, monkeypatch, capsys):
+    from bmad_loop import runs
+
+    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-r1"])
+    run_dir = _make_run_with_state(tmp_path, "r1")
+    assert cli.main(["archive", "--project", str(tmp_path), "r1"]) == 1
+    err = capsys.readouterr().err
+    # `(or pass --force)` is the handler's own; main's catch-all backstop would give
+    # the same exit code and a bare `error: ...`, so asserting only the run message
+    # would pass with the handler's except removed
+    assert "agent session is still live" in err and "(or pass --force)" in err
+    assert run_dir.exists()
+    assert not (tmp_path / ".bmad-loop" / "archive").exists()
+
+
 def test_delete_dead_run(tmp_path, capsys):
     run_dir = _make_run_with_state(tmp_path, "r1")  # no pid -> not alive
     assert cli.main(["delete", "--project", str(tmp_path), "r1"]) == 0

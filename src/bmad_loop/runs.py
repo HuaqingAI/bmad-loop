@@ -51,6 +51,12 @@ class GracefulStopError(Exception):
     the operator-facing message the CLI/TUI surface verbatim."""
 
 
+class LiveSessionError(Exception):
+    """A run directory was not removed because the run's agent session is still
+    live (see :func:`session_alive`). ``str()`` is the operator-facing message the
+    CLI/TUI surface verbatim."""
+
+
 # How long stop_run waits for a signalled engine to exit before falling back to
 # marking the run stopped itself.
 _STOP_WAIT_S = 10.0
@@ -552,15 +558,49 @@ def stop_run(run_dir: Path) -> bool:
     return True
 
 
+def session_alive(run_id: str) -> bool:
+    """True when the run's agent session (``bmad-loop-<id>``) is live right now.
+
+    An observation, so it degrades rather than raising: :func:`mux_sessions`
+    answers ``[]`` when the multiplexer is missing, no server is running, or the
+    query fails, and that reads here as "no session". The asymmetry is deliberate
+    — a false negative only costs the backstop below, while a false positive would
+    block a removal the operator is entitled to."""
+    return session_name(run_id) in mux_sessions()
+
+
+def _refuse_live_session(run_id: str, verb: str) -> None:
+    """Backstop for #419: refuse to remove a run dir out from under a live session.
+
+    Every caller's live guard is keyed on *engine pid* liveness, so an orphan —
+    engine dead, agent session still alive in the multiplexer — passes all of them.
+    That is the one state where the run dir is load-bearing: for an untagged
+    session it is the only ownership proof :func:`prunable_sessions` can read, so
+    removing it leaks the session (and its server) for the life of the machine.
+    Refusing is a repair-path write failing loudly, per the module doctrine."""
+    if session_alive(run_id):
+        raise LiveSessionError(
+            f"run {run_id}: refusing to {verb} its directory while its agent session "
+            f"is still live — kill it first with `bmad-loop cleanup` (the directory is "
+            f"the only ownership proof a later prune has for an untagged session)"
+        )
+
+
 def delete_run(run_dir: Path) -> None:
-    """Permanently remove a run directory. Callers enforce the live guard."""
+    """Permanently remove a run directory. Callers enforce the engine-liveness
+    guard; the session guard is enforced here (see :func:`_refuse_live_session`),
+    which raises :class:`LiveSessionError` instead of removing."""
+    _refuse_live_session(run_dir.name, "delete")
     shutil.rmtree(run_dir)
 
 
 def archive_run(project: Path, run_dir: Path) -> Path:
     """Compress a run dir into .bmad-loop/archive/<id>.tar.gz and remove the
     original. The tarball is written to a temp path then atomically replaced into
-    place so a partial archive never appears. Callers enforce the live guard."""
+    place so a partial archive never appears. Callers enforce the engine-liveness
+    guard; the session guard is enforced here (see :func:`_refuse_live_session`)
+    and runs before the tarball is written, so a refusal leaves nothing behind."""
+    _refuse_live_session(run_dir.name, "archive")
     archive_dir = project / ARCHIVE_DIR
     archive_dir.mkdir(parents=True, exist_ok=True)
     dest = archive_dir / f"{run_dir.name}.tar.gz"

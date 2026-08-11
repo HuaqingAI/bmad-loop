@@ -282,6 +282,24 @@ def test_cmd_clean_hard_deletes_past_retention(project):
     assert not (repo / ".bmad-loop" / "archive").exists()
 
 
+def test_cmd_clean_protects_a_run_whose_agent_session_is_still_live(project, monkeypatch, capsys):
+    """`reclaimable` is keyed on engine pid liveness, so an orphan — engine dead,
+    agent session still live — is past retention and would be removed. That takes
+    the only ownership proof an untagged session has, leaking it for the life of
+    the machine (#419), so the run is protected instead and the operator is told."""
+    install_bmad_config(project)
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", finished=True))
+    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-20260101-000000-aaaa"])
+
+    assert cli.cmd_clean(_clean_args(repo, retain=0)) == 0
+
+    assert run_dir.is_dir()  # not archived out from under the session
+    assert not (repo / ".bmad-loop" / "archive").exists()
+    assert "20260101-000000-aaaa: agent session still live — not removed" in capsys.readouterr().err
+
+
 # -------------------------------------------------------- cmd_clean --json
 
 
@@ -378,6 +396,22 @@ def test_cmd_clean_json_carries_unverifiable_pid_with_empty_stderr(project, monk
     doc = _clean_json(repo, capsys)
 
     assert doc["unverifiable_pid"] == ["20260101-000000-aaaa"]
+
+
+def test_cmd_clean_json_reports_a_live_session_run_as_protected(project, monkeypatch, capsys):
+    # the live-session backstop's JSON half: the run is classified, not silently
+    # dropped, and (like every other warning) stderr stays empty in JSON mode.
+    install_bmad_config(project)
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", finished=True))
+    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-20260101-000000-aaaa"])
+
+    doc = _clean_json(repo, capsys, "--retain", "0")
+
+    assert doc["protected"] == ["20260101-000000-aaaa"]
+    assert doc["archived"] == [] and doc["deleted"] == []
+    assert run_dir.is_dir()
 
 
 def test_cmd_clean_json_nothing_to_reclaim_is_a_valid_empty_document(project, capsys):

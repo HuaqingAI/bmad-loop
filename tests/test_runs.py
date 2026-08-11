@@ -747,6 +747,44 @@ def test_prunable_sessions_accepts_legacy_path_tag(tmp_path, monkeypatch):
     assert live == [] and unknown == set()
 
 
+def test_prunable_sessions_claims_an_untagged_session_on_a_run_id_collision(tmp_path, monkeypatch):
+    """Characterization (#419): for an untagged session, ownership is proven by run-id
+    collision on the filesystem, not by identity — so a project that happens to hold a
+    dead run dir with the same id classifies *another* project's session as prunable,
+    reading its own pid file to make the call.
+
+    Nothing in the fixture marks the session as foreign, because nothing can: that is
+    the defect. Foreignness is constructed out of band — `theirs` created the session
+    (untagged, because its tag write failed or it predates a working one) and is still
+    running it, while `ours` only shares the id. Both views are asserted, so the test
+    shows the two projects disagreeing about one live session rather than just echoing
+    one side.
+
+    The collision needs no luck: `--run-id` is accepted from the CLI and validated for
+    shape only, so a script reusing one fixed id across two projects reproduces it.
+
+    Pinned as the actual outcome, not the desired one. #523's digest keeps ordinary
+    paths tagged, so this is reachable only for untagged state, and closing it needs a
+    second ownership proof that outlives the run dir (#419 direction 2) — not a change
+    here, and not the removal backstop (#526 residual A), which guards a different
+    sequence. Flip this test deliberately if that proof ever lands."""
+    ours = tmp_path / "ours"
+    theirs = tmp_path / "theirs"
+    ours.mkdir()
+    theirs.mkdir()
+    collided = "shared-id"
+    # their run: engine alive, so the session is genuinely in use
+    runs.write_pid(_make_state_run(theirs, collided))
+    # our run: same id, dead engine — the only thing that makes us claim the session
+    (_make_state_run(ours, collided) / "engine.pid").write_text(str(_dead_pid()))
+
+    monkeypatch.setattr(runs, "mux_sessions", lambda: [runs.session_name(collided)])
+    monkeypatch.setattr(runs, "session_project_tags", lambda: {})  # untagged everywhere
+
+    assert runs.prunable_sessions(ours) == ([collided], [], set())  # ours would kill it
+    assert runs.prunable_sessions(theirs) == ([], [collided], set())  # theirs is using it
+
+
 def test_prunable_sessions_skips_invalid_run_ids(tmp_path, monkeypatch):
     """A session name is untrusted input (anyone can create one). Stripping the
     prefix off `bmad-loop-../../x` would hand `run_dir_for` a traversing id, and a
@@ -812,6 +850,40 @@ def test_prune_sessions_returns_unknown_from_same_sample(tmp_path, monkeypatch):
 
 def test_delete_run(tmp_path):
     run_dir = _make_state_run(tmp_path, "r1")
+    runs.delete_run(run_dir)
+    assert not run_dir.exists()
+
+
+def test_delete_run_refuses_while_the_agent_session_is_live(tmp_path, monkeypatch):
+    """The #419 backstop: every caller's guard is keyed on engine pid liveness, so an
+    orphan (engine dead, session alive) reaches here. For an untagged session the run
+    dir is the only ownership proof a later prune can read, so the dir must outlive
+    the session, not the other way round."""
+    run_dir = _make_state_run(tmp_path, "r1")
+    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-r1"])
+    with pytest.raises(runs.LiveSessionError, match="still live"):
+        runs.delete_run(run_dir)
+    assert run_dir.exists()
+
+
+def test_delete_run_matches_the_session_by_exact_run_id(tmp_path, monkeypatch):
+    """The guard keys on `bmad-loop-<id>` exactly. A session for a *different* run —
+    including one whose id merely extends ours — must not block this removal, or one
+    live run would wedge cleanup for every id it prefixes."""
+    run_dir = _make_state_run(tmp_path, "r1")
+    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-r1-2", "bmad-loop-ctl", "r1"])
+    runs.delete_run(run_dir)
+    assert not run_dir.exists()
+
+
+@pytest.mark.usefixtures("force_tmux_backend")  # the degradation is the seam's, not a stub's
+def test_delete_run_proceeds_when_the_multiplexer_cannot_answer(tmp_path, monkeypatch):
+    """Observation degrades: an absent multiplexer, a dead server, or a failed query
+    all read as "no session" (mux_sessions returns []). A removal the operator asked
+    for must not be blocked by an unanswerable question — the cost is only that the
+    backstop is inert there, which is the pre-#419 behavior."""
+    run_dir = _make_state_run(tmp_path, "r1")
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda _name: None)  # no tmux at all
     runs.delete_run(run_dir)
     assert not run_dir.exists()
 
@@ -1047,3 +1119,14 @@ def test_archive_run(tmp_path):
         names = tar.getnames()
     assert "20260611-100000-aaaa/state.json" in names
     assert "20260611-100000-aaaa/journal.jsonl" in names
+
+
+def test_archive_run_refuses_while_the_agent_session_is_live(tmp_path, monkeypatch):
+    """Same backstop as delete (#419), and it runs before the tarball is written —
+    a refusal must not leave a half-archived run behind for the operator to find."""
+    run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
+    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-20260611-100000-aaaa"])
+    with pytest.raises(runs.LiveSessionError, match="still live"):
+        runs.archive_run(tmp_path, run_dir)
+    assert run_dir.exists()
+    assert not (tmp_path / ".bmad-loop" / "archive").exists()
