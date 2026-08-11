@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import shutil
+import sys
 import tarfile
 import time
 from pathlib import Path
@@ -325,7 +326,10 @@ def project_tag(project: Path) -> str:
         return raw
     # safe="" so no separator can hide in a reserved character; the output is
     # unreserved ASCII plus "%", which is inert to both the row and field splits.
-    return _TAG_ENCODED_PREFIX + quote(raw, safe="")
+    # surrogateescape turns a non-UTF-8 filename byte back into that byte before
+    # percent-encoding it — without it this call raises UnicodeEncodeError on
+    # exactly the paths the encoding exists to carry.
+    return _TAG_ENCODED_PREFIX + quote(raw, safe="", errors="surrogateescape")
 
 
 def _survives_listing(tag: str) -> bool:
@@ -362,6 +366,15 @@ def _survives_listing(tag: str) -> bool:
     stay disjoint on purpose: delete the bounded split and the tab cases fail;
     delete the encoding and the separator cases fail. Neither covers the other.
 
+    Two ways to fail, and both are asked in the transport's own terms rather
+    than by enumerating characters. A separator splits the *row*, which the
+    framing puts beyond any receiving-side parse. A surrogateescaped byte — what
+    `os.fsdecode` leaves behind for a filename byte that is not valid in the
+    filesystem encoding, and legal in every POSIX name — cannot be encoded at
+    all, so the listing carries the original byte and the backend's strict
+    decode raises `UnicodeDecodeError` on the way back. Left raw, that turns an
+    attach or a stop into a crash rather than a mismatch.
+
     This selects `project_tag`'s spelling; it is not a question any comparison
     site asks. An earlier shape exposed it to callers so they could fall back to
     the untagged path when their own tag looked unsafe, but "stop comparing
@@ -369,7 +382,13 @@ def _survives_listing(tag: str) -> bool:
     reach by giving up the discriminator that keeps a stop from crossing project
     boundaries. Encoding the few paths that need it keeps the discriminator for
     every project instead."""
-    return tag.splitlines()[:1] == [tag]
+    if tag.splitlines()[:1] != [tag]:
+        return False
+    try:
+        tag.encode(sys.getfilesystemencoding())
+    except UnicodeEncodeError:
+        return False  # a surrogateescaped byte — no codec can carry it as text
+    return True
 
 
 def mux_sessions() -> list[str]:
