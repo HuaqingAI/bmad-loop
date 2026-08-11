@@ -54,7 +54,7 @@ vintage: environment injection goes out as `new-window -e KEY=VALUE`, which tmux
 3.0, so anything older fails loudly at window creation, while other forms — the `=`
 exact-match target prefix among them — are considerably older and parse fine. Do not take the
 oldest form the argv happens to accept as the floor either. Between whatever an old tmux still
-parses and 3.2 lies a range that runs without complaint and that nobody tests.
+parses and 3.2 lies a range that may run without complaint, and that nobody tests.
 psmux carries a separate version requirement of its own, for unrelated reasons — see below.
 The two floors are independent and neither implies the other.
 
