@@ -36,9 +36,9 @@ the ``client verbs: observed effect (#317)`` block. ``available()``
 additionally gates on the reported version: psmux releases up to 3.3.6 kill
 recycled PIDs during pane/session teardown without a process-identity check,
 which can take down an unrelated long-lived process mid-run. The psmux
-behaviors cited in this
-module were read from the psmux source at tag ``v3.3.7``. See
-:mod:`.multiplexer` for the contract.
+behaviors cited in this module were read from the psmux source at tag
+``v3.3.7``; the safe observable subset is probed in ``tests/test_psmux_live.py``.
+See :mod:`.multiplexer` for the contract.
 """
 
 from __future__ import annotations

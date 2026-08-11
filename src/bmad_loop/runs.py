@@ -301,8 +301,23 @@ def project_tag(project: Path) -> str:
     single source of normalization: both sides must route through this so symlinks
     and relative paths can't make a project look foreign to its own sessions.
 
-    Hashing the resolved path makes every value safe for psmux's control line;
-    16 hex characters are ample for one machine's project population (#419).
+    Hashing the resolved path makes every value safe by construction, on both
+    transports a tag has to cross. It clears psmux's control line (#419), whose
+    gate refuses any value the CLI->server hop would mangle — a UNC share whose
+    name holds a space is refused verbatim, and that refusal left the session
+    untagged, which is weak ownership twice over. It equally clears the listing
+    round trip (#518): a hex digest holds nothing `str.splitlines()` breaks on,
+    no tab, and no byte outside ASCII, so it can neither split a row nor fail the
+    backends' strict decode.
+
+    That subsumes the conditional percent-encoding this function briefly applied.
+    Encoding answered only the listing half, so a path the listing could carry but
+    the control line could not — the spaced UNC above — still went untagged. The
+    compatibility objection encoding was shaped around, that rewriting every tag
+    strands the ones already stored on live sessions and windows, is answered on
+    the read side instead, by `accepted_tags`.
+
+    16 hex characters are ample for one machine's project population.
     """
     return hashlib.sha256(os.fsencode(str(project.resolve()))).hexdigest()[:16]
 
@@ -314,6 +329,17 @@ def accepted_tags(project: Path) -> frozenset[str]:
     survive an upgrade; remove it once no path-tagged multiplexer state can remain.
     Returns the whole set rather than answering per tag so a read site resolves the
     project once per prune instead of once per session.
+
+    The two shapes cannot collide into false ownership: a legacy tag is an absolute
+    path, so it always holds a separator, while a digest is bare 16-hex.
+
+    Deliberately two members and not three — a tag spelled with the `%enc%` prefix,
+    from the window when this module encoded rather than hashed, is not accepted.
+    Only a path the listing could not carry was ever spelled that way (one holding
+    a line separator, or a byte invalid in the filesystem encoding), and that
+    spelling never reached a release. An unaccepted tag reads as foreign, which
+    skips the session rather than pruning it, so the edge is fail-safe and clears
+    itself on the next tag write.
     """
     return frozenset({project_tag(project), str(project.resolve())})
 

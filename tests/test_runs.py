@@ -624,6 +624,49 @@ def test_mux_sessions_no_server(monkeypatch):
     assert runs.mux_sessions() == []
 
 
+# Everything `str.splitlines()` breaks on. Spelled as escapes on purpose: the
+# literals are invisible in a diff, and a raw U+2028/U+2029 in a source file
+# makes every splitlines()-based tool disagree with Python's tokenizer about
+# which line anything after it is on.
+_LINE_SEPARATORS = [
+    ("LF", "\n"),
+    ("CR", "\r"),
+    ("CRLF", "\r\n"),
+    ("VT", "\v"),
+    ("FF", "\f"),
+    ("FS", "\x1c"),
+    ("GS", "\x1d"),
+    ("RS", "\x1e"),
+    ("NEL", "\x85"),
+    ("LS", "\u2028"),
+    ("PS", "\u2029"),
+]
+_SEP_VALUES = [s for _, s in _LINE_SEPARATORS]
+_SEP_IDS = [i for i, _ in _LINE_SEPARATORS]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="separators are illegal in win32 names")
+@pytest.mark.parametrize("separator", _SEP_VALUES, ids=_SEP_IDS)
+def test_project_tag_carries_a_path_the_listing_cannot_carry(tmp_path, separator):
+    """A listing splits on far more than LF, and every one of those is legal in a
+    POSIX directory name (#518).
+
+    The digest makes this true by construction instead of by encoding the few paths
+    that needed it, but the property is the same one and still needs pinning: return
+    a raw path from project_tag again and these ride the transport raw, arriving
+    truncated at every comparison site — a truncated tag is non-empty, so it reads as
+    *another* project's and the scan discards the project's own windows.
+
+    Trailing is not a separate case here as it was for the old predicate: a digest
+    has no separator anywhere, so there is no row-count blind spot left to probe.
+    Two projects must also stay distinguishable — a tag collapsing them would let a
+    prune cross the boundary the tag exists to hold."""
+    tag = runs.project_tag(tmp_path / f"my{separator}proj")
+    assert re.fullmatch("[0-9a-f]{16}", tag)
+    assert tag.splitlines()[:1] == [tag]  # one row, and the whole of it
+    assert tag != runs.project_tag(tmp_path / "theirproj")
+
+
 def test_prunable_sessions_partitions(tmp_path, monkeypatch):
     mine = runs.project_tag(tmp_path)
     # live run: real run dir with this process's pid, tagged ours

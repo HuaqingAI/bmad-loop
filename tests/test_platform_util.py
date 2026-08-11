@@ -316,6 +316,68 @@ def test_atomic_write_text_writes_through_a_symlink(tmp_path):
     assert real.read_text(encoding="utf-8") == "after"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_atomic_write_text_no_follow_replaces_the_link(tmp_path):
+    """The inverse contract, for a machine-minted file somewhere a less-trusted
+    writer can reach: honouring a planted link would aim the write at a path of
+    that writer's choosing, so the *name* is what gets replaced.
+
+    No preflight check is what makes it safe — `os.replace` does not dereference
+    its destination, so a link planted at any moment, including after a check
+    would have run, is clobbered rather than written through."""
+    real = tmp_path / "someone-elses-file"
+    real.write_text("before", encoding="utf-8")
+    link = tmp_path / "record"
+    link.symlink_to(real)
+
+    platform_util.atomic_write_text(link, "after", follow_symlinks=False)
+
+    assert not link.is_symlink()
+    assert link.read_text(encoding="utf-8") == "after"
+    assert real.read_text(encoding="utf-8") == "before"  # untouched
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+def test_atomic_write_text_no_follow_does_not_inherit_a_link_targets_mode(tmp_path):
+    """A name being replaced rather than updated carries nothing of whatever it
+    used to point at — inheriting the target's mode would let a planted link
+    choose the new record's permissions."""
+    real = tmp_path / "someone-elses-file"
+    real.write_text("before", encoding="utf-8")
+    real.chmod(0o666)
+    link = tmp_path / "record"
+    link.symlink_to(real)
+
+    platform_util.atomic_write_text(link, "after", follow_symlinks=False)
+
+    assert stat.S_IMODE(link.stat().st_mode) == 0o600  # mkstemp's private default
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+def test_atomic_write_text_no_follow_does_not_inherit_a_plain_files_mode(tmp_path):
+    """No-follow inherits nothing, and takes no probe to decide it — the sibling
+    above covers the link; this covers the plain file, which is the case a probe
+    would have said yes to.
+
+    Inheriting here needs a shape check and then a `copymode`, and `copymode`
+    re-resolves: a writer who plants a link in that gap chooses the new record's
+    permissions. The probe is what makes that gap exist, so there is none. 0o640,
+    for the reason the follow-mode pins give — `mkstemp` already arrives at 0600,
+    so only a mode it does NOT arrive with can tell inheritance from its absence.
+
+    The pairing is the ablation: restore the probe-and-copy and this reddens
+    while the link sibling stays green, so it bites on inheritance itself rather
+    than on anything the no-follow path does incidentally."""
+    target = tmp_path / "record"
+    target.write_text("before", encoding="utf-8")
+    target.chmod(0o640)
+
+    platform_util.atomic_write_text(target, "after", follow_symlinks=False)
+
+    assert target.read_text(encoding="utf-8") == "after"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
 def test_atomic_write_text_preserves_extended_attributes(tmp_path):
     """`os.replace` swaps a fresh inode into place, so anything carried by the old
     inode rather than by its name is silently reset — xattrs included, which on a

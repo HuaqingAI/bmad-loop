@@ -1621,10 +1621,16 @@ def test_psmux_detach_outside_a_pane_is_false(monkeypatch):
 
 
 def test_psmux_switch_reports_the_drop(monkeypatch):
-    calls = _client_fake(monkeypatch, attached=["1", "0"])
-    assert PsmuxMultiplexer().switch_client("ctl:%9") is True
+    # `last_fallback=True` is what gives the last assertion teeth: with the
+    # default False the `-l` leg is unreachable by construction, so "no fallback
+    # when -t moved it" would hold even with the early return gone. Counts for
+    # two probes for the same reason — a second one must reach the assertion
+    # rather than run the fixture dry.
+    calls = _client_fake(monkeypatch, attached=["1", "0", "1", "0"])
+    assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is True
     assert ["psmux", "switch-client", "-t", "ctl:%9"] in calls
-    assert not any(c[2:] == ["-l"] for c in calls)  # no fallback when -t moved it
+    # no fallback when -t moved it
+    assert not any(c[1:3] == ["switch-client", "-l"] for c in calls)
 
 
 def test_psmux_switch_falls_back_then_reports_the_drop(monkeypatch):
@@ -1644,6 +1650,8 @@ def test_psmux_switch_is_false_while_the_leg_is_inert(monkeypatch):
 
 
 def test_psmux_switch_without_fallback_does_not_attempt_it(monkeypatch):
-    calls = _client_fake(monkeypatch, attached=["1", "1"])
+    # Scripted for two probes though one is expected: dropping the `last_fallback`
+    # conjunct must fail this on its assertion, not on the counts running dry.
+    calls = _client_fake(monkeypatch, attached=["1", "1", "1", "1"])
     assert PsmuxMultiplexer().switch_client("ctl:%9") is False
     assert not any(c[1:3] == ["switch-client", "-l"] for c in calls)

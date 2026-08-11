@@ -13,11 +13,14 @@ from __future__ import annotations
 
 import hashlib
 import re
+from bisect import bisect_right
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date as calendar_date
 from pathlib import Path
 
+from . import sprintstatus
+from .fences import fenced_spans
 from .platform_util import atomic_write_text
 
 HEADING_RE = re.compile(r"^### (DW-\d+): (.+?)\s*$", re.MULTILINE)
@@ -33,6 +36,74 @@ ANY_HEADING_RE = re.compile(r"^#{1,6} ", re.MULTILINE)
 _FLAT_SOURCE_BODY = r"source_spec:[ \t]"
 FLAT_ENTRY_RE = re.compile(rf"^[-*][ \t]+{_FLAT_SOURCE_BODY}", re.IGNORECASE | re.MULTILINE)
 STATUS_RE = re.compile(r"^status:[ \t]*(.*)$", re.MULTILINE)
+# The mechanical half of a hard gate. An entry could always *say* it blocked a
+# story — `HARD GATE: must land before 3-2` in the reason line — and saying it
+# stopped nothing: the queue picked the story up anyway, and the gate surfaced
+# afterwards in the diff of work built on a leg nobody had wired. `gate:` names
+# the blocked story keys in a form a check can match, so the claim can refuse.
+# Parsed exactly like `status:`: a field line, read inside `parse_ledger`'s
+# canonical span, so a line under a flat-append bullet belongs to that block and
+# not to the entry above it.
+GATE_RE = re.compile(r"^gate:[ \t]*(.*)$", re.MULTILINE)
+# A story key as either queue spells one: a sprint key (`3-2-invite-link`), the
+# stories-mode id it starts with (`3-2`), or a bare slug. Whitespace and
+# separators are deliberately out — a token nothing can match is the same silent
+# no-op the field exists to end, so it is surfaced rather than dropped.
+GATE_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+# The second half of "can this token gate anything", and a different miss from the
+# one above: `GATE_TOKEN_RE` rejects the spellings a *line* cannot carry (a space,
+# a bare separator), this rejects the ones no *key* can carry. `gate: 3.2` passes
+# the first and can never match `gates_story` against any legal key, so it used to
+# report a green `ok` while gating nothing — the field's own silent no-op, one
+# keystroke away from the shape that works.
+#
+# Two arms, because BMAD spells a story key two ways and they are NOT
+# interchangeable. A stories-mode id is alphanumeric segments joined by single
+# dashes (`_STORIES_ID_RE`), so `3.2` and `3_2` are out. A sprint key's slug is
+# unconstrained (`sprintstatus.STORY_RE`'s trailing group), so `3-2-foo.bar` and
+# `3-2-a_b` are LEGAL keys that gate correctly — which is why this is a
+# whole-token shape test and not a ban on `.`/`_`. Only those characters in the
+# *number* prefix are unmatchable; banning them outright would refuse real gates.
+#
+# Sound in the direction that matters: a token matching either arm is itself a
+# legal key, so a story it could gate can exist. `gates_story`'s prefix and split
+# arms only ever extend a key rightward past a `-`, and every such prefix of a
+# legal key matches one of these arms too.
+#
+# `sprintstatus` is imported for its regex; `stories.ID_RE` is copied rather than
+# imported because `stories` imports *this* module (a cycle). The copy is pinned
+# to the original by a drift test rather than to a comment.
+_STORIES_ID_RE = re.compile(r"^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$")
+# The tokens `gates_story`'s split arm may fire for: a bare `<epic>-<story>`, both
+# numeric. `sprintstatus.STORY_RE` attaches the split letter straight after the
+# story *number*, so that is the only token a split can extend. "Ends in a digit"
+# is a weaker test that reads the same shape into a slug — `3-2-v2` would take the
+# arm and refuse `3-2-v2a-followup`, a different and legal key.
+_SPLITTABLE_TOKEN_RE = re.compile(r"^\d+-\d+$")
+# A `gate:` line the strict field pattern above will never see. `GATE_RE` is
+# anchored to a lowercase `gate:` in column 0, exactly like `status:`, and that
+# strictness fails in opposite directions for the two fields: a missed `status:`
+# leaves an entry unresolved, which now gates conservatively, while a missed
+# `gate:` leaves no gate at all. `Gate: 3-2` and an indented `  gate: 3-2` are
+# therefore surfaced as unenforceable rather than silently absent — and surfaced
+# rather than *accepted*, because accepting an indented line would read a fenced
+# example inside an entry as a live gate and refuse a story nobody meant to block.
+_GATE_NEAR_RE = re.compile(r"^[ \t]*gate[ \t]*:", re.IGNORECASE | re.MULTILINE)
+# The prose convention `gate:` replaces, matched anywhere on a line rather than
+# at its start: real ledgers hard-wrap their `reason:` prose, so the declaration
+# routinely lands mid-line and a line-anchored pattern misses exactly the entries
+# that have one. The quote lookbehind is what keeps that from over-firing — an
+# entry *citing* the phrase (`names a "HARD GATE: ..."`) is discussion, not a
+# declaration — and the colon does the rest of the work, since a sentence about
+# "this HARD GATE is textual only" never reaches the pattern at all.
+# The class covers the backtick and the curly quotes as well as the ASCII pair:
+# a ledger is markdown, so `HARD GATE:` is the citation form an author reaches for
+# first, and an LLM-written entry curls its quotes. Missing them made the warning
+# fire on entries documenting the convention — including this repo's own docs.
+# The lookbehind only reaches an *inline* citation, though; the block form of the
+# same quoting is a fence, and no character precedes a line inside one. Callers
+# read this through `declares_prose_gate`, which masks those out.
+HARD_GATE_PROSE_RE = re.compile(r"""(?<!["'`«“”‘’])HARD GATE:""")
 # Everything `str.splitlines()` splits on, not `\n` alone (#305). The writers
 # below interpolate their arguments into a line-oriented file, so a break in a
 # value injects ledger lines. The C1/Unicode members are load-bearing rather
@@ -56,22 +127,139 @@ class DWEntry:
     status: str  # the status field value, "" when the line is missing
     body: str  # full entry text including the heading
     span: tuple[int, int]  # char offsets of the entry in the ledger text
+    # Body-relative offsets of the line `status` was read from; None when the
+    # entry has no status line. Carried rather than re-derived because the reader
+    # picks the status with a fence-aware lookup at file scope, and a writer that
+    # ran `STATUS_RE.search(body)` again would pick the *first* raw match instead.
+    # Those differ exactly when an entry quotes an example above its live status:
+    # the writer rewrote the quoted line, the reader kept reporting the real
+    # `status: open`, and the close reported success while the entry — and any
+    # `gate:` it carries — stayed open forever. No default: `parse_ledger` is the
+    # only constructor, and a fallback here would silently restore that split.
+    status_span: tuple[int, int] | None
+    # The whole-file fence index the entry was carved with, so the gate scans can
+    # ask the question the heading and status reads already ask at file scope. A
+    # body slice cannot see a fence opened above the heading, and the two views
+    # disagree: under a stray unclosed ``` above the heading, whole-file scope
+    # treats the opener as text (so this entry EXISTS) while the body sees a later
+    # matched `~~~` pair as a real fence and reads a live `gate:` as an example.
+    # That direction loses a gate in silence, which is what the field exists to
+    # end. No default, for `status_span`'s reason: the fallback IS the bug.
+    examples: _Examples
 
     @property
     def open(self) -> bool:
         return self.status.split()[0] == "open" if self.status else False
 
+    @property
+    def done(self) -> bool:
+        """Whether the entry has landed.
+
+        Deliberately NOT ``not open``. A status line the format does not
+        understand — ``status: opne``, or no status line at all — is neither open
+        nor done, and the readers that ask want *opposite* answers about it:
+        :func:`open_ids` drops it (it may already be finished), while a gate on it
+        has to hold (it may not be). Deriving one from the other is what let
+        ``gate:`` fail open on a one-character typo — the entry read as closed, so
+        the gate was skipped and ``validate`` reported an all-clear naming it.
+        """
+        return self.status.split()[0] == "done" if self.status else False
+
+
+@dataclass(frozen=True)
+class _Examples:
+    """The ledger's fenced worked examples, indexed for repeated offset queries.
+
+    ``fenced_spans`` returns its ranges in increasing order and non-overlapping (a
+    fence cannot open inside an open one), so a query is a binary search for the
+    last span starting at or before the offset. Kept as an index rather than a bare
+    list because both scales are in play at once: a parse asks once per heading and
+    several times per entry, so a linear membership test would leave the parse
+    quadratic whenever a ledger's examples grow with its entries.
+    """
+
+    spans: tuple[tuple[int, int], ...]
+    starts: tuple[int, ...]
+
+    def covers(self, offset: int) -> bool:
+        i = bisect_right(self.starts, offset)
+        return i > 0 and offset < self.spans[i - 1][1]
+
+
+def _example_spans(text: str) -> _Examples:
+    """The ledger's fenced worked examples, as offset ranges.
+
+    Read at WHOLE-FILE scope, which is the whole point. A fence that opens above
+    a quoted ``### DW-n:`` heading is stranded in the *previous* entry once spans
+    are carved, so an entry-local query reads the example as live — a phantom
+    entry whose ``gate:`` refuses a story nobody deferred. `deferred-work-format.md`
+    ships exactly that shape (a complete entry inside a ```markdown fence), so
+    quoting it into a ledger is the expected trigger, not a corner case.
+
+    ``unclosed_hides_rest=False`` repeats the answer `gates()` gives one level
+    down, and here for a stronger reason: under ``True`` a single stray opener
+    would erase every heading below it, dropping real open work out of
+    ``open_ids()`` in silence. A phantom entry from an unterminated fence is
+    today's behaviour and is visible; a vanished ledger is neither.
+
+    Walked once per :func:`parse_ledger` and passed down to the offset checks. The
+    walk covers the whole file, so recomputing it per offset made the parse
+    quadratic in the number of entries — and `Engine._refuse_gated_story` re-parses
+    before every story dispatch, so a mature ledger paid it on the dispatch path.
+    """
+    spans = tuple(fenced_spans(text, unclosed_hides_rest=False))
+    return _Examples(spans=spans, starts=tuple(s for s, _ in spans))
+
+
+def _example(examples: _Examples, offset: int) -> bool:
+    """Whether ``offset`` sits in a fenced worked example rather than the ledger.
+
+    Takes the index rather than the text: the answer must come from the same
+    whole-file walk for every offset in one parse, and a signature that re-derived
+    it per call is what made that expensive enough to matter.
+    """
+    return examples.covers(offset)
+
+
+def _unfenced(
+    pattern: re.Pattern[str],
+    text: str,
+    start: int,
+    end: int,
+    examples: _Examples,
+) -> re.Match[str] | None:
+    """First match of ``pattern`` within ``text[start:end]`` that is not quoted.
+
+    Not `search()` plus a check: the first match may be the quoted one, and the
+    real boundary sits after it. Bounded by ``endpos`` so a match beyond the span
+    cannot claim it, while ``examples`` still describes fence state from offset 0.
+    """
+    for m in pattern.finditer(text, start, end):
+        if not _example(examples, m.start()):
+            return m
+    return None
+
 
 def parse_ledger(text: str) -> list[DWEntry]:
     """Extract DW entries; non-conforming sections are skipped, an entry
-    without a status line parses with status "" (not open)."""
+    without a status line parses with status "" (not open).
+
+    Fenced matches are skipped by every scan below, not just the heading one: a
+    heading or flat bullet quoted inside an example must not start an entry, end
+    one, or bound a block out of one. Filtering only the headings would trade the
+    phantom entry for a truncation — a fenced ``## heading`` would still cut a
+    real entry short at its own boundary, and a `gate:` line below the example
+    would fall outside the span and stop gating, which is the failure this field
+    exists to end.
+    """
     entries = []
-    headings = list(HEADING_RE.finditer(text))
+    examples = _example_spans(text)
+    headings = [m for m in HEADING_RE.finditer(text) if not _example(examples, m.start())]
     for i, m in enumerate(headings):
         end = headings[i + 1].start() if i + 1 < len(headings) else len(text)
         # an entry also ends at any intervening heading (e.g. a "## Deferred
         # from:" section header between freeform and DW-format content)
-        other = ANY_HEADING_RE.search(text, m.end(), end)
+        other = _unfenced(ANY_HEADING_RE, text, m.end(), end, examples)
         if other:
             end = other.start()
         # ...and at a flat appender block, which belongs to no canonical entry
@@ -82,12 +270,18 @@ def parse_ledger(text: str) -> list[DWEntry]:
         # done (open_ids() drops it, classify() calls it malformed), which trades
         # one lost flat block for one lost tracked entry. An entry with no status
         # line has nothing to protect, so the whole span is fair game.
-        status_m = STATUS_RE.search(text, m.end(), end)
-        flat = FLAT_ENTRY_RE.search(text, status_m.end() if status_m else m.end(), end)
+        status_m = _unfenced(STATUS_RE, text, m.end(), end, examples)
+        flat = _unfenced(
+            FLAT_ENTRY_RE, text, status_m.end() if status_m else m.end(), end, examples
+        )
         if flat:
             end = flat.start()
         body = text[m.start() : end]
-        status_m = STATUS_RE.search(body)
+        # Re-read rather than reuse the probe above: `end` may have moved, and the
+        # status must be the one inside the final span. Searched over `text` at
+        # absolute offsets because `_example` reads fence state from the top of the
+        # file — a body slice cannot see an opener that sits above the heading.
+        status_m = _unfenced(STATUS_RE, text, m.start(), end, examples)
         entries.append(
             DWEntry(
                 id=m.group(1),
@@ -95,6 +289,10 @@ def parse_ledger(text: str) -> list[DWEntry]:
                 status=status_m.group(1).strip() if status_m else "",
                 body=body,
                 span=(m.start(), end),
+                status_span=(
+                    (status_m.start() - m.start(), status_m.end() - m.start()) if status_m else None
+                ),
+                examples=examples,
             )
         )
     return entries
@@ -102,6 +300,184 @@ def parse_ledger(text: str) -> list[DWEntry]:
 
 def open_ids(text: str) -> set[str]:
     return {e.id for e in parse_ledger(text) if e.open}
+
+
+@dataclass(frozen=True)
+class EntryGates:
+    """One entry's ``gate:`` declaration, split by what a check can act on.
+
+    Every shape that is not an enforceable token is reported by ``validate``,
+    because none of them is a *weaker* gate than a valid one — each is the prose
+    gate again wearing the field's clothes, and silence about it is what let the
+    story run. ``lines`` is what distinguishes "declared nothing usable" from
+    "declared nothing at all": an entry with no ``gate:`` line has made no claim,
+    while ``gate:`` with an empty value has made one and inertly.
+
+    ``empty`` counts those inert lines individually rather than folding them into
+    an entry-wide verdict, because the two coexist: ``gate: 3-2`` followed by a
+    bare ``gate:`` has both a gate in force and a line that names nothing, and an
+    aggregate answer can only report one of them. Reporting the tokens and
+    swallowing the empty line is the worse half to lose — the operator who wrote
+    it believes a second story is held back.
+    """
+
+    tokens: tuple[str, ...] = ()
+    malformed: tuple[str, ...] = ()
+    lines: int = 0
+    empty: int = 0
+    near_miss: int = 0
+
+    @property
+    def inert(self) -> bool:
+        """Every ``gate:`` line named nothing — ``gate:`` or ``gate: ,`` and no others."""
+        return self.lines > 0 and not self.tokens and not self.malformed
+
+
+def _quoted(entry: DWEntry, offset: int) -> bool:
+    """Whether a BODY-relative ``offset`` sits in a fenced example.
+
+    The single rule every gate scan in this module reads through, so that a fence
+    means the same thing to all of them: an entry documenting the field quotes it,
+    and a quoted example is not a declaration. Sharing it is the point — the prose
+    scan was left on the raw body once, on the reasoning that a warning is cheap
+    and its quote lookbehind was guard enough. It is not: that lookbehind reaches
+    an inline citation only, so an entry explaining the old convention in a fenced
+    block was told to convert a gate it was not declaring.
+
+    Asked at FILE scope, like the heading and status reads in :func:`parse_ledger`
+    and for the same reason: a body slice cannot see a fence opened above the
+    heading, so the two views can disagree about the same line. They disagree in
+    the direction that matters — a stray unclosed ``` above the heading leaves the
+    entry standing at file scope while the body reads a later matched ``~~~`` pair
+    as a real fence, masking a live ``gate:`` into an example. A gate lost in
+    silence is the failure this field exists to end; a spurious refusal in an entry
+    whose markdown is already malformed is the cheaper wrong answer.
+    """
+    return entry.examples.covers(entry.span[0] + offset)
+
+
+def declares_prose_gate(entry: DWEntry) -> bool:
+    """Whether the entry declares a gate in the pre-``gate:`` prose convention.
+
+    :data:`HARD_GATE_PROSE_RE` filtered the way every other gate scan here is
+    filtered. Lives beside them rather than at the caller so the fence rule has
+    one implementation: ``validate`` is the only reader today, and a second one
+    reaching for the bare pattern would reintroduce exactly the half-applied rule
+    this replaced.
+    """
+    return any(not _quoted(entry, m.start()) for m in HARD_GATE_PROSE_RE.finditer(entry.body))
+
+
+def gates(entry: DWEntry) -> EntryGates:
+    """Every ``gate:`` token in one entry's canonical span, order-preserving.
+
+    Multiple ``gate:`` lines union: an entry blocking three stories may list them
+    on one line or on three, and to a line-oriented file neither spelling is the
+    wrong one. Within a line the separator is a comma, and only a comma — a
+    space-separated ``gate: 3-2 3-3`` lands in ``malformed`` rather than being
+    read leniently, so the operator is told the spelling gated nothing instead of
+    finding out from a story that ran.
+
+    Duplicates collapse (an id repeated across lines is one claim, not two);
+    empty items drop, so a trailing separator is not a token — but the *line* is
+    still counted, which is how an all-empty declaration stays reportable.
+
+    ``near_miss`` counts the lines this function deliberately did NOT read as a
+    declaration: a `gate:` the strict field anchor misses (see
+    :data:`_GATE_NEAR_RE`). They are counted rather than parsed so the operator is
+    told the spelling gated nothing — the same trade the space-separated token
+    makes, one level up.
+    """
+    tokens: list[str] = []
+    malformed: list[str] = []
+    lines = 0
+    empty = 0
+
+    # Both scans below skip fenced matches: an entry documenting this field quotes
+    # it, and a quoted example is not a declaration — a fenced `gate: 3-2` sits in
+    # column 0, right where the anchor looks, and the answer here is a *refusal*.
+    for m in GATE_RE.finditer(entry.body):
+        if _quoted(entry, m.start()):
+            continue
+        lines += 1
+        named = False
+        for raw in m.group(1).split(","):
+            token = raw.strip()
+            if not token:
+                continue
+            named = True
+            bucket = tokens if _matchable_token(token) else malformed
+            if token not in bucket:
+                bucket.append(token)
+        if not named:
+            empty += 1
+    near_miss = sum(
+        # `^` puts every match at a line start, so this asks whether the same line
+        # would have satisfied `GATE_RE` — i.e. whether it is the canonical spelling
+        # already counted above — without re-running the anchor against a slice.
+        not entry.body.startswith("gate:", m.start())
+        for m in _GATE_NEAR_RE.finditer(entry.body)
+        if not _quoted(entry, m.start())
+    )
+    return EntryGates(
+        tokens=tuple(tokens),
+        malformed=tuple(malformed),
+        lines=lines,
+        empty=empty,
+        near_miss=near_miss,
+    )
+
+
+def _matchable_token(token: str) -> bool:
+    """Whether ``token`` could gate any legal story key — the test that decides
+    :attr:`EntryGates.tokens` vs :attr:`EntryGates.malformed`.
+
+    Both halves are required and neither implies the other: ``GATE_TOKEN_RE``
+    alone admits ``3.2``, which nothing can match, and the key shapes alone admit
+    ``3-2 3-3`` via the sprint slug, which is one token pretending to be two.
+    """
+    if not GATE_TOKEN_RE.match(token):
+        return False
+    return bool(_STORIES_ID_RE.match(token) or sprintstatus.STORY_RE.match(token))
+
+
+def gates_story(token: str, story_key: str) -> bool:
+    """Whether ``token`` gates ``story_key``: equal, or its prefix at a key boundary.
+
+    The prefix arm is what lets one token reach both queues — stories mode keys on
+    the bare id (``3-2``) while sprint mode keys on the full ``3-2-invite-link``,
+    and an author gating "story 3-2" means the story, not the spelling. The
+    boundary is required rather than a bare ``startswith`` so ``3-2`` cannot sweep
+    in its numeric neighbours: ``3-20-later`` is a different story.
+
+    Two boundaries count, because BMAD spells a story key two ways. The plain one
+    is ``-``. The other is a **split**: ``sprintstatus.STORY_RE`` lets an oversized
+    story become ``3-2a-...`` / ``3-2b-...`` at breakdown time, and a token that
+    only knew ``-`` would lose its gate the moment the gated story was split —
+    silently, which is the worst thing a gate can do. One lowercase ASCII letter
+    followed by ``-`` is therefore also a boundary. Exactly one letter, and the
+    ``-`` after it is required, so ``3-2ab-x`` and a bare ``3-2a`` are not swept in.
+
+    The split arm applies only to a token that *is* a bare ``<epic>-<story>``,
+    because that is the only place a split letter can attach: ``STORY_RE`` puts it
+    straight after the story *number*. Without that guard the arm reads any
+    trailing letter as a split and gates a story nobody named — ``stories.ID_RE``
+    admits word ids, so ``gate: auth`` refused ``authz-login``, and a hard failure
+    on an unrelated story is the one way this check can be worse than the prose it
+    replaced. "Ends in a digit" is the same guard written too loosely: the digit
+    can belong to a *slug*, so ``gate: 3-2-v2`` took the arm and refused
+    ``3-2-v2a-followup`` — a different, legal key — and ``gate: 3`` refused the
+    distinct stories id ``3a-task``.
+    """
+    if story_key == token or story_key.startswith(f"{token}-"):
+        return True
+    # The `startswith` guard is load-bearing, not redundant with the slice below:
+    # `story_key[len(token):]` says nothing about what preceded it, so without it
+    # `3-2` would gate `9-9a-x` on the tail alone.
+    if not story_key.startswith(token) or not _SPLITTABLE_TOKEN_RE.match(token):
+        return False
+    rest = story_key[len(token) :]
+    return len(rest) >= 2 and "a" <= rest[0] <= "z" and rest[1] == "-"
 
 
 def parse_declaration(raw: object) -> tuple[tuple[str, ...], str | None]:
@@ -210,9 +586,8 @@ def _find_entry(text: str, dw_id: str) -> DWEntry | None:
 def _insert_after_status(text: str, entry: DWEntry, line: str) -> str:
     """Insert a field line right after the entry's status line (or at the end
     of the entry when no status line exists)."""
-    status_m = STATUS_RE.search(entry.body)
-    if status_m:
-        pos = entry.span[0] + status_m.end()
+    if entry.status_span:
+        pos = entry.span[0] + entry.status_span[1]
         return text[:pos] + "\n" + line + text[pos:]
     insert_at = entry.span[0] + len(entry.body.rstrip())
     return text[:insert_at] + "\n" + line + text[insert_at:]
@@ -330,11 +705,10 @@ def _apply_done(
     entry = _find_entry(text, dw_id)
     if entry is None or not entry.open:
         return None
-    status_m = STATUS_RE.search(entry.body)
-    assert status_m is not None  # open implies a status line
-    start = entry.span[0] + status_m.start()
-    end = entry.span[0] + status_m.end()
-    previous_status_line = status_m.group(0)
+    assert entry.status_span is not None  # open implies a status line
+    start = entry.span[0] + entry.status_span[0]
+    end = entry.span[0] + entry.status_span[1]
+    previous_status_line = entry.body[entry.status_span[0] : entry.status_span[1]]
     if undo_owner is not None and LINE_BREAK_RE.search(previous_status_line):
         # An undo marker must never preserve a value that becomes more than one line
         # under the ledger readers' shared splitlines semantics. Standard closes
@@ -453,24 +827,24 @@ def mark_open(path: Path, dw_id: str, note: str, operation_id: str) -> bool:
     entry = _find_entry(text, dw_id)
     if entry is None or entry.open:
         return False
-    status_m = STATUS_RE.search(entry.body)
-    if status_m is None:
+    if entry.status_span is None:
         # parse_ledger deliberately tolerates status-less entries. This primitive
         # is later called from _defer, where an AttributeError would crash the run
         # instead of completing the deferral.
         return False
+    status_line = entry.body[entry.status_span[0] : entry.status_span[1]]
     try:
         _require_canonical_status(entry.status)
     except ValueError:
         # Only a canonical status written by mark_done is eligible for undo.
         # Preserve malformed or human-authored statuses for validation/reporting.
         return False
-    res_m = _MARK_DONE_TAIL_RE.match(entry.body, status_m.end())
+    res_m = _MARK_DONE_TAIL_RE.match(entry.body, entry.status_span[1])
     if res_m is None:
         return False
     if res_m.group(1).strip() != _one_line(note).strip() or res_m.group(2) != undo_owner:
         return False
-    if status_m.group(0) != f"status: done {res_m.group(3)}":
+    if status_line != f"status: done {res_m.group(3)}":
         return False
     try:
         previous_status_line = bytes.fromhex(res_m.group(4)).decode("utf-8")
@@ -482,7 +856,7 @@ def mark_open(path: Path, dw_id: str, note: str, operation_id: str) -> bool:
     previous_status = previous_status_m.group(1).strip() if previous_status_m else ""
     if not previous_status or previous_status.split()[0] != "open":
         return False
-    start = entry.span[0] + status_m.start()
+    start = entry.span[0] + entry.status_span[0]
     end = entry.span[0] + res_m.end()
     atomic_write_text(path, text[:start] + previous_status_line + text[end:])
     return True
@@ -799,11 +1173,23 @@ def _heading_entry(struck: bool, hid: str, rest: str, body: str, section: str) -
 
 
 def parse_legacy(text: str) -> list[LegacyEntry]:
-    """Extract legacy (non-DW) deferred items. Canonical DW entries are
-    masked out first, so mixed ledgers parse both ways without overlap."""
+    """Extract legacy (non-DW) deferred items. Canonical DW entries and fenced
+    examples are masked out first, so mixed ledgers parse both ways without
+    overlap and a quoted example contributes nothing to either reading.
+
+    The fenced half is not symmetry for its own sake. `parse_ledger` used to hand
+    a quoted example over as a phantom canonical entry, whose span masked the
+    example here by accident; once it stopped doing that, the same quotation
+    surfaced on this side instead — a bullet or `### DW-n:` heading inside a fence
+    read as a legacy finding (#514).
+    """
     masked = text
-    for e in parse_ledger(text):
-        s, t = e.span
+    # `unclosed_hides_rest=False` for the reason the canonical side uses it: one
+    # stray opener must not blank every legacy finding below it out of view. The
+    # delimiter lines survive as a lone backtick or tilde plus spaces, which no
+    # pattern below can start an item on — masking them too made no test disagree.
+    spans = [e.span for e in parse_ledger(text)] + fenced_spans(text, unclosed_hides_rest=False)
+    for s, t in spans:
         masked = masked[:s] + re.sub(r"[^\n]", " ", masked[s:t]) + masked[t:]
 
     found: list[tuple[dict, tuple[int, int]]] = []

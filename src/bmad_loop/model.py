@@ -52,6 +52,9 @@ TERMINAL_PHASES = frozenset({Phase.DONE, Phase.DEFERRED, Phase.ESCALATED, Phase.
 PAUSE_SPEC_APPROVAL = "spec-approval"
 PAUSE_EPIC_BOUNDARY = "epic-boundary"
 PAUSE_ESCALATION = "escalation"
+# Raised by Engine._refuse_gated_story: the picked story is named by the `gate:`
+# line of a deferred-work entry that has not landed. Produced before the story is
+# recorded in state.tasks, so a resume re-picks it and re-reads the ledger.
 PAUSE_STORY_GATE = "story-gate"
 # stories-mode HITL checkpoints (independent per story). PLAN fires after a
 # spec_checkpoint story's plan-halt leg (ready-for-dev, awaiting human plan

@@ -14,6 +14,22 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Added
 
+- **Add raw psmux premise probes (#488).** The zero-token Windows live gate now flags droppable
+  workarounds, and ablation repairs two vacuous backend assertions.
+
+- **A deferred-work entry can block a story: `gate:`.** An entry that must land before specific
+  stories run could only say so in prose (`HARD GATE: must land before 3-2`), and prose stopped
+  nothing — `run` drove the story anyway. A `gate: 3-2, 3-3` line names the blocked story keys, and
+  it is enforced on both sides: `bmad-loop validate` fails (`deferred.hard-gate`) for every
+  actionable story a token matches, in both queue modes, and `run` pauses (`story-gate`) rather
+  than dispatch a gated story — so the refusal no longer depends on remembering to run the
+  preflight. The pause happens before the story is recorded, so closing the entry and resuming
+  runs it. Sweeps are exempt: they are what closes the gating entry. The only deferred check that
+  gates rather than advises; cleared by closing the entry or dropping the token. A gate that can
+  enforce nothing — an unusable token, an empty `gate:` line, a `gate:` not written lowercase at
+  the start of a line, or a prose-only `HARD GATE:` — warns instead
+  (`deferred.hard-gate-unstructured`). Silent on a ledger that gates nothing, as before.
+
 - **Deferred review findings are harvested from spec frontmatter (#433).** BMAD-METHOD#2640 moved
   `defer`-triaged findings into the spec's unfiled `deferred:` list. A successful dev, review,
   repair or review-timeout-salvage pass now files each as `### DW-<n>` (`spec-deferrals-harvested`),
@@ -103,6 +119,12 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Changed
 
+- **An unreadable deferred-work ledger fails `validate` instead of warning
+  (`deferred.ledger-unreadable`).** The hard gate rides on the same bytes, so a warning exited 0
+  with the gate never evaluated — a fail-open on the one deferred check that refuses, and one that
+  cannot be narrowed by asking whether the project uses gates, because the file that would answer
+  is the unreadable one. `run` pauses on the same fault, so preflight and dispatch now agree.
+
 - **Every spec-frontmatter status read goes through `status_of` (#358 follow-up).** Five inline
   status reads remained in the engine and the generic adapter, each reading a blank `status:` as the
   token `none` — the defect #358 fixed at the shared reader. Three were neutral; the pair that was
@@ -160,9 +182,42 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
-- **Keep psmux sessions and ctl windows on spaced UNC project paths tagged (#419).** Store project ownership as a
-  transportable digest and accept legacy path tags during pruning, preventing orphan leaks and
-  cross-project run-id collisions.
+- **A tab in the project path no longer truncates the project tag a window listing carries.**
+  The multiplexer listing is tab-delimited and the tag holds a resolved filesystem path, where a tab
+  is a legal byte — so the parse split one row into extra fields and dropped the tail, leaving a
+  truncated tag that reads as another project's. The prune scan then skipped the project's own
+  parked control windows. The last requested field now keeps its delimiters.
+
+- **A project path the multiplexer cannot carry no longer strands the scans over it (#419).**
+  Ownership was tagged with the resolved path, and two different transports mangled it. psmux's
+  control line refuses any value its CLI->server hop would corrupt, and a UNC share whose name holds
+  a space is one — so the write was refused and the session stayed untagged, which is weak ownership
+  twice over: it dies with the run dir, so an orphaned session leaked once `clean` removed the
+  directory, and it proves ownership by run-id collision on disk rather than by identity, so a
+  reused `--run-id` let one project prune another's session. Window listings are one row per window,
+  split with `str.splitlines()` and decoded strictly, and two kinds of byte defeat that while being
+  perfectly legal in a POSIX path: a line separator (LF, CR, VT, FF, FS, GS, RS, NEL, U+2028,
+  U+2029) put the tag on a row of its own, so it never matched and the prune scan skipped the
+  project's own parked windows and sessions; and a byte invalid in the filesystem encoding arrived
+  surrogate-escaped and made the listing read raise `UnicodeDecodeError` outright. The tag is now a
+  16-hex digest of the resolved path, which clears both transports by construction. Pruning also
+  accepts the legacy path-shaped tag, so sessions and control windows that survive an upgrade keep
+  proving ownership. Reading a legacy raw tag stored by an older version is the decode half, tracked
+  in #380.
+
+- **A run id that is a suffix of another no longer resolves to the neighbour's control window.**
+  `--run-id` is caller-supplied and may contain `-`, so `run-other-RID` satisfied the lookup for
+  `RID` — and sorted ahead of it, so `x` could kill the neighbouring run's live orchestrator.
+  Window names are parsed and the run id compared whole, as the prune scan already did.
+
+- **Attach, return-stamp and kill follow the run's live control window, not an older one (#482).**
+  `<kind>-<run_id>` window names are not unique, so the lookup answered the first match — `a`, the
+  return stamp and `x` all landed on a parked run's dead window while the live one ran on. Each
+  launch records the window id it minted and the lookup prefers it while the listing still shows it
+  under this run id; with no record the answer is unchanged, and a resume whose id was not captured
+  warns rather than reporting plain success. **Adapter authors:** the re-prove pairs
+  `new_parked_window`'s id with the `window_id` column of `list_windows`, which the seam previously
+  left free to diverge — a backend where they differ degrades to the by-name resolve.
 
 - **A native-Windows install driven from a WSL shell now says so (#332).** WSL appends the Windows
   `PATH` to its own, so a bash prompt can reach a Windows-installed `bmad-loop`: that interpreter

@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from . import deferredwork
+from .fences import fenced as _fenced
 from .frontmatter import _edit_frontmatter_block, status_of
 from .platform_util import atomic_replace
 from .verify import DEV_WORKFLOW, operator_actions_of, read_frontmatter
@@ -111,37 +112,6 @@ class AutoRunResult:
     present: bool
     status: str  # lowercased Status: value, or "" when absent/unparsed
     detail: str  # the prose body after the heading, trimmed (human-readable)
-
-
-# A fence line: up to three spaces of indent, then a maximal run of >= 3 backticks
-# or tildes (its char AND length both matter per CommonMark), then the rest of the
-# line — an info string on an opener; on a close, only whitespace is allowed.
-_FENCE_LINE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})([^\n]*)$", re.MULTILINE)
-
-
-def _fenced(text: str, offset: int) -> bool:
-    """True when `offset` falls inside a ``` / ~~~ fenced code block.
-
-    A fence opens on a line of three-or-more backticks or tildes (indentable up
-    to three spaces; a tab would make an indented code block instead). Per
-    CommonMark it closes only on a later line using the SAME character, at least
-    as long as the opener, with no trailing non-whitespace — so a shorter run, a
-    different fence char, or an info-bearing line inside the block is content,
-    not a close. Tracking the open fence's char+length (not a bare line-parity
-    count) is what stops a nested-or-mismatched inner fence from flipping state
-    early and exposing a quoted `## Auto Run Result` as a real heading — a
-    destructive misread on the strip path."""
-    open_marker: str | None = None
-    for m in _FENCE_LINE_RE.finditer(text):
-        if m.start() >= offset:
-            break
-        marker, rest = m.group(1), m.group(2)
-        if open_marker is None:
-            open_marker = marker  # opening fence — an info string is allowed
-        elif marker[0] == open_marker[0] and len(marker) >= len(open_marker) and not rest.strip():
-            open_marker = None  # valid closing fence
-        # else: a shorter / mismatched / info-bearing fence line — literal content
-    return open_marker is not None
 
 
 def _section_headings(

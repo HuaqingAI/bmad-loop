@@ -136,7 +136,11 @@ the backend owns those conditions, and applies them uniformly, so the
 Both are replayed opaquely; neither is parsed by core. psmux applies the same
 qualification to `new_parked_window`, the `window_id` columns of `list_windows`
 and `current_window_id`; the latter two must agree, since the ctl-window prune
-compares them to skip its own window.) tmux consumes the token natively (it coincides with tmux exact-match
+compares them to skip its own window. To preserve unambiguous lookup,
+`new_parked_window` must agree with the `list_windows` column too; a backend that
+qualifies one side only remains usable but falls back to resolving parked
+windows by name, which is ambiguous whenever several kinds share a run id
+(#482). tmux consumes the token natively (it coincides with tmux exact-match
 syntax), so `BaseTmuxBackend` passes it straight through. A native-id backend
 calls `parse_target()` first — `None` means "already a native id, use as-is",
 otherwise resolve `(session, window)` yourself; the herdr adapter's
