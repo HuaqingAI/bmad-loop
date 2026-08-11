@@ -189,23 +189,18 @@ whose seams had diverged enough that several ports needed a different fix, and t
   records the divergence. Every other collision the sweep surfaced was adjudicated deliberate
   (disjoint `parametrize` sets, or one body run against two different shipped scripts).
 
-- **Cover the env-var registry, and enforce it.** `envvars.py` — the module AGENTS.md names as the
-  one place a core `BMAD_LOOP_*` var is defined — had no test naming it. `tests/test_envvars.py`
-  pins each reader's parse and fallback: `session_timeout_s()` ignores an override that is not a
-  finite positive number (see Fixed), and `mux_backend()` / `process_host()` hand their value back verbatim so the
-  registry downstream is what rejects an unknown name. The second half of the invariant
-  ("plugin-owned env-var families stay with their plugin") is now enforced rather than documented:
-  a new `test_portability_guard.py` scan fails any `BMAD_LOOP_*` read taken straight from the
-  environment outside `envvars.py`, the two stdlib-only hook relays and the Unity helper scripts.
-  It scans reads only — the env dicts the engine and plugins _build_ for a child session are the
-  producing side. No violation existed; the guard is a tripwire for the next one.
+- **The env-var registry invariant is enforced, not just documented.** A new
+  `test_portability_guard.py` scan fails any `BMAD_LOOP_*` read taken straight from the process
+  environment outside `envvars.py`, the two stdlib-only hook relays and the Unity helper scripts —
+  reads only, since the env dicts the engine and plugins _build_ for a child session are the
+  producing side. No violation existed; it is a tripwire for the next one. `envvars.py` also gains
+  the tests it never had, pinning each reader's parse and fallback.
 
-- **Cover the TUI's hard-stop and archive paths.** `x` and `A` had no Pilot test. Added: `x` on a
-  live run stops it and kills the ctl window; `x` on a run that is not _provably_ alive refuses
-  (the gate is `== "alive"`, so an unverifiable pid is refused alongside a dead one — stricter
-  than `S`, and asymmetric with `A`, which only blocks `alive`); `A` archives and forgets the run,
-  and refuses a live one; and `shift+tab` reverse-cycles the resize ring, mirroring the forward-tab
-  test that had no counterpart.
+- **The TUI's hard-stop and archive paths are covered.** `x` stops a live run and kills its ctl
+  window; on a run that is not _provably_ alive it refuses (the gate is `== "alive"`, so an
+  unverifiable pid is refused alongside a dead one — stricter than `S`, and asymmetric with `A`,
+  which blocks only `alive`). `A` archives and forgets the run, and refuses a live one.
+  `shift+tab` reverse-cycles the resize ring.
 
 ### Removed
 
@@ -222,16 +217,14 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
-- **`BMAD_LOOP_SESSION_TIMEOUT_S=inf` no longer disables the session timeout.** The override's guard
-  was one-sided: it rejected a non-positive value so a fat-fingered override could not silently
-  _shorten_ a run's budget, but `float()` accepts `inf`, `1e999` and `Infinity`, and all three pass
-  `> 0`. Both adapters build their monotonic and wall-clock deadlines as `time.monotonic() +
-timeout_s`, so a non-finite budget produced a deadline that could never expire — and that budget
-  is the outer bound every stall-grace and wake-nudge window defers to, so an unattended run could
-  wedge with no backstop left. The reader now requires a finite positive value and otherwise falls
-  back to `limits.session_timeout_min × 60`, as it already did for `0`, `-1` and unparseable input.
-  A large _finite_ value is still honoured: that is a duration, however unwise, where `inf` is not
-  one. Only ever reachable by explicitly exporting such a value — this is a test/E2E hook.
+- **`BMAD_LOOP_SESSION_TIMEOUT_S=inf` no longer disables the session timeout.** The guard was
+  one-sided — it rejected a non-positive value so an override could not silently _shorten_ a run's
+  budget — but `float()` accepts `inf`, `1e999` and `Infinity`, and all three pass `> 0`. Both
+  adapters build their deadlines as `time.monotonic() + timeout_s`, so a non-finite budget produced
+  a deadline that could never expire, and that budget is the outer bound every stall-grace and
+  wake-nudge window defers to: an unattended run could wedge with no backstop left. The reader now
+  requires a finite positive value and otherwise falls back to `limits.session_timeout_min × 60`,
+  as it already did for `0`, `-1` and unparseable input. A large _finite_ value is still honoured.
 
 - **A tab in the project path no longer truncates the project tag a window listing carries.**
   The multiplexer listing is tab-delimited and the tag holds a resolved filesystem path, where a tab

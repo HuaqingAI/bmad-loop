@@ -12,8 +12,9 @@ Contract parity: `test_engine.py::test_session_timeout_s_env_override` pins the
 same rejection set one layer up, through `Engine._session_timeout_s` (does the
 policy default survive a bad override?). This file grades the reader itself
 (what does the parse return?), which is why it carries the rows that only a
-direct read can distinguish — `nan`, which parses and is rejected by the
-comparison — and the two name readers the engine never touches. Deliberately
+direct read can distinguish — `nan`, which parses, survives the `<= 0`
+comparison, and is rejected only by the finiteness check — and the two name
+readers the engine never touches. Deliberately
 layered, not duplicated: a behavior change lands in both or records the
 divergence.
 """
@@ -78,7 +79,7 @@ def test_session_timeout_s_is_none_when_unset(monkeypatch):
         "0.0",  # the float spelling of the same
         "-1",  # negative: already-elapsed budget
         "-0.5",  # negative float
-        "nan",  # parses to nan; held by the finiteness check AND by `<= 0` being False
+        "nan",  # parses; `nan <= 0` is False, so ONLY the finiteness check rejects it
         "inf",  # parses to inf and passes `> 0` — a deadline that never arrives
         "1e999",  # overflows to inf: the same hole reachable without typing "inf"
         "Infinity",  # float()'s other accepted spelling
