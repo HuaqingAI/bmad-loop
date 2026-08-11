@@ -4731,6 +4731,10 @@ class Engine:
         """Feedback-driven repair after a clean review whose verify commands
         failed. Consumes the story's dev-attempt budget; returns PROCEED once
         commands pass, or terminal review routing when repair cannot continue."""
+        # Why the LAST attempt failed, when it failed without completing (#489).
+        # Empty whenever the last attempt completed: the verify failure `reason`
+        # already describes that, and the callers' own wording is the honest one.
+        session_failure = ""
         while task.attempt < self.policy.limits.max_dev_attempts:
             task.attempt += 1
             feedback = self._write_feedback(task, reason)
@@ -4788,6 +4792,9 @@ class Engine:
                 if not outcome.ok:
                     reason = outcome.reason
             ok = outcome is not None and outcome.ok
+            session_failure = (
+                "" if result.status == "completed" else session_failure_reason("fix", result)
+            )
             self.journal.append(
                 "fix-decision",
                 story_key=task.story_key,
@@ -4795,6 +4802,9 @@ class Engine:
                 session_status=result.status,
                 ok=ok,
                 env_fault=bool((outcome is not None and outcome.env_fault) or result.env_fault),
+                # parity with `dev-decision`: pair the diagnosis with the routing
+                # it fed, so the fix path is greppable the same way (#489).
+                session_vanished=result.session_vanished,
             )
             if result.status != "completed" and result.env_fault:
                 # A fix session whose CLI lost its API connection (#194) did no
@@ -4822,7 +4832,11 @@ class Engine:
                 return terminal
             if ok:
                 return Decision(Action.PROCEED)
-        return Decision(Action.DEFER)
+        # Budget spent. Carry the last session's own failure so a repair the mux
+        # destroyed is not filed as the verification failure that sent it here —
+        # the callers substitute verify-centric text for an empty reason, which
+        # is right only when the repair actually ran (#489).
+        return Decision(Action.DEFER, session_failure)
 
     def _record_review_budget_followup(self, task: StoryTask, damped: bool = False) -> None:
         """A *finalized, verify-green* story that the review pass kept recommending
