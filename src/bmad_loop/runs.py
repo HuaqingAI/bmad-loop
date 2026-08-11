@@ -306,20 +306,34 @@ def project_tag(project: Path) -> str:
 def tag_is_transportable(tag: str) -> bool:
     """Whether `tag` survives a multiplexer listing round trip intact.
 
-    The backends emit one window per line with tab-separated fields. A newline
-    is a legal POSIX filename byte, so a project path can hold one, and it
-    splits the tag across two rows — which no parse on the receiving side can
-    undo, because the row boundary is the framing itself. A comparison against
-    the truncated remainder does not merely fail to match: it makes a window
-    look like it belongs to *another* project, so the caller discards the
+    The backends emit one window per line with tab-separated fields and split
+    the result with `str.splitlines()`, so anything *that* treats as a line
+    break splits the tag across two rows — which no parse on the receiving side
+    can undo, because the row boundary is the framing itself. A comparison
+    against the truncated remainder does not merely fail to match: it makes a
+    window look like it belongs to *another* project, so the caller discards the
     project's own windows.
 
-    Tabs are deliberately NOT rejected here. They are equally legal in a path,
-    but the backends' bounded split lets a trailing field carry them intact
-    (see BaseTmuxBackend.list_windows), so a tab round-trips and a tagged
-    comparison stays exact. Widening this to tabs as well would send those
-    projects down the weaker untagged path for no reason — and would mask the
-    parser's guarantee rather than rest on it.
+    Asked of `splitlines` itself rather than by listing the characters. The set
+    is far wider than LF and CR — VT, FF, FS, GS, RS, NEL, U+2028, U+2029 all
+    split — and every one of them is a legal byte in a POSIX directory name, so
+    an enumeration here would be a second copy of CPython's table that silently
+    rots when it grows. Routing the question through the same function the
+    parser uses cannot drift from it.
+
+    The comparison is against the whole tag, not a row count, because a
+    *trailing* separator is equally fatal and does not add a row: `"/p\\r"`
+    splits to `["/p"]`, one element, yet the tag read back is `"/p"` and no
+    longer equals what was written. `text=True` on the subprocess also folds
+    CR and CRLF to LF before any of this, which is one more reason not to
+    reason about individual characters here.
+
+    Tabs are deliberately NOT rejected here, and `splitlines` does not split on
+    them. They are equally legal in a path, but the backends' bounded split lets
+    a trailing field carry them intact (see BaseTmuxBackend.list_windows), so a
+    tab round-trips and a tagged comparison stays exact. Widening this to tabs
+    as well would send those projects down the weaker untagged path for no
+    reason — and would mask the parser's guarantee rather than rest on it.
 
     Callers use this to choose between "tags are authoritative" and "tags cannot
     be trusted here", never to reject the project itself. Returning False is not
@@ -328,7 +342,7 @@ def tag_is_transportable(tag: str) -> bool:
     rather than to nothing. The tag is left in its raw form on purpose: it is
     persisted on live windows and sessions, so encoding it would strand every
     tag written before the change (AGENTS.md's compatibility rule)."""
-    return "\n" not in tag
+    return tag.splitlines()[:1] == [tag]
 
 
 def mux_sessions() -> list[str]:

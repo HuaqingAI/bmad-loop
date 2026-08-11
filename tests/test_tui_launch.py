@@ -876,7 +876,11 @@ def test_forget_falls_back_to_the_confinement_check_without_dir_fd(tmp_path: Pat
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="tab/newline are legal POSIX name bytes")
-@pytest.mark.parametrize("odd_name", ["my\tproj", "my\nproj"])
+@pytest.mark.parametrize(
+    "odd_name",
+    ["my\tproj", "my\nproj", "my\rproj", "my\vproj", "my\x85proj", "my proj"],
+    ids=["tab", "LF", "CR", "VT", "NEL", "LS"],
+)
 def test_a_delimiter_in_the_project_path_does_not_hide_its_own_window(
     monkeypatch, tmp_path: Path, odd_name: str
 ):

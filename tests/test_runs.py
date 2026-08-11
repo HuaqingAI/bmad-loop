@@ -623,6 +623,37 @@ def test_mux_sessions_no_server(monkeypatch):
     assert runs.mux_sessions() == []
 
 
+@pytest.mark.parametrize(
+    "separator",
+    ["\n", "\r", "\r\n", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", " ", " "],
+    ids=["LF", "CR", "CRLF", "VT", "FF", "FS", "GS", "RS", "NEL", "LS", "PS"],
+)
+@pytest.mark.parametrize("place", ["middle", "trailing"], ids=["mid", "tail"])
+def test_tag_is_transportable_rejects_every_line_separator(separator, place):
+    """Everything `str.splitlines()` breaks on, not just LF.
+
+    The listing is parsed with `splitlines()`, whose set is much wider than the
+    two obvious characters — and all of them are legal bytes in a POSIX
+    directory name. A predicate naming only LF reports the rest as safe, the
+    caller then trusts a tag that arrives truncated, and it discards the
+    project's own windows.
+
+    `trailing` is a separate case on purpose: a separator at the end does not
+    add a row (`"/p\\r".splitlines()` is one element), so a row-count check
+    passes it while the tag still comes back changed."""
+    tag = f"/home/u/p{separator}x" if place == "middle" else f"/home/u/p{separator}"
+    assert runs.tag_is_transportable(tag) is False
+
+
+def test_tag_is_transportable_accepts_paths_that_survive_the_round_trip():
+    # The control: ordinary paths, and a tab — which splitlines does not break
+    # on and the backends' bounded split carries intact, so rejecting it would
+    # push those projects onto the weaker untagged path for nothing.
+    assert runs.tag_is_transportable("/home/u/proj") is True
+    assert runs.tag_is_transportable("/home/u/my proj") is True
+    assert runs.tag_is_transportable("/home/u/my\tproj") is True
+
+
 def test_prunable_sessions_partitions(tmp_path, monkeypatch):
     mine = runs.project_tag(tmp_path)
     # live run: real run dir with this process's pid, tagged ours
