@@ -119,6 +119,12 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Changed
 
+- **State the supported tmux floor: 3.2.** It was never written down, so the only floor a reader
+  could infer was the one implied by the argv grammar — which is far older than anything the
+  project tests, and would have read as support for tmux releases nobody has verified. Nothing
+  enforces the floor; an older tmux still runs. psmux's separate version gate is unrelated and
+  unchanged.
+
 - **An unreadable deferred-work ledger fails `validate` instead of warning
   (`deferred.ledger-unreadable`).** The hard gate rides on the same bytes, so a warning exited 0
   with the gate never evaluated — a fail-open on the one deferred check that refuses, and one that

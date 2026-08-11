@@ -47,6 +47,14 @@ While tmux is the selected backend it is required for launching, attaching, and 
 runs (an external backend brings its own session mechanism instead); pure TUI observation
 works without any backend.
 
+**The supported floor is tmux 3.2.** Nothing enforces it: tmux is selected on the presence of
+the binary alone, so an older tmux is not refused — it is simply a configuration nobody has
+verified. Do not read the floor off the argv grammar. The command forms these adapters use,
+including the `=` exact-match target prefix, long predate 3.2, so an older tmux will parse
+every command this backend sends and fail (if at all) somewhere less obvious than startup.
+psmux carries a separate version requirement of its own, for unrelated reasons — see below.
+The two floors are independent and neither implies the other.
+
 ## psmux (native Windows, experimental)
 
 On a native-Windows host the bundled **psmux** backend is the platform default. psmux is a
