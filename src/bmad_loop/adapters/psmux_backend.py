@@ -35,7 +35,15 @@ the session's attached-client count instead of read off the exit code; see
 the ``client verbs: observed effect (#317)`` block. ``available()``
 additionally gates on the reported version: psmux releases up to 3.3.6 kill
 recycled PIDs during pane/session teardown without a process-identity check,
-which can take down an unrelated long-lived process mid-run. The psmux
+which can take down an unrelated long-lived process mid-run. ``has_session``
+is inherited unchanged, but one server per session gives it a residual the
+tmux path does not have: a ``-t`` read naming a session whose own server is
+gone can be answered by a different server, so a wrong ``True`` is reachable
+when a same-named session exists on a foreign one. For the lost-session probe
+(#489) that is the safe direction — a wrong ``True`` drops the diagnosis
+rather than inventing one — and the collision it needs is an independently
+created session sharing a ``bmad-loop-<run-id>`` name: an operator's, or
+another run's on a colliding id (see #531). The psmux
 behaviors cited in this module were read from the psmux source at tag
 ``v3.3.7``; the safe observable subset is probed in ``tests/test_psmux_live.py``.
 See :mod:`.multiplexer` for the contract.
