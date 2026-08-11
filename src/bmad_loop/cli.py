@@ -3031,7 +3031,9 @@ def cmd_clean(args: argparse.Namespace) -> int:
             # session is the only ownership proof a later prune can read (#419).
             # So the guard is the first thing in the loop, ahead of every mutation,
             # and the run is reported untouched rather than half-reclaimed.
-            # `cleanup` kills the session; the next `clean` then reclaims the run.
+            # `cleanup` clears the session — but for an untagged one it proves
+            # ownership by this same run dir, so the operator confirms first
+            # (`bmad-loop attach <id>`); the next `clean` then reclaims the run.
             protected.append(run_dir.name)
             if not args.json:
                 print(

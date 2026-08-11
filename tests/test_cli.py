@@ -2145,9 +2145,12 @@ def test_delete_force_overrides_the_session_guard_without_killing_it(tmp_path, m
     Killing `bmad-loop-<id>` from here would be unscoped: a session name carries no
     project, so on a `--run-id` collision it would tear down another project's live
     run — and this project cannot prove the session is its own, which is the very
-    defect the guard exists for. The scoped kill is `bmad-loop cleanup`
-    (prune_sessions proves ownership from the tag first). So --force stays an
-    override of a warning about the operator's own leak, not a destructive act."""
+    defect the guard exists for. `bmad-loop cleanup` is the remedy the refusal
+    names, but it is not sound unaided either: prune_sessions proves ownership from
+    the tag only when there is one, and falls back to the local run dir when there
+    is not — so it too can prune another project's session on a shared id, which is
+    why the message asks the operator to confirm first. So --force stays an override
+    of a warning about the operator's own leak, not a destructive act."""
     from bmad_loop import runs
 
     killed = []

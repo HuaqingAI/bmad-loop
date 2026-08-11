@@ -435,9 +435,10 @@ def clean_document(
 
     Every list names items the text enumerates or counts: `worktrees` holds
     absolute worktree paths, the rest hold run ids. `protected` is the runs left
-    untouched — `--keep`-listed, non-terminal, or past retention but still
-    carrying a live agent session (removing that run dir would strand it, #419)
-    — which the text reports only as a count. `unverifiable_pid` is the subset
+    untouched — `--keep`-listed, non-terminal, or carrying a live agent session,
+    which protects a run wherever it sits relative to the retention window
+    (reclaiming it would strand the session, #419) — which the text reports only
+    as a count. `unverifiable_pid` is the subset
     of touched runs whose engine liveness could not be proven; it is the text
     mode's stderr warning, carried in the document so JSON mode leaves stderr
     empty, and it never blocks reclamation.
