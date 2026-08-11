@@ -116,6 +116,16 @@ class BaseTmuxBackend(TerminalMultiplexer):
         # error), so this can't use check=True. But a timeout or a missing binary
         # is a real backend failure: raise the seam type so callers catch it via
         # MultiplexerError instead of a raw subprocess error escaping.
+        #
+        # Strength of a False: EVERY nonzero exit maps to it — "no such session",
+        # "no server running", and a target the grammar could not parse alike. That
+        # is exactly right for the create-if-missing callers this predicate was
+        # written for, where a wrong False self-corrects on the next line. It is
+        # weaker than it looks for a caller that reports the answer as evidence
+        # (#489), which is why that one words its output as what the negative
+        # withdraws rather than what it proves. Deliberately NOT tightened here:
+        # `list_window_ids` raises on transport failure because it backs a liveness
+        # probe, and this predicate has no such duty to its existing callers.
         try:
             probe = self._run(["has-session", "-t", f"={name}"], check=False)
         except (subprocess.TimeoutExpired, OSError) as exc:

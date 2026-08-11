@@ -7103,6 +7103,42 @@ def test_fix_phase_env_fault_escalates_instead_of_looping(project):
 # budget. Guard pins confirm plain (non-classified) failures still retry/defer.
 
 
+def test_lost_session_is_journaled_structurally_on_dev_decision(project):
+    """#489: the diagnosis has to be greppable, not only readable. The flag
+    rides every role's `session-end` entry via `_session_end_extras` (so "how
+    often did this host destroy my sessions" is a query over the journal rather
+    than a reading exercise over reason strings) and `dev-decision` pairs it
+    with the routing it fed. Routing stays the ordinary retry."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [
+            SessionResult(status="crashed", session_vanished=True),
+            SessionResult(status="crashed", session_vanished=True),
+        ],
+    )
+    engine.run()
+
+    assert len(adapter.sessions) == 2  # both attempts spent: the retry actually ran
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert len(decisions) == 2 and all(d["session_vanished"] is True for d in decisions)
+    assert decisions[0]["action"] == "retry"  # diagnosis, not routing
+    assert "multiplexer no longer reports the session" in decisions[0]["reason"]
+    ends = [e for e in engine.journal.entries() if e["kind"] == "session-end"]
+    assert len(ends) == 2 and all(e["session_vanished"] is True for e in ends)
+    # guard pin: an ordinary crash records the field as False rather than omitting
+    # it on the decision, and omits it on session-end (the env_fault convention
+    # there). The journal is per-project and this second run appends to the same
+    # file, so only its own last entries may be inspected.
+    engine2, _ = make_engine(project, [SessionResult(status="crashed")])
+    engine2.run()
+    plain = [e for e in engine2.journal.entries() if e["kind"] == "dev-decision"][-1]
+    assert plain["session_vanished"] is False
+    assert "multiplexer" not in plain["reason"]
+    plain_end = [e for e in engine2.journal.entries() if e["kind"] == "session-end"][-1]
+    assert "session_vanished" not in plain_end
+
+
 def test_session_env_fault_pauses_dev_without_burning_budget(project):
     """A dev session classified an environment fault (#194) pauses the run at the
     first story rather than charging the attempt; the decision + session-end carry
@@ -7158,6 +7194,78 @@ def test_two_plain_timeouts_still_defer(project):
     assert engine.state.tasks["1-1-a"].phase == Phase.DEFERRED
     dec = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
     assert all(d["env_fault"] is False for d in dec)
+
+
+def test_fix_phase_lost_session_defers_naming_the_mux(project):
+    """#489 on the repair path: a fix session the mux destroyed must not be filed
+    as the verification failure that sent it there. `_fix_phase` returns an empty
+    reason on budget exhaustion and both callers substitute verify-centric text
+    for it, so the operator read "verify commands kept failing" about repairs
+    that never ran — the #489 misdiagnosis one layer further out, and blaming the
+    tree rather than even the agent. Routing is unchanged: still a defer."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    marker = project.project / "fixed.marker"
+
+    def dev_with_marker(spec):
+        marker.write_text("ok\n")
+        return dev_effect(project, "1-1-a")(spec)
+
+    def breaking_review(spec):
+        marker.unlink()  # ordinary fixable failure -> routes to a fix session
+        return review_effect(project, "1-1-a", clean=True)(spec)
+
+    lost = SessionResult(status="crashed", session_vanished=True)  # not an env fault
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker), _OK)),
+        limits=LimitsPolicy(max_dev_attempts=3),  # dev + two fix attempts
+    )
+    engine, adapter = make_engine(
+        project, [dev_with_marker, breaking_review, lost, lost], policy=policy
+    )
+    summary = engine.run()
+
+    assert summary.deferred == 1
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "dev", "dev"]
+    reason = engine.state.tasks["1-1-a"].defer_reason
+    assert "fix session crashed" in reason
+    assert "multiplexer no longer reports the session" in reason
+    fixes = [e for e in engine.journal.entries() if e["kind"] == "fix-decision"]
+    assert len(fixes) == 2 and all(f["session_vanished"] is True for f in fixes)
+
+
+def test_fix_phase_exhaustion_keeps_the_verify_reason_when_the_repair_ran(project):
+    """Guard pin for the case above: when the last repair session actually ran and
+    only its verify failed, the caller's verify-centric wording is the honest one
+    and must survive. The session-failure reason is carried only for a session
+    that did not complete, so this path is left exactly as it was."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    marker = project.project / "fixed.marker"
+
+    def dev_with_marker(spec):
+        marker.write_text("ok\n")
+        return dev_effect(project, "1-1-a")(spec)
+
+    def breaking_review(spec):
+        marker.unlink()
+        return review_effect(project, "1-1-a", clean=True)(spec)
+
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker), _OK)),
+        limits=LimitsPolicy(max_dev_attempts=3),
+    )
+    # the fix sessions complete; the marker stays missing, so verify keeps failing
+    ran = SessionResult(status="completed")
+    engine, _ = make_engine(project, [dev_with_marker, breaking_review, ran, ran], policy=policy)
+    summary = engine.run()
+
+    assert summary.deferred == 1
+    reason = engine.state.tasks["1-1-a"].defer_reason
+    assert "multiplexer" not in reason
+    assert "verify commands kept failing after clean review" in reason
 
 
 def test_fix_phase_session_env_fault_escalates(project):

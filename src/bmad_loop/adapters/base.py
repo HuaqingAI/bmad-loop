@@ -145,6 +145,14 @@ class SessionResult:
     # and both fire on a CLI that launched and wedged without doing anything. Stop
     # is the only canonical event that means a turn actually ended.
     stop_seen: bool = False
+    # Set on a `crashed` verdict when the mux no longer reports the SESSION, not
+    # just its window (#489) — see `GenericAdapter._session_vanished` for why the
+    # two are otherwise indistinguishable. Diagnostic label only: it changes the
+    # reason text, never the routing. Deliberately NOT carried by
+    # `_post_kill_reconcile`'s hand-built result — that path gates on
+    # stalled/timeout/over_budget, which this flag can never accompany; add it
+    # there if `crashed` ever joins that rescue set.
+    session_vanished: bool = False
 
 
 class CodingCLIAdapter(ABC):

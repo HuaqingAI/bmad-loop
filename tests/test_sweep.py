@@ -1638,6 +1638,44 @@ def test_triage_plain_timeout_still_retries_to_cap(project):
     assert all(d["env_fault"] is False for d in dec)
 
 
+def test_triage_lost_session_names_the_mux_in_its_errors(project):
+    """#489 on the sweep triage path: a destroyed session must not be filed as a
+    triage that ran and failed. The adopted reason builder is only verified on the
+    dev/review paths otherwise, so reverting this site would go unnoticed."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, adapter = make_sweep(
+        project,
+        [
+            SessionResult(status="crashed", session_vanished=True),
+            SessionResult(status="crashed", session_vanished=True),
+        ],
+    )
+    engine.run()
+
+    assert len(adapter.sessions) == 2  # both attempts spent: the retry actually ran
+    dec = [e for e in engine.journal.entries() if e["kind"] == "triage-decision"][-1]
+    assert any("triage session crashed" in e for e in dec["errors"])
+    assert any("multiplexer no longer reports the session" in e for e in dec["errors"])
+
+
+def test_migration_lost_session_names_the_mux_in_its_errors(project):
+    """The migration twin of the triage case above — same builder, same blind spot."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, adapter = make_sweep(
+        project,
+        [
+            SessionResult(status="crashed", session_vanished=True),
+            SessionResult(status="crashed", session_vanished=True),
+        ],
+    )
+    engine.run()
+
+    assert len(adapter.sessions) == 2  # both attempts spent: the retry actually ran
+    dec = [e for e in engine.journal.entries() if e["kind"] == "migrate-decision"][-1]
+    assert any("migration session crashed" in e for e in dec["errors"])
+    assert any("multiplexer no longer reports the session" in e for e in dec["errors"])
+
+
 def test_migration_session_env_fault_escalates_without_consuming_attempts(project):
     """A migration session whose CLI lost its API connection (#194) escalates on the
     first attempt instead of charging a migration retry; migrate-decision carries

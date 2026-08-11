@@ -92,7 +92,16 @@ class TerminalMultiplexer(ABC):
 
     @abstractmethod
     def has_session(self, name: str) -> bool:
-        """True iff a session named exactly ``name`` exists."""
+        """True iff a session named exactly ``name`` exists.
+
+        Weak False (#489): a False means the backend did not *confirm* the
+        session, not that it provably no longer exists — implementations map
+        any failed lookup ("no such session", "no server running", a target
+        the grammar could not parse) to False alike. A transport failure
+        (the backend could not be asked at all) raises ``MultiplexerError``
+        rather than returning False. Callers that surface a False as
+        evidence must word it as what the negative withdraws, not what it
+        proves — see ``escalation.session_failure_reason``."""
 
     @abstractmethod
     def new_session(

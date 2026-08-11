@@ -77,8 +77,43 @@ def env_fault_pause_reason(role: str, result: SessionResult) -> str:
     """The uniform pause/escalation reason for a transport-failed session (#194).
     `role` is the descriptor placed before "session" — e.g. "dev", "review",
     "fix", "migration", "triage", or a richer "blocking workflow 'x' (y)". Keeps
-    the wording identical across escalation/engine/sweep (see env_fault_detail)."""
-    return f"environment fault: {role} session {result.status} ({env_fault_detail(result)})"
+    the wording identical across escalation/engine/sweep (see env_fault_detail).
+
+    Composed over `session_failure_reason` so the two diagnoses cannot cancel
+    each other out (#489): `crashed` is in `ENV_FAULT_STATUSES`, and both deciders
+    test `env_fault` FIRST, so a session destroyed under the run whose pane-log
+    tail also matches a transport pattern would otherwise pause blaming only the
+    provider. Both facts hold and the operator needs both — a lost session is not
+    evidence about the API, and a log pattern is not evidence the session
+    survived."""
+    return f"environment fault: {session_failure_reason(role, result)} ({env_fault_detail(result)})"
+
+
+def session_failure_reason(role: str, result: SessionResult) -> str:
+    """The reason text for a non-completed session: ``<role> session <status>``,
+    plus the lost-session diagnosis (#489).
+
+    Without the suffix a session destroyed under the run reads exactly like a CLI
+    that ran and produced nothing, and the operator debugs the agent instead of
+    the host. Routing is unchanged either way — the verdict was already correct,
+    only its explanation was missing.
+
+    Only a ``crashed`` verdict can ever carry the suffix (``session_vanished`` is
+    stamped nowhere else), so on the timeout/stall paths the suffix never appears.
+
+    The wording states what the evidence *withdraws*, not what it proves. All the
+    probe establishes is that a session lookup came back negative — see
+    ``TerminalMultiplexer.has_session``, whose False is "the backend did not
+    confirm it", not "the session provably no longer exists". That is enough to
+    stop an operator reading window death as a CLI exit, and not enough to assert
+    the session was destroyed."""
+    reason = f"{role} session {result.status}"
+    if result.session_vanished:
+        return (
+            f"{reason}: the multiplexer no longer reports the session, so the window's "
+            "disappearance is not evidence the CLI exited"
+        )
+    return reason
 
 
 def decide_dev(
@@ -107,7 +142,7 @@ def decide_dev(
                 Action.PAUSE,
                 env_fault_pause_reason("dev", result),
             )
-        reason = f"dev session {result.status}"
+        reason = session_failure_reason("dev", result)
         if budget_left:
             return Decision(Action.RETRY, reason)
         return Decision(exhausted, _exhaust_reason(task, reason))
@@ -137,7 +172,7 @@ def decide_review_session(task: StoryTask, result: SessionResult, policy: Policy
                 Action.PAUSE,
                 env_fault_pause_reason("review", result),
             )
-        reason = f"review session {result.status}"
+        reason = session_failure_reason("review", result)
         if result.status in REVIEW_TIMEOUT_STATUSES:
             mode = policy.review.on_timeout
             if mode == "defer":

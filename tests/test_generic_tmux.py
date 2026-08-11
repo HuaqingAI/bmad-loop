@@ -478,7 +478,31 @@ def test_kill_grace_zero_is_the_legacy_single_strike(tmp_path):
 # Stop event, via devcontract. These exercise that override in isolation.
 
 
-def make_dev_adapter(tmp_path, profile_name="claude", policy=None):
+class _UnitMux:
+    """Mux stand-in for the unit tests: the session is alive, nothing else exists.
+
+    These tests stub `_window_alive`, so before #489 they never touched `self.mux`
+    at all and the module docstring's "unit tests need no tmux" held by accident.
+    The crash path now asks `has_session` for its diagnosis, which without this
+    would reach the HOST multiplexer — a real subprocess (~130ms) answering False
+    for a tmp_path session that never existed, scoring every crash test
+    `session_vanished` and writing a breadcrumb. Answering True keeps each test on
+    the side of the distinction it was written for: the CLI exited.
+    """
+
+    def __init__(self):
+        self.sent: list[tuple[str, str]] = []
+
+    def has_session(self, name):
+        return True
+
+    def send_text(self, window_id, text):
+        # The contract/stall nudges reach the mux too; recording them keeps that
+        # off the host binary as well, which is the same promise as has_session.
+        self.sent.append((window_id, text))
+
+
+def make_dev_adapter(tmp_path, profile_name="claude", policy=None, mux=None):
     impl = tmp_path / "impl"
     impl.mkdir()
     # project root == tmp_path so rebased(spec.cwd=tmp_path) is a no-op: these
@@ -493,6 +517,7 @@ def make_dev_adapter(tmp_path, profile_name="claude", policy=None):
         policy=policy or Policy(limits=LimitsPolicy()),
         profile=get_profile(profile_name),
         paths=paths,
+        mux=mux or _UnitMux(),
     )
     return adapter, impl
 
@@ -2157,6 +2182,11 @@ def test_post_kill_reconcile_leaves_other_statuses_alone(tmp_path):
         assert (
             adapter._post_kill_reconcile(_dev_handle(), _dev_spec(tmp_path), original) is original
         )
+    # pins the base.py cross-claim that `session_vanished` rides only verdicts
+    # this hook never rebuilds: if `crashed` ever joins the rescue set, this
+    # rescuable artifact would produce a rebuilt result without the flag.
+    vanished = _unvouched("crashed", session_vanished=True)
+    assert adapter._post_kill_reconcile(_dev_handle(), _dev_spec(tmp_path), vanished) is vanished
 
 
 def test_post_kill_reconcile_keeps_stall_when_window_alive_after_kill(tmp_path):
@@ -2613,6 +2643,11 @@ class _StartSessionMux:
     def pipe_pane(self, window_id, log_file):
         self.piped.append((window_id, Path(log_file)))
 
+    def has_session(self, name):
+        # The crash-path diagnosis probe (#489) asks this; these tests are about a
+        # window that died under a session that is still very much there.
+        return True
+
 
 def test_start_session_resets_reused_task_log(tmp_path):
     """A re-armed run reuses task_ids and both mux backends APPEND to
@@ -2762,6 +2797,93 @@ def test_wait_for_completion_genuine_window_death_still_crashes(tmp_path, monkey
     adapter.watcher = _ScriptedWatcher([])  # None on the first idle tick
     result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
     assert result.status == "crashed"
+
+
+class _SessionProbeMux:
+    """Mux stand-in exposing only what `_session_vanished` asks: has_session."""
+
+    def __init__(self, answer):
+        self._answer = answer
+        self.calls: list[str] = []
+
+    def has_session(self, name):
+        self.calls.append(name)
+        if isinstance(self._answer, Exception):
+            raise self._answer
+        return self._answer
+
+
+@pytest.mark.parametrize(
+    ("has_session", "expect_vanished"),
+    [
+        (False, True),  # the session itself is gone: something destroyed it
+        (True, False),  # session alive, window gone: the CLI exited
+        (MultiplexerError("server wedged"), False),  # unknown is not vanished
+    ],
+)
+def test_window_death_distinguishes_a_destroyed_session_from_an_exited_cli(
+    tmp_path, monkeypatch, has_session, expect_vanished
+):
+    """#489: `list_window_ids` answers [] for a dead window AND for a session that
+    no longer exists, so the crash verdict alone cannot say which happened. The
+    verdict is `crashed` either way — only the diagnosis differs."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    adapter, _ = make_dev_adapter(tmp_path)
+    adapter._window_alive = lambda handle: False
+    adapter.mux = _SessionProbeMux(has_session)
+
+    adapter.watcher = _ScriptedWatcher([])
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "crashed"
+    assert result.session_vanished is expect_vanished
+    assert adapter.mux.calls == [adapter.session_name]
+    # The durable half of the diagnosis: CHANGELOG and FEATURES both promise this
+    # crumb, and without an assertion deleting the write keeps the suite green.
+    crumbs = _lifecycle_events(adapter, "session-vanished")
+    assert len(crumbs) == (1 if expect_vanished else 0)
+    if expect_vanished:
+        assert crumbs[0]["session"] == adapter.session_name
+        assert crumbs[0]["status"] == "crashed"
+
+
+def test_session_probe_is_skipped_for_non_crash_verdicts(tmp_path, monkeypatch):
+    """The probe answers "why did the window die" — a stall/timeout reached under a
+    LIVE window never asks it, or an unrelated mux outage would be misattributed to
+    a session the mux never touched."""
+    adapter, _ = make_dev_adapter(tmp_path)
+    adapter.mux = _SessionProbeMux(False)  # would say "vanished" if asked
+
+    res = adapter._final(_dev_handle(), _dev_spec(tmp_path), "timeout", None, None)
+
+    assert res.status == "timeout"
+    assert res.session_vanished is False
+    assert adapter.mux.calls == []
+
+
+def test_read_back_upgrade_is_not_diagnosed_even_if_the_session_is_gone(tmp_path):
+    """The deliberately-dropped case: a session reaped AFTER flushing its result
+    still earns `completed`, and a completed session gets no vanished diagnosis —
+    it produced something. Pinned separately because the skip test above only
+    exercises a `timeout` fallback, so this branch could invert unnoticed."""
+    adapter = make_adapter(tmp_path)
+    adapter.mux = _SessionProbeMux(False)  # the session really is gone
+    task_dir = adapter.tasks_dir / "1-1-a-dev-1"
+    task_dir.mkdir(parents=True)
+    (task_dir / "result.json").write_text('{"status": "done", "workflow": "dev"}')
+
+    res = adapter._final(
+        SessionHandle(task_id="1-1-a-dev-1", native_id="@1"),
+        make_spec(tmp_path),
+        "crashed",
+        None,
+        None,
+    )
+
+    assert res.status == "completed"
+    assert res.session_vanished is False
+    assert adapter.mux.calls == []  # never even asked
 
 
 def _usage_adapter(tmp_path, profile_name, **kw) -> GenericTmuxAdapter:
@@ -4302,8 +4424,11 @@ def test_proof_of_work_leaves_task_scoped_result_json_alone(tmp_path):
     large (#298 review). A base adapter's `tasks/<task_id>/result.json` is unique to
     this task and unlinked at launch, so its presence already proves THIS session
     wrote it — no foreign writer can reach it. Gating it could only ever discard an
-    authoritative completion, so `_ResultFileMixin` declines the gate outright."""
-    adapter = make_adapter(tmp_path)
+    authoritative completion, so `_ResultFileMixin` declines the gate outright.
+    `_UnitMux` keeps the crash-verdict `_final` call off the host multiplexer —
+    the read-back upgrade skips the probe today, but that must not be what this
+    test leans on."""
+    adapter = make_adapter(tmp_path, mux=_UnitMux())
     task_dir = adapter.tasks_dir / "1-1-a-dev-1"
     task_dir.mkdir(parents=True)
     (task_dir / "result.json").write_text('{"status": "done", "workflow": "dev"}')
@@ -4316,8 +4441,8 @@ def test_proof_of_work_leaves_task_scoped_result_json_alone(tmp_path):
 
 
 def test_proof_of_work_gates_post_kill_reconcile(tmp_path, monkeypatch):
-    """The i-11 call path: the rescue is for a session that finished and lost its
-    Stop, not for one that never ran."""
+    """The post-kill call path: the rescue is for a session that finished and
+    lost its Stop, not for one that never ran."""
     adapter, impl = make_dev_adapter(tmp_path)
     monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
     adapter._window_alive = lambda handle: False
