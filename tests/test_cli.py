@@ -2122,6 +2122,79 @@ def test_archive_force_stop_error_blocks(tmp_path, monkeypatch, capsys):
     assert run_dir.exists()
 
 
+def test_delete_refuses_an_orphaned_session_without_force(tmp_path, monkeypatch, capsys):
+    """Engine dead, agent session still live — the one state the pid-keyed guard
+    passes, and the one where the run dir is the only ownership proof an untagged
+    session has left (#419)."""
+    from bmad_loop import runs
+
+    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-r1"])
+    run_dir = _make_run_with_state(tmp_path, "r1")  # no pid -> engine reads dead
+    assert cli.main(["delete", "--project", str(tmp_path), "r1"]) == 1
+    err = capsys.readouterr().err
+    # the refusal surfaces as an exit code + message, never as a traceback, and the
+    # CLI adds the escape its own flag provides to what runs.py could say alone
+    assert "agent session is still live" in err and "bmad-loop cleanup" in err
+    assert "(or pass --force)" in err
+    assert run_dir.exists()
+
+
+def test_delete_force_overrides_the_session_guard_without_killing_it(tmp_path, monkeypatch, capsys):
+    """--force removes anyway, and kills nothing.
+
+    Killing `bmad-loop-<id>` from here would be unscoped: a session name carries no
+    project, so on a `--run-id` collision it would tear down another project's live
+    run — and this project cannot prove the session is its own, which is the very
+    defect the guard exists for. `bmad-loop cleanup` is the remedy the refusal
+    names, but it is not sound unaided either: prune_sessions proves ownership from
+    the tag only when there is one, and falls back to the local run dir when there
+    is not — so it too can prune another project's session on a shared id, which is
+    why the message asks the operator to confirm first. So --force stays an override
+    of a warning about the operator's own leak, not a destructive act."""
+    from bmad_loop import runs
+
+    killed = []
+    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-r1"])
+    monkeypatch.setattr(runs, "kill_session", lambda rid: killed.append(rid))
+    run_dir = _make_run_with_state(tmp_path, "r1")
+    assert cli.main(["delete", "--project", str(tmp_path), "r1", "--force"]) == 0
+    assert killed == []  # the session — which may be another project's — is left alone
+    assert not run_dir.exists()
+
+
+def test_archive_force_overrides_the_session_guard_without_killing_it(
+    tmp_path, monkeypatch, capsys
+):
+    """Archive's half of the same property — see the delete test for why nothing is
+    killed. Asserted separately because the two commands reach the guard by
+    different calls, and only one of them writes a tarball."""
+    from bmad_loop import runs
+
+    killed = []
+    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-r1"])
+    monkeypatch.setattr(runs, "kill_session", lambda rid: killed.append(rid))
+    run_dir = _make_run_with_state(tmp_path, "r1")
+    assert cli.main(["archive", "--project", str(tmp_path), "r1", "--force"]) == 0
+    assert killed == []
+    assert not run_dir.exists()
+    assert (tmp_path / ".bmad-loop" / "archive" / "r1.tar.gz").is_file()
+
+
+def test_archive_refuses_an_orphaned_session_without_force(tmp_path, monkeypatch, capsys):
+    from bmad_loop import runs
+
+    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-r1"])
+    run_dir = _make_run_with_state(tmp_path, "r1")
+    assert cli.main(["archive", "--project", str(tmp_path), "r1"]) == 1
+    err = capsys.readouterr().err
+    # `(or pass --force)` is the handler's own; main's catch-all backstop would give
+    # the same exit code and a bare `error: ...`, so asserting only the run message
+    # would pass with the handler's except removed
+    assert "agent session is still live" in err and "(or pass --force)" in err
+    assert run_dir.exists()
+    assert not (tmp_path / ".bmad-loop" / "archive").exists()
+
+
 def test_delete_dead_run(tmp_path, capsys):
     run_dir = _make_run_with_state(tmp_path, "r1")  # no pid -> not alive
     assert cli.main(["delete", "--project", str(tmp_path), "r1"]) == 0

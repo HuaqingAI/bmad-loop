@@ -2894,7 +2894,11 @@ def cmd_delete(args: argparse.Namespace) -> int:
     rc = _stop_or_block_live_engine(run_dir, args.run_id, args.force)
     if rc is not None:
         return rc
-    runs.delete_run(run_dir)
+    try:
+        runs.delete_run(project, run_dir, force=args.force)
+    except runs.LiveSessionError as e:
+        print(f"{e} (or pass --force)", file=sys.stderr)
+        return 1
     print(f"run {args.run_id} deleted")
     return 0
 
@@ -2910,7 +2914,11 @@ def cmd_archive(args: argparse.Namespace) -> int:
     rc = _stop_or_block_live_engine(run_dir, args.run_id, args.force)
     if rc is not None:
         return rc
-    dest = runs.archive_run(project, run_dir)
+    try:
+        dest = runs.archive_run(project, run_dir, force=args.force)
+    except runs.LiveSessionError as e:
+        print(f"{e} (or pass --force)", file=sys.stderr)
+        return 1
     print(f"run {args.run_id} archived to {dest}")
     return 0
 
@@ -3015,6 +3023,24 @@ def cmd_clean(args: argparse.Namespace) -> int:
     deleted: list[str] = []
     unverifiable: list[str] = []
     for run_dir in reclaimable:
+        if runs.live_session_may_be_ours(project, run_dir.name):
+            # `reclaimable` is keyed on engine pid liveness, so an orphan — engine
+            # dead, agent session still live — passes it, and everything below this
+            # point mutates: the worktree the session may still be working in, the
+            # trimmed artifacts, and the run dir itself, which for an untagged
+            # session is the only ownership proof a later prune can read (#419).
+            # So the guard is the first thing in the loop, ahead of every mutation,
+            # and the run is reported untouched rather than half-reclaimed.
+            # `cleanup` clears the session — but for an untagged one it proves
+            # ownership by this same run dir, so the operator confirms first
+            # (`bmad-loop attach <id>`); the next `clean` then reclaims the run.
+            protected.append(run_dir.name)
+            if not args.json:
+                print(
+                    f"run {run_dir.name}: agent session still live — left untouched",
+                    file=sys.stderr,
+                )
+            continue
         if runs.engine_liveness(run_dir) == "unknown":
             # warn-only: unknown never blocks cleanup, but say so before removal.
             # In JSON mode this lives in the document instead (unverifiable_pid),
@@ -3031,21 +3057,44 @@ def cmd_clean(args: argparse.Namespace) -> int:
         run_bytes = _dir_size(run_dir)
         # collect, never print-as-you-mutate: the document is emitted once at the
         # end, so every per-item line has to survive the loop as data
-        for wt in runs.reconcile_orphan_worktrees(repo, run_dir, dry_run=dry):
+        run_worktrees = runs.reconcile_orphan_worktrees(repo, run_dir, dry_run=dry)
+        for wt in run_worktrees:
             worktrees.append(str(wt))
             if not args.json:
                 print(f"{'would remove' if dry else 'removed'} worktree {wt}")
         if run_dir.name in past:
             freed += run_bytes
-            runs.trim_run_dir(run_dir, dry_run=dry)  # shrink before archiving
-            if args.hard or not pol.cleanup.archive_old:
-                if not dry:
-                    runs.delete_run(run_dir)
-                deleted.append(run_dir.name)
-            else:
-                if not dry:
-                    runs.archive_run(project, run_dir)
-                archived.append(run_dir.name)
+            shrunk = runs.trim_run_dir(run_dir, dry_run=dry)  # shrink before archiving
+            try:
+                if args.hard or not pol.cleanup.archive_old:
+                    if not dry:
+                        runs.delete_run(project, run_dir)
+                    deleted.append(run_dir.name)
+                else:
+                    if not dry:
+                        runs.archive_run(project, run_dir)
+                    archived.append(run_dir.name)
+            except runs.LiveSessionError:
+                # A session appeared between the loop-top guard and here — a resume
+                # of a stopped run, racing this clean. The chokepoint refused the
+                # removal; record the run instead of letting one racing run abort
+                # the whole invocation. Correct the estimate down to what actually
+                # went. The wider race — every mutation in this loop against a
+                # concurrent resume — is older than this guard (`reclaimable` is
+                # sampled in the loop above and never re-read) and is tracked in
+                # issue #533.
+                freed += wt_bytes - run_bytes
+                # Classify by what happened, not by what was intended: the steps
+                # above may already have taken this run's worktree and artifacts,
+                # and `protected` means "left untouched" in the --json contract.
+                # Only a run nothing reached is protected; one already shrunk is
+                # trimmed, which is exactly the state it ends in.
+                (trimmed if run_worktrees or shrunk else protected).append(run_dir.name)
+                if not args.json:
+                    print(
+                        f"run {run_dir.name}: agent session appeared mid-clean — not removed",
+                        file=sys.stderr,
+                    )
         elif pol.cleanup.trim_artifacts:
             if runs.trim_run_dir(run_dir, dry_run=dry):
                 freed += wt_bytes
