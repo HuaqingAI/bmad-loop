@@ -163,8 +163,37 @@ def _forget_ctl_window(project: Path, run_id: str) -> None:
         pass  # a removal we cannot force — see the ceiling
 
 
+def _is_link_of_any_kind(path: Path) -> bool:
+    """Whether `path` is a link that redirects traversal — symlink or, on win32,
+    a junction. Raises `OSError` for a component that cannot be probed, which
+    the caller turns into a refusal.
+
+    `is_symlink()` alone is not enough, and the gap is win32-shaped. It answers
+    for the symlink reparse tag only and returns **False** for a directory
+    junction, which redirects traversal identically. A junction is also the
+    *easier* plant of the two: `mklink /J` needs neither elevation nor Developer
+    Mode, while a symlink needs one of them. So the check this backs would have
+    been blind on win32 to the cheaper version of the very attack it exists for.
+
+    Detected by the reparse-point attribute rather than `os.path.isjunction`,
+    which only exists from 3.12 — this project supports 3.11, and that leg is
+    one CI runs on win32. One `lstat`, no version branch: `st_file_attributes`
+    is win32-only, so the bit test degrades to False on POSIX, where `S_ISLNK`
+    is already the whole answer.
+
+    Any reparse point counts, not just the junction tag. Other kinds (cloud
+    placeholders, app-exec links) have no business being a run dir, and the
+    failure this produces is a refusal to write a best-effort hint — the lookup
+    degrades to the name scan. Over-refusing is the cheap direction here."""
+    info = os.lstat(path)
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    attributes = getattr(info, "st_file_attributes", 0)  # win32-only field
+    return bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
 def _run_dir_is_confined(project: Path, run_dir: Path) -> bool:
-    """Whether `run_dir` is reached from `project` without traversing a symlink.
+    """Whether `run_dir` is reached from `project` without traversing a link.
 
     `follow_symlinks=False` refuses a link at the *final* component only, which
     leaves the ancestors: a session that replaces `.bmad-loop/runs/<run_id>`
@@ -179,6 +208,14 @@ def _run_dir_is_confined(project: Path, run_dir: Path) -> bool:
     while everything under it is session-writable. `lstat`-based throughout, so
     the check never resolves through what it is testing for.
 
+    Each component goes through `_is_link_of_any_kind`, not `is_symlink()` —
+    on win32 the latter is blind to a junction, which redirects the same way and
+    is the easier of the two to plant. That also fixes a quieter gap: `Path`'s
+    predicates swallow the `OSError` from a component that cannot be probed and
+    answer False, so an unreadable ancestor used to be walked *past* as "not a
+    link" — the opposite of the sentence below. Raising from the probe is what
+    makes that sentence true.
+
     A check, not a race-free open: the portable answer would be to walk the
     components with `dir_fd`, which POSIX has and win32 does not, and this
     record is atomic precisely for the win32 leg. So the standing redirect —
@@ -191,7 +228,7 @@ def _run_dir_is_confined(project: Path, run_dir: Path) -> bool:
             return False
         cursor = run_dir
         while cursor != project:
-            if cursor.is_symlink():
+            if _is_link_of_any_kind(cursor):
                 return False
             cursor = cursor.parent
     except OSError:

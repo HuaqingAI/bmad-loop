@@ -13,6 +13,7 @@ import json
 import os
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -855,6 +856,82 @@ def test_forget_falls_back_to_the_confinement_check_without_dir_fd(tmp_path: Pat
 
     launch._forget_ctl_window(project, "RID")
     assert victim.read_text(encoding="utf-8") == "@99"
+
+
+def test_confinement_check_refuses_a_reparse_point_ancestor(tmp_path: Path, monkeypatch):
+    """win32's junction, reachable from POSIX by faking the attribute.
+
+    `is_symlink()` answers for the symlink reparse tag only, so a directory
+    junction — which redirects traversal identically, and needs neither
+    elevation nor Developer Mode to create — used to walk straight past this
+    check. There is no way to make a real junction on POSIX, so the win32-only
+    `st_file_attributes` field is what gets faked; `test_confinement_check_
+    refuses_a_real_junction` is the same assertion against `mklink /J` and runs
+    on the Windows legs."""
+    project = tmp_path / "proj"
+    run_dir = runs.run_dir_for(project, "RID")
+    run_dir.mkdir(parents=True)
+    real_lstat = os.lstat
+
+    def lstat_with_a_reparse_bit(path, **kwargs):
+        info = real_lstat(path, **kwargs)
+        if Path(path) != run_dir:
+            return info
+        # A junction: the reparse bit is set, but S_ISLNK stays False — which is
+        # exactly why is_symlink() missed it.
+        return type(
+            "FakeStat",
+            (),
+            {
+                "st_mode": info.st_mode,
+                "st_file_attributes": stat.FILE_ATTRIBUTE_REPARSE_POINT,
+            },
+        )()
+
+    monkeypatch.setattr(launch.os, "lstat", lstat_with_a_reparse_bit)
+    assert not launch._run_dir_is_confined(project, run_dir)
+    # Positive control: the same dir without the bit is confined, so this cannot
+    # pass by the walk having become a blanket refusal.
+    monkeypatch.setattr(launch.os, "lstat", real_lstat)
+    assert launch._run_dir_is_confined(project, run_dir)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="junctions are win32-only")
+def test_confinement_check_refuses_a_real_junction(tmp_path: Path):
+    # The unfaked version of the test above, on the platform that has junctions.
+    # `mklink /J` needs no elevation, unlike `mklink /D`, so this is the cheap
+    # plant a coding session can actually make.
+    project = tmp_path / "proj"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    run_dir = runs.run_dir_for(project, "RID")
+    run_dir.parent.mkdir(parents=True)
+    created = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(run_dir), str(outside)],
+        capture_output=True,
+        text=True,
+    )
+    assert created.returncode == 0, created.stderr  # never silently skip the point
+    assert not run_dir.is_symlink()  # the blindness this covers: not a symlink
+    assert not launch._run_dir_is_confined(project, run_dir)
+
+
+def test_confinement_check_refuses_an_unprobeable_ancestor(tmp_path: Path, monkeypatch):
+    # `Path.is_symlink()` swallows OSError and answers False, so an ancestor
+    # that cannot be probed used to be walked past as "not a link" — the
+    # opposite of what the docstring promised. The probe raises now.
+    project = tmp_path / "proj"
+    run_dir = runs.run_dir_for(project, "RID")
+    run_dir.mkdir(parents=True)
+    real_lstat = os.lstat
+
+    def lstat_denied(path, **kwargs):
+        if Path(path) == run_dir:
+            raise PermissionError("cannot probe")
+        return real_lstat(path, **kwargs)
+
+    monkeypatch.setattr(launch.os, "lstat", lstat_denied)
+    assert not launch._run_dir_is_confined(project, run_dir)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
