@@ -122,16 +122,43 @@ def _forget_ctl_window(project: Path, run_id: str) -> None:
     superseded window, and the honest answer is no record at all, which puts the
     lookup back on the name scan.
 
-    Ceiling: when the removal itself fails too, the superseded id survives on
-    disk. It still has to pass ctl_window_id's re-prove, so the worst it can
-    answer is a live window carrying this run's name — the pre-fix by-name
-    result, never a wilder target.
+    Ceiling: when the removal fails, or is declined because the path cannot be
+    vouched for, the superseded id survives on disk. It still has to pass
+    ctl_window_id's re-prove, so the worst it can answer is a live window
+    carrying this run's name — the pre-fix by-name result, never a wilder target.
+    Retaining a stale hint is strictly the cheaper failure here, which is why
+    this declines rather than deleting on a path it cannot stand behind.
+
+    Anchored exactly like the write in _record_ctl_window, and for a sharper
+    reason: a delete needs no race at all. `unlink` does not follow a link at the
+    *final* component, but the ancestors resolve normally, so a run dir standing
+    as a link to an external directory makes `run_dir / ctl-window` name a file
+    over there — another project's live record — and this deletes it. The write
+    path's escape needed the attacker to win a window between check and write;
+    a planted link just sits there until the next launch fails to capture an id.
+    So the descriptor from `open_dir_confined` is what the unlink is relative to,
+    and no path is named. win32 keeps the check-then-delete fallback on the same
+    terms as the write — see `_run_dir_is_confined` for that residual.
 
     A plain unlink, not retrying_unlink: launches run on the Textual event
     loop, and dropping a best-effort hint is not worth ~5s of blocked win32
     backoff — the ceiling above already covers the miss."""
+    run_dir = runs.run_dir_for(project, run_id)
     try:
-        (runs.run_dir_for(project, run_id) / _CTL_WINDOW_FILE).unlink(missing_ok=True)
+        if DIR_FD_ANCHORED_WRITES:
+            dir_fd = open_dir_confined(project, run_dir)
+            if dir_fd is None:
+                return  # a component we cannot vouch for — see the ceiling
+            try:
+                os.unlink(_CTL_WINDOW_FILE, dir_fd=dir_fd)
+            except FileNotFoundError:
+                pass  # already gone: missing_ok, by hand
+            finally:
+                os.close(dir_fd)
+        else:
+            if not _run_dir_is_confined(project, run_dir):
+                return  # see the ceiling
+            (run_dir / _CTL_WINDOW_FILE).unlink(missing_ok=True)
     except OSError:
         pass  # a removal we cannot force — see the ceiling
 

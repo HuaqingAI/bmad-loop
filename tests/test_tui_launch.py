@@ -759,6 +759,105 @@ def test_record_falls_back_to_the_confinement_check_without_dir_fd(fake_run, tmp
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_forget_refuses_a_linked_run_dir(tmp_path: Path):
+    """The forget path is a *delete*, so it needs no race to be redirected.
+
+    `unlink` leaves a link at the final component alone, but the ancestors
+    resolve normally: a run dir standing as a link to an external directory
+    makes `run_dir / ctl-window` name a file over there, and dropping the hint
+    drops that instead. Unlike the write's escape there is no window to win —
+    the link can be planted whenever and simply waits for the next launch that
+    fails to capture a window id.
+
+    What this pins is the *refusal*: the standing link is caught by the
+    confinement walk (`open_dir_confined` answers None), so deleting the whole
+    guard is what reddens it. The residual race — a swap landing after that walk
+    — is not covered here at all; `test_forget_is_anchored_against_an_ancestor_swap`
+    is the one that pins the anchoring."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    outside = tmp_path / "other-project"
+    outside.mkdir()
+    victim = outside / launch._CTL_WINDOW_FILE
+    victim.write_text("@99", encoding="utf-8")  # another project's live record
+
+    run_dir = runs.run_dir_for(project, "RID")
+    run_dir.parent.mkdir(parents=True)
+    run_dir.symlink_to(outside)
+
+    launch._forget_ctl_window(project, "RID")
+    assert victim.read_text(encoding="utf-8") == "@99"  # the neighbour survived
+
+    # Positive control: with the link gone the removal still happens, so this
+    # cannot pass by _forget_ctl_window having quietly become a no-op.
+    run_dir.unlink()
+    run_dir.mkdir()
+    (run_dir / launch._CTL_WINDOW_FILE).write_text("@2", encoding="utf-8")
+    launch._forget_ctl_window(project, "RID")
+    assert not (run_dir / launch._CTL_WINDOW_FILE).exists()
+
+
+@pytest.mark.skipif(not launch.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only")
+def test_forget_is_anchored_against_an_ancestor_swap(tmp_path: Path, monkeypatch):
+    """The window the confinement walk above cannot close: the session re-plants
+    the run dir as a link *after* the walk and before the removal. A path-based
+    unlink resolves the new link and drops the neighbour's record; the unlink
+    relative to the walked descriptor names no path, so the swap renames
+    something it no longer consults.
+
+    Forced by hooking the helper rather than raced with threads — the same
+    deterministic interleaving as the write's anchoring test."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    outside = tmp_path / "other-project"
+    outside.mkdir()
+    victim = outside / launch._CTL_WINDOW_FILE
+    victim.write_text("@99", encoding="utf-8")  # another project's live record
+
+    run_dir = runs.run_dir_for(project, "RID")
+    run_dir.parent.mkdir(parents=True)
+    run_dir.mkdir()
+    (run_dir / launch._CTL_WINDOW_FILE).write_text("@2", encoding="utf-8")
+    real_open = launch.open_dir_confined
+
+    def swap_after_the_walk(proj: Path, target: Path):
+        fd = real_open(proj, target)
+        # attacker wins: the name now points next door, the fd still points home
+        target.rename(tmp_path / "moved-aside")
+        target.symlink_to(outside)
+        return fd
+
+    monkeypatch.setattr(launch, "open_dir_confined", swap_after_the_walk)
+    launch._forget_ctl_window(project, "RID")
+
+    assert victim.read_text(encoding="utf-8") == "@99"  # the neighbour survived
+    # Positive control: the real record was still dropped, through the
+    # descriptor — so this cannot pass by the removal simply not happening.
+    assert not (tmp_path / "moved-aside" / launch._CTL_WINDOW_FILE).exists()
+    assert run_dir.is_symlink()  # the swap really was in place for the unlink
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_forget_falls_back_to_the_confinement_check_without_dir_fd(tmp_path: Path, monkeypatch):
+    # The win32 branch of the same refusal, exercised from POSIX rather than
+    # left to the Windows legs: no *at() family there, so it check-then-deletes.
+    monkeypatch.setattr(launch, "DIR_FD_ANCHORED_WRITES", False)
+    project = tmp_path / "proj"
+    project.mkdir()
+    outside = tmp_path / "other-project"
+    outside.mkdir()
+    victim = outside / launch._CTL_WINDOW_FILE
+    victim.write_text("@99", encoding="utf-8")
+
+    run_dir = runs.run_dir_for(project, "RID")
+    run_dir.parent.mkdir(parents=True)
+    run_dir.symlink_to(outside)
+
+    launch._forget_ctl_window(project, "RID")
+    assert victim.read_text(encoding="utf-8") == "@99"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_symlinked_record_is_replaced_not_followed(fake_run, tmp_path: Path):
     # `atomic_write_text` follows a symlink under its default contract, and the
     # run dir lives under the project root every coding session can write — so a
