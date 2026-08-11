@@ -7121,11 +7121,11 @@ def test_lost_session_is_journaled_structurally_on_dev_decision(project):
 
     assert len(adapter.sessions) == 2  # both attempts spent: the retry actually ran
     decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
-    assert decisions and all(d["session_vanished"] is True for d in decisions)
+    assert len(decisions) == 2 and all(d["session_vanished"] is True for d in decisions)
     assert decisions[0]["action"] == "retry"  # diagnosis, not routing
     assert "multiplexer no longer reports the session" in decisions[0]["reason"]
     ends = [e for e in engine.journal.entries() if e["kind"] == "session-end"]
-    assert ends and all(e["session_vanished"] is True for e in ends)
+    assert len(ends) == 2 and all(e["session_vanished"] is True for e in ends)
     # guard pin: an ordinary crash records the field as False rather than omitting
     # it on the decision, and omits it on session-end (the env_fault convention
     # there). The journal is per-project and this second run appends to the same
@@ -7232,7 +7232,7 @@ def test_fix_phase_lost_session_defers_naming_the_mux(project):
     assert "fix session crashed" in reason
     assert "multiplexer no longer reports the session" in reason
     fixes = [e for e in engine.journal.entries() if e["kind"] == "fix-decision"]
-    assert fixes and all(f["session_vanished"] is True for f in fixes)
+    assert len(fixes) == 2 and all(f["session_vanished"] is True for f in fixes)
 
 
 def test_fix_phase_exhaustion_keeps_the_verify_reason_when_the_repair_ran(project):
