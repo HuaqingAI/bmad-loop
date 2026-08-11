@@ -189,15 +189,11 @@ whose seams had diverged enough that several ports needed a different fix, and t
   parked control windows. The last requested field now keeps its delimiters.
 
 - **Removing a run directory no longer strands a session that outlived its engine (#526).**
-  `delete`, `archive` and `clean` all gated on engine-pid liveness, which an orphan — engine dead,
+  `delete`, `archive` and `clean` gated on engine-pid liveness, which an orphan — engine dead,
   agent session still alive — passes. For an untagged session the run dir is the last ownership
-  proof a prune can read, so removing it leaked the session for the life of the machine. The
-  removal paths now refuse while `bmad-loop-<run-id>` is live, and `clean` leaves the run untouched
-  rather than half-reclaiming it. The refusal names `cleanup` as the remedy along with the
-  confirmation it needs — for an untagged session `cleanup` proves ownership by that same run dir,
-  so a shared run id could prune another project's session; `--force` overrides the refusal and
-  kills nothing. An unreachable multiplexer reads as no session, so an unanswerable question never
-  blocks a removal.
+  proof a prune can read, so removing it leaked the session for the life of the machine. Removal
+  now refuses while `bmad-loop-<run-id>` is live and `clean` leaves the run untouched; `--force`
+  overrides the refusal and kills nothing, since a session name carries no project.
 
 - **A project path the multiplexer cannot carry no longer strands the scans over it (#419).** The
   ownership tag held the resolved path, and two transports mangled it: psmux's control line refuses
