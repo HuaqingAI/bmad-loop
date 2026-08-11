@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 from . import devcontract, verify
-from .adapters.multiplexer import get_multiplexer
+from .adapters.multiplexer import MultiplexerError, get_multiplexer
 from .journal import STATE_FILE, Journal, load_state, save_state
 from .model import PAUSE_ESCALATION, Phase, RunState, StoryTask
 from .platform_util import (
@@ -569,16 +569,29 @@ def live_session_may_be_ours(project: Path, run_id: str) -> bool:
     nothing. Untagged, or tagged as ours, answers True — neither can be ruled out
     as depending on this run dir, and only the untagged case is load-bearing.
 
-    An observation, so it degrades rather than raising: :func:`mux_sessions`
-    answers ``[]`` when the multiplexer is missing, no server is running, or the
-    query fails, and that reads here as "no session". A degraded
-    :func:`session_project_tags` reads as untagged, which errs toward refusing —
-    the safe direction, since an unread tag is not proof of anything. The session
-    listing is checked first so the tag query only runs on a name collision."""
+    An observation, so it degrades rather than raising, and each read degrades in
+    its own direction. A listing that cannot answer reads as "no session": that is
+    already what the bundled backend returns for a missing multiplexer, a dead
+    server or a failed query, and a guard that varied by backend would be worse
+    than no guard. A tag that cannot be read is *not* proof the session is foreign,
+    so it reads as untagged and the refusal stands — by then the listing has
+    already established that a session is live.
+
+    Both reads are caught explicitly because the seam permits a raise: only
+    `pipe_pane` and `kill_session` are contractually best-effort, so an
+    out-of-tree backend raises :class:`MultiplexerError` here where the bundled
+    one returns empty (docs/adapter-authoring-guide.md). The listing is checked
+    first, so the tag query only runs on a name collision."""
     name = session_name(run_id)
-    if name not in mux_sessions():
+    try:
+        if name not in mux_sessions():
+            return False
+    except MultiplexerError:
         return False
-    tag = session_project_tags().get(name, "")
+    try:
+        tag = session_project_tags().get(name, "")
+    except MultiplexerError:
+        tag = ""  # unread is not proof of foreign
     return not tag or tag in accepted_tags(project)
 
 

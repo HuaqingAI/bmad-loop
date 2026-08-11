@@ -12,6 +12,7 @@ from conftest import escalated_run, git
 
 from bmad_loop import platform_util, runs, verify
 from bmad_loop.adapters import tmux_base
+from bmad_loop.adapters.multiplexer import MultiplexerError
 from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
 from bmad_loop.journal import load_state, save_state
 from bmad_loop.model import RunState
@@ -901,6 +902,41 @@ def test_delete_run_refuses_a_session_tagged_as_ours(tmp_path, monkeypatch):
     monkeypatch.setattr(
         runs, "session_project_tags", lambda: {"bmad-loop-r1": runs.project_tag(tmp_path)}
     )
+    with pytest.raises(runs.LiveSessionError):
+        runs.delete_run(tmp_path, run_dir)
+    assert run_dir.exists()
+
+
+def test_delete_run_proceeds_when_the_session_listing_raises(tmp_path, monkeypatch):
+    """The seam only promises `pipe_pane` and `kill_session` never raise, so an
+    out-of-tree backend answers a failed listing with MultiplexerError where the
+    bundled one answers `[]`. Both must reach the same place, or the guard would
+    turn a transient transport error into a failed `delete`/`archive`/`clean` —
+    and `clean` has no override. Degrading to "no session" matches what tmux
+    already does for a dead server."""
+    run_dir = _make_state_run(tmp_path, "r1")
+
+    def boom():
+        raise MultiplexerError("transport down")
+
+    monkeypatch.setattr(runs, "mux_sessions", boom)
+    runs.delete_run(tmp_path, run_dir)
+    assert not run_dir.exists()
+
+
+def test_delete_run_refuses_when_the_tag_read_raises(tmp_path, monkeypatch):
+    """The other read degrades the other way. By the time the tag is queried the
+    listing has already proven a session live, and a tag that could not be read is
+    not proof it is another project's — so it reads as untagged and the refusal
+    stands. Asserted separately from the listing case: one `except` returning the
+    wrong constant would otherwise hide behind the other."""
+    run_dir = _make_state_run(tmp_path, "r1")
+
+    def boom(*_args):
+        raise MultiplexerError("option read failed")
+
+    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-r1"])
+    monkeypatch.setattr(runs, "session_project_tags", boom)
     with pytest.raises(runs.LiveSessionError):
         runs.delete_run(tmp_path, run_dir)
     assert run_dir.exists()
