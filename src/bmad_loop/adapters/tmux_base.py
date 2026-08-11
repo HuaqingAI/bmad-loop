@@ -361,15 +361,18 @@ class BaseTmuxBackend(TerminalMultiplexer):
             return []
         rows: list[tuple[str, ...]] = []
         for line in probe.stdout.splitlines():
-            # Bounded split, so the LAST field may itself contain tabs. Fields
-            # carrying arbitrary text do exist — PROJECT_OPTION holds a resolved
-            # filesystem path, and a tab is a legal POSIX filename byte — and an
-            # unbounded split turns one such row into extra parts that the slice
-            # below then truncates, silently corrupting the field's value.
-            # Callers requesting a free-text field must therefore ask for it
-            # last; every current caller does. (A newline in that value still
-            # splits the row, which no parse here can undo — so runs.project_tag
-            # encodes a path holding one rather than leaning on this split.)
+            # Bounded split, so the LAST field may itself contain tabs. An
+            # unbounded split turns a row whose last field carries arbitrary
+            # text into extra parts that the slice below then truncates,
+            # silently corrupting the value. Callers requesting a free-text
+            # field must therefore ask for it last; every current caller does.
+            # This is the seam's standing contract, not a fix for one caller:
+            # no field requested today can hold a tab — PROJECT_OPTION is a
+            # digest and window names carry a shape-validated run id — so the
+            # bound is here for the next free-text field rather than these.
+            # (A newline in a value still splits the row, which no parse here
+            # can undo; runs.project_tag's digest is what keeps the tag clear
+            # of one.)
             parts = line.split("\t", len(fields) - 1)
             parts += [""] * (len(fields) - len(parts))  # tolerate unset trailing fields
             rows.append(tuple(parts[: len(fields)]))

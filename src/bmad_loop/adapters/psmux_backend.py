@@ -506,15 +506,9 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # tag is non-empty and never equals the caller's tag again, so the
         # prune skips that session forever.
         #
-        # Refusing leaves the option UNSET, which is the correct degradation
-        # and not the lesser evil: the prune's untagged path falls back to the
-        # run dir, claiming our own dead runs and skipping foreign ones. State
-        # the bound rather than the slogan — that fallback proves ownership by
-        # run-id collision on disk, not by identity, so it skips a foreign
-        # session only while no run dir HERE shares its run id. Ids are
-        # timestamped plus two random bytes, but `--run-id` is caller-supplied,
-        # so untagged is weaker proof than a tag even though it beats a
-        # corrupted one. Both edges of that fallback are bounded in #419.
+        # Refusing leaves the option unset. Project ownership now uses a hex
+        # digest that clears this gate by construction (#419), but the gate stays
+        # as the general contract for every `@` session option.
         #
         # The refusal frees the key rather than just returning. A session this
         # backend just created is NOT a blank map — the server loads the user's
@@ -526,7 +520,7 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             print(
                 f"warning: set-option {option} skipped on session {name} — value does "
                 "not survive psmux's control-line transport verbatim; the key is freed "
-                "and ownership falls back to the run dir",
+                "and the option reads as unset",
                 file=sys.stderr,
             )
             self._write_scoped(["set-option", "-u", "-t", name, option], option)

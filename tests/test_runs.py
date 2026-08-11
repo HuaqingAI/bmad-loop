@@ -6,13 +6,13 @@ import re
 import subprocess
 import sys
 import tarfile
-from pathlib import Path
 
 import pytest
 from conftest import escalated_run, git
 
 from bmad_loop import platform_util, runs, verify
 from bmad_loop.adapters import tmux_base
+from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
 from bmad_loop.journal import load_state, save_state
 from bmad_loop.model import RunState
 from bmad_loop.process_host import ProcessHost
@@ -645,97 +645,26 @@ _SEP_VALUES = [s for _, s in _LINE_SEPARATORS]
 _SEP_IDS = [i for i, _ in _LINE_SEPARATORS]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="a separator in a name is a POSIX concern")
 @pytest.mark.parametrize("separator", _SEP_VALUES, ids=_SEP_IDS)
-@pytest.mark.parametrize("place", ["middle", "trailing"], ids=["mid", "tail"])
-def test_survives_listing_rejects_every_line_separator(separator, place):
-    """Everything `str.splitlines()` breaks on, not just LF.
+def test_project_tag_carries_a_path_the_listing_cannot_carry(tmp_path, separator):
+    """A listing splits on far more than LF, and every one of those is legal in a
+    POSIX directory name (#518).
 
-    The listing is parsed with `splitlines()`, whose set is much wider than the
-    two obvious characters — and all of them are legal bytes in a POSIX
-    directory name. This predicate chooses `project_tag`'s spelling, so naming
-    only LF here would leave the rest riding the transport raw and arriving
-    truncated at every comparison site.
+    The digest makes this true by construction instead of by encoding the few paths
+    that needed it, but the property is the same one and still needs pinning: return
+    a raw path from project_tag again and these ride the transport raw, arriving
+    truncated at every comparison site — a truncated tag is non-empty, so it reads as
+    *another* project's and the scan discards the project's own windows.
 
-    `trailing` is a separate case on purpose: a separator at the end does not
-    add a row (`"/p\\r".splitlines()` is one element), so a row-count check
-    passes it while the tag still comes back changed."""
-    tag = f"/home/u/p{separator}x" if place == "middle" else f"/home/u/p{separator}"
-    assert runs._survives_listing(tag) is False
-
-
-def test_survives_listing_accepts_paths_that_survive_the_round_trip():
-    # The control: ordinary paths, and a tab — which splitlines does not break
-    # on and the backends' bounded split carries intact, so encoding it would
-    # rewrite the stored tag of every project holding one, for nothing.
-    assert runs._survives_listing("/home/u/proj") is True
-    assert runs._survives_listing("/home/u/my proj") is True
-    assert runs._survives_listing("/home/u/my\tproj") is True
-
-
-def test_project_tag_leaves_a_transportable_path_byte_identical(tmp_path):
-    """The compatibility half of the conditional encoding.
-
-    Tags persist on live windows and sessions, so one written by an earlier
-    version has to keep comparing equal after an upgrade. Encoding only the
-    paths the transport cannot carry is what makes that true: drop the
-    `_survives_listing` branch from project_tag and every ordinary project's
-    stored tag stops matching itself. A tab, a space, a percent and non-ASCII
-    are all carried as-is."""
-    for name in ("proj", "my proj", "my\tproj", "100%done", "prögram"):
-        project = tmp_path / name
-        assert runs.project_tag(project) == str(project.resolve())
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="separators are illegal in win32 names")
-@pytest.mark.parametrize("separator", _SEP_VALUES, ids=_SEP_IDS)
-def test_project_tag_encodes_a_path_the_listing_cannot_carry(tmp_path, separator):
-    """The correctness half: a comparison site receives the tag that was
-    written, for *every* project, so no caller needs a trust fallback.
-
-    Two projects must also stay distinguishable. The fallback this replaced
-    stopped comparing tags when its own looked unsafe, which admitted rows
-    carrying another project's tag — so an encoding that collapsed two projects
-    together would reintroduce exactly the boundary crossing it removed."""
-    mine = tmp_path / f"my{separator}proj"
-    tag = runs.project_tag(mine)
-    assert runs._survives_listing(tag) is True
-    assert tag.startswith(runs._TAG_ENCODED_PREFIX)
+    Trailing is not a separate case here as it was for the old predicate: a digest
+    has no separator anywhere, so there is no row-count blind spot left to probe.
+    Two projects must also stay distinguishable — a tag collapsing them would let a
+    prune cross the boundary the tag exists to hold."""
+    tag = runs.project_tag(tmp_path / f"my{separator}proj")
+    assert re.fullmatch("[0-9a-f]{16}", tag)
+    assert tag.splitlines()[:1] == [tag]  # one row, and the whole of it
     assert tag != runs.project_tag(tmp_path / "theirproj")
-
-
-def test_survives_listing_rejects_a_surrogateescaped_filename_byte():
-    """A byte that is not valid in the filesystem encoding is legal in a POSIX
-    name, and `os.fsdecode` leaves it as a lone surrogate.
-
-    No codec can encode that surrogate, so the listing carries the original byte
-    and the backend's strict decode raises `UnicodeDecodeError` reading it back
-    — an attach or a stop *crashes* rather than mismatching. Checking only line
-    separators here reported such a tag as safe and left it raw."""
-    assert runs._survives_listing("/home/u/proj\udcff") is False
-    assert runs._survives_listing("/home/u/pr\N{LATIN SMALL LETTER O WITH DIAERESIS}gram") is True
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="win32 names are valid UTF-16 by construction")
-def test_project_tag_encodes_a_non_utf8_filename_byte(tmp_path):
-    """The encoded tag must be pure ASCII, and the encoder must survive the very
-    bytes it exists to carry.
-
-    `quote(safe="")` defaults to strict UTF-8 and raises `UnicodeEncodeError` on
-    a surrogate, so without `errors="surrogateescape"` project_tag itself blew up
-    on exactly these paths — worse than the mismatch it was added to prevent."""
-    weird = Path(os.fsdecode(os.path.join(os.fsencode(tmp_path), b"proj\xff")))
-    weird.mkdir()
-    tag = runs.project_tag(weird)
-    assert tag.startswith(runs._TAG_ENCODED_PREFIX)
-    assert tag.isascii()  # nothing left for a strict decode to choke on
-    assert runs._survives_listing(tag) is True
-
-    # A separator AND a bad byte together: the combined case reached the encoder.
-    both = Path(os.fsdecode(os.path.join(os.fsencode(tmp_path), b"p\nq\xff")))
-    both.mkdir()
-    combined = runs.project_tag(both)
-    assert combined.isascii()
-    assert combined != tag  # still injective across the two failure modes
 
 
 def test_prunable_sessions_partitions(tmp_path, monkeypatch):
@@ -778,6 +707,44 @@ def test_prunable_sessions_partitions(tmp_path, monkeypatch):
     assert sorted(prunable) == ["fin-1", "orphan-1", "untag-fin"]
     assert alive == ["live-1"]
     assert unknown == set()
+
+
+def test_project_tag_is_transportable_whatever_the_path(tmp_path):
+    """Tags have one safe shape even for paths psmux or UTF-8 cannot carry raw.
+
+    Assert the shape, not just that the gate accepts it: an ordinary spaced Windows
+    path clears the gate on its own, so only "hex whatever the input" fails when
+    project_tag returns a raw path.
+    """
+    assert not PsmuxMultiplexer._transportable(r"\\srv\share name\proj")  # the premise
+    project = tmp_path / "share name" / "proj"
+    project.mkdir(parents=True)
+    tag = runs.project_tag(project)
+    assert re.fullmatch("[0-9a-f]{16}", tag)
+    assert PsmuxMultiplexer._transportable(tag)
+    assert re.fullmatch("[0-9a-f]{16}", runs.project_tag(tmp_path / f"bad{chr(0xDC80)}"))
+    assert len({tag, runs.project_tag(tmp_path / "other")}) == 2
+
+
+def test_prunable_sessions_accepts_legacy_path_tag(tmp_path, monkeypatch):
+    """A pre-digest tag stays ours; another project's path or digest stays foreign."""
+    legacy = str(tmp_path.resolve())
+    fin = _make_state_run(tmp_path, "legacy-fin")
+    (fin / "engine.pid").write_text(str(_dead_pid()))
+    sessions = ["bmad-loop-legacy-fin", "bmad-loop-legacy-other", "bmad-loop-legacy-digest"]
+    monkeypatch.setattr(runs, "mux_sessions", lambda: sessions)
+    monkeypatch.setattr(
+        runs,
+        "session_project_tags",
+        lambda: {
+            "bmad-loop-legacy-fin": legacy,
+            "bmad-loop-legacy-other": "/some/other/project",
+            "bmad-loop-legacy-digest": runs.project_tag(tmp_path / "other"),
+        },
+    )
+    prunable, live, unknown = runs.prunable_sessions(tmp_path)
+    assert prunable == ["legacy-fin"]
+    assert live == [] and unknown == set()
 
 
 def test_prunable_sessions_skips_invalid_run_ids(tmp_path, monkeypatch):

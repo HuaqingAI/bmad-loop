@@ -379,7 +379,7 @@ def ctl_window_id(project: Path, run_id: str) -> str | None:
     for a fresh `run`, where recording is deliberately skipped."""
     if not mux_available():
         return None
-    mine = runs.project_tag(project)
+    mine = runs.accepted_tags(project)
     local = runs.is_run(runs.run_dir_for(project, run_id))
     tagged: list[str] = []
     untagged: list[str] = []
@@ -403,12 +403,17 @@ def ctl_window_id(project: Path, run_id: str) -> str | None:
         m = _CTL_WINDOW_RE.match(name)
         if m is None or m.group(1) != run_id:
             continue
-        # An exact tag comparison, with no "the tag looks unsafe here" escape:
-        # runs.project_tag guarantees the value arrives as it was written, so a
-        # nonempty tag that is not ours belongs to another project and must not
-        # be a candidate — `x` resolves through here, and admitting a foreign
-        # row lets a stop cross a project boundary.
-        if tag == mine:
+        # Set membership, with no "the tag looks unsafe here" escape: the digest
+        # arrives as it was written, so a nonempty tag outside the accepted set
+        # belongs to another project and must not be a candidate — `x` resolves
+        # through here, and admitting a foreign row lets a stop cross a project
+        # boundary. The set is what keeps a window tagged by an earlier release
+        # reachable: the control session is long-lived and survives the upgrade
+        # that changes the tag's spelling, so comparing against the current
+        # digest alone would strand this project's own orchestrator — prunable
+        # by _ctl_window_candidates, which accepts the legacy tag, yet
+        # unreachable by `a` and `x`, which resolve through here.
+        if tag in mine:
             tagged.append(win_id)
         elif not tag and local:
             # untagged, and this project holds the run dir — ownership is
@@ -645,17 +650,16 @@ def _ctl_window_candidates(project: Path) -> list[tuple[str, str]]:
     the ctl session never targets itself; live runs and the session's own shell
     window are excluded too.
 
-    The control session is shared across projects, so pruning is scoped to
-    `project` via the per-window PROJECT_OPTION tag (mirrors runs.prunable_sessions):
-    a window tagged for another project is left alone; an untagged (pre-upgrade)
-    window is only a candidate when its run dir exists under this project.
+    The control session is shared across projects, so its per-window PROJECT_OPTION
+    accepts current and legacy project tags; untagged windows still require a run
+    directory under this project (mirrors runs.prunable_sessions).
     """
     mux = get_multiplexer()
     if not mux_usable(mux) or not session_exists(CTL_SESSION):
         return []
     current = mux.current_window_id()
     rows = mux.list_windows(CTL_SESSION, ["window_id", "window_name", runs.PROJECT_OPTION])
-    mine = runs.project_tag(project)
+    mine = runs.accepted_tags(project)
     candidates: list[tuple[str, str]] = []
     for win_id, name, tag in rows:
         if not win_id or win_id == current:
@@ -667,7 +671,7 @@ def _ctl_window_candidates(project: Path) -> list[tuple[str, str]]:
             continue  # a foreign/mangled window name must not steer a run-dir path
         run_dir = runs.run_dir_for(project, m.group(1))
         if tag:
-            if tag != mine:
+            if tag not in mine:
                 continue  # another project's window
         elif not runs.is_run(run_dir):
             continue  # untagged and no run dir here — ownership unprovable

@@ -381,6 +381,23 @@ def test_ctl_window_id_ignores_a_record_naming_another_projects_window(monkeypat
     assert launch.ctl_window_id(tmp_path, "RID") == "@2"
 
 
+def test_ctl_window_id_accepts_a_legacy_path_tag(monkeypatch, tmp_path: Path):
+    # The ctl session is long-lived and shared across projects, so it survives the
+    # upgrade that changes the tag's spelling from a path to a digest. Comparing
+    # against the current digest alone strands this project's OWN orchestrator:
+    # _ctl_window_candidates accepts the legacy tag and would prune the window,
+    # while `a` and `x` resolve through here and could no longer reach it.
+    legacy = str(tmp_path.resolve())
+    _ctl_listing(monkeypatch, f"@1\trun-RID\t{legacy}\n", tmp_path)
+    assert launch.ctl_window_id(tmp_path, "RID") == "@1"
+
+    # Still scoped: another project's legacy path tag stays foreign, so accepting
+    # the legacy spelling does not widen the boundary a stop must not cross.
+    other = str((tmp_path / "elsewhere").resolve())
+    _ctl_listing(monkeypatch, f"@1\trun-RID\t{other}\n", tmp_path)
+    assert launch.ctl_window_id(tmp_path, "RID") is None
+
+
 def test_ctl_window_id_admits_an_untagged_window_with_a_local_run(monkeypatch, tmp_path: Path):
     # The tag is written by a best-effort set_window_option that can fail, and a
     # window whose tag never landed must stay reachable by its own project
@@ -892,9 +909,11 @@ def test_a_delimiter_in_the_project_path_does_not_hide_its_own_window(
     `a`/`x` then could not reach a run the pre-tag lookup found. Worse than a
     missed match, because the fallthrough for an unknown tag is exclusion.
 
-    Parametrized over all six on purpose: two different mechanisms carry them —
-    the tab by the backends' bounded field split, the separators by project_tag's
-    encoding — so one spelling passing says nothing about another."""
+    Parametrized over all six on purpose: each is a byte a resolved project path
+    can legally hold, and project_tag hashes the path rather than carrying any
+    spelling of it, so none of them reaches the listing. The matrix pins that the
+    digest is the single mechanism — return a raw path here and the tab and the
+    separators fail again, by two different routes."""
     project = tmp_path / odd_name
     project.mkdir()
     _make_run(project)
@@ -914,8 +933,9 @@ def test_a_separator_in_the_project_path_does_not_admit_a_foreign_window(
     when its own could not survive the listing. That admits every row carrying
     the run id — including one tagged for another project — and `x` resolves
     through here, so a stop could kill a neighbouring project's orchestrator.
-    Reach and scoping are not a trade: project_tag encodes the tag instead, so
-    the comparison stays exact and this row is simply not ours.
+    Reach and scoping are not a trade: project_tag hashes the resolved path, so
+    the tag is listing-safe by construction, the comparison stays exact, and this
+    row is simply not ours.
 
     The two assertions differ only in whose tag the row carries, which is what
     makes the refusal about the tag rather than about the listing being
@@ -1278,6 +1298,32 @@ def test_prune_ctl_windows(monkeypatch, tmp_path: Path):
     assert killed == []  # dry-run view kills nothing
     assert launch.prune_ctl_windows(tmp_path) == ["sweep-20260101-000000-dead"]
     assert killed == [["tmux", "kill-window", "-t", "@3"]]
+
+
+def test_prune_ctl_windows_accepts_legacy_path_tag(monkeypatch, tmp_path: Path):
+    """A ctl window carrying a pre-digest tag remains owned after upgrade."""
+    from bmad_loop import runs
+
+    legacy = str(tmp_path.resolve())
+    windows = (
+        f"@2\trun-20260101-000000-dead\t{legacy}\n"  # our own pre-upgrade window — kill
+        "@3\trun-20260101-000000-alien\t/some/other/project\n"  # foreign — skip
+    )
+
+    def fake(argv, **kwargs):
+        verb = argv[1]
+        if verb == "list-windows":
+            return subprocess.CompletedProcess(argv, 0, stdout=windows, stderr="")
+        if verb == "display-message":
+            return subprocess.CompletedProcess(argv, 0, stdout="@9\n", stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,123,0")
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    assert launch.prunable_ctl_windows(tmp_path) == ["run-20260101-000000-dead"]
+    assert runs.project_tag(tmp_path) != legacy  # the shapes really are different
 
 
 def test_prune_ctl_windows_skips_invalid_run_ids(monkeypatch, tmp_path: Path):
