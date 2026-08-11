@@ -284,12 +284,21 @@ def test_cmd_clean_hard_deletes_past_retention(project):
 
 def test_cmd_clean_protects_a_run_whose_agent_session_is_still_live(project, monkeypatch, capsys):
     """`reclaimable` is keyed on engine pid liveness, so an orphan — engine dead,
-    agent session still live — is past retention and would be removed. That takes
-    the only ownership proof an untagged session has, leaking it for the life of
-    the machine (#419), so the run is protected instead and the operator is told."""
+    agent session still live — is past retention and would be reclaimed. That takes
+    the only ownership proof an untagged session has, leaking it for the life of the
+    machine (#419), so the run is protected instead and the operator is told.
+
+    The run is given a real worktree and put past retention so every mutation in the
+    loop is in play at once: the guard has to sit ahead of `reconcile_orphan_worktrees`
+    and `trim_run_dir`, not just ahead of the archive. Half-reclaiming a protected run
+    would strip the tree the live session may still be working in and still report it
+    untouched."""
     install_bmad_config(project)
     repo = project.project
     run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    wt = run_dir / "worktrees" / "u"
+    wt.parent.mkdir(parents=True)
+    verify.worktree_add(repo, wt, "fb", "main")
     save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", finished=True))
     monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-20260101-000000-aaaa"])
 
@@ -297,7 +306,10 @@ def test_cmd_clean_protects_a_run_whose_agent_session_is_still_live(project, mon
 
     assert run_dir.is_dir()  # not archived out from under the session
     assert not (repo / ".bmad-loop" / "archive").exists()
-    assert "20260101-000000-aaaa: agent session still live — not removed" in capsys.readouterr().err
+    assert wt.exists()  # worktree not reconciled away either
+    out, err = capsys.readouterr()
+    assert "20260101-000000-aaaa: agent session still live — left untouched" in err
+    assert "removed worktree" not in out
 
 
 # -------------------------------------------------------- cmd_clean --json

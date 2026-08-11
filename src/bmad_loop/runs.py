@@ -577,7 +577,13 @@ def _refuse_live_session(run_id: str, verb: str) -> None:
     That is the one state where the run dir is load-bearing: for an untagged
     session it is the only ownership proof :func:`prunable_sessions` can read, so
     removing it leaks the session (and its server) for the life of the machine.
-    Refusing is a repair-path write failing loudly, per the module doctrine."""
+    Refusing is a repair-path write failing loudly, per the module doctrine.
+
+    The remedy the message names is `bmad-loop cleanup`, never a kill from here: a
+    session name carries no project, so killing `bmad-loop-<id>` by name would tear
+    down another project's live run whenever the two share a run id (reachable —
+    `--run-id` is caller-supplied). `prune_sessions` is the scoped kill; it proves
+    ownership from the tag before killing anything."""
     if session_alive(run_id):
         raise LiveSessionError(
             f"run {run_id}: refusing to {verb} its directory while its agent session "
@@ -586,21 +592,29 @@ def _refuse_live_session(run_id: str, verb: str) -> None:
         )
 
 
-def delete_run(run_dir: Path) -> None:
+def delete_run(run_dir: Path, *, force: bool = False) -> None:
     """Permanently remove a run directory. Callers enforce the engine-liveness
     guard; the session guard is enforced here (see :func:`_refuse_live_session`),
-    which raises :class:`LiveSessionError` instead of removing."""
-    _refuse_live_session(run_dir.name, "delete")
+    which raises :class:`LiveSessionError` instead of removing.
+
+    ``force`` is the operator's explicit override and skips that guard, accepting
+    the leak on their own say-so. It deliberately does not kill the session
+    instead — that would be unscoped, and this project cannot prove the session is
+    its own (which is the whole defect)."""
+    if not force:
+        _refuse_live_session(run_dir.name, "delete")
     shutil.rmtree(run_dir)
 
 
-def archive_run(project: Path, run_dir: Path) -> Path:
+def archive_run(project: Path, run_dir: Path, *, force: bool = False) -> Path:
     """Compress a run dir into .bmad-loop/archive/<id>.tar.gz and remove the
     original. The tarball is written to a temp path then atomically replaced into
     place so a partial archive never appears. Callers enforce the engine-liveness
-    guard; the session guard is enforced here (see :func:`_refuse_live_session`)
-    and runs before the tarball is written, so a refusal leaves nothing behind."""
-    _refuse_live_session(run_dir.name, "archive")
+    guard; the session guard is enforced here (see :func:`_refuse_live_session`,
+    and :func:`delete_run` for ``force``) and runs before the tarball is written,
+    so a refusal leaves nothing behind."""
+    if not force:
+        _refuse_live_session(run_dir.name, "archive")
     archive_dir = project / ARCHIVE_DIR
     archive_dir.mkdir(parents=True, exist_ok=True)
     dest = archive_dir / f"{run_dir.name}.tar.gz"

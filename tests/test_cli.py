@@ -2139,20 +2139,42 @@ def test_delete_refuses_an_orphaned_session_without_force(tmp_path, monkeypatch,
     assert run_dir.exists()
 
 
-def test_delete_force_kills_the_orphaned_session_then_removes(tmp_path, monkeypatch, capsys):
-    """--force means "make it not-live, then remove", exactly as it does for a live
-    engine (which routes through stop_run). It satisfies the run-dir guard by killing
-    the session rather than bypassing it, so the dir still never outlives the
-    session — hence the removal only succeeds because the kill landed first."""
+def test_delete_force_overrides_the_session_guard_without_killing_it(tmp_path, monkeypatch, capsys):
+    """--force removes anyway, and kills nothing.
+
+    Killing `bmad-loop-<id>` from here would be unscoped: a session name carries no
+    project, so on a `--run-id` collision it would tear down another project's live
+    run — and this project cannot prove the session is its own, which is the very
+    defect the guard exists for. The scoped kill is `bmad-loop cleanup`
+    (prune_sessions proves ownership from the tag first). So --force stays an
+    override of a warning about the operator's own leak, not a destructive act."""
     from bmad_loop import runs
 
     killed = []
-    monkeypatch.setattr(runs, "mux_sessions", lambda: [] if killed else ["bmad-loop-r1"])
+    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-r1"])
     monkeypatch.setattr(runs, "kill_session", lambda rid: killed.append(rid))
     run_dir = _make_run_with_state(tmp_path, "r1")
     assert cli.main(["delete", "--project", str(tmp_path), "r1", "--force"]) == 0
-    assert killed == ["r1"]
+    assert killed == []  # the session — which may be another project's — is left alone
     assert not run_dir.exists()
+
+
+def test_archive_force_overrides_the_session_guard_without_killing_it(
+    tmp_path, monkeypatch, capsys
+):
+    """Archive's half of the same property — see the delete test for why nothing is
+    killed. Asserted separately because the two commands reach the guard by
+    different calls, and only one of them writes a tarball."""
+    from bmad_loop import runs
+
+    killed = []
+    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-r1"])
+    monkeypatch.setattr(runs, "kill_session", lambda rid: killed.append(rid))
+    run_dir = _make_run_with_state(tmp_path, "r1")
+    assert cli.main(["archive", "--project", str(tmp_path), "r1", "--force"]) == 0
+    assert killed == []
+    assert not run_dir.exists()
+    assert (tmp_path / ".bmad-loop" / "archive" / "r1.tar.gz").is_file()
 
 
 def test_archive_refuses_an_orphaned_session_without_force(tmp_path, monkeypatch, capsys):
