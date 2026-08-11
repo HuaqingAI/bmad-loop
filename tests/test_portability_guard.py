@@ -163,10 +163,14 @@ def _classify_posix_path(value: str) -> str | None:
 
 
 def _is_os_environ(node: ast.expr) -> bool:
-    """True for the ``os.environ`` attribute access itself."""
+    """True for the ``os.environ`` / ``os.environb`` attribute access itself.
+
+    ``environb`` is the bytes-keyed twin (POSIX-only, absent on Windows). Nobody
+    reaches for it here, but it is the same mapping and costs one string to cover,
+    which is cheaper than discovering it later."""
     return (
         isinstance(node, ast.Attribute)
-        and node.attr == "environ"
+        and node.attr in ("environ", "environb")
         and isinstance(node.value, ast.Name)
         and node.value.id == "os"
     )
@@ -245,6 +249,10 @@ def _env_read_key(node: ast.expr | None, aliases: dict[str, str]) -> str | None:
     that reads like an env lookup, not a silent miss — the direction a tripwire
     should fail in."""
     if isinstance(node, ast.Constant):
+        # bytes ride along for os.environb's b"BMAD_LOOP_…" keys
+        if isinstance(node.value, bytes):
+            decoded = node.value.decode("utf-8", "replace")
+            return decoded if decoded.startswith(ENV_PREFIX) else None
         if isinstance(node.value, str) and node.value.startswith(ENV_PREFIX):
             return node.value
     if isinstance(node, ast.Name):
@@ -374,6 +382,15 @@ def _scan():
                 and isinstance(node.ctx, ast.Load)
             ):
                 env_key = _env_read_key(node.slice, env_aliases)
+            elif isinstance(node, ast.Compare):
+                # `"BMAD_LOOP_X" in os.environ` / `not in` — a presence read, and the
+                # most natural way to spell a boolean flag. Walks every (op, rhs) pair
+                # so a chained comparison cannot hide one.
+                for op, rhs in zip(node.ops, node.comparators):
+                    if isinstance(op, (ast.In, ast.NotIn)) and _is_os_environ(rhs):
+                        env_key = _env_read_key(node.left, env_aliases)
+                        if env_key:
+                            break
             if env_key:
                 findings.append(("envread", rel, node.lineno, line_at(node.lineno)))
 
@@ -478,13 +495,24 @@ def test_bmad_loop_env_reads_only_in_the_registry():
     ``envvars.py``; plugin-owned env-var families stay with their plugin." Reading a
     knob inline is what made these undiscoverable before the registry existed, so a
     core module must call an ``envvars`` reader rather than touch ``os.environ``
-    itself. Detects the literal ``os.environ`` / ``os.getenv`` forms with the key
-    spelled four ways — literal, same-module constant, ``envvars.MUX_BACKEND``, and
-    the registry constant imported in (see ``_env_read_key``). ``from os import
-    environ`` aliases are deliberately not tracked: that is a way to obscure the
-    *lookup*, and this is a review tripwire, not a sandbox. Borrowing the registry's
-    *key* is different — it is the shape a well-meaning change actually takes, so it
-    resolves.
+    itself.
+
+    COVERED — the access shape (all verified by planting, see the ablation list):
+    ``os.environ.get/pop/setdefault``, ``os.getenv``, ``os.environ[K]``, the
+    ``key=`` keyword form of each, ``K in os.environ`` / ``not in``, and the
+    ``os.environb`` bytes twin of all of them. Crossed with the key spelling: a
+    literal, a same-module constant, ``envvars.MUX_BACKEND``, and the registry
+    constant imported in (see ``_env_read_key``).
+
+    NOT COVERED, deliberately — both obscure the *lookup* rather than the key:
+    rebinding the mapping (``e = os.environ; e.get(K)``) and ``from os import
+    environ``. This is a review tripwire, not a sandbox: it exists to catch the
+    change someone writes while trying to do the right thing, not to withstand
+    someone routing around it. Borrowing the registry's *key* is the opposite case
+    — that IS what a well-meaning change looks like, so every key spelling resolves.
+
+    Bulk copies (``dict(os.environ)``, ``{**os.environ}``) are correctly silent:
+    they name no variable, so there is no var being defined outside the registry.
 
     Scoped to reads. Writes are a different act: engine.py, resolve.py, probe.py,
     plugins/bus.py and unity_plugin.py all BUILD a ``BMAD_LOOP_*`` dict to inject
@@ -533,7 +561,17 @@ def test_bmad_loop_env_reads_only_in_the_registry():
     its methods are the ABC's plain-Python defs; the ``dict.get`` intuition, which
     is positional-only, points the wrong way). Confirmed against the live
     interpreter before fixing, then re-verified as CAUGHT, including the keyword
-    form carrying an imported registry constant."""
+    form carrying an imported registry constant.
+
+    A third round added ``K in os.environ`` / ``not in`` (an ``ast.Compare``, and
+    the most natural way to spell a boolean flag) and the ``os.environb`` twin.
+    ⚠️ Three consecutive rounds each found another uncovered AST shape, which is
+    worth reading as a property of the design rather than three unlucky misses:
+    this is a denylist of access forms, so it is only ever as complete as the last
+    sweep over them. The full matrix above was then swept in one pass — 12 read
+    shapes CAUGHT, 4 controls (two bulk copies, a non-BMAD var, prose) correctly
+    silent — and the NOT COVERED list is the honest boundary, not an oversight.
+    Extend the matrix, not just the branch, if a new form turns up."""
     offenders = [(rel, ln, txt) for _, rel, ln, txt in _of("envread") if rel not in ENV_READ_ALLOW]
     assert not offenders, (
         "BMAD_LOOP_* read outside envvars.py and the plugin-owned families — name "
