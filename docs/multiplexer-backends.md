@@ -76,17 +76,16 @@ upstream release. Practical consequence: such a value is **not** readable via
 `psmux show-options -w` by hand — read it with
 `psmux show-options -qv -t <session> "@bmad_project__blw@N"` instead. Session-scoped options need
 no such substitute — one server per session means that server's single map _is_ the session's —
-but they cross the same control line, so the session project tag is gated the same way. One
+but they cross the same control line, so session-scoped `@` options are gated the same way. One
 visible limit: a value that cannot survive psmux's control-line transport verbatim is refused
-with a stderr warning at every launch, and that project's windows and agent sessions stay
-untagged — the prune then scopes them through the run-dir fallback instead of the tag. Which
-paths those are is counter-intuitive, because the psmux client quotes a value only when it
-contains an ASCII space and `'` is literal inside those quotes: `C:\Users\O'Brien\dev` is
-**refused** while `C:\Users\O'Brien Files\dev` is accepted, and a spaced UNC path
-(`\\server\share\My Proj`) is refused while the spaceless `\\server\share\proj` is accepted. The
-fallback that catches those refusals has a lifecycle ceiling
-([#419](https://github.com/bmad-code-org/bmad-loop/issues/419)): an untagged session whose run
-directory is later removed by `clean` or `archive` can no longer be pruned by any project.
+with a stderr warning and the option reads as unset. Which values those are is
+counter-intuitive, because the psmux client quotes a value only when it contains an ASCII space
+and `'` is literal inside those quotes: `C:\Users\O'Brien\dev` is **refused** while
+`C:\Users\O'Brien Files\dev` is accepted, and a spaced UNC path (`\\server\share\My Proj`) is
+refused while the spaceless `\\server\share\proj` is accepted. The project ownership tag no
+longer meets this gate: it is stored as a hex digest of the project path, transportable by
+construction ([#419](https://github.com/bmad-code-org/bmad-loop/issues/419)), so sessions stay
+tagged whatever the path and the run-dir fallback remains only for genuinely untagged state.
 
 ## External backends
 

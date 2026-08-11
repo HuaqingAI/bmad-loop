@@ -341,9 +341,9 @@ def cmd_validate(args: argparse.Namespace) -> int:
     if paths:
         if stories_on:
             _validate_stories_queue(project, paths, spec_folder, dev_trees, report)
-            _validate_closes_deferred(paths, report, spec_folder=spec_folder)
+            _validate_deferred_ledger(paths, report, spec_folder=spec_folder)
         else:
-            _validate_closes_deferred(paths, report)
+            _validate_deferred_ledger(paths, report)
             _validate_operator_registry(project, paths, report)
             try:
                 ss = sprintstatus.load(paths.sprint_status)
@@ -1034,8 +1034,293 @@ def _validate_operator_registry(
         )
 
 
+def _validate_deferred_ledger(
+    paths: bmadconfig.ProjectPaths,
+    report: ValidationReport,
+    *,
+    spec_folder: str | None = None,
+) -> None:
+    """Read the deferred-work ledger once, then run every check that needs it.
+
+    The read sits here rather than inside each check because an unreadable ledger
+    is one fault, not one per reader: two checks opening the same file would
+    report the same outage twice under two ids.
+
+    A ledger that cannot be read at all is reported. Staying quiet there is not
+    the same trade as staying quiet about an unparseable manifest: the manifest is
+    already reported by ``queue.stories-manifest``, while nothing else in
+    ``validate`` reads the ledger, so silence meant reporting success for
+    preflights that checked nothing.
+
+    The gate runs first for one reason only: an operator who has both a blocked
+    story and a stale traceability field should meet the refusal before the
+    advisory. Presentation, nothing more — ``_validate_closes_deferred``'s early
+    return leaves *that function*, so it could never have skipped a sibling call
+    here, and swapping the two lines changes no severity and no exit code.
+    """
+    ledger = paths.deferred_work
+    try:
+        text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+    except (OSError, UnicodeDecodeError) as e:
+        # Split from the manifest read in the checks below, which is silent for a
+        # good reason that does not apply here: nothing else in `validate` reads
+        # the ledger, so returning quietly reported success for preflights that
+        # checked nothing, against the very file the run's closure will fail on
+        # (#284 round-5 review, finding 6).
+        #
+        # A problem rather than a warning, escalated from the severity this id
+        # carried while the read served only `closes_deferred`. The hard gate now
+        # rides on the same bytes, and a warning exits 0 having evaluated no gate
+        # at all — a fail-open on the one deferred check that is a refusal, and one
+        # that cannot be narrowed by asking whether the project uses gates, because
+        # the file that would answer is the unreadable one. `Engine._loop` refuses
+        # the same way for the same reason, so preflight and dispatch agree about
+        # this file instead of `validate` reporting a run that then pauses at its
+        # first story. Nothing is lost by failing early: the message's last clause
+        # is literal — the run's own closure reads this file too.
+        report.fail(
+            "deferred.ledger-unreadable",
+            f"{ledger} cannot be read ({e}) — neither closes_deferred declarations nor "
+            "`gate:` hard gates were checked against it, so an open entry could be "
+            "gating an actionable story unseen; the run's own closure will fail the same way",
+            {"ledger": str(ledger), "error": str(e)},
+        )
+        return
+    _validate_hard_gates(paths, text, report, spec_folder=spec_folder)
+    _validate_closes_deferred(paths, text, report, spec_folder=spec_folder)
+
+
+def _validate_hard_gates(
+    paths: bmadconfig.ProjectPaths,
+    text: str,
+    report: ValidationReport,
+    *,
+    spec_folder: str | None = None,
+) -> None:
+    """FAIL when the queue would dispatch a story an unlanded ledger entry gates.
+
+    The preflight half of a two-sided refusal: ``Engine._refuse_gated_story``
+    enforces the same gate at dispatch, so a ``run`` that skipped ``validate``
+    pauses instead of proceeding. This side exists to move the answer earlier —
+    the operator learns before the run starts, and learns about *every* gated
+    story on the queue rather than just the first one picked.
+
+    The two must keep agreeing about what "unlanded" means (only an explicit
+    ``done`` retires a gate) and about an unreadable ledger (both refuse); a
+    ``validate`` that passed a run which then paused at its first story would
+    teach operators to trust neither.
+
+    A ledger entry could always *say* it blocked a story — ``HARD GATE: must land
+    before 3-2`` in its reason — and saying it stopped nothing. ``run`` took the
+    story off the board and drove it, and the gate was discovered afterwards, in
+    the diff of work built on a leg nobody had wired. A ``gate:`` line makes the
+    claim matchable and this check makes it a refusal.
+
+    The only deferred check that is a gate rather than an advisory, and the
+    severity is the whole point: the ``closes-*`` siblings describe traceability
+    that is wrong, which must never block a run, while this one describes work
+    that must not start, which is exactly what a non-zero exit is for.
+
+    Silent on a ledger nobody has gated, so the zero-config output is unchanged.
+    Once a gate exists the passing case reports itself — a gate that only ever
+    speaks when it fires is indistinguishable, on the day it matters, from one
+    nobody remembered to write.
+    """
+    declared = [(entry, deferredwork.gates(entry)) for entry in deferredwork.parse_ledger(text)]
+    for entry, entry_gates in declared:
+        if entry.done:
+            continue  # a landed entry gates nothing; that is what closing it means
+        _report_unstructured_gate(entry, entry_gates, report)
+    # Keyed on enforceable tokens, not on `gate:` lines: a ledger whose only gate is
+    # malformed enforced nothing, and an `ok` there would be the same false all-clear
+    # the warning above exists to break. Closed entries still count, deliberately —
+    # the passing case has to keep speaking after the gate lands, or `ok` and "nobody
+    # ever wrote a gate" become the same silence. Reading the queue sits behind this
+    # test so a project that gates nothing pays neither the walk nor its failure modes.
+    if not any(entry_gates.tokens for _, entry_gates in declared):
+        return
+    story_keys = _actionable_story_keys(paths, spec_folder)
+    if story_keys is None:
+        # The queue could not be read, so nothing was compared. `queue.sprint-status`
+        # and `queue.stories-manifest` already fail for it; adding an `ok` here would
+        # say "no story is gated" about a queue this check never saw.
+        return
+    gating = [e.id for e, g in declared if not e.done and g.tokens]
+    gated = False
+    for entry, entry_gates in declared:
+        # `done`, not `not open` — the tri-state is the whole point. An entry whose
+        # status the format cannot read (`status: opne`, or no status line) is not
+        # evidence the work landed, and skipping it let one typo disable the gate
+        # *and* emit an `ok` naming the entry as clear. Only an explicit `done`
+        # retires a gate; everything else holds until someone writes that word.
+        if entry.done:
+            continue
+        for story_key in story_keys:
+            hits = [t for t in entry_gates.tokens if deferredwork.gates_story(t, story_key)]
+            if not hits:
+                continue
+            gated = True
+            report.fail(
+                "deferred.hard-gate",
+                f"{entry.id} ({entry.title}) {_gate_status_clause(entry)} and gates "
+                f"{story_key} (gate: {', '.join(hits)}) — that story must not run until "
+                f"the entry lands. Close it in {paths.deferred_work.name} "
+                f"(`status: done <date>`), or drop the token from its `gate:` line if it "
+                f"no longer blocks this work",
+                {
+                    "dw_id": entry.id,
+                    "title": entry.title,
+                    "story_key": story_key,
+                    "tokens": hits,
+                },
+            )
+    if not gated:
+        report.ok(
+            "deferred.hard-gate",
+            f"deferred-work gates OK: no actionable story is gated by an unlanded entry "
+            f"({', '.join(gating) if gating else 'no unlanded gated entries'})",
+            {"gating_ids": gating, "actionable": list(story_keys)},
+        )
+
+
+def _gate_status_clause(entry: deferredwork.DWEntry) -> str:
+    """How the failure names *why* this entry still gates.
+
+    An unreadable status is reported as what it is rather than folded into "is
+    open": the remedy differs — the operator with a typo fixes the `status:` line,
+    and telling them the entry "is open" sends them to close work that may already
+    have landed. Naming the offending value is what makes a one-character typo
+    findable in a ledger of fifty entries.
+    """
+    if entry.open:
+        return "is open"
+    if not entry.status:
+        return "has no `status:` line, so it cannot be read as landed"
+    return f"has an unreadable status (`{entry.status}`), so it cannot be read as landed"
+
+
+def _report_unstructured_gate(
+    entry: deferredwork.DWEntry,
+    entry_gates: deferredwork.EntryGates,
+    report: ValidationReport,
+) -> None:
+    """Warn about a hard gate the mechanical check cannot enforce.
+
+    Three causes, one id, because the remedy is the same line in the same file.
+    A ``HARD GATE:`` written as prose is the pre-``gate:`` convention still
+    holding nothing back. A token that cannot name a story key, and a ``gate:``
+    line with nothing after the colon, are that same nothing with the field's
+    syntax around it — worse, because to anyone scanning the entry they read as a
+    gate already in force.
+
+    An entry carrying a valid token *and* an unenforceable one is still reported,
+    and each cause is reported on its own rather than the first one winning: the
+    valid half gates what it names, and the operator's belief about the other half
+    is exactly the thing that goes wrong quietly. That applies to an empty line as
+    much as to a malformed token — ``gate: 3-2`` followed by a bare ``gate:`` used
+    to report neither, because the entry had tokens and so read as fully gated.
+
+    A fourth cause, and the only one that is about a line the parser never saw: a
+    ``gate:`` the strict field anchor misses (``Gate:``, or indented). It is a
+    warning rather than an accepted gate on purpose — see :data:`_GATE_NEAR_RE`.
+
+    Runs for every entry that is not ``done``, which is the same set the refusal
+    holds against. Keying it on ``open`` instead would have left an entry with an
+    unreadable status silent about a malformed token as well as about its gate.
+    """
+    reasons: list[str] = []
+    if entry_gates.malformed:
+        reasons.append(
+            f"declares `gate:` tokens that cannot name a story: {', '.join(entry_gates.malformed)}"
+        )
+    if entry_gates.empty == 1:
+        reasons.append("declares an empty `gate:` line, which names no story")
+    elif entry_gates.empty:
+        reasons.append(f"declares {entry_gates.empty} empty `gate:` lines, which name no story")
+    if entry_gates.near_miss:
+        reasons.append(
+            f"spells {entry_gates.near_miss} `gate:` line(s) in a form the field does not "
+            f"read (the field is a lowercase `gate:` at the very start of a line)"
+        )
+    prose_only = not entry_gates.tokens and not reasons
+    if prose_only and deferredwork.declares_prose_gate(entry):
+        reasons.append("declares a `HARD GATE:` in prose but carries no `gate:` line")
+    if not reasons:
+        return
+    report.warn(
+        "deferred.hard-gate-unstructured",
+        f"{entry.id} ({entry.title}) {' and '.join(reasons)} — so `validate` cannot refuse "
+        f"the gated story and nothing holds it back; name the blocked stories on a `gate:` "
+        f"line (comma-separated) to make the gate enforceable",
+        {
+            "dw_id": entry.id,
+            "malformed": list(entry_gates.malformed),
+            "empty": entry_gates.empty,
+            "near_miss": entry_gates.near_miss,
+        },
+    )
+
+
+def _actionable_story_keys(
+    paths: bmadconfig.ProjectPaths, spec_folder: str | None
+) -> list[str] | None:
+    """The story keys this queue could dispatch, in queue order, in either mode.
+
+    ``None`` when the queue could not be read, which is not the same answer as an
+    empty list: ``queue.sprint-status`` and ``queue.stories-manifest`` own queue
+    readability, so this check stays quiet rather than raising — but a caller that
+    read ``[]`` as "nothing is gated" would report an all-clear about a queue it
+    never saw. The whole walk is inside the guard for the same reason: the
+    per-story ``resolve_story_spec`` globs the filesystem too, and leaving it
+    outside turned a degraded check into a traceback out of ``validate``.
+
+    Stories mode has no status column — the manifest is a flat schedule and the
+    story's own spec carries the status — so actionability comes from
+    :func:`stories._classify`, the predicate the scheduler itself picks with.
+    Dropping only ``done`` is not the same line the sprint board draws:
+    ``ACTIONABLE_STATUSES`` is a two-element allowlist, so ``blocked`` and the
+    rest are already out on that side. In stories mode a ``blocked``, sentinel,
+    ambiguous or unknown-status entry is one :func:`stories.schedule` refuses to
+    dispatch (``SCHEDULE_WEDGED``), so treating every non-``done`` state as
+    actionable made ``validate`` exit nonzero over a gate on a story the queue
+    could not run — and made the two queue modes disagree about what a gate
+    refuses.
+
+    What is shared is that per-entry predicate and deliberately NOT the scan's
+    stop rule: ``schedule`` gives up at the FIRST wedged entry, and mirroring that
+    here would drop every later story from this list. Two reasons not to. A wedge
+    is a property of some *other* story, and ``run --story <id>`` scans that entry
+    alone (``selector``), so a later story really is reachable while the wedge
+    stands — while ``validate`` takes no story selector and so cannot know which
+    run is coming. And stopping would let one blocked entry near the top of a
+    manifest silence the gate check for everything below it, which is the failure
+    this check exists to prevent, arriving by a quieter route than the one it
+    fixed. Over-reporting a real gate on a story that needs an unrelated
+    resolution first is the cheaper wrong answer, and dispatch still refuses
+    independently.
+    """
+    if spec_folder is not None:
+        keys: list[str] = []
+        try:
+            folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
+            for entry in stories_mod.load_stories(folder).entries:
+                state = stories_mod.resolve_story_spec(folder, entry.id)
+                if stories_mod._classify(state) != "actionable":
+                    continue
+                keys.append(entry.id)
+        except (OSError, UnicodeDecodeError, stories_mod.StoriesError):
+            return None
+        return keys
+    try:
+        ss = sprintstatus.load(paths.sprint_status)
+    except (sprintstatus.SprintStatusError, OSError, UnicodeDecodeError):
+        return None
+    return [s.key for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
+
+
 def _validate_closes_deferred(
     paths: bmadconfig.ProjectPaths,
+    text: str,
     report: ValidationReport,
     *,
     spec_folder: str | None = None,
@@ -1070,31 +1355,12 @@ def _validate_closes_deferred(
     close nothing and say nothing. Covering only two of the three left the third
     to be discovered in the journal after the run it should have preceded.
 
-    A ledger that cannot be read at all is reported as well. Staying quiet there
-    is not the same trade as staying quiet about an unparseable manifest: the
-    manifest is already reported by ``queue.stories-manifest``, while nothing
-    else in ``validate`` reads the ledger, so silence meant reporting success for
-    a preflight that checked nothing.
-
     Never a failure. The annotation is traceability, not a gate, so a stale
     reference must not be able to block a run that would otherwise start.
+    ``text`` is the ledger snapshot :func:`_validate_deferred_ledger` already
+    read; an unreadable ledger never reaches here.
     """
     ledger = paths.deferred_work
-    try:
-        text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
-    except (OSError, UnicodeDecodeError) as e:
-        # Split from the manifest read below, which is silent for a good reason
-        # that does not apply here: nothing else in `validate` reads the ledger, so
-        # returning quietly reported success for a preflight that checked nothing,
-        # against the very file the run's closure will fail on
-        # (#284 round-5 review, finding 6).
-        report.warn(
-            "deferred.ledger-unreadable",
-            f"{ledger} cannot be read ({e}) — closes_deferred declarations were not "
-            "checked against it, and the run's own closure will fail the same way",
-            {"ledger": str(ledger), "error": str(e)},
-        )
-        return
     try:
         sources = (
             _stories_declarations(paths, spec_folder)
@@ -2628,7 +2894,11 @@ def cmd_delete(args: argparse.Namespace) -> int:
     rc = _stop_or_block_live_engine(run_dir, args.run_id, args.force)
     if rc is not None:
         return rc
-    runs.delete_run(run_dir)
+    try:
+        runs.delete_run(project, run_dir, force=args.force)
+    except runs.LiveSessionError as e:
+        print(f"{e} (or pass --force)", file=sys.stderr)
+        return 1
     print(f"run {args.run_id} deleted")
     return 0
 
@@ -2644,7 +2914,11 @@ def cmd_archive(args: argparse.Namespace) -> int:
     rc = _stop_or_block_live_engine(run_dir, args.run_id, args.force)
     if rc is not None:
         return rc
-    dest = runs.archive_run(project, run_dir)
+    try:
+        dest = runs.archive_run(project, run_dir, force=args.force)
+    except runs.LiveSessionError as e:
+        print(f"{e} (or pass --force)", file=sys.stderr)
+        return 1
     print(f"run {args.run_id} archived to {dest}")
     return 0
 
@@ -2749,6 +3023,24 @@ def cmd_clean(args: argparse.Namespace) -> int:
     deleted: list[str] = []
     unverifiable: list[str] = []
     for run_dir in reclaimable:
+        if runs.live_session_may_be_ours(project, run_dir.name):
+            # `reclaimable` is keyed on engine pid liveness, so an orphan — engine
+            # dead, agent session still live — passes it, and everything below this
+            # point mutates: the worktree the session may still be working in, the
+            # trimmed artifacts, and the run dir itself, which for an untagged
+            # session is the only ownership proof a later prune can read (#419).
+            # So the guard is the first thing in the loop, ahead of every mutation,
+            # and the run is reported untouched rather than half-reclaimed.
+            # `cleanup` clears the session — but for an untagged one it proves
+            # ownership by this same run dir, so the operator confirms first
+            # (`bmad-loop attach <id>`); the next `clean` then reclaims the run.
+            protected.append(run_dir.name)
+            if not args.json:
+                print(
+                    f"run {run_dir.name}: agent session still live — left untouched",
+                    file=sys.stderr,
+                )
+            continue
         if runs.engine_liveness(run_dir) == "unknown":
             # warn-only: unknown never blocks cleanup, but say so before removal.
             # In JSON mode this lives in the document instead (unverifiable_pid),
@@ -2765,21 +3057,44 @@ def cmd_clean(args: argparse.Namespace) -> int:
         run_bytes = _dir_size(run_dir)
         # collect, never print-as-you-mutate: the document is emitted once at the
         # end, so every per-item line has to survive the loop as data
-        for wt in runs.reconcile_orphan_worktrees(repo, run_dir, dry_run=dry):
+        run_worktrees = runs.reconcile_orphan_worktrees(repo, run_dir, dry_run=dry)
+        for wt in run_worktrees:
             worktrees.append(str(wt))
             if not args.json:
                 print(f"{'would remove' if dry else 'removed'} worktree {wt}")
         if run_dir.name in past:
             freed += run_bytes
-            runs.trim_run_dir(run_dir, dry_run=dry)  # shrink before archiving
-            if args.hard or not pol.cleanup.archive_old:
-                if not dry:
-                    runs.delete_run(run_dir)
-                deleted.append(run_dir.name)
-            else:
-                if not dry:
-                    runs.archive_run(project, run_dir)
-                archived.append(run_dir.name)
+            shrunk = runs.trim_run_dir(run_dir, dry_run=dry)  # shrink before archiving
+            try:
+                if args.hard or not pol.cleanup.archive_old:
+                    if not dry:
+                        runs.delete_run(project, run_dir)
+                    deleted.append(run_dir.name)
+                else:
+                    if not dry:
+                        runs.archive_run(project, run_dir)
+                    archived.append(run_dir.name)
+            except runs.LiveSessionError:
+                # A session appeared between the loop-top guard and here — a resume
+                # of a stopped run, racing this clean. The chokepoint refused the
+                # removal; record the run instead of letting one racing run abort
+                # the whole invocation. Correct the estimate down to what actually
+                # went. The wider race — every mutation in this loop against a
+                # concurrent resume — is older than this guard (`reclaimable` is
+                # sampled in the loop above and never re-read) and is tracked in
+                # issue #533.
+                freed += wt_bytes - run_bytes
+                # Classify by what happened, not by what was intended: the steps
+                # above may already have taken this run's worktree and artifacts,
+                # and `protected` means "left untouched" in the --json contract.
+                # Only a run nothing reached is protected; one already shrunk is
+                # trimmed, which is exactly the state it ends in.
+                (trimmed if run_worktrees or shrunk else protected).append(run_dir.name)
+                if not args.json:
+                    print(
+                        f"run {run_dir.name}: agent session appeared mid-clean — not removed",
+                        file=sys.stderr,
+                    )
         elif pol.cleanup.trim_artifacts:
             if runs.trim_run_dir(run_dir, dry_run=dry):
                 freed += wt_bytes

@@ -1960,6 +1960,31 @@ async def test_resume_confirm_launches(project, monkeypatch):
         await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
 
 
+async def test_resume_uncaptured_window_id_warns(project, monkeypatch):
+    # The resume itself is running; only the #482 disambiguation record is lost,
+    # so attach/stop may target an older same-run_id window. The success toast
+    # must not mask that (the resolve path already errors on this condition).
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: None)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    make_run(
+        project.project,
+        "20260611-100000-aaaa",
+        paused_stage="DEV_VERIFY",
+        paused_reason="verify failed",
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: dashboard(app).selected_run_id is not None)
+        await pilot.press("e")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmResumeModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(
+            pilot, lambda: any("window id was not recorded" in m for m in notifications(app))
+        )
+
+
 async def test_resume_unknown_pid_warns(project, monkeypatch):
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(data, "liveness", lambda run_dir: "unknown")
@@ -2082,7 +2107,7 @@ async def test_attach_without_mux_notifies(project, monkeypatch):
 async def test_attach_without_agent_session_notifies(project, monkeypatch):
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "session_exists", lambda session: False)
-    monkeypatch.setattr(launch, "ctl_window_id", lambda run_id: None)
+    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, run_id: None)
     make_run(project.project, "20260611-100000-aaaa")
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
@@ -2099,7 +2124,7 @@ async def test_attach_multiplexer_error_notifies(project, monkeypatch):
     # TUI must surface the error as a toast, not crash the app.
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "session_exists", lambda session: True)
-    monkeypatch.setattr(launch, "ctl_window_id", lambda run_id: None)
+    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, run_id: None)
 
     def boom(_target):
         raise MultiplexerError("backend server not reachable")
@@ -2123,7 +2148,7 @@ async def test_attach_session_probe_error_notifies(project, monkeypatch):
     # torn down in between). action_attach routes it through _mux_guarded, so the
     # TUI toasts the error and aborts the attach instead of crashing the app.
     monkeypatch.setattr(launch, "mux_available", lambda: True)
-    monkeypatch.setattr(launch, "ctl_window_id", lambda run_id: None)
+    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, run_id: None)
 
     def boom(_session):
         raise MultiplexerError("session probe unreachable")
@@ -2214,7 +2239,7 @@ async def test_attach_targets_ctl_window_when_decision_pending(project, monkeypa
     selected: list[str] = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "session_exists", lambda session: True)  # agent up too
-    monkeypatch.setattr(launch, "ctl_window_id", lambda run_id: "@5")
+    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, run_id: "@5")
     monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: selected.append(w))
     calls, stamps = _patch_attach_exec(monkeypatch)
     app = BmadLoopApp(project.project)
@@ -2230,6 +2255,42 @@ async def test_attach_targets_ctl_window_when_decision_pending(project, monkeypa
 
 
 @pytest.mark.usefixtures("force_tmux_backend")  # pin tmux against win32-matching externals
+async def test_attach_uses_the_recorded_ctl_window(project, monkeypatch):
+    # The one attach test that does NOT replace ctl_window_id, so it pins the
+    # seam every other one stubs out: that the TUI hands it the same project root
+    # the launch recorded the window under (#482). Point app.py at anything else
+    # — the run dir, an unresolved path — and the record is unfindable, the scan
+    # answers the parked `run-` corpse, and attach + return-stamp both go there.
+    import subprocess as _subprocess
+
+    from bmad_loop.adapters import tmux_base
+
+    rid = "20260611-100000-aaaa"
+    run_dir = make_run(project.project, rid, run_type="sweep", alive=True)
+    Journal(run_dir).append("decision-pending", dw_id="DW-7", question="q?")
+    (run_dir / launch._CTL_WINDOW_FILE).write_text("@2", encoding="utf-8")
+    selected: list[str] = []
+
+    def fake(argv, **kwargs):
+        out = f"@1\trun-{rid}\n@2\tresume-{rid}\n" if argv[1] == "list-windows" else ""
+        return _subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(launch, "session_exists", lambda session: True)
+    monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: selected.append(w))
+    calls, stamps = _patch_attach_exec(monkeypatch)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: dashboard(app).decision_pending is not None)
+        await pilot.press("a")
+        await until(pilot, lambda: bool(calls))
+    assert selected == ["@2"]
+    assert stamps == [("@2", "=main:%9")]
+
+
+@pytest.mark.usefixtures("force_tmux_backend")  # pin tmux against win32-matching externals
 async def test_attach_outside_tmux_stamps_detach(project, monkeypatch):
     # No TMUX: a throwaway client attaches under suspend, so the ctl window is
     # stamped to detach it on exit (returning to the suspended TUI) rather than
@@ -2240,7 +2301,7 @@ async def test_attach_outside_tmux_stamps_detach(project, monkeypatch):
     stamps: list[tuple[str, str]] = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "session_exists", lambda session: True)
-    monkeypatch.setattr(launch, "ctl_window_id", lambda run_id: "@5")
+    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, run_id: "@5")
     monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: None)
     monkeypatch.setattr(launch, "set_return_pane", lambda w, p: stamps.append((w, p)))
     app = BmadLoopApp(project.project)
@@ -2257,7 +2318,7 @@ async def test_attach_prefers_agent_session_without_decision(project, monkeypatc
     make_run(project.project, "20260611-100000-aaaa", alive=True)
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "session_exists", lambda session: True)
-    monkeypatch.setattr(launch, "ctl_window_id", lambda run_id: "@5")
+    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, run_id: "@5")
     calls, stamps = _patch_attach_exec(monkeypatch)
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
@@ -2276,7 +2337,7 @@ async def test_attach_falls_back_to_ctl_window(project, monkeypatch):
     selected: list[str] = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "session_exists", lambda session: False)
-    monkeypatch.setattr(launch, "ctl_window_id", lambda run_id: "@5")
+    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, run_id: "@5")
     monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: selected.append(w))
     calls, stamps = _patch_attach_exec(monkeypatch)
     app = BmadLoopApp(project.project)
@@ -2304,6 +2365,10 @@ async def test_resolve_escalation_launches_and_attaches(project, monkeypatch):
     monkeypatch.setattr(launch, "start_resolve_detached", fake_start_resolve)
     monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: selected.append(w))
     calls, stamps = _patch_attach_exec(monkeypatch)
+    # The healthy path: the lookup answers the window the launch minted, so no
+    # warning. Stubbed at the same seam every other attach test stubs — the
+    # helper's own listing/record logic is pinned in tests/test_tui_launch.py.
+    monkeypatch.setattr(launch, "ctl_window_recorded", lambda proj, rid, wid: True)
     make_run(
         project.project,
         "20260611-100000-aaaa",
@@ -2318,11 +2383,43 @@ async def test_resolve_escalation_launches_and_attaches(project, monkeypatch):
         await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
         await pilot.click(await ready(pilot, "#ok"))
         await until(pilot, lambda: bool(calls))
+        assert not any("was not recorded" in m for m in notifications(app))
     assert launched == ["20260611-100000-aaaa"]
     assert selected == ["@7"]
     assert calls == [["tmux", "switch-client", "-t", "=bmad-loop-ctl"]]
     # resolve runs in the freshly launched ctl window (@7) — stamp it to return
     assert stamps == [("@7", "=main:%9")]
+
+
+@pytest.mark.usefixtures("force_tmux_backend")  # pin tmux against win32-matching externals
+async def test_resolve_warns_when_the_record_did_not_survive(project, monkeypatch):
+    # The resolve path kept the captured id (it attaches with it) but never
+    # asked whether the record landed, so a failed write left `a`/`x` on the
+    # ambiguous scan behind a clean attach. Warn, and attach anyway: this
+    # window is reached by the id in hand, only later verbs are degraded.
+    selected: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(launch, "start_resolve_detached", lambda proj, rid: "@7")
+    monkeypatch.setattr(launch, "ctl_window_recorded", lambda proj, rid, wid: False)
+    monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: selected.append(w))
+    calls, _stamps = _patch_attach_exec(monkeypatch)
+    make_run(
+        project.project,
+        "20260611-100000-aaaa",
+        paused_stage="escalation",
+        paused_reason="CRITICAL escalation",
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: dashboard(app).selected_run_id is not None)
+        await pilot.press("R")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: any("was not recorded" in m for m in notifications(app)))
+    assert selected == ["@7"]  # still attached to the window it minted
+    assert calls == [["tmux", "switch-client", "-t", "=bmad-loop-ctl"]]
 
 
 async def test_resolve_unknown_pid_refused(project, monkeypatch):
@@ -2628,10 +2725,11 @@ async def test_story_checkpoint_stop_marks_stopped(project, monkeypatch):
     from bmad_loop import runs
 
     stops: list[Path] = []
+    kills: list[tuple[Path, str]] = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
     monkeypatch.setattr(runs, "stop_run", lambda rd: stops.append(rd) or True)
-    monkeypatch.setattr(launch, "kill_ctl_window", lambda rid: None)
+    monkeypatch.setattr(launch, "kill_ctl_window", lambda proj, rid: kills.append((proj, rid)))
     _stories_paused_run(
         project.project,
         stage="story-checkpoint",
@@ -2643,7 +2741,9 @@ async def test_story_checkpoint_stop_marks_stopped(project, monkeypatch):
     async with app.run_test() as pilot:
         await _open_review(app, pilot, StoryCheckpointModal)
         await pilot.click(await ready(pilot, "#act-stop"))
-        await until(pilot, lambda: len(stops) == 1)
+        await until(pilot, lambda: len(kills) == 1)
+    assert stops == [project.project / runs.RUNS_DIR / "20260611-100000-aaaa"]
+    assert kills == [(project.project, "20260611-100000-aaaa")]
 
 
 def test_checkpoint_gate_line_pluralization():

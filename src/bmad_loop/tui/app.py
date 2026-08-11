@@ -415,7 +415,7 @@ class BmadLoopApp(App[None]):
             self.notify("no run selected", severity="warning")
             return
         session = runs.session_name(run_id)
-        win_id = launch.ctl_window_id(run_id)
+        win_id = launch.ctl_window_id(self.project, run_id)
         ok, agent_live = self._mux_guarded(lambda: launch.session_exists(session))
         if not ok:
             return
@@ -522,6 +522,16 @@ class BmadLoopApp(App[None]):
         if not win_id:
             self.notify("resolve launched but its window id was not captured", severity="error")
             return
+        if not launch.ctl_window_recorded(self.project, run_id, win_id):
+            # Not an error and not a reason to abort: this attach targets the id
+            # in hand, so the resolve session itself is reached correctly. What
+            # is lost is the record *later* verbs read, so `a`/`x` after this
+            # window is minted may answer an older one (#482's symptom).
+            self.notify(
+                "resolve launched but its window id was not recorded — "
+                "later attach/stop may target an older window for this run",
+                severity="warning",
+            )
         launch.select_ctl_window_id(win_id)
         self._attach_to_target(launch.ctl_target(), return_window=win_id)
 
@@ -709,10 +719,22 @@ class BmadLoopApp(App[None]):
             self.notify(f"run {run_id} may still be live — stop it first", severity="warning")
             return
         try:
-            launch.resume_detached(self.project, run_id)
+            win_id = launch.resume_detached(self.project, run_id)
         except launch.LaunchError as e:
             self.notify(str(e), severity="error")
             return
+        if not win_id:
+            # The resume itself is running; only the disambiguation record is
+            # lost, so `a`/`x` may target an older same-run_id window (#482's
+            # symptom). Warn instead of masking it behind the success toast.
+            # "not recorded", not "not captured": resume_detached reports the
+            # uncaptured id and the unwritten record through this one signal
+            # because they leave the operator in the same place.
+            self.notify(
+                "resume launched but its window id was not recorded — "
+                "attach/stop may target an older window for this run",
+                severity="warning",
+            )
         self.notify(f"resume of {run_id} launched (control session {launch.CTL_SESSION})")
 
     def _do_replan(self, run_id: str, spec_path: Path) -> None:
@@ -874,7 +896,7 @@ class BmadLoopApp(App[None]):
     def _stop_run_worker(self, run_id: str, run_dir: Path) -> None:
         try:
             runs.stop_run(run_dir)
-            launch.kill_ctl_window(run_id)
+            launch.kill_ctl_window(self.project, run_id)
         except (OSError, StopRunError, ProcessHostError) as e:
             self.call_from_thread(self.notify, f"stop failed: {e}", severity="error")
             return
@@ -978,8 +1000,11 @@ class BmadLoopApp(App[None]):
     @work(thread=True, group="lifecycle")
     def _delete_run_worker(self, run_id: str, run_dir: Path) -> None:
         try:
-            runs.delete_run(run_dir)
-        except OSError as e:
+            runs.delete_run(self.project, run_dir)
+        except (OSError, runs.LiveSessionError) as e:
+            # LiveSessionError is the #419 backstop: the confirm above gates on engine
+            # liveness, which an orphaned session passes. Surface it like any other
+            # failed removal rather than letting it kill the worker thread.
             self.call_from_thread(self.notify, f"delete failed: {e}", severity="error")
             return
         self.call_from_thread(self._dashboard.forget_run, run_id)
@@ -1015,7 +1040,9 @@ class BmadLoopApp(App[None]):
     def _archive_run_worker(self, run_id: str, run_dir: Path) -> None:
         try:
             dest = runs.archive_run(self.project, run_dir)
-        except OSError as e:
+        except (OSError, runs.LiveSessionError) as e:
+            # see _delete_run_worker: the confirm's guard is engine-keyed, this one
+            # is session-keyed (#419).
             self.call_from_thread(self.notify, f"archive failed: {e}", severity="error")
             return
         self.call_from_thread(self._dashboard.forget_run, run_id)

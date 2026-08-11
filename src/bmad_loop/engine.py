@@ -43,6 +43,7 @@ from .model import (
     PAUSE_EPIC_BOUNDARY,
     PAUSE_ESCALATION,
     PAUSE_SPEC_APPROVAL,
+    PAUSE_STORY_GATE,
     Phase,
     RunState,
     SessionRecord,
@@ -833,6 +834,10 @@ class Engine:
             if story is None:
                 self._maybe_auto_sweep("run-end", "run-end")
                 return
+            # Before ANY state mutation for this story, and deliberately so — see
+            # _refuse_gated_story. The story is not in state.tasks yet, so a resume
+            # re-picks it and re-asks the ledger.
+            self._refuse_gated_story(story.key)
             if self.state.current_epic is not None and story.epic != self.state.current_epic:
                 self._epic_boundary(self.state.current_epic, story.epic)
             self.state.current_epic = story.epic
@@ -853,6 +858,117 @@ class Engine:
         count is the durable dispatch tally. Without this, a checkpoint pause then
         resume would reset the counter and let the run dispatch past its cap."""
         return len(self.state.tasks)
+
+    def _refuse_gated_story(self, story_key: str) -> None:
+        """Pause the run rather than dispatch a story an unlanded ledger entry gates.
+
+        The enforcing half of ``gate:``. ``bmad-loop validate`` refuses the same
+        story at preflight, but a preflight is only as strong as the operator's
+        habit — ``run`` never called it, and ``_pick_next`` reads the board alone,
+        so before this the field's whole promise rested on someone remembering to
+        type a second command.
+
+        **Placement is load-bearing.** Called from ``_loop`` before
+        ``state.tasks[key] = task``, so the gated story is *not* recorded as
+        touched by this run. That is what makes the refusal re-askable: a resume
+        re-picks the same story and re-reads the ledger, so closing the entry and
+        resuming runs it. Registering the task first — the obvious placement, next
+        to ``_run_story`` — would put the key in ``_pick_next``'s ``base_skip``,
+        and the gate would fire once and then silently retire the story for the
+        rest of the run and every resume of it. A gate that drops the work it was
+        protecting is worse than no gate.
+
+        **Pause, not skip.** ``validate`` fails the whole preflight over one gated
+        story, and the two surfaces have to agree or the operator learns to
+        distrust both. It raises the reserved :data:`PAUSE_STORY_GATE` stage, which
+        the TUI already renders and routes to its gate viewer.
+
+        The ledger is re-read here rather than carried from preflight: a sweep (or
+        a human) may have closed the entry since, and a gate answering from a stale
+        snapshot would refuse work that has landed.
+
+        **Unreadable ledger pauses too.** Degrading to "not gated" would let the
+        one deferred check that is a refusal be disabled by a broken file, and the
+        question "does this project use gates?" is answerable only from the file
+        that will not open. ``deferred.ledger-unreadable`` is a ``validate``
+        problem for the same reason.
+
+        Two exemptions, both deliberate. ``SweepEngine`` overrides ``_loop`` and so
+        never reaches this call — it must not, because the sweep is the only
+        automated closer of the gating entry (``sweep.py`` `_close_resolved` /
+        bundle close), and gating the sweep would deadlock the gate against its own
+        remedy. And a resumed story *finishes* rather than stranding a half-done
+        session with a live worktree; the gate applies to work that must not
+        *start*, which is the same line ``validate`` draws when it passes a story
+        the board has already finished.
+
+        That second exemption belongs to ``_finish_inflight``'s finishing arms —
+        the defer replay, the spec-approval continuation, the recorded-session
+        replay, the commit completion — and not to its restart arm, which finishes
+        nothing: it discards the worktree (or resets to baseline) and re-runs the
+        story from scratch. So the restart arm re-asks this gate, and
+        unconditionally. ``_pick_next`` cannot ask for it, having skipped the key as
+        touched, and the run's own crash must not be what disables the one deferred
+        check that refuses.
+
+        Both call sites ask **before** their caller mutates anything, and that is
+        one rule rather than two coincidences. In ``_loop`` it keeps the refusal
+        re-askable; in the restart arm it keeps the ledger readable, because that
+        arm's in-place rollback is ``git reset --hard <baseline>`` and a gate
+        committed while the run was down is a commit *after* that baseline.
+
+        Deliberately no "but did a session really run?" test there. Every available
+        signal is wrong somewhere: ``attempt`` is bumped before the session launches,
+        ``sessions`` is written only after one returns, and ``rearmed`` covers a
+        stories-mode wedge (``StoriesEngine._pause_wedged``) that reaches ESCALATED
+        with no session at all. The arm's own unwinding is the stronger guarantee.
+        """
+        ledger = self.paths.deferred_work
+        try:
+            text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+        except (OSError, UnicodeDecodeError) as e:
+            self.journal.append("story-gate-unreadable", story_key=story_key, error=str(e))
+            reason = (
+                f"{ledger} cannot be read ({e}), so the `gate:` hard gates protecting "
+                f"{story_key} could not be evaluated — fix the file, then "
+                f"`bmad-loop resume {self.state.run_id}`"
+            )
+            gates.notify(self.policy, self.run_dir, f"story gated: {story_key}", reason)
+            raise RunPaused(reason, PAUSE_STORY_GATE, story_key) from e
+        blocking = [
+            (entry.id, hits)
+            for entry, hits in (
+                (
+                    entry,
+                    [
+                        token
+                        for token in deferredwork.gates(entry).tokens
+                        if deferredwork.gates_story(token, story_key)
+                    ],
+                )
+                # `done`, not `not open`: an entry whose status the format cannot
+                # read is not evidence the work landed, and reading it as closed
+                # would let a one-character typo disable the gate.
+                for entry in deferredwork.parse_ledger(text)
+                if not entry.done
+            )
+            if hits
+        ]
+        if not blocking:
+            return
+        named = ", ".join(f"{dw_id} (gate: {', '.join(hits)})" for dw_id, hits in blocking)
+        reason = (
+            f"{story_key} is gated by unlanded deferred work: {named} — close the "
+            f"entry in {ledger.name} (`status: done <date>`) or run `bmad-loop sweep`, "
+            f"then `bmad-loop resume {self.state.run_id}`"
+        )
+        self.journal.append(
+            "story-gated",
+            story_key=story_key,
+            dw_ids=[dw_id for dw_id, _ in blocking],
+        )
+        gates.notify(self.policy, self.run_dir, f"story gated: {story_key}", reason)
+        raise RunPaused(reason, PAUSE_STORY_GATE, story_key)
 
     def _pick_next(self):
         ss = load_sprint_status(self.paths.sprint_status)
@@ -1118,6 +1234,30 @@ class Engine:
                 else:
                     self._finalize_commit_phase(task)
             else:
+                # This arm is the one that does not finish work: it discards the
+                # worktree or resets the tree to baseline and re-runs the story
+                # from scratch, so what follows is a *start* and gets the same
+                # question `_loop` asks. Unconditionally — any test for "did a
+                # session really run?" is wrong somewhere: `attempt` is bumped
+                # before the session launches, `sessions` is written only after one
+                # returns, and `rearmed` covers a stories-mode wedge that reached
+                # ESCALATED with no session at all.
+                #
+                # Asked BEFORE the unwinding below, for the same reason `_loop`
+                # asks before it registers the task: the in-place rollback is
+                # `git reset --hard <baseline>`, and a `gate:` committed while the
+                # run was down lives in a commit *after* that baseline. Rolling
+                # back first would rewind a tracked ledger and put the question to
+                # a file the human never wrote — `keep=(".bmad-loop",)` guards only
+                # untracked deletion, which is exactly why `verify.safe_rollback`
+                # has to restore `policy.toml` by hand. It also keeps the pause
+                # honest under the default `rollback_on_failure = false`, where
+                # `_rollback_or_pause` would otherwise pause for manual recovery
+                # and never reach the gate. The cost is that a refused isolated
+                # task keeps its half-built worktree mounted until a resume gets
+                # past the gate — the same thing an escalation pause does, and the
+                # cheaper of the two mistakes.
+                self._refuse_gated_story(task.story_key)
                 self.journal.append(
                     "resume-restart", story_key=task.story_key, phase=str(task.phase)
                 )

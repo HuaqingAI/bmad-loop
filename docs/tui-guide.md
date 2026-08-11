@@ -43,7 +43,10 @@ The TUI never runs an engine in-process. The two halves:
   lives in a separate `bmad-loop-<run-id>` session; it is torn down when the run
   finishes (unless `[adapter] cleanup_session_on_finish = false`). These parked
   `bmad-loop-ctl` windows and any leftover `bmad-loop-<id>` sessions can be
-  swept with `c` (see [Cleaning up sessions](#cleaning-up-sessions-c)).
+  swept with `c` (see [Cleaning up sessions](#cleaning-up-sessions-c)). Each
+  launch over an existing run records the id of the window it minted in the
+  run dir (`ctl-window`), so attach/stop follow the run's live window even
+  while an older same-run-id window is still parked (#482).
 - **Observer** — the dashboard reads only the artifacts the engine writes
   atomically into `.bmad-loop/runs/<run-id>/`: `state.json`, `journal.jsonl`,
   `logs/<task-id>.log`, `ATTENTION`, `engine.pid`. It polls the selected run
@@ -441,9 +444,11 @@ artifacts the engine already wrote.
   interactive agent as `R`; **Re-arm & resume** (offered once the resolve agent has
   recorded a resolution) re-arms and resumes — deleting a sentinel with a preserved
   copy for a clean re-dispatch. Both refuse a still-live engine.
-- **Spec-approval / epic gate** — reuses the spec viewer (view the finalized spec,
-  then **Approve & resume**), so the pre-existing sprint-mode gates inherit the same
-  richer surface.
+- **Spec-approval / epic / story gate** — reuses the spec viewer (view the finalized
+  spec, then **Approve & resume**), so the pre-existing sprint-mode gates inherit the
+  same richer surface. A story gate fires before the story is recorded, so it has no
+  spec to show; read its reason — which names the blocking entries and the remedy — in
+  the run-header banner or the resume confirmation.
 
 `p` and `R` overlap for an escalation (both reach Resolve); `p` also exposes
 Re-arm & resume inline once a resolution exists. Pause badges in the run list and

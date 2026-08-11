@@ -26,6 +26,7 @@ from conftest import (
     review_effect,
     set_sprint,
     spec_path,
+    write_gated_ledger,
     write_ledger,
     write_spec,
     write_sprint,
@@ -40,6 +41,7 @@ from bmad_loop.model import (
     PAUSE_EPIC_BOUNDARY,
     PAUSE_ESCALATION,
     PAUSE_SPEC_APPROVAL,
+    PAUSE_STORY_GATE,
     Phase,
     RunState,
     SessionRecord,
@@ -6449,6 +6451,334 @@ def test_critical_escalation_pauses_and_resume_continues(project):
     summary2 = resumed.run()
     assert summary2.done == 1 and not summary2.paused
     assert resumed.state.finished
+
+
+def test_dispatch_refuses_a_story_an_unlanded_entry_gates(project):
+    """The enforcing half of `gate:`. Before this, `_pick_next` read the board
+    alone: the ledger could say a story was blocked and `run` drove it anyway, and
+    the gate was discovered afterwards in the diff of work built on a leg nobody
+    had wired. `validate` refuses the same story, but only if someone ran it."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1-1"])})
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")])
+
+    summary = engine.run()
+
+    assert summary.paused
+    saved = load_state(engine.run_dir)
+    assert saved.paused_stage == PAUSE_STORY_GATE
+    assert saved.paused_story_key == "1-1-a"
+    # the refusal has to precede the work, not follow it
+    assert adapter.sessions == []
+    # ...and precede the *record* of the work: the story is deliberately NOT in
+    # state.tasks, which is what `_pick_next`'s base_skip keys on. Registering it
+    # first would fire the gate once and then retire the story for this run and
+    # every resume of it — a gate that drops the work it was protecting.
+    assert saved.tasks == {}
+    events = [e for e in engine.journal.entries() if e["kind"] == "story-gated"]
+    assert len(events) == 1 and events[0]["dw_ids"] == ["DW-1"]
+    assert "DW-1" in saved.paused_reason and "bmad-loop sweep" in saved.paused_reason
+
+
+def test_the_gate_still_holds_when_a_resume_has_not_closed_the_entry(project):
+    """A resume that fixed nothing must not get the story through.
+
+    This is what the placement buys, stated as behavior. Recording the task before
+    the check — the obvious placement, next to `_run_story` — leaves a non-terminal
+    task behind, and `_finish_inflight` runs *before* the loop and drives exactly
+    those: the resume would dispatch the gated story without ever consulting the
+    ledger again. Refusing before the story is recorded is what makes the gate a
+    standing condition rather than a one-shot speed bump.
+    """
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1-1"])})
+    engine, _ = make_engine(project, [])
+    assert engine.run().paused
+
+    resumed, adapter = resume_engine(project, engine, [dev_effect(project, "1-1-a")])
+    summary = resumed.run()
+
+    assert summary.paused and summary.done == 0
+    assert adapter.sessions == []  # the entry is still open; nothing may run
+    assert load_state(resumed.run_dir).paused_stage == PAUSE_STORY_GATE
+
+
+def test_a_gated_story_runs_once_the_entry_lands(project):
+    """Closing the entry is the primary remedy the pause names, so it has to be
+    the one that clears it — a gate nobody can get past is a wedge, not a gate.
+    (That the refusal survives a resume which changed nothing is the test above;
+    this one is the release.)"""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1-1"])})
+    engine, _ = make_engine(project, [])
+    assert engine.run().paused
+
+    write_gated_ledger(project, {"DW-1": ("done 2026-08-01", ["gate: 1-1"])})
+    resumed, _ = resume_engine(
+        project,
+        engine,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.paused
+
+
+def test_dispatch_gate_holds_on_a_status_the_format_cannot_read(project):
+    """`status: opne` is not evidence the work landed. The check keys on an
+    explicit `done` rather than on `not open` precisely so a one-character typo
+    cannot disable the gate — the silent no-op the whole field exists to end."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_gated_ledger(project, {"DW-1": ("opne", ["gate: 1-1"])})
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")])
+
+    summary = engine.run()
+
+    assert summary.paused
+    assert load_state(engine.run_dir).paused_stage == PAUSE_STORY_GATE
+    assert adapter.sessions == []
+
+
+def test_dispatch_gate_does_not_fire_for_a_story_it_does_not_name(project):
+    """A false refusal wedges a run, which is worse than the prose gate this
+    replaced. An entry gating 2-1 must let 1-1-a through untouched."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 2-1"])})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+
+
+def test_dispatch_pauses_when_the_ledger_cannot_be_read(project, monkeypatch):
+    """Degrading to "not gated" would let a broken file disable the one deferred
+    check that refuses, and "does this project use gates?" is answerable only from
+    the file that will not open. `validate` reports the same fault as a problem."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 9-9"])})
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")])
+    fault_read_text(monkeypatch, project.deferred_work)
+
+    summary = engine.run()
+
+    assert summary.paused
+    saved = load_state(engine.run_dir)
+    assert saved.paused_stage == PAUSE_STORY_GATE
+    assert adapter.sessions == []
+    assert "cannot be read" in saved.paused_reason
+    assert [e["kind"] for e in engine.journal.entries()].count("story-gate-unreadable") == 1
+
+
+def test_resume_re_gates_a_story_registered_but_never_started(project):
+    """`_loop` saves the task and *then* calls `_run_story`, so a host death in
+    that window — or anywhere before `_dev_phase`'s advance, which spans the
+    isolated worktree mount — persists a PENDING task no session ever touched.
+    `_pick_next` skips it (it is in `base_skip`), so only `_finish_inflight`
+    drives it, and its restart arm calls `_run_story` directly. A gate that
+    landed while the run was down would never be asked.
+
+    The exemption below is for work already *in flight*; this task is not. Its
+    state is byte-identical to one the loop would have re-picked and re-gated a
+    microsecond earlier, and the run's own crash is not a reason to skip it.
+    """
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    # exactly what _loop persists between `state.tasks[key] = task` and _run_story
+    engine.state.tasks["1-1-a"] = StoryTask(story_key="1-1-a", epic=1)
+    engine._save()
+    # the gate lands while the run is down
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1-1"])})
+
+    resumed, adapter = resume_engine(
+        project,
+        engine,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+    )
+    summary = resumed.run()
+
+    assert summary.paused and summary.done == 0
+    assert adapter.sessions == []
+    saved = load_state(resumed.run_dir)
+    assert saved.paused_stage == PAUSE_STORY_GATE
+    assert saved.paused_story_key == "1-1-a"
+
+
+def test_resume_re_gates_a_story_whose_attempt_never_reached_a_session(project):
+    """The second window, and why the arm asks unconditionally rather than testing
+    the attempt counter: `_dev_phase` persists `attempt == 1` with the DEV_RUNNING
+    advance, but the session does not launch until `adapter.run()` — past
+    `_restore_patch`, the prompt build and the pre_session plugin gate, any of which
+    can be slow or can pause. A host death in there records an attempt no session
+    ever backed, and the restart arm rolls the task back and re-runs it from
+    scratch, so this is a start too."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    # attempt counted, no session record: the state _dev_phase saves before launch
+    engine.state.tasks["1-1-a"] = StoryTask(
+        story_key="1-1-a", epic=1, phase=Phase.DEV_RUNNING, attempt=1
+    )
+    engine._save()
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1-1"])})
+
+    resumed, adapter = resume_engine(
+        project,
+        engine,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+    )
+    summary = resumed.run()
+
+    assert summary.paused and summary.done == 0
+    assert adapter.sessions == []
+    assert load_state(resumed.run_dir).paused_stage == PAUSE_STORY_GATE
+
+
+def test_restart_arm_gate_re_asks_until_the_entry_lands(project):
+    """The restart arm's refusal must be a standing condition, not a one-shot.
+
+    `_finish_inflight` drives every non-terminal task, and a refused task stays
+    non-terminal — so each resume re-reads the ledger, and closing the entry is
+    what releases it. Were the refusal to retire the story instead, the gate would
+    drop the very work it was protecting; that is the same property the `_loop`
+    side buys by refusing before it records the task."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    engine.state.tasks["1-1-a"] = StoryTask(story_key="1-1-a", epic=1)
+    engine._save()
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1-1"])})
+
+    first, adapter1 = resume_engine(project, engine, [dev_effect(project, "1-1-a")])
+    assert first.run().paused and adapter1.sessions == []
+
+    # a resume that changed nothing must not get the story through
+    second, adapter2 = resume_engine(project, first, [dev_effect(project, "1-1-a")])
+    assert second.run().paused and adapter2.sessions == []
+    assert load_state(second.run_dir).paused_stage == PAUSE_STORY_GATE
+
+    # ...and closing the entry releases it, so the gate is not a wedge
+    write_gated_ledger(project, {"DW-1": ("done 2026-08-01", ["gate: 1-1"])})
+    third, _ = resume_engine(
+        project,
+        second,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+    )
+    summary = third.run()
+
+    assert summary.done == 1 and not summary.paused
+
+
+def test_resume_reads_the_gate_before_the_restart_rollback_rewinds_the_ledger(project):
+    """Order matters, not just placement. The restart arm's in-place rollback is
+    `git reset --hard <baseline>`, and `keep=(".bmad-loop",)` guards only untracked
+    deletion — tracked content under it is reverted anyway, which is why
+    `verify.safe_rollback` restores `policy.toml` by hand. A tracked ledger has no
+    such rescue: a `gate:` committed while the run was down lives in a commit
+    *after* the baseline, so a rollback that ran first would rewind the ledger and
+    the gate would read a file the human never wrote. Ask before the arm mutates
+    anything — the same rule `_loop` follows."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "board")  # board predates the baseline
+    engine, _ = make_engine(project, [])  # default test policy: rollback_on_failure=True
+    baseline = rev_parse_head(project.project)
+    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_RUNNING, attempt=1)
+    task.baseline_commit = baseline
+    task.baseline_untracked = []
+    engine.state.tasks["1-1-a"] = task
+    engine._save()
+    # the gate is committed while the run is down — i.e. after the task's baseline
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1-1"])})
+    assert rev_parse_head(project.project) != baseline  # the gate is a later commit
+
+    resumed, adapter = resume_engine(
+        project,
+        engine,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+    )
+    summary = resumed.run()
+
+    assert summary.paused and summary.done == 0
+    assert adapter.sessions == []
+    assert load_state(resumed.run_dir).paused_stage == PAUSE_STORY_GATE
+
+
+def test_resume_still_finishes_a_story_whose_session_already_completed(project):
+    """The other side of the line, and the exemption stated as behavior. It belongs
+    to `_finish_inflight`'s *finishing* arms, not to every non-terminal task: here
+    the review session completed and its result is on disk, so the resume replays
+    that record straight into the decision path. Gating it would abandon a verified
+    session's work over an entry whose remedy is a later story — and the story is
+    not starting, it is ending. The restart arm is the opposite case: it discards
+    the work and re-runs, so it re-asks (the tests above)."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+    )
+    post_sessions = []
+    original_emit = engine._emit
+
+    def crashing_emit(stage, *args, **kwargs):
+        if stage == "post_session":
+            post_sessions.append(stage)
+            if len(post_sessions) == 2:  # the review session's post_session window
+                raise RuntimeError("host died in the post-session window")
+        return original_emit(stage, *args, **kwargs)
+
+    engine._emit = crashing_emit
+    assert engine.run().crashed
+    assert load_state(engine.run_dir).tasks["1-1-a"].phase == Phase.REVIEW_RUNNING
+    # the gate lands while the run is down, on a story whose work is already done
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1-1"])})
+
+    resumed, adapter = resume_engine(project, engine, [])
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.paused
+    assert adapter.sessions == []  # replayed the recorded result; nothing re-run
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "resume-verify" in kinds and "resume-restart" not in kinds
+
+
+def test_resume_re_gates_a_human_armed_re_drive(project):
+    """A resolved escalation re-drives through the restart arm — the escalated
+    attempt is rolled back and the story re-runs from scratch — so it is a start,
+    and the gate is asked. Resolving an escalation is not evidence that the gating
+    entry landed, and `validate` refuses this story on the same ledger no matter
+    what its task record remembers; the two surfaces have to agree.
+
+    `rearmed` is also the signal a "has this story ever run a session?" test would
+    most want to trust, and it cannot be trusted: `StoriesEngine._pause_wedged`
+    reaches ESCALATED with `attempt == 0` and no session at all, so exempting
+    re-drives would wave through a wedged story's very first dispatch."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    escalating = SessionResult(
+        status="completed",
+        result_json={
+            "workflow": "auto-dev",
+            "escalations": [{"type": "missing-config", "severity": "CRITICAL", "detail": "boom"}],
+        },
+    )
+    engine, _ = make_engine(project, [escalating])
+    assert engine.run().escalated == 1
+    rearm_escalation(engine.run_dir)  # the resolve workflow's re-arm step
+    assert load_state(engine.run_dir).tasks["1-1-a"].attempt == 0  # the confusable state
+    # a gate lands on the story while the operator is resolving it
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1-1"])})
+
+    resumed, adapter = resume_engine(
+        project,
+        engine,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+    )
+    summary = resumed.run()
+
+    assert summary.paused and summary.done == 0
+    assert adapter.sessions == []  # the re-drive is a start, and it was refused
+    assert load_state(resumed.run_dir).paused_stage == PAUSE_STORY_GATE
 
 
 def test_epic_boundary_gate_pause_and_resume(project):

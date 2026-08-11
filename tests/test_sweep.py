@@ -965,6 +965,50 @@ def test_sweep_happy_path(project):
     assert "fix both" in intent and "DW-2" in intent and "### DW-3" in intent
 
 
+def test_sweep_is_exempt_from_the_dispatch_hard_gate(project):
+    """The sweep must never be gated by the ledger it exists to drain.
+
+    `Engine._refuse_gated_story` refuses a picked story named by an unlanded
+    `gate:` entry. `SweepEngine` overrides `_loop` and so never reaches that call —
+    exemption by omission, which is exactly the kind of thing a later refactor
+    "unifies" away. Gating the sweep would deadlock the gate against its own
+    remedy: closing DW-1 is what the pause tells the operator to run a sweep for,
+    and here DW-1 gates the sweep's own unit keys.
+
+    Written behaviorally rather than as "the method was not called" so it also
+    fails if the refusal arrives by some other route.
+    """
+    paths = project
+    paths.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: item DW-1\n\norigin: test, 2026-06-01\nlocation: src.txt:1\n"
+        "reason: test entry.\nstatus: open\ngate: sweep-triage, dw-fix-things\n",
+        encoding="utf-8",
+    )
+    git(paths.project, "add", "-A")
+    git(paths.project, "commit", "-q", "-m", "ledger")
+    plan = triage_result(
+        ["DW-1"],
+        bundles=[{"name": "fix-things", "dw_ids": ["DW-1"], "intent": "fix it"}],
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "fix-things", ["DW-1"]),
+            bundle_review_effect(project, "fix-things"),
+        ],
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused, "the sweep must not be gated by the ledger it drains"
+    assert engine.state.tasks["sweep-triage"].phase == Phase.DONE
+    assert engine.state.tasks["dw-fix-things"].phase == Phase.DONE
+    # and the gating entry is closed — the remedy the story-gate pause points at
+    assert ledger_entries(project)["DW-1"].status.startswith("done")
+
+
 def test_generic_skill_bundle_orchestrator_closes_ledger(project):
     """B4: on the generic bmad-dev-auto path the bundle session never edits the
     ledger; the orchestrator marks each owned dw id done only after the dev attempt

@@ -282,6 +282,129 @@ def test_cmd_clean_hard_deletes_past_retention(project):
     assert not (repo / ".bmad-loop" / "archive").exists()
 
 
+def test_cmd_clean_protects_a_run_whose_agent_session_is_still_live(project, monkeypatch, capsys):
+    """`reclaimable` is keyed on engine pid liveness, so an orphan — engine dead,
+    agent session still live — is past retention and would be reclaimed. That takes
+    the only ownership proof an untagged session has, leaking it for the life of the
+    machine (#419), so the run is protected instead and the operator is told.
+
+    The run is given a real worktree and put past retention so every mutation in the
+    loop is in play at once: the guard has to sit ahead of `reconcile_orphan_worktrees`
+    and `trim_run_dir`, not just ahead of the archive. Half-reclaiming a protected run
+    would strip the tree the live session may still be working in and still report it
+    untouched."""
+    install_bmad_config(project)
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    wt = run_dir / "worktrees" / "u"
+    wt.parent.mkdir(parents=True)
+    verify.worktree_add(repo, wt, "fb", "main")
+    save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", finished=True))
+    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-20260101-000000-aaaa"])
+
+    assert cli.cmd_clean(_clean_args(repo, retain=0)) == 0
+
+    assert run_dir.is_dir()  # not archived out from under the session
+    assert not (repo / ".bmad-loop" / "archive").exists()
+    assert wt.exists()  # worktree not reconciled away either
+    out, err = capsys.readouterr()
+    assert "20260101-000000-aaaa: agent session still live — left untouched" in err
+    assert "removed worktree" not in out
+
+
+def test_cmd_clean_survives_a_session_appearing_mid_clean(project, monkeypatch, capsys):
+    """The loop-top guard is one sample, so a resume racing this clean can start a
+    session after it and before the removal. The chokepoint refuses there, and that
+    refusal must not abort the whole invocation — one racing run is recorded and the
+    rest of the reclaim continues.
+
+    The race is simulated by making the ownership read flip between the two calls;
+    a stateless fake would answer the same both times and test nothing. The wider
+    race — every mutation in the loop against a concurrent resume — predates this
+    guard (`reclaimable` is sampled once and never re-read) and is out of scope."""
+    install_bmad_config(project)
+    repo = project.project
+    racer = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    other = repo / ".bmad-loop" / "runs" / "20260101-000001-bbbb"
+    for d in (racer, other):
+        save_state(d, RunState(run_id=d.name, project=str(repo), started_at="x", finished=True))
+    seen: list[str] = []
+
+    def racing(_project, run_id):
+        if run_id != racer.name:
+            return False  # only one run races; the other must still be reclaimed
+        seen.append(run_id)
+        # dead at the loop-top guard, live by the time the removal asks again
+        return len(seen) > 1
+
+    monkeypatch.setattr(runs, "live_session_may_be_ours", racing)
+
+    assert cli.cmd_clean(_clean_args(repo, retain=0)) == 0  # not an aborted clean
+
+    out, err = capsys.readouterr()
+    assert racer.is_dir()  # refused at the chokepoint, not removed
+    assert not other.is_dir()  # the racing run did not stop the rest
+    assert "20260101-000000-aaaa: agent session appeared mid-clean — not removed" in err
+    # nothing reached this run before the refusal, so "untouched" is the honest
+    # classification here — the sibling test pins the other side, where it is not
+    assert "left 1 live/resumable run(s) untouched" in out
+
+
+def test_cmd_clean_reports_a_mid_clean_racer_by_what_it_actually_did(project, monkeypatch, capsys):
+    """A run the race caught *after* its worktree was reconciled and its artifacts
+    trimmed is not "left untouched", so it must not land in `protected` — that field
+    is documented as exactly that, and a consumer would read a partially reclaimed
+    run as a preserved one. It ends in the trimmed state, so that is what is
+    reported. The sibling test above covers the other side: a run nothing reached
+    before the refusal really is protected."""
+    install_bmad_config(project)
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    wt = run_dir / "worktrees" / "u"
+    wt.parent.mkdir(parents=True)
+    verify.worktree_add(repo, wt, "fb", "main")
+    save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", finished=True))
+    seen: list[str] = []
+
+    def racing(_project, run_id):
+        seen.append(run_id)
+        return len(seen) > 1
+
+    monkeypatch.setattr(runs, "live_session_may_be_ours", racing)
+
+    doc = _clean_json(repo, capsys, "--retain", "0")
+
+    assert run_dir.is_dir() and not (run_dir / "worktrees").exists()  # the racy state
+    assert doc["trimmed"] == ["20260101-000000-aaaa"]
+    assert doc["protected"] == []
+    assert doc["archived"] == [] and doc["deleted"] == []
+
+
+def test_cmd_clean_reclaims_past_a_session_proven_to_be_another_project_s(
+    project, monkeypatch, capsys
+):
+    """Same run id, but the session's tag proves it belongs elsewhere — it carries
+    its own ownership proof and does not need this run dir, so reclaiming strands
+    nothing. Refusing would wedge `clean` for as long as the other project's run
+    lives, and `clean` has no `--force`."""
+    install_bmad_config(project)
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", finished=True))
+    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-20260101-000000-aaaa"])
+    monkeypatch.setattr(
+        runs,
+        "session_project_tags",
+        lambda: {"bmad-loop-20260101-000000-aaaa": runs.project_tag(repo / "someone-else")},
+    )
+
+    assert cli.cmd_clean(_clean_args(repo, retain=0)) == 0
+
+    assert not run_dir.exists()
+    assert (repo / ".bmad-loop" / "archive" / "20260101-000000-aaaa.tar.gz").is_file()
+    assert "still live" not in capsys.readouterr().err
+
+
 # -------------------------------------------------------- cmd_clean --json
 
 
@@ -378,6 +501,22 @@ def test_cmd_clean_json_carries_unverifiable_pid_with_empty_stderr(project, monk
     doc = _clean_json(repo, capsys)
 
     assert doc["unverifiable_pid"] == ["20260101-000000-aaaa"]
+
+
+def test_cmd_clean_json_reports_a_live_session_run_as_protected(project, monkeypatch, capsys):
+    # the live-session backstop's JSON half: the run is classified, not silently
+    # dropped, and (like every other warning) stderr stays empty in JSON mode.
+    install_bmad_config(project)
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", finished=True))
+    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-20260101-000000-aaaa"])
+
+    doc = _clean_json(repo, capsys, "--retain", "0")
+
+    assert doc["protected"] == ["20260101-000000-aaaa"]
+    assert doc["archived"] == [] and doc["deleted"] == []
+    assert run_dir.is_dir()
 
 
 def test_cmd_clean_json_nothing_to_reclaim_is_a_valid_empty_document(project, capsys):
