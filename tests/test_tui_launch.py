@@ -758,6 +758,15 @@ def test_record_falls_back_to_the_confinement_check_without_dir_fd(fake_run, tmp
     assert launch.resume_detached(tmp_path, "RID") == "@7"
     assert not (outside / launch._CTL_WINDOW_FILE).exists()
 
+    # Positive control: the `@7` above only says the lookup fell back to the one
+    # listed window, which it would do whether or not the write was attempted.
+    # With a regular run dir the same fallback branch really does write, so the
+    # refusal is a refusal rather than a write that never got as far as trying.
+    run_dir.unlink()
+    _make_run(tmp_path)
+    assert launch.resume_detached(tmp_path, "RID") == "@7"
+    assert (run_dir / launch._CTL_WINDOW_FILE).read_text(encoding="utf-8") == "@7"
+
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_forget_refuses_a_linked_run_dir(tmp_path: Path):
@@ -856,6 +865,41 @@ def test_forget_falls_back_to_the_confinement_check_without_dir_fd(tmp_path: Pat
 
     launch._forget_ctl_window(project, "RID")
     assert victim.read_text(encoding="utf-8") == "@99"
+
+    # Positive control: the same branch still removes a record it can vouch for,
+    # so the refusal above is not this branch having quietly become a no-op.
+    run_dir.unlink()
+    run_dir.mkdir()
+    (run_dir / launch._CTL_WINDOW_FILE).write_text("@2", encoding="utf-8")
+    launch._forget_ctl_window(project, "RID")
+    assert not (run_dir / launch._CTL_WINDOW_FILE).exists()
+
+
+def test_a_skipped_record_forgets_the_previous_one(fake_run, tmp_path: Path):
+    """Skipping the record because there is no run must still drop the old one.
+
+    `_record_ctl_window` returns early when `runs.is_run` says no, and the
+    rationale for that is a fresh `run`/`sweep`, where nothing shares the id yet.
+    But the same early return is reachable with a *superseded* window live: the
+    TUI reads state, shows a confirm modal, and launches from the callback, so
+    anything that removes `state.json` during that human-length window (an
+    external cleanup, a concurrent prune) lands here with a previous launch's
+    record still on disk. That record names a window this launch just
+    superseded, and `ctl_window_id` prefers a record that still resolves — so
+    `a` attaches to and `x` kills the parked predecessor while the orchestrator
+    this launch minted keeps running. #482's exact symptom.
+
+    The listing puts the live window first on purpose: the fix has to be visible
+    as *the record no longer steering*, not as the record happening to agree
+    with first-match order."""
+    tag = runs.project_tag(tmp_path)
+    fake_run.windows = f"@7\tresume-RID\t{tag}\n@2\trun-RID\t{tag}\n"
+    run_dir = _write_record(tmp_path, "RID", "@2")  # a previous launch's record
+    assert not runs.is_run(run_dir)  # premise: no state.json, so recording skips
+
+    assert launch.resume_detached(tmp_path, "RID") == "@7"
+    assert not (run_dir / launch._CTL_WINDOW_FILE).exists()
+    assert launch.ctl_window_id(tmp_path, "RID") == "@7"  # not the parked @2
 
 
 def test_confinement_check_refuses_a_reparse_point_ancestor(tmp_path: Path, monkeypatch):

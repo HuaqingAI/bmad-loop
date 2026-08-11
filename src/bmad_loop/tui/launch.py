@@ -252,6 +252,21 @@ def _record_ctl_window(project: Path, run_id: str, win_id: str) -> None:
     and must not be written into a run-dir-shaped directory (pruned, partial)
     that runs.is_run reports as not a run.
 
+    That skip forgets too, and the "nothing to disambiguate" clause above is
+    exactly why it must. The clause holds for the case it was written for —
+    `new_run_id` mints a fresh id, so no other window carries it — but it does
+    not hold for every way of reaching this branch. resume/resolve read state,
+    raise a confirm modal, and launch from the callback, so anything that
+    removes `state.json` inside that human-length window arrives here with a
+    predecessor window live and a previous launch's record still on disk. That
+    record names the window this launch just superseded, and ctl_window_id
+    prefers any record that still resolves — so `a` and `x` would answer the
+    parked predecessor while the orchestrator just minted keeps running, which
+    is #482's symptom reintroduced by the record meant to fix it. Dropping it
+    puts the lookup back on the name scan, which is this file's stated
+    preference throughout: degrading to the scan is the intended fallback,
+    answering a superseded window is not.
+
     Atomic, not a bare write_text: the record is read cross-process (`bmad-loop
     attach`), and on win32 an AV/indexer holding the previous record open fails
     a plain overwrite with a transient sharing violation — which would swallow
@@ -302,6 +317,7 @@ def _record_ctl_window(project: Path, run_id: str, win_id: str) -> None:
     """
     run_dir = runs.run_dir_for(project, run_id)
     if not runs.is_run(run_dir):
+        _forget_ctl_window(project, run_id)
         return
     try:
         if DIR_FD_ANCHORED_WRITES:
