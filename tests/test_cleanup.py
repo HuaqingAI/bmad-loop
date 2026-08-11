@@ -312,6 +312,42 @@ def test_cmd_clean_protects_a_run_whose_agent_session_is_still_live(project, mon
     assert "removed worktree" not in out
 
 
+def test_cmd_clean_survives_a_session_appearing_mid_clean(project, monkeypatch, capsys):
+    """The loop-top guard is one sample, so a resume racing this clean can start a
+    session after it and before the removal. The chokepoint refuses there, and that
+    refusal must not abort the whole invocation — one racing run is recorded and the
+    rest of the reclaim continues.
+
+    The race is simulated by making the ownership read flip between the two calls;
+    a stateless fake would answer the same both times and test nothing. The wider
+    race — every mutation in the loop against a concurrent resume — predates this
+    guard (`reclaimable` is sampled once and never re-read) and is out of scope."""
+    install_bmad_config(project)
+    repo = project.project
+    racer = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    other = repo / ".bmad-loop" / "runs" / "20260101-000001-bbbb"
+    for d in (racer, other):
+        save_state(d, RunState(run_id=d.name, project=str(repo), started_at="x", finished=True))
+    seen: list[str] = []
+
+    def racing(_project, run_id):
+        if run_id != racer.name:
+            return False  # only one run races; the other must still be reclaimed
+        seen.append(run_id)
+        # dead at the loop-top guard, live by the time the removal asks again
+        return len(seen) > 1
+
+    monkeypatch.setattr(runs, "live_session_may_be_ours", racing)
+
+    assert cli.cmd_clean(_clean_args(repo, retain=0)) == 0  # not an aborted clean
+
+    assert racer.is_dir()  # refused at the chokepoint, not removed
+    assert not other.is_dir()  # the racing run did not stop the rest
+    assert "20260101-000000-aaaa: agent session appeared mid-clean — not removed" in (
+        capsys.readouterr().err
+    )
+
+
 def test_cmd_clean_reclaims_past_a_session_proven_to_be_another_project_s(
     project, monkeypatch, capsys
 ):

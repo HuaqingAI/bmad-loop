@@ -3062,14 +3062,31 @@ def cmd_clean(args: argparse.Namespace) -> int:
         if run_dir.name in past:
             freed += run_bytes
             runs.trim_run_dir(run_dir, dry_run=dry)  # shrink before archiving
-            if args.hard or not pol.cleanup.archive_old:
-                if not dry:
-                    runs.delete_run(project, run_dir)
-                deleted.append(run_dir.name)
-            else:
-                if not dry:
-                    runs.archive_run(project, run_dir)
-                archived.append(run_dir.name)
+            try:
+                if args.hard or not pol.cleanup.archive_old:
+                    if not dry:
+                        runs.delete_run(project, run_dir)
+                    deleted.append(run_dir.name)
+                else:
+                    if not dry:
+                        runs.archive_run(project, run_dir)
+                    archived.append(run_dir.name)
+            except runs.LiveSessionError:
+                # A session appeared between the loop-top guard and here — a resume
+                # of a stopped run, racing this clean. The chokepoint refused the
+                # removal; record the run instead of letting one racing run abort
+                # the whole invocation. The trim above already ran, so correct the
+                # estimate down to what it actually freed. The wider race — every
+                # mutation in this loop against a concurrent resume — is older than
+                # this guard (`reclaimable` is sampled in the loop above and never
+                # re-read) and is tracked separately.
+                freed += wt_bytes - run_bytes
+                protected.append(run_dir.name)
+                if not args.json:
+                    print(
+                        f"run {run_dir.name}: agent session appeared mid-clean — not removed",
+                        file=sys.stderr,
+                    )
         elif pol.cleanup.trim_artifacts:
             if runs.trim_run_dir(run_dir, dry_run=dry):
                 freed += wt_bytes
