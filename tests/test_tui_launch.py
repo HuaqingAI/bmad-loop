@@ -909,9 +909,11 @@ def test_a_delimiter_in_the_project_path_does_not_hide_its_own_window(
     `a`/`x` then could not reach a run the pre-tag lookup found. Worse than a
     missed match, because the fallthrough for an unknown tag is exclusion.
 
-    Parametrized over all six on purpose: two different mechanisms carry them —
-    the tab by the backends' bounded field split, the separators by project_tag's
-    encoding — so one spelling passing says nothing about another."""
+    Parametrized over all six on purpose: each is a byte a resolved project path
+    can legally hold, and project_tag hashes the path rather than carrying any
+    spelling of it, so none of them reaches the listing. The matrix pins that the
+    digest is the single mechanism — return a raw path here and the tab and the
+    separators fail again, by two different routes."""
     project = tmp_path / odd_name
     project.mkdir()
     _make_run(project)
@@ -931,8 +933,9 @@ def test_a_separator_in_the_project_path_does_not_admit_a_foreign_window(
     when its own could not survive the listing. That admits every row carrying
     the run id — including one tagged for another project — and `x` resolves
     through here, so a stop could kill a neighbouring project's orchestrator.
-    Reach and scoping are not a trade: project_tag encodes the tag instead, so
-    the comparison stays exact and this row is simply not ours.
+    Reach and scoping are not a trade: project_tag hashes the resolved path, so
+    the tag is listing-safe by construction, the comparison stays exact, and this
+    row is simply not ours.
 
     The two assertions differ only in whose tag the row carries, which is what
     makes the refusal about the tag rather than about the listing being

@@ -188,22 +188,14 @@ whose seams had diverged enough that several ports needed a different fix, and t
   truncated tag that reads as another project's. The prune scan then skipped the project's own
   parked control windows. The last requested field now keeps its delimiters.
 
-- **A project path the multiplexer cannot carry no longer strands the scans over it (#419).**
-  Ownership was tagged with the resolved path, and two different transports mangled it. psmux's
-  control line refuses any value its CLI->server hop would corrupt, and a UNC share whose name holds
-  a space is one — so the write was refused and the session stayed untagged, which is weak ownership
-  twice over: it dies with the run dir, so an orphaned session leaked once `clean` removed the
-  directory, and it proves ownership by run-id collision on disk rather than by identity, so a
-  reused `--run-id` let one project prune another's session. Window listings are one row per window,
-  split with `str.splitlines()` and decoded strictly, and two kinds of byte defeat that while being
-  perfectly legal in a POSIX path: a line separator (LF, CR, VT, FF, FS, GS, RS, NEL, U+2028,
-  U+2029) put the tag on a row of its own, so it never matched and the prune scan skipped the
-  project's own parked windows and sessions; and a byte invalid in the filesystem encoding arrived
-  surrogate-escaped and made the listing read raise `UnicodeDecodeError` outright. The tag is now a
-  16-hex digest of the resolved path, which clears both transports by construction. Pruning also
-  accepts the legacy path-shaped tag, so sessions and control windows that survive an upgrade keep
-  proving ownership. Reading a legacy raw tag stored by an older version is the decode half, tracked
-  in #380.
+- **A project path the multiplexer cannot carry no longer strands the scans over it (#419).** The
+  ownership tag held the resolved path, and two transports mangled it: psmux's control line refuses
+  a spaced UNC share, and a listing row splits on any separator `splitlines()` knows (LF, CR, VT,
+  FF, FS, GS, RS, NEL, U+2028, U+2029) or fails a strict decode on a non-UTF-8 filename byte. Either
+  way the session or window went untagged — leaking once `clean` removed its run dir, and prunable
+  by another project on a reused `--run-id`. The tag is now a 16-hex digest of the path, safe on
+  both transports by construction; pruning still accepts the legacy path tag, so state surviving the
+  upgrade keeps its ownership. Reading a legacy raw tag is the decode half (#380).
 
 - **A run id that is a suffix of another no longer resolves to the neighbour's control window.**
   `--run-id` is caller-supplied and may contain `-`, so `run-other-RID` satisfied the lookup for

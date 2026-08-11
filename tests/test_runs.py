@@ -645,7 +645,7 @@ _SEP_VALUES = [s for _, s in _LINE_SEPARATORS]
 _SEP_IDS = [i for i, _ in _LINE_SEPARATORS]
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="separators are illegal in win32 names")
+@pytest.mark.skipif(sys.platform == "win32", reason="a separator in a name is a POSIX concern")
 @pytest.mark.parametrize("separator", _SEP_VALUES, ids=_SEP_IDS)
 def test_project_tag_carries_a_path_the_listing_cannot_carry(tmp_path, separator):
     """A listing splits on far more than LF, and every one of those is legal in a
