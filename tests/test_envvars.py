@@ -47,23 +47,28 @@ def test_session_timeout_s_is_none_when_unset(monkeypatch):
     assert envvars.session_timeout_s() is None
 
 
-# ABLATION (both halves run singly, 2026-08-11). The rejection is two independent
-# gates, and ablating them together would grade neither — it would redden all
-# seven rows at once (the union of (a) and (b)) while telling you nothing about
-# which half holds which:
+# ABLATION (each gate run singly, 2026-08-11). The rejection is three independent
+# gates, and ablating them together would grade none of them — it would redden
+# every row at once while telling you nothing about which gate holds which:
 #   (a) drop the `try/except ValueError` (parse straight into `float(raw)`) and
 #       exactly the two unparseable rows fail — [not-a-number] and [] raise
 #       `ValueError: could not convert string to float` out of the reader
-#       instead of reading as None. The zero/negative/nan rows keep passing,
-#       held by the surviving `> 0`.
-#   (b) drop the `value > 0` guard (`return value`) and exactly the five
-#       numeric rows fail — [0] and [0.0] on `assert 0.0 is None`, [-1] on
-#       `assert -1.0 is None`, [-0.5] on `assert -0.5 is None`, [nan] on
-#       `assert nan is None`. The two unparseable rows keep passing, held by the
-#       surviving except arm.
-# So every row names which half holds it, and [nan] is the row proving the guard
-# is a COMPARISON and not a sign test: nan parses cleanly, and is rejected only
-# because every comparison against nan is False.
+#       instead of reading as None. Every other row keeps passing.
+#   (b) drop the `value <= 0` half and exactly the four zero/negative rows fail
+#       — [0], [0.0], [-1], [-0.5]. Nothing else moves.
+#   (c) drop the `not math.isfinite(value)` half and FIVE rows fail: the four
+#       non-finite spellings [inf], [1e999], [Infinity], [INF] — and [nan].
+#       That last one is the measured surprise, and it is load-bearing. Under
+#       the old `return value if value > 0 else None`, nan was rejected by the
+#       comparison (every comparison against nan is False). The guard is now
+#       spelled `value <= 0`, and `nan <= 0` is ALSO False — so nan no longer
+#       falls out of the comparison and is held by the finiteness check alone.
+#       Same result, different gate: do not "simplify" (c) away on the theory
+#       that `> 0` already covers nan, because this form does not.
+# So every row names the gate that holds it. Rows [inf]/[1e999]/[Infinity]/[INF]
+# are why the finiteness half exists: `float()` accepts all four and each passes
+# a bare `> 0`, so before it they read as a real budget, and the deadline the
+# adapters computed from it (`time.monotonic() + timeout_s`) could never expire.
 @pytest.mark.parametrize(
     "raw",
     [
@@ -73,19 +78,41 @@ def test_session_timeout_s_is_none_when_unset(monkeypatch):
         "0.0",  # the float spelling of the same
         "-1",  # negative: already-elapsed budget
         "-0.5",  # negative float
-        "nan",  # parses to nan; `nan > 0` is False, so the comparison rejects it
+        "nan",  # parses to nan; held by the finiteness check AND by `<= 0` being False
+        "inf",  # parses to inf and passes `> 0` — a deadline that never arrives
+        "1e999",  # overflows to inf: the same hole reachable without typing "inf"
+        "Infinity",  # float()'s other accepted spelling
+        "INF",  # float() is case-insensitive here, so the guard must be too
     ],
 )
 def test_session_timeout_s_ignores_a_value_that_cannot_be_a_budget(monkeypatch, raw):
-    """A non-positive or unparseable override reads as `None` (ignored) rather
-    than as a budget. That matters because the failure mode is silent and
-    asymmetric: a fat-fingered `0` or `-1` would not error, it would shorten
-    every session to nothing and read as a run of instant timeouts."""
+    """Anything that is not a finite positive number of seconds reads as `None`
+    (ignored) rather than as a budget, and the guard is two-sided because the
+    failure mode is silent in BOTH directions. A fat-fingered `0` or `-1` would
+    not error — it would shorten every session to nothing and read as a run of
+    instant timeouts. `inf` (or `1e999`, which overflows to it) is the opposite
+    and worse: both adapters build their deadlines as `time.monotonic() +
+    timeout_s`, so a non-finite budget yields a deadline that never arrives, and
+    this is the outer bound every stall-grace and wake-nudge window defers to.
+    An unattended run would wedge with nothing left to stop it."""
     monkeypatch.setenv(envvars.SESSION_TIMEOUT_S, raw)
     assert envvars.session_timeout_s() is None
 
 
-@pytest.mark.parametrize(("raw", "expected"), [("3", 3.0), ("0.5", 0.5)])
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("3", 3.0),
+        ("0.5", 0.5),
+        # The deliberate boundary of the finiteness guard, pinned so it is a
+        # reviewable decision rather than an accident: a huge but FINITE value is
+        # still honoured. It is a duration, however unwise, and an operator asking
+        # for one is expressing intent — where `inf` is not a duration at all.
+        # Drawing the line anywhere else would mean inventing a ceiling, which is
+        # a policy number this module has no business choosing.
+        ("1e308", 1e308),
+    ],
+)
 def test_session_timeout_s_reads_a_positive_override_as_seconds(monkeypatch, raw, expected):
     """Both spellings land as a float: the int-looking one an operator types and
     the sub-second one the E2E gates rely on (`test_stories_e2e` drives a

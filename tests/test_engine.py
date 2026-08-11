@@ -402,7 +402,10 @@ def test_session_timeout_s_env_override(monkeypatch):
     assert Engine._session_timeout_s(5400.0) == 5400.0  # unset -> policy default
     monkeypatch.setenv("BMAD_LOOP_SESSION_TIMEOUT_S", "2.5")
     assert Engine._session_timeout_s(5400.0) == 2.5  # positive -> override wins
-    for bad in ("0", "-1", "nonsense", ""):
+    # "inf"/"1e999" ride along because they are the rows that reach *this* seam
+    # with teeth: they parse and are positive, so before the finiteness guard they
+    # became the session's budget and the deadline built from it never expired.
+    for bad in ("0", "-1", "nonsense", "", "inf", "1e999"):
         monkeypatch.setenv("BMAD_LOOP_SESSION_TIMEOUT_S", bad)
         assert Engine._session_timeout_s(5400.0) == 5400.0  # ignored -> fall back
 

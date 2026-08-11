@@ -191,8 +191,8 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 - **Cover the env-var registry, and enforce it.** `envvars.py` — the module AGENTS.md names as the
   one place a core `BMAD_LOOP_*` var is defined — had no test naming it. `tests/test_envvars.py`
-  pins each reader's parse and fallback: `session_timeout_s()` ignores an unparseable, zero or
-  negative override, and `mux_backend()` / `process_host()` hand their value back verbatim so the
+  pins each reader's parse and fallback: `session_timeout_s()` ignores an override that is not a
+  finite positive number (see Fixed), and `mux_backend()` / `process_host()` hand their value back verbatim so the
   registry downstream is what rejects an unknown name. The second half of the invariant
   ("plugin-owned env-var families stay with their plugin") is now enforced rather than documented:
   a new `test_portability_guard.py` scan fails any `BMAD_LOOP_*` read taken straight from the
@@ -221,6 +221,17 @@ whose seams had diverged enough that several ports needed a different fix, and t
   environment is an invitation to paper over a real flake, so it goes rather than stays unused.
 
 ### Fixed
+
+- **`BMAD_LOOP_SESSION_TIMEOUT_S=inf` no longer disables the session timeout.** The override's guard
+  was one-sided: it rejected a non-positive value so a fat-fingered override could not silently
+  _shorten_ a run's budget, but `float()` accepts `inf`, `1e999` and `Infinity`, and all three pass
+  `> 0`. Both adapters build their monotonic and wall-clock deadlines as `time.monotonic() +
+timeout_s`, so a non-finite budget produced a deadline that could never expire — and that budget
+  is the outer bound every stall-grace and wake-nudge window defers to, so an unattended run could
+  wedge with no backstop left. The reader now requires a finite positive value and otherwise falls
+  back to `limits.session_timeout_min × 60`, as it already did for `0`, `-1` and unparseable input.
+  A large _finite_ value is still honoured: that is a duration, however unwise, where `inf` is not
+  one. Only ever reachable by explicitly exporting such a value — this is a test/E2E hook.
 
 - **A tab in the project path no longer truncates the project tag a window listing carries.**
   The multiplexer listing is tab-delimited and the tag holds a resolved filesystem path, where a tab
