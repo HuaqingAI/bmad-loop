@@ -1000,7 +1000,7 @@ class BmadLoopApp(App[None]):
     @work(thread=True, group="lifecycle")
     def _delete_run_worker(self, run_id: str, run_dir: Path) -> None:
         try:
-            runs.delete_run(run_dir)
+            runs.delete_run(self.project, run_dir)
         except (OSError, runs.LiveSessionError) as e:
             # LiveSessionError is the #419 backstop: the confirm above gates on engine
             # liveness, which an orphaned session passes. Surface it like any other

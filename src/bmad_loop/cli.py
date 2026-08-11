@@ -2895,7 +2895,7 @@ def cmd_delete(args: argparse.Namespace) -> int:
     if rc is not None:
         return rc
     try:
-        runs.delete_run(run_dir, force=args.force)
+        runs.delete_run(project, run_dir, force=args.force)
     except runs.LiveSessionError as e:
         print(f"{e} (or pass --force)", file=sys.stderr)
         return 1
@@ -3023,7 +3023,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
     deleted: list[str] = []
     unverifiable: list[str] = []
     for run_dir in reclaimable:
-        if runs.session_alive(run_dir.name):
+        if runs.live_session_may_be_ours(project, run_dir.name):
             # `reclaimable` is keyed on engine pid liveness, so an orphan — engine
             # dead, agent session still live — passes it, and everything below this
             # point mutates: the worktree the session may still be working in, the
@@ -3064,7 +3064,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
             runs.trim_run_dir(run_dir, dry_run=dry)  # shrink before archiving
             if args.hard or not pol.cleanup.archive_old:
                 if not dry:
-                    runs.delete_run(run_dir)
+                    runs.delete_run(project, run_dir)
                 deleted.append(run_dir.name)
             else:
                 if not dry:

@@ -312,6 +312,31 @@ def test_cmd_clean_protects_a_run_whose_agent_session_is_still_live(project, mon
     assert "removed worktree" not in out
 
 
+def test_cmd_clean_reclaims_past_a_session_proven_to_be_another_project_s(
+    project, monkeypatch, capsys
+):
+    """Same run id, but the session's tag proves it belongs elsewhere — it carries
+    its own ownership proof and does not need this run dir, so reclaiming strands
+    nothing. Refusing would wedge `clean` for as long as the other project's run
+    lives, and `clean` has no `--force`."""
+    install_bmad_config(project)
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", finished=True))
+    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-20260101-000000-aaaa"])
+    monkeypatch.setattr(
+        runs,
+        "session_project_tags",
+        lambda: {"bmad-loop-20260101-000000-aaaa": runs.project_tag(repo / "someone-else")},
+    )
+
+    assert cli.cmd_clean(_clean_args(repo, retain=0)) == 0
+
+    assert not run_dir.exists()
+    assert (repo / ".bmad-loop" / "archive" / "20260101-000000-aaaa.tar.gz").is_file()
+    assert "still live" not in capsys.readouterr().err
+
+
 # -------------------------------------------------------- cmd_clean --json
 
 

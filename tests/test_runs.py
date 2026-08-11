@@ -850,7 +850,7 @@ def test_prune_sessions_returns_unknown_from_same_sample(tmp_path, monkeypatch):
 
 def test_delete_run(tmp_path):
     run_dir = _make_state_run(tmp_path, "r1")
-    runs.delete_run(run_dir)
+    runs.delete_run(tmp_path, run_dir)
     assert not run_dir.exists()
 
 
@@ -862,7 +862,7 @@ def test_delete_run_refuses_while_the_agent_session_is_live(tmp_path, monkeypatc
     run_dir = _make_state_run(tmp_path, "r1")
     monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-r1"])
     with pytest.raises(runs.LiveSessionError, match="still live") as exc:
-        runs.delete_run(run_dir)
+        runs.delete_run(tmp_path, run_dir)
     assert run_dir.exists()
     # The remedy it names is not sound on its own: `cleanup` proves an untagged
     # session ours by this same run dir, so it can prune another project's on a
@@ -872,13 +872,47 @@ def test_delete_run_refuses_while_the_agent_session_is_live(tmp_path, monkeypatc
     assert "bmad-loop attach r1" in str(exc.value)
 
 
+def test_delete_run_ignores_a_session_proven_to_be_another_project_s(tmp_path, monkeypatch):
+    """The guard is scoped to what it can justify. A tag outside `accepted_tags`
+    proves the session foreign, and a tagged session carries its own ownership
+    proof — it does not need this run dir — so removing the dir strands nothing.
+
+    Refusing here would be a pure false positive that wedges every removal path
+    for as long as the other project's run lives, `clean` included, and `clean`
+    has no override. Untagged still refuses: unread is not proof (see the
+    degradation test above)."""
+    run_dir = _make_state_run(tmp_path, "r1")
+    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-r1"])
+    monkeypatch.setattr(
+        runs,
+        "session_project_tags",
+        lambda: {"bmad-loop-r1": runs.project_tag(tmp_path / "someone-else")},
+    )
+    runs.delete_run(tmp_path, run_dir)
+    assert not run_dir.exists()
+
+
+def test_delete_run_refuses_a_session_tagged_as_ours(tmp_path, monkeypatch):
+    """The mirror of the test above, so the tag read cannot be mistaken for "any
+    tag clears the guard". Our own tag proves nothing about whether the removal is
+    safe — it only fails to prove the session foreign — so the refusal stands."""
+    run_dir = _make_state_run(tmp_path, "r1")
+    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-r1"])
+    monkeypatch.setattr(
+        runs, "session_project_tags", lambda: {"bmad-loop-r1": runs.project_tag(tmp_path)}
+    )
+    with pytest.raises(runs.LiveSessionError):
+        runs.delete_run(tmp_path, run_dir)
+    assert run_dir.exists()
+
+
 def test_delete_run_matches_the_session_by_exact_run_id(tmp_path, monkeypatch):
     """The guard keys on `bmad-loop-<id>` exactly. A session for a *different* run —
     including one whose id merely extends ours — must not block this removal, or one
     live run would wedge cleanup for every id it prefixes."""
     run_dir = _make_state_run(tmp_path, "r1")
     monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-r1-2", "bmad-loop-ctl", "r1"])
-    runs.delete_run(run_dir)
+    runs.delete_run(tmp_path, run_dir)
     assert not run_dir.exists()
 
 
@@ -890,7 +924,7 @@ def test_delete_run_proceeds_when_the_multiplexer_cannot_answer(tmp_path, monkey
     backstop is inert there, which is the pre-#419 behavior."""
     run_dir = _make_state_run(tmp_path, "r1")
     monkeypatch.setattr(tmux_base.shutil, "which", lambda _name: None)  # no tmux at all
-    runs.delete_run(run_dir)
+    runs.delete_run(tmp_path, run_dir)
     assert not run_dir.exists()
 
 

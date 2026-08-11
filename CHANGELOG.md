@@ -192,8 +192,9 @@ whose seams had diverged enough that several ports needed a different fix, and t
   `delete`, `archive` and `clean` gated on engine-pid liveness, which an orphan — engine dead,
   agent session still alive — passes. For an untagged session the run dir is the last ownership
   proof a prune can read, so removing it leaked the session for the life of the machine. Removal
-  now refuses while `bmad-loop-<run-id>` is live and `clean` leaves the run untouched; `--force`
-  overrides the refusal and kills nothing, since a session name carries no project.
+  now refuses while a `bmad-loop-<run-id>` session the project cannot prove foreign is live, and
+  `clean` leaves the run untouched; `--force` overrides the refusal and kills nothing, since a
+  session name carries no project.
 
 - **A project path the multiplexer cannot carry no longer strands the scans over it (#419).** The
   ownership tag held the resolved path, and two transports mangled it: psmux's control line refuses

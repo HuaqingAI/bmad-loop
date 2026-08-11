@@ -53,8 +53,8 @@ class GracefulStopError(Exception):
 
 class LiveSessionError(Exception):
     """A run directory was not removed because the run's agent session is still
-    live (see :func:`session_alive`). ``str()`` is the operator-facing message the
-    CLI/TUI surface verbatim."""
+    live (see :func:`live_session_may_be_ours`). ``str()`` is the operator-facing
+    message the CLI/TUI surface verbatim."""
 
 
 # How long stop_run waits for a signalled engine to exit before falling back to
@@ -558,18 +558,31 @@ def stop_run(run_dir: Path) -> bool:
     return True
 
 
-def session_alive(run_id: str) -> bool:
-    """True when the run's agent session (``bmad-loop-<id>``) is live right now.
+def live_session_may_be_ours(project: Path, run_id: str) -> bool:
+    """True when a live ``bmad-loop-<id>`` session exists that this project cannot
+    prove belongs to another one — the precondition of the removal guard below.
+
+    Ownership is read exactly as :func:`prunable_sessions` reads it. A tag outside
+    :func:`accepted_tags` proves the session foreign, and a *tagged* session carries
+    its own ownership proof, so it does not need this project's run dir at all:
+    answering False there keeps the guard off a removal that provably strands
+    nothing. Untagged, or tagged as ours, answers True — neither can be ruled out
+    as depending on this run dir, and only the untagged case is load-bearing.
 
     An observation, so it degrades rather than raising: :func:`mux_sessions`
     answers ``[]`` when the multiplexer is missing, no server is running, or the
-    query fails, and that reads here as "no session". The asymmetry is deliberate
-    — a false negative only costs the backstop below, while a false positive would
-    block a removal the operator is entitled to."""
-    return session_name(run_id) in mux_sessions()
+    query fails, and that reads here as "no session". A degraded
+    :func:`session_project_tags` reads as untagged, which errs toward refusing —
+    the safe direction, since an unread tag is not proof of anything. The session
+    listing is checked first so the tag query only runs on a name collision."""
+    name = session_name(run_id)
+    if name not in mux_sessions():
+        return False
+    tag = session_project_tags().get(name, "")
+    return not tag or tag in accepted_tags(project)
 
 
-def _refuse_live_session(run_id: str, verb: str) -> None:
+def _refuse_live_session(project: Path, run_id: str, verb: str) -> None:
     """Backstop for #419: refuse to remove a run dir out from under a live session.
 
     Every caller's live guard is keyed on *engine pid* liveness, so an orphan —
@@ -578,6 +591,11 @@ def _refuse_live_session(run_id: str, verb: str) -> None:
     session it is the only ownership proof :func:`prunable_sessions` can read, so
     removing it leaks the session (and its server) for the life of the machine.
     Refusing is a repair-path write failing loudly, per the module doctrine.
+
+    Scoped to what it can justify: a session this project can prove is another
+    one's does not block anything (see :func:`live_session_may_be_ours`). Refusing
+    there would strand nothing and wedge every removal path — including `clean`,
+    which has no override — for as long as the other project's run lives.
 
     Never a kill from here: a session name carries no project, so killing
     `bmad-loop-<id>` by name would tear down another project's live run whenever the
@@ -592,7 +610,7 @@ def _refuse_live_session(run_id: str, verb: str) -> None:
     Hence the message asks the operator to confirm first: nothing available here can
     prove the session ours, and minting a proof that outlives the run dir is #419
     direction (2), not this guard."""
-    if session_alive(run_id):
+    if live_session_may_be_ours(project, run_id):
         raise LiveSessionError(
             f"run {run_id}: refusing to {verb} its directory while its agent session is "
             f"still live — for an untagged session this directory is the only ownership "
@@ -603,7 +621,7 @@ def _refuse_live_session(run_id: str, verb: str) -> None:
         )
 
 
-def delete_run(run_dir: Path, *, force: bool = False) -> None:
+def delete_run(project: Path, run_dir: Path, *, force: bool = False) -> None:
     """Permanently remove a run directory. Callers enforce the engine-liveness
     guard; the session guard is enforced here (see :func:`_refuse_live_session`),
     which raises :class:`LiveSessionError` instead of removing.
@@ -614,7 +632,7 @@ def delete_run(run_dir: Path, *, force: bool = False) -> None:
     its own (which is the whole defect). Trading a possible leak of our own session
     for a possible kill of someone else's is the wrong direction for an override."""
     if not force:
-        _refuse_live_session(run_dir.name, "delete")
+        _refuse_live_session(project, run_dir.name, "delete")
     shutil.rmtree(run_dir)
 
 
@@ -626,7 +644,7 @@ def archive_run(project: Path, run_dir: Path, *, force: bool = False) -> Path:
     and :func:`delete_run` for ``force``) and runs before the tarball is written,
     so a refusal leaves nothing behind."""
     if not force:
-        _refuse_live_session(run_dir.name, "archive")
+        _refuse_live_session(project, run_dir.name, "archive")
     archive_dir = project / ARCHIVE_DIR
     archive_dir.mkdir(parents=True, exist_ok=True)
     dest = archive_dir / f"{run_dir.name}.tar.gz"
