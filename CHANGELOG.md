@@ -166,21 +166,26 @@ whose seams had diverged enough that several ports needed a different fix, and t
   truncated tag that reads as another project's. The prune scan then skipped the project's own
   parked control windows. The last requested field now keeps its delimiters.
 
+- **A line separator in the project path no longer strands the project's own sessions and windows.**
+  Listings are split with `str.splitlines()`, which breaks on far more than LF — CR, VT, FF, FS, GS,
+  RS, NEL, U+2028 and U+2029 are all legal bytes in a POSIX path — so the tag arrived on a row of its
+  own and never matched, and the prune scan skipped the project's own parked windows and sessions.
+  Such a path is now percent-encoded in the tag; every other path is tagged byte-identically, so
+  tags already stored on live windows and sessions keep comparing equal.
+
 - **A run id that is a suffix of another no longer resolves to the neighbour's control window.**
   `--run-id` is caller-supplied and may contain `-`, so `run-other-RID` satisfied the lookup for
   `RID` — and sorted ahead of it, so `x` could kill the neighbouring run's live orchestrator.
   Window names are parsed and the run id compared whole, as the prune scan already did.
 
 - **Attach, return-stamp and kill follow the run's live control window, not an older one (#482).**
-  `<kind>-<run_id>` window names are not unique, so the lookup answered the first match: resuming a
-  parked run left `a` attaching to the dead `run-<rid>` window, the return pane stamped on it (so the
-  live window had no way back to the operator's origin pane), and `x` killing it while the live one
-  ran on. Each launch now records the window id it minted in the run dir and the lookup prefers it,
-  but only while the live listing still shows that id under this run id; with no record the answer is
-  unchanged. A resume whose window id was not captured warns instead of reporting plain success.
-  **Adapter authors:** the re-prove pairs `new_parked_window`'s id with the `window_id` column of
-  `list_windows`, which the seam previously left free to diverge — both bundled backends agree; one
-  that does not degrades to the ambiguous by-name resolve rather than mistargeting.
+  `<kind>-<run_id>` window names are not unique, so the lookup answered the first match — `a`, the
+  return stamp and `x` all landed on a parked run's dead window while the live one ran on. Each
+  launch records the window id it minted and the lookup prefers it while the listing still shows it
+  under this run id; with no record the answer is unchanged, and a resume whose id was not captured
+  warns rather than reporting plain success. **Adapter authors:** the re-prove pairs
+  `new_parked_window`'s id with the `window_id` column of `list_windows`, which the seam previously
+  left free to diverge — a backend where they differ degrades to the by-name resolve.
 
 - **A native-Windows install driven from a WSL shell now says so (#332).** WSL appends the Windows
   `PATH` to its own, so a bash prompt can reach a Windows-installed `bmad-loop`: that interpreter

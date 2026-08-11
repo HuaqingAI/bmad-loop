@@ -623,35 +623,83 @@ def test_mux_sessions_no_server(monkeypatch):
     assert runs.mux_sessions() == []
 
 
-@pytest.mark.parametrize(
-    "separator",
-    ["\n", "\r", "\r\n", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", " ", " "],
-    ids=["LF", "CR", "CRLF", "VT", "FF", "FS", "GS", "RS", "NEL", "LS", "PS"],
-)
+# Everything `str.splitlines()` breaks on. Spelled as escapes on purpose: the
+# literals are invisible in a diff, and a raw U+2028/U+2029 in a source file
+# makes every splitlines()-based tool disagree with Python's tokenizer about
+# which line anything after it is on.
+_LINE_SEPARATORS = [
+    ("LF", "\n"),
+    ("CR", "\r"),
+    ("CRLF", "\r\n"),
+    ("VT", "\v"),
+    ("FF", "\f"),
+    ("FS", "\x1c"),
+    ("GS", "\x1d"),
+    ("RS", "\x1e"),
+    ("NEL", "\x85"),
+    ("LS", "\u2028"),
+    ("PS", "\u2029"),
+]
+_SEP_VALUES = [s for _, s in _LINE_SEPARATORS]
+_SEP_IDS = [i for i, _ in _LINE_SEPARATORS]
+
+
+@pytest.mark.parametrize("separator", _SEP_VALUES, ids=_SEP_IDS)
 @pytest.mark.parametrize("place", ["middle", "trailing"], ids=["mid", "tail"])
-def test_tag_is_transportable_rejects_every_line_separator(separator, place):
+def test_survives_listing_rejects_every_line_separator(separator, place):
     """Everything `str.splitlines()` breaks on, not just LF.
 
     The listing is parsed with `splitlines()`, whose set is much wider than the
     two obvious characters — and all of them are legal bytes in a POSIX
-    directory name. A predicate naming only LF reports the rest as safe, the
-    caller then trusts a tag that arrives truncated, and it discards the
-    project's own windows.
+    directory name. This predicate chooses `project_tag`'s spelling, so naming
+    only LF here would leave the rest riding the transport raw and arriving
+    truncated at every comparison site.
 
     `trailing` is a separate case on purpose: a separator at the end does not
     add a row (`"/p\\r".splitlines()` is one element), so a row-count check
     passes it while the tag still comes back changed."""
     tag = f"/home/u/p{separator}x" if place == "middle" else f"/home/u/p{separator}"
-    assert runs.tag_is_transportable(tag) is False
+    assert runs._survives_listing(tag) is False
 
 
-def test_tag_is_transportable_accepts_paths_that_survive_the_round_trip():
+def test_survives_listing_accepts_paths_that_survive_the_round_trip():
     # The control: ordinary paths, and a tab — which splitlines does not break
-    # on and the backends' bounded split carries intact, so rejecting it would
-    # push those projects onto the weaker untagged path for nothing.
-    assert runs.tag_is_transportable("/home/u/proj") is True
-    assert runs.tag_is_transportable("/home/u/my proj") is True
-    assert runs.tag_is_transportable("/home/u/my\tproj") is True
+    # on and the backends' bounded split carries intact, so encoding it would
+    # rewrite the stored tag of every project holding one, for nothing.
+    assert runs._survives_listing("/home/u/proj") is True
+    assert runs._survives_listing("/home/u/my proj") is True
+    assert runs._survives_listing("/home/u/my\tproj") is True
+
+
+def test_project_tag_leaves_a_transportable_path_byte_identical(tmp_path):
+    """The compatibility half of the conditional encoding.
+
+    Tags persist on live windows and sessions, so one written by an earlier
+    version has to keep comparing equal after an upgrade. Encoding only the
+    paths the transport cannot carry is what makes that true: drop the
+    `_survives_listing` branch from project_tag and every ordinary project's
+    stored tag stops matching itself. A tab, a space, a percent and non-ASCII
+    are all carried as-is."""
+    for name in ("proj", "my proj", "my\tproj", "100%done", "prögram"):
+        project = tmp_path / name
+        assert runs.project_tag(project) == str(project.resolve())
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="separators are illegal in win32 names")
+@pytest.mark.parametrize("separator", _SEP_VALUES, ids=_SEP_IDS)
+def test_project_tag_encodes_a_path_the_listing_cannot_carry(tmp_path, separator):
+    """The correctness half: a comparison site receives the tag that was
+    written, for *every* project, so no caller needs a trust fallback.
+
+    Two projects must also stay distinguishable. The fallback this replaced
+    stopped comparing tags when its own looked unsafe, which admitted rows
+    carrying another project's tag — so an encoding that collapsed two projects
+    together would reintroduce exactly the boundary crossing it removed."""
+    mine = tmp_path / f"my{separator}proj"
+    tag = runs.project_tag(mine)
+    assert runs._survives_listing(tag) is True
+    assert tag.startswith(runs._TAG_ENCODED_PREFIX)
+    assert tag != runs.project_tag(tmp_path / "theirproj")
 
 
 def test_prunable_sessions_partitions(tmp_path, monkeypatch):

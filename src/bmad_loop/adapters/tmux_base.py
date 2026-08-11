@@ -368,8 +368,8 @@ class BaseTmuxBackend(TerminalMultiplexer):
             # below then truncates, silently corrupting the field's value.
             # Callers requesting a free-text field must therefore ask for it
             # last; every current caller does. (A newline in that value still
-            # splits the row, which no parse here can undo — see
-            # runs.tag_is_transportable for how the comparison sites cope.)
+            # splits the row, which no parse here can undo — so runs.project_tag
+            # encodes a path holding one rather than leaning on this split.)
             parts = line.split("\t", len(fields) - 1)
             parts += [""] * (len(fields) - len(parts))  # tolerate unset trailing fields
             rows.append(tuple(parts[: len(fields)]))

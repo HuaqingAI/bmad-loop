@@ -878,23 +878,23 @@ def test_forget_falls_back_to_the_confinement_check_without_dir_fd(tmp_path: Pat
 @pytest.mark.skipif(sys.platform == "win32", reason="tab/newline are legal POSIX name bytes")
 @pytest.mark.parametrize(
     "odd_name",
-    ["my\tproj", "my\nproj", "my\rproj", "my\vproj", "my\x85proj", "my proj"],
+    ["my\tproj", "my\nproj", "my\rproj", "my\vproj", "my\x85proj", "my\u2028proj"],
     ids=["tab", "LF", "CR", "VT", "NEL", "LS"],
 )
 def test_a_delimiter_in_the_project_path_does_not_hide_its_own_window(
     monkeypatch, tmp_path: Path, odd_name: str
 ):
     """The project tag rides the same tab-delimited, line-per-window listing it
-    is compared against, and a resolved project path can legally hold either
-    delimiter. A tab truncated the tag; a newline split the row. Either way the
-    tag read back was not the tag written, so this project's own window looked
-    like a *neighbour's* and was discarded — and `a`/`x` then could not reach a
-    run the pre-tag lookup found. Worse than a missed match, because the
-    fallthrough for an unknown tag is exclusion.
+    is compared against, and a resolved project path can legally hold any of
+    these bytes. A tab truncated the tag; every separator `splitlines()` knows
+    split the row. Either way the tag read back was not the tag written, so this
+    project's own window looked like a *neighbour's* and was discarded — and
+    `a`/`x` then could not reach a run the pre-tag lookup found. Worse than a
+    missed match, because the fallthrough for an unknown tag is exclusion.
 
-    Parametrized over both delimiters on purpose: they fail at different layers
-    (the field split vs the row split) and are fixed in different places, so one
-    spelling passing says nothing about the other."""
+    Parametrized over all six on purpose: two different mechanisms carry them —
+    the tab by the backends' bounded field split, the separators by project_tag's
+    encoding — so one spelling passing says nothing about another."""
     project = tmp_path / odd_name
     project.mkdir()
     _make_run(project)
@@ -902,6 +902,38 @@ def test_a_delimiter_in_the_project_path_does_not_hide_its_own_window(
     _ctl_listing(monkeypatch, f"@7\tresume-RID\t{tag}\n")
 
     assert launch.ctl_window_id(project, "RID") == "@7"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="separators are illegal in win32 names")
+def test_a_separator_in_the_project_path_does_not_admit_a_foreign_window(
+    monkeypatch, tmp_path: Path
+):
+    """The other half of the delimiter story, and the dangerous half.
+
+    An earlier fix restored reach for these projects by *not comparing* tags
+    when its own could not survive the listing. That admits every row carrying
+    the run id — including one tagged for another project — and `x` resolves
+    through here, so a stop could kill a neighbouring project's orchestrator.
+    Reach and scoping are not a trade: project_tag encodes the tag instead, so
+    the comparison stays exact and this row is simply not ours.
+
+    The two assertions differ only in whose tag the row carries, which is what
+    makes the refusal about the tag rather than about the listing being
+    unusable."""
+    mine = tmp_path / "my\nproj"
+    theirs = tmp_path / "theirproj"
+    mine.mkdir()
+    theirs.mkdir()
+    _make_run(mine)  # so `local` is True — ownership-by-run-dir would say yes
+
+    _ctl_listing(monkeypatch, f"@9\trun-RID\t{runs.project_tag(theirs)}\n")
+    assert launch.ctl_window_id(mine, "RID") is None
+
+    # Positive control: the identical row tagged for THIS project is found, so
+    # the None above is the tag comparison refusing, not a listing that parsed
+    # to nothing or a run id that never matched.
+    _ctl_listing(monkeypatch, f"@9\trun-RID\t{runs.project_tag(mine)}\n")
+    assert launch.ctl_window_id(mine, "RID") == "@9"
 
 
 def test_a_skipped_record_forgets_the_previous_one(fake_run, tmp_path: Path):
@@ -1005,6 +1037,11 @@ def test_confinement_check_refuses_an_unprobeable_ancestor(tmp_path: Path, monke
 
     monkeypatch.setattr(launch.os, "lstat", lstat_denied)
     assert not launch._run_dir_is_confined(project, run_dir)
+    # Positive control: the same directory, once it can be probed again, IS
+    # confined. Without this the refusal above is satisfied by the walk having
+    # become a blanket no — which is every reason a negative assertion can pass.
+    monkeypatch.setattr(launch.os, "lstat", real_lstat)
+    assert launch._run_dir_is_confined(project, run_dir)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
@@ -1034,9 +1071,15 @@ def _fail_the_record(monkeypatch, exc: BaseException) -> None:
     POSIX anchors the write at a directory descriptor (`atomic_write_text_at`)
     and win32 falls back to the path-based `atomic_write_text`; patching both
     keeps these tests about the degradation rather than about which branch ran.
-    Each caller writes a record FIRST and asserts it is gone afterwards, so a
-    patch that reached neither writer would leave that record in place and fail
-    — the assertions are not satisfiable by the write simply never happening."""
+
+    The two forget tests write a record FIRST and assert it is gone afterwards,
+    so a patch that reached neither writer would leave that record in place and
+    fail — their assertions are not satisfiable by the write simply never
+    happening. `test_resume_reports_a_record_that_did_not_survive` does not use
+    that shape: its control is its sibling
+    `test_resume_returns_the_id_when_the_record_survives`, which runs the same
+    two-window listing unpatched and gets `@7`, so the `None` here can only come
+    from the record failing to land."""
 
     def boom(*_a, **_k):
         raise exc

@@ -11,6 +11,7 @@ import shutil
 import tarfile
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 from . import devcontract, verify
 from .adapters.multiplexer import get_multiplexer
@@ -294,16 +295,40 @@ _SESSION_PREFIX = "bmad-loop-"
 # prunable_sessions and tui.launch.
 PROJECT_OPTION = "@bmad_project"
 
+# Marks a tag whose project path could not ride a listing verbatim. A resolved
+# absolute path never begins with it — POSIX starts at "/", win32 at a drive
+# letter or "\\" — so an encoded tag can never be mistaken for a raw one, in
+# either direction, and the two namespaces stay disjoint without a version byte.
+_TAG_ENCODED_PREFIX = "%enc%"
+
 
 def project_tag(project: Path) -> str:
     """Canonical project identity stored in PROJECT_OPTION. The single source of
     normalization: both the tagging (at session/window creation) and the prune
     comparison must route through this so symlinks/relative paths can't make a
-    project look foreign to its own sessions."""
-    return str(project.resolve())
+    project look foreign to its own sessions.
+
+    The result always reaches a comparison site as it was written, so the tag is
+    authoritative and no caller needs a can-I-trust-this fallback. Two halves
+    make that true: nothing `splitlines()` breaks on survives here (those are
+    encoded), so a row cannot split; and a tab is carried intact by the bounded
+    field split in `BaseTmuxBackend.list_windows`, so it needs no encoding.
+
+    Encoding is conditional on purpose, and that is the whole compatibility
+    story. Tags are persisted on live windows and sessions, so encoding *every*
+    path would strand every tag written before this change (AGENTS.md's
+    compatibility rule). Returning a transportable path byte-identical strands
+    none: the only tags whose spelling changes are the ones the transport was
+    already mangling, which by definition never compared equal to anything."""
+    raw = str(project.resolve())
+    if _survives_listing(raw):
+        return raw
+    # safe="" so no separator can hide in a reserved character; the output is
+    # unreserved ASCII plus "%", which is inert to both the row and field splits.
+    return _TAG_ENCODED_PREFIX + quote(raw, safe="")
 
 
-def tag_is_transportable(tag: str) -> bool:
+def _survives_listing(tag: str) -> bool:
     """Whether `tag` survives a multiplexer listing round trip intact.
 
     The backends emit one window per line with tab-separated fields and split
@@ -332,16 +357,18 @@ def tag_is_transportable(tag: str) -> bool:
     them. They are equally legal in a path, but the backends' bounded split lets
     a trailing field carry them intact (see BaseTmuxBackend.list_windows), so a
     tab round-trips and a tagged comparison stays exact. Widening this to tabs
-    as well would send those projects down the weaker untagged path for no
-    reason — and would mask the parser's guarantee rather than rest on it.
+    would rewrite the stored tag of every project holding one, for nothing — and
+    would mask the parser's guarantee rather than rest on it. The two mechanisms
+    stay disjoint on purpose: delete the bounded split and the tab cases fail;
+    delete the encoding and the separator cases fail. Neither covers the other.
 
-    Callers use this to choose between "tags are authoritative" and "tags cannot
-    be trusted here", never to reject the project itself. Returning False is not
-    an error condition — it selects the untagged path, which is the same one a
-    pre-upgrade window takes, so the answer degrades to ownership-by-run-dir
-    rather than to nothing. The tag is left in its raw form on purpose: it is
-    persisted on live windows and sessions, so encoding it would strand every
-    tag written before the change (AGENTS.md's compatibility rule)."""
+    This selects `project_tag`'s spelling; it is not a question any comparison
+    site asks. An earlier shape exposed it to callers so they could fall back to
+    the untagged path when their own tag looked unsafe, but "stop comparing
+    tags" admits rows carrying *another* project's tag — the fallback restored
+    reach by giving up the discriminator that keeps a stop from crossing project
+    boundaries. Encoding the few paths that need it keeps the discriminator for
+    every project instead."""
     return tag.splitlines()[:1] == [tag]
 
 
