@@ -22,6 +22,7 @@ import ast
 from pathlib import Path
 
 import bmad_loop
+from bmad_loop import envvars
 
 SRC = Path(bmad_loop.__file__).resolve().parent
 # Marker an allowlisted exception line must carry. Written as ``# portability: …``;
@@ -112,6 +113,17 @@ POSIX_PATHS = ("/tmp", "/proc", "/dev/null")
 # Prefix that makes an environment variable this project's to register.
 ENV_PREFIX = "BMAD_LOOP_"
 
+# ``CONSTANT_NAME -> "BMAD_LOOP_…"`` for the registry's own public constants, read
+# off the live module so the guard cannot drift from it: register a fourth var in
+# envvars.py and the scan resolves reads spelled through it with no edit here.
+# This is what lets a read reach the guard when it borrows the registry's constant
+# but skips the registry's reader — the shape a well-meaning change actually takes.
+REGISTRY_NAMES = {
+    name: value
+    for name, value in vars(envvars).items()
+    if isinstance(value, str) and value.startswith(ENV_PREFIX)
+}
+
 
 def _py_files() -> list[Path]:
     return sorted(SRC.rglob("*.py"))
@@ -186,15 +198,42 @@ def _env_name_aliases(tree: ast.AST) -> dict[str, str]:
     return aliases
 
 
-def _env_read_key(node: ast.expr | None, aliases: dict[str, str], docs: set[int]) -> str | None:
-    """The ``BMAD_LOOP_*`` variable an environment-lookup key names, or None. Prose
-    is excluded the same way the POSIX-path scan excludes it — a var named in a
-    docstring is documentation, not a read."""
-    if isinstance(node, ast.Constant) and id(node) not in docs:
+def _env_read_key(node: ast.expr | None, aliases: dict[str, str]) -> str | None:
+    """The ``BMAD_LOOP_*`` variable an environment-lookup key names, or None.
+
+    No docstring exclusion here, unlike the POSIX-path scan: that one walks *every*
+    string Constant in the tree and so must skip prose, but this one only ever
+    inspects a key position (a call's first arg, a subscript's slice). A docstring
+    is a standalone ``Expr`` statement and can never appear there, so a
+    ``BMAD_LOOP_*`` mention in prose produces no finding to exclude. Verified by
+    counting key-position nodes that are also docstring nodes across the whole
+    tree: zero. An exclusion here would be unreachable code implying a check that
+    is not happening.
+
+    Four spellings resolve, because the interesting violation is the *half-right*
+    one: someone who reuses the registry's own constant but skips its reader. A
+    literal and a same-module alias were never the risky shapes — reaching for
+    ``envvars.MUX_BACKEND`` is, precisely because it looks tidy.
+
+    1. ``os.environ.get("BMAD_LOOP_X")``          — string literal
+    2. ``os.environ.get(LOCAL)``                  — bound to a literal here
+    3. ``os.environ.get(envvars.MUX_BACKEND)``    — qualified registry attribute
+    4. ``os.environ.get(MUX_BACKEND)``            — registry constant imported in
+
+    (3) matches on the attribute name alone rather than proving the object is the
+    registry module: `import bmad_loop.envvars as ev` / `from . import envvars`
+    and a rebound alias all spell it differently, and resolving that statically
+    costs more than it buys. A false positive here is a review prompt on a line
+    that reads like an env lookup, not a silent miss — the direction a tripwire
+    should fail in."""
+    if isinstance(node, ast.Constant):
         if isinstance(node.value, str) and node.value.startswith(ENV_PREFIX):
             return node.value
     if isinstance(node, ast.Name):
-        return aliases.get(node.id)
+        # a same-module binding wins over the registry name it may shadow
+        return aliases.get(node.id) or REGISTRY_NAMES.get(node.id)
+    if isinstance(node, ast.Attribute):
+        return REGISTRY_NAMES.get(node.attr)
     return None
 
 
@@ -301,19 +340,19 @@ def _scan():
             if isinstance(node, ast.Call) and node.args and isinstance(node.func, ast.Attribute):
                 func = node.func
                 if func.attr in ("get", "pop", "setdefault") and _is_os_environ(func.value):
-                    env_key = _env_read_key(node.args[0], env_aliases, docs)
+                    env_key = _env_read_key(node.args[0], env_aliases)
                 elif (
                     func.attr == "getenv"
                     and isinstance(func.value, ast.Name)
                     and func.value.id == "os"
                 ):
-                    env_key = _env_read_key(node.args[0], env_aliases, docs)
+                    env_key = _env_read_key(node.args[0], env_aliases)
             elif (
                 isinstance(node, ast.Subscript)
                 and _is_os_environ(node.value)
                 and isinstance(node.ctx, ast.Load)
             ):
-                env_key = _env_read_key(node.slice, env_aliases, docs)
+                env_key = _env_read_key(node.slice, env_aliases)
             if env_key:
                 findings.append(("envread", rel, node.lineno, line_at(node.lineno)))
 
@@ -418,9 +457,13 @@ def test_bmad_loop_env_reads_only_in_the_registry():
     ``envvars.py``; plugin-owned env-var families stay with their plugin." Reading a
     knob inline is what made these undiscoverable before the registry existed, so a
     core module must call an ``envvars`` reader rather than touch ``os.environ``
-    itself. Detects the literal ``os.environ`` / ``os.getenv`` forms plus keys named
-    through a module constant; ``from os import environ`` aliases are deliberately
-    not tracked — this is a review tripwire, not a sandbox.
+    itself. Detects the literal ``os.environ`` / ``os.getenv`` forms with the key
+    spelled four ways — literal, same-module constant, ``envvars.MUX_BACKEND``, and
+    the registry constant imported in (see ``_env_read_key``). ``from os import
+    environ`` aliases are deliberately not tracked: that is a way to obscure the
+    *lookup*, and this is a review tripwire, not a sandbox. Borrowing the registry's
+    *key* is different — it is the shape a well-meaning change actually takes, so it
+    resolves.
 
     Scoped to reads. Writes are a different act: engine.py, resolve.py, probe.py,
     plugins/bus.py and unity_plugin.py all BUILD a ``BMAD_LOOP_*`` dict to inject
@@ -429,7 +472,7 @@ def test_bmad_loop_env_reads_only_in_the_registry():
     Reads of a SessionSpec's ``spec.env`` (adapters/generic.py) are likewise out:
     that is a plain dict handed down in-process, not the environment.
 
-    Ablated 2026-08-11, four ways — a negative assertion passes for every reason a
+    Ablated 2026-08-11, six ways — a negative assertion passes for every reason a
     value could be absent, including a branch that never fires:
     - emptying ENV_READ_ALLOW fails listing all 52 real reads across the 10
       ENV_READ_ALLOW files, so the scan sees them rather than passing on an empty
@@ -441,9 +484,25 @@ def test_bmad_loop_env_reads_only_in_the_registry():
       ``_ABLATION_ENV = "BMAD_LOOP_SOMETHING"`` / ``os.environ.get(_ABLATION_ENV)``
       fails too — drop ``_env_name_aliases`` and it passes, and so would every read
       in envvars.py, which is the only shape the registry itself uses;
-    - the name written into a non-allowlisted module's docstring instead stays green,
-      so prose is not what this reads.
-    """
+    - the name written into a non-allowlisted module's docstring instead stays green.
+      ⚠️ That row is a CONTROL, not an ablation: it passes because a prose mention
+      creates no key-position node at all, so it would stay green no matter what the
+      scan did. An earlier revision carried a docstring exclusion inside
+      ``_env_read_key`` and cited this row as proof it worked; counting
+      key-position nodes that are also docstring nodes across the whole tree gives
+      zero, so that exclusion was unreachable and the row graded nothing. The
+      exclusion is gone — keep the row for the property, not as evidence.
+
+    The last two close a hole this guard SHIPPED WITH and a review caught (both
+    verified by planting in verify.py, and both passed green before REGISTRY_NAMES
+    existed — the guard asserted an invariant it did not enforce):
+    - ``from . import envvars as _ev`` / ``os.environ.get(_ev.MUX_BACKEND)`` now
+      fails with ``verify.py:13: _LEAK1 = os.environ.get(_ev.MUX_BACKEND)``;
+    - ``from .envvars import MUX_BACKEND`` / ``os.environ.get(MUX_BACKEND)`` now
+      fails with ``verify.py:13: _LEAK2 = os.environ.get(MUX_BACKEND)``.
+    Both spellings borrow the registry's constant while skipping its reader, which
+    is a *more* likely violation than an inline literal, not a more exotic one —
+    the tidy-looking version is the one that gets written."""
     offenders = [(rel, ln, txt) for _, rel, ln, txt in _of("envread") if rel not in ENV_READ_ALLOW]
     assert not offenders, (
         "BMAD_LOOP_* read outside envvars.py and the plugin-owned families — name "
