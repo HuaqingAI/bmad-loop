@@ -341,11 +341,43 @@ def test_cmd_clean_survives_a_session_appearing_mid_clean(project, monkeypatch, 
 
     assert cli.cmd_clean(_clean_args(repo, retain=0)) == 0  # not an aborted clean
 
+    out, err = capsys.readouterr()
     assert racer.is_dir()  # refused at the chokepoint, not removed
     assert not other.is_dir()  # the racing run did not stop the rest
-    assert "20260101-000000-aaaa: agent session appeared mid-clean — not removed" in (
-        capsys.readouterr().err
-    )
+    assert "20260101-000000-aaaa: agent session appeared mid-clean — not removed" in err
+    # nothing reached this run before the refusal, so "untouched" is the honest
+    # classification here — the sibling test pins the other side, where it is not
+    assert "left 1 live/resumable run(s) untouched" in out
+
+
+def test_cmd_clean_reports_a_mid_clean_racer_by_what_it_actually_did(project, monkeypatch, capsys):
+    """A run the race caught *after* its worktree was reconciled and its artifacts
+    trimmed is not "left untouched", so it must not land in `protected` — that field
+    is documented as exactly that, and a consumer would read a partially reclaimed
+    run as a preserved one. It ends in the trimmed state, so that is what is
+    reported. The sibling test above covers the other side: a run nothing reached
+    before the refusal really is protected."""
+    install_bmad_config(project)
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    wt = run_dir / "worktrees" / "u"
+    wt.parent.mkdir(parents=True)
+    verify.worktree_add(repo, wt, "fb", "main")
+    save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", finished=True))
+    seen: list[str] = []
+
+    def racing(_project, run_id):
+        seen.append(run_id)
+        return len(seen) > 1
+
+    monkeypatch.setattr(runs, "live_session_may_be_ours", racing)
+
+    doc = _clean_json(repo, capsys, "--retain", "0")
+
+    assert run_dir.is_dir() and not (run_dir / "worktrees").exists()  # the racy state
+    assert doc["trimmed"] == ["20260101-000000-aaaa"]
+    assert doc["protected"] == []
+    assert doc["archived"] == [] and doc["deleted"] == []
 
 
 def test_cmd_clean_reclaims_past_a_session_proven_to_be_another_project_s(

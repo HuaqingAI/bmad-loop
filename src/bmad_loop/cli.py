@@ -3055,13 +3055,14 @@ def cmd_clean(args: argparse.Namespace) -> int:
         run_bytes = _dir_size(run_dir)
         # collect, never print-as-you-mutate: the document is emitted once at the
         # end, so every per-item line has to survive the loop as data
-        for wt in runs.reconcile_orphan_worktrees(repo, run_dir, dry_run=dry):
+        run_worktrees = runs.reconcile_orphan_worktrees(repo, run_dir, dry_run=dry)
+        for wt in run_worktrees:
             worktrees.append(str(wt))
             if not args.json:
                 print(f"{'would remove' if dry else 'removed'} worktree {wt}")
         if run_dir.name in past:
             freed += run_bytes
-            runs.trim_run_dir(run_dir, dry_run=dry)  # shrink before archiving
+            shrunk = runs.trim_run_dir(run_dir, dry_run=dry)  # shrink before archiving
             try:
                 if args.hard or not pol.cleanup.archive_old:
                     if not dry:
@@ -3075,13 +3076,18 @@ def cmd_clean(args: argparse.Namespace) -> int:
                 # A session appeared between the loop-top guard and here — a resume
                 # of a stopped run, racing this clean. The chokepoint refused the
                 # removal; record the run instead of letting one racing run abort
-                # the whole invocation. The trim above already ran, so correct the
-                # estimate down to what it actually freed. The wider race — every
-                # mutation in this loop against a concurrent resume — is older than
-                # this guard (`reclaimable` is sampled in the loop above and never
-                # re-read) and is tracked separately.
+                # the whole invocation. Correct the estimate down to what actually
+                # went. The wider race — every mutation in this loop against a
+                # concurrent resume — is older than this guard (`reclaimable` is
+                # sampled in the loop above and never re-read) and is tracked in
+                # issue #533.
                 freed += wt_bytes - run_bytes
-                protected.append(run_dir.name)
+                # Classify by what happened, not by what was intended: the steps
+                # above may already have taken this run's worktree and artifacts,
+                # and `protected` means "left untouched" in the --json contract.
+                # Only a run nothing reached is protected; one already shrunk is
+                # trimmed, which is exactly the state it ends in.
+                (trimmed if run_worktrees or shrunk else protected).append(run_dir.name)
                 if not args.json:
                     print(
                         f"run {run_dir.name}: agent session appeared mid-clean — not removed",
