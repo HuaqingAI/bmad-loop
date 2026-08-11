@@ -579,16 +579,27 @@ def _refuse_live_session(run_id: str, verb: str) -> None:
     removing it leaks the session (and its server) for the life of the machine.
     Refusing is a repair-path write failing loudly, per the module doctrine.
 
-    The remedy the message names is `bmad-loop cleanup`, never a kill from here: a
-    session name carries no project, so killing `bmad-loop-<id>` by name would tear
-    down another project's live run whenever the two share a run id (reachable —
-    `--run-id` is caller-supplied). `prune_sessions` is the scoped kill; it proves
-    ownership from the tag before killing anything."""
+    Never a kill from here: a session name carries no project, so killing
+    `bmad-loop-<id>` by name would tear down another project's live run whenever the
+    two share a run id (reachable — `--run-id` is caller-supplied).
+
+    The message names `bmad-loop cleanup` as the remedy but does not call it sound.
+    `prune_sessions` proves ownership from the tag when there is one and falls back
+    to *this same run dir* when there is not — the weak proof this guard exists to
+    protect, so on the untagged case it can prune another project's session on a
+    shared run id (#419's second edge, pinned by
+    `test_prunable_sessions_claims_an_untagged_session_on_a_run_id_collision`).
+    Hence the message asks the operator to confirm first: nothing available here can
+    prove the session ours, and minting a proof that outlives the run dir is #419
+    direction (2), not this guard."""
     if session_alive(run_id):
         raise LiveSessionError(
-            f"run {run_id}: refusing to {verb} its directory while its agent session "
-            f"is still live — kill it first with `bmad-loop cleanup` (the directory is "
-            f"the only ownership proof a later prune has for an untagged session)"
+            f"run {run_id}: refusing to {verb} its directory while its agent session is "
+            f"still live — for an untagged session this directory is the only ownership "
+            f"proof a later prune has. Clear the session with `bmad-loop cleanup` first, "
+            f"having confirmed it is this project's (`bmad-loop attach {run_id}`): an "
+            f"untagged session is proven ours by this same directory, so a run id shared "
+            f"with another project would prune theirs"
         )
 
 
@@ -600,7 +611,8 @@ def delete_run(run_dir: Path, *, force: bool = False) -> None:
     ``force`` is the operator's explicit override and skips that guard, accepting
     the leak on their own say-so. It deliberately does not kill the session
     instead — that would be unscoped, and this project cannot prove the session is
-    its own (which is the whole defect)."""
+    its own (which is the whole defect). Trading a possible leak of our own session
+    for a possible kill of someone else's is the wrong direction for an override."""
     if not force:
         _refuse_live_session(run_dir.name, "delete")
     shutil.rmtree(run_dir)

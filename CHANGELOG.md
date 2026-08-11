@@ -193,9 +193,10 @@ whose seams had diverged enough that several ports needed a different fix, and t
   agent session still alive — passes. For an untagged session the run dir is the last ownership
   proof a prune can read, so removing it leaked the session for the life of the machine. The
   removal paths now refuse while `bmad-loop-<run-id>` is live, and `clean` leaves the run untouched
-  rather than half-reclaiming it. `cleanup` is the remedy — it proves ownership from the tag before
-  killing, which a kill by session name cannot; `--force` overrides the refusal without killing
-  anything. An unreachable multiplexer reads as no session, so an unanswerable question never
+  rather than half-reclaiming it. The refusal names `cleanup` as the remedy along with the
+  confirmation it needs — for an untagged session `cleanup` proves ownership by that same run dir,
+  so a shared run id could prune another project's session; `--force` overrides the refusal and
+  kills nothing. An unreachable multiplexer reads as no session, so an unanswerable question never
   blocks a removal.
 
 - **A project path the multiplexer cannot carry no longer strands the scans over it (#419).** The

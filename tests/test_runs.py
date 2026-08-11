@@ -861,9 +861,15 @@ def test_delete_run_refuses_while_the_agent_session_is_live(tmp_path, monkeypatc
     the session, not the other way round."""
     run_dir = _make_state_run(tmp_path, "r1")
     monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-r1"])
-    with pytest.raises(runs.LiveSessionError, match="still live"):
+    with pytest.raises(runs.LiveSessionError, match="still live") as exc:
         runs.delete_run(run_dir)
     assert run_dir.exists()
+    # The remedy it names is not sound on its own: `cleanup` proves an untagged
+    # session ours by this same run dir, so it can prune another project's on a
+    # shared id (the case the collision test above pins). The message must carry
+    # the confirmation step, not just the command.
+    assert "bmad-loop cleanup" in str(exc.value)
+    assert "bmad-loop attach r1" in str(exc.value)
 
 
 def test_delete_run_matches_the_session_by_exact_run_id(tmp_path, monkeypatch):
