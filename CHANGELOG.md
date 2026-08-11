@@ -182,6 +182,36 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
+- **A tab in the project path no longer truncates the project tag a window listing carries.**
+  The multiplexer listing is tab-delimited and the tag holds a resolved filesystem path, where a tab
+  is a legal byte — so the parse split one row into extra fields and dropped the tail, leaving a
+  truncated tag that reads as another project's. The prune scan then skipped the project's own
+  parked control windows. The last requested field now keeps its delimiters.
+
+- **A project path a window listing cannot carry no longer strands — or crashes — the scans over it.**
+  Listings are one row per window, split with `str.splitlines()` and decoded strictly, and two kinds
+  of byte defeat that while being perfectly legal in a POSIX path. A line separator (LF, CR, VT, FF,
+  FS, GS, RS, NEL, U+2028, U+2029) put the tag on a row of its own, so it never matched and the prune
+  scan skipped the project's own parked windows and sessions. A byte that is not valid in the
+  filesystem encoding arrived surrogate-escaped and made the listing read raise `UnicodeDecodeError`
+  outright. Both are now percent-encoded in the tag; every other path is tagged byte-identically, so
+  tags already stored on live windows and sessions keep comparing equal. Reading a tag stored raw by
+  an older version is the decode half, tracked in #380.
+
+- **A run id that is a suffix of another no longer resolves to the neighbour's control window.**
+  `--run-id` is caller-supplied and may contain `-`, so `run-other-RID` satisfied the lookup for
+  `RID` — and sorted ahead of it, so `x` could kill the neighbouring run's live orchestrator.
+  Window names are parsed and the run id compared whole, as the prune scan already did.
+
+- **Attach, return-stamp and kill follow the run's live control window, not an older one (#482).**
+  `<kind>-<run_id>` window names are not unique, so the lookup answered the first match — `a`, the
+  return stamp and `x` all landed on a parked run's dead window while the live one ran on. Each
+  launch records the window id it minted and the lookup prefers it while the listing still shows it
+  under this run id; with no record the answer is unchanged, and a resume whose id was not captured
+  warns rather than reporting plain success. **Adapter authors:** the re-prove pairs
+  `new_parked_window`'s id with the `window_id` column of `list_windows`, which the seam previously
+  left free to diverge — a backend where they differ degrades to the by-name resolve.
+
 - **A native-Windows install driven from a WSL shell now says so (#332).** WSL appends the Windows
   `PATH` to its own, so a bash prompt can reach a Windows-installed `bmad-loop`: that interpreter
   reports `win32`, takes the psmux platform default, and never sees the distro's tmux — while

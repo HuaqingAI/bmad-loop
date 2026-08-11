@@ -1502,10 +1502,12 @@ def test_attach_records_return_pane_inside_tmux(project, monkeypatch):
     from bmad_loop.tui import launch
 
     _make_run_with_decision(project, run_id="20260101-000000-aaaa")
+    planned: list = []
     monkeypatch.setattr(
         launch,
         "attach_plan",
-        lambda proj, rid: (
+        lambda proj, rid: planned.append((proj, rid))
+        or (
             ["tmux", "switch-client", "-t", "=bmad-loop-ctl"],
             "=bmad-loop-ctl:sweep-RID",
         ),
@@ -1520,6 +1522,9 @@ def test_attach_records_return_pane_inside_tmux(project, monkeypatch):
     assert cli.main(["attach", "--project", str(project.project), "20260101-000000-aaaa"]) == 0
     assert recorded == [("=bmad-loop-ctl:sweep-RID", "=main:%3")]
     assert called == [["tmux", "switch-client", "-t", "=bmad-loop-ctl"]]
+    # The *value* of the project argument, not just the arity: attach_plan finds
+    # the run's recorded ctl window only under the --project root (#482).
+    assert planned == [(project.project, "20260101-000000-aaaa")]
 
 
 def test_attach_records_detach_outside_tmux(project, monkeypatch):

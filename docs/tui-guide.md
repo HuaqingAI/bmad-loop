@@ -43,7 +43,10 @@ The TUI never runs an engine in-process. The two halves:
   lives in a separate `bmad-loop-<run-id>` session; it is torn down when the run
   finishes (unless `[adapter] cleanup_session_on_finish = false`). These parked
   `bmad-loop-ctl` windows and any leftover `bmad-loop-<id>` sessions can be
-  swept with `c` (see [Cleaning up sessions](#cleaning-up-sessions-c)).
+  swept with `c` (see [Cleaning up sessions](#cleaning-up-sessions-c)). Each
+  launch over an existing run records the id of the window it minted in the
+  run dir (`ctl-window`), so attach/stop follow the run's live window even
+  while an older same-run-id window is still parked (#482).
 - **Observer** — the dashboard reads only the artifacts the engine writes
   atomically into `.bmad-loop/runs/<run-id>/`: `state.json`, `journal.jsonl`,
   `logs/<task-id>.log`, `ATTENTION`, `engine.pid`. It polls the selected run

@@ -8,9 +8,11 @@ import os
 import re
 import secrets
 import shutil
+import sys
 import tarfile
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 from . import devcontract, verify
 from .adapters.multiplexer import get_multiplexer
@@ -294,13 +296,99 @@ _SESSION_PREFIX = "bmad-loop-"
 # prunable_sessions and tui.launch.
 PROJECT_OPTION = "@bmad_project"
 
+# Marks a tag whose project path could not ride a listing verbatim. A resolved
+# absolute path never begins with it — POSIX starts at "/", win32 at a drive
+# letter or "\\" — so an encoded tag can never be mistaken for a raw one, in
+# either direction, and the two namespaces stay disjoint without a version byte.
+_TAG_ENCODED_PREFIX = "%enc%"
+
 
 def project_tag(project: Path) -> str:
     """Canonical project identity stored in PROJECT_OPTION. The single source of
     normalization: both the tagging (at session/window creation) and the prune
     comparison must route through this so symlinks/relative paths can't make a
-    project look foreign to its own sessions."""
-    return str(project.resolve())
+    project look foreign to its own sessions.
+
+    The result always reaches a comparison site as it was written, so the tag is
+    authoritative and no caller needs a can-I-trust-this fallback. Two halves
+    make that true: nothing `splitlines()` breaks on survives here (those are
+    encoded), so a row cannot split; and a tab is carried intact by the bounded
+    field split in `BaseTmuxBackend.list_windows`, so it needs no encoding.
+
+    Encoding is conditional on purpose, and that is the whole compatibility
+    story. Tags are persisted on live windows and sessions, so encoding *every*
+    path would strand every tag written before this change (AGENTS.md's
+    compatibility rule). Returning a transportable path byte-identical strands
+    none: the only tags whose spelling changes are the ones the transport was
+    already mangling, which by definition never compared equal to anything."""
+    raw = str(project.resolve())
+    if _survives_listing(raw):
+        return raw
+    # safe="" so no separator can hide in a reserved character; the output is
+    # unreserved ASCII plus "%", which is inert to both the row and field splits.
+    # surrogateescape turns a non-UTF-8 filename byte back into that byte before
+    # percent-encoding it — without it this call raises UnicodeEncodeError on
+    # exactly the paths the encoding exists to carry.
+    return _TAG_ENCODED_PREFIX + quote(raw, safe="", errors="surrogateescape")
+
+
+def _survives_listing(tag: str) -> bool:
+    """Whether `tag` survives a multiplexer listing round trip intact.
+
+    The backends emit one window per line with tab-separated fields and split
+    the result with `str.splitlines()`, so anything *that* treats as a line
+    break splits the tag across two rows — which no parse on the receiving side
+    can undo, because the row boundary is the framing itself. A comparison
+    against the truncated remainder does not merely fail to match: it makes a
+    window look like it belongs to *another* project, so the caller discards the
+    project's own windows.
+
+    Asked of `splitlines` itself rather than by listing the characters. The set
+    is far wider than LF and CR — VT, FF, FS, GS, RS, NEL, U+2028, U+2029 all
+    split — and every one of them is a legal byte in a POSIX directory name, so
+    an enumeration here would be a second copy of CPython's table that silently
+    rots when it grows. Routing the question through the same function the
+    parser uses cannot drift from it.
+
+    The comparison is against the whole tag, not a row count, because a
+    *trailing* separator is equally fatal and does not add a row: `"/p\\r"`
+    splits to `["/p"]`, one element, yet the tag read back is `"/p"` and no
+    longer equals what was written. `text=True` on the subprocess also folds
+    CR and CRLF to LF before any of this, which is one more reason not to
+    reason about individual characters here.
+
+    Tabs are deliberately NOT rejected here, and `splitlines` does not split on
+    them. They are equally legal in a path, but the backends' bounded split lets
+    a trailing field carry them intact (see BaseTmuxBackend.list_windows), so a
+    tab round-trips and a tagged comparison stays exact. Widening this to tabs
+    would rewrite the stored tag of every project holding one, for nothing — and
+    would mask the parser's guarantee rather than rest on it. The two mechanisms
+    stay disjoint on purpose: delete the bounded split and the tab cases fail;
+    delete the encoding and the separator cases fail. Neither covers the other.
+
+    Two ways to fail, and both are asked in the transport's own terms rather
+    than by enumerating characters. A separator splits the *row*, which the
+    framing puts beyond any receiving-side parse. A surrogateescaped byte — what
+    `os.fsdecode` leaves behind for a filename byte that is not valid in the
+    filesystem encoding, and legal in every POSIX name — cannot be encoded at
+    all, so the listing carries the original byte and the backend's strict
+    decode raises `UnicodeDecodeError` on the way back. Left raw, that turns an
+    attach or a stop into a crash rather than a mismatch.
+
+    This selects `project_tag`'s spelling; it is not a question any comparison
+    site asks. An earlier shape exposed it to callers so they could fall back to
+    the untagged path when their own tag looked unsafe, but "stop comparing
+    tags" admits rows carrying *another* project's tag — the fallback restored
+    reach by giving up the discriminator that keeps a stop from crossing project
+    boundaries. Encoding the few paths that need it keeps the discriminator for
+    every project instead."""
+    if tag.splitlines()[:1] != [tag]:
+        return False
+    try:
+        tag.encode(sys.getfilesystemencoding())
+    except UnicodeEncodeError:
+        return False  # a surrogateescaped byte — no codec can carry it as text
+    return True
 
 
 def mux_sessions() -> list[str]:

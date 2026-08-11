@@ -300,6 +300,38 @@ def test_tmux_window_pane_pids_parses_pane_pid_lines(monkeypatch):
     assert seen["argv"] == ["tmux", "list-panes", "-t", "@7", "-F", "#{pane_pid}"]
 
 
+def test_tmux_list_windows_keeps_tabs_inside_the_trailing_field(monkeypatch):
+    """The last requested field may legally contain the delimiter.
+
+    PROJECT_OPTION carries a resolved filesystem path, and a tab is a legal
+    POSIX filename byte — so an unbounded split turns one row into four parts
+    and the field slice then drops the tail, handing the caller a *truncated*
+    path. That does not read as "no tag", it reads as another project's tag, so
+    the comparison sites discard the project's own windows. The bounded split
+    keeps the remainder in the field it belongs to."""
+    mux = TmuxMultiplexer()
+    monkeypatch.setattr(
+        tmux_base.subprocess,
+        "run",
+        lambda argv, **k: subprocess.CompletedProcess(
+            argv, 0, stdout="@7\tresume-RID\t/home/u/my\tproj\n", stderr=""
+        ),
+    )
+    rows = mux.list_windows("ctl", ["window_id", "window_name", "@bmad_project"])
+    assert rows == [("@7", "resume-RID", "/home/u/my\tproj")]
+
+    # Unchanged where it always held: short rows still pad trailing fields, and
+    # a single-field request still takes the whole line.
+    monkeypatch.setattr(
+        tmux_base.subprocess,
+        "run",
+        lambda argv, **k: subprocess.CompletedProcess(argv, 0, stdout="@7\trun-RID\n", stderr=""),
+    )
+    assert mux.list_windows("ctl", ["window_id", "window_name", "@bmad_project"]) == [
+        ("@7", "run-RID", "")
+    ]
+
+
 @pytest.mark.parametrize(
     "outcome",
     [
