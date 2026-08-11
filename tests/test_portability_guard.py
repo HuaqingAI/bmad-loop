@@ -21,6 +21,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
 import bmad_loop
 from bmad_loop import envvars
 
@@ -267,132 +269,143 @@ def _scan():
     """Single pass over the tree → list of (kind, rel, lineno, line_text)."""
     findings = []
     for path in _py_files():
-        rel = _rel(path)
-        src = path.read_text(encoding="utf-8")
-        lines = src.splitlines()
-        tree = ast.parse(src, filename=str(path))
-        docs = _docstring_node_ids(tree)
-        env_aliases = _env_name_aliases(tree)
+        findings.extend(_scan_source(path.read_text(encoding="utf-8"), _rel(path)))
+    return findings
 
-        def line_at(lineno: int) -> str:
-            return lines[lineno - 1] if 1 <= lineno <= len(lines) else ""
 
-        for node in ast.walk(tree):
-            # tmux argv literal: ["tmux", ...] (not the which-list tuple ("tmux", ...))
-            if isinstance(node, ast.List) and node.elts:
-                first = node.elts[0]
-                if isinstance(first, ast.Constant) and first.value == "tmux":
-                    findings.append(("tmux", rel, node.lineno, line_at(node.lineno)))
+def _scan_source(src: str, rel: str):
+    """The whole per-file scan, over one source string → the same
+    ``(kind, rel, lineno, line_text)`` tuples ``_scan`` collects.
 
-            # bare POSIX path string literal (skip docstrings)
-            if (
-                isinstance(node, ast.Constant)
-                and isinstance(node.value, str)
-                and id(node) not in docs
-                and _classify_posix_path(node.value)
-            ):
-                findings.append(("path", rel, node.lineno, line_at(node.lineno)))
+    Split out from ``_scan`` so the detectors can be driven by a snippet and not
+    only by what happens to be in the tree today. A repo-wide "nothing is flagged"
+    assertion is green both when the invariant holds and when the detector has
+    quietly stopped detecting; the probes below feed known-bad sources through
+    THIS function — the same code path the real scan uses — so the two failure
+    modes stop being indistinguishable."""
+    findings = []
+    lines = src.splitlines()
+    tree = ast.parse(src, filename=rel)
+    docs = _docstring_node_ids(tree)
+    env_aliases = _env_name_aliases(tree)
 
-            # signal.SIGKILL attribute access (the guarded form is a "SIGKILL"
-            # *string* passed to getattr — not an attribute access — so it's clean)
-            if (
-                isinstance(node, ast.Attribute)
-                and node.attr == "SIGKILL"
-                and isinstance(node.value, ast.Name)
-                and node.value.id == "signal"
-            ):
-                findings.append(("sigkill", rel, node.lineno, line_at(node.lineno)))
+    def line_at(lineno: int) -> str:
+        return lines[lineno - 1] if 1 <= lineno <= len(lines) else ""
 
-            # os.kill(<pid>, 0) — the existence-probe form (signal 0), not a real
-            # signal send like os.kill(pid, SIGTERM)
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "kill"
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "os"
-                and len(node.args) >= 2
-                and isinstance(node.args[1], ast.Constant)
-                and node.args[1].value == 0
-                and node.args[1].value is not False
-            ):
-                findings.append(("killprobe", rel, node.lineno, line_at(node.lineno)))
+    for node in ast.walk(tree):
+        # tmux argv literal: ["tmux", ...] (not the which-list tuple ("tmux", ...))
+        if isinstance(node, ast.List) and node.elts:
+            first = node.elts[0]
+            if isinstance(first, ast.Constant) and first.value == "tmux":
+                findings.append(("tmux", rel, node.lineno, line_at(node.lineno)))
 
-            # os.kill(...) in any form — every signal send maps to a destructive
-            # TerminateProcess on Windows, so confine the call to the ProcessHost.
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "kill"
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "os"
-            ):
-                findings.append(("oskill", rel, node.lineno, line_at(node.lineno)))
+        # bare POSIX path string literal (skip docstrings)
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in docs
+            and _classify_posix_path(node.value)
+        ):
+            findings.append(("path", rel, node.lineno, line_at(node.lineno)))
 
-            # start_new_session=True as a call kwarg
-            if (
-                isinstance(node, ast.keyword)
-                and node.arg == "start_new_session"
-                and isinstance(node.value, ast.Constant)
-                and node.value.value is True
-            ):
-                findings.append(("detach", rel, node.lineno, line_at(node.lineno)))
+        # signal.SIGKILL attribute access (the guarded form is a "SIGKILL"
+        # *string* passed to getattr — not an attribute access — so it's clean)
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == "SIGKILL"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "signal"
+        ):
+            findings.append(("sigkill", rel, node.lineno, line_at(node.lineno)))
 
-            # {"start_new_session": True} as a dict literal (the detach-kwargs form)
-            if isinstance(node, ast.Dict):
-                for key, val in zip(node.keys, node.values):
-                    if (
-                        isinstance(key, ast.Constant)
-                        and key.value == "start_new_session"
-                        and isinstance(val, ast.Constant)
-                        and val.value is True
-                    ):
-                        findings.append(("detach", rel, key.lineno, line_at(key.lineno)))
+        # os.kill(<pid>, 0) — the existence-probe form (signal 0), not a real
+        # signal send like os.kill(pid, SIGTERM)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "kill"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "os"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value == 0
+            and node.args[1].value is not False
+        ):
+            findings.append(("killprobe", rel, node.lineno, line_at(node.lineno)))
 
-            # shell=True as a call kwarg
-            if (
-                isinstance(node, ast.keyword)
-                and node.arg == "shell"
-                and isinstance(node.value, ast.Constant)
-                and node.value.value is True
-            ):
-                findings.append(("shell", rel, node.lineno, line_at(node.lineno)))
+        # os.kill(...) in any form — every signal send maps to a destructive
+        # TerminateProcess on Windows, so confine the call to the ProcessHost.
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "kill"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "os"
+        ):
+            findings.append(("oskill", rel, node.lineno, line_at(node.lineno)))
 
-            # A `BMAD_LOOP_*` variable READ out of the process environment:
-            # os.environ.get(K) / os.environ.pop(K) / os.getenv(K) / os.environ[K].
-            # Reads only — the env dicts modules *build* to inject into a child
-            # session are the producing side, which the invariant does not constrain.
-            env_key = None
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-                func = node.func
-                key_node = _env_call_key_node(node)
-                if key_node is None:
-                    pass
-                elif func.attr in ("get", "pop", "setdefault") and _is_os_environ(func.value):
-                    env_key = _env_read_key(key_node, env_aliases)
-                elif (
-                    func.attr == "getenv"
-                    and isinstance(func.value, ast.Name)
-                    and func.value.id == "os"
+        # start_new_session=True as a call kwarg
+        if (
+            isinstance(node, ast.keyword)
+            and node.arg == "start_new_session"
+            and isinstance(node.value, ast.Constant)
+            and node.value.value is True
+        ):
+            findings.append(("detach", rel, node.lineno, line_at(node.lineno)))
+
+        # {"start_new_session": True} as a dict literal (the detach-kwargs form)
+        if isinstance(node, ast.Dict):
+            for key, val in zip(node.keys, node.values):
+                if (
+                    isinstance(key, ast.Constant)
+                    and key.value == "start_new_session"
+                    and isinstance(val, ast.Constant)
+                    and val.value is True
                 ):
-                    env_key = _env_read_key(key_node, env_aliases)
+                    findings.append(("detach", rel, key.lineno, line_at(key.lineno)))
+
+        # shell=True as a call kwarg
+        if (
+            isinstance(node, ast.keyword)
+            and node.arg == "shell"
+            and isinstance(node.value, ast.Constant)
+            and node.value.value is True
+        ):
+            findings.append(("shell", rel, node.lineno, line_at(node.lineno)))
+
+        # A `BMAD_LOOP_*` variable READ out of the process environment:
+        # os.environ.get(K) / os.environ.pop(K) / os.getenv(K) / os.environ[K].
+        # Reads only — the env dicts modules *build* to inject into a child
+        # session are the producing side, which the invariant does not constrain.
+        env_key = None
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            func = node.func
+            key_node = _env_call_key_node(node)
+            if key_node is None:
+                pass
+            elif func.attr in ("get", "pop", "setdefault") and _is_os_environ(func.value):
+                env_key = _env_read_key(key_node, env_aliases)
             elif (
-                isinstance(node, ast.Subscript)
-                and _is_os_environ(node.value)
-                and isinstance(node.ctx, ast.Load)
+                func.attr == "getenv" and isinstance(func.value, ast.Name) and func.value.id == "os"
             ):
-                env_key = _env_read_key(node.slice, env_aliases)
-            elif isinstance(node, ast.Compare):
-                # `"BMAD_LOOP_X" in os.environ` / `not in` — a presence read, and the
-                # most natural way to spell a boolean flag. Walks every (op, rhs) pair
-                # so a chained comparison cannot hide one.
-                for op, rhs in zip(node.ops, node.comparators):
-                    if isinstance(op, (ast.In, ast.NotIn)) and _is_os_environ(rhs):
-                        env_key = _env_read_key(node.left, env_aliases)
-                        if env_key:
-                            break
-            if env_key:
-                findings.append(("envread", rel, node.lineno, line_at(node.lineno)))
+                env_key = _env_read_key(key_node, env_aliases)
+        elif (
+            isinstance(node, ast.Subscript)
+            and _is_os_environ(node.value)
+            and isinstance(node.ctx, ast.Load)
+        ):
+            env_key = _env_read_key(node.slice, env_aliases)
+        elif isinstance(node, ast.Compare):
+            # `"BMAD_LOOP_X" in os.environ` / `not in` — a presence read, and the
+            # most natural way to spell a boolean flag. Walks every (op, rhs) pair
+            # so a chained comparison cannot hide one.
+            for op, rhs in zip(node.ops, node.comparators):
+                if isinstance(op, (ast.In, ast.NotIn)) and _is_os_environ(rhs):
+                    env_key = _env_read_key(node.left, env_aliases)
+                    if env_key:
+                        break
+        if env_key:
+            findings.append(("envread", rel, node.lineno, line_at(node.lineno)))
 
     return findings
 
@@ -571,12 +584,109 @@ def test_bmad_loop_env_reads_only_in_the_registry():
     sweep over them. The full matrix above was then swept in one pass — 12 read
     shapes CAUGHT, 4 controls (two bulk copies, a non-BMAD var, prose) correctly
     silent — and the NOT COVERED list is the honest boundary, not an oversight.
-    Extend the matrix, not just the branch, if a new form turns up."""
+    Extend the matrix, not just the branch, if a new form turns up.
+
+    ⚠️ That matrix now lives in ``ENV_READ_PROBES`` / ``ENV_READ_NON_PROBES`` as
+    executable rows, because a fourth review round made the sharper point: THIS
+    test cannot grade the detector at all. It asserts only that today's tree has
+    no unallowlisted finding, which is equally green when the scan has stopped
+    scanning. Measured, not argued — deleting the membership branch reddens its 3
+    probe rows and leaves this test PASSING; dropping the ``key=`` arm reddens 4
+    and leaves this test PASSING; dropping ``REGISTRY_NAMES`` reddens 4 and leaves
+    this test PASSING. So this assertion is the invariant, and the probes are the
+    proof the invariant is being checked. Neither replaces the other."""
     offenders = [(rel, ln, txt) for _, rel, ln, txt in _of("envread") if rel not in ENV_READ_ALLOW]
     assert not offenders, (
         "BMAD_LOOP_* read outside envvars.py and the plugin-owned families — name "
         "the var in envvars.py and call its reader instead of widening the "
         "allowlist:\n" + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders)
+    )
+
+
+# Every access form the env-read detector claims to cover, as a source snippet that
+# MUST produce an `envread` finding. These are the executable half of the matrix the
+# test above documents: that test asserts only that today's tree is clean, which stays
+# green both when the invariant holds and when the detector has silently stopped
+# detecting. Driving known-bad sources through the real `_scan_source` separates
+# those. Snippets are parsed, never imported, so a nonexistent relative import is fine.
+# Fix order when a new form turns up: add the row here FIRST and watch it fail.
+ENV_READ_PROBES = [
+    ("get-literal", 'import os\nX = os.environ.get("BMAD_LOOP_X")\n'),
+    ("get-local-const", 'import os\nK = "BMAD_LOOP_X"\nX = os.environ.get(K)\n'),
+    (
+        "get-qualified-registry",
+        "import os\nfrom . import envvars\nX = os.environ.get(envvars.MUX_BACKEND)\n",
+    ),
+    (
+        "get-aliased-registry",
+        "import os\nfrom . import envvars as ev\nX = os.environ.get(ev.MUX_BACKEND)\n",
+    ),
+    (
+        "get-imported-registry",
+        "import os\nfrom .envvars import MUX_BACKEND\nX = os.environ.get(MUX_BACKEND)\n",
+    ),
+    ("getenv", 'import os\nX = os.getenv("BMAD_LOOP_X")\n'),
+    ("subscript", 'import os\ndef f():\n    return os.environ["BMAD_LOOP_X"]\n'),
+    ("getenv-keyword", 'import os\nX = os.getenv(key="BMAD_LOOP_X")\n'),
+    ("get-keyword", 'import os\nX = os.environ.get(key="BMAD_LOOP_X")\n'),
+    ("pop-keyword", 'import os\ndef f():\n    return os.environ.pop(key="BMAD_LOOP_X")\n'),
+    ("setdefault-keyword", 'import os\nX = os.environ.setdefault(key="BMAD_LOOP_X", value="v")\n'),
+    ("membership-in", 'import os\nX = "BMAD_LOOP_X" in os.environ\n'),
+    ("membership-not-in", 'import os\nX = "BMAD_LOOP_X" not in os.environ\n'),
+    (
+        "membership-registry",
+        "import os\nfrom .envvars import MUX_BACKEND\nX = MUX_BACKEND in os.environ\n",
+    ),
+    ("environb-get", 'import os\nX = os.environb.get(b"BMAD_LOOP_X")\n'),
+    ("environb-subscript", 'import os\ndef f():\n    return os.environb[b"BMAD_LOOP_X"]\n'),
+]
+
+# The other half: shapes that must stay SILENT. Without these the detector could pass
+# every probe above by flagging everything, which would be just as broken — a guard
+# that cries wolf gets its allowlist widened until it means nothing.
+ENV_READ_NON_PROBES = [
+    ("bulk-dict-copy", "import os\nX = dict(os.environ)\n"),
+    ("bulk-splat-copy", "import os\nX = {**os.environ}\n"),
+    ("bulk-copy-method", "import os\nX = os.environ.copy()\n"),
+    ("foreign-var", 'import os\nX = os.environ.get("PATH")\n'),
+    (
+        "prose-in-docstring",
+        'import os\ndef f():\n    """Injects BMAD_LOOP_X downstream."""\n    return 1\n',
+    ),
+    ("write-not-read", 'import os\nos.environ["BMAD_LOOP_X"] = "1"\n'),
+    ("session-spec-env", 'def f(spec):\n    return spec.env.get("BMAD_LOOP_X")\n'),
+]
+
+
+@pytest.mark.parametrize(("label", "source"), ENV_READ_PROBES, ids=[p[0] for p in ENV_READ_PROBES])
+def test_env_read_detector_flags_every_claimed_access_form(label, source):
+    """Each documented access form really does produce a finding.
+
+    This is the check the repo-wide assertion cannot be: delete any single branch of
+    the `envread` scan and the tree-wide test stays green (nothing in `src/` uses that
+    branch today), while exactly the matching row here reddens. Written after a review
+    pointed out that the guard's coverage claim lived only in a docstring — three
+    earlier rounds had each found an uncovered form, and prose does not fail a build."""
+    found = [f for f in _scan_source(source, "probe.py") if f[0] == "envread"]
+    assert found, (
+        f"the {label!r} access form produced no `envread` finding — the detector does "
+        f"not cover a shape the guard's docstring claims:\n{source}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("label", "source"), ENV_READ_NON_PROBES, ids=[p[0] for p in ENV_READ_NON_PROBES]
+)
+def test_env_read_detector_stays_silent_on_non_reads(label, source):
+    """The complement: a bulk environment copy, a foreign variable, prose, a WRITE,
+    and a `SessionSpec.env` lookup are all silent. Pins the scoping decisions the
+    guard's docstring argues for, so narrowing or widening the detector has to be
+    deliberate — and stops a future fix from passing the probes by flagging
+    everything."""
+    found = [f for f in _scan_source(source, "probe.py") if f[0] == "envread"]
+    assert not found, (
+        f"the {label!r} shape was flagged as an env read; it is deliberately out of "
+        f"scope:\n{source}"
     )
 
 
