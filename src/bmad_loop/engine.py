@@ -62,7 +62,6 @@ from .sprintstatus import next_actionable, parse_selector
 from .statemachine import advance
 from .workspace import UnitWorkspace, Workspace, discard_worktree, open_unit_workspace
 from .worktree_flow import WorktreeFlow
-from .worktree_flow import _setup_mcp_agent_id as _setup_mcp_agent_id  # re-export for tests
 
 if TYPE_CHECKING:
     # Type-only: the worktree-provisioning helpers speak in CLI profiles.
