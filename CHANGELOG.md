@@ -189,6 +189,24 @@ whose seams had diverged enough that several ports needed a different fix, and t
   records the divergence. Every other collision the sweep surfaced was adjudicated deliberate
   (disjoint `parametrize` sets, or one body run against two different shipped scripts).
 
+- **Cover the env-var registry, and enforce it.** `envvars.py` — the module AGENTS.md names as the
+  one place a core `BMAD_LOOP_*` var is defined — had no test naming it. `tests/test_envvars.py`
+  pins each reader's parse and fallback: `session_timeout_s()` ignores an unparseable, zero or
+  negative override, and `mux_backend()` / `process_host()` hand their value back verbatim so the
+  registry downstream is what rejects an unknown name. The second half of the invariant
+  ("plugin-owned env-var families stay with their plugin") is now enforced rather than documented:
+  a new `test_portability_guard.py` scan fails any `BMAD_LOOP_*` read taken straight from the
+  environment outside `envvars.py`, the two stdlib-only hook relays and the Unity helper scripts.
+  It scans reads only — the env dicts the engine and plugins _build_ for a child session are the
+  producing side. No violation existed; the guard is a tripwire for the next one.
+
+- **Cover the TUI's hard-stop and archive paths.** `x` and `A` had no Pilot test. Added: `x` on a
+  live run stops it and kills the ctl window; `x` on a run that is not _provably_ alive refuses
+  (the gate is `== "alive"`, so an unverifiable pid is refused alongside a dead one — stricter
+  than `S`, and asymmetric with `A`, which only blocks `alive`); `A` archives and forgets the run,
+  and refuses a live one; and `shift+tab` reverse-cycles the resize ring, mirroring the forward-tab
+  test that had no counterpart.
+
 ### Removed
 
 - **The `bmad-auto` → `bmad-loop` rename compatibility is gone.** The rename shipped in 0.8.0 and no
@@ -197,6 +215,10 @@ whose seams had diverged enough that several ports needed a different fix, and t
   prints the leftover-`.automator/` note; `bmad-loop-setup` drops its migration section with them.
   A project still on `bmad-auto` should migrate on 0.9.1 — the last release carrying the shims —
   before upgrading past it.
+
+- **`pytest-rerunfailures` is out of the dev group.** Nothing invoked it — no `--reruns`, no
+  `addopts`, no `flaky` marker anywhere in the repo or CI. A test-retry plugin sitting in the
+  environment is an invitation to paper over a real flake, so it goes rather than stays unused.
 
 ### Fixed
 

@@ -7,6 +7,11 @@ hard POSIX dependency can't sneak in unnoticed. Each sanctioned exception lives
 in an allowlisted file and — outside the wholesale tmux quarantine — carries a
 ``# portability:`` ack on its line, so exceptions stay deliberate.
 
+The same single-pass scan also carries the one non-POSIX quarantine that has the
+identical shape: AGENTS.md's "New core env vars register in ``envvars.py``;
+plugin-owned env-var families stay with their plugin" — see
+``test_bmad_loop_env_reads_only_in_the_registry``.
+
 If this test flags something unexpected, fix the source (route it through the
 seam / a platform helper) rather than widening an allowlist.
 """
@@ -74,9 +79,38 @@ SHELL_ALLOW = {
     "plugins/bus.py",
 }
 
+# The files allowed to read a `BMAD_LOOP_*` variable straight out of the process
+# environment. `envvars.py` *is* the registry — the one place a core var is named,
+# typed and given a reader, which every core call site then calls (AGENTS.md: "New
+# core env vars register in `envvars.py`"). The two hook relays are copied OUT of
+# the package into the target project and run inside the coding CLI's process under
+# whatever interpreter the host has (both say "Stdlib only" in their docstrings), so
+# they cannot import bmad_loop to reach the registry at all. The Unity helper
+# scripts are stand-alone in the same way and read the plugin's own
+# `BMAD_LOOP_UNITY_*` / `BMAD_LOOP_ENGINE_*` contract, which the second half of the
+# invariant leaves with the plugin — envvars.py's docstring carves them out by name.
+# Writes stay out of scope on purpose: engine/resolve/probe/plugins.bus/unity_plugin
+# *build* a `BMAD_LOOP_*` env dict to inject into a child session, and that
+# producing side is what these readers consume, not a second source of truth.
+ENV_READ_ALLOW = {
+    "envvars.py",
+    "data/bmad_loop_hook.py",
+    "data/bmad_loop_probe_hook.py",
+    "data/plugins/unity/unity_cleanup.py",
+    "data/plugins/unity/unity_dialog_probe.py",
+    "data/plugins/unity/unity_quiesce.py",
+    "data/plugins/unity/unity_ready.py",
+    "data/plugins/unity/unity_seed_assets.py",
+    "data/plugins/unity/unity_setup.py",
+    "data/plugins/unity/unity_teardown.py",
+}
+
 # Bare POSIX paths that must not be hardcoded outside PATH_ALLOW. `os.devnull` is
 # the portable replacement for "/dev/null".
 POSIX_PATHS = ("/tmp", "/proc", "/dev/null")
+
+# Prefix that makes an environment variable this project's to register.
+ENV_PREFIX = "BMAD_LOOP_"
 
 
 def _py_files() -> list[Path]:
@@ -116,6 +150,54 @@ def _classify_posix_path(value: str) -> str | None:
     return None
 
 
+def _is_os_environ(node: ast.expr) -> bool:
+    """True for the ``os.environ`` attribute access itself."""
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "environ"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "os"
+    )
+
+
+def _env_name_aliases(tree: ast.AST) -> dict[str, str]:
+    """``NAME -> "BMAD_LOOP_…"`` for every constant binding in the module, so a read
+    spelled through a named constant still resolves. That indirection is the norm
+    here, not an edge case: the registry reads ``os.environ.get(MUX_BACKEND)`` and
+    gates.py names its notify vars ``_TITLE_ENV`` / ``_MESSAGE_ENV`` — matching the
+    string literal alone would miss exactly the well-behaved shape."""
+    aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = [t for t in node.targets if isinstance(t, ast.Name)]
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            targets = [node.target]
+        else:
+            continue
+        value = node.value
+        if (
+            targets
+            and isinstance(value, ast.Constant)
+            and isinstance(value.value, str)
+            and value.value.startswith(ENV_PREFIX)
+        ):
+            for target in targets:
+                aliases[target.id] = value.value
+    return aliases
+
+
+def _env_read_key(node: ast.expr | None, aliases: dict[str, str], docs: set[int]) -> str | None:
+    """The ``BMAD_LOOP_*`` variable an environment-lookup key names, or None. Prose
+    is excluded the same way the POSIX-path scan excludes it — a var named in a
+    docstring is documentation, not a read."""
+    if isinstance(node, ast.Constant) and id(node) not in docs:
+        if isinstance(node.value, str) and node.value.startswith(ENV_PREFIX):
+            return node.value
+    if isinstance(node, ast.Name):
+        return aliases.get(node.id)
+    return None
+
+
 def _scan():
     """Single pass over the tree → list of (kind, rel, lineno, line_text)."""
     findings = []
@@ -125,6 +207,7 @@ def _scan():
         lines = src.splitlines()
         tree = ast.parse(src, filename=str(path))
         docs = _docstring_node_ids(tree)
+        env_aliases = _env_name_aliases(tree)
 
         def line_at(lineno: int) -> str:
             return lines[lineno - 1] if 1 <= lineno <= len(lines) else ""
@@ -209,6 +292,30 @@ def _scan():
                 and node.value.value is True
             ):
                 findings.append(("shell", rel, node.lineno, line_at(node.lineno)))
+
+            # A `BMAD_LOOP_*` variable READ out of the process environment:
+            # os.environ.get(K) / os.environ.pop(K) / os.getenv(K) / os.environ[K].
+            # Reads only — the env dicts modules *build* to inject into a child
+            # session are the producing side, which the invariant does not constrain.
+            env_key = None
+            if isinstance(node, ast.Call) and node.args and isinstance(node.func, ast.Attribute):
+                func = node.func
+                if func.attr in ("get", "pop", "setdefault") and _is_os_environ(func.value):
+                    env_key = _env_read_key(node.args[0], env_aliases, docs)
+                elif (
+                    func.attr == "getenv"
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "os"
+                ):
+                    env_key = _env_read_key(node.args[0], env_aliases, docs)
+            elif (
+                isinstance(node, ast.Subscript)
+                and _is_os_environ(node.value)
+                and isinstance(node.ctx, ast.Load)
+            ):
+                env_key = _env_read_key(node.slice, env_aliases, docs)
+            if env_key:
+                findings.append(("envread", rel, node.lineno, line_at(node.lineno)))
 
     return findings
 
@@ -304,6 +411,45 @@ def test_shell_true_only_in_sanctioned_spots():
         elif ACK not in txt:
             bad.append(f"  {rel}:{ln}: {txt.strip()}  (missing '{ACK}' ack)")
     assert not bad, "shell=True outside verify.py / plugins/bus.py:\n" + "\n".join(bad)
+
+
+def test_bmad_loop_env_reads_only_in_the_registry():
+    """AGENTS.md's env invariant, enforced: "New core env vars register in
+    ``envvars.py``; plugin-owned env-var families stay with their plugin." Reading a
+    knob inline is what made these undiscoverable before the registry existed, so a
+    core module must call an ``envvars`` reader rather than touch ``os.environ``
+    itself. Detects the literal ``os.environ`` / ``os.getenv`` forms plus keys named
+    through a module constant; ``from os import environ`` aliases are deliberately
+    not tracked — this is a review tripwire, not a sandbox.
+
+    Scoped to reads. Writes are a different act: engine.py, resolve.py, probe.py,
+    plugins/bus.py and unity_plugin.py all BUILD a ``BMAD_LOOP_*`` dict to inject
+    into a child session, and gates.py hands notify text to osascript/PowerShell the
+    same way — all producing side, none of it a second place a var is *defined*.
+    Reads of a SessionSpec's ``spec.env`` (adapters/generic.py) are likewise out:
+    that is a plain dict handed down in-process, not the environment.
+
+    Ablated 2026-08-11, four ways — a negative assertion passes for every reason a
+    value could be absent, including a branch that never fires:
+    - emptying ENV_READ_ALLOW fails listing all 52 real reads across the 10
+      ENV_READ_ALLOW files, so the scan sees them rather than passing on an empty
+      finding set;
+    - ``_ABLATION_TIMEOUT = os.environ.get("BMAD_LOOP_SOMETHING")`` planted at module
+      scope in verify.py (core, not allowlisted) fails with
+      ``verify.py:37: _ABLATION_TIMEOUT = os.environ.get("BMAD_LOOP_SOMETHING")``;
+    - the alias arm is live, not decoration: the same read spelled
+      ``_ABLATION_ENV = "BMAD_LOOP_SOMETHING"`` / ``os.environ.get(_ABLATION_ENV)``
+      fails too — drop ``_env_name_aliases`` and it passes, and so would every read
+      in envvars.py, which is the only shape the registry itself uses;
+    - the name written into a non-allowlisted module's docstring instead stays green,
+      so prose is not what this reads.
+    """
+    offenders = [(rel, ln, txt) for _, rel, ln, txt in _of("envread") if rel not in ENV_READ_ALLOW]
+    assert not offenders, (
+        "BMAD_LOOP_* read outside envvars.py and the plugin-owned families — name "
+        "the var in envvars.py and call its reader instead of widening the "
+        "allowlist:\n" + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders)
+    )
 
 
 def test_guard_actually_scanned_files():

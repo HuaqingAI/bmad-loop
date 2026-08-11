@@ -392,7 +392,12 @@ def test_session_timeout_s_env_override(monkeypatch):
     deterministic-E2E seam for the #157 timeout path, whose 1-minute policy floor
     is too coarse to exercise in a fast real-binary run. Only a positive, parseable
     value wins; anything else falls back so a fat-fingered env can never silently
-    shorten a real run's budget."""
+    shorten a real run's budget.
+
+    Contract parity: `test_envvars.py` grades the reader this delegates to. Here
+    the claim is that the policy default SURVIVES a bad override; there it is
+    what the parse returns. A behavior change lands in both or records the
+    divergence."""
     monkeypatch.delenv("BMAD_LOOP_SESSION_TIMEOUT_S", raising=False)
     assert Engine._session_timeout_s(5400.0) == 5400.0  # unset -> policy default
     monkeypatch.setenv("BMAD_LOOP_SESSION_TIMEOUT_S", "2.5")

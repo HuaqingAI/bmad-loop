@@ -2754,6 +2754,116 @@ def test_checkpoint_gate_line_pluralization():
     assert f(3) == "verify + review gates passed · 3 follow-up review cycles"
 
 
+# ------------------------------------------------- hard stop (x) & archive (A)
+
+
+async def test_stop_run_stops_and_kills_ctl_window(project, monkeypatch):
+    # x on a live run confirms, then the worker runs BOTH halves of the hard stop:
+    # runs.stop_run (signal + mark) and launch.kill_ctl_window (the run's #482
+    # ctl window). Monkeypatched at the same seam the graceful-stop tests use, so
+    # nothing signals a real engine and no multiplexer is touched.
+    from bmad_loop import runs
+
+    stops: list[Path] = []
+    kills: list[tuple[Path, str]] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "alive")
+    monkeypatch.setattr(runs, "stop_run", lambda rd: stops.append(rd) or True)
+    monkeypatch.setattr(launch, "kill_ctl_window", lambda proj, rid: kills.append((proj, rid)))
+    make_run(project.project, "20260611-100000-aaaa", alive=True)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: dashboard(app).selected_run_id == "20260611-100000-aaaa")
+        await pilot.press("x")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        needle = "run 20260611-100000-aaaa stopped"
+        await until(pilot, lambda: any(needle in m for m in notifications(app)))
+    assert stops == [project.project / RUNS_DIR / "20260611-100000-aaaa"]
+    assert kills == [(project.project, "20260611-100000-aaaa")]
+
+
+@pytest.mark.parametrize("live", ["dead", "unknown"])
+async def test_stop_run_not_live_warns_without_calling(project, monkeypatch, live):
+    """`x` is the hard stop: it only ever fires at a *provably alive* engine, so the
+    gate is `== "alive"` and an unverifiable ('unknown') pid is refused alongside a
+    dead one — deliberately stricter than `S`'s `!= "dead"` gate, because killing
+    the agent window on a pid we cannot identify is not recoverable the way a
+    control-file request is. Neither helper is called and no confirm modal opens.
+
+    Ablation (2026-08-11): delete the `if not data.liveness(run_dir) == "alive":`
+    warn-and-return block from `action_stop_run` and both rows fail at the toast
+    wait with `AssertionError: condition not met before timeout` — the confirm
+    modal opens instead."""
+    from bmad_loop import runs
+
+    stops: list[Path] = []
+    kills: list[tuple[Path, str]] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: live)
+    monkeypatch.setattr(runs, "stop_run", lambda rd: stops.append(rd) or True)
+    monkeypatch.setattr(launch, "kill_ctl_window", lambda proj, rid: kills.append((proj, rid)))
+    make_run(project.project, "20260611-100000-aaaa")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: dashboard(app).selected_run_id == "20260611-100000-aaaa")
+        await pilot.press("x")
+        await until(pilot, lambda: any("is not live" in m for m in notifications(app)))
+        assert stops == []
+        assert kills == []
+        assert not isinstance(app.screen, ConfirmModal)
+
+
+async def test_archive_run_archives_and_forgets(project, monkeypatch):
+    # A on a concluded run confirms, then the worker archives via the runs helper
+    # and tells the dashboard to forget the now-gone run dir (selection drop +
+    # rescan) before toasting the destination.
+    from bmad_loop import runs
+
+    archived: list[tuple[Path, Path]] = []
+    forgotten: list[str] = []
+    dest = project.project / ".bmad-loop" / "archive" / "20260611-100000-aaaa.tar.gz"
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(runs, "archive_run", lambda proj, rd: archived.append((proj, rd)) or dest)
+    monkeypatch.setattr(DashboardScreen, "forget_run", lambda self, rid: forgotten.append(rid))
+    make_run(project.project, "20260611-100000-aaaa", finished=True)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: dashboard(app).selected_run_id == "20260611-100000-aaaa")
+        await pilot.press("A")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: any(str(dest) in m for m in notifications(app)))
+    assert archived == [(project.project, project.project / RUNS_DIR / "20260611-100000-aaaa")]
+    assert forgotten == ["20260611-100000-aaaa"]
+
+
+async def test_archive_live_run_refused_without_calling(project, monkeypatch):
+    """Archiving compresses the run dir and removes the original, so a live engine's
+    open run dir is refused up front — the same guard `D` applies — rather than
+    racing the writer. The helper is never called and no confirm modal opens.
+    ('unknown' is not blocked here, only warned inside the confirm; see
+    test_delete_unknown_pid_warns_but_does_not_block for the sibling gate.)
+
+    Ablation (2026-08-11): delete the `if live == "alive":` warn-and-return block
+    from `action_archive_run` and this fails at the toast wait with
+    `AssertionError: condition not met before timeout` — the archive confirm opens
+    on a live run instead."""
+    from bmad_loop import runs
+
+    archived: list[tuple[Path, Path]] = []
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "alive")
+    monkeypatch.setattr(runs, "archive_run", lambda proj, rd: archived.append((proj, rd)) or proj)
+    make_run(project.project, "20260611-100000-aaaa", alive=True)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: dashboard(app).selected_run_id == "20260611-100000-aaaa")
+        await pilot.press("A")
+        await until(pilot, lambda: any("is live — stop it first" in m for m in notifications(app)))
+        assert archived == []
+        assert not isinstance(app.screen, ConfirmModal)
+
+
 # ------------------------------------------------------------ graceful stop (S)
 
 
@@ -3350,6 +3460,37 @@ async def test_resize_mode_grows_left_panes_and_cycles(project):
         await pilot.pause()
         assert deferred.size.height == f0 + 2
         assert runs.size.height == r0 + 3  # Runs boundary unaffected
+
+
+async def test_resize_mode_reverse_cycles_left_panes(project):
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(120, 40)) as pilot:
+        screen = await _seeded(pilot, app)
+        runs = screen.query_one("#runs")
+        deferred = screen.query_one("#deferred")
+        r0, f0 = runs.size.height, deferred.size.height
+        await pilot.press("ctrl+w")
+        # Shift+Tab walks the same ring the other way: from Runs|Sprint it wraps
+        # backwards onto the last boundary (Tasks|Tabs, in the detail column).
+        await pilot.press("shift+tab")
+        assert screen._active_hsplit == 2
+        # One more step back lands on Sprint|Deferred; Up grows Deferred.
+        await pilot.press("shift+tab")
+        assert screen._active_hsplit == 1
+        for _ in range(2):
+            await pilot.press("up")
+        await pilot.pause()
+        assert screen._left_frozen
+        assert deferred.size.height == f0 + 2
+        assert runs.size.height == r0  # untouched boundary stays put
+        # A third step back closes the ring at Runs|Sprint; Down grows Runs.
+        await pilot.press("shift+tab")
+        assert screen._active_hsplit == 0
+        for _ in range(3):
+            await pilot.press("down")
+        await pilot.pause()
+        assert runs.size.height == r0 + 3
+        assert deferred.size.height == f0 + 2  # Deferred boundary unaffected
 
 
 async def test_arrows_and_tab_untouched_outside_resize_mode(project):
