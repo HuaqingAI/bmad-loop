@@ -198,6 +198,24 @@ def _env_name_aliases(tree: ast.AST) -> dict[str, str]:
     return aliases
 
 
+def _env_call_key_node(call: ast.Call) -> ast.expr | None:
+    """The node holding the looked-up key: the first positional arg, or the ``key=``
+    keyword when the call passes none.
+
+    The keyword form is not hypothetical. ``os.environ`` is ``os._Environ``, a
+    Python-level ``MutableMapping``, so its ``get`` / ``pop`` / ``setdefault`` are
+    the ABC's plain-Python defs and DO bind ``key=`` — unlike ``dict.get``, whose C
+    signature is positional-only and would raise. ``os.getenv(key=...)`` binds for
+    the same reason. All four were confirmed against the live interpreter rather
+    than assumed, because the dict intuition points the wrong way here."""
+    if call.args:
+        return call.args[0]
+    for kw in call.keywords:
+        if kw.arg == "key":
+            return kw.value
+    return None
+
+
 def _env_read_key(node: ast.expr | None, aliases: dict[str, str]) -> str | None:
     """The ``BMAD_LOOP_*`` variable an environment-lookup key names, or None.
 
@@ -337,16 +355,19 @@ def _scan():
             # Reads only — the env dicts modules *build* to inject into a child
             # session are the producing side, which the invariant does not constrain.
             env_key = None
-            if isinstance(node, ast.Call) and node.args and isinstance(node.func, ast.Attribute):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
                 func = node.func
-                if func.attr in ("get", "pop", "setdefault") and _is_os_environ(func.value):
-                    env_key = _env_read_key(node.args[0], env_aliases)
+                key_node = _env_call_key_node(node)
+                if key_node is None:
+                    pass
+                elif func.attr in ("get", "pop", "setdefault") and _is_os_environ(func.value):
+                    env_key = _env_read_key(key_node, env_aliases)
                 elif (
                     func.attr == "getenv"
                     and isinstance(func.value, ast.Name)
                     and func.value.id == "os"
                 ):
-                    env_key = _env_read_key(node.args[0], env_aliases)
+                    env_key = _env_read_key(key_node, env_aliases)
             elif (
                 isinstance(node, ast.Subscript)
                 and _is_os_environ(node.value)
@@ -502,7 +523,17 @@ def test_bmad_loop_env_reads_only_in_the_registry():
       fails with ``verify.py:13: _LEAK2 = os.environ.get(MUX_BACKEND)``.
     Both spellings borrow the registry's constant while skipping its reader, which
     is a *more* likely violation than an inline literal, not a more exotic one —
-    the tidy-looking version is the one that gets written."""
+    the tidy-looking version is the one that gets written.
+
+    A later review round closed a third hole the same way: the key passed as a
+    KEYWORD. ``os.getenv(key="BMAD_LOOP_X")`` and ``os.environ.get(key=...)`` /
+    ``.pop(key=...)`` / ``.setdefault(key=...)`` all leave ``node.args`` empty, and
+    the scan required a positional arg — so each read green. All four bind ``key=``
+    for real (``os.environ`` is ``os._Environ``, a Python-level MutableMapping, so
+    its methods are the ABC's plain-Python defs; the ``dict.get`` intuition, which
+    is positional-only, points the wrong way). Confirmed against the live
+    interpreter before fixing, then re-verified as CAUGHT, including the keyword
+    form carrying an imported registry constant."""
     offenders = [(rel, ln, txt) for _, rel, ln, txt in _of("envread") if rel not in ENV_READ_ALLOW]
     assert not offenders, (
         "BMAD_LOOP_* read outside envvars.py and the plugin-owned families — name "
