@@ -875,6 +875,31 @@ def test_forget_falls_back_to_the_confinement_check_without_dir_fd(tmp_path: Pat
     assert not (run_dir / launch._CTL_WINDOW_FILE).exists()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="tab/newline are legal POSIX name bytes")
+@pytest.mark.parametrize("odd_name", ["my\tproj", "my\nproj"])
+def test_a_delimiter_in_the_project_path_does_not_hide_its_own_window(
+    monkeypatch, tmp_path: Path, odd_name: str
+):
+    """The project tag rides the same tab-delimited, line-per-window listing it
+    is compared against, and a resolved project path can legally hold either
+    delimiter. A tab truncated the tag; a newline split the row. Either way the
+    tag read back was not the tag written, so this project's own window looked
+    like a *neighbour's* and was discarded — and `a`/`x` then could not reach a
+    run the pre-tag lookup found. Worse than a missed match, because the
+    fallthrough for an unknown tag is exclusion.
+
+    Parametrized over both delimiters on purpose: they fail at different layers
+    (the field split vs the row split) and are fixed in different places, so one
+    spelling passing says nothing about the other."""
+    project = tmp_path / odd_name
+    project.mkdir()
+    _make_run(project)
+    tag = runs.project_tag(project)
+    _ctl_listing(monkeypatch, f"@7\tresume-RID\t{tag}\n")
+
+    assert launch.ctl_window_id(project, "RID") == "@7"
+
+
 def test_a_skipped_record_forgets_the_previous_one(fake_run, tmp_path: Path):
     """Skipping the record because there is no run must still drop the old one.
 

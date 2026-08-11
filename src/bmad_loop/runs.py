@@ -303,6 +303,34 @@ def project_tag(project: Path) -> str:
     return str(project.resolve())
 
 
+def tag_is_transportable(tag: str) -> bool:
+    """Whether `tag` survives a multiplexer listing round trip intact.
+
+    The backends emit one window per line with tab-separated fields. A newline
+    is a legal POSIX filename byte, so a project path can hold one, and it
+    splits the tag across two rows — which no parse on the receiving side can
+    undo, because the row boundary is the framing itself. A comparison against
+    the truncated remainder does not merely fail to match: it makes a window
+    look like it belongs to *another* project, so the caller discards the
+    project's own windows.
+
+    Tabs are deliberately NOT rejected here. They are equally legal in a path,
+    but the backends' bounded split lets a trailing field carry them intact
+    (see BaseTmuxBackend.list_windows), so a tab round-trips and a tagged
+    comparison stays exact. Widening this to tabs as well would send those
+    projects down the weaker untagged path for no reason — and would mask the
+    parser's guarantee rather than rest on it.
+
+    Callers use this to choose between "tags are authoritative" and "tags cannot
+    be trusted here", never to reject the project itself. Returning False is not
+    an error condition — it selects the untagged path, which is the same one a
+    pre-upgrade window takes, so the answer degrades to ownership-by-run-dir
+    rather than to nothing. The tag is left in its raw form on purpose: it is
+    persisted on live windows and sessions, so encoding it would strand every
+    tag written before the change (AGENTS.md's compatibility rule)."""
+    return "\n" not in tag
+
+
 def mux_sessions() -> list[str]:
     """All live session names, or [] when the multiplexer is missing, no server
     is running, or the query fails."""

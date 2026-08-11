@@ -361,7 +361,16 @@ class BaseTmuxBackend(TerminalMultiplexer):
             return []
         rows: list[tuple[str, ...]] = []
         for line in probe.stdout.splitlines():
-            parts = line.split("\t")
+            # Bounded split, so the LAST field may itself contain tabs. Fields
+            # carrying arbitrary text do exist — PROJECT_OPTION holds a resolved
+            # filesystem path, and a tab is a legal POSIX filename byte — and an
+            # unbounded split turns one such row into extra parts that the slice
+            # below then truncates, silently corrupting the field's value.
+            # Callers requesting a free-text field must therefore ask for it
+            # last; every current caller does. (A newline in that value still
+            # splits the row, which no parse here can undo — see
+            # runs.tag_is_transportable for how the comparison sites cope.)
+            parts = line.split("\t", len(fields) - 1)
             parts += [""] * (len(fields) - len(parts))  # tolerate unset trailing fields
             rows.append(tuple(parts[: len(fields)]))
         return rows

@@ -160,6 +160,12 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
+- **A tab in the project path no longer truncates the project tag a window listing carries.**
+  The multiplexer listing is tab-delimited and the tag holds a resolved filesystem path, where a tab
+  is a legal byte — so the parse split one row into extra fields and dropped the tail, leaving a
+  truncated tag that reads as another project's. The prune scan then skipped the project's own
+  parked control windows. The last requested field now keeps its delimiters.
+
 - **A run id that is a suffix of another no longer resolves to the neighbour's control window.**
   `--run-id` is caller-supplied and may contain `-`, so `run-other-RID` satisfied the lookup for
   `RID` — and sorted ahead of it, so `x` could kill the neighbouring run's live orchestrator.

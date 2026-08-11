@@ -381,6 +381,14 @@ def ctl_window_id(project: Path, run_id: str) -> str | None:
         return None
     mine = runs.project_tag(project)
     local = runs.is_run(runs.run_dir_for(project, run_id))
+    # A tag that cannot survive the listing round trip must not be compared: a
+    # newline in the project path splits the row, so this project's own window
+    # arrives carrying a truncated tag, which reads as *another* project's and
+    # gets discarded — leaving `a`/`x` unable to reach a run the pre-tag lookup
+    # found. Falling back to the untagged path restores that reach on the same
+    # terms a pre-upgrade window gets. (Tabs are handled in the backend's parse;
+    # only the row split is beyond it.)
+    trust_tags = runs.tag_is_transportable(runs.project_tag(project))
     tagged: list[str] = []
     untagged: list[str] = []
     rows = get_multiplexer().list_windows(
@@ -403,9 +411,9 @@ def ctl_window_id(project: Path, run_id: str) -> str | None:
         m = _CTL_WINDOW_RE.match(name)
         if m is None or m.group(1) != run_id:
             continue
-        if tag == mine:
+        if trust_tags and tag == mine:
             tagged.append(win_id)
-        elif not tag and local:
+        elif (not tag or not trust_tags) and local:
             # untagged, and this project holds the run dir — ownership is
             # plausible but unproven, so it only counts if nothing is tagged
             untagged.append(win_id)
