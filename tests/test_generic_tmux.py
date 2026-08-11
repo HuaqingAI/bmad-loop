@@ -1544,6 +1544,10 @@ def test_capped_session_still_completes_when_marker_lands_late(tmp_path, monkeyp
 # a session-lifecycle.jsonl line, a wall-clock co-bound fires through a frozen
 # monotonic clock (but may never EXTEND the deadline), and each tick tops up a
 # throttled heartbeat.json whose staleness diagnoses a frozen orchestrator.
+#
+# Contract parity: test_opencode_http.py holds identically named tests over the
+# HTTP transport. A behavior change here must land in both or record the
+# divergence.
 
 
 def _timeout_clock_adapter(tmp_path, monkeypatch):
@@ -1693,6 +1697,10 @@ def test_lifecycle_and_heartbeat_write_failure_is_swallowed(tmp_path):
 # artifact under a live window. Driven with a scripted watcher, a steerable
 # clock (ticks advance past HEARTBEAT_INTERVAL_S to cross the throttle), and a
 # real claude-jsonl transcript file.
+#
+# Contract parity: test_opencode_http.py holds identically named tests over the
+# HTTP transport. A behavior change here must land in both or record the
+# divergence.
 
 
 def _write_claude_transcript(path: Path, input_tokens: int) -> None:

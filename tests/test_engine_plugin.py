@@ -27,7 +27,7 @@ import time
 import pytest
 from conftest import write_script_launcher
 
-from bmad_loop.engine import Engine, _setup_mcp_agent_id
+from bmad_loop.engine import Engine
 from bmad_loop.plugins import HookContext, PluginError, get_plugin, load_plugins
 from bmad_loop.plugins.model import PluginManifest
 from bmad_loop.policy import NotifyPolicy, PluginsPolicy, Policy, ScmPolicy
@@ -695,15 +695,10 @@ def test_engine_rejects_invalid_coupling_at_construction(project):
 
 
 # ------------------------------------ per_worktree MCP agent routing (feeds ctx.agents)
-
-
-def test_setup_mcp_agent_id_mapping():
-    # only claude carries the "-code" suffix; everything else passes through
-    assert _setup_mcp_agent_id("claude") == "claude-code"
-    assert _setup_mcp_agent_id("codex") == "codex"
-    assert _setup_mcp_agent_id("gemini") == "gemini"
-    assert _setup_mcp_agent_id("cursor") == "cursor"
-    assert _setup_mcp_agent_id("some-custom-profile") == "some-custom-profile"
+#
+# The profile -> agent-id mapping itself is covered in tests/test_worktree_flow.py,
+# next to the _setup_mcp_agent_id definition; what is under test here is the
+# routing that carries that id into ctx.agents.
 
 
 class _FakeProfile:

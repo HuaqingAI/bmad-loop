@@ -178,6 +178,17 @@ whose seams had diverged enough that several ports needed a different fix, and t
   traceback dumped after any partial `--json` stdout; it is now a clean exit, so a Python caller's
   `subprocess.returncode` shows `130` rather than `-2`. A Ctrl+C _during_ a run is unchanged.
 
+- **Dedup the test suite; drop `engine._setup_mcp_agent_id`.** An AST sweep over all 69 test files
+  (name collisions plus normalized-body hashes) found one true duplicate:
+  `test_setup_mcp_agent_id_mapping` existed in both `test_engine_plugin.py` and
+  `test_worktree_flow.py`, the latter asserting a subset. The superset now lives once, beside the
+  function it covers, and `engine.py`'s `_setup_mcp_agent_id` re-export — carried solely for the
+  deleted import — goes with it. The adapter timeout (#157) and token-budget (#158) blocks in
+  `test_generic_tmux.py` now state their contract parity with the identically named
+  `test_opencode_http.py` tests, which already pointed back: a behavior change lands in both or
+  records the divergence. Every other collision the sweep surfaced was adjudicated deliberate
+  (disjoint `parametrize` sets, or one body run against two different shipped scripts).
+
 ### Removed
 
 - **The `bmad-auto` → `bmad-loop` rename compatibility is gone.** The rename shipped in 0.8.0 and no
