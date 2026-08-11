@@ -229,10 +229,11 @@ whose seams had diverged enough that several ports needed a different fix, and t
 - **Diagnose a lost multiplexer session on the crash path (#489).** A dead window and a session
   destroyed under the run (a reaper, this tool's own prune/stop, an operator `kill-session`, a
   server crash) both scored `crashed` and read as an agent fault. Probe `has_session` on a crash
-  verdict and carry the answer in the failure reason, on every role's `session-end` journal entry
-  (`session_vanished`), and as a `session-vanished` lifecycle breadcrumb, composed with an
-  environment-fault pause. Diagnosis only: routing is unchanged and a retry re-creates the
-  session.
+  verdict and carry the answer in the failure reason — including the repair path's exhaustion
+  defer, which otherwise blamed the tree for repairs that never ran — on every role's `session-end`
+  journal entry (`session_vanished`), on `dev-decision` and `fix-decision`, and as a
+  `session-vanished` lifecycle breadcrumb, composed with an environment-fault pause. Diagnosis
+  only: routing is unchanged and a retry re-creates the session.
 
 - **A native-Windows install driven from a WSL shell now says so (#332).** WSL appends the Windows
   `PATH` to its own, so a bash prompt can reach a Windows-installed `bmad-loop`: that interpreter
