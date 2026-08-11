@@ -234,6 +234,11 @@ whose seams had diverged enough that several ports needed a different fix, and t
   environment-fault pause. Diagnosis only: routing is unchanged and a retry re-creates the
   session.
 
+- **Stop a #332 resolve guard from flaking on the Windows runner (#529).** Test-only; no runtime
+  change. Resolving a real `\\wsl$\...` path tied the guard to the runner's WSL provider, which
+  answers `ERROR_NETNAME_DELETED` (64) when registered but not serving — a code CPython's non-strict
+  resolution does not tolerate. The syscall is stubbed instead, covering both `realpath` branches.
+
 - **A native-Windows install driven from a WSL shell now says so (#332).** WSL appends the Windows
   `PATH` to its own, so a bash prompt can reach a Windows-installed `bmad-loop`: that interpreter
   reports `win32`, takes the psmux platform default, and never sees the distro's tmux — while
