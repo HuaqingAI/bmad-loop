@@ -82,32 +82,6 @@ SHELL_ALLOW = {
     "plugins/bus.py",
 }
 
-# The files allowed to read a `BMAD_LOOP_*` variable straight out of the process
-# environment. `envvars.py` *is* the registry — the one place a core var is named,
-# typed and given a reader, which every core call site then calls (AGENTS.md: "New
-# core env vars register in `envvars.py`"). The two hook relays are copied OUT of
-# the package into the target project and run inside the coding CLI's process under
-# whatever interpreter the host has (both say "Stdlib only" in their docstrings), so
-# they cannot import bmad_loop to reach the registry at all. The Unity helper
-# scripts are stand-alone in the same way and read the plugin's own
-# `BMAD_LOOP_UNITY_*` / `BMAD_LOOP_ENGINE_*` contract, which the second half of the
-# invariant leaves with the plugin — envvars.py's docstring carves them out by name.
-# Writes stay out of scope on purpose: engine/resolve/probe/plugins.bus/unity_plugin
-# *build* a `BMAD_LOOP_*` env dict to inject into a child session, and that
-# producing side is what these readers consume, not a second source of truth.
-ENV_READ_ALLOW = {
-    "envvars.py",
-    "data/bmad_loop_hook.py",
-    "data/bmad_loop_probe_hook.py",
-    "data/plugins/unity/unity_cleanup.py",
-    "data/plugins/unity/unity_dialog_probe.py",
-    "data/plugins/unity/unity_quiesce.py",
-    "data/plugins/unity/unity_ready.py",
-    "data/plugins/unity/unity_seed_assets.py",
-    "data/plugins/unity/unity_setup.py",
-    "data/plugins/unity/unity_teardown.py",
-}
-
 # Bare POSIX paths that must not be hardcoded outside PATH_ALLOW. `os.devnull` is
 # the portable replacement for "/dev/null".
 POSIX_PATHS = ("/tmp", "/proc", "/dev/null")
@@ -125,6 +99,67 @@ REGISTRY_NAMES = {
     for name, value in vars(envvars).items()
     if isinstance(value, str) and value.startswith(ENV_PREFIX)
 }
+
+# The session-protocol vars the engine injects into every child session so a
+# stand-alone script can find the run it belongs to. They are not operator knobs:
+# engine.py / resolve.py / probe.py / plugins.bus build them on the producing side,
+# and these scripts read back what was handed to them.
+SESSION_PROTOCOL_ENV = (
+    "BMAD_LOOP_RUN_DIR",
+    "BMAD_LOOP_TASK_ID",
+    "BMAD_LOOP_WORKTREE",
+    "BMAD_LOOP_REPO_ROOT",
+    "BMAD_LOOP_CLEAN_TMP",
+    "BMAD_LOOP_QUIESCE_PHASE",
+    "BMAD_LOOP_PROBE_CAPTURE_DIR",
+)
+
+# The plugin's own families, which AGENTS.md's second clause leaves with the plugin
+# ("plugin-owned env-var families stay with their plugin"), plus the session
+# protocol every injected script reads.
+UNITY_ENV = ("BMAD_LOOP_UNITY_", "BMAD_LOOP_ENGINE_", *SESSION_PROTOCOL_ENV)
+
+# ``rel -> the key families that file may read straight out of the environment``,
+# matched as prefixes. Scoped by FAMILY rather than by file on purpose: a
+# file-wide exemption would let one of these read a core knob such as
+# `BMAD_LOOP_MUX_BACKEND` inline and have the finding dropped on its path alone,
+# which is the exact distinction the invariant draws.
+#
+# `envvars.py` *is* the registry — the one place a core var is named, typed and
+# given a reader (AGENTS.md: "New core env vars register in `envvars.py`") — so it
+# is scoped to the names it defines, read off the live module: register a fourth
+# var there and this needs no edit. The two hook relays are copied OUT of the
+# package into the target project and run inside the coding CLI's process under
+# whatever interpreter the host has (both say "Stdlib only" in their docstrings),
+# so they cannot import bmad_loop to reach the registry at all; the Unity helpers
+# are stand-alone the same way. None of them may reach past the families below.
+#
+# Writes stay out of scope on purpose: engine/resolve/probe/plugins.bus/unity_plugin
+# *build* a `BMAD_LOOP_*` env dict to inject into a child session, and that
+# producing side is what these readers consume, not a second source of truth.
+ENV_READ_ALLOW = {
+    "envvars.py": tuple(REGISTRY_NAMES.values()),
+    "data/bmad_loop_hook.py": SESSION_PROTOCOL_ENV,
+    "data/bmad_loop_probe_hook.py": SESSION_PROTOCOL_ENV,
+    "data/plugins/unity/unity_cleanup.py": UNITY_ENV,
+    "data/plugins/unity/unity_dialog_probe.py": UNITY_ENV,
+    "data/plugins/unity/unity_quiesce.py": UNITY_ENV,
+    "data/plugins/unity/unity_ready.py": UNITY_ENV,
+    "data/plugins/unity/unity_seed_assets.py": UNITY_ENV,
+    "data/plugins/unity/unity_setup.py": UNITY_ENV,
+    "data/plugins/unity/unity_teardown.py": UNITY_ENV,
+}
+
+
+def _env_read_offenders(findings) -> list[tuple[str, int, str, str]]:
+    """The env reads no file's declared families cover — the assertion's whole
+    policy, factored out so it can be graded on synthetic findings rather than only
+    on today's tree."""
+    return [
+        (rel, ln, txt, key)
+        for _, rel, ln, txt, key in findings
+        if not any(key.startswith(family) for family in ENV_READ_ALLOW.get(rel, ()))
+    ]
 
 
 def _py_files() -> list[Path]:
@@ -418,7 +453,10 @@ def _scan_source(src: str, rel: str):
                         break
                 left = rhs
         if env_key:
-            findings.append(("envread", rel, node.lineno, line_at(node.lineno)))
+            # The only 5-wide finding: the allowlist is keyed by variable FAMILY,
+            # not by file, so the filter needs the resolved key and not just the
+            # source line — a read spelled through a constant does not carry it.
+            findings.append(("envread", rel, node.lineno, line_at(node.lineno), env_key))
 
     return findings
 
@@ -578,12 +616,17 @@ def test_bmad_loop_env_reads_only_in_the_registry():
     is the honest boundary rather than an oversight. Sweep an axis when you touch
     it — every mapping form at once, not the one that prompted the visit — and
     extend the matrix before the branch: add the probe row, watch it fail, then fix
-    the scan."""
-    offenders = [(rel, ln, txt) for _, rel, ln, txt in _of("envread") if rel not in ENV_READ_ALLOW]
+    the scan.
+
+    The exemption is scoped by variable FAMILY, not by file — see
+    ``ENV_READ_ALLOW`` for why, and ``ENV_SCOPE_CASES`` for that claim as rows
+    rather than prose."""
+    offenders = _env_read_offenders(_of("envread"))
     assert not offenders, (
-        "BMAD_LOOP_* read outside envvars.py and the plugin-owned families — name "
-        "the var in envvars.py and call its reader instead of widening the "
-        "allowlist:\n" + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders)
+        "BMAD_LOOP_* read outside envvars.py and the families each stand-alone "
+        "script owns — name the var in envvars.py and call its reader instead of "
+        "widening the allowlist:\n"
+        + "\n".join(f"  {rel}:{ln}: {key} — {txt.strip()}" for rel, ln, txt, key in offenders)
     )
 
 
@@ -689,6 +732,51 @@ def test_env_read_detector_stays_silent_on_non_reads(label, source):
     assert not found, (
         f"the {label!r} shape was flagged as an env read; it is deliberately out of "
         f"scope:\n{source}"
+    )
+
+
+# The allowlist's scoping, as rows: `(rel, key, is_offender)`. Same reason the
+# access-form matrix is executable — a file-scoped exemption and a family-scoped one
+# are indistinguishable on today's tree, where every read already sits inside its
+# own family, so only synthetic findings can tell them apart.
+ENV_SCOPE_CASES = [
+    # A core knob read inline from a file that is exempt for OTHER reasons. This is
+    # the case a file-wide allowlist drops on the path alone.
+    ("unity-reads-core-knob", "data/plugins/unity/unity_ready.py", "BMAD_LOOP_MUX_BACKEND", True),
+    ("hook-reads-core-knob", "data/bmad_loop_hook.py", "BMAD_LOOP_SESSION_TIMEOUT_S", True),
+    # The registry is scoped to the names it defines, not to the prefix at large.
+    ("registry-reads-session-var", "envvars.py", "BMAD_LOOP_RUN_DIR", True),
+    # …and the reads each file genuinely owns stay exempt.
+    ("unity-reads-own-family", "data/plugins/unity/unity_ready.py", "BMAD_LOOP_UNITY_PATH", False),
+    (
+        "unity-reads-engine-family",
+        "data/plugins/unity/unity_setup.py",
+        "BMAD_LOOP_ENGINE_MCP",
+        False,
+    ),
+    ("unity-reads-session-var", "data/plugins/unity/unity_cleanup.py", "BMAD_LOOP_WORKTREE", False),
+    ("hook-reads-session-var", "data/bmad_loop_hook.py", "BMAD_LOOP_RUN_DIR", False),
+    ("registry-reads-own-name", "envvars.py", "BMAD_LOOP_MUX_BACKEND", False),
+    # A non-allowlisted core module is refused whatever the key.
+    ("core-module-any-key", "verify.py", "BMAD_LOOP_RUN_DIR", True),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "rel", "key", "is_offender"),
+    ENV_SCOPE_CASES,
+    ids=[c[0] for c in ENV_SCOPE_CASES],
+)
+def test_env_read_allowlist_is_scoped_by_family_not_by_file(label, rel, key, is_offender):
+    """Being allowlisted buys a file its own variable families and nothing wider.
+
+    Without this, `ENV_READ_ALLOW` could go back to a set of paths and every
+    assertion in this file would stay green — the distinction only shows up on a
+    read that does not exist yet, which is the only kind a tripwire is for."""
+    offenders = _env_read_offenders([("envread", rel, 1, f"os.environ.get({key!r})", key)])
+    assert bool(offenders) is is_offender, (
+        f"{rel} reading {key} should {'be refused' if is_offender else 'be allowed'}; "
+        f"declared families for that file: {ENV_READ_ALLOW.get(rel, ())}"
     )
 
 
