@@ -14,11 +14,9 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Added
 
-- **docs/testing.md: the formal testing strategy.** The five-layer taxonomy and placement rules,
-  fixture and ablation doctrines, the quality-guard inventory, the per-gate zero-token mechanisms
-  and the manual-gate cadence, the zero-retry flake policy with its deliberate absences, TUI and
-  contract-parity doctrine, and an honest gap register (#545–#549). AGENTS.md, docs/README.md and
-  CONTRIBUTING.md link in; AGENTS.md keeps only the terse invariants.
+- **docs/testing.md: the formal testing strategy.** Layer taxonomy and placement rules, fixture
+  and ablation doctrine, the quality-guard inventory, zero-token and flake policy, and a tracked
+  gap register (#545–#549); AGENTS.md, docs/README.md and CONTRIBUTING.md link here.
 
 - **Add raw psmux premise probes (#488).** The zero-token Windows live gate now flags droppable
   workarounds, and ablation repairs two vacuous backend assertions.

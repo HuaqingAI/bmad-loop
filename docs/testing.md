@@ -368,10 +368,12 @@ The rules a reviewer actually enforces, in one place:
    `Ablation:`/`Ablation target:` sentence in-file, the run evidence in the commit message.
 4. Time-dependent test ⇒ frozen clock. No sleeps toward deadlines, no retries, ever. A flake
    gets an issue.
-5. In-process `--json` test ⇒ `machine_json` (whole-stdout parse is the purity assertion).
-   Process-boundary tests — `test_entry_point.py`, and `test_stories_e2e.py` where it runs
-   `validate --json` — deliberately spawn a real subprocess and parse its whole stdout
-   themselves; the subprocess _is_ the test, so never convert one to `cli.main`.
+5. In-process `--json` test expecting a document on stdout ⇒ `machine_json` (whole-stdout
+   parse is the purity assertion); error paths that owe an **empty** stdout and `--json
+--out` runs that validate the written file sit outside it. Process-boundary tests —
+   `test_entry_point.py`, and `test_stories_e2e.py` where it runs `validate --json` —
+   spawn a real subprocess and parse its whole stdout themselves; the subprocess _is_ the
+   test, so never convert one to `cli.main`.
 6. Sandbox test ⇒ `project` fixture; never hand-roll a repo, never touch the template.
 7. Cross-transport/cross-layer twins keep identical names and two-way header cross-links.
 8. Guard finding ⇒ fix the source; allowlist widening is a reviewed exception with a scoped,
