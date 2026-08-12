@@ -167,6 +167,36 @@ jobs:
 
       - name: Run the console script from the built wheel
         # `--isolated --no-project` resolves `bmad-loop` from the wheel alone
-        # rather than the checkout, so a package or data file the build dropped
-        # fails here instead of at a user's install.
+        # rather than from the checkout, so a broken entry point or an import the
+        # wheel cannot satisfy fails here instead of at a user's install.
         run: uv run --isolated --no-project --with dist/*.whl -- bmad-loop --version
+
+      - name: Check the wheel carries every packaged data file
+        # The step above cannot stand in for this one: argparse answers --version
+        # from `__version__` before anything touches `bmad_loop.data`, so it exits
+        # 0 even on a wheel built with the whole data tree excluded (verified by
+        # building one). Compare against `git ls-files` rather than a hand-listed
+        # set, so a newly added resource is covered without anyone remembering.
+        run: |
+          uv run --isolated --no-project --with dist/*.whl -- python - <<'PY'
+          import pathlib
+          import subprocess
+          import sys
+          from importlib.resources import files
+
+          ROOT = "src/bmad_loop/data/"
+          tracked = subprocess.run(
+              ["git", "ls-files", "-z", ROOT], capture_output=True, text=True, check=True
+          ).stdout.split("\0")
+          expected = [p.removeprefix(ROOT) for p in tracked if p]
+          if not expected:
+              sys.exit(f"no tracked files under {ROOT} — this check would pass vacuously")
+
+          installed = pathlib.Path(str(files("bmad_loop"))) / "data"
+          missing = [rel for rel in expected if not installed.joinpath(rel).is_file()]
+          if missing:
+              shown = "\n  ".join(missing[:20])
+              more = f"\n  ...and {len(missing) - 20} more" if len(missing) > 20 else ""
+              sys.exit(f"wheel is missing {len(missing)}/{len(expected)}:\n  {shown}{more}")
+          print(f"ok: all {len(expected)} packaged data files are present in the wheel")
+          PY

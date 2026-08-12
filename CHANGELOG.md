@@ -120,10 +120,12 @@ whose seams had diverged enough that several ports needed a different fix, and t
 ### Changed
 
 - **Lint the workflows, and smoke-test the built package.** `trunk check` now runs `actionlint` and
-  `zizmor` over `.github/workflows/`, and a `build` CI job builds the sdist + wheel and runs
-  `bmad-loop --version` from the installed wheel — every other job runs from the source tree, so a
+  `zizmor` over `.github/workflows/`, and a `build` CI job builds the sdist + wheel, runs
+  `bmad-loop --version` from the installed wheel, and checks that wheel carries every data file
+  `git ls-files` lists under `src/bmad_loop/data` — every other job runs from the source tree, so a
   packaging break was invisible until release (`.trunk` had to be excluded from the sdist once
-  already). `.github/zizmor.yml` records the three deliberate suppressions: we tag-pin actions and
+  already). The inventory check is separate because `--version` is answered by argparse before
+  anything loads a packaged resource, so it passes on a wheel with no data tree at all. `.github/zizmor.yml` records the three deliberate suppressions: we tag-pin actions and
   let Dependabot patrol them (`ref-pin`, not `hash-pin`), ci.yml publishes nothing, and the lint and
   publish jobs keep their checkout credentials on purpose. The publish and build jobs set
   `enable-cache: false` rather than being suppressed. Also: the `version-sync` job drops its
