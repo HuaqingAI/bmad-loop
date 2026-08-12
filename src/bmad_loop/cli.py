@@ -809,6 +809,38 @@ def _dev_skill_for_role(pol, project: Path, role: str) -> str:
     return install.dev_primitive_or_default(project, tree)
 
 
+def _unknown_adapter_kinds(project: Path, pol) -> list[str]:
+    """Problem lines for each role-selected profile whose ``adapter`` names no
+    registered kind — resolved against the live registry, never a hardcoded set.
+
+    Such a profile renders a perfectly plausible dry-run preview (``_render_invocation``
+    reads only ``binary``/``launch_args``/``prompt_template``) but aborts the real
+    run in ``make_adapters``, which is precisely the gap the banner exists to close.
+    Only the roles a run would actually build are checked; `validate` reports the
+    same condition over *every* profile as an ``adapter.kind`` finding.
+
+    A profile that will not even parse is skipped rather than reported here: the
+    renderer immediately after raises the ``ProfileError`` itself, which names the
+    real problem better than a derived one would."""
+    from .adapters.profile import ProfileError, get_profile
+    from .adapters.registry import known_adapter_kinds
+
+    kinds = known_adapter_kinds()
+    problems: list[str] = []
+    for name in dict.fromkeys(pol.adapter.resolved(role).name for role in ROLES):
+        try:
+            profile = get_profile(name, project)
+        except ProfileError:
+            continue
+        if profile.adapter not in kinds:
+            problems.append(
+                f"profile {profile.name!r} names unknown adapter kind "
+                f"{profile.adapter!r} — known: {', '.join(kinds)} "
+                f"(install the plugin that provides it, or fix the profile's `adapter`)"
+            )
+    return problems
+
+
 def _warn_preflight_would_abort(
     paths: bmadconfig.ProjectPaths, pol, *, require_stories: bool = False
 ) -> None:
@@ -821,9 +853,11 @@ def _warn_preflight_would_abort(
     ``/bmad-dev-auto`` reads fine and would HALT an unattended session on the
     shim's interactive migration gate.
 
-    Mirrors both of the refusals the dry-run's early return skips past, and only
-    those: the finding list `_require_base_skills` gates on, and the #414 isolation
-    conflict `_reject_isolation_conflict` refuses ahead of it. Reading the same
+    Mirrors the refusals the dry-run's early return skips past, and only those:
+    the finding list `_require_base_skills` gates on, the #414 isolation conflict
+    `_reject_isolation_conflict` refuses ahead of it, and the unregistered adapter
+    kind `make_adapters` aborts on (`_unknown_adapter_kinds` — a preview reads none
+    of the fields that would give the misconfiguration away). Reading the same
     sources as the gates themselves is what keeps the preview from disagreeing with
     the real command about what "runnable" means. Severity-filtered to `problem`
     for that same reason — `_require_base_skills` ignores warnings, so reporting one
@@ -849,6 +883,7 @@ def _warn_preflight_would_abort(
     conflict = bmadconfig.worktree_isolation_conflict(paths, pol.scm.isolation)
     if conflict is not None:
         problems.insert(0, conflict)
+    problems += _unknown_adapter_kinds(paths.project, pol)
     if not problems:
         return
     print(

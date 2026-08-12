@@ -32,7 +32,7 @@ import argparse
 import json
 
 import pytest
-from conftest import install_bmad_config
+from conftest import install_bmad_config, write_sprint
 
 from bmad_loop import cli
 from bmad_loop import policy as policy_mod
@@ -261,6 +261,53 @@ def test_builtins_first_wins_over_external(scan_adapter_registry):
         registry.register_adapter("generic", needs_mux=False, load=lambda: _stub_builder())
 
     arm(_FakeEntryPoint("shadow", load))
+    kind = registry.get_adapter_kind("generic")
+    assert kind.needs_mux is True  # the builtin, not the external
+    assert kind.load().plain.__name__ == "GenericAdapter"
+
+
+def test_builtins_win_over_an_external_imported_by_the_profile_scan(
+    fresh_adapter_registry, monkeypatch
+):
+    """The shadowing hole that first-wins ALONE does not close.
+
+    The documented packaging layout puts both entry points in one module, so the
+    ``bmad_loop.profiles`` scan imports it too — and that scan runs on any
+    ``load_profiles`` call, which every command makes long before a kind is ever
+    resolved. The external's import-time ``register_adapter`` therefore lands
+    before ``_load_builtin_adapters`` would have run, and ``setdefault`` keeps it
+    under the bundled name: every default profile silently redirects to a
+    third-party class. Only ``register_adapter`` seeding the builtins on its own
+    side makes first-wins an invariant instead of an ordering coincidence.
+
+    ABLATION: drop the ``_load_builtin_adapters()`` call from ``register_adapter``
+    and this reddens — while ``test_builtins_first_wins_over_external`` above stays
+    green, because ``get_adapter_kind`` seeds the builtins on that path in."""
+    registry = fresh_adapter_registry
+
+    def provider():
+        return [
+            CLIProfile(name="ext", binary="ext", adapter="generic", hooks=HookSpec("none", "", {}))
+        ]
+
+    def ep_load():
+        # The import side effect of a module carrying BOTH entry points: a clumsy
+        # (or hostile) external claiming the builtin name with wrong needs_mux.
+        registry.register_adapter("generic", needs_mux=False, load=lambda: _stub_builder())
+        return provider
+
+    def fake_entry_points(*, group):
+        assert group == profile_mod.PROFILES_GROUP
+        return [_FakeEntryPoint("dual", ep_load)]
+
+    monkeypatch.setattr(profile_mod.importlib.metadata, "entry_points", fake_entry_points)
+    profile_mod._EXTERNALS_LOADED = False  # re-arm the scan the fixture parks
+
+    # The real process order: profiles resolve first (cmd_adapters and cmd_run
+    # both do), and nothing has touched the adapter registry yet.
+    assert "ext" in profile_mod.load_profiles(None)
+    assert registry._ADAPTERS, "the external registered — otherwise this proves nothing"
+
     kind = registry.get_adapter_kind("generic")
     assert kind.needs_mux is True  # the builtin, not the external
     assert kind.load().plain.__name__ == "GenericAdapter"
@@ -533,6 +580,54 @@ def test_make_adapters_unrelated_construct_failure_is_not_swallowed(
         runsetup.make_adapters(project.project, _run_dir(project.project), pol)
 
 
+def test_make_adapters_load_thunk_failure_becomes_systemexit(fresh_adapter_registry, project):
+    """A load thunk that raises — the family's own module missing an optional
+    dependency is the ordinary case — aborts with a clean SystemExit naming the
+    profile and the kind, not a raw traceback.
+
+    This is the one failure mode with no earlier gate: `validate` and `bmad-loop
+    adapters` both deliberately avoid invoking the thunk, and by the time
+    `make_adapters` runs, `compose_run` has already written the run state and pid,
+    so an escaping ImportError strands a run directory behind a traceback.
+
+    ABLATION: drop the try/except around `kind.load()` and this reddens (the
+    ModuleNotFoundError propagates as itself)."""
+
+    def _load():
+        raise ModuleNotFoundError("No module named 'acmesdk'")
+
+    fresh_adapter_registry.register_adapter("lazyboom", needs_mux=False, load=_load)
+    install_bmad_config(project)
+    _write_profile(project.project, "lazyboom", adapter="lazyboom")
+    _write_policy(project.project, '[adapter]\nname = "lazyboom"\n')
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+
+    with pytest.raises(SystemExit, match=r"lazyboom.*failed to load.*acmesdk"):
+        runsetup.make_adapters(project.project, _run_dir(project.project), pol)
+
+
+def test_make_adapters_non_import_thunk_failure_is_not_swallowed(fresh_adapter_registry, project):
+    """The other half of the pair above, and the same rule `construct_error` follows:
+    a missing dependency is a lazy loader's DECLARED failure, but anything else is a
+    bug in that package and must surface as itself. Swallowing it would hand an
+    adapter author an `error:` line where the traceback was the whole diagnosis.
+
+    ABLATION: widen the `except ImportError` to `except Exception` and this reddens
+    (SystemExit is raised instead)."""
+
+    def _load():
+        raise ZeroDivisionError("a real bug, not a missing dependency")
+
+    fresh_adapter_registry.register_adapter("lazybug", needs_mux=False, load=_load)
+    install_bmad_config(project)
+    _write_profile(project.project, "lazybug", adapter="lazybug")
+    _write_policy(project.project, '[adapter]\nname = "lazybug"\n')
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+
+    with pytest.raises(ZeroDivisionError):
+        runsetup.make_adapters(project.project, _run_dir(project.project), pol)
+
+
 def test_make_adapters_unknown_kind_systemexit_names_profile(fresh_adapter_registry, project):
     """A profile whose ``adapter`` names no registered kind aborts the run with a
     SystemExit that names both the profile and the known kinds."""
@@ -680,6 +775,68 @@ def test_validate_flags_an_unregistered_adapter_kind(fresh_adapter_registry, pro
     ]
     assert [f["severity"] for f in findings] == ["problem"]
     assert "ghostkind" in findings[0]["message"] and "generic" in findings[0]["message"]
+
+
+def test_dry_run_says_an_unregistered_kind_would_abort(fresh_adapter_registry, project, capsys):
+    """`--dry-run` renders a preview from `binary`/`launch_args`/`prompt_template`
+    alone, so an unregistered `adapter` is invisible in it: the operator reads a
+    perfectly plausible invocation for a config `make_adapters` refuses to build.
+    That is exactly the gap the honesty banner exists to close, so the unknown kind
+    joins the refusals it already mirrors.
+
+    Same contract as the other banner sources: stderr-only, the schedule still
+    renders on stdout, and the exit code stays 0 — a dry-run is a diagnostic.
+
+    ABLATION: drop the `_unknown_adapter_kinds` call from
+    `_warn_preflight_would_abort` and this reddens (stderr is empty, rc still 0)."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    _write_profile(project.project, "weird", adapter="ghostkind")
+    _write_policy(project.project, '[adapter]\nname = "weird"\n')
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args) == 0
+    out, err = capsys.readouterr()
+    assert "NOT runnable" in err
+    assert "ghostkind" in err and "generic" in err
+    assert "1-1-a" in out  # the schedule itself still rendered
+
+
+def test_validate_reports_a_broken_profile_package_even_when_policy_fails(
+    fresh_adapter_registry, project, monkeypatch, capsys
+):
+    """A broken profile package must be reported for its OWN reason, not silently
+    dropped because something else in the config is also wrong.
+
+    The `bmad_loop.profiles` scan has exactly one other trigger — `load_profiles`,
+    which validate reaches via `get_profile`, inside the block a `PolicyError`
+    aborts. Reading the error map without scanning would print nothing here, which
+    an operator reads as "no profile package failed". The adapter half never had
+    the gap, because `known_adapter_kinds()` runs unconditionally.
+
+    ABLATION: drop the `_load_external_profiles()` call from
+    `external_profile_errors` and this reddens (no adapter.external-profile
+    finding) while the `policy` failure below still reports."""
+
+    def fake_entry_points(*, group):
+        assert group == profile_mod.PROFILES_GROUP
+
+        def boom():
+            raise ImportError("No module named 'ghost_profile_dep'")
+
+        return [_FakeEntryPoint("brokenprofiles", boom)]
+
+    monkeypatch.setattr(profile_mod.importlib.metadata, "entry_points", fake_entry_points)
+    profile_mod._EXTERNALS_LOADED = False  # re-arm the scan the fixture parks
+
+    install_bmad_config(project)
+    _write_policy(project.project, "this is not = valid toml [[[\n")
+
+    findings = _validate_findings(project.project, capsys)
+    assert [f["severity"] for f in findings if f["check"] == "policy"] == ["problem"]
+    external = [f for f in findings if f["check"] == "adapter.external-profile"]
+    assert [f["severity"] for f in external] == ["warning"]
+    assert "ghost_profile_dep" in external[0]["message"]
 
 
 def test_validate_warns_on_a_broken_external_package(scan_adapter_registry, project, capsys):

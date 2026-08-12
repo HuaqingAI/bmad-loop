@@ -31,9 +31,10 @@ Bundled kinds register from :func:`_load_builtin_adapters` (:data:`GENERIC`,
 :data:`OPENCODE_HTTP`); out-of-tree kinds arrive at import time, triggered by the
 ``bmad_loop.adapters`` entry-point scan in :func:`_load_external_adapters` — so a
 pip/uv co-installed adapter package is selectable with no config step. Builtins
-load first, so an external can never shadow a bundled name. A broken third-party
-distribution degrades to a recorded, surfaced reason
-(:func:`external_adapter_errors`) and can never break selection.
+are seeded by :func:`register_adapter` itself, so an external can never shadow a
+bundled name however early its import lands. A broken third-party distribution
+degrades to a recorded, surfaced reason (:func:`external_adapter_errors`) and can
+never break selection.
 
 **Two deliberate asymmetries versus the multiplexer seam** (this is not a
 copy-paste omission):
@@ -149,25 +150,39 @@ def register_adapter(name: str, needs_mux: bool, load: Callable[[], AdapterBuild
     """Register an adapter kind. ``name`` is the ``profile.adapter`` key that
     selects it; ``needs_mux`` declares whether the family drives a terminal
     multiplexer; ``load`` is the lazy builder thunk. First registration of a name
-    wins — bundled kinds register from :func:`_load_builtin_adapters` before the
-    entry-point scan, so an out-of-tree package can never shadow a bundled name.
-    An out-of-tree kind calls this at import time — no core edit required. There
-    is no selection cache to invalidate (see the module docstring)."""
+    wins, and the builtins are seeded here rather than only by the resolution
+    entry points, so an out-of-tree package can never shadow a bundled name. An
+    out-of-tree kind calls this at import time — no core edit required. There is
+    no selection cache to invalidate (see the module docstring).
+
+    Seeding on *this* side is what makes first-wins an invariant instead of an
+    ordering coincidence. An external module runs its ``register_adapter`` calls
+    as an import side effect, and the import is not always triggered by an
+    adapter resolution: the documented packaging layout puts both entry points in
+    one module, so the ``bmad_loop.profiles`` scan in :mod:`~.profile` — which
+    runs long before any kind is resolved — imports it too, as does any plugin
+    that imports the package directly. Any of those arriving first would have
+    ``setdefault`` keep the external under a bundled name and silently redirect
+    every default profile to it."""
+    _load_builtin_adapters()
     _ADAPTERS.setdefault(name, AdapterKind(name=name, needs_mux=needs_mux, load=load))
 
 
 def _load_builtin_adapters() -> None:
     """Register the bundled adapter kinds. Idempotent and lazy (called from the
-    resolution entry points, not at module import) to stay cycle-safe: the load
-    thunks import ``generic`` / ``opencode_http``, which import back through the
-    package. Builtins register before externals so a bundled name keeps
-    first-wins on any collision."""
+    resolution entry points and from :func:`register_adapter`, not at module
+    import) to stay cycle-safe: the load thunks import ``generic`` /
+    ``opencode_http``, which import back through the package. Builtins register
+    before externals so a bundled name keeps first-wins on any collision.
+
+    The flag is set BEFORE the loop because the loop re-enters through
+    ``register_adapter``; setting it afterwards would recurse without end."""
     global _BUILTINS_LOADED
     if _BUILTINS_LOADED:
         return
+    _BUILTINS_LOADED = True
     for name, needs_mux, load in _BUILTIN_ADAPTERS:
         register_adapter(name, needs_mux, load)
-    _BUILTINS_LOADED = True
 
 
 # The entry-point group an out-of-tree adapter package advertises its module
@@ -188,13 +203,26 @@ def _load_external_adapters() -> None:
     adapters`` and the ``validate`` preflight via :func:`external_adapter_errors`),
     not raised. The loaded-flag is set up front: a third-party import failure is
     not transient, and retrying on every resolution would re-import (and re-fail)
-    each time — mirroring the multiplexer's external scan."""
+    each time — mirroring the multiplexer's external scan.
+
+    A recorded failure does NOT mean the entry point registered nothing: a module
+    that registers kind A and then raises while registering kind B leaves A
+    registered and selectable. Deliberate — unwinding would mean tracking which
+    names a half-run import claimed, and a kind that registered cleanly is usable
+    whatever else its package got wrong. The recorded reason is a fact about the
+    import, not a promise about the registry.
+
+    Entry points are visited in name order. ``importlib.metadata`` yields them in
+    distribution-discovery order, which varies with ``sys.path``, so without this
+    two hosts carrying the same packages could resolve a name collision
+    differently — and first-wins would be a fact about the install rather than
+    about the packages."""
     global _EXTERNALS_LOADED
     if _EXTERNALS_LOADED:
         return
     _EXTERNALS_LOADED = True
     try:
-        eps = importlib.metadata.entry_points(group=ADAPTERS_GROUP)
+        eps = sorted(importlib.metadata.entry_points(group=ADAPTERS_GROUP), key=lambda e: e.name)
     except Exception as exc:  # noqa: BLE001 — diagnostics path, never crash selection
         _EXTERNAL_ERRORS["<entry-point scan>"] = f"{type(exc).__name__}: {exc}"
         return
@@ -207,7 +235,13 @@ def _load_external_adapters() -> None:
 
 def external_adapter_errors() -> dict[str, str]:
     """Entry-point name -> failure reason for every external adapter that failed
-    to load this process (empty when all loaded). For diagnostics surfaces."""
+    to load this process (empty when all loaded). For diagnostics surfaces.
+
+    Performs the scan itself rather than relying on a neighbouring
+    ``known_adapter_kinds`` / ``detect_adapters`` call having run first — an
+    accessor whose emptiness depends on call order reads as "nothing failed"."""
+    _load_builtin_adapters()
+    _load_external_adapters()
     return dict(_EXTERNAL_ERRORS)
 
 

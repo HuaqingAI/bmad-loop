@@ -145,6 +145,12 @@ whose seams had diverged enough that several ports needed a different fix, and t
   hookless profile driven by another kind no longer FAILs with a remedy that installs the wrong
   package.
 
+- **A profile written before the `adapter` field keeps its old dispatch.** `hooks.dialect = "none"`
+  used to be the class selector, so a project overlay copied from the packaged opencode profile
+  carries no `adapter` key; it now resolves to `opencode-http` rather than defaulting onto the tmux
+  generic adapter, where it would have waited out `session_timeout_min` for a hook a hookless profile
+  never registers. An explicit `adapter` is always honored, including hookless driven by another kind.
+
 - **Profiles from a `bmad_loop.profiles` entry point are validated like TOML ones.** Both routes into
   the profile map now share one invariant set (hook dialect, path containment, `env_fault_patterns`
   compilation, …), so a package can no longer install a profile state the parser would refuse — an

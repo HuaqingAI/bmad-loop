@@ -192,6 +192,46 @@ def test_adapter_field_defaults_to_generic_and_parses():
     )
 
 
+def test_absent_adapter_on_a_hookless_profile_keeps_the_pre_registry_dispatch(tmp_path):
+    """Back-compat for the TOML files this field did not exist in.
+
+    Before the registry, `hooks.dialect = "none"` WAS the class selector — every
+    hookless profile went to the opencode HTTP adapters. Copying the packaged
+    opencode profile into `.bmad-loop/profiles/` to tweak binary/env/model is the
+    documented customization, and that copy carries no `adapter` key. Taking the
+    dataclass default would move it onto the tmux generic adapter, where it waits
+    out `session_timeout_min` for a `Stop` hook a hookless profile never registers
+    — and every `validate` check that would catch it keys on `hookless` too, so the
+    preflight stays green. Non-hookless profiles keep defaulting to generic.
+
+    ABLATION: restore `doc.get("adapter", "generic")` and the hookless row reddens
+    (it resolves to `generic`) while the dialect row stays green."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    # The pre-field bytes: hookless, and no `adapter` key anywhere.
+    (profiles_dir / "legacy.toml").write_text(HOOKLESS_PROFILE)
+    (profiles_dir / "hooked.toml").write_text(MINIMAL_PROFILE)
+
+    profiles = load_profiles(tmp_path)
+    assert profiles["mycli-http"].hookless
+    assert profiles["mycli-http"].adapter == "opencode-http"
+    assert profiles["mycli"].adapter == "generic"
+
+
+def test_explicit_adapter_beats_the_hookless_back_compat_default(tmp_path):
+    """The back-compat default fires ONLY on the absent key. An explicit `adapter`
+    is always honored — including hookless-driven-by-something-else, which is the
+    decoupling the registry exists to allow and which the old dispatch could not
+    express."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "decoupled.toml").write_text(
+        HOOKLESS_PROFILE.replace("[hooks]", 'adapter = "some-other-http-kind"\n[hooks]')
+    )
+    profile = load_profiles(tmp_path)["mycli-http"]
+    assert profile.hookless and profile.adapter == "some-other-http-kind"
+
+
 def test_adapter_kind_membership_is_not_checked_at_parse_time(tmp_path):
     """A profile naming an unregistered adapter kind still PARSES — validity is
     enforced later against the live registry (at construction / by `validate`),
@@ -462,10 +502,21 @@ def test_every_toml_value_type_parses_or_raises_profile_error(tmp_path, key, val
 @pytest.fixture
 def profile_scan(monkeypatch):
     """Isolate + re-arm the profile entry-point scan: snapshot/clear the module's
-    external-scan state, then hand back a hook to install fake entry points."""
+    external-scan state, then hand back a hook to install fake entry points.
+
+    Setup parks the scan as ALREADY-LOADED over an empty map rather than leaving
+    whatever a previous test wrote — a test that takes this fixture without
+    calling `arm` would otherwise assert against leftovers and pass for the wrong
+    reason. Parked, not re-armed: arming without a fake `entry_points` in place
+    would run the REAL scan and leak whichever profile packages the dev box
+    happens to have installed into the assertions. `arm` re-opens it, exactly as
+    `fresh_adapter_registry` does for the adapter half."""
     saved_loaded = profile_mod._EXTERNALS_LOADED
     saved_profiles = dict(profile_mod._EXTERNAL_PROFILES)
     saved_errors = dict(profile_mod._PROFILE_LOAD_ERRORS)
+    profile_mod._EXTERNALS_LOADED = True
+    profile_mod._EXTERNAL_PROFILES.clear()
+    profile_mod._PROFILE_LOAD_ERRORS.clear()
 
     def arm(*eps, scan_error=None):
         def fake_entry_points(*, group):
@@ -631,6 +682,10 @@ def test_profile_scan_failure_degrades(profile_scan):
         ({"usage_grace_s": -1.0}, "usage_grace_s"),
         ({"stop_without_result_nudges": -2}, "stop_without_result_nudges"),
         ({"adapter": ""}, "adapter"),
+        # whitespace-only, not just empty: the TOML route strips before validating,
+        # so testing the raw value would refuse `adapter = "  "` from a file while
+        # admitting it from a provider — the divergence this whole test denies
+        ({"adapter": "   "}, "adapter"),
         ({"binary": "  "}, "required"),
     ],
 )

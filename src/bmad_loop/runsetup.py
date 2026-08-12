@@ -456,7 +456,24 @@ def make_adapters(
                 kind = get_adapter_kind(profile.adapter)
             except AdapterError as e:
                 raise SystemExit(f"error: profile {profile.name!r}: {e}") from e
-            builder = kind.load()
+            # The load thunk is where a family's classes — and any optional
+            # dependency they pull in — are first imported, and it is deliberately
+            # never invoked by `validate` or `bmad-loop adapters` (both stay free
+            # of heavy imports), so a thunk that raises has had no earlier gate.
+            # By here `compose_run` has already written the run state and pid, so
+            # an escaping ImportError strands a run directory behind a traceback.
+            # ImportError ONLY, on the same rule as `construct_error` below: a
+            # missing dependency is a lazy loader's DECLARED failure, while
+            # anything else is a bug in that package and must surface as itself
+            # rather than as a misleading `error:` line. Widening this to
+            # `Exception` would contradict the pin two tests down.
+            try:
+                builder = kind.load()
+            except ImportError as e:
+                raise SystemExit(
+                    f"error: profile {profile.name!r}: adapter kind "
+                    f"{profile.adapter!r} failed to load: {type(e).__name__}: {e}"
+                ) from e
             # Annotated: the literal below would otherwise fix the value type to
             # `Path | CLIProfile`, and the `needs_mux` arm adds a multiplexer.
             common: dict[str, object] = dict(

@@ -222,7 +222,11 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
     # Shape only — membership against the registered kinds is deliberately NOT
     # checked here (see the module docstring): that set is open-ended and lives in
     # adapters/registry.py, which importing from here would make a cycle.
-    if not profile.adapter:
+    # `.strip()` because the TOML route strips before it gets here: testing the raw
+    # value would refuse `adapter = "  "` from a file while admitting it from an
+    # entry-point provider, which is exactly the two-routes divergence this
+    # function exists to prevent.
+    if not profile.adapter.strip():
         raise fail("adapter must be a non-empty string naming an adapter kind")
 
     if profile.usage_parser not in USAGE_PARSERS:
@@ -259,6 +263,32 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
             raise fail(f"env_fault_patterns entry is not a valid regex: {pattern!r} ({e})") from e
 
 
+def _legacy_adapter_default(dialect: str) -> str:
+    """The adapter kind a TOML profile that predates the ``adapter`` field meant.
+
+    Before the registry, ``hooks.dialect`` WAS the class selector: ``make_adapters``
+    sent every hookless profile to the opencode HTTP adapters and everything else to
+    the generic ones. Project overlays are a documented customization point
+    (``<project>/.bmad-loop/profiles/*.toml``, same name overrides), and the way to
+    tweak the opencode profile's ``binary``/``env``/``model`` was to copy the
+    packaged one — which carried no ``adapter`` key, because the key did not exist.
+    Taking the dataclass default for those files would silently move a working
+    hookless run onto tmux, where it launches the CLI in a window and waits out
+    ``session_timeout_min`` for a ``Stop`` hook a hookless profile never registers —
+    and ``validate`` stays green, because every check it would trip keys on
+    ``hookless`` too. So reproduce the old dispatch instead of defaulting.
+
+    Only the absent key takes this path; an explicit ``adapter`` is always honored,
+    including the now-legal hookless-but-not-``opencode-http`` combination the axes
+    were decoupled to allow. Naming the two bundled kinds here is a fact about what
+    the *old* dispatch did, not a valid-kinds set — that set is only ever
+    ``registry.known_adapter_kinds()``. Imported inside the function so this module
+    keeps no import-time dependency on the registry."""
+    from .registry import GENERIC, OPENCODE_HTTP
+
+    return OPENCODE_HTTP if dialect == "none" else GENERIC
+
+
 def _parse_profile(doc: dict, source: str) -> CLIProfile:
     """Coerce a TOML document into a :class:`CLIProfile`.
 
@@ -291,7 +321,9 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
     # and carry it all the way to `get_adapter_kind`, which would then name that
     # nonsense as the unknown kind. #384's rule — a malformed value funnels into
     # ProfileError at the boundary, never a silent coercion.
-    raw_adapter = doc.get("adapter", "generic")
+    raw_adapter = doc.get("adapter")
+    if raw_adapter is None:
+        raw_adapter = _legacy_adapter_default(str(hooks_d.get("dialect", "")))
     if not isinstance(raw_adapter, str):
         raise fail(f"adapter must be a string: got {type(raw_adapter).__name__}")
 
@@ -394,13 +426,17 @@ def _load_external_profiles() -> dict[str, CLIProfile]:
     A provider is rejected WHOLE: one invalid profile in the returned batch drops
     the batch, because ``_coerce_profiles`` raises before any of them is recorded.
     Deliberate — a provider is one package's declaration, and half-installing it
-    would leave an operator with a profile set no error message accounts for."""
+    would leave an operator with a profile set no error message accounts for.
+
+    Entry points are visited in name order, so which provider wins a name
+    collision is a property of the packages rather than of ``sys.path`` ordering
+    (the adapter scan sorts for the same reason)."""
     global _EXTERNALS_LOADED
     if _EXTERNALS_LOADED:
         return _EXTERNAL_PROFILES
     _EXTERNALS_LOADED = True
     try:
-        eps = importlib.metadata.entry_points(group=PROFILES_GROUP)
+        eps = sorted(importlib.metadata.entry_points(group=PROFILES_GROUP), key=lambda e: e.name)
     except Exception as exc:  # noqa: BLE001 — diagnostics path, never crash loading
         _PROFILE_LOAD_ERRORS["<entry-point scan>"] = f"{type(exc).__name__}: {exc}"
         return _EXTERNAL_PROFILES
@@ -417,7 +453,15 @@ def _load_external_profiles() -> dict[str, CLIProfile]:
 
 def external_profile_errors() -> dict[str, str]:
     """Entry-point name -> failure reason for every external profile provider that
-    failed to load this process (empty when all loaded). For diagnostics surfaces."""
+    failed to load this process (empty when all loaded). For diagnostics surfaces.
+
+    Performs the scan rather than assuming a neighbouring call already did. The
+    only other trigger is :func:`load_profiles`, which ``validate`` reaches through
+    ``get_profile`` — inside the block that a ``PolicyError`` aborts. Reading a map
+    nothing had populated would report a broken profile package as absent for a
+    reason having nothing to do with that package, exactly when an operator is
+    already looking at a broken config. Scan-once still holds."""
+    _load_external_profiles()
     return dict(_PROFILE_LOAD_ERRORS)
 
 
