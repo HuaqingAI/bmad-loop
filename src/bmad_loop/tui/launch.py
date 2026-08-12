@@ -729,7 +729,17 @@ def prune_ctl_windows(project: Path) -> tuple[list[str], list[str], list[str]]:
     if not candidates:
         return [], [], []
     for win_id, _name in candidates:
-        mux.kill_window(win_id)
+        # kill_window is best-effort and reports nothing; a strict-POSIX decode
+        # fault of the kill's own capture escapes its swallow tuple (#380) but
+        # says exactly as little about the outcome — the command may well have
+        # reached the server. More of the same nothing: the fan-out continues
+        # and the one post-kill listing hands down the verdict either way. An
+        # escape here would surface at the callers as a scan failure, an
+        # empty-armed receipt denying kills that just fired.
+        try:
+            mux.kill_window(win_id)
+        except UnicodeError:
+            pass
     try:
         live = set(mux.list_window_ids(CTL_SESSION))
     except MultiplexerError:

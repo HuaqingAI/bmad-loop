@@ -1259,7 +1259,7 @@ def test_record_with_trailing_newline_still_matches(monkeypatch, tmp_path: Path)
 
 
 def _ctl_prune_fake(
-    monkeypatch, tmp_path: Path, *, kill: str = "lands"
+    monkeypatch, tmp_path: Path, *, kill: str = "lands", kill_boom: str | None = None
 ) -> tuple[list[list[str]], list[int]]:
     """Stand a fake ctl session up for the prune; returns (kill-argv log, liveness
     probe log) — the second is what proves the verdict costs ONE listing.
@@ -1274,6 +1274,11 @@ def _ctl_prune_fake(
     the session died with its last window). Those are the prune's whole verdict
     space (#435), and the listing is the only thing that distinguishes them —
     `kill-window` exits 0 in all of them.
+
+    ``kill_boom`` names a window id whose kill-window call raises a strict-POSIX
+    decode fault AFTER the command is recorded — the command may have reached
+    the server, so the kill is "attempted" like any other and the listing still
+    owns the verdict (#380 tracks the seam guard it escapes).
     """
     from bmad_loop import runs
 
@@ -1329,6 +1334,8 @@ def _ctl_prune_fake(
             )
         if verb == "kill-window":
             killed.append(list(argv))
+            if kill_boom is not None and argv[-1] == kill_boom:
+                raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
     monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,123,0")  # we sit in a pane of @4
@@ -1353,6 +1360,23 @@ def test_prune_ctl_windows(monkeypatch, tmp_path: Path):
     # is the kill count at probe time, so a per-window implementation would read
     # [1, 2] and a probe-before-kill 0.
     assert probes == [2]
+
+
+def test_prune_ctl_windows_kill_decode_fault_does_not_abort_the_fan_out(
+    monkeypatch, tmp_path: Path
+):
+    """kill_window is best-effort and reports nothing; a strict-POSIX decode
+    fault of its own capture is more of the same nothing (#380), not a scan
+    failure. The fan-out must continue past it and the one post-kill listing
+    still hands down the verdict — a kill that landed is reported removed,
+    never surfaced to the cleanup callers as an empty-armed scan failure that
+    denies the kills just fired."""
+    killed, probes = _ctl_prune_fake(monkeypatch, tmp_path, kill_boom="@3")
+
+    both = ["sweep-20260101-000000-dead", "run-20260101-000000-dead2"]
+    assert launch.prune_ctl_windows(tmp_path) == (both, [], [])
+    assert [argv[-1] for argv in killed] == ["@3", "@6"]  # the fault did not stop @6
+    assert probes == [2]  # and the verdict still cost ONE listing, after both
 
 
 def test_prune_ctl_windows_reports_a_survivor_separately(monkeypatch, tmp_path: Path):
