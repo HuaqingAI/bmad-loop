@@ -160,7 +160,9 @@ def test_load_paths_raises_typed_when_the_root_cannot_canonicalize(
     _write_config(root)
     refuse_to_resolve(monkeypatch, root)
 
-    with pytest.raises(bmadconfig.BmadConfigError, match="cannot canonicalize"):
+    # the full prefix, not just "cannot canonicalize": _resolve raises a message
+    # sharing that stem for a configured path, and this row pins the ROOT boundary
+    with pytest.raises(bmadconfig.BmadConfigError, match="cannot canonicalize the project root"):
         bmadconfig.load_paths(root)
 
 
@@ -299,5 +301,6 @@ def test_load_paths_refuses_a_degraded_root_beside_canonically_spelled_config_pa
     )
     refuse_to_resolve(monkeypatch, root)
 
-    with pytest.raises(bmadconfig.BmadConfigError, match="cannot canonicalize"):
+    # the full prefix: this row pins the ROOT refusing, not a member's shared stem
+    with pytest.raises(bmadconfig.BmadConfigError, match="cannot canonicalize the project root"):
         bmadconfig.load_paths(root)

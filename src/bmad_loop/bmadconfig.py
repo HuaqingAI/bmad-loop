@@ -134,6 +134,22 @@ def worktree_isolation_conflict(paths: ProjectPaths, isolation: str) -> str | No
     )
 
 
+def _canonical(expanded: Path, label: str) -> Path:
+    """Canonicalize-or-raise, the shared boundary for every ProjectPaths member.
+    `label` names what refused in the operator's terms — a configured string is
+    reported with its raw spelling, the default output folder as the default —
+    so the message never calls a path "configured" that nobody configured."""
+    try:
+        return expanded.resolve()
+    except (OSError, RuntimeError) as e:
+        raise BmadConfigError(
+            f"cannot canonicalize the {label} ({expanded}): {e} — "
+            "whether it lies inside or outside the project tree cannot be determined, "
+            "so no run can safely proceed. Run `bmad-loop validate` for what this "
+            "host is doing."
+        ) from e
+
+
 def _resolve(raw: str, project: Path) -> Path:
     """Expand `{project-root}` and canonicalize, or raise typed. A config string can
     name a UNC share of its own, independent of `--project`, so it refuses on the same
@@ -145,15 +161,7 @@ def _resolve(raw: str, project: Path) -> Path:
     sends a worktree-isolated run's artifact writes into a worktree-local directory
     instead of the configured destination. No member enters a snapshot unresolved."""
     expanded = Path(raw.replace("{project-root}", str(project)))
-    try:
-        return expanded.resolve()
-    except (OSError, RuntimeError) as e:
-        raise BmadConfigError(
-            f"cannot canonicalize the configured path {raw!r} ({expanded}): {e} — "
-            "whether it lies inside or outside the project tree cannot be determined, "
-            "so no run can safely proceed. Run `bmad-loop validate` for what this "
-            "host is doing."
-        ) from e
+    return _canonical(expanded, f"configured path {raw!r}")
 
 
 def load_paths(project: Path) -> ProjectPaths:
@@ -207,7 +215,7 @@ def load_paths(project: Path) -> ProjectPaths:
         # the default branch is a bare join off the (canonical) root and takes the
         # same canonicalize-or-raise treatment as a configured string: an in-tree
         # junction under the default name misclassifies exactly like a configured one.
-        else _resolve(str(project / "_bmad-output"), project)
+        else _canonical(project / "_bmad-output", "default output folder")
     )
     return ProjectPaths(
         project=project,
