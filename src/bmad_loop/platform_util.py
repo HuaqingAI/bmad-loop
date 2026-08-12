@@ -255,6 +255,24 @@ def resolve_or_lexical(path: str | Path) -> Path:
 
     A relative ``path`` with an unreadable cwd still raises out of ``absolute()``:
     there is no lexical answer to degrade to, and the backstop is the honest reply."""
+    resolved = try_resolve(path)
+    return Path(path).absolute() if resolved is None else resolved
+
+
+def try_resolve(path: str | Path) -> Path | None:
+    """``Path(path).resolve()``, or ``None`` when the OS refuses it — emitting the same
+    one-note-per-process explanation as :func:`resolve_or_lexical`, which is built on
+    this.
+
+    Use it when the *fact* of the refusal changes what the caller does next, rather
+    than only the value. The one such caller is ``bmadconfig.load_paths``, which has to
+    hand back an internally consistent :class:`ProjectPaths`: if the project root
+    degrades to lexical while an artifact path underneath it canonicalizes, the two are
+    spelled either side of a symlink, ``ProjectPaths.rebased`` fails its
+    ``relative_to`` and files the artifact dir as configured *outside* the tree — so a
+    worktree-isolated run would write into the original checkout instead of its own
+    worktree. One snapshot, one spelling. Everywhere else the value is all the caller
+    needs, and :func:`resolve_or_lexical` is the shorter way to ask."""
     try:
         return Path(path).resolve()
     except (OSError, RuntimeError) as e:
@@ -268,7 +286,7 @@ def resolve_or_lexical(path: str | Path) -> Path:
                 "Run `bmad-loop validate` for what this host is doing.",
                 file=sys.stderr,
             )
-        return lexical
+        return None
 
 
 def _retry_on_sharing_violation(op: Callable[[], None]) -> None:

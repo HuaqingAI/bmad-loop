@@ -7,7 +7,7 @@ from pathlib import Path
 
 import yaml
 
-from .platform_util import resolve_or_lexical
+from .platform_util import resolve_or_lexical, try_resolve
 
 
 class BmadConfigError(Exception):
@@ -132,11 +132,22 @@ def worktree_isolation_conflict(paths: ProjectPaths, isolation: str) -> str | No
     )
 
 
-def _resolve(raw: str, project: Path) -> Path:
+def _resolve(raw: str, project: Path, *, canonical: bool) -> Path:
     """Expand `{project-root}` and canonicalize. A config string can name a UNC share
     of its own, independent of `--project`, so it degrades on the same terms — see
-    `platform_util.resolve_or_lexical` (#552)."""
-    return resolve_or_lexical(raw.replace("{project-root}", str(project)))
+    `platform_util.resolve_or_lexical` (#552).
+
+    `canonical` says whether the project root itself canonicalized. When it did not,
+    this one does not even try: consistency across the returned ProjectPaths matters
+    more than canonicality of any single member, because `rebased` decides "is this
+    artifact dir inside the project" with `relative_to`, and a lexical project paired
+    with a canonical artifact path answers *no* either side of a symlink. That files an
+    in-tree artifact dir as externally configured, and a worktree-isolated run then
+    writes into the original checkout. The asymmetry only runs one way: a canonical
+    root paired with an artifact path that degrades is fine, because such a path is on
+    some other share and genuinely *is* outside the tree."""
+    expanded = Path(raw.replace("{project-root}", str(project)))
+    return resolve_or_lexical(expanded) if canonical else expanded.absolute()
 
 
 def load_paths(project: Path) -> ProjectPaths:
@@ -144,8 +155,12 @@ def load_paths(project: Path) -> ProjectPaths:
     # already ran this, so on a host that refuses it the argument arriving here is
     # the lexical form and a bare `.resolve()` would raise a second time — taking out
     # `validate`, which loads paths before it reaches the finding that explains the
-    # host. See `platform_util.resolve_or_lexical` for the bounds of the degrade.
-    project = resolve_or_lexical(project)
+    # host. `try_resolve` rather than `resolve_or_lexical` because the *fact* of the
+    # refusal has to reach `_resolve` below; see its docstring for what a
+    # half-canonical ProjectPaths costs.
+    resolved = try_resolve(project)
+    canonical = resolved is not None
+    project = Path(project).absolute() if resolved is None else resolved
     config_path = project / "_bmad" / "bmm" / "config.yaml"
     if not config_path.is_file():
         raise BmadConfigError(f"BMAD config not found: {config_path} (is BMAD installed here?)")
@@ -168,13 +183,21 @@ def load_paths(project: Path) -> ProjectPaths:
             f"{config_path} missing implementation_artifacts/planning_artifacts keys"
         )
     repo_root_raw = doc.get("repo_root")
-    repo_root = _resolve(str(repo_root_raw), project) if repo_root_raw else project
+    repo_root = (
+        _resolve(str(repo_root_raw), project, canonical=canonical) if repo_root_raw else project
+    )
     out_raw = doc.get("output_folder")
-    output_folder = _resolve(str(out_raw), project) if out_raw else (project / "_bmad-output")
+    output_folder = (
+        _resolve(str(out_raw), project, canonical=canonical)
+        if out_raw
+        else (project / "_bmad-output")
+    )
     return ProjectPaths(
         project=project,
-        implementation_artifacts=_resolve(str(impl), project),
-        planning_artifacts=_resolve(str(plan), project),
-        output_folder=resolve_or_lexical(output_folder),
+        implementation_artifacts=_resolve(str(impl), project, canonical=canonical),
+        planning_artifacts=_resolve(str(plan), project, canonical=canonical),
+        # already routed through `_resolve` when configured; the default branch is a
+        # bare join off `project` and needs the same one-spelling treatment.
+        output_folder=resolve_or_lexical(output_folder) if canonical else output_folder.absolute(),
         repo_root=repo_root,
     )

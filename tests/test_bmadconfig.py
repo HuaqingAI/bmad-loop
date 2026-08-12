@@ -247,3 +247,41 @@ def test_load_paths_degrades_for_a_config_path_that_is_itself_unresolvable(
 
     assert paths.implementation_artifacts == share
     assert paths.project == root.resolve(), "the healthy root still canonicalizes"
+
+
+def test_load_paths_keeps_one_spelling_when_the_root_degrades(tmp_path: Path, monkeypatch) -> None:
+    """A ProjectPaths must be internally consistent, not maximally canonical.
+
+    If the project root degrades to lexical while the artifact paths underneath it
+    canonicalize, the two end up spelled either side of a symlink. `rebased` decides
+    "does this artifact dir live inside the project" with `relative_to`, that answers
+    *no*, and the dir is filed as configured outside the tree and left where it is — so
+    a worktree-isolated run writes into the original checkout instead of its own
+    worktree. Silent, and a write.
+
+    The symlinked root is what makes the row bite: with a canonical `tmp_path` the
+    lexical and resolved spellings are the same string and a half-canonical
+    ProjectPaths would be indistinguishable from a consistent one."""
+    target = tmp_path / "target"
+    target.mkdir()
+    root = tmp_path / "p"
+    try:
+        root.symlink_to(target, target_is_directory=True)
+    except OSError as e:  # Windows without SeCreateSymbolicLink / developer mode
+        pytest.skip(f"cannot create a symlink here: {e}")
+    _write_config(root)
+    # Only the root refuses. The artifact paths beneath it resolve perfectly well, and
+    # that is precisely the split that produced the mismatch.
+    refuse_to_resolve(monkeypatch, root)
+
+    paths = bmadconfig.load_paths(root)
+
+    assert paths.implementation_artifacts.is_relative_to(paths.project)
+    assert paths.planning_artifacts.is_relative_to(paths.project)
+    assert paths.output_folder.is_relative_to(paths.project)
+    # the consequence itself, not just the spelling: rebasing onto a worktree has to
+    # move the artifact dirs rather than file them as external
+    moved = paths.rebased(tmp_path / "wt")
+    assert moved.implementation_artifacts == tmp_path / "wt" / "_bmad-output" / (
+        "implementation-artifacts"
+    )
