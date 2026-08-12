@@ -14,6 +14,10 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Added
 
+- **docs/testing.md: the formal testing strategy.** Layer taxonomy and placement rules, fixture
+  and ablation doctrine, the quality-guard inventory, zero-token and flake policy, and a tracked
+  gap register (#545–#549); AGENTS.md, docs/README.md and CONTRIBUTING.md link here.
+
 - **Add raw psmux premise probes (#488).** The zero-token Windows live gate now flags droppable
   workarounds, and ablation repairs two vacuous backend assertions.
 

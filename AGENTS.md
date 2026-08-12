@@ -60,6 +60,7 @@ Two orthogonal seams: **which CLI** (adapter axis: `adapters/base.py` `CodingCLI
 - E2E gates: `tests/test_stories_e2e.py` (real tmux on Linux + a scripted fake-claude profile, zero LLM tokens), `tests/test_opencode_live.py` (zero-token invariant — never sends a prompt), and `tests/test_psmux_live.py` (real psmux on Windows, parked windows only, zero tokens). Never "fix" these to call real CLIs.
 - Ablation rule: for any test asserting "X is refused/absent", delete the gating code and confirm the test FAILS before trusting it — negative assertions pass for every reason a value could be absent.
 - New behavior lands with a test at the lowest layer that can catch its regression: pure-core unit > seam > sandbox E2E.
+- Full strategy — layer taxonomy, fixture/ablation doctrine, guard inventory, flake policy: [docs/testing.md](docs/testing.md).
 
 ## Repo hygiene
 
@@ -87,6 +88,7 @@ These rules apply to code you are already touching — do not initiate refactors
 | [docs/multiplexer-backends.md](docs/multiplexer-backends.md)       | mux backend selection/porting                |
 | [docs/plugin-authoring-guide.md](docs/plugin-authoring-guide.md)   | plugin work (incl. game-engine + TEA guides) |
 | [docs/porting-to-a-new-os.md](docs/porting-to-a-new-os.md)         | OS seams                                     |
+| [docs/testing.md](docs/testing.md)                                 | writing/placing tests, guards, flake policy  |
 | [docs/ROADMAP.md](docs/ROADMAP.md)                                 | planned vs deliberately-deferred work        |
 
 Full list: [docs/README.md](docs/README.md).
