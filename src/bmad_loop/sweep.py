@@ -19,7 +19,7 @@ from typing import Any, Callable
 
 from . import deferredwork, gates, verify
 from .engine import Engine
-from .escalation import critical_escalations, env_fault_pause_reason
+from .escalation import critical_escalations, env_fault_pause_reason, session_failure_reason
 from .model import Phase, StoryTask
 from .platform_util import atomic_replace
 from .statemachine import advance
@@ -749,7 +749,7 @@ class SweepEngine(Engine):
                 self._escalate(task, f"CRITICAL escalation from migration session: {details}")
             new_text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
             if result.status != "completed":
-                errors = [f"migration session {result.status}"]
+                errors = [session_failure_reason("migration", result)]
             else:
                 errors = validate_migration(result.result_json, manifest, pre_canonical, new_text)
             self.journal.append(
@@ -863,7 +863,7 @@ class SweepEngine(Engine):
                 details = "; ".join(str(e.get("detail", e.get("type", "?"))) for e in crits)
                 self._escalate(task, f"CRITICAL escalation from triage session: {details}")
             if result.status != "completed":
-                plan, errors = None, [f"triage session {result.status}"]
+                plan, errors = None, [session_failure_reason("triage", result)]
             else:
                 plan, errors = validate_triage(result.result_json, open_now)
             self.journal.append(

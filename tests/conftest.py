@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from bmad_loop import cli, documents
+from bmad_loop import cli, documents, platform_util
 from bmad_loop.adapters.base import SessionResult, SessionSpec
 from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.checks import ValidationReport
@@ -320,6 +320,32 @@ def project(tmp_path: Path, _project_template: Path) -> ProjectPaths:
         implementation_artifacts=root / "_bmad-output" / "implementation-artifacts",
         planning_artifacts=root / "_bmad-output" / "planning-artifacts",
     )
+
+
+UNRESOLVABLE = "stubbed: the provider is registered but not serving"
+
+
+def refuse_to_resolve(monkeypatch, *targets: Path) -> None:
+    """Make ``Path.resolve()`` raise WinError 64 for exactly ``targets`` — the answer
+    a registered-but-not-serving WSL UNC provider gives (#529/#536), and one CPython's
+    non-strict ``ntpath`` allow-list does not absorb, so ``resolve()`` fails outright
+    instead of degrading to its own lexical walk. That is the #552 condition.
+
+    Scoped to named paths on purpose: a blanket stub would break every unrelated
+    resolve in the process, and a row asserting "the command survived" would then pass
+    for a reason that has nothing to do with the guard under test. Also clears the
+    one-note-per-process dedupe set, so a row can assert on a note a previous test in
+    the same session would otherwise have consumed."""
+    real = Path.resolve
+    wanted = {str(t) for t in targets}
+
+    def stub(self, strict: bool = False):
+        if str(self) in wanted:
+            raise OSError(0, UNRESOLVABLE, None, 64)
+        return real(self, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", stub)
+    monkeypatch.setattr(platform_util, "_LEXICAL_FALLBACK_NOTED", set())
 
 
 def install_bmad_config(paths: ProjectPaths) -> None:
@@ -869,6 +895,30 @@ def write_ledger(paths: ProjectPaths, statuses: dict[str, str], commit: bool = T
         parts.append(
             f"### {dw_id}: item {dw_id}\n\norigin: test, 2026-06-01\n"
             f"location: src.txt:1\nreason: test entry.\nstatus: {status}\n"
+        )
+    paths.deferred_work.write_text("\n".join(parts), encoding="utf-8")
+    if commit:
+        git(paths.project, "add", "-A")
+        git(paths.project, "commit", "-q", "-m", "ledger")
+
+
+def write_gated_ledger(paths: ProjectPaths, entries, commit: bool = True) -> None:
+    """`write_ledger` plus the lines a hard gate is written on: `entries` maps a
+    DW id to `(status, extra_field_lines)`, appended verbatim after `status:` so a
+    test can spell a `gate:` line, a prose `HARD GATE:`, or a deliberately broken
+    one exactly as a human would.
+
+    Committed by default, like `write_ledger` and for the same reason: the engine
+    paths that dispatch a story need a clean tree. `validate` reads the file
+    directly and never looks at git, so its callers pass `commit=False` and skip
+    the git round-trip.
+    """
+    parts = ["# Deferred Work\n"]
+    for dw_id, (status, extra) in entries.items():
+        tail = "".join(f"{line}\n" for line in extra)
+        parts.append(
+            f"### {dw_id}: item {dw_id}\n\norigin: test, 2026-06-01\n"
+            f"location: src.txt:1\nreason: test entry.\nstatus: {status}\n{tail}"
         )
     paths.deferred_work.write_text("\n".join(parts), encoding="utf-8")
     if commit:

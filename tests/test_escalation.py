@@ -95,6 +95,48 @@ def test_dev_plain_noncompleted_still_retries_with_budget():
     assert "environment fault" not in decision.reason
 
 
+def test_vanished_session_says_so_without_changing_the_routing():
+    """#489: a session the multiplexer destroyed and a CLI that exited both land
+    `crashed`. The routing is the same (a retry re-creates the session), but the
+    reason must not read as "the agent ran and produced nothing"."""
+    task = _task(attempt=1)
+    vanished = SessionResult(status="crashed", session_vanished=True)
+    decision = decide_dev(task, vanished, None, POLICY)
+    assert decision.action == Action.RETRY  # unchanged: diagnosis, not routing
+    assert "multiplexer no longer reports the session" in decision.reason
+    # ablation pin: the same verdict WITHOUT the flag stays bare, or the suffix
+    # would be decoration rather than a discriminator. Pinned on a word the suffix
+    # actually contains — an assertion keyed to wording the text no longer uses
+    # passes for the wrong reason and stops guarding anything.
+    plain = decide_dev(task, SessionResult(status="crashed"), None, POLICY)
+    assert plain.reason == "dev session crashed"
+    # and the review side reads the same signal
+    review = decide_review_session(task, vanished, POLICY)
+    assert "multiplexer no longer reports the session" in review.reason
+
+
+def test_env_fault_and_lost_session_compose_instead_of_cancelling():
+    """#489 x #194: `crashed` is in ENV_FAULT_STATUSES and both deciders test
+    env_fault FIRST, so a session destroyed under the run whose log tail also
+    matches a transport pattern would otherwise pause blaming only the provider.
+    Both facts hold; the operator needs both."""
+    task = _task(attempt=1)
+    both = SessionResult(
+        status="crashed",
+        env_fault=True,
+        env_fault_evidence="API Error: Connection refused",
+        session_vanished=True,
+    )
+    decision = decide_dev(task, both, None, POLICY)
+    assert decision.action == Action.PAUSE  # env-fault routing is untouched
+    assert "environment fault: dev session crashed" in decision.reason
+    assert "multiplexer no longer reports the session" in decision.reason
+    assert "API Error: Connection refused" in decision.reason
+    # ablation pin: an env fault WITHOUT a lost session stays exactly as before
+    plain = SessionResult(status="crashed", env_fault=True)
+    assert "multiplexer" not in decide_dev(task, plain, None, POLICY).reason
+
+
 def test_review_env_fault_session_pauses():
     """The same classification pauses a review session (evidence in the reason),
     where a plain non-completed review would RETRY/DEFER."""

@@ -7,6 +7,8 @@ from pathlib import Path
 
 import yaml
 
+from .platform_util import resolve_or_lexical
+
 
 class BmadConfigError(Exception):
     pass
@@ -100,7 +102,27 @@ def worktree_isolation_conflict(paths: ProjectPaths, isolation: str) -> str | No
     hand-built :class:`ProjectPaths` (tests) need not have."""
     if isolation != "worktree":
         return None
-    if paths.repo_root.resolve() == paths.project.resolve():
+    # The default config — no `repo_root` key, so `__post_init__` makes the two the
+    # same object — is settled here, before anything asks the OS. That is not just an
+    # optimization: the two calls below are independent, so a *transient*
+    # canonicalization failure between them (the guard catches every OSError, not only
+    # a persistent WinError 64) could have one side degrade to lexical while the other
+    # succeeds and canonicalizes, making one path unequal to itself and refusing an
+    # ordinary isolated run with the #414 text. Comparing raw first means the common
+    # shape cannot reach that window at all.
+    if paths.repo_root == paths.project:
+        return None
+    # Degrades rather than raises (#552): this gate runs in `cmd_validate` *before*
+    # the platform preflight, so a raise here is the #332 finding going unreachable
+    # again for anyone on `isolation = "worktree"`. A ProjectPaths built by
+    # `load_paths` arrives with both sides canonical (it raises otherwise), so the
+    # degrade below covers only hand-built instances and a share flapping between
+    # the load and this gate. Both sides take the same treatment, so a host that
+    # cannot canonicalize compares lexical to lexical; the cost, stated rather than
+    # hidden: two spellings that only canonicalization folds together (`p/../p` vs
+    # `p`) would be refused with a wrong message, where the alternative is no
+    # message and no command at all.
+    if resolve_or_lexical(paths.repo_root) == resolve_or_lexical(paths.project):
         return None
     return (
         'isolation = "worktree" is not supported when repo_root differs from the project '
@@ -112,12 +134,57 @@ def worktree_isolation_conflict(paths: ProjectPaths, isolation: str) -> str | No
     )
 
 
+def _canonical(expanded: Path, label: str) -> Path:
+    """Canonicalize-or-raise, the shared boundary for every ProjectPaths member.
+    `label` names what refused in the operator's terms — a configured string is
+    reported with its raw spelling, the default output folder as the default —
+    so the message never calls a path "configured" that nobody configured."""
+    try:
+        return expanded.resolve()
+    except (OSError, RuntimeError) as e:
+        raise BmadConfigError(
+            f"cannot canonicalize the {label} ({expanded}): {e} — "
+            "whether it lies inside or outside the project tree cannot be determined, "
+            "so no run can safely proceed. Run `bmad-loop validate` for what this "
+            "host is doing."
+        ) from e
+
+
 def _resolve(raw: str, project: Path) -> Path:
-    return Path(raw.replace("{project-root}", str(project))).resolve()
+    """Expand `{project-root}` and canonicalize, or raise typed. A config string can
+    name a UNC share of its own, independent of `--project`, so it refuses on the same
+    terms as the root in `load_paths` (#552). Degrading to the lexical spelling was
+    tried and retired: a spelling the OS cannot canonicalize has an *unknowable*
+    location — it can sit lexically inside the project while an in-tree symlink or
+    junction carries it to a dead share outside — so any in-tree/external answer
+    `rebased`'s `relative_to` reads off the spelling is a guess, and a wrong guess
+    sends a worktree-isolated run's artifact writes into a worktree-local directory
+    instead of the configured destination. No member enters a snapshot unresolved."""
+    expanded = Path(raw.replace("{project-root}", str(project)))
+    return _canonical(expanded, f"configured path {raw!r}")
 
 
 def load_paths(project: Path) -> ProjectPaths:
-    project = project.resolve()
+    # The root must canonicalize or there is no consistent ProjectPaths to hand back
+    # (#552). Every member is compared against `project` — `rebased` decides "is this
+    # artifact dir inside the tree" with `relative_to` — so a lexical root next to a
+    # canonically spelled member (a resolved child, or an absolute path written
+    # canonically in config.yaml) sits on the far side of a symlink from it, files an
+    # in-tree artifact dir as external, and a worktree-isolated run then writes into
+    # the original checkout. Degrading here reopened that split once per review round;
+    # a typed raise closes every route at once, and it costs the diagnostic commands
+    # nothing: every caller already catches BmadConfigError — `cmd_validate` records
+    # the failure and still reaches the platform preflight that names the host — and
+    # `diagnose` never loads paths at all. Only `cli._project` still degrades: it runs
+    # pre-dispatch, where there is no handler to catch anything.
+    try:
+        project = Path(project).resolve()
+    except (OSError, RuntimeError) as e:
+        raise BmadConfigError(
+            f"cannot canonicalize the project root {project}: {e} — artifact paths "
+            "are derived from the canonical root, so no run can safely proceed. "
+            "Run `bmad-loop validate` for what this host is doing."
+        ) from e
     config_path = project / "_bmad" / "bmm" / "config.yaml"
     if not config_path.is_file():
         raise BmadConfigError(f"BMAD config not found: {config_path} (is BMAD installed here?)")
@@ -142,11 +209,18 @@ def load_paths(project: Path) -> ProjectPaths:
     repo_root_raw = doc.get("repo_root")
     repo_root = _resolve(str(repo_root_raw), project) if repo_root_raw else project
     out_raw = doc.get("output_folder")
-    output_folder = _resolve(str(out_raw), project) if out_raw else (project / "_bmad-output")
+    output_folder = (
+        _resolve(str(out_raw), project)
+        if out_raw
+        # the default branch is a bare join off the (canonical) root and takes the
+        # same canonicalize-or-raise treatment as a configured string: an in-tree
+        # junction under the default name misclassifies exactly like a configured one.
+        else _canonical(project / "_bmad-output", "default output folder")
+    )
     return ProjectPaths(
         project=project,
         implementation_artifacts=_resolve(str(impl), project),
         planning_artifacts=_resolve(str(plan), project),
-        output_folder=output_folder.resolve(),
+        output_folder=output_folder,
         repo_root=repo_root,
     )

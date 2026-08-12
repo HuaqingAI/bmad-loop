@@ -14,6 +14,26 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Added
 
+- **docs/testing.md: the formal testing strategy.** Layer taxonomy and placement rules, fixture
+  and ablation doctrine, the quality-guard inventory, zero-token and flake policy, and a tracked
+  gap register (#545–#549); AGENTS.md, docs/README.md and CONTRIBUTING.md link here.
+
+- **Add raw psmux premise probes (#488).** The zero-token Windows live gate now flags droppable
+  workarounds, and ablation repairs two vacuous backend assertions.
+
+- **A deferred-work entry can block a story: `gate:`.** An entry that must land before specific
+  stories run could only say so in prose (`HARD GATE: must land before 3-2`), and prose stopped
+  nothing — `run` drove the story anyway. A `gate: 3-2, 3-3` line names the blocked story keys, and
+  it is enforced on both sides: `bmad-loop validate` fails (`deferred.hard-gate`) for every
+  actionable story a token matches, in both queue modes, and `run` pauses (`story-gate`) rather
+  than dispatch a gated story — so the refusal no longer depends on remembering to run the
+  preflight. The pause happens before the story is recorded, so closing the entry and resuming
+  runs it. Sweeps are exempt: they are what closes the gating entry. The only deferred check that
+  gates rather than advises; cleared by closing the entry or dropping the token. A gate that can
+  enforce nothing — an unusable token, an empty `gate:` line, a `gate:` not written lowercase at
+  the start of a line, or a prose-only `HARD GATE:` — warns instead
+  (`deferred.hard-gate-unstructured`). Silent on a ledger that gates nothing, as before.
+
 - **Deferred review findings are harvested from spec frontmatter (#433).** BMAD-METHOD#2640 moved
   `defer`-triaged findings into the spec's unfiled `deferred:` list. A successful dev, review,
   repair or review-timeout-salvage pass now files each as `### DW-<n>` (`spec-deferrals-harvested`),
@@ -103,6 +123,33 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Changed
 
+- **Lint the workflows, and smoke-test the built package.** `trunk check` now runs `actionlint` and
+  `zizmor` over `.github/workflows/`, and a `build` CI job builds the sdist + wheel, runs
+  `bmad-loop --version` from the installed wheel, and checks that wheel carries every data file
+  `git ls-files` lists under `src/bmad_loop/data` — every other job runs from the source tree, so a
+  packaging break was invisible until release (`.trunk` had to be excluded from the sdist once
+  already). The inventory check is separate because `--version` is answered by argparse before
+  anything loads a packaged resource, so it passes on a wheel with no data tree at all. `.github/zizmor.yml` records the three deliberate suppressions: we tag-pin actions and
+  let Dependabot patrol them (`ref-pin`, not `hash-pin`), ci.yml publishes nothing, and the lint and
+  publish jobs keep their checkout credentials on purpose. The publish and build jobs set
+  `enable-cache: false` rather than being suppressed. Also: the `version-sync` job drops its
+  checkout credentials like its siblings, the release `publish` job gains the `timeout-minutes` it
+  was the only job missing, and Dependabot watches `uv.lock` for security advisories only
+  (`open-pull-requests-limit: 0` — pins here are deliberate, an advisory is not).
+
+- **State the supported tmux floor: 3.2.** It was never written down, so the only floor a reader
+  could infer was whatever the argv grammar happens to accept — which is older than anything the
+  project tests, and would have read as support for tmux releases nobody has verified. No version
+  gate enforces the floor; an older tmux is not refused up front, though it need not get far
+  either (env injection uses `new-window -e`, tmux 3.0). psmux's separate version gate is
+  unrelated and unchanged.
+
+- **An unreadable deferred-work ledger fails `validate` instead of warning
+  (`deferred.ledger-unreadable`).** The hard gate rides on the same bytes, so a warning exited 0
+  with the gate never evaluated — a fail-open on the one deferred check that refuses, and one that
+  cannot be narrowed by asking whether the project uses gates, because the file that would answer
+  is the unreadable one. `run` pauses on the same fault, so preflight and dispatch now agree.
+
 - **Every spec-frontmatter status read goes through `status_of` (#358 follow-up).** Five inline
   status reads remained in the engine and the generic adapter, each reading a blank `status:` as the
   token `none` — the defect #358 fixed at the shared reader. Three were neutral; the pair that was
@@ -149,6 +196,30 @@ whose seams had diverged enough that several ports needed a different fix, and t
   traceback dumped after any partial `--json` stdout; it is now a clean exit, so a Python caller's
   `subprocess.returncode` shows `130` rather than `-2`. A Ctrl+C _during_ a run is unchanged.
 
+- **Dedup the test suite; drop `engine._setup_mcp_agent_id`.** An AST sweep over all 69 test files
+  (name collisions plus normalized-body hashes) found one true duplicate:
+  `test_setup_mcp_agent_id_mapping` existed in both `test_engine_plugin.py` and
+  `test_worktree_flow.py`, the latter asserting a subset. The superset now lives once, beside the
+  function it covers, and `engine.py`'s `_setup_mcp_agent_id` re-export — carried solely for the
+  deleted import — goes with it. The adapter timeout (#157) and token-budget (#158) blocks in
+  `test_generic_tmux.py` now state their contract parity with the identically named
+  `test_opencode_http.py` tests, which already pointed back: a behavior change lands in both or
+  records the divergence. Every other collision the sweep surfaced was adjudicated deliberate
+  (disjoint `parametrize` sets, or one body run against two different shipped scripts).
+
+- **The env-var registry invariant is enforced, not just documented.** A new
+  `test_portability_guard.py` scan fails any `BMAD_LOOP_*` read taken straight from the process
+  environment outside `envvars.py`, the two stdlib-only hook relays and the Unity helper scripts —
+  reads only, since the env dicts the engine and plugins _build_ for a child session are the
+  producing side. No violation existed; it is a tripwire for the next one. `envvars.py` also gains
+  the tests it never had, pinning each reader's parse and fallback.
+
+- **The TUI's hard-stop and archive paths are covered.** `x` stops a live run and kills its ctl
+  window; on a run that is not _provably_ alive it refuses (the gate is `== "alive"`, so an
+  unverifiable pid is refused alongside a dead one — stricter than `S`, and asymmetric with `A`,
+  which blocks only `alive`). `A` archives and forgets the run, and refuses a live one.
+  `shift+tab` reverse-cycles the resize ring.
+
 ### Removed
 
 - **The `bmad-auto` → `bmad-loop` rename compatibility is gone.** The rename shipped in 0.8.0 and no
@@ -157,6 +228,10 @@ whose seams had diverged enough that several ports needed a different fix, and t
   prints the leftover-`.automator/` note; `bmad-loop-setup` drops its migration section with them.
   A project still on `bmad-auto` should migrate on 0.9.1 — the last release carrying the shims —
   before upgrading past it.
+
+- **`pytest-rerunfailures` is out of the dev group.** Nothing invoked it — no `--reruns`, no
+  `addopts`, no `flaky` marker anywhere in the repo or CI. A test-retry plugin sitting in the
+  environment is an invitation to paper over a real flake, so it goes rather than stays unused.
 
 ### Fixed
 
@@ -172,6 +247,107 @@ whose seams had diverged enough that several ports needed a different fix, and t
   a new `version_error()` seam accessor carries the dropped diagnostic, and `bmad-loop mux` prints
   it as a whitespace-collapsed `warning:` line on stderr below the table — the `-` in the VERSION
   column cannot say which of the two happened.
+
+- **A project path the OS refuses to canonicalize no longer kills every command (#552).** On a
+  Windows host whose WSL UNC provider is registered but not serving, resolving
+  `\\wsl$\<distro>\...` raises `ERROR_NETNAME_DELETED` (WinError 64) — off CPython's non-strict
+  allow-list, so `Path.resolve()` fails outright. `cli._project` runs before dispatch, so every
+  subcommand died at the backstop with `error: [WinError 64] ...`, `diagnose` and `validate`
+  included: the `host.win32-on-wsl-path` warning naming the fault was unreachable on the only
+  hosts it is for. `cli._project` now degrades to `Path.absolute()` with one note on stderr — it
+  runs pre-dispatch, where no handler can catch anything — so those commands run and report.
+  `bmadconfig.load_paths` refuses instead, with a typed `BmadConfigError`: every artifact path is
+  compared against the canonical root, so a degraded root beside any canonically spelled member —
+  a resolved child, or an absolute path written canonically in config.yaml — mis-files an in-tree
+  artifact dir as external and sends a worktree-isolated run's writes into the original checkout.
+  Every caller already catches the typed error; `validate` records the `bmad-config` failure and
+  still reaches the platform preflight. Configured artifact strings refuse on the same terms: a
+  spelling the OS cannot canonicalize has an unknowable location — it can sit lexically inside
+  the project while an in-tree junction carries it to a dead share outside — so classifying it by
+  its spelling is a guess that can redirect a worktree-isolated run's writes.
+  The paths that need a canonical answer downstream — `runs.project_tag`, worktree provisioning,
+  `verify` — still raise, so nothing tags one project two ways. `..` is kept rather than
+  collapsed; folding it lexically names a different directory across a symlink, and this value is
+  persisted as `state.project` and reused as a repo root and a cwd.
+
+- **The last two bare git spawns route through the `_run_git` chokepoint, and a guard now
+  enforces the invariant (#390).** An undecodable byte in a commit subject crashed the TUI's
+  story-checkpoint modal: the bare spawn decoded strictly, and `UnicodeDecodeError` slipped both
+  arms of its guard. It and `install`'s tracked-policy probe (which ignored `limits.git_timeout_s`
+  and the `LC_ALL=C` pin) now call `verify.git_bytes`, with the subject decoded
+  `errors="replace"`. Both keep their original short deadlines through a new per-call
+  `timeout_s` override on the chokepoint (5s on the TUI's event loop, 10s for the init hint) —
+  standing inside the chokepoint no longer costs an interactive surface the difference between
+  a degraded label and a two-minute freeze. `test_portability_guard.py` gains a git-argv
+  detector quarantining `["git", ...]` — tuple spellings, string-form spawns
+  (`subprocess.run("git status")`, with or without a shell), and either shape factored into a
+  named constant (`GIT = "git"`, `GIT_STATUS = "git status"`) included — to `_run_git`'s own
+  argv argument in `verify.py`, so the next bypass fails CI
+  instead of surviving by convention, including one added to a non-chokepoint helper inside
+  `verify.py` itself. AGENTS.md's chokepoint line now states its real
+  scope (`src/bmad_loop`) and names the enforcer; tests, `scripts/` and CI workflows deliberately
+  spawn their own git, since a harness must not depend on the artifact it validates.
+
+- **`BMAD_LOOP_SESSION_TIMEOUT_S=inf` no longer disables the session timeout.** The guard was
+  one-sided — it rejected a non-positive value so an override could not silently _shorten_ a run's
+  budget — but `float()` accepts `inf`, `1e999` and `Infinity`, and all three pass `> 0`. Both
+  adapters build their deadlines as `time.monotonic() + timeout_s`, so a non-finite budget produced
+  a deadline that could never expire, and that budget is the outer bound every stall-grace and
+  wake-nudge window defers to: an unattended run could wedge with no backstop left. The reader now
+  requires a finite positive value and otherwise falls back to `limits.session_timeout_min × 60`,
+  as it already did for `0`, `-1` and unparseable input. A large _finite_ value is still honoured.
+
+- **A tab in the project path no longer truncates the project tag a window listing carries.**
+  The multiplexer listing is tab-delimited and the tag holds a resolved filesystem path, where a tab
+  is a legal byte — so the parse split one row into extra fields and dropped the tail, leaving a
+  truncated tag that reads as another project's. The prune scan then skipped the project's own
+  parked control windows. The last requested field now keeps its delimiters.
+
+- **Removing a run directory no longer strands a session that outlived its engine (#526).**
+  `delete`, `archive` and `clean` gated on engine-pid liveness, which an orphan — engine dead,
+  agent session still alive — passes. For an untagged session the run dir is the last ownership
+  proof a prune can read, so removing it leaked the session for the life of the machine. Removal
+  now refuses while a `bmad-loop-<run-id>` session the project cannot prove foreign is live, and
+  `clean` leaves the run untouched; `--force` overrides the refusal and kills nothing, since a
+  session name carries no project.
+
+- **A project path the multiplexer cannot carry no longer strands the scans over it (#419).** The
+  ownership tag held the resolved path, and two transports mangled it: psmux's control line refuses
+  a spaced UNC share, and a listing row splits on any separator `splitlines()` knows (LF, CR, VT,
+  FF, FS, GS, RS, NEL, U+2028, U+2029) or fails a strict decode on a non-UTF-8 filename byte. Either
+  way the session or window went untagged — leaking once `clean` removed its run dir, and prunable
+  by another project on a reused `--run-id`. The tag is now a 16-hex digest of the path, safe on
+  both transports by construction; pruning still accepts the legacy path tag, so state surviving the
+  upgrade keeps its ownership. Reading a legacy raw tag is the decode half (#380).
+
+- **A run id that is a suffix of another no longer resolves to the neighbour's control window.**
+  `--run-id` is caller-supplied and may contain `-`, so `run-other-RID` satisfied the lookup for
+  `RID` — and sorted ahead of it, so `x` could kill the neighbouring run's live orchestrator.
+  Window names are parsed and the run id compared whole, as the prune scan already did.
+
+- **Attach, return-stamp and kill follow the run's live control window, not an older one (#482).**
+  `<kind>-<run_id>` window names are not unique, so the lookup answered the first match — `a`, the
+  return stamp and `x` all landed on a parked run's dead window while the live one ran on. Each
+  launch records the window id it minted and the lookup prefers it while the listing still shows it
+  under this run id; with no record the answer is unchanged, and a resume whose id was not captured
+  warns rather than reporting plain success. **Adapter authors:** the re-prove pairs
+  `new_parked_window`'s id with the `window_id` column of `list_windows`, which the seam previously
+  left free to diverge — a backend where they differ degrades to the by-name resolve.
+
+- **Diagnose a lost multiplexer session on the crash path (#489).** A dead window and a session
+  destroyed under the run (a reaper, this tool's own prune/stop, an operator `kill-session`, a
+  server crash) both scored `crashed` and read as an agent fault. Probe `has_session` on a crash
+  verdict and carry the answer in the failure reason — including the repair path's exhaustion
+  defer, which otherwise blamed the tree for repairs that never ran — as `session_vanished` on
+  `dev-decision` and `fix-decision` either way, on every role's `session-end` entry when true (the
+  `env_fault` convention there), and as a `session-vanished` lifecycle breadcrumb, composed with an
+  environment-fault pause. Diagnosis only: routing is unchanged and a retry re-creates the session.
+
+- **Stop a #332 resolve guard from flaking on the Windows runner (#529).** Test-only; no runtime
+  change. Resolving a real `\\wsl$\...` path tied the guard to the runner's WSL provider, which
+  answers `ERROR_NETNAME_DELETED` (64) when registered but not serving — a code CPython's non-strict
+  resolution does not tolerate. The syscall is stubbed instead, covering both `realpath` branches.
+
 - **A native-Windows install driven from a WSL shell now says so (#332).** WSL appends the Windows
   `PATH` to its own, so a bash prompt can reach a Windows-installed `bmad-loop`: that interpreter
   reports `win32`, takes the psmux platform default, and never sees the distro's tmux — while

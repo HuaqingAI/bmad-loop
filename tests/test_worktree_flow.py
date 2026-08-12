@@ -439,5 +439,9 @@ def test_provision_worktree_reexported_from_install():
 
 
 def test_setup_mcp_agent_id_mapping():
+    # only claude carries the "-code" suffix; everything else passes through
     assert _setup_mcp_agent_id("claude") == "claude-code"
     assert _setup_mcp_agent_id("codex") == "codex"
+    assert _setup_mcp_agent_id("gemini") == "gemini"
+    assert _setup_mcp_agent_id("cursor") == "cursor"
+    assert _setup_mcp_agent_id("some-custom-profile") == "some-custom-profile"

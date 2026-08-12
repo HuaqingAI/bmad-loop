@@ -230,6 +230,27 @@ def test_configure_git_timeout_overrides_bound(project, monkeypatch):
     assert seen["timeout"] == 7
 
 
+def test_git_bytes_per_call_timeout_overrides_module_state(project, monkeypatch):
+    """`timeout_s=` wins over the engine-configured module bound for one call —
+    the interactive callers' seam (#390): the TUI keeps its 5s modal deadline and
+    install its 10s probe bound while standing inside the chokepoint, and a call
+    that passes nothing keeps the module default. Ablation: ignore the param in
+    `_run_git` (or drop `git_bytes`' passthrough) and the spied timeout is the
+    120s default on the first call."""
+    seen: dict[str, object] = {}
+    real_run = subprocess.run
+
+    def spying_run(cmd, **kwargs):
+        seen["timeout"] = kwargs.get("timeout")
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(verify.subprocess, "run", spying_run)
+    verify.git_bytes(project.project, "rev-parse", "HEAD", timeout_s=7)
+    assert seen["timeout"] == 7
+    verify.git_bytes(project.project, "rev-parse", "HEAD")
+    assert seen["timeout"] == verify.GIT_TIMEOUT_S
+
+
 def test_run_git_forces_c_locale(project, monkeypatch):
     """Every git child runs with LC_ALL=C so message text stays stable English —
     the chokepoint fix for #236 (safe_rollback's "did not match" tolerance must not

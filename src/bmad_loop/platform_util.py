@@ -188,11 +188,94 @@ def is_wsl_unc_path(value: str | Path) -> bool:
     of those match. An extended-length ``\\\\?\\UNC\\...`` prefix the input already
     carried (``ntpath.realpath`` only strips one it added itself) is folded down to the
     plain UNC form here, so that spelling matches too. A spelling this still misses
-    degrades gracefully: the ``mux.selection`` line names the platform regardless."""
+    degrades gracefully: the ``mux.selection`` line names the platform regardless.
+
+    One caller now passes an *un*resolved path: when the OS refuses to canonicalize,
+    :func:`resolve_or_lexical` degrades to ``absolute()``, which is the only way this
+    check runs at all on the host it is for (#552). All four bridge spellings still
+    match — they are already absolute — but the mapped-drive/``subst`` dereference is
+    gone, so a substituted drive letter over a *dead* provider goes unflagged. That is
+    the graceful-degradation case above, not a new one: the finding is a warning, and
+    ``mux.selection`` still names the platform."""
     text = str(value).replace("/", "\\").lower()
     if text.startswith("\\\\?\\unc\\"):
         text = "\\\\" + text[len("\\\\?\\unc\\") :]
     return text.startswith(("\\\\wsl.localhost\\", "\\\\wsl$\\"))
+
+
+# One note per degraded spelling per process. A single invocation canonicalizes the
+# project root at least twice — `main()` pre-dispatch, then the handler's own
+# `_project` — and one condition must not print two lines.
+_LEXICAL_FALLBACK_NOTED: set[str] = set()
+
+
+def resolve_or_lexical(path: str | Path) -> Path:
+    """``Path(path).resolve()``, degrading to a *lexical* absolutization — and one
+    note on stderr — when the OS refuses to canonicalize the path (#552).
+
+    The condition this exists for: on a Windows host whose WSL UNC provider is
+    registered but not serving, resolving ``\\\\wsl$\\<distro>\\...`` raises
+    ``ERROR_NETNAME_DELETED`` (WinError 64). CPython's non-strict
+    ``ntpath._getfinalpathname_nonstrict`` re-raises any winerror outside its
+    allow-list, and 64 is not on it, so ``resolve()`` fails outright rather than
+    falling back to its own lexical walk. Reached from ``cli._project`` before
+    dispatch, that killed *every* subcommand at ``main()``'s backstop — including
+    ``diagnose`` and ``validate``, whose ``host.win32-on-wsl-path`` finding names
+    that exact host. The warning was unreachable on the only hosts it is for.
+
+    ``RuntimeError`` is caught alongside ``OSError`` because ``resolve()`` raises it,
+    not an ``OSError``, for a symlink loop on the 3.11/3.12 floor — the asymmetry
+    ``install._shield_undo_extension`` documents; the pair is this repo's house guard,
+    applied at 17-odd sites already.
+
+    **Degrade, not fail** — deliberately, and bounded. The fallback is exactly
+    ``Path(path).absolute()``: absolute, nothing else. It is enough for the
+    observation surface, because :func:`is_wsl_unc_path` is purely lexical and every
+    bridge spelling is already absolute, so ``absolute()`` hands it back untouched
+    (pathlib folds ``//wsl.localhost/...`` to the backslash form on the way). It is
+    *not* canonical, so this helper stays at the observation surface —
+    ``cli._project``, which runs pre-dispatch where there is no handler to catch
+    anything, and ``bmadconfig.worktree_isolation_conflict``'s comparison, which must
+    not kill ``validate`` ahead of the platform preflight. ``bmadconfig.load_paths``
+    is the boundary and refuses instead — a typed ``BmadConfigError`` for the project
+    root *and* every configured path: a spelling the OS cannot canonicalize has an
+    unknowable location (it can sit lexically inside the project while an in-tree
+    junction carries it to a dead share outside), and classifying it by its spelling
+    is a guess that can redirect a worktree-isolated run's writes. The write paths
+    that need a canonical answer keep their bare ``resolve()`` and still raise:
+    ``runs.project_tag`` digests ``str(project.resolve())`` into a session-ownership
+    tag, and two spellings of one project would strand live sessions. So a ``run`` on
+    such a host fails loud at config load, while ``validate``/``diagnose`` still
+    reach the finding that explains it — observation degrades, repair writes raise.
+
+    **Rejected: ``normpath(absolute(path))``.** Collapsing ``..`` lexically is not a
+    respelling, it names a *different directory* whenever the ``..`` crosses a
+    symlink — measured, not reasoned: with ``/home/u/link -> /var/x``,
+    ``/home/u/link/../proj`` opens ``/var/proj``, and normpath yields
+    ``/home/u/proj``. The raw value reaching here is persisted as ``state.project``
+    and reused as a git repo root and a session cwd (``runsetup.build_run_state``,
+    ``runs``, ``resolve``), so that would be a silent wrong-directory write — a
+    failure class ``resolve()`` never had, introduced by the guard meant to soften
+    it. Plain ``absolute()`` keeps the ``..`` and lets the OS dereference it
+    correctly at every use, which is the whole reason to prefer it over a
+    prettier-looking string.
+
+    A relative ``path`` with an unreadable cwd still raises out of ``absolute()``:
+    there is no lexical answer to degrade to, and the backstop is the honest reply."""
+    try:
+        return Path(path).resolve()
+    except (OSError, RuntimeError) as e:
+        lexical = Path(path).absolute()
+        if str(lexical) not in _LEXICAL_FALLBACK_NOTED:
+            _LEXICAL_FALLBACK_NOTED.add(str(lexical))
+            # stderr, never stdout: `<cmd> --json` is a one-object-on-stdout contract.
+            print(
+                f"note: cannot canonicalize {path}: {e} — continuing with the lexical "
+                f"path {lexical} (symlinks are not dereferenced). "
+                "Run `bmad-loop validate` for what this host is doing.",
+                file=sys.stderr,
+            )
+        return lexical
 
 
 def _retry_on_sharing_violation(op: Callable[[], None]) -> None:
@@ -242,7 +325,7 @@ def _copy_xattrs(src: Path, dst: Path) -> None:
             continue
 
 
-def atomic_write_text(path: Path, text: str) -> None:
+def atomic_write_text(path: Path, text: str, *, follow_symlinks: bool = True) -> None:
     """Replace ``path``'s contents with ``text`` atomically, preserving what the
     replacement would otherwise silently discard.
 
@@ -253,7 +336,11 @@ def atomic_write_text(path: Path, text: str) -> None:
     * **Symlinks are followed.** ``path.resolve()`` first, so a ledger symlinked
       into the repo keeps being a symlink and the real file is what gets rewritten
       — a replace against the link itself would turn it into a regular file and
-      orphan the target.
+      orphan the target. Pass ``follow_symlinks=False`` to invert that: the name
+      is replaced, whatever it points at. Right for a machine-minted file living
+      somewhere a less-trusted writer can reach, where honouring a planted link
+      would aim this write at a path of that writer's choosing; wrong for the
+      operator-curated ledgers this helper was built for, hence the default.
     * **Permission bits survive.** A ``0600`` file stays ``0600`` instead of
       becoming ``0644 & ~umask``, which on a shared artifact dir is the difference
       between "the group can still write this" and a silent lockout (or a
@@ -285,7 +372,7 @@ def atomic_write_text(path: Path, text: str) -> None:
     above and differ only in the ``os.fdopen`` mode. Text mode's *newline*
     default (translating) is deliberate here — it matches the ``Path.write_text``
     this replaced, so a ledger's line endings do not change under Windows."""
-    _atomic_write(path, text, mode="w", encoding="utf-8")
+    _atomic_write(path, text, mode="w", encoding="utf-8", follow_symlinks=follow_symlinks)
 
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -304,14 +391,41 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
     _atomic_write(path, data, mode="wb", encoding=None)
 
 
-def _atomic_write(path: Path, payload: str | bytes, *, mode: str, encoding: str | None) -> None:
+def _atomic_write(
+    path: Path,
+    payload: str | bytes,
+    *,
+    mode: str,
+    encoding: str | None,
+    follow_symlinks: bool = True,
+) -> None:
     """The shared body of the two public helpers above — see
     :func:`atomic_write_text` for the contract every step here implements.
 
     Written through ``os.fdopen`` rather than a raw ``os.write`` loop on purpose:
     it routes to ``io.open``, the one seam a test can inject a short write at for
-    both variants at once (tests/test_install.py's #375 case)."""
-    target = path.resolve()
+    both variants at once (tests/test_install.py's #375 case).
+
+    ``follow_symlinks=False`` skips the resolve, so the *name* is what gets
+    replaced. It needs no preflight ``is_symlink`` check to be safe, and that is
+    the reason to prefer it over one: ``os.replace`` does not dereference its
+    destination, so a link planted at any moment — including between a check and
+    this call — is overwritten rather than written through.
+
+    Mode and xattrs are then not inherited **at all**, and nothing is probed to
+    decide that. A name being replaced rather than updated should carry nothing
+    of whatever it used to point at, and in this mode there is no trustworthy
+    prior to carry over anyway: the caller asked for no-follow precisely because
+    a less-trusted writer can reach the name, so the mode found there is that
+    writer's choice as much as anyone's. Probing first and copying after would
+    also reopen by the back door the very window the paragraph above closes —
+    ``shutil.copymode`` re-resolves the path it is handed, so a link planted
+    between the probe and the copy hands the new record the mode of a file of
+    the planter's choosing (the contents stay safe; ``os.replace`` still does not
+    dereference). Taking no probe leaves no window to race, and ``mkstemp``'s
+    private ``0600`` is the right mode for the machine-minted file this mode
+    exists for."""
+    target = path.resolve() if follow_symlinks else path
     fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=target.name + ".", suffix=".tmp")
     tmp = Path(tmp_name)
     try:
@@ -319,13 +433,116 @@ def _atomic_write(path: Path, payload: str | bytes, *, mode: str, encoding: str 
             fh.write(payload)
             fh.flush()  # userspace buffer -> kernel, so there is something to sync
             os.fsync(fh.fileno())
-        if target.exists():
+        if follow_symlinks and target.exists():
             shutil.copymode(target, tmp)
             _copy_xattrs(target, tmp)
         atomic_replace(tmp, target)
     except BaseException:
         with suppress(OSError):
             tmp.unlink()
+        raise
+
+
+# Whether this platform has the `*at()` family the two helpers below need. The
+# probe is `O_DIRECTORY` rather than `os.supports_dir_fd`: that set tracks only
+# the literal `dir_fd` parameter, so `os.replace` — which spells it
+# `src_dir_fd`/`dst_dir_fd` — is absent from it even on Linux, where renameat
+# works. CPython gates the whole family on one configure pass, so the flag's
+# presence answers for all of them: it is defined on Linux/macOS and absent on
+# Windows, whose pyconfig has neither HAVE_RENAMEAT nor HAVE_OPENAT.
+DIR_FD_ANCHORED_WRITES = hasattr(os, "O_DIRECTORY")
+
+
+def open_dir_confined(root: Path, target: Path) -> int | None:
+    """An open descriptor for ``target``, reached from ``root`` without
+    traversing a symlink at any component below it — or None when that cannot be
+    established. The caller owns the descriptor and must ``os.close`` it.
+
+    A *descriptor*, not a verdict, and that is the whole point. A boolean
+    "is this path confined?" is answered about a path, and the answer is stale
+    the instant it returns: whoever can write those directories can swap one for
+    a symlink before the caller gets around to opening anything. The descriptor
+    this hands back is bound to the directory that was actually walked, so a
+    later swap of any name along the way renames a path this no longer consults.
+    Pair it with :func:`atomic_write_text_at`, which never names a path again.
+
+    Each component is opened ``O_NOFOLLOW | O_DIRECTORY`` relative to the one
+    above it, so a link anywhere below ``root`` fails the open rather than being
+    followed. ``root`` itself is opened without ``O_NOFOLLOW``: the operator
+    chooses where the project lives and may keep it behind a link, while
+    everything under it is session-writable.
+
+    POSIX only — see :data:`DIR_FD_ANCHORED_WRITES`. Callers need a fallback for
+    win32, which has no ``*at()`` family to anchor against."""
+    if not DIR_FD_ANCHORED_WRITES:
+        return None
+    try:
+        relative = target.relative_to(root)
+    except ValueError:
+        return None  # not under root at all
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return None
+    for part in relative.parts:
+        try:
+            nested = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+        except OSError:
+            os.close(fd)
+            return None  # a link, a missing component, or one we cannot probe
+        os.close(fd)
+        fd = nested
+    return fd
+
+
+# Draws before giving up on a unique temp name. O_EXCL makes a collision
+# harmless, so this only bounds a pathological loop.
+_TMP_NAME_ATTEMPTS = 100
+
+
+def atomic_write_text_at(dir_fd: int, name: str, text: str) -> None:
+    """:func:`atomic_write_text`, anchored at an open directory descriptor.
+
+    Every syscall here is relative to ``dir_fd``, so nothing resolves a path a
+    concurrent writer could have redirected — the directory is the one
+    :func:`open_dir_confined` walked to, whatever its name points at now. That
+    closes the window a preflight path check leaves open, rather than narrowing
+    it. ``name`` must be a single component.
+
+    Shares the shape of the path-based helper: unique temp in the same
+    directory, contents fsynced *before* the replace publishes them, temp
+    removed on any failure. It deliberately does NOT inherit mode or xattrs —
+    this exists for machine-minted files under a session-writable root, where
+    the prior file's mode is as untrusted as the rest of it, so the new record
+    keeps the private ``0600`` it is created with. Text is written UTF-8 with
+    no newline translation; the callers are records, not operator-edited files.
+
+    No win32 sharing-violation retry, unlike :func:`atomic_replace`: there is no
+    win32 here at all — the ``*at()`` family this is built on does not exist
+    there, so a caller reaching this is on POSIX by construction."""
+    for _ in range(_TMP_NAME_ATTEMPTS):
+        # os.urandom, not `random`: this name is created in a directory a
+        # less-trusted writer can reach, and a predictable one lets them
+        # pre-create it and fail every record write (O_EXCL turns the collision
+        # into a refusal rather than a clobber, so the harm is a stuck hint
+        # rather than a redirect — but an unguessable name removes even that).
+        tmp = f"{name}.{os.getpid():x}.{os.urandom(4).hex()}.tmp"
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=dir_fd)
+        except FileExistsError:
+            continue  # astronomically unlikely; costs one more draw
+        break
+    else:
+        raise OSError(f"no free temp name beside {name!r} after {_TMP_NAME_ATTEMPTS} tries")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
+            fh.flush()  # userspace buffer -> kernel, so there is something to sync
+            os.fsync(fh.fileno())
+        os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except BaseException:
+        with suppress(OSError):
+            os.unlink(tmp, dir_fd=dir_fd)
         raise
 
 

@@ -35,10 +35,18 @@ the session's attached-client count instead of read off the exit code; see
 the ``client verbs: observed effect (#317)`` block. ``available()``
 additionally gates on the reported version: psmux releases up to 3.3.6 kill
 recycled PIDs during pane/session teardown without a process-identity check,
-which can take down an unrelated long-lived process mid-run. The psmux
-behaviors cited in this
-module were read from the psmux source at tag ``v3.3.7``. See
-:mod:`.multiplexer` for the contract.
+which can take down an unrelated long-lived process mid-run. ``has_session``
+is inherited unchanged, but one server per session gives it a residual the
+tmux path does not have: a ``-t`` read naming a session whose own server is
+gone can be answered by a different server, so a wrong ``True`` is reachable
+when a same-named session exists on a foreign one. For the lost-session probe
+(#489) that is the safe direction — a wrong ``True`` drops the diagnosis
+rather than inventing one — and the collision it needs is an independently
+created session sharing a ``bmad-loop-<run-id>`` name: an operator's, or
+another run's on a colliding id (see #531). The psmux
+behaviors cited in this module were read from the psmux source at tag
+``v3.3.7``; the safe observable subset is probed in ``tests/test_psmux_live.py``.
+See :mod:`.multiplexer` for the contract.
 """
 
 from __future__ import annotations
@@ -506,15 +514,9 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # tag is non-empty and never equals the caller's tag again, so the
         # prune skips that session forever.
         #
-        # Refusing leaves the option UNSET, which is the correct degradation
-        # and not the lesser evil: the prune's untagged path falls back to the
-        # run dir, claiming our own dead runs and skipping foreign ones. State
-        # the bound rather than the slogan — that fallback proves ownership by
-        # run-id collision on disk, not by identity, so it skips a foreign
-        # session only while no run dir HERE shares its run id. Ids are
-        # timestamped plus two random bytes, but `--run-id` is caller-supplied,
-        # so untagged is weaker proof than a tag even though it beats a
-        # corrupted one. Both edges of that fallback are bounded in #419.
+        # Refusing leaves the option unset. Project ownership now uses a hex
+        # digest that clears this gate by construction (#419), but the gate stays
+        # as the general contract for every `@` session option.
         #
         # The refusal frees the key rather than just returning. A session this
         # backend just created is NOT a blank map — the server loads the user's
@@ -526,7 +528,7 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             print(
                 f"warning: set-option {option} skipped on session {name} — value does "
                 "not survive psmux's control-line transport verbatim; the key is freed "
-                "and ownership falls back to the run dir",
+                "and the option reads as unset",
                 file=sys.stderr,
             )
             self._write_scoped(["set-option", "-u", "-t", name, option], option)

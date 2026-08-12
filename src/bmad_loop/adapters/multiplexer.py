@@ -92,7 +92,16 @@ class TerminalMultiplexer(ABC):
 
     @abstractmethod
     def has_session(self, name: str) -> bool:
-        """True iff a session named exactly ``name`` exists."""
+        """True iff a session named exactly ``name`` exists.
+
+        Weak False (#489): a False means the backend did not *confirm* the
+        session, not that it provably no longer exists — implementations map
+        any failed lookup ("no such session", "no server running", a target
+        the grammar could not parse) to False alike. A transport failure
+        (the backend could not be asked at all) raises ``MultiplexerError``
+        rather than returning False. Callers that surface a False as
+        evidence must word it as what the negative withdraws, not what it
+        proves — see ``escalation.session_failure_reason``."""
 
     @abstractmethod
     def new_session(
@@ -158,7 +167,8 @@ class TerminalMultiplexer(ABC):
         """Create a window that runs ``argv`` then *parks* — waiting on a key so
         the exit status stays inspectable instead of the window closing the moment
         the process exits — and finally returns an attached client to its origin
-        (keyed by the per-window ``return_opt``). Returns the native window id."""
+        (keyed by the per-window ``return_opt``). Returns the native window id;
+        for its required form see :meth:`list_window_ids`'s note on #482."""
 
     @abstractmethod
     def list_window_ids(self, session: str) -> list[str]:
@@ -172,10 +182,11 @@ class TerminalMultiplexer(ABC):
         server per session), so a bare ``@N`` replayed as a ``-t`` target
         routes by the *caller's* server instead of the owning one.
 
-        :meth:`new_parked_window` is *outside* the rule — nothing
-        membership-tests a parked id, it is only replayed as a ``-t`` target by
-        the TUI — so a backend MAY mint it in a form this list never carries
-        (psmux happens to qualify it too, #291).
+        :meth:`new_parked_window` is outside *this* list's rule. To preserve
+        #482's unambiguous lookup, however, its id must match the ``window_id``
+        column of :meth:`list_windows` (psmux qualifies both, #291). A backend
+        that diverges remains usable, but falls back to the ambiguous by-name
+        lookup whenever several kinds share a run id.
 
         Raises :class:`MultiplexerError` if the transport itself fails (timeout /
         missing binary): an empty list means "no windows" and must not be
