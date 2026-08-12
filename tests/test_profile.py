@@ -741,6 +741,15 @@ def test_profile_scan_failure_degrades(profile_scan):
         # admitting it from a provider — the divergence this whole test denies
         ({"adapter": "   "}, "adapter"),
         ({"binary": "  "}, "required"),
+        # ...and the other half of that same divergence: NON-canonical, not empty.
+        # `_parse_profile` strips exactly these three, so an unstripped value is
+        # content the TOML route cannot produce. Validating a stripped copy while
+        # installing the frozen original would file the profile under a key no
+        # `--cli` finds / a binary no `which` resolves / a kind no registry has,
+        # with the provider recorded as fine.
+        ({"adapter": " acme "}, "whitespace"),
+        ({"name": " acme "}, "whitespace"),
+        ({"binary": " acme "}, "whitespace"),
     ],
 )
 def test_entry_point_profile_must_pass_the_parser_invariants(profile_scan, over, match):

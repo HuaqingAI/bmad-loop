@@ -238,6 +238,35 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
     if not profile.adapter.strip():
         raise fail("adapter must be a non-empty string naming an adapter kind")
 
+    # The emptiness tests above use `.strip()` because the TOML route CANONICALIZES
+    # before it gets here — `_parse_profile` strips exactly these three fields — so
+    # testing the raw value would refuse `adapter = "  "` from a file while
+    # admitting it from a provider. But validating a stripped COPY while the frozen
+    # original is what gets installed leaves the other half of that same divergence
+    # open: `" acme "` is content `_parse_profile` cannot produce, and every
+    # consumer keys on the exact string. The profile lands under a map key `--cli
+    # acme` never finds, a `binary` `shutil.which` never resolves, and an `adapter`
+    # `get_adapter_kind` reports as an unknown kind — while the provider that
+    # shipped it is recorded as perfectly fine.
+    #
+    # Refused, not normalized: this function validates and does not rewrite, and a
+    # frozen dataclass rebuilt here would leave the caller holding the original
+    # anyway. Refusing is also the louder half — the provider is dropped WITH a
+    # reason naming the field, which is what the recorded-degrade contract owes an
+    # operator. Ordered after the emptiness tests so `"   "` still reads as empty
+    # rather than as non-canonical.
+    for label, value in (
+        ("name", profile.name),
+        ("binary", profile.binary),
+        ("adapter", profile.adapter),
+    ):
+        if value != value.strip():
+            raise fail(
+                f"{label} must not carry leading/trailing whitespace: {value!r} "
+                "(the TOML route strips it; a provider must hand over the "
+                "canonical value so both routes install the same profile)"
+            )
+
     # The one coherence rule between the two axes, and the only place both routes
     # pass through. `generic` is the bundled tmux adapter: it injects into a window
     # and completes on a Stop hook (or the window dying), so pairing it with

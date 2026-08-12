@@ -165,7 +165,10 @@ whose seams had diverged enough that several ports needed a different fix, and t
   the profile map now share one invariant set (hook dialect, path containment, `env_fault_patterns`
   compilation, …), so a package can no longer install a profile state the parser would refuse — an
   invalid env-fault regex used to trade a load-time error for a silent never-match at classification
-  time. A malformed `adapter` value funnels into `ProfileError` rather than being `str()`-coerced.
+  time. A malformed `adapter` value funnels into `ProfileError` rather than being `str()`-coerced,
+  and `name`/`binary`/`adapter` must arrive already canonical — the TOML route strips them, so a
+  provider handing over `" acme "` would otherwise install a profile filed under a key no `--cli`
+  resolves, with the provider itself recorded as fine.
 
 - **Lint the workflows, and smoke-test the built package.** `trunk check` now runs `actionlint` and
   `zizmor` over `.github/workflows/`, and a `build` CI job builds the sdist + wheel, runs
