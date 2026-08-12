@@ -142,23 +142,26 @@ def _write_config(root: Path, **keys: str) -> None:
     )
 
 
-def test_load_paths_degrades_rather_than_re_raising(tmp_path: Path, monkeypatch) -> None:
+def test_load_paths_raises_typed_when_the_root_cannot_canonicalize(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Hardening `cli._project` alone would not have been enough: `load_paths`
-    re-resolves the very same root, so on the failing host the second call raised the
-    exception the first one had just absorbed — straight past every caller's
-    `except BmadConfigError` and into `main()`'s backstop. `cmd_validate` loads paths
-    before it reaches the platform preflight, so this sits on the critical path for
-    the #332 finding rather than beside it."""
+    re-resolves the very same root, so on the failing host the second call raised a
+    bare OSError — straight past every caller's `except BmadConfigError` and into
+    `main()`'s backstop. The raise stays, but *typed*, which is the whole fix: every
+    caller already catches BmadConfigError, `cmd_validate` records the failure and
+    still reaches the platform preflight that names the host, and `diagnose` never
+    loads paths at all. Degrading instead was tried and retired — a lexical root
+    beside any canonically spelled member is a half-canonical snapshot that `rebased`
+    mis-files, sending a worktree-isolated run's writes into the original checkout,
+    and each review round found another route to that split."""
     root = tmp_path / "p"
     root.mkdir()
     _write_config(root)
     refuse_to_resolve(monkeypatch, root)
 
-    paths = bmadconfig.load_paths(root)
-
-    assert paths.project == root
-    assert paths.implementation_artifacts == root / "_bmad-output" / "implementation-artifacts"
-    assert paths.output_folder == root / "_bmad-output"
+    with pytest.raises(bmadconfig.BmadConfigError, match="cannot canonicalize"):
+        bmadconfig.load_paths(root)
 
 
 def test_worktree_isolation_conflict_degrades_rather_than_re_raising(
@@ -249,19 +252,22 @@ def test_load_paths_degrades_for_a_config_path_that_is_itself_unresolvable(
     assert paths.project == root.resolve(), "the healthy root still canonicalizes"
 
 
-def test_load_paths_keeps_one_spelling_when_the_root_degrades(tmp_path: Path, monkeypatch) -> None:
-    """A ProjectPaths must be internally consistent, not maximally canonical.
+def test_load_paths_refuses_a_degraded_root_beside_canonically_spelled_config_paths(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The route no per-member plumbing could cover, pinned so the raise never quietly
+    becomes a degrade again: an *explicit absolute* artifact path written in
+    config.yaml in canonical spelling needs no `.resolve()` call to arrive canonical.
+    Had the root degraded to its lexical spelling instead of raising, the snapshot
+    would be half-canonical with the two spellings either side of the symlink —
+    `rebased`'s `relative_to` files the in-tree artifact dir as external, and a
+    worktree-isolated run writes into the original checkout. Silent, and a write.
+    Refusing the root is the one boundary that closes this route and every future
+    one at once.
 
-    If the project root degrades to lexical while the artifact paths underneath it
-    canonicalize, the two end up spelled either side of a symlink. `rebased` decides
-    "does this artifact dir live inside the project" with `relative_to`, that answers
-    *no*, and the dir is filed as configured outside the tree and left where it is — so
-    a worktree-isolated run writes into the original checkout instead of its own
-    worktree. Silent, and a write.
-
-    The symlinked root is what makes the row bite: with a canonical `tmp_path` the
-    lexical and resolved spellings are the same string and a half-canonical
-    ProjectPaths would be indistinguishable from a consistent one."""
+    The symlinked root is what makes the row bite: on a canonical `tmp_path` the
+    lexical and canonical spellings are the same string, and the row would stay green
+    with the raise ablated back to a degrade."""
     target = tmp_path / "target"
     target.mkdir()
     root = tmp_path / "p"
@@ -269,19 +275,13 @@ def test_load_paths_keeps_one_spelling_when_the_root_degrades(tmp_path: Path, mo
         root.symlink_to(target, target_is_directory=True)
     except OSError as e:  # Windows without SeCreateSymbolicLink / developer mode
         pytest.skip(f"cannot create a symlink here: {e}")
-    _write_config(root)
-    # Only the root refuses. The artifact paths beneath it resolve perfectly well, and
-    # that is precisely the split that produced the mismatch.
+    # The operator wrote the artifact dir absolutely, already in canonical spelling —
+    # no resolve() is involved in it arriving canonical. Only the root refuses.
+    _write_config(
+        root,
+        implementation_artifacts=str(target / "_bmad-output" / "implementation-artifacts"),
+    )
     refuse_to_resolve(monkeypatch, root)
 
-    paths = bmadconfig.load_paths(root)
-
-    assert paths.implementation_artifacts.is_relative_to(paths.project)
-    assert paths.planning_artifacts.is_relative_to(paths.project)
-    assert paths.output_folder.is_relative_to(paths.project)
-    # the consequence itself, not just the spelling: rebasing onto a worktree has to
-    # move the artifact dirs rather than file them as external
-    moved = paths.rebased(tmp_path / "wt")
-    assert moved.implementation_artifacts == tmp_path / "wt" / "_bmad-output" / (
-        "implementation-artifacts"
-    )
+    with pytest.raises(bmadconfig.BmadConfigError, match="cannot canonicalize"):
+        bmadconfig.load_paths(root)

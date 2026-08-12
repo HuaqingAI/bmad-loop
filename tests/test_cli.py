@@ -7496,6 +7496,32 @@ def test_diagnostic_commands_survive_an_unresolvable_project_root(
     assert rc in (0, 1)  # a verdict of either kind is a handler that ran
 
 
+def test_validate_records_the_refused_root_and_still_reaches_later_gates(
+    project, monkeypatch, capsys
+):
+    """The property the typed raise in `load_paths` has to preserve — the reason #552
+    exists: `cmd_validate` catches the BmadConfigError, records it as the
+    `bmad-config` finding, and keeps going, so the gates after the config load (the
+    platform preflight among them) still run on the one host that needs their
+    findings. Pinned on the document rather than the prose: the failure is recorded
+    AND a later gate contributed a finding of its own."""
+    install_bmad_config(project)
+    refuse_to_resolve(monkeypatch, project.project)
+
+    rc = cli.main(["validate", "--json", "--project", str(project.project)])
+
+    doc = json.loads(capsys.readouterr().out)
+    by_check = {}
+    for finding in doc["findings"]:
+        by_check.setdefault(finding["check"], finding)
+    assert by_check["bmad-config"]["severity"] == "problem"
+    assert "cannot canonicalize" in by_check["bmad-config"]["message"]
+    # policy loads after the config gate; its presence is the handler continuing
+    # past the raise rather than dying on it
+    assert "policy" in by_check
+    assert rc == 1
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="UNC resolution is a Windows behavior")
 @pytest.mark.parametrize(
     "spelling",

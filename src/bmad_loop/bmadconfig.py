@@ -7,7 +7,7 @@ from pathlib import Path
 
 import yaml
 
-from .platform_util import resolve_or_lexical, try_resolve
+from .platform_util import resolve_or_lexical
 
 
 class BmadConfigError(Exception):
@@ -112,14 +112,16 @@ def worktree_isolation_conflict(paths: ProjectPaths, isolation: str) -> str | No
     # shape cannot reach that window at all.
     if paths.repo_root == paths.project:
         return None
-    # Same degrade as `load_paths` (#552): this gate runs in `cmd_validate` *before*
+    # Degrades rather than raises (#552): this gate runs in `cmd_validate` *before*
     # the platform preflight, so a raise here is the #332 finding going unreachable
-    # again for anyone on `isolation = "worktree"`. Both sides take the same treatment,
-    # so a host that cannot canonicalize compares lexical to lexical. What that costs,
-    # stated rather than hidden: on such a host the two spellings the test above pins
-    # (`p/../p` vs `p`) no longer fold together, so a `repo_root` override that merely
-    # respells the project directory would be refused — a wrong message, where the
-    # alternative is no message and no command at all.
+    # again for anyone on `isolation = "worktree"`. A ProjectPaths built by
+    # `load_paths` arrives with both sides canonical (it raises otherwise), so the
+    # degrade below covers only hand-built instances and a share flapping between
+    # the load and this gate. Both sides take the same treatment, so a host that
+    # cannot canonicalize compares lexical to lexical; the cost, stated rather than
+    # hidden: two spellings that only canonicalization folds together (`p/../p` vs
+    # `p`) would be refused with a wrong message, where the alternative is no
+    # message and no command at all.
     if resolve_or_lexical(paths.repo_root) == resolve_or_lexical(paths.project):
         return None
     return (
@@ -132,35 +134,38 @@ def worktree_isolation_conflict(paths: ProjectPaths, isolation: str) -> str | No
     )
 
 
-def _resolve(raw: str, project: Path, *, canonical: bool) -> Path:
+def _resolve(raw: str, project: Path) -> Path:
     """Expand `{project-root}` and canonicalize. A config string can name a UNC share
     of its own, independent of `--project`, so it degrades on the same terms — see
-    `platform_util.resolve_or_lexical` (#552).
-
-    `canonical` says whether the project root itself canonicalized. When it did not,
-    this one does not even try: consistency across the returned ProjectPaths matters
-    more than canonicality of any single member, because `rebased` decides "is this
-    artifact dir inside the project" with `relative_to`, and a lexical project paired
-    with a canonical artifact path answers *no* either side of a symlink. That files an
-    in-tree artifact dir as externally configured, and a worktree-isolated run then
-    writes into the original checkout. The asymmetry only runs one way: a canonical
-    root paired with an artifact path that degrades is fine, because such a path is on
-    some other share and genuinely *is* outside the tree."""
+    `platform_util.resolve_or_lexical` (#552). The degrade is safe *here* because
+    `load_paths` guarantees `project` canonicalized before any config string is
+    resolved: a member that refuses is on some other share and genuinely *is* outside
+    the tree, which is exactly how `rebased`'s `relative_to` will file it."""
     expanded = Path(raw.replace("{project-root}", str(project)))
-    return resolve_or_lexical(expanded) if canonical else expanded.absolute()
+    return resolve_or_lexical(expanded)
 
 
 def load_paths(project: Path) -> ProjectPaths:
-    # Degrades rather than raises when the OS cannot canonicalize (#552). `_project`
-    # already ran this, so on a host that refuses it the argument arriving here is
-    # the lexical form and a bare `.resolve()` would raise a second time — taking out
-    # `validate`, which loads paths before it reaches the finding that explains the
-    # host. `try_resolve` rather than `resolve_or_lexical` because the *fact* of the
-    # refusal has to reach `_resolve` below; see its docstring for what a
-    # half-canonical ProjectPaths costs.
-    resolved = try_resolve(project)
-    canonical = resolved is not None
-    project = Path(project).absolute() if resolved is None else resolved
+    # The root must canonicalize or there is no consistent ProjectPaths to hand back
+    # (#552). Every member is compared against `project` — `rebased` decides "is this
+    # artifact dir inside the tree" with `relative_to` — so a lexical root next to a
+    # canonically spelled member (a resolved child, or an absolute path written
+    # canonically in config.yaml) sits on the far side of a symlink from it, files an
+    # in-tree artifact dir as external, and a worktree-isolated run then writes into
+    # the original checkout. Degrading here reopened that split once per review round;
+    # a typed raise closes every route at once, and it costs the diagnostic commands
+    # nothing: every caller already catches BmadConfigError — `cmd_validate` records
+    # the failure and still reaches the platform preflight that names the host — and
+    # `diagnose` never loads paths at all. Only `cli._project` still degrades: it runs
+    # pre-dispatch, where there is no handler to catch anything.
+    try:
+        project = Path(project).resolve()
+    except (OSError, RuntimeError) as e:
+        raise BmadConfigError(
+            f"cannot canonicalize the project root {project}: {e} — artifact paths "
+            "are derived from the canonical root, so no run can safely proceed. "
+            "Run `bmad-loop validate` for what this host is doing."
+        ) from e
     config_path = project / "_bmad" / "bmm" / "config.yaml"
     if not config_path.is_file():
         raise BmadConfigError(f"BMAD config not found: {config_path} (is BMAD installed here?)")
@@ -183,21 +188,19 @@ def load_paths(project: Path) -> ProjectPaths:
             f"{config_path} missing implementation_artifacts/planning_artifacts keys"
         )
     repo_root_raw = doc.get("repo_root")
-    repo_root = (
-        _resolve(str(repo_root_raw), project, canonical=canonical) if repo_root_raw else project
-    )
+    repo_root = _resolve(str(repo_root_raw), project) if repo_root_raw else project
     out_raw = doc.get("output_folder")
     output_folder = (
-        _resolve(str(out_raw), project, canonical=canonical)
+        _resolve(str(out_raw), project)
         if out_raw
-        else (project / "_bmad-output")
+        # the default branch is a bare join off the (canonical) root and takes the
+        # same per-member degrade as a configured string would.
+        else resolve_or_lexical(project / "_bmad-output")
     )
     return ProjectPaths(
         project=project,
-        implementation_artifacts=_resolve(str(impl), project, canonical=canonical),
-        planning_artifacts=_resolve(str(plan), project, canonical=canonical),
-        # already routed through `_resolve` when configured; the default branch is a
-        # bare join off `project` and needs the same one-spelling treatment.
-        output_folder=resolve_or_lexical(output_folder) if canonical else output_folder.absolute(),
+        implementation_artifacts=_resolve(str(impl), project),
+        planning_artifacts=_resolve(str(plan), project),
+        output_folder=output_folder,
         repo_root=repo_root,
     )

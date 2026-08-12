@@ -204,8 +204,8 @@ def is_wsl_unc_path(value: str | Path) -> bool:
 
 
 # One note per degraded spelling per process. A single invocation canonicalizes the
-# project root at least three times — `main()` pre-dispatch, the handler's own
-# `_project`, then `load_paths` — and one condition must not print three lines.
+# project root at least twice — `main()` pre-dispatch, then the handler's own
+# `_project` — and one condition must not print two lines.
 _LEXICAL_FALLBACK_NOTED: set[str] = set()
 
 
@@ -233,13 +233,18 @@ def resolve_or_lexical(path: str | Path) -> Path:
     observation surface, because :func:`is_wsl_unc_path` is purely lexical and every
     bridge spelling is already absolute, so ``absolute()`` hands it back untouched
     (pathlib folds ``//wsl.localhost/...`` to the backslash form on the way). It is
-    *not* canonical, so this helper stays at the entry chokepoint — ``cli._project``
-    and ``bmadconfig.load_paths``. The write paths that need a canonical answer keep
-    their bare ``resolve()`` and still raise: ``runs.project_tag`` digests
-    ``str(project.resolve())`` into a session-ownership tag, and two spellings of one
-    project would strand live sessions. A ``run`` on such a host therefore still
-    fails loud a step later, while ``validate``/``diagnose`` now reach the finding
-    that explains it — observation degrades, repair writes raise.
+    *not* canonical, so this helper stays at the observation surface —
+    ``cli._project``, which runs pre-dispatch where there is no handler to catch
+    anything, and the configured artifact strings in ``bmadconfig._resolve``, where a
+    member that degrades beside a canonical root is genuinely on some other share.
+    The project root inside ``load_paths`` is the boundary: it raises a typed
+    ``BmadConfigError`` instead, because every artifact path is compared against the
+    root and a half-canonical snapshot is a silent wrong-directory write. The write
+    paths that need a canonical answer keep their bare ``resolve()`` and still raise:
+    ``runs.project_tag`` digests ``str(project.resolve())`` into a session-ownership
+    tag, and two spellings of one project would strand live sessions. So a ``run`` on
+    such a host fails loud at config load, while ``validate``/``diagnose`` still
+    reach the finding that explains it — observation degrades, repair writes raise.
 
     **Rejected: ``normpath(absolute(path))``.** Collapsing ``..`` lexically is not a
     respelling, it names a *different directory* whenever the ``..`` crosses a
@@ -255,24 +260,6 @@ def resolve_or_lexical(path: str | Path) -> Path:
 
     A relative ``path`` with an unreadable cwd still raises out of ``absolute()``:
     there is no lexical answer to degrade to, and the backstop is the honest reply."""
-    resolved = try_resolve(path)
-    return Path(path).absolute() if resolved is None else resolved
-
-
-def try_resolve(path: str | Path) -> Path | None:
-    """``Path(path).resolve()``, or ``None`` when the OS refuses it — emitting the same
-    one-note-per-process explanation as :func:`resolve_or_lexical`, which is built on
-    this.
-
-    Use it when the *fact* of the refusal changes what the caller does next, rather
-    than only the value. The one such caller is ``bmadconfig.load_paths``, which has to
-    hand back an internally consistent :class:`ProjectPaths`: if the project root
-    degrades to lexical while an artifact path underneath it canonicalizes, the two are
-    spelled either side of a symlink, ``ProjectPaths.rebased`` fails its
-    ``relative_to`` and files the artifact dir as configured *outside* the tree — so a
-    worktree-isolated run would write into the original checkout instead of its own
-    worktree. One snapshot, one spelling. Everywhere else the value is all the caller
-    needs, and :func:`resolve_or_lexical` is the shorter way to ask."""
     try:
         return Path(path).resolve()
     except (OSError, RuntimeError) as e:
@@ -286,7 +273,7 @@ def try_resolve(path: str | Path) -> Path | None:
                 "Run `bmad-loop validate` for what this host is doing.",
                 file=sys.stderr,
             )
-        return None
+        return lexical
 
 
 def _retry_on_sharing_violation(op: Callable[[], None]) -> None:
