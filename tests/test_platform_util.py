@@ -7,6 +7,7 @@ the legacy ``platform_util`` entry points still delegate, plus the real
 
 from __future__ import annotations
 
+import ntpath
 import os
 import stat
 import subprocess
@@ -188,25 +189,87 @@ def test_is_wsl_unc_path_is_platform_blind(monkeypatch):
 
 @pytest.mark.skipif(sys.platform != "win32", reason="UNC resolution is a Windows behavior")
 @pytest.mark.parametrize(
-    "spelling",
+    "spelling,expected",
     [
-        "\\\\wsl.localhost\\{d}\\home",
-        "\\\\wsl$\\{d}\\home",
-        "//wsl.localhost/{d}/home",
+        ("\\\\wsl.localhost\\{d}\\home", "\\\\wsl.localhost\\{d}\\home"),
+        ("\\\\wsl$\\{d}\\home", "\\\\wsl$\\{d}\\home"),
+        ("//wsl.localhost/{d}/home", "\\\\wsl.localhost\\{d}\\home"),
         # resolve() must keep, not strip, an extended prefix the input carried —
         # the premise the predicate's fold rests on; if a future CPython starts
         # stripping it, the fold goes dead and only this row notices
-        "\\\\?\\UNC\\wsl.localhost\\{d}\\home",
+        ("\\\\?\\UNC\\wsl.localhost\\{d}\\home", "\\\\?\\UNC\\wsl.localhost\\{d}\\home"),
     ],
 )
-def test_is_wsl_unc_path_survives_the_resolve_the_caller_applies(spelling):
+def test_is_wsl_unc_path_survives_the_resolve_the_caller_applies(spelling, expected, monkeypatch):
     """The one shape production actually sees. `cli._project` hands the preflight a
     `Path(...).resolve()`, and every other test here passes an unresolved literal — so
     a `Path.resolve()` semantics change (it has moved across 3.6/3.8/3.13) could
     normalize the bridge prefix away and silently disable the whole #332 check with
-    this file still green. The distro need not exist: resolution is non-strict."""
-    raw = spelling.format(d="Ubuntu-24.04")
-    assert platform_util.is_wsl_unc_path(Path(raw).resolve()) is True
+    this file still green.
+
+    This row pins `realpath`'s *lexical* walk — the branch taken when the syscall
+    cannot answer — so the syscall wrapper is stubbed rather than aimed at a live
+    provider. It raises ERROR_BAD_NET_NAME (67), which is on CPython's non-strict
+    allow-list, so `realpath` degrades instead of failing. That is what the earlier
+    "the distro need not exist" premise assumed it always got, and #529 is what
+    happens when it does not: a registered-but-not-serving `wsl$` provider answers
+    ERROR_NETNAME_DELETED (64), which is *off* that list, so `resolve()` raises and a
+    semantics guard flakes on network state. The other branch — what a *serving*
+    distro makes `realpath` do — is pinned by the sibling test below; keep both, they
+    reach the same string by different routes."""
+    calls: list[str] = []
+
+    def unreachable_provider(path):
+        calls.append(path)
+        # Only the 4th arg (winerror) matters: an OSError escaping this test means 67
+        # left ntpath's non-strict allow-list and the premise below needs re-measuring.
+        raise OSError(0, "stubbed: 67 must stay on ntpath's non-strict allow-list", None, 67)
+
+    def no_symlink(_path):
+        raise OSError(0, "stubbed: nothing to dereference", None, 67)
+
+    monkeypatch.setattr(ntpath, "_getfinalpathname", unreachable_provider)
+    # the lexical walk also tries to read the path as a symlink; stub that too so the
+    # row touches no provider at all, on a runner with WSL or without
+    monkeypatch.setattr(ntpath, "_nt_readlink", no_symlink)
+
+    resolved = Path(spelling.format(d="Ubuntu-24.04")).resolve()
+    # Ablation guard: a future pathlib that stops routing resolve() through ntpath would
+    # leave the stub unused and everything below would pass while pinning nothing. The
+    # second half is what proves the *lexical walk* ran and not just the opening call:
+    # measured 3.11-3.14, it asks 3 times and the last ask is the parent, having climbed.
+    assert len(calls) > 1 and calls[-1] != calls[0], "resolve() no longer walks the path in ntpath"
+    assert str(resolved) == expected.format(d="Ubuntu-24.04")
+    assert platform_util.is_wsl_unc_path(resolved) is True
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="UNC resolution is a Windows behavior")
+@pytest.mark.parametrize("host", ["wsl.localhost", "wsl$"])
+def test_is_wsl_unc_path_survives_the_resolve_a_serving_distro_takes(host, monkeypatch):
+    """The other branch of the same `resolve()`, and the one production runs on the
+    hosts #332 exists for. Measured on Win11/WSL2 with the distro serving: the syscall
+    *succeeds* and hands `realpath` the extended form, which `realpath` then strips
+    back down because it added that prefix itself — an add/strip decision the sibling
+    test's lexical walk never reaches. Stubbing the syscall's *return value* covers it
+    with no provider; a live row would only reinstate the #529 flake."""
+    plain = f"\\\\{host}\\Ubuntu-24.04\\home"
+    calls: list[str] = []
+
+    def serving_provider(path):
+        calls.append(path)
+        return f"\\\\?\\UNC\\{host}\\Ubuntu-24.04\\home"
+
+    monkeypatch.setattr(ntpath, "_getfinalpathname", serving_provider)
+
+    resolved = Path(plain).resolve()
+    # Same ablation guard, and it is what makes this row non-vacuous: on a host with a
+    # live distro an unstubbed resolve() returns `plain` too, so without proof the stub
+    # answered, both asserts below would pass on the environment rather than the code.
+    # Two asks, measured 3.11-3.14: the input, then the prefix-stripped candidate
+    # realpath re-verifies before returning it — that verify *is* the strip decision.
+    assert calls == [plain, plain], "realpath no longer verifies the prefix it strips"
+    assert str(resolved) == plain
+    assert platform_util.is_wsl_unc_path(resolved) is True
 
 
 # ---------------------------------------------------------------- atomic_replace
