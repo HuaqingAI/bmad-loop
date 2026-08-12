@@ -1075,7 +1075,9 @@ def strip_relay_hooks(config: dict, dialect: str) -> bool:
     exists. `merge_hooks` will not replace it, since `_managed_hook_in_handlers`
     reports the event as already registered, so the stale command has to go first.
 
-    Only RELAY_MARKER handlers are removed. A probe-capture hook is a deliberate,
+    Only RELAY_MARKER commands are removed, at command granularity: a matcher
+    entry whose nested list holds a project command beside the relay keeps the
+    entry and loses only the relay command. A probe-capture hook is a deliberate,
     temporary registration that no worktree seeding produces, and is left alone.
     Empty event lists are dropped; an empty container is left in place for
     `merge_hooks` to refill.
@@ -1086,9 +1088,27 @@ def strip_relay_hooks(config: dict, dialect: str) -> bool:
         handlers = container.get(native_event)
         if not isinstance(handlers, list):
             continue
-        kept = [h for h in handlers if RELAY_MARKER not in json.dumps(h)]
-        if len(kept) != len(handlers):
+        kept = []
+        for handler in handlers:
+            if RELAY_MARKER not in json.dumps(handler):
+                kept.append(handler)
+                continue
+            # claude/codex/gemini wrap commands in a nested "hooks" list, and a
+            # user may have added their own command beside the relay inside ONE
+            # matcher entry — strip inside the list so theirs survives. copilot
+            # and agy store the command dict flat in the event list, so a marker
+            # match means the entry IS the relay and it drops whole.
+            nested = handler.get("hooks") if isinstance(handler, dict) else None
+            if isinstance(nested, list):
+                surviving = [c for c in nested if RELAY_MARKER not in json.dumps(c)]
+                if surviving:
+                    if len(surviving) != len(nested):
+                        handler["hooks"] = surviving
+                        removed = True
+                    kept.append(handler)
+                    continue
             removed = True
+        if len(kept) != len(handlers):
             if kept:
                 container[native_event] = kept
             else:

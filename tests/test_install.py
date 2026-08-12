@@ -559,10 +559,11 @@ def test_provision_worktree_rewrites_seeded_relative_hook_to_absolute(tmp_path):
 
 
 def test_strip_relay_hooks_leaves_foreign_handlers(tmp_path):
-    """Only bmad relay handlers go. A project's own hooks share the event list and
-    must survive — as must a probe-capture hook, which merge_hooks' dedup also owns
-    but strip deliberately does not — and an event that held nothing else is dropped
-    rather than left as an empty list."""
+    """Only bmad relay commands go. A project's own hooks must survive whether they
+    hold their own matcher entry or share OURS (a user appending to the relay's
+    nested list is an ordinary hand-edit) — as must a probe-capture hook, which
+    merge_hooks' dedup also owns but strip deliberately does not — and an event
+    that held nothing else is dropped rather than left as an empty list."""
     probe = {
         "matcher": "",
         "hooks": [{"type": "command", "command": "python bmad_loop_probe_hook.py Stop"}],
@@ -576,6 +577,13 @@ def test_strip_relay_hooks_leaves_foreign_handlers(tmp_path):
                 },
                 {"matcher": "", "hooks": [{"type": "command", "command": "make lint"}]},
                 probe,
+                {
+                    "matcher": "",
+                    "hooks": [
+                        {"type": "command", "command": "python bmad_loop_hook.py Stop"},
+                        {"type": "command", "command": "make fmt"},
+                    ],
+                },
             ],
             "SessionStart": [
                 {
@@ -589,6 +597,7 @@ def test_strip_relay_hooks_leaves_foreign_handlers(tmp_path):
     assert config["hooks"]["Stop"] == [
         {"matcher": "", "hooks": [{"type": "command", "command": "make lint"}]},
         probe,
+        {"matcher": "", "hooks": [{"type": "command", "command": "make fmt"}]},
     ]
     assert "SessionStart" not in config["hooks"]
     # idempotent: nothing left to remove
