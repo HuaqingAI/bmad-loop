@@ -41,10 +41,15 @@ ACK = "portability:"
 # *are* the sanctioned spot (their module docstrings say so).
 TMUX_BACKENDS = {"adapters/tmux_base.py", "adapters/tmux_backend.py"}
 
-# The one file allowed to build a ``["git", ...]`` argv — the `_run_git`
-# chokepoint (engine-configured timeout, ``LC_ALL=C``, the GitError taxonomy).
-# Same whole-file quarantine as tmux, no per-line ack: verify.py *is* the
-# sanctioned spot. Every other module calls a verify helper (``git_bytes``,
+# The one file allowed to build a ``["git", ...]`` argv — and within it, only as
+# the argv argument of a ``_run_git(...)`` call, the position where the
+# chokepoint (engine-configured timeout, ``LC_ALL=C``, the GitError taxonomy) is
+# being FED rather than bypassed. Unlike the tmux quarantine the sanction is not
+# the whole file: verify.py is mostly non-chokepoint helpers, and a bare
+# ``subprocess.run(["git", ...])`` added to one of them skips all three
+# guarantees exactly like a bypass in any other module, so the scanner tags each
+# git finding with the call-position bit and ``_git_offenders`` requires both
+# halves. Every other module calls a verify helper (``git_bytes``,
 # ``worktree_clean``, …) instead of spawning git itself. Both bypasses open when
 # this guard landed carried real defects (#390): a strict decode crashing the
 # TUI checkpoint modal, and a probe ignoring `limits.git_timeout_s`.
@@ -350,6 +355,20 @@ def _scan_source(src: str, rel: str):
     docs = _docstring_node_ids(tree)
     env_aliases = _env_name_aliases(tree)
 
+    # First positional args of `_run_git(...)` calls — the one position where a
+    # git argv literal feeds the chokepoint instead of bypassing it. Collected up
+    # front so the walk below can tag each git finding; an argv bound to a name
+    # first is deliberately NOT resolved through the binding (same stance as the
+    # tuple form: a false positive is a review prompt, not a miss).
+    run_git_argvs = {
+        id(call.args[0])
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "_run_git"
+        and call.args
+    }
+
     def line_at(lineno: int) -> str:
         return lines[lineno - 1] if 1 <= lineno <= len(lines) else ""
 
@@ -360,13 +379,18 @@ def _scan_source(src: str, rel: str):
         # too — subprocess accepts any sequence, and git has no legitimate tuple
         # form to spare, so the tuple spelling of a bypass must not slip the
         # net. A path segment ("git" outside a sequence) and prose stay silent.
+        # A git finding carries one extra field: whether the literal sits in the
+        # argv position of a `_run_git(...)` call — the only spot the chokepoint
+        # file's own exemption covers.
         if isinstance(node, (ast.List, ast.Tuple)) and node.elts:
             first = node.elts[0]
             if isinstance(first, ast.Constant):
                 if first.value == "tmux" and isinstance(node, ast.List):
                     findings.append(("tmux", rel, node.lineno, line_at(node.lineno)))
                 if first.value == "git":
-                    findings.append(("git", rel, node.lineno, line_at(node.lineno)))
+                    findings.append(
+                        ("git", rel, node.lineno, line_at(node.lineno), id(node) in run_git_argvs)
+                    )
 
         # bare POSIX path string literal (skip docstrings)
         if (
@@ -509,15 +533,27 @@ def test_no_tmux_invocation_outside_backend():
     )
 
 
+def _git_offenders(findings) -> list[tuple[str, int, str]]:
+    """The chokepoint invariant as a filter: a git argv is sanctioned only in a
+    ``GIT_CHOKEPOINT`` file AND only as the argv argument of a ``_run_git(...)``
+    call — the file alone is not enough (see the allowlist's comment)."""
+    return [
+        (rel, ln, txt)
+        for _, rel, ln, txt, feeds_chokepoint in findings
+        if not (rel in GIT_CHOKEPOINT and feeds_chokepoint)
+    ]
+
+
 def test_no_git_invocation_outside_verify():
-    """Only ``verify.py`` may build a ``["git", ...]`` argv — every other call
-    site goes through the chokepoint's helpers (``git_bytes`` and siblings),
-    which buy the engine-configured timeout, the ``LC_ALL=C`` pin, and the
-    GitError taxonomy. AGENTS.md has stated this since the chokepoint existed;
-    nothing enforced it, which is how both #390 bypasses survived."""
-    offenders = [(rel, ln, txt) for _, rel, ln, txt in _of("git") if rel not in GIT_CHOKEPOINT]
+    """Only ``verify.py`` may build a ``["git", ...]`` argv, and only to hand it
+    to ``_run_git`` — every other call site goes through the chokepoint's helpers
+    (``git_bytes`` and siblings), which buy the engine-configured timeout, the
+    ``LC_ALL=C`` pin, and the GitError taxonomy. AGENTS.md has stated this since
+    the chokepoint existed; nothing enforced it, which is how both #390 bypasses
+    survived."""
+    offenders = _git_offenders(_of("git"))
     assert not offenders, (
-        "git spawned outside the verify.py chokepoint — route it through "
+        "git spawned outside the _run_git chokepoint — route it through "
         "verify.git_bytes or a sibling helper instead:\n"
         + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders)
     )
@@ -815,6 +851,72 @@ def test_git_argv_detector_stays_silent_on_lookalikes(label, source):
     widened until it means nothing."""
     found = [f for f in _scan_source(source, "probe.py") if f[0] == "git"]
     assert not found, f"the {label!r} shape was flagged; it is not a git argv:\n{source}"
+
+
+# The git exemption's scoping, as rows: `(rel, source, is_offender)`. Every git
+# argv in verify.py today already sits in a `_run_git(...)` call, so a file-wide
+# filter and the call-position one are indistinguishable on the real tree — only
+# synthetic sources can tell them apart.
+GIT_SCOPE_CASES = [
+    # The hole a file-wide exemption leaves open: a verify.py helper spawning git
+    # directly, past the timeout, the locale pin, and the GitError taxonomy.
+    (
+        "verify-bare-spawn",
+        "verify.py",
+        'import subprocess\nsubprocess.run(["git", "status"])\n',
+        True,
+    ),
+    # The tuple spelling of the same bypass stays refused inside the file too.
+    (
+        "verify-bare-tuple",
+        "verify.py",
+        'import subprocess\nsubprocess.run(("git", "status"))\n',
+        True,
+    ),
+    # …while the chokepoint's real feed line stays exempt: the argv as
+    # `_run_git`'s first argument, the shape of every sanctioned site today.
+    (
+        "verify-chokepoint-arg",
+        "verify.py",
+        'proc = _run_git(["git", "-C", str(repo), "status"], repo)\n',
+        False,
+    ),
+    # An argv bound to a name first is flagged even en route to `_run_git` — the
+    # detector's documented stance (a false positive is a review prompt, not a
+    # miss), and today's tree has no such site to spare.
+    (
+        "verify-argv-built-first",
+        "verify.py",
+        'argv = ["git", "log", "-1"]\nproc = _run_git(argv, repo)\n',
+        True,
+    ),
+    # The private spelling does not travel: `_run_git` imported into another
+    # module is an offender there, argv position notwithstanding.
+    (
+        "engine-calls-run-git",
+        "engine.py",
+        'proc = _run_git(["git", "fetch"], repo)\n',
+        True,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "rel", "source", "is_offender"),
+    GIT_SCOPE_CASES,
+    ids=[c[0] for c in GIT_SCOPE_CASES],
+)
+def test_git_argv_exemption_is_scoped_to_the_chokepoint_call(label, rel, source, is_offender):
+    """Being verify.py buys the file its `_run_git(...)` feed lines and nothing
+    wider. Without this, `_git_offenders` could go back to exempting the file
+    wholesale and every assertion in this file would stay green — the difference
+    only shows up on a bypass that does not exist yet, which is the only kind a
+    tripwire is for."""
+    offenders = _git_offenders([f for f in _scan_source(source, rel) if f[0] == "git"])
+    assert bool(offenders) is is_offender, (
+        f"a git argv in {rel} here should {'be refused' if is_offender else 'be allowed'}:\n"
+        f"{source}"
+    )
 
 
 # The allowlist's scoping, as rows: `(rel, key, is_offender)`. Same reason the
