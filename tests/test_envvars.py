@@ -39,37 +39,32 @@ def test_session_timeout_s_is_none_when_unset(monkeypatch):
     """Unset is the ordinary case — `None` is what makes the engine keep its
     policy budget (`limits.session_timeout_min x 60`) instead of an override.
 
-    Ablation target (verified 2026-08-11): delete the `if raw is None: return
-    None` early-out and this test fails ALONE, on `TypeError: float() argument
-    must be a string or a real number, not 'NoneType'` — a TypeError the
-    `except ValueError` arm below deliberately does not catch, so the early-out
-    is a separate gate rather than a shortcut through the parse."""
+    Ablation target: delete the `if raw is None: return None` early-out and this
+    test fails alone, on the `TypeError` `float(None)` raises — which the reader's
+    `except ValueError` deliberately does not catch. The early-out is a gate in its
+    own right, not a shortcut through the parse."""
     monkeypatch.delenv(envvars.SESSION_TIMEOUT_S, raising=False)
     assert envvars.session_timeout_s() is None
 
 
-# ABLATION (each gate run singly, 2026-08-11). The rejection is three independent
-# gates, and ablating them together would grade none of them — it would redden
-# every row at once while telling you nothing about which gate holds which:
-#   (a) drop the `try/except ValueError` (parse straight into `float(raw)`) and
-#       exactly the two unparseable rows fail — [not-a-number] and [] raise
-#       `ValueError: could not convert string to float` out of the reader
-#       instead of reading as None. Every other row keeps passing.
-#   (b) drop the `value <= 0` half and exactly the four zero/negative rows fail
-#       — [0], [0.0], [-1], [-0.5]. Nothing else moves.
-#   (c) drop the `not math.isfinite(value)` half and FIVE rows fail: the four
-#       non-finite spellings [inf], [1e999], [Infinity], [INF] — and [nan].
-#       That last one is the measured surprise, and it is load-bearing. Under
-#       the old `return value if value > 0 else None`, nan was rejected by the
-#       comparison (every comparison against nan is False). The guard is now
-#       spelled `value <= 0`, and `nan <= 0` is ALSO False — so nan no longer
-#       falls out of the comparison and is held by the finiteness check alone.
-#       Same result, different gate: do not "simplify" (c) away on the theory
-#       that `> 0` already covers nan, because this form does not.
-# So every row names the gate that holds it. Rows [inf]/[1e999]/[Infinity]/[INF]
-# are why the finiteness half exists: `float()` accepts all four and each passes
-# a bare `> 0`, so before it they read as a real budget, and the deadline the
-# adapters computed from it (`time.monotonic() + timeout_s`) could never expire.
+# The rejection is three independent gates, and every row below is held by exactly
+# one of them — grade them singly, since ablating them together reddens every row
+# at once and so grades none of them:
+#   (a) the `try/except ValueError` holds the unparseable rows, which would
+#       otherwise raise out of the reader instead of reading as None;
+#   (b) the `value <= 0` half holds the zero and negative rows;
+#   (c) the `not math.isfinite(value)` half holds the non-finite spellings — and
+#       `nan`.
+# ⚠️ (c) holding `nan` is load-bearing and easy to get backwards. Under the old
+# `return value if value > 0 else None`, nan was rejected by the COMPARISON (every
+# comparison against nan is False). The guard is now spelled `value <= 0`, and
+# `nan <= 0` is ALSO False — so nan no longer falls out of the comparison and the
+# finiteness check holds it alone. Same result, different gate: do not "simplify"
+# (c) away on the theory that `> 0` already covers nan, because this form does not.
+# The [inf]/[1e999]/[Infinity]/[INF] rows are why (c) exists at all: `float()`
+# accepts all four and each passes a bare `> 0`, so before it they read as a real
+# budget and the deadline the adapters compute from it (`time.monotonic() +
+# timeout_s`) could never expire.
 @pytest.mark.parametrize(
     "raw",
     [
@@ -132,11 +127,10 @@ def test_mux_backend_is_a_verbatim_passthrough(monkeypatch):
     reaches it. A reader that swallowed the unknown name would turn a loud
     misconfiguration into a silent auto-select.
 
-    Ablation target (verified 2026-08-11): make the reader "helpful" —
-    `return raw if raw in {"tmux", "psmux"} else None` — and this test fails
-    alone (of this file's 13), on `assert None == 'no-such-backend'` — the
-    unset and `tmux` rows above keep passing under it, so they do not carry the
-    no-validation claim on their own."""
+    Ablation target: make the reader "helpful" (`return raw if raw in {"tmux",
+    "psmux"} else None`) and this test fails on the unregistered-name assertion
+    alone — the unset and `tmux` assertions stay green under it, so neither pins
+    the no-validation contract on its own."""
     monkeypatch.delenv(envvars.MUX_BACKEND, raising=False)
     assert envvars.mux_backend() is None
 

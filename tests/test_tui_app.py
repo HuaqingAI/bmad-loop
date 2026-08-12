@@ -2791,10 +2791,9 @@ async def test_stop_run_not_live_warns_without_calling(project, monkeypatch, liv
     the agent window on a pid we cannot identify is not recoverable the way a
     control-file request is. Neither helper is called and no confirm modal opens.
 
-    Ablation (2026-08-11): delete the `if not data.liveness(run_dir) == "alive":`
+    Ablation target: delete the `if not data.liveness(run_dir) == "alive":`
     warn-and-return block from `action_stop_run` and both rows fail at the toast
-    wait with `AssertionError: condition not met before timeout` — the confirm
-    modal opens instead."""
+    wait — the confirm modal opens instead."""
     from bmad_loop import runs
 
     stops: list[Path] = []
@@ -2845,10 +2844,9 @@ async def test_archive_live_run_refused_without_calling(project, monkeypatch):
     ('unknown' is not blocked here, only warned inside the confirm; see
     test_delete_unknown_pid_warns_but_does_not_block for the sibling gate.)
 
-    Ablation (2026-08-11): delete the `if live == "alive":` warn-and-return block
-    from `action_archive_run` and this fails at the toast wait with
-    `AssertionError: condition not met before timeout` — the archive confirm opens
-    on a live run instead."""
+    Ablation target: delete the `if live == "alive":` warn-and-return block from
+    `action_archive_run` and this fails at the toast wait — the archive confirm
+    opens on a live run instead."""
     from bmad_loop import runs
 
     archived: list[tuple[Path, Path]] = []
