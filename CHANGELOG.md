@@ -189,6 +189,19 @@ whose seams had diverged enough that several ports needed a different fix, and t
   records the divergence. Every other collision the sweep surfaced was adjudicated deliberate
   (disjoint `parametrize` sets, or one body run against two different shipped scripts).
 
+- **The env-var registry invariant is enforced, not just documented.** A new
+  `test_portability_guard.py` scan fails any `BMAD_LOOP_*` read taken straight from the process
+  environment outside `envvars.py`, the two stdlib-only hook relays and the Unity helper scripts —
+  reads only, since the env dicts the engine and plugins _build_ for a child session are the
+  producing side. No violation existed; it is a tripwire for the next one. `envvars.py` also gains
+  the tests it never had, pinning each reader's parse and fallback.
+
+- **The TUI's hard-stop and archive paths are covered.** `x` stops a live run and kills its ctl
+  window; on a run that is not _provably_ alive it refuses (the gate is `== "alive"`, so an
+  unverifiable pid is refused alongside a dead one — stricter than `S`, and asymmetric with `A`,
+  which blocks only `alive`). `A` archives and forgets the run, and refuses a live one.
+  `shift+tab` reverse-cycles the resize ring.
+
 ### Removed
 
 - **The `bmad-auto` → `bmad-loop` rename compatibility is gone.** The rename shipped in 0.8.0 and no
@@ -198,7 +211,20 @@ whose seams had diverged enough that several ports needed a different fix, and t
   A project still on `bmad-auto` should migrate on 0.9.1 — the last release carrying the shims —
   before upgrading past it.
 
+- **`pytest-rerunfailures` is out of the dev group.** Nothing invoked it — no `--reruns`, no
+  `addopts`, no `flaky` marker anywhere in the repo or CI. A test-retry plugin sitting in the
+  environment is an invitation to paper over a real flake, so it goes rather than stays unused.
+
 ### Fixed
+
+- **`BMAD_LOOP_SESSION_TIMEOUT_S=inf` no longer disables the session timeout.** The guard was
+  one-sided — it rejected a non-positive value so an override could not silently _shorten_ a run's
+  budget — but `float()` accepts `inf`, `1e999` and `Infinity`, and all three pass `> 0`. Both
+  adapters build their deadlines as `time.monotonic() + timeout_s`, so a non-finite budget produced
+  a deadline that could never expire, and that budget is the outer bound every stall-grace and
+  wake-nudge window defers to: an unattended run could wedge with no backstop left. The reader now
+  requires a finite positive value and otherwise falls back to `limits.session_timeout_min × 60`,
+  as it already did for `0`, `-1` and unparseable input. A large _finite_ value is still honoured.
 
 - **A tab in the project path no longer truncates the project tag a window listing carries.**
   The multiplexer listing is tab-delimited and the tag holds a resolved filesystem path, where a tab

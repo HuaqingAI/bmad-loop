@@ -15,6 +15,7 @@ plugin's own contract (documented in the game-engine guide) and stays with it.
 
 from __future__ import annotations
 
+import math
 import os
 
 #: Overrides the per-session wall-clock budget, in seconds (test / E2E hook).
@@ -28,8 +29,21 @@ PROCESS_HOST = "BMAD_LOOP_PROCESS_HOST"
 def session_timeout_s() -> float | None:
     """The per-session wall-clock override in seconds, or ``None`` when unset.
 
-    A non-positive or unparseable value reads as ``None`` (ignored), so a
-    fat-fingered override can never silently shorten a real run's budget.
+    Anything that is not a finite positive number of seconds reads as ``None``
+    (ignored), and the guard is deliberately two-sided. Rejecting zero and
+    negatives keeps a fat-fingered override from silently *shortening* a real
+    run's budget; rejecting non-finite values keeps ``inf`` / ``1e999`` /
+    ``Infinity`` — all of which ``float()`` accepts and all of which pass a bare
+    ``> 0`` — from silently *removing* it. That second half matters more than it
+    looks: both adapters build their monotonic and wall-clock deadlines by
+    adding this to the current time, so a non-finite budget yields a deadline
+    that can never expire, and this is the outer bound every stall-grace and
+    wake-nudge window defers to. Losing it means an unattended run can wedge
+    with no backstop left.
+
+    A very large *finite* value is still honoured. It is a duration, however
+    unwise, and an operator asking for one is expressing intent; ``inf`` is not
+    a duration at all.
     """
     raw = os.environ.get(SESSION_TIMEOUT_S)
     if raw is None:
@@ -38,7 +52,9 @@ def session_timeout_s() -> float | None:
         value = float(raw)
     except ValueError:
         return None
-    return value if value > 0 else None
+    if not math.isfinite(value) or value <= 0:
+        return None
+    return value
 
 
 def mux_backend() -> str | None:
