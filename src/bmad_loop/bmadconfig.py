@@ -102,16 +102,24 @@ def worktree_isolation_conflict(paths: ProjectPaths, isolation: str) -> str | No
     hand-built :class:`ProjectPaths` (tests) need not have."""
     if isolation != "worktree":
         return None
+    # The default config — no `repo_root` key, so `__post_init__` makes the two the
+    # same object — is settled here, before anything asks the OS. That is not just an
+    # optimization: the two calls below are independent, so a *transient*
+    # canonicalization failure between them (the guard catches every OSError, not only
+    # a persistent WinError 64) could have one side degrade to lexical while the other
+    # succeeds and canonicalizes, making one path unequal to itself and refusing an
+    # ordinary isolated run with the #414 text. Comparing raw first means the common
+    # shape cannot reach that window at all.
+    if paths.repo_root == paths.project:
+        return None
     # Same degrade as `load_paths` (#552): this gate runs in `cmd_validate` *before*
     # the platform preflight, so a raise here is the #332 finding going unreachable
-    # again for anyone on `isolation = "worktree"`. Both sides take the same
-    # treatment, so a host that cannot canonicalize compares lexical to lexical.
-    # What that costs, stated rather than hidden: on such a host the two spellings
-    # the test below pins (`p/../p` vs `p`) no longer fold together, so an override
-    # that merely respells the project directory would be refused with the #414 text
-    # — a wrong message, where the alternative is no message and no command at all.
-    # The default config never reaches it: with no `repo_root` key the two sides are
-    # the same object.
+    # again for anyone on `isolation = "worktree"`. Both sides take the same treatment,
+    # so a host that cannot canonicalize compares lexical to lexical. What that costs,
+    # stated rather than hidden: on such a host the two spellings the test above pins
+    # (`p/../p` vs `p`) no longer fold together, so a `repo_root` override that merely
+    # respells the project directory would be refused — a wrong message, where the
+    # alternative is no message and no command at all.
     if resolve_or_lexical(paths.repo_root) == resolve_or_lexical(paths.project):
         return None
     return (

@@ -8,9 +8,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from conftest import install_bmad_config, refuse_to_resolve
+from conftest import UNRESOLVABLE, install_bmad_config, refuse_to_resolve
 
-from bmad_loop import bmadconfig
+from bmad_loop import bmadconfig, platform_util
 from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.workspace import Workspace
 
@@ -162,7 +162,7 @@ def test_load_paths_degrades_rather_than_re_raising(tmp_path: Path, monkeypatch)
 
 
 def test_worktree_isolation_conflict_degrades_rather_than_re_raising(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, capsys
 ) -> None:
     """`cmd_validate` runs this gate *before* the platform preflight, so under
     `isolation = "worktree"` a raise here put the #332 finding back out of reach for
@@ -179,6 +179,54 @@ def test_worktree_isolation_conflict_degrades_rather_than_re_raising(
     refuse_to_resolve(monkeypatch, root)
 
     assert bmadconfig.worktree_isolation_conflict(paths, "worktree") is None
+    assert capsys.readouterr().err == "", "the default shape must not ask the OS at all"
+
+
+def test_worktree_isolation_conflict_survives_a_flapping_resolve(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The two `resolve_or_lexical` calls below the short-circuit are independent, and
+    the guard catches every `OSError` rather than only a persistent WinError 64. So a
+    provider that fails on one call and answers on the next would have one side degrade
+    to lexical while the other canonicalized — making a path unequal to *itself* and
+    refusing an ordinary isolated run with the #414 text. Comparing raw paths first is
+    what keeps the default shape out of that window.
+
+    The stub fails exactly once, which is the whole scenario: `repo_root` and `project`
+    are the same object here, so any disagreement between the two calls is spurious by
+    construction."""
+    # The root must be reached through a symlink or the row is vacuous: on a canonical
+    # tmp_path the lexical and resolved spellings are the same string, so the two sides
+    # would agree even when one degraded and the other did not, and deleting the
+    # short-circuit would leave this green.
+    target = tmp_path / "target"
+    target.mkdir()
+    root = tmp_path / "p"
+    try:
+        root.symlink_to(target, target_is_directory=True)
+    except OSError as e:  # Windows without SeCreateSymbolicLink / developer mode
+        pytest.skip(f"cannot create a symlink here: {e}")
+    assert root.resolve() != root, "the two spellings really are different"
+
+    paths = ProjectPaths(
+        project=root,
+        implementation_artifacts=root / "impl",
+        planning_artifacts=root / "plan",
+        output_folder=root / "out",
+    )
+    real = Path.resolve
+    failures = [OSError(0, UNRESOLVABLE, None, 64)]
+
+    def flaky(self, strict: bool = False):
+        if str(self) == str(root) and failures:
+            raise failures.pop()
+        return real(self, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", flaky)
+    monkeypatch.setattr(platform_util, "_LEXICAL_FALLBACK_NOTED", set())
+
+    assert bmadconfig.worktree_isolation_conflict(paths, "worktree") is None
+    assert failures, "the flap never fired — the short-circuit answered first"
 
 
 def test_load_paths_degrades_for_a_config_path_that_is_itself_unresolvable(
