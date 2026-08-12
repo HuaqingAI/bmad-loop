@@ -590,6 +590,26 @@ def test_provision_worktree_tracked_config_rewrite_stays_out_of_commits(project,
     assert "$CLAUDE_PROJECT_DIR" in (repo / hook_rel).read_text(encoding="utf-8")
 
 
+def test_provision_worktree_tracked_pin_failure_raises(project, tmp_path):
+    """The pin is a repair write: when the config is KNOWN tracked and
+    `update-index --skip-worktree` fails (here: a held index.lock), provisioning
+    must raise rather than journal-and-continue — continuing knowingly leaves
+    `git add -A` free to commit the machine-specific relay rewrite and merge it
+    back. Observation faults (an unanswerable tracked-probe) still degrade."""
+    repo = project.project
+    claude = get_profile("claude")
+    assert _register_hooks(repo, claude) == 0
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "track the hook config")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    gitdir = Path(git(wt, "rev-parse", "--absolute-git-dir").strip())
+    (gitdir / "index.lock").touch()
+
+    with pytest.raises(verify.GitError, match="skip-worktree"):
+        provision_worktree(wt, [claude], repo)
+
+
 def test_strip_relay_hooks_leaves_foreign_handlers(tmp_path):
     """Only bmad relay commands go. A project's own hooks must survive whether they
     hold their own matcher entry or share OURS (a user appending to the relay's

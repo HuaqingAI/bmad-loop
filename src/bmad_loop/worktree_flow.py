@@ -196,13 +196,21 @@ def _pin_tracked_config_rewrite(worktree: Path, rel: str) -> str | None:
     (it is the sparse-checkout mechanism) and that dies with the worktree, so
     the rewrite stays session-local.
 
+    While the pin holds, the config is orchestrator-owned: a story's own edit to
+    the pinned file stays session-local and is discarded with the worktree. That
+    is deliberate — before this pin the tracked case stalled outright (#352), so
+    there is no prior working behavior to preserve, and any file-level hiding
+    that keeps OUR rewrite out of `add -A` hides a story's edit with it.
+
     NOT-A-REPO IS SILENT for the same reason the shield's tracked-probe is:
     provisioning a plain directory is ordinary, and there is no index and no
     `git add -A` to be wrong about. An untracked config needs nothing — the
-    exclude shield owns it. Anything else — an unanswerable tracked-probe, a
-    failed update-index — is returned for the caller to journal: the rewrite
-    stands either way, since a stalled session is the worse outcome (#352),
-    but the operator learns the story commit may carry it.
+    exclude shield owns it. A tracked-probe that cannot answer is returned for
+    the caller to journal (observation degrades; the rewrite stands, since a
+    stalled session is the worse outcome, #352). But a failed update-index on a
+    KNOWN-tracked config raises: the pin is a repair write, and continuing
+    without it knowingly leaves `git add -A` free to commit the machine-specific
+    command and merge it back.
     """
     try:
         if verify.git_bytes(worktree, "rev-parse", "--absolute-git-dir").returncode != 0:
@@ -212,18 +220,18 @@ def _pin_tracked_config_rewrite(worktree: Path, rel: str) -> str | None:
     try:
         if not verify.path_tracked_file(worktree, rel):
             return None
-        pinned = verify.git_bytes(worktree, "update-index", "--skip-worktree", "--", rel)
     except (verify.GitError, OSError) as e:
         return (
-            f"could not keep the rewritten hook config {rel} out of story commits "
+            f"could not check whether the rewritten hook config {rel} is tracked "
             f"({e}); if the project tracks it, the worktree's machine-specific relay "
             "command may be committed and merged back (#352)"
         )
+    pinned = verify.git_bytes(worktree, "update-index", "--skip-worktree", "--", rel)
     if pinned.returncode != 0:
-        return (
-            f"git update-index --skip-worktree {rel} failed in the worktree; the "
-            "rewritten hook config is tracked, so the machine-specific relay command "
-            "may be committed and merged back (#352)"
+        raise verify.GitError(
+            f"git update-index --skip-worktree {rel} failed in the worktree; the hook "
+            "config is tracked, so without the pin its machine-specific relay rewrite "
+            "would reach story commits and merge back (#352)"
         )
     return None
 
