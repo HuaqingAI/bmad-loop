@@ -28,6 +28,7 @@ For released changes, see the [CHANGELOG](../CHANGELOG.md).
 ## Contributing & community
 
 - **[Contributing guide](../CONTRIBUTING.md)** — dev setup (uv + trunk), PR guidelines, and conventional commits.
+- **[Testing strategy](testing.md)** — the layer model, fixture and ablation doctrines, quality guards, the zero-token invariant, and the CI/flake policy behind the suite.
 - **[Code of Conduct](../.github/CODE_OF_CONDUCT.md)** — the Contributor Covenant we follow.
 - **[Security policy](../SECURITY.md)** — how to report a vulnerability and what's in scope.
 - **[Trademark guidelines](../TRADEMARK.md)** — proper use of the BMad name and brand.
