@@ -377,6 +377,7 @@ def cleanup_document(
     windows: list[str],
     windows_survived: list[str],
     windows_unverifiable: list[str],
+    scan_error: str | None = None,
 ) -> dict[str, object]:
     """The `cleanup --json` document: the multiplexer artifacts this invocation
     removed, or — under ``--dry-run`` — would remove.
@@ -403,6 +404,14 @@ def cleanup_document(
     plan/outcome shape holds, with `dry_run` still the field that says which one
     you are holding.
 
+    `ctl_windows.scan_error` is the candidate scan failing before any window was
+    chosen or killed: the three arms are empty and mean "no answer", not
+    "verified empty". Without it, a failed preflight is indistinguishable from a
+    clean scan that found nothing — automation reading the document would accept
+    the empty partition and skip cleanup it still owes. The `unverifiable_pid`
+    precedent: the degradation travels in the document, not only on stderr.
+    `null` on a scan that answered.
+
     `sessions.removed` did NOT get the same treatment and is still the pre-kill
     prunable partition — an *attempted* kill, since `kill_session` is best-effort
     and silent in exactly the way `kill_window` is. #435 narrowed the windows
@@ -420,6 +429,7 @@ def cleanup_document(
             "removed": list(windows),
             "survived": list(windows_survived),
             "unverifiable": list(windows_unverifiable),
+            "scan_error": scan_error,
         },
     }
 

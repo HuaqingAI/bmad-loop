@@ -239,7 +239,10 @@ whose seams had diverged enough that several ports needed a different fix, and t
   best-effort and reports nothing, so the prune counted every _attempted_ kill as a removal. It now
   verifies with one liveness listing and partitions into removed / survived / unverifiable.
   A liveness capture the strict POSIX codec cannot decode is the same transport fault as a
-  timeout — `unverifiable`, never a raw crash after the kills fired.
+  timeout — `unverifiable`, never a raw crash after the kills fired. A candidate scan that
+  fails outright is contracted too: `ctl_windows.scan_error` in the `--json` document (arms
+  empty — no plan was formed), the stderr note in text mode, exit 0 either way, so a failed
+  preflight is never the same document as "nothing to prune".
   `ctl_windows.removed` means _verifiably gone_ and gains `survived` / `unverifiable` siblings, so
   `CLEANUP_SCHEMA_VERSION` is **2**; text mode names the two non-removed arms on stderr, still at
   exit 0. `sessions.removed` is untouched and still an attempted kill.

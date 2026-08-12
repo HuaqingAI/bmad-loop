@@ -2966,6 +2966,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     #
     # dry-run kills nothing, so there is no kill outcome to partition: the
     # candidate list IS the plan, and the other two arms stay empty.
+    scan_error: str | None = None
     try:
         if args.dry_run:
             windows, survived, unverifiable = launch.prunable_ctl_windows(project), [], []
@@ -2973,9 +2974,13 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
             windows, survived, unverifiable = launch.prune_ctl_windows(project)
     except MultiplexerError as e:
         # Three empty lists is the honest answer: the raise comes from the
-        # candidate scan, so no window was killed or even chosen.
+        # candidate scan, so no window was killed or even chosen. But an empty
+        # partition alone is also what a clean scan that found nothing emits, so
+        # the document carries the failure as ctl_windows.scan_error — without
+        # it a --json consumer accepts a failed preflight as "nothing to do".
         print(f"ctl window prune failed: {e}", file=sys.stderr)
         windows, survived, unverifiable = [], [], []
+        scan_error = str(e)
     if args.json:
         machine.emit(
             cleanup_document(
@@ -2986,6 +2991,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                 windows=windows,
                 windows_survived=survived,
                 windows_unverifiable=unverifiable,
+                scan_error=scan_error,
             )
         )
         return 0

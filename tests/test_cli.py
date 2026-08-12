@@ -2909,7 +2909,12 @@ def test_cleanup_json_dry_run_plans_without_pruning(tmp_path, monkeypatch, capsy
     assert doc["schema_version"] == cli.CLEANUP_SCHEMA_VERSION
     assert doc["dry_run"] is True
     assert doc["sessions"] == {"removed": ["fin-1"], "live": ["live-1"], "unverifiable_pid": []}
-    assert doc["ctl_windows"] == {"removed": ["sweep-fin-1"], "survived": [], "unverifiable": []}
+    assert doc["ctl_windows"] == {
+        "removed": ["sweep-fin-1"],
+        "survived": [],
+        "unverifiable": [],
+        "scan_error": None,
+    }
     assert dry_runs == [True]  # the kill stayed suppressed
 
 
@@ -2955,7 +2960,12 @@ def test_cleanup_json_nothing_to_clean_up_is_a_valid_empty_document(tmp_path, mo
 
     assert doc["schema_version"] == cli.CLEANUP_SCHEMA_VERSION
     assert doc["sessions"] == {"removed": [], "live": [], "unverifiable_pid": []}
-    assert doc["ctl_windows"] == {"removed": [], "survived": [], "unverifiable": []}
+    assert doc["ctl_windows"] == {
+        "removed": [],
+        "survived": [],
+        "unverifiable": [],
+        "scan_error": None,
+    }
 
 
 def test_cleanup_json_still_emits_its_document_when_the_ctl_prune_raises(
@@ -2965,7 +2975,10 @@ def test_cleanup_json_still_emits_its_document_when_the_ctl_prune_raises(
     runs, and the ctl half is raiser-side. An unguarded raise reaches main()'s
     backstop, which leaves stdout EMPTY — so the record of those kills is gone
     and a consumer cannot tell "killed nothing" from "killed one and lost the
-    receipt". The repair succeeded; only the observation failed."""
+    receipt". The repair succeeded; only the observation failed — and the
+    document says so: empty arms with a null scan_error would read as a clean
+    scan that found nothing, so the failure travels as ctl_windows.scan_error
+    (the unverifiable_pid precedent)."""
     from bmad_loop import runs
     from bmad_loop.adapters.multiplexer import MultiplexerError
     from bmad_loop.tui import launch
@@ -2986,7 +2999,45 @@ def test_cleanup_json_still_emits_its_document_when_the_ctl_prune_raises(
     )
 
     assert doc["sessions"]["removed"] == ["fin-1"]  # the receipt survives
-    assert doc["ctl_windows"] == {"removed": [], "survived": [], "unverifiable": []}
+    assert doc["ctl_windows"] == {
+        "removed": [],
+        "survived": [],
+        "unverifiable": [],
+        "scan_error": "tmux has-session failed: server gone",
+    }
+
+
+def test_cleanup_dry_run_json_marks_a_failed_candidate_scan(tmp_path, monkeypatch, capsys):
+    """--dry-run --json is a preflight automation diffs against the real run, so
+    a candidate scan dying in transport must not emit the same document as a
+    scan that found nothing to prune — that reads as "nothing to do" and the
+    owed cleanup is skipped. Arms empty (no plan was formed), scan_error set,
+    exit still 0: dry-run kills nothing, so there is no receipt an exit 1 could
+    destroy, but the shared plan/outcome shape keeps one failure contract."""
+    from bmad_loop import runs
+    from bmad_loop.adapters.multiplexer import MultiplexerError
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: ([], [], set()))
+
+    def boom(_proj):
+        raise MultiplexerError("tmux list-windows failed: timeout")
+
+    monkeypatch.setattr(launch, "prunable_ctl_windows", boom)
+
+    doc = machine_json(
+        ["cleanup", "--project", str(tmp_path), "--dry-run", "--json"],
+        capsys,
+        err_contains="ctl window prune failed",
+    )
+
+    assert doc["dry_run"] is True
+    assert doc["ctl_windows"] == {
+        "removed": [],
+        "survived": [],
+        "unverifiable": [],
+        "scan_error": "tmux list-windows failed: timeout",
+    }
 
 
 def test_cleanup_text_reports_a_raising_ctl_prune_without_losing_the_sessions(
@@ -3038,6 +3089,7 @@ def test_cleanup_json_separates_survivors_from_removals(tmp_path, monkeypatch, c
         "removed": ["gone-1"],
         "survived": ["stuck-1"],
         "unverifiable": ["dunno-1"],
+        "scan_error": None,
     }
 
 
