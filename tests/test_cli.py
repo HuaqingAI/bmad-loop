@@ -3040,6 +3040,32 @@ def test_cleanup_dry_run_json_marks_a_failed_candidate_scan(tmp_path, monkeypatc
     }
 
 
+def test_cleanup_json_survives_a_decode_faulting_scan(tmp_path, monkeypatch, capsys):
+    """The scan's raiser-side probes decode with the strict POSIX handler and do
+    not all normalize a decode fault to the seam type (#380). It is the same
+    scan failure: the sessions receipt must survive and the document must say
+    the scan failed — reaching main()'s backstop instead empties stdout of both."""
+    from bmad_loop import runs
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1"], [], set()))
+
+    def boom(_proj):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(launch, "prune_ctl_windows", boom)
+
+    doc = machine_json(
+        ["cleanup", "--project", str(tmp_path), "--json"],
+        capsys,
+        err_contains="ctl window prune failed",
+    )
+
+    assert doc["sessions"]["removed"] == ["fin-1"]  # the receipt survives
+    assert doc["ctl_windows"]["removed"] == []
+    assert "invalid start byte" in doc["ctl_windows"]["scan_error"]
+
+
 def test_cleanup_text_reports_a_raising_ctl_prune_without_losing_the_sessions(
     tmp_path, monkeypatch, capsys
 ):

@@ -1083,7 +1083,10 @@ class BmadLoopApp(App[None]):
         # notify() must not be called directly (see _mux_guarded — foreground only).
         try:
             windows, survived, unverifiable = launch.prune_ctl_windows(self.project)
-        except MultiplexerError as e:
+        except (MultiplexerError, UnicodeError) as e:
+            # UnicodeError: a strict-POSIX decode fault from a scan probe that
+            # does not normalize it to the seam type (#380) — the cli cleanup
+            # arm's twin; an escape here kills the worker thread instead.
             # prune_sessions already killed the agent sessions above; surface the
             # ctl-window failure but keep reporting that completed work (and the
             # unknown-pid warning) rather than swallowing it on an early return.

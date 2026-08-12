@@ -2045,7 +2045,17 @@ async def test_cleanup_unknown_sessions_notifies(project, monkeypatch):
         await until(pilot, lambda: any("removed 1 session(s)" in m for m in notifications(app)))
 
 
-async def test_cleanup_sessions_mux_error_notifies(project, monkeypatch):
+@pytest.mark.parametrize(
+    "fault, toast",
+    [
+        (MultiplexerError("ctl window probe unreachable"), "ctl window probe unreachable"),
+        # a strict-POSIX decode fault from a scan probe that does not normalize
+        # to the seam type (#380) must fail just as soft — an escape kills the
+        # worker thread instead of toasting (the cli cleanup arm's twin).
+        (UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"), "invalid start byte"),
+    ],
+)
+async def test_cleanup_sessions_mux_error_notifies(project, monkeypatch, fault, toast):
     # prune_ctl_windows probes has_session on the shared ctl session (raiser-side),
     # so it can raise on a server-backed backend. The worker must marshal the error
     # to a toast via call_from_thread without crashing on an unhandled worker
@@ -2058,7 +2068,7 @@ async def test_cleanup_sessions_mux_error_notifies(project, monkeypatch):
     monkeypatch.setattr(runs, "prune_sessions", lambda _p: (["odd-1"], [], {"odd-1"}))
 
     def boom(_p):
-        raise MultiplexerError("ctl window probe unreachable")
+        raise fault
 
     monkeypatch.setattr(launch, "prune_ctl_windows", boom)
     make_run(project.project, "20260611-100000-aaaa")
@@ -2068,9 +2078,7 @@ async def test_cleanup_sessions_mux_error_notifies(project, monkeypatch):
         await pilot.press("c")
         await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
         await pilot.click(await ready(pilot, "#ok"))
-        await until(
-            pilot, lambda: any("ctl window probe unreachable" in m for m in notifications(app))
-        )
+        await until(pilot, lambda: any(toast in m for m in notifications(app)))
         # the ctl-window failure is surfaced, but the session pruning that already
         # completed is still reported — not swallowed by an early return
         await until(pilot, lambda: any("unverifiable engine pid" in m for m in notifications(app)))

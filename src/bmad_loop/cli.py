@@ -2972,12 +2972,16 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
             windows, survived, unverifiable = launch.prunable_ctl_windows(project), [], []
         else:
             windows, survived, unverifiable = launch.prune_ctl_windows(project)
-    except MultiplexerError as e:
+    except (MultiplexerError, UnicodeError) as e:
         # Three empty lists is the honest answer: the raise comes from the
         # candidate scan, so no window was killed or even chosen. But an empty
         # partition alone is also what a clean scan that found nothing emits, so
         # the document carries the failure as ctl_windows.scan_error — without
         # it a --json consumer accepts a failed preflight as "nothing to do".
+        # UnicodeError: the scan's raiser-side probes decode with the strict
+        # POSIX handler and do not all normalize a decode fault to the seam type
+        # (#380); it is the same scan failure, and letting it reach main()'s
+        # backstop would empty stdout of the sessions receipt this arm protects.
         print(f"ctl window prune failed: {e}", file=sys.stderr)
         windows, survived, unverifiable = [], [], []
         scan_error = str(e)
