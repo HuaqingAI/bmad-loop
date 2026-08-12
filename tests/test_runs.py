@@ -6,11 +6,12 @@ import re
 import subprocess
 import sys
 import tarfile
+from pathlib import Path
 
 import pytest
-from conftest import escalated_run, git
+from conftest import escalated_run, git, refuse_to_resolve
 
-from bmad_loop import platform_util, runs, verify
+from bmad_loop import envvars, platform_util, runs, verify
 from bmad_loop.adapters import tmux_base
 from bmad_loop.adapters.multiplexer import MultiplexerError
 from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
@@ -725,6 +726,207 @@ def test_project_tag_is_transportable_whatever_the_path(tmp_path):
     assert PsmuxMultiplexer._transportable(tag)
     assert re.fullmatch("[0-9a-f]{16}", runs.project_tag(tmp_path / f"bad{chr(0xDC80)}"))
     assert len({tag, runs.project_tag(tmp_path / "other")}) == 2
+
+
+# ------------------------------------------------- user-scoped state root (#494)
+#
+# Every row here clears the suite-wide `_isolate_state_root` override first: that
+# fixture exists so no test writes into the real state directory, and it is the
+# first thing `state_root` consults, so a cascade row that left it set would grade
+# nothing. `sys.platform` is faked per branch (the house idiom — see
+# test_journal.py), and the fake home is written to HOME *and* USERPROFILE because
+# `expanduser` reads the first on POSIX and the second on Windows, so a row must
+# set both to mean the same thing on either host (tests/test_diagnostics.py:630).
+
+
+def _fake_home(monkeypatch, home) -> None:
+    """Point `expanduser("~")` at `home` on whichever host is running, and clear
+    everything else `state_root` would answer from first."""
+    monkeypatch.delenv(envvars.STATE_DIR, raising=False)
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+
+
+def test_state_root_precedence_override_then_xdg_then_home(tmp_path, monkeypatch):
+    """Three answers, ranked, and the ranking is what each assertion removes.
+
+    The override outranks a *set* XDG_STATE_HOME and not merely an unset one —
+    graded by leaving XDG set throughout — because it is the operator's stated
+    answer and the suite's own isolation depends on it winning against whatever a
+    host exports.
+
+    The asymmetry in the middle is deliberate and pinned here rather than left to
+    the reader: `XDG_STATE_HOME` is a *base* to build under, so `bmad-loop` is
+    appended to it, while `BMAD_LOOP_STATE_DIR` names our root itself and is used
+    as spelled. Appending to the override would silently move every path a
+    phase-3 hook computes from that same variable."""
+    monkeypatch.setattr(runs.sys, "platform", "linux")
+    home = tmp_path / "home"
+    _fake_home(monkeypatch, home)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "override"))
+
+    assert runs.state_root() == tmp_path / "override"  # verbatim: no "bmad-loop" tail
+
+    monkeypatch.delenv(envvars.STATE_DIR)
+    assert runs.state_root() == tmp_path / "xdg" / "bmad-loop"
+
+    monkeypatch.delenv("XDG_STATE_HOME")
+    assert runs.state_root() == home / ".local" / "state" / "bmad-loop"
+
+
+@pytest.mark.parametrize("value", ["state", "./state", "~/state", ""], ids=repr)
+def test_state_root_ignores_an_xdg_state_home_that_is_not_absolute(tmp_path, monkeypatch, value):
+    """The XDG base-directory spec says a relative value "must be ignored", and
+    ignoring it means falling through to the home default — not resolving it
+    against the cwd, which is what `Path(value) / "bmad-loop"` would do.
+
+    That distinction is the whole test: a cwd-relative control plane is not a
+    failure anyone sees, it is a run whose events land somewhere the next process
+    to ask does not look, and a run that finds no completion signal waits out
+    `session_timeout_min`. `~/state` is here because expansion is not this
+    reader's job either — nothing expands it, so it stays relative. The empty
+    string is the same rule reached from the other side: set-but-empty is how an
+    unset-looking export reads, and `Path("")` is the cwd.
+
+    Ablation target: drop the `os.path.isabs` half of `_state_base` and the three
+    relative rows fail together, each on a cwd-relative root. The empty row is
+    held by BOTH halves — `os.path.isabs("")` is already False — so no single
+    ablation reddens it here, and it is kept as the spelling an operator produces
+    rather than as an independent gate. What the emptiness half holds alone is the
+    *unset* variable, where `os.path.isabs(None)` raises; the refusal rows below
+    are what grade it."""
+    monkeypatch.setattr(runs.sys, "platform", "linux")
+    home = tmp_path / "home"
+    _fake_home(monkeypatch, home)
+    monkeypatch.setenv("XDG_STATE_HOME", value)
+
+    assert runs.state_root() == home / ".local" / "state" / "bmad-loop"
+
+
+def test_state_root_on_win32_prefers_localappdata_over_the_user_profile(tmp_path, monkeypatch):
+    """Windows keeps this class of per-user, per-machine state under
+    `%LOCALAPPDATA%`, and `%USERPROFILE%\\AppData\\Local` is that variable's
+    documented default location — the fallback, not a second opinion.
+
+    XDG_STATE_HOME stays set across both assertions: it is a POSIX variable, and a
+    branch that consulted it on Windows would answer from an operator's WSL or
+    MSYS environment instead of the local store."""
+    monkeypatch.setattr(runs.sys, "platform", "win32")
+    monkeypatch.delenv(envvars.STATE_DIR, raising=False)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "profile"))
+
+    assert runs.state_root() == tmp_path / "local" / "bmad-loop" / "state"
+
+    monkeypatch.delenv("LOCALAPPDATA")
+    expected = tmp_path / "profile" / "AppData" / "Local" / "bmad-loop" / "state"
+    assert runs.state_root() == expected
+
+
+def test_state_root_on_win32_refuses_a_home_derived_from_homedrive(tmp_path, monkeypatch):
+    """With neither `%LOCALAPPDATA%` nor `%USERPROFILE%` set, refuse — do not fall
+    back to a home directory.
+
+    `Path.home()` is `ntpath.expanduser("~")`, which prefers `USERPROFILE` and then
+    `HOMEDRIVE` + `HOMEPATH`; on a domain-joined machine that pair can name a
+    network home share, and the control plane's `O_NOFOLLOW`-anchored writes and
+    atomic renames are not something to move onto SMB by inference. So the
+    variables are read by name and an absent store raises.
+
+    Ablation target: replace the `USERPROFILE` read with `Path.home()` and this
+    row fails — on Windows it derives `Z:\\users\\x`, and on a POSIX host running
+    the faked branch `expanduser` falls back to the passwd entry. Both answer
+    where the guard refuses to."""
+    monkeypatch.setattr(runs.sys, "platform", "win32")
+    monkeypatch.delenv(envvars.STATE_DIR, raising=False)
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.delenv("USERPROFILE", raising=False)
+    monkeypatch.delenv("HOME", raising=False)
+    monkeypatch.setenv("HOMEDRIVE", "Z:")
+    monkeypatch.setenv("HOMEPATH", "\\users\\x")
+
+    with pytest.raises(runs.StateRootError, match=envvars.STATE_DIR):
+        runs.state_root()
+
+
+@pytest.mark.parametrize("home", ["", "relative-home", "~"], ids=repr)
+def test_state_root_refuses_a_home_that_cannot_root_a_control_plane(monkeypatch, home):
+    """A write path fails loud rather than picking a plausible-looking directory.
+
+    Each row is an answer `expanduser` really gives: `""` for a set-but-empty
+    `USERPROFILE` on Windows — and, on POSIX, `"/"`, since `posixpath` folds the
+    empty prefix to the root; `"relative-home"` for a `HOME` that is not a path at
+    all; and `"~"` for the input handed back when nothing can expand it. All three
+    would otherwise mkdir the control plane somewhere silently wrong — the launch
+    cwd, or `/.local/state`, which is a permission error for an ordinary user and
+    a real write to `/` for a containerised root.
+
+    The message names the override, because that is the one remedy an operator
+    always has."""
+    monkeypatch.setattr(runs.sys, "platform", "linux")
+    _fake_home(monkeypatch, home)
+
+    with pytest.raises(runs.StateRootError, match=envvars.STATE_DIR):
+        runs.state_root()
+
+
+def test_state_dir_for_is_keyed_on_project_identity_not_spelling(tmp_path, monkeypatch):
+    """One project reached by two spellings must key to ONE control plane.
+
+    It is the same requirement `project_tag` was written for, and it reaches here
+    because the run and the hook that signals its completion can arrive with
+    different spellings of the project: the engine holds a resolved path, a relay
+    computes from what it was handed. Two keys would mean the poller watching one
+    directory while the events land in the other — no completion signal, and a run
+    that waits out `session_timeout_min` with the signal sitting on disk.
+
+    Distinctness is asserted alongside identity: a key that collapsed every
+    project would satisfy the first half by making all runs share one plane."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    absolute = runs.state_dir_for(project, "20260812-101500-ab12")
+    relative = runs.state_dir_for(Path("proj"), "20260812-101500-ab12")
+    assert absolute == relative
+    assert absolute == runs.state_root() / runs.project_tag(project) / "20260812-101500-ab12"
+    assert runs.events_dir_for(project, "20260812-101500-ab12") == absolute / "events"
+
+    assert runs.state_dir_for(project, "20260812-101500-cd34") != absolute
+    assert runs.state_dir_for(tmp_path / "other", "20260812-101500-ab12") != absolute
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_state_dir_for_follows_a_symlinked_project_to_one_key(tmp_path):
+    """The symlink half of the spelling problem, and the one a lexical comparison
+    of the two paths would never catch — they share no component."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(project)
+
+    assert runs.state_dir_for(link, "r1") == runs.state_dir_for(project, "r1")
+
+
+def test_state_dir_for_raises_when_the_project_cannot_be_canonicalized(tmp_path, monkeypatch):
+    """A project the OS refuses to canonicalize (#552: a registered-but-not-serving
+    WSL UNC provider) has no knowable identity, so it gets no key.
+
+    `project_tag`'s bare `resolve()` raising is the correct behaviour to inherit
+    rather than soften. Degrading to the lexical spelling would hand two spellings
+    of the one project two different control planes — the failure the test above
+    exists to prevent — and this is a write path, where the doctrine is to raise
+    (`platform_util.resolve_or_lexical`)."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    refuse_to_resolve(monkeypatch, project)
+
+    with pytest.raises(OSError):
+        runs.state_dir_for(project, "r1")
 
 
 def test_prunable_sessions_accepts_legacy_path_tag(tmp_path, monkeypatch):

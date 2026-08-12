@@ -8,9 +8,14 @@ typed, and given a reader; the operator-facing table lives in the README under
 
 Each reader preserves its call site's exact semantics — same parse, same
 fallback — so routing a site through here changes nothing observable. Only the
-three core vars belong here; the `BMAD_LOOP_UNITY_*` / `BMAD_LOOP_ENGINE_*`
-family read by the bundled Unity plugin's stand-alone helper scripts is that
-plugin's own contract (documented in the game-engine guide) and stays with it.
+core operator/test knobs belong here (the count is deliberately not stated — it
+has already changed once); the `BMAD_LOOP_UNITY_*` / `BMAD_LOOP_ENGINE_*` family
+read by the bundled Unity plugin's stand-alone helper scripts is that plugin's
+own contract (documented in the game-engine guide) and stays with it. Nor do the
+session-protocol vars the engine *injects* into a child session
+(`BMAD_LOOP_RUN_DIR`, `BMAD_LOOP_TASK_ID`, …): those have a producing side inside
+the orchestrator, and the stdlib-only relays that read them back cannot import
+this module at all.
 """
 
 from __future__ import annotations
@@ -24,6 +29,9 @@ SESSION_TIMEOUT_S = "BMAD_LOOP_SESSION_TIMEOUT_S"
 MUX_BACKEND = "BMAD_LOOP_MUX_BACKEND"
 #: Forces the process-host implementation by registered name (test / override).
 PROCESS_HOST = "BMAD_LOOP_PROCESS_HOST"
+#: Overrides the user-scoped state root that per-run control-plane state lives
+#: under (see :func:`runs.state_root`), replacing the whole platform cascade.
+STATE_DIR = "BMAD_LOOP_STATE_DIR"
 
 
 def session_timeout_s() -> float | None:
@@ -69,3 +77,23 @@ def mux_backend() -> str | None:
 def process_host() -> str | None:
     """The forced process-host name, or ``None`` when unset."""
     return os.environ.get(PROCESS_HOST)
+
+
+def state_dir() -> str | None:
+    """The overriding bmad-loop state root, or ``None`` when unset.
+
+    Verbatim like the two name readers above — :func:`runs.state_root` uses the
+    value as the state root itself, so an operator who names a directory gets that
+    directory, relative spelling included. Silently ignoring a stated override in
+    favour of the platform cascade would be the same failure
+    :func:`mux_backend` refuses: a loud misconfiguration turned into a quiet
+    auto-select, discoverable only by noticing where a run's events did *not*
+    appear.
+
+    The one value not passed through is the empty string, which reads as unset.
+    ``export BMAD_LOOP_STATE_DIR=`` is what an unset-looking export leaves behind,
+    and it is not a directory an operator can have meant: ``Path("")`` is the
+    *current directory*, so honouring it would silently root the control plane at
+    whatever cwd the loop happened to be launched from.
+    """
+    return os.environ.get(STATE_DIR) or None

@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from bmad_loop import cli, documents, platform_util
+from bmad_loop import cli, documents, envvars, platform_util
 from bmad_loop.adapters.base import SessionResult, SessionSpec
 from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.checks import ValidationReport
@@ -281,6 +281,33 @@ def _isolate_ambient_git_ignores(tmp_path_factory: pytest.TempPathFactory):
     mp.setenv("XDG_CONFIG_HOME", str(env / "xdg"))
     yield
     mp.undo()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_state_root(tmp_path_factory: pytest.TempPathFactory, monkeypatch):
+    """Point the user-scoped state root at a per-test temp dir, for every test.
+
+    `runs.state_root()` resolves to `~/.local/state/bmad-loop` (POSIX) or
+    `%LOCALAPPDATA%\\bmad-loop\\state` (win32) when nothing overrides it, and the
+    run control plane does not merely *read* that location — it mkdirs into it.
+    Without this every test that constructs an adapter would write into the
+    developer's (or the CI runner's) real state directory and leave it there, one
+    stray tree per run id, on a path no fixture cleans up.
+
+    One variable is enough: `BMAD_LOOP_STATE_DIR` is checked before the platform
+    cascade and outranks all of it, so this cannot be defeated by whatever
+    XDG/LOCALAPPDATA the host happens to export.
+
+    Deliberately NOT a blanket reset of HOME / USERPROFILE / LOCALAPPDATA /
+    XDG_STATE_HOME. Those are not ours: git reads HOME (`install`'s shield
+    probes it), the coding CLIs discover their own config under them, and
+    `sanitize.redact_home` measures against the real one — shadowing them
+    suite-wide would change what unrelated tests measure, which is the argument
+    `_isolate_ambient_git_ignores` makes for shadowing only the two it must.
+    Tests that grade the cascade itself `delenv` this variable and monkeypatch
+    the ones they need, and share this fixture's monkeypatch instance, so the
+    override comes off cleanly for exactly that test."""
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path_factory.mktemp("state-root")))
 
 
 @pytest.fixture(scope="session")

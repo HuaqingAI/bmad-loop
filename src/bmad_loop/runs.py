@@ -9,11 +9,12 @@ import os
 import re
 import secrets
 import shutil
+import sys
 import tarfile
 import time
 from pathlib import Path
 
-from . import devcontract, verify
+from . import devcontract, envvars, verify
 from .adapters.multiplexer import MultiplexerError, get_multiplexer
 from .journal import STATE_FILE, Journal, load_state, save_state
 from .model import PAUSE_ESCALATION, Phase, RunState, StoryTask
@@ -149,6 +150,147 @@ def session_target(run_id: str) -> str:
 
 def attach_argv(run_id: str) -> list[str]:
     return attach_target_argv(session_target(run_id))
+
+
+# ------------------------------------------------------- user-scoped state root
+
+
+class StateRootError(Exception):
+    """No user-scoped state root could be derived from this environment — every
+    candidate base was unset, empty, relative, or named the filesystem root. The
+    control plane has nowhere to live, and the caller must fail rather than guess
+    (see :func:`state_root`)."""
+
+
+def _state_base(value: str | None) -> Path | None:
+    """``value`` as a usable base directory, or ``None`` when it cannot be one.
+
+    The single rule every *derived* candidate below is held to, so the POSIX and
+    win32 branches cannot drift into judging their inputs differently. A base is
+    rejected when it is unset, empty, relative, or names the filesystem root
+    itself. The last three are the answers a broken environment gives *instead* of
+    raising, which is what makes them worth naming:
+
+    - **empty**: ``os.path.expanduser("~")`` answers ``""`` on Windows for a
+      set-but-empty ``USERPROFILE``, and ``Path("")`` is the current directory.
+    - **relative**: including ``"~"`` itself, which is what ``expanduser`` returns
+      when it cannot expand at all. The state root would then move with the
+      launch cwd, and a run whose control plane it cannot find again is a run
+      that stalls to ``session_timeout_min`` rather than one that fails.
+    - **the root**: ``expanduser("~")`` answers ``"/"`` on POSIX for a set-but-empty
+      ``HOME`` (``posixpath`` folds the empty prefix to the root), which would put
+      ``/.local/state/bmad-loop`` on the filesystem root — a permission error for
+      an ordinary user and, for a containerised root, a silent write to ``/``.
+      ``base == base.parent`` is the root test on both flavours.
+
+    ``os.path.isabs`` rather than :func:`platform_util.is_absolute_path`: the
+    latter is purpose-built for "must stay inside the project" guards and is
+    strictly broader — it calls the drive-*relative* ``C:foo`` absolute, which is
+    exactly the value that must not become a state root. The question here is the
+    platform's own, and each branch below only ever runs on its own platform.
+    """
+    if not value or not os.path.isabs(value):
+        return None
+    base = Path(value)
+    return None if base == base.parent else base
+
+
+def state_root() -> Path:
+    """The bmad-loop state root for this user: the out-of-tree home of per-run
+    control-plane state — the events channel (#494) and, later, the config digest
+    (#498). Outside the project tree because a branch switch, a worktree mount or
+    a rollback must not be able to take a live run's control plane away.
+
+    Resolution, first answer wins:
+
+    1. ``BMAD_LOOP_STATE_DIR``, used as the state root **itself** — no
+       ``bmad-loop`` segment is appended, because the variable names our root
+       rather than a base to build one under. It is honoured as spelled (see
+       :func:`envvars.state_dir`), so it is the one candidate ``_state_base`` does
+       not filter: skipping a stated override would be a silent countermand, where
+       skipping a *derived* base only moves on to the next guess.
+    2. POSIX — ``$XDG_STATE_HOME/bmad-loop`` when that variable names an absolute
+       path, else ``~/.local/state/bmad-loop``. A relative ``XDG_STATE_HOME`` is
+       *ignored*, which the XDG base-directory spec requires of its consumers.
+       (``install._shield_inherited_excludes`` resolves a relative
+       ``XDG_CONFIG_HOME`` instead of ignoring it — the opposite call for the
+       opposite reason: there we reproduce *git's* reading of the variable, here
+       we are the spec's own consumer.)
+    3. win32 — ``%LOCALAPPDATA%\\bmad-loop\\state``, else
+       ``%USERPROFILE%\\AppData\\Local\\bmad-loop\\state``. ``LOCALAPPDATA`` names
+       the per-user, per-machine, non-roaming store Windows intends for exactly
+       this, and the second form is its documented default location.
+
+    **Never** ``Path.home()`` on the win32 arm. It is ``ntpath.expanduser("~")``,
+    which prefers ``USERPROFILE`` and then falls back to ``HOMEDRIVE`` +
+    ``HOMEPATH`` — a pair that on a domain-joined machine may name a network home
+    share. A control plane whose atomic renames and ``O_NOFOLLOW``-anchored writes
+    live on an SMB share is not the local directory this needs, and the derivation
+    also disagrees with the one git uses for its own ``$HOME``
+    (``install._shield_home_git_ignore`` documents that split in full). Reading
+    ``LOCALAPPDATA``/``USERPROFILE`` directly asks for the store by name instead of
+    inferring it from a home.
+
+    Raises :class:`StateRootError` when no candidate answers. This is a write
+    path, so it raises rather than degrading to a plausible-looking default:
+    ``platform_util.resolve_or_lexical`` states the doctrine (observation may
+    degrade, repair writes must raise), and the degraded outcomes here are all
+    silent — a control plane at the cwd, or at ``/``, that the *next* process to
+    ask resolves somewhere else.
+    """
+    override = envvars.state_dir()
+    if override:
+        return Path(override)
+    if sys.platform == "win32":
+        local = _state_base(os.environ.get("LOCALAPPDATA"))
+        if local:
+            return local / "bmad-loop" / "state"
+        profile = _state_base(os.environ.get("USERPROFILE"))
+        if profile:
+            return profile / "AppData" / "Local" / "bmad-loop" / "state"
+    else:
+        xdg = _state_base(os.environ.get("XDG_STATE_HOME"))
+        if xdg:
+            return xdg / "bmad-loop"
+        home = _state_base(os.path.expanduser("~"))
+        if home:
+            return home / ".local" / "state" / "bmad-loop"
+    raise StateRootError(
+        "cannot locate a state directory for bmad-loop's run control plane: "
+        + (
+            "neither %LOCALAPPDATA% nor %USERPROFILE% names an absolute directory"
+            if sys.platform == "win32"
+            else "neither $XDG_STATE_HOME nor $HOME names an absolute directory"
+        )
+        + f" — set {envvars.STATE_DIR} to the directory it should live in"
+    )
+
+
+def state_dir_for(project: Path, run_id: str) -> Path:
+    """This run's control-plane directory: ``<state root>/<project key>/<run id>``.
+
+    The project key is :func:`project_tag`, reused verbatim rather than re-derived:
+    it already resolves the project before digesting it, so the two spellings of
+    one project a caller can arrive with — a symlinked path, a relative one — key
+    to the same directory. They must, or a run started through one spelling would
+    write its events where a poll through the other never looks, and the run would
+    wait out ``session_timeout_min`` with the completion signal sitting on disk.
+    Its ``resolve()`` raising on a project the OS cannot canonicalize is correct
+    here for the same reason: an unknowable location cannot be keyed at all, and
+    guessing one is the wrong-directory write the tag exists to prevent.
+
+    ``run_id`` needs no sanitizing — the id contract (see :data:`RUN_ID_RE`) is
+    already "a legal path segment on every platform", pinned by
+    :func:`is_valid_run_id`, and an id from outside is rejected there rather than
+    coerced here.
+    """
+    return state_root() / project_tag(project) / run_id
+
+
+def events_dir_for(project: Path, run_id: str) -> Path:
+    """The run's hook-event channel: the directory the relay writes a session's
+    events into and ``SignalWatcher`` polls for them."""
+    return state_dir_for(project, run_id) / "events"
 
 
 # ---------------------------------------------------- run resolution / liveness

@@ -23,6 +23,13 @@ whose seams had diverged enough that several ports needed a different fix, and t
   neither a broken `policy.toml` nor an unexpected exception can turn a session's Stop signal into a
   failed hook. First phase of moving `events/` to a control-plane root outside the project tree.
 
+  The root itself lands next: a user-scoped state directory (`$XDG_STATE_HOME/bmad-loop` or
+  `~/.local/state/bmad-loop`; `%LOCALAPPDATA%\bmad-loop\state` on Windows), keyed
+  `<root>/<project>/<run-id>/` by the same project identity that scopes session ownership, so two
+  spellings of one project cannot end up with two control planes. `BMAD_LOOP_STATE_DIR` overrides
+  the whole cascade for a host where none of those is derivable or writable. Nothing reads the root
+  yet — the events channel moves into it in the next phase.
+
 - **Coding-CLI adapter registry: a new adapter class ships out-of-tree (#226).** The transport axis
   has long been extensible out-of-tree; the CLI axis had no equivalent, so a CLI needing its own
   adapter _class_ forced a name-branch in the run bootstrap. A profile's new `adapter` field names a
