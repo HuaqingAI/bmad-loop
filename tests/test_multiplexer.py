@@ -255,6 +255,27 @@ def test_seam_methods_never_leak_raw_subprocess_error(boom_run, tmp_path):
     assert mux.current_pane_id() is None
 
 
+def test_list_window_ids_decode_fault_raises_the_seam_type(monkeypatch):
+    """A byte the strict POSIX codec cannot decode is a transport failure like a
+    timeout: the liveness probe must answer MultiplexerError ("unknowable"), not
+    leak the raw UnicodeDecodeError — prune_ctl_windows' post-kill verdict and
+    the engine's window_alive catch only the seam type (#435).
+
+    Deliberately scoped to list_window_ids: the sentinel-returner methods still
+    leak a POSIX decode fault, which stays #380's territory.
+    """
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda _name: "/usr/bin/tmux")
+
+    def boom(*_a, **_k):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", boom)
+    mux = TmuxMultiplexer()
+    with pytest.raises(MultiplexerError) as excinfo:
+        mux.list_window_ids("s")
+    assert not isinstance(excinfo.value, UnicodeError)
+
+
 def test_seam_honesty_holds_for_psmux_style_run_override(monkeypatch):
     """The guarantee lives ABOVE _run, so a backend (like the eventual psmux) that
     overrides only _run and lets a raw TimeoutExpired escape it still gets seam

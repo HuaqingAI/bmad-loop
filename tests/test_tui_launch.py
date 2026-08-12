@@ -1268,7 +1268,9 @@ def _ctl_prune_fake(
     one-probe-per-window implementation cannot pass the probe-count assertion.
     ``kill`` picks what the
     post-kill liveness listing then shows: `lands` (gone), `fails` (still there),
-    `unknowable` (the listing itself dies in transport), `session-gone` (empty —
+    `unknowable` (the listing itself dies in transport), `undecodable` (its
+    capture defeats the strict POSIX decode — the same transport verdict),
+    `session-gone` (empty —
     the session died with its last window). Those are the prune's whole verdict
     space (#435), and the listing is the only thing that distinguishes them —
     `kill-window` exits 0 in all of them.
@@ -1310,6 +1312,8 @@ def _ctl_prune_fake(
                 probes.append(len(killed))
                 if kill == "unknowable":
                     raise OSError("server gone")
+                if kill == "undecodable":
+                    raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
                 if kill == "session-gone":
                     # rc 1, not rc 0 with empty stdout: real tmux answers a
                     # vanished session with a nonzero exit and list_window_ids
@@ -1369,6 +1373,20 @@ def test_prune_ctl_windows_unprobeable_liveness_claims_nothing(monkeypatch, tmp_
     it may well have landed — so the candidate is neither removed nor survived,
     and the raise must not escape a prune that already fired its kills."""
     _ctl_prune_fake(monkeypatch, tmp_path, kill="unknowable")
+
+    assert launch.prune_ctl_windows(tmp_path) == (
+        [],
+        [],
+        ["sweep-20260101-000000-dead", "run-20260101-000000-dead2"],
+    )
+
+
+def test_prune_ctl_windows_undecodable_liveness_is_a_transport_fault(monkeypatch, tmp_path: Path):
+    """The strict POSIX decode raising on the liveness capture is the listing
+    dying in transport by another name: same verdict — unverifiable, receipt
+    intact — not a raw UnicodeDecodeError escaping a prune that already fired
+    its kills (the seam folds it to MultiplexerError; #380 tracks the rest)."""
+    _ctl_prune_fake(monkeypatch, tmp_path, kill="undecodable")
 
     assert launch.prune_ctl_windows(tmp_path) == (
         [],

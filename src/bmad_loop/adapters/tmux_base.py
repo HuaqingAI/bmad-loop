@@ -321,11 +321,18 @@ class BaseTmuxBackend(TerminalMultiplexer):
         # read as "window dead -> session crashed" on a mere tmux hang. The honest
         # answer to "is it alive?" is "unknowable" -> MultiplexerError. A real dead
         # window still returns [] via the returncode != 0 path below (no exception).
+        #
+        # UnicodeError is a transport failure too: _run decodes with the strict
+        # POSIX handler (see version()), so an undecodable byte in the capture
+        # raises a ValueError-family error that neither exception arm above names.
+        # It must not escape raw — prune_ctl_windows takes its post-kill verdict
+        # from this probe and only a MultiplexerError lands the candidates in
+        # `unverifiable` rather than aborting cleanup mid-receipt (#435).
         try:
             probe = self._run(
                 ["list-windows", "-t", f"={session}", "-F", "#{window_id}"], check=False
             )
-        except (subprocess.TimeoutExpired, OSError) as exc:
+        except (subprocess.TimeoutExpired, OSError, UnicodeError) as exc:
             raise TmuxError(f"{self._BINARY} list-windows failed: {exc}") from exc
         if probe.returncode != 0:
             return []

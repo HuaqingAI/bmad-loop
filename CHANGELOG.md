@@ -238,6 +238,8 @@ whose seams had diverged enough that several ports needed a different fix, and t
 - **`cleanup` no longer reports a surviving ctl window as removed (#435).** Killing a window is
   best-effort and reports nothing, so the prune counted every _attempted_ kill as a removal. It now
   verifies with one liveness listing and partitions into removed / survived / unverifiable.
+  A liveness capture the strict POSIX codec cannot decode is the same transport fault as a
+  timeout — `unverifiable`, never a raw crash after the kills fired.
   `ctl_windows.removed` means _verifiably gone_ and gains `survived` / `unverifiable` siblings, so
   `CLEANUP_SCHEMA_VERSION` is **2**; text mode names the two non-removed arms on stderr, still at
   exit 0. `sessions.removed` is untouched and still an attempted kill.
