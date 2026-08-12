@@ -270,6 +270,29 @@ def _env_name_aliases(tree: ast.AST) -> dict[str, str]:
     return aliases
 
 
+def _git_head_names(tree: ast.AST) -> set[str]:
+    """The names bound to the constant ``"git"`` anywhere in the module — the
+    spawn-argv twin of ``_env_name_aliases``: an executable factored into a named
+    constant (``GIT = "git"``) is the tidy spelling a well-meaning bypass takes,
+    and matching the literal head alone would miss exactly that shape. ANY
+    binding qualifies the name — a later rebind must not launder an argv that was
+    git somewhere in the module — which can only over-flag, and a false positive
+    is a review prompt, not a miss. The tmux detector keeps its literal-only
+    head: widening that older tripwire is a separate decision from the git
+    chokepoint invariant this one enforces."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = [t for t in node.targets if isinstance(t, ast.Name)]
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            targets = [node.target]
+        else:
+            continue
+        if isinstance(node.value, ast.Constant) and node.value.value == "git":
+            names.update(t.id for t in targets)
+    return names
+
+
 def _env_call_key_node(call: ast.Call) -> ast.expr | None:
     """The node holding the looked-up key: the first positional arg, or the ``key=``
     keyword when the call passes none.
@@ -368,6 +391,7 @@ def _scan_source(src: str, rel: str):
         and call.func.id == "_run_git"
         and call.args
     }
+    git_heads = _git_head_names(tree)
 
     def line_at(lineno: int) -> str:
         return lines[lineno - 1] if 1 <= lineno <= len(lines) else ""
@@ -379,18 +403,25 @@ def _scan_source(src: str, rel: str):
         # too — subprocess accepts any sequence, and git has no legitimate tuple
         # form to spare, so the tuple spelling of a bypass must not slip the
         # net. A path segment ("git" outside a sequence) and prose stay silent.
-        # A git finding carries one extra field: whether the literal sits in the
-        # argv position of a `_run_git(...)` call — the only spot the chokepoint
-        # file's own exemption covers.
+        # A git head also resolves through the module's own constant bindings
+        # (`GIT = "git"` — see `_git_head_names`), and each git finding carries
+        # one extra field: whether the literal sits in the argv position of a
+        # `_run_git(...)` call — the only spot the chokepoint file's own
+        # exemption covers.
         if isinstance(node, (ast.List, ast.Tuple)) and node.elts:
             first = node.elts[0]
-            if isinstance(first, ast.Constant):
-                if first.value == "tmux" and isinstance(node, ast.List):
-                    findings.append(("tmux", rel, node.lineno, line_at(node.lineno)))
-                if first.value == "git":
-                    findings.append(
-                        ("git", rel, node.lineno, line_at(node.lineno), id(node) in run_git_argvs)
-                    )
+            if (
+                isinstance(first, ast.Constant)
+                and first.value == "tmux"
+                and isinstance(node, ast.List)
+            ):
+                findings.append(("tmux", rel, node.lineno, line_at(node.lineno)))
+            if (isinstance(first, ast.Constant) and first.value == "git") or (
+                isinstance(first, ast.Name) and first.id in git_heads
+            ):
+                findings.append(
+                    ("git", rel, node.lineno, line_at(node.lineno), id(node) in run_git_argvs)
+                )
 
         # bare POSIX path string literal (skip docstrings)
         if (
@@ -826,11 +857,33 @@ GIT_ARGV_PROBES = [
     # unlike tmux there is no which-tuple shape to spare, so it is flagged even
     # unattached to a call (a false positive is a review prompt, not a miss).
     ("tuple-argv", 'import subprocess\nsubprocess.run(("git", "status"))\n'),
+    # The executable factored into a named constant — the head resolves through
+    # the module's own bindings, as the env detector's aliases do.
+    (
+        "named-executable",
+        'import subprocess\nGIT = "git"\nsubprocess.run([GIT, "status"])\n',
+    ),
+    # …and a rebind does not launder it: any binding to "git" qualifies the name.
+    (
+        "named-executable-rebound",
+        'import subprocess\nGIT = "git"\nGIT = "other"\nsubprocess.run([GIT, "status"])\n',
+    ),
 ]
 GIT_ARGV_NON_PROBES = [
     ("path-segment", 'from pathlib import Path\nX = Path(h) / "git" / "ignore"\n'),
     ("prose-in-docstring", 'def f():\n    """Runs `git add -A` downstream."""\n    return 1\n'),
     ("chokepoint-args-tail", 'proc = git_bytes(repo, "ls-files", "-z")\n'),
+    # A named head that binds to a DIFFERENT executable, and one that never binds
+    # at all (a parameter), stay silent — the alias reach is exactly the names
+    # the module itself ties to "git".
+    (
+        "named-other-executable",
+        'import subprocess\nRG = "rg"\nsubprocess.run([RG, "--files"])\n',
+    ),
+    (
+        "named-unbound-head",
+        'import subprocess\ndef run(exe):\n    return subprocess.run([exe, "status"])\n',
+    ),
 ]
 
 
