@@ -629,6 +629,18 @@ def cmd_mux(args: argparse.Namespace) -> int:
             "note: AVAILABLE means the binary answers here, not that the backend supports "
             f"{sys.platform} — {', '.join(stranded)} can only be reached by forcing the choice"
         )
+    # A VERSION of `-` is the same cell whether the binary reports no version or
+    # crashed answering (#428). The row can't carry the difference — a table cell
+    # holds no stderr — so the dropped diagnostic is named here, beside the other
+    # reason a backend looks absent for no visible cause.
+    for r in rows:
+        if r.version_error:
+            # Whitespace-collapsed: the text carries the probe's own stderr, which
+            # is routinely multi-line, and a warning that spans lines reads as
+            # several unrelated ones. Not length-bounded like a table cell (#321)
+            # — nothing here sizes a column, and the diagnostic IS the payload.
+            detail = " ".join(r.version_error.split())
+            print(f"warning: {r.name} version probe failed: {detail}", file=sys.stderr)
     # A failed external package is invisible in the table (it never registered),
     # so name it here — the one place an operator looks when a backend is missing.
     for ep_name, reason in sorted(external_backend_errors().items()):
@@ -2930,6 +2942,7 @@ def cmd_archive(args: argparse.Namespace) -> int:
 
 
 def cmd_cleanup(args: argparse.Namespace) -> int:
+    from .adapters.multiplexer import MultiplexerError
     from .tui import launch  # pure stdlib; no textual import
 
     project = _project(args)
@@ -2943,13 +2956,46 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
             # holds after the fact too. In JSON mode this lives in the document
             # instead (sessions.unverifiable_pid), leaving stderr empty.
             print(f"run {run_id}: engine may still be live (unverifiable pid)", file=sys.stderr)
-    windows = (
-        launch.prunable_ctl_windows(project) if args.dry_run else launch.prune_ctl_windows(project)
-    )
+    # The ctl-window half is raiser-side (its candidate scan probes has_session),
+    # and the sessions above are ALREADY killed by the time it runs. Letting the
+    # raise reach main()'s backstop prints an error and returns 1 with stdout
+    # empty — which in --json mode destroys the record of those kills, leaving a
+    # consumer unable to tell "killed nothing" from "killed three, lost the
+    # receipt". The repair succeeded; only the observation failed, and
+    # observation degrades. Mirrors what the TUI worker already does.
+    #
+    # dry-run kills nothing, so there is no kill outcome to partition: the
+    # candidate list IS the plan, and the other two arms stay empty.
+    scan_error: str | None = None
+    try:
+        if args.dry_run:
+            windows, survived, unverifiable = launch.prunable_ctl_windows(project), [], []
+        else:
+            windows, survived, unverifiable = launch.prune_ctl_windows(project)
+    except (MultiplexerError, UnicodeError) as e:
+        # Three empty lists is the honest answer: the raise comes from the
+        # candidate scan, so no window was killed or even chosen. But an empty
+        # partition alone is also what a clean scan that found nothing emits, so
+        # the document carries the failure as ctl_windows.scan_error — without
+        # it a --json consumer accepts a failed preflight as "nothing to do".
+        # UnicodeError: the scan's raiser-side probes decode with the strict
+        # POSIX handler and do not all normalize a decode fault to the seam type
+        # (#380); it is the same scan failure, and letting it reach main()'s
+        # backstop would empty stdout of the sessions receipt this arm protects.
+        print(f"ctl window prune failed: {e}", file=sys.stderr)
+        windows, survived, unverifiable = [], [], []
+        scan_error = str(e)
     if args.json:
         machine.emit(
             cleanup_document(
-                dry_run=args.dry_run, killed=killed, live=live, unknown=unknown, windows=windows
+                dry_run=args.dry_run,
+                killed=killed,
+                live=live,
+                unknown=unknown,
+                windows=windows,
+                windows_survived=survived,
+                windows_unverifiable=unverifiable,
+                scan_error=scan_error,
             )
         )
         return 0
@@ -2964,7 +3010,30 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         if live:
             print(f"leaving {len(live)} live session(s) untouched")
         return 0
-    print(f"removed {len(killed)} session(s), {len(windows)} ctl window(s)")
+    # The count now excludes non-removals, so on stdout alone a smaller number is
+    # indistinguishable from a quieter sweep — and `cleanup > log` keeps only
+    # stdout. The marker travels with the count; the names stay on stderr, the
+    # unverifiable_pid precedent.
+    unaccounted = len(survived) + len(unverifiable)
+    print(
+        f"removed {len(killed)} session(s), {len(windows)} ctl window(s)"
+        + (f" ({unaccounted} not verified — see stderr)" if unaccounted else "")
+    )
+    # Only ever printed when a kill did not verifiably land — silence on the
+    # normal path, and the count above now excludes these rather than counting
+    # them as removed (#435). Both are retried by the next cleanup.
+    if survived:
+        # Same wording as the TUI toast: one claim, one phrase, so an operator
+        # moving between the two surfaces is reading the same thing.
+        print(f"ctl window(s) still open after the kill: {', '.join(survived)}", file=sys.stderr)
+    if unverifiable:
+        # Not "killed but unverifiable": kill_window is a silent no-op on a
+        # transport failure, so whether the kill even reached the server is part
+        # of what is unknown here.
+        print(
+            f"ctl window(s) kill attempted, outcome unverifiable: {', '.join(unverifiable)}",
+            file=sys.stderr,
+        )
     if live:
         print(f"left {len(live)} live session(s) untouched")
     return 0

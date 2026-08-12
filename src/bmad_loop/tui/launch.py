@@ -689,15 +689,66 @@ def prunable_ctl_windows(project: Path) -> list[str]:
     return [name for _, name in _ctl_window_candidates(project)]
 
 
-def prune_ctl_windows(project: Path) -> list[str]:
+def prune_ctl_windows(project: Path) -> tuple[list[str], list[str], list[str]]:
     """Close parked control-session windows whose run is no longer live; returns
-    the names of the windows that were closed (see _ctl_window_candidates)."""
+    (removed, survived, unverifiable) window names (see _ctl_window_candidates).
+    A three-list tuple like runs.prune_sessions, but do NOT read the arms across:
+    that one partitions BEFORE its kills, so its `killed` is still an attempted
+    kill, its `live` is "deliberately not touched" rather than "survived", and its
+    `unknown` is a pid question and a SUBSET of `killed`. These three are disjoint
+    (by window id — the values are names) and all three are about kill outcome.
+
+    kill_window is best-effort by contract (a hang, a missing binary, and a
+    refused kill are all the same silent no-op), so an attempted kill is not a
+    removal and must not be reported as one (#435). The verdict is taken here
+    rather than pushed into the seam because this is the caller that both needs
+    it and already holds the session: kill_window(target) alone cannot verify
+    anything on a backend whose liveness listing is session-scoped, which is all
+    of them.
+
+    ONE listing after the whole fan-out, not a probe per window: the answer is a
+    set membership either way, so the verdict costs one extra round trip instead
+    of N. A transport fault raises and nothing can be claimed there.
+
+    Two ceilings, both deliberate:
+
+    - The membership test pairs list_windows' `window_id` column with
+      list_window_ids. The seam states its symmetry rules pairwise and this pair
+      is stated because of THIS caller — a backend qualifying one side and not
+      the other reads every candidate as removed, which is #435 restored on the
+      optimistic side, with no error anywhere.
+    - `[]` is read as "the session went with its last window". The seam's `[]`
+      is wider than that: BaseTmuxBackend folds EVERY nonzero exit to `[]`, so a
+      server that errors while its windows live would report them removed. The
+      common cause by far is the session really being gone, and pessimism there
+      would invent a phantom survivor on every future sweep. Narrowing the
+      sentinel is a change to the engine's liveness probe, not to this function.
+    """
     mux = get_multiplexer()
-    killed: list[str] = []
-    for win_id, name in _ctl_window_candidates(project):
-        mux.kill_window(win_id)
-        killed.append(name)
-    return killed
+    candidates = _ctl_window_candidates(project)
+    if not candidates:
+        return [], [], []
+    for win_id, _name in candidates:
+        # kill_window is best-effort and reports nothing; a strict-POSIX decode
+        # fault of the kill's own capture escapes its swallow tuple (#380) but
+        # says exactly as little about the outcome — the command may well have
+        # reached the server. More of the same nothing: the fan-out continues
+        # and the one post-kill listing hands down the verdict either way. An
+        # escape here would surface at the callers as a scan failure, an
+        # empty-armed receipt denying kills that just fired.
+        try:
+            mux.kill_window(win_id)
+        except UnicodeError:
+            pass
+    try:
+        live = set(mux.list_window_ids(CTL_SESSION))
+    except MultiplexerError:
+        # The kills may well have landed; nothing here can say so. Claiming the
+        # optimistic half is exactly the bug — the next cleanup pass retries.
+        return [], [], [name for _win_id, name in candidates]
+    removed = [name for win_id, name in candidates if win_id not in live]
+    survived = [name for win_id, name in candidates if win_id in live]
+    return removed, survived, []
 
 
 def _ensure_ctl_session(project: Path) -> None:

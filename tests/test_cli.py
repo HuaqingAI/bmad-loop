@@ -2868,7 +2868,7 @@ def test_cleanup_prunes_sessions_and_windows(tmp_path, monkeypatch, capsys):
     from bmad_loop.tui import launch
 
     monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1"], [], set()))
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: ["sweep-fin-1"])
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: (["sweep-fin-1"], [], []))
 
     assert cli.main(["cleanup", "--project", str(tmp_path)]) == 0
     assert "removed 1 session(s), 1 ctl window(s)" in capsys.readouterr().out
@@ -2881,7 +2881,7 @@ def test_cleanup_warns_per_unknown_session(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(
         runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1", "odd-1"], [], {"odd-1"})
     )
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: [])
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: ([], [], []))
 
     assert cli.main(["cleanup", "--project", str(tmp_path)]) == 0
     captured = capsys.readouterr()
@@ -2909,7 +2909,12 @@ def test_cleanup_json_dry_run_plans_without_pruning(tmp_path, monkeypatch, capsy
     assert doc["schema_version"] == cli.CLEANUP_SCHEMA_VERSION
     assert doc["dry_run"] is True
     assert doc["sessions"] == {"removed": ["fin-1"], "live": ["live-1"], "unverifiable_pid": []}
-    assert doc["ctl_windows"] == {"removed": ["sweep-fin-1"]}
+    assert doc["ctl_windows"] == {
+        "removed": ["sweep-fin-1"],
+        "survived": [],
+        "unverifiable": [],
+        "scan_error": None,
+    }
     assert dry_runs == [True]  # the kill stayed suppressed
 
 
@@ -2918,7 +2923,7 @@ def test_cleanup_json_real_run_reports_what_it_did(tmp_path, monkeypatch, capsys
     from bmad_loop.tui import launch
 
     monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1"], [], set()))
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: ["sweep-fin-1"])
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: (["sweep-fin-1"], [], []))
 
     doc = machine_json(["cleanup", "--project", str(tmp_path), "--json"], capsys)
 
@@ -2936,7 +2941,7 @@ def test_cleanup_json_carries_unverifiable_pid_with_empty_stderr(tmp_path, monke
     monkeypatch.setattr(
         runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1", "odd-1"], [], {"odd-1"})
     )
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: [])
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: ([], [], []))
 
     doc = machine_json(["cleanup", "--project", str(tmp_path), "--json"], capsys)
 
@@ -2949,13 +2954,192 @@ def test_cleanup_json_nothing_to_clean_up_is_a_valid_empty_document(tmp_path, mo
     from bmad_loop.tui import launch
 
     monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: ([], [], set()))
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: [])
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: ([], [], []))
 
     doc = machine_json(["cleanup", "--project", str(tmp_path), "--json"], capsys)
 
     assert doc["schema_version"] == cli.CLEANUP_SCHEMA_VERSION
     assert doc["sessions"] == {"removed": [], "live": [], "unverifiable_pid": []}
-    assert doc["ctl_windows"] == {"removed": []}
+    assert doc["ctl_windows"] == {
+        "removed": [],
+        "survived": [],
+        "unverifiable": [],
+        "scan_error": None,
+    }
+
+
+def test_cleanup_json_still_emits_its_document_when_the_ctl_prune_raises(
+    tmp_path, monkeypatch, capsys
+):
+    """prune_sessions has already killed the sessions by the time the ctl half
+    runs, and the ctl half is raiser-side. An unguarded raise reaches main()'s
+    backstop, which leaves stdout EMPTY — so the record of those kills is gone
+    and a consumer cannot tell "killed nothing" from "killed one and lost the
+    receipt". The repair succeeded; only the observation failed — and the
+    document says so: empty arms with a null scan_error would read as a clean
+    scan that found nothing, so the failure travels as ctl_windows.scan_error
+    (the unverifiable_pid precedent)."""
+    from bmad_loop import runs
+    from bmad_loop.adapters.multiplexer import MultiplexerError
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1"], [], set()))
+
+    def boom(_proj):
+        raise MultiplexerError("tmux has-session failed: server gone")
+
+    monkeypatch.setattr(launch, "prune_ctl_windows", boom)
+
+    # err_contains, not the strict empty-stderr default: the failure is chatter
+    # this command now documents, and stdout must still be the document alone.
+    doc = machine_json(
+        ["cleanup", "--project", str(tmp_path), "--json"],
+        capsys,
+        err_contains="ctl window prune failed",
+    )
+
+    assert doc["sessions"]["removed"] == ["fin-1"]  # the receipt survives
+    assert doc["ctl_windows"] == {
+        "removed": [],
+        "survived": [],
+        "unverifiable": [],
+        "scan_error": "tmux has-session failed: server gone",
+    }
+
+
+def test_cleanup_dry_run_json_marks_a_failed_candidate_scan(tmp_path, monkeypatch, capsys):
+    """--dry-run --json is a preflight automation diffs against the real run, so
+    a candidate scan dying in transport must not emit the same document as a
+    scan that found nothing to prune — that reads as "nothing to do" and the
+    owed cleanup is skipped. Arms empty (no plan was formed), scan_error set,
+    exit still 0: dry-run kills nothing, so there is no receipt an exit 1 could
+    destroy, but the shared plan/outcome shape keeps one failure contract."""
+    from bmad_loop import runs
+    from bmad_loop.adapters.multiplexer import MultiplexerError
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: ([], [], set()))
+
+    def boom(_proj):
+        raise MultiplexerError("tmux list-windows failed: timeout")
+
+    monkeypatch.setattr(launch, "prunable_ctl_windows", boom)
+
+    doc = machine_json(
+        ["cleanup", "--project", str(tmp_path), "--dry-run", "--json"],
+        capsys,
+        err_contains="ctl window prune failed",
+    )
+
+    assert doc["dry_run"] is True
+    assert doc["ctl_windows"] == {
+        "removed": [],
+        "survived": [],
+        "unverifiable": [],
+        "scan_error": "tmux list-windows failed: timeout",
+    }
+
+
+def test_cleanup_json_survives_a_decode_faulting_scan(tmp_path, monkeypatch, capsys):
+    """The scan's raiser-side probes decode with the strict POSIX handler and do
+    not all normalize a decode fault to the seam type (#380). It is the same
+    scan failure: the sessions receipt must survive and the document must say
+    the scan failed — reaching main()'s backstop instead empties stdout of both."""
+    from bmad_loop import runs
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1"], [], set()))
+
+    def boom(_proj):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(launch, "prune_ctl_windows", boom)
+
+    doc = machine_json(
+        ["cleanup", "--project", str(tmp_path), "--json"],
+        capsys,
+        err_contains="ctl window prune failed",
+    )
+
+    assert doc["sessions"]["removed"] == ["fin-1"]  # the receipt survives
+    assert doc["ctl_windows"]["removed"] == []
+    assert "invalid start byte" in doc["ctl_windows"]["scan_error"]
+
+
+def test_cleanup_text_reports_a_raising_ctl_prune_without_losing_the_sessions(
+    tmp_path, monkeypatch, capsys
+):
+    from bmad_loop import runs
+    from bmad_loop.adapters.multiplexer import MultiplexerError
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1"], [], set()))
+
+    def boom(_proj):
+        raise MultiplexerError("tmux has-session failed: server gone")
+
+    monkeypatch.setattr(launch, "prune_ctl_windows", boom)
+
+    assert cli.main(["cleanup", "--project", str(tmp_path)]) == 0
+    captured = capsys.readouterr()
+    assert "removed 1 session(s), 0 ctl window(s)" in captured.out
+    assert "ctl window prune failed: tmux has-session failed" in captured.err
+
+
+def test_cleanup_schema_version_is_2_after_removed_narrowed(tmp_path, monkeypatch, capsys):
+    """`ctl_windows.removed` changed meaning (attempted -> verifiably gone), which
+    the contract says bumps the version rather than riding an additive field."""
+    from bmad_loop import runs
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: ([], [], []))
+
+    doc = machine_json(["cleanup", "--project", str(tmp_path), "--json"], capsys)
+
+    assert doc["schema_version"] == 2
+
+
+def test_cleanup_json_separates_survivors_from_removals(tmp_path, monkeypatch, capsys):
+    from bmad_loop import runs
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(
+        launch, "prune_ctl_windows", lambda _proj: (["gone-1"], ["stuck-1"], ["dunno-1"])
+    )
+
+    doc = machine_json(["cleanup", "--project", str(tmp_path), "--json"], capsys)
+
+    assert doc["ctl_windows"] == {
+        "removed": ["gone-1"],
+        "survived": ["stuck-1"],
+        "unverifiable": ["dunno-1"],
+        "scan_error": None,
+    }
+
+
+def test_cleanup_text_counts_only_verified_removals_and_names_the_rest(
+    tmp_path, monkeypatch, capsys
+):
+    """The count is what an operator reads as "it worked", so a window that
+    survived its kill must not be in it — and must not vanish silently either."""
+    from bmad_loop import runs
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(
+        launch, "prune_ctl_windows", lambda _proj: (["gone-1"], ["stuck-1"], ["dunno-1"])
+    )
+
+    assert cli.main(["cleanup", "--project", str(tmp_path)]) == 0
+    captured = capsys.readouterr()
+    assert "removed 0 session(s), 1 ctl window(s) (2 not verified — see stderr)" in captured.out
+    # Bound name-to-label, not just name-present: the two arms make different
+    # claims (still open vs no idea), and a bare membership check passes just as
+    # happily when the code reports one under the other's wording.
+    assert "still open after the kill: stuck-1" in captured.err
+    assert "kill attempted, outcome unverifiable: dunno-1" in captured.err
 
 
 def test_resume_kills_stale_session_before_running(project, monkeypatch):
@@ -5094,14 +5278,18 @@ def test_dry_run_stories_relativizes_absolute_folder(project, capsys):
 class _MuxStub:
     """Selection-surface double (available/version only — `mux` needs no more)."""
 
-    def __init__(self, avail=True, version=None):
+    def __init__(self, avail=True, version=None, version_error=None):
         self._avail, self._version = avail, version
+        self._version_error = version_error
 
     def available(self):
         return self._avail
 
     def version(self):
         return self._version
+
+    def version_error(self):
+        return self._version_error
 
 
 @pytest.fixture
@@ -5248,6 +5436,73 @@ def test_mux_keeps_the_placeholder_for_a_blank_version(mux_registry, tmp_path, c
 
     row = next(line for line in capsys.readouterr().out.splitlines() if line.startswith("alpha"))
     assert "-" in row and "* first available platform match" in row
+
+
+def test_mux_names_the_diagnostic_a_crashed_version_probe_dropped(mux_registry, tmp_path, capsys):
+    """VERSION `-` is the same cell for "reports no version" and "crashed being
+    asked" (#428). The table cannot carry the difference, so the probe's own
+    failure text goes to stderr — otherwise a corrupt/AV-blocked binary is
+    indistinguishable from a quiet one, with nothing left to diagnose it by."""
+    import sys as _sys
+
+    mux_registry.register_multiplexer(
+        "alpha",
+        lambda p: p == _sys.platform,
+        lambda: _MuxStub(avail=True, version_error="tmux -V failed: [WinError 5] Access is denied"),
+    )
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+
+    captured = capsys.readouterr()
+    row = next(line for line in captured.out.splitlines() if line.startswith("alpha"))
+    assert "-" in row  # the table is unchanged; the diagnostic is not a column
+    assert "warning: alpha version probe failed: tmux -V failed: [WinError 5]" in captured.err
+
+
+def test_mux_keeps_a_multiline_diagnostic_on_one_warning_line(mux_registry, tmp_path, capsys):
+    """The text carries the probe's own stderr, which is routinely multi-line —
+    left raw it reads as several unrelated warnings (the #321 lesson, applied to
+    the diagnostic rather than the table cell). Collapsed, not truncated: the
+    diagnostic is the payload here, not a sized column."""
+    import sys as _sys
+
+    mux_registry.register_multiplexer(
+        "alpha",
+        lambda p: p == _sys.platform,
+        lambda: _MuxStub(avail=True, version_error="tmux -V failed:\n  no server\n  running\n"),
+    )
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+
+    warnings = [ln for ln in capsys.readouterr().err.splitlines() if "version probe failed" in ln]
+    assert warnings == ["warning: alpha version probe failed: tmux -V failed: no server running"]
+
+
+def test_mux_warns_for_an_unavailable_backend_too(mux_registry, tmp_path, capsys):
+    """psmux's availability probe gates on its own version(), so the AV-blocked
+    binary the warning exists for lands on an available=no row. Warning only for
+    available backends would drop the diagnostic exactly where it is needed."""
+    import sys as _sys
+
+    mux_registry.register_multiplexer(
+        "alpha",
+        lambda p: p == _sys.platform,
+        lambda: _MuxStub(avail=False, version_error="psmux -V failed: [WinError 5]"),
+    )
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+
+    assert "warning: alpha version probe failed: psmux -V failed" in capsys.readouterr().err
+
+
+def test_mux_stays_silent_when_a_backend_simply_reports_no_version(mux_registry, tmp_path, capsys):
+    import sys as _sys
+
+    mux_registry.register_multiplexer(
+        "alpha", lambda p: p == _sys.platform, lambda: _MuxStub(avail=True, version=None)
+    )
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+
+    # Owns one mutation: warning unconditionally rather than per version_error.
+    # It cannot own "the loop was deleted" — the two positive tests do that.
+    assert "version probe failed" not in capsys.readouterr().err
 
 
 def test_mux_omits_the_note_when_every_available_backend_matches(mux_registry, tmp_path, capsys):

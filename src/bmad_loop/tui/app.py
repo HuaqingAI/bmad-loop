@@ -1082,18 +1082,42 @@ class BmadLoopApp(App[None]):
         # raiser-side call; on a worker thread the toast must be marshalled, and
         # notify() must not be called directly (see _mux_guarded — foreground only).
         try:
-            windows = launch.prune_ctl_windows(self.project)
-        except MultiplexerError as e:
+            windows, survived, unverifiable = launch.prune_ctl_windows(self.project)
+        except (MultiplexerError, UnicodeError) as e:
+            # UnicodeError: a strict-POSIX decode fault from a scan probe that
+            # does not normalize it to the seam type (#380) — the cli cleanup
+            # arm's twin; an escape here kills the worker thread instead.
             # prune_sessions already killed the agent sessions above; surface the
             # ctl-window failure but keep reporting that completed work (and the
             # unknown-pid warning) rather than swallowing it on an early return.
-            self.call_from_thread(self.notify, str(e), severity="error")
-            windows = []
+            # Named: a bare transport message next to a "removed N session(s), 0
+            # window(s)" toast reads as a successful window sweep.
+            self.call_from_thread(self.notify, f"ctl window prune failed: {e}", severity="error")
+            windows, survived, unverifiable = [], [], []
         if unknown:
             self.call_from_thread(
                 self.notify,
                 f"{len(unknown)} pruned session(s) had an unverifiable engine pid "
                 f"(may still be live): {', '.join(sorted(unknown))}",
+                severity="warning",
+            )
+        # A kill that did not verifiably land gets its own toast rather than a
+        # silent subtraction from the count below (#435) — the count now reports
+        # only verified removals, so without this the windows would just vanish
+        # from the report. Kept apart because they are different claims: one is
+        # positive evidence the window is still there, the other is the absence
+        # of any evidence at all. Both are retried by the next cleanup.
+        if survived:
+            self.call_from_thread(
+                self.notify,
+                f"{len(survived)} ctl window(s) still open after the kill: {', '.join(survived)}",
+                severity="warning",
+            )
+        if unverifiable:
+            self.call_from_thread(
+                self.notify,
+                f"{len(unverifiable)} ctl window(s) kill attempted, outcome unverifiable: "
+                f"{', '.join(unverifiable)}",
                 severity="warning",
             )
         self.call_from_thread(

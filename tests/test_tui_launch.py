@@ -1258,7 +1258,28 @@ def test_record_with_trailing_newline_still_matches(monkeypatch, tmp_path: Path)
     assert launch.ctl_window_id(tmp_path, "RID") == "@2"
 
 
-def test_prune_ctl_windows(monkeypatch, tmp_path: Path):
+def _ctl_prune_fake(
+    monkeypatch, tmp_path: Path, *, kill: str = "lands", kill_boom: str | None = None
+) -> tuple[list[list[str]], list[int]]:
+    """Stand a fake ctl session up for the prune; returns (kill-argv log, liveness
+    probe log) — the second is what proves the verdict costs ONE listing.
+
+    Two tagged-ours orphans (`@3`, `@6`) are the candidates — two, so a wrong
+    one-probe-per-window implementation cannot pass the probe-count assertion.
+    ``kill`` picks what the
+    post-kill liveness listing then shows: `lands` (gone), `fails` (still there),
+    `unknowable` (the listing itself dies in transport), `undecodable` (its
+    capture defeats the strict POSIX decode — the same transport verdict),
+    `session-gone` (empty —
+    the session died with its last window). Those are the prune's whole verdict
+    space (#435), and the listing is the only thing that distinguishes them —
+    `kill-window` exits 0 in all of them.
+
+    ``kill_boom`` names a window id whose kill-window call raises a strict-POSIX
+    decode fault AFTER the command is recorded — the command may have reached
+    the server, so the kill is "attempted" like any other and the listing still
+    owns the verdict (#380 tracks the seam guard it escapes).
+    """
     from bmad_loop import runs
 
     mine = runs.project_tag(tmp_path)
@@ -1269,14 +1290,16 @@ def test_prune_ctl_windows(monkeypatch, tmp_path: Path):
     runs.write_pid(live)
 
     # window format is window_id\twindow_name\t@bmad_project
-    windows = (
-        "@1\t0\t\n"  # the session's initial shell — not a run window
-        f"@2\trun-20260101-000000-live\t{mine}\n"  # live run, ours — keep
-        f"@3\tsweep-20260101-000000-dead\t{mine}\n"  # tagged-ours orphan — kill
-        "@5\tsweep-20260101-000000-other\t/some/other/project\n"  # another project — skip
-        f"@4\tresume-20260101-000000-cur\t{mine}\n"  # matches, but is the current window
-    )
+    rows = [
+        ("@1", "0", ""),  # the session's initial shell — not a run window
+        ("@2", "run-20260101-000000-live", mine),  # live run, ours — keep
+        ("@3", "sweep-20260101-000000-dead", mine),  # tagged-ours orphan — kill
+        ("@5", "sweep-20260101-000000-other", "/some/other/project"),  # not ours — skip
+        ("@4", "resume-20260101-000000-cur", mine),  # matches, but is the current window
+        ("@6", "run-20260101-000000-dead2", mine),  # a SECOND orphan — kill
+    ]
     killed: list[list[str]] = []
+    probes: list[int] = []
 
     def fake(argv, **kwargs):
         verb = argv[1]
@@ -1285,19 +1308,142 @@ def test_prune_ctl_windows(monkeypatch, tmp_path: Path):
         if verb == "display-message":  # we are sitting in @4
             return subprocess.CompletedProcess(argv, 0, stdout="@4\n", stderr="")
         if verb == "list-windows":
-            return subprocess.CompletedProcess(argv, 0, stdout=windows, stderr="")
+            if argv[-1] == "#{window_id}":  # the post-kill liveness probe
+                # The session it asks about is half the verdict: tmux exits
+                # nonzero on a session it cannot find, which list_window_ids
+                # folds to [] — so a probe aimed at the wrong session reads every
+                # candidate as removed, the pre-#435 optimism restored silently.
+                assert argv[argv.index("-t") + 1] == f"={launch.CTL_SESSION}"
+                probes.append(len(killed))
+                if kill == "unknowable":
+                    raise OSError("server gone")
+                if kill == "undecodable":
+                    raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+                if kill == "session-gone":
+                    # rc 1, not rc 0 with empty stdout: real tmux answers a
+                    # vanished session with a nonzero exit and list_window_ids
+                    # folds it to [] — same verdict, and the path the transport
+                    # actually takes.
+                    return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+                gone = {a[-1] for a in killed} if kill == "lands" else set()
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout="\n".join(r[0] for r in rows if r[0] not in gone), stderr=""
+                )
+            return subprocess.CompletedProcess(
+                argv, 0, stdout="".join("\t".join(r) + "\n" for r in rows), stderr=""
+            )
         if verb == "kill-window":
             killed.append(list(argv))
+            if kill_boom is not None and argv[-1] == kill_boom:
+                raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
     monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,123,0")  # we sit in a pane of @4
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+    return killed, probes
 
-    assert launch.prunable_ctl_windows(tmp_path) == ["sweep-20260101-000000-dead"]
+
+def test_prune_ctl_windows(monkeypatch, tmp_path: Path):
+    killed, probes = _ctl_prune_fake(monkeypatch, tmp_path)
+
+    both = ["sweep-20260101-000000-dead", "run-20260101-000000-dead2"]
+    assert launch.prunable_ctl_windows(tmp_path) == both
     assert killed == []  # dry-run view kills nothing
-    assert launch.prune_ctl_windows(tmp_path) == ["sweep-20260101-000000-dead"]
-    assert killed == [["tmux", "kill-window", "-t", "@3"]]
+    assert probes == []  # ...and asks nothing about liveness either
+    assert launch.prune_ctl_windows(tmp_path) == (both, [], [])
+    assert killed == [
+        ["tmux", "kill-window", "-t", "@3"],
+        ["tmux", "kill-window", "-t", "@6"],
+    ]
+    # ONE listing for BOTH windows, and only after every kill: the recorded value
+    # is the kill count at probe time, so a per-window implementation would read
+    # [1, 2] and a probe-before-kill 0.
+    assert probes == [2]
+
+
+def test_prune_ctl_windows_kill_decode_fault_does_not_abort_the_fan_out(
+    monkeypatch, tmp_path: Path
+):
+    """kill_window is best-effort and reports nothing; a strict-POSIX decode
+    fault of its own capture is more of the same nothing (#380), not a scan
+    failure. The fan-out must continue past it and the one post-kill listing
+    still hands down the verdict — a kill that landed is reported removed,
+    never surfaced to the cleanup callers as an empty-armed scan failure that
+    denies the kills just fired."""
+    killed, probes = _ctl_prune_fake(monkeypatch, tmp_path, kill_boom="@3")
+
+    both = ["sweep-20260101-000000-dead", "run-20260101-000000-dead2"]
+    assert launch.prune_ctl_windows(tmp_path) == (both, [], [])
+    assert [argv[-1] for argv in killed] == ["@3", "@6"]  # the fault did not stop @6
+    assert probes == [2]  # and the verdict still cost ONE listing, after both
+
+
+def test_prune_ctl_windows_reports_a_survivor_separately(monkeypatch, tmp_path: Path):
+    """kill-window is best-effort and exits 0 either way, so a window still in the
+    post-kill listing must land in `survived`, never in `removed` (#435) — the
+    whole point is that the report stops being optimistic."""
+    _ctl_prune_fake(monkeypatch, tmp_path, kill="fails")
+
+    assert launch.prune_ctl_windows(tmp_path) == (
+        [],
+        ["sweep-20260101-000000-dead", "run-20260101-000000-dead2"],
+        [],
+    )
+
+
+def test_prune_ctl_windows_unprobeable_liveness_claims_nothing(monkeypatch, tmp_path: Path):
+    """A transport failure on the liveness listing says nothing about the kill —
+    it may well have landed — so the candidate is neither removed nor survived,
+    and the raise must not escape a prune that already fired its kills."""
+    _ctl_prune_fake(monkeypatch, tmp_path, kill="unknowable")
+
+    assert launch.prune_ctl_windows(tmp_path) == (
+        [],
+        [],
+        ["sweep-20260101-000000-dead", "run-20260101-000000-dead2"],
+    )
+
+
+def test_prune_ctl_windows_undecodable_liveness_is_a_transport_fault(monkeypatch, tmp_path: Path):
+    """The strict POSIX decode raising on the liveness capture is the listing
+    dying in transport by another name: same verdict — unverifiable, receipt
+    intact — not a raw UnicodeDecodeError escaping a prune that already fired
+    its kills (the seam folds it to MultiplexerError; #380 tracks the rest)."""
+    _ctl_prune_fake(monkeypatch, tmp_path, kill="undecodable")
+
+    assert launch.prune_ctl_windows(tmp_path) == (
+        [],
+        [],
+        ["sweep-20260101-000000-dead", "run-20260101-000000-dead2"],
+    )
+
+
+def test_prune_ctl_windows_reads_an_empty_listing_as_the_session_going_with_it(
+    monkeypatch, tmp_path: Path
+):
+    """`[]` is the seam's "no windows", not a failed probe (only a transport fault
+    raises) — a ctl session that died with its last window really did take the
+    candidate, so pessimism here would report a phantom survivor forever."""
+    _ctl_prune_fake(monkeypatch, tmp_path, kill="session-gone")
+
+    assert launch.prune_ctl_windows(tmp_path) == (
+        ["sweep-20260101-000000-dead", "run-20260101-000000-dead2"],
+        [],
+        [],
+    )
+
+
+def test_prune_ctl_windows_with_no_candidates_never_probes(monkeypatch, tmp_path: Path):
+    """The listing is a real round trip; a prune with nothing to kill must not
+    pay for it (and must not read an empty ctl session as anything at all)."""
+    _killed, probes = _ctl_prune_fake(monkeypatch, tmp_path)
+    # no runs dir for this project => every window is another project's / untagged
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+
+    assert launch.prune_ctl_windows(other) == ([], [], [])
+    assert probes == []
 
 
 def test_prune_ctl_windows_accepts_legacy_path_tag(monkeypatch, tmp_path: Path):
@@ -1358,6 +1504,12 @@ def test_prune_ctl_windows_skips_invalid_run_ids(monkeypatch, tmp_path: Path):
         if verb == "display-message":  # current window is none of the rows
             return subprocess.CompletedProcess(argv, 0, stdout="@1\n", stderr="")
         if verb == "list-windows":
+            if argv[-1] == "#{window_id}":  # post-kill liveness: the kill landed
+                gone = {a[-1] for a in killed}
+                ids = [line.split("\t")[0] for line in windows.splitlines()]
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout="\n".join(i for i in ids if i not in gone), stderr=""
+                )
             return subprocess.CompletedProcess(argv, 0, stdout=windows, stderr="")
         if verb == "kill-window":
             killed.append(list(argv))
@@ -1368,7 +1520,7 @@ def test_prune_ctl_windows_skips_invalid_run_ids(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     assert launch.prunable_ctl_windows(tmp_path) == ["sweep-20260101-000000-dead"]
-    assert launch.prune_ctl_windows(tmp_path) == ["sweep-20260101-000000-dead"]
+    assert launch.prune_ctl_windows(tmp_path) == (["sweep-20260101-000000-dead"], [], [])
     assert killed == [["tmux", "kill-window", "-t", "@2"]]
 
 
@@ -1378,7 +1530,7 @@ def test_prune_ctl_windows_no_session(monkeypatch, tmp_path: Path):
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
-    assert launch.prune_ctl_windows(tmp_path) == []
+    assert launch.prune_ctl_windows(tmp_path) == ([], [], [])
 
 
 def test_select_ctl_window_id_argv(fake_run):

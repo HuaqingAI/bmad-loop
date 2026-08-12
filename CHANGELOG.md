@@ -235,6 +235,24 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
+- **`cleanup` no longer reports a surviving ctl window as removed (#435).** Killing a window is
+  best-effort and reports nothing, so the prune counted every _attempted_ kill as a removal. It now
+  verifies with one liveness listing and partitions into removed / survived / unverifiable.
+  A liveness capture the strict POSIX codec cannot decode is the same transport fault as a
+  timeout — `unverifiable`, never a raw crash after the kills fired. A candidate scan that
+  fails outright is contracted too: `ctl_windows.scan_error` in the `--json` document (arms
+  empty — no plan was formed), the stderr note in text mode, exit 0 either way, so a reported
+  preflight failure is never the same document as "nothing to prune".
+  `ctl_windows.removed` means _verifiably gone_ and gains `survived` / `unverifiable` siblings, so
+  `CLEANUP_SCHEMA_VERSION` is **2**; text mode names the two non-removed arms on stderr, still at
+  exit 0. `sessions.removed` is untouched and still an attempted kill.
+- **A crashed version probe is distinguishable from "reports no version" (#428).** A binary on
+  `PATH` that dies answering `-V` — corrupt install, AV-blocked exe, hung server — collapsed to the
+  same `None` a quiet binary returns, and its stderr was gone. `version()` keeps that contract, but
+  a new `version_error()` seam accessor carries the dropped diagnostic, and `bmad-loop mux` prints
+  it as a whitespace-collapsed `warning:` line on stderr below the table — the `-` in the VERSION
+  column cannot say which of the two happened.
+
 - **A project path the OS refuses to canonicalize no longer kills every command (#552).** On a
   Windows host whose WSL UNC provider is registered but not serving, resolving
   `\\wsl$\<distro>\...` raises `ERROR_NETNAME_DELETED` (WinError 64) — off CPython's non-strict
