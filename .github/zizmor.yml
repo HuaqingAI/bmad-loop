@@ -1,0 +1,33 @@
+# zizmor — static analysis for GitHub Actions (https://docs.zizmor.sh), run via
+# trunk. Every suppression below is a deliberate policy statement; prefer fixing
+# a workflow over adding to this file.
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        # zizmor defaults to `hash-pin`. We tag-pin instead (`actions/checkout@v7`,
+        # `astral-sh/setup-uv@v9.0.0`) and let Dependabot patrol the tags — see
+        # dependabot.yml. `ref-pin` keeps the part of the audit that matters here:
+        # a `uses:` with no ref at all still fails.
+        '*': ref-pin
+
+  cache-poisoning:
+    ignore:
+      # ci.yml publishes nothing. It runs under `permissions: contents: read`,
+      # uploads no artifact, and pushes nowhere; the audit fires on its `push:`
+      # trigger alone. The two jobs that *do* produce something outside the run —
+      # release.yml's publish and ci.yml's build — set `enable-cache: false`
+      # rather than being listed here. Drop this ignore if ci.yml ever grows a
+      # publishing step.
+      - ci.yml
+
+  artipacked:
+    ignore:
+      # ci.yml's trunk lint job. Unlike its siblings it keeps the checkout
+      # credentials: trunk-action runs its own git fetches for diff-aware checks,
+      # and dropping them is a change to validate against a real PR run, not to
+      # make blind. It pushes nothing.
+      - ci.yml:108
+      # release.yml's publish job pushes the release tag, so the credentials are
+      # the point.
+      - release.yml:31

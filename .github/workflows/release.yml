@@ -26,6 +26,7 @@ jobs:
   publish:
     name: publish
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
         with:
@@ -33,6 +34,12 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v9.0.0
+        with:
+          # This is the one job that writes outside the run (it pushes a tag and
+          # cuts a release), so it does not restore a cache another workflow could
+          # have poisoned. `release.py publish` runs under `--no-project` and
+          # installs nothing, so there is no cache worth keeping here anyway.
+          enable-cache: false
 
       - name: Create tag + GitHub release (idempotent)
         env:

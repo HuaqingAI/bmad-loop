@@ -7,3 +7,16 @@ updates:
       interval: weekly
     commit-message:
       prefix: ci
+
+  # Security advisories only, for the Python dependencies in uv.lock.
+  # `open-pull-requests-limit: 0` switches off routine version-update PRs;
+  # security updates are exempt from the limit and still open. Version pins here
+  # are deliberate (pyright is pinned exactly so CI and contributors run one
+  # version), so a weekly bump stream would be noise — an advisory is not.
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    commit-message:
+      prefix: chore
