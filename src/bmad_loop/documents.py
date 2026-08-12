@@ -410,7 +410,12 @@ def cleanup_document(
     clean scan that found nothing — automation reading the document would accept
     the empty partition and skip cleanup it still owes. The `unverifiable_pid`
     precedent: the degradation travels in the document, not only on stderr.
-    `null` on a scan that answered.
+    `null` when the scan reported no failure — which is as much as this document
+    can promise: the seam's listing call degrades a transport fault to an empty
+    listing by contract (the sentinel-returner half of the multiplexer seam), so
+    that one fault mode still reads as an empty scan. The same documented
+    ceiling as prune_ctl_windows' post-kill probe; narrowing it is seam work,
+    not a document field.
 
     `sessions.removed` did NOT get the same treatment and is still the pre-kill
     prunable partition — an *attempted* kill, since `kill_session` is best-effort
