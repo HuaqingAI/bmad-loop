@@ -102,6 +102,15 @@ SHELL_ALLOW = {
 # the portable replacement for "/dev/null".
 POSIX_PATHS = ("/tmp", "/proc", "/dev/null")
 
+# The subprocess spawn entry points a string-form git command could ride in on —
+# `subprocess.run("git status", shell=True)`, or the same string with no shell at
+# all, which Windows happily execs (CreateProcess takes a command line). Matched
+# as `subprocess.<name>(...)` or as the bare from-import spelling. String
+# detection anchors on these calls, unlike the sequence detector, because a
+# string starting with "git " is routinely prose (an error message, a doc line)
+# while a sequence literal headed by "git" is not.
+SPAWN_CALL_NAMES = {"run", "Popen", "call", "check_call", "check_output"}
+
 # Prefix that makes an environment variable this project's to register.
 ENV_PREFIX = "BMAD_LOOP_"
 
@@ -422,6 +431,30 @@ def _scan_source(src: str, rel: str):
                 findings.append(
                     ("git", rel, node.lineno, line_at(node.lineno), id(node) in run_git_argvs)
                 )
+
+        # string-form git spawn: `subprocess.run("git status", shell=True)`, or
+        # the same string with no shell — a spelling Windows execs directly. The
+        # sequence detector never sees it, and in the SHELL_ALLOW files the
+        # shell guard is silent too, so it gets its own anchored check (see
+        # SPAWN_CALL_NAMES). "git" exactly or a "git " prefix: `gitk` is a
+        # different program. Never the chokepoint's feed position — `_run_git`
+        # takes a sequence — so the extra field is constant False.
+        if isinstance(node, ast.Call) and node.args:
+            func = node.func
+            is_spawn = (
+                isinstance(func, ast.Attribute)
+                and func.attr in SPAWN_CALL_NAMES
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "subprocess"
+            ) or (isinstance(func, ast.Name) and func.id in SPAWN_CALL_NAMES)
+            cmd = node.args[0]
+            if (
+                is_spawn
+                and isinstance(cmd, ast.Constant)
+                and isinstance(cmd.value, str)
+                and (cmd.value == "git" or cmd.value.startswith("git "))
+            ):
+                findings.append(("git", rel, node.lineno, line_at(node.lineno), False))
 
         # bare POSIX path string literal (skip docstrings)
         if (
@@ -868,6 +901,20 @@ GIT_ARGV_PROBES = [
         "named-executable-rebound",
         'import subprocess\nGIT = "git"\nGIT = "other"\nsubprocess.run([GIT, "status"])\n',
     ),
+    # The string spellings: a shell command, and the same string with no shell —
+    # which Windows execs directly — plus the from-import spawn name.
+    (
+        "string-shell",
+        'import subprocess\nsubprocess.run("git status", shell=True)\n',
+    ),
+    (
+        "string-no-shell",
+        'import subprocess\nsubprocess.Popen("git -C . log")\n',
+    ),
+    (
+        "string-from-import",
+        'from subprocess import run\nrun("git status", shell=True)\n',
+    ),
 ]
 GIT_ARGV_NON_PROBES = [
     ("path-segment", 'from pathlib import Path\nX = Path(h) / "git" / "ignore"\n'),
@@ -883,6 +930,17 @@ GIT_ARGV_NON_PROBES = [
     (
         "named-unbound-head",
         'import subprocess\ndef run(exe):\n    return subprocess.run([exe, "status"])\n',
+    ),
+    # The string check anchors on spawn calls and on the word boundary: a git
+    # command in a NON-spawn call (the message shape — an exception, a logger)
+    # and a different program that merely starts with "git" both stay silent.
+    (
+        "string-in-message-call",
+        'raise RuntimeError("git status failed")\n',
+    ),
+    (
+        "string-other-program",
+        'import subprocess\nsubprocess.run("gitk", shell=True)\n',
     ),
 ]
 
@@ -949,6 +1007,16 @@ GIT_SCOPE_CASES = [
         "engine-calls-run-git",
         "engine.py",
         'proc = _run_git(["git", "fetch"], repo)\n',
+        True,
+    ),
+    # The string form is refused inside verify.py too — there `shell=True` is
+    # allowlisted (SHELL_ALLOW), so without this the spelling would slip both
+    # tripwires at once; it can never be the chokepoint's feed position, since
+    # `_run_git` takes a sequence.
+    (
+        "verify-string-shell",
+        "verify.py",
+        'import subprocess\nsubprocess.run("git status", shell=True)\n',
         True,
     ),
 ]
