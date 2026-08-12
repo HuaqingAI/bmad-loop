@@ -232,24 +232,40 @@ def test_worktree_isolation_conflict_survives_a_flapping_resolve(
     assert failures, "the flap never fired — the short-circuit answered first"
 
 
-def test_load_paths_degrades_for_a_config_path_that_is_itself_unresolvable(
-    tmp_path: Path, monkeypatch
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        # an absolute path elsewhere: a config string can name a dead share of its
+        # own while `--project` points at a perfectly healthy local directory
+        "external-absolute",
+        # the round-4 shape: spelled *inside* the project, where an in-tree symlink
+        # or junction can carry it to a dead share outside — degrading to this
+        # spelling made `rebased` file it as internal, and a worktree-isolated run
+        # then wrote a worktree-local directory instead of the configured one
+        "in-tree-token",
+    ],
+)
+def test_load_paths_refuses_a_config_path_it_cannot_canonicalize(
+    spelling: str, tmp_path: Path, monkeypatch
 ) -> None:
-    """`_resolve` needs the same treatment as the project root, and not for the same
-    reason: `implementation_artifacts`, `planning_artifacts`, `output_folder` and
-    `repo_root` are arbitrary operator strings, so one of them can name a dead share
-    while `--project` points at a perfectly healthy local directory. Pinned with the
-    project root left resolvable so only the config string can be what degrades."""
+    """`_resolve` takes the same boundary as the project root, and not for the same
+    reason: a config string the OS cannot canonicalize has an *unknowable* location —
+    its lexical spelling can sit inside the project while its target lies outside —
+    so any in-tree/external classification read off the spelling is a guess, and
+    `rebased` acting on a wrong guess is a silent wrong-directory write. Pinned with
+    the project root left resolvable so only the config string is what refuses."""
     root = tmp_path / "p"
     root.mkdir()
-    share = tmp_path / "elsewhere" / "impl"
-    _write_config(root, implementation_artifacts=str(share))
-    refuse_to_resolve(monkeypatch, share)
+    if spelling == "external-absolute":
+        target = tmp_path / "elsewhere" / "impl"
+        _write_config(root, implementation_artifacts=str(target))
+    else:
+        target = root.resolve() / "artifacts"
+        _write_config(root, implementation_artifacts="{project-root}/artifacts")
+    refuse_to_resolve(monkeypatch, target)
 
-    paths = bmadconfig.load_paths(root)
-
-    assert paths.implementation_artifacts == share
-    assert paths.project == root.resolve(), "the healthy root still canonicalizes"
+    with pytest.raises(bmadconfig.BmadConfigError, match="cannot canonicalize the configured"):
+        bmadconfig.load_paths(root)
 
 
 def test_load_paths_refuses_a_degraded_root_beside_canonically_spelled_config_paths(

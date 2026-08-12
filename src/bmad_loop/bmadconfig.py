@@ -135,14 +135,25 @@ def worktree_isolation_conflict(paths: ProjectPaths, isolation: str) -> str | No
 
 
 def _resolve(raw: str, project: Path) -> Path:
-    """Expand `{project-root}` and canonicalize. A config string can name a UNC share
-    of its own, independent of `--project`, so it degrades on the same terms — see
-    `platform_util.resolve_or_lexical` (#552). The degrade is safe *here* because
-    `load_paths` guarantees `project` canonicalized before any config string is
-    resolved: a member that refuses is on some other share and genuinely *is* outside
-    the tree, which is exactly how `rebased`'s `relative_to` will file it."""
+    """Expand `{project-root}` and canonicalize, or raise typed. A config string can
+    name a UNC share of its own, independent of `--project`, so it refuses on the same
+    terms as the root in `load_paths` (#552). Degrading to the lexical spelling was
+    tried and retired: a spelling the OS cannot canonicalize has an *unknowable*
+    location — it can sit lexically inside the project while an in-tree symlink or
+    junction carries it to a dead share outside — so any in-tree/external answer
+    `rebased`'s `relative_to` reads off the spelling is a guess, and a wrong guess
+    sends a worktree-isolated run's artifact writes into a worktree-local directory
+    instead of the configured destination. No member enters a snapshot unresolved."""
     expanded = Path(raw.replace("{project-root}", str(project)))
-    return resolve_or_lexical(expanded)
+    try:
+        return expanded.resolve()
+    except (OSError, RuntimeError) as e:
+        raise BmadConfigError(
+            f"cannot canonicalize the configured path {raw!r} ({expanded}): {e} — "
+            "whether it lies inside or outside the project tree cannot be determined, "
+            "so no run can safely proceed. Run `bmad-loop validate` for what this "
+            "host is doing."
+        ) from e
 
 
 def load_paths(project: Path) -> ProjectPaths:
@@ -194,8 +205,9 @@ def load_paths(project: Path) -> ProjectPaths:
         _resolve(str(out_raw), project)
         if out_raw
         # the default branch is a bare join off the (canonical) root and takes the
-        # same per-member degrade as a configured string would.
-        else resolve_or_lexical(project / "_bmad-output")
+        # same canonicalize-or-raise treatment as a configured string: an in-tree
+        # junction under the default name misclassifies exactly like a configured one.
+        else _resolve(str(project / "_bmad-output"), project)
     )
     return ProjectPaths(
         project=project,

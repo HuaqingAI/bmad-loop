@@ -248,8 +248,10 @@ whose seams had diverged enough that several ports needed a different fix, and t
   a resolved child, or an absolute path written canonically in config.yaml — mis-files an in-tree
   artifact dir as external and sends a worktree-isolated run's writes into the original checkout.
   Every caller already catches the typed error; `validate` records the `bmad-config` failure and
-  still reaches the platform preflight. Configured artifact strings keep a per-member degrade: one
-  that refuses beside a canonical root is on some other share and genuinely is outside the tree.
+  still reaches the platform preflight. Configured artifact strings refuse on the same terms: a
+  spelling the OS cannot canonicalize has an unknowable location — it can sit lexically inside
+  the project while an in-tree junction carries it to a dead share outside — so classifying it by
+  its spelling is a guess that can redirect a worktree-isolated run's writes.
   The paths that need a canonical answer downstream — `runs.project_tag`, worktree provisioning,
   `verify` — still raise, so nothing tags one project two ways. `..` is kept rather than
   collapsed; folding it lexically names a different directory across a symlink, and this value is
