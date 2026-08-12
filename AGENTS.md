@@ -35,7 +35,7 @@ Things that break silently. Never violate; when in doubt, read the named module'
 
 ## Architecture
 
-Two orthogonal seams: **which CLI** (adapter axis: `adapters/base.py` `CodingCLIAdapter`, TOML profiles in `src/bmad_loop/data/profiles/`, user overlay `.bmad-loop/profiles/*.toml` — a new coding CLI is a TOML profile plus `bmad-loop probe-adapter`, not Python) and **which transport** (mux axis: `adapters/multiplexer.py` `TerminalMultiplexer` registry; selection: `BMAD_LOOP_MUX_BACKEND` env > policy `[mux] backend` > platform default > first available match > fallback — full 5-step precedence in [docs/multiplexer-backends.md](docs/multiplexer-backends.md)).
+Two orthogonal seams: **which CLI** (adapter axis: `adapters/base.py` `CodingCLIAdapter`, TOML profiles in `src/bmad_loop/data/profiles/`, user overlay `.bmad-loop/profiles/*.toml` — a new coding CLI is a TOML profile plus `bmad-loop probe-adapter`, not Python; a CLI needing its own adapter **class** registers one in `adapters/registry.py` (`register_adapter`, `bmad_loop.adapters` entry point), selected by the profile's `adapter` field) and **which transport** (mux axis: `adapters/multiplexer.py` `TerminalMultiplexer` registry; selection: `BMAD_LOOP_MUX_BACKEND` env > policy `[mux] backend` > platform default > first available match > fallback — full 5-step precedence in [docs/multiplexer-backends.md](docs/multiplexer-backends.md)).
 
 | Module                                     | Role                                                                                        |
 | ------------------------------------------ | ------------------------------------------------------------------------------------------- |
@@ -79,16 +79,16 @@ These rules apply to code you are already touching — do not initiate refactors
 
 ## Docs index
 
-| Doc                                                                | Read when                                    |
-| ------------------------------------------------------------------ | -------------------------------------------- |
-| [docs/setup-guide.md](docs/setup-guide.md)                         | installing/initializing a target project     |
-| [docs/FEATURES.md](docs/FEATURES.md)                               | any behavior or policy question              |
-| [docs/tui-guide.md](docs/tui-guide.md)                             | TUI work                                     |
-| [docs/adapter-authoring-guide.md](docs/adapter-authoring-guide.md) | adding/finalizing a coding-CLI profile       |
-| [docs/multiplexer-backends.md](docs/multiplexer-backends.md)       | mux backend selection/porting                |
-| [docs/plugin-authoring-guide.md](docs/plugin-authoring-guide.md)   | plugin work (incl. game-engine + TEA guides) |
-| [docs/porting-to-a-new-os.md](docs/porting-to-a-new-os.md)         | OS seams                                     |
-| [docs/testing.md](docs/testing.md)                                 | writing/placing tests, guards, flake policy  |
-| [docs/ROADMAP.md](docs/ROADMAP.md)                                 | planned vs deliberately-deferred work        |
+| Doc                                                                | Read when                                               |
+| ------------------------------------------------------------------ | ------------------------------------------------------- |
+| [docs/setup-guide.md](docs/setup-guide.md)                         | installing/initializing a target project                |
+| [docs/FEATURES.md](docs/FEATURES.md)                               | any behavior or policy question                         |
+| [docs/tui-guide.md](docs/tui-guide.md)                             | TUI work                                                |
+| [docs/adapter-authoring-guide.md](docs/adapter-authoring-guide.md) | adding/finalizing a coding-CLI profile or adapter class |
+| [docs/multiplexer-backends.md](docs/multiplexer-backends.md)       | mux backend selection/porting                           |
+| [docs/plugin-authoring-guide.md](docs/plugin-authoring-guide.md)   | plugin work (incl. game-engine + TEA guides)            |
+| [docs/porting-to-a-new-os.md](docs/porting-to-a-new-os.md)         | OS seams                                                |
+| [docs/testing.md](docs/testing.md)                                 | writing/placing tests, guards, flake policy             |
+| [docs/ROADMAP.md](docs/ROADMAP.md)                                 | planned vs deliberately-deferred work                   |
 
 Full list: [docs/README.md](docs/README.md).

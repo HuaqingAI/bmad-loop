@@ -1668,15 +1668,21 @@ def test_make_adapters_review_synthesizes_from_spec(project, monkeypatch):
 
 
 def test_make_adapters_hookless_synthesizing_roles_get_dev_adapter(project, monkeypatch):
-    """Hookless dev/review (bmad-dev-auto roles) dispatch to OpencodeDevAdapter —
-    the _DevSynthesisMixin composed over the HTTP transport — sharing one
-    instance via the (cfg, synthesizes) key, while triage on the same config
-    gets a separate plain OpencodeHttpAdapter (it reads a real result.json)."""
+    """Dev/review on the `opencode-http` adapter KIND dispatch to
+    OpencodeDevAdapter — the _DevSynthesisMixin composed over the HTTP transport —
+    sharing one instance via the (cfg, synthesizes) key, while triage on the same
+    config gets a separate plain OpencodeHttpAdapter (it reads a real result.json).
+
+    Named `hookless` for the era when `profile.hookless` was what selected the
+    adapter class. It no longer is: the kind comes from `profile.adapter` and
+    hooklessness only describes the hook transport. The opencode profile carries
+    both, so this still exercises the same dispatch — see
+    tests/test_adapter_registry.py for the axes tested apart."""
     from bmad_loop.adapters import opencode_http
     from bmad_loop.adapters.opencode_http import OpencodeDevAdapter, OpencodeHttpAdapter
 
     def no_mux():
-        raise AssertionError("hookless adapters must not resolve a multiplexer")
+        raise AssertionError("a needs_mux=False kind must not resolve a multiplexer")
 
     monkeypatch.setattr(opencode_http, "_require_httpx", lambda: object())
     monkeypatch.setattr(mux_mod, "get_multiplexer", no_mux)
@@ -1695,9 +1701,9 @@ def test_make_adapters_hookless_synthesizing_roles_get_dev_adapter(project, monk
 
 
 def test_make_adapters_hookless_triage_dispatches_http_adapter(project, monkeypatch):
-    """A hookless profile on a non-synthesizing role (triage) dispatches to the
-    HTTP adapter — resolved via the `opencode` alias — while dev/review keep the
-    shared spec-synthesizing tmux adapter. The HTTP adapter exposes `profile`
+    """An `opencode-http`-kind profile on a non-synthesizing role (triage)
+    dispatches to the HTTP adapter — resolved via the `opencode` alias — while
+    dev/review keep the shared spec-synthesizing tmux adapter. The HTTP adapter exposes `profile`
     (worktree provisioning keys off it) and never constructs a multiplexer."""
     from bmad_loop.adapters import opencode_http
     from bmad_loop.adapters.generic import GenericDevAdapter

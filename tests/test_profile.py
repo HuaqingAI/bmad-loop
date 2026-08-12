@@ -1,6 +1,9 @@
 import pytest
 
+from bmad_loop.adapters import profile as profile_mod
 from bmad_loop.adapters.profile import (
+    CLIProfile,
+    HookSpec,
     ProfileError,
     get_profile,
     load_profiles,
@@ -171,6 +174,52 @@ def test_hookless_user_profile_parses(tmp_path):
 def test_unknown_profile_raises():
     with pytest.raises(ProfileError, match="unknown CLI profile"):
         get_profile("acme-cli")
+
+
+# --------------------------------------------------------------------------- #
+# The `adapter` field (which adapter CLASS drives the profile)
+
+
+def test_adapter_field_defaults_to_generic_and_parses():
+    """The adapter kind is read at parse time: unset defaults to the bundled tmux
+    generic; opencode-http declares its HTTP adapter kind. Asserted across ALL
+    built-ins, not two spot checks — a profile silently defaulting to `generic`
+    would dispatch to the tmux adapter, which cannot host it."""
+    profiles = load_profiles()
+    assert profiles["opencode-http"].adapter == "opencode-http"
+    assert {name for name, p in profiles.items() if p.adapter == "generic"} == (
+        set(profiles) - {"opencode-http"}
+    )
+
+
+def test_adapter_kind_membership_is_not_checked_at_parse_time(tmp_path):
+    """A profile naming an unregistered adapter kind still PARSES — validity is
+    enforced later against the live registry (at construction / by `validate`),
+    never a set literal here that every new adapter would have to edit."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "future.toml").write_text(
+        MINIMAL_PROFILE.replace("[hooks]", 'adapter = "not-a-real-kind-yet"\n[hooks]')
+    )
+    assert load_profiles(tmp_path)["mycli"].adapter == "not-a-real-kind-yet"
+
+
+@pytest.mark.parametrize("value", ["5", "[1]", "{ k = 1 }", "true", '""'])
+def test_malformed_adapter_value_funnels_into_profile_error(tmp_path, value):
+    """#384: a malformed value funnels into ProfileError at the boundary rather
+    than being coerced. `adapter` is the one selector field with no parse-time
+    membership test to land in afterwards, so `str(["x"])` would carry the literal
+    `"['x']"` all the way to `get_adapter_kind` and name that as the unknown kind.
+
+    ABLATION: replace the isinstance check with `str(doc.get("adapter", ...))` and
+    every row but `""` stops raising."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "bad.toml").write_text(
+        MINIMAL_PROFILE.replace("[hooks]", f"adapter = {value}\n[hooks]")
+    )
+    with pytest.raises(ProfileError, match="adapter"):
+        load_profiles(tmp_path)
 
 
 def test_render_prompt_passthrough_and_template():
@@ -404,3 +453,235 @@ def test_every_toml_value_type_parses_or_raises_profile_error(tmp_path, key, val
         load_profiles(tmp_path)
     except ProfileError:
         pass
+
+
+# --------------------------------------------------------------------------- #
+# Out-of-tree profile providers (the bmad_loop.profiles entry-point scan)
+
+
+@pytest.fixture
+def profile_scan(monkeypatch):
+    """Isolate + re-arm the profile entry-point scan: snapshot/clear the module's
+    external-scan state, then hand back a hook to install fake entry points."""
+    saved_loaded = profile_mod._EXTERNALS_LOADED
+    saved_profiles = dict(profile_mod._EXTERNAL_PROFILES)
+    saved_errors = dict(profile_mod._PROFILE_LOAD_ERRORS)
+
+    def arm(*eps, scan_error=None):
+        def fake_entry_points(*, group):
+            assert group == profile_mod.PROFILES_GROUP
+            if scan_error is not None:
+                raise scan_error
+            return list(eps)
+
+        monkeypatch.setattr(profile_mod.importlib.metadata, "entry_points", fake_entry_points)
+        profile_mod._EXTERNALS_LOADED = False
+        profile_mod._EXTERNAL_PROFILES.clear()
+        profile_mod._PROFILE_LOAD_ERRORS.clear()
+
+    yield arm
+
+    profile_mod._EXTERNALS_LOADED = saved_loaded
+    profile_mod._EXTERNAL_PROFILES.clear()
+    profile_mod._EXTERNAL_PROFILES.update(saved_profiles)
+    profile_mod._PROFILE_LOAD_ERRORS.clear()
+    profile_mod._PROFILE_LOAD_ERRORS.update(saved_errors)
+
+
+class _FakeEntryPoint:
+    def __init__(self, name, load):
+        self.name = name
+        self._load = load
+
+    def load(self):
+        return self._load()
+
+
+def _plugin_profile(name="acme", adapter="acme", **over):
+    fields = {
+        "name": name,
+        "binary": name,
+        "adapter": adapter,
+        "hooks": HookSpec("none", "", {}),
+        **over,
+    }
+    return CLIProfile(**fields)
+
+
+def test_entry_point_profile_is_discovered(profile_scan):
+    """A pip-installed profile provider (a callable returning CLIProfiles) makes
+    its profile resolvable with no project TOML — the zero-config selection path."""
+    profile_scan(_FakeEntryPoint("acme", lambda: (lambda: [_plugin_profile()])))
+    prof = get_profile("acme")
+    assert prof.name == "acme" and prof.adapter == "acme"
+    assert profile_mod.external_profile_errors() == {}
+
+
+def test_entry_point_profile_provider_may_be_iterable(profile_scan):
+    """The provider may be an iterable directly, not only a callable returning
+    one — both shapes are accepted."""
+    profile_scan(_FakeEntryPoint("acme", lambda: [_plugin_profile()]))
+    assert "acme" in load_profiles()
+
+
+def test_project_profile_overrides_entry_point(profile_scan, tmp_path):
+    """Precedence packaged < entry-point < project: a project-local TOML of the
+    same name wins over an entry-point profile."""
+    profile_scan(_FakeEntryPoint("acme", lambda: [_plugin_profile(adapter="acme")]))
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "acme.toml").write_text(
+        MINIMAL_PROFILE.replace('name = "mycli"', 'name = "acme"')
+    )
+    prof = load_profiles(tmp_path)["acme"]
+    assert prof.binary == "mycli"  # the project TOML, not the entry-point profile
+
+
+def test_entry_point_profile_can_override_packaged(profile_scan):
+    """Entry-point profiles overlay the packaged built-ins (packaged <
+    entry-point), so a plugin may re-point a bundled name."""
+    profile_scan(_FakeEntryPoint("acme", lambda: [_plugin_profile(name="claude", adapter="acme")]))
+    assert load_profiles()["claude"].adapter == "acme"
+
+
+def test_broken_profile_provider_degrades_and_is_recorded(profile_scan):
+    """A provider that blows up must not break profile loading: the built-ins
+    still load, and the failure is recorded for diagnostics."""
+
+    def boom():
+        raise RuntimeError("half-installed plugin")
+
+    profile_scan(_FakeEntryPoint("broken", boom))
+    profiles = load_profiles()
+    assert "claude" in profiles  # built-ins unaffected
+    assert list(profile_mod.external_profile_errors()) == ["broken"]
+    assert "half-installed" in profile_mod.external_profile_errors()["broken"]
+
+
+def test_one_broken_profile_package_does_not_hide_the_rest(profile_scan):
+    """Per-entry isolation: a good provider still registers alongside a broken one."""
+
+    def boom():
+        raise RuntimeError("broke")
+
+    profile_scan(
+        _FakeEntryPoint("broken", boom),
+        _FakeEntryPoint("acme", lambda: [_plugin_profile()]),
+    )
+    profiles = load_profiles()
+    assert "acme" in profiles
+    assert list(profile_mod.external_profile_errors()) == ["broken"]
+
+
+def test_profile_provider_returning_junk_is_rejected(profile_scan):
+    """A provider that yields a non-CLIProfile is the package's bug — recorded,
+    never trusted into the profile map."""
+    profile_scan(_FakeEntryPoint("acme", lambda: [object()]))
+    profiles = load_profiles()
+    assert "acme" not in profiles
+    assert "not CLIProfile" in profile_mod.external_profile_errors()["acme"]
+
+
+def test_profile_provider_returning_a_non_iterable_is_rejected(profile_scan):
+    """`list(produced)` is the shape check: a provider handing back a scalar is
+    reported rather than raising a bare TypeError out of load_profiles."""
+    profile_scan(_FakeEntryPoint("acme", lambda: 5))
+    assert "acme" not in load_profiles()
+    assert "iterable of CLIProfile" in profile_mod.external_profile_errors()["acme"]
+
+
+def test_profile_scan_failure_degrades(profile_scan):
+    """The enumeration itself blowing up leaves built-in loading working, with the
+    scan failure recorded."""
+    profile_scan(scan_error=RuntimeError("metadata index corrupt"))
+    assert "claude" in load_profiles()
+    assert "<entry-point scan>" in profile_mod.external_profile_errors()
+
+
+# --------------------------------------------------------------------------- #
+# Entry-point profiles obey the SAME invariants a TOML profile does
+
+
+@pytest.mark.parametrize(
+    ("over", "match"),
+    [
+        # the finding's own example: unchecked, this compile error moves from LOAD
+        # time to MATCH time, inside a session's env-fault classification, where
+        # the caller degrades rather than raises and the pattern never fires
+        ({"env_fault_patterns": ("API Error(unbalanced",)}, "not a valid regex"),
+        # a dialect the hook writer has no branch for
+        ({"hooks": HookSpec("mycli-json", ".mycli/s.json", {"Stop": "Stop"})}, "dialect"),
+        # a non-canonical event name silently never maps to a completion signal
+        (
+            {"hooks": HookSpec("claude-settings-json", ".m/s.json", {"Stop": "TurnDone"})},
+            "canonical",
+        ),
+        # path containment — the three fields provision_worktree/install resolve
+        ({"skill_tree": "/abs/skills"}, "skill_tree"),
+        ({"skill_tree": "."}, "skill_tree"),
+        ({"seed_files": ("/etc/passwd",)}, "seed_files"),
+        ({"seed_files": (".",)}, "seed_files"),
+        ({"hooks": HookSpec("claude-settings-json", "..", {"Stop": "Stop"})}, "relative"),
+        # a real dialect with nothing to write to
+        ({"hooks": HookSpec("claude-settings-json", "", {"Stop": "Stop"})}, "config_path"),
+        # hookless carrying hook plumbing is a contradiction either way in
+        ({"hooks": HookSpec("none", ".m/s.json", {})}, "hookless"),
+        # the remaining value-level knobs
+        ({"usage_parser": "magic"}, "usage_parser"),
+        ({"usage_grace_s": -1.0}, "usage_grace_s"),
+        ({"stop_without_result_nudges": -2}, "stop_without_result_nudges"),
+        ({"adapter": ""}, "adapter"),
+        ({"binary": "  "}, "required"),
+    ],
+)
+def test_entry_point_profile_must_pass_the_parser_invariants(profile_scan, over, match):
+    """The trust-boundary fix: an entry point hands over an already-CONSTRUCTED
+    CLIProfile, so it is the one route into the profile map with no parser in
+    front of it. Every value-level invariant `_parse_profile` enforces has to
+    apply here too, or a Python package can install a state a TOML author would
+    have been refused.
+
+    Rejection is degrade-and-record (the entry-point contract), so the proof is
+    that the profile never lands in the map AND the reason names the invariant.
+
+    ABLATION: delete the `_validate_profile` call from `_coerce_profiles` and
+    every row here goes green-with-a-bad-profile-installed — `"acme" in profiles`
+    becomes true. Deleting it from `_parse_profile` instead reddens the TOML rows
+    in `test_invalid_profiles_rejected`, which is the other half of the pair."""
+    profile_scan(_FakeEntryPoint("acme", lambda: [_plugin_profile(**over)]))
+    profiles = load_profiles()
+    assert "acme" not in profiles, "an invalid profile must never reach the map"
+    assert match in profile_mod.external_profile_errors()["acme"]
+
+
+def test_entry_point_batch_is_rejected_whole(profile_scan):
+    """One invalid profile drops the provider's whole batch rather than
+    half-installing it: a provider is one package's declaration, and an operator
+    reading the recorded reason would otherwise be looking at a profile set the
+    error message does not account for."""
+    profile_scan(
+        _FakeEntryPoint(
+            "acme",
+            lambda: [
+                _plugin_profile(name="good"),
+                _plugin_profile(name="bad", env_fault_patterns=("(unbalanced",)),
+            ],
+        )
+    )
+    profiles = load_profiles()
+    assert "good" not in profiles and "bad" not in profiles
+    assert "not a valid regex" in profile_mod.external_profile_errors()["acme"]
+
+
+def test_a_valid_entry_point_profile_still_lands(profile_scan):
+    """The control for the rejection rows above: a provider whose profiles DO
+    satisfy the invariants is installed unchanged, so those tests are failing on
+    the invariant rather than on the plumbing."""
+    profile_scan(
+        _FakeEntryPoint(
+            "acme",
+            lambda: [_plugin_profile(env_fault_patterns=("API Error.*Connection refused",))],
+        )
+    )
+    assert load_profiles()["acme"].env_fault_patterns == ("API Error.*Connection refused",)
+    assert profile_mod.external_profile_errors() == {}

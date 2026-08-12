@@ -14,6 +14,17 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Added
 
+- **Coding-CLI adapter registry: a new adapter class ships out-of-tree (#226).** The transport axis
+  has long been extensible out-of-tree; the CLI axis had no equivalent, so a CLI needing its own
+  adapter _class_ forced a name-branch in the run bootstrap. A profile's new `adapter` field names a
+  kind resolved against `adapters/registry.py`, and a co-installed package registers its own kind
+  via the `bmad_loop.adapters` entry point and the profile that selects it via `bmad_loop.profiles`
+  — with no core edit. `bmad-loop adapters` lists the registered kinds and which profiles select
+  them; `validate` gains `adapter.kind` (checked against the live registry, never a hardcoded set)
+  plus `adapter.external` / `adapter.external-profile` warnings. A broken third-party package
+  degrades to a recorded, surfaced reason and can never break selection. `opencode-http` is migrated
+  to a registered builtin behind a dispatch-unchanged regression pin.
+
 - **docs/testing.md: the formal testing strategy.** Layer taxonomy and placement rules, fixture
   and ablation doctrine, the quality-guard inventory, zero-token and flake policy, and a tracked
   gap register (#545–#549); AGENTS.md, docs/README.md and CONTRIBUTING.md link here.
@@ -122,6 +133,23 @@ whose seams had diverged enough that several ports needed a different fix, and t
   unpaired surrogates) are dropped. Templates that do not name the placeholder skip the read.
 
 ### Changed
+
+- **The mid-run config pin covers the adapter kind (#461).** `adapter` selects which argv builder
+  runs at all, so it joins the `config_digest` launch payload — a driven session rewriting it now
+  moves the pin the auto-triggered child sweep gates on, instead of swapping the whole launch shape
+  underneath it. The digest resolves the kind from the profile bytes it was handed, not a second
+  read.
+
+- **`validate`'s httpx check keys on the adapter kind, not hooklessness.** `httpx` is the
+  `opencode-http` family's optional extra; with the transport and driving class now separate axes, a
+  hookless profile driven by another kind no longer FAILs with a remedy that installs the wrong
+  package.
+
+- **Profiles from a `bmad_loop.profiles` entry point are validated like TOML ones.** Both routes into
+  the profile map now share one invariant set (hook dialect, path containment, `env_fault_patterns`
+  compilation, …), so a package can no longer install a profile state the parser would refuse — an
+  invalid env-fault regex used to trade a load-time error for a silent never-match at classification
+  time. A malformed `adapter` value funnels into `ProfileError` rather than being `str()`-coerced.
 
 - **Lint the workflows, and smoke-test the built package.** `trunk check` now runs `actionlint` and
   `zizmor` over `.github/workflows/`, and a `build` CI job builds the sdist + wheel, runs

@@ -9,10 +9,29 @@ Built-in profiles ship as packaged TOML (bmad_loop/data/profiles/*.toml) and
 project-local TOML files in <project>/.bmad-loop/profiles/*.toml overlay them
 (same name overrides, new names extend) — adding a CLI that clones an
 existing hook dialect needs no Python.
+
+An out-of-tree package advertises additional profiles under the
+``bmad_loop.profiles`` entry-point group (:func:`load_profiles` scans it): the
+companion to the ``bmad_loop.adapters`` registry (:mod:`~.registry`), so a
+co-installed adapter package ships both its class and the profile that selects
+it with zero project config. Precedence is packaged < entry-point < project (a
+project TOML always wins). A broken entry point degrades to a recorded reason
+(:func:`external_profile_errors`), never a crash.
+
+Which adapter *class* drives a profile is the ``adapter`` field, resolved against
+the :mod:`~.registry` — it is read here but intentionally **not** checked against
+the set of registered kinds at parse time (an unknown kind is caught at
+construction and by ``validate``, against the live registry, never a hardcoded
+set). Its *shape* is still enforced here, like every other field.
+
+Both routes into the profile map — the TOML parser and the entry-point scan —
+converge on :func:`_validate_profile`, so a Python package cannot install a
+profile state a TOML author would have been refused.
 """
 
 from __future__ import annotations
 
+import importlib.metadata
 import tomllib
 from dataclasses import dataclass, field
 from importlib import resources
@@ -69,6 +88,15 @@ class CLIProfile:
     name: str
     binary: str
     hooks: HookSpec
+    # Which adapter *class* drives this CLI — a key resolved against the adapter
+    # registry (adapters/registry.py), not a hardcoded enum. "generic" = the
+    # bundled tmux-injection + hook-signal adapter; "opencode-http" = the bundled
+    # HTTP/SSE adapter; an out-of-tree package registers its own. Membership is NOT
+    # checked at parse time: an unknown kind fails loud at construction and as a
+    # `validate` finding, both against the live registry. A hookless HTTP profile
+    # (hooks.dialect = "none") MUST set this to its HTTP adapter kind — the
+    # transport (hookless) and the driving class are now decoupled axes.
+    adapter: str = "generic"
     # project-relative tree this CLI reads skills from, e.g. ".claude/skills"
     # (claude) or ".agents/skills" (codex/gemini); `bmad-loop init` installs the
     # bundled bmad-loop-* skills here.
@@ -139,7 +167,106 @@ class CLIProfile:
         return self.prompt_template.format(prompt=prompt, skill=skill, args=args)
 
 
+def _validate_profile(profile: CLIProfile, source: str) -> None:
+    """Enforce every value-level invariant a ``CLIProfile`` must satisfy, whatever
+    built it.
+
+    Two routes reach the profile map and only one has a parser in front of it:
+    :func:`_parse_profile` coerces a TOML document, while a ``bmad_loop.profiles``
+    entry point hands over an already-constructed instance. Holding the invariants
+    in one function is what stops those routes drifting — the failure it closes is
+    a Python package installing a state the TOML parser would have refused, and
+    the sharpest instance is an ``env_fault_patterns`` entry that is not a valid
+    regex: unchecked, it trades a compile error at LOAD time for one at MATCH
+    time, inside a session's env-fault classification, where the caller degrades
+    rather than raises and the pattern silently never fires.
+
+    Scope is semantic, not type-level. A package that constructs a ``CLIProfile``
+    with the wrong runtime type in a field (a list where a ``str`` belongs) is a
+    bug this deliberately does not chase: reaching here already ran that package's
+    code in-process, so this is not a security boundary and hardening it as one
+    would invite it being trusted as one. What it does catch is the well-typed and
+    wrong profile — exactly what a TOML author is told about at parse time."""
+
+    def fail(msg: str) -> ProfileError:
+        return ProfileError(f"profile {source}: {msg}")
+
+    if not profile.name.strip() or not profile.binary.strip():
+        raise fail("'name' and 'binary' are required")
+
+    hooks = profile.hooks
+    if hooks.dialect not in HOOK_DIALECTS:
+        raise fail(f"hooks.dialect must be one of {sorted(HOOK_DIALECTS)}: got {hooks.dialect!r}")
+    if hooks.dialect == "none":
+        # hookless: nothing is ever registered, so a config_path or events map
+        # is a contradiction — reject rather than silently ignore.
+        if hooks.config_path or hooks.events:
+            raise fail('hookless profiles (dialect = "none") must not set hooks.config_path/events')
+    else:
+        if (
+            names_tree_root(hooks.config_path)
+            or is_absolute_path(hooks.config_path)
+            or has_parent_ref(hooks.config_path)
+        ):
+            # `names_tree_root("")` is True, so this arm also carries the
+            # "a real dialect must name a config_path at all" case.
+            raise fail("hooks.config_path must be a project-relative path")
+        if not hooks.events:
+            raise fail("hooks.events must map native event names to canonical ones")
+        bad = sorted(set(hooks.events.values()) - CANONICAL_EVENTS)
+        if bad:
+            raise fail(
+                f"hooks.events values must be canonical {sorted(CANONICAL_EVENTS)}: got {bad}"
+            )
+
+    # Shape only — membership against the registered kinds is deliberately NOT
+    # checked here (see the module docstring): that set is open-ended and lives in
+    # adapters/registry.py, which importing from here would make a cycle.
+    if not profile.adapter:
+        raise fail("adapter must be a non-empty string naming an adapter kind")
+
+    if profile.usage_parser not in USAGE_PARSERS:
+        raise fail(
+            f"usage_parser must be one of {sorted(USAGE_PARSERS)}: got {profile.usage_parser!r}"
+        )
+
+    if profile.usage_grace_s < 0:
+        raise fail(f"usage_grace_s must be >= 0: got {profile.usage_grace_s}")
+
+    nudges = profile.stop_without_result_nudges
+    if nudges is not None and nudges < 0:
+        raise fail(f"stop_without_result_nudges must be >= 0: got {nudges}")
+
+    if (
+        names_tree_root(profile.skill_tree)
+        or is_absolute_path(profile.skill_tree)
+        or has_parent_ref(profile.skill_tree)
+    ):
+        raise fail("skill_tree must be a project-relative path")
+
+    # `names_tree_root` subsumes the emptiness check it replaced. These entries feed
+    # provision_worktree's seed loop, where any spelling of the root ("", ".", "./",
+    # ".\") resolves src to the repo root and dst to the worktree — both pass the
+    # loop's containment checks, so the whole repo is copied in.
+    for seed in profile.seed_files:
+        if names_tree_root(seed) or is_absolute_path(seed) or has_parent_ref(seed):
+            raise fail(f"seed_files entries must be project-relative paths: got {seed!r}")
+
+    for pattern in profile.env_fault_patterns:
+        try:
+            regex.compile(pattern)  # same engine the adapter matches with (timeout-guarded)
+        except regex.error as e:
+            raise fail(f"env_fault_patterns entry is not a valid regex: {pattern!r} ({e})") from e
+
+
 def _parse_profile(doc: dict, source: str) -> CLIProfile:
+    """Coerce a TOML document into a :class:`CLIProfile`.
+
+    SHAPE only: the container and element types a TOML document can get wrong and
+    a constructed dataclass cannot. Every value-level invariant lives in
+    :func:`_validate_profile`, called on the result — so the entry-point route,
+    which has no document to coerce, enforces exactly the same set."""
+
     def fail(msg: str) -> ProfileError:
         return ProfileError(f"profile {source}: {msg}")
 
@@ -151,93 +278,53 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
             raise fail(f"{key} must be a list of strings")
         return tuple(raw)
 
-    name = str(doc.get("name", "")).strip()
-    binary = str(doc.get("binary", "")).strip()
-    if not name or not binary:
-        raise fail("'name' and 'binary' are required")
-
     hooks_d = doc.get("hooks")
     if not isinstance(hooks_d, dict):
         raise fail("missing [hooks] table")
-    dialect = str(hooks_d.get("dialect", ""))
-    if dialect not in HOOK_DIALECTS:
-        raise fail(f"hooks.dialect must be one of {sorted(HOOK_DIALECTS)}: got {dialect!r}")
-    if dialect == "none":
-        # hookless: nothing is ever registered, so a config_path or events map
-        # is a contradiction — reject rather than silently ignore.
-        if hooks_d.get("config_path") or hooks_d.get("events"):
-            raise fail('hookless profiles (dialect = "none") must not set hooks.config_path/events')
-        config_path = ""
-        events: dict[str, str] = {}
-    else:
-        config_path = str(hooks_d.get("config_path", ""))
-        if (
-            names_tree_root(config_path)
-            or is_absolute_path(config_path)
-            or has_parent_ref(config_path)
-        ):
-            raise fail("hooks.config_path must be a project-relative path")
-        events_d = hooks_d.get("events")
-        if not isinstance(events_d, dict) or not events_d:
-            raise fail("hooks.events must map native event names to canonical ones")
-        events = {str(k): str(v) for k, v in events_d.items()}
-        bad = sorted(set(events.values()) - CANONICAL_EVENTS)
-        if bad:
-            raise fail(
-                f"hooks.events values must be canonical {sorted(CANONICAL_EVENTS)}: got {bad}"
-            )
+    events_d = hooks_d.get("events", {})
+    if not isinstance(events_d, dict):
+        raise fail("hooks.events must map native event names to canonical ones")
 
-    usage_parser = str(doc.get("usage_parser", "none"))
-    if usage_parser not in USAGE_PARSERS:
-        raise fail(f"usage_parser must be one of {sorted(USAGE_PARSERS)}: got {usage_parser!r}")
+    # A dedicated shape check rather than the `str()` coercion the neighbouring
+    # scalars get, because `adapter` has no parse-time membership test to land in
+    # afterwards: `str(["x"])` would coerce a TOML array to the literal `"['x']"`
+    # and carry it all the way to `get_adapter_kind`, which would then name that
+    # nonsense as the unknown kind. #384's rule — a malformed value funnels into
+    # ProfileError at the boundary, never a silent coercion.
+    raw_adapter = doc.get("adapter", "generic")
+    if not isinstance(raw_adapter, str):
+        raise fail(f"adapter must be a string: got {type(raw_adapter).__name__}")
 
-    usage_grace_s = float(doc.get("usage_grace_s", 0.0))
-    if usage_grace_s < 0:
-        raise fail(f"usage_grace_s must be >= 0: got {usage_grace_s}")
-
-    raw_nudges = doc.get("stop_without_result_nudges")
-    stop_nudges = None if raw_nudges is None else int(raw_nudges)
-    if stop_nudges is not None and stop_nudges < 0:
-        raise fail(f"stop_without_result_nudges must be >= 0: got {stop_nudges}")
-
-    skill_tree = str(doc.get("skill_tree", ".claude/skills"))
-    if names_tree_root(skill_tree) or is_absolute_path(skill_tree) or has_parent_ref(skill_tree):
-        raise fail("skill_tree must be a project-relative path")
-
-    seed_files = str_list("seed_files")
-    # `names_tree_root` subsumes the emptiness check it replaced. These entries feed
-    # provision_worktree's seed loop, where any spelling of the root ("", ".", "./",
-    # ".\") resolves src to the repo root and dst to the worktree — both pass the
-    # loop's containment checks, so the whole repo is copied in.
-    for seed in seed_files:
-        if names_tree_root(seed) or is_absolute_path(seed) or has_parent_ref(seed):
-            raise fail(f"seed_files entries must be project-relative paths: got {seed!r}")
-
-    env_fault_patterns = str_list("env_fault_patterns")
-    for pattern in env_fault_patterns:
-        try:
-            regex.compile(pattern)  # same engine the adapter matches with (timeout-guarded)
-        except regex.error as e:
-            raise fail(f"env_fault_patterns entry is not a valid regex: {pattern!r} ({e})") from e
-
-    return CLIProfile(
-        name=name,
-        binary=binary,
-        hooks=HookSpec(dialect=dialect, config_path=config_path, events=events),
-        skill_tree=skill_tree,
+    profile = CLIProfile(
+        name=str(doc.get("name", "")).strip(),
+        binary=str(doc.get("binary", "")).strip(),
+        hooks=HookSpec(
+            dialect=str(hooks_d.get("dialect", "")),
+            config_path=str(hooks_d.get("config_path", "")),
+            events={str(k): str(v) for k, v in events_d.items()},
+        ),
+        adapter=raw_adapter.strip(),
+        skill_tree=str(doc.get("skill_tree", ".claude/skills")),
         prompt_template=str(doc.get("prompt_template", "{prompt}")),
         launch_args=str_list("launch_args"),
         bypass_args=str_list("bypass_args"),
         model_flag=str(doc.get("model_flag", "--model")),
         env={str(k): str(v) for k, v in doc.get("env", {}).items()},
-        usage_parser=usage_parser,
-        usage_grace_s=usage_grace_s,
-        stop_without_result_nudges=stop_nudges,
+        usage_parser=str(doc.get("usage_parser", "none")),
+        # `float()`/`int()` are the raw coercions `_load_toml`'s CONVERSION_FAULTS
+        # funnel exists for: they answer OverflowError for `inf` and for an integer
+        # too large to be a float, both of which are legal TOML.
+        usage_grace_s=float(doc.get("usage_grace_s", 0.0)),
+        stop_without_result_nudges=(
+            None if (raw := doc.get("stop_without_result_nudges")) is None else int(raw)
+        ),
         subagent_stop_without_transcript=bool(doc.get("subagent_stop_without_transcript", False)),
         first_run_note=str(doc.get("first_run_note", "")),
-        seed_files=seed_files,
-        env_fault_patterns=env_fault_patterns,
+        seed_files=str_list("seed_files"),
+        env_fault_patterns=str_list("env_fault_patterns"),
     )
+    _validate_profile(profile, source)
+    return profile
 
 
 def _load_toml(text: str, source: str) -> CLIProfile:
@@ -260,14 +347,93 @@ def _load_toml(text: str, source: str) -> CLIProfile:
         raise ProfileError(f"profile {source}: malformed field value: {e}") from e
 
 
+# The entry-point group an out-of-tree package advertises extra profiles under —
+# the companion to adapters/registry.py's `bmad_loop.adapters` group. Each entry
+# point loads to a provider: a callable returning an iterable of CLIProfile (or an
+# iterable directly), e.g. one built from the package's own bundled TOML. Scanned
+# once per process (a third-party import failure is not transient); the resulting
+# profiles are process-global (project-independent), so only the project overlay
+# is re-read per load_profiles call. A broken entry point is recorded, not raised.
+PROFILES_GROUP = "bmad_loop.profiles"
+_EXTERNALS_LOADED = False
+_EXTERNAL_PROFILES: dict[str, CLIProfile] = {}
+_PROFILE_LOAD_ERRORS: dict[str, str] = {}
+
+
+def _coerce_profiles(produced: object, ep_name: str) -> list[CLIProfile]:
+    """A provider may return a callable's result or an iterable directly; either
+    way it must yield CLIProfile instances that satisfy the same invariants a TOML
+    profile does. Anything else is the package's bug — reported (per
+    :func:`external_profile_errors`), never trusted into the map.
+
+    The :func:`_validate_profile` call is the point of this function: without it a
+    Python provider is the one route into the profile map with no parser in front
+    of it, and it could install a state ``_parse_profile`` would refuse."""
+    try:
+        items = list(produced)  # pyright: ignore[reportArgumentType] — TypeError is the check
+    except TypeError as exc:
+        raise ProfileError(
+            f"{ep_name}: profile provider must return an iterable of CLIProfile"
+        ) from exc
+    for item in items:
+        if not isinstance(item, CLIProfile):
+            raise ProfileError(
+                f"{ep_name}: profile provider yielded {type(item).__name__}, not CLIProfile"
+            )
+        _validate_profile(item, f"entry point {ep_name}")
+    return items
+
+
+def _load_external_profiles() -> dict[str, CLIProfile]:
+    """Import every ``bmad_loop.profiles`` entry point and collect the profiles it
+    provides, first-registration-wins on a name collision. Scan-once; failures are
+    recorded in ``_PROFILE_LOAD_ERRORS`` (surfaced via
+    :func:`external_profile_errors`), never raised — a broken adapter package must
+    not break profile loading for everything else.
+
+    A provider is rejected WHOLE: one invalid profile in the returned batch drops
+    the batch, because ``_coerce_profiles`` raises before any of them is recorded.
+    Deliberate — a provider is one package's declaration, and half-installing it
+    would leave an operator with a profile set no error message accounts for."""
+    global _EXTERNALS_LOADED
+    if _EXTERNALS_LOADED:
+        return _EXTERNAL_PROFILES
+    _EXTERNALS_LOADED = True
+    try:
+        eps = importlib.metadata.entry_points(group=PROFILES_GROUP)
+    except Exception as exc:  # noqa: BLE001 — diagnostics path, never crash loading
+        _PROFILE_LOAD_ERRORS["<entry-point scan>"] = f"{type(exc).__name__}: {exc}"
+        return _EXTERNAL_PROFILES
+    for ep in eps:
+        try:
+            provider = ep.load()
+            produced = provider() if callable(provider) else provider
+            for profile in _coerce_profiles(produced, ep.name):
+                _EXTERNAL_PROFILES.setdefault(profile.name, profile)
+        except Exception as exc:  # noqa: BLE001 — one bad package must not hide the rest
+            _PROFILE_LOAD_ERRORS[ep.name] = f"{type(exc).__name__}: {exc}"
+    return _EXTERNAL_PROFILES
+
+
+def external_profile_errors() -> dict[str, str]:
+    """Entry-point name -> failure reason for every external profile provider that
+    failed to load this process (empty when all loaded). For diagnostics surfaces."""
+    return dict(_PROFILE_LOAD_ERRORS)
+
+
 def load_profiles(project: Path | None = None) -> dict[str, CLIProfile]:
-    """Packaged built-ins, overlaid by <project>/.bmad-loop/profiles/*.toml."""
+    """Packaged built-ins, overlaid by ``bmad_loop.profiles`` entry-point
+    profiles, overlaid by <project>/.bmad-loop/profiles/*.toml.
+
+    Precedence is packaged < entry-point < project: a co-installed adapter package
+    extends (or overrides) the bundled set, and a project TOML always wins."""
     profiles: dict[str, CLIProfile] = {}
     packaged = resources.files("bmad_loop.data").joinpath("profiles")
     for entry in sorted(packaged.iterdir(), key=lambda e: e.name):
         if entry.name.endswith(".toml"):
             profile = _load_toml(entry.read_text(encoding="utf-8"), entry.name)
             profiles[profile.name] = profile
+    profiles.update(_load_external_profiles())
     if project is not None:
         user_dir = project / USER_PROFILES_REL
         if user_dir.is_dir():

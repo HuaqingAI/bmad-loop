@@ -295,7 +295,8 @@ def cmd_validate(args: argparse.Namespace) -> int:
     # story-queue gate runs below: the sprint-status file (sprint mode) or the
     # stories.yaml manifest (stories mode). Loaded before the queue gate so a
     # stories-only project is not failed on a missing sprint-status.yaml.
-    from .adapters.profile import ProfileError, get_profile
+    from .adapters import registry as adapter_registry
+    from .adapters.profile import ProfileError, external_profile_errors, get_profile
 
     profiles = []
     profile_by_name: dict[str, CLIProfile] = {}
@@ -425,14 +426,17 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
     any_hooks_registered = False
     for profile in profiles:
-        if profile.hookless:
-            report.ok(
-                "adapter.hookless",
-                f"{profile.name}: hookless (HTTP/SSE transport) — no hook registration needed",
-                {"profile": profile.name},
-            )
-            # The HTTP adapter needs httpx, which ships as an optional extra —
-            # surface a missing install here instead of at run start.
+        # Keyed on the adapter KIND, not on `hookless`. httpx is the bundled
+        # opencode family's optional extra — a fact about one adapter class, which
+        # is a different question from "does this profile register hooks". Those
+        # were the same question only while `hookless` selected the adapter; the
+        # registry decoupled them, so a hookless profile driven by some other
+        # registered kind needs nothing from `bmad-loop[opencode]` and must not be
+        # FAILed with a remedy that installs the wrong package. Naming one bundled
+        # kind here is not the hardcoded-valid-set the registry exists to remove:
+        # the set of VALID kinds is only ever `known_adapter_kinds()` (below).
+        if profile.adapter == adapter_registry.OPENCODE_HTTP:
+            # Surface a missing install here instead of at run start.
             if importlib.util.find_spec("httpx") is not None:
                 report.ok(
                     "adapter.httpx",
@@ -446,6 +450,12 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     f"run `pip install 'bmad-loop[opencode]'`",
                     {"profile": profile.name},
                 )
+        if profile.hookless:
+            report.ok(
+                "adapter.hookless",
+                f"{profile.name}: hookless (HTTP/SSE transport) — no hook registration needed",
+                {"profile": profile.name},
+            )
             continue
         hook_config = project / profile.hooks.config_path
         hooks_ok = False
@@ -526,6 +536,40 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 f"hook relay script present: {relay}",
                 {"path": str(relay)},
             )
+
+    # Adapter-kind validity is enforced against the LIVE registry, never a
+    # hardcoded set: a profile.adapter naming no registered kind is a config error
+    # (a typo, or an uninstalled plugin package). External adapter/profile packages
+    # that failed to load are surfaced as warnings — selection already degraded
+    # past them (the same non-blocking treatment as a failed mux backend package).
+    kinds = adapter_registry.known_adapter_kinds()
+    for profile in profiles:
+        if profile.adapter in kinds:
+            report.ok(
+                "adapter.kind",
+                f"{profile.name}: adapter kind {profile.adapter!r} registered",
+                {"profile": profile.name, "adapter": profile.adapter},
+            )
+        else:
+            report.fail(
+                "adapter.kind",
+                f"{profile.name}: unknown adapter kind {profile.adapter!r} — "
+                f"known: {', '.join(kinds)} (install the plugin that provides it, "
+                f"or fix the profile's `adapter`)",
+                {"profile": profile.name, "adapter": profile.adapter, "known": kinds},
+            )
+    for ep_name, reason in sorted(adapter_registry.external_adapter_errors().items()):
+        report.warn(
+            "adapter.external",
+            f"external adapter '{ep_name}' failed to load: {reason}",
+            {"entry_point": ep_name, "error": reason},
+        )
+    for ep_name, reason in sorted(external_profile_errors().items()):
+        report.warn(
+            "adapter.external-profile",
+            f"external profile '{ep_name}' failed to load: {reason}",
+            {"entry_point": ep_name, "error": reason},
+        )
 
     # opencode config-file model ids are "provider/model" (see the opencode_http docstring);
     # a bare model name silently falls back to the server's default model, so warn
@@ -814,6 +858,64 @@ def _warn_preflight_would_abort(
     for problem in problems:
         print(f"  FAIL: {problem}", file=sys.stderr)
     print("run `bmad-loop validate` for details", file=sys.stderr)
+
+
+def cmd_adapters(args: argparse.Namespace) -> int:
+    """List the registered coding-CLI adapter kinds (the CLI axis's counterpart to
+    `bmad-loop mux` for the transport axis) and name any out-of-tree adapter or
+    profile package that failed to load. Unlike `mux`, there is no global choice
+    to persist: an adapter kind is selected per profile by its `adapter` field."""
+    from .adapters.profile import ProfileError, external_profile_errors, load_profiles
+    from .adapters.registry import detect_adapters, external_adapter_errors
+
+    # Loading profiles also triggers the bmad_loop.profiles entry-point scan, so a
+    # broken profile package surfaces below alongside a broken adapter package.
+    # A malformed project overlay is the operator's own file and aborts — this is a
+    # listing command, and printing a table assembled from a profile set that
+    # silently lost an entry is worse than saying which file is wrong.
+    try:
+        profiles = load_profiles(_project(args))
+    except ProfileError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    by_kind: dict[str, list[str]] = {}
+    for prof in profiles.values():
+        by_kind.setdefault(prof.adapter, []).append(prof.name)
+
+    rows = detect_adapters()
+    header = ("NAME", "ORIGIN", "NEEDS MUX", "PROFILES")
+    table = [
+        (
+            r.name,
+            "builtin" if r.builtin else "external",
+            "yes" if r.needs_mux else "no",
+            ", ".join(sorted(by_kind.get(r.name, []))) or "-",
+        )
+        for r in rows
+    ]
+    widths = [max(len(h), *(len(row[i]) for row in table), 0) for i, h in enumerate(header)]
+    for row in (header, *table):
+        print("  ".join(cell.ljust(w) for cell, w in zip(row, widths)).rstrip())
+    # A profile whose adapter kind never registered (a typo, or an uninstalled
+    # plugin) is invisible in the table above — name it so an operator can see the
+    # dangling reference, exactly as `mux` names a failed backend package.
+    known = {r.name for r in rows}
+    for kind in sorted(set(by_kind) - known):
+        print(
+            f"warning: profile(s) {', '.join(sorted(by_kind[kind]))} reference unknown "
+            f"adapter kind '{kind}' (no registered kind or plugin provides it)",
+            file=sys.stderr,
+        )
+    for ep_name, reason in sorted(external_adapter_errors().items()):
+        print(f"warning: external adapter '{ep_name}' failed to load: {reason}", file=sys.stderr)
+    for ep_name, reason in sorted(external_profile_errors().items()):
+        print(f"warning: external profile '{ep_name}' failed to load: {reason}", file=sys.stderr)
+    print(
+        "adapter kind is selected per profile by its `adapter` field "
+        "(default: generic); an out-of-tree package registers new kinds via the "
+        "bmad_loop.adapters + bmad_loop.profiles entry points"
+    )
+    return 0
 
 
 def _require_base_skills(project: Path, pol, *, require_stories: bool = False) -> bool:
@@ -3554,6 +3656,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="with set: persist a name not registered in this process (e.g. a plugin "
         "backend that only registers on the target machine)",
+    )
+
+    add(
+        "adapters",
+        cmd_adapters,
+        "list registered coding-CLI adapter kinds + which profiles select them",
     )
 
     probe_p = add(
