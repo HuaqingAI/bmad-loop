@@ -20,6 +20,7 @@ it lazily for its own tests.
 
 from __future__ import annotations
 
+import copy
 import json
 from collections.abc import Sequence
 from importlib import resources
@@ -736,13 +737,18 @@ def provision_worktree(
         # (user-overlay aliases of one CLI), and a later profile's pass must not
         # tear out the relay events an earlier one just registered — merge_hooks
         # unions its events in, the first registration winning a shared event.
-        if config_path in stripped_paths:
-            stripped = False
-        else:
-            stripped = strip_relay_hooks(config, profile.hooks.dialect)
+        baseline_config = copy.deepcopy(config)
+        if config_path not in stripped_paths:
+            strip_relay_hooks(config, profile.hooks.dialect)
             stripped_paths.add(config_path)
-        config, merged = merge_hooks(config, registrations, profile.hooks.dialect)
-        if stripped or merged:
+        config, _ = merge_hooks(config, registrations, profile.hooks.dialect)
+        # Write — and pin — only when the strip+merge actually changed the parsed
+        # config. Non-claude dialects bake the absolute main-repo relay at init
+        # (_hook_command), so a tracked codex/gemini config often arrives already
+        # carrying exactly the command registered here: strip-then-merge nets to
+        # zero, and a pin would claim orchestrator ownership of a file this run
+        # never modified, hiding a story's own edit to it for no benefit.
+        if config != baseline_config:
             config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
             pin_degrade = _pin_tracked_config_rewrite(worktree, profile.hooks.config_path)
             if pin_degrade is not None and on_degraded is not None:

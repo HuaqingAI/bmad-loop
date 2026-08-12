@@ -591,6 +591,33 @@ def test_provision_worktree_tracked_config_rewrite_stays_out_of_commits(project,
     assert "$CLAUDE_PROJECT_DIR" in (repo / hook_rel).read_text(encoding="utf-8")
 
 
+def test_provision_worktree_tracked_portable_config_is_left_alone(project, tmp_path):
+    """Non-claude dialects bake the absolute main-repo relay at init
+    (_hook_command), so a tracked codex config arrives in the worktree already
+    carrying exactly the command provisioning would register: strip-then-merge
+    nets to zero. No write may happen and no skip-worktree pin may be set —
+    pinning claims orchestrator ownership of a file this run never modified,
+    hiding a story's own edit to it for no benefit."""
+    repo = project.project
+    codex = get_profile("codex")
+    hook_rel = codex.hooks.config_path
+    assert _register_hooks(repo, codex) == 0
+    committed = (repo / hook_rel).read_bytes()
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "track the codex hook config")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [codex], repo)
+
+    assert (wt / hook_rel).read_bytes() == committed  # no rewrite happened
+    assert not git(wt, "ls-files", "-t", "--", hook_rel).startswith("S")  # and no pin
+    # a story's own edit to the un-pinned tracked config stays stageable
+    (wt / hook_rel).write_text((wt / hook_rel).read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    git(wt, "add", "-A")
+    assert hook_rel in git(wt, "diff", "--cached", "--name-only").splitlines()
+
+
 def test_provision_worktree_shared_config_path_keeps_first_profiles_events(tmp_path):
     """Profiles can share a hooks.config_path (user-overlay aliases of one CLI)
     with different event maps. The strip runs once per config file: a later
