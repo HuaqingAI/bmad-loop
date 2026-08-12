@@ -240,9 +240,10 @@ whose seams had diverged enough that several ports needed a different fix, and t
   `timeout_s` override on the chokepoint (5s on the TUI's event loop, 10s for the init hint) —
   standing inside the chokepoint no longer costs an interactive surface the difference between
   a degraded label and a two-minute freeze. `test_portability_guard.py` gains a git-argv
-  detector quarantining `["git", ...]` — tuple spellings, heads factored into named
-  constants (`GIT = "git"`), and string-form spawns (`subprocess.run("git status")`, with or
-  without a shell) included — to `_run_git`'s own argv argument in `verify.py`, so the next bypass fails CI
+  detector quarantining `["git", ...]` — tuple spellings, string-form spawns
+  (`subprocess.run("git status")`, with or without a shell), and either shape factored into a
+  named constant (`GIT = "git"`, `GIT_STATUS = "git status"`) included — to `_run_git`'s own
+  argv argument in `verify.py`, so the next bypass fails CI
   instead of surviving by convention, including one added to a non-chokepoint helper inside
   `verify.py` itself. AGENTS.md's chokepoint line now states its real
   scope (`src/bmad_loop`) and names the enforcer; tests, `scripts/` and CI workflows deliberately

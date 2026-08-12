@@ -279,27 +279,36 @@ def _env_name_aliases(tree: ast.AST) -> dict[str, str]:
     return aliases
 
 
-def _git_head_names(tree: ast.AST) -> set[str]:
-    """The names bound to the constant ``"git"`` anywhere in the module — the
-    spawn-argv twin of ``_env_name_aliases``: an executable factored into a named
-    constant (``GIT = "git"``) is the tidy spelling a well-meaning bypass takes,
-    and matching the literal head alone would miss exactly that shape. ANY
-    binding qualifies the name — a later rebind must not launder an argv that was
-    git somewhere in the module — which can only over-flag, and a false positive
-    is a review prompt, not a miss. The tmux detector keeps its literal-only
-    head: widening that older tripwire is a separate decision from the git
-    chokepoint invariant this one enforces."""
-    names: set[str] = set()
+def _git_name_bindings(tree: ast.AST) -> tuple[set[str], set[str]]:
+    """``(head_names, command_names)`` — the names bound anywhere in the module
+    to the constant ``"git"`` (a sequence head) and to a string-form git command
+    (``"git"`` or a ``"git "`` prefix). The spawn-argv twin of
+    ``_env_name_aliases``: a command factored into a named constant
+    (``GIT = "git"``, ``GIT_STATUS = "git status"``) is the tidy spelling a
+    well-meaning bypass takes, and matching the literal alone would miss exactly
+    that shape — in both the sequence and the string branch. ANY binding
+    qualifies a name — a later rebind must not launder a spawn that was git
+    somewhere in the module — which can only over-flag, and a false positive is
+    a review prompt, not a miss. The tmux detector keeps its literal-only head:
+    widening that older tripwire is a separate decision from the git chokepoint
+    invariant this one enforces."""
+    heads: set[str] = set()
+    commands: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
-            targets = [t for t in node.targets if isinstance(t, ast.Name)]
+            targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            targets = [node.target]
+            targets = [node.target.id]
         else:
             continue
-        if isinstance(node.value, ast.Constant) and node.value.value == "git":
-            names.update(t.id for t in targets)
-    return names
+        value = node.value
+        if not targets or not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+            continue
+        if value.value == "git":
+            heads.update(targets)
+        if value.value == "git" or value.value.startswith("git "):
+            commands.update(targets)
+    return heads, commands
 
 
 def _env_call_key_node(call: ast.Call) -> ast.expr | None:
@@ -400,7 +409,7 @@ def _scan_source(src: str, rel: str):
         and call.func.id == "_run_git"
         and call.args
     }
-    git_heads = _git_head_names(tree)
+    git_heads, git_commands = _git_name_bindings(tree)
 
     def line_at(lineno: int) -> str:
         return lines[lineno - 1] if 1 <= lineno <= len(lines) else ""
@@ -413,7 +422,7 @@ def _scan_source(src: str, rel: str):
         # form to spare, so the tuple spelling of a bypass must not slip the
         # net. A path segment ("git" outside a sequence) and prose stay silent.
         # A git head also resolves through the module's own constant bindings
-        # (`GIT = "git"` — see `_git_head_names`), and each git finding carries
+        # (`GIT = "git"` — see `_git_name_bindings`), and each git finding carries
         # one extra field: whether the literal sits in the argv position of a
         # `_run_git(...)` call — the only spot the chokepoint file's own
         # exemption covers.
@@ -437,8 +446,11 @@ def _scan_source(src: str, rel: str):
         # sequence detector never sees it, and in the SHELL_ALLOW files the
         # shell guard is silent too, so it gets its own anchored check (see
         # SPAWN_CALL_NAMES). "git" exactly or a "git " prefix: `gitk` is a
-        # different program. Never the chokepoint's feed position — `_run_git`
-        # takes a sequence — so the extra field is constant False.
+        # different program. The command resolves through the module's constant
+        # bindings the same way a sequence head does (`GIT_STATUS = "git
+        # status"` — see `_git_name_bindings`). Never the chokepoint's feed
+        # position — `_run_git` takes a sequence — so the extra field is
+        # constant False.
         if isinstance(node, ast.Call) and node.args:
             func = node.func
             is_spawn = (
@@ -448,11 +460,13 @@ def _scan_source(src: str, rel: str):
                 and func.value.id == "subprocess"
             ) or (isinstance(func, ast.Name) and func.id in SPAWN_CALL_NAMES)
             cmd = node.args[0]
-            if (
-                is_spawn
-                and isinstance(cmd, ast.Constant)
-                and isinstance(cmd.value, str)
-                and (cmd.value == "git" or cmd.value.startswith("git "))
+            if is_spawn and (
+                (
+                    isinstance(cmd, ast.Constant)
+                    and isinstance(cmd.value, str)
+                    and (cmd.value == "git" or cmd.value.startswith("git "))
+                )
+                or (isinstance(cmd, ast.Name) and cmd.id in git_commands)
             ):
                 findings.append(("git", rel, node.lineno, line_at(node.lineno), False))
 
@@ -915,6 +929,13 @@ GIT_ARGV_PROBES = [
         "string-from-import",
         'from subprocess import run\nrun("git status", shell=True)\n',
     ),
+    # …and the string command factored into a constant resolves the same way a
+    # sequence head does — the last cell of the spelling matrix
+    # ({sequence, string} × {inline, named}).
+    (
+        "string-named-command",
+        'import subprocess\nGIT_STATUS = "git status"\nsubprocess.run(GIT_STATUS, shell=True)\n',
+    ),
 ]
 GIT_ARGV_NON_PROBES = [
     ("path-segment", 'from pathlib import Path\nX = Path(h) / "git" / "ignore"\n'),
@@ -941,6 +962,17 @@ GIT_ARGV_NON_PROBES = [
     (
         "string-other-program",
         'import subprocess\nsubprocess.run("gitk", shell=True)\n',
+    ),
+    # The named-command reach is exactly the strings the module ties to git:
+    # a different command and a "git"-prefixed different program stay silent
+    # through the alias path too.
+    (
+        "string-named-other-command",
+        'import subprocess\nLS = "ls -la"\nsubprocess.run(LS, shell=True)\n',
+    ),
+    (
+        "string-named-other-program",
+        'import subprocess\nGITK = "gitk"\nsubprocess.run(GITK, shell=True)\n',
     ),
 ]
 
