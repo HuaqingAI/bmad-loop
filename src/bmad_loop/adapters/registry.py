@@ -212,17 +212,28 @@ def _load_external_adapters() -> None:
     whatever else its package got wrong. The recorded reason is a fact about the
     import, not a promise about the registry.
 
-    Entry points are visited in name order. ``importlib.metadata`` yields them in
-    distribution-discovery order, which varies with ``sys.path``, so without this
-    two hosts carrying the same packages could resolve a name collision
-    differently — and first-wins would be a fact about the install rather than
-    about the packages."""
+    Entry points are visited in (name, distribution) order. ``importlib.metadata``
+    yields them in distribution-discovery order, which varies with ``sys.path``, so
+    without an explicit sort two hosts carrying the same packages could resolve a
+    collision differently — first-wins would be a fact about the install rather
+    than about the packages.
+
+    The distribution belongs in the key because the name alone is NOT a total
+    order. ``entry_points(group=...)`` does not dedup across distributions, so two
+    packages advertising the same entry-point name come back as two entries, and
+    ``sorted`` is stable — a name-only key resolves that tie straight back into
+    ``sys.path`` order. That tie is the whole case the sort exists for: a package
+    conventionally names its entry point after the kind it registers, so packages
+    that collide on a kind normally collide on the entry-point name too."""
     global _EXTERNALS_LOADED
     if _EXTERNALS_LOADED:
         return
     _EXTERNALS_LOADED = True
     try:
-        eps = sorted(importlib.metadata.entry_points(group=ADAPTERS_GROUP), key=lambda e: e.name)
+        eps = sorted(
+            importlib.metadata.entry_points(group=ADAPTERS_GROUP),
+            key=lambda e: (e.name, getattr(e.dist, "name", "") or ""),
+        )
     except Exception as exc:  # noqa: BLE001 — diagnostics path, never crash selection
         _EXTERNAL_ERRORS["<entry-point scan>"] = f"{type(exc).__name__}: {exc}"
         return

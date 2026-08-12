@@ -232,6 +232,48 @@ def test_explicit_adapter_beats_the_hookless_back_compat_default(tmp_path):
     assert profile.hookless and profile.adapter == "some-other-http-kind"
 
 
+def test_hookless_profile_cannot_select_the_generic_adapter(tmp_path):
+    """The one coherence rule between the two axes, written out longhand.
+
+    `generic` is the bundled tmux adapter and completes on a Stop hook (or the
+    window dying); `dialect = "none"` means nothing ever registers one. The pair
+    therefore describes a session that can only wait out `session_timeout_min`
+    against an interactive CLI that never exits — the exact failure
+    `_legacy_adapter_default` steers the ABSENT-key file away from, which an
+    explicit file could still spell out.
+
+    ABLATION: drop the `profile.hookless and ... == GENERIC` guard from
+    `_validate_profile` and this reddens (the profile loads happily)."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "hangy.toml").write_text(
+        HOOKLESS_PROFILE.replace("[hooks]", 'adapter = "generic"\n[hooks]')
+    )
+    with pytest.raises(ProfileError, match="cannot select the 'generic' adapter"):
+        load_profiles(tmp_path)
+
+
+def test_entry_point_profile_at_the_default_adapter_while_hookless_is_refused(profile_scan):
+    """The same pair by the route `_legacy_adapter_default` cannot reach — and the
+    reason the rule lives in `_validate_profile` rather than in the TOML parser.
+
+    A provider that builds a hookless `HookSpec` and never sets `adapter` takes the
+    dataclass default `generic`. Content a TOML file expresses by OMITTING the key,
+    which the parser steers to the HTTP kind; the Python route has no absent-key to
+    detect, so without this rule the two routes disagree about the same profile and
+    the provider's silently hangs at run time. Dropped with a reason instead.
+
+    ABLATION: drop the guard and `acme` loads with `adapter == "generic"`."""
+    profile_scan(
+        _FakeEntryPoint(
+            "acme",
+            lambda: [CLIProfile(name="acme", binary="acme", hooks=HookSpec("none", "", {}))],
+        )
+    )
+    assert "acme" not in load_profiles()
+    assert "generic" in profile_mod.external_profile_errors()["acme"]
+
+
 def test_adapter_kind_membership_is_not_checked_at_parse_time(tmp_path):
     """A profile naming an unregistered adapter kind still PARSES — validity is
     enforced later against the live registry (at construction / by `validate`),
@@ -539,9 +581,21 @@ def profile_scan(monkeypatch):
     profile_mod._PROFILE_LOAD_ERRORS.update(saved_errors)
 
 
-class _FakeEntryPoint:
-    def __init__(self, name, load):
+class _FakeDist:
+    """Stands in for ``EntryPoint.dist``; the scan orders on its ``.name``."""
+
+    def __init__(self, name):
         self.name = name
+
+
+class _FakeEntryPoint:
+    """Duck-typed EntryPoint. ``dist`` is the scan's ordering tiebreak (see
+    `_load_external_profiles`) and defaults to a distinct-per-name stand-in, so
+    only a test that sets it can decide a same-name collision."""
+
+    def __init__(self, name, load, dist=None):
+        self.name = name
+        self.dist = _FakeDist(dist if dist is not None else f"{name}-dist")
         self._load = load
 
     def load(self):

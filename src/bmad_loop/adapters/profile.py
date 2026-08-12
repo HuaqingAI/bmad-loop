@@ -238,6 +238,31 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
     if not profile.adapter.strip():
         raise fail("adapter must be a non-empty string naming an adapter kind")
 
+    # The one coherence rule between the two axes, and the only place both routes
+    # pass through. `generic` is the bundled tmux adapter: it injects into a window
+    # and completes on a Stop hook (or the window dying), so pairing it with
+    # dialect = "none" — which means nothing ever registers that hook — describes a
+    # session that can only wait out `session_timeout_min` against an interactive
+    # CLI that never exits. Both routes could reach it: a TOML file naming the pair
+    # outright, and an entry-point provider that builds a hookless `HookSpec` while
+    # leaving `adapter` at its dataclass default. (The absent-key TOML case cannot:
+    # `_legacy_adapter_default` sends a hookless file to the HTTP kind.)
+    #
+    # This is the membership check's opposite, not an instance of it: naming ONE
+    # bundled kind is a fact about that adapter's completion contract, which this
+    # package owns, and the same latitude `validate`'s httpx check takes. Hookless
+    # on any OTHER kind stays legal — that decoupling is what the registry is for,
+    # and an out-of-tree kind's completion contract is its own to state.
+    from .registry import GENERIC
+
+    if profile.hookless and profile.adapter.strip() == GENERIC:
+        raise fail(
+            f'hookless profiles (dialect = "none") cannot select the {GENERIC!r} adapter: '
+            "it completes on a Stop hook a hookless profile never registers, so the "
+            "session would wait out session_timeout_min. Name the adapter kind that "
+            "drives this CLI over its own transport."
+        )
+
     if profile.usage_parser not in USAGE_PARSERS:
         raise fail(
             f"usage_parser must be one of {sorted(USAGE_PARSERS)}: got {profile.usage_parser!r}"
@@ -437,15 +462,21 @@ def _load_external_profiles() -> dict[str, CLIProfile]:
     Deliberate — a provider is one package's declaration, and half-installing it
     would leave an operator with a profile set no error message accounts for.
 
-    Entry points are visited in name order, so which provider wins a name
-    collision is a property of the packages rather than of ``sys.path`` ordering
-    (the adapter scan sorts for the same reason)."""
+    Entry points are visited in (name, distribution) order, so which provider wins
+    a name collision is a property of the packages rather than of ``sys.path``
+    ordering. The distribution is part of the key because the name alone is not a
+    total order — ``entry_points(group=...)`` does not dedup across distributions,
+    and ``sorted`` being stable would resolve a same-name tie back into discovery
+    order (the adapter scan sorts on the same key, for the same reason)."""
     global _EXTERNALS_LOADED
     if _EXTERNALS_LOADED:
         return _EXTERNAL_PROFILES
     _EXTERNALS_LOADED = True
     try:
-        eps = sorted(importlib.metadata.entry_points(group=PROFILES_GROUP), key=lambda e: e.name)
+        eps = sorted(
+            importlib.metadata.entry_points(group=PROFILES_GROUP),
+            key=lambda e: (e.name, getattr(e.dist, "name", "") or ""),
+        )
     except Exception as exc:  # noqa: BLE001 — diagnostics path, never crash loading
         _PROFILE_LOAD_ERRORS["<entry-point scan>"] = f"{type(exc).__name__}: {exc}"
         return _EXTERNAL_PROFILES

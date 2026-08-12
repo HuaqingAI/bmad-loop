@@ -69,12 +69,22 @@ def _stub_builder(*, construct_error=()):
     return AdapterBuilder(plain=_StubAdapter, dev=_StubDevAdapter, construct_error=construct_error)
 
 
-class _FakeEntryPoint:
-    """Duck-typed importlib.metadata.EntryPoint: the loader only touches
-    ``.name`` and ``.load()``."""
+class _FakeDist:
+    """Stands in for ``EntryPoint.dist``; the scan orders on its ``.name``."""
 
-    def __init__(self, name, load):
+    def __init__(self, name):
         self.name = name
+
+
+class _FakeEntryPoint:
+    """Duck-typed importlib.metadata.EntryPoint: the loader touches ``.name``,
+    ``.dist`` (the scan's tiebreak — see `_load_external_adapters`) and
+    ``.load()``. ``dist`` defaults to a distinct-per-name stand-in so the ordering
+    of same-named entries is only ever decided by a test that sets it."""
+
+    def __init__(self, name, load, dist=None):
+        self.name = name
+        self.dist = _FakeDist(dist if dist is not None else f"{name}-dist")
         self._load = load
 
     def load(self):
@@ -286,8 +296,12 @@ def test_builtins_win_over_an_external_imported_by_the_profile_scan(
     registry = fresh_adapter_registry
 
     def provider():
+        # Any loadable profile does — it exists so the scan has something to
+        # accept. The shadowing is the entry point's import side effect below,
+        # not anything about this profile. (Its kind is deliberately not
+        # `generic`: hookless + `generic` is refused as incoherent.)
         return [
-            CLIProfile(name="ext", binary="ext", adapter="generic", hooks=HookSpec("none", "", {}))
+            CLIProfile(name="ext", binary="ext", adapter="ext-http", hooks=HookSpec("none", "", {}))
         ]
 
     def ep_load():
@@ -366,6 +380,45 @@ def test_scan_runs_once_per_process(scan_adapter_registry):
     registry.known_adapter_kinds()
     registry.known_adapter_kinds()
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "order", [("alpha", "zeta"), ("zeta", "alpha")], ids=["alpha-discovered-first", "zeta-first"]
+)
+def test_same_named_entry_points_resolve_by_distribution_not_install_order(
+    scan_adapter_registry, order
+):
+    """Two distributions may advertise the SAME entry-point name in one group —
+    `entry_points(group=...)` does not dedup across distributions — and a package
+    conventionally names its entry point after the kind it registers, so packages
+    colliding on a kind normally arrive as a NAME collision too. `sorted` is
+    stable, so a name-only key resolves that tie in distribution-discovery order,
+    which is `sys.path` order: the very same two packages would then pick
+    different winners on two hosts. Ordering on the distribution as well is what
+    makes first-wins a fact about the packages.
+
+    Both parameters arm the identical pair and differ only in the order the scan
+    yields them; `alpha-adapter` must win either way.
+
+    ABLATION: drop the `getattr(e.dist, ...)` half of the sort key in
+    `_load_external_adapters` and the `zeta-first` case reddens (needs_mux True)
+    while `alpha-discovered-first` stays green — which is the finding: the
+    name-only key is right only when the install happens to agree with it."""
+    registry, arm = scan_adapter_registry
+
+    def register(needs_mux):
+        def load():
+            registry.register_adapter("acme", needs_mux=needs_mux, load=lambda: _stub_builder())
+
+        return load
+
+    eps = {
+        "alpha": _FakeEntryPoint("acme", register(False), dist="alpha-adapter"),
+        "zeta": _FakeEntryPoint("acme", register(True), dist="zeta-adapter"),
+    }
+    arm(*(eps[k] for k in order))
+
+    assert registry.get_adapter_kind("acme").needs_mux is False  # alpha-adapter's
 
 
 def test_real_dist_info_metadata_is_discovered(fresh_adapter_registry, monkeypatch, tmp_path):

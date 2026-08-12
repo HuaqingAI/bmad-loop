@@ -154,6 +154,13 @@ whose seams had diverged enough that several ports needed a different fix, and t
   generic adapter, where it would have waited out `session_timeout_min` for a hook a hookless profile
   never registers. An explicit `adapter` is always honored, including hookless driven by another kind.
 
+- **A hookless profile can no longer select the `generic` adapter.** `generic` completes on a Stop
+  hook and `dialect = "none"` means none is ever registered, so the pair described a session that
+  could only wait out `session_timeout_min` against a CLI that never exits — with `validate` green.
+  Both routes into the profile map now refuse it: a TOML file naming the pair outright, and an
+  entry-point provider that builds a hookless profile while leaving `adapter` at its default.
+  Hookless on any other kind stays legal — that decoupling is what the registry is for.
+
 - **Profiles from a `bmad_loop.profiles` entry point are validated like TOML ones.** Both routes into
   the profile map now share one invariant set (hook dialect, path containment, `env_fault_patterns`
   compilation, …), so a package can no longer install a profile state the parser would refuse — an
