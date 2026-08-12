@@ -90,6 +90,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@v9.0.0
@@ -140,3 +142,31 @@ jobs:
         # `uv run`, not `uvx pyright@<version>`: the same command a contributor
         # runs locally, resolving the same pinned version from uv.lock.
         run: uv run pyright
+
+  build:
+    # Packaging smoke test. Every other job runs from the source tree, so a
+    # packaging break is invisible to them — it has bitten before (`.trunk` had
+    # to be excluded from the sdist). This builds both distributions and runs the
+    # console script out of the installed wheel.
+    name: build (packaging)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          # A clean-room build: nothing here should come from a restored cache.
+          enable-cache: false
+
+      - name: Build sdist + wheel
+        run: uv build --clear
+
+      - name: Run the console script from the built wheel
+        # `--isolated --no-project` resolves `bmad-loop` from the wheel alone
+        # rather than the checkout, so a package or data file the build dropped
+        # fails here instead of at a user's install.
+        run: uv run --isolated --no-project --with dist/*.whl -- bmad-loop --version

@@ -119,6 +119,18 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Changed
 
+- **Lint the workflows, and smoke-test the built package.** `trunk check` now runs `actionlint` and
+  `zizmor` over `.github/workflows/`, and a `build` CI job builds the sdist + wheel and runs
+  `bmad-loop --version` from the installed wheel — every other job runs from the source tree, so a
+  packaging break was invisible until release (`.trunk` had to be excluded from the sdist once
+  already). `.github/zizmor.yml` records the three deliberate suppressions: we tag-pin actions and
+  let Dependabot patrol them (`ref-pin`, not `hash-pin`), ci.yml publishes nothing, and the lint and
+  publish jobs keep their checkout credentials on purpose. The publish and build jobs set
+  `enable-cache: false` rather than being suppressed. Also: the `version-sync` job drops its
+  checkout credentials like its siblings, the release `publish` job gains the `timeout-minutes` it
+  was the only job missing, and Dependabot watches `uv.lock` for security advisories only
+  (`open-pull-requests-limit: 0` — pins here are deliberate, an advisory is not).
+
 - **State the supported tmux floor: 3.2.** It was never written down, so the only floor a reader
   could infer was whatever the argv grammar happens to accept — which is older than anything the
   project tests, and would have read as support for tmux releases nobody has verified. No version
