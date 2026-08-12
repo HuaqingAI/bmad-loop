@@ -574,11 +574,26 @@ def cmd_validate(args: argparse.Namespace) -> int:
     # opencode config-file model ids are "provider/model" (see the opencode_http docstring);
     # a bare model name silently falls back to the server's default model, so warn
     # (advisory — a note, not a FAIL: an empty model legitimately means "default").
+    #
+    # Keyed on the adapter KIND, for the same reason `adapter.httpx` above is: the
+    # "provider/model" spelling is a fact about the opencode server's config file,
+    # not about whether a profile registers hooks. Those were one question only
+    # while `hookless` selected the builder; the registry decoupled them, and
+    # keying on `hookless` is now wrong in BOTH directions — it warns an
+    # out-of-tree hookless family whose server takes bare model names, naming a
+    # convention that family does not use, and it stays silent for an
+    # `opencode-http` profile carrying a hook dialect, which is exactly where the
+    # bare name really does fall back to the server default.
     if pol is not None:
         for role in ROLES:
             cfg = pol.adapter.resolved(role)
             prof = profile_by_name.get(cfg.name)
-            if prof is not None and prof.hookless and cfg.model and "/" not in cfg.model:
+            if (
+                prof is not None
+                and prof.adapter == adapter_registry.OPENCODE_HTTP
+                and cfg.model
+                and "/" not in cfg.model
+            ):
                 report.warn(
                     "policy.model-qualified",
                     f"{role} model {cfg.model!r} is not 'provider/model' — "

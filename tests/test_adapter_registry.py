@@ -763,6 +763,57 @@ def test_validate_httpx_check_keys_on_the_adapter_kind_not_hooklessness(
     assert [f["severity"] for f in findings if f["check"] == "adapter.kind"] == ["ok"]
 
 
+def test_validate_model_format_check_keys_on_the_adapter_kind_not_hooklessness(
+    fresh_adapter_registry, project, capsys
+):
+    """`policy.model-qualified` is the httpx check's sibling and needed the same
+    re-keying: "provider/model" is a fact about the opencode SERVER's config file,
+    not about whether a profile registers hooks. An out-of-tree hookless family
+    whose server takes bare model names must draw no warning naming a spelling it
+    does not use.
+
+    The `adapter.hookless` assert is the positive control, and the point of the
+    test: the profile IS hookless, so the old predicate would have fired here. The
+    absent warning is therefore the re-keying and not a profile that failed to
+    load, a model that never reached the check, or a validate that bailed early.
+
+    ABLATION: re-key the check on `prof.hookless` and the `not any(...)` reddens."""
+    fresh_adapter_registry.register_adapter("hermes", needs_mux=False, load=lambda: _stub_builder())
+    install_bmad_config(project)
+    _write_profile(project.project, "hermes", adapter="hermes")  # hookless=True
+    _write_policy(project.project, '[adapter]\nname = "hermes"\nmodel = "haiku"\n')
+
+    findings = _validate_findings(project.project, capsys)
+    assert not any(f["check"] == "policy.model-qualified" for f in findings)
+    # controls: the profile loaded, its kind resolved, and it really is hookless
+    assert [f["severity"] for f in findings if f["check"] == "adapter.kind"] == ["ok"]
+    assert any(f["check"] == "adapter.hookless" for f in findings)
+
+
+def test_validate_model_format_warns_on_an_opencode_kind_carrying_a_hook_dialect(
+    fresh_adapter_registry, project, capsys
+):
+    """The other direction of the same miss: keyed on `hookless`, the check also
+    UNDER-fires. Decoupling the axes made `opencode-http` beside a hook dialect a
+    legal profile, and its bare model still falls back to the server's default —
+    the case the warning exists for — while `prof.hookless` reads False.
+
+    ABLATION: re-key the check on `prof.hookless` and this reddens (no finding at
+    all, because the profile is not hookless)."""
+    install_bmad_config(project)
+    _write_profile(project.project, "ochooked", adapter="opencode-http", hookless=False)
+    _write_policy(project.project, '[adapter]\nname = "ochooked"\nmodel = "haiku"\n')
+
+    findings = [
+        f
+        for f in _validate_findings(project.project, capsys)
+        if f["check"] == "policy.model-qualified"
+    ]
+    assert findings, "a bare model on the opencode-http kind must warn"
+    assert {f["severity"] for f in findings} == {"warning"}
+    assert all("haiku" in f["message"] for f in findings)
+
+
 def test_validate_flags_an_unregistered_adapter_kind(fresh_adapter_registry, project, capsys):
     """`adapter.kind` is resolved against the live registry, so a profile naming a
     kind no installed package provides is a FAIL that names the known set."""

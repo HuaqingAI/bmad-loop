@@ -140,10 +140,13 @@ whose seams had diverged enough that several ports needed a different fix, and t
   underneath it. The digest resolves the kind from the profile bytes it was handed, not a second
   read.
 
-- **`validate`'s httpx check keys on the adapter kind, not hooklessness.** `httpx` is the
-  `opencode-http` family's optional extra; with the transport and driving class now separate axes, a
-  hookless profile driven by another kind no longer FAILs with a remedy that installs the wrong
-  package.
+- **`validate`'s httpx and model-format checks key on the adapter kind, not hooklessness.** `httpx`
+  is the `opencode-http` family's optional extra and `provider/model` is its server's config-file
+  spelling; both are facts about one adapter class, not about whether a profile registers hooks.
+  With the transport and driving class now separate axes, a hookless profile driven by another kind
+  no longer FAILs with a remedy that installs the wrong package, nor draws a `policy.model-qualified`
+  warning naming a convention it does not use — and an `opencode-http` profile carrying a hook
+  dialect now gets the model warning it always needed.
 
 - **A profile written before the `adapter` field keeps its old dispatch.** `hooks.dialect = "none"`
   used to be the class selector, so a project overlay copied from the packaged opencode profile

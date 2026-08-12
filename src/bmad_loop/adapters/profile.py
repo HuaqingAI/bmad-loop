@@ -96,6 +96,15 @@ class CLIProfile:
     # `validate` finding, both against the live registry. A hookless HTTP profile
     # (hooks.dialect = "none") MUST set this to its HTTP adapter kind — the
     # transport (hookless) and the driving class are now decoupled axes.
+    #
+    # That MUST binds the two routes differently, which is why the default below
+    # is not the whole story. A TOML profile that OMITS the key is read as
+    # predating the field and keeps the old dialect-based dispatch
+    # (`_legacy_adapter_default`), so a hookless file still lands on the HTTP
+    # kind. A provider that constructs this dataclass directly takes the default
+    # verbatim — nothing infers a kind for it — so an entry-point profile really
+    # must set the field, and a hookless one that leaves it at "generic" resolves
+    # to a mux-driving kind that will never see a Stop hook.
     adapter: str = "generic"
     # project-relative tree this CLI reads skills from, e.g. ".claude/skills"
     # (claude) or ".agents/skills" (codex/gemini); `bmad-loop init` installs the
