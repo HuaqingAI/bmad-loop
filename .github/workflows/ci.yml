@@ -185,8 +185,12 @@ jobs:
           from importlib.resources import files
 
           ROOT = "src/bmad_loop/data/"
-          tracked = subprocess.run(
-              ["git", "ls-files", "-z", ROOT], capture_output=True, text=True, check=True
+          tracked = subprocess.run(  # fixed argv, no shell
+              ["git", "ls-files", "-z", ROOT],
+              capture_output=True,
+              text=True,
+              check=True,
+              timeout=60,
           ).stdout.split("\0")
           expected = [p.removeprefix(ROOT) for p in tracked if p]
           if not expected:
