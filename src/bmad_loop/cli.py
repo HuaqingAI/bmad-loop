@@ -21,6 +21,7 @@ from . import (
     deferredwork,
     devcontract,
     envvars,
+    events,
     frontmatter,
     gates,
     install,
@@ -495,10 +496,13 @@ def cmd_validate(args: argparse.Namespace) -> int:
     # A distinct id, not a repurposed `hooks.registered` — the two answer different
     # questions and an operator needs to see which one failed.
     #
-    # COUPLING (#461 Phase 2): Phase 2 moves the relay to
-    # `<abs-python> -m bmad_loop.hookrelay` and retires HOOK_SCRIPT_REL. It must
-    # RETARGET this check to stat the registered interpreter (`hooks.interpreter`),
-    # not drop it — the stall it guards against survives the move.
+    # COUPLING (#461 Phase 2): Phase 2 moves the relay to the installed console
+    # script — `bmad-loop relay <Event>` (cmd_relay / events.py), NOT the
+    # `<abs-python> -m bmad_loop.hookrelay` spelling this once anticipated — and
+    # retires HOOK_SCRIPT_REL. It must RETARGET this check to stat what the
+    # registration actually points at (the resolved `bmad-loop` executable), not
+    # drop it — the stall it guards against survives the move: an entry point that
+    # is gone or unreadable strands every hook event exactly like a missing script.
     if any_hooks_registered:
         relay = project / install.HOOK_SCRIPT_REL
         # Existence is not enough: `is_file()` stays True for a mode-000 file, and
@@ -3639,6 +3643,32 @@ def cmd_init(args: argparse.Namespace) -> int:
     return install_into(project, clis=clis, skills=args.skills, force_skills=args.force_skills)
 
 
+def cmd_relay(args: argparse.Namespace) -> int:
+    """``bmad-loop relay <Event>`` — the hook relay as an installed console script.
+
+    Total by contract, unlike every other handler: a coding CLI runs this INSIDE
+    the session whose completion it reports, and several of them surface a
+    non-zero hook exit as a failed tool call in that session. So nothing here
+    escalates. :func:`events.relay` already swallows the relay-level failures
+    (unset env, garbage stdin, a hostile events dir); the backstop below covers
+    the rest — an unexpected exception is a bug in this file, and a bug must not
+    be the reason a run's Stop signal turns into a broken session. It reports on
+    stderr, never stdout: hook stdout is parsed by the host.
+
+    Dispatched from ``main()`` BEFORE its shared ``try``/``except`` on purpose —
+    see the comment there.
+    """
+    try:
+        return events.relay(args.event, sys.stdin)
+    except Exception as e:
+        # Deliberately broad, and deliberately not re-raised: the alternative to a
+        # diagnostic line here is a traceback on the host's hook channel plus a
+        # non-zero rc. Narrower than the BaseException it could be — a Ctrl+C or a
+        # SystemExit is not a relay-level problem and keeps its own exit path.
+        print(f"bmad-loop relay: {type(e).__name__}: {e}", file=sys.stderr)
+        return ExitCode.OK
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="bmad-loop",
@@ -3978,7 +4008,34 @@ def main(argv: list[str] | None = None) -> int:
         "fixes repaint tearing over slow/SSH links; also settable via [tui] low_frame_rate",
     )
 
+    # Registered directly rather than through `add()`: `relay` takes no --project.
+    # It is handed a run directory by the engine (via the session env) and must
+    # work with no project state at all — see the dispatch below.
+    relay_p = sub.add_parser(
+        "relay",
+        help="write one session event file from a coding-CLI hook payload on stdin "
+        "(invoked by the installed hooks, not by hand)",
+    )
+    relay_p.add_argument(
+        "event",
+        nargs="?",
+        default="Unknown",
+        help="canonical event name (Stop, SessionStart, …); the hooks always pass one",
+    )
+    relay_p.set_defaults(func=cmd_relay)
+
     args = parser.parse_args(argv)
+    # `relay` dispatches HERE, ahead of everything below, and the placement is the
+    # contract rather than an optimization. A coding CLI runs `bmad-loop relay Stop`
+    # inside the session whose completion it reports, and a hook that exits non-zero
+    # is surfaced by several hosts as a failed tool call in that session — so the
+    # `except` arms below, which print `error: …` and return 1 (or 130), are exactly
+    # the outcome the hook contract forbids. `_configure_mux(_project(args))` is
+    # skipped for the same reason and one more: relay touches neither mux nor policy,
+    # and a project whose policy.toml is broken must still be able to report that its
+    # session stopped. `cmd_relay` is total, so nothing is lost by not wrapping it.
+    if args.func is cmd_relay:
+        return cmd_relay(args)
     try:
         # Install the policy [mux] backend choice before dispatch: several
         # handlers (probe/diagnose/attach/stop/cleanup/tui) reach the mux

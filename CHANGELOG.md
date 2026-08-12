@@ -14,6 +14,15 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Added
 
+- **`bmad-loop relay <Event>`: write a session event without the copied-in script (#494).** The
+  hardened event write gains an importable twin, `events.py`, held byte-identical to the stdlib-only
+  hook relay by an AST parity test — the two writers of the events control plane can no longer be
+  hardened differently by accident. The new `relay` subcommand takes the same hook payload on stdin
+  and honours the same contract: nothing on stdout, rc 0 always, a silent no-op outside a driven
+  session. It dispatches ahead of `main()`'s shared error handler and its mux configuration, so
+  neither a broken `policy.toml` nor an unexpected exception can turn a session's Stop signal into a
+  failed hook. First phase of moving `events/` to a control-plane root outside the project tree.
+
 - **Coding-CLI adapter registry: a new adapter class ships out-of-tree (#226).** The transport axis
   has long been extensible out-of-tree; the CLI axis had no equivalent, so a CLI needing its own
   adapter _class_ forced a name-branch in the run bootstrap. A profile's new `adapter` field names a
