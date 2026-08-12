@@ -183,7 +183,11 @@ def _env_name_aliases(tree: ast.AST) -> dict[str, str]:
     spelled through a named constant still resolves. That indirection is the norm
     here, not an edge case: the registry reads ``os.environ.get(MUX_BACKEND)`` and
     gates.py names its notify vars ``_TITLE_ENV`` / ``_MESSAGE_ENV`` — matching the
-    string literal alone would miss exactly the well-behaved shape."""
+    string literal alone would miss exactly the well-behaved shape.
+
+    A ``bytes`` constant binds too, since ``os.environb`` can only be keyed by
+    bytes: the registry's own constants are ``str`` and would raise there, so a
+    bytes literal or a bytes constant are the only two spellings that axis has."""
     aliases: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
@@ -193,14 +197,14 @@ def _env_name_aliases(tree: ast.AST) -> dict[str, str]:
         else:
             continue
         value = node.value
-        if (
-            targets
-            and isinstance(value, ast.Constant)
-            and isinstance(value.value, str)
-            and value.value.startswith(ENV_PREFIX)
-        ):
+        if not targets or not isinstance(value, ast.Constant):
+            continue
+        name = value.value
+        if isinstance(name, bytes):
+            name = name.decode("utf-8", "replace")
+        if isinstance(name, str) and name.startswith(ENV_PREFIX):
             for target in targets:
-                aliases[target.id] = value.value
+                aliases[target.id] = name
     return aliases
 
 
@@ -386,7 +390,10 @@ def _scan_source(src: str, rel: str):
             elif func.attr in ("get", "pop", "setdefault") and _is_os_environ(func.value):
                 env_key = _env_read_key(key_node, env_aliases)
             elif (
-                func.attr == "getenv" and isinstance(func.value, ast.Name) and func.value.id == "os"
+                # `getenvb` is the bytes twin, and POSIX-only like `environb`
+                func.attr in ("getenv", "getenvb")
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "os"
             ):
                 env_key = _env_read_key(key_node, env_aliases)
         elif (
@@ -517,14 +524,19 @@ def test_bmad_loop_env_reads_only_in_the_registry():
     itself.
 
     COVERED — the access shape: ``os.environ.get/pop/setdefault``, ``os.getenv``,
-    ``os.environ[K]``, the ``key=`` keyword form of each, ``K in os.environ`` /
-    ``not in`` (including as a link in a chained comparison), and the
-    ``os.environb`` bytes twin of all of them. Crossed with the key spelling: a
-    literal, a same-module constant, ``envvars.MUX_BACKEND``, and the registry
-    constant imported in (see ``_env_read_key``). Borrowing the registry's own
-    constant while skipping its reader is the *likeliest* violation rather than an
-    exotic one — the tidy-looking version is the one that gets written — so every
-    key spelling resolves.
+    ``os.environ[K]``, the ``key=`` keyword form of each, and ``K in os.environ`` /
+    ``not in`` (including as a link in a chained comparison). Each has a POSIX-only
+    bytes twin — ``os.environb`` for the mapping forms, ``os.getenvb`` for the
+    function — and both twins are covered.
+
+    Crossed with the key spelling: a literal, a same-module constant,
+    ``envvars.MUX_BACKEND``, and the registry constant imported in (see
+    ``_env_read_key``). Borrowing the registry's own constant while skipping its
+    reader is the *likeliest* violation rather than an exotic one — the
+    tidy-looking version is the one that gets written — so every key spelling
+    resolves. The bytes twins take only the first two: their keys must be bytes,
+    and the registry's constants are ``str``, so that half of the cross product
+    cannot be written at all rather than being an uncovered case.
 
     ``ENV_READ_PROBES`` / ``ENV_READ_NON_PROBES`` are that matrix, executable. Read
     them for what is covered; this docstring only argues the boundary.
@@ -560,12 +572,13 @@ def test_bmad_loop_env_reads_only_in_the_registry():
     as proof of a docstring exclusion in ``_env_read_key`` that was in fact
     unreachable. Keep the row for the property, never as evidence.
 
-    ⚠️ Four review rounds each turned up another uncovered AST shape. Read that as
-    a property of the design rather than four unlucky misses: this is a denylist of
-    access forms, so it is only ever as complete as the last sweep over them, and
-    the NOT COVERED list is the honest boundary rather than an oversight. When a
-    new form turns up, extend the matrix before the branch — add the probe row,
-    watch it fail, then fix the scan."""
+    ⚠️ New uncovered shapes keep surfacing here, and that is a property of the
+    design rather than a run of bad luck: this is a denylist of access forms, so it
+    is only ever as complete as the last sweep over them, and the NOT COVERED list
+    is the honest boundary rather than an oversight. Sweep an axis when you touch
+    it — every mapping form at once, not the one that prompted the visit — and
+    extend the matrix before the branch: add the probe row, watch it fail, then fix
+    the scan."""
     offenders = [(rel, ln, txt) for _, rel, ln, txt in _of("envread") if rel not in ENV_READ_ALLOW]
     assert not offenders, (
         "BMAD_LOOP_* read outside envvars.py and the plugin-owned families — name "
@@ -612,8 +625,22 @@ ENV_READ_PROBES = [
     # Keyed by a literal on purpose: the registry row above already grades key
     # resolution, so this row reddens for one reason only — chain position.
     ("membership-chained", 'import os\nc = "x"\nX = c == "BMAD_LOOP_X" in os.environ\n'),
+    # The `os.environb` axis, swept rather than sampled: every mapping form above
+    # has a bytes twin, and `os.getenvb` is the twin of `os.getenv`. Keys here are a
+    # bytes literal or a bytes constant, which is the whole spelling axis — the
+    # registry's constants are `str` and would raise against a bytes mapping.
     ("environb-get", 'import os\nX = os.environb.get(b"BMAD_LOOP_X")\n'),
     ("environb-subscript", 'import os\ndef f():\n    return os.environb[b"BMAD_LOOP_X"]\n'),
+    ("environb-local-const", 'import os\nK = b"BMAD_LOOP_X"\nX = os.environb.get(K)\n'),
+    ("environb-pop-keyword", 'import os\nX = os.environb.pop(key=b"BMAD_LOOP_X")\n'),
+    ("environb-setdefault", 'import os\nX = os.environb.setdefault(b"BMAD_LOOP_X", b"v")\n'),
+    ("environb-membership", 'import os\nX = b"BMAD_LOOP_X" in os.environb\n'),
+    (
+        "environb-membership-chained",
+        'import os\nc = b"y"\nX = c == b"BMAD_LOOP_X" in os.environb\n',
+    ),
+    ("getenvb", 'import os\nX = os.getenvb(b"BMAD_LOOP_X")\n'),
+    ("getenvb-keyword", 'import os\nX = os.getenvb(key=b"BMAD_LOOP_X")\n'),
 ]
 
 # The other half: shapes that must stay SILENT. Without these the detector could pass
@@ -639,9 +666,9 @@ def test_env_read_detector_flags_every_claimed_access_form(label, source):
 
     This is the check the repo-wide assertion cannot be: delete any single branch of
     the `envread` scan and the tree-wide test stays green (nothing in `src/` uses that
-    branch today), while exactly the matching row here reddens. Written after a review
-    pointed out that the guard's coverage claim lived only in a docstring — three
-    earlier rounds had each found an uncovered form, and prose does not fail a build."""
+    branch today), while exactly the matching row here reddens. The coverage claim
+    lives here rather than in the guard's docstring alone, because prose does not
+    fail a build."""
     found = [f for f in _scan_source(source, "probe.py") if f[0] == "envread"]
     assert found, (
         f"the {label!r} access form produced no `envread` finding — the detector does "
