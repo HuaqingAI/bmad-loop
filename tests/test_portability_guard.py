@@ -397,13 +397,19 @@ def _scan_source(src: str, rel: str):
             env_key = _env_read_key(node.slice, env_aliases)
         elif isinstance(node, ast.Compare):
             # `"BMAD_LOOP_X" in os.environ` / `not in` — a presence read, and the
-            # most natural way to spell a boolean flag. Walks every (op, rhs) pair
-            # so a chained comparison cannot hide one.
+            # most natural way to spell a boolean flag. A chain expands PAIRWISE
+            # (`c == K in os.environ` means `c == K and K in os.environ`), so the
+            # operand a membership tests is the one to its immediate left — the
+            # PRECEDING comparator, not `node.left`, for any op past the first.
+            # Carry the left operand across the pairs rather than re-reading
+            # `node.left`, which resolves the wrong name on a chain.
+            left = node.left
             for op, rhs in zip(node.ops, node.comparators):
                 if isinstance(op, (ast.In, ast.NotIn)) and _is_os_environ(rhs):
-                    env_key = _env_read_key(node.left, env_aliases)
+                    env_key = _env_read_key(left, env_aliases)
                     if env_key:
                         break
+                left = rhs
         if env_key:
             findings.append(("envread", rel, node.lineno, line_at(node.lineno)))
 
@@ -510,19 +516,24 @@ def test_bmad_loop_env_reads_only_in_the_registry():
     core module must call an ``envvars`` reader rather than touch ``os.environ``
     itself.
 
-    COVERED — the access shape (all verified by planting, see the ablation list):
-    ``os.environ.get/pop/setdefault``, ``os.getenv``, ``os.environ[K]``, the
-    ``key=`` keyword form of each, ``K in os.environ`` / ``not in``, and the
+    COVERED — the access shape: ``os.environ.get/pop/setdefault``, ``os.getenv``,
+    ``os.environ[K]``, the ``key=`` keyword form of each, ``K in os.environ`` /
+    ``not in`` (including as a link in a chained comparison), and the
     ``os.environb`` bytes twin of all of them. Crossed with the key spelling: a
     literal, a same-module constant, ``envvars.MUX_BACKEND``, and the registry
-    constant imported in (see ``_env_read_key``).
+    constant imported in (see ``_env_read_key``). Borrowing the registry's own
+    constant while skipping its reader is the *likeliest* violation rather than an
+    exotic one — the tidy-looking version is the one that gets written — so every
+    key spelling resolves.
+
+    ``ENV_READ_PROBES`` / ``ENV_READ_NON_PROBES`` are that matrix, executable. Read
+    them for what is covered; this docstring only argues the boundary.
 
     NOT COVERED, deliberately — both obscure the *lookup* rather than the key:
     rebinding the mapping (``e = os.environ; e.get(K)``) and ``from os import
     environ``. This is a review tripwire, not a sandbox: it exists to catch the
     change someone writes while trying to do the right thing, not to withstand
-    someone routing around it. Borrowing the registry's *key* is the opposite case
-    — that IS what a well-meaning change looks like, so every key spelling resolves.
+    someone routing around it.
 
     Bulk copies (``dict(os.environ)``, ``{**os.environ}``) are correctly silent:
     they name no variable, so there is no var being defined outside the registry.
@@ -534,67 +545,27 @@ def test_bmad_loop_env_reads_only_in_the_registry():
     Reads of a SessionSpec's ``spec.env`` (adapters/generic.py) are likewise out:
     that is a plain dict handed down in-process, not the environment.
 
-    Ablated 2026-08-11, six ways — a negative assertion passes for every reason a
-    value could be absent, including a branch that never fires:
-    - emptying ENV_READ_ALLOW fails listing all 52 real reads across the 10
-      ENV_READ_ALLOW files, so the scan sees them rather than passing on an empty
-      finding set;
-    - ``_ABLATION_TIMEOUT = os.environ.get("BMAD_LOOP_SOMETHING")`` planted at module
-      scope in verify.py (core, not allowlisted) fails with
-      ``verify.py:37: _ABLATION_TIMEOUT = os.environ.get("BMAD_LOOP_SOMETHING")``;
-    - the alias arm is live, not decoration: the same read spelled
-      ``_ABLATION_ENV = "BMAD_LOOP_SOMETHING"`` / ``os.environ.get(_ABLATION_ENV)``
-      fails too — drop ``_env_name_aliases`` and it passes, and so would every read
-      in envvars.py, which is the only shape the registry itself uses;
-    - the name written into a non-allowlisted module's docstring instead stays green.
-      ⚠️ That row is a CONTROL, not an ablation: it passes because a prose mention
-      creates no key-position node at all, so it would stay green no matter what the
-      scan did. An earlier revision carried a docstring exclusion inside
-      ``_env_read_key`` and cited this row as proof it worked; counting
-      key-position nodes that are also docstring nodes across the whole tree gives
-      zero, so that exclusion was unreachable and the row graded nothing. The
-      exclusion is gone — keep the row for the property, not as evidence.
+    ⚠️ THIS assertion cannot grade the detector. It says only that today's tree
+    carries no unallowlisted finding — equally green when the scan has silently
+    stopped scanning. Delete any single branch of the ``envread`` detector and this
+    test still passes while exactly the matching ``ENV_READ_PROBES`` rows redden.
+    The assertion is the invariant; the probes are the proof it is being checked,
+    and neither replaces the other. What this test does grade alone is the
+    allowlist: empty ``ENV_READ_ALLOW`` and it fails naming every real read, so a
+    green run means the scan saw those reads rather than that it found nothing.
 
-    The last two close a hole this guard SHIPPED WITH and a review caught (both
-    verified by planting in verify.py, and both passed green before REGISTRY_NAMES
-    existed — the guard asserted an invariant it did not enforce):
-    - ``from . import envvars as _ev`` / ``os.environ.get(_ev.MUX_BACKEND)`` now
-      fails with ``verify.py:13: _LEAK1 = os.environ.get(_ev.MUX_BACKEND)``;
-    - ``from .envvars import MUX_BACKEND`` / ``os.environ.get(MUX_BACKEND)`` now
-      fails with ``verify.py:13: _LEAK2 = os.environ.get(MUX_BACKEND)``.
-    Both spellings borrow the registry's constant while skipping its reader, which
-    is a *more* likely violation than an inline literal, not a more exotic one —
-    the tidy-looking version is the one that gets written.
+    ⚠️ The prose row in ``ENV_READ_NON_PROBES`` is a CONTROL, not an ablation. A
+    ``BMAD_LOOP_*`` mention in a docstring creates no key-position node at all, so
+    it stays silent no matter what the detector does — an earlier revision cited it
+    as proof of a docstring exclusion in ``_env_read_key`` that was in fact
+    unreachable. Keep the row for the property, never as evidence.
 
-    A later review round closed a third hole the same way: the key passed as a
-    KEYWORD. ``os.getenv(key="BMAD_LOOP_X")`` and ``os.environ.get(key=...)`` /
-    ``.pop(key=...)`` / ``.setdefault(key=...)`` all leave ``node.args`` empty, and
-    the scan required a positional arg — so each read green. All four bind ``key=``
-    for real (``os.environ`` is ``os._Environ``, a Python-level MutableMapping, so
-    its methods are the ABC's plain-Python defs; the ``dict.get`` intuition, which
-    is positional-only, points the wrong way). Confirmed against the live
-    interpreter before fixing, then re-verified as CAUGHT, including the keyword
-    form carrying an imported registry constant.
-
-    A third round added ``K in os.environ`` / ``not in`` (an ``ast.Compare``, and
-    the most natural way to spell a boolean flag) and the ``os.environb`` twin.
-    ⚠️ Three consecutive rounds each found another uncovered AST shape, which is
-    worth reading as a property of the design rather than three unlucky misses:
-    this is a denylist of access forms, so it is only ever as complete as the last
-    sweep over them. The full matrix above was then swept in one pass — 12 read
-    shapes CAUGHT, 4 controls (two bulk copies, a non-BMAD var, prose) correctly
-    silent — and the NOT COVERED list is the honest boundary, not an oversight.
-    Extend the matrix, not just the branch, if a new form turns up.
-
-    ⚠️ That matrix now lives in ``ENV_READ_PROBES`` / ``ENV_READ_NON_PROBES`` as
-    executable rows, because a fourth review round made the sharper point: THIS
-    test cannot grade the detector at all. It asserts only that today's tree has
-    no unallowlisted finding, which is equally green when the scan has stopped
-    scanning. Measured, not argued — deleting the membership branch reddens its 3
-    probe rows and leaves this test PASSING; dropping the ``key=`` arm reddens 4
-    and leaves this test PASSING; dropping ``REGISTRY_NAMES`` reddens 4 and leaves
-    this test PASSING. So this assertion is the invariant, and the probes are the
-    proof the invariant is being checked. Neither replaces the other."""
+    ⚠️ Four review rounds each turned up another uncovered AST shape. Read that as
+    a property of the design rather than four unlucky misses: this is a denylist of
+    access forms, so it is only ever as complete as the last sweep over them, and
+    the NOT COVERED list is the honest boundary rather than an oversight. When a
+    new form turns up, extend the matrix before the branch — add the probe row,
+    watch it fail, then fix the scan."""
     offenders = [(rel, ln, txt) for _, rel, ln, txt in _of("envread") if rel not in ENV_READ_ALLOW]
     assert not offenders, (
         "BMAD_LOOP_* read outside envvars.py and the plugin-owned families — name "
@@ -637,6 +608,10 @@ ENV_READ_PROBES = [
         "membership-registry",
         "import os\nfrom .envvars import MUX_BACKEND\nX = MUX_BACKEND in os.environ\n",
     ),
+    # A chain, where the membership's left operand is the PRECEDING comparator.
+    # Keyed by a literal on purpose: the registry row above already grades key
+    # resolution, so this row reddens for one reason only — chain position.
+    ("membership-chained", 'import os\nc = "x"\nX = c == "BMAD_LOOP_X" in os.environ\n'),
     ("environb-get", 'import os\nX = os.environb.get(b"BMAD_LOOP_X")\n'),
     ("environb-subscript", 'import os\ndef f():\n    return os.environb[b"BMAD_LOOP_X"]\n'),
 ]
