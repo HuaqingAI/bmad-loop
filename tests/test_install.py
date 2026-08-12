@@ -558,6 +558,38 @@ def test_provision_worktree_rewrites_seeded_relative_hook_to_absolute(tmp_path):
     assert "$CLAUDE_PROJECT_DIR" not in cmd
 
 
+def test_provision_worktree_tracked_config_rewrite_stays_out_of_commits(project, tmp_path):
+    """A project that TRACKS its hook config still gets the relay rewrite — the
+    checkout carries the same stale $CLAUDE_PROJECT_DIR command a seeded copy
+    would, so #352 stalls there identically — but the rewrite is machine-specific
+    and a tracked file cannot be shielded by the worktree exclude (#392): without
+    the skip-worktree pin, `git add -A` folds it into the story commit and the
+    merge-back hands every other checkout a relay path that does not exist there.
+    Asserted through git's own staging answer, since that is what finalize_commit
+    and the skill's own commits run."""
+    repo = project.project
+    claude = get_profile("claude")
+    hook_rel = claude.hooks.config_path
+    assert _register_hooks(repo, claude) == 0
+    assert "$CLAUDE_PROJECT_DIR" in (repo / hook_rel).read_text(encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "track the hook config")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [claude], repo)
+
+    cmd = json.loads((wt / hook_rel).read_text(encoding="utf-8"))["hooks"]["Stop"][0]["hooks"][0][
+        "command"
+    ]
+    assert str(repo / ".bmad-loop" / "bmad_loop_hook.py") in cmd
+    assert "$CLAUDE_PROJECT_DIR" not in cmd
+    git(wt, "add", "-A")
+    assert hook_rel not in git(wt, "diff", "--cached", "--name-only").splitlines()
+    # and the main checkout keeps the portable command it committed
+    assert "$CLAUDE_PROJECT_DIR" in (repo / hook_rel).read_text(encoding="utf-8")
+
+
 def test_strip_relay_hooks_leaves_foreign_handlers(tmp_path):
     """Only bmad relay commands go. A project's own hooks must survive whether they
     hold their own matcher entry or share OURS (a user appending to the relay's

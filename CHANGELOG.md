@@ -242,7 +242,9 @@ whose seams had diverged enough that several ports needed a different fix, and t
   event as already registered and left the stale command in place, so the session emitted no
   hook events and idled out the session clock. `provision_worktree` now strips relay entries
   from the seeded config before merging, so its own absolute registration is authoritative
-  rather than additive.
+  rather than additive. A project that _tracks_ its hook config gets the same rewrite — the
+  checkout carries the same stale command — pinned `skip-worktree` in the worktree's own
+  index, so `git add -A` never folds the machine-specific command into a story commit.
 - **`cleanup` no longer reports a surviving ctl window as removed (#435).** Killing a window is
   best-effort and reports nothing, so the prune counted every _attempted_ kill as a removal. It now
   verifies with one liveness listing and partitions into removed / survived / unverifiable.

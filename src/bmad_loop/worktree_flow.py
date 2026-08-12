@@ -183,6 +183,51 @@ def _drop_inert_tracked_file_patterns(
     return kept, None
 
 
+def _pin_tracked_config_rewrite(worktree: Path, rel: str) -> str | None:
+    """Keep a rewritten TRACKED hook config out of the unit's story commits.
+
+    The worktree-local exclude cannot: git consults ignore rules only for
+    untracked paths (#392). When a project tracks its hook config, the relay
+    rewrite — a machine-specific absolute command — would ride every
+    `git add -A` (the skill's own commits and finalize_commit alike) into the
+    story commit and merge back to the target branch, handing every other
+    checkout a relay path that does not exist there. The worktree's own index
+    carries a skip-worktree bit that `add -A`, `status` and checkout all honor
+    (it is the sparse-checkout mechanism) and that dies with the worktree, so
+    the rewrite stays session-local.
+
+    NOT-A-REPO IS SILENT for the same reason the shield's tracked-probe is:
+    provisioning a plain directory is ordinary, and there is no index and no
+    `git add -A` to be wrong about. An untracked config needs nothing — the
+    exclude shield owns it. Anything else — an unanswerable tracked-probe, a
+    failed update-index — is returned for the caller to journal: the rewrite
+    stands either way, since a stalled session is the worse outcome (#352),
+    but the operator learns the story commit may carry it.
+    """
+    try:
+        if verify.git_bytes(worktree, "rev-parse", "--absolute-git-dir").returncode != 0:
+            return None
+    except (verify.GitError, OSError):
+        return None
+    try:
+        if not verify.path_tracked_file(worktree, rel):
+            return None
+        pinned = verify.git_bytes(worktree, "update-index", "--skip-worktree", "--", rel)
+    except (verify.GitError, OSError) as e:
+        return (
+            f"could not keep the rewritten hook config {rel} out of story commits "
+            f"({e}); if the project tracks it, the worktree's machine-specific relay "
+            "command may be committed and merged back (#352)"
+        )
+    if pinned.returncode != 0:
+        return (
+            f"git update-index --skip-worktree {rel} failed in the worktree; the "
+            "rewritten hook config is tracked, so the machine-specific relay command "
+            "may be committed and merged back (#352)"
+        )
+    return None
+
+
 def _seed_bmad_tree(worktree: Path, repo_root: Path) -> list[str]:
     """Merge the repo's project-local BMAD surface into an isolated worktree.
 
@@ -682,6 +727,9 @@ def provision_worktree(
         config, merged = merge_hooks(config, registrations, profile.hooks.dialect)
         if stripped or merged:
             config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+            pin_degrade = _pin_tracked_config_rewrite(worktree, profile.hooks.config_path)
+            if pin_degrade is not None and on_degraded is not None:
+                on_degraded(pin_degrade)
 
     # Shield exactly the paths we wrote (skill trees + hook configs + seeded
     # configs) from the unit's `git add -A`, in case a project doesn't gitignore
