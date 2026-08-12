@@ -7,10 +7,12 @@ hard POSIX dependency can't sneak in unnoticed. Each sanctioned exception lives
 in an allowlisted file and — outside the wholesale tmux quarantine — carries a
 ``# portability:`` ack on its line, so exceptions stay deliberate.
 
-The same single-pass scan also carries the one non-POSIX quarantine that has the
+The same single-pass scan also carries the two non-POSIX quarantines that have the
 identical shape: AGENTS.md's "New core env vars register in ``envvars.py``;
 plugin-owned env-var families stay with their plugin" — see
-``test_bmad_loop_env_reads_only_in_the_registry``.
+``test_bmad_loop_env_reads_only_in_the_registry`` — and its "all git subprocess
+calls go through the ``_run_git`` chokepoint in ``verify.py``" — see
+``test_no_git_invocation_outside_verify``.
 
 If this test flags something unexpected, fix the source (route it through the
 seam / a platform helper) rather than widening an allowlist.
@@ -38,6 +40,15 @@ ACK = "portability:"
 # primitive + argv live) and its POSIX leaf. No per-line ack needed: these files
 # *are* the sanctioned spot (their module docstrings say so).
 TMUX_BACKENDS = {"adapters/tmux_base.py", "adapters/tmux_backend.py"}
+
+# The one file allowed to build a ``["git", ...]`` argv — the `_run_git`
+# chokepoint (engine-configured timeout, ``LC_ALL=C``, the GitError taxonomy).
+# Same whole-file quarantine as tmux, no per-line ack: verify.py *is* the
+# sanctioned spot. Every other module calls a verify helper (``git_bytes``,
+# ``worktree_clean``, …) instead of spawning git itself. Both bypasses open when
+# this guard landed carried real defects (#390): a strict decode crashing the
+# TUI checkpoint modal, and a probe ignoring `limits.git_timeout_s`.
+GIT_CHOKEPOINT = {"verify.py"}
 
 # Files that may name a bare POSIX path, each on a line carrying a `# portability:`
 # ack. process_host.py's Linux identity reader walks `/proc/<pid>/stat` behind a
@@ -343,11 +354,15 @@ def _scan_source(src: str, rel: str):
         return lines[lineno - 1] if 1 <= lineno <= len(lines) else ""
 
     for node in ast.walk(tree):
-        # tmux argv literal: ["tmux", ...] (not the which-list tuple ("tmux", ...))
+        # spawn-argv literals: ["tmux", ...] / ["git", ...] — each quarantined to
+        # its owner. A which-list *tuple* ("tmux", ...), a path segment ("git"
+        # outside a list), and prose are not argvs and stay silent.
         if isinstance(node, ast.List) and node.elts:
             first = node.elts[0]
             if isinstance(first, ast.Constant) and first.value == "tmux":
                 findings.append(("tmux", rel, node.lineno, line_at(node.lineno)))
+            if isinstance(first, ast.Constant) and first.value == "git":
+                findings.append(("git", rel, node.lineno, line_at(node.lineno)))
 
         # bare POSIX path string literal (skip docstrings)
         if (
@@ -486,6 +501,20 @@ def test_no_tmux_invocation_outside_backend():
     assert not offenders, (
         "tmux invoked outside the tmux backend (adapters/tmux_base.py, "
         "adapters/tmux_backend.py) — route it through get_multiplexer() instead:\n"
+        + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders)
+    )
+
+
+def test_no_git_invocation_outside_verify():
+    """Only ``verify.py`` may build a ``["git", ...]`` argv — every other call
+    site goes through the chokepoint's helpers (``git_bytes`` and siblings),
+    which buy the engine-configured timeout, the ``LC_ALL=C`` pin, and the
+    GitError taxonomy. AGENTS.md has stated this since the chokepoint existed;
+    nothing enforced it, which is how both #390 bypasses survived."""
+    offenders = [(rel, ln, txt) for _, rel, ln, txt in _of("git") if rel not in GIT_CHOKEPOINT]
+    assert not offenders, (
+        "git spawned outside the verify.py chokepoint — route it through "
+        "verify.git_bytes or a sibling helper instead:\n"
         + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders)
     )
 
@@ -744,6 +773,41 @@ def test_env_read_detector_stays_silent_on_non_reads(label, source):
         f"the {label!r} shape was flagged as an env read; it is deliberately out of "
         f"scope:\n{source}"
     )
+
+
+# The git-argv detector's probe matrix, same rationale as the env pair above:
+# nothing in `src/` builds a bare ["git", ...] today, so deleting the detector
+# branch leaves the tree-wide guard green — only these rows redden.
+GIT_ARGV_PROBES = [
+    ("bare-run", 'import subprocess\nsubprocess.run(["git", "-C", str(p), "status"])\n'),
+    ("bare-popen", 'import subprocess\nsubprocess.Popen(["git", "ls-files"])\n'),
+    ("argv-built-first", 'argv = ["git", "log", "-1"]\n'),
+]
+GIT_ARGV_NON_PROBES = [
+    ("which-tuple", 'X = ("git", "--version")\n'),
+    ("path-segment", 'from pathlib import Path\nX = Path(h) / "git" / "ignore"\n'),
+    ("prose-in-docstring", 'def f():\n    """Runs `git add -A` downstream."""\n    return 1\n'),
+    ("chokepoint-args-tail", 'proc = git_bytes(repo, "ls-files", "-z")\n'),
+]
+
+
+@pytest.mark.parametrize(("label", "source"), GIT_ARGV_PROBES, ids=[p[0] for p in GIT_ARGV_PROBES])
+def test_git_argv_detector_flags_every_spawn_shape(label, source):
+    """Each spawn shape produces a `git` finding — including an argv bound to a
+    name first, which is how a bypass would most tidily be written."""
+    found = [f for f in _scan_source(source, "probe.py") if f[0] == "git"]
+    assert found, f"the {label!r} shape produced no `git` finding:\n{source}"
+
+
+@pytest.mark.parametrize(
+    ("label", "source"), GIT_ARGV_NON_PROBES, ids=[p[0] for p in GIT_ARGV_NON_PROBES]
+)
+def test_git_argv_detector_stays_silent_on_lookalikes(label, source):
+    """The complement: a which-list tuple, a path segment, prose, and the
+    chokepoint's own args-tail name git without building an argv — flagging them
+    would get the allowlist widened until it means nothing."""
+    found = [f for f in _scan_source(source, "probe.py") if f[0] == "git"]
+    assert not found, f"the {label!r} shape was flagged; it is not a git argv:\n{source}"
 
 
 # The allowlist's scoping, as rows: `(rel, key, is_offender)`. Same reason the

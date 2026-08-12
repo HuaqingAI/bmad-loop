@@ -231,6 +231,17 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
+- **The last two bare git spawns route through the `_run_git` chokepoint, and a guard now
+  enforces the invariant (#390).** An undecodable byte in a commit subject crashed the TUI's
+  story-checkpoint modal: the bare spawn decoded strictly, and `UnicodeDecodeError` slipped both
+  arms of its guard. It and `install`'s tracked-policy probe (which ignored `limits.git_timeout_s`
+  and the `LC_ALL=C` pin) now call `verify.git_bytes`, with the subject decoded
+  `errors="replace"`. `test_portability_guard.py` gains a git-argv detector quarantining
+  `["git", ...]` to `verify.py` — the same tripwire the tmux backends have — so the next bypass
+  fails CI instead of surviving by convention. AGENTS.md's chokepoint line now states its real
+  scope (`src/bmad_loop`) and names the enforcer; tests, `scripts/` and CI workflows deliberately
+  spawn their own git, since a harness must not depend on the artifact it validates.
+
 - **`BMAD_LOOP_SESSION_TIMEOUT_S=inf` no longer disables the session timeout.** The guard was
   one-sided — it rejected a non-positive value so an override could not silently _shorten_ a run's
   budget — but `float()` accepts `inf`, `1e999` and `Infinity`, and all three pass `> 0`. Both

@@ -397,6 +397,41 @@ def test_install_into_no_tracking_warning_outside_a_repo(tmp_path, capsys):
     assert "git rm --cached" not in capsys.readouterr().out
 
 
+def test_tracking_warning_probe_answers_through_the_chokepoint(tmp_path, capsys, monkeypatch):
+    """The probe consults `git_bytes`, not a bare spawn: an rc-0 chokepoint answer
+    produces the hint even though tmp_path is no repo, where a real git would say
+    "not tracked" and stay silent. Ablation: revert `_warn_if_policy_tracked` to a
+    direct `subprocess.run` and this fails — the fake is never consulted (#390)."""
+    real = install_mod.git_bytes
+
+    def tracked_answer(repo, *args):
+        if args == ("ls-files", "--error-unmatch", ".bmad-loop/policy.toml"):
+            return subprocess.CompletedProcess(["git", *args], 0, b".bmad-loop/policy.toml\n", b"")
+        return real(repo, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", tracked_answer)
+    assert install_into(tmp_path) == 0
+    assert "git rm --cached .bmad-loop/policy.toml" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("fault", [verify.GitError, verify.GitSpawnError])
+def test_tracking_warning_degrades_on_a_chokepoint_fault(tmp_path, capsys, monkeypatch, fault):
+    """A timeout or failed spawn arrives as GitError / its GitSpawnError subclass,
+    not the raw `(OSError, SubprocessError)` pair the pre-#390 bare spawn guarded —
+    the hint is skipped and the install still succeeds, the guard re-derived the
+    way #389 re-derived the shield's."""
+    real = install_mod.git_bytes
+
+    def unanswerable(repo, *args):
+        if args == ("ls-files", "--error-unmatch", ".bmad-loop/policy.toml"):
+            raise fault("git ls-files did not answer")
+        return real(repo, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", unanswerable)
+    assert install_into(tmp_path) == 0
+    assert "git rm --cached" not in capsys.readouterr().out
+
+
 def test_hook_command_uses_selected_process_host(tmp_path, monkeypatch):
     # The hook interpreter is platform-selected: forcing the Windows host swaps the
     # registered command's prefix without `install` branching on sys.platform.

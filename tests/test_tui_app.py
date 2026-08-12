@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import subprocess
 import tomllib
 from pathlib import Path
 
@@ -34,6 +35,7 @@ from textual.widgets import (
 
 from bmad_loop import bmadconfig, documents
 from bmad_loop import policy as policy_mod
+from bmad_loop import verify
 from bmad_loop.adapters.multiplexer import MultiplexerError
 from bmad_loop.journal import Journal, save_state
 from bmad_loop.model import Phase, RunState, SessionRecord, StoryTask, TokenUsage
@@ -2752,6 +2754,39 @@ def test_checkpoint_gate_line_pluralization():
     assert f(0) == "verify + review gates passed · no follow-up review cycles"
     assert f(1) == "verify + review gates passed · 1 follow-up review cycle"
     assert f(3) == "verify + review gates passed · 3 follow-up review cycles"
+
+
+def test_commit_subject_routes_the_chokepoint_and_replaces_undecodable_bytes(tmp_path, monkeypatch):
+    """`_commit_subject` consults `verify.git_bytes` and decodes with replace: a
+    subject byte invalid in UTF-8 degrades to U+FFFD instead of raising. The
+    pre-#390 bare spawn decoded strictly, and its `(OSError, SubprocessError)`
+    guard covered neither `UnicodeDecodeError` nor the GitError the chokepoint
+    turns it into — one odd byte crashed the story-checkpoint modal. Ablation:
+    revert to the bare `subprocess.run` and this fails on the routing half
+    alone — the fake is never consulted, tmp_path is no repo, and "" comes back."""
+
+    def latin1_subject(repo, *args):
+        assert repo == tmp_path
+        assert args == ("log", "-1", "--format=%s", "abc123")
+        return subprocess.CompletedProcess(["git", *args], 0, b"caf\xe9 fix\n", b"")
+
+    monkeypatch.setattr(verify, "git_bytes", latin1_subject)
+    app = BmadLoopApp(tmp_path)
+    assert app._commit_subject("abc123") == "caf� fix"
+
+
+@pytest.mark.parametrize("fault", [verify.GitError, verify.GitSpawnError])
+def test_commit_subject_degrades_on_a_chokepoint_fault(tmp_path, monkeypatch, fault):
+    """A timeout or failed spawn arrives as GitError / its GitSpawnError subclass —
+    the subject degrades to empty and the modal still renders, mirroring the
+    rc-nonzero arm an unknown sha already takes."""
+
+    def unanswerable(repo, *args):
+        raise fault("git log did not answer")
+
+    monkeypatch.setattr(verify, "git_bytes", unanswerable)
+    app = BmadLoopApp(tmp_path)
+    assert app._commit_subject("abc123") == ""
 
 
 # ------------------------------------------------- hard stop (x) & archive (A)
