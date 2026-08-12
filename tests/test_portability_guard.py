@@ -119,8 +119,8 @@ SESSION_PROTOCOL_ENV = (
 # protocol every injected script reads.
 UNITY_ENV = ("BMAD_LOOP_UNITY_", "BMAD_LOOP_ENGINE_", *SESSION_PROTOCOL_ENV)
 
-# ``rel -> the key families that file may read straight out of the environment``,
-# matched as prefixes. Scoped by FAMILY rather than by file on purpose: a
+# ``rel -> the keys and key families that file may read straight out of the
+# environment``. Scoped by FAMILY rather than by file on purpose: a
 # file-wide exemption would let one of these read a core knob such as
 # `BMAD_LOOP_MUX_BACKEND` inline and have the finding dropped on its path alone,
 # which is the exact distinction the invariant draws.
@@ -151,14 +151,25 @@ ENV_READ_ALLOW = {
 }
 
 
+def _env_key_allowed(key: str, entries: tuple[str, ...]) -> bool:
+    """A trailing underscore marks a FAMILY, matched as a prefix; every other entry
+    is one variable, matched exactly.
+
+    The split is the difference between exempting a name and exempting everything
+    built on it. Under a bare prefix test an entry for ``BMAD_LOOP_MUX_BACKEND``
+    would also exempt an unregistered ``BMAD_LOOP_MUX_BACKEND_FALLBACK`` — the
+    guard would wave through the very thing it exists to make someone register."""
+    return any(key.startswith(e) if e.endswith("_") else key == e for e in entries)
+
+
 def _env_read_offenders(findings) -> list[tuple[str, int, str, str]]:
-    """The env reads no file's declared families cover — the assertion's whole
+    """The env reads no file's declared entries cover — the assertion's whole
     policy, factored out so it can be graded on synthetic findings rather than only
     on today's tree."""
     return [
         (rel, ln, txt, key)
         for _, rel, ln, txt, key in findings
-        if not any(key.startswith(family) for family in ENV_READ_ALLOW.get(rel, ()))
+        if not _env_key_allowed(key, ENV_READ_ALLOW.get(rel, ()))
     ]
 
 
@@ -759,6 +770,18 @@ ENV_SCOPE_CASES = [
     ("registry-reads-own-name", "envvars.py", "BMAD_LOOP_MUX_BACKEND", False),
     # A non-allowlisted core module is refused whatever the key.
     ("core-module-any-key", "verify.py", "BMAD_LOOP_RUN_DIR", True),
+    # An entry naming ONE variable must not exempt every longer name built on it,
+    # or a new unregistered knob rides in on a registered one's spelling.
+    ("registry-name-extended", "envvars.py", "BMAD_LOOP_MUX_BACKEND_FALLBACK", True),
+    ("session-name-extended", "data/bmad_loop_hook.py", "BMAD_LOOP_RUN_DIR_EXTRA", True),
+    # …while a real family (trailing underscore) still covers a member it has
+    # never seen, which is what makes it a family rather than a list.
+    (
+        "unity-family-unseen-member",
+        "data/plugins/unity/unity_ready.py",
+        "BMAD_LOOP_UNITY_NEW",
+        False,
+    ),
 ]
 
 
