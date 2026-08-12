@@ -236,8 +236,12 @@ whose seams had diverged enough that several ports needed a different fix, and t
   story-checkpoint modal: the bare spawn decoded strictly, and `UnicodeDecodeError` slipped both
   arms of its guard. It and `install`'s tracked-policy probe (which ignored `limits.git_timeout_s`
   and the `LC_ALL=C` pin) now call `verify.git_bytes`, with the subject decoded
-  `errors="replace"`. `test_portability_guard.py` gains a git-argv detector quarantining
-  `["git", ...]` to `verify.py` — the same tripwire the tmux backends have — so the next bypass
+  `errors="replace"`. Both keep their original short deadlines through a new per-call
+  `timeout_s` override on the chokepoint (5s on the TUI's event loop, 10s for the init hint) —
+  standing inside the chokepoint no longer costs an interactive surface the difference between
+  a degraded label and a two-minute freeze. `test_portability_guard.py` gains a git-argv
+  detector quarantining `["git", ...]` — tuple spellings included, since subprocess accepts any
+  sequence — to `verify.py`, the same tripwire the tmux backends have, so the next bypass
   fails CI instead of surviving by convention. AGENTS.md's chokepoint line now states its real
   scope (`src/bmad_loop`) and names the enforcer; tests, `scripts/` and CI workflows deliberately
   spawn their own git, since a harness must not depend on the artifact it validates.

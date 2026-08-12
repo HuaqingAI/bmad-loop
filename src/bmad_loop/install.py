@@ -2462,7 +2462,13 @@ def _warn_if_policy_tracked(project: Path) -> None:
     means nothing to warn about."""
     try:
         tracked = (
-            git_bytes(project, "ls-files", "--error-unmatch", ".bmad-loop/policy.toml").returncode
+            git_bytes(
+                project,
+                "ls-files",
+                "--error-unmatch",
+                ".bmad-loop/policy.toml",
+                timeout_s=10,  # the pre-#390 bound: a hint must not stall init
+            ).returncode
             == 0
         )
     except GitError:

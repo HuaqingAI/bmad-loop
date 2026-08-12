@@ -355,14 +355,18 @@ def _scan_source(src: str, rel: str):
 
     for node in ast.walk(tree):
         # spawn-argv literals: ["tmux", ...] / ["git", ...] — each quarantined to
-        # its owner. A which-list *tuple* ("tmux", ...), a path segment ("git"
-        # outside a list), and prose are not argvs and stay silent.
-        if isinstance(node, ast.List) and node.elts:
+        # its owner. tmux matches lists only: the which-list *tuple*
+        # ("tmux", ...) is a real lookup shape in the tree. git matches tuples
+        # too — subprocess accepts any sequence, and git has no legitimate tuple
+        # form to spare, so the tuple spelling of a bypass must not slip the
+        # net. A path segment ("git" outside a sequence) and prose stay silent.
+        if isinstance(node, (ast.List, ast.Tuple)) and node.elts:
             first = node.elts[0]
-            if isinstance(first, ast.Constant) and first.value == "tmux":
-                findings.append(("tmux", rel, node.lineno, line_at(node.lineno)))
-            if isinstance(first, ast.Constant) and first.value == "git":
-                findings.append(("git", rel, node.lineno, line_at(node.lineno)))
+            if isinstance(first, ast.Constant):
+                if first.value == "tmux" and isinstance(node, ast.List):
+                    findings.append(("tmux", rel, node.lineno, line_at(node.lineno)))
+                if first.value == "git":
+                    findings.append(("git", rel, node.lineno, line_at(node.lineno)))
 
         # bare POSIX path string literal (skip docstrings)
         if (
@@ -782,9 +786,12 @@ GIT_ARGV_PROBES = [
     ("bare-run", 'import subprocess\nsubprocess.run(["git", "-C", str(p), "status"])\n'),
     ("bare-popen", 'import subprocess\nsubprocess.Popen(["git", "ls-files"])\n'),
     ("argv-built-first", 'argv = ["git", "log", "-1"]\n'),
+    # subprocess accepts any sequence, so the tuple spelling is a legal spawn —
+    # unlike tmux there is no which-tuple shape to spare, so it is flagged even
+    # unattached to a call (a false positive is a review prompt, not a miss).
+    ("tuple-argv", 'import subprocess\nsubprocess.run(("git", "status"))\n'),
 ]
 GIT_ARGV_NON_PROBES = [
-    ("which-tuple", 'X = ("git", "--version")\n'),
     ("path-segment", 'from pathlib import Path\nX = Path(h) / "git" / "ignore"\n'),
     ("prose-in-docstring", 'def f():\n    """Runs `git add -A` downstream."""\n    return 1\n'),
     ("chokepoint-args-tail", 'proc = git_bytes(repo, "ls-files", "-z")\n'),
@@ -803,9 +810,9 @@ def test_git_argv_detector_flags_every_spawn_shape(label, source):
     ("label", "source"), GIT_ARGV_NON_PROBES, ids=[p[0] for p in GIT_ARGV_NON_PROBES]
 )
 def test_git_argv_detector_stays_silent_on_lookalikes(label, source):
-    """The complement: a which-list tuple, a path segment, prose, and the
-    chokepoint's own args-tail name git without building an argv — flagging them
-    would get the allowlist widened until it means nothing."""
+    """The complement: a path segment, prose, and the chokepoint's own args-tail
+    name git without building an argv — flagging them would get the allowlist
+    widened until it means nothing."""
     found = [f for f in _scan_source(source, "probe.py") if f[0] == "git"]
     assert not found, f"the {label!r} shape was flagged; it is not a git argv:\n{source}"
 

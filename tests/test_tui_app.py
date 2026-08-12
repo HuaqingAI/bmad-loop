@@ -2761,13 +2761,17 @@ def test_commit_subject_routes_the_chokepoint_and_replaces_undecodable_bytes(tmp
     subject byte invalid in UTF-8 degrades to U+FFFD instead of raising. The
     pre-#390 bare spawn decoded strictly, and its `(OSError, SubprocessError)`
     guard covered neither `UnicodeDecodeError` nor the GitError the chokepoint
-    turns it into — one odd byte crashed the story-checkpoint modal. Ablation:
-    revert to the bare `subprocess.run` and this fails on the routing half
-    alone — the fake is never consulted, tmp_path is no repo, and "" comes back."""
+    turns it into — one odd byte crashed the story-checkpoint modal. The fake
+    also pins `timeout_s=5`: this call sits on the event loop, so the pre-#390
+    five-second deadline must survive the reroute (a stalled git degrades a
+    label, never freezes the UI for the 120s module default). Ablation: revert
+    to the bare `subprocess.run` and this fails on the routing half alone — the
+    fake is never consulted, tmp_path is no repo, and "" comes back."""
 
-    def latin1_subject(repo, *args):
+    def latin1_subject(repo, *args, timeout_s=None):
         assert repo == tmp_path
         assert args == ("log", "-1", "--format=%s", "abc123")
+        assert timeout_s == 5
         return subprocess.CompletedProcess(["git", *args], 0, b"caf\xe9 fix\n", b"")
 
     monkeypatch.setattr(verify, "git_bytes", latin1_subject)
@@ -2781,7 +2785,7 @@ def test_commit_subject_degrades_on_a_chokepoint_fault(tmp_path, monkeypatch, fa
     the subject degrades to empty and the modal still renders, mirroring the
     rc-nonzero arm an unknown sha already takes."""
 
-    def unanswerable(repo, *args):
+    def unanswerable(repo, *args, timeout_s=None):
         raise fault("git log did not answer")
 
     monkeypatch.setattr(verify, "git_bytes", unanswerable)

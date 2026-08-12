@@ -861,8 +861,11 @@ class BmadLoopApp(App[None]):
         # checkpoint modal. Subject bytes are git's logOutputEncoding (UTF-8
         # unless configured); replace so an odd byte degrades one label,
         # never raises mid-render.
+        # timeout_s=5 keeps the pre-#390 deadline: this runs on the event loop
+        # (the checkpoint modal's build path), so a stalled git must surface as
+        # a missing subject in seconds, not a 120s frozen UI.
         try:
-            proc = verify.git_bytes(self.project, "log", "-1", "--format=%s", sha)
+            proc = verify.git_bytes(self.project, "log", "-1", "--format=%s", sha, timeout_s=5)
         except verify.GitError:
             return ""
         if proc.returncode != 0:

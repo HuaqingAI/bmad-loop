@@ -404,8 +404,11 @@ def test_tracking_warning_probe_answers_through_the_chokepoint(tmp_path, capsys,
     direct `subprocess.run` and this fails — the fake is never consulted (#390)."""
     real = install_mod.git_bytes
 
-    def tracked_answer(repo, *args):
+    def tracked_answer(repo, *args, timeout_s=None):
         if args == ("ls-files", "--error-unmatch", ".bmad-loop/policy.toml"):
+            # the pre-#390 10s probe bound must survive the reroute — a hint
+            # must not stall init for the 120s module default
+            assert timeout_s == 10
             return subprocess.CompletedProcess(["git", *args], 0, b".bmad-loop/policy.toml\n", b"")
         return real(repo, *args)
 
@@ -422,7 +425,7 @@ def test_tracking_warning_degrades_on_a_chokepoint_fault(tmp_path, capsys, monke
     way #389 re-derived the shield's."""
     real = install_mod.git_bytes
 
-    def unanswerable(repo, *args):
+    def unanswerable(repo, *args, timeout_s=None):
         if args == ("ls-files", "--error-unmatch", ".bmad-loop/policy.toml"):
             raise fault("git ls-files did not answer")
         return real(repo, *args)
