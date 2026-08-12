@@ -3,6 +3,7 @@
 import argparse
 import io
 import json
+import ntpath
 import os
 import sys
 import types
@@ -11,6 +12,7 @@ from pathlib import Path
 import pytest
 import yaml
 from conftest import (
+    UNRESOLVABLE,
     escalated_run,
     fault_read_text,
     git,
@@ -20,6 +22,7 @@ from conftest import (
     install_dev_shim,
     machine_json,
     mark_ledger_done,
+    refuse_to_resolve,
     spec_path,
     write_gated_ledger,
     write_ledger,
@@ -27,7 +30,7 @@ from conftest import (
     write_sprint,
 )
 
-from bmad_loop import cli
+from bmad_loop import cli, platform_util
 from bmad_loop import policy as policy_mod
 from bmad_loop import runsetup
 from bmad_loop.adapters import multiplexer as mux_mod
@@ -7450,3 +7453,87 @@ def test_dry_run_banner_names_the_isolation_refusal_first(project, capsys):
     assert REFUSAL in fails[0]
     assert len(fails) > 1, "the base-skill problems the banner already reported"
     assert "1-1-a" in out  # the schedule itself still rendered
+
+
+# ------------------- a project root the OS refuses to canonicalize (#552) --------
+
+
+def test_project_degrades_when_the_os_cannot_canonicalize(monkeypatch, capsys, tmp_path):
+    """`_project` runs inside `main()` before dispatch, so a raise here took out every
+    subcommand at the broad backstop — `diagnose` and `validate` included, which are
+    the two that name the host responsible."""
+    refuse_to_resolve(monkeypatch, tmp_path)
+
+    got = cli._project(argparse.Namespace(project=str(tmp_path)))
+
+    assert got == tmp_path
+    assert UNRESOLVABLE in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", ["validate", "diagnose"])
+def test_diagnostic_commands_survive_an_unresolvable_project_root(
+    command, project, monkeypatch, capsys
+):
+    """The regression itself. Both commands exist to tell an operator what is wrong
+    with their host; on the one host that answers WinError 64 they were the two that
+    could not run. Asserted through `--json` because it proves three things at once:
+    the handler reached its end, the document is whole, and the stderr note did not
+    leak onto the one-object-on-stdout surface."""
+    install_bmad_config(project)
+    # `diagnose` has an early "no runs found" exit that would let it pass this row
+    # without ever building a document; give it one to report on.
+    escalated_run(project.project)
+    refuse_to_resolve(monkeypatch, project.project)
+
+    rc = cli.main([command, "--json", "--project", str(project.project)])
+
+    captured = capsys.readouterr()
+    # The pre-fix shape: nothing on stdout, `error: [WinError 64] ...` on stderr, rc 1.
+    assert f"error: {UNRESOLVABLE}" not in captured.err
+    assert "cannot canonicalize" in captured.err
+    doc = json.loads(captured.out)  # raises if the note leaked to stdout
+    assert doc["schema_version"] >= 1
+    assert rc in (0, 1)  # a verdict of either kind is a handler that ran
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="UNC resolution is a Windows behavior")
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        "\\\\wsl.localhost\\Ubuntu-24.04\\home\\u\\proj",
+        "\\\\wsl$\\Ubuntu-24.04\\home\\u\\proj",
+    ],
+)
+def test_project_degrades_on_a_real_unc_refusal(spelling, monkeypatch, capsys):
+    """The whole bug, on the platform that has it, through real `Path.resolve()`.
+
+    Technique borrowed from the #536 guards in `test_platform_util.py`: stub the
+    syscall wrapper rather than aim at a live provider, so the row cannot flake on
+    whether a distro happens to be serving on the runner. Unlike those guards this one
+    answers ERROR_NETNAME_DELETED (64), which is *off* `ntpath`'s non-strict
+    allow-list — that is the difference between `realpath` degrading to its own
+    lexical walk and `realpath` raising, and raising is #552. No `_nt_readlink` stub
+    is needed here for exactly that reason: the walk never starts.
+
+    The final assertion is the point of the whole change. `host.win32-on-wsl-path` is
+    the finding that explains this host, `is_wsl_unc_path` is its predicate, and the
+    predicate has to still match what the fallback returns or the command survives
+    with nothing to say."""
+    calls: list[str] = []
+
+    def dead_provider(path):
+        calls.append(path)
+        raise OSError(0, "stubbed: the provider is registered but not serving", None, 64)
+
+    monkeypatch.setattr(ntpath, "_getfinalpathname", dead_provider)
+    monkeypatch.setattr(platform_util, "_LEXICAL_FALLBACK_NOTED", set())
+
+    got = cli._project(argparse.Namespace(project=spelling))
+
+    # Ablation guard: a pathlib that stopped routing resolve() through ntpath would
+    # leave the stub unused, resolve() would succeed, and everything below would pass
+    # while pinning nothing about the degrade.
+    assert calls, "resolve() no longer reaches ntpath._getfinalpathname"
+    assert str(got) == spelling, "absolute() must hand an already-absolute path back whole"
+    assert platform_util.is_wsl_unc_path(got) is True
+    assert "cannot canonicalize" in capsys.readouterr().err

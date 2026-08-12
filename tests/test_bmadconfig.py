@@ -8,7 +8,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from conftest import install_bmad_config
+from conftest import install_bmad_config, refuse_to_resolve
 
 from bmad_loop import bmadconfig
 from bmad_loop.bmadconfig import ProjectPaths
@@ -121,3 +121,81 @@ def test_worktree_isolation_conflict_compares_normalized_paths(tmp_path: Path) -
     )
     assert paths.repo_root != paths.project, "the two spellings really are different"
     assert bmadconfig.worktree_isolation_conflict(paths, "worktree") is None
+
+
+# ------------- a project root the OS refuses to canonicalize (#552) -------------
+
+
+def _write_config(root: Path, **keys: str) -> None:
+    """The `_bmad/bmm/config.yaml` `load_paths` reads, with arbitrary key overrides —
+    `install_bmad_config` hard-codes `{project-root}` forms, and these rows need a
+    config string that names somewhere else entirely."""
+    body = {
+        "implementation_artifacts": "{project-root}/_bmad-output/implementation-artifacts",
+        "planning_artifacts": "{project-root}/_bmad-output/planning-artifacts",
+        **keys,
+    }
+    cfg = root / "_bmad" / "bmm"
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / "config.yaml").write_text(
+        "".join(f"{k}: '{v}'\n" for k, v in body.items()), encoding="utf-8"
+    )
+
+
+def test_load_paths_degrades_rather_than_re_raising(tmp_path: Path, monkeypatch) -> None:
+    """Hardening `cli._project` alone would not have been enough: `load_paths`
+    re-resolves the very same root, so on the failing host the second call raised the
+    exception the first one had just absorbed — straight past every caller's
+    `except BmadConfigError` and into `main()`'s backstop. `cmd_validate` loads paths
+    before it reaches the platform preflight, so this sits on the critical path for
+    the #332 finding rather than beside it."""
+    root = tmp_path / "p"
+    root.mkdir()
+    _write_config(root)
+    refuse_to_resolve(monkeypatch, root)
+
+    paths = bmadconfig.load_paths(root)
+
+    assert paths.project == root
+    assert paths.implementation_artifacts == root / "_bmad-output" / "implementation-artifacts"
+    assert paths.output_folder == root / "_bmad-output"
+
+
+def test_worktree_isolation_conflict_degrades_rather_than_re_raising(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`cmd_validate` runs this gate *before* the platform preflight, so under
+    `isolation = "worktree"` a raise here put the #332 finding back out of reach for
+    exactly the operators it is written for. The default shape is what is pinned:
+    no `repo_root` key, so both sides are the project and the gate must pass."""
+    root = tmp_path / "p"
+    root.mkdir()
+    paths = ProjectPaths(
+        project=root,
+        implementation_artifacts=root / "impl",
+        planning_artifacts=root / "plan",
+        output_folder=root / "out",
+    )
+    refuse_to_resolve(monkeypatch, root)
+
+    assert bmadconfig.worktree_isolation_conflict(paths, "worktree") is None
+
+
+def test_load_paths_degrades_for_a_config_path_that_is_itself_unresolvable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`_resolve` needs the same treatment as the project root, and not for the same
+    reason: `implementation_artifacts`, `planning_artifacts`, `output_folder` and
+    `repo_root` are arbitrary operator strings, so one of them can name a dead share
+    while `--project` points at a perfectly healthy local directory. Pinned with the
+    project root left resolvable so only the config string can be what degrades."""
+    root = tmp_path / "p"
+    root.mkdir()
+    share = tmp_path / "elsewhere" / "impl"
+    _write_config(root, implementation_artifacts=str(share))
+    refuse_to_resolve(monkeypatch, share)
+
+    paths = bmadconfig.load_paths(root)
+
+    assert paths.implementation_artifacts == share
+    assert paths.project == root.resolve(), "the healthy root still canonicalizes"

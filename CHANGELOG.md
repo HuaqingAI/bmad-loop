@@ -235,6 +235,19 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
+- **A project path the OS refuses to canonicalize no longer kills every command (#552).** On a
+  Windows host whose WSL UNC provider is registered but not serving, resolving
+  `\\wsl$\<distro>\...` raises `ERROR_NETNAME_DELETED` (WinError 64) — off CPython's non-strict
+  allow-list, so `Path.resolve()` fails outright. `cli._project` runs before dispatch, so every
+  subcommand died at the backstop with `error: [WinError 64] ...`, `diagnose` and `validate`
+  included: the `host.win32-on-wsl-path` warning naming the fault was unreachable on the only
+  hosts it is for. `_project` and `bmadconfig.load_paths` now degrade to `Path.absolute()` with
+  one note on stderr, so those commands run and report. Deliberately bounded to the entry
+  chokepoint: the paths that need a canonical answer — `runs.project_tag`, worktree provisioning,
+  `verify` — still raise, so a `run` fails loud rather than tagging one project two ways.
+  `..` is kept rather than collapsed; folding it lexically names a different directory across a
+  symlink, and this value is persisted as `state.project` and reused as a repo root and a cwd.
+
 - **The last two bare git spawns route through the `_run_git` chokepoint, and a guard now
   enforces the invariant (#390).** An undecodable byte in a commit subject crashed the TUI's
   story-checkpoint modal: the bare spawn decoded strictly, and `UnicodeDecodeError` slipped both

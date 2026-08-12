@@ -7,6 +7,8 @@ from pathlib import Path
 
 import yaml
 
+from .platform_util import resolve_or_lexical
+
 
 class BmadConfigError(Exception):
     pass
@@ -100,7 +102,17 @@ def worktree_isolation_conflict(paths: ProjectPaths, isolation: str) -> str | No
     hand-built :class:`ProjectPaths` (tests) need not have."""
     if isolation != "worktree":
         return None
-    if paths.repo_root.resolve() == paths.project.resolve():
+    # Same degrade as `load_paths` (#552): this gate runs in `cmd_validate` *before*
+    # the platform preflight, so a raise here is the #332 finding going unreachable
+    # again for anyone on `isolation = "worktree"`. Both sides take the same
+    # treatment, so a host that cannot canonicalize compares lexical to lexical.
+    # What that costs, stated rather than hidden: on such a host the two spellings
+    # the test below pins (`p/../p` vs `p`) no longer fold together, so an override
+    # that merely respells the project directory would be refused with the #414 text
+    # — a wrong message, where the alternative is no message and no command at all.
+    # The default config never reaches it: with no `repo_root` key the two sides are
+    # the same object.
+    if resolve_or_lexical(paths.repo_root) == resolve_or_lexical(paths.project):
         return None
     return (
         'isolation = "worktree" is not supported when repo_root differs from the project '
@@ -113,11 +125,19 @@ def worktree_isolation_conflict(paths: ProjectPaths, isolation: str) -> str | No
 
 
 def _resolve(raw: str, project: Path) -> Path:
-    return Path(raw.replace("{project-root}", str(project))).resolve()
+    """Expand `{project-root}` and canonicalize. A config string can name a UNC share
+    of its own, independent of `--project`, so it degrades on the same terms — see
+    `platform_util.resolve_or_lexical` (#552)."""
+    return resolve_or_lexical(raw.replace("{project-root}", str(project)))
 
 
 def load_paths(project: Path) -> ProjectPaths:
-    project = project.resolve()
+    # Degrades rather than raises when the OS cannot canonicalize (#552). `_project`
+    # already ran this, so on a host that refuses it the argument arriving here is
+    # the lexical form and a bare `.resolve()` would raise a second time — taking out
+    # `validate`, which loads paths before it reaches the finding that explains the
+    # host. See `platform_util.resolve_or_lexical` for the bounds of the degrade.
+    project = resolve_or_lexical(project)
     config_path = project / "_bmad" / "bmm" / "config.yaml"
     if not config_path.is_file():
         raise BmadConfigError(f"BMAD config not found: {config_path} (is BMAD installed here?)")
@@ -147,6 +167,6 @@ def load_paths(project: Path) -> ProjectPaths:
         project=project,
         implementation_artifacts=_resolve(str(impl), project),
         planning_artifacts=_resolve(str(plan), project),
-        output_folder=output_folder.resolve(),
+        output_folder=resolve_or_lexical(output_folder),
         repo_root=repo_root,
     )

@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from bmad_loop import cli, documents
+from bmad_loop import cli, documents, platform_util
 from bmad_loop.adapters.base import SessionResult, SessionSpec
 from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.checks import ValidationReport
@@ -320,6 +320,32 @@ def project(tmp_path: Path, _project_template: Path) -> ProjectPaths:
         implementation_artifacts=root / "_bmad-output" / "implementation-artifacts",
         planning_artifacts=root / "_bmad-output" / "planning-artifacts",
     )
+
+
+UNRESOLVABLE = "stubbed: the provider is registered but not serving"
+
+
+def refuse_to_resolve(monkeypatch, *targets: Path) -> None:
+    """Make ``Path.resolve()`` raise WinError 64 for exactly ``targets`` — the answer
+    a registered-but-not-serving WSL UNC provider gives (#529/#536), and one CPython's
+    non-strict ``ntpath`` allow-list does not absorb, so ``resolve()`` fails outright
+    instead of degrading to its own lexical walk. That is the #552 condition.
+
+    Scoped to named paths on purpose: a blanket stub would break every unrelated
+    resolve in the process, and a row asserting "the command survived" would then pass
+    for a reason that has nothing to do with the guard under test. Also clears the
+    one-note-per-process dedupe set, so a row can assert on a note a previous test in
+    the same session would otherwise have consumed."""
+    real = Path.resolve
+    wanted = {str(t) for t in targets}
+
+    def stub(self, strict: bool = False):
+        if str(self) in wanted:
+            raise OSError(0, UNRESOLVABLE, None, 64)
+        return real(self, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", stub)
+    monkeypatch.setattr(platform_util, "_LEXICAL_FALLBACK_NOTED", set())
 
 
 def install_bmad_config(paths: ProjectPaths) -> None:
