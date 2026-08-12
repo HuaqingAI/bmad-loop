@@ -181,8 +181,11 @@ def test_digest_ignores_the_adapter_model(pinned):
 
 
 def test_digest_moves_when_the_transport_flips_to_hookless(pinned):
-    """`hooks.dialect = "none"` swaps the argv BUILDER, not a token in it:
-    `make_adapters` routes to the HTTP adapter, whose `_serve_argv` drops
+    """`hooks.dialect = "none"` reshapes the argv WHOLESALE rather than moving a
+    token in it. (Since the adapter registry the field that picks the BUILDER is
+    `profile.adapter` — pinned by its own test; `hookless` still decides what the
+    opencode builder emits, which is what this row covers.) That builder's
+    `_serve_argv` drops
     `launch_args`, the prompt and the `bypass_args` fallback and puts the literal
     "serve" at argv[1] — run with `cwd` at the workspace root. Against an
     interpreter `binary` (python/sh/node, the real program in `launch_args` —

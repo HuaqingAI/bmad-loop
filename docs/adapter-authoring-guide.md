@@ -14,7 +14,10 @@ bmad-loop a new CLI:
 - **The advanced case — a new adapter class.** If the CLI does _not_ fit that
   transport (e.g. an HTTP/SSE service), see
   [Writing a new adapter class](#writing-a-new-adapter-class) for the
-  `CodingCLIAdapter` ABC.
+  `CodingCLIAdapter` ABC — and
+  [Shipping a new adapter class out-of-tree](#shipping-a-new-adapter-class-out-of-tree)
+  to register it (and the profile that selects it) from a co-installed package
+  with **zero core edits**, the same way a transport backend ships out-of-tree.
 
 ## Two axes: CLI vs transport
 
@@ -22,7 +25,10 @@ These are independent and abstracted separately:
 
 - **CLI axis** — `CodingCLIAdapter` (`adapters/base.py`): _which_ binary to launch,
   how the prompt is rendered, the hook dialect, where the transcript lives. The
-  generic adapter + a TOML profile cover this; the rest of this guide is about it.
+  generic adapter + a TOML profile cover the common case; a CLI needing its own
+  adapter class registers one via `register_adapter(...)` (`adapters/registry.py`),
+  selected by the profile's `adapter` field and shippable out-of-tree just like a
+  transport backend. Most of this guide is about this axis.
 - **Transport axis** — `TerminalMultiplexer` (`adapters/multiplexer.py`): how
   sessions, windows, and panes are created, observed, and torn down. The generic
   adapter never shells out itself — it goes through `self.mux`, obtained from
@@ -400,6 +406,7 @@ resolves to `claude`.
 | `name`                             | ✅       | —                  | Profile id, also the `--cli` value and override key.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `binary`                           | ✅       | —                  | Executable to launch (resolved on `PATH`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `[hooks]`                          | ✅       | —                  | The `HookSpec` table (see below).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `adapter`                          |          | `generic`          | Which adapter **class** drives this CLI — a key resolved against the [adapter registry](#shipping-a-new-adapter-class-out-of-tree), not a fixed enum. `generic` = the bundled tmux + hook-signal adapter; `opencode-http` = the bundled HTTP/SSE adapter; an out-of-tree package registers its own. Membership is checked against the **live** registry (at run start, and by `bmad-loop validate`'s `adapter.kind`), never at parse time — so an unknown kind is a clear config error rather than a schema change. Orthogonal to `hooks.dialect = "none"` — hooklessness is about the transport, this is about the driving class — with two qualifications. A back-compat carve-out for files written before this field existed: when the key is **absent** and the dialect is `none`, the kind is `opencode-http` (what hooklessness used to select), not `generic`. And one refused pairing: an explicit `generic` beside `dialect = "none"` is rejected at load — that adapter completes on a `Stop` hook a hookless profile never registers, so the session could only wait out `session_timeout_min`. Hookless on any **other** kind stays legal, which is the decoupling this field exists for; a provider shipping a hookless profile must therefore set `adapter` rather than leave it at the default.                                           |
 | `skill_tree`                       |          | `.claude/skills`   | Project-relative tree this CLI reads skills from (`.agents/skills` for codex/gemini); `bmad-loop init` installs the `bmad-loop-*` skills here. Must be relative.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `prompt_template`                  |          | `{prompt}`         | How the canonical `/skill args` prompt is rendered. Placeholders: `{prompt}` (whole string), `{skill}` (leading slash-command name, no `/`), `{args}` (the remainder).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `launch_args`                      |          | `()`               | Extra argv passed at launch, e.g. `["-i"]` to stay interactive (gemini/copilot).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
@@ -600,8 +607,108 @@ adapter against a scripted stdlib FakeOpencode (no binary, no network beyond
 smoke-checks the pinned HTTP contract against a real local binary — skipped
 when absent, zero tokens spent.
 
+### Shipping a new adapter class out-of-tree
+
+How does a new adapter class ever get _selected_ when it lives in its own package?
+Which class drives a CLI is data — the profile's `adapter` field, resolved against
+the adapter registry
+([`adapters/registry.py`](../src/bmad_loop/adapters/registry.py)) — so a
+co-installed package registers its own kind with no edit to any core `.py`, exactly
+as a transport backend ships via `bmad_loop.mux_backends`
+([the transport contract](#the-transport-contract-for-a-backend-author)).
+
+Advertise **two entry points** in the package's `pyproject.toml`:
+
+- **`bmad_loop.adapters`** → a module whose import registers the kind. Core scans
+  the group and imports each advertised module (after the builtins, so a bundled
+  name always keeps first registration) before it resolves any adapter:
+
+  ```python
+  # acme_adapter/__init__.py
+  from bmad_loop.adapters.registry import AdapterBuilder, register_adapter
+
+  def _load():                       # lazy: imported only when a run builds this kind,
+      from .acme import AcmeAdapter, AcmeDevAdapter   # so an optional dep stays unpaid
+      return AdapterBuilder(
+          plain=AcmeAdapter,          # the plain class
+          dev=AcmeDevAdapter,         # the _DevSynthesisMixin-composed dev/review class
+          construct_error=(),         # exception type(s) __init__ may raise; () = none
+      )
+
+  register_adapter("acme", needs_mux=True, load=_load)   # needs_mux: does it drive a multiplexer?
+  ```
+
+  ```toml
+  # pyproject.toml
+  [project.entry-points."bmad_loop.adapters"]
+  acme = "acme_adapter"
+  ```
+
+- **`bmad_loop.profiles`** → a callable returning `CLIProfile`s (or an iterable of
+  them), so the profile that _selects_ your kind ships with it — no project TOML
+  required. Precedence is packaged < entry-point < project, so a project TOML can
+  still override it:
+
+  ```python
+  # acme_adapter/__init__.py  (same package)
+  from bmad_loop.adapters.profile import CLIProfile, HookSpec
+
+  def profiles():
+      return [CLIProfile(name="acme", binary="acme", adapter="acme",
+                         hooks=HookSpec("none", "", {}))]
+  ```
+
+  ```toml
+  [project.entry-points."bmad_loop.profiles"]
+  acme = "acme_adapter:profiles"
+  ```
+
+The two entry-point **values** differ on purpose: the adapter group's is a bare
+module path (core only imports it — registration is the import's side effect, and
+the entry-point name is just a diagnostic label), while the profile group's names a
+provider object core actually calls. Installing the package into bmad-loop's
+environment is the entire setup — e.g.
+`uv tool install bmad-loop --with <your-adapter>` — with no core edit and no config
+step.
+
+Once co-installed, `bmad-loop adapters` lists the kind and the profiles that select
+it, `bmad-loop validate` checks the reference (an `adapter.kind` finding, resolved
+against the live registry — never a hardcoded set), and a run whose policy
+`[adapter] name` points at a profile carrying `adapter = "acme"` selects it. Note
+those are two different keys: policy's `[adapter] name` picks the **profile**; the
+profile's own `adapter` field picks the **kind**.
+
+A broken package can never break selection: the failure is recorded and reported by
+`bmad-loop adapters` (a `warning: external adapter '<name>' failed to load: <reason>`
+line, and the same for a failed profile provider) and by the `validate` preflight,
+and selection proceeds without it. There is no out-of-tree adapter-**class** package
+to copy yet; the packaging pattern is identical to the transport axis's
+[bmad-loop-adapter-herdr](https://github.com/pbean/bmad-loop-adapter-herdr), which
+registers a `TerminalMultiplexer` rather than an adapter class.
+
+Two seam facts worth internalizing:
+
+- **`needs_mux`** gates whether the run bootstrap resolves and usability-checks the
+  shared terminal multiplexer for your family. A tmux/hook family sets it `True`; a
+  self-hosted HTTP/SSE family (like opencode) sets it `False` and is never handed a
+  `mux`.
+- **The `dev` / `plain` split is a pipeline concept, not a per-family branch.** When
+  a dev/review session runs the dev primitive (which writes no `result.json`), the
+  bootstrap builds the `dev` variant — the `_DevSynthesisMixin`-composed class — and
+  threads the project `paths` into it so it can synthesize the result from the spec
+  on disk; every other role builds `plain`. Both variants of a family share the
+  `(*args, paths, **kwargs)` dev `__init__` contract, so honoring it is all an
+  out-of-tree class must do to slot into that machinery.
+
+An entry-point profile is held to the same invariants a TOML profile is (hook
+dialect, path containment, `env_fault_patterns` compilation, …): it is validated on
+arrival, so a provider that ships an invalid profile is reported rather than
+half-installed.
+
 ### References
 
+- [`adapters/registry.py`](../src/bmad_loop/adapters/registry.py) — the adapter-kind
+  registry and the two entry-point scans described above.
 - [`adapters/opencode_http.py`](../src/bmad_loop/adapters/opencode_http.py) — the
   worked example above: a real non-tmux (HTTP/SSE) transport.
 - [`adapters/mock.py`](../src/bmad_loop/adapters/mock.py) — the test-only reference

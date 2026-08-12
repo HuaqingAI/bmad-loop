@@ -154,9 +154,16 @@ def config_digest(
       ``profile.env`` plus one *generated* variable, which the ``skill_tree``
       bullet below accounts for. See the union paragraph on why the subset does
       not narrow what is hashed.
-    * ``hookless`` — the transport, because it decides *which of those two argv
-      builders runs at all*. See the paragraph below on why a hard-coded token is
-      not the same thing as a safe one.
+    * ``adapter`` — the field naming the adapter KIND, because it decides *which
+      argv builder runs at all*. ``make_adapters`` resolves it against the adapter
+      registry (``adapters/registry.py``), so rewriting it does not add a token: it
+      swaps the entire builder, and with it every rule the bullets above assume.
+      See the paragraph below on why a hard-coded token is not the same thing as a
+      safe one — that argument was written about ``hookless`` and transferred here
+      intact when the registry made ``adapter`` the selector.
+    * ``hookless`` — the transport. It no longer *selects* a builder, but it still
+      decides what the opencode builder emits, and it is what gates hook
+      registration; kept for the same wholesale-rewrite reason.
 
     Three of those are easy to lose, and each was lost in an earlier cut of this
     function — which is why the rule above is stated rather than the list.
@@ -173,9 +180,11 @@ def config_digest(
     ``shlex.quote``\\ s it, which bounds it to ONE token — no word-splitting — but
     one token is enough for the ``--opt=value`` form.
 
-    ``hookless`` was the fourth, and it was excluded here on a reading that turned
-    out to be wrong, so the correction is worth keeping: *a hard-coded argv token
-    is not the same thing as a safe one.* Flipping ``hooks.dialect`` to ``"none"``
+    The builder selector was the fourth, and it was excluded here on a reading
+    that turned out to be wrong, so the correction is worth keeping — it is now
+    the argument for ``adapter``, since ``hookless`` selected the builder only
+    until the registry took that job over: *a hard-coded argv token is not the
+    same thing as a safe one.* Flipping ``hooks.dialect`` to ``"none"``
     does not add a token — it swaps the whole builder, dropping ``launch_args``,
     the prompt and the ``bypass_args`` fallback and putting the literal ``"serve"``
     at argv[1], which ``_spawn_server`` then runs with ``cwd`` at the workspace
@@ -208,6 +217,32 @@ def config_digest(
     ``policy.toml`` (``extra_args`` included). So a dead-field rewrite arriving
     mid-run is a config change nobody automated made under a running loop, which
     is the condition this gate reports rather than a false alarm to suppress.
+
+    That completeness rule — *walk the builder; every token traces back to a
+    hashed field* — is only available for a builder whose code is ours, and since
+    the adapter registry that is no longer guaranteed: an out-of-tree kind arrives
+    through the ``bmad_loop.adapters`` entry point, and its field reads cannot be
+    walked from here. What the rule becomes for such a kind:
+
+    * The reads are still drawn from a CLOSED set even though the builder is open.
+      An adapter is constructed from its kwargs and nothing else — the resolved
+      ``CLIProfile``, the frozen ``Policy``, and the per-role ``extra_args`` /
+      ``usage_grace_s`` / ``stop_without_result_nudges`` — so there is no field an
+      external builder can invent. But ``Policy`` is WIDER than the launch surface
+      hashed above: an external builder that read, say, a ``[limits]`` knob into an
+      argv token would be reading a field the exclusions below drop on the grounds
+      that *the bundled builders* cannot turn it into one. That reasoning is
+      builder-scoped, so for an external kind it does not carry.
+    * ``adapter`` being hashed bounds what that costs. A session cannot swap in an
+      unpinned builder mid-run — naming a different kind moves this digest. It can
+      only rewrite fields of the kind the run already launched under, and which of
+      those that kind reads was decided by that kind's own package.
+
+    So: derived for a bundled kind; for an external kind this pins the selector
+    plus the bundled launch surface, and the remainder is that package's own trust
+    boundary — the same boundary an enabled plugin's ``[python]`` module already
+    sits behind (see the plugin gaps at the end), not something a wider hash here
+    could close.
 
     Deliberately EXCLUDED:
 
@@ -343,10 +378,17 @@ def config_digest(
             # template formatted, and it need not reference {prompt} at all.
             "prompt_template": prof.prompt_template,
             "env": dict(prof.env),
-            # The transport, because it rewrites the argv WHOLESALE rather than
-            # adding a token: hookless drops launch_args/prompt/bypass_args and
-            # substitutes `serve --port … --print-logs`, whose literal "serve" an
-            # interpreter binary reads as a cwd-relative script path.
+            # THE builder selector: `make_adapters` resolves this against the
+            # adapter registry and the kind it names decides which argv builder
+            # runs at all. Rewriting it swaps the whole launch shape without
+            # moving one of the fields above.
+            "adapter": prof.adapter,
+            # The transport. It no longer selects the builder (`adapter` does),
+            # but it still rewrites what the opencode builder emits WHOLESALE
+            # rather than adding a token: hookless drops launch_args/prompt/
+            # bypass_args and substitutes `serve --port … --print-logs`, whose
+            # literal "serve" an interpreter binary reads as a cwd-relative
+            # script path.
             "hookless": prof.hookless,
             # None (inherit profile.bypass_args) is NOT the same state as () (an
             # explicit override to no flags at all); json.dumps keeps them apart.
@@ -371,9 +413,9 @@ def make_adapters(
     from :func:`resolve_profiles`; when given, no profile is re-read from disk, so
     a caller that gated on :func:`config_digest` launches the *same* bytes it
     validated (#461 point 4). Omitted, each role resolves fresh as before."""
-    from .adapters.generic import GenericAdapter, GenericDevAdapter
     from .adapters.multiplexer import fold_version, get_multiplexer, mux_usable
     from .adapters.profile import ProfileError, get_profile
+    from .adapters.registry import AdapterError, get_adapter_kind
 
     # The dev skill (bmad-dev-auto) writes no result.json: its adapter
     # synthesizes the result from the spec, and so needs the project paths to
@@ -389,7 +431,10 @@ def make_adapters(
         # session re-invokes the dev skill on the done spec for a follow-up pass),
         # and the skill writes no result.json — its adapter synthesizes the result
         # from the spec it leaves on disk, so it needs the project paths to find
-        # that spec and cannot be shared with the triage role even on identical config.
+        # that spec and cannot be shared with the triage role even on identical
+        # config. `synthesizes` is a bmad-dev-auto pipeline concept (which variant
+        # of a family to build + whether to thread `paths`), NOT a per-family
+        # branch — it stays a documented contract for every registered adapter.
         synthesizes = role in ("dev", "review") and policy.dev.skill == "bmad-dev-auto"
         key = (cfg, synthesizes)
         if key not in by_cfg:
@@ -400,35 +445,49 @@ def make_adapters(
                     profile = get_profile(cfg.name, project)
                 except ProfileError as e:
                     raise SystemExit(f"error: {e}") from e
-            if profile.hookless:
-                # Hookless profiles (opencode-http) are driven over HTTP/SSE —
-                # the tmux adapters below cannot host them.
-                from .adapters.opencode_http import (
-                    OpencodeDevAdapter,
-                    OpencodeHttpAdapter,
-                    OpencodeServerError,
-                )
-
-                common = dict(
-                    run_dir=run_dir,
-                    policy=policy,
-                    profile=profile,
-                    extra_args=cfg.extra_args,
-                    usage_grace_s=cfg.usage_grace_s,
-                    stop_without_result_nudges=cfg.stop_without_result_nudges,
-                )
-                try:
-                    # heterogeneous **kwargs: pyright unions the dict values; per-arg error is spurious
-                    by_cfg[key] = (
-                        OpencodeDevAdapter(**common, paths=paths)
-                        if synthesizes
-                        else OpencodeHttpAdapter(**common)  # pyright: ignore[reportArgumentType]
-                    )
-                except OpencodeServerError as e:
-                    raise SystemExit(f"error: {e}") from e
-            else:
-                # Resolve and probe the shared multiplexer only when a profile
-                # actually uses it; hookless HTTP/SSE runs need no transport.
+            # Which adapter class drives this CLI is pure data — `profile.adapter`
+            # resolved against the registry. No adapter-name branching lives here;
+            # a new family plugs in with zero edits to this function. Note this
+            # reads the profile RESOLVED ABOVE, so under the `profiles is not None`
+            # path the kind comes from the same bytes `config_digest` pinned (#461
+            # point 4) rather than a second read of a file a session can rewrite in
+            # between. An unknown kind fails loud naming the profile.
+            try:
+                kind = get_adapter_kind(profile.adapter)
+            except AdapterError as e:
+                raise SystemExit(f"error: profile {profile.name!r}: {e}") from e
+            # The load thunk is where a family's classes — and any optional
+            # dependency they pull in — are first imported, and it is deliberately
+            # never invoked by `validate` or `bmad-loop adapters` (both stay free
+            # of heavy imports), so a thunk that raises has had no earlier gate.
+            # By here `compose_run` has already written the run state and pid, so
+            # an escaping ImportError strands a run directory behind a traceback.
+            # ImportError ONLY, on the same rule as `construct_error` below: a
+            # missing dependency is a lazy loader's DECLARED failure, while
+            # anything else is a bug in that package and must surface as itself
+            # rather than as a misleading `error:` line. Widening this to
+            # `Exception` would contradict the pin two tests down.
+            try:
+                builder = kind.load()
+            except ImportError as e:
+                raise SystemExit(
+                    f"error: profile {profile.name!r}: adapter kind "
+                    f"{profile.adapter!r} failed to load: {type(e).__name__}: {e}"
+                ) from e
+            # Annotated: the literal below would otherwise fix the value type to
+            # `Path | CLIProfile`, and the `needs_mux` arm adds a multiplexer.
+            common: dict[str, object] = dict(
+                run_dir=run_dir,
+                policy=policy,
+                profile=profile,
+                extra_args=cfg.extra_args,
+                usage_grace_s=cfg.usage_grace_s,
+                stop_without_result_nudges=cfg.stop_without_result_nudges,
+            )
+            if kind.needs_mux:
+                # Resolve and probe the shared multiplexer only when a kind
+                # actually drives one; a self-hosted HTTP/SSE family needs no
+                # transport (and a test asserts it is never even resolved).
                 if mux is None:
                     mux = get_multiplexer()
                     if not mux_usable(mux):
@@ -442,21 +501,20 @@ def make_adapters(
                             "missing, the version is unsupported, or a required helper is "
                             "absent (psmux needs `pwsh` on PATH); see `bmad-loop diagnose`"
                         )
-                common = dict(
-                    run_dir=run_dir,
-                    policy=policy,
-                    profile=profile,
-                    extra_args=cfg.extra_args,
-                    usage_grace_s=cfg.usage_grace_s,
-                    stop_without_result_nudges=cfg.stop_without_result_nudges,
-                    mux=mux,
-                )
+                common["mux"] = mux
+            # The synthesizing variant additionally needs `paths`; the plain
+            # variant does not accept it. `construct_error` is family-declared —
+            # `()` for a family that cannot fail construction (generic), or e.g.
+            # `(OpencodeServerError,)` for one that can — and becomes a SystemExit
+            # so a run aborts with a clean message instead of a traceback.
+            # `except ():` catches nothing, which is exactly right for the `()` case.
+            cls = builder.dev if synthesizes else builder.plain
+            build_kwargs = {**common, "paths": paths} if synthesizes else common
+            try:
                 # heterogeneous **kwargs: pyright unions the dict values; per-arg error is spurious
-                by_cfg[key] = (
-                    GenericDevAdapter(**common, paths=paths)
-                    if synthesizes
-                    else GenericAdapter(**common)  # pyright: ignore[reportArgumentType]
-                )
+                by_cfg[key] = cls(**build_kwargs)  # pyright: ignore[reportArgumentType]
+            except builder.construct_error as e:
+                raise SystemExit(f"error: {e}") from e
         adapters[role] = by_cfg[key]
     return adapters
 
