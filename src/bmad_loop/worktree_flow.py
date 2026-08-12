@@ -448,7 +448,10 @@ def provision_worktree(
 
     seed_files are copied BEFORE the hook step so a seeded settings file that is
     also a hook config_path (.claude/settings.json, .gemini/settings.json) keeps its
-    real content and just gets the Stop hook merged in, rather than being created empty.
+    real content rather than being created empty. Its relay entry is replaced, not
+    kept: the seeded copy carries the main repo's $CLAUDE_PROJECT_DIR-relative relay
+    command, which resolves to the worktree, so the hook step strips it and registers
+    its own absolute command in its place (#352).
 
     The repo's `_bmad/` surface is also merge-seeded, excluding generated render
     output. Renderer and upstream-skill completeness failures share the return

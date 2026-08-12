@@ -560,8 +560,13 @@ def test_provision_worktree_rewrites_seeded_relative_hook_to_absolute(tmp_path):
 
 def test_strip_relay_hooks_leaves_foreign_handlers(tmp_path):
     """Only bmad relay handlers go. A project's own hooks share the event list and
-    must survive, and an event that held nothing else is dropped rather than left
-    as an empty list."""
+    must survive — as must a probe-capture hook, which merge_hooks' dedup also owns
+    but strip deliberately does not — and an event that held nothing else is dropped
+    rather than left as an empty list."""
+    probe = {
+        "matcher": "",
+        "hooks": [{"type": "command", "command": "python bmad_loop_probe_hook.py Stop"}],
+    }
     config = {
         "hooks": {
             "Stop": [
@@ -570,6 +575,7 @@ def test_strip_relay_hooks_leaves_foreign_handlers(tmp_path):
                     "hooks": [{"type": "command", "command": "python bmad_loop_hook.py Stop"}],
                 },
                 {"matcher": "", "hooks": [{"type": "command", "command": "make lint"}]},
+                probe,
             ],
             "SessionStart": [
                 {
@@ -581,7 +587,8 @@ def test_strip_relay_hooks_leaves_foreign_handlers(tmp_path):
     }
     assert strip_relay_hooks(config, "claude-settings-json") is True
     assert config["hooks"]["Stop"] == [
-        {"matcher": "", "hooks": [{"type": "command", "command": "make lint"}]}
+        {"matcher": "", "hooks": [{"type": "command", "command": "make lint"}]},
+        probe,
     ]
     assert "SessionStart" not in config["hooks"]
     # idempotent: nothing left to remove
