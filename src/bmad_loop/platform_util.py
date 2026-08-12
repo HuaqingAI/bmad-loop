@@ -188,11 +188,94 @@ def is_wsl_unc_path(value: str | Path) -> bool:
     of those match. An extended-length ``\\\\?\\UNC\\...`` prefix the input already
     carried (``ntpath.realpath`` only strips one it added itself) is folded down to the
     plain UNC form here, so that spelling matches too. A spelling this still misses
-    degrades gracefully: the ``mux.selection`` line names the platform regardless."""
+    degrades gracefully: the ``mux.selection`` line names the platform regardless.
+
+    One caller now passes an *un*resolved path: when the OS refuses to canonicalize,
+    :func:`resolve_or_lexical` degrades to ``absolute()``, which is the only way this
+    check runs at all on the host it is for (#552). All four bridge spellings still
+    match — they are already absolute — but the mapped-drive/``subst`` dereference is
+    gone, so a substituted drive letter over a *dead* provider goes unflagged. That is
+    the graceful-degradation case above, not a new one: the finding is a warning, and
+    ``mux.selection`` still names the platform."""
     text = str(value).replace("/", "\\").lower()
     if text.startswith("\\\\?\\unc\\"):
         text = "\\\\" + text[len("\\\\?\\unc\\") :]
     return text.startswith(("\\\\wsl.localhost\\", "\\\\wsl$\\"))
+
+
+# One note per degraded spelling per process. A single invocation canonicalizes the
+# project root at least twice — `main()` pre-dispatch, then the handler's own
+# `_project` — and one condition must not print two lines.
+_LEXICAL_FALLBACK_NOTED: set[str] = set()
+
+
+def resolve_or_lexical(path: str | Path) -> Path:
+    """``Path(path).resolve()``, degrading to a *lexical* absolutization — and one
+    note on stderr — when the OS refuses to canonicalize the path (#552).
+
+    The condition this exists for: on a Windows host whose WSL UNC provider is
+    registered but not serving, resolving ``\\\\wsl$\\<distro>\\...`` raises
+    ``ERROR_NETNAME_DELETED`` (WinError 64). CPython's non-strict
+    ``ntpath._getfinalpathname_nonstrict`` re-raises any winerror outside its
+    allow-list, and 64 is not on it, so ``resolve()`` fails outright rather than
+    falling back to its own lexical walk. Reached from ``cli._project`` before
+    dispatch, that killed *every* subcommand at ``main()``'s backstop — including
+    ``diagnose`` and ``validate``, whose ``host.win32-on-wsl-path`` finding names
+    that exact host. The warning was unreachable on the only hosts it is for.
+
+    ``RuntimeError`` is caught alongside ``OSError`` because ``resolve()`` raises it,
+    not an ``OSError``, for a symlink loop on the 3.11/3.12 floor — the asymmetry
+    ``install._shield_undo_extension`` documents; the pair is this repo's house guard,
+    applied at 17-odd sites already.
+
+    **Degrade, not fail** — deliberately, and bounded. The fallback is exactly
+    ``Path(path).absolute()``: absolute, nothing else. It is enough for the
+    observation surface, because :func:`is_wsl_unc_path` is purely lexical and every
+    bridge spelling is already absolute, so ``absolute()`` hands it back untouched
+    (pathlib folds ``//wsl.localhost/...`` to the backslash form on the way). It is
+    *not* canonical, so this helper stays at the observation surface —
+    ``cli._project``, which runs pre-dispatch where there is no handler to catch
+    anything, and ``bmadconfig.worktree_isolation_conflict``'s comparison, which must
+    not kill ``validate`` ahead of the platform preflight. ``bmadconfig.load_paths``
+    is the boundary and refuses instead — a typed ``BmadConfigError`` for the project
+    root *and* every configured path: a spelling the OS cannot canonicalize has an
+    unknowable location (it can sit lexically inside the project while an in-tree
+    junction carries it to a dead share outside), and classifying it by its spelling
+    is a guess that can redirect a worktree-isolated run's writes. The write paths
+    that need a canonical answer keep their bare ``resolve()`` and still raise:
+    ``runs.project_tag`` digests ``str(project.resolve())`` into a session-ownership
+    tag, and two spellings of one project would strand live sessions. So a ``run`` on
+    such a host fails loud at config load, while ``validate``/``diagnose`` still
+    reach the finding that explains it — observation degrades, repair writes raise.
+
+    **Rejected: ``normpath(absolute(path))``.** Collapsing ``..`` lexically is not a
+    respelling, it names a *different directory* whenever the ``..`` crosses a
+    symlink — measured, not reasoned: with ``/home/u/link -> /var/x``,
+    ``/home/u/link/../proj`` opens ``/var/proj``, and normpath yields
+    ``/home/u/proj``. The raw value reaching here is persisted as ``state.project``
+    and reused as a git repo root and a session cwd (``runsetup.build_run_state``,
+    ``runs``, ``resolve``), so that would be a silent wrong-directory write — a
+    failure class ``resolve()`` never had, introduced by the guard meant to soften
+    it. Plain ``absolute()`` keeps the ``..`` and lets the OS dereference it
+    correctly at every use, which is the whole reason to prefer it over a
+    prettier-looking string.
+
+    A relative ``path`` with an unreadable cwd still raises out of ``absolute()``:
+    there is no lexical answer to degrade to, and the backstop is the honest reply."""
+    try:
+        return Path(path).resolve()
+    except (OSError, RuntimeError) as e:
+        lexical = Path(path).absolute()
+        if str(lexical) not in _LEXICAL_FALLBACK_NOTED:
+            _LEXICAL_FALLBACK_NOTED.add(str(lexical))
+            # stderr, never stdout: `<cmd> --json` is a one-object-on-stdout contract.
+            print(
+                f"note: cannot canonicalize {path}: {e} — continuing with the lexical "
+                f"path {lexical} (symlinks are not dereferenced). "
+                "Run `bmad-loop validate` for what this host is doing.",
+                file=sys.stderr,
+            )
+        return lexical
 
 
 def _retry_on_sharing_violation(op: Callable[[], None]) -> None:

@@ -71,7 +71,7 @@ from .documents import (
 from .engine import Engine
 from .journal import Journal, load_state, save_state
 from .model import RunState
-from .platform_util import MAX_SEGMENT
+from .platform_util import MAX_SEGMENT, resolve_or_lexical
 from .process_host import ProcessHostError
 
 # The run-composition helpers now live in runsetup.py (the library layer a non-CLI
@@ -129,7 +129,13 @@ class ExitCode(IntEnum):
 
 
 def _project(args: argparse.Namespace) -> Path:
-    return Path(args.project).resolve()
+    """The project root every handler works from, canonicalized.
+
+    Degrades rather than fails when the OS cannot canonicalize it — see
+    :func:`platform_util.resolve_or_lexical` for the decision and its bounds. This
+    is called from ``main()`` before dispatch, so a raise here takes out every
+    subcommand at the backstop, ``diagnose`` and ``validate`` included (#552)."""
+    return resolve_or_lexical(args.project)
 
 
 def _policy_path(project: Path) -> Path:

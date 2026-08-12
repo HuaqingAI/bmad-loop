@@ -12,7 +12,7 @@ import os
 import stat
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
@@ -1051,3 +1051,126 @@ def test_safe_ref_segment_output_passes_git_check_ref_format(value, template):
         text=True,
     )
     assert proc.returncode == 0, f"{value!r} -> {branch!r}: {proc.stderr.strip()}"
+
+
+# ----------------------------------------------------- resolve_or_lexical (#552)
+
+# One string, asserted on, so a row proves the *cause* reached stderr rather than
+# just that some note did.
+_REFUSAL = "stubbed: the provider is registered but not serving"
+
+
+@pytest.fixture
+def unnoted(monkeypatch):
+    """A clean note-dedupe set. The real one is module state that lives as long as the
+    process, so without this the second test to degrade the same path in a session
+    would assert on a note the first one already consumed."""
+    monkeypatch.setattr(platform_util, "_LEXICAL_FALLBACK_NOTED", set())
+
+
+def _refusing_resolve(exc):
+    def stub(self, strict=False):
+        raise exc
+
+    return stub
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        # What a registered-but-not-serving WSL UNC provider answers. 64 is *off*
+        # ntpath's non-strict allow-list, so resolve() raises rather than falling
+        # back to its own lexical walk — the whole reason this helper exists.
+        OSError(0, _REFUSAL, None, 64),
+        # resolve() raises this, not an OSError, for a symlink loop on the 3.11/3.12
+        # floor. A guard that caught OSError alone would be a floor-only hole.
+        RuntimeError(_REFUSAL),
+    ],
+    ids=["oserror-winerror-64", "runtimeerror-symlink-loop"],
+)
+def test_resolve_or_lexical_degrades_when_the_os_refuses(exc, monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(platform_util, "_LEXICAL_FALLBACK_NOTED", set())
+    monkeypatch.setattr(Path, "resolve", _refusing_resolve(exc))
+
+    got = platform_util.resolve_or_lexical(tmp_path / "a" / ".." / "b")
+
+    # `..` is *kept*, not collapsed: see the rejected-normpath note on the helper —
+    # folding it lexically names a different directory across a symlink, and this
+    # value is persisted as state.project and reused as a repo root and a cwd.
+    assert got == tmp_path / "a" / ".." / "b"
+    assert got.is_absolute()
+    captured = capsys.readouterr()
+    assert captured.out == ""  # `<cmd> --json` is a one-object-on-stdout contract
+    assert _REFUSAL in captured.err, "the note must carry the cause, not just its own text"
+    assert "cannot canonicalize" in captured.err
+
+
+def test_resolve_or_lexical_keeps_a_relative_path_relative_to_the_cwd(monkeypatch, capsys, unnoted):
+    """`--project` defaults to `"."`, so the degraded path is the common case, not an
+    edge one. `absolute()` is what supplies the root that `resolve()` would have."""
+    monkeypatch.setattr(Path, "resolve", _refusing_resolve(OSError(0, _REFUSAL, None, 64)))
+    assert platform_util.resolve_or_lexical(".") == Path.cwd()
+
+
+def test_resolve_or_lexical_notes_once_per_process(monkeypatch, capsys, tmp_path, unnoted):
+    """One condition, one line. A single invocation canonicalizes the project root at
+    least three times — `main()`'s pre-dispatch `_configure_mux`, the handler's own
+    `_project`, then `load_paths` — and three copies of one note reads as three
+    faults."""
+    monkeypatch.setattr(Path, "resolve", _refusing_resolve(OSError(0, _REFUSAL, None, 64)))
+
+    for _ in range(3):
+        platform_util.resolve_or_lexical(tmp_path)
+
+    assert capsys.readouterr().err.count("cannot canonicalize") == 1
+
+
+def test_resolve_or_lexical_notes_each_distinct_path(monkeypatch, capsys, tmp_path, unnoted):
+    """The dedupe is per path, not a one-shot latch: a second, different path that also
+    degrades is a second thing the operator has not been told about."""
+    monkeypatch.setattr(Path, "resolve", _refusing_resolve(OSError(0, _REFUSAL, None, 64)))
+
+    platform_util.resolve_or_lexical(tmp_path / "a")
+    platform_util.resolve_or_lexical(tmp_path / "b")
+
+    assert capsys.readouterr().err.count("cannot canonicalize") == 2
+
+
+def test_resolve_or_lexical_prefers_the_real_resolve(tmp_path, capsys, unnoted):
+    """The fallback is a fallback. On a working OS this is `Path.resolve()` — symlink
+    dereference included — and it says nothing. Without the second assertion the row
+    would still pass if the helper had degraded, since both answers are absolute."""
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    try:
+        link.symlink_to(real, target_is_directory=True)
+    except OSError as e:  # Windows without SeCreateSymbolicLink / developer mode
+        pytest.skip(f"cannot create a symlink here: {e}")
+
+    got = platform_util.resolve_or_lexical(link)
+
+    assert got == real.resolve()
+    assert got != link.absolute(), "took the lexical branch on a host that can resolve"
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        "\\\\wsl.localhost\\Ubuntu-24.04\\home",
+        "\\\\wsl$\\Ubuntu-24.04\\home",
+        "//wsl.localhost/Ubuntu-24.04/home",
+        "\\\\?\\UNC\\wsl.localhost\\Ubuntu-24.04\\home",
+    ],
+)
+def test_the_lexical_fallback_keeps_every_bridge_spelling_matchable(spelling):
+    """The premise the whole degrade rests on, pinned platform-blind so a Linux run
+    catches a regression too. `absolute()` returns an already-absolute path untouched,
+    so `is_wsl_unc_path` — the #332 predicate, and the reason these commands must live
+    long enough to run — still matches what the fallback hands it. Uses the pure
+    Windows flavour because the real `absolute()` needs a Windows host; the flavour is
+    what decides `is_absolute` and the separator fold, which is the whole claim."""
+    pure = PureWindowsPath(spelling)
+    assert pure.is_absolute(), "absolute() would prepend a POSIX cwd and destroy the prefix"
+    assert platform_util.is_wsl_unc_path(pure) is True
