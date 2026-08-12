@@ -688,6 +688,7 @@ def provision_worktree(
 
     # per-CLI signal-hook registration, baked to the main repo's relay (absolute).
     # Hookless profiles (HTTP/SSE transport) have no config to merge.
+    stripped_paths: set[Path] = set()
     for profile in profiles:
         if profile.hookless:
             continue
@@ -730,8 +731,16 @@ def provision_worktree(
         # claude dialect is $CLAUDE_PROJECT_DIR-relative and resolves to a path that
         # does not exist inside the worktree. merge_hooks will not replace an
         # already-registered relay, so strip it first and let this registration —
-        # baked to the main repo's relay, absolute — be authoritative.
-        stripped = strip_relay_hooks(config, profile.hooks.dialect)
+        # baked to the main repo's relay, absolute — be authoritative. Strip only on
+        # FIRST encounter per config file: profiles can share a config_path
+        # (user-overlay aliases of one CLI), and a later profile's pass must not
+        # tear out the relay events an earlier one just registered — merge_hooks
+        # unions its events in, the first registration winning a shared event.
+        if config_path in stripped_paths:
+            stripped = False
+        else:
+            stripped = strip_relay_hooks(config, profile.hooks.dialect)
+            stripped_paths.add(config_path)
         config, merged = merge_hooks(config, registrations, profile.hooks.dialect)
         if stripped or merged:
             config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")

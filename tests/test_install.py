@@ -1,4 +1,5 @@
 import contextlib
+import dataclasses
 import errno
 import io
 import json
@@ -588,6 +589,31 @@ def test_provision_worktree_tracked_config_rewrite_stays_out_of_commits(project,
     assert hook_rel not in git(wt, "diff", "--cached", "--name-only").splitlines()
     # and the main checkout keeps the portable command it committed
     assert "$CLAUDE_PROJECT_DIR" in (repo / hook_rel).read_text(encoding="utf-8")
+
+
+def test_provision_worktree_shared_config_path_keeps_first_profiles_events(tmp_path):
+    """Profiles can share a hooks.config_path (user-overlay aliases of one CLI)
+    with different event maps. The strip runs once per config file: a later
+    profile's pass must not tear out the relay events an earlier one registered —
+    otherwise a session completing on an event only the first profile declares
+    has no relay and idles to timeout. Events union, first registration wins."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    claude = get_profile("claude")
+    alias = dataclasses.replace(
+        claude,
+        name="claude-alias",
+        hooks=dataclasses.replace(claude.hooks, events={"Notification": "Notification"}),
+    )
+
+    provision_worktree(wt, [claude, alias], repo)
+
+    hooks = json.loads((wt / claude.hooks.config_path).read_text(encoding="utf-8"))["hooks"]
+    assert "Stop" in hooks  # claude's completion event survived the alias pass
+    assert "Notification" in hooks  # and the alias still merged its own event in
+    relay = str(repo / ".bmad-loop" / "bmad_loop_hook.py")
+    assert relay in hooks["Stop"][0]["hooks"][0]["command"]
+    assert relay in hooks["Notification"][0]["hooks"][0]["command"]
 
 
 def test_provision_worktree_tracked_pin_failure_raises(project, tmp_path):
