@@ -853,16 +853,24 @@ class BmadLoopApp(App[None]):
         return spec_text[idx:].strip() if idx != -1 else ""
 
     def _commit_subject(self, sha: str) -> str:
+        # Through the chokepoint (#390): a timeout or failed spawn arrives as
+        # GitError/GitSpawnError instead of the raw subprocess pair, and taking
+        # bytes closes the strict-decode hole — text=True raised
+        # UnicodeDecodeError (a ValueError, caught by neither arm of the old
+        # guard) on a subject undecodable in the run's codec, crashing the
+        # checkpoint modal. Subject bytes are git's logOutputEncoding (UTF-8
+        # unless configured); replace so an odd byte degrades one label,
+        # never raises mid-render.
+        # timeout_s=5 keeps the pre-#390 deadline: this runs on the event loop
+        # (the checkpoint modal's build path), so a stalled git must surface as
+        # a missing subject in seconds, not a 120s frozen UI.
         try:
-            proc = subprocess.run(
-                ["git", "-C", str(self.project), "log", "-1", "--format=%s", sha],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-        except (OSError, subprocess.SubprocessError):
+            proc = verify.git_bytes(self.project, "log", "-1", "--format=%s", sha, timeout_s=5)
+        except verify.GitError:
             return ""
-        return proc.stdout.strip() if proc.returncode == 0 else ""
+        if proc.returncode != 0:
+            return ""
+        return proc.stdout.decode("utf-8", errors="replace").strip()
 
     # ------------------------------------------------------ stop / delete / archive
 

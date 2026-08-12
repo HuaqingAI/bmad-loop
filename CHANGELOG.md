@@ -231,6 +231,24 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
+- **The last two bare git spawns route through the `_run_git` chokepoint, and a guard now
+  enforces the invariant (#390).** An undecodable byte in a commit subject crashed the TUI's
+  story-checkpoint modal: the bare spawn decoded strictly, and `UnicodeDecodeError` slipped both
+  arms of its guard. It and `install`'s tracked-policy probe (which ignored `limits.git_timeout_s`
+  and the `LC_ALL=C` pin) now call `verify.git_bytes`, with the subject decoded
+  `errors="replace"`. Both keep their original short deadlines through a new per-call
+  `timeout_s` override on the chokepoint (5s on the TUI's event loop, 10s for the init hint) —
+  standing inside the chokepoint no longer costs an interactive surface the difference between
+  a degraded label and a two-minute freeze. `test_portability_guard.py` gains a git-argv
+  detector quarantining `["git", ...]` — tuple spellings, string-form spawns
+  (`subprocess.run("git status")`, with or without a shell), and either shape factored into a
+  named constant (`GIT = "git"`, `GIT_STATUS = "git status"`) included — to `_run_git`'s own
+  argv argument in `verify.py`, so the next bypass fails CI
+  instead of surviving by convention, including one added to a non-chokepoint helper inside
+  `verify.py` itself. AGENTS.md's chokepoint line now states its real
+  scope (`src/bmad_loop`) and names the enforcer; tests, `scripts/` and CI workflows deliberately
+  spawn their own git, since a harness must not depend on the artifact it validates.
+
 - **`BMAD_LOOP_SESSION_TIMEOUT_S=inf` no longer disables the session timeout.** The guard was
   one-sided — it rejected a non-positive value so an override could not silently _shorten_ a run's
   budget — but `float()` accepts `inf`, `1e999` and `Infinity`, and all three pass `> 0`. Both

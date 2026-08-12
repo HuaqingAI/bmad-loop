@@ -39,6 +39,9 @@ COMMAND_TIMEOUT_S = 30 * 60
 # Current bound on a single git subprocess. Module state rather than a per-call
 # parameter so the ~40 git helpers need no threading; the engine overrides it
 # from `limits.git_timeout_s` at startup, everything else keeps the default.
+# Interactive callers with a deadline of their own (a TUI render, install's
+# best-effort probe) pass `timeout_s=` through `git_bytes` instead — a per-call
+# override, never a rebind of this state.
 _git_timeout_s = GIT_TIMEOUT_S
 
 
@@ -86,18 +89,33 @@ class GitSpawnError(GitError):
 
 @overload
 def _run_git(
-    cmd: list[str], repo: Path, *, env: dict[str, str] | None = ..., binary: Literal[False] = ...
+    cmd: list[str],
+    repo: Path,
+    *,
+    env: dict[str, str] | None = ...,
+    binary: Literal[False] = ...,
+    timeout_s: int | None = ...,
 ) -> subprocess.CompletedProcess[str]: ...
 
 
 @overload
 def _run_git(
-    cmd: list[str], repo: Path, *, env: dict[str, str] | None = ..., binary: Literal[True]
+    cmd: list[str],
+    repo: Path,
+    *,
+    env: dict[str, str] | None = ...,
+    binary: Literal[True],
+    timeout_s: int | None = ...,
 ) -> subprocess.CompletedProcess[bytes]: ...
 
 
 def _run_git(
-    cmd: list[str], repo: Path, *, env: dict[str, str] | None = None, binary: bool = False
+    cmd: list[str],
+    repo: Path,
+    *,
+    env: dict[str, str] | None = None,
+    binary: bool = False,
+    timeout_s: int | None = None,
 ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
     """Sole spawn point for git subprocesses. Three failures are raised by
     `subprocess.run` *before* any return code exists — a timeout (#156), a
@@ -125,17 +143,22 @@ def _run_git(
     benign "pathspec did not match" tolerance — must not misread a translated
     message under a localized git (#236). Merged last so it wins over both the
     inherited environment and any explicit `env` (the `_git_env` callers' throwaway
-    `GIT_INDEX_FILE` / synthetic identity vars are preserved by the spread)."""
+    `GIT_INDEX_FILE` / synthetic identity vars are preserved by the spread).
+
+    `timeout_s` overrides the module bound for this one call — the interactive
+    callers' seam (#390): a TUI render or install's best-effort probe keeps its
+    own short deadline while standing inside the chokepoint."""
+    effective_timeout_s = _git_timeout_s if timeout_s is None else timeout_s
     try:
         return subprocess.run(
             cmd,
             capture_output=True,
             text=not binary,
-            timeout=_git_timeout_s,
+            timeout=effective_timeout_s,
             env={**(env if env is not None else os.environ), "LC_ALL": "C"},
         )
     except subprocess.TimeoutExpired as exc:
-        raise GitError(f"git {cmd[3]} timed out after {_git_timeout_s}s in {repo}") from exc
+        raise GitError(f"git {cmd[3]} timed out after {effective_timeout_s}s in {repo}") from exc
     except UnicodeDecodeError as exc:
         raise GitError(f"git {cmd[3]} returned undecodable output in {repo}: {exc}") from exc
     except OSError as exc:
@@ -163,7 +186,9 @@ def _git_env(repo: Path, *args: str, env: dict[str, str]) -> tuple[int, str]:
     return proc.returncode, (proc.stdout + proc.stderr).strip()
 
 
-def git_bytes(repo: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
+def git_bytes(
+    repo: Path, *args: str, timeout_s: int | None = None
+) -> subprocess.CompletedProcess[bytes]:
     """Run one `git -C <repo> …` through the chokepoint, capturing raw BYTES.
 
     For the callers the `(rc, str)` wrappers above cannot serve, on two counts:
@@ -180,10 +205,12 @@ def git_bytes(repo: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
 
     Standing inside the chokepoint is what buys the rest: the `LC_ALL=C` pin so
     git's message text stays stable English (#236), and the `_git_timeout_s` bound
-    the engine sets from `limits.git_timeout_s` (#156). The two faults with no rc
-    to return still raise — a timeout as `GitError`, a spawn failure as
-    `GitSpawnError` — since neither can be expressed as a `CompletedProcess`."""
-    return _run_git(["git", "-C", str(repo), *args], repo, binary=True)
+    the engine sets from `limits.git_timeout_s` (#156) — or, for an interactive
+    caller whose surface must not appear hung, the shorter per-call `timeout_s`
+    (#390). The two faults with no rc to return still raise — a timeout as
+    `GitError`, a spawn failure as `GitSpawnError` — since neither can be
+    expressed as a `CompletedProcess`."""
+    return _run_git(["git", "-C", str(repo), *args], repo, binary=True, timeout_s=timeout_s)
 
 
 def rev_parse_head(repo: Path) -> str:

@@ -21,7 +21,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import tomllib
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import ExitStack
@@ -2463,15 +2462,16 @@ def _warn_if_policy_tracked(project: Path) -> None:
     means nothing to warn about."""
     try:
         tracked = (
-            subprocess.run(  # fixed argv, no shell
-                ["git", "ls-files", "--error-unmatch", ".bmad-loop/policy.toml"],
-                cwd=project,
-                capture_output=True,
-                timeout=10,
+            git_bytes(
+                project,
+                "ls-files",
+                "--error-unmatch",
+                ".bmad-loop/policy.toml",
+                timeout_s=10,  # the pre-#390 bound: a hint must not stall init
             ).returncode
             == 0
         )
-    except (OSError, subprocess.SubprocessError):
+    except GitError:
         return
     if tracked:
         print(
