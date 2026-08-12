@@ -235,6 +235,18 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
+- **Worktree runs no longer stall when a seeded hook config carries the main repo's relay
+  (#352).** `.claude/settings.json` is both a seeded file and the hook `config_path`, so it
+  arrived in the worktree still naming the main repo's `$CLAUDE_PROJECT_DIR`-relative relay
+  command — which resolves to the worktree, where no relay exists. `merge_hooks` treated the
+  event as already registered and left the stale command in place, so the session emitted no
+  hook events and idled out the session clock. `provision_worktree` now strips relay entries
+  from the seeded config before merging, so its own absolute registration is authoritative
+  rather than additive. A project that _tracks_ its hook config gets the same rewrite — the
+  checkout carries the same stale command — pinned `skip-worktree` in the worktree's own
+  index, so `git add -A` never folds the machine-specific command into a story commit. A pin
+  that cannot land fails provisioning loudly rather than risking that commit; while pinned,
+  the config is orchestrator-owned — a story's own edit to it stays session-local.
 - **`cleanup` no longer reports a surviving ctl window as removed (#435).** Killing a window is
   best-effort and reports nothing, so the prune counted every _attempted_ kill as a removal. It now
   verifies with one liveness listing and partitions into removed / survived / unverifiable.

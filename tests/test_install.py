@@ -1,4 +1,5 @@
 import contextlib
+import dataclasses
 import errno
 import io
 import json
@@ -44,6 +45,7 @@ from bmad_loop.install import (
     _copy_traversable,
     _git_version_at_least,
     _is_dev_primitive_shim,
+    _register_hooks,
     _shield_undo_extension,
     _worktree_local_exclude,
     dev_primitive_or_default,
@@ -56,6 +58,7 @@ from bmad_loop.install import (
     renderer_stub_resolved,
     resolve_dev_primitive,
     resolve_review_layers,
+    strip_relay_hooks,
 )
 from bmad_loop.worktree_flow import (
     _bmad_scripts_seed_incomplete,
@@ -532,6 +535,178 @@ def test_provision_worktree_lays_down_skills_and_hook(tmp_path):
     cmd = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
     assert str((repo / ".bmad-loop" / "bmad_loop_hook.py")) in cmd
     assert not (wt / ".bmad-loop").exists()
+
+
+def test_provision_worktree_rewrites_seeded_relative_hook_to_absolute(tmp_path):
+    """The main repo's .claude/settings.json carries a $CLAUDE_PROJECT_DIR-relative
+    relay command. Seeded into a worktree, that variable resolves to the worktree,
+    where no .bmad-loop/ relay exists — the hook fails, no Stop signal ever fires and
+    the run stalls. The registration must overwrite the seeded command, which
+    merge_hooks alone will not do (it treats the event as already registered)."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    claude = get_profile("claude")
+    assert _register_hooks(repo, claude) == 0
+    main_settings = json.loads((repo / claude.hooks.config_path).read_text())
+    assert "$CLAUDE_PROJECT_DIR" in main_settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+
+    provision_worktree(wt, [claude], repo, seed_files=[claude.hooks.config_path])
+
+    stop = json.loads((wt / claude.hooks.config_path).read_text())["hooks"]["Stop"]
+    assert len(stop) == 1  # replaced, not appended alongside
+    cmd = stop[0]["hooks"][0]["command"]
+    assert str(repo / ".bmad-loop" / "bmad_loop_hook.py") in cmd
+    assert "$CLAUDE_PROJECT_DIR" not in cmd
+
+
+def test_provision_worktree_tracked_config_rewrite_stays_out_of_commits(project, tmp_path):
+    """A project that TRACKS its hook config still gets the relay rewrite — the
+    checkout carries the same stale $CLAUDE_PROJECT_DIR command a seeded copy
+    would, so #352 stalls there identically — but the rewrite is machine-specific
+    and a tracked file cannot be shielded by the worktree exclude (#392): without
+    the skip-worktree pin, `git add -A` folds it into the story commit and the
+    merge-back hands every other checkout a relay path that does not exist there.
+    Asserted through git's own staging answer, since that is what finalize_commit
+    and the skill's own commits run."""
+    repo = project.project
+    claude = get_profile("claude")
+    hook_rel = claude.hooks.config_path
+    assert _register_hooks(repo, claude) == 0
+    assert "$CLAUDE_PROJECT_DIR" in (repo / hook_rel).read_text(encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "track the hook config")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [claude], repo)
+
+    cmd = json.loads((wt / hook_rel).read_text(encoding="utf-8"))["hooks"]["Stop"][0]["hooks"][0][
+        "command"
+    ]
+    assert str(repo / ".bmad-loop" / "bmad_loop_hook.py") in cmd
+    assert "$CLAUDE_PROJECT_DIR" not in cmd
+    git(wt, "add", "-A")
+    assert hook_rel not in git(wt, "diff", "--cached", "--name-only").splitlines()
+    # and the main checkout keeps the portable command it committed
+    assert "$CLAUDE_PROJECT_DIR" in (repo / hook_rel).read_text(encoding="utf-8")
+
+
+def test_provision_worktree_tracked_portable_config_is_left_alone(project, tmp_path):
+    """Non-claude dialects bake the absolute main-repo relay at init
+    (_hook_command), so a tracked codex config arrives in the worktree already
+    carrying exactly the command provisioning would register: strip-then-merge
+    nets to zero. No write may happen and no skip-worktree pin may be set —
+    pinning claims orchestrator ownership of a file this run never modified,
+    hiding a story's own edit to it for no benefit."""
+    repo = project.project
+    codex = get_profile("codex")
+    hook_rel = codex.hooks.config_path
+    assert _register_hooks(repo, codex) == 0
+    committed = (repo / hook_rel).read_bytes()
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "track the codex hook config")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [codex], repo)
+
+    assert (wt / hook_rel).read_bytes() == committed  # no rewrite happened
+    assert not git(wt, "ls-files", "-t", "--", hook_rel).startswith("S")  # and no pin
+    # a story's own edit to the un-pinned tracked config stays stageable
+    (wt / hook_rel).write_text((wt / hook_rel).read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    git(wt, "add", "-A")
+    assert hook_rel in git(wt, "diff", "--cached", "--name-only").splitlines()
+
+
+def test_provision_worktree_shared_config_path_keeps_first_profiles_events(tmp_path):
+    """Profiles can share a hooks.config_path (user-overlay aliases of one CLI)
+    with different event maps. The strip runs once per config file: a later
+    profile's pass must not tear out the relay events an earlier one registered —
+    otherwise a session completing on an event only the first profile declares
+    has no relay and idles to timeout. Events union, first registration wins."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    claude = get_profile("claude")
+    alias = dataclasses.replace(
+        claude,
+        name="claude-alias",
+        hooks=dataclasses.replace(claude.hooks, events={"Notification": "Notification"}),
+    )
+
+    provision_worktree(wt, [claude, alias], repo)
+
+    hooks = json.loads((wt / claude.hooks.config_path).read_text(encoding="utf-8"))["hooks"]
+    assert "Stop" in hooks  # claude's completion event survived the alias pass
+    assert "Notification" in hooks  # and the alias still merged its own event in
+    relay = str(repo / ".bmad-loop" / "bmad_loop_hook.py")
+    assert relay in hooks["Stop"][0]["hooks"][0]["command"]
+    assert relay in hooks["Notification"][0]["hooks"][0]["command"]
+
+
+def test_provision_worktree_tracked_pin_failure_raises(project, tmp_path):
+    """The pin is a repair write: when the config is KNOWN tracked and
+    `update-index --skip-worktree` fails (here: a held index.lock), provisioning
+    must raise rather than journal-and-continue — continuing knowingly leaves
+    `git add -A` free to commit the machine-specific relay rewrite and merge it
+    back. Observation faults (an unanswerable tracked-probe) still degrade."""
+    repo = project.project
+    claude = get_profile("claude")
+    assert _register_hooks(repo, claude) == 0
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "track the hook config")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    gitdir = Path(git(wt, "rev-parse", "--absolute-git-dir").strip())
+    (gitdir / "index.lock").touch()
+
+    with pytest.raises(verify.GitError, match="skip-worktree"):
+        provision_worktree(wt, [claude], repo)
+
+
+def test_strip_relay_hooks_leaves_foreign_handlers(tmp_path):
+    """Only bmad relay commands go. A project's own hooks must survive whether they
+    hold their own matcher entry or share OURS (a user appending to the relay's
+    nested list is an ordinary hand-edit) — as must a probe-capture hook, which
+    merge_hooks' dedup also owns but strip deliberately does not — and an event
+    that held nothing else is dropped rather than left as an empty list."""
+    probe = {
+        "matcher": "",
+        "hooks": [{"type": "command", "command": "python bmad_loop_probe_hook.py Stop"}],
+    }
+    config = {
+        "hooks": {
+            "Stop": [
+                {
+                    "matcher": "",
+                    "hooks": [{"type": "command", "command": "python bmad_loop_hook.py Stop"}],
+                },
+                {"matcher": "", "hooks": [{"type": "command", "command": "make lint"}]},
+                probe,
+                {
+                    "matcher": "",
+                    "hooks": [
+                        {"type": "command", "command": "python bmad_loop_hook.py Stop"},
+                        {"type": "command", "command": "make fmt"},
+                    ],
+                },
+            ],
+            "SessionStart": [
+                {
+                    "matcher": "",
+                    "hooks": [{"type": "command", "command": "python bmad_loop_hook.py start"}],
+                }
+            ],
+        }
+    }
+    assert strip_relay_hooks(config, "claude-settings-json") is True
+    assert config["hooks"]["Stop"] == [
+        {"matcher": "", "hooks": [{"type": "command", "command": "make lint"}]},
+        probe,
+        {"matcher": "", "hooks": [{"type": "command", "command": "make fmt"}]},
+    ]
+    assert "SessionStart" not in config["hooks"]
+    # idempotent: nothing left to remove
+    assert strip_relay_hooks(config, "claude-settings-json") is False
 
 
 def test_provision_worktree_covers_multiple_profiles(tmp_path):

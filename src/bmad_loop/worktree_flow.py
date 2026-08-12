@@ -20,6 +20,7 @@ it lazily for its own tests.
 
 from __future__ import annotations
 
+import copy
 import json
 from collections.abc import Sequence
 from importlib import resources
@@ -56,6 +57,7 @@ from .install import (
     missing_stories_support,
     renderer_stub_resolved,
     resolve_review_layers,
+    strip_relay_hooks,
 )
 from .model import Phase
 from .process_host import get_process_host
@@ -180,6 +182,59 @@ def _drop_inert_tracked_file_patterns(
             f"ignored to repo-hygiene checks (#392): {'; '.join(sorted(unprobed))}"
         )
     return kept, None
+
+
+def _pin_tracked_config_rewrite(worktree: Path, rel: str) -> str | None:
+    """Keep a rewritten TRACKED hook config out of the unit's story commits.
+
+    The worktree-local exclude cannot: git consults ignore rules only for
+    untracked paths (#392). When a project tracks its hook config, the relay
+    rewrite — a machine-specific absolute command — would ride every
+    `git add -A` (the skill's own commits and finalize_commit alike) into the
+    story commit and merge back to the target branch, handing every other
+    checkout a relay path that does not exist there. The worktree's own index
+    carries a skip-worktree bit that `add -A`, `status` and checkout all honor
+    (it is the sparse-checkout mechanism) and that dies with the worktree, so
+    the rewrite stays session-local.
+
+    While the pin holds, the config is orchestrator-owned: a story's own edit to
+    the pinned file stays session-local and is discarded with the worktree. That
+    is deliberate — before this pin the tracked case stalled outright (#352), so
+    there is no prior working behavior to preserve, and any file-level hiding
+    that keeps OUR rewrite out of `add -A` hides a story's edit with it.
+
+    NOT-A-REPO IS SILENT for the same reason the shield's tracked-probe is:
+    provisioning a plain directory is ordinary, and there is no index and no
+    `git add -A` to be wrong about. An untracked config needs nothing — the
+    exclude shield owns it. A tracked-probe that cannot answer is returned for
+    the caller to journal (observation degrades; the rewrite stands, since a
+    stalled session is the worse outcome, #352). But a failed update-index on a
+    KNOWN-tracked config raises: the pin is a repair write, and continuing
+    without it knowingly leaves `git add -A` free to commit the machine-specific
+    command and merge it back.
+    """
+    try:
+        if verify.git_bytes(worktree, "rev-parse", "--absolute-git-dir").returncode != 0:
+            return None
+    except (verify.GitError, OSError):
+        return None
+    try:
+        if not verify.path_tracked_file(worktree, rel):
+            return None
+    except (verify.GitError, OSError) as e:
+        return (
+            f"could not check whether the rewritten hook config {rel} is tracked "
+            f"({e}); if the project tracks it, the worktree's machine-specific relay "
+            "command may be committed and merged back (#352)"
+        )
+    pinned = verify.git_bytes(worktree, "update-index", "--skip-worktree", "--", rel)
+    if pinned.returncode != 0:
+        raise verify.GitError(
+            f"git update-index --skip-worktree {rel} failed in the worktree; the hook "
+            "config is tracked, so without the pin its machine-specific relay rewrite "
+            "would reach story commits and merge back (#352)"
+        )
+    return None
 
 
 def _seed_bmad_tree(worktree: Path, repo_root: Path) -> list[str]:
@@ -447,7 +502,10 @@ def provision_worktree(
 
     seed_files are copied BEFORE the hook step so a seeded settings file that is
     also a hook config_path (.claude/settings.json, .gemini/settings.json) keeps its
-    real content and just gets the Stop hook merged in, rather than being created empty.
+    real content rather than being created empty. Its relay entry is replaced, not
+    kept: the seeded copy carries the main repo's $CLAUDE_PROJECT_DIR-relative relay
+    command, which resolves to the worktree, so the hook step strips it and registers
+    its own absolute command in its place (#352).
 
     The repo's `_bmad/` surface is also merge-seeded, excluding generated render
     output. Renderer and upstream-skill completeness failures share the return
@@ -631,6 +689,7 @@ def provision_worktree(
 
     # per-CLI signal-hook registration, baked to the main repo's relay (absolute).
     # Hookless profiles (HTTP/SSE transport) have no config to merge.
+    stripped_paths: set[Path] = set()
     for profile in profiles:
         if profile.hookless:
             continue
@@ -668,9 +727,32 @@ def provision_worktree(
             native: f"{interp} {host.shell_quote(str(relay))} {canonical}"
             for native, canonical in profile.hooks.events.items()
         }
-        config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
-        if changed:
+        # A seeded config_path (.claude/settings.json is both a seeded file and the
+        # hook config) arrives carrying the MAIN repo's relay command, which for the
+        # claude dialect is $CLAUDE_PROJECT_DIR-relative and resolves to a path that
+        # does not exist inside the worktree. merge_hooks will not replace an
+        # already-registered relay, so strip it first and let this registration —
+        # baked to the main repo's relay, absolute — be authoritative. Strip only on
+        # FIRST encounter per config file: profiles can share a config_path
+        # (user-overlay aliases of one CLI), and a later profile's pass must not
+        # tear out the relay events an earlier one just registered — merge_hooks
+        # unions its events in, the first registration winning a shared event.
+        baseline_config = copy.deepcopy(config)
+        if config_path not in stripped_paths:
+            strip_relay_hooks(config, profile.hooks.dialect)
+            stripped_paths.add(config_path)
+        config, _ = merge_hooks(config, registrations, profile.hooks.dialect)
+        # Write — and pin — only when the strip+merge actually changed the parsed
+        # config. Non-claude dialects bake the absolute main-repo relay at init
+        # (_hook_command), so a tracked codex/gemini config often arrives already
+        # carrying exactly the command registered here: strip-then-merge nets to
+        # zero, and a pin would claim orchestrator ownership of a file this run
+        # never modified, hiding a story's own edit to it for no benefit.
+        if config != baseline_config:
             config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+            pin_degrade = _pin_tracked_config_rewrite(worktree, profile.hooks.config_path)
+            if pin_degrade is not None and on_degraded is not None:
+                on_degraded(pin_degrade)
 
     # Shield exactly the paths we wrote (skill trees + hook configs + seeded
     # configs) from the unit's `git add -A`, in case a project doesn't gitignore
