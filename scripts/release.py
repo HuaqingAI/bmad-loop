@@ -140,6 +140,13 @@ def has_curated_section(text: str, version: str) -> bool:
     return bool(body)
 
 
+# The shape a promoted heading must take: `## [X.Y.Z] — YYYY-MM-DD`. `section_re`
+# accepts any suffix after `]`, so nothing else notices a dateless or garbled one.
+# Every release heading in CHANGELOG.md matches this — the sole exception is the
+# pre-dating `## [0.1.0]`, which no release re-prepares.
+RELEASE_HEADING_RE = re.compile(
+    r"(?m)^##\s+\[(?P<version>[^\]]+)\]\s+—\s+(?P<date>\d{4}-\d{2}-\d{2})\s*$"
+)
 # Any `[Unreleased]:` link-reference line. Deliberately shape-blind: `ensure_link_ref`
 # rewrites whatever is there in place, so a hand-mangled line is repaired rather than
 # duplicated by an insert.
@@ -369,6 +376,14 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     # fires on a push to `main`/`release/*` with no dependency on the CI workflow, so
     # it can tag and publish while `version-sync` is still running — this precondition
     # is the last gate before that irreversible step, not a duplicate of `check`.
+    # The release date is part of the promoted shape, and only this notices it missing.
+    if section_re(version).search(changelog) and not any(
+        m.group("version") == version for m in RELEASE_HEADING_RE.finditer(changelog)
+    ):
+        problems.append(
+            f"CHANGELOG.md heading for {version} is not `## [{version}] — <ISO date>` — "
+            "the promotion stamps the release date on the heading it renames"
+        )
     # Every heading, not just the first: `extract_section` searches, so a leftover
     # populated Unreleased *below* a freshly-inserted empty one would hide behind it
     # and its entries would never ship.

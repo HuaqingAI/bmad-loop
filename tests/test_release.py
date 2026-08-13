@@ -154,6 +154,10 @@ STALE_UNRELEASED_REF = PROMOTED.replace("/compare/v0.5.0...HEAD", "/compare/v0.4
 # Renamed but never reopened. `has_curated_section` reports False here for the same
 # reason it does for a correctly emptied one, so `prepare` needs the missing/empty
 # distinction that `extract_section`'s None makes.
+# Renamed and emptied correctly, but the release date never got stamped on. `section_re`
+# accepts any suffix after `]`, so every other guard reads this as a clean promotion.
+UNDATED_RELEASE_HEADING = PROMOTED.replace("## [0.5.0] — 2026-07-01", "## [0.5.0]", 1)
+
 # A half-finished rename: the fresh empty heading went in, the old populated one was
 # never renamed. Guards that `search` for the first Unreleased see only the empty one.
 DUPLICATE_UNRELEASED = """# Changelog
@@ -385,6 +389,12 @@ def test_prepare_refuses_a_never_reopened_unreleased(monkeypatch, tmp_path):
     with pytest.raises(SystemExit) as exc:
         _prepare_dry_run(monkeypatch, tmp_path, NO_UNRELEASED_HEADING)
     assert "no `## [Unreleased]` heading" in str(exc.value)
+
+
+def test_prepare_refuses_a_release_heading_without_a_date(monkeypatch, tmp_path):
+    with pytest.raises(SystemExit) as exc:
+        _prepare_dry_run(monkeypatch, tmp_path, UNDATED_RELEASE_HEADING)
+    assert "is not `## [0.5.0] — <ISO date>`" in str(exc.value)
 
 
 def test_prepare_refuses_a_leftover_second_unreleased(monkeypatch, tmp_path):
