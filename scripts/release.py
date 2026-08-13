@@ -36,6 +36,7 @@ import re
 import shutil
 import subprocess
 import sys
+from datetime import date
 from pathlib import Path
 
 # sync_version is the canonical owner of the version value + format. Import it
@@ -156,6 +157,22 @@ UNRELEASED_REF_RE = re.compile(r"(?m)^\[Unreleased\]:[^\n]*$")
 UNRELEASED_COMPARE_RE = re.compile(
     r"(?m)^\[Unreleased\]:\s*\S+/compare/v(?P<base>\S+)\.\.\.HEAD\s*$"
 )
+
+
+def is_promoted_heading(m: re.Match[str], version: str) -> bool:
+    """Whether a ``## [...] — <date>`` match is *this* release's heading, dated.
+
+    ``RELEASE_HEADING_RE`` pins digit widths only, so ``2026-02-31`` and ``2026-99-99``
+    are correctly shaped. ``date.fromisoformat`` is what makes "ISO date" mean a real
+    calendar date rather than a digit pattern.
+    """
+    if m.group("version") != version:
+        return False
+    try:
+        date.fromisoformat(m.group("date"))
+    except ValueError:
+        return False
+    return True
 
 
 def ensure_link_ref(text: str, version: str, repo_url: str) -> str:
@@ -378,11 +395,12 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     # is the last gate before that irreversible step, not a duplicate of `check`.
     # The release date is part of the promoted shape, and only this notices it missing.
     if section_re(version).search(changelog) and not any(
-        m.group("version") == version for m in RELEASE_HEADING_RE.finditer(changelog)
+        is_promoted_heading(m, version) for m in RELEASE_HEADING_RE.finditer(changelog)
     ):
         problems.append(
-            f"CHANGELOG.md heading for {version} is not `## [{version}] — <ISO date>` — "
-            "the promotion stamps the release date on the heading it renames"
+            f"CHANGELOG.md heading for {version} is not `## [{version}] — <ISO date>` "
+            "with a real calendar date — the promotion stamps the release date on the "
+            "heading it renames"
         )
     # Every heading, not just the first: `extract_section` searches, so a leftover
     # populated Unreleased *below* a freshly-inserted empty one would hide behind it

@@ -397,6 +397,14 @@ def test_prepare_refuses_a_release_heading_without_a_date(monkeypatch, tmp_path)
     assert "is not `## [0.5.0] — <ISO date>`" in str(exc.value)
 
 
+@pytest.mark.parametrize("bad", ["2026-02-31", "2026-99-99", "2026-13-05"])
+def test_prepare_refuses_an_impossible_release_date(monkeypatch, tmp_path, bad):
+    text = PROMOTED.replace("2026-07-01", bad, 1)
+    with pytest.raises(SystemExit) as exc:
+        _prepare_dry_run(monkeypatch, tmp_path, text)
+    assert "real calendar date" in str(exc.value)
+
+
 def test_prepare_refuses_a_leftover_second_unreleased(monkeypatch, tmp_path):
     # The empty heading is first, so anything that `search`es rather than scanning
     # every match reads it and passes while the real entries sit below, unshipped.
