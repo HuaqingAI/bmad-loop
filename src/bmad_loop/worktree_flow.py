@@ -70,6 +70,8 @@ from .workspace import (
 )
 
 if TYPE_CHECKING:
+    from importlib.resources.abc import Traversable
+
     from .adapters.base import CodingCLIAdapter
     from .adapters.profile import CLIProfile
     from .bmadconfig import ProjectPaths
@@ -442,6 +444,73 @@ def worktree_seed_undelivered(
     return undelivered
 
 
+def module_skills_seed_undelivered(
+    worktree: Path,
+    trees: Sequence[str],
+    skills_root: Traversable | None = None,
+) -> list[str]:
+    """Wheel-bundled ``MODULE_SKILLS`` whose content never reached the worktree.
+
+    Re-probes DISK, never the copier's bookkeeping: a user-authored
+    ``scm.worktree_seed`` entry that happens to spell a skill rel can therefore
+    neither forge nor mask a report. The source is the wheel's own skills tree, which
+    may be a zip Traversable rather than a real directory, so enumeration goes through
+    the shared :func:`install._walk_traversable_files` walk instead of ``rglob``.
+
+    Presence is the whole contract; content is NEVER compared. Seeding is per-FILE
+    no-clobber, so a checkout carrying its own divergent fork of a bundled skill keeps
+    those bytes while its absent siblings are filled in — comparing content would
+    report that healthy shape as undelivered. A skill the wheel itself lacks is
+    skipped: a broken wheel is the module-skills sync test's concern, not a run's.
+
+    Informational, and NEVER an escalation gate. No ``MODULE_SKILLS`` entry has a
+    worktree-resident consumer — sweep triage dispatches ``/bmad-loop-sweep`` at the
+    MAIN checkout, ``bmad-loop-resolve`` runs at the main checkout too, and
+    ``bmad-loop-setup`` has no session consumer at all — so an absence here cannot
+    prove a stall, and a CRITICAL gate would refuse healthy runs. Extension point: if
+    a consumer ever becomes worktree-resident (e.g. sweep triage moving into unit
+    worktrees), arm the gate by routing this predicate's result into
+    :meth:`WorktreeFlow.escalate_unit` for that consumer's required subset.
+
+    Returns coarse ``"{tree}/{skill}"`` posix rels in iteration order.
+    """
+    if skills_root is None:
+        skills_root = resources.files("bmad_loop.data").joinpath("skills")
+    worktree = worktree.resolve()
+
+    def contained(target: Path) -> bool:
+        try:
+            return target.resolve().is_relative_to(worktree)
+        except (OSError, RuntimeError):
+            return False
+
+    def delivered(src: Traversable, dst: Path) -> bool:
+        """Whether every usable wheel entry has a matching worktree destination."""
+        for rel, entry in _walk_traversable_files(src):
+            target = dst.joinpath(*rel.split("/")) if rel else dst
+            if _is_file(entry):
+                if contained(target) and _is_file(target):
+                    continue
+                return False
+            if _is_dir(entry):
+                # Directories are yielded only when enumeration was refused, so
+                # their unknown descendants cannot be claimed as delivered.
+                return False
+            # Neither a readable file nor a directory: the copier has no path for
+            # such an entry either, so its absence is not a delivery failure.
+        return True
+
+    undelivered: list[str] = []
+    for tree in dict.fromkeys(trees):
+        for skill in MODULE_SKILLS:
+            src = skills_root.joinpath(skill)
+            if not (_is_file(src) or _is_dir(src)):
+                continue
+            if not delivered(src, worktree / tree / skill):
+                undelivered.append(f"{tree}/{skill}")
+    return undelivered
+
+
 def provision_worktree(
     worktree: Path,
     profiles: Sequence[CLIProfile],
@@ -644,12 +713,15 @@ def provision_worktree(
                 skip_existing=True,
                 worktree=worktree,
             )
-        # Known gap, deliberately restated rather than folded into the CRITICAL gate
-        # below: wheel MODULE_SKILLS have no result-side completeness predicate. Story
-        # worktrees deterministically dispatch the upstream dev/review skills, while
-        # these bundled operator/triage skills are a different invocation surface; a
-        # partial wheel copy therefore cannot honestly reuse the guaranteed-stall gate.
-        # Closing that observability gap needs its own required-consumer contract.
+        # Wheel MODULE_SKILLS get the same result-side completeness re-probe as every
+        # other seeded surface (`module_skills_seed_undelivered`, journaled by the
+        # caller as `worktree-module-skills-dropped`) — but journal-only, never the
+        # CRITICAL gate below: no MODULE_SKILLS entry has a worktree-resident consumer
+        # (sweep triage and bmad-loop-resolve dispatch at the MAIN checkout;
+        # bmad-loop-setup has no session consumer), so a partial wheel copy cannot
+        # prove a stall the way a missing upstream dev/review skill does. A future
+        # worktree-resident consumer arms the gate via escalate_unit over that
+        # predicate's result.
         # The orchestrator-driven upstream skills are not in the wheel; copy them
         # from the MAIN REPO's installed tree (same tree path) so an isolated
         # worktree can still resolve the dev primitive and the review layers. Skip
@@ -1100,11 +1172,23 @@ class WorktreeFlow:
                 "worktree-seed-dropped", story_key=task.story_key, entries=undelivered_seeds
             )
 
+        trees = [p.skill_tree for p in profiles]
+        # The wheel's own bundled skills, journal-only like worktree-seed-dropped but
+        # under their own kind so a user seed that spells a skill rel can neither forge
+        # nor mask an entry. No MODULE_SKILLS entry has a worktree-resident consumer,
+        # so an absence here cannot prove a stall and must never escalate.
+        undelivered_module_skills = module_skills_seed_undelivered(unit.path, trees)
+        if undelivered_module_skills:
+            self.journal.append(
+                "worktree-module-skills-dropped",
+                story_key=task.story_key,
+                entries=undelivered_module_skills,
+            )
+
         # Missing upstream skill content is a determinate stall for both inline and
         # renderer-era primitives. Re-probe disk rather than trusting skipped_seeds,
         # which a user-authored seed rel could otherwise forge. Check this first so a
         # wholly absent primitive is not misdiagnosed as a renderer-surface problem.
-        trees = [p.skill_tree for p in profiles]
         absent_skills = base_skills_seed_incomplete(unit.path, self.paths.repo_root, trees)
         if absent_skills:
             reason = (

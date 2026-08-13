@@ -65,6 +65,7 @@ from bmad_loop.worktree_flow import (
     _central_config_seed_incomplete,
     _seed_bmad_tree,
     base_skills_seed_incomplete,
+    module_skills_seed_undelivered,
     worktree_seed_undelivered,
 )
 
@@ -7493,3 +7494,181 @@ def test_hook_config_cannot_supply_its_dropped_seed_alibi(tmp_path):
     assert (wt / rel).is_file(), "the in-worktree link looks delivered generically"
     assert worktree_seed_undelivered(wt, repo, seed_files=[rel]) == []
     assert worktree_seed_undelivered(wt, repo, seed_files=[rel], config_paths=[rel]) == [rel]
+
+
+# ------------------------------------------------- wheel module-skill seed completeness
+
+_MODULE_SKILL_TREE = ".claude/skills"
+
+
+class _StubTraversable:
+    """A minimal Traversable node: a file, a listable dir, or one that refuses iterdir.
+
+    A `chmod 0o000` fixture cannot express the last case portably — CI may run as
+    root, where the mode is ignored — so the refusal is modelled directly.
+    """
+
+    def __init__(self, name, kind, children=None, *, readable=True):
+        self.name = name
+        self._kind = kind
+        self._children = children or {}
+        self._readable = readable
+
+    def is_file(self):
+        return self._kind == "file"
+
+    def is_dir(self):
+        return self._kind == "dir"
+
+    def iterdir(self):
+        if not self._readable:
+            raise OSError(errno.EACCES, "Permission denied")
+        return iter(self._children.values())
+
+    def joinpath(self, name):
+        return self._children.get(name, _StubTraversable(name, "absent"))
+
+
+def test_module_skills_seed_undelivered_reports_only_missing_content(tmp_path):
+    """The wheel's bundled skills, re-probed on disk after a real provision.
+
+    Ablation: delete the `_is_file(target)` conjunct in the predicate's file arm and
+    this fails — every unlinked file still counts as delivered."""
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    repo.mkdir()
+    wt.mkdir()
+
+    provision_worktree(wt, [get_profile("claude")], repo)
+
+    assert module_skills_seed_undelivered(wt, [_MODULE_SKILL_TREE]) == []
+
+    (wt / _MODULE_SKILL_TREE / "bmad-loop-sweep" / "migration-mode.md").unlink()
+    assert module_skills_seed_undelivered(wt, [_MODULE_SKILL_TREE]) == [
+        f"{_MODULE_SKILL_TREE}/bmad-loop-sweep"
+    ]
+
+    shutil.rmtree(wt / _MODULE_SKILL_TREE / "bmad-loop-resolve")
+    assert module_skills_seed_undelivered(wt, [_MODULE_SKILL_TREE]) == [
+        f"{_MODULE_SKILL_TREE}/bmad-loop-resolve",
+        f"{_MODULE_SKILL_TREE}/bmad-loop-sweep",
+    ]
+
+
+def test_module_skills_seed_undelivered_answers_through_a_zip_source(tmp_path):
+    """A zip-imported wheel is a Traversable with no filesystem path, so the probe
+    must enumerate it through the shared walk rather than `rglob`. Skills the source
+    does not carry are the sync test's concern and are skipped, not reported.
+
+    Ablation: swap `_walk_traversable_files` for a `Path.rglob` enumeration and this
+    fails — a zipfile.Path has no rglob at all."""
+    zf_path = tmp_path / "wheel.zip"
+    with zipfile.ZipFile(zf_path, "w") as zf:
+        zf.writestr("skills/bmad-loop-sweep/SKILL.md", "FROM_ZIP")
+        zf.writestr("skills/bmad-loop-sweep/notes/extra.md", "FROM_ZIP")
+    skills_root = zipfile.Path(zf_path, "skills/")
+    wt = tmp_path / "wt"
+    wt.mkdir()
+
+    assert module_skills_seed_undelivered(wt, [_MODULE_SKILL_TREE], skills_root) == [
+        f"{_MODULE_SKILL_TREE}/bmad-loop-sweep"
+    ]
+
+    dst = wt / _MODULE_SKILL_TREE / "bmad-loop-sweep"
+    (dst / "notes").mkdir(parents=True)
+    (dst / "SKILL.md").write_text("FROM_ZIP", encoding="utf-8")
+    (dst / "notes" / "extra.md").write_text("FROM_ZIP", encoding="utf-8")
+
+    assert module_skills_seed_undelivered(wt, [_MODULE_SKILL_TREE], skills_root) == []
+
+
+def test_module_skills_divergent_fork_counts_as_delivered(tmp_path):
+    """Seeding is per-FILE no-clobber, so a checkout that carries its own fork of a
+    bundled skill keeps those bytes while its absent siblings are filled in. Presence
+    is the contract: comparing content would report that healthy shape as a drop."""
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    repo.mkdir()
+    fork = wt / _MODULE_SKILL_TREE / "bmad-loop-sweep" / "SKILL.md"
+    fork.parent.mkdir(parents=True)
+    fork.write_text("# FORKED IN THIS CHECKOUT\n", encoding="utf-8")
+
+    provision_worktree(wt, [get_profile("claude")], repo)
+
+    assert fork.read_text(encoding="utf-8") == "# FORKED IN THIS CHECKOUT\n"
+    assert (fork.parent / "migration-mode.md").is_file(), "absent siblings still seeded"
+    assert module_skills_seed_undelivered(wt, [_MODULE_SKILL_TREE]) == []
+
+
+def test_module_skills_squatting_file_is_reported(tmp_path):
+    """A checkout file standing where a bundled skill's directory goes: the copier
+    refuses the whole subtree rather than mkdir over it, so nothing is delivered.
+
+    Ablation: delete the predicate's `_is_file(target)` conjunct and this fails — the
+    squatting file's rel is never probed, so the skill reads as delivered."""
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    repo.mkdir()
+    squatter = wt / _MODULE_SKILL_TREE / "bmad-loop-sweep"
+    squatter.parent.mkdir(parents=True)
+    squatter.write_text("A FILE, NOT A SKILL\n", encoding="utf-8")
+
+    provision_worktree(wt, [get_profile("claude")], repo)
+
+    assert squatter.read_text(encoding="utf-8") == "A FILE, NOT A SKILL\n"
+    assert module_skills_seed_undelivered(wt, [_MODULE_SKILL_TREE]) == [
+        f"{_MODULE_SKILL_TREE}/bmad-loop-sweep"
+    ]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_module_skills_symlinked_out_destination_is_not_delivery(tmp_path):
+    """A skill directory linked to a complete copy OUTSIDE the worktree reads as
+    present through the link, but the unit commits its own checkout — content that
+    lives outside it was never delivered.
+
+    Ablation: delete the `contained(target)` conjunct in the predicate's file arm and
+    this fails — every file answers `is_file` through the link."""
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    repo.mkdir()
+    wt.mkdir()
+    provision_worktree(wt, [get_profile("claude")], repo)
+    skill = wt / _MODULE_SKILL_TREE / "bmad-loop-sweep"
+    outside = tmp_path / "shared-skill"
+    shutil.move(skill, outside)
+    skill.symlink_to(outside, target_is_directory=True)
+
+    assert (skill / "SKILL.md").is_file(), "the link looks delivered generically"
+    assert module_skills_seed_undelivered(wt, [_MODULE_SKILL_TREE]) == [
+        f"{_MODULE_SKILL_TREE}/bmad-loop-sweep"
+    ]
+
+
+def test_module_skills_unreadable_source_dir_is_reported(tmp_path):
+    """A source directory the walk could not enumerate is yielded as a leaf: its
+    unknown descendants cannot be claimed as delivered, however complete the
+    destination looks.
+
+    Ablation: delete the predicate's `_is_dir(entry)` arm and this fails — the
+    unlistable directory falls through to the neither-file-nor-dir case and the skill
+    reads as delivered."""
+    skills_root = _StubTraversable(
+        "skills",
+        "dir",
+        {
+            "bmad-loop-sweep": _StubTraversable(
+                "bmad-loop-sweep",
+                "dir",
+                {
+                    "SKILL.md": _StubTraversable("SKILL.md", "file"),
+                    "notes": _StubTraversable("notes", "dir", readable=False),
+                },
+            )
+        },
+    )
+    wt = tmp_path / "wt"
+    dst = wt / _MODULE_SKILL_TREE / "bmad-loop-sweep"
+    (dst / "notes").mkdir(parents=True)
+    (dst / "SKILL.md").write_text("x\n", encoding="utf-8")
+    (dst / "notes" / "extra.md").write_text("x\n", encoding="utf-8")
+
+    assert module_skills_seed_undelivered(wt, [_MODULE_SKILL_TREE], skills_root) == [
+        f"{_MODULE_SKILL_TREE}/bmad-loop-sweep"
+    ]
