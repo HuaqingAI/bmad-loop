@@ -699,6 +699,20 @@ Two seam facts worth internalizing:
   on disk; every other role builds `plain`. Both variants of a family share the
   `(*args, paths, **kwargs)` dev `__init__` contract, so honoring it is all an
   out-of-tree class must do to slot into that machinery.
+- **The bootstrap's keyword set grows, so accept `**kwargs`in both variants.**`runsetup.make*adapters`builds every class with`cls(\*\*build_kwargs)`, and that
+  dict is a \_description of the run* — `run_dir`, `policy`, `profile`, the usage and
+  nudge settings, `events_dir` (the run's hook-event channel), plus `mux` for a
+  `needs_mux=True` kind and `paths` for the `dev` variant. Core adds to it as the run
+  gains things worth describing; `events_dir` arrived that way (#494). A class with a
+  closed signature raises `TypeError` on the first keyword it has not heard of,
+  before the session starts.
+
+  The bundled families carry closed signatures instead, which is not a second
+  pattern to copy: they are edited in the same commit that adds the keyword, and an
+  out-of-tree class cannot be. What they do model is the other half of the
+  obligation — accept what you have no use for rather than refusing it.
+  `opencode_http` takes `events_dir` and immediately `del`s it, because that family
+  observes over SSE and fires no hooks, so there is no channel for it to point at.
 
 An entry-point profile is held to the same invariants a TOML profile is (hook
 dialect, path containment, `env_fault_patterns` compilation, …): it is validated on
