@@ -360,17 +360,37 @@ def cmd_prepare(args: argparse.Namespace) -> int:
             f"CHANGELOG.md has no non-empty `## [{version}]` section — "
             "curate the release notes there first"
         )
-    # Paired with the guard above, this is what proves a *promotion* happened:
-    # the notes left `## [Unreleased]` and arrived under `## [X.Y.Z]`. A populated
-    # Unreleased alongside a populated version section means a new section was
-    # authored beside it instead, which is how the two drift apart.
-    if has_curated_section(changelog, "Unreleased"):
+    # Paired with the guard above, these prove a *promotion* happened: the notes left
+    # `## [Unreleased]` and arrived under `## [X.Y.Z]`, and an empty Unreleased was
+    # reopened above it.
+    #
+    # Missing and empty are separate failures, not one: `has_curated_section` reports
+    # False for both, and only `prepare` can tell them apart in time. `release.yml`
+    # fires on a push to `main`/`release/*` with no dependency on the CI workflow, so
+    # it can tag and publish while `version-sync` is still running — this precondition
+    # is the last gate before that irreversible step, not a duplicate of `check`.
+    unreleased = extract_section(changelog, "Unreleased")
+    if unreleased is None:
+        problems.append(
+            "CHANGELOG.md has no `## [Unreleased]` heading — a release renames the old "
+            f"one to `## [{version}]`, so a fresh empty one must be reopened above it"
+        )
+    elif unreleased:
         problems.append(
             "CHANGELOG.md `## [Unreleased]` still has content — a release *promotes* "
             f"that section (rename its heading to `## [{version}] — <ISO date>`, then "
             "reopen an empty `## [Unreleased]` above it), it does not author a new "
             "section beside it"
         )
+    else:
+        # Reopened, but it has to sit above the section it was promoted into — Keep a
+        # Changelog is newest-first, and `publish` reads sections by heading, not order.
+        u, v = section_re("Unreleased").search(changelog), section_re(version).search(changelog)
+        if u and v and u.start() > v.start():
+            problems.append(
+                f"CHANGELOG.md `## [Unreleased]` sits below `## [{version}]` — reopen it "
+                "above the section it was promoted into"
+            )
     # Only CHANGELOG.md + regenerated assets are expected to be dirty pre-prepare.
     expected_dirty = {"CHANGELOG.md"}
     unexpected = [
@@ -500,10 +520,13 @@ def cmd_publish(args: argparse.Namespace) -> int:
 def cmd_check(args: argparse.Namespace) -> int:
     """Run the CI release guards locally — and, via the `version-sync` job, in CI.
 
-    Every problem is reported before returning, so one run shows the whole picture.
-    Deliberately stdlib-only (``sync_version.check()`` in-process rather than a
-    ``uv run`` child) so CI can invoke it under ``--no-project`` without syncing
-    the project just to compare version strings.
+    A strict superset of ``sync_version.py --check``: it calls that check in-process,
+    then holds the CHANGELOG release contract. Every problem is reported before
+    returning, so one run shows the whole picture. Deliberately stdlib-only (that
+    in-process call rather than a ``uv run`` child) so CI can invoke it under
+    ``--no-project`` without syncing the project just to compare version strings.
+    The `version-sync` job name is load-bearing for branch protection — when wiring
+    this in, change the step's command, never the job.
 
     The CHANGELOG arms assert what *promote-and-reopen* leaves behind, not the
     prepare-time precondition: between releases a populated `## [Unreleased]` is

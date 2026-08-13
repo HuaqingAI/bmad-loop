@@ -151,6 +151,23 @@ NO_UNRELEASED_REF = PROMOTED.replace(
 )
 STALE_UNRELEASED_REF = PROMOTED.replace("/compare/v0.5.0...HEAD", "/compare/v0.4.3...HEAD", 1)
 
+# Renamed but never reopened. `has_curated_section` reports False here for the same
+# reason it does for a correctly emptied one, so `prepare` needs the missing/empty
+# distinction that `extract_section`'s None makes.
+UNRELEASED_REOPENED_BELOW = """# Changelog
+
+## [0.5.0] — 2026-07-01
+
+### Fixed
+
+- **A thing.** It no longer breaks.
+
+## [Unreleased]
+
+[Unreleased]: https://github.com/bmad-code-org/bmad-loop/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.5.0
+"""
+
 
 # `section_re` already escapes its argument, so the promotion guards reuse it for the
 # non-numeric "Unreleased" heading rather than adding a second section regex.
@@ -337,6 +354,21 @@ def test_prepare_refuses_a_still_populated_unreleased(monkeypatch, tmp_path):
     with pytest.raises(SystemExit) as exc:
         _prepare_dry_run(monkeypatch, tmp_path, DRIFTED)
     assert "`## [Unreleased]` still has content" in str(exc.value)
+
+
+def test_prepare_refuses_a_never_reopened_unreleased(monkeypatch, tmp_path):
+    # Renaming the heading without reopening one leaves `has_curated_section` False,
+    # exactly as a correct promotion does — and `release.yml` publishes on push without
+    # waiting for the CI check that would catch it, so `prepare` has to.
+    with pytest.raises(SystemExit) as exc:
+        _prepare_dry_run(monkeypatch, tmp_path, NO_UNRELEASED_HEADING)
+    assert "no `## [Unreleased]` heading" in str(exc.value)
+
+
+def test_prepare_refuses_an_unreleased_reopened_below_the_release(monkeypatch, tmp_path):
+    with pytest.raises(SystemExit) as exc:
+        _prepare_dry_run(monkeypatch, tmp_path, UNRELEASED_REOPENED_BELOW)
+    assert "sits below `## [0.5.0]`" in str(exc.value)
 
 
 def test_prepare_accepts_a_promoted_changelog(monkeypatch, tmp_path):
