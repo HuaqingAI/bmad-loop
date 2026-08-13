@@ -699,8 +699,9 @@ Two seam facts worth internalizing:
   on disk; every other role builds `plain`. Both variants of a family share the
   `(*args, paths, **kwargs)` dev `__init__` contract, so honoring it is all an
   out-of-tree class must do to slot into that machinery.
-- **The bootstrap's keyword set grows, so accept `**kwargs`in both variants.**`runsetup.make*adapters`builds every class with`cls(\*\*build_kwargs)`, and that
-  dict is a \_description of the run* — `run_dir`, `policy`, `profile`, the usage and
+- **The bootstrap's keyword set grows.** Accept `**kwargs` in both variants.
+  `runsetup.make_adapters` builds every class with `cls(**build_kwargs)`, and that
+  dict is a _description of the run_ — `run_dir`, `policy`, `profile`, the usage and
   nudge settings, `events_dir` (the run's hook-event channel), plus `mux` for a
   `needs_mux=True` kind and `paths` for the `dev` variant. Core adds to it as the run
   gains things worth describing; `events_dir` arrived that way (#494). A class with a
