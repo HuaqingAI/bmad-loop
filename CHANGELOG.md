@@ -309,7 +309,7 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
-- **A session can no longer silence `resume`'s config-change warning (#498).** The host-exec
+- **`resume`'s config-change baseline moves out of the agent-writable tree (#498).** The host-exec
   baseline `resume` compares against — verify commands, launch binary/args/env, plugin allowlist
   — round-tripped through `state.json`, inside the very tree the digest exists to police, so the
   session that rewrote `policy.toml` could blank the field in the same breath and the warning
@@ -318,9 +318,16 @@ whose seams had diverged enough that several ports needed a different fix, and t
   `delete`/`archive`/`clean` lifecycle. The auto-sweep gate is unchanged — it always compared
   against an in-memory baseline no session can reach. Runs paused under an older version keep
   their old baseline for this release: `resume` falls back to `state.json` when the run has no
-  file out of tree, warns as before, and migrates it. The field is no longer written; it is not
-  a hard boundary against a `--dangerously-skip-permissions` session, which can name the
-  directory.
+  file out of tree, warns as before, and migrates it. The field is no longer written.
+
+  **What this does and does not buy.** It closes the _incidental_ path — nothing a session does
+  in the ordinary course of rewriting project files can blank the pin any more, because the pin
+  is no longer a project file. It is **not** a boundary against a deliberate session: sessions
+  launch with permission bypass by default (that is what an unattended loop is), and are handed
+  `BMAD_LOOP_EVENTS_DIR`, whose parent is the state dir — so a session that goes looking can
+  still delete or truncate the baseline and silence the warning. Closing that needs privilege
+  separation on the state dir, not a better hiding place; tracked in #571.
+
 - **Worktree runs no longer stall when a seeded hook config carries the main repo's relay
   (#352).** `.claude/settings.json` is both a seeded file and the hook `config_path`, so it
   arrived in the worktree still naming the main repo's `$CLAUDE_PROJECT_DIR`-relative relay

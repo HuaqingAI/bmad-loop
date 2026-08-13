@@ -343,9 +343,24 @@ def config_digest_path_for(project: Path, run_id: str) -> Path:
     Out here rather than in ``state.json`` because the baseline exists to police
     the agent-writable tree, and until this move it *lived* in it: a session that
     rewrote ``policy.toml`` could blank or re-stamp the field in the same breath
-    and the warning `resume` owes the operator never fired. A pin a session can
-    edit is not a pin. The same reasoning the events channel moved on (#494), and
-    with the same honest limit — see :func:`state_root`."""
+    and the warning `resume` owes the operator never fired. The same reasoning the
+    events channel moved on (#494).
+
+    **What moving it buys, stated exactly.** It closes the *incidental* path: the
+    pin is no longer a project file, so nothing a session does in the ordinary
+    course of rewriting the tree can collaterally blank it — which is the case the
+    advisory was documented to catch. It is **not** a boundary against a
+    deliberate one. Sessions run with permission bypass by default — every shipped
+    profile's ``bypass_args``, which ``GenericAdapter.interactive_argv`` uses
+    unless ``[adapter] extra_args`` overrides them; that is what an unattended loop
+    is — and are handed
+    ``BMAD_LOOP_EVENTS_DIR``, whose parent is this directory, so a session that
+    goes looking can delete or truncate this file and the reader below will answer
+    "no baseline" exactly as it would for a run that never had one. That is
+    undetectable from here: any marker saying "this run *should* have a baseline"
+    would have to live somewhere the same session cannot reach, and no such place
+    exists at equal privilege. Closing it needs privilege separation on the state
+    root, not a better hiding place — tracked in #571."""
     return state_dir_for(project, run_id) / CONFIG_DIGEST_FILE
 
 
