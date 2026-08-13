@@ -21,7 +21,7 @@ from . import deferredwork, gates, verify
 from .engine import Engine
 from .escalation import critical_escalations, env_fault_pause_reason, session_failure_reason
 from .model import Phase, StoryTask
-from .platform_util import atomic_replace, atomic_write_text
+from .platform_util import atomic_replace, atomic_write_text, neutralize_surrogates
 from .statemachine import advance
 from .workspace import discard_worktree
 
@@ -1152,7 +1152,13 @@ class SweepEngine(Engine):
         lines += ["", "## Ledger entries (verbatim)", "", "\n\n".join(blocks), ""]
         path = self.run_dir / "bundles" / dirname / "intent.md"
         path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(path, "\n".join(lines))
+        # Surrogates are neutralized over the whole document, not per field: the
+        # triage-authored `intent`/`decision_note` are the ones that can revive one
+        # (#329), but a document-wide pass covers whatever prose is added here
+        # later. Line breaks are deliberately *kept* — this file is markdown, so
+        # `_one_line`'s collapse would be damage, and the ledger blocks are read
+        # back from a strict-UTF-8 file and so pass through byte-unchanged.
+        atomic_write_text(path, neutralize_surrogates("\n".join(lines)))
         return path
 
     def _ensure_bundle_intent(self, task: StoryTask) -> None:

@@ -43,6 +43,7 @@ from bmad_loop.policy import (
     VerifyPolicy,
 )
 from bmad_loop.sweep import (
+    Bundle,
     Decision,
     DecisionOption,
     DecisionPrompter,
@@ -992,6 +993,29 @@ def test_sweep_happy_path(project):
     intent_path = re.findall(r"`([^`]*)`", dev_spec.prompt)[0]
     intent = open(intent_path).read()
     assert "fix both" in intent and "DW-2" in intent and "### DW-3" in intent
+
+
+def test_write_intent_neutralizes_surrogates_and_keeps_the_markdown(project):
+    """intent.md is written with `atomic_write_text` too, so a surrogate carried
+    by the triage session's authored prose crashes the strict encode exactly as
+    it does in the ledger — same revival chain, different file. What differs is
+    the remedy: line breaks are LEGITIMATE markdown here, so `_one_line`'s
+    collapse would be damage and only the surrogates are neutralized."""
+    engine, _ = make_sweep(project, [])
+    bundle = Bundle(
+        name="fix-things",
+        dw_ids=(),
+        intent="keep\ud800this\n\nsecond para",
+        decision_note="note\ud800",
+    )
+
+    path = engine._write_intent(bundle, "fix-things")
+
+    assert path.is_file()
+    text = path.read_text(encoding="utf-8")  # strict read; the write did not raise
+    assert "note�" in text
+    # the surrogate is gone AND the paragraph break either side of it is verbatim
+    assert "keep�this\n\nsecond para" in text
 
 
 def test_sweep_is_exempt_from_the_dispatch_hard_gate(project):

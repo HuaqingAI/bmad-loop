@@ -334,6 +334,67 @@ def test_atomic_replace_no_retry_on_posix(tmp_path, monkeypatch):
     assert sleeps == []  # zero backoff — a real POSIX error surfaces at once
 
 
+# -------------------------------------------------------- neutralize_surrogates
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("plain text", "plain text"),
+        ("", ""),
+        ("\ud800", "\ufffd"),  # the lone surrogate json.loads revives (#329)
+        ("a\ud800b", "a\ufffdb"),
+        ("\udfff", "\ufffd"),  # the far end of the range
+        ("x\udfffy", "x\ufffdy"),
+        ("\ud800\ud801\udfff", "\ufffd\ufffd\ufffd"),  # a run: one per code point
+        ("\U0001d11e", "\U0001d11e"),  # astral, ONE code point — never a pair here
+        ("\u00e9\U0001d11e\u6f22", "\u00e9\U0001d11e\u6f22"),
+        ("\ud7ff\ue000", "\ud7ff\ue000"),  # the code points either side of the range
+    ],
+    ids=[
+        "clean",
+        "empty",
+        "lone-d800",
+        "surrounded",
+        "lone-dfff",
+        "surrounded-dfff",
+        "run-per-code-point",
+        "astral-untouched",
+        "mixed-non-ascii",
+        "range-boundaries",
+    ],
+)
+def test_neutralize_surrogates_replaces_only_lone_surrogates(value, expected):
+    """A surrogate has no UTF-8 encoding; everything else must survive intact.
+    The astral row is the one that would break under a naive UTF-16 mental model:
+    Python holds U+1D11E as a single code point, not a D834/DD1E pair, so it is
+    outside the range and must come back byte-identical."""
+    result = platform_util.neutralize_surrogates(value)
+
+    assert result == expected
+    result.encode("utf-8")  # the whole point: the strict encode now succeeds
+
+
+def test_neutralize_surrogates_returns_clean_text_untouched():
+    """The fast path hands back the identical object, so a clean ledger write
+    stays byte-identical to one taken before the guard existed."""
+    value = "origin: review of spec-foo.md"
+
+    assert platform_util.neutralize_surrogates(value) is value
+
+
+def test_neutralize_surrogates_makes_atomic_write_text_survive_a_surrogate(tmp_path):
+    """The pairing this helper exists for: the same value crashes the strict
+    encode without it and round-trips through a strict read with it."""
+    target = tmp_path / "ledger.md"
+
+    with pytest.raises(UnicodeEncodeError):
+        platform_util.atomic_write_text(target, "note: \ud800")
+
+    platform_util.atomic_write_text(target, platform_util.neutralize_surrogates("note: \ud800"))
+    assert target.read_text(encoding="utf-8") == "note: �"
+
+
 # ------------------------------------------------------------- atomic_write_text
 
 

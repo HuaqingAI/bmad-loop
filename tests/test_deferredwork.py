@@ -1276,24 +1276,81 @@ def test_append_entry_leaves_an_already_empty_title_as_it_was(tmp_path):
     assert p.read_text(encoding="utf-8").startswith("### DW-1: \n")
 
 
-def test_append_entry_idempotence_survives_sanitizing(tmp_path):
+@pytest.mark.parametrize(
+    ("origin", "source_spec"),
+    [
+        ("review-budget-followup", "spec-foo.md\nstatus: open"),
+        ("review\ud800followup", "spec-foo.md"),
+        ("review-budget-followup", "spec-\udfff-foo.md"),
+    ],
+    ids=["line-break", "surrogate-origin", "surrogate-source-spec"],
+)
+def test_append_entry_idempotence_survives_sanitizing(tmp_path, origin, source_spec):
     """Sanitizing must happen BEFORE the idempotence scan: that scan compares the
     caller's value against the stored line via `field_line_present`, so
     sanitizing afterwards would compare raw against sanitized and append a fresh
-    entry on every replay of the same defer."""
-    p = tmp_path / "deferred-work.md"
-    dirty = "spec-foo.md\nstatus: open"
+    entry on every replay of the same defer.
 
-    first = append_entry(
-        p, title="t", origin="review-budget-followup", source_spec=dirty, reason="r"
-    )
-    again = append_entry(
-        p, title="t2", origin="review-budget-followup", source_spec=dirty, reason="r2"
-    )
+    Both sanitizing passes are in front of that scan, so both are covered here.
+    The surrogate rows would otherwise regress the same way the break row does —
+    a replayed defer whose origin carries a `\\ud800` matches nothing on disk
+    (the ledger stores the U+FFFD) and burns a fresh id every run."""
+    p = tmp_path / "deferred-work.md"
+
+    first = append_entry(p, title="t", origin=origin, source_spec=source_spec, reason="r")
+    again = append_entry(p, title="t2", origin=origin, source_spec=source_spec, reason="r2")
 
     assert first == "DW-1"
     assert again is None
     assert len(parse_ledger(p.read_text(encoding="utf-8"))) == 1
+
+
+# ------------------------- surrogate neutralization at the sanitizer chokepoint (#329)
+# Every row here calls a real writer with no monkeypatching: the value has to
+# survive `_one_line`, `atomic_write_text`'s strict UTF-8 encode, and the strict
+# read back. Delete the `neutralize_surrogates` call in `_one_line` and each one
+# fails with `UnicodeEncodeError` — the crash #329 filed, arriving from a close
+# path that calls these writers bare.
+
+
+def test_append_entry_writes_a_finding_carrying_a_lone_surrogate(tmp_path):
+    """A lone surrogate is not a line break, so it sailed past the break collapse
+    untouched and detonated in the encode. Note the title stays truthy — `�` is a
+    visible replacement, so `append_entry`'s `(untitled DW-<n>)` substitution
+    deliberately does NOT fire for it."""
+    p = tmp_path / "deferred-work.md"
+
+    dw_id = append_entry(p, title="\ud800", origin="o", source_spec="s.md", reason="x\udfffy")
+
+    assert dw_id == "DW-1"
+    text = p.read_text(encoding="utf-8")  # strict read: unencodable text never got here
+    (entry,) = parse_ledger(text)
+    assert entry.title == "�"  # replaced, not vanished into `(untitled DW-1)`
+    assert "reason: x�y" in entry.body
+
+
+def test_append_decision_writes_a_label_and_detail_carrying_a_lone_surrogate(tmp_path):
+    """`decisions.apply_pre_answer` calls this bare, so the raise would end the
+    sweep. Both interpolated fields go through the chokepoint."""
+    path = write_ledger(tmp_path)
+
+    assert append_decision(path, "DW-3", "2026-06-11", "\ud800", "a\ud800b")
+
+    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    assert "decision: 2026-06-11 � — a�b" in entries["DW-3"].body
+
+
+def test_mark_done_writes_a_note_carrying_a_lone_surrogate(tmp_path):
+    """The exact string `sweep._close_resolved` builds — `f"already resolved:
+    {entry.evidence}"` — where `evidence` is the field the cached triage JSON
+    revives a surrogate into."""
+    path = write_ledger(tmp_path)
+
+    assert mark_done(path, "DW-1", "2026-06-11", "already resolved: \ud800evidence")
+
+    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    assert entries["DW-1"].status == "done 2026-06-11"
+    assert "resolution: already resolved: �evidence" in entries["DW-1"].body
 
 
 @pytest.mark.parametrize("status", ["", "done", "closed", "open\n### DW-99: injected", "OPEN"])
@@ -1398,13 +1455,12 @@ def test_append_entry_encode_failure_cannot_truncate_the_ledger(tmp_path, monkey
     together — the exact compounding #329 describes."""
     path = write_ledger(tmp_path)
     before = path.read_bytes()
-    # Patching the sanitizer to the identity is a NO-OP today: `_one_line`
-    # collapses line breaks and does not touch surrogates, so the value would
-    # reach the write unchanged either way. It becomes load-bearing after the
-    # #329 phase adds surrogate neutralization there. Keeping it pins the WRITE
-    # layer's defense independently of the sanitizer's — without it this row
-    # would quietly stop testing #328 and become a second test of #329's fix.
-    # Do not remove it.
+    # Patching the sanitizer to the identity is now LOAD-BEARING: since #329,
+    # `_one_line` neutralizes surrogates, so without this patch the value would
+    # reach the write already encodable and nothing would raise. Keeping it pins
+    # the WRITE layer's defense independently of the sanitizer's — without it
+    # this row would quietly stop testing #328 and become a second test of
+    # #329's fix. Do not remove it.
     monkeypatch.setattr(deferredwork, "_one_line", lambda v: v)
 
     with pytest.raises(UnicodeEncodeError):

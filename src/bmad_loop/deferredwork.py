@@ -24,7 +24,7 @@ from pathlib import Path
 
 from . import sprintstatus
 from .fences import fenced_spans
-from .platform_util import atomic_write_text
+from .platform_util import atomic_write_text, neutralize_surrogates
 
 HEADING_RE = re.compile(r"^### (DW-\d+): (.+?)\s*$", re.MULTILINE)
 ANY_HEADING_RE = re.compile(r"^#{1,6} ", re.MULTILINE)
@@ -618,11 +618,24 @@ def _one_line(value: str) -> str:
     line anyway — so this is the fix, and the skill docs are guidance that
     reduces occurrences without gating on them.
 
-    A value with no break is returned **untouched**, so an existing ledger is
-    never reformatted and a clean write is byte-identical to before the guard.
-    The trailing `.strip()` removes all surrounding whitespace, not merely the
-    space a leading or trailing break left behind — which is why it must stay on
-    the far side of that fast path.
+    That contract covers one hazard more than the break collapse alone, which is
+    what the `neutralize_surrogates` pass in front of it buys (#329). A lone
+    surrogate is not a line break, so it sailed through untouched — but it has
+    no UTF-8 encoding, and `atomic_write_text`'s strict encode raises
+    `UnicodeEncodeError` (a `ValueError` subclass) on it, from inside those same
+    bare close-path calls. It arrives the way the break did: a triage
+    `result.json` is cached with `json.dumps`, whose `ensure_ascii` keeps the
+    code point a harmless `\\ud800` escape, and the reload's `json.loads` revives
+    the real thing into `ResolvedEntry.evidence` and on into the `mark_done`
+    note. Refusing it upstream would only move the stoppage again — same
+    doctrine, same answer.
+
+    A value with neither a break nor a surrogate is returned **untouched**, so an
+    existing ledger is never reformatted and a clean write is byte-identical to
+    before the guard; each pass keeps its own fast path, so the common value is
+    scanned twice and copied never. The trailing `.strip()` removes all
+    surrounding whitespace, not merely the space a leading or trailing break left
+    behind — which is why it must stay on the far side of that fast path.
 
     A break-only value therefore sanitizes to `""`. Keeping it non-empty *here*
     could only yield bare whitespace, which trades an unfindable entry for an
@@ -634,7 +647,13 @@ def _one_line(value: str) -> str:
     empty detail rather than promising one that is not there. Its `label` needs
     neither: every member of :data:`LINE_BREAK_RE` is `str.isspace()`, and
     `validate_triage` builds each `DecisionOption` with `.strip() or key`, so a
-    break-only label has already become the option key before it arrives."""
+    break-only label has already become the option key before it arrives.
+
+    A surrogate-only value, by contrast, sanitizes to a truthy `"�"`, so neither
+    caller's empty-handling fires for it. That is the point of replacing rather
+    than stripping: a title reading `�` still says *something unencodable was
+    here*, where a vanished one would silently become `(untitled DW-<n>)`."""
+    value = neutralize_surrogates(value)
     if not LINE_BREAK_RE.search(value):
         return value
     return LINE_BREAK_RE.sub(" ", value).strip()
