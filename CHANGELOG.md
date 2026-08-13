@@ -324,7 +324,10 @@ whose seams had diverged enough that several ports needed a different fix, and t
   version, whose baseline is there and nowhere else (this resume migrates it); and a run whose
   project has been moved or renamed. The state root is keyed by the project's _resolved path_, so
   a rename keys the run somewhere new and orphans the subtree holding its digest — the copy in
-  the run directory travels with the run, and the warning survives the move.
+  the run directory travels with the run, and the warning survives the move. A project that
+  later returns to a path it ran under before is the one case this does not get right: the old
+  subtree is still there, its pin is preferred, and one resume answers off it before re-stamping
+  and healing (#572).
 
   **What this does and does not buy.** It closes the _incidental_ path — nothing a session does
   in the ordinary course of rewriting project files can blank the pin any more, because the pin

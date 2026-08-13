@@ -383,6 +383,18 @@ def read_trusted_config_digest(project: Path, run_id: str) -> str | None:
     (:func:`project_state_root`). An *empty* file, by contrast, is a real answer
     of "no baseline" and comes back as ``""``.
 
+    **Known limit: a file at this key can be stale (#572).** The key is the
+    project's resolved path, so a project that moves away and later returns finds
+    its old subtree still here — nothing can sweep it in between (FEATURES.md) —
+    holding the baseline blessed before it left, while the blessing it picked up
+    in between is the one in ``state.json``. Preferring the file means that older
+    pin wins for one resume, which re-stamps this key and heals it. Preferring the
+    fresher-looking in-tree copy is *not* the fix: it is session-writable, so it
+    would hand any session the silencing #498 closed. Arbitrating by sequence
+    number needs a counterpart the session cannot forge, and at equal privilege
+    there is none — the same wall as #571, reached by re-keying instead of
+    tampering.
+
     Pure observation, so it degrades rather than raising: a state root this host
     cannot name, or a file it cannot read, both answer ``None`` and hand the
     decision to the in-tree copy. The write half raises — see
