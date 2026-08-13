@@ -118,11 +118,12 @@ reviewers that copy will actually invoke — which on current sources is none at
   `[[workflow.review_layers]]`, and a layer's `instruction` may name a skill to hand
   off to. Current (6.11) sources define four layers — `blind-hunter`,
   `edge-case-hunter`, `verification-gap` and `intent-alignment` — and none of them
-  invokes a skill: each is a self-contained prompt, three of them reading the
-  primitive's own `review-prompts/*.md`. Such a tree requires no review skill at all.
-  An intermediate release whose layers invoke the merged `bmad-review` with one lens
-  each needs `bmad-review`; an earlier one naming the standalone hunters needs exactly
-  those instead.
+  invokes a skill: each is a self-contained prompt — `edge-case-hunter` and
+  `verification-gap` read the primitive's own `review-prompts/*.md`, `blind-hunter`
+  and `intent-alignment` carry their prompt inline. Such a tree requires no review
+  skill at all. An intermediate release whose layers invoke the merged `bmad-review`
+  with one lens each needs `bmad-review`; an earlier one naming the standalone hunters
+  needs exactly those instead.
 - **v6.10.0** — no `review_layers` section at all; `step-04-review.md` names
   `bmad-review-adversarial-general` and `bmad-review-edge-case-hunter` inline, so those
   two are what is required.

@@ -180,8 +180,9 @@ DEV_BASE_SKILLS = {
 # customize.toml's [[workflow.review_layers]], with the hunter layers each invoking
 # bmad-review with one lens. On 6.11 sources the same four layers (blind-hunter,
 # edge-case-hunter, verification-gap, intent-alignment) invoke no skill at all —
-# three read the primitive's own review-prompts/*.md — so that tree derives an empty
-# `required` map, which is satisfied rather than unsatisfiable: _review_findings
+# two of them read the primitive's own review-prompts/*.md, two carry their prompt
+# inline — so that tree derives an empty `required` map, which is satisfied rather
+# than unsatisfiable: _review_findings
 # falls back to the static catalog only when the resolution is None (an unreadable
 # shape), never because it resolved to requiring nothing. Both topologies stay
 # supported; this constant is named here for the fallback path only, and the derived
