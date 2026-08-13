@@ -155,7 +155,7 @@ UNRELEASED_REF_RE = re.compile(r"(?m)^\[Unreleased\]:[^\n]*$")
 # ...and the base version that line's compare link must name. `cmd_check` reads the
 # group; matching only this shape is what makes a stale base detectable at all.
 UNRELEASED_COMPARE_RE = re.compile(
-    r"(?m)^\[Unreleased\]:\s*\S+/compare/v(?P<base>\S+)\.\.\.HEAD\s*$"
+    r"(?m)^\[Unreleased\]:\s*(?P<repo>\S+)/compare/v(?P<base>\S+)\.\.\.HEAD\s*$"
 )
 
 
@@ -564,9 +564,13 @@ def cmd_check(args: argparse.Namespace) -> int:
 
     A strict superset of ``sync_version.py --check``: it calls that check in-process,
     then holds the CHANGELOG release contract. Every problem is reported before
-    returning, so one run shows the whole picture. Deliberately stdlib-only (that
-    in-process call rather than a ``uv run`` child) so CI can invoke it under
-    ``--no-project`` without syncing the project just to compare version strings.
+    returning, so one run shows the whole picture. It installs nothing — that
+    in-process call rather than a ``uv run`` child is what lets CI invoke it under
+    ``--no-project``. It does read ``origin`` (via :func:`repo_url`), so it wants a
+    git checkout, which every context that runs it has; on a clone whose ``origin``
+    is a fork the compare-link arm reports the fork, which is accurate rather than
+    spurious. ``actions/checkout`` sets ``origin`` to the *base* repo even for a
+    fork PR, so CI is unaffected.
     The `version-sync` job name is load-bearing for branch protection — when wiring
     this in, change the step's command, never the job.
 
@@ -595,10 +599,18 @@ def cmd_check(args: argparse.Namespace) -> int:
     else:
         print("changelog: `## [Unreleased]` heading present")
     m = UNRELEASED_COMPARE_RE.search(text)
+    url = repo_url()
     if m is None:
         print(
             "changelog: MISSING `[Unreleased]:` compare link ref "
             f"(expected one naming `compare/v{version}...HEAD`)",
+            file=sys.stderr,
+        )
+        rc = 1
+    elif m.group("repo") != url:
+        print(
+            f"changelog: `[Unreleased]:` compares against {m.group('repo')} "
+            f"— expected this repository, {url}",
             file=sys.stderr,
         )
         rc = 1

@@ -432,6 +432,7 @@ def _check(monkeypatch, tmp_path, changelog_text, *, canonical="0.5.0", sync_rc=
     monkeypatch.setattr(release, "CHANGELOG", cl)
     monkeypatch.setattr(release.sync_version, "read_canonical", lambda: canonical)
     monkeypatch.setattr(release.sync_version, "check", lambda: sync_rc)
+    monkeypatch.setattr(release, "repo_url", lambda: REPO_URL)
     return release.cmd_check(SimpleNamespace())
 
 
@@ -449,6 +450,14 @@ def test_check_flags_a_missing_unreleased_compare_ref(monkeypatch, capsys, tmp_p
     rc = _check(monkeypatch, tmp_path, NO_UNRELEASED_REF)
     assert rc == 1
     assert "MISSING `[Unreleased]:` compare link ref" in capsys.readouterr().err
+
+
+def test_check_flags_an_unreleased_compare_link_to_another_repo(monkeypatch, capsys, tmp_path):
+    # Correct version, wrong repository: the base alone cannot tell these apart.
+    text = PROMOTED.replace(f"{REPO_URL}/compare", "https://github.com/other/repo/compare", 1)
+    rc = _check(monkeypatch, tmp_path, text)
+    assert rc == 1
+    assert "compares against https://github.com/other/repo" in capsys.readouterr().err
 
 
 def test_check_flags_a_stale_unreleased_compare_base(monkeypatch, capsys, tmp_path):
