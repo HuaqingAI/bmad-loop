@@ -192,7 +192,17 @@ def test_a_hash_inside_a_quoted_value_never_becomes_a_comment(tmp_path):
     ` #` on the line writes `3-2-x: done # b"`, promoting the tail of the value
     into a comment the board never had and truncating the value it came from. A
     quote-led remainder is taken whole instead, which drops nothing that was
-    ever a comment."""
+    ever a comment.
+
+    Compares the full resulting TEXT, not its bytes. Full-content equality is the
+    point — a substring or a re-parse is blind to a fabricated comment — but
+    `advance` writes through `Path.write_text`, whose `newline=None` relays every
+    line ending in the board to `os.linesep`, so a byte comparison also asserts
+    line endings and fails on Windows for a reason that has nothing to do with
+    #366. That relay is real and known (#576); it is not this test's subject, and
+    pinning it here would put a second, accidental contract on the row that guards
+    the value/comment split. Reading back with universal newlines drops exactly
+    that difference and nothing else."""
     p = tmp_path / "sprint-status.yaml"
     board = (
         'last_updated: 01-06-2026 10:00\ndevelopment_status:\n  3-2-x: "a # b"\n  3-3-y: backlog\n'
@@ -201,7 +211,7 @@ def test_a_hash_inside_a_quoted_value_never_becomes_a_comment(tmp_path):
 
     assert sprintstatus.advance(p, "3-2-x", "done") == "done"
 
-    assert p.read_bytes().decode() == board.replace('"a # b"', "done")
+    assert p.read_text(encoding="utf-8") == board.replace('"a # b"', "done")
 
 
 def test_a_quoted_value_is_replaced_whole_with_no_comment_carried(tmp_path):
