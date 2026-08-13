@@ -325,6 +325,38 @@ def _copy_xattrs(src: Path, dst: Path) -> None:
             continue
 
 
+# Matched as a code-point range rather than by an encode round trip, the same way
+# ``engine._TITLE_CONTROL_RE`` reaches these: a Python ``str`` holds code points,
+# so an astral character like U+1D11E is one code point *outside* this range and
+# is never touched. Only genuinely lone surrogates match.
+_SURROGATES_RE = re.compile(r"[\ud800-\udfff]")
+
+
+def neutralize_surrogates(text: str) -> str:
+    """Replace every lone surrogate in ``text`` with U+FFFD (``�``).
+
+    A surrogate is a legal ``str`` code point with **no UTF-8 encoding at all**,
+    so any strict encode — :func:`atomic_write_text`'s included — raises
+    ``UnicodeEncodeError`` on one. That is a ``ValueError`` subclass, which is
+    how a single unpaired code point reaches a caller as a crash rather than as
+    mangled text. They arrive from anywhere a decoder is allowed to mint them:
+    ``json.loads`` reviving a ``\\ud800`` escape, a double-quoted YAML scalar, a
+    ``surrogateescape`` decode of undecodable filesystem bytes.
+
+    Replace, not strip and not refuse. U+FFFD keeps the value **visible** — the
+    field still says *something unencodable was here* — where dropping the code
+    point would let it vanish silently and refusing would only move the stoppage
+    upstream. It is also why this is a substitution rather than the shorter
+    ``text.encode("utf-8", "replace").decode("utf-8")``: that spelling yields
+    ``"?"``, indistinguishable from a question mark the author actually typed.
+
+    Text with no surrogate is returned untouched — the identical object, so a
+    clean write stays byte-identical."""
+    if not _SURROGATES_RE.search(text):
+        return text
+    return _SURROGATES_RE.sub("�", text)
+
+
 def atomic_write_text(path: Path, text: str, *, follow_symlinks: bool = True) -> None:
     """Replace ``path``'s contents with ``text`` atomically, preserving what the
     replacement would otherwise silently discard.

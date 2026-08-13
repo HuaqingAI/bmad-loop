@@ -322,6 +322,24 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
+- **A failed ledger write can no longer empty the deferred-work ledger (#328).** `Path.write_text`
+  truncates the file and only then encodes, so any failure in that window — an unencodable value,
+  `ENOSPC`, `EIO` — left a zero-byte ledger with every entry gone. `append_decision`,
+  `append_entry`, the post-rollback and migration-failure restores, and the bundle intent write now
+  go through `atomic_write_text` like their `mark_done_many` sibling: the replacement is built
+  beside the target, so a failure raises with the original untouched. A ledger `append_entry`
+  creates from nothing now lands `0600` (the helper's private temp mode) rather than the umask
+  default.
+
+- **A lone surrogate in triage text no longer crashes the sweep (#329).** A cached triage
+  `result.json` stores `\ud800` as an escape; the reload's `json.loads` revives the real code point
+  into an entry's evidence and on into the ledger note. It is not a line break, so the sanitizer
+  passed it through untouched, and it has no UTF-8 encoding at all — the strict encode raised
+  `UnicodeEncodeError` from a close path that calls the writers bare. Every free-text ledger field
+  is now neutralized at that same chokepoint, and the bundle `intent.md` gets the same pass over the
+  whole document (its line breaks are legitimate markdown, so only surrogates are touched). Each
+  becomes U+FFFD `�`, so the text stays visible rather than vanishing.
+
 - **A `#` inside a quoted sprint-status value is no longer rewritten into a comment (#366).** The
   board writer split value from inline comment with one fused pattern, so `3-2-x: "a # b"` advanced
   to `3-2-x: done # b"` — scalar text promoted into a comment the board never had. The split is now

@@ -5152,7 +5152,7 @@ class Engine:
                 )
                 if current != snapshot:
                     deferred_work.parent.mkdir(parents=True, exist_ok=True)
-                    deferred_work.write_text(snapshot, encoding="utf-8")
+                    atomic_write_text(deferred_work, snapshot)
             # The restore deliberately keeps review-found ledger knowledge, but
             # it also replays this bundle's accepted close after the code was
             # discarded. Let the mode undo only the close it can identify as its

@@ -43,6 +43,7 @@ from bmad_loop.policy import (
     VerifyPolicy,
 )
 from bmad_loop.sweep import (
+    Bundle,
     Decision,
     DecisionOption,
     DecisionPrompter,
@@ -992,6 +993,29 @@ def test_sweep_happy_path(project):
     intent_path = re.findall(r"`([^`]*)`", dev_spec.prompt)[0]
     intent = open(intent_path).read()
     assert "fix both" in intent and "DW-2" in intent and "### DW-3" in intent
+
+
+def test_write_intent_neutralizes_surrogates_and_keeps_the_markdown(project):
+    """intent.md is written with `atomic_write_text` too, so a surrogate carried
+    by the triage session's authored prose crashes the strict encode exactly as
+    it does in the ledger — same revival chain, different file. What differs is
+    the remedy: line breaks are LEGITIMATE markdown here, so `_one_line`'s
+    collapse would be damage and only the surrogates are neutralized."""
+    engine, _ = make_sweep(project, [])
+    bundle = Bundle(
+        name="fix-things",
+        dw_ids=(),
+        intent="keep\ud800this\n\nsecond para",
+        decision_note="note\ud800",
+    )
+
+    path = engine._write_intent(bundle, "fix-things")
+
+    assert path.is_file()
+    text = path.read_text(encoding="utf-8")  # strict read; the write did not raise
+    assert "note�" in text
+    # the surrogate is gone AND the paragraph break either side of it is verbatim
+    assert "keep�this\n\nsecond para" in text
 
 
 def test_sweep_is_exempt_from_the_dispatch_hard_gate(project):
@@ -2830,6 +2854,43 @@ def test_migration_validation_failure_restores_ledger_then_escalates(project):
     assert "--feedback" not in prompts[0] and "--feedback" in prompts[1]
     feedback = open(prompts[1].split("--feedback ", 1)[1]).read()
     assert "still parse as legacy" in feedback and "not mapped" in feedback
+
+
+def test_migration_restore_write_failure_propagates_and_keeps_the_ledger(project, monkeypatch):
+    """#328. The restore after a failed migration is a repair write: it raises
+    rather than degrades, and it must never be the thing that empties the ledger
+    it exists to put back. Under a bare `Path.write_text` the truncate landed
+    before the failure did — the run crashed with the ledger at zero bytes, and
+    the `_safe_reset` that would have restored it was already spent.
+
+    The patch is module-wide but reaches exactly one call — probed on this
+    harness, `_ensure_migration`'s restore is the only `sweep.atomic_write_text`
+    a failed migration reaches; the bundle-intent write needs a triage plan this
+    run never gets to."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    manifest = legacy_manifest()
+    half = (
+        "# Deferred Work\n\n"
+        "### DW-1: Old fixed thing\n\norigin: migrated, 2026-06-12\nlocation: n/a\n"
+        "reason: repaired.\nstatus: done 2026-04-06\n\n"
+        "## Deferred from: epic 1 review (2026-04-06)\n\n"
+        "- **Open legacy thing here** — `src.txt` mishandles em-dashes\n"
+    )
+    bad = migrate_effect(project, half, [{"key": manifest[0]["key"], "dw_id": "DW-1"}])
+    engine, _ = make_sweep(project, [bad, bad])
+
+    def boom(path, text):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("bmad_loop.sweep.atomic_write_text", boom)
+
+    summary = engine.run()
+
+    assert summary.crashed and "disk full" in str(summary.crash_error)
+    # compared as TEXT, not bytes: the fixture reached disk through `write_text`,
+    # so a byte assertion would read CRLF on Windows and redden there only
+    assert project.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
+    assert project.deferred_work.read_bytes()  # and emphatically not zero bytes
 
 
 def test_migration_escalation_resume_retries(project):

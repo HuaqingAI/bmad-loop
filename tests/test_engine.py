@@ -9704,6 +9704,41 @@ def test_dev_defer_keeps_harvest_and_disarms_snapshot(project):
     assert (persisted.pre_harvest_ledger_captured, persisted.pre_harvest_ledger) == (False, None)
 
 
+def test_defer_ledger_restore_write_failure_propagates_and_keeps_the_ledger(project, monkeypatch):
+    """#328. The post-rollback ledger restore inside `_defer` is a repair write:
+    it must raise rather than degrade, and a failed attempt must never be the
+    thing that empties the ledger it exists to put back. Under a bare
+    `Path.write_text` the truncate lands before the failure does, so the run
+    crashed AND the ledger it was restoring went to zero bytes.
+
+    The patch is module-wide but lands on exactly one call — probed on this
+    harness, `_defer`'s restore is the only `engine.atomic_write_text` this path
+    reaches; the pre-harvest restore and the deferred-close rollback both need
+    state this scenario never builds. Committing the ledger is what makes the
+    restore fire at all: `git reset` reverts the harvest's append to a *tracked*
+    file, so the snapshot and the bytes on disk then differ."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_engine(
+        project,
+        [_baseline_liar_effect(project, deferred=[HARVEST_A])],
+        policy=_harvest_policy(attempts=1),
+    )
+
+    def boom(path, text):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("bmad_loop.engine.atomic_write_text", boom)
+
+    summary = engine.run()
+
+    assert summary.crashed and "disk full" in str(summary.crash_error)
+    # the restore never landed, but the ledger is the committed one `git reset`
+    # put back — not a zero-byte file the failed write truncated on its way out
+    assert project.deferred_work.read_bytes()
+    assert _ledger_entries(project)["DW-1"].open
+
+
 def test_dev_escalation_keeps_harvest_and_disarms_snapshot(project):
     inner = dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A])
 

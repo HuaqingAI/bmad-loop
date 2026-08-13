@@ -24,7 +24,7 @@ from pathlib import Path
 
 from . import sprintstatus
 from .fences import fenced_spans
-from .platform_util import atomic_write_text
+from .platform_util import atomic_write_text, neutralize_surrogates
 
 HEADING_RE = re.compile(r"^### (DW-\d+): (.+?)\s*$", re.MULTILINE)
 ANY_HEADING_RE = re.compile(r"^#{1,6} ", re.MULTILINE)
@@ -618,11 +618,24 @@ def _one_line(value: str) -> str:
     line anyway — so this is the fix, and the skill docs are guidance that
     reduces occurrences without gating on them.
 
-    A value with no break is returned **untouched**, so an existing ledger is
-    never reformatted and a clean write is byte-identical to before the guard.
-    The trailing `.strip()` removes all surrounding whitespace, not merely the
-    space a leading or trailing break left behind — which is why it must stay on
-    the far side of that fast path.
+    That contract covers one hazard more than the break collapse alone, which is
+    what the `neutralize_surrogates` pass in front of it buys (#329). A lone
+    surrogate is not a line break, so it sailed through untouched — but it has
+    no UTF-8 encoding, and `atomic_write_text`'s strict encode raises
+    `UnicodeEncodeError` (a `ValueError` subclass) on it, from inside those same
+    bare close-path calls. It arrives the way the break did: a triage
+    `result.json` is cached with `json.dumps`, whose `ensure_ascii` keeps the
+    code point a harmless `\\ud800` escape, and the reload's `json.loads` revives
+    the real thing into `ResolvedEntry.evidence` and on into the `mark_done`
+    note. Refusing it upstream would only move the stoppage again — same
+    doctrine, same answer.
+
+    A value with neither a break nor a surrogate is returned **untouched**, so an
+    existing ledger is never reformatted and a clean write is byte-identical to
+    before the guard; each pass keeps its own fast path, so the common value is
+    scanned twice and copied never. The trailing `.strip()` removes all
+    surrounding whitespace, not merely the space a leading or trailing break left
+    behind — which is why it must stay on the far side of that fast path.
 
     A break-only value therefore sanitizes to `""`. Keeping it non-empty *here*
     could only yield bare whitespace, which trades an unfindable entry for an
@@ -634,7 +647,13 @@ def _one_line(value: str) -> str:
     empty detail rather than promising one that is not there. Its `label` needs
     neither: every member of :data:`LINE_BREAK_RE` is `str.isspace()`, and
     `validate_triage` builds each `DecisionOption` with `.strip() or key`, so a
-    break-only label has already become the option key before it arrives."""
+    break-only label has already become the option key before it arrives.
+
+    A surrogate-only value, by contrast, sanitizes to a truthy `"�"`, so neither
+    caller's empty-handling fires for it. That is the point of replacing rather
+    than stripping: a title reading `�` still says *something unencodable was
+    here*, where a vanished one would silently become `(untitled DW-<n>)`."""
+    value = neutralize_surrogates(value)
     if not LINE_BREAK_RE.search(value):
         return value
     return LINE_BREAK_RE.sub(" ", value).strip()
@@ -875,7 +894,13 @@ def append_decision(path: Path, dw_id: str, date: str, label: str, detail: str) 
 
     Precondition: `date` is ISO `YYYY-MM-DD`; anything else raises `ValueError`,
     checked before the ``is_file`` short-circuit so an absent ledger cannot hide
-    the bug."""
+    the bug.
+
+    The write goes through :func:`~bmad_loop.platform_util.atomic_write_text` for
+    the reasons documented on :func:`mark_done_many`, plus one this sibling shares
+    with it: a bare ``Path.write_text`` truncates *before* it encodes, so any
+    failure between the two — an unencodable value, ``ENOSPC``, ``EIO`` — leaves a
+    zero-byte ledger where every entry used to be (#328)."""
     _require_iso_date(date)
     if not path.is_file():
         return False
@@ -890,7 +915,7 @@ def append_decision(path: Path, dw_id: str, date: str, label: str, detail: str) 
     detail = _one_line(detail)
     detail_part = f" — {detail}" if detail else ""
     text = _insert_after_status(text, entry, f"decision: {date} {label}{detail_part}")
-    path.write_text(text, encoding="utf-8")
+    atomic_write_text(path, text)
     return True
 
 
@@ -938,7 +963,13 @@ def append_entry(
     :func:`field_line_present`: sanitizing afterwards would compare a raw value
     against a sanitized line, so every replay of the same multiline defer would
     miss its own entry and append another. `status` and `severity` are
-    orchestrator-owned enumerations and raise instead."""
+    orchestrator-owned enumerations and raise instead.
+
+    The write goes through :func:`~bmad_loop.platform_util.atomic_write_text` for
+    the reasons documented on :func:`mark_done_many`, plus one this sibling shares
+    with it: a bare ``Path.write_text`` truncates *before* it encodes, so any
+    failure between the two — an unencodable value, ``ENOSPC``, ``EIO`` — leaves a
+    zero-byte ledger where every entry used to be (#328)."""
     _require_canonical_status(status)
     # The whitelist is derived from the legacy parser's alias table (defined
     # below; resolved at call time) so what this writer emits and what
@@ -993,7 +1024,7 @@ def append_entry(
     else:
         sep = "\n\n"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text + sep + block, encoding="utf-8")
+    atomic_write_text(path, text + sep + block)
     return dw_id
 
 
