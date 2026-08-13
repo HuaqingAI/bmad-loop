@@ -711,6 +711,14 @@ whose seams had diverged enough that several ports needed a different fix, and t
   per-CLI hook config — the only default seed for gemini, copilot and antigravity — is asked about
   its source and symlinks rather than answering with the bytes it writes after both loops.
 
+- **A wheel-bundled skill that lands partially in a worktree is reported (#464).** The
+  `MODULE_SKILLS` copy loop dropped the copier's result on the floor, so a `bmad-loop-*` skill the
+  copy could not deliver — a checkout file squatting the skill's directory refuses the whole
+  subtree under per-file no-clobber — seeded nothing and said nothing. Shortfalls are now re-probed
+  on disk and journaled `worktree-module-skills-dropped`: informational, never a pause, because
+  these skills dispatch at the main checkout and their absence in a worktree stalls no session.
+  Presence is the contract — a checkout's own fork of a bundled skill still counts as delivered.
+
 - **Worktree provisioning survives a filesystem it cannot fully read (#422).** It ran with no `try`
   around it, so a single unreadable file, dangling link, symlink cycle or FIFO in the repo's skill
   trees or seed sources ended the whole run with a traceback where a named, resumable escalation
