@@ -39,6 +39,7 @@ from bmad_loop.install import (
     BMAD_SCRIPTS_SEED_REL,
     CENTRAL_CONFIG_REL,
     DEV_PRIMITIVE_NEW,
+    MODULE_SKILLS,
 )
 from bmad_loop.journal import Journal, load_state
 from bmad_loop.model import Phase, RunState, SessionRecord, StoryTask, TokenUsage
@@ -339,6 +340,57 @@ def test_undelivered_arbitrary_seed_is_journaled_never_escalated(project, tmp_pa
     ]
     assert len(dropped) == 1 and dropped[0]["entries"] == [".mcp.json"]
     assert "story-escalated" not in journal_kinds(engine)
+
+
+def test_undelivered_module_skill_is_journaled_never_escalated(project):
+    """#464 — a wheel-bundled MODULE_SKILL whose content never reached the unit
+    worktree is journaled under its own kind, and the run still completes.
+
+    The obstruction is the real copier's, not a mock's: a plain FILE tracked at the
+    skill's destination rel is carried into the checkout by `git worktree add`, and
+    `_copy_traversable`'s no-clobber then prunes the whole subtree at its root (a
+    non-directory squatting a directory target wins, and mkdir must never replace
+    it). So the copy loop lands nothing and the real predicate reports it under the
+    real engine.
+
+    `attach_profile` is REQUIRED, not decoration: MockAdapter deliberately carries
+    no profile, `worktree_profiles` then yields no skill trees at all, and the
+    MODULE_SKILLS copy loop and this predicate never run — the test would pass
+    while asserting nothing.
+
+    Ablation: delete the `module_skills_seed_undelivered` call (or its journal
+    append) in `WorktreeFlow.run_isolated` and the entry assertion fails; route its
+    result into `escalate_unit` instead and the `summary.done == 1` assertion
+    fails. Both halves of "journaled, never escalated" are load-bearing."""
+    tree = ".claude/skills"
+    squatted = "bmad-loop-sweep"
+    assert squatted in MODULE_SKILLS  # the precondition that makes this bite
+    squatter = project.project / tree / squatted
+    squatter.parent.mkdir(parents=True, exist_ok=True)
+    squatter.write_text("a file where the wheel has a directory\n", encoding="utf-8")
+    # NOT gitignored and committed by `git add -A`: only a TRACKED squatter rides
+    # the checkout into the worktree, where the copier meets it.
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+        policy=wt_policy(),
+    )
+    attach_profile(adapter)
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    dropped = [
+        entry
+        for entry in engine.journal.entries()
+        if entry["kind"] == "worktree-module-skills-dropped"
+    ]
+    assert len(dropped) == 1 and dropped[0]["entries"] == [f"{tree}/{squatted}"]
+    assert "story-escalated" not in journal_kinds(engine)
+    # Provenance stays observable: the wheel's own skills report under their own
+    # kind, never folded into the arbitrary-seed one.
+    assert "worktree-seed-dropped" not in journal_kinds(engine)
 
 
 def test_hook_config_is_seeded_for_every_non_hookless_profile(project, monkeypatch):
