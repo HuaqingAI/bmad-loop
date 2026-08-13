@@ -97,6 +97,12 @@ def wt_dev_effect(
             src = cwd / "src.txt"
             src.write_text(src.read_text() + f"change for {story_key}\n")
         sp = wt.implementation_artifacts / f"spec-{story_key}.md"
+        # A real dev session creates its artifacts dir. Most rows here commit the
+        # board, so the checkout delivers the dir and this is a no-op — but a row
+        # over a GITIGNORED board has nothing tracked in there at all, and without
+        # this the session would die on the spec write before reaching the gate the
+        # row is about (`wt_bundle_dev` in test_sweep.py says the same).
+        sp.parent.mkdir(parents=True, exist_ok=True)
         write_spec(
             sp,
             final_status,
@@ -3650,6 +3656,82 @@ def test_gitignored_declared_closure_reaches_the_main_ledger(project):
     entry = _ledger_entry(project, "DW-1")
     assert entry.status.startswith("done") and not entry.open
     assert "resolution: resolved by story 1-1-a" in entry.body
+
+
+# ------------------------------------------------------- gitignored sprint board
+
+
+def ignored_sprint(project, statuses: dict[str, str]) -> str:
+    """Gitignore the board, then write and commit in that order — `ignored_ledger`'s
+    shape (test_sweep.py) for the other seeded artifact.
+
+    Order matters both ways: committing the rule first leaves the `git add -A` below
+    with nothing to stage (empty-index commit failure), and writing the board first
+    would TRACK it, which is the shape that needs no seed at all. `check-ignore` is
+    the oracle — a pattern that is present is not necessarily effective.
+
+    The deliberate opposite of `commit_sprint`, which every other row in this file
+    uses: that helper tracks the board, which is precisely why #350 had no coverage.
+    The `add -A` is safe here only because the rule is already in the working-tree
+    .gitignore, so the board cannot be swept into the commit; a later `add -A` over
+    an untracked board would be, and a baseline reset would then delete it.
+    """
+    ignore_before_commit(project, "sprint-status.yaml")
+    write_sprint(project, statuses)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "gitignore the board")
+    rel = project.sprint_status.relative_to(project.project).as_posix()
+    assert git(project.project, "check-ignore", rel).strip() == rel
+    assert not verify.path_tracked(project.project, rel)
+    return rel
+
+
+def test_gitignored_board_under_isolation_survives_verify(project):
+    """#350 — the board's absence from a unit worktree is a CRASH, not a lost write.
+
+    `git worktree add` checks out tracked files only, so a gitignored board reaches
+    no unit; `_post_dev_state_sync` then advances `self.workspace.paths.sprint_status`
+    — that missing file — where `sprintstatus.advance` returns None in silence, and
+    `verify_dev` reads the SAME missing file through `story_status`, where
+    `sprintstatus.load` raises `SprintStatusError`. cli, operatoractions and the TUI
+    all catch that class; engine.py and verify.py do not, so it escapes to `run()`'s
+    catch-all and the story takes the whole run down with it.
+
+    Seeding the board removes that structurally: the gate reads the orchestrator's
+    own write. Ablating the seed (`_board_seed` -> `()`) puts the pre-fix behavior
+    back — `summary.crashed`, `state.crash_error` naming `SprintStatusError`.
+
+    Scoped to no-crash plus a passing verify ON PURPOSE. The worktree copy is
+    canonical for the duration of the story (#350's maintainer decision), and until
+    the post-merge carry lands the advance still legitimately dies with the worktree
+    at teardown — so the MAIN board's content is not yet an oracle for anything and
+    is deliberately not asserted here.
+    """
+    rel = ignored_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [wt_dev_effect(project, "1-1-a", followup_review=False)])
+
+    summary = engine.run()
+
+    # crash_error first: it is the field that NAMES the exception class, so an
+    # ablation of the seed reddens this row with `SprintStatusError` in the failure
+    # message rather than a bare `crashed=True` that any fault would produce.
+    assert engine.state.crash_error is None and not summary.crashed
+    assert summary.done == 1 and not summary.paused
+    assert engine.state.tasks["1-1-a"].phase == Phase.DONE
+    # the seed was delivered, not merely requested: an undelivered or no-op seed
+    # entry names itself in one of these two journals.
+    seeded = [
+        e
+        for e in engine.journal.entries()
+        if e["kind"] in ("worktree-seed-skipped", "worktree-seed-dropped")
+        and rel in e.get("entries", [])
+    ]
+    assert seeded == []
+    # the unit's work landed and the board stayed the orchestrator's own file
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+    assert not verify.path_tracked(project.project, rel)
+    assert worktree_clean(project.project)
+    assert [p.resolve() for p in worktree_list(project.project)] == [project.project.resolve()]
 
 
 def test_crashed_post_merge_story_close_replays_from_its_record(project):
