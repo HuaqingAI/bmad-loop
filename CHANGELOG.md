@@ -309,6 +309,34 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
+- **`resume`'s config-change baseline moves out of the agent-writable tree (#498).** The host-exec
+  baseline `resume` compares against — verify commands, launch binary/args/env, plugin allowlist
+  — round-tripped through `state.json`, inside the very tree the digest exists to police, so the
+  session that rewrote `policy.toml` could blank the field in the same breath and the warning
+  never fired. It now lives beside the events channel in the run's out-of-tree state dir
+  (`<state root>/<project>/<run-id>/config-digest`, #494), and is collected by the same
+  `delete`/`archive`/`clean` lifecycle. The auto-sweep gate is unchanged — it always compared
+  against an in-memory baseline no session can reach.
+
+  `state.json` keeps a second copy, and `resume` consults it **only** when the run has no file
+  out of tree — so rewriting it silences nothing while that file is in reach. Two cases need it,
+  and in both the file is honestly absent rather than tampered away: a run paused under an older
+  version, whose baseline is there and nowhere else (this resume migrates it); and a run whose
+  project has been moved or renamed. The state root is keyed by the project's _resolved path_, so
+  a rename keys the run somewhere new and orphans the subtree holding its digest — the copy in
+  the run directory travels with the run, and the warning survives the move. A project that
+  later returns to a path it ran under before is the one case this does not get right: the old
+  subtree is still there, its pin is preferred, and one resume answers off it before re-stamping
+  and healing (#572).
+
+  **What this does and does not buy.** It closes the _incidental_ path — nothing a session does
+  in the ordinary course of rewriting project files can blank the pin any more, because the pin
+  is no longer a project file. It is **not** a boundary against a deliberate session: sessions
+  launch with permission bypass by default (that is what an unattended loop is), and are handed
+  `BMAD_LOOP_EVENTS_DIR`, whose parent is the state dir — so a session that goes looking can
+  still delete or truncate the baseline and silence the warning. Closing that needs privilege
+  separation on the state dir, not a better hiding place; tracked in #571.
+
 - **Worktree runs no longer stall when a seeded hook config carries the main repo's relay
   (#352).** `.claude/settings.json` is both a seeded file and the hook `config_path`, so it
   arrived in the worktree still naming the main repo's `$CLAUDE_PROJECT_DIR`-relative relay

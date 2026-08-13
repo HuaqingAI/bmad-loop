@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tarfile
 from pathlib import Path
+from unittest import mock
 
 import pytest
 from conftest import escalated_run, git, refuse_to_resolve
@@ -959,6 +960,269 @@ def test_state_dir_for_raises_when_the_project_cannot_be_canonicalized(tmp_path,
 
     with pytest.raises(OSError):
         runs.state_dir_for(project, "r1")
+
+
+def test_config_digest_is_stamped_under_the_state_root_not_in_the_project(tmp_path):
+    """#498's whole point: the baseline `resume` TRUSTS leaves the tree the driven
+    sessions can write to.
+
+    The negative half is the load-bearing one — asserting only that the state root
+    holds the digest would still pass if this writer also dropped a copy in the
+    project, and a file inside `.bmad-loop/` is exactly the thing a session edits
+    to silence the warning.
+
+    Scope, so the negative assert is not read as more than it is: it pins THIS
+    function, which writes out of tree and nowhere else. The run as a whole does
+    keep a second copy in `state.json` (`RunState.trusted_config_digest`, itself
+    under `.bmad-loop/runs/`) — the travelling secondary a project move needs, and
+    deliberately never preferred over this file. `test_cli` owns that precedence:
+    `..._still_warns_when_a_session_rewrote_the_digest_in_state_json` proves the
+    in-tree copy loses, `..._still_warns_after_the_project_is_renamed` proves it is
+    consulted when this file is out of reach."""
+    project = tmp_path / "proj"
+    (project / ".bmad-loop").mkdir(parents=True)
+
+    runs.write_trusted_config_digest(project, "r1", "abc123")
+
+    path = runs.config_digest_path_for(project, "r1")
+    assert path == runs.state_dir_for(project, "r1") / "config-digest"
+    assert runs.read_trusted_config_digest(project, "r1") == "abc123"
+    assert not any(p.is_file() for p in (project / ".bmad-loop").rglob("*"))
+
+
+def test_read_trusted_config_digest_separates_an_absent_file_from_an_empty_one(tmp_path):
+    """`None` and `""` are different answers and the resume acts on the
+    difference: `None` means "this run predates #498, ask state.json", while `""`
+    means "a baseline was stamped and it is empty" and must NOT reopen the
+    agent-writable field. Collapsing them to `""` would retire the legacy runs'
+    fallback; collapsing them to `None` would let a session that truncates the
+    out-of-tree file fall back into the tree it controls.
+
+    ABLATION: return `""` instead of `None` from the reader's except arm, or drop
+    the `.strip()`-of-an-empty-file distinction, and one of these two fails."""
+    project = tmp_path / "proj"
+    project.mkdir()
+
+    assert runs.read_trusted_config_digest(project, "r1") is None
+
+    runs.write_trusted_config_digest(project, "r1", "")
+    assert runs.read_trusted_config_digest(project, "r1") == ""
+
+
+@pytest.mark.parametrize(
+    "attr, exc",
+    [
+        ("state_root", runs.StateRootError("no root")),
+        ("project_tag", OSError("cannot canonicalize")),
+        ("project_tag", RuntimeError("Symlink loop from '/p'")),
+    ],
+    ids=["no-derivable-state-root", "unresolvable-project", "symlink-loop-project"],
+)
+def test_trusted_config_digest_read_degrades_where_the_write_raises(
+    tmp_path, monkeypatch, attr, exc
+):
+    """The halves are deliberately asymmetric, and each row runs both.
+
+    Reading is observation feeding an advisory warning, so an unnameable state
+    root costs the warning and nothing else — and the resume is about to resolve
+    the same root for its events channel, where the error is owned and reported.
+    Writing is a repair write, and a silently skipped stamp is undetectable later:
+    the next resume finds no file, falls back to a legacy field that is empty for
+    any run this code started, and quietly declines to warn.
+
+    The `RuntimeError` row is live below 3.13, where `Path.resolve` reports a
+    symlink loop that way — same reason `_discard_state_dir` holds it.
+
+    ABLATION: widen the write to swallow these and the second half passes."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.setattr(runs, attr, _raising(exc))
+
+    assert runs.read_trusted_config_digest(project, "r1") is None
+    with pytest.raises(type(exc)):
+        runs.write_trusted_config_digest(project, "r1", "abc123")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX FIFOs")
+def test_read_trusted_config_digest_refuses_a_planted_fifo_instead_of_hanging(tmp_path):
+    """The read is on a path the driven session can reach, so its *shape* has to be
+    established before any bytes are consumed. A FIFO opened for reading blocks
+    until someone writes — indefinitely — and `resume` is a foreground command a
+    human is waiting on, so this wedges the terminal rather than costing a warning.
+
+    Guarded by `SIGALRM` because the failure mode under test IS a hang: an
+    unguarded call would not fail, it would never return, and the suite would sit
+    there until CI killed the job with no attributable test. The alarm converts
+    "never returns" into a named assertion.
+
+    Deliberately not a `multiprocessing.Process` with a join timeout, which was
+    the first draft: the default start method on Linux is `fork`, and forking a
+    process pytest may already have threaded earns a DeprecationWarning on 3.12+
+    and risks a child deadlock — trading a hang under ablation for a possible hang
+    in the ordinary run. The alarm stays in one process and needs no picklable
+    target. POSIX-only, which this test already is.
+
+    ABLATION: restore `Path.read_text` in the reader, or drop `O_NONBLOCK`, and
+    the alarm fires. Dropping the `S_ISREG` check instead fails the assert rather
+    than the alarm — with no writer the FIFO reads EOF, so the reader answers `""`
+    where it owes `None`. Both are graded; the twin below covers the case where a
+    writer makes those bytes attacker-chosen instead of empty."""
+    import signal
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    path = runs.config_digest_path_for(project, "r1")
+    path.parent.mkdir(parents=True)
+    os.mkfifo(path)
+
+    def _blew_up(signum, frame):
+        raise AssertionError("the read blocked on the FIFO instead of refusing it")
+
+    previous = signal.signal(signal.SIGALRM, _blew_up)
+    signal.alarm(20)
+    try:
+        assert runs.read_trusted_config_digest(project, "r1") is None
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX FIFOs")
+def test_read_trusted_config_digest_refuses_a_fed_fifo_instead_of_reading_it(tmp_path):
+    """The twin of the FIFO test above, on the half that is the actual attack. That
+    one plants an idle FIFO, so the harm is a hang and — with the `S_ISREG` check
+    gone — the bytes read are merely empty. Here a writer is holding it open and
+    feeding it, so a reader that got as far as `os.read` would come back with
+    whatever the session piped in and treat it as this run's baseline: feed the
+    digest of the config it just installed and `resume` is satisfied, feed noise
+    and the operator is warned off a change nobody made. Neither is a hang, so the
+    alarm above would never notice.
+
+    Opened `O_RDWR` deliberately: a write-only open on a FIFO blocks until a reader
+    arrives, which would wedge the test itself, and `O_RDWR` never blocks.
+
+    ABLATION: drop the `S_ISREG` check and this returns the piped text instead of
+    `None` — the assert names the value it got."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    path = runs.config_digest_path_for(project, "r1")
+    path.parent.mkdir(parents=True)
+    os.mkfifo(path)
+
+    holder = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+    try:
+        os.write(holder, b"ff" * 32 + b"\n")  # a plausible-looking sha256 hex digest
+        assert runs.read_trusted_config_digest(project, "r1") is None
+    finally:
+        os.close(holder)
+
+
+def test_read_trusted_config_digest_is_bounded(tmp_path):
+    """A link to an endless source (`/dev/zero`) would otherwise read until
+    `MemoryError` — a ValueError-family escape from a function that promises never
+    to raise. The cap removes the condition rather than absorbing it.
+
+    A large regular file stands in for the endless one: same read path, same
+    bound, and it runs on every platform.
+
+    What is asserted is the BOUND ON THE READ, which is not the same as the length
+    of what comes back, and the difference is the whole point: a reader that
+    slurped the file and only then truncated would return exactly
+    `_MAX_DIGEST_BYTES` too, pass a returned-length assert, and still exhaust
+    memory on /dev/zero — the condition this cap exists to remove rather than
+    absorb. So the requested counts are captured at `os.read` and totalled. (The
+    returned-length assert stays: it is what catches a cap applied to the read but
+    not honoured afterwards.)
+
+    ABLATION: two rows, and the first is the one a length-only assert misses.
+    Slurp the whole file and truncate at the end — the total-bytes assert fails,
+    the length assert does not. Drop `_MAX_DIGEST_BYTES` from the `os.read`
+    outright and both fail."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    path = runs.config_digest_path_for(project, "r1")
+    path.parent.mkdir(parents=True)
+    path.write_text("a" * (1024 * 1024))
+
+    requested: list[int] = []
+    real_read = os.read
+
+    def _spy(fd: int, n: int) -> bytes:
+        requested.append(n)
+        return real_read(fd, n)
+
+    with mock.patch.object(runs.os, "read", _spy):
+        got = runs.read_trusted_config_digest(project, "r1")
+
+    assert got is not None
+    assert len(got) == runs._MAX_DIGEST_BYTES
+    # The read never asks for more than the cap, however many calls it makes.
+    assert requested, "the spy saw no read at all — the assertion below would be vacuous"
+    assert sum(requested) <= runs._MAX_DIGEST_BYTES
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_read_trusted_config_digest_does_not_follow_a_planted_symlink(tmp_path):
+    """`O_NOFOLLOW`: the name is read, not wherever it points. Without it a session
+    aims the orchestrator's read at any file the orchestrator can open, and the
+    "digest" it comes back with is that file's contents.
+
+    ABLATION: drop `O_NOFOLLOW` from the flags and the read returns the target's
+    contents instead of `None`."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    secret = tmp_path / "elsewhere.txt"
+    secret.write_text("not-the-digest")
+    path = runs.config_digest_path_for(project, "r1")
+    path.parent.mkdir(parents=True)
+    path.symlink_to(secret)
+
+    assert runs.read_trusted_config_digest(project, "r1") is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_write_trusted_config_digest_replaces_a_planted_symlink(tmp_path):
+    """`follow_symlinks=False`, and the reason is that this record lives under a
+    root whose path the driven session is handed — the engine exports the sibling
+    events dir as `BMAD_LOOP_EVENTS_DIR`. Following a link planted at the digest's
+    name would aim an orchestrator write at a path of the session's choosing.
+
+    ABLATION: drop `follow_symlinks=False` and the target below is what gets
+    written."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    target = tmp_path / "outside.txt"
+    target.write_text("untouched")
+    path = runs.config_digest_path_for(project, "r1")
+    path.parent.mkdir(parents=True)
+    path.symlink_to(target)
+
+    runs.write_trusted_config_digest(project, "r1", "abc123")
+
+    assert target.read_text() == "untouched"
+    assert not path.is_symlink()
+    assert runs.read_trusted_config_digest(project, "r1") == "abc123"
+
+
+def test_the_state_dir_gc_reclaims_the_config_digest(tmp_path):
+    """#498's GC is #494's GC — the digest is a file inside the run's state dir, so
+    the lifecycle that already reclaims that subtree reclaims this too. Asserted
+    rather than assumed: a digest stamped somewhere the sweep does not reach would
+    leak one file per run, outside the project, for the life of the machine.
+
+    Deliberately the ORPHAN SWEEP and not `delete_run`, which was the first draft
+    and was fake green — it removes the run dir as well, so it passes whether the
+    digest is out of tree or sitting in `.bmad-loop/runs/<id>/`, which is the one
+    thing this needs to tell apart. `reconcile_orphan_state_dirs` reaches only
+    out-of-tree state, so a digest that drifted back into the project survives it
+    and this reddens."""
+    runs.write_trusted_config_digest(tmp_path, "r1", "abc123")
+    digest = runs.config_digest_path_for(tmp_path, "r1")
+    assert digest.is_file()
+
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == [runs.state_dir_for(tmp_path, "r1")]
+
+    assert not digest.exists()
 
 
 def test_prunable_sessions_accepts_legacy_path_tag(tmp_path, monkeypatch):

@@ -744,21 +744,22 @@ def build_run_state(
     the weights the run actually launched under; ``source`` / ``spec_folder``
     record which queue the run dispatches (a stories manifest vs sprint-status).
 
-    ``trusted_config_digest`` is passed in rather than derived from ``policy`` +
-    ``project`` here so the value stamped on the run is the same string the caller
-    handed the sweep factory — and so a broken profile still aborts where it always
-    did (``make_adapters``'s ``SystemExit``), not from inside this constructor."""
+    ``trusted_config_digest`` is carried here **as well as** stamped out of the
+    tree by :func:`compose_run` (#498). The out-of-tree file is the one resume
+    trusts; this copy is the secondary that travels with the run directory — see
+    ``RunState.trusted_config_digest`` for why a run that outlives its state key
+    needs one."""
     return RunState(
         run_id=run_id,
         project=str(project),
         started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
         policy_snapshot=policy.to_dict(),
-        trusted_config_digest=trusted_config_digest,
         epic_filter=epic_filter,
         story_filter=story_filter,
         max_stories=max_stories,
         source="stories" if stories_on else "sprint-status",
         spec_folder=spec_folder if stories_on else "",
+        trusted_config_digest=trusted_config_digest,
     )
 
 
@@ -806,6 +807,13 @@ def compose_run(
     baseline describes the bytes these adapters are built from rather than a second
     read of an agent-writable file (#461 point 4). ``None`` resolves fresh.
 
+    ``trusted_config_digest`` is stamped into the run's out-of-tree state dir
+    (#498), so the baseline ``resume`` warns off is not sitting in the tree the
+    driven sessions write to, **and** onto the :class:`RunState` as the secondary
+    that travels with the run dir. The out-of-tree copy is preferred whenever it
+    exists, which is what keeps the in-tree one from being worth tampering with;
+    ``RunState.trusted_config_digest`` states the split and why both are needed.
+
     ``make_adapters`` and the engine classes are injected (rather than imported
     here) so ``cli`` supplies its own module-level names — keeping the test
     suite's ``monkeypatch.setattr(cli, "Engine"/"_make_adapters", ...)`` effective.
@@ -825,6 +833,10 @@ def compose_run(
         trusted_config_digest=trusted_config_digest,
     )
     save_state(run_dir, state)
+    # After the run dir exists (Journal mkdir'd it above) and before the pid lands:
+    # the ordering `reconcile_orphan_state_dirs` reads runs in, and a stamp that
+    # cannot be written fails the launch before an observer can see a live run.
+    runs.write_trusted_config_digest(project, run_id, trusted_config_digest)
     runs.write_pid(run_dir)
     adapters = make_adapters(project, run_dir, policy, profiles=profiles)
     journal.append(
@@ -881,6 +893,8 @@ def compose_sweep(
     to ``make_adapters``. The child-sweep factory passes the same one it gated on,
     so the adapters are built from the validated bytes instead of a fresh read of
     an agent-writable file (#461 point 4); ``cmd_sweep`` (human-present) omits it.
+    ``trusted_config_digest`` lands in the run's out-of-tree state dir and, as the
+    travelling secondary, on the :class:`RunState` — see :func:`compose_run`.
 
     ``sweep.json`` freezes the launch options so a resume rebuilds the same sweep
     (see :func:`compose_resume`). ``make_adapters`` and ``sweep_engine_cls`` are
@@ -895,10 +909,12 @@ def compose_sweep(
         project=str(project),
         started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
         policy_snapshot=policy.to_dict(),
-        trusted_config_digest=trusted_config_digest,
         run_type="sweep",
+        trusted_config_digest=trusted_config_digest,
     )
     save_state(run_dir, state)
+    # Out of the tree, same ordering and same reason as compose_run's stamp.
+    runs.write_trusted_config_digest(project, run_id, trusted_config_digest)
     runs.write_pid(run_dir)
     options = {
         "prompting": prompting,
