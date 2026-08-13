@@ -369,13 +369,22 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     # fires on a push to `main`/`release/*` with no dependency on the CI workflow, so
     # it can tag and publish while `version-sync` is still running — this precondition
     # is the last gate before that irreversible step, not a duplicate of `check`.
-    unreleased = extract_section(changelog, "Unreleased")
-    if unreleased is None:
+    # Every heading, not just the first: `extract_section` searches, so a leftover
+    # populated Unreleased *below* a freshly-inserted empty one would hide behind it
+    # and its entries would never ship.
+    unreleased = list(section_re("Unreleased").finditer(changelog))
+    if not unreleased:
         problems.append(
             "CHANGELOG.md has no `## [Unreleased]` heading — a release renames the old "
             f"one to `## [{version}]`, so a fresh empty one must be reopened above it"
         )
-    elif unreleased:
+    elif len(unreleased) > 1:
+        problems.append(
+            f"CHANGELOG.md has {len(unreleased)} `## [Unreleased]` headings — the "
+            "promotion renames the existing one rather than inserting a second; the "
+            "leftover still holds entries that would never ship"
+        )
+    elif unreleased[0].group("body").strip():
         problems.append(
             "CHANGELOG.md `## [Unreleased]` still has content — a release *promotes* "
             f"that section (rename its heading to `## [{version}] — <ISO date>`, then "
@@ -385,8 +394,8 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     else:
         # Reopened, but it has to sit above the section it was promoted into — Keep a
         # Changelog is newest-first, and `publish` reads sections by heading, not order.
-        u, v = section_re("Unreleased").search(changelog), section_re(version).search(changelog)
-        if u and v and u.start() > v.start():
+        v = section_re(version).search(changelog)
+        if v and unreleased[0].start() > v.start():
             problems.append(
                 f"CHANGELOG.md `## [Unreleased]` sits below `## [{version}]` — reopen it "
                 "above the section it was promoted into"

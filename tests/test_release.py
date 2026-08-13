@@ -154,6 +154,28 @@ STALE_UNRELEASED_REF = PROMOTED.replace("/compare/v0.5.0...HEAD", "/compare/v0.4
 # Renamed but never reopened. `has_curated_section` reports False here for the same
 # reason it does for a correctly emptied one, so `prepare` needs the missing/empty
 # distinction that `extract_section`'s None makes.
+# A half-finished rename: the fresh empty heading went in, the old populated one was
+# never renamed. Guards that `search` for the first Unreleased see only the empty one.
+DUPLICATE_UNRELEASED = """# Changelog
+
+## [Unreleased]
+
+## [0.5.0] — 2026-07-01
+
+### Fixed
+
+- **A thing.** It no longer breaks.
+
+## [Unreleased]
+
+### Added
+
+- **Never promoted.** Left behind by the half-finished rename.
+
+[Unreleased]: https://github.com/bmad-code-org/bmad-loop/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.5.0
+"""
+
 UNRELEASED_REOPENED_BELOW = """# Changelog
 
 ## [0.5.0] — 2026-07-01
@@ -363,6 +385,14 @@ def test_prepare_refuses_a_never_reopened_unreleased(monkeypatch, tmp_path):
     with pytest.raises(SystemExit) as exc:
         _prepare_dry_run(monkeypatch, tmp_path, NO_UNRELEASED_HEADING)
     assert "no `## [Unreleased]` heading" in str(exc.value)
+
+
+def test_prepare_refuses_a_leftover_second_unreleased(monkeypatch, tmp_path):
+    # The empty heading is first, so anything that `search`es rather than scanning
+    # every match reads it and passes while the real entries sit below, unshipped.
+    with pytest.raises(SystemExit) as exc:
+        _prepare_dry_run(monkeypatch, tmp_path, DUPLICATE_UNRELEASED)
+    assert "2 `## [Unreleased]` headings" in str(exc.value)
 
 
 def test_prepare_refuses_an_unreleased_reopened_below_the_release(monkeypatch, tmp_path):
