@@ -40,6 +40,16 @@ whose seams had diverged enough that several ports needed a different fix, and t
   `session_timeout_min`. Re-run `bmad-loop init` to refresh the relay. `--dry-run` previews the
   directory the run would use.
 
+  Both observation surfaces are honest about the split. `validate` gains `hooks.relay-stale`: a
+  present, readable relay is not necessarily a current one, so the installed copy is compared
+  against the packaged source and a difference is reported with the `init` that refreshes it. It is
+  a **warning** and never moves the exit code — the fallback keeps a stale relay working, so this
+  reports a lost property, not a broken run. `diagnose`'s `events` file group is retargeted to the
+  state root and sums both roots into the one category (unchanged payload, no schema bump); it had
+  silently reported nothing after the move, since a category with no directory is a no-op. An
+  underivable state root — a dump read on a machine that did not produce the run — costs the events
+  count and nothing else.
+
 - **Coding-CLI adapter registry: a new adapter class ships out-of-tree (#226).** The transport axis
   has long been extensible out-of-tree; the CLI axis had no equivalent, so a CLI needing its own
   adapter _class_ forced a name-branch in the run bootstrap. A profile's new `adapter` field names a

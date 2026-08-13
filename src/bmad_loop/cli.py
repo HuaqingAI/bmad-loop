@@ -541,6 +541,38 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 {"path": str(relay)},
             )
 
+        # #494 Phase 4: present-and-readable is not current. The relay is COPIED
+        # into the project by `init`, so an upgraded orchestrator routinely drives
+        # sessions through a relay written by an older wheel — and the #494 move
+        # is exactly the kind of change that skew hides: a pre-move relay writes
+        # its events to the in-tree `<run-dir>/events` while the operator believes
+        # the channel left the project tree, so a branch switch can still take the
+        # control plane away mid-run.
+        #
+        # A WARNING, never a problem, and validate's exit code must not move:
+        # Phase 3's fallback pair keeps a stale relay FUNCTIONAL (it writes the
+        # legacy directory, which SignalWatcher still polls), so the run completes
+        # — the operator is losing the property, not the loop. `passed` counts
+        # only problems, so `warn` is what says "degraded but working".
+        stale = install.hook_script_current(project)
+        if stale is False:
+            report.warn(
+                "hooks.relay-stale",
+                f"the installed hook relay {relay} differs from this bmad-loop's "
+                f"— it is from another version, or was edited. Events may still be "
+                f"written inside the project tree; run `bmad-loop init` to refresh it",
+                {"path": str(relay)},
+            )
+        elif stale is True:
+            report.ok(
+                "hooks.relay-stale",
+                f"hook relay script up to date: {relay}",
+                {"path": str(relay)},
+            )
+        # `None` (unreadable/undecodable on either side) reports nothing: the
+        # relay-present block above already spoke for the cases an operator can
+        # act on, and "I could not compare" is not a finding about their project.
+
     # Adapter-kind validity is enforced against the LIVE registry, never a
     # hardcoded set: a profile.adapter naming no registered kind is a config error
     # (a typo, or an uninstalled plugin package). External adapter/profile packages

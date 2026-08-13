@@ -63,10 +63,14 @@ from .sanitize import LeakDetected  # noqa: F401 — re-export
 SCHEMA_VERSION = 1
 DEFAULT_JOURNAL_CAP = 200
 
-# Run-dir subdirectories whose mere existence/size is diagnostic but whose
-# CONTENTS are off-limits (raw tmux panes = code, prompts, feedback prose,
-# patches, full worktree checkouts). We stat them; we never read into output.
+# Subdirectories whose mere existence/size is diagnostic but whose CONTENTS are
+# off-limits (raw tmux panes = code, prompts, feedback prose, patches, full
+# worktree checkouts). We stat them; we never read into output.
+#
+# All are run-dir-relative EXCEPT "events", which since #494 lives out of the
+# project tree at the user state root — see `_category_roots`.
 _FILE_CATEGORIES = ("logs", "tasks", "feedback", "bundles", "failed", "worktrees", "events")
+_EVENTS_CATEGORY = "events"
 
 # Journal fields that name a proprietary identifier — pseudonymized, not dropped,
 # so events stay correlatable. Maps field name -> alias namespace.
@@ -297,30 +301,62 @@ def collect_env(project: Path) -> EnvInfo:
     )
 
 
-def summarize_files(run_dir: Path) -> list[FileGroup]:
-    """Counts/sizes only — file contents are NEVER opened into the output."""
+def _category_roots(category: str, run_dir: Path, events_dir: Path | None) -> list[Path]:
+    """Where a category's files live. One directory for all but ``events``.
+
+    The events channel has TWO live roots since #494 (Phase 3): the primary is
+    out of the project tree under the user state root, and the legacy in-tree
+    ``<run-dir>/events`` is still both written and polled. It has to be, because
+    the hook relay is COPIED into the project by ``init`` — an upgraded
+    orchestrator routinely drives sessions whose relay predates the move and
+    still writes in-tree, so the watcher dual-polls. Counting only one root would
+    report zero events for precisely the runs whose event routing is what a
+    maintainer is reading the dump to understand.
+
+    Both are summed into ONE ``FileGroup`` named ``events``: the payload shape is
+    the schema, and splitting the category (or adding a field) would be a break
+    for a v1 consumer. Which root the events came from is not what the count is
+    for — "did the hooks fire at all" is.
+    """
+    if category != _EVENTS_CATEGORY:
+        return [run_dir / category]
+    legacy = run_dir / _EVENTS_CATEGORY
+    # Deduped by spelling so a state root deliberately pointed inside the run dir
+    # (BMAD_LOOP_STATE_DIR is honoured as spelled) cannot double-count.
+    if events_dir is None or events_dir == legacy:
+        return [legacy]
+    return [events_dir, legacy]
+
+
+def summarize_files(run_dir: Path, *, events_dir: Path | None = None) -> list[FileGroup]:
+    """Counts/sizes only — file contents are NEVER opened into the output.
+
+    ``events_dir`` is this run's out-of-tree event channel (#494); ``None`` when
+    the caller could not derive one, which degrades to the legacy in-tree
+    location alone rather than dropping the category.
+    """
     groups: list[FileGroup] = []
     for category in _FILE_CATEGORIES:
-        root = run_dir / category
-        if not root.is_dir():
-            continue
         count = 0
         total_bytes = 0
         total_lines = 0
-        for p in root.rglob("*"):
-            if not p.is_file():
+        for root in _category_roots(category, run_dir, events_dir):
+            if not root.is_dir():
                 continue
-            count += 1
-            try:
-                total_bytes += p.stat().st_size
-            except OSError:
-                pass
-            if category == "logs":
+            for p in root.rglob("*"):
+                if not p.is_file():
+                    continue
+                count += 1
                 try:
-                    with p.open("rb") as f:
-                        total_lines += sum(1 for _ in f)
+                    total_bytes += p.stat().st_size
                 except OSError:
                     pass
+                if category == "logs":
+                    try:
+                        with p.open("rb") as f:
+                            total_lines += sum(1 for _ in f)
+                    except OSError:
+                        pass
         if count:
             groups.append(
                 FileGroup(
@@ -500,6 +536,33 @@ def _coarsen_date(started_at: str | None) -> str | None:
     return head if sanitize.looks_like_identifier(head.replace("-", "0")) else None
 
 
+def _events_dir(state: RunState) -> Path | None:
+    """This run's out-of-tree event channel, or ``None`` if it is not derivable.
+
+    Derived from the run's OWN recorded project and id rather than threaded down
+    from ``cmd_diagnose``'s ``--project``, which is the smaller change and the
+    truer one: ``--all`` dumps every run under a project, and a run carries the
+    project it was started against. ``run_dir`` cannot answer this — the state
+    root is keyed by a digest of the resolved project, not by the run dir's
+    ancestry.
+
+    Every failure mode is observation, so every one of them degrades. The
+    derivation resolves the project (``runs.project_tag``) and consults the host
+    for a state root, and a dump is routinely read on a machine that is not the
+    one that produced it: an unresolvable project, or a host with no derivable
+    state root, must cost the events count and nothing else.
+    """
+    from . import runs
+
+    try:
+        return runs.events_dir_for(Path(state.project), state.run_id)
+    except Exception:
+        # No `# nosec`: bandit's B110/B112 are about `pass`/`continue` bodies, and
+        # a directive naming a rule that never fires here would read as a waived
+        # finding. The breadth is deliberate and stated above, not silenced.
+        return None
+
+
 def collect_run(run_dir: Path, *, pseudo: sanitize.Pseudonymizer, cap: int) -> RunDiag:
     state: RunState = load_state(run_dir)
     tasks = list(state.tasks.values())
@@ -541,7 +604,7 @@ def collect_run(run_dir: Path, *, pseudo: sanitize.Pseudonymizer, cap: int) -> R
         session_tally=_session_tally(tasks),
         tasks=[_task_diag(t, pseudo, weight) for t in tasks],
         journal=summarize_journal(Journal(run_dir).entries(), pseudo, epic_by_key, cap=cap),
-        files=summarize_files(run_dir),
+        files=summarize_files(run_dir, events_dir=_events_dir(state)),
     )
 
 
