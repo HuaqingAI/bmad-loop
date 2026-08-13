@@ -1441,9 +1441,12 @@ def test_review_hunter_missing_without_merged_review_reported(tmp_path):
     assert "update bmm" in problems[0].message
 
 
-# Verbatim shape of BMAD-METHOD main's bmad-dev-auto/customize.toml: four review
-# layers, three invoking the merged `bmad-review` with one lens each, plus
-# intent-alignment — a self-contained prompt that invokes no skill at all.
+# The invoke-a-skill layer topology: four review layers, three invoking the merged
+# `bmad-review` with one lens each, plus intent-alignment — a self-contained prompt
+# that invokes no skill at all. This was BMAD-METHOD main's shape when the derived
+# requirement landed; 6.11 has since made all four self-contained (they read the
+# primitive's own review-prompts/*.md). Both topologies are supported, and this
+# fixture is what pins the handoff half — do not retire it as historical.
 LAYER_CUSTOMIZE = """
 [workflow]
 implementation_handoff = "irrelevant here"

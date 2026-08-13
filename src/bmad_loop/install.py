@@ -175,12 +175,17 @@ DEV_BASE_SKILLS = {
     "bmad-review-adversarial-general": (),
     "bmad-review-edge-case-hunter": (),
 }
-# The merged lens-based reviewer (BMAD-METHOD core-streamline). Current sources make
-# step-04 layer-driven off customize.toml's [[workflow.review_layers]]: four layers
-# (blind-hunter, edge-case-hunter, verification-gap — each invoking bmad-review with
-# one lens — plus intent-alignment, an inline prompt invoking no skill at all), so
-# bmad-review alone satisfies every layer that needs a skill. Named here for the
-# fallback path only; the derived path sees it named in the layers themselves.
+# The merged lens-based reviewer (BMAD-METHOD core-streamline). It satisfies the
+# layer topology of the releases that hand off to it: step-04 driven off
+# customize.toml's [[workflow.review_layers]], with the hunter layers each invoking
+# bmad-review with one lens. On 6.11 sources the same four layers (blind-hunter,
+# edge-case-hunter, verification-gap, intent-alignment) invoke no skill at all —
+# three read the primitive's own review-prompts/*.md — so that tree derives an empty
+# `required` map, which is satisfied rather than unsatisfiable: _review_findings
+# falls back to the static catalog only when the resolution is None (an unreadable
+# shape), never because it resolved to requiring nothing. Both topologies stay
+# supported; this constant is named here for the fallback path only, and the derived
+# path sees it named in the layers themselves.
 MERGED_REVIEW_SKILL = "bmad-review"
 # The DEV_BASE_SKILLS entries MERGED_REVIEW_SKILL subsumes. bmad-dev-auto (the dev
 # primitive) is NOT here — the merged reviewer never substitutes for it.

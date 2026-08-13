@@ -3,7 +3,7 @@
 This module is two things: the bundled `bmad-loop-*` skills and the `bmad-loop`
 orchestrator tool (the Python program that actually drives the loop). The skills do
 nothing on their own — the orchestrator is what spawns the fresh coding-CLI sessions
-that invoke the upstream `bmad-dev-auto` skill (which implements and, re-invoked on
+that invoke the upstream `bmad-build-auto` skill (which implements and, re-invoked on
 the done spec, runs the follow-up review) plus `bmad-loop-sweep` and
 `bmad-loop-resolve`, watches their hook signals, and verifies
 their artifacts. Installing the tool is part of setup, not
@@ -101,30 +101,34 @@ claude "/bmad-loop-setup accept all defaults"                   # install the to
 Add `--cli codex --cli gemini` to also populate `.agents/skills/`. `init` always
 installs all the bundled skills together (`bmad-loop-resolve`, `bmad-loop-sweep`,
 `bmad-loop-setup`); `bmad-loop-sweep` owns the canonical `deferred-work-format.md`
-the orchestrator normalizes the ledger to. The dev primitive `bmad-dev-auto` is
+the orchestrator normalizes the ledger to. The dev primitive `bmad-build-auto`
+(spelled `bmad-dev-auto` before the 6.10.1 rename — the orchestrator resolves
+whichever name is on disk and invokes that one) is
 **not** bundled: it is the upstream skill the orchestrator drives (for both
 implementation and the follow-up review), installed by the BMad Method (bmm)
-module. `bmad-loop validate` checks it — plus the review layers it invokes
-inline — are present before a run starts.
+module. `bmad-loop validate` checks it — plus any review skills its layers
+invoke — are present before a run starts.
 
-**Minimum BMAD-METHOD: v6.10.0** for sprint mode. Beyond `bmad-dev-auto` itself (with
+**Minimum BMAD-METHOD: v6.10.0** for sprint mode. Beyond the primitive itself (with
 its `customize.toml`), `bmad-loop validate` holds you to no fixed list of review
-skills: it reads the `bmad-dev-auto` you actually have installed and requires the
-reviewers that copy will actually invoke.
+skills: it reads the primitive you actually have installed and requires the
+reviewers that copy will actually invoke — which on current sources is none at all.
 
 - **Layer-driven (post-6.10.0)** — `customize.toml` defines
-  `[[workflow.review_layers]]`, and each layer's `instruction` names the skill it hands
-  off to. Current sources define four layers: `blind-hunter`, `edge-case-hunter`, and
-  `verification-gap`, each invoking the merged `bmad-review` skill with one lens, plus
-  `intent-alignment`, a self-contained prompt that invokes no skill at all. Such a tree
-  needs `bmad-review` and none of the standalone hunters. An intermediate release whose
-  layers name the standalone hunters needs exactly those instead.
+  `[[workflow.review_layers]]`, and a layer's `instruction` may name a skill to hand
+  off to. Current (6.11) sources define four layers — `blind-hunter`,
+  `edge-case-hunter`, `verification-gap` and `intent-alignment` — and none of them
+  invokes a skill: each is a self-contained prompt, three of them reading the
+  primitive's own `review-prompts/*.md`. Such a tree requires no review skill at all.
+  An intermediate release whose layers invoke the merged `bmad-review` with one lens
+  each needs `bmad-review`; an earlier one naming the standalone hunters needs exactly
+  those instead.
 - **v6.10.0** — no `review_layers` section at all; `step-04-review.md` names
   `bmad-review-adversarial-general` and `bmad-review-edge-case-hunter` inline, so those
   two are what is required.
 
 A layer disabled with an empty `instruction`, or replaced in
-`_bmad/custom/bmad-dev-auto.toml` by a recipe that runs something else, requires
+`_bmad/custom/bmad-build-auto.toml` by a recipe that runs something else, requires
 nothing. If the shape cannot be read at all, `validate` falls back to requiring the two
 v6.10.0 hunters — which a tree carrying `bmad-review` satisfies.
 
@@ -134,10 +138,13 @@ forwarder to `bmad-review`. It is required exactly when your installed layers na
 
 ### Customizing the review layers
 
-Your project overrides in `_bmad/custom/bmad-dev-auto.toml` (team) and
-`_bmad/custom/bmad-dev-auto.user.toml` (personal, gitignored by the bmm installer) are
-applied before the requirement is computed, using the same merge rules BMAD's own
-resolver uses: an array of tables merges by key only when _every_ entry — default and
+Your project overrides in `_bmad/custom/bmad-build-auto.toml` (team) and
+`_bmad/custom/bmad-build-auto.user.toml` (personal, gitignored by the bmm installer) are
+applied before the requirement is computed. (Overrides are keyed by skill directory
+name, so a pre-6.10.1 install spells both files `bmad-dev-auto*.toml`; the deprecated
+shim offers to rename them when you first invoke the old name.) The merge follows the
+same rules BMAD's own resolver uses: an array of tables merges by key only when
+_every_ entry — default and
 override alike — carries the same `code` or `id`; otherwise the override appends. So
 adding a layer with a new `id` adds a requirement, and replacing one by `id` moves it.
 
@@ -150,7 +157,7 @@ without running the review:
 
 Both come back as `skills.review-layer-unresolved` warnings, so a customized layer can
 never block a run the way the old fixed catalog did. What _is_ a problem: every layer
-disabled at once (`skills.review-layers-empty`), which makes `bmad-dev-auto` HALT
+disabled at once (`skills.review-layers-empty`), which makes the primitive HALT
 blocked with `no active review layers`.
 
 Under `isolation = "worktree"` the skills your layers name are copied into each unit's
