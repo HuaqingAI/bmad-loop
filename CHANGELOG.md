@@ -14,41 +14,27 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Added
 
-- **`bmad-loop relay <Event>`: write a session event without the copied-in script (#494).** The
-  hardened event write gains an importable twin, `events.py`, held byte-identical to the stdlib-only
-  hook relay by an AST parity test — the two writers of the events control plane can no longer be
-  hardened differently by accident. The new `relay` subcommand takes the same hook payload on stdin
-  and honours the same contract: nothing on stdout, rc 0 always, a silent no-op outside a driven
-  session. It dispatches ahead of `main()`'s shared error handler and its mux configuration, so
-  neither a broken `policy.toml` nor an unexpected exception can turn a session's Stop signal into a
-  failed hook. First phase of moving `events/` to a control-plane root outside the project tree.
+- **The hook-event channel moves out of the project tree (#494).** A run's session-completion
+  signals now land under a user-scoped state root — `$XDG_STATE_HOME/bmad-loop` (else
+  `~/.local/state/bmad-loop`), `%LOCALAPPDATA%\bmad-loop\state` on Windows, or wherever
+  `BMAD_LOOP_STATE_DIR` points — keyed `<root>/<project>/<run-id>/events/`, so a branch switch, a
+  worktree mount or a rollback can no longer take a live run's control plane away.
 
-  The root itself is a user-scoped state directory (`$XDG_STATE_HOME/bmad-loop` or
-  `~/.local/state/bmad-loop`; `%LOCALAPPDATA%\bmad-loop\state` on Windows), keyed
-  `<root>/<project>/<run-id>/` by the same project identity that scopes session ownership, so two
-  spellings of one project cannot end up with two control planes. `BMAD_LOOP_STATE_DIR` overrides
-  the whole cascade for a host where none of those is derivable or writable.
-
-  **The events channel now lives there**, at `<root>/<project>/<run-id>/events/` — out of the
-  project tree, where a branch switch, a worktree mount or a rollback cannot take a live run's
-  control plane away. Every engine-driven session is told the directory through
-  `BMAD_LOOP_EVENTS_DIR`, and both relays (the copied hook script and `bmad-loop relay`) prefer it,
-  falling back to the legacy in-tree `<run-dir>/events`. The orchestrator keeps polling that legacy
-  location too, and the fallback pair is load-bearing rather than tidy: the hook script is COPIED
-  into the project by `init`, so an upgraded orchestrator routinely drives sessions whose relay
-  predates the move — without both halves every such session would observe no Stop and stall to
-  `session_timeout_min`. Re-run `bmad-loop init` to refresh the relay. `--dry-run` previews the
-  directory the run would use.
-
-  Both observation surfaces are honest about the split. `validate` gains `hooks.relay-stale`: a
-  present, readable relay is not necessarily a current one, so the installed copy is compared
-  against the packaged source and a difference is reported with the `init` that refreshes it. It is
-  a **warning** and never moves the exit code — the fallback keeps a stale relay working, so this
-  reports a lost property, not a broken run. `diagnose`'s `events` file group is retargeted to the
-  state root and sums both roots into the one category (unchanged payload, no schema bump); it had
-  silently reported nothing after the move, since a category with no directory is a no-op. An
-  underivable state root — a dump read on a machine that did not produce the run — costs the events
-  count and nothing else.
+  - **Older relays keep working.** Sessions are told the directory via `BMAD_LOOP_EVENTS_DIR`; both
+    relays fall back to the in-tree `<run-dir>/events` and the orchestrator polls both locations.
+    `init` copies the relay into the project, so an upgraded orchestrator regularly drives sessions
+    whose relay predates the move — re-run `bmad-loop init` to refresh it.
+  - **`bmad-loop relay <Event>`** writes a session event without the copied-in script, on the same
+    contract (nothing on stdout, rc 0 always, silent no-op outside a driven session). It is backed
+    by a new `events.py`, held byte-identical to the stdlib-only relay by an AST parity test, and
+    dispatches ahead of the shared error handler so a broken `policy.toml` cannot fail a hook.
+  - **`validate` gains `hooks.relay-stale`** — the installed relay compared against the packaged
+    one, a warning that never moves the exit code (the fallback keeps a stale relay working).
+    `diagnose`'s `events` group now counts both locations; payload and schema unchanged.
+  - **`delete`/`archive`/`clean` collect the out-of-tree dir** with the run, and `clean` sweeps
+    orphans whose run dir is already gone (`--json`: `state_dirs_swept`, an additive field). An
+    archived tarball therefore no longer contains `events/` — consumed transient signals.
+  - `run`/`sweep` `--dry-run` previews the events directory a session would use.
 
 - **Coding-CLI adapter registry: a new adapter class ships out-of-tree (#226).** The transport axis
   has long been extensible out-of-tree; the CLI axis had no equivalent, so a CLI needing its own

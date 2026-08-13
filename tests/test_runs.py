@@ -1051,9 +1051,67 @@ def test_prune_sessions_returns_unknown_from_same_sample(tmp_path, monkeypatch):
     assert killed == ["odd-1"]
 
 
+def _seed_state_dir(project, run_id) -> Path:
+    """The out-of-tree control plane a driven run leaves behind: its events dir
+    holding one already-consumed completion signal."""
+    events = runs.events_dir_for(project, run_id)
+    events.mkdir(parents=True)
+    (events / "1700000000-t1-Stop.json").write_text("{}")
+    return runs.state_dir_for(project, run_id)
+
+
+def _raising(exc: Exception):
+    def _fail(*_args, **_kwargs):
+        raise exc
+
+    return _fail
+
+
 def test_delete_run(tmp_path):
     run_dir = _make_state_run(tmp_path, "r1")
     runs.delete_run(tmp_path, run_dir)
+    assert not run_dir.exists()
+
+
+def test_delete_run_removes_the_out_of_tree_state_counterpart(tmp_path):
+    """#494 moved the events channel out of the project tree, so removing the run
+    dir stopped removing everything the run owns. Without this tail every delete
+    leaks a subtree under the user-scoped state root — outside the project, where
+    no operator thinks to look — one per run, for the life of the machine."""
+    run_dir = _make_state_run(tmp_path, "r1")
+    state_dir = _seed_state_dir(tmp_path, "r1")
+
+    runs.delete_run(tmp_path, run_dir)
+
+    assert not run_dir.exists()
+    assert not state_dir.exists()
+
+
+@pytest.mark.parametrize(
+    "attr, exc",
+    [
+        ("state_root", runs.StateRootError("no root")),
+        ("project_tag", OSError("cannot canonicalize")),
+    ],
+    ids=["no-derivable-state-root", "unresolvable-project"],
+)
+def test_delete_run_survives_a_counterpart_it_cannot_name(tmp_path, monkeypatch, attr, exc):
+    """The counterpart removal is a never-raise tail (#139 teardown doctrine).
+
+    Both rows are the counterpart being *unnameable*, which is the only failure
+    that can escape: an environment with no derivable state root, and a project
+    the OS refuses to canonicalize (#552). Removal failures are absorbed
+    separately, by `ignore_errors`.
+
+    Raising would be worse than the leak it reports. The run dir is already gone
+    by this point, so the exception would fail a delete that in fact happened and
+    send the operator to retry a removal that can only fail the same way — while
+    `reconcile_orphan_state_dirs` already backstops the leak."""
+    run_dir = _make_state_run(tmp_path, "r1")
+    monkeypatch.setattr(runs, attr, _raising(exc))
+
+    runs.delete_run(tmp_path, run_dir)
+
     assert not run_dir.exists()
 
 
@@ -1408,3 +1466,174 @@ def test_archive_run_refuses_while_the_agent_session_is_live(tmp_path, monkeypat
         runs.archive_run(tmp_path, run_dir)
     assert run_dir.exists()
     assert not (tmp_path / ".bmad-loop" / "archive").exists()
+
+
+def test_archive_run_removes_the_out_of_tree_state_counterpart(tmp_path):
+    """Archive inherits delete's tail — it removes the run dir just the same, so
+    it would leak the same subtree.
+
+    The ordering is what the assertions pin: the tarball is complete before the
+    counterpart goes. Since #494 that tarball no longer carries the run's
+    `events/` — the channel is out of the tree and never enters the tar — which
+    the recorded decision accepts: those files are transient completion signals
+    the watcher consumed while the run was live, and everything an archive is
+    read for later (state, journal, tasks, logs) is in the run dir."""
+    run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
+    state_dir = _seed_state_dir(tmp_path, "20260611-100000-aaaa")
+
+    dest = runs.archive_run(tmp_path, run_dir)
+
+    with tarfile.open(dest) as tar:
+        assert "20260611-100000-aaaa/state.json" in tar.getnames()
+    assert not state_dir.exists()
+
+
+# ------------------------------------------------- orphan state-dir sweep (#494)
+
+
+def test_reconcile_orphan_state_dirs_removes_only_what_has_no_run_dir(tmp_path):
+    """The GC backstop for everything `_discard_state_dir` cannot reach: a run dir
+    removed by hand, an `rm -rf .bmad-loop`, a delete from before that tail
+    existed. Distinctness is the load-bearing half — a sweep that took the live
+    run's control plane too would strand a resumable run's completion channel."""
+    _make_state_run(tmp_path, "live-1")
+    kept = _seed_state_dir(tmp_path, "live-1")
+    orphan = _seed_state_dir(tmp_path, "gone-1")
+
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == [orphan]
+
+    assert not orphan.exists()
+    assert kept.is_dir()
+
+
+def test_reconcile_orphan_state_dirs_keeps_a_run_dir_with_no_state_json(tmp_path):
+    """Existence of the *directory* is the test, not `list_run_dirs`, which is
+    state.json-gated.
+
+    A run whose state.json is missing or corrupt is exactly the run an operator is
+    trying to recover, and it still owns its control plane. Reading liveness from
+    the gated listing would sweep the counterpart out from under it — deleting
+    state on the strength of state being unreadable."""
+    _make_run(tmp_path, "corrupt-1", with_state=False)
+    kept = _seed_state_dir(tmp_path, "corrupt-1")
+
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == []
+
+    assert kept.is_dir()
+
+
+def test_reconcile_orphan_state_dirs_dry_run_reports_without_removing(tmp_path):
+    """`clean --dry-run` promises a preview: the plan must name the work and leave
+    the disk alone, so the count a caller pre-flights is the count they get."""
+    orphan = _seed_state_dir(tmp_path, "gone-1")
+
+    assert runs.reconcile_orphan_state_dirs(tmp_path, dry_run=True) == [orphan]
+
+    assert orphan.is_dir()
+
+
+def test_reconcile_orphan_state_dirs_sweeps_a_project_whose_runs_dir_is_gone(tmp_path):
+    """`rm -rf .bmad-loop` is the leak this exists for, and it is the case a
+    missing runs dir has to answer *as an answer*: no runs exist, so every state
+    dir under this project's key is an orphan. Reading it as "cannot tell" would
+    leave the whole subtree behind permanently — nothing will ever re-create the
+    runs dir with those ids in it."""
+    orphan = _seed_state_dir(tmp_path, "gone-1")
+    assert not (tmp_path / ".bmad-loop" / "runs").exists()
+
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == [orphan]
+
+    assert not orphan.exists()
+
+
+def test_reconcile_orphan_state_dirs_sweeps_nothing_when_the_runs_dir_cannot_be_read(
+    tmp_path, monkeypatch
+):
+    """The mirror of the test above, and the reason the two failures are told
+    apart. An unreadable runs dir answers nothing at all — treating it like the
+    missing one would sweep every control plane this project has, live runs
+    included, on the strength of a transient permission error.
+
+    The fault is scoped to the runs dir on purpose. A blanket `os.scandir` raise
+    also takes out the state-root enumeration below it (and `rmtree`), so the
+    sweep returns `[]` whatever the arm under test does — measured: with the
+    degradation ablated to `set()` the test still passed, which is the negative
+    assertion holding for a reason that has nothing to do with the gate."""
+    _make_state_run(tmp_path, "live-1")
+    kept = _seed_state_dir(tmp_path, "live-1")
+    runs_dir = tmp_path / ".bmad-loop" / "runs"
+    real_scandir = runs.os.scandir
+
+    def _refuse_only_the_runs_dir(path, *args, **kwargs):
+        if Path(path) == runs_dir:
+            raise PermissionError("nope")
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(runs.os, "scandir", _refuse_only_the_runs_dir)
+
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == []
+
+    assert kept.is_dir()
+
+
+def test_reconcile_orphan_state_dirs_leaves_another_projects_subtree_alone(tmp_path):
+    """One state root holds every project's control planes, keyed by project
+    identity. The sweep enumerates its own key's subtree only — a sweep from the
+    root would let one project's `clean` delete another project's live runs, and
+    the two need not even be on the same disk."""
+    mine = tmp_path / "mine"
+    theirs = tmp_path / "theirs"
+    (mine / ".bmad-loop" / "runs").mkdir(parents=True)
+    _make_state_run(theirs, "live-1")
+    foreign = _seed_state_dir(theirs, "live-1")
+    # my own orphan, so the sweep provably enumerates rather than finding nothing
+    orphan = _seed_state_dir(mine, "gone-1")
+
+    assert runs.reconcile_orphan_state_dirs(mine) == [orphan]
+
+    assert not orphan.exists()
+    assert foreign.is_dir()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_reconcile_orphan_state_dirs_never_removes_through_a_symlink(tmp_path):
+    """A symlink is not a state dir we created, so it is skipped rather than
+    followed — and this row points *inside* the root, where the containment test
+    below it cannot help.
+
+    Reporting it would be a false count even where the removal fails harmlessly
+    (`rmtree` refuses a symlink): `clean` would claim a sweep that never happened
+    and go on claiming it every run. On Windows the containment test carries the
+    case this one cannot: a **junction** reads as a plain directory
+    (`is_symlink()` is False) but `resolve()` follows it, so without the
+    containment test `rmtree` would delete the target's contents outside the
+    root. That row is POSIX-invisible and is not graded here."""
+    _make_state_run(tmp_path, "live-1")
+    target = _seed_state_dir(tmp_path, "live-1")
+    link = runs.project_state_root(tmp_path) / "ghost-1"
+    link.symlink_to(target)
+
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == []
+
+    assert link.is_symlink()  # not followed, not removed
+    assert target.is_dir()
+
+
+@pytest.mark.parametrize(
+    "attr, exc",
+    [
+        ("state_root", runs.StateRootError("no root")),
+        ("project_tag", OSError("cannot canonicalize")),
+    ],
+    ids=["no-derivable-state-root", "unresolvable-project"],
+)
+def test_reconcile_orphan_state_dirs_degrades_when_the_root_cannot_be_named(
+    tmp_path, monkeypatch, attr, exc
+):
+    """Reclamation, not repair: a sweep that cannot name its root sweeps nothing
+    and says so, rather than failing the whole `clean` around it. Leaving disk
+    behind is the cheap outcome here — the caller's real work (worktrees, trims,
+    archives) has already been done by the time this runs."""
+    monkeypatch.setattr(runs, attr, _raising(exc))
+
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == []

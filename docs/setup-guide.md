@@ -331,7 +331,9 @@ bmad-loop cleanup --project <project-root>         # kill leftover tmux sessions
 ```
 
 `clean --hard` permanently deletes runs instead of archiving them (we're removing the tool, so
-there's nothing to keep). See the disk-reclamation coverage in
+there's nothing to keep). Running it **first** also matters for the out-of-tree half: each run's
+control-plane directory lives under the user-scoped state root, and `clean` is what collects it
+(step 2 covers what is left over). See the disk-reclamation coverage in
 [docs/FEATURES.md](FEATURES.md) and the [command reference](../README.md#command-reference) for
 what each command touches. Make sure no run is still live (Editor open, session attached) first.
 
@@ -343,6 +345,18 @@ Delete the `.bmad-loop/` directory. This removes the hook relay script
 
 ```bash
 rm -rf .bmad-loop/
+```
+
+One piece is **not** under `.bmad-loop/`: each run's hook-event channel lives in a user-scoped
+state root outside the project (#494) — `$XDG_STATE_HOME/bmad-loop`, else
+`~/.local/state/bmad-loop`; `%LOCALAPPDATA%\bmad-loop\state` on Windows; or whatever
+`BMAD_LOOP_STATE_DIR` names. Step 1 collected this project's runs from it, leaving an empty
+per-project directory whose name is a digest of the project path — not something to pick out by
+hand. That root is shared by **every** project on this machine, so delete the whole thing only if
+you are removing bmad-loop everywhere:
+
+```bash
+rm -rf "${XDG_STATE_HOME:-$HOME/.local/state}/bmad-loop"   # all projects on this machine
 ```
 
 ### 3. Remove the bundled skills

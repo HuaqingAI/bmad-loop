@@ -266,6 +266,15 @@ def state_root() -> Path:
     )
 
 
+def project_state_root(project: Path) -> Path:
+    """The subtree of :func:`state_root` holding every run of this project:
+    ``<state root>/<project key>``. Split out from :func:`state_dir_for` because
+    the GC reads it as a *directory to enumerate* rather than composing one run's
+    path — see :func:`reconcile_orphan_state_dirs`, whose whole job is the entries
+    under here that no longer have a run dir."""
+    return state_root() / project_tag(project)
+
+
 def state_dir_for(project: Path, run_id: str) -> Path:
     """This run's control-plane directory: ``<state root>/<project key>/<run id>``.
 
@@ -284,7 +293,7 @@ def state_dir_for(project: Path, run_id: str) -> Path:
     :func:`is_valid_run_id`, and an id from outside is rejected there rather than
     coerced here.
     """
-    return state_root() / project_tag(project) / run_id
+    return project_state_root(project) / run_id
 
 
 def events_dir_for(project: Path, run_id: str) -> Path:
@@ -776,6 +785,35 @@ def _refuse_live_session(project: Path, run_id: str, verb: str) -> None:
         )
 
 
+def _discard_state_dir(project: Path, run_id: str) -> None:
+    """Remove the run's out-of-tree control-plane counterpart, best-effort.
+
+    The events channel (#494) lives outside the project tree, so removing a run
+    dir no longer removes everything the run owns: without this every
+    delete/archive would leak ``<state root>/<project>/<run-id>/`` forever. It
+    lives here rather than in the CLI so every caller inherits it — `delete`,
+    `archive`, `clean`, the TUI's removal actions and the engine's own
+    finish-time reclamation alike.
+
+    A **never-raise tail**, per the teardown doctrine (#139): the run dir is
+    already gone by the time this runs, and failing the operator's delete over an
+    unreachable state root would report a removal that in fact happened. The two
+    catchable outcomes are both "the counterpart could not even be named" —
+    :class:`StateRootError` for an environment with no derivable root, ``OSError``
+    for a project path the OS cannot canonicalize (:func:`project_tag` resolves
+    before digesting). Removal failures are absorbed by ``ignore_errors``. Either
+    way the orphan sweep in :func:`reconcile_orphan_state_dirs` is the backstop.
+
+    Deliberately not called by :func:`trim_run_dir`: a trimmed run is still live
+    on disk and resumable, and its control plane must outlive the scaffolding.
+    """
+    try:
+        target = state_dir_for(project, run_id)
+    except (StateRootError, OSError):
+        return
+    shutil.rmtree(target, ignore_errors=True)
+
+
 def delete_run(project: Path, run_dir: Path, *, force: bool = False) -> None:
     """Permanently remove a run directory. Callers enforce the engine-liveness
     guard; the session guard is enforced here (see :func:`_refuse_live_session`),
@@ -789,6 +827,9 @@ def delete_run(project: Path, run_dir: Path, *, force: bool = False) -> None:
     if not force:
         _refuse_live_session(project, run_dir.name, "delete")
     shutil.rmtree(run_dir)
+    # after the run dir, never before: a raise above leaves the run whole, and a
+    # whole run keeps its control plane (see _discard_state_dir).
+    _discard_state_dir(project, run_dir.name)
 
 
 def archive_run(project: Path, run_dir: Path, *, force: bool = False) -> Path:
@@ -797,7 +838,13 @@ def archive_run(project: Path, run_dir: Path, *, force: bool = False) -> Path:
     place so a partial archive never appears. Callers enforce the engine-liveness
     guard; the session guard is enforced here (see :func:`_refuse_live_session`,
     and :func:`delete_run` for ``force``) and runs before the tarball is written,
-    so a refusal leaves nothing behind."""
+    so a refusal leaves nothing behind.
+
+    The tarball holds the run dir only, so since #494 an archive no longer carries
+    the run's ``events/``: the channel moved out of the tree, and its files are
+    transient completion signals the watcher has already consumed — the recorded
+    decision accepts losing them from the archive. Everything an archive is read
+    for later (state, journal, tasks, logs) is in the run dir and unaffected."""
     if not force:
         _refuse_live_session(project, run_dir.name, "archive")
     archive_dir = project / ARCHIVE_DIR
@@ -808,6 +855,7 @@ def archive_run(project: Path, run_dir: Path, *, force: bool = False) -> Path:
         tar.add(run_dir, arcname=run_dir.name)
     atomic_replace(tmp, dest)
     shutil.rmtree(run_dir)
+    _discard_state_dir(project, run_dir.name)  # same tail as delete_run
     return dest
 
 
@@ -897,10 +945,89 @@ def reconcile_stale_worktrees(repo: Path, project: Path, *, dry_run: bool = Fals
     return handled
 
 
+def _run_dir_names(project: Path) -> set[str] | None:
+    """Every *directory name* under the runs dir, or ``None`` when that listing
+    could not be taken.
+
+    Deliberately not :func:`list_run_dirs`, which is ``state.json``-gated: this
+    answers "does a run dir by this name exist", and a run whose ``state.json`` is
+    missing or corrupt still owns its control plane. Gating on state.json would
+    sweep the counterpart out from under exactly the run an operator is trying to
+    recover.
+
+    The two failures are distinguished because they mean opposite things. A
+    *missing* runs dir is a real answer — no runs, so nothing is live — while an
+    unreadable one answers nothing at all, and a sweep run against "no live names"
+    would remove every state dir this project has. ``None`` is that second case.
+    """
+    try:
+        return {entry.name for entry in os.scandir(project / RUNS_DIR) if entry.is_dir()}
+    except FileNotFoundError:
+        return set()
+    except OSError:
+        return None
+
+
+def reconcile_orphan_state_dirs(project: Path, *, dry_run: bool = False) -> list[Path]:
+    """Remove this project's out-of-tree control-plane dirs whose run dir is gone.
+
+    The GC backstop for the events channel (#494). :func:`_discard_state_dir`
+    removes the counterpart on every ordinary delete/archive, so this catches what
+    that path could not: a run dir removed by hand or by an `rm -rf .bmad-loop`,
+    a delete that ran before this version existed, and any tail that failed
+    quietly. Without it the state root accumulates one dead subtree per run
+    forever, on a path outside the project that no operator thinks to look at.
+
+    Shaped like :func:`reconcile_orphan_worktrees`: enumerate on-disk truth,
+    containment-test each path, remove with failures tolerated. Returns what was
+    removed (or, under ``dry_run``, what would be).
+
+    Every path is built from an entry name this function itself enumerated —
+    never from a caller-supplied ref, which is what :func:`_is_path_escape`
+    refuses on the ref-resolution path. Entries that are not real directories are
+    skipped, symlinks included: a link is not a state dir we created, and
+    reporting one swept would be a false count even where ``rmtree`` refuses it.
+    The containment test then covers what ``is_symlink`` cannot — a Windows
+    *junction* reads as a plain directory while ``resolve()`` follows it, so
+    without the test ``rmtree`` would empty a target sitting outside the root.
+    That case is POSIX-invisible, and the tests say so rather than claim it.
+
+    Degrades to no-op rather than raising, in either direction: an underivable
+    state root, an unreadable root, or an unreadable runs dir all sweep nothing.
+    This is reclamation, not repair — leaving disk behind is the cheap outcome,
+    and removing a live run's control plane is not.
+    """
+    live = _run_dir_names(project)
+    if live is None:
+        return []
+    try:
+        root = project_state_root(project)
+        entries = sorted(root.iterdir())
+        root_res = root.resolve()
+    except (StateRootError, OSError):
+        return []
+    handled: list[Path] = []
+    for entry in entries:
+        if entry.name in live or entry.is_symlink() or not entry.is_dir():
+            continue
+        try:
+            entry.resolve().relative_to(root_res)
+        except (OSError, ValueError):
+            continue
+        handled.append(entry)
+        if not dry_run:
+            shutil.rmtree(entry, ignore_errors=True)
+    return handled
+
+
 def trim_run_dir(run_dir: Path, *, dry_run: bool = False) -> list[Path]:
     """Delete heavy scaffolding (the ``worktrees/`` tree) from a concluded run
     dir, preserving its TUI-visible core so the run still appears in the
-    dashboard with full status/journal/logs. Returns the paths removed."""
+    dashboard with full status/journal/logs. Returns the paths removed.
+
+    The run's out-of-tree control plane is deliberately left alone (see
+    :func:`_discard_state_dir`): a trimmed run still exists and is still
+    resumable, so its state dir has to outlive its scaffolding."""
     removed: list[Path] = []
     for name in _HEAVY_RUN_ENTRIES:
         p = run_dir / name

@@ -3385,6 +3385,13 @@ def cmd_clean(args: argparse.Namespace) -> int:
                 freed += wt_bytes
                 trimmed.append(run_dir.name)
 
+    # After the loop, so the counterparts the removals above already took are gone
+    # from the enumeration rather than counted twice. Their bytes stay out of
+    # `freed` on purpose: a state dir holds consumed event files and nothing else,
+    # so sizing every one of them would buy kilobytes of accuracy for a walk of a
+    # second tree. The count is the honest report of what went.
+    swept = len(runs.reconcile_orphan_state_dirs(project, dry_run=dry))
+
     if args.json:
         machine.emit(
             clean_document(
@@ -3398,12 +3405,12 @@ def cmd_clean(args: argparse.Namespace) -> int:
                 deleted=deleted,
                 protected=protected,
                 unverifiable_pid=unverifiable,
+                state_dirs_swept=swept,
             )
         )
         return 0
-    if not worktrees and not trimmed and not archived and not deleted:
-        print("nothing to reclaim")
-    else:
+    reclaimed = bool(worktrees or trimmed or archived or deleted)
+    if reclaimed:
         head = "would reclaim" if dry else "reclaimed"
         print(
             f"{head} ~{_human_bytes(freed)}: {len(worktrees)} worktree(s), "
@@ -3413,6 +3420,12 @@ def cmd_clean(args: argparse.Namespace) -> int:
             print(f"  archived {name} -> .bmad-loop/archive/{name}.tar.gz")
         for name in deleted:
             print(f"  deleted {name}")
+    if swept:
+        # its own line rather than a fifth count in the summary above, which is a
+        # reclaimed-bytes report these dirs are deliberately outside of
+        print(f"{'would sweep' if dry else 'swept'} {swept} orphaned run state dir(s)")
+    if not reclaimed and not swept:
+        print("nothing to reclaim")
     if protected:
         print(f"left {len(protected)} live/resumable run(s) untouched")
     return 0

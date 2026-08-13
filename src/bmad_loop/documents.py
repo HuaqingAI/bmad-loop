@@ -454,6 +454,7 @@ def clean_document(
     deleted: list[str],
     protected: list[str],
     unverifiable_pid: list[str],
+    state_dirs_swept: int,
 ) -> dict[str, object]:
     """The `clean --json` document: the disk this invocation reclaimed, or —
     under ``--dry-run`` — would reclaim.
@@ -483,6 +484,15 @@ def clean_document(
     `[cleanup] run_retention`. The other three are the configured policy as
     loaded. Note `--hard` overrides `archive_old` for this invocation only, so
     it does not change the reported value; the outcome shows in `deleted`.
+
+    `state_dirs_swept` counts the orphaned out-of-tree control-plane dirs the
+    invocation reclaimed (#494) — run state dirs under the user-scoped state root
+    with no run dir left to own them. A count rather than a list, because that is
+    exactly what the text mode reports and the paths name a location outside the
+    project that no caller acts on per-item. It is an additive field on the
+    existing schema version: a v1 consumer reads every field it already knew.
+    Those dirs hold only consumed event files, so their bytes are not in
+    `freed_bytes` — an accepted under-count of a few kilobytes at most.
     """
     return {
         "schema_version": CLEAN_SCHEMA_VERSION,
@@ -500,4 +510,5 @@ def clean_document(
         "deleted": list(deleted),
         "protected": list(protected),
         "unverifiable_pid": list(unverifiable_pid),
+        "state_dirs_swept": state_dirs_swept,
     }
