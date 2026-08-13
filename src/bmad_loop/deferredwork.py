@@ -875,7 +875,13 @@ def append_decision(path: Path, dw_id: str, date: str, label: str, detail: str) 
 
     Precondition: `date` is ISO `YYYY-MM-DD`; anything else raises `ValueError`,
     checked before the ``is_file`` short-circuit so an absent ledger cannot hide
-    the bug."""
+    the bug.
+
+    The write goes through :func:`~bmad_loop.platform_util.atomic_write_text` for
+    the reasons documented on :func:`mark_done_many`, plus one this sibling shares
+    with it: a bare ``Path.write_text`` truncates *before* it encodes, so any
+    failure between the two — an unencodable value, ``ENOSPC``, ``EIO`` — leaves a
+    zero-byte ledger where every entry used to be (#328)."""
     _require_iso_date(date)
     if not path.is_file():
         return False
@@ -890,7 +896,7 @@ def append_decision(path: Path, dw_id: str, date: str, label: str, detail: str) 
     detail = _one_line(detail)
     detail_part = f" — {detail}" if detail else ""
     text = _insert_after_status(text, entry, f"decision: {date} {label}{detail_part}")
-    path.write_text(text, encoding="utf-8")
+    atomic_write_text(path, text)
     return True
 
 
@@ -938,7 +944,13 @@ def append_entry(
     :func:`field_line_present`: sanitizing afterwards would compare a raw value
     against a sanitized line, so every replay of the same multiline defer would
     miss its own entry and append another. `status` and `severity` are
-    orchestrator-owned enumerations and raise instead."""
+    orchestrator-owned enumerations and raise instead.
+
+    The write goes through :func:`~bmad_loop.platform_util.atomic_write_text` for
+    the reasons documented on :func:`mark_done_many`, plus one this sibling shares
+    with it: a bare ``Path.write_text`` truncates *before* it encodes, so any
+    failure between the two — an unencodable value, ``ENOSPC``, ``EIO`` — leaves a
+    zero-byte ledger where every entry used to be (#328)."""
     _require_canonical_status(status)
     # The whitelist is derived from the legacy parser's alias table (defined
     # below; resolved at call time) so what this writer emits and what
@@ -993,7 +1005,7 @@ def append_entry(
     else:
         sep = "\n\n"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text + sep + block, encoding="utf-8")
+    atomic_write_text(path, text + sep + block)
     return dw_id
 
 

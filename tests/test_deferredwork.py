@@ -467,6 +467,23 @@ def test_append_decision_missing_file(tmp_path):
     assert not mark_done(tmp_path / "nope.md", "DW-1", "2026-06-11", "x")
 
 
+def test_append_decision_write_failure_raises_and_keeps_the_ledger(tmp_path, monkeypatch):
+    """#328. `Path.write_text` opens `'w'` (truncate) and only THEN encodes, so a
+    failure anywhere in that window left the whole ledger at zero bytes. The
+    atomic helper builds the replacement beside the target, so a raise leaves the
+    original exactly as it was."""
+    path = write_ledger(tmp_path)
+    before = path.read_bytes()
+
+    def boom(path, text):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(deferredwork, "atomic_write_text", boom)
+    with pytest.raises(OSError, match="disk full"):
+        append_decision(path, "DW-3", "2026-06-11", "Keep cap", "frozen intent stands")
+    assert path.read_bytes() == before
+
+
 # ------------------------------------------------- line-break injection (#305)
 #
 # The ledger is line-oriented and every mutator interpolates its arguments, so a
@@ -1352,6 +1369,56 @@ def test_append_entry_leaves_a_clean_value_byte_identical(tmp_path):
         "reason: review budget exhausted, work committed\n"
         "status: open\n"
     )
+
+
+def test_append_entry_write_failure_raises_and_keeps_the_ledger(tmp_path, monkeypatch):
+    """#328, the `append_entry` half — see the `append_decision` twin above."""
+    path = write_ledger(tmp_path)
+    before = path.read_bytes()
+
+    def boom(path, text):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(deferredwork, "atomic_write_text", boom)
+    with pytest.raises(OSError, match="disk full"):
+        append_entry(
+            path,
+            title="new finding",
+            origin="review of spec-foo.md",
+            source_spec="spec-foo.md",
+            reason="out of scope",
+        )
+    assert path.read_bytes() == before
+
+
+def test_append_entry_encode_failure_cannot_truncate_the_ledger(tmp_path, monkeypatch):
+    """#328's worst case, reached without any injected OSError: an unencodable
+    value raises from inside the encode step itself. Under a bare `write_text`
+    the file is already truncated by then, so the raise and the data loss arrive
+    together — the exact compounding #329 describes."""
+    path = write_ledger(tmp_path)
+    before = path.read_bytes()
+    # Patching the sanitizer to the identity is a NO-OP today: `_one_line`
+    # collapses line breaks and does not touch surrogates, so the value would
+    # reach the write unchanged either way. It becomes load-bearing after the
+    # #329 phase adds surrogate neutralization there. Keeping it pins the WRITE
+    # layer's defense independently of the sanitizer's — without it this row
+    # would quietly stop testing #328 and become a second test of #329's fix.
+    # Do not remove it.
+    monkeypatch.setattr(deferredwork, "_one_line", lambda v: v)
+
+    with pytest.raises(UnicodeEncodeError):
+        append_entry(
+            path,
+            title="\ud800",
+            origin="review of spec-foo.md",
+            source_spec="spec-foo.md",
+            reason="out of scope",
+        )
+
+    # The raise is NOT the invariant under test — a bare `write_text` raises here
+    # too. The bytes are: this is the assertion that reddens without the fix.
+    assert path.read_bytes() == before
 
 
 def test_field_line_present_matches_field_not_substring():

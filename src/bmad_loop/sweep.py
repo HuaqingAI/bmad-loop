@@ -21,7 +21,7 @@ from . import deferredwork, gates, verify
 from .engine import Engine
 from .escalation import critical_escalations, env_fault_pause_reason, session_failure_reason
 from .model import Phase, StoryTask
-from .platform_util import atomic_replace
+from .platform_util import atomic_replace, atomic_write_text
 from .statemachine import advance
 from .workspace import discard_worktree
 
@@ -793,7 +793,7 @@ class SweepEngine(Engine):
             # ledger that `git reset` cannot restore
             self._safe_reset(task)
             ledger.parent.mkdir(parents=True, exist_ok=True)
-            ledger.write_text(text, encoding="utf-8")
+            atomic_write_text(ledger, text)
             if task.attempt >= self.policy.sweep.max_migration_attempts:
                 self._escalate(
                     task, "migration failed deterministic validation: " + "; ".join(errors)
@@ -1152,7 +1152,7 @@ class SweepEngine(Engine):
         lines += ["", "## Ledger entries (verbatim)", "", "\n\n".join(blocks), ""]
         path = self.run_dir / "bundles" / dirname / "intent.md"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("\n".join(lines), encoding="utf-8")
+        atomic_write_text(path, "\n".join(lines))
         return path
 
     def _ensure_bundle_intent(self, task: StoryTask) -> None:
