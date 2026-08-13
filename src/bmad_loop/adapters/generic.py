@@ -410,6 +410,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         usage_grace_s: float | None = None,
         stop_without_result_nudges: int | None = None,
         mux: TerminalMultiplexer | None = None,
+        events_dir: Path | None = None,
     ):
         self.run_dir = run_dir
         self.policy = policy
@@ -441,7 +442,19 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         self.name = f"{profile.name}-tmux"
         self.binary = binary or profile.binary
         self.session_name = f"bmad-loop-{run_dir.name}"
-        self.watcher = SignalWatcher(run_dir / "events")
+        # The run's hook-event channel (#494): the out-of-tree directory the run
+        # bootstrap resolved, plus the legacy in-tree one kept under poll so a
+        # project whose installed relay predates the move still completes its
+        # sessions. `events_dir` is handed in rather than derived here because
+        # deriving it needs the PROJECT, and the only project this class can
+        # reach is `run_dir.parents[2]` — a shape real run dirs have and test run
+        # dirs do not, so a derivation would key the watcher off a directory that
+        # is not the project (see `_ensure_session`, which accepts exactly that
+        # weakness for a session tag but must not for the completion channel).
+        # Defaulting to the legacy dir keeps direct construction (tests, any
+        # caller outside `runsetup.make_adapters`) working unchanged; the
+        # bootstrap always passes one, pinned by a test.
+        self.watcher = SignalWatcher(events_dir or run_dir / "events", run_dir / "events")
         self.tasks_dir = run_dir / "tasks"
         self.logs_dir = run_dir / LOGS_DIR
         self.tasks_dir.mkdir(parents=True, exist_ok=True)

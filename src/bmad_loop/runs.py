@@ -9,11 +9,12 @@ import os
 import re
 import secrets
 import shutil
+import sys
 import tarfile
 import time
 from pathlib import Path
 
-from . import devcontract, verify
+from . import devcontract, envvars, verify
 from .adapters.multiplexer import MultiplexerError, get_multiplexer
 from .journal import STATE_FILE, Journal, load_state, save_state
 from .model import PAUSE_ESCALATION, Phase, RunState, StoryTask
@@ -149,6 +150,185 @@ def session_target(run_id: str) -> str:
 
 def attach_argv(run_id: str) -> list[str]:
     return attach_target_argv(session_target(run_id))
+
+
+# ------------------------------------------------------- user-scoped state root
+
+
+class StateRootError(Exception):
+    """No user-scoped state root could be derived from this environment — every
+    candidate base was unset, empty, relative, or named the filesystem root. The
+    control plane has nowhere to live, and the caller must fail rather than guess
+    (see :func:`state_root`)."""
+
+
+def _state_base(value: str | None) -> Path | None:
+    """``value`` as a usable base directory, or ``None`` when it cannot be one.
+
+    The single rule every *derived* candidate below is held to, so the POSIX and
+    win32 branches cannot drift into judging their inputs differently. A base is
+    rejected when it is unset, empty, relative, or names the filesystem root
+    itself. The last three are the answers a broken environment gives *instead* of
+    raising, which is what makes them worth naming:
+
+    - **empty**: ``os.path.expanduser("~")`` answers ``""`` on Windows for a
+      set-but-empty ``USERPROFILE``, and ``Path("")`` is the current directory.
+    - **relative**: including ``"~"`` itself, which is what ``expanduser`` returns
+      when it cannot expand at all. The state root would then move with the
+      launch cwd, and a run whose control plane it cannot find again is a run
+      that stalls to ``session_timeout_min`` rather than one that fails.
+    - **the root**: ``expanduser("~")`` answers ``"/"`` on POSIX for a set-but-empty
+      ``HOME`` (``posixpath`` folds the empty prefix to the root), which would put
+      ``/.local/state/bmad-loop`` on the filesystem root — a permission error for
+      an ordinary user and, for a containerised root, a silent write to ``/``.
+      ``base == base.parent`` is the root test on both flavours.
+
+    ``os.path.isabs`` rather than :func:`platform_util.is_absolute_path`: the
+    latter is purpose-built for "must stay inside the project" guards and is
+    strictly broader — it calls the drive-*relative* ``C:foo`` absolute, which is
+    exactly the value that must not become a state root. The question here is the
+    platform's own, and each branch below only ever runs on its own platform.
+    """
+    if not value or not os.path.isabs(value):
+        return None
+    base = Path(value)
+    return None if base == base.parent else base
+
+
+def state_root() -> Path:
+    """The bmad-loop state root for this user: the out-of-tree home of per-run
+    control-plane state — the events channel (#494) and, later, the config digest
+    (#498). Outside the project tree because a branch switch, a worktree mount or
+    a rollback must not be able to take a live run's control plane away.
+
+    Resolution, first answer wins:
+
+    1. ``BMAD_LOOP_STATE_DIR``, used as the state root **itself** — no
+       ``bmad-loop`` segment is appended, because the variable names our root
+       rather than a base to build one under. It is honoured as spelled (see
+       :func:`envvars.state_dir`) and is not passed through ``_state_base``:
+       *skipping* a stated override would be a silent countermand, where skipping
+       a derived base only moves on to the next guess.
+
+       It must still be **absolute**, and a relative spelling raises rather than
+       being resolved for the operator. Absoluteness is not a matter of taste
+       here — the root is read by two processes with different working
+       directories. The engine exports it to the session as
+       ``BMAD_LOOP_EVENTS_DIR`` and the multiplexer launches that session at
+       ``spec.cwd`` (a worktree under isolation), while the watcher polls it from
+       the orchestrator's own cwd. A relative root therefore names two different
+       directories at once: the relay writes its Stop where nothing is watching,
+       and the run waits out ``session_timeout_min`` — the exact silent stall
+       ``_state_base`` rejects relative *derived* bases to avoid, and the one
+       this whole channel was moved out of the tree to prevent.
+
+       Raising is not the countermand the paragraph above refuses: it names the
+       variable and the fix, where absolutizing against whichever cwd this
+       process happens to have would be the guess. The not-the-root half of
+       ``_state_base``'s rule is deliberately *not* applied — that half exists to
+       stop a broken environment's ``""`` from landing a guess at ``/``, and an
+       override is not a guess.
+    2. POSIX — ``$XDG_STATE_HOME/bmad-loop`` when that variable names an absolute
+       path, else ``~/.local/state/bmad-loop``. A relative ``XDG_STATE_HOME`` is
+       *ignored*, which the XDG base-directory spec requires of its consumers.
+       (``install._shield_inherited_excludes`` resolves a relative
+       ``XDG_CONFIG_HOME`` instead of ignoring it — the opposite call for the
+       opposite reason: there we reproduce *git's* reading of the variable, here
+       we are the spec's own consumer.)
+    3. win32 — ``%LOCALAPPDATA%\\bmad-loop\\state``, else
+       ``%USERPROFILE%\\AppData\\Local\\bmad-loop\\state``. ``LOCALAPPDATA`` names
+       the per-user, per-machine, non-roaming store Windows intends for exactly
+       this, and the second form is its documented default location.
+
+    **Never** ``Path.home()`` on the win32 arm. It is ``ntpath.expanduser("~")``,
+    which prefers ``USERPROFILE`` and then falls back to ``HOMEDRIVE`` +
+    ``HOMEPATH`` — a pair that on a domain-joined machine may name a network home
+    share. A control plane whose atomic renames and ``O_NOFOLLOW``-anchored writes
+    live on an SMB share is not the local directory this needs, and the derivation
+    also disagrees with the one git uses for its own ``$HOME``
+    (``install._shield_home_git_ignore`` documents that split in full). Reading
+    ``LOCALAPPDATA``/``USERPROFILE`` directly asks for the store by name instead of
+    inferring it from a home.
+
+    Raises :class:`StateRootError` when no candidate answers. This is a write
+    path, so it raises rather than degrading to a plausible-looking default:
+    ``platform_util.resolve_or_lexical`` states the doctrine (observation may
+    degrade, repair writes must raise), and the degraded outcomes here are all
+    silent — a control plane at the cwd, or at ``/``, that the *next* process to
+    ask resolves somewhere else.
+    """
+    override = envvars.state_dir()
+    if override:
+        # `os.path.isabs` on the raw string, matching `_state_base` exactly rather
+        # than `Path.is_absolute` — the rule and its reason are stated there.
+        if not os.path.isabs(override):
+            raise StateRootError(
+                f"{envvars.STATE_DIR} must name an absolute directory: {override!r} is "
+                "relative, and the state root is read by both this process and the "
+                "session it launches — which run from different working directories, "
+                "so a relative root names two different places and the run's "
+                "completion signal is written where nothing is watching"
+            )
+        return Path(override)
+    if sys.platform == "win32":
+        local = _state_base(os.environ.get("LOCALAPPDATA"))
+        if local:
+            return local / "bmad-loop" / "state"
+        profile = _state_base(os.environ.get("USERPROFILE"))
+        if profile:
+            return profile / "AppData" / "Local" / "bmad-loop" / "state"
+    else:
+        xdg = _state_base(os.environ.get("XDG_STATE_HOME"))
+        if xdg:
+            return xdg / "bmad-loop"
+        home = _state_base(os.path.expanduser("~"))
+        if home:
+            return home / ".local" / "state" / "bmad-loop"
+    raise StateRootError(
+        "cannot locate a state directory for bmad-loop's run control plane: "
+        + (
+            "neither %LOCALAPPDATA% nor %USERPROFILE% names an absolute directory"
+            if sys.platform == "win32"
+            else "neither $XDG_STATE_HOME nor $HOME names an absolute directory"
+        )
+        + f" — set {envvars.STATE_DIR} to the directory it should live in"
+    )
+
+
+def project_state_root(project: Path) -> Path:
+    """The subtree of :func:`state_root` holding every run of this project:
+    ``<state root>/<project key>``. Split out from :func:`state_dir_for` because
+    the GC reads it as a *directory to enumerate* rather than composing one run's
+    path — see :func:`reconcile_orphan_state_dirs`, whose whole job is the entries
+    under here that no longer have a run dir."""
+    return state_root() / project_tag(project)
+
+
+def state_dir_for(project: Path, run_id: str) -> Path:
+    """This run's control-plane directory: ``<state root>/<project key>/<run id>``.
+
+    The project key is :func:`project_tag`, reused verbatim rather than re-derived:
+    it already resolves the project before digesting it, so the two spellings of
+    one project a caller can arrive with — a symlinked path, a relative one — key
+    to the same directory. They must, or a run started through one spelling would
+    write its events where a poll through the other never looks, and the run would
+    wait out ``session_timeout_min`` with the completion signal sitting on disk.
+    Its ``resolve()`` raising on a project the OS cannot canonicalize is correct
+    here for the same reason: an unknowable location cannot be keyed at all, and
+    guessing one is the wrong-directory write the tag exists to prevent.
+
+    ``run_id`` needs no sanitizing — the id contract (see :data:`RUN_ID_RE`) is
+    already "a legal path segment on every platform", pinned by
+    :func:`is_valid_run_id`, and an id from outside is rejected there rather than
+    coerced here.
+    """
+    return project_state_root(project) / run_id
+
+
+def events_dir_for(project: Path, run_id: str) -> Path:
+    """The run's hook-event channel: the directory the relay writes a session's
+    events into and ``SignalWatcher`` polls for them."""
+    return state_dir_for(project, run_id) / "events"
 
 
 # ---------------------------------------------------- run resolution / liveness
@@ -634,6 +814,40 @@ def _refuse_live_session(project: Path, run_id: str, verb: str) -> None:
         )
 
 
+def _discard_state_dir(project: Path, run_id: str) -> None:
+    """Remove the run's out-of-tree control-plane counterpart, best-effort.
+
+    The events channel (#494) lives outside the project tree, so removing a run
+    dir no longer removes everything the run owns: without this every
+    delete/archive would leak ``<state root>/<project>/<run-id>/`` forever. It
+    lives here rather than in the CLI so every caller inherits it — `delete`,
+    `archive`, `clean`, the TUI's removal actions and the engine's own
+    finish-time reclamation alike.
+
+    A **never-raise tail**, per the teardown doctrine (#139): the run dir is
+    already gone by the time this runs, and failing the operator's delete over an
+    unreachable state root would report a removal that in fact happened. Every
+    catchable outcome is "the counterpart could not even be named" —
+    :class:`StateRootError` for an environment with no derivable root, and
+    ``OSError``/``RuntimeError`` for a project path the OS cannot canonicalize
+    (:func:`project_tag` resolves before digesting). ``RuntimeError`` is not
+    optional there: below 3.13 ``Path.resolve`` reports a symlink loop that way
+    rather than as ``OSError`` (measured — 3.11 and 3.12 raise, 3.13 and 3.14
+    return the unresolved path), so on two supported interpreters an ``OSError``
+    -only guard lets a loop escape and breaks the promise in this paragraph.
+    Removal failures are absorbed by ``ignore_errors``. Either way the orphan
+    sweep in :func:`reconcile_orphan_state_dirs` is the backstop.
+
+    Deliberately not called by :func:`trim_run_dir`: a trimmed run is still live
+    on disk and resumable, and its control plane must outlive the scaffolding.
+    """
+    try:
+        target = state_dir_for(project, run_id)
+    except (StateRootError, OSError, RuntimeError):
+        return
+    shutil.rmtree(target, ignore_errors=True)
+
+
 def delete_run(project: Path, run_dir: Path, *, force: bool = False) -> None:
     """Permanently remove a run directory. Callers enforce the engine-liveness
     guard; the session guard is enforced here (see :func:`_refuse_live_session`),
@@ -647,6 +861,9 @@ def delete_run(project: Path, run_dir: Path, *, force: bool = False) -> None:
     if not force:
         _refuse_live_session(project, run_dir.name, "delete")
     shutil.rmtree(run_dir)
+    # after the run dir, never before: a raise above leaves the run whole, and a
+    # whole run keeps its control plane (see _discard_state_dir).
+    _discard_state_dir(project, run_dir.name)
 
 
 def archive_run(project: Path, run_dir: Path, *, force: bool = False) -> Path:
@@ -655,7 +872,13 @@ def archive_run(project: Path, run_dir: Path, *, force: bool = False) -> Path:
     place so a partial archive never appears. Callers enforce the engine-liveness
     guard; the session guard is enforced here (see :func:`_refuse_live_session`,
     and :func:`delete_run` for ``force``) and runs before the tarball is written,
-    so a refusal leaves nothing behind."""
+    so a refusal leaves nothing behind.
+
+    The tarball holds the run dir only, so since #494 an archive no longer carries
+    the run's ``events/``: the channel moved out of the tree, and its files are
+    transient completion signals the watcher has already consumed — the recorded
+    decision accepts losing them from the archive. Everything an archive is read
+    for later (state, journal, tasks, logs) is in the run dir and unaffected."""
     if not force:
         _refuse_live_session(project, run_dir.name, "archive")
     archive_dir = project / ARCHIVE_DIR
@@ -666,6 +889,7 @@ def archive_run(project: Path, run_dir: Path, *, force: bool = False) -> Path:
         tar.add(run_dir, arcname=run_dir.name)
     atomic_replace(tmp, dest)
     shutil.rmtree(run_dir)
+    _discard_state_dir(project, run_dir.name)  # same tail as delete_run
     return dest
 
 
@@ -755,10 +979,111 @@ def reconcile_stale_worktrees(repo: Path, project: Path, *, dry_run: bool = Fals
     return handled
 
 
+def _run_dir_names(project: Path) -> set[str] | None:
+    """Every *directory name* under the runs dir, or ``None`` when that listing
+    could not be taken.
+
+    Deliberately not :func:`list_run_dirs`, which is ``state.json``-gated: this
+    answers "does a run dir by this name exist", and a run whose ``state.json`` is
+    missing or corrupt still owns its control plane. Gating on state.json would
+    sweep the counterpart out from under exactly the run an operator is trying to
+    recover.
+
+    The two failures are distinguished because they mean opposite things. A
+    *missing* runs dir is a real answer — no runs, so nothing is live — while an
+    unreadable one answers nothing at all, and a sweep run against "no live names"
+    would remove every state dir this project has. ``None`` is that second case.
+    """
+    try:
+        return {entry.name for entry in os.scandir(project / RUNS_DIR) if entry.is_dir()}
+    except FileNotFoundError:
+        return set()
+    except OSError:
+        return None
+
+
+def reconcile_orphan_state_dirs(project: Path, *, dry_run: bool = False) -> list[Path]:
+    """Remove this project's out-of-tree control-plane dirs whose run dir is gone.
+
+    The GC backstop for the events channel (#494). :func:`_discard_state_dir`
+    removes the counterpart on every ordinary delete/archive, so this catches what
+    that path could not: a run dir removed by hand or by an `rm -rf .bmad-loop`,
+    a delete that ran before this version existed, and any tail that failed
+    quietly. Without it the state root accumulates one dead subtree per run
+    forever, on a path outside the project that no operator thinks to look at.
+
+    Shaped like :func:`reconcile_orphan_worktrees`: enumerate on-disk truth,
+    containment-test each path, remove with failures tolerated. Returns what was
+    removed (or, under ``dry_run``, what would be).
+
+    Every path is built from an entry name this function itself enumerated —
+    never from a caller-supplied ref, which is what :func:`_is_path_escape`
+    refuses on the ref-resolution path. Entries that are not real directories are
+    skipped, symlinks included: a link is not a state dir we created, and
+    reporting one swept would be a false count even where ``rmtree`` refuses it.
+    The containment test then covers what ``is_symlink`` cannot — a Windows
+    *junction* reads as a plain directory while ``resolve()`` follows it, so
+    without the test ``rmtree`` would empty a target sitting outside the root.
+    That case is POSIX-invisible, and the tests say so rather than claim it.
+
+    Degrades to no-op rather than raising, in either direction: an underivable
+    state root, an unreadable root, or an unreadable runs dir all sweep nothing.
+    This is reclamation, not repair — leaving disk behind is the cheap outcome,
+    and removing a live run's control plane is not.
+
+    Both guards hold ``RuntimeError`` alongside ``OSError`` for the same reason
+    :func:`_discard_state_dir` does: every path here is resolved (the project by
+    :func:`project_tag`, then the root, then each entry), and below 3.13
+    ``Path.resolve`` reports a symlink loop as ``RuntimeError``. A loop planted
+    among the entries would otherwise escape a sweep whose whole contract is to
+    degrade, and take the operator's ``clean`` down with it after its real work
+    was already done.
+
+    **The two reads are ordered, and the order is the whole race guard.** State
+    entries are enumerated *before* the live run-dir names, because a run creates
+    its run dir strictly before its state dir — ``compose_run`` builds the
+    ``Journal`` (which mkdirs the run dir) and only then calls ``make_adapters``,
+    whose ``SignalWatcher`` mkdirs the events dir. Reading entries first makes
+    that ordering carry the guarantee: anything in ``entries`` had its state dir
+    on disk at the first read, so its run dir was on disk *before* that, so the
+    later ``live`` read is certain to contain it. Read the other way round, a run
+    starting in the gap is missing from ``live`` and present in ``entries``, and
+    an operator's ``clean`` deletes the control plane of a run that is starting
+    right now — whose watcher then polls a primary that no longer exists, or
+    simply never sees the Stop. A run dir that disappears *between* the reads is
+    the opposite case and correctly swept: it is a real orphan by then.
+    """
+    try:
+        root = project_state_root(project)
+        entries = sorted(root.iterdir())
+        root_res = root.resolve()
+    except (StateRootError, OSError, RuntimeError):
+        return []
+    live = _run_dir_names(project)
+    if live is None:
+        return []
+    handled: list[Path] = []
+    for entry in entries:
+        if entry.name in live or entry.is_symlink() or not entry.is_dir():
+            continue
+        try:
+            entry.resolve().relative_to(root_res)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        handled.append(entry)
+        if not dry_run:
+            shutil.rmtree(entry, ignore_errors=True)
+    return handled
+
+
 def trim_run_dir(run_dir: Path, *, dry_run: bool = False) -> list[Path]:
     """Delete heavy scaffolding (the ``worktrees/`` tree) from a concluded run
     dir, preserving its TUI-visible core so the run still appears in the
-    dashboard with full status/journal/logs. Returns the paths removed."""
+    dashboard with full status/journal/logs. Returns the paths removed.
+
+    The run's out-of-tree control plane is deliberately left alone (see
+    :func:`_discard_state_dir`): a trimmed run still exists and is still
+    resumable, so its state dir has to outlive its scaffolding."""
     removed: list[Path] = []
     for name in _HEAVY_RUN_ENTRIES:
         p = run_dir / name

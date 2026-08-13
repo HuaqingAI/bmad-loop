@@ -412,7 +412,10 @@ def make_adapters(
     """Build the per-role adapters. ``profiles`` is an already-resolved mapping
     from :func:`resolve_profiles`; when given, no profile is re-read from disk, so
     a caller that gated on :func:`config_digest` launches the *same* bytes it
-    validated (#461 point 4). Omitted, each role resolves fresh as before."""
+    validated (#461 point 4). Omitted, each role resolves fresh as before.
+
+    Also the single resolution point for this run's out-of-tree events directory
+    (#494), handed to every family it builds — see the ``events_dir`` note below."""
     from .adapters.multiplexer import fold_version, get_multiplexer, mux_usable
     from .adapters.profile import ProfileError, get_profile
     from .adapters.registry import AdapterError, get_adapter_kind
@@ -483,6 +486,15 @@ def make_adapters(
                 extra_args=cfg.extra_args,
                 usage_grace_s=cfg.usage_grace_s,
                 stop_without_result_nudges=cfg.stop_without_result_nudges,
+                # The run's out-of-tree hook-event channel (#494). Resolved HERE,
+                # from the `project` this function is handed, because it is the
+                # only layer that holds both halves of the key — the adapter sees
+                # a run dir and nothing else. Handed to every family rather than
+                # gated like `mux`: this is a description of the run, not a
+                # capability, and unlike resolving a multiplexer it costs no probe
+                # and can refuse no host. The engine derives the same value from
+                # the same two inputs for the producing side.
+                events_dir=runs.events_dir_for(project, run_dir.name),
             )
             if kind.needs_mux:
                 # Resolve and probe the shared multiplexer only when a kind

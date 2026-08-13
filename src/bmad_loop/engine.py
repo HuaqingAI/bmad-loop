@@ -54,7 +54,7 @@ from .platform_util import atomic_replace, atomic_write_text, retrying_unlink, s
 from .plugins import HookBus, HookContext, PluginRegistry
 from .policy import Policy
 from .recovery_flow import RecoveryFlow
-from .runs import clear_graceful_stop, graceful_stop_requested, kill_session
+from .runs import clear_graceful_stop, events_dir_for, graceful_stop_requested, kill_session
 from .sprintstatus import ACTIONABLE_STATUSES
 from .sprintstatus import advance as sprint_advance
 from .sprintstatus import load as load_sprint_status
@@ -4057,6 +4057,21 @@ class Engine:
         env = {
             "BMAD_LOOP_MODE": "1",
             "BMAD_LOOP_RUN_DIR": str(self.run_dir),
+            # Where this session's hook relay writes its events (#494). The one
+            # required producer site: every engine-driven session — dev/review,
+            # sweep bundles, stories, injected plugin workflows — is dispatched
+            # through this dict. The deliberate non-sites all fail closed without
+            # it: `resolve.py` sets no BMAD_LOOP_TASK_ID, so the relay no-ops and
+            # an interactive resolve session produces no events at all; `probe.py`
+            # captures through BMAD_LOOP_PROBE_CAPTURE_DIR and its own probe relay;
+            # `plugins/bus.py` spawns plain shells with no task id; the Unity
+            # plugin's helper scripts are not CLI sessions.
+            #
+            # Keyed on the run's project and id, not on `self.run_dir`, so the
+            # value cannot drift from the directory `runsetup.make_adapters`
+            # pointed this run's SignalWatcher at — the producer and the consumer
+            # of one channel, derived by one function from the same two inputs.
+            "BMAD_LOOP_EVENTS_DIR": str(events_dir_for(self.paths.project, self.run_dir.name)),
             "BMAD_LOOP_TASK_ID": task_id,
             "BMAD_LOOP_STORY_KEY": task.story_key,
         }

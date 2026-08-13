@@ -1,39 +1,36 @@
-#!/usr/bin/env python3
-"""Coding-CLI hook relay for bmad-loop. Stdlib only.
+"""Importable twin of the hardened event write in ``data/bmad_loop_hook.py``.
 
-Each CLI's hook config registers this script under its native event names
-(Claude/Codex: SessionStart/Stop/..., Gemini: AfterAgent for Stop, Copilot:
-agentStop for Stop) but always passes the CANONICAL event name as argv[1] — the
-orchestrator only ever sees canonical events. Payload keys vary too: snake_case
-(claude/codex), conversation_id (cursor), or camelCase (copilot's sessionId/
-transcriptPath, agy's conversationId/transcriptPath — protojson encoding); the
-field extraction below tries each. agy alone carries no cwd, sending the
-workspacePaths list instead. Reads the hook payload
-from stdin and writes one event file
-into the orchestrator's events directory. No-ops (exit 0) unless the session was
-spawned by bmad-loop (detected via env vars set on the tmux window), so
-normal interactive sessions are unaffected.
+The hook script is COPIED into every target project and runs inside the coding
+CLI's process under whatever interpreter the host has, so it is stdlib-only by
+contract (its docstring says so) and cannot import ``bmad_loop`` to reach this
+module — and this module cannot import it back, since it ships as package DATA
+rather than as an importable module. Hence a twin rather than shared code:
+``_LINK_REPARSE_TAGS``, ``_first_workspace``, ``_is_link_like``, ``_write_all``
+and ``_write_event`` below are byte-identical copies of the hook's, pinned that
+way by ``tests/test_events.py::test_the_twinned_source_is_identical`` — which
+AST-extracts both sides and compares the source segments, so a fix applied to one
+writer of the events control plane and not the other cannot pass review silently.
 
-Where that directory is: $BMAD_LOOP_EVENTS_DIR when the orchestrator names one,
-else the legacy $BMAD_LOOP_RUN_DIR/events. The channel moved out of the project
-tree in #494 so a branch switch or a worktree mount cannot take a live run's
-control plane away, and this script is COPIED into the target project at init
-time — so an upgraded orchestrator regularly drives sessions whose installed
-copy is this file's older self, which knows only the legacy path. That pairing
-is what the orchestrator's own dual poll (signals.SignalWatcher) covers.
+Because they are byte-identical, their docstrings and comments are written from
+the hook script's vantage point ("this relay runs under whatever interpreter the
+host has") and stay that way on purpose: rewording either side to suit its own
+file breaks parity, and diverging is exactly what two separately-hardened writers
+of one control plane must not do. What the shared text says about the attack, the
+platform branches, and the residual Windows windows holds for both.
 
-$BMAD_LOOP_EVENTS_DIR is deliberately NOT part of the no-op detector above: the
-mirror-image skew — an older orchestrator that sets only RUN_DIR/TASK_ID driving
-a session whose installed relay is this newer file — must still write its
-events, and requiring the new variable would silently stall every one of those
-runs instead.
+The rest of the module is this side's own: the payload shaping the hook does
+inline in its ``main()``, and :func:`relay`, which backs ``bmad-loop relay
+<Event>`` — the #461 Phase 2 hook target, an installed console script instead of
+a file path inside the workspace that a branch switch can take away.
 """
+
+from __future__ import annotations
 
 import json
 import os
 import stat
-import sys
 import time
+from typing import IO, Any
 
 # Windows reparse tags that make a directory entry REDIRECT somewhere else,
 # compared against os.lstat().st_reparse_tag (Windows, 3.8+). Deliberately not
@@ -178,21 +175,21 @@ def _write_event(events_dir, name, event):
     os.replace(tmp_path, os.path.join(events_dir, name))
 
 
-def main() -> int:
-    run_dir = os.environ.get("BMAD_LOOP_RUN_DIR")
-    task_id = os.environ.get("BMAD_LOOP_TASK_ID")
-    if not run_dir or not task_id:
-        return 0
-    event_name = sys.argv[1] if len(sys.argv) > 1 else "Unknown"
-    try:
-        payload = json.load(sys.stdin)
-    except (json.JSONDecodeError, ValueError):
-        payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
+# --------------------------------------------------------------- this side only
 
-    ts = time.time_ns()
-    event = {
+
+def event_file_name(ts: int, task_id: str, event_name: str) -> str:
+    """The event file's name. Sorted-by-time by construction (``ts`` first, fixed
+    width in practice), and carrying the task id so ``SignalWatcher`` can attribute
+    a file without opening it. Mirrors the hook's f-string exactly; the twin above
+    stops at the write, so this and :func:`shape_event` are pinned behaviorally
+    instead (``test_relay_and_hook_produce_the_same_event``)."""
+    return f"{ts}-{task_id}-{event_name}.json"
+
+
+def shape_event(ts: int, event_name: str, task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """The event record the orchestrator consumes, built from one hook payload."""
+    return {
         "ts": ts,
         "event": event_name,
         "task_id": task_id,
@@ -209,20 +206,61 @@ def main() -> int:
         # agy sends no cwd — it sends workspacePaths, a list of workspace roots.
         "cwd": payload.get("cwd") or _first_workspace(payload),
     }
-    # The orchestrator's own events dir when it named one, else the legacy
-    # in-tree location this file's older selves are still installed at (see the
-    # module docstring). `or`, not a presence test: an exported-but-empty value
-    # names the launch cwd, which is not a control plane.
+
+
+def _read_payload(stdin: IO[str]) -> dict[str, Any]:
+    """The hook payload, or an empty dict for anything unreadable.
+
+    A hook that fires with nothing on stdin, half a JSON document, undecodable
+    bytes, or a bare list is not an error the operator can act on — the event still
+    has to be written, because the run's completion signal rides on it. Every
+    non-dict outcome collapses to ``{}`` and the shaped event simply carries nulls.
+    ``UnicodeDecodeError`` and ``json.JSONDecodeError`` are both ``ValueError``
+    subclasses and ride the same arm; ``OSError`` covers a closed or unreadable
+    descriptor.
+    """
+    try:
+        payload = json.load(stdin)
+    except (ValueError, OSError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def relay(event_name: str, stdin: IO[str]) -> int:
+    """Write one event file for the session this process was spawned inside.
+
+    The contract is the hook script's, because the hook config points at one or
+    the other and the orchestrator must not be able to tell which ran: a silent
+    no-op when the session was not spawned by bmad-loop (the env vars are the
+    detector), garbage stdin tolerated, and any ``OSError`` from a hostile or
+    broken events dir degrading to rc 0. Never anything on stdout — the CLI hosts
+    parse hook stdout — and never a non-zero rc, which several of them surface as
+    a failed tool call inside the very session whose completion this reports.
+
+    Returns 0 unconditionally. Nothing here is worth failing a session over: the
+    orchestrator's fallback for a missing event is ``session_timeout_min``, and an
+    attacker who can suppress the event can already get that outcome by planting
+    the redirect ``_write_event`` refuses.
+    """
+    run_dir = os.environ.get("BMAD_LOOP_RUN_DIR")
+    task_id = os.environ.get("BMAD_LOOP_TASK_ID")
+    if not run_dir or not task_id:
+        return 0
+    ts = time.time_ns()
+    event = shape_event(ts, event_name, task_id, _read_payload(stdin))
+    # $BMAD_LOOP_EVENTS_DIR when the orchestrator names one (#494 moved the
+    # channel out of the project tree), else the legacy in-tree location — the
+    # same preference, spelled the same way, as the copied hook script's `main()`.
+    # `or`, not a presence test: an exported-but-empty value names the launch cwd.
+    # The no-op detector above stays RUN_DIR + TASK_ID for the reason the hook's
+    # docstring gives: an older orchestrator sets neither the new variable nor any
+    # expectation that this relay needs it, and its sessions must still complete.
     events_dir = os.environ.get("BMAD_LOOP_EVENTS_DIR") or os.path.join(run_dir, "events")
     try:
-        _write_event(events_dir, f"{ts}-{task_id}-{event_name}.json", event)
+        _write_event(events_dir, event_file_name(ts, task_id, event_name), event)
     except OSError:
-        # A hostile or broken events dir must degrade to the orchestrator's
-        # normal session_timeout_min path, never surface as a hook failure that
-        # fails the CLI window (mirrors bmad_loop_probe_hook.py's write wrap).
+        # A hostile or broken events dir must degrade to the orchestrator's normal
+        # session_timeout_min path, never surface as a hook failure that fails the
+        # CLI window (mirrors the hook script's own write wrap).
         return 0
     return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

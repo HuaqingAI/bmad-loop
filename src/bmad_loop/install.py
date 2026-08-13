@@ -1010,6 +1010,44 @@ def _review_findings(project: Path, tree: str) -> list[Finding]:
     return findings
 
 
+def hook_script_current(project: Path) -> bool | None:
+    """Does the project's installed relay match the one this wheel would write?
+
+    ``True`` yes, ``False`` stale (or otherwise divergent), ``None`` unknowable —
+    the installed copy or the packaged source could not be read as text. The
+    unknown arm is a third state and not a coerced ``False`` on purpose: the sole
+    caller (``cmd_validate``'s ``hooks.relay-stale``) reports what it knows, and
+    "I could not look" is not "your relay is out of date".
+
+    Lives here, beside :func:`install_into`'s write of the same two paths, so the
+    reader and the writer of the relay stay in one module and one reviewer's view
+    — a comparison that resolved the source differently from the writer would
+    answer a different question.
+
+    Compared as TEXT read with universal newlines, not as raw bytes. That is
+    precisely the round trip ``install_into`` performs (``read_text`` then
+    ``write_text``), and ``write_text`` translates ``\\n`` to ``os.linesep`` — so
+    on Windows every freshly-installed relay differs from the packaged source
+    byte-for-byte while being exactly what ``init`` writes. A byte compare would
+    call those installs permanently stale.
+    """
+    try:
+        installed = (project / HOOK_SCRIPT_REL).read_text(encoding="utf-8")
+        packaged = (
+            resources.files("bmad_loop.data")
+            .joinpath("bmad_loop_hook.py")
+            .read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        # ValueError covers UnicodeDecodeError (a relay overwritten with non-UTF-8
+        # bytes); OSError covers missing/unreadable on either side. Observation
+        # degrades — the missing and unreadable cases already have their own
+        # finding (`hooks.relay-present`), and a packaged source this process
+        # cannot read is a broken wheel, not a stale project.
+        return None
+    return installed == packaged
+
+
 def _hook_command(project: Path, profile: CLIProfile, canonical_event: str) -> str:
     host = get_process_host()
     interp = host.hook_interpreter()

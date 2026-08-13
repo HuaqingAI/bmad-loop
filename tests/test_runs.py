@@ -6,11 +6,12 @@ import re
 import subprocess
 import sys
 import tarfile
+from pathlib import Path
 
 import pytest
-from conftest import escalated_run, git
+from conftest import escalated_run, git, refuse_to_resolve
 
-from bmad_loop import platform_util, runs, verify
+from bmad_loop import envvars, platform_util, runs, verify
 from bmad_loop.adapters import tmux_base
 from bmad_loop.adapters.multiplexer import MultiplexerError
 from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
@@ -727,6 +728,239 @@ def test_project_tag_is_transportable_whatever_the_path(tmp_path):
     assert len({tag, runs.project_tag(tmp_path / "other")}) == 2
 
 
+# ------------------------------------------------- user-scoped state root (#494)
+#
+# Every row here clears the suite-wide `_isolate_state_root` override first: that
+# fixture exists so no test writes into the real state directory, and it is the
+# first thing `state_root` consults, so a cascade row that left it set would grade
+# nothing. `sys.platform` is faked per branch (the house idiom — see
+# test_journal.py), and the fake home is written to HOME *and* USERPROFILE because
+# `expanduser` reads the first on POSIX and the second on Windows, so a row must
+# set both to mean the same thing on either host (tests/test_diagnostics.py:630).
+
+
+def _fake_home(monkeypatch, home) -> None:
+    """Point `expanduser("~")` at `home` on whichever host is running, and clear
+    everything else `state_root` would answer from first."""
+    monkeypatch.delenv(envvars.STATE_DIR, raising=False)
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+
+
+def test_state_root_precedence_override_then_xdg_then_home(tmp_path, monkeypatch):
+    """Three answers, ranked, and the ranking is what each assertion removes.
+
+    The override outranks a *set* XDG_STATE_HOME and not merely an unset one —
+    graded by leaving XDG set throughout — because it is the operator's stated
+    answer and the suite's own isolation depends on it winning against whatever a
+    host exports.
+
+    The asymmetry in the middle is deliberate and pinned here rather than left to
+    the reader: `XDG_STATE_HOME` is a *base* to build under, so `bmad-loop` is
+    appended to it, while `BMAD_LOOP_STATE_DIR` names our root itself and is used
+    as spelled. Appending to the override would silently move every path a
+    phase-3 hook computes from that same variable."""
+    monkeypatch.setattr(runs.sys, "platform", "linux")
+    home = tmp_path / "home"
+    _fake_home(monkeypatch, home)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "override"))
+
+    assert runs.state_root() == tmp_path / "override"  # verbatim: no "bmad-loop" tail
+
+    monkeypatch.delenv(envvars.STATE_DIR)
+    assert runs.state_root() == tmp_path / "xdg" / "bmad-loop"
+
+    monkeypatch.delenv("XDG_STATE_HOME")
+    assert runs.state_root() == home / ".local" / "state" / "bmad-loop"
+
+
+@pytest.mark.parametrize("value", ["state", "./state", "~/state"], ids=repr)
+def test_state_root_refuses_a_relative_override(tmp_path, monkeypatch, value):
+    """`BMAD_LOOP_STATE_DIR` is honoured as spelled, but a relative spelling is
+    not a root — it is two roots. The engine exports this path to the session as
+    `BMAD_LOOP_EVENTS_DIR` and the multiplexer launches that session at
+    `spec.cwd` (a worktree, under isolation), while the watcher polls from the
+    orchestrator's cwd. So the relay writes its Stop into one directory and
+    nothing watches it, and the run waits out `session_timeout_min` — silent, and
+    exactly the stall moving this channel out of the tree was meant to prevent.
+
+    It RAISES rather than falling through to the cascade, which is the split from
+    the sibling XDG test above: a derived base that fails its check is a guess we
+    move on from, an override is a statement we cannot honour and must not
+    silently replace. It equally does not absolutize — resolving against whichever
+    cwd this process happens to have is the guess, and picking one of the two
+    directories at random is how the stall gets harder to see rather than gone.
+
+    `~/state` is here for the same reason it is in the XDG rows: nothing expands
+    it, so it stays relative. The empty string is deliberately NOT a row — empty
+    reads as *unset* and falls through to the cascade, which
+    `test_state_root_precedence_override_then_xdg_then_home` already grades.
+
+    Ablation target: drop the `os.path.isabs` guard from the override arm and all
+    three rows fail — each returning a cwd-relative root instead of raising."""
+    monkeypatch.setattr(runs.sys, "platform", "linux")
+    _fake_home(monkeypatch, tmp_path / "home")
+    monkeypatch.setenv(envvars.STATE_DIR, value)
+
+    with pytest.raises(runs.StateRootError, match=envvars.STATE_DIR):
+        runs.state_root()
+
+
+@pytest.mark.parametrize("value", ["state", "./state", "~/state", ""], ids=repr)
+def test_state_root_ignores_an_xdg_state_home_that_is_not_absolute(tmp_path, monkeypatch, value):
+    """The XDG base-directory spec says a relative value "must be ignored", and
+    ignoring it means falling through to the home default — not resolving it
+    against the cwd, which is what `Path(value) / "bmad-loop"` would do.
+
+    That distinction is the whole test: a cwd-relative control plane is not a
+    failure anyone sees, it is a run whose events land somewhere the next process
+    to ask does not look, and a run that finds no completion signal waits out
+    `session_timeout_min`. `~/state` is here because expansion is not this
+    reader's job either — nothing expands it, so it stays relative. The empty
+    string is the same rule reached from the other side: set-but-empty is how an
+    unset-looking export reads, and `Path("")` is the cwd.
+
+    Ablation target: drop the `os.path.isabs` half of `_state_base` and the three
+    relative rows fail together, each on a cwd-relative root. The empty row is
+    held by BOTH halves — `os.path.isabs("")` is already False — so no single
+    ablation reddens it here, and it is kept as the spelling an operator produces
+    rather than as an independent gate. What the emptiness half holds alone is the
+    *unset* variable, where `os.path.isabs(None)` raises; the refusal rows below
+    are what grade it."""
+    monkeypatch.setattr(runs.sys, "platform", "linux")
+    home = tmp_path / "home"
+    _fake_home(monkeypatch, home)
+    monkeypatch.setenv("XDG_STATE_HOME", value)
+
+    assert runs.state_root() == home / ".local" / "state" / "bmad-loop"
+
+
+def test_state_root_on_win32_prefers_localappdata_over_the_user_profile(tmp_path, monkeypatch):
+    """Windows keeps this class of per-user, per-machine state under
+    `%LOCALAPPDATA%`, and `%USERPROFILE%\\AppData\\Local` is that variable's
+    documented default location — the fallback, not a second opinion.
+
+    XDG_STATE_HOME stays set across both assertions: it is a POSIX variable, and a
+    branch that consulted it on Windows would answer from an operator's WSL or
+    MSYS environment instead of the local store."""
+    monkeypatch.setattr(runs.sys, "platform", "win32")
+    monkeypatch.delenv(envvars.STATE_DIR, raising=False)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "profile"))
+
+    assert runs.state_root() == tmp_path / "local" / "bmad-loop" / "state"
+
+    monkeypatch.delenv("LOCALAPPDATA")
+    expected = tmp_path / "profile" / "AppData" / "Local" / "bmad-loop" / "state"
+    assert runs.state_root() == expected
+
+
+def test_state_root_on_win32_refuses_a_home_derived_from_homedrive(tmp_path, monkeypatch):
+    """With neither `%LOCALAPPDATA%` nor `%USERPROFILE%` set, refuse — do not fall
+    back to a home directory.
+
+    `Path.home()` is `ntpath.expanduser("~")`, which prefers `USERPROFILE` and then
+    `HOMEDRIVE` + `HOMEPATH`; on a domain-joined machine that pair can name a
+    network home share, and the control plane's `O_NOFOLLOW`-anchored writes and
+    atomic renames are not something to move onto SMB by inference. So the
+    variables are read by name and an absent store raises.
+
+    Ablation target: replace the `USERPROFILE` read with `Path.home()` and this
+    row fails — on Windows it derives `Z:\\users\\x`, and on a POSIX host running
+    the faked branch `expanduser` falls back to the passwd entry. Both answer
+    where the guard refuses to."""
+    monkeypatch.setattr(runs.sys, "platform", "win32")
+    monkeypatch.delenv(envvars.STATE_DIR, raising=False)
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.delenv("USERPROFILE", raising=False)
+    monkeypatch.delenv("HOME", raising=False)
+    monkeypatch.setenv("HOMEDRIVE", "Z:")
+    monkeypatch.setenv("HOMEPATH", "\\users\\x")
+
+    with pytest.raises(runs.StateRootError, match=envvars.STATE_DIR):
+        runs.state_root()
+
+
+@pytest.mark.parametrize("home", ["", "relative-home", "~"], ids=repr)
+def test_state_root_refuses_a_home_that_cannot_root_a_control_plane(monkeypatch, home):
+    """A write path fails loud rather than picking a plausible-looking directory.
+
+    Each row is an answer `expanduser` really gives: `""` for a set-but-empty
+    `USERPROFILE` on Windows — and, on POSIX, `"/"`, since `posixpath` folds the
+    empty prefix to the root; `"relative-home"` for a `HOME` that is not a path at
+    all; and `"~"` for the input handed back when nothing can expand it. All three
+    would otherwise mkdir the control plane somewhere silently wrong — the launch
+    cwd, or `/.local/state`, which is a permission error for an ordinary user and
+    a real write to `/` for a containerised root.
+
+    The message names the override, because that is the one remedy an operator
+    always has."""
+    monkeypatch.setattr(runs.sys, "platform", "linux")
+    _fake_home(monkeypatch, home)
+
+    with pytest.raises(runs.StateRootError, match=envvars.STATE_DIR):
+        runs.state_root()
+
+
+def test_state_dir_for_is_keyed_on_project_identity_not_spelling(tmp_path, monkeypatch):
+    """One project reached by two spellings must key to ONE control plane.
+
+    It is the same requirement `project_tag` was written for, and it reaches here
+    because the run and the hook that signals its completion can arrive with
+    different spellings of the project: the engine holds a resolved path, a relay
+    computes from what it was handed. Two keys would mean the poller watching one
+    directory while the events land in the other — no completion signal, and a run
+    that waits out `session_timeout_min` with the signal sitting on disk.
+
+    Distinctness is asserted alongside identity: a key that collapsed every
+    project would satisfy the first half by making all runs share one plane."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    absolute = runs.state_dir_for(project, "20260812-101500-ab12")
+    relative = runs.state_dir_for(Path("proj"), "20260812-101500-ab12")
+    assert absolute == relative
+    assert absolute == runs.state_root() / runs.project_tag(project) / "20260812-101500-ab12"
+    assert runs.events_dir_for(project, "20260812-101500-ab12") == absolute / "events"
+
+    assert runs.state_dir_for(project, "20260812-101500-cd34") != absolute
+    assert runs.state_dir_for(tmp_path / "other", "20260812-101500-ab12") != absolute
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_state_dir_for_follows_a_symlinked_project_to_one_key(tmp_path):
+    """The symlink half of the spelling problem, and the one a lexical comparison
+    of the two paths would never catch — they share no component."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(project)
+
+    assert runs.state_dir_for(link, "r1") == runs.state_dir_for(project, "r1")
+
+
+def test_state_dir_for_raises_when_the_project_cannot_be_canonicalized(tmp_path, monkeypatch):
+    """A project the OS refuses to canonicalize (#552: a registered-but-not-serving
+    WSL UNC provider) has no knowable identity, so it gets no key.
+
+    `project_tag`'s bare `resolve()` raising is the correct behaviour to inherit
+    rather than soften. Degrading to the lexical spelling would hand two spellings
+    of the one project two different control planes — the failure the test above
+    exists to prevent — and this is a write path, where the doctrine is to raise
+    (`platform_util.resolve_or_lexical`)."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    refuse_to_resolve(monkeypatch, project)
+
+    with pytest.raises(OSError):
+        runs.state_dir_for(project, "r1")
+
+
 def test_prunable_sessions_accepts_legacy_path_tag(tmp_path, monkeypatch):
     """A pre-digest tag stays ours; another project's path or digest stays foreign."""
     legacy = str(tmp_path.resolve())
@@ -849,9 +1083,76 @@ def test_prune_sessions_returns_unknown_from_same_sample(tmp_path, monkeypatch):
     assert killed == ["odd-1"]
 
 
+def _seed_state_dir(project, run_id) -> Path:
+    """The out-of-tree control plane a driven run leaves behind: its events dir
+    holding one already-consumed completion signal."""
+    events = runs.events_dir_for(project, run_id)
+    events.mkdir(parents=True)
+    (events / "1700000000-t1-Stop.json").write_text("{}")
+    return runs.state_dir_for(project, run_id)
+
+
+def _raising(exc: Exception):
+    def _fail(*_args, **_kwargs):
+        raise exc
+
+    return _fail
+
+
 def test_delete_run(tmp_path):
     run_dir = _make_state_run(tmp_path, "r1")
     runs.delete_run(tmp_path, run_dir)
+    assert not run_dir.exists()
+
+
+def test_delete_run_removes_the_out_of_tree_state_counterpart(tmp_path):
+    """#494 moved the events channel out of the project tree, so removing the run
+    dir stopped removing everything the run owns. Without this tail every delete
+    leaks a subtree under the user-scoped state root — outside the project, where
+    no operator thinks to look — one per run, for the life of the machine."""
+    run_dir = _make_state_run(tmp_path, "r1")
+    state_dir = _seed_state_dir(tmp_path, "r1")
+
+    runs.delete_run(tmp_path, run_dir)
+
+    assert not run_dir.exists()
+    assert not state_dir.exists()
+
+
+@pytest.mark.parametrize(
+    "attr, exc",
+    [
+        ("state_root", runs.StateRootError("no root")),
+        ("project_tag", OSError("cannot canonicalize")),
+        ("project_tag", RuntimeError("Symlink loop from '/p'")),
+    ],
+    ids=["no-derivable-state-root", "unresolvable-project", "symlink-loop-project"],
+)
+def test_delete_run_survives_a_counterpart_it_cannot_name(tmp_path, monkeypatch, attr, exc):
+    """The counterpart removal is a never-raise tail (#139 teardown doctrine).
+
+    Every row is the counterpart being *unnameable*, which is the only failure
+    that can escape: an environment with no derivable state root, and a project
+    the OS refuses to canonicalize (#552). Removal failures are absorbed
+    separately, by `ignore_errors`.
+
+    The `RuntimeError` row is not a hypothetical type: `project_tag` resolves
+    before digesting, and below 3.13 `Path.resolve` reports a symlink loop as
+    `RuntimeError` rather than `OSError` — measured across the support matrix,
+    3.11 and 3.12 raise it where 3.13 and 3.14 return the unresolved path. So on
+    two supported interpreters this is the live arm, and it is injected here
+    rather than built from real symlinks because the loop would have to sit on
+    the *project* path, which the sandbox fixtures own.
+
+    Raising would be worse than the leak it reports. The run dir is already gone
+    by this point, so the exception would fail a delete that in fact happened and
+    send the operator to retry a removal that can only fail the same way — while
+    `reconcile_orphan_state_dirs` already backstops the leak."""
+    run_dir = _make_state_run(tmp_path, "r1")
+    monkeypatch.setattr(runs, attr, _raising(exc))
+
+    runs.delete_run(tmp_path, run_dir)
+
     assert not run_dir.exists()
 
 
@@ -1206,3 +1507,252 @@ def test_archive_run_refuses_while_the_agent_session_is_live(tmp_path, monkeypat
         runs.archive_run(tmp_path, run_dir)
     assert run_dir.exists()
     assert not (tmp_path / ".bmad-loop" / "archive").exists()
+
+
+def test_archive_run_removes_the_out_of_tree_state_counterpart(tmp_path):
+    """Archive inherits delete's tail — it removes the run dir just the same, so
+    it would leak the same subtree.
+
+    The ordering is what the assertions pin: the tarball is complete before the
+    counterpart goes. Since #494 that tarball no longer carries the run's
+    `events/` — the channel is out of the tree and never enters the tar — which
+    the recorded decision accepts: those files are transient completion signals
+    the watcher consumed while the run was live, and everything an archive is
+    read for later (state, journal, tasks, logs) is in the run dir."""
+    run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
+    state_dir = _seed_state_dir(tmp_path, "20260611-100000-aaaa")
+
+    dest = runs.archive_run(tmp_path, run_dir)
+
+    with tarfile.open(dest) as tar:
+        assert "20260611-100000-aaaa/state.json" in tar.getnames()
+    assert not state_dir.exists()
+
+
+# ------------------------------------------------- orphan state-dir sweep (#494)
+
+
+def test_reconcile_orphan_state_dirs_removes_only_what_has_no_run_dir(tmp_path):
+    """The GC backstop for everything `_discard_state_dir` cannot reach: a run dir
+    removed by hand, an `rm -rf .bmad-loop`, a delete from before that tail
+    existed. Distinctness is the load-bearing half — a sweep that took the live
+    run's control plane too would strand a resumable run's completion channel."""
+    _make_state_run(tmp_path, "live-1")
+    kept = _seed_state_dir(tmp_path, "live-1")
+    orphan = _seed_state_dir(tmp_path, "gone-1")
+
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == [orphan]
+
+    assert not orphan.exists()
+    assert kept.is_dir()
+
+
+def test_reconcile_orphan_state_dirs_keeps_a_run_dir_with_no_state_json(tmp_path):
+    """Existence of the *directory* is the test, not `list_run_dirs`, which is
+    state.json-gated.
+
+    A run whose state.json is missing or corrupt is exactly the run an operator is
+    trying to recover, and it still owns its control plane. Reading liveness from
+    the gated listing would sweep the counterpart out from under it — deleting
+    state on the strength of state being unreadable."""
+    _make_run(tmp_path, "corrupt-1", with_state=False)
+    kept = _seed_state_dir(tmp_path, "corrupt-1")
+
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == []
+
+    assert kept.is_dir()
+
+
+def test_reconcile_orphan_state_dirs_dry_run_reports_without_removing(tmp_path):
+    """`clean --dry-run` promises a preview: the plan must name the work and leave
+    the disk alone, so the count a caller pre-flights is the count they get."""
+    orphan = _seed_state_dir(tmp_path, "gone-1")
+
+    assert runs.reconcile_orphan_state_dirs(tmp_path, dry_run=True) == [orphan]
+
+    assert orphan.is_dir()
+
+
+def test_reconcile_orphan_state_dirs_sweeps_a_project_whose_runs_dir_is_gone(tmp_path):
+    """`rm -rf .bmad-loop` is the leak this exists for, and it is the case a
+    missing runs dir has to answer *as an answer*: no runs exist, so every state
+    dir under this project's key is an orphan. Reading it as "cannot tell" would
+    leave the whole subtree behind permanently — nothing will ever re-create the
+    runs dir with those ids in it."""
+    orphan = _seed_state_dir(tmp_path, "gone-1")
+    assert not (tmp_path / ".bmad-loop" / "runs").exists()
+
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == [orphan]
+
+    assert not orphan.exists()
+
+
+def test_reconcile_orphan_state_dirs_sweeps_nothing_when_the_runs_dir_cannot_be_read(
+    tmp_path, monkeypatch
+):
+    """The mirror of the test above, and the reason the two failures are told
+    apart. An unreadable runs dir answers nothing at all — treating it like the
+    missing one would sweep every control plane this project has, live runs
+    included, on the strength of a transient permission error.
+
+    The fault is scoped to the runs dir on purpose. A blanket `os.scandir` raise
+    also takes out the state-root enumeration below it (and `rmtree`), so the
+    sweep returns `[]` whatever the arm under test does — measured: with the
+    degradation ablated to `set()` the test still passed, which is the negative
+    assertion holding for a reason that has nothing to do with the gate."""
+    _make_state_run(tmp_path, "live-1")
+    kept = _seed_state_dir(tmp_path, "live-1")
+    runs_dir = tmp_path / ".bmad-loop" / "runs"
+    real_scandir = runs.os.scandir
+
+    def _refuse_only_the_runs_dir(path, *args, **kwargs):
+        if Path(path) == runs_dir:
+            raise PermissionError("nope")
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(runs.os, "scandir", _refuse_only_the_runs_dir)
+
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == []
+
+    assert kept.is_dir()
+
+
+def test_reconcile_orphan_state_dirs_leaves_another_projects_subtree_alone(tmp_path):
+    """One state root holds every project's control planes, keyed by project
+    identity. The sweep enumerates its own key's subtree only — a sweep from the
+    root would let one project's `clean` delete another project's live runs, and
+    the two need not even be on the same disk."""
+    mine = tmp_path / "mine"
+    theirs = tmp_path / "theirs"
+    (mine / ".bmad-loop" / "runs").mkdir(parents=True)
+    _make_state_run(theirs, "live-1")
+    foreign = _seed_state_dir(theirs, "live-1")
+    # my own orphan, so the sweep provably enumerates rather than finding nothing
+    orphan = _seed_state_dir(mine, "gone-1")
+
+    assert runs.reconcile_orphan_state_dirs(mine) == [orphan]
+
+    assert not orphan.exists()
+    assert foreign.is_dir()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_reconcile_orphan_state_dirs_never_removes_through_a_symlink(tmp_path):
+    """A symlink is not a state dir we created, so it is skipped rather than
+    followed — and this row points *inside* the root, where the containment test
+    below it cannot help.
+
+    Reporting it would be a false count even where the removal fails harmlessly
+    (`rmtree` refuses a symlink): `clean` would claim a sweep that never happened
+    and go on claiming it every run. On Windows the containment test carries the
+    case this one cannot: a **junction** reads as a plain directory
+    (`is_symlink()` is False) but `resolve()` follows it, so without the
+    containment test `rmtree` would delete the target's contents outside the
+    root. That row is POSIX-invisible and is not graded here."""
+    _make_state_run(tmp_path, "live-1")
+    target = _seed_state_dir(tmp_path, "live-1")
+    link = runs.project_state_root(tmp_path) / "ghost-1"
+    link.symlink_to(target)
+
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == []
+
+    assert link.is_symlink()  # not followed, not removed
+    assert target.is_dir()
+
+
+@pytest.mark.parametrize(
+    "attr, exc",
+    [
+        ("state_root", runs.StateRootError("no root")),
+        ("project_tag", OSError("cannot canonicalize")),
+        ("project_tag", RuntimeError("Symlink loop from '/p'")),
+    ],
+    ids=["no-derivable-state-root", "unresolvable-project", "symlink-loop-project"],
+)
+def test_reconcile_orphan_state_dirs_degrades_when_the_root_cannot_be_named(
+    tmp_path, monkeypatch, attr, exc
+):
+    """Reclamation, not repair: a sweep that cannot name its root sweeps nothing
+    and says so, rather than failing the whole `clean` around it. Leaving disk
+    behind is the cheap outcome here — the caller's real work (worktrees, trims,
+    archives) has already been done by the time this runs.
+
+    `RuntimeError` is the below-3.13 spelling of a symlink loop out of
+    `Path.resolve`, which `project_tag` calls; see the sibling delete test for
+    the measured version split."""
+    monkeypatch.setattr(runs, attr, _raising(exc))
+
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == []
+
+
+def test_reconcile_orphan_state_dirs_keeps_a_run_that_starts_mid_sweep(tmp_path, monkeypatch):
+    """`clean` is an operator command with no lock against a run starting, and the
+    two reads it makes are of different trees. A run creates its run dir strictly
+    before its state dir (`compose_run` builds the `Journal`, which mkdirs the run
+    dir, and only then calls `make_adapters`, whose `SignalWatcher` mkdirs the
+    events dir) — so reading state entries FIRST is what makes the ordering carry
+    the guarantee: an entry seen there had its run dir on disk even earlier, and
+    the later `live` read cannot miss it.
+
+    Read the other way round, a run that starts in the gap is absent from `live`
+    and present in `entries`, and `clean` deletes the control plane of a run that
+    is starting right now. The cost is not a lost directory — it is the run, which
+    then polls a primary that no longer exists or never sees its Stop and waits
+    out `session_timeout_min`.
+
+    The gap is simulated where it actually lives, by starting a run *inside* the
+    `live` read rather than by patching the sweep: whichever read runs second is
+    the one that sees `racer`, which is exactly what a real interleaving does.
+
+    Ablation guard: move the `live = _run_dir_names(project)` read back above the
+    `entries` enumeration and this fails, sweeping `racer` mid-startup."""
+    _make_state_run(tmp_path, "live-1")
+    _seed_state_dir(tmp_path, "live-1")
+    orphan = _seed_state_dir(tmp_path, "ghost-1")
+
+    real_names = runs._run_dir_names
+    racer: list[Path] = []
+
+    def _names_then_a_new_run(project: Path):
+        names = real_names(project)  # the snapshot, taken before `racer` exists
+        _make_state_run(project, "racer")
+        racer.append(_seed_state_dir(project, "racer"))
+        return names
+
+    monkeypatch.setattr(runs, "_run_dir_names", _names_then_a_new_run)
+
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == [orphan]
+
+    assert not orphan.exists()
+    assert racer[0].is_dir(), "swept the control plane of a run that was starting"
+
+
+def test_reconcile_orphan_state_dirs_skips_an_entry_it_cannot_resolve(tmp_path, monkeypatch):
+    """The containment test resolves each candidate, so it inherits the same
+    below-3.13 `RuntimeError` a symlink loop raises — and here it lands *per
+    entry*, mid-sweep, after earlier entries have already been removed. An
+    unguarded loop would abort `clean` half-done and report none of what it had
+    just deleted.
+
+    Skipping is the safe arm rather than sweeping: an entry that cannot be
+    resolved cannot be proven inside the root, and that proof is the only thing
+    standing between `rmtree` and a Windows junction's target.
+
+    Ablation guard: drop `RuntimeError` from the containment guard and this
+    raises instead of returning the resolvable orphan."""
+    _make_state_run(tmp_path, "live-1")
+    _seed_state_dir(tmp_path, "live-1")
+    good = _seed_state_dir(tmp_path, "ghost-good")
+    bad = _seed_state_dir(tmp_path, "ghost-loop")
+
+    real_resolve = Path.resolve
+
+    def _resolve(self: Path, *args, **kwargs):
+        if self == bad:
+            raise RuntimeError(f"Symlink loop from {str(self)!r}")
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", _resolve)
+
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == [good]
+    assert not good.exists() and bad.is_dir()

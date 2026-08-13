@@ -657,6 +657,158 @@ def test_non_ascii_survives_the_utf8_round_trip(tmp_path, monkeypatch):
     assert json.loads(path.read_text(encoding="utf-8"))["note"] == "café — naïve ✓"
 
 
+# --------------------------------------------- the out-of-tree events channel
+
+
+def _seed_bare_run(project_dir, run_id="20260812-090000-bbbb"):
+    """A run dir with just enough state to collect: this test family is about
+    WHERE `summarize_files` looks, not about the canary sweep."""
+    run_dir = project_dir / ".bmad-loop" / "runs" / run_id
+    save_state(
+        run_dir,
+        RunState(
+            run_id=run_id,
+            project=str(project_dir),
+            started_at="2026-08-12T09:00:00",
+            run_type="story",
+        ),
+    )
+    return run_dir
+
+
+def _events_group(run_dir, project_dir):
+    diag = diagnostics.collect(
+        [run_dir], pseudo=sanitize.Pseudonymizer(), project=Path(project_dir)
+    )
+    return next((g for g in diag.runs[0].files if g.category == "events"), None)
+
+
+def _write_events(events_dir, n, *, prefix=""):
+    events_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(n):
+        (events_dir / f"{prefix}17550000{i}-t-Stop.json").write_text("{}", encoding="utf-8")
+
+
+def test_events_are_counted_at_the_out_of_tree_state_root(project, tmp_path, monkeypatch):
+    """#494: the events channel left the project tree for the user state root, and
+    `_FILE_CATEGORIES` listed "events" as a run-dir-relative name. That made the
+    group VANISH silently rather than redden — the `is_dir()` guard turns a
+    category with no directory into a no-op, so the dump simply stopped mentioning
+    events at all, on exactly the runs a maintainer reads a dump to understand.
+
+    The count is derived through the real `collect` path, not by handing
+    `summarize_files` the directory: what has to hold is that a collector given
+    only a run dir finds the channel, and the derivation (from the run's OWN
+    recorded project and id) is the part that can break.
+
+    Ablation guard: making `_events_dir` return None, or dropping the primary from
+    `_category_roots`, makes this FAIL on the count."""
+    from bmad_loop import envvars, runs
+
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "state"))
+    run_dir = _seed_bare_run(project.project)
+    _write_events(runs.events_dir_for(project.project, run_dir.name), 3)
+
+    group = _events_group(run_dir, project.project)
+    assert group is not None and group.count == 3
+    assert group.total_bytes > 0
+    # The in-tree location is genuinely empty — the count above came from the
+    # state root, not from a legacy directory a fixture happened to create.
+    assert not (run_dir / "events").exists()
+
+
+def test_legacy_in_tree_events_still_counted_and_summed_with_the_primary(
+    project, tmp_path, monkeypatch
+):
+    """Both roots are live at once. The hook relay is COPIED into the project by
+    `init`, so an upgraded orchestrator routinely drives sessions whose relay
+    predates the move and still writes in-tree; `SignalWatcher` dual-polls for
+    exactly that reason. A dump that counted only the primary would report zero
+    for such a session, which is the same blind spot in a different place.
+
+    Ablation guard: dropping the legacy root from `_category_roots` makes this
+    FAIL (2 instead of 5)."""
+    from bmad_loop import envvars, runs
+
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "state"))
+    run_dir = _seed_bare_run(project.project)
+    _write_events(runs.events_dir_for(project.project, run_dir.name), 3, prefix="new-")
+    _write_events(run_dir / "events", 2, prefix="old-")
+
+    group = _events_group(run_dir, project.project)
+    assert group is not None
+    # ONE group, summed — the payload shape is the v1 schema and does not split.
+    assert group.count == 5
+
+
+def test_events_degrade_to_the_legacy_root_when_the_state_root_is_underivable(
+    project, tmp_path, monkeypatch
+):
+    """A dump is routinely read on a machine that did not produce the run, and the
+    state root is a HOST fact. `runs.state_root()` raises rather than guessing when
+    no candidate answers (it is a write path); observation must not inherit that —
+    the events count is worth losing, the dump is not.
+
+    Ablation guard: narrowing `_events_dir`'s except clause so the raise escapes
+    makes this FAIL — and the way it fails is the point. `collect` catches per
+    run, so the escape does not crash the dump; it demotes the WHOLE run to
+    `_unreadable_run`, losing its tasks, journal and every other file group to a
+    host fact that has nothing to do with the run. Silent, and far worse than the
+    count this degradation gives up."""
+    from bmad_loop import envvars, runs
+
+    monkeypatch.delenv(envvars.STATE_DIR, raising=False)
+    monkeypatch.setattr(runs, "state_root", _raise_no_state_root)
+    run_dir = _seed_bare_run(project.project)
+    _write_events(run_dir / "events", 2)
+
+    group = _events_group(run_dir, project.project)
+    assert group is not None and group.count == 2
+
+
+def _raise_no_state_root():
+    from bmad_loop.runs import StateRootError
+
+    raise StateRootError("no state root on this host")
+
+
+def test_state_root_path_is_redacted_in_the_dump(project, tmp_path, monkeypatch):
+    """#494 put a control-plane directory under the user's home, and every home is
+    an egress hazard: `/home/<user>/.local/state/bmad-loop/...` and
+    `C:\\Users\\<user>\\AppData\\Local\\bmad-loop\\state\\...` both name a real
+    person. The dump only ever *stats* that directory, so no field carries it
+    today — this pins the two backstops that must hold if one ever does.
+
+    Both spellings are asserted on ONE host on purpose: `_ABS_HOME_RE` is
+    platform-independent by construction (a Windows-shaped path is diagnosed on
+    POSIX whenever a Windows run's dump is read on Linux), and a rule that only
+    fired on its native platform would pass CI on the runner that never sees it.
+    Neither uses the host's own home, which `redact_home` would rewrite to `~`
+    before the rule was ever consulted — that would prove the wrong mechanism."""
+    monkeypatch.setenv("BMAD_LOOP_STATE_DIR", str(tmp_path / "state"))
+    posix_root = "/home/canaryoperator/.local/state/bmad-loop/9f1c2d3e4a5b6c7d/r/events"
+    win_root = r"C:\Users\canaryoperator\AppData\Local\bmad-loop\state\9f1c2d3e4a5b6c7d\r\events"
+
+    # The realistic vector: an unknown journal field. Unknown fields fall to
+    # `scrub_json`, so this half proves per-field routing catches the path.
+    for i, planted in enumerate((posix_root, win_root)):
+        run_dir = _seed_bare_run(project.project, run_id=f"20260812-09000{i}-cccc")
+        Journal(run_dir).append("events-routed", events_dir=planted)
+        _diag, _pseudo, combined = _render_all([run_dir])
+        assert planted not in combined
+        assert "canaryoperator" not in combined
+
+    # And this half proves the egress guard would have refused the path anyway —
+    # which is what actually covers a field nobody has written yet. It runs LAST
+    # and in its own loop: `_render_json_over` leaves `_to_jsonable` monkeypatched
+    # for the rest of the test, so a later `_render_all` would re-render this
+    # payload instead of its own run.
+    for planted in (posix_root, win_root):
+        with pytest.raises(diagnostics.LeakDetected) as exc:
+            _render_json_over(monkeypatch, {"events_dir": planted})
+        assert "absolute-home-path" in exc.value.rules
+
+
 # The pure guard-mechanics tests (hard-rule refusal, repair tally, cyclic
 # termination) live in tests/test_sanitize.py since #199 made guard shared API;
 # this file keeps the integration surface: real collectors, real renders.

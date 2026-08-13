@@ -21,6 +21,7 @@ from . import (
     deferredwork,
     devcontract,
     envvars,
+    events,
     frontmatter,
     gates,
     install,
@@ -495,10 +496,13 @@ def cmd_validate(args: argparse.Namespace) -> int:
     # A distinct id, not a repurposed `hooks.registered` — the two answer different
     # questions and an operator needs to see which one failed.
     #
-    # COUPLING (#461 Phase 2): Phase 2 moves the relay to
-    # `<abs-python> -m bmad_loop.hookrelay` and retires HOOK_SCRIPT_REL. It must
-    # RETARGET this check to stat the registered interpreter (`hooks.interpreter`),
-    # not drop it — the stall it guards against survives the move.
+    # COUPLING (#461 Phase 2): Phase 2 moves the relay to the installed console
+    # script — `bmad-loop relay <Event>` (cmd_relay / events.py), NOT the
+    # `<abs-python> -m bmad_loop.hookrelay` spelling this once anticipated — and
+    # retires HOOK_SCRIPT_REL. It must RETARGET this check to stat what the
+    # registration actually points at (the resolved `bmad-loop` executable), not
+    # drop it — the stall it guards against survives the move: an entry point that
+    # is gone or unreadable strands every hook event exactly like a missing script.
     if any_hooks_registered:
         relay = project / install.HOOK_SCRIPT_REL
         # Existence is not enough: `is_file()` stays True for a mode-000 file, and
@@ -536,6 +540,38 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 f"hook relay script present: {relay}",
                 {"path": str(relay)},
             )
+
+        # #494 Phase 4: present-and-readable is not current. The relay is COPIED
+        # into the project by `init`, so an upgraded orchestrator routinely drives
+        # sessions through a relay written by an older wheel — and the #494 move
+        # is exactly the kind of change that skew hides: a pre-move relay writes
+        # its events to the in-tree `<run-dir>/events` while the operator believes
+        # the channel left the project tree, so a branch switch can still take the
+        # control plane away mid-run.
+        #
+        # A WARNING, never a problem, and validate's exit code must not move:
+        # Phase 3's fallback pair keeps a stale relay FUNCTIONAL (it writes the
+        # legacy directory, which SignalWatcher still polls), so the run completes
+        # — the operator is losing the property, not the loop. `passed` counts
+        # only problems, so `warn` is what says "degraded but working".
+        stale = install.hook_script_current(project)
+        if stale is False:
+            report.warn(
+                "hooks.relay-stale",
+                f"the installed hook relay {relay} differs from this bmad-loop's "
+                f"— it is from another version, or was edited. Events may still be "
+                f"written inside the project tree; run `bmad-loop init` to refresh it",
+                {"path": str(relay)},
+            )
+        elif stale is True:
+            report.ok(
+                "hooks.relay-stale",
+                f"hook relay script up to date: {relay}",
+                {"path": str(relay)},
+            )
+        # `None` (unreadable/undecodable on either side) reports nothing: the
+        # relay-present block above already spoke for the cases an operator can
+        # act on, and "I could not compare" is not a finding about their project.
 
     # Adapter-kind validity is enforced against the LIVE registry, never a
     # hardcoded set: a profile.adapter naming no registered kind is a config error
@@ -1738,6 +1774,24 @@ def _render_invocation(pol, project: Path, role: str, prompt: str) -> str:
     return " ".join(argv)
 
 
+def _events_dir_preview(project: Path) -> str | None:
+    """``BMAD_LOOP_EVENTS_DIR`` as a real run would set it, with a ``<run-id>``
+    placeholder standing in for the id no dry run has (a preview creates nothing,
+    so the placeholder never reaches a filesystem). Printed once per preview
+    rather than on every story's ``env:`` line: only the run id varies, and the
+    path is long.
+
+    ``None`` — plus the state root's own error on stderr — when no state root can
+    be resolved. A real run resolves the same path while building its adapters, so
+    silently dropping the line would turn a preview into a promise the run cannot
+    keep."""
+    try:
+        return str(runs.events_dir_for(project, "<run-id>"))
+    except runs.StateRootError as e:
+        print(f"warning: {e}", file=sys.stderr)
+        return None
+
+
 def _dry_run(
     paths: bmadconfig.ProjectPaths,
     pol,
@@ -1766,6 +1820,8 @@ def _dry_run(
         print("no actionable stories")
         return 0
     print(f"would process {len(queue)} stories (gates={pol.gates.mode}):")
+    if (events_dir := _events_dir_preview(paths.project)) is not None:
+        print(f"  env (every session): BMAD_LOOP_EVENTS_DIR={events_dir}")
     dev_skill = _dev_skill_for_role(pol, paths.project, "dev")
     review_skill = _dev_skill_for_role(pol, paths.project, "review")
     for story in queue:
@@ -1810,6 +1866,8 @@ def _dry_run_stories(
         f"stories mode: {len(rows)} stories from {folder}/stories.yaml "
         f"(gates={pol.gates.mode}){spec_ok}"
     )
+    if (events_dir := _events_dir_preview(paths.project)) is not None:
+        print(f"  env (every session): BMAD_LOOP_EVENTS_DIR={events_dir}")
     print("linear schedule (list order — no depends_on, strictly serial):")
     dev_skill = _dev_skill_for_role(pol, paths.project, "dev")
     for row in rows:
@@ -3327,6 +3385,13 @@ def cmd_clean(args: argparse.Namespace) -> int:
                 freed += wt_bytes
                 trimmed.append(run_dir.name)
 
+    # After the loop, so the counterparts the removals above already took are gone
+    # from the enumeration rather than counted twice. Their bytes stay out of
+    # `freed` on purpose: a state dir holds consumed event files and nothing else,
+    # so sizing every one of them would buy kilobytes of accuracy for a walk of a
+    # second tree. The count is the honest report of what went.
+    swept = len(runs.reconcile_orphan_state_dirs(project, dry_run=dry))
+
     if args.json:
         machine.emit(
             clean_document(
@@ -3340,12 +3405,12 @@ def cmd_clean(args: argparse.Namespace) -> int:
                 deleted=deleted,
                 protected=protected,
                 unverifiable_pid=unverifiable,
+                state_dirs_swept=swept,
             )
         )
         return 0
-    if not worktrees and not trimmed and not archived and not deleted:
-        print("nothing to reclaim")
-    else:
+    reclaimed = bool(worktrees or trimmed or archived or deleted)
+    if reclaimed:
         head = "would reclaim" if dry else "reclaimed"
         print(
             f"{head} ~{_human_bytes(freed)}: {len(worktrees)} worktree(s), "
@@ -3355,6 +3420,12 @@ def cmd_clean(args: argparse.Namespace) -> int:
             print(f"  archived {name} -> .bmad-loop/archive/{name}.tar.gz")
         for name in deleted:
             print(f"  deleted {name}")
+    if swept:
+        # its own line rather than a fifth count in the summary above, which is a
+        # reclaimed-bytes report these dirs are deliberately outside of
+        print(f"{'would sweep' if dry else 'swept'} {swept} orphaned run state dir(s)")
+    if not reclaimed and not swept:
+        print("nothing to reclaim")
     if protected:
         print(f"left {len(protected)} live/resumable run(s) untouched")
     return 0
@@ -3637,6 +3708,41 @@ def cmd_init(args: argparse.Namespace) -> int:
         pol = policy_mod.load(_policy_path(project))
         clis = tuple(dict.fromkeys(pol.adapter.resolved(role).name for role in ROLES))
     return install_into(project, clis=clis, skills=args.skills, force_skills=args.force_skills)
+
+
+def cmd_relay(args: argparse.Namespace) -> int:
+    """``bmad-loop relay <Event>`` — the hook relay as an installed console script.
+
+    **Nothing points at it yet.** ``init`` still registers the copied workspace
+    relay (``install._hook_command`` emits ``<interpreter> <project>/.bmad-loop/
+    bmad_loop_hook.py <Event>``), so no installed hook reaches this handler today;
+    it is the target #461 Phase 2 retargets those registrations to, and that move
+    carries its own obligation — see the COUPLING note on ``hooks.relay-present``,
+    which must be retargeted rather than dropped in the same change. Said here
+    because a console script that exists and is documented reads as the live path,
+    and an operator debugging a lost Stop needs to know which relay actually ran.
+
+    Total by contract, unlike every other handler: a coding CLI runs this INSIDE
+    the session whose completion it reports, and several of them surface a
+    non-zero hook exit as a failed tool call in that session. So nothing here
+    escalates. :func:`events.relay` already swallows the relay-level failures
+    (unset env, garbage stdin, a hostile events dir); the backstop below covers
+    the rest — an unexpected exception is a bug in this file, and a bug must not
+    be the reason a run's Stop signal turns into a broken session. It reports on
+    stderr, never stdout: hook stdout is parsed by the host.
+
+    Dispatched from ``main()`` BEFORE its shared ``try``/``except`` on purpose —
+    see the comment there.
+    """
+    try:
+        return events.relay(args.event, sys.stdin)
+    except Exception as e:
+        # Deliberately broad, and deliberately not re-raised: the alternative to a
+        # diagnostic line here is a traceback on the host's hook channel plus a
+        # non-zero rc. Narrower than the BaseException it could be — a Ctrl+C or a
+        # SystemExit is not a relay-level problem and keeps its own exit path.
+        print(f"bmad-loop relay: {type(e).__name__}: {e}", file=sys.stderr)
+        return ExitCode.OK
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -3978,7 +4084,34 @@ def main(argv: list[str] | None = None) -> int:
         "fixes repaint tearing over slow/SSH links; also settable via [tui] low_frame_rate",
     )
 
+    # Registered directly rather than through `add()`: `relay` takes no --project.
+    # It is handed a run directory by the engine (via the session env) and must
+    # work with no project state at all — see the dispatch below.
+    relay_p = sub.add_parser(
+        "relay",
+        help="write one session event file from a coding-CLI hook payload on stdin "
+        "(a hook target for machines, not a command to run by hand)",
+    )
+    relay_p.add_argument(
+        "event",
+        nargs="?",
+        default="Unknown",
+        help="canonical event name (Stop, SessionStart, …); the hooks always pass one",
+    )
+    relay_p.set_defaults(func=cmd_relay)
+
     args = parser.parse_args(argv)
+    # `relay` dispatches HERE, ahead of everything below, and the placement is the
+    # contract rather than an optimization. A coding CLI runs `bmad-loop relay Stop`
+    # inside the session whose completion it reports, and a hook that exits non-zero
+    # is surfaced by several hosts as a failed tool call in that session — so the
+    # `except` arms below, which print `error: …` and return 1 (or 130), are exactly
+    # the outcome the hook contract forbids. `_configure_mux(_project(args))` is
+    # skipped for the same reason and one more: relay touches neither mux nor policy,
+    # and a project whose policy.toml is broken must still be able to report that its
+    # session stopped. `cmd_relay` is total, so nothing is lost by not wrapping it.
+    if args.func is cmd_relay:
+        return cmd_relay(args)
     try:
         # Install the policy [mux] backend choice before dispatch: several
         # handlers (probe/diagnose/attach/stop/cleanup/tui) reach the mux

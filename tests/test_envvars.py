@@ -1,12 +1,15 @@
-"""Registry tests for the three core `BMAD_LOOP_*` runtime overrides.
+"""Registry tests for the core `BMAD_LOOP_*` runtime overrides.
 
 `envvars` is the one place each core var is named, typed, and given a reader, so
 what is pinned here is the *contract* the call sites (`engine`,
-`adapters.multiplexer`, `cli`, `process_host`) and the README's "Environment
-variables" table both depend on: the literal names, and each reader's parse and
-fallback. The two name readers pass their value through verbatim on purpose —
-validation lives downstream in the registry that resolves the name — so a test
-asserting rejection here would be asserting the wrong module's job.
+`adapters.multiplexer`, `cli`, `process_host`, `runs`) and the README's
+"Environment variables" table both depend on: the literal names, and each
+reader's parse and fallback. The two name readers pass their value through
+verbatim on purpose — validation lives downstream in the registry that resolves
+the name — so a test asserting rejection here would be asserting the wrong
+module's job. `state_dir` is verbatim for a related reason (a stated override
+must not be silently swapped for a guess) with one exception, the empty string,
+which is graded here because `runs.state_root` trusts what this reader returns.
 
 Contract parity: `test_engine.py::test_session_timeout_s_env_override` pins the
 same rejection set one layer up, through `Engine._session_timeout_s` (does the
@@ -33,6 +36,7 @@ def test_constants_are_the_literal_env_var_names():
     assert envvars.SESSION_TIMEOUT_S == "BMAD_LOOP_SESSION_TIMEOUT_S"
     assert envvars.MUX_BACKEND == "BMAD_LOOP_MUX_BACKEND"
     assert envvars.PROCESS_HOST == "BMAD_LOOP_PROCESS_HOST"
+    assert envvars.STATE_DIR == "BMAD_LOOP_STATE_DIR"
 
 
 def test_session_timeout_s_is_none_when_unset(monkeypatch):
@@ -154,3 +158,33 @@ def test_process_host_is_a_verbatim_passthrough(monkeypatch):
 
     monkeypatch.setenv(envvars.PROCESS_HOST, "bogus")
     assert envvars.process_host() == "bogus"
+
+
+def test_state_dir_is_a_verbatim_passthrough_except_for_the_empty_string(monkeypatch):
+    """`runs.state_root` uses this value as the state root itself, so the reader
+    hands back what the operator wrote — a relative spelling included. Filtering it
+    would put the loop in the position `mux_backend` refuses: an override the
+    operator can see they exported, silently swapped for the platform guess, and
+    detectable only by noticing where a run's events did *not* appear.
+
+    The empty string is the exception, and it is a value this reader must hold
+    rather than the caller: `export BMAD_LOOP_STATE_DIR=` is what an unset-looking
+    export leaves behind, `Path("")` is the *current directory*, and rooting the
+    control plane at the launch cwd is neither what was meant nor something a
+    later process would resolve the same way. Reading it as unset falls through to
+    the platform cascade, which is the same thing not exporting it at all does.
+
+    Ablation target: spell the reader `os.environ.get(STATE_DIR)` and only the
+    empty row fails — the unset and value rows pass under it, so neither pins the
+    rule on its own."""
+    monkeypatch.delenv(envvars.STATE_DIR, raising=False)
+    assert envvars.state_dir() is None
+
+    monkeypatch.setenv(envvars.STATE_DIR, "")
+    assert envvars.state_dir() is None
+
+    monkeypatch.setenv(envvars.STATE_DIR, "/var/lib/bmad-loop")
+    assert envvars.state_dir() == "/var/lib/bmad-loop"
+
+    monkeypatch.setenv(envvars.STATE_DIR, "relative/state")
+    assert envvars.state_dir() == "relative/state"

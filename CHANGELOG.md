@@ -14,6 +14,33 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Added
 
+- **The hook-event channel moves out of the project tree (#494).** A run's session-completion
+  signals now land under a user-scoped state root — `$XDG_STATE_HOME/bmad-loop` (else
+  `~/.local/state/bmad-loop`), `%LOCALAPPDATA%\bmad-loop\state` on Windows, or wherever
+  `BMAD_LOOP_STATE_DIR` points (absolute paths only — the orchestrator and the session it
+  launches read the root from different working directories) — keyed
+  `<root>/<project>/<run-id>/events/`, so a branch switch, a
+  worktree mount or a rollback can no longer take a live run's control plane away.
+
+  - **Older relays keep working.** Sessions are told the directory via `BMAD_LOOP_EVENTS_DIR`; both
+    relays fall back to the in-tree `<run-dir>/events` and the orchestrator polls both locations.
+    `init` copies the relay into the project, so an upgraded orchestrator regularly drives sessions
+    whose relay predates the move — re-run `bmad-loop init` to refresh it.
+  - **`bmad-loop relay <Event>`** writes a session event without the copied-in script, on the same
+    contract (nothing on stdout, rc 0 always, silent no-op outside a driven session). `init` does
+    not point hooks at it yet — that retargeting is #461 Phase 2 — so it changes no run today. It
+    is backed
+    by a new `events.py`, whose write path an AST parity test holds byte-identical to the
+    stdlib-only relay's, and dispatches ahead of the shared error handler so a broken
+    `policy.toml` cannot fail a hook.
+  - **`validate` gains `hooks.relay-stale`** — the installed relay compared against the packaged
+    one, a warning that never moves the exit code (the fallback keeps a stale relay working).
+    `diagnose`'s `events` group now counts both locations; payload and schema unchanged.
+  - **`delete`/`archive`/`clean` collect the out-of-tree dir** with the run, and `clean` sweeps
+    orphans whose run dir is already gone (`--json`: `state_dirs_swept`, an additive field). An
+    archived tarball therefore no longer contains `events/` — consumed transient signals.
+  - `run`/`sweep` `--dry-run` previews the events directory a session would use.
+
 - **Coding-CLI adapter registry: a new adapter class ships out-of-tree (#226).** The transport axis
   has long been extensible out-of-tree; the CLI axis had no equivalent, so a CLI needing its own
   adapter _class_ forced a name-branch in the run bootstrap. A profile's new `adapter` field names a

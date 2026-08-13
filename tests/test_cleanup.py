@@ -526,5 +526,101 @@ def test_cmd_clean_json_nothing_to_reclaim_is_a_valid_empty_document(project, ca
 
     assert doc["schema_version"] == cli.CLEAN_SCHEMA_VERSION
     assert doc["freed_bytes"] == 0
+    assert doc["state_dirs_swept"] == 0
     for key in ("worktrees", "trimmed", "archived", "deleted", "protected", "unverifiable_pid"):
         assert doc[key] == [], key
+
+
+# ------------------------------------------- cmd_clean: out-of-tree state (#494)
+
+
+def _seed_state_dir(project, run_id):
+    events = runs.events_dir_for(project, run_id)
+    events.mkdir(parents=True)
+    (events / "1700000000-t1-Stop.json").write_text("{}")
+    return runs.state_dir_for(project, run_id)
+
+
+def test_cmd_clean_removes_the_state_counterpart_of_a_deleted_run(project):
+    """The whole reason `clean` needed changing: past the retention window it
+    removes the run dir, and since #494 the run's control plane is no longer
+    inside it. Asserted through the command rather than `delete_run` alone, since
+    `clean` is the path an operator schedules and the only one that runs
+    unattended."""
+    install_bmad_config(project)
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", finished=True))
+    state_dir = _seed_state_dir(repo, "20260101-000000-aaaa")
+
+    assert cli.cmd_clean(_clean_args(repo, retain=0, hard=True)) == 0
+
+    assert not run_dir.exists()
+    assert not state_dir.exists()
+
+
+def test_cmd_clean_keeps_the_state_counterpart_of_a_run_it_only_trimmed(project):
+    """A trimmed run is still on disk and still resumable, so its control plane
+    has to survive its scaffolding. Two paths could take it: `trim_run_dir` (which
+    deliberately does not) and the orphan sweep (whose live-name check is what
+    keeps it). This grades them together, at the level where a mistake in either
+    would strand a resumable run's completion channel."""
+    install_bmad_config(project)
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    (run_dir / "worktrees" / "u").mkdir(parents=True)
+    save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", stopped=True))
+    state_dir = _seed_state_dir(repo, "20260101-000000-aaaa")
+
+    assert cli.cmd_clean(_clean_args(repo)) == 0
+
+    assert run_dir.is_dir() and not (run_dir / "worktrees").exists()  # trimmed, not removed
+    assert state_dir.is_dir()
+
+
+def test_cmd_clean_sweeps_an_orphaned_state_dir_and_reports_it(project, capsys):
+    """The backstop reaching a leak `clean` did not create: a run dir removed by
+    hand leaves a control plane nothing else will ever collect. The text mode says
+    so on its own line — the reclaim summary above it is a byte estimate these
+    dirs are deliberately outside of."""
+    install_bmad_config(project)
+    repo = project.project
+    orphan = _seed_state_dir(repo, "20260101-000000-aaaa")
+
+    assert cli.cmd_clean(_clean_args(repo)) == 0
+
+    assert not orphan.exists()
+    out = capsys.readouterr().out
+    assert "swept 1 orphaned run state dir(s)" in out
+    assert "nothing to reclaim" not in out  # something WAS reclaimed
+
+
+def test_cmd_clean_dry_run_plans_the_sweep_without_removing(project, capsys):
+    """Plan and outcome share one shape: the preview names the same work the real
+    run would do, and provably leaves the disk alone."""
+    install_bmad_config(project)
+    repo = project.project
+    orphan = _seed_state_dir(repo, "20260101-000000-aaaa")
+
+    assert cli.cmd_clean(_clean_args(repo, dry_run=True)) == 0
+
+    assert orphan.is_dir()
+    assert "would sweep 1 orphaned run state dir(s)" in capsys.readouterr().out
+
+
+def test_cmd_clean_json_carries_the_sweep_count_in_both_modes(project, capsys):
+    """The additive field, on the existing schema version (nothing a v1 consumer
+    already read changed shape). Populated under `--dry-run` too, or a caller
+    pre-flighting a reclaim would see the sweep appear only after committing."""
+    install_bmad_config(project)
+    repo = project.project
+    orphan = _seed_state_dir(repo, "20260101-000000-aaaa")
+
+    plan = _clean_json(repo, capsys, "--dry-run")
+    assert plan["schema_version"] == cli.CLEAN_SCHEMA_VERSION
+    assert plan["state_dirs_swept"] == 1
+    assert orphan.is_dir()
+
+    outcome = _clean_json(repo, capsys)
+    assert outcome["state_dirs_swept"] == 1
+    assert not orphan.exists()

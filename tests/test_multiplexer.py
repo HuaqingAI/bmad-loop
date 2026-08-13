@@ -154,6 +154,9 @@ def test_generic_adapter_drives_only_the_mux(tmp_path, no_tmux):
         policy=Policy(limits=LimitsPolicy()),
         profile=get_profile("claude"),
         mux=stub,
+        # out of the project tree, as `runsetup.make_adapters` resolves it (#494),
+        # so the seeded Stop below has to be observed on the PRIMARY channel
+        events_dir=tmp_path / "state" / "events",
     )
     spec = _spec(tmp_path)
 

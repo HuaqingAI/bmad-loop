@@ -390,7 +390,14 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         extra_args: tuple[str, ...] | None = None,
         usage_grace_s: float | None = None,
         stop_without_result_nudges: int | None = None,
+        events_dir: Path | None = None,
     ):
+        # `events_dir` is accepted and unused: this family observes over SSE and
+        # fires no hooks, so it has no event channel to point at. It is part of
+        # the run description `runsetup.make_adapters` hands every family (#494),
+        # and refusing the kwarg here would make the bootstrap branch per family
+        # on a value that costs nothing to carry.
+        del events_dir
         self._httpx = _require_httpx()
         self.run_dir = run_dir
         self.policy = policy

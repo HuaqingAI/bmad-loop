@@ -374,7 +374,7 @@ description = "⚠ ON: capture failed-unit diffs with NO size limit (overrides t
 
 [[section]]
 name = "cleanup"
-description = "disk reclamation for .bmad-loop/runs (terminal runs only)"
+description = "disk reclamation for .bmad-loop/runs, plus each run's out-of-tree control-plane dir (terminal runs only)"
 [[section.field]]
 key = "run_retention"
 kind = "int"

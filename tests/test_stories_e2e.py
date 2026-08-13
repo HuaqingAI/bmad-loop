@@ -62,6 +62,7 @@ from conftest import (
     install_dev_base_skills,
 )
 
+from bmad_loop import runs
 from bmad_loop.install import (
     BMAD_SCRIPTS_SEED_REL,
     CENTRAL_CONFIG_REL,
@@ -88,9 +89,10 @@ rd="$BMAD_LOOP_RUN_DIR"; tid="$BMAD_LOOP_TASK_ID"
 story="$BMAD_LOOP_STORY_KEY"; folder="$BMAD_LOOP_SPEC_FOLDER"
 prompt="${1:-}"
 ts=$(date +%s%N)
-mkdir -p "$rd/events" "$rd/tasks/$tid"
+ed="$BMAD_LOOP_EVENTS_DIR"
+mkdir -p "$ed" "$rd/tasks/$tid"
 printf '{"ts": %s, "event": "SessionStart", "task_id": "%s", "session_id": "fake-1"}' \
-    "$ts" "$tid" > "$rd/events/$ts-$tid-SessionStart.json"
+    "$ts" "$tid" > "$ed/$ts-$tid-SessionStart.json"
 # argv as it ARRIVED, after profile render + tmux quoting — the orchestrator's own
 # tasks/<id>/prompt.txt records the pre-render prompt, so only this file can prove a
 # dispatched skill NAME actually reached the binary.
@@ -109,7 +111,7 @@ if printf '%s' "$prompt" | grep -q "bmad-loop-sweep"; then
         > "$tdir/result.json"
     ts2=$(( ts + 1 ))
     printf '{"ts": %s, "event": "Stop", "task_id": "%s", "session_id": "fake-1"}' \
-        "$ts2" "$tid" > "$rd/events/$ts2-$tid-Stop.json"
+        "$ts2" "$tid" > "$ed/$ts2-$tid-Stop.json"
     sleep 30
     exit 0
 fi
@@ -158,7 +160,7 @@ if [ -z "$folder" ]; then
     fi
     ts2=$(( ts + 1 ))
     printf '{"ts": %s, "event": "Stop", "task_id": "%s", "session_id": "fake-1"}' \
-        "$ts2" "$tid" > "$rd/events/$ts2-$tid-Stop.json"
+        "$ts2" "$tid" > "$ed/$ts2-$tid-Stop.json"
     sleep 30
     exit 0
 fi
@@ -196,9 +198,15 @@ fi
 
 ts2=$(( ts + 1 ))
 printf '{"ts": %s, "event": "Stop", "task_id": "%s", "session_id": "fake-1"}' \
-    "$ts2" "$tid" > "$rd/events/$ts2-$tid-Stop.json"
+    "$ts2" "$tid" > "$ed/$ts2-$tid-Stop.json"
 sleep 30
 """
+
+# The same script as a relay installed BEFORE #494 would be: it knows only the
+# in-tree `<run_dir>/events` and ignores the variable the orchestrator now exports.
+# Built by swapping the one line that names the directory, so it can differ from
+# FAKE_CLI in nothing else.
+LEGACY_EVENTS_FAKE_CLI = FAKE_CLI.replace('ed="$BMAD_LOOP_EVENTS_DIR"', 'ed="$rd/events"')
 
 PROFILE_TOML = """\
 name = "fakestories"
@@ -225,9 +233,10 @@ TIMEOUT_FAKE_CLI = r"""#!/usr/bin/env bash
 set -e
 rd="$BMAD_LOOP_RUN_DIR"; tid="$BMAD_LOOP_TASK_ID"
 ts=$(date +%s%N)
-mkdir -p "$rd/events"
+ed="$BMAD_LOOP_EVENTS_DIR"
+mkdir -p "$ed"
 printf '{"ts": %s, "event": "SessionStart", "task_id": "%s", "session_id": "fake-1"}' \
-    "$ts" "$tid" > "$rd/events/$ts-$tid-SessionStart.json"
+    "$ts" "$tid" > "$ed/$ts-$tid-SessionStart.json"
 # Background + wait keeps the same process group as a foreground sleep, but
 # records the child's pid so the test can prove teardown reaped descendants,
 # not just this shell (whose cmdline is all the pgrep check can see).
@@ -247,9 +256,10 @@ DETACHED_WRITER_FAKE_CLI = r"""#!/usr/bin/env bash
 set -e
 rd="$BMAD_LOOP_RUN_DIR"; tid="$BMAD_LOOP_TASK_ID"; story="$BMAD_LOOP_STORY_KEY"
 ts=$(date +%s%N)
-mkdir -p "$rd/events"
+ed="$BMAD_LOOP_EVENTS_DIR"
+mkdir -p "$ed"
 printf '{"ts": %s, "event": "SessionStart", "task_id": "%s", "session_id": "fake-1"}' \
-    "$ts" "$tid" > "$rd/events/$ts-$tid-SessionStart.json"
+    "$ts" "$tid" > "$ed/$ts-$tid-SessionStart.json"
 baseline=$(git rev-parse HEAD)
 
 # Detach a straggler into a NEW session (setsid): $! is the setsid'd process itself
@@ -269,7 +279,7 @@ printf -- '---\ntitle: %s\nstatus: done\nbaseline_commit: %s\n---\n\n## Intent\n
 
 ts2=$(( ts + 1 ))
 printf '{"ts": %s, "event": "Stop", "task_id": "%s", "session_id": "fake-1"}' \
-    "$ts2" "$tid" > "$rd/events/$ts2-$tid-Stop.json"
+    "$ts2" "$tid" > "$ed/$ts2-$tid-Stop.json"
 # Stay alive like an idle interactive session so the pane shell is still live when
 # the engine kills it: the harvest sees the detached child as our descendant only
 # while we (its parent) are still around. Long enough to outlast Stop -> kill_window
@@ -1012,6 +1022,41 @@ def test_e2e_sweep_intent_gap_patch_restore(tmp_path):
     run_dir = root / ".bmad-loop" / "runs" / run_id
     prompts = [p.read_text(encoding="utf-8") for p in (run_dir / "tasks").glob("*/prompt.txt")]
     assert any(str(spec) in p for p in prompts)
+
+
+def test_e2e_a_relay_that_only_knows_the_legacy_events_dir_still_completes(tmp_path):
+    """The #494 version-skew guard, through the real CLI and real tmux.
+
+    `bmad_loop_hook.py` is COPIED into the target project by `init`, so a project
+    that upgraded bmad-loop without re-initing runs a relay that has never heard of
+    BMAD_LOOP_EVENTS_DIR and writes only to `<run_dir>/events`. The orchestrator
+    exports the variable and waits on the out-of-tree channel regardless — so
+    without the watcher's second poll, that pairing observes no Stop at all and
+    EVERY session in the project stalls to `session_timeout_min`. It would not fail
+    a test suite; it would hang a user's overnight run.
+
+    Asserted on the outcome (the story reaches `done` and commits), plus the
+    premise: the events really did land only in the legacy location, so the
+    completion cannot have come through the primary channel.
+
+    Ablation guard: drop `legacy_dir` from `SignalWatcher._dirs()` and this fails —
+    slowly, as the session timeout, which is exactly the production symptom."""
+    assert "$BMAD_LOOP_EVENTS_DIR" not in LEGACY_EVENTS_FAKE_CLI, "the twin still reads the new var"
+    assert LEGACY_EVENTS_FAKE_CLI != FAKE_CLI, "the swap did not take"
+
+    root = tmp_path / "sbx"
+    story = "1-1-thing"
+    _scaffold_sprint(root, story, fake_cli=LEGACY_EVENTS_FAKE_CLI)
+    base = _commit_count(root)
+
+    proc = _run(root, "run")
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    assert _sprint_status(root, story) == "done"
+    assert _commit_count(root) == base + 1
+
+    run_id = _run_id(root)
+    assert list((root / ".bmad-loop" / "runs" / run_id / "events").glob("*.json"))
+    assert not list(runs.events_dir_for(root, run_id).glob("*.json"))
 
 
 def test_e2e_sprint_mode_regression(tmp_path):
