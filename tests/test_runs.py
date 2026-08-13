@@ -961,6 +961,123 @@ def test_state_dir_for_raises_when_the_project_cannot_be_canonicalized(tmp_path,
         runs.state_dir_for(project, "r1")
 
 
+def test_config_digest_is_stamped_under_the_state_root_not_in_the_project(tmp_path):
+    """#498's whole point: the baseline `resume` warns off leaves the tree the
+    driven sessions can write to.
+
+    The negative half is the load-bearing one — asserting only that the state root
+    holds the digest would still pass if the project also kept a copy, and a copy
+    inside `.bmad-loop/` is exactly the thing a session edits to silence the
+    warning."""
+    project = tmp_path / "proj"
+    (project / ".bmad-loop").mkdir(parents=True)
+
+    runs.write_trusted_config_digest(project, "r1", "abc123")
+
+    path = runs.config_digest_path_for(project, "r1")
+    assert path == runs.state_dir_for(project, "r1") / "config-digest"
+    assert runs.read_trusted_config_digest(project, "r1") == "abc123"
+    assert not any(p.is_file() for p in (project / ".bmad-loop").rglob("*"))
+
+
+def test_read_trusted_config_digest_separates_an_absent_file_from_an_empty_one(tmp_path):
+    """`None` and `""` are different answers and the resume acts on the
+    difference: `None` means "this run predates #498, ask state.json", while `""`
+    means "a baseline was stamped and it is empty" and must NOT reopen the
+    agent-writable field. Collapsing them to `""` would retire the legacy runs'
+    fallback; collapsing them to `None` would let a session that truncates the
+    out-of-tree file fall back into the tree it controls.
+
+    ABLATION: return `""` instead of `None` from the reader's except arm, or drop
+    the `.strip()`-of-an-empty-file distinction, and one of these two fails."""
+    project = tmp_path / "proj"
+    project.mkdir()
+
+    assert runs.read_trusted_config_digest(project, "r1") is None
+
+    runs.write_trusted_config_digest(project, "r1", "")
+    assert runs.read_trusted_config_digest(project, "r1") == ""
+
+
+@pytest.mark.parametrize(
+    "attr, exc",
+    [
+        ("state_root", runs.StateRootError("no root")),
+        ("project_tag", OSError("cannot canonicalize")),
+        ("project_tag", RuntimeError("Symlink loop from '/p'")),
+    ],
+    ids=["no-derivable-state-root", "unresolvable-project", "symlink-loop-project"],
+)
+def test_trusted_config_digest_read_degrades_where_the_write_raises(
+    tmp_path, monkeypatch, attr, exc
+):
+    """The halves are deliberately asymmetric, and each row runs both.
+
+    Reading is observation feeding an advisory warning, so an unnameable state
+    root costs the warning and nothing else — and the resume is about to resolve
+    the same root for its events channel, where the error is owned and reported.
+    Writing is a repair write, and a silently skipped stamp is undetectable later:
+    the next resume finds no file, falls back to a legacy field that is empty for
+    any run this code started, and quietly declines to warn.
+
+    The `RuntimeError` row is live below 3.13, where `Path.resolve` reports a
+    symlink loop that way — same reason `_discard_state_dir` holds it.
+
+    ABLATION: widen the write to swallow these and the second half passes."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.setattr(runs, attr, _raising(exc))
+
+    assert runs.read_trusted_config_digest(project, "r1") is None
+    with pytest.raises(type(exc)):
+        runs.write_trusted_config_digest(project, "r1", "abc123")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_write_trusted_config_digest_replaces_a_planted_symlink(tmp_path):
+    """`follow_symlinks=False`, and the reason is that this record lives under a
+    root whose path the driven session is handed — the engine exports the sibling
+    events dir as `BMAD_LOOP_EVENTS_DIR`. Following a link planted at the digest's
+    name would aim an orchestrator write at a path of the session's choosing.
+
+    ABLATION: drop `follow_symlinks=False` and the target below is what gets
+    written."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    target = tmp_path / "outside.txt"
+    target.write_text("untouched")
+    path = runs.config_digest_path_for(project, "r1")
+    path.parent.mkdir(parents=True)
+    path.symlink_to(target)
+
+    runs.write_trusted_config_digest(project, "r1", "abc123")
+
+    assert target.read_text() == "untouched"
+    assert not path.is_symlink()
+    assert runs.read_trusted_config_digest(project, "r1") == "abc123"
+
+
+def test_the_state_dir_gc_reclaims_the_config_digest(tmp_path):
+    """#498's GC is #494's GC — the digest is a file inside the run's state dir, so
+    the lifecycle that already reclaims that subtree reclaims this too. Asserted
+    rather than assumed: a digest stamped somewhere the sweep does not reach would
+    leak one file per run, outside the project, for the life of the machine.
+
+    Deliberately the ORPHAN SWEEP and not `delete_run`, which was the first draft
+    and was fake green — it removes the run dir as well, so it passes whether the
+    digest is out of tree or sitting in `.bmad-loop/runs/<id>/`, which is the one
+    thing this needs to tell apart. `reconcile_orphan_state_dirs` reaches only
+    out-of-tree state, so a digest that drifted back into the project survives it
+    and this reddens."""
+    runs.write_trusted_config_digest(tmp_path, "r1", "abc123")
+    digest = runs.config_digest_path_for(tmp_path, "r1")
+    assert digest.is_file()
+
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == [runs.state_dir_for(tmp_path, "r1")]
+
+    assert not digest.exists()
+
+
 def test_prunable_sessions_accepts_legacy_path_tag(tmp_path, monkeypatch):
     """A pre-digest tag stays ours; another project's path or digest stays foreign."""
     legacy = str(tmp_path.resolve())

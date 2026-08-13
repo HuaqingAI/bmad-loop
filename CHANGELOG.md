@@ -309,6 +309,18 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
+- **A session can no longer silence `resume`'s config-change warning (#498).** The host-exec
+  baseline `resume` compares against — verify commands, launch binary/args/env, plugin allowlist
+  — round-tripped through `state.json`, inside the very tree the digest exists to police, so the
+  session that rewrote `policy.toml` could blank the field in the same breath and the warning
+  never fired. It now lives beside the events channel in the run's out-of-tree state dir
+  (`<state root>/<project>/<run-id>/config-digest`, #494), and is collected by the same
+  `delete`/`archive`/`clean` lifecycle. The auto-sweep gate is unchanged — it always compared
+  against an in-memory baseline no session can reach. Runs paused under an older version keep
+  their old baseline for this release: `resume` falls back to `state.json` when the run has no
+  file out of tree, warns as before, and migrates it. The field is no longer written; it is not
+  a hard boundary against a `--dangerously-skip-permissions` session, which can name the
+  directory.
 - **Worktree runs no longer stall when a seeded hook config carries the main repo's relay
   (#352).** `.claude/settings.json` is both a seeded file and the hook `config_path`, so it
   arrived in the worktree still naming the main repo's `$CLAUDE_PROJECT_DIR`-relative relay

@@ -2127,18 +2127,28 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     # Deliberately no --allow-config-change flag: a refuse-by-default gate here
     # would break resume-to-fix-a-setting, which is a supported workflow.
     #
-    # ADVISORY, not a control, and the asymmetry with the gate is deliberate. The
+    # ADVISORY, not a control, and the asymmetry with the gate is deliberate: the
     # auto-sweep refusal in `_sweep_factory` baselines off a digest threaded in
-    # MEMORY from launch (see cmd_run/the compose_resume call below), which a
-    # session cannot reach. This comparison baselines off `state.trusted_config_digest`,
-    # which round-trips through <project>/.bmad-loop/runs/<id>/state.json — inside
-    # the same agent-writable tree the digest exists to police. A session that
-    # rewrites policy.toml can blank or re-stamp that field and silence the warning
-    # (blank suffices: the bool() guard reads "" as no prior pin). It catches the
-    # incidental change, not a deliberate one. Tracked in #498.
-    security_config_changed = bool(state.trusted_config_digest) and (
-        new_digest != state.trusted_config_digest
-    )
+    # MEMORY from launch (see cmd_run/the compose_resume call below), which nothing
+    # on disk can reach at all. This one has to survive the pause, so it is read
+    # back — and since #498 from the run's out-of-tree state dir rather than from
+    # <project>/.bmad-loop/runs/<id>/state.json, which is inside the very tree the
+    # digest exists to police. It used to be readable there: a session that
+    # rewrote policy.toml could blank the field in the same breath and silence this
+    # warning (blank sufficed — the bool() guard reads "" as no prior pin), so the
+    # advisory caught the incidental change and never the deliberate one.
+    #
+    # The legacy fallback, for one release: a run PAUSED under the old code has no
+    # file in the state root, and its baseline is in state.json and nowhere else.
+    # `None` from the reader means exactly that "no file" — distinct from an empty
+    # file, which is a real answer of "no baseline" and must NOT reopen the tree —
+    # so the fallback fires only for those runs, and the re-stamp below migrates
+    # them on this very resume. Empty either way keeps its meaning: no prior pin,
+    # no warning.
+    pinned = runs.read_trusted_config_digest(project, run_dir.name)
+    if pinned is None:
+        pinned = state.trusted_config_digest
+    security_config_changed = bool(pinned) and new_digest != pinned
     fields: dict[str, object] = {
         # Scalars only, per the note above: a bool records THAT the pinned surface
         # moved without journaling a command, a binary path or a plugin name.
@@ -2187,7 +2197,14 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     # this process is about to arm re-reads it from there. Leaving the launch
     # digest would make every auto-sweep after a legitimate resume-to-fix-a-setting
     # refuse — and would make the warning above fire forever, on every later resume.
-    state.trusted_config_digest = new_digest
+    #
+    # This is also the migration for a run paused under the old code: it read its
+    # baseline out of state.json above, and from here on it has a file in the state
+    # root, so the fallback never fires for it again. The legacy field is left as it
+    # was found rather than cleared — it is that run's honest record of what it
+    # launched under, nothing reads it once the file exists, and erasing persisted
+    # data to tidy up is not this change's business.
+    runs.write_trusted_config_digest(project, run_dir.name, new_digest)
     state.clear_pause()
     # A resume is fresh user intent: discard any graceful-stop request left over from
     # a prior stopped-gracefully run so the re-armed engine does not consume it at the

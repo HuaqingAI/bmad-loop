@@ -467,13 +467,25 @@ class RunState:
     project: str
     started_at: str
     policy_snapshot: dict[str, Any] = field(default_factory=dict)
-    # runsetup.config_digest over the agent-writable config that reaches HOST code
-    # execution — verify commands, the resolved launch binary/args/env, the plugin
-    # allowlist (#461 point 4). Stamped at launch and re-stamped on resume, beside
-    # policy_snapshot. The auto-sweep gate compares against its own closure
-    # baseline, not this; the field is the audit record plus the baseline `resume`
-    # warns off. Empty on runs persisted before the field existed, which is why the
-    # resume compare is guarded on it being non-empty — no prior pin, no warning.
+    # LEGACY, read-only, one release (#498). runsetup.config_digest over the
+    # agent-writable config that reaches HOST code execution — verify commands, the
+    # resolved launch binary/args/env, the plugin allowlist (#461 point 4). It used
+    # to be stamped here at launch and re-stamped on resume, beside policy_snapshot;
+    # it is now stamped out of the tree instead (`runs.write_trusted_config_digest`),
+    # because a baseline whose whole job is to police the agent-writable tree cannot
+    # live in it — a session that rewrote policy.toml could blank this field in the
+    # same breath and silence the warning `resume` owes the operator.
+    #
+    # Nothing writes it any more, so it is "" on every run this code starts. It is
+    # still PARSED and still round-tripped by to_dict, for the runs that were paused
+    # under the old code and are resumed under this one: their baseline is here and
+    # nowhere else, and `_resume_paused_run` falls back to it when the state root
+    # holds no file for the run. Dropping it outright would turn "this run has a
+    # pin" into "this run has none" for exactly those runs, which is the empty-means
+    # -legacy contract read backwards. Empty still means what it always did — no
+    # prior pin, hence no warning — which is why the resume compare is guarded on
+    # non-emptiness. The auto-sweep gate has never read this field: it compares
+    # against its own in-memory closure baseline, which no session can reach.
     trusted_config_digest: str = ""
     current_epic: int | None = None
     # the run's story scope + cap, as passed on the launching CLI (`--epic`,

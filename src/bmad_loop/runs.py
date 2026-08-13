@@ -21,6 +21,7 @@ from .model import PAUSE_ESCALATION, Phase, RunState, StoryTask
 from .platform_util import (
     MAX_SEGMENT,
     atomic_replace,
+    atomic_write_text,
     has_parent_ref,
     is_absolute_path,
     retrying_unlink,
@@ -37,6 +38,10 @@ PID_FILE = "engine.pid"
 # already means "hard stop". The engine stays the single writer of journal.jsonl;
 # requesters only ever touch this file.
 STOP_REQUEST_FILE = "stop-request.json"
+# The host-exec config baseline's name inside a run's state dir (see
+# `config_digest_path_for`). A bare hex digest, not JSON: one opaque token, and a
+# format an operator can read with `cat`.
+CONFIG_DIGEST_FILE = "config-digest"
 _INVALID_PID_IDENTITY = -1.0  # impossible process start/create time; forces "not ours"
 
 
@@ -329,6 +334,69 @@ def events_dir_for(project: Path, run_id: str) -> Path:
     """The run's hook-event channel: the directory the relay writes a session's
     events into and ``SignalWatcher`` polls for them."""
     return state_dir_for(project, run_id) / "events"
+
+
+def config_digest_path_for(project: Path, run_id: str) -> Path:
+    """The run's host-exec config baseline: ``runsetup.config_digest`` as of the
+    last time a human started or resumed this run (#498).
+
+    Out here rather than in ``state.json`` because the baseline exists to police
+    the agent-writable tree, and until this move it *lived* in it: a session that
+    rewrote ``policy.toml`` could blank or re-stamp the field in the same breath
+    and the warning `resume` owes the operator never fired. A pin a session can
+    edit is not a pin. The same reasoning the events channel moved on (#494), and
+    with the same honest limit — see :func:`state_root`."""
+    return state_dir_for(project, run_id) / CONFIG_DIGEST_FILE
+
+
+def read_trusted_config_digest(project: Path, run_id: str) -> str | None:
+    """This run's persisted host-exec baseline, or ``None`` when the state root
+    holds none for it.
+
+    ``None`` is "ask the legacy field", not "no pin" — the two are different
+    answers and the caller acts on the difference (see
+    ``cli._resume_paused_run``). A run started before #498 has no file here and
+    its baseline is still in ``state.json``; an *empty* file, by contrast, is a
+    real answer of "no baseline" and comes back as ``""``.
+
+    Pure observation, so it degrades rather than raising: a state root this host
+    cannot name, or a file it cannot read, both answer ``None`` and hand the
+    decision to the legacy fallback. The write half raises — see
+    :func:`write_trusted_config_digest` — and the split is the standard one
+    (``platform_util.resolve_or_lexical`` states the doctrine). Degrading here
+    costs at most one advisory warning; a resume that *aborts* because an
+    advisory could not be read would be the worse failure, and the resume is
+    about to resolve the same state root for its events channel anyway, where
+    the error is owned and reported."""
+    try:
+        return config_digest_path_for(project, run_id).read_text(encoding="utf-8").strip()
+    except (StateRootError, OSError, RuntimeError, UnicodeDecodeError):
+        return None
+
+
+def write_trusted_config_digest(project: Path, run_id: str, digest: str) -> None:
+    """Stamp ``digest`` as this run's host-exec baseline, creating the state dir.
+
+    Raises rather than degrading — a repair write, and a silently skipped stamp
+    is the one outcome that cannot be detected later: the next resume reads no
+    file, falls back to a legacy field that is empty for any run this new code
+    started, and quietly declines to warn. The caller is starting or resuming a
+    run and is about to resolve the very same state root for its events channel,
+    so a root that cannot be named or written fails that run regardless; failing
+    here just fails it sooner, before the pid lands.
+
+    **Call this only after the run dir exists.** Creating the state dir is what
+    makes this the earliest writer into it, and :func:`reconcile_orphan_state_dirs`
+    reads its entries *before* the live run-dir names on the strength of run dirs
+    being created strictly first — a state dir minted ahead of its run dir would
+    look like an orphan to a ``clean`` racing the launch."""
+    path = config_digest_path_for(project, run_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # follow_symlinks=False: a machine-minted record under a root whose path the
+    # driven session is handed (BMAD_LOOP_EVENTS_DIR names its sibling), so a
+    # planted link here must be replaced, never written through to whatever it
+    # aims at. The trailing newline is for the operator who cats the file.
+    atomic_write_text(path, digest + "\n", follow_symlinks=False)
 
 
 # ---------------------------------------------------- run resolution / liveness
@@ -1042,8 +1110,10 @@ def reconcile_orphan_state_dirs(project: Path, *, dry_run: bool = False) -> list
     **The two reads are ordered, and the order is the whole race guard.** State
     entries are enumerated *before* the live run-dir names, because a run creates
     its run dir strictly before its state dir — ``compose_run`` builds the
-    ``Journal`` (which mkdirs the run dir) and only then calls ``make_adapters``,
-    whose ``SignalWatcher`` mkdirs the events dir. Reading entries first makes
+    ``Journal`` (which mkdirs the run dir) and only then stamps the config digest
+    (:func:`write_trusted_config_digest`, the earliest writer into the state dir
+    since #498) and calls ``make_adapters``, whose ``SignalWatcher`` mkdirs the
+    events dir alongside it. Reading entries first makes
     that ordering carry the guarantee: anything in ``entries`` had its state dir
     on disk at the first read, so its run dir was on disk *before* that, so the
     later ``live`` read is certain to contain it. Read the other way round, a run

@@ -3434,15 +3434,18 @@ def test_resume_warns_when_the_pinned_host_exec_config_changed(project, monkeypa
     """#461 point 4, human-present half. A session may have rewritten the verify
     commands while the operator was away; `resume` is the moment they can still
     look, so the change stops being silent. It stays a WARNING — a human typed
-    `resume`, and refusing here would break resume-to-fix-a-setting."""
-    from bmad_loop.journal import load_state
+    `resume`, and refusing here would break resume-to-fix-a-setting.
+
+    The baseline round-trips through the out-of-tree state dir since #498; the
+    behaviour asserted here is the one that must NOT have changed with it."""
+    from bmad_loop import runs
 
     run_dir = _paused_run_for_resume(project, monkeypatch)
     monkeypatch.setattr(cli, "Engine", _StubEngine)
     # First resume stamps the pin (the run predates the field, so it has none).
     assert cli._resume_paused_run(project.project, run_dir) == 0
     assert _resume_entry(run_dir)["security_config_changed"] is False
-    pinned = load_state(run_dir).trusted_config_digest
+    pinned = runs.read_trusted_config_digest(project.project, run_dir.name)
     assert pinned  # the launch/resume baseline is persisted, not just in memory
     capsys.readouterr()
 
@@ -3456,7 +3459,78 @@ def test_resume_warns_when_the_pinned_host_exec_config_changed(project, monkeypa
     assert "verify commands" in err and "plugin allowlist" in err
     assert "touch pwned" not in err
     # ...and the resume re-blesses it, so the next one is quiet again.
-    assert load_state(run_dir).trusted_config_digest != pinned
+    assert runs.read_trusted_config_digest(project.project, run_dir.name) != pinned
+
+
+def test_resume_still_warns_when_a_session_rewrote_the_digest_in_state_json(
+    project, monkeypatch, capsys
+):
+    """#498, the whole point of the relocation. The baseline used to round-trip
+    through `<project>/.bmad-loop/runs/<id>/state.json` — inside the very tree the
+    digest exists to police — so the session that rewrote `policy.toml` could blank
+    the field in the same breath and the warning never fired. Blanking sufficed:
+    the guard reads "" as "no prior pin".
+
+    This is the attack, run end to end: change the host-exec config AND blank the
+    in-tree field, exactly as one session could. The warning must still fire,
+    because the baseline that decides it is now out of the tree.
+
+    ABLATION: point `_resume_paused_run`'s read back at
+    `state.trusted_config_digest` (or make the reader prefer the legacy field over
+    the state-root file) and this goes quiet — no warning, `security_config_changed`
+    False."""
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state, save_state
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+    assert runs.read_trusted_config_digest(project.project, run_dir.name)
+    capsys.readouterr()
+
+    # The session rewrites the verify commands...
+    _write_policy(project.project, RESUME_POLICY.replace('["true"]', '["touch pwned"]'))
+    # ...and covers its tracks in the one file it can reach.
+    state = load_state(run_dir)
+    state.trusted_config_digest = ""
+    save_state(run_dir, state)
+    assert load_state(run_dir).trusted_config_digest == ""  # the cover-up landed
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    assert _resume_entries(run_dir)[-1]["security_config_changed"] is True
+    assert "host-exec config pinned at launch has changed" in capsys.readouterr().err
+
+
+def test_resume_migrates_a_pre_498_baseline_out_of_state_json(project, monkeypatch, capsys):
+    """The one-release legacy fallback. A run PAUSED under the old code has its
+    baseline in `state.json` and nowhere else, so reading only the state root would
+    silently drop the pin for exactly the runs that sat idle longest — turning
+    "this run has a pin" into "this run has none" on the first resume after the
+    upgrade, which is the empty-means-legacy contract read backwards.
+
+    So: no state-root file + a non-empty legacy field = compare against the legacy
+    field, warn, and migrate. The second half is what bounds the fallback to one
+    release — after this resume the run has a file out of tree and never consults
+    the field again.
+
+    ABLATION: drop the `if pinned is None` fallback in `_resume_paused_run` and the
+    warning assert fails (the migrated run reads no baseline and stays quiet)."""
+    from bmad_loop import runs
+
+    # A run persisted by the old code: a pin in state.json, nothing out of tree.
+    run_dir = _paused_run_for_resume(project, monkeypatch, trusted_config_digest="stale-pin")
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    assert runs.read_trusted_config_digest(project.project, run_dir.name) is None
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    # It compared against the legacy field, so the change is caught on this resume.
+    assert _resume_entries(run_dir)[-1]["security_config_changed"] is True
+    assert "host-exec config pinned at launch has changed" in capsys.readouterr().err
+    # ...and migrated: the baseline now lives out of tree, and is the fresh one.
+    migrated = runs.read_trusted_config_digest(project.project, run_dir.name)
+    assert migrated and migrated != "stale-pin"
 
 
 def test_resume_under_an_unchanged_host_exec_config_reports_no_security_change(
@@ -7635,7 +7709,7 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
 
     ABLATION: drop `profiles=` from either `runsetup.make_adapters` or
     `_trusted_config_digest` in `_start_sweep` and the matching assert fails."""
-    from bmad_loop import bmadconfig
+    from bmad_loop import bmadconfig, runs
     from bmad_loop.adapters import profile as profile_mod
 
     monkeypatch.setattr(mux_mod, "_usable", lambda mux: True)
@@ -7676,7 +7750,8 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
         profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
     ), "the swap must actually have landed on disk, or this test proves nothing"
     assert captured["adapter"].profile.binary == "mycli"
-    assert captured["state"].trusted_config_digest == pin
+    run_id = captured["state"].run_id
+    assert runs.read_trusted_config_digest(project.project, run_id) == pin
 
 
 def test_run_pins_the_profile_bytes_it_launches(project, monkeypatch):
@@ -7707,6 +7782,7 @@ def test_run_pins_the_profile_bytes_it_launches(project, monkeypatch):
     after the swap and pins config the run never launched)."""
     from conftest import git, install_base_skills
 
+    from bmad_loop import runs
     from bmad_loop.adapters import profile as profile_mod
 
     monkeypatch.setattr(mux_mod, "_usable", lambda mux: True)
@@ -7748,7 +7824,8 @@ def test_run_pins_the_profile_bytes_it_launches(project, monkeypatch):
         profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
     ), "the swap must actually have landed on disk, or this test proves nothing"
     assert captured["adapter"].profile.binary == "mycli"
-    assert captured["state"].trusted_config_digest == pin
+    run_id = captured["state"].run_id
+    assert runs.read_trusted_config_digest(project.project, run_id) == pin
 
 
 def test_resume_pins_the_profile_bytes_it_launches(project, monkeypatch):
@@ -7804,7 +7881,7 @@ def test_resume_pins_the_profile_bytes_it_launches(project, monkeypatch):
         profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
     ), "the swap must actually have landed on disk, or this test proves nothing"
     assert captured["adapter"].profile.binary == "mycli"
-    assert captured["state"].trusted_config_digest == pin
+    assert runs.read_trusted_config_digest(project.project, run_dir.name) == pin
 
 
 def test_dry_run_banner_names_the_isolation_refusal_first(project, capsys):
