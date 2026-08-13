@@ -337,8 +337,12 @@ whose seams had diverged enough that several ports needed a different fix, and t
   making it canonical for the duration of the story, and the story's advance is re-applied to the
   main checkout after the merge — journaled `board-advance-carried`, or
   `board-advance-carry-uncommitted` where `git add` refuses the ignored path, which for such a
-  board is the ordinary outcome. The carry replays from its record across a crash between the
-  merge and its latch, and `advance` never regresses, so a double application writes nothing.
+  board is the ordinary outcome, or `board-advance-carry-failed` where the main row never reached
+  the target at all (deleted, or a quoted key the writer's line edit declines) — never a success
+  filed for a carry that did not happen, since the run tears down the worktree holding the
+  advanced copy on the strength of that record. The carry replays from its record across a crash
+  between the merge and its latch, and `advance` never regresses, so a double application writes
+  nothing.
   Without it `_pick_next`, which reads the **main** board, hands a finished story back to the
   next run. Tracked boards are unaffected — their advance rides the story commit as before.
 

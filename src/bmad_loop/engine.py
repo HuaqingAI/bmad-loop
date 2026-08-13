@@ -55,7 +55,7 @@ from .plugins import HookBus, HookContext, PluginRegistry
 from .policy import Policy
 from .recovery_flow import RecoveryFlow
 from .runs import clear_graceful_stop, events_dir_for, graceful_stop_requested, kill_session
-from .sprintstatus import ACTIONABLE_STATUSES
+from .sprintstatus import ACTIONABLE_STATUSES, STATUS_ORDER
 from .sprintstatus import advance as sprint_advance
 from .sprintstatus import load as load_sprint_status
 from .sprintstatus import next_actionable, parse_selector
@@ -235,6 +235,24 @@ def _session_task_id(story_key: str, part: str, seq: int) -> str:
     differs between the two orders. ``_resumable_session``'s resume match must
     be byte-identical to what ``_run_session`` stored, so both MUST call this."""
     return safe_segment(f"{story_key}-{part}-{seq}")
+
+
+def _at_or_past(landed: str | None, target: str) -> bool:
+    """Whether ``sprintstatus.advance``'s return means the row REACHED ``target``.
+
+    Mirrors ``advance``'s own never-regress comparison so the two agree on what
+    "already there" means; `None` (missing file, or absent row) is never reached.
+    A status outside ``STATUS_ORDER`` is unorderable rather than late, so it counts
+    only on an exact match — the same direction ``advance`` takes when it declines
+    to compare an unknown current against a known target.
+    """
+    if landed is None:
+        return False
+    if landed == target:
+        return True
+    if landed not in STATUS_ORDER or target not in STATUS_ORDER:
+        return False
+    return STATUS_ORDER.index(landed) >= STATUS_ORDER.index(target)
 
 
 # A story id in this repo is a dash/dot composite ("1.1", "3-2", "1-1-a"), so the
@@ -5449,12 +5467,38 @@ class Engine:
         ``commit_paths`` nothing to commit, and ``clean_incoming_collisions`` has
         just restored any unrelated dirt on a tracked board, so there is none to
         sweep in.
+
+        What ``advance`` CAN report is that the row did not REACH ``target``, and
+        that is a different question from whether it wrote — the one this method has
+        to ask before naming its outcome ``board-advance-carried``. It answers
+        below-target in two shapes, both of them a carry that did not happen: `None`
+        when the main board or the story's row is gone (deleted or renamed while the
+        isolated session held its own copy, or before a merge-to-carry replay), and
+        the current status when the row is there but ``_set_mapping_value``'s line
+        regex could not rewrite it — a quoted or block-scalar key, which
+        ``story_status``'s full YAML parse resolves and the writer then declines.
+        Latching either as carried would file a success for a main board still
+        sitting in ``ACTIONABLE_STATUSES``, and the run would tear the worktree
+        holding the advanced copy down on the strength of that record. It journals
+        ``board-advance-carry-failed`` instead and skips the commit, which has
+        nothing to carry. Still best effort, not a raise: the shapes that get here
+        are ones a retry cannot repair (a board that is gone stays gone), and the
+        cost of the honest record is the next run re-picking the story — the #350
+        behavior, minus the false claim that it was fixed.
         """
         target = task.board_advance_intended
         if not target:
             return
         board = self.paths.sprint_status
         landed = sprint_advance(board, task.story_key, target)
+        if not _at_or_past(landed, target):
+            self.journal.append(
+                "board-advance-carry-failed",
+                story_key=task.story_key,
+                target=target,
+                status=landed,
+            )
+            return
         try:
             verify.commit_paths(
                 self.paths.repo_root,

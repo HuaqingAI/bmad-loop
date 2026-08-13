@@ -2204,15 +2204,65 @@ def test_path_ignored_reads_a_metachar_name_literally(project):
     needs `:(literal)` to survive them and which this function cannot use at all
     (`check-ignore` rejects pathspec magic outright).
 
-    The collision is live: a `da/` rule DOES ignore `da/f.md`, and the question is
-    whether asking about `d[a]/f.md` borrows that answer. It must not."""
-    repo = project.project
-    _metachar_pair(repo, "d[a]", "da")  # both committed, glob-colliding names
-    _ignore_rule(repo, "da/")
+    The collision is live: a `da/` rule DOES ignore `da/new.md`, and the question is
+    whether asking about `d[a]/new.md` borrows that answer. It must not.
 
-    assert not verify.path_ignored(repo, repo / "d[a]" / "f.md")
-    # the neighbour is tracked, so the rule over it is inert too — same asymmetry
-    assert not verify.path_ignored(repo, repo / "da" / "f.md")
+    Both operands have to be UNTRACKED for that question to be asked at all. This
+    function consults the index, so a tracked pair reads not-ignored twice over for a
+    reason that has nothing to do with globbing — the row would pass whether or not
+    `d[a]` borrowed its neighbour's answer, and the rule would be inert against both.
+    The `da/new.md` assertion is the positive control that proves it is not."""
+    repo = project.project
+    literal, victim = _metachar_pair(repo, "d[a]", "da")  # committed, glob-colliding
+    _ignore_rule(repo, "da/")
+    for parent in (literal.parent, victim.parent):
+        (parent / "new.md").write_text("untracked\n")
+
+    assert not verify.path_ignored(repo, literal.parent / "new.md")
+    assert verify.path_ignored(repo, victim.parent / "new.md")  # the rule does reach
+    # and the committed pair is the OTHER asymmetry: a rule over a tracked file is
+    # inert, so both of those read not-ignored however the operand globs
+    assert not verify.path_ignored(repo, literal)
+    assert not verify.path_ignored(repo, victim)
+
+
+# A board rel beginning with `:` is read as pathspec magic, and it fails two ways
+# that redden APART — which is why these are two rows rather than one: the loud row's
+# assertion never runs if the quiet row's has already failed the test. Exotic names,
+# but `sprint_status` is resolved out of the operator's `_bmad/bmm/config.yaml` and
+# nothing sanitizes it — the premise that makes `commit_paths` force every operand
+# literal. Ablation for both: drop the `./` in `path_ignored`.
+
+
+@RESERVED_IN_WINDOWS_FILENAMES
+def test_path_ignored_disarms_supported_pathspec_magic(project):
+    """The QUIET half, and the reason the `./` is not cosmetic. `:(top)` is magic git
+    SUPPORTS, so it answers about what the magic denotes — plain `board.yaml`, which
+    the rule here does ignore — and a bare operand reads rc 0 for a file no rule
+    matches. No error, just the wrong answer, in the direction that drops a
+    committable board from `confirm`'s operand list so its advance never commits."""
+    repo = project.project
+    _ignore_rule(repo, "board.yaml")
+    (repo / "board.yaml").write_text("a: 1\n")
+    (repo / ":(top)board.yaml").write_text("a: 1\n")
+
+    assert verify.path_ignored(repo, repo / "board.yaml")  # the magic's TARGET
+    assert not verify.path_ignored(repo, repo / ":(top)board.yaml")
+
+
+@RESERVED_IN_WINDOWS_FILENAMES
+def test_path_ignored_disarms_unsupported_pathspec_magic(project):
+    """The LOUD half. `:(literal)` is magic `check-ignore` rejects outright — rc 128,
+    so an un-prefixed operand raises `GitError` here instead of answering. The caller
+    degrades to not-ignored, keeping a genuinely ignored board in the operand list,
+    and `git add` refuses the whole list along with it: the #577 loss of the spec and
+    park-record writes. Under the ablation this row ERRORS on the raise rather than
+    failing an assertion, which is how it stays distinct from its sibling above."""
+    repo = project.project
+    _ignore_rule(repo, ":(literal)board.yaml")
+    (repo / ":(literal)board.yaml").write_text("a: 1\n")
+
+    assert verify.path_ignored(repo, repo / ":(literal)board.yaml")
 
 
 def test_path_ignored_is_false_outside_the_repo(project, tmp_path):

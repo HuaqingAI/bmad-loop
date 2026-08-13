@@ -581,9 +581,27 @@ def path_ignored(repo: Path, path: Path) -> bool:
     needed for the glob half: gitignore matching makes the PATTERN the wildmatch and
     the pathname a literal, so `[`, `]`, `*` and `?` in ``rel`` are inert (verified
     against a repo holding both `d[a]/b.yaml` and `da/b.yaml` under a `da/` rule —
-    the metacharacter path correctly reads not-ignored). What stays unguarded is a
-    ``rel`` git parses AS magic, i.e. one beginning with `:`, which exits 128 and
-    reaches the caller as `GitError` rather than as a wrong answer.
+    the metacharacter path correctly reads not-ignored).
+
+    The leading `./` is what stands in for it, and it is load-bearing: magic is
+    recognized only on an operand that STARTS with `:`, so a prefix that is a no-op
+    as a path is enough to make git read the whole rel as a pathname. Without it a
+    ``rel`` beginning with `:` fails TWO ways, not one, and the quiet way is the
+    reason this is not merely cosmetic (both measured, git 2.55.0):
+
+    - UNSUPPORTED magic (`:(literal)`, `:(icase)`, `:!`, `:^`) exits 128, which
+      surfaces as `GitError` and degrades to "not ignored" — a gitignored board then
+      stays in `confirm`'s operand list and `git add` refuses the WHOLE list with it,
+      losing the spec and park-record writes that #577 exists to keep.
+    - SUPPORTED magic (`:(top)`, `:/`) is accepted, and git answers about the path
+      the magic DENOTES rather than the file named on disk: `:(top)board.yaml` reads
+      rc 0 whenever a plain `board.yaml` is ignored, even though nothing matches the
+      real file. That is a silent wrong answer in the drop direction — `confirm`
+      would omit a perfectly committable board and never commit its advance.
+
+    Verified that `./` costs neither contract above: the index consultation still
+    reads a tracked-and-ignored board as not-ignored, and `d[a]/f.md` still reads
+    literally beside an ignored `da/`.
 
     Raises GitError like every other probe in this module. Its caller degrades by
     treating the path as NOT ignored, which keeps it in the commit — the behavior
@@ -593,12 +611,16 @@ def path_ignored(repo: Path, path: Path) -> bool:
         rel = Path(path).resolve().relative_to(repo_root).as_posix()
     except ValueError:
         return False
-    proc = _run_git(["git", "-C", str(repo), "check-ignore", "-q", "--", rel], repo)
+    # `./` disarms pathspec magic on a rel beginning with `:` — see the docstring;
+    # it is not decoration. `rel` is already posix-separated and relative, so the
+    # prefix is a pure no-op as a path on every platform.
+    operand = f"./{rel}"
+    proc = _run_git(["git", "-C", str(repo), "check-ignore", "-q", "--", operand], repo)
     # 0 = ignored, 1 = not; anything else is git failing rather than answering, and
     # `-q` means there is no output to misread either way.
     if proc.returncode not in (0, 1):
         merged = (proc.stdout + proc.stderr).strip()
-        raise GitError(f"git check-ignore -- {rel} failed in {repo}: {merged}")
+        raise GitError(f"git check-ignore -- {operand} failed in {repo}: {merged}")
     return proc.returncode == 0
 
 

@@ -3835,6 +3835,84 @@ def test_tracked_board_carry_is_a_no_op_that_still_reports_itself(project):
     assert worktree_clean(project.project)
 
 
+# `advance` cannot report whether it WROTE — a never-regress echo returns the target
+# too, which is why the row above is a legitimate ("done", "done"). It can report that
+# the row did not REACH the target, and these two rows are that answer's two shapes.
+# Both matter because the run tears down the worktree holding the advanced copy on the
+# strength of the carry's record: latched as carried, the advance is lost AND the
+# journal says it landed. Ablation for both: drop the `_at_or_past` guard and each row
+# fails on the `board-advance-carried` assertion, the false success it exists to stop.
+
+
+def test_board_carry_over_a_vanished_main_row_is_not_journalled_as_carried(project):
+    """Shape one: `advance` returns `None` because the story's row is gone. Reachable
+    while an isolated session runs — the worktree holds its own seeded copy, so the
+    story completes normally and only the carry finds nothing to write to.
+
+    The ROW rather than the whole FILE, and a second row left standing: a main board
+    that is missing outright — or left with an empty `development_status` — raises
+    `SprintStatusError` out of `advance` itself, which ends the run over the carry's
+    shoulder and proves nothing about the carry's own record. `1-1-b` is parked at
+    `done` so it holds the map open without being actionable."""
+    ignored_sprint(project, {"1-1-a": "ready-for-dev", "1-1-b": "done"})
+    inner = wt_dev_effect(project, "1-1-a", followup_review=False)
+
+    def effect(spec):
+        result = inner(spec)
+        board = project.sprint_status  # the MAIN board, not the worktree's
+        kept = [
+            ln
+            for ln in board.read_text(encoding="utf-8").splitlines(keepends=True)
+            if "1-1-a" not in ln
+        ]
+        board.write_text("".join(kept), encoding="utf-8")
+        return result
+
+    engine, _ = make_engine(project, [effect])
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") is None  # premise
+    assert _board_carry_events(engine) == []  # no success filed for a carry that isn't
+    assert [
+        (e["target"], e["status"])
+        for e in _board_carry_events(engine, "board-advance-carry-failed")
+    ] == [("done", None)]
+    assert _sprint_carry_commits(project) == []
+
+
+def test_board_carry_that_cannot_rewrite_the_row_is_not_journalled_as_carried(project):
+    """Shape two, and the one a `None` check alone would miss: the row is THERE and
+    `advance` still leaves it below target. `story_status` resolves a quoted key
+    through a full YAML parse, `_set_mapping_value`'s line regex then declines it,
+    and `advance` returns the row's current status rather than falsely claiming the
+    target — a distinction this method has to carry through to its journal."""
+    ignored_sprint(project, {"1-1-a": "ready-for-dev"})
+    inner = wt_dev_effect(project, "1-1-a", followup_review=False)
+
+    def effect(spec):
+        result = inner(spec)
+        board = project.sprint_status
+        text = board.read_text(encoding="utf-8").replace("1-1-a:", '"1-1-a":')
+        board.write_text(text, encoding="utf-8")
+        return result
+
+    engine, _ = make_engine(project, [effect])
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed
+    assert _board_carry_events(engine) == []
+    assert [
+        (e["target"], e["status"])
+        for e in _board_carry_events(engine, "board-advance-carry-failed")
+    ] == [("done", "ready-for-dev")]
+    # the premise, stated: the row is readable and still did not move
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "ready-for-dev"
+    assert _sprint_carry_commits(project) == []
+
+
 def test_crashed_post_merge_board_advance_replays_from_its_record(project):
     """The merge-to-carry window, for the payload that reaches it most often.
 
