@@ -97,6 +97,12 @@ def wt_dev_effect(
             src = cwd / "src.txt"
             src.write_text(src.read_text() + f"change for {story_key}\n")
         sp = wt.implementation_artifacts / f"spec-{story_key}.md"
+        # A real dev session creates its artifacts dir. Most rows here commit the
+        # board, so the checkout delivers the dir and this is a no-op — but a row
+        # over a GITIGNORED board has nothing tracked in there at all, and without
+        # this the session would die on the spec write before reaching the gate the
+        # row is about (`wt_bundle_dev` in test_sweep.py says the same).
+        sp.parent.mkdir(parents=True, exist_ok=True)
         write_spec(
             sp,
             final_status,
@@ -3650,6 +3656,492 @@ def test_gitignored_declared_closure_reaches_the_main_ledger(project):
     entry = _ledger_entry(project, "DW-1")
     assert entry.status.startswith("done") and not entry.open
     assert "resolution: resolved by story 1-1-a" in entry.body
+
+
+# ------------------------------------------------------- gitignored sprint board
+
+
+def ignored_sprint(project, statuses: dict[str, str]) -> str:
+    """Gitignore the board, then write and commit in that order — `ignored_ledger`'s
+    shape (test_sweep.py) for the other seeded artifact.
+
+    Order matters both ways: committing the rule first leaves the `git add -A` below
+    with nothing to stage (empty-index commit failure), and writing the board first
+    would TRACK it, which is the shape that needs no seed at all. `check-ignore` is
+    the oracle — a pattern that is present is not necessarily effective.
+
+    The deliberate opposite of `commit_sprint`, which every other row in this file
+    uses: that helper tracks the board, which is precisely why #350 had no coverage.
+    The `add -A` is safe here only because the rule is already in the working-tree
+    .gitignore, so the board cannot be swept into the commit; a later `add -A` over
+    an untracked board would be, and a baseline reset would then delete it.
+    """
+    ignore_before_commit(project, "sprint-status.yaml")
+    write_sprint(project, statuses)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "gitignore the board")
+    rel = project.sprint_status.relative_to(project.project).as_posix()
+    assert git(project.project, "check-ignore", rel).strip() == rel
+    assert not verify.path_tracked(project.project, rel)
+    return rel
+
+
+def test_gitignored_board_under_isolation_survives_verify(project):
+    """#350 — the board's absence from a unit worktree is a CRASH, not a lost write.
+
+    `git worktree add` checks out tracked files only, so a gitignored board reaches
+    no unit; `_post_dev_state_sync` then advances `self.workspace.paths.sprint_status`
+    — that missing file — where `sprintstatus.advance` returns None in silence, and
+    `verify_dev` reads the SAME missing file through `story_status`, where
+    `sprintstatus.load` raises `SprintStatusError`. cli, operatoractions and the TUI
+    all catch that class; engine.py and verify.py do not, so it escapes to `run()`'s
+    catch-all and the story takes the whole run down with it.
+
+    Seeding the board removes that structurally: the gate reads the orchestrator's
+    own write. Ablating the seed (`_board_seed` -> `()`) puts the pre-fix behavior
+    back — `summary.crashed`, `state.crash_error` naming `SprintStatusError`.
+
+    Scoped to no-crash plus a passing verify ON PURPOSE. The worktree copy is
+    canonical for the duration of the story (#350's maintainer decision) and the
+    main board is advanced separately, by the post-merge carry — which has its own
+    rows below. Keeping the two halves on separate oracles is what lets an ablation
+    of either redden only its own.
+    """
+    rel = ignored_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [wt_dev_effect(project, "1-1-a", followup_review=False)])
+
+    summary = engine.run()
+
+    # crash_error first: it is the field that NAMES the exception class, so an
+    # ablation of the seed reddens this row with `SprintStatusError` in the failure
+    # message rather than a bare `crashed=True` that any fault would produce.
+    assert engine.state.crash_error is None and not summary.crashed
+    assert summary.done == 1 and not summary.paused
+    assert engine.state.tasks["1-1-a"].phase == Phase.DONE
+    # the seed was delivered, not merely requested: an undelivered or no-op seed
+    # entry names itself in one of these two journals.
+    seeded = [
+        e
+        for e in engine.journal.entries()
+        if e["kind"] in ("worktree-seed-skipped", "worktree-seed-dropped")
+        and rel in e.get("entries", [])
+    ]
+    assert seeded == []
+    # the unit's work landed and the board stayed the orchestrator's own file
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+    assert not verify.path_tracked(project.project, rel)
+    assert worktree_clean(project.project)
+    assert [p.resolve() for p in worktree_list(project.project)] == [project.project.resolve()]
+
+
+def _board_carry_events(engine, kind="board-advance-carried"):
+    return [e for e in engine.journal.entries() if e["kind"] == kind]
+
+
+def _sprint_carry_commits(project) -> list[str]:
+    """Every commit the board carry authored, by subject. Empty is the assertion
+    that ``commit_paths`` found nothing to commit — a claim `worktree_clean` alone
+    cannot make, since a carry that DID commit also leaves a clean tree."""
+    subjects = git(project.project, "log", "--format=%s").splitlines()
+    return [s for s in subjects if s.startswith("chore(sprint-status)")]
+
+
+def test_done_isolated_unit_carries_its_board_advance_after_merge(project):
+    """#350's carry half: the story's advance reaches the MAIN board.
+
+    The advance lands on the seeded worktree board, which is shielded from the
+    unit's `git add -A` with every other seeded rel, so nothing about it rides the
+    merge. Without the carry the main board keeps the story at `ready-for-dev` —
+    inside ACTIONABLE_STATUSES — and `_pick_next`, which reads the MAIN board, hands
+    finished work back to the next run.
+
+    The `board-advance-carry-uncommitted` row is the expected outcome here, not a
+    fault: `git add` refuses an ignored pathspec with rc 1 every time, which is why
+    the carry commits best effort. The status on disk is the value.
+    """
+    rel = ignored_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [wt_dev_effect(project, "1-1-a", followup_review=False)])
+
+    summary = engine.run()
+
+    task = engine.state.tasks["1-1-a"]
+    assert summary.done == 1 and task.phase == Phase.DONE and not summary.crashed
+    assert task.board_advance_intended == "done"
+    assert task.isolated_ledger_carried
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+    assert [(e["target"], e["status"]) for e in _board_carry_events(engine)] == [("done", "done")]
+    assert len(_board_carry_events(engine, "board-advance-carry-uncommitted")) == 1
+    # the carry writes the board, never tracks it: an ignored path stays ignored
+    assert not verify.path_tracked(project.project, rel)
+    assert _sprint_carry_commits(project) == []
+    assert worktree_clean(project.project)
+
+
+def test_awaiting_operator_isolated_unit_carries_its_board_advance(project):
+    """A park is the other terminal `_post_dev_state_sync` records, and
+    `integrate_unit` merges it beside DONE — so it carries beside DONE too.
+
+    `awaiting-operator` sits immediately below `done` in STATUS_ORDER, so this is an
+    ordinary forward advance the later `bmad-loop confirm` finishes.
+    """
+    ignored_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            wt_dev_effect(
+                project,
+                "1-1-a",
+                final_status="awaiting-operator",
+                followup_review=False,
+                operator_actions=["publish the DNS record"],
+            )
+        ],
+    )
+
+    summary = engine.run()
+
+    task = engine.state.tasks["1-1-a"]
+    assert summary.awaiting_operator == 1 and task.phase == Phase.AWAITING_OPERATOR
+    assert task.board_advance_intended == "awaiting-operator"
+    assert task.isolated_ledger_carried
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+    assert [(e["target"], e["status"]) for e in _board_carry_events(engine)] == [
+        ("awaiting-operator", "awaiting-operator")
+    ]
+
+
+def test_tracked_board_carry_is_a_no_op_that_still_reports_itself(project):
+    """The common shape: a TRACKED board needs no carry and must not get a commit.
+
+    The worktree's advance is an ordinary modification of a tracked file, which no
+    ignore rule masks, so it rides the unit commit through the merge and the main
+    board is already at the target when the carry runs. `advance` then returns the
+    current status without writing, `commit_paths` finds nothing to commit, and
+    `board-advance-carried` names a status the carry did not itself write — an
+    ordinary outcome, and the reason the journal carries the landed status rather
+    than a wrote/did-not flag it cannot honestly produce.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [wt_dev_effect(project, "1-1-a", followup_review=False)])
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+    assert [(e["target"], e["status"]) for e in _board_carry_events(engine)] == [("done", "done")]
+    # nothing to commit and nothing refused: the merge already delivered the flip
+    assert _board_carry_events(engine, "board-advance-carry-uncommitted") == []
+    assert _sprint_carry_commits(project) == []
+    assert worktree_clean(project.project)
+
+
+# `advance` cannot report whether it WROTE — a never-regress echo returns the target
+# too, which is why the row above is a legitimate ("done", "done"). It can report that
+# the row did not REACH the target, and these two rows are that answer's two shapes.
+# Both matter because the run tears down the worktree holding the advanced copy on the
+# strength of the carry's record: latched as carried, the advance is lost AND the
+# journal says it landed. Ablation for both: drop the `_at_or_past` guard and each row
+# fails on the `board-advance-carried` assertion, the false success it exists to stop.
+
+
+def test_board_carry_over_a_vanished_main_row_is_not_journalled_as_carried(project):
+    """Shape one: `advance` returns `None` because the story's row is gone. Reachable
+    while an isolated session runs — the worktree holds its own seeded copy, so the
+    story completes normally and only the carry finds nothing to write to.
+
+    The ROW rather than the whole FILE, and a second row left standing: a main board
+    that is missing outright — or left with an empty `development_status` — raises
+    `SprintStatusError` out of `advance` itself, which ends the run over the carry's
+    shoulder and proves nothing about the carry's own record. `1-1-b` is parked at
+    `done` so it holds the map open without being actionable."""
+    ignored_sprint(project, {"1-1-a": "ready-for-dev", "1-1-b": "done"})
+    inner = wt_dev_effect(project, "1-1-a", followup_review=False)
+
+    def effect(spec):
+        result = inner(spec)
+        board = project.sprint_status  # the MAIN board, not the worktree's
+        kept = [
+            ln
+            for ln in board.read_text(encoding="utf-8").splitlines(keepends=True)
+            if "1-1-a" not in ln
+        ]
+        board.write_text("".join(kept), encoding="utf-8")
+        return result
+
+    engine, _ = make_engine(project, [effect])
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") is None  # premise
+    assert _board_carry_events(engine) == []  # no success filed for a carry that isn't
+    assert [
+        (e["target"], e["status"])
+        for e in _board_carry_events(engine, "board-advance-carry-failed")
+    ] == [("done", None)]
+    assert _sprint_carry_commits(project) == []
+
+
+def test_board_carry_that_cannot_rewrite_the_row_is_not_journalled_as_carried(project):
+    """Shape two, and the one a `None` check alone would miss: the row is THERE and
+    `advance` still leaves it below target. `story_status` resolves a quoted key
+    through a full YAML parse, `_set_mapping_value`'s line regex then declines it,
+    and `advance` returns the row's current status rather than falsely claiming the
+    target — a distinction this method has to carry through to its journal."""
+    ignored_sprint(project, {"1-1-a": "ready-for-dev"})
+    inner = wt_dev_effect(project, "1-1-a", followup_review=False)
+
+    def effect(spec):
+        result = inner(spec)
+        board = project.sprint_status
+        text = board.read_text(encoding="utf-8").replace("1-1-a:", '"1-1-a":')
+        board.write_text(text, encoding="utf-8")
+        return result
+
+    engine, _ = make_engine(project, [effect])
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed
+    assert _board_carry_events(engine) == []
+    assert [
+        (e["target"], e["status"])
+        for e in _board_carry_events(engine, "board-advance-carry-failed")
+    ] == [("done", "ready-for-dev")]
+    # the premise, stated: the row is readable and still did not move
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "ready-for-dev"
+    assert _sprint_carry_commits(project) == []
+
+
+def test_crashed_post_merge_board_advance_replays_from_its_record(project):
+    """The merge-to-carry window, for the payload that reaches it most often.
+
+    A generic story usually records a board advance and NOTHING else, so the resume
+    pass reaches it only because the eligibility disjunct names this field — the
+    strand the comment above that disjunct warns about, on the ordinary case rather
+    than a rare one.
+    """
+    ignored_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [wt_dev_effect(project, "1-1-a", followup_review=False)])
+    crash_at_merge_back(engine, after="merge")
+
+    assert engine.run().crashed
+
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed.phase == Phase.DONE and not crashed.isolated_ledger_carried
+    # durable, and the ONLY payload that can reach the carry for this story
+    assert crashed.board_advance_intended == "done"
+    assert not crashed.harvested_deferrals and not crashed.refiled_followups
+    assert not crashed.story_closes_intended and not crashed.bundle_closes_intended
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "ready-for-dev"
+
+    state = load_state(engine.run_dir)
+    state.clear_pause()
+    adapter = MockAdapter([])
+    resumed = Engine(
+        paths=project,
+        policy=engine.policy,
+        adapter=adapter,
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=state,
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.crashed and not summary.paused
+    assert adapter.sessions == []  # replayed, not re-driven
+    assert "resume-ledger-carry" in journal_kinds(resumed)
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+    assert load_state(resumed.run_dir).tasks["1-1-a"].isolated_ledger_carried
+
+
+def test_board_advance_carried_twice_by_a_crash_before_its_latch_is_a_no_op(project):
+    """The carry-to-latch window: the resume replays a carry that already ran.
+
+    That is safe for the board because `advance` never regresses — the second
+    application reads `done` and returns it unwritten. This is the window that pins
+    call-site latching: a latch moved inside the hook would already be durable here
+    and the resume would never replay at all.
+    """
+    ignored_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [wt_dev_effect(project, "1-1-a", followup_review=False)])
+    crash_at_merge_back(engine, after="carry")
+
+    assert engine.run().crashed
+
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed.phase == Phase.DONE and not crashed.isolated_ledger_carried
+    # the carry itself completed before the host died
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+    before = project.sprint_status.read_bytes()
+
+    state = load_state(engine.run_dir)
+    state.clear_pause()
+    resumed = Engine(
+        paths=project,
+        policy=engine.policy,
+        adapter=MockAdapter([]),
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=state,
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.crashed and not summary.paused
+    assert "resume-ledger-carry" in journal_kinds(resumed)
+    # byte-identical: a re-applied advance rewrites nothing, comments included
+    assert project.sprint_status.read_bytes() == before
+    assert [(e["target"], e["status"]) for e in _board_carry_events(resumed)] == [
+        ("done", "done"),
+        ("done", "done"),
+    ]
+    assert load_state(resumed.run_dir).tasks["1-1-a"].isolated_ledger_carried
+
+
+def test_unmerged_terminal_unit_does_not_replay_a_board_advance(project):
+    """Merge evidence still gates the replay now that nearly every story has a
+    payload.
+
+    Before #350 a DONE story with no ledger write fell out of the eligibility
+    disjunct and never reached the merge-evidence check at all; the board record
+    puts it there on the ordinary path, so the guard that used to be shadowed is now
+    the only thing standing between a terminal phase and a carry onto a branch that
+    never landed. A tracked board makes the refusal legible: the carry would advance
+    it, so `ready-for-dev` is proof the body did not run.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    engine.state.target_branch = "main"
+    worktree = engine.run_dir / "worktrees" / "1-1-a"
+    worktree.mkdir(parents=True)
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=Phase.DONE,
+        worktree_path=str(worktree),
+        branch="bmad-loop/test-run/1-1-a",
+        board_advance_intended="done",
+    )
+    engine.state.tasks[task.story_key] = task
+
+    engine._replay_unlatched_ledger_carries()
+
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "ready-for-dev"
+    assert task.isolated_ledger_carried is False
+    assert "resume-ledger-carry" not in journal_kinds(engine)
+    assert _board_carry_events(engine) == []
+
+
+def test_a_park_confirms_only_after_its_board_advance_is_carried(project):
+    """`confirm` reads the COMMITTED board, so the crash window is visible to it.
+
+    In the merge-to-carry window the park record and its spec have landed on the
+    target while the main board still says `ready-for-dev`, and `confirm` refuses
+    on exactly that disagreement rather than flipping a board on the record's word.
+    The replay is what makes the story confirmable — this is the operator-facing
+    consequence of stranding the carry, and it lives here rather than in
+    test_operatoractions.py because only the engine can reach the window.
+    """
+    from bmad_loop import operatoractions
+
+    ignored_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            wt_dev_effect(
+                project,
+                "1-1-a",
+                final_status="awaiting-operator",
+                followup_review=False,
+                operator_actions=["publish the DNS record"],
+            )
+        ],
+    )
+    crash_at_merge_back(engine, after="merge")
+
+    assert engine.run().crashed
+
+    (parked,) = operatoractions.resolve(project.project, project)
+    assert parked.spec_status == "awaiting-operator"  # the spec rode the merge
+    assert parked.board_status == "ready-for-dev"  # the board did not
+    assert not parked.confirmable
+    assert parked.committed_drift() == "the board now says ready-for-dev"
+
+    state = load_state(engine.run_dir)
+    state.clear_pause()
+    resumed = Engine(
+        paths=project,
+        policy=engine.policy,
+        adapter=MockAdapter([]),
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=state,
+    )
+    assert resumed.run().awaiting_operator == 1
+
+    (parked,) = operatoractions.resolve(project.project, project)
+    assert parked.board_status == "awaiting-operator"
+    assert parked.committed_drift() is None
+    assert parked.confirmable
+
+
+def test_a_gitignored_board_story_finished_by_one_run_is_not_re_picked_by_the_next(project):
+    """#350 end to end, across the run boundary that is the only place it shows.
+
+    Both halves have to hold for this to pass, and neither can stand in for the
+    other. WITHOUT THE SEED run 1 does not finish at all: the worktree has no board,
+    `verify_dev` reads that missing file through `story_status`, and
+    `SprintStatusError` takes the run down. WITHOUT THE CARRY run 1 finishes
+    perfectly and the damage is invisible until run 2 — inside a single run
+    `state.tasks` shields a finished story from `_pick_next` no matter what the board
+    says, so a fresh RunState reading the MAIN board is the only thing that can tell
+    a carried advance from a lost one.
+
+    That makes run 2 the discriminating assertion of the whole bundle: it is
+    `_pick_next`'s own reader, against `ACTIONABLE_STATUSES`, over the file the
+    orchestrator actually kept. A lost advance leaves `ready-for-dev` there, and the
+    next unattended run hands finished work back to a dev session.
+
+    The board's FULL text is asserted, not just the story's status: the carry runs
+    through `_set_mapping_value`, so this doubles as #366's oracle at the top layer —
+    one value moved, `last_updated`'s unquoted `01-06-2026 10:00` (spaces and all)
+    untouched, no line fabricated. A `yaml.safe_load` comparison would see none of
+    that.
+    """
+    rel = ignored_sprint(project, {"1-1-a": "ready-for-dev"})
+    parked_board = project.sprint_status.read_text()
+    first_engine, first_adapter = make_engine(
+        project, [wt_dev_effect(project, "1-1-a", followup_review=False)]
+    )
+
+    first = first_engine.run()
+
+    # run 1: the seed's half — it completes rather than crashing on the missing board
+    assert first_engine.state.crash_error is None and not first.crashed
+    assert first.done == 1 and not first.paused
+    assert first_engine.state.tasks["1-1-a"].phase == Phase.DONE
+    assert len(first_adapter.sessions) == 1
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+    # run 1: the carry's half — the main board moved, and ONLY where it should have
+    assert project.sprint_status.read_text() == parked_board.replace(
+        "1-1-a: ready-for-dev", "1-1-a: done"
+    )
+    assert not verify.path_tracked(project.project, rel)  # still git's to refuse
+    assert worktree_clean(project.project)
+
+    # Run 2 is a fresh RunState over the same project: nothing shields the story now
+    # except the board itself.
+    second_engine, second_adapter = make_engine(project, [], run_id="test-run-2")
+
+    second = second_engine.run()
+
+    assert second_adapter.sessions == []  # never re-picked, so never re-driven
+    assert second.done == 0 and not second.crashed and not second.paused
+    assert second_engine.state.tasks == {}
+    assert [p.resolve() for p in worktree_list(project.project)] == [project.project.resolve()]
+    assert project.sprint_status.read_text() == parked_board.replace(
+        "1-1-a: ready-for-dev", "1-1-a: done"
+    )
 
 
 def test_crashed_post_merge_story_close_replays_from_its_record(project):

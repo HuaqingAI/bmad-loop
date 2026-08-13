@@ -1050,6 +1050,72 @@ class WorktreeFlow:
             return ()
         return (rel,)
 
+    def _board_seed(self, worktree: Path) -> tuple[str, ...]:
+        """The sprint board, when a worktree checkout cannot deliver it (#350).
+
+        The structural sibling of :meth:`_ledger_seed`, for the other
+        orchestrator-owned artifact in the BMAD artifacts dir, and the same shape
+        for the same reason: `git worktree add` checks out TRACKED files only, so a
+        project that gitignores its board gets a unit worktree with none, while the
+        orchestrator writes the board through ``self.workspace.paths`` — i.e. that
+        missing copy.
+
+        What the ledger's absence costs is a livelock; the board's is a CRASH.
+        ``Engine._post_dev_state_sync``'s ``advance`` returns None on a file that is
+        not there (a silent no-op), and ``verify_dev`` then reads the SAME absent
+        file through ``story_status``, where ``sprintstatus.load`` raises
+        ``SprintStatusError`` — a class cli, operatoractions and the TUI all catch
+        and neither engine.py nor verify.py does, so the story dies and takes the
+        run with it. Seeding removes that structurally: the gate reads the
+        orchestrator's own write instead of a hole.
+
+        Per the maintainer decision on #350 the worktree copy is CANONICAL for the
+        duration of the story. As with the ledger, the copy is not what delivers the
+        advance back: every seeded rel is shielded from the unit's ``git add -A``,
+        so the worktree's flip never rides the merge, and a post-merge carry is the
+        delivery path.
+
+        Excluded, arm for arm as the ledger's: a board already in the checkout
+        (tracked, hence delivered — seeding it would copy nothing and journal
+        ``worktree-seed-skipped`` on every isolated unit of every project that
+        tracks its board, which is the common shape for this file); one absent from
+        the main checkout, which the seed loop drops SILENTLY — neither
+        ``worktree-seed-skipped`` nor ``worktree-seed-dropped`` — so naming it would
+        be invisible rather than merely inert (a story run cannot reach here without
+        a board, since ``_pick_next`` reads it first, but a sweep or stories run
+        needs no board at all); and one resolving outside the project tree, which
+        for an out-of-tree artifacts dir ``ProjectPaths.rebased`` leaves unmoved, so
+        the worktree already reads this very file. Presence is asked of the
+        WORKTREE, not of git, for the ledger's reason: it is the predicate the seed
+        loop itself decides on, it costs no subprocess and it cannot raise.
+
+        A board that is itself a symlink inherits ``_ledger_seed``'s caveat verbatim
+        (#462); it is derived there and not repeated here.
+
+        INHERITED LIMITATION — parity, not a regression, and NOT fixed here: a
+        non-fixable rollback does not restore a seeded board. Rollback resets
+        TRACKED paths and removes untracked NON-IGNORED ones
+        (``verify.untracked_files``); an ignored board is in neither set, so nothing
+        puts back the pre-attempt status. An attempt that advanced the worktree
+        board to ``done`` therefore PINS it there — ``advance`` never regresses — and
+        a later attempt that parks instead cannot satisfy ``verify_dev``'s
+        ``awaiting-operator`` expectation. That is exactly what an in-place
+        gitignored board already does under ``isolation = "none"``; only a TRACKED
+        board escapes, via the rollback's ``reset --hard``. Seeding neither
+        introduces the trap nor widens it.
+
+        Deduped against ``scm.worktree_seed`` by the caller.
+        """
+        board = self.paths.sprint_status
+        repo = self.paths.repo_root
+        try:
+            rel = board.resolve().relative_to(repo.resolve()).as_posix()
+        except (OSError, RuntimeError, ValueError):
+            return ()
+        if not _is_file(board) or _is_file(worktree / rel):
+            return ()
+        return (rel,)
+
     def run_isolated(self, task: StoryTask, drive: Callable[[StoryTask], None]) -> None:
         """Run one unit's `drive` body in a fresh per-unit worktree, then merge
         it back into the target branch. `drive` either returns (DONE/DEFERRED →
@@ -1129,7 +1195,10 @@ class WorktreeFlow:
                 if not profile.hookless and profile.hooks.config_path:
                     seeds.append(profile.hooks.config_path)
         seeds.extend(scm.worktree_seed)
+        # the two orchestrator-owned artifacts a tracked-only checkout can leave
+        # behind — each decides its own exclusions; see the methods.
         seeds.extend(self._ledger_seed(unit.path))
+        seeds.extend(self._board_seed(unit.path))
         # plugins (e.g. the Unity engine) may prime an isolated checkout with
         # gitignored paths they need — e.g. an MCP-generated skill tree + client
         # config so the worktree's Editor MCP is reachable. Aggregate every loaded

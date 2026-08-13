@@ -180,7 +180,10 @@ def test_merge_message_format(tmp_path):
 # them are silent in the journal by design.
 
 
-def _ledger_flow(tmp_path, *, artifacts: Path | None = None) -> WorktreeFlow:
+def _artifact_flow(tmp_path, *, artifacts: Path | None = None) -> WorktreeFlow:
+    """A flow over BMAD-shaped paths, shared by the ledger- and board-seed rows —
+    both seeds decide over the same artifacts dir, and `artifacts` moves it out of
+    the project tree for the exclusion each has for that case."""
     repo = tmp_path / "repo"
     (repo / "_bmad-output" / "implementation-artifacts").mkdir(parents=True)
     paths = ProjectPaths(
@@ -199,7 +202,7 @@ def test_ledger_seed_names_a_ledger_the_checkout_cannot_deliver(tmp_path):
     """The default shape: a gitignored ledger is absent from a tracked-only
     checkout, so the orchestrator's own close would be written to — and read back
     from — a file that does not exist."""
-    flow = _ledger_flow(tmp_path)
+    flow = _artifact_flow(tmp_path)
     flow.paths.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
     worktree = tmp_path / "wt"
     worktree.mkdir()
@@ -214,7 +217,7 @@ def test_ledger_seed_skips_a_ledger_the_checkout_already_has(tmp_path):
     copies nothing and journals `worktree-seed-skipped` — a diagnostic meaning "a
     seed you asked for did nothing" — on every isolated unit of every ordinary
     project."""
-    flow = _ledger_flow(tmp_path)
+    flow = _artifact_flow(tmp_path)
     flow.paths.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
     worktree = tmp_path / "wt"
     delivered = worktree / "_bmad-output" / "implementation-artifacts" / "deferred-work.md"
@@ -229,7 +232,7 @@ def test_ledger_seed_skips_an_absent_ledger(tmp_path):
     it. A seed entry naming a non-existent source is dropped by the seed loop
     without `worktree-seed-skipped` OR `worktree-seed-dropped`, so it would be
     invisible rather than merely inert."""
-    flow = _ledger_flow(tmp_path)
+    flow = _artifact_flow(tmp_path)
     worktree = tmp_path / "wt"
     worktree.mkdir()
 
@@ -242,13 +245,77 @@ def test_ledger_seed_skips_a_ledger_outside_the_project_tree(tmp_path):
     worktree already reads this very file and there is nothing to deliver."""
     shared = tmp_path / "shared-artifacts"
     shared.mkdir()
-    flow = _ledger_flow(tmp_path, artifacts=shared)
+    flow = _artifact_flow(tmp_path, artifacts=shared)
     flow.paths.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
     worktree = tmp_path / "wt"
     worktree.mkdir()
 
     assert flow.paths.rebased(worktree).deferred_work == flow.paths.deferred_work
     assert flow._ledger_seed(worktree) == ()
+
+
+# -------------------------------------------------------------------- board seed
+#
+# `_board_seed` is `_ledger_seed`'s sibling for the sprint board (#350): same three
+# exclusions, same worktree-presence predicate, different artifact — and a harsher
+# failure when it is missing, since `verify_dev` RAISES on an absent board where
+# the ledger's gate merely re-bundles. Unit-level for the ledger's reason: two of
+# the exclusions are silent in the journal by design.
+
+
+def test_board_seed_names_a_board_the_checkout_cannot_deliver(tmp_path):
+    """A gitignored board is absent from a tracked-only checkout, so the
+    orchestrator's own advance would be written to — and read back from — a file
+    that does not exist, and the read-back raises."""
+    flow = _artifact_flow(tmp_path)
+    flow.paths.sprint_status.write_text("development_status:\n  1-1-a: ready-for-dev\n")
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    assert flow._board_seed(worktree) == (
+        "_bmad-output/implementation-artifacts/sprint-status.yaml",
+    )
+
+
+def test_board_seed_skips_a_board_the_checkout_already_has(tmp_path):
+    """A tracked board — the common shape for this file — is delivered by `git
+    worktree add`. Seeding it anyway copies nothing and journals
+    `worktree-seed-skipped` on every isolated unit of every such project."""
+    flow = _artifact_flow(tmp_path)
+    flow.paths.sprint_status.write_text("development_status:\n  1-1-a: ready-for-dev\n")
+    worktree = tmp_path / "wt"
+    delivered = worktree / "_bmad-output" / "implementation-artifacts" / "sprint-status.yaml"
+    delivered.parent.mkdir(parents=True)
+    delivered.write_text("development_status:\n  1-1-a: ready-for-dev\n")
+
+    assert flow._board_seed(worktree) == ()
+
+
+def test_board_seed_skips_an_absent_board(tmp_path):
+    """No board at all is a real state for the run types that need none (sweep,
+    stories). A seed entry naming a non-existent source is dropped by the seed loop
+    without `worktree-seed-skipped` OR `worktree-seed-dropped`, so it would be
+    invisible rather than merely inert."""
+    flow = _artifact_flow(tmp_path)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    assert not flow.paths.sprint_status.exists()
+    assert flow._board_seed(worktree) == ()
+
+
+def test_board_seed_skips_a_board_outside_the_project_tree(tmp_path):
+    """`ProjectPaths.rebased` leaves an out-of-tree artifacts dir unmoved, so the
+    worktree already reads this very file and there is nothing to deliver."""
+    shared = tmp_path / "shared-artifacts"
+    shared.mkdir()
+    flow = _artifact_flow(tmp_path, artifacts=shared)
+    flow.paths.sprint_status.write_text("development_status:\n  1-1-a: ready-for-dev\n")
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    assert flow.paths.rebased(worktree).sprint_status == flow.paths.sprint_status
+    assert flow._board_seed(worktree) == ()
 
 
 # --------------------------------------------------------------- profiles / agents

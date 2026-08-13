@@ -553,6 +553,77 @@ def path_tracked_file(repo: Path, rel: str) -> bool:
     return {entry for entry in proc.stdout.split(b"\0") if entry} == {os.fsencode(rel)}
 
 
+def path_ignored(repo: Path, path: Path) -> bool:
+    """True when `git add` would REFUSE ``path`` for being ignored — i.e. an ignore
+    rule matches it AND git does not already track it (#577).
+
+    Both halves matter, and `check-ignore` answers both in one call: it consults the
+    INDEX unless told not to (`--no-index` exists precisely to turn that off), so a
+    tracked file under a matching rule reads NOT ignored here — rc 1 — which is
+    exactly what `git add` does with it. That asymmetry is the #392 one seen from the
+    other side: a rule over a tracked regular file suppresses nothing, because git
+    consults ignore rules only for untracked paths. A probe that read the RULE alone
+    would answer "ignored" for a `git add -f`'d board and drop it from a commit git
+    would have taken. Measured, git 2.55.0.
+
+    Takes an absolute `Path` rather than a repo-relative rel like its two siblings
+    above, because its caller holds a CONFIGURED path (`ProjectPaths.sprint_status`,
+    resolved out of the operator's `_bmad/bmm/config.yaml`) rather than a git-derived
+    relpath, and the answer has to be about the same rel :func:`commit_paths` will
+    derive from that same `Path`. Deriving it twice in two modules is how the two
+    drift apart. Out-of-repo answers False for the same reason `commit_paths` skips
+    such a path: there is nothing here to omit from a commit that will not contain it.
+
+    The one probe in this module that CANNOT force a literal operand: `check-ignore`
+    parses pathspec magic and then rejects it outright — `:(literal)x` exits 128 with
+    "pathspec magic not supported by this command" (measured, git 2.55.0) — so the
+    hardening `path_tracked` documents at length is unavailable. It is also not
+    needed for the glob half: gitignore matching makes the PATTERN the wildmatch and
+    the pathname a literal, so `[`, `]`, `*` and `?` in ``rel`` are inert (verified
+    against a repo holding both `d[a]/b.yaml` and `da/b.yaml` under a `da/` rule —
+    the metacharacter path correctly reads not-ignored).
+
+    The leading `./` is what stands in for it, and it is load-bearing: magic is
+    recognized only on an operand that STARTS with `:`, so a prefix that is a no-op
+    as a path is enough to make git read the whole rel as a pathname. Without it a
+    ``rel`` beginning with `:` fails TWO ways, not one, and the quiet way is the
+    reason this is not merely cosmetic (both measured, git 2.55.0):
+
+    - UNSUPPORTED magic (`:(literal)`, `:(icase)`, `:!`, `:^`) exits 128, which
+      surfaces as `GitError` and degrades to "not ignored" — a gitignored board then
+      stays in `confirm`'s operand list and `git add` refuses the WHOLE list with it,
+      losing the spec and park-record writes that #577 exists to keep.
+    - SUPPORTED magic (`:(top)`, `:/`) is accepted, and git answers about the path
+      the magic DENOTES rather than the file named on disk: `:(top)board.yaml` reads
+      rc 0 whenever a plain `board.yaml` is ignored, even though nothing matches the
+      real file. That is a silent wrong answer in the drop direction — `confirm`
+      would omit a perfectly committable board and never commit its advance.
+
+    Verified that `./` costs neither contract above: the index consultation still
+    reads a tracked-and-ignored board as not-ignored, and `d[a]/f.md` still reads
+    literally beside an ignored `da/`.
+
+    Raises GitError like every other probe in this module. Its caller degrades by
+    treating the path as NOT ignored, which keeps it in the commit — the behavior
+    before this function existed, and the direction that cannot lose a write."""
+    repo_root = repo.resolve()
+    try:
+        rel = Path(path).resolve().relative_to(repo_root).as_posix()
+    except ValueError:
+        return False
+    # `./` disarms pathspec magic on a rel beginning with `:` — see the docstring;
+    # it is not decoration. `rel` is already posix-separated and relative, so the
+    # prefix is a pure no-op as a path on every platform.
+    operand = f"./{rel}"
+    proc = _run_git(["git", "-C", str(repo), "check-ignore", "-q", "--", operand], repo)
+    # 0 = ignored, 1 = not; anything else is git failing rather than answering, and
+    # `-q` means there is no output to misread either way.
+    if proc.returncode not in (0, 1):
+        merged = (proc.stdout + proc.stderr).strip()
+        raise GitError(f"git check-ignore -- {operand} failed in {repo}: {merged}")
+    return proc.returncode == 0
+
+
 def commits_above(repo: Path, baseline: str) -> list[str]:
     """Commit shas reachable from HEAD but not from ``baseline`` — the commits an
     attempt added on top of its pre-attempt baseline, in ``git rev-list`` order (do

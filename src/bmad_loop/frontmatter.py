@@ -182,12 +182,15 @@ LineRenderer = Callable[[str, "re.Match[str]", str], str]
 # token and the ordinary scalar frontmatter values have; anything richer than
 # that falls back to the full-drop render, which is merely lossy, never wrong.
 #
-# `sprintstatus._set_mapping_value` solves the same problem with the WIDE `val`
-# this one refuses (`\S(?:.*?\S)?`), and the asymmetry is deliberate rather than
-# an oversight: it writes the orchestrator-owned board, whose values are status
-# tokens and timestamps, while this writes a hand-authored spec. It has the
-# fabricated-comment defect described above and is tracked separately (#366) —
-# do not "unify" the two by widening this one.
+# `sprintstatus._set_mapping_value` solves the same problem with a wider value
+# class than this one accepts, and the asymmetry is deliberate rather than an
+# oversight: it writes the orchestrator-owned board, whose `last_updated` is a
+# bare scalar WITH SPACES that this token class would refuse outright, while this
+# writes a hand-authored spec where a value richer than a token is exactly the
+# shape whose boundary cannot be trusted. Since #366 the two agree on the part
+# that matters — neither guesses where a QUOTED scalar ends — and they part only
+# on how much of an unquoted one they will read. Do not "unify" them by widening
+# this one back; the token class is this side's whole gate.
 _VALUE_COMMENT_RE = re.compile(
     r"^[ \t]*(?P<q>['\"]?)(?P<val>[A-Za-z0-9._-]*)(?P=q)(?P<sep>[ \t]+)(?P<comment>#.*)$"
 )

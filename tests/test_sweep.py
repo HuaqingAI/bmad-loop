@@ -729,6 +729,35 @@ def test_isolated_bundle_carries_its_gitignored_ledger_close_to_the_main_checkou
     assert worktree_clean(project.project)
 
 
+def test_isolated_bundle_carry_never_touches_the_sprint_board(project):
+    """The board carry rides the shared dispatcher, so a sweep runs it too — and it
+    must return before doing anything (#350).
+
+    `SweepEngine._post_dev_state_sync` is a no-op, so `board_advance_intended` is
+    never set and the record IS the guard: no `_isolated`, `_generic_dev` or
+    run-type predicate is added anywhere for this. The journal is the oracle rather
+    than the board's content, which for a bundle has no row to move in the first
+    place and so would agree with a carry that ran on nothing.
+    """
+    ignored_ledger(project, {"DW-1": "open"})
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan(["DW-1"])), wt_bundle_dev(project)],
+        policy=isolated_seeded_policy(project),
+    )
+
+    summary = engine.run()
+
+    task = engine.state.tasks["dw-fix"]
+    assert not summary.paused and not summary.crashed
+    assert task.phase == Phase.DONE and task.isolated_ledger_carried
+    assert task.board_advance_intended is None
+    kinds = journal_kinds(engine)
+    assert "sweep-bundle-close-carried" in kinds  # the dispatcher DID run
+    assert "board-advance-carried" not in kinds
+    assert "board-advance-carry-uncommitted" not in kinds
+
+
 def test_isolated_bundle_carry_files_the_harvest_before_closing_the_bundle(project):
     """`super()` first: `append_entry`'s idempotence scan is open-only, so a close
     applied ahead of the harvest would hide an already-filed row from it.
@@ -1411,6 +1440,9 @@ def test_bundle_pre_gate_state_sync_is_a_noop(project):
     assert ledger_entries(project)["DW-1"].open
     assert task.bundle_closes_intended == []
     assert "sweep-bundle-closed" not in {e["kind"] for e in engine.journal.entries()}
+    # and no sprint-board intent either: a bundle has no board row, and this
+    # override being a no-op is the whole of `_carry_board_advance`'s guard (#350)
+    assert task.board_advance_intended is None
 
 
 def test_bundle_ledger_close_skips_on_unreadable_spec(project, monkeypatch):

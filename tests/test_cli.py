@@ -17,6 +17,7 @@ from conftest import (
     escalated_run,
     fault_read_text,
     git,
+    ignore_before_commit,
     install_bmad_config,
     install_build_auto_skill,
     install_dev_base_skills,
@@ -6467,6 +6468,57 @@ def test_confirm_commits_even_without_a_committed_record(project, capsys, monkey
     assert "confirm 1-1-a" in git(project.project, "log", "-1", "--format=%s")
     assert operatoractions.load(project.project) == {}  # legacy entry pruned too
     assert verify.worktree_clean(project.project)
+
+
+def test_confirm_lands_its_commit_over_a_gitignored_board(project, capsys, monkeypatch):
+    """A gitignored board must not sink the confirm commit with it.
+
+    `git add` refuses an explicitly named ignored pathspec with rc 1 — and refuses
+    the WHOLE operand list with it, staging nothing — so handing `commit_paths` a
+    gitignored board raises `GitError` before the spec and the record ever reach
+    the index. That error is swallowed as best-effort ("files are the state"),
+    which is right for the board and wrong for the other two: the spec's flip to
+    `done` and the record's DELETION stay uncommitted, and the record's deletion in
+    particular arrived in the park's commit (#356), so leaving it out dirties the
+    tree the next run's preflight refuses. The board carry (#350) makes
+    gitignored-board parks the ordinary shape rather than an exotic one.
+
+    Ablation: drop the `path_ignored` filter in `_land_confirmation` and this
+    reddens on the log assertion — HEAD still reads `park`, with the spec's flip
+    and the record's deletion left dirtying the tree under a `✓ confirmed`. The
+    other 30 confirm rows stay green, which is the point: a TRACKED board is
+    untouched by the filter."""
+    from bmad_loop import operatoractions, sprintstatus, verify
+
+    install_bmad_config(project)
+    # the rule first, so the park's `add -A` below cannot sweep the board in; the
+    # board is written by `_park_story` after it, and stays untracked forever.
+    ignore_before_commit(project, "sprint-status.yaml")
+    sp = _park_story(project)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "park")
+    rel = project.sprint_status.relative_to(project.project).as_posix()
+    # `check-ignore` is the oracle: a rule that is present is not necessarily
+    # effective, and a board that reads TRACKED here is the shape with no defect.
+    assert git(project.project, "check-ignore", rel).strip() == rel
+    assert not verify.path_tracked(project.project, rel)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 0
+
+    # the board advanced ON DISK — an ignored file is still the state
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+    assert not verify.path_tracked(project.project, rel)
+    # ...and the two records git DOES own moved into history together
+    assert operatoractions.load(project.project) == {}
+    assert "confirm 1-1-a" in git(project.project, "log", "-1", "--format=%s")
+    changed = git(project.project, "show", "--name-only", "--format=", "HEAD").split()
+    assert sp.relative_to(project.project).as_posix() in changed
+    assert ".bmad-loop/operator/1-1-a.json" in changed
+    assert rel not in changed  # the board is git's business to refuse, not ours
+    # the whole point: the next run's preflight finds nothing left behind
+    assert verify.worktree_clean(project.project)
+    assert "✓ 1-1-a confirmed" in capsys.readouterr().out
 
 
 def test_confirm_works_on_a_fresh_clone_of_a_parked_repo(project, capsys, monkeypatch, tmp_path):

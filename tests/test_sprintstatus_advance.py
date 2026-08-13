@@ -166,3 +166,113 @@ def test_advance_story_not_found(tmp_path):
 
 def test_advance_missing_file(tmp_path):
     assert sprintstatus.advance(tmp_path / "ghost.yaml", "3-2-x", "in-progress") is None
+
+
+# ================================================= the value / comment split
+#
+# #366. `_set_mapping_value` decides where a line's scalar ends and a trailing
+# inline comment begins, and NOTHING checks that guess afterwards: `advance` has
+# no oracle at all, and the one a caller might reach for cannot see this class of
+# error anyway — `yaml.safe_load` strips comments before it could compare, so a
+# line rewritten with a comment invented out of the tail of a quoted value
+# re-parses as a perfectly clean `3-2-x: done`. (Proven by ablation on the sibling
+# defect, PR #365, whose three verification gates all passed the fabricated
+# comment.) The pattern is therefore the gate here, and these tests hold it.
+#
+# Called directly rather than through `advance` wherever the shape under test is
+# a REFUSAL: `advance` answers a refused line and a story already at target with
+# the same unchanged status, so only the writer's own return separates them.
+# Every assertion is on the FULL resulting text — a substring or a re-parse is
+# blind to exactly the fabrication these are here to catch.
+
+
+def test_a_hash_inside_a_quoted_value_never_becomes_a_comment(tmp_path):
+    """The case #366 is about, end to end through the sole writer. `"a # b"`
+    carries no comment — the `#` is scalar text — so a split guessed from the last
+    ` #` on the line writes `3-2-x: done # b"`, promoting the tail of the value
+    into a comment the board never had and truncating the value it came from. A
+    quote-led remainder is taken whole instead, which drops nothing that was
+    ever a comment.
+
+    Compares the full resulting TEXT, not its bytes. Full-content equality is the
+    point — a substring or a re-parse is blind to a fabricated comment — but
+    `advance` writes through `Path.write_text`, whose `newline=None` relays every
+    line ending in the board to `os.linesep`, so a byte comparison also asserts
+    line endings and fails on Windows for a reason that has nothing to do with
+    #366. That relay is real and known (#576); it is not this test's subject, and
+    pinning it here would put a second, accidental contract on the row that guards
+    the value/comment split. Reading back with universal newlines drops exactly
+    that difference and nothing else."""
+    p = tmp_path / "sprint-status.yaml"
+    board = (
+        'last_updated: 01-06-2026 10:00\ndevelopment_status:\n  3-2-x: "a # b"\n  3-3-y: backlog\n'
+    )
+    p.write_text(board, encoding="utf-8")
+
+    assert sprintstatus.advance(p, "3-2-x", "done") == "done"
+
+    assert p.read_text(encoding="utf-8") == board.replace('"a # b"', "done")
+
+
+def test_a_quoted_value_is_replaced_whole_with_no_comment_carried(tmp_path):
+    """The writer's own half of the case above: the write SUCCEEDS (a quoted
+    hand-edit is still a value the orchestrator owns and replaces), and what it
+    leaves behind is the bare target and nothing else."""
+    lines = ['  3-2-x: "a # b"  # real comment\n']
+
+    assert sprintstatus._set_mapping_value(lines, "3-2-x", "done") is True
+
+    # the trailing comment goes too: nothing here can tell a closing quote from
+    # a quote inside the scalar, so a comment after one is dropped, not guessed.
+    assert "".join(lines) == "  3-2-x: done\n"
+
+
+def test_a_value_with_internal_spaces_is_matched_whole(tmp_path):
+    """Why this board cannot borrow `frontmatter._VALUE_COMMENT_RE`'s
+    conservative token class: `last_updated` is a bare scalar WITH SPACES, and a
+    token gate would refuse it — the timestamp refresh would silently stop
+    happening (`test_advance_refreshes_last_updated` is the advance-level half)."""
+    lines = ["last_updated: 01-06-2026 10:00\n"]
+
+    assert sprintstatus._set_mapping_value(lines, "last_updated", "22-06-2026 14:30") is True
+
+    assert "".join(lines) == "last_updated: 22-06-2026 14:30\n"
+
+
+def test_an_inline_comment_carries_with_its_authored_separator(tmp_path):
+    """The preservation the split exists to make possible, unchanged by #366: an
+    unquoted value cedes the FIRST whitespace-preceded `#`, and the whitespace
+    that separates it comes through as authored (two spaces here), so a
+    hand-aligned comment column is not reflowed by a status flip."""
+    lines = ["  3-2-digest-delivery: backlog  # the next story\n"]
+
+    assert sprintstatus._set_mapping_value(lines, "3-2-digest-delivery", "in-progress") is True
+
+    assert "".join(lines) == "  3-2-digest-delivery: in-progress  # the next story\n"
+
+
+def test_a_hash_glued_to_the_value_stays_part_of_the_value(tmp_path):
+    """YAML needs whitespace before a `#` for it to open a comment, so
+    `backlog#x` is the single scalar `backlog#x`. The value is replaced whole and
+    `#x` is not carried forward as a comment the board never had."""
+    lines = ["  3-2-x: backlog#x\n"]
+
+    assert sprintstatus._set_mapping_value(lines, "3-2-x", "done") is True
+
+    assert "".join(lines) == "  3-2-x: done\n"
+
+
+def test_a_line_with_trailing_whitespace_and_no_comment_is_refused(tmp_path):
+    """Characterization, not a requirement — but pinned so the split cannot
+    change it by accident. Both arms end at a non-space character, so a value
+    with trailing whitespace and no comment is a remainder neither can account
+    for, and the line is left exactly as authored rather than rewritten a few
+    invisible characters shorter. `advance` then reports the unchanged status
+    (`test_advance_returns_current_when_line_not_rewritable` is that half)."""
+    trailing = "  3-2-x: backlog  \n"
+    quoted_trailing = "  3-2-x: 'backlog' \n"
+
+    for line in (trailing, quoted_trailing):
+        lines = [line]
+        assert sprintstatus._set_mapping_value(lines, "3-2-x", "done") is False
+        assert "".join(lines) == line
