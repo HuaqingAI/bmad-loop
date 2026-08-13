@@ -27,7 +27,9 @@ whose seams had diverged enough that several ports needed a different fix, and t
     `init` copies the relay into the project, so an upgraded orchestrator regularly drives sessions
     whose relay predates the move — re-run `bmad-loop init` to refresh it.
   - **`bmad-loop relay <Event>`** writes a session event without the copied-in script, on the same
-    contract (nothing on stdout, rc 0 always, silent no-op outside a driven session). It is backed
+    contract (nothing on stdout, rc 0 always, silent no-op outside a driven session). `init` does
+    not point hooks at it yet — that retargeting is #461 Phase 2 — so it changes no run today. It
+    is backed
     by a new `events.py`, whose write path an AST parity test holds byte-identical to the
     stdlib-only relay's, and dispatches ahead of the shared error handler so a broken
     `policy.toml` cannot fail a hook.

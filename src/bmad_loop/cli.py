@@ -3713,6 +3713,15 @@ def cmd_init(args: argparse.Namespace) -> int:
 def cmd_relay(args: argparse.Namespace) -> int:
     """``bmad-loop relay <Event>`` — the hook relay as an installed console script.
 
+    **Nothing points at it yet.** ``init`` still registers the copied workspace
+    relay (``install._hook_command`` emits ``<interpreter> <project>/.bmad-loop/
+    bmad_loop_hook.py <Event>``), so no installed hook reaches this handler today;
+    it is the target #461 Phase 2 retargets those registrations to, and that move
+    carries its own obligation — see the COUPLING note on ``hooks.relay-present``,
+    which must be retargeted rather than dropped in the same change. Said here
+    because a console script that exists and is documented reads as the live path,
+    and an operator debugging a lost Stop needs to know which relay actually ran.
+
     Total by contract, unlike every other handler: a coding CLI runs this INSIDE
     the session whose completion it reports, and several of them surface a
     non-zero hook exit as a failed tool call in that session. So nothing here
@@ -4081,7 +4090,7 @@ def main(argv: list[str] | None = None) -> int:
     relay_p = sub.add_parser(
         "relay",
         help="write one session event file from a coding-CLI hook payload on stdin "
-        "(invoked by the installed hooks, not by hand)",
+        "(a hook target for machines, not a command to run by hand)",
     )
     relay_p.add_argument(
         "event",
