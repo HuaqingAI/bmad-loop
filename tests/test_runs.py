@@ -777,6 +777,38 @@ def test_state_root_precedence_override_then_xdg_then_home(tmp_path, monkeypatch
     assert runs.state_root() == home / ".local" / "state" / "bmad-loop"
 
 
+@pytest.mark.parametrize("value", ["state", "./state", "~/state"], ids=repr)
+def test_state_root_refuses_a_relative_override(tmp_path, monkeypatch, value):
+    """`BMAD_LOOP_STATE_DIR` is honoured as spelled, but a relative spelling is
+    not a root — it is two roots. The engine exports this path to the session as
+    `BMAD_LOOP_EVENTS_DIR` and the multiplexer launches that session at
+    `spec.cwd` (a worktree, under isolation), while the watcher polls from the
+    orchestrator's cwd. So the relay writes its Stop into one directory and
+    nothing watches it, and the run waits out `session_timeout_min` — silent, and
+    exactly the stall moving this channel out of the tree was meant to prevent.
+
+    It RAISES rather than falling through to the cascade, which is the split from
+    the sibling XDG test above: a derived base that fails its check is a guess we
+    move on from, an override is a statement we cannot honour and must not
+    silently replace. It equally does not absolutize — resolving against whichever
+    cwd this process happens to have is the guess, and picking one of the two
+    directories at random is how the stall gets harder to see rather than gone.
+
+    `~/state` is here for the same reason it is in the XDG rows: nothing expands
+    it, so it stays relative. The empty string is deliberately NOT a row — empty
+    reads as *unset* and falls through to the cascade, which
+    `test_state_root_precedence_override_then_xdg_then_home` already grades.
+
+    Ablation target: drop the `os.path.isabs` guard from the override arm and all
+    three rows fail — each returning a cwd-relative root instead of raising."""
+    monkeypatch.setattr(runs.sys, "platform", "linux")
+    _fake_home(monkeypatch, tmp_path / "home")
+    monkeypatch.setenv(envvars.STATE_DIR, value)
+
+    with pytest.raises(runs.StateRootError, match=envvars.STATE_DIR):
+        runs.state_root()
+
+
 @pytest.mark.parametrize("value", ["state", "./state", "~/state", ""], ids=repr)
 def test_state_root_ignores_an_xdg_state_home_that_is_not_absolute(tmp_path, monkeypatch, value):
     """The XDG base-directory spec says a relative value "must be ignored", and
@@ -1651,6 +1683,48 @@ def test_reconcile_orphan_state_dirs_degrades_when_the_root_cannot_be_named(
     monkeypatch.setattr(runs, attr, _raising(exc))
 
     assert runs.reconcile_orphan_state_dirs(tmp_path) == []
+
+
+def test_reconcile_orphan_state_dirs_keeps_a_run_that_starts_mid_sweep(tmp_path, monkeypatch):
+    """`clean` is an operator command with no lock against a run starting, and the
+    two reads it makes are of different trees. A run creates its run dir strictly
+    before its state dir (`compose_run` builds the `Journal`, which mkdirs the run
+    dir, and only then calls `make_adapters`, whose `SignalWatcher` mkdirs the
+    events dir) — so reading state entries FIRST is what makes the ordering carry
+    the guarantee: an entry seen there had its run dir on disk even earlier, and
+    the later `live` read cannot miss it.
+
+    Read the other way round, a run that starts in the gap is absent from `live`
+    and present in `entries`, and `clean` deletes the control plane of a run that
+    is starting right now. The cost is not a lost directory — it is the run, which
+    then polls a primary that no longer exists or never sees its Stop and waits
+    out `session_timeout_min`.
+
+    The gap is simulated where it actually lives, by starting a run *inside* the
+    `live` read rather than by patching the sweep: whichever read runs second is
+    the one that sees `racer`, which is exactly what a real interleaving does.
+
+    Ablation guard: move the `live = _run_dir_names(project)` read back above the
+    `entries` enumeration and this fails, sweeping `racer` mid-startup."""
+    _make_state_run(tmp_path, "live-1")
+    _seed_state_dir(tmp_path, "live-1")
+    orphan = _seed_state_dir(tmp_path, "ghost-1")
+
+    real_names = runs._run_dir_names
+    racer: list[Path] = []
+
+    def _names_then_a_new_run(project: Path):
+        names = real_names(project)  # the snapshot, taken before `racer` exists
+        _make_state_run(project, "racer")
+        racer.append(_seed_state_dir(project, "racer"))
+        return names
+
+    monkeypatch.setattr(runs, "_run_dir_names", _names_then_a_new_run)
+
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == [orphan]
+
+    assert not orphan.exists()
+    assert racer[0].is_dir(), "swept the control plane of a run that was starting"
 
 
 def test_reconcile_orphan_state_dirs_skips_an_entry_it_cannot_resolve(tmp_path, monkeypatch):

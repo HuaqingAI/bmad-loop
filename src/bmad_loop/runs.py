@@ -206,9 +206,28 @@ def state_root() -> Path:
     1. ``BMAD_LOOP_STATE_DIR``, used as the state root **itself** — no
        ``bmad-loop`` segment is appended, because the variable names our root
        rather than a base to build one under. It is honoured as spelled (see
-       :func:`envvars.state_dir`), so it is the one candidate ``_state_base`` does
-       not filter: skipping a stated override would be a silent countermand, where
-       skipping a *derived* base only moves on to the next guess.
+       :func:`envvars.state_dir`) and is not passed through ``_state_base``:
+       *skipping* a stated override would be a silent countermand, where skipping
+       a derived base only moves on to the next guess.
+
+       It must still be **absolute**, and a relative spelling raises rather than
+       being resolved for the operator. Absoluteness is not a matter of taste
+       here — the root is read by two processes with different working
+       directories. The engine exports it to the session as
+       ``BMAD_LOOP_EVENTS_DIR`` and the multiplexer launches that session at
+       ``spec.cwd`` (a worktree under isolation), while the watcher polls it from
+       the orchestrator's own cwd. A relative root therefore names two different
+       directories at once: the relay writes its Stop where nothing is watching,
+       and the run waits out ``session_timeout_min`` — the exact silent stall
+       ``_state_base`` rejects relative *derived* bases to avoid, and the one
+       this whole channel was moved out of the tree to prevent.
+
+       Raising is not the countermand the paragraph above refuses: it names the
+       variable and the fix, where absolutizing against whichever cwd this
+       process happens to have would be the guess. The not-the-root half of
+       ``_state_base``'s rule is deliberately *not* applied — that half exists to
+       stop a broken environment's ``""`` from landing a guess at ``/``, and an
+       override is not a guess.
     2. POSIX — ``$XDG_STATE_HOME/bmad-loop`` when that variable names an absolute
        path, else ``~/.local/state/bmad-loop``. A relative ``XDG_STATE_HOME`` is
        *ignored*, which the XDG base-directory spec requires of its consumers.
@@ -240,6 +259,16 @@ def state_root() -> Path:
     """
     override = envvars.state_dir()
     if override:
+        # `os.path.isabs` on the raw string, matching `_state_base` exactly rather
+        # than `Path.is_absolute` — the rule and its reason are stated there.
+        if not os.path.isabs(override):
+            raise StateRootError(
+                f"{envvars.STATE_DIR} must name an absolute directory: {override!r} is "
+                "relative, and the state root is read by both this process and the "
+                "session it launches — which run from different working directories, "
+                "so a relative root names two different places and the run's "
+                "completion signal is written where nothing is watching"
+            )
         return Path(override)
     if sys.platform == "win32":
         local = _state_base(os.environ.get("LOCALAPPDATA"))
@@ -1009,15 +1038,29 @@ def reconcile_orphan_state_dirs(project: Path, *, dry_run: bool = False) -> list
     among the entries would otherwise escape a sweep whose whole contract is to
     degrade, and take the operator's ``clean`` down with it after its real work
     was already done.
+
+    **The two reads are ordered, and the order is the whole race guard.** State
+    entries are enumerated *before* the live run-dir names, because a run creates
+    its run dir strictly before its state dir — ``compose_run`` builds the
+    ``Journal`` (which mkdirs the run dir) and only then calls ``make_adapters``,
+    whose ``SignalWatcher`` mkdirs the events dir. Reading entries first makes
+    that ordering carry the guarantee: anything in ``entries`` had its state dir
+    on disk at the first read, so its run dir was on disk *before* that, so the
+    later ``live`` read is certain to contain it. Read the other way round, a run
+    starting in the gap is missing from ``live`` and present in ``entries``, and
+    an operator's ``clean`` deletes the control plane of a run that is starting
+    right now — whose watcher then polls a primary that no longer exists, or
+    simply never sees the Stop. A run dir that disappears *between* the reads is
+    the opposite case and correctly swept: it is a real orphan by then.
     """
-    live = _run_dir_names(project)
-    if live is None:
-        return []
     try:
         root = project_state_root(project)
         entries = sorted(root.iterdir())
         root_res = root.resolve()
     except (StateRootError, OSError, RuntimeError):
+        return []
+    live = _run_dir_names(project)
+    if live is None:
         return []
     handled: list[Path] = []
     for entry in entries:

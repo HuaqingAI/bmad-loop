@@ -17,7 +17,9 @@ whose seams had diverged enough that several ports needed a different fix, and t
 - **The hook-event channel moves out of the project tree (#494).** A run's session-completion
   signals now land under a user-scoped state root — `$XDG_STATE_HOME/bmad-loop` (else
   `~/.local/state/bmad-loop`), `%LOCALAPPDATA%\bmad-loop\state` on Windows, or wherever
-  `BMAD_LOOP_STATE_DIR` points — keyed `<root>/<project>/<run-id>/events/`, so a branch switch, a
+  `BMAD_LOOP_STATE_DIR` points (absolute paths only — the orchestrator and the session it
+  launches read the root from different working directories) — keyed
+  `<root>/<project>/<run-id>/events/`, so a branch switch, a
   worktree mount or a rollback can no longer take a live run's control plane away.
 
   - **Older relays keep working.** Sessions are told the directory via `BMAD_LOOP_EVENTS_DIR`; both

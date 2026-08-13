@@ -84,11 +84,17 @@ def state_dir() -> str | None:
 
     Verbatim like the two name readers above — :func:`runs.state_root` uses the
     value as the state root itself, so an operator who names a directory gets that
-    directory, relative spelling included. Silently ignoring a stated override in
-    favour of the platform cascade would be the same failure
-    :func:`mux_backend` refuses: a loud misconfiguration turned into a quiet
-    auto-select, discoverable only by noticing where a run's events did *not*
-    appear.
+    directory. Silently ignoring a stated override in favour of the platform
+    cascade would be the same failure :func:`mux_backend` refuses: a loud
+    misconfiguration turned into a quiet auto-select, discoverable only by
+    noticing where a run's events did *not* appear.
+
+    Reading verbatim is not the same as accepting anything: this reader reports
+    what is set, and :func:`runs.state_root` judges it. A **relative** value is
+    refused there rather than resolved, because the root is read by two processes
+    with different working directories — see that function for the full reason.
+    The split is deliberate; a reader that silently rewrote its variable would
+    make the refusal impossible to state.
 
     The one value not passed through is the empty string, which reads as unset.
     ``export BMAD_LOOP_STATE_DIR=`` is what an unset-looking export leaves behind,
