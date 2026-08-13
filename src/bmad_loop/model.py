@@ -467,25 +467,33 @@ class RunState:
     project: str
     started_at: str
     policy_snapshot: dict[str, Any] = field(default_factory=dict)
-    # LEGACY, read-only, one release (#498). runsetup.config_digest over the
-    # agent-writable config that reaches HOST code execution — verify commands, the
-    # resolved launch binary/args/env, the plugin allowlist (#461 point 4). It used
-    # to be stamped here at launch and re-stamped on resume, beside policy_snapshot;
-    # it is now stamped out of the tree instead (`runs.write_trusted_config_digest`),
+    # SECONDARY copy of the host-exec baseline (#498) — runsetup.config_digest over
+    # the agent-writable config that reaches HOST code execution: verify commands,
+    # the resolved launch binary/args/env, the plugin allowlist (#461 point 4).
+    #
+    # The one resume TRUSTS is out of the tree (`runs.write_trusted_config_digest`),
     # because a baseline whose whole job is to police the agent-writable tree cannot
     # live in it — a session that rewrote policy.toml could blank this field in the
-    # same breath and silence the warning `resume` owes the operator.
+    # same breath and silence the warning `resume` owes the operator. So this copy is
+    # never preferred: `_resume_paused_run` consults it ONLY when the state root
+    # holds no file for the run, which is what keeps rewriting it pointless (the
+    # #498 attack test asserts exactly that).
     #
-    # Nothing writes it any more, so it is "" on every run this code starts. It is
-    # still PARSED and still round-tripped by to_dict, for the runs that were paused
-    # under the old code and are resumed under this one: their baseline is here and
-    # nowhere else, and `_resume_paused_run` falls back to it when the state root
-    # holds no file for the run. Dropping it outright would turn "this run has a
-    # pin" into "this run has none" for exactly those runs, which is the empty-means
-    # -legacy contract read backwards. Empty still means what it always did — no
-    # prior pin, hence no warning — which is why the resume compare is guarded on
-    # non-emptiness. The auto-sweep gate has never read this field: it compares
-    # against its own in-memory closure baseline, which no session can reach.
+    # It is still written, and must be, for the two cases where the out-of-tree file
+    # is honestly absent rather than tampered away — in both, this copy is the run's
+    # only surviving pin:
+    #   * the state root is keyed by the project's RESOLVED PATH (`runs.project_tag`),
+    #     so moving or renaming the project keys the run somewhere new and orphans
+    #     its state subtree (FEATURES.md documents the GC half of this). state.json
+    #     lives in the run dir and travels with it. Same for a BMAD_LOOP_STATE_DIR
+    #     that changes between launch and resume.
+    #   * a run PAUSED before #498 has its baseline here and nowhere else; the first
+    #     resume under this code reads it and mints the out-of-tree file.
+    # Dropping it would turn "this run has a pin" into "this run has none" in all of
+    # them. Empty means what it always did — no prior pin, hence no warning — which
+    # is why the resume compare is guarded on non-emptiness. The auto-sweep gate has
+    # never read this field: it compares against its own in-memory closure baseline,
+    # which no session can reach.
     trusted_config_digest: str = ""
     current_epic: int | None = None
     # the run's story scope + cap, as passed on the launching CLI (`--epic`,

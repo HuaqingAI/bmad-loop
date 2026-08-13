@@ -5,6 +5,7 @@ import io
 import json
 import ntpath
 import os
+import shutil
 import sys
 import types
 from pathlib import Path
@@ -3509,10 +3510,9 @@ def test_resume_migrates_a_pre_498_baseline_out_of_state_json(project, monkeypat
     "this run has a pin" into "this run has none" on the first resume after the
     upgrade, which is the empty-means-legacy contract read backwards.
 
-    So: no state-root file + a non-empty legacy field = compare against the legacy
-    field, warn, and migrate. The second half is what bounds the fallback to one
-    release — after this resume the run has a file out of tree and never consults
-    the field again.
+    So: no state-root file + a non-empty in-tree field = compare against the field,
+    warn, and migrate. After this resume the run has a file out of tree, and the
+    in-tree copy stops deciding anything for it while that file stays reachable.
 
     ABLATION: drop the `if pinned is None` fallback in `_resume_paused_run` and the
     warning assert fails (the migrated run reads no baseline and stays quiet)."""
@@ -3531,6 +3531,54 @@ def test_resume_migrates_a_pre_498_baseline_out_of_state_json(project, monkeypat
     # ...and migrated: the baseline now lives out of tree, and is the fresh one.
     migrated = runs.read_trusted_config_digest(project.project, run_dir.name)
     assert migrated and migrated != "stale-pin"
+
+
+def test_resume_still_warns_after_the_project_is_renamed(project, monkeypatch, capsys):
+    """The out-of-tree baseline is keyed by the project's RESOLVED PATH
+    (`runs.project_tag`), so moving or renaming the project keys the run somewhere
+    new and orphans the subtree holding its `config-digest` — FEATURES.md documents
+    the GC half of the same fact. state.json travels with the run dir instead.
+
+    Stamping ONLY out of tree therefore made a rename silently retire the pin: the
+    reader answers `None`, the in-tree copy was never written under that code, and
+    an empty fallback means "no prior pin, no warning" — so a host-exec config
+    change across a move was accepted in silence, and every later resume stayed
+    quiet too. No tampering involved; a documented operator action. Pre-#498 the
+    pin lived in state.json and survived this, which makes it a regression, not a
+    pre-existing hole. Writing both copies keeps the warning alive here WITHOUT
+    making the in-tree one authoritative — the test above is the other half of that
+    pair, and still passes: with the file present, this copy loses.
+
+    ABLATION: drop `state.trusted_config_digest = new_digest` from
+    `_resume_paused_run` (or the `trusted_config_digest=` argument from
+    `runsetup.build_run_state`) and the warning assert fails."""
+    from bmad_loop import runs
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+    assert runs.read_trusted_config_digest(project.project, run_dir.name)
+    capsys.readouterr()
+
+    # The operator renames the project directory; the run dir goes with it.
+    src = project.project
+    dst = src.parent / (src.name + "-renamed")
+    shutil.move(str(src), str(dst))
+    moved = dst / run_dir.relative_to(src)
+    assert moved.is_dir()
+    # Precondition, or this test would pass for the wrong reason: the rename really
+    # did put the out-of-tree baseline out of reach.
+    assert runs.project_tag(dst) != runs.project_tag(src)
+    assert runs.read_trusted_config_digest(dst, run_dir.name) is None
+
+    # ...and the host-exec config changes, exactly as in the no-move case.
+    _write_policy(dst, RESUME_POLICY.replace('["true"]', '["touch pwned"]'))
+    assert cli._resume_paused_run(dst, moved) == 0
+
+    assert _resume_entries(moved)[-1]["security_config_changed"] is True
+    assert "host-exec config pinned at launch has changed" in capsys.readouterr().err
+    # The resume re-keys the run: from here the baseline is out of tree again.
+    assert runs.read_trusted_config_digest(dst, run_dir.name)
 
 
 def test_resume_under_an_unchanged_host_exec_config_reports_no_security_change(
@@ -7752,6 +7800,10 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
     assert captured["adapter"].profile.binary == "mycli"
     run_id = captured["state"].run_id
     assert runs.read_trusted_config_digest(project.project, run_id) == pin
+    # Both copies, and the same validated bytes in each: the in-tree secondary is
+    # what survives a project rename (the state root is keyed by resolved path), so
+    # a launch that stamped only out of tree loses the pin on the first move.
+    assert captured["state"].trusted_config_digest == pin
 
 
 def test_run_pins_the_profile_bytes_it_launches(project, monkeypatch):
@@ -7826,6 +7878,9 @@ def test_run_pins_the_profile_bytes_it_launches(project, monkeypatch):
     assert captured["adapter"].profile.binary == "mycli"
     run_id = captured["state"].run_id
     assert runs.read_trusted_config_digest(project.project, run_id) == pin
+    # As in the sweep twin: the launch stamps both copies, out-of-tree (trusted) and
+    # in-tree (travels with the run dir when the project is renamed).
+    assert captured["state"].trusted_config_digest == pin
 
 
 def test_resume_pins_the_profile_bytes_it_launches(project, monkeypatch):

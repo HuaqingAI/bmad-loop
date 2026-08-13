@@ -736,6 +736,7 @@ def build_run_state(
     max_stories: int | None,
     stories_on: bool,
     spec_folder: str,
+    trusted_config_digest: str,
 ) -> RunState:
     """Assemble the launch-time :class:`RunState` for a fresh run.
 
@@ -743,10 +744,11 @@ def build_run_state(
     the weights the run actually launched under; ``source`` / ``spec_folder``
     record which queue the run dispatches (a stories manifest vs sprint-status).
 
-    No ``trusted_config_digest``: since #498 the host-exec baseline is stamped out
-    of the project tree by :func:`compose_run`, not carried on the state (see
-    ``RunState.trusted_config_digest``, kept one release as a read-only legacy
-    fallback)."""
+    ``trusted_config_digest`` is carried here **as well as** stamped out of the
+    tree by :func:`compose_run` (#498). The out-of-tree file is the one resume
+    trusts; this copy is the secondary that travels with the run directory — see
+    ``RunState.trusted_config_digest`` for why a run that outlives its state key
+    needs one."""
     return RunState(
         run_id=run_id,
         project=str(project),
@@ -757,6 +759,7 @@ def build_run_state(
         max_stories=max_stories,
         source="stories" if stories_on else "sprint-status",
         spec_folder=spec_folder if stories_on else "",
+        trusted_config_digest=trusted_config_digest,
     )
 
 
@@ -805,8 +808,11 @@ def compose_run(
     read of an agent-writable file (#461 point 4). ``None`` resolves fresh.
 
     ``trusted_config_digest`` is stamped into the run's out-of-tree state dir
-    rather than onto the :class:`RunState` (#498), so the one baseline ``resume``
-    warns off is not sitting in the tree the driven sessions write to.
+    (#498), so the baseline ``resume`` warns off is not sitting in the tree the
+    driven sessions write to, **and** onto the :class:`RunState` as the secondary
+    that travels with the run dir. The out-of-tree copy is preferred whenever it
+    exists, which is what keeps the in-tree one from being worth tampering with;
+    ``RunState.trusted_config_digest`` states the split and why both are needed.
 
     ``make_adapters`` and the engine classes are injected (rather than imported
     here) so ``cli`` supplies its own module-level names — keeping the test
@@ -824,6 +830,7 @@ def compose_run(
         max_stories=max_stories,
         stories_on=stories_on,
         spec_folder=spec_folder,
+        trusted_config_digest=trusted_config_digest,
     )
     save_state(run_dir, state)
     # After the run dir exists (Journal mkdir'd it above) and before the pid lands:
@@ -886,8 +893,8 @@ def compose_sweep(
     to ``make_adapters``. The child-sweep factory passes the same one it gated on,
     so the adapters are built from the validated bytes instead of a fresh read of
     an agent-writable file (#461 point 4); ``cmd_sweep`` (human-present) omits it.
-    ``trusted_config_digest`` lands in the run's out-of-tree state dir, not on the
-    :class:`RunState` — see :func:`compose_run`.
+    ``trusted_config_digest`` lands in the run's out-of-tree state dir and, as the
+    travelling secondary, on the :class:`RunState` — see :func:`compose_run`.
 
     ``sweep.json`` freezes the launch options so a resume rebuilds the same sweep
     (see :func:`compose_resume`). ``make_adapters`` and ``sweep_engine_cls`` are
@@ -903,6 +910,7 @@ def compose_sweep(
         started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
         policy_snapshot=policy.to_dict(),
         run_type="sweep",
+        trusted_config_digest=trusted_config_digest,
     )
     save_state(run_dir, state)
     # Out of the tree, same ordering and same reason as compose_run's stamp.

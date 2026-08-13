@@ -962,13 +962,22 @@ def test_state_dir_for_raises_when_the_project_cannot_be_canonicalized(tmp_path,
 
 
 def test_config_digest_is_stamped_under_the_state_root_not_in_the_project(tmp_path):
-    """#498's whole point: the baseline `resume` warns off leaves the tree the
-    driven sessions can write to.
+    """#498's whole point: the baseline `resume` TRUSTS leaves the tree the driven
+    sessions can write to.
 
     The negative half is the load-bearing one — asserting only that the state root
-    holds the digest would still pass if the project also kept a copy, and a copy
-    inside `.bmad-loop/` is exactly the thing a session edits to silence the
-    warning."""
+    holds the digest would still pass if this writer also dropped a copy in the
+    project, and a file inside `.bmad-loop/` is exactly the thing a session edits
+    to silence the warning.
+
+    Scope, so the negative assert is not read as more than it is: it pins THIS
+    function, which writes out of tree and nowhere else. The run as a whole does
+    keep a second copy in `state.json` (`RunState.trusted_config_digest`, itself
+    under `.bmad-loop/runs/`) — the travelling secondary a project move needs, and
+    deliberately never preferred over this file. `test_cli` owns that precedence:
+    `..._still_warns_when_a_session_rewrote_the_digest_in_state_json` proves the
+    in-tree copy loses, `..._still_warns_after_the_project_is_renamed` proves it is
+    consulted when this file is out of reach."""
     project = tmp_path / "proj"
     (project / ".bmad-loop").mkdir(parents=True)
 

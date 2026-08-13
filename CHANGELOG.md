@@ -316,9 +316,15 @@ whose seams had diverged enough that several ports needed a different fix, and t
   never fired. It now lives beside the events channel in the run's out-of-tree state dir
   (`<state root>/<project>/<run-id>/config-digest`, #494), and is collected by the same
   `delete`/`archive`/`clean` lifecycle. The auto-sweep gate is unchanged — it always compared
-  against an in-memory baseline no session can reach. Runs paused under an older version keep
-  their old baseline for this release: `resume` falls back to `state.json` when the run has no
-  file out of tree, warns as before, and migrates it. The field is no longer written.
+  against an in-memory baseline no session can reach.
+
+  `state.json` keeps a second copy, and `resume` consults it **only** when the run has no file
+  out of tree — so rewriting it silences nothing while that file is in reach. Two cases need it,
+  and in both the file is honestly absent rather than tampered away: a run paused under an older
+  version, whose baseline is there and nowhere else (this resume migrates it); and a run whose
+  project has been moved or renamed. The state root is keyed by the project's _resolved path_, so
+  a rename keys the run somewhere new and orphans the subtree holding its digest — the copy in
+  the run directory travels with the run, and the warning survives the move.
 
   **What this does and does not buy.** It closes the _incidental_ path — nothing a session does
   in the ordinary course of rewriting project files can blank the pin any more, because the pin

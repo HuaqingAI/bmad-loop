@@ -359,14 +359,15 @@ def config_digest_path_for(project: Path, run_id: str) -> Path:
     deliberate one. Sessions run with permission bypass by default — every shipped
     profile's ``bypass_args``, which ``GenericAdapter.interactive_argv`` uses
     unless ``[adapter] extra_args`` overrides them; that is what an unattended loop
-    is — and are handed
-    ``BMAD_LOOP_EVENTS_DIR``, whose parent is this directory, so a session that
-    goes looking can delete or truncate this file and the reader below will answer
-    "no baseline" exactly as it would for a run that never had one. That is
-    undetectable from here: any marker saying "this run *should* have a baseline"
-    would have to live somewhere the same session cannot reach, and no such place
-    exists at equal privilege. Closing it needs privilege separation on the state
-    root, not a better hiding place — tracked in #571."""
+    is — and are handed ``BMAD_LOOP_EVENTS_DIR``, whose parent is this directory. A
+    session that goes looking can *truncate* this file and the reader below answers
+    ``""`` — a real "no baseline" — or delete it and blank the in-tree copy
+    (``RunState.trusted_config_digest``, the secondary this falls back to) for the
+    same silence. Either way the result is indistinguishable from a run that never
+    had a baseline: any marker saying "this run *should* have one" would have to
+    live somewhere the same session cannot reach, and no such place exists at equal
+    privilege. Closing it needs privilege separation on the state root, not a better
+    hiding place — tracked in #571."""
     return state_dir_for(project, run_id) / CONFIG_DIGEST_FILE
 
 
@@ -374,15 +375,17 @@ def read_trusted_config_digest(project: Path, run_id: str) -> str | None:
     """This run's persisted host-exec baseline, or ``None`` when the state root
     holds none for it.
 
-    ``None`` is "ask the legacy field", not "no pin" — the two are different
+    ``None`` is "ask the in-tree copy", not "no pin" — the two are different
     answers and the caller acts on the difference (see
-    ``cli._resume_paused_run``). A run started before #498 has no file here and
-    its baseline is still in ``state.json``; an *empty* file, by contrast, is a
-    real answer of "no baseline" and comes back as ``""``.
+    ``cli._resume_paused_run``). No file here means this run's baseline is
+    reachable only through ``state.json``: it was paused before #498, or the
+    project moved and keyed its state subtree somewhere new
+    (:func:`project_state_root`). An *empty* file, by contrast, is a real answer
+    of "no baseline" and comes back as ``""``.
 
     Pure observation, so it degrades rather than raising: a state root this host
     cannot name, or a file it cannot read, both answer ``None`` and hand the
-    decision to the legacy fallback. The write half raises — see
+    decision to the in-tree copy. The write half raises — see
     :func:`write_trusted_config_digest` — and the split is the standard one
     (``platform_util.resolve_or_lexical`` states the doctrine). Degrading here
     costs at most one advisory warning; a resume that *aborts* because an
@@ -446,12 +449,12 @@ def write_trusted_config_digest(project: Path, run_id: str, digest: str) -> None
     """Stamp ``digest`` as this run's host-exec baseline, creating the state dir.
 
     Raises rather than degrading — a repair write, and a silently skipped stamp
-    is the one outcome that cannot be detected later: the next resume reads no
-    file, falls back to a legacy field that is empty for any run this new code
-    started, and quietly declines to warn. The caller is starting or resuming a
-    run and is about to resolve the very same state root for its events channel,
-    so a root that cannot be named or written fails that run regardless; failing
-    here just fails it sooner, before the pid lands.
+    is the outcome hardest to detect later: the next resume reads no file and
+    decides on the in-tree copy alone, which is the tree this baseline exists to
+    police. The caller is starting or resuming a run and is about to resolve the
+    very same state root for its events channel, so a root that cannot be named
+    or written fails that run regardless; failing here just fails it sooner,
+    before the pid lands.
 
     **Call this only after the run dir exists.** Creating the state dir is what
     makes this the earliest writer into it, and :func:`reconcile_orphan_state_dirs`

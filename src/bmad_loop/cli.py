@@ -2200,11 +2200,21 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     #
     # This is also the migration for a run paused under the old code: it read its
     # baseline out of state.json above, and from here on it has a file in the state
-    # root, so the fallback never fires for it again. The legacy field is left as it
-    # was found rather than cleared — it is that run's honest record of what it
-    # launched under, nothing reads it once the file exists, and erasing persisted
-    # data to tidy up is not this change's business.
+    # root, so the in-tree copy stops deciding anything for it.
     runs.write_trusted_config_digest(project, run_dir.name, new_digest)
+    # ...and the in-tree secondary is re-stamped in the same breath, for the same
+    # reason it is written at launch: the state root is keyed by the project's
+    # RESOLVED PATH (`runs.project_tag`), so moving or renaming the project — a
+    # documented operation, FEATURES.md states the GC half of it — keys the run
+    # somewhere new and the file above becomes unreachable. Leaving only that copy
+    # made a move silently retire the pin, and the advisory this whole guard exists
+    # to raise never fired again. Writing both keeps the warning alive across a move
+    # without making this copy authoritative: the reader prefers the out-of-tree
+    # file whenever it exists, so a session that rewrites this one is still ignored
+    # (which is #498, and its test still holds). Same for a changed
+    # BMAD_LOOP_STATE_DIR. Tampering that removes the out-of-tree file is a
+    # different problem with no fix at equal privilege — #571.
+    state.trusted_config_digest = new_digest
     state.clear_pause()
     # A resume is fresh user intent: discard any graceful-stop request left over from
     # a prior stopped-gracefully run so the re-armed engine does not consume it at the
