@@ -96,8 +96,14 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v9.0.0
 
-      - name: Check every version field agrees
-        run: uv run --no-project python scripts/sync_version.py --check
+      # `release.py check` is a strict superset of `sync_version.py --check`: it calls
+      # that check in-process, then holds the CHANGELOG release contract (the version's
+      # section exists, `## [Unreleased]` was reopened, its compare link tracks the
+      # current version). Stdlib-only, so `--no-project` stays honest — nothing here
+      # installs the project. The job name is load-bearing for branch protection; only
+      # the command changed.
+      - name: Check every version field agrees + the CHANGELOG release contract
+        run: uv run --no-project python scripts/release.py check
 
   lint:
     name: lint (trunk)
@@ -109,6 +115,9 @@ jobs:
         with:
           # Trunk needs full history for diff-aware checks.
           fetch-depth: 0
+          # ...but not a credential helper: it only reads local history. Matches
+          # every other checkout in this file (zizmor/artipacked).
+          persist-credentials: false
 
       - name: Trunk Check
         uses: trunk-io/trunk-action@v1
