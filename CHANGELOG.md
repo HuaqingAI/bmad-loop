@@ -26,8 +26,9 @@ whose seams had diverged enough that several ports needed a different fix, and t
     whose relay predates the move — re-run `bmad-loop init` to refresh it.
   - **`bmad-loop relay <Event>`** writes a session event without the copied-in script, on the same
     contract (nothing on stdout, rc 0 always, silent no-op outside a driven session). It is backed
-    by a new `events.py`, held byte-identical to the stdlib-only relay by an AST parity test, and
-    dispatches ahead of the shared error handler so a broken `policy.toml` cannot fail a hook.
+    by a new `events.py`, whose write path an AST parity test holds byte-identical to the
+    stdlib-only relay's, and dispatches ahead of the shared error handler so a broken
+    `policy.toml` cannot fail a hook.
   - **`validate` gains `hooks.relay-stale`** — the installed relay compared against the packaged
     one, a warning that never moves the exit code (the fallback keeps a stale relay working).
     `diagnose`'s `events` group now counts both locations; payload and schema unchanged.
