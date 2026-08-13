@@ -1,13 +1,26 @@
 # Deferred Work Format
 
-Canonical entry format for `{implementation_artifacts}/deferred-work.md`. On the
-inner dev path the bmad-dev-auto session appends its own flat entries (review
-defers, multi-goal splits, token splits); the orchestrator owns the ledger and
-normalizes those flat entries into this canonical form on sweep, and a
-`bmad-loop sweep` migration rewrites freeform pre-DW-format content from older
-projects into it wholesale (see `./migration-mode.md`; the TUI displays such
-legacy items read-only until that happens). The file is append-only — never
-rewrite or delete existing entries.
+Canonical entry format for `{implementation_artifacts}/deferred-work.md`. The
+orchestrator owns this file, and two eras of dev session feed it:
+
+- **Current (BMAD-METHOD 6.10.1-next.33+).** The unattended primitive
+  `bmad-build-auto` writes nothing here: it records defer-triaged review findings
+  in its spec's frontmatter `deferred:` list, and after the session the
+  orchestrator harvests those into canonical entries below, carrying a
+  fingerprinted `origin:` that starts with `spec-deferred`, plus `source_spec:`.
+- **Legacy and attended.** Pre-rename primitives (`bmad-dev-auto`) and the
+  attended `bmad-build` append flat `- source_spec:` blocks directly into this
+  file; a `bmad-loop sweep --migrate` session normalizes them into the canonical
+  form, and rewrites freeform pre-DW-format content from older projects wholesale
+  (see `./migration-mode.md`; the TUI shows such legacy items read-only until
+  then).
+
+Either way this file stays the sweep's sole read surface. Multi-goal and token
+splits are a legacy/attended source only — the current unattended primitive does
+not split a multi-goal spec, it records a `multiple-goals` warning in the spec's
+`warnings:` and proceeds.
+
+The file is append-only — never rewrite or delete existing entries.
 
 ## Before appending: dedupe check
 

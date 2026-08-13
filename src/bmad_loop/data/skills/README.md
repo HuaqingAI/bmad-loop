@@ -17,14 +17,15 @@ the table below).
 | `bmad-loop-sweep`   | — (bmad-loop-native) | read-only deferred-work ledger triage; owns the canonical `deferred-work-format.md`                                                               |
 | `bmad-loop-setup`   | — (scaffolded)       | **installs the orchestrator tool from Git**, runs `bmad-loop init` + `validate`, refreshes `_bmad/bmad-loop/module-help.csv`                      |
 
-The **inner dev primitive is the upstream `bmad-dev-auto` skill** (BMAD-METHOD's
-generic unattended dev session). It is **not** owned or bundled here — the
-orchestrator drives it as an external skill that must already be installed
+The **inner dev primitive is the upstream `bmad-build-auto` skill** (BMAD-METHOD's
+generic unattended dev session; `bmad-dev-auto` on pre-rename releases, resolved
+from disk and invoked under whichever name is there). It is **not** owned or
+bundled here — the orchestrator drives it as an external skill that must already be installed
 (by the BMad installer / bmm-core). The bmad-loop orchestrator synthesizes its `result.json`
 from the spec the session leaves on disk (see `bmad_loop.devcontract`). The skill
-self-reviews inline (Blind + Edge-Case hunters in its step-04) and commits its own
+self-reviews inline (its step-04 review layers) and commits its own
 work each iteration; the orchestrator's **follow-up review is just a re-invocation
-of `bmad-dev-auto` on the done spec** (BMAD-METHOD #2508 routes a `done` spec to a
+of the primitive on the done spec** (BMAD-METHOD #2508 routes a `done` spec to a
 fresh review pass), so there is no separate review skill.
 
 ## Install into a project
@@ -50,10 +51,11 @@ which regenerates it on every run; the only file the skill writes there is
 `_bmad/bmad-loop/module-help.csv`.
 
 The skills must be installed **together**: `bmad-loop-sweep` owns the canonical
-`deferred-work-format.md` that the ledger normalizes to, and the upstream
-`bmad-dev-auto` dev session must also be present (it appends flat deferred-work
-entries the orchestrator normalizes on sweep). Requires the BMad Method (bmm)
-module (`_bmad/bmm/config.yaml`) and a `sprint-status.yaml` from
+`deferred-work-format.md` that the ledger normalizes to, and the upstream dev
+primitive must also be present (since BMAD-METHOD 6.10.1-next.33 it records
+deferred findings in its spec's frontmatter for the orchestrator to harvest into
+the ledger; pre-rename copies append flat entries the sweep normalizes instead).
+Requires the BMad Method (bmm) module (`_bmad/bmm/config.yaml`) and a `sprint-status.yaml` from
 `bmad-sprint-planning`.
 
 `_bmad/custom/<skill-name>.toml` customization overrides are keyed by skill
@@ -72,9 +74,10 @@ directory name.
   <https://github.com/bmad-code-org/bmad-loop> (`src/bmad_loop`, `pyproject.toml`
   are canonical at the repo root). (The skills, by contrast, ride along inside
   the package wheel.)
-- The inner dev primitive `bmad-dev-auto` is **not** maintained here — it is the
-  upstream bmm-core skill, driven unmodified. Nothing in this directory mirrors
-  it; the orchestrator adapts to it via `bmad_loop.devcontract`.
+- The inner dev primitive (`bmad-build-auto`, or `bmad-dev-auto` pre-rename) is
+  **not** maintained here — it is the upstream bmm-core skill, driven unmodified.
+  Nothing in this directory mirrors it; the orchestrator adapts to it via
+  `bmad_loop.devcontract`.
 - Do **not** rename the result.json `workflow` values — they are machine
   contracts the orchestrator validates, not skill names:
   - dev → `"auto-dev"` (checked by `verify.DEV_WORKFLOW` in

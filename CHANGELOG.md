@@ -161,6 +161,19 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Changed
 
+- **Docs state the deferred-work contract of the 6.11 era (#567).** Since BMAD-METHOD
+  6.10.1-next.33 the unattended primitive `bmad-build-auto` records defer-triaged review findings
+  in its spec's frontmatter `deferred:` list and writes nothing to the ledger; the orchestrator
+  harvests them into canonical `DW-<n>` entries, deduped on `origin: spec-deferred <fp>` plus
+  `source_spec:`, so `deferred-work.md` stays the sweep's sole read surface. Pre-rename primitives
+  and the attended `bmad-build` still append flat `- source_spec:` blocks, which `sweep --migrate`
+  normalizes; multi-goal splits belong to that era only, since the current primitive warns
+  `multiple-goals` and proceeds. The sweep's format doc, FEATURES.md, the setup guide and the
+  module skills now name `bmad-build-auto` (and `_bmad/custom/bmad-build-auto.toml`), keeping the
+  legacy spelling where a pre-rename install still needs it. Review-layer prose matches 6.11 too:
+  every layer is a self-contained prompt invoking no skill, so such a tree requires no review
+  skill — both topologies stay supported. Prose only, no behavior change.
+
 - **The mid-run config pin covers the adapter kind (#461).** `adapter` selects which argv builder
   runs at all, so it joins the `config_digest` launch payload — a driven session rewriting it now
   moves the pin the auto-triggered child sweep gates on, instead of swapping the whole launch shape
