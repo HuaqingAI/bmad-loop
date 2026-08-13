@@ -2143,6 +2143,95 @@ def test_path_tracked_raises_on_git_failure(project):
         verify.path_tracked(project.project / "not-a-repo", "src.txt")
 
 
+# ------------------------------------------------------------- path_ignored (#577)
+#
+# The predicate `confirm` uses to keep a gitignored board OUT of its commit list.
+# Contracted to answer git's own `add` refusal, not the ignore rules on their own —
+# which is a different question wherever the index disagrees with a pattern.
+
+
+def _ignore_rule(repo, *patterns: str) -> None:
+    gitignore = repo / ".gitignore"
+    existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
+    prefix = existing if not existing or existing.endswith("\n") else existing + "\n"
+    gitignore.write_text(prefix + "".join(f"{p}\n" for p in patterns), encoding="utf-8")
+    git(repo, "add", "--", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore rule")
+
+
+def test_path_ignored_answers_gits_own_add_refusal(project):
+    """The contract, stated as the two calls agreeing: whatever this says, `git add`
+    does. An ignored untracked path is the one shape `add` refuses (rc 1) — and it
+    refuses the whole operand list with it, which is the loss #577 is about."""
+    repo = project.project
+    _ignore_rule(repo, "board.yaml")
+    (repo / "board.yaml").write_text("a: 1\n")
+
+    assert verify.path_ignored(repo, repo / "board.yaml")
+    assert not verify.path_ignored(repo, repo / "src.txt")
+    # a path git has never seen, and one under no rule at all: both addable
+    assert not verify.path_ignored(repo, repo / "never_existed.txt")
+    with pytest.raises(verify.GitError):  # the refusal this predicate exists to avoid
+        verify.commit_paths(repo, "would fail", [repo / "board.yaml"])
+
+
+def test_path_ignored_is_false_for_a_tracked_path_under_a_matching_rule(project):
+    """#392 seen from the other side: an ignore rule over a TRACKED regular file
+    suppresses nothing, because git consults ignore rules only for untracked paths.
+    `git add` stages it regardless, so a probe that read the RULE alone would drop a
+    perfectly committable board from the commit list.
+
+    `check-ignore` consults the index unless told not to, which is what makes one
+    call answer both halves. Ablation: pass `--no-index` in `path_ignored` and this
+    flips to True while the `commit_paths` assertion below still lands the commit —
+    the probe and the action would then disagree."""
+    repo = project.project
+    _ignore_rule(repo, "board.yaml")
+    (repo / "board.yaml").write_text("a: 1\n")
+    git(repo, "add", "-f", "--", "board.yaml")
+    git(repo, "commit", "-q", "-m", "force-track the board")
+
+    assert verify.path_tracked(repo, "board.yaml")
+    assert not verify.path_ignored(repo, repo / "board.yaml")
+    # and git agrees: a modification to it commits like any other tracked file
+    (repo / "board.yaml").write_text("a: 2\n")
+    assert verify.commit_paths(repo, "tracked board moves", [repo / "board.yaml"])
+
+
+def test_path_ignored_reads_a_metachar_name_literally(project):
+    """A gitignore PATTERN is the wildmatch and the pathname is the literal, so `[`,
+    `]`, `*` and `?` in the operand are inert here — unlike `path_tracked`, which
+    needs `:(literal)` to survive them and which this function cannot use at all
+    (`check-ignore` rejects pathspec magic outright).
+
+    The collision is live: a `da/` rule DOES ignore `da/f.md`, and the question is
+    whether asking about `d[a]/f.md` borrows that answer. It must not."""
+    repo = project.project
+    _metachar_pair(repo, "d[a]", "da")  # both committed, glob-colliding names
+    _ignore_rule(repo, "da/")
+
+    assert not verify.path_ignored(repo, repo / "d[a]" / "f.md")
+    # the neighbour is tracked, so the rule over it is inert too — same asymmetry
+    assert not verify.path_ignored(repo, repo / "da" / "f.md")
+
+
+def test_path_ignored_is_false_outside_the_repo(project, tmp_path):
+    """Nothing to omit from a commit that will not contain it: `commit_paths` drops
+    an out-of-repo path itself, so answering False here keeps the two agreeing."""
+    assert not verify.path_ignored(project.project, tmp_path / "elsewhere" / "board.yaml")
+
+
+def test_path_ignored_raises_on_git_failure(project):
+    """Raises GitError like every other probe here. Its caller degrades by keeping
+    the path IN the commit list — uncertainty must not silently drop a write.
+
+    The path has to sit UNDER the bogus root: an out-of-repo one answers False
+    without ever spawning git, which is the other branch's contract."""
+    missing = project.project / "not-a-repo"
+    with pytest.raises(verify.GitError, match="check-ignore"):
+        verify.path_ignored(missing, missing / "src.txt")
+
+
 def test_worktree_clean_ignores_stderr_chatter_on_success(project, monkeypatch):
     """A pristine tree must not read DIRTY because git wrote to stderr while
     exiting 0. Seven callers gate on this and `cli.py`'s three refuse the command

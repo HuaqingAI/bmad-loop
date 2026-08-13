@@ -329,6 +329,26 @@ whose seams had diverged enough that several ports needed a different fix, and t
   keep the wide class this board needs (`last_updated: 01-06-2026 10:00`) and still cede the first
   whitespace-preceded `#` as authored.
 
+- **A gitignored sprint board no longer crashes the run or loses the story's advance under
+  worktree isolation (#350).** A worktree checks out tracked files only, so the board the
+  orchestrator advances through the worktree was simply absent: `advance` no-opped in silence and
+  `verify_dev` then read the same missing file, raising `SprintStatusError` past every guard and
+  taking the run down. The board is now seeded into the worktree beside the deferred-work ledger,
+  making it canonical for the duration of the story, and the story's advance is re-applied to the
+  main checkout after the merge — journaled `board-advance-carried`, or
+  `board-advance-carry-uncommitted` where `git add` refuses the ignored path, which for such a
+  board is the ordinary outcome. The carry replays from its record across a crash between the
+  merge and its latch, and `advance` never regresses, so a double application writes nothing.
+  Without it `_pick_next`, which reads the **main** board, hands a finished story back to the
+  next run. Tracked boards are unaffected — their advance rides the story commit as before.
+
+- **`confirm` no longer loses its commit to a gitignored board (#577).** `git add` refuses an
+  explicitly named ignored path and refuses the whole operand list with it, so confirming a park
+  on such a board printed `✓ confirmed` while the spec's flip to `done` and the park record's
+  deletion stayed uncommitted — dirtying the tree the next run's preflight refuses. The board is
+  now left out of that commit when git will not take it (probed through the `_run_git` chokepoint,
+  index consulted, so a force-tracked board still commits); it is advanced on disk either way.
+
 - **`resume`'s config-change baseline moves out of the agent-writable tree (#498).** The host-exec
   baseline `resume` compares against — verify commands, launch binary/args/env, plugin allowlist
   — round-tripped through `state.json`, inside the very tree the digest exists to police, so the

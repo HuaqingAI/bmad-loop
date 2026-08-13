@@ -2837,11 +2837,24 @@ def _land_confirmation(
     # skips the path when no record was ever committed (a legacy-index park).
     record = operatoractions.record_path(project, story.story_key)
     operatoractions.drop(project, story.story_key)
+    # A GITIGNORED board is left OUT of the list rather than handed over and
+    # forgiven (#577). `commit_paths` forces every operand literal, so `git add`
+    # refuses an ignored one with rc 1 — and refuses the whole operand list with
+    # it, staging nothing — which the swallow below then turns into a silent loss
+    # of the other two. That is right for the board (a file git will not track has
+    # no commit to ride; the status on disk is the value) and wrong for the spec
+    # and the record, whose deletion in particular MUST land per the #356 note
+    # above. #350's board carry makes a gitignored board an ordinary shape, so
+    # this is the common park's exit and not an exotic one.
+    try:
+        board_ignored = verify.path_ignored(paths.repo_root, paths.sprint_status)
+    except verify.GitError:
+        board_ignored = False  # uncertainty keeps the board in: the older behavior
     try:
         verify.commit_paths(
             paths.repo_root,
             f"chore(operator): confirm {story.story_key}",
-            [spec, paths.sprint_status, record],
+            [spec, record] if board_ignored else [spec, paths.sprint_status, record],
         )
     except verify.GitError:
         pass  # files are written; git history is best effort (as `decisions`)

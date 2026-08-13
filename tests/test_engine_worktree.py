@@ -4007,6 +4007,65 @@ def test_a_park_confirms_only_after_its_board_advance_is_carried(project):
     assert parked.confirmable
 
 
+def test_a_gitignored_board_story_finished_by_one_run_is_not_re_picked_by_the_next(project):
+    """#350 end to end, across the run boundary that is the only place it shows.
+
+    Both halves have to hold for this to pass, and neither can stand in for the
+    other. WITHOUT THE SEED run 1 does not finish at all: the worktree has no board,
+    `verify_dev` reads that missing file through `story_status`, and
+    `SprintStatusError` takes the run down. WITHOUT THE CARRY run 1 finishes
+    perfectly and the damage is invisible until run 2 — inside a single run
+    `state.tasks` shields a finished story from `_pick_next` no matter what the board
+    says, so a fresh RunState reading the MAIN board is the only thing that can tell
+    a carried advance from a lost one.
+
+    That makes run 2 the discriminating assertion of the whole bundle: it is
+    `_pick_next`'s own reader, against `ACTIONABLE_STATUSES`, over the file the
+    orchestrator actually kept. A lost advance leaves `ready-for-dev` there, and the
+    next unattended run hands finished work back to a dev session.
+
+    The board's FULL text is asserted, not just the story's status: the carry runs
+    through `_set_mapping_value`, so this doubles as #366's oracle at the top layer —
+    one value moved, `last_updated`'s unquoted `01-06-2026 10:00` (spaces and all)
+    untouched, no line fabricated. A `yaml.safe_load` comparison would see none of
+    that.
+    """
+    rel = ignored_sprint(project, {"1-1-a": "ready-for-dev"})
+    parked_board = project.sprint_status.read_text()
+    first_engine, first_adapter = make_engine(
+        project, [wt_dev_effect(project, "1-1-a", followup_review=False)]
+    )
+
+    first = first_engine.run()
+
+    # run 1: the seed's half — it completes rather than crashing on the missing board
+    assert first_engine.state.crash_error is None and not first.crashed
+    assert first.done == 1 and not first.paused
+    assert first_engine.state.tasks["1-1-a"].phase == Phase.DONE
+    assert len(first_adapter.sessions) == 1
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+    # run 1: the carry's half — the main board moved, and ONLY where it should have
+    assert project.sprint_status.read_text() == parked_board.replace(
+        "1-1-a: ready-for-dev", "1-1-a: done"
+    )
+    assert not verify.path_tracked(project.project, rel)  # still git's to refuse
+    assert worktree_clean(project.project)
+
+    # Run 2 is a fresh RunState over the same project: nothing shields the story now
+    # except the board itself.
+    second_engine, second_adapter = make_engine(project, [], run_id="test-run-2")
+
+    second = second_engine.run()
+
+    assert second_adapter.sessions == []  # never re-picked, so never re-driven
+    assert second.done == 0 and not second.crashed and not second.paused
+    assert second_engine.state.tasks == {}
+    assert [p.resolve() for p in worktree_list(project.project)] == [project.project.resolve()]
+    assert project.sprint_status.read_text() == parked_board.replace(
+        "1-1-a: ready-for-dev", "1-1-a: done"
+    )
+
+
 def test_crashed_post_merge_story_close_replays_from_its_record(project):
     """A story whose ONLY ledger write is a declared close has every other carry
     payload empty, so the resume pass has to name this one to reach it — the same
