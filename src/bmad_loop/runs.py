@@ -797,19 +797,24 @@ def _discard_state_dir(project: Path, run_id: str) -> None:
 
     A **never-raise tail**, per the teardown doctrine (#139): the run dir is
     already gone by the time this runs, and failing the operator's delete over an
-    unreachable state root would report a removal that in fact happened. The two
-    catchable outcomes are both "the counterpart could not even be named" —
-    :class:`StateRootError` for an environment with no derivable root, ``OSError``
-    for a project path the OS cannot canonicalize (:func:`project_tag` resolves
-    before digesting). Removal failures are absorbed by ``ignore_errors``. Either
-    way the orphan sweep in :func:`reconcile_orphan_state_dirs` is the backstop.
+    unreachable state root would report a removal that in fact happened. Every
+    catchable outcome is "the counterpart could not even be named" —
+    :class:`StateRootError` for an environment with no derivable root, and
+    ``OSError``/``RuntimeError`` for a project path the OS cannot canonicalize
+    (:func:`project_tag` resolves before digesting). ``RuntimeError`` is not
+    optional there: below 3.13 ``Path.resolve`` reports a symlink loop that way
+    rather than as ``OSError`` (measured — 3.11 and 3.12 raise, 3.13 and 3.14
+    return the unresolved path), so on two supported interpreters an ``OSError``
+    -only guard lets a loop escape and breaks the promise in this paragraph.
+    Removal failures are absorbed by ``ignore_errors``. Either way the orphan
+    sweep in :func:`reconcile_orphan_state_dirs` is the backstop.
 
     Deliberately not called by :func:`trim_run_dir`: a trimmed run is still live
     on disk and resumable, and its control plane must outlive the scaffolding.
     """
     try:
         target = state_dir_for(project, run_id)
-    except (StateRootError, OSError):
+    except (StateRootError, OSError, RuntimeError):
         return
     shutil.rmtree(target, ignore_errors=True)
 
@@ -996,6 +1001,14 @@ def reconcile_orphan_state_dirs(project: Path, *, dry_run: bool = False) -> list
     state root, an unreadable root, or an unreadable runs dir all sweep nothing.
     This is reclamation, not repair — leaving disk behind is the cheap outcome,
     and removing a live run's control plane is not.
+
+    Both guards hold ``RuntimeError`` alongside ``OSError`` for the same reason
+    :func:`_discard_state_dir` does: every path here is resolved (the project by
+    :func:`project_tag`, then the root, then each entry), and below 3.13
+    ``Path.resolve`` reports a symlink loop as ``RuntimeError``. A loop planted
+    among the entries would otherwise escape a sweep whose whole contract is to
+    degrade, and take the operator's ``clean`` down with it after its real work
+    was already done.
     """
     live = _run_dir_names(project)
     if live is None:
@@ -1004,7 +1017,7 @@ def reconcile_orphan_state_dirs(project: Path, *, dry_run: bool = False) -> list
         root = project_state_root(project)
         entries = sorted(root.iterdir())
         root_res = root.resolve()
-    except (StateRootError, OSError):
+    except (StateRootError, OSError, RuntimeError):
         return []
     handled: list[Path] = []
     for entry in entries:
@@ -1012,7 +1025,7 @@ def reconcile_orphan_state_dirs(project: Path, *, dry_run: bool = False) -> list
             continue
         try:
             entry.resolve().relative_to(root_res)
-        except (OSError, ValueError):
+        except (OSError, RuntimeError, ValueError):
             continue
         handled.append(entry)
         if not dry_run:

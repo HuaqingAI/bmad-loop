@@ -1092,16 +1092,25 @@ def test_delete_run_removes_the_out_of_tree_state_counterpart(tmp_path):
     [
         ("state_root", runs.StateRootError("no root")),
         ("project_tag", OSError("cannot canonicalize")),
+        ("project_tag", RuntimeError("Symlink loop from '/p'")),
     ],
-    ids=["no-derivable-state-root", "unresolvable-project"],
+    ids=["no-derivable-state-root", "unresolvable-project", "symlink-loop-project"],
 )
 def test_delete_run_survives_a_counterpart_it_cannot_name(tmp_path, monkeypatch, attr, exc):
     """The counterpart removal is a never-raise tail (#139 teardown doctrine).
 
-    Both rows are the counterpart being *unnameable*, which is the only failure
+    Every row is the counterpart being *unnameable*, which is the only failure
     that can escape: an environment with no derivable state root, and a project
     the OS refuses to canonicalize (#552). Removal failures are absorbed
     separately, by `ignore_errors`.
+
+    The `RuntimeError` row is not a hypothetical type: `project_tag` resolves
+    before digesting, and below 3.13 `Path.resolve` reports a symlink loop as
+    `RuntimeError` rather than `OSError` — measured across the support matrix,
+    3.11 and 3.12 raise it where 3.13 and 3.14 return the unresolved path. So on
+    two supported interpreters this is the live arm, and it is injected here
+    rather than built from real symlinks because the loop would have to sit on
+    the *project* path, which the sandbox fixtures own.
 
     Raising would be worse than the leak it reports. The run dir is already gone
     by this point, so the exception would fail a delete that in fact happened and
@@ -1624,8 +1633,9 @@ def test_reconcile_orphan_state_dirs_never_removes_through_a_symlink(tmp_path):
     [
         ("state_root", runs.StateRootError("no root")),
         ("project_tag", OSError("cannot canonicalize")),
+        ("project_tag", RuntimeError("Symlink loop from '/p'")),
     ],
-    ids=["no-derivable-state-root", "unresolvable-project"],
+    ids=["no-derivable-state-root", "unresolvable-project", "symlink-loop-project"],
 )
 def test_reconcile_orphan_state_dirs_degrades_when_the_root_cannot_be_named(
     tmp_path, monkeypatch, attr, exc
@@ -1633,7 +1643,42 @@ def test_reconcile_orphan_state_dirs_degrades_when_the_root_cannot_be_named(
     """Reclamation, not repair: a sweep that cannot name its root sweeps nothing
     and says so, rather than failing the whole `clean` around it. Leaving disk
     behind is the cheap outcome here — the caller's real work (worktrees, trims,
-    archives) has already been done by the time this runs."""
+    archives) has already been done by the time this runs.
+
+    `RuntimeError` is the below-3.13 spelling of a symlink loop out of
+    `Path.resolve`, which `project_tag` calls; see the sibling delete test for
+    the measured version split."""
     monkeypatch.setattr(runs, attr, _raising(exc))
 
     assert runs.reconcile_orphan_state_dirs(tmp_path) == []
+
+
+def test_reconcile_orphan_state_dirs_skips_an_entry_it_cannot_resolve(tmp_path, monkeypatch):
+    """The containment test resolves each candidate, so it inherits the same
+    below-3.13 `RuntimeError` a symlink loop raises — and here it lands *per
+    entry*, mid-sweep, after earlier entries have already been removed. An
+    unguarded loop would abort `clean` half-done and report none of what it had
+    just deleted.
+
+    Skipping is the safe arm rather than sweeping: an entry that cannot be
+    resolved cannot be proven inside the root, and that proof is the only thing
+    standing between `rmtree` and a Windows junction's target.
+
+    Ablation guard: drop `RuntimeError` from the containment guard and this
+    raises instead of returning the resolvable orphan."""
+    _make_state_run(tmp_path, "live-1")
+    _seed_state_dir(tmp_path, "live-1")
+    good = _seed_state_dir(tmp_path, "ghost-good")
+    bad = _seed_state_dir(tmp_path, "ghost-loop")
+
+    real_resolve = Path.resolve
+
+    def _resolve(self: Path, *args, **kwargs):
+        if self == bad:
+            raise RuntimeError(f"Symlink loop from {str(self)!r}")
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", _resolve)
+
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == [good]
+    assert not good.exists() and bad.is_dir()

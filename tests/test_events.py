@@ -132,8 +132,14 @@ def test_relay_and_the_hook_shape_the_same_event(tmp_path, monkeypatch):
     proc = subprocess.run(
         [sys.executable, str(HOOK), "Stop"],
         input=json.dumps(payload),
+        # `env=` REPLACES the environment rather than extending it, and on Windows
+        # a Python child started without SYSTEMROOT can fail to load its
+        # side-by-side assemblies — a start failure that would read here as the
+        # relay misbehaving. Kept minimal otherwise: the relay is stdlib-only and
+        # must need nothing else.
         env={
             "PATH": os.environ.get("PATH", ""),
+            **({"SYSTEMROOT": os.environ.get("SYSTEMROOT", "")} if os.name == "nt" else {}),
             "BMAD_LOOP_RUN_DIR": str(hook_run),
             "BMAD_LOOP_TASK_ID": "1-1-a-dev-1",
         },
@@ -614,12 +620,13 @@ def test_relay_prefers_the_events_dir_env(tmp_path, monkeypatch, capsys):
     config happens to name."""
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    events = tmp_path / "state" / "runs" / "RID" / "events"
+    # Not `events` — that name is the imported module for the rest of this file.
+    events_dir = tmp_path / "state" / "runs" / "RID" / "events"
 
-    assert _relay("Stop", {"session_id": "s1"}, monkeypatch, run_dir, events_dir=events) == 0
+    assert _relay("Stop", {"session_id": "s1"}, monkeypatch, run_dir, events_dir=events_dir) == 0
     assert capsys.readouterr() == ("", "")
 
-    files = list(events.glob("*.json"))
+    files = list(events_dir.glob("*.json"))
     assert len(files) == 1 and json.loads(files[0].read_text())["session_id"] == "s1"
     assert not (run_dir / "events").exists()
 

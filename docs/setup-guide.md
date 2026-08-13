@@ -356,7 +356,8 @@ hand. That root is shared by **every** project on this machine, so delete the wh
 you are removing bmad-loop everywhere:
 
 ```bash
-rm -rf "${XDG_STATE_HOME:-$HOME/.local/state}/bmad-loop"   # all projects on this machine
+# all projects on this machine — same cascade the orchestrator resolves
+rm -rf "${BMAD_LOOP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/bmad-loop}"
 ```
 
 ### 3. Remove the bundled skills

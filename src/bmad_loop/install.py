@@ -1020,8 +1020,9 @@ def hook_script_current(project: Path) -> bool | None:
     "I could not look" is not "your relay is out of date".
 
     Lives here, beside :func:`install_into`'s write of the same two paths, so the
-    packaged-source spelling has exactly one home — a comparison that resolved
-    the source differently from the writer would answer a different question.
+    reader and the writer of the relay stay in one module and one reviewer's view
+    — a comparison that resolved the source differently from the writer would
+    answer a different question.
 
     Compared as TEXT read with universal newlines, not as raw bytes. That is
     precisely the round trip ``install_into`` performs (``read_text`` then
