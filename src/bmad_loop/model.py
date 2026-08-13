@@ -205,6 +205,15 @@ class StoryTask:
     # the commit boundary. Same ledger, same isolation problem: a gitignored path
     # never merges out of the unit worktree, so the flip has to be re-applied.
     story_closes_intended: list[str] = field(default_factory=list)
+    # The sprint-status stage `_post_dev_state_sync` REQUESTED for this story, or
+    # None when it never ran (sweep bundles, stories mode, the legacy path). Same
+    # isolation problem as the ledger payloads above, one file over: under
+    # `isolation = "worktree"` that advance lands on the unit worktree's board,
+    # which for a gitignored board is a seeded copy shielded from the unit commit,
+    # so the post-merge carry has to re-apply it. Latest-wins — a scalar, not a
+    # list, because the board holds one stage per story and only the accepted
+    # attempt's stage can ever be carried.
+    board_advance_intended: str | None = None
     # Index of the append-only primary dev SessionRecord whose initial decision or
     # later verify-repair result durably returned PROCEED. Attempt numbers can be
     # reused after a human re-arm, so the exact record occurrence is the acceptance
@@ -361,6 +370,7 @@ class StoryTask:
             "bundle_closes_intended": self.bundle_closes_intended,
             "refiled_followups": self.refiled_followups,
             "story_closes_intended": self.story_closes_intended,
+            "board_advance_intended": self.board_advance_intended,
             "accepted_dev_session_index": self.accepted_dev_session_index,
             "harvest_carry_commit_pending": self.harvest_carry_commit_pending,
             "isolated_ledger_carried": self.isolated_ledger_carried,
@@ -432,6 +442,11 @@ class StoryTask:
             bundle_closes_intended=[str(i) for i in d.get("bundle_closes_intended", [])],
             refiled_followups=[deepcopy(dict(item)) for item in d.get("refiled_followups", [])],
             story_closes_intended=[str(i) for i in d.get("story_closes_intended", [])],
+            board_advance_intended=(
+                str(d["board_advance_intended"])
+                if d.get("board_advance_intended") is not None
+                else None
+            ),
             accepted_dev_session_index=(
                 int(d["accepted_dev_session_index"])
                 if d.get("accepted_dev_session_index") is not None

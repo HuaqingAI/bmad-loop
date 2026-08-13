@@ -1102,12 +1102,16 @@ class Engine:
             # Every payload the hook carries has to be named here — a story whose
             # only ledger write was a damped review-budget follow-up, or a declared
             # `closes_deferred:` flip, has every other list empty, and omitting it
-            # strands that write in a deleted worktree.
+            # strands that write in a deleted worktree. The board advance (#350) is
+            # the ordinary case of exactly that: nearly every generic story records
+            # one and nothing else, so leaving it out here would strand the write
+            # that keeps `_pick_next` from re-picking the finished story.
             if not task.worktree_path or not (
                 task.harvested_deferrals
                 or task.bundle_closes_intended
                 or task.refiled_followups
                 or task.story_closes_intended
+                or task.board_advance_intended
             ):
                 continue
             if merged_key not in merged_units:
@@ -3002,7 +3006,34 @@ class Engine:
         This runs above the artifact gate because ``verify_dev`` reads the board it
         writes. That ordering does not generalize to bookkeeping a gate does not
         consume: ``SweepEngine`` makes this a no-op and closes bundle ledger entries
-        from ``_post_dev_accepted_sync`` instead."""
+        from ``_post_dev_accepted_sync`` instead.
+
+        Each advance also records ``board_advance_intended`` for
+        ``_carry_board_advance`` (#350). The board written here is
+        ``self.workspace.paths``', which under isolation is the unit worktree's copy
+        — seeded and shielded for a gitignored board, so it never rides the merge —
+        and the record is what lets the post-merge carry re-apply the same stage to
+        the main checkout.
+
+        The requested TARGET, never ``advance``'s return: that return is the status
+        the board LANDED at, which a never-regress echo makes equal to the CURRENT
+        status rather than to the intent. They can diverge only when the board was
+        already at or past ``target``, and ``verify_dev`` reads that same board
+        immediately after and rejects the attempt for the mismatch — so an attempt
+        whose record and board disagree never reaches integration.
+
+        Unconditional and latest-wins. Both writes sit inside the ``_generic_dev()``
+        arm of the one method ``SweepEngine`` and ``StoriesEngine`` override to a
+        no-op, so a run type with no sprint board cannot leave a value here and the
+        record IS the carry's guard — no second predicate downstream. Re-entering
+        this on a DEV_VERIFY replay re-records the same value, and an attempt that
+        ends at the other terminal overwrites it, because the phase that selects the
+        terminal is the phase that writes the record.
+
+        Not saved here, deliberately: the write it describes lands in a unit
+        worktree that a host loss discards whole, and the re-drive re-derives the
+        intent from the spec. Only the merge makes that write survivable, and every
+        path to a merge persists the task before reaching it."""
         if not self._generic_dev():
             return
         spec_file = (result_json or {}).get("spec_file")
@@ -3030,11 +3061,13 @@ class Engine:
             sprint_advance(
                 self.workspace.paths.sprint_status, task.story_key, verify.AWAITING_OPERATOR
             )
+            task.board_advance_intended = verify.AWAITING_OPERATOR
             return
         if status != success_status:
             return
         target = "review" if review_enabled else "done"
         sprint_advance(self.workspace.paths.sprint_status, task.story_key, target)
+        task.board_advance_intended = target
 
     def _post_dev_accepted_sync(self, task: StoryTask, result_json: dict | None) -> None:
         """Write bookkeeping that is valid only after a dev attempt is accepted.
@@ -5137,10 +5170,15 @@ class Engine:
         The two closes never coexist on one task — ``SweepEngine`` overrides the
         story producer to a no-op, and a story run has no bundle — so their
         relative order is unobservable.
+
+        ``_carry_board_advance`` trails all three and is ordered freely: it writes
+        sprint-status.yaml, which shares no state with the deferred-work ledger, so
+        the appends-before-closes contract has nothing to say about it.
         """
         self._carry_harvested_deferrals(task)
         self._carry_review_budget_followups(task)
         self._carry_story_deferred_closes(task)
+        self._carry_board_advance(task)
 
     def _harvest_carry_commit_may_degrade(self, ledger: Path) -> bool:
         """Whether a carry may remain uncommitted because git cannot own its path."""
@@ -5362,6 +5400,79 @@ class Engine:
                 )
         self.journal.append(
             "story-deferred-close-carried", story_key=task.story_key, dw_ids=carried
+        )
+
+    def _carry_board_advance(self, task: StoryTask) -> None:
+        """Re-apply the story's sprint-board advance to the main checkout (#350).
+
+        The one member of the ``git add -A`` family that is not about the
+        deferred-work ledger. ``_post_dev_state_sync`` advances
+        ``self.workspace.paths.sprint_status``, which under isolation is the unit
+        worktree's board: for a GITIGNORED board that is ``_board_seed``'s copy,
+        shielded from ``finalize_commit``'s ``git add -A`` with every other seeded
+        rel, so the advance never rides the unit branch and dies with the worktree
+        at teardown. Uncarried, the main board keeps the story at
+        ``ready-for-dev`` — inside ``ACTIONABLE_STATUSES`` — and ``_pick_next``,
+        which reads the MAIN board, re-picks finished work on the next run.
+
+        Through ``sprintstatus.advance``, the orchestrator's sole write path to this
+        file, never a copy of the worktree's: that keeps the never-regress rule and
+        the comment-preserving line edit in one place, and a copy would also
+        overwrite rows the worktree's board knows nothing about.
+
+        ``self.paths``, not ``self.workspace.paths`` — the MAIN checkout's board, for
+        the reason spelled out in ``_carry_story_deferred_closes``: the workspace is
+        swapped back before every call site reaches here, so no test can tell them
+        apart, and the explicit form states an intent that stops being obvious the
+        moment that stops holding.
+
+        Unconditional and idempotent, with no tracked/ignored predicate. ``advance``
+        never regresses, so re-applying a landed carry is a no-op, and so is the
+        whole call for a TRACKED board: the worktree's flip is an ordinary
+        modification that no ignore rule masks, so it rides the merge and the main
+        board is already at the target when this runs. ``board-advance-carried``
+        naming a status the carry did not itself write is an ordinary outcome.
+
+        No ``now=``: refreshing ``last_updated`` is ``bmad-loop confirm``'s to do,
+        and passing it here would rewrite a second line — a whole-file relay on a
+        usually-tracked file (#576) — for bookkeeping the story's own advance
+        already declined to touch.
+
+        Best effort, like the two carries above it, and for their reason: of the
+        board shapes that reach this frame, a gitignored one is the only one with
+        anything to write, and ``git add`` refuses an ignored path with rc 1 every
+        time — a commit-pending latch would only retry a refusal. The status on disk
+        is the value that keeps ``_pick_next`` honest; the commit is bookkeeping.
+        The commit is attempted unconditionally rather than gated on evidence of a
+        write, because ``advance`` cannot report whether it wrote (a never-regress
+        echo returns the target too) — an unchanged board simply gives
+        ``commit_paths`` nothing to commit, and ``clean_incoming_collisions`` has
+        just restored any unrelated dirt on a tracked board, so there is none to
+        sweep in.
+        """
+        target = task.board_advance_intended
+        if not target:
+            return
+        board = self.paths.sprint_status
+        landed = sprint_advance(board, task.story_key, target)
+        try:
+            verify.commit_paths(
+                self.paths.repo_root,
+                f"chore(sprint-status): carry {task.story_key} to {target}",
+                [board],
+            )
+        except verify.GitError as e:
+            self.journal.append(
+                "board-advance-carry-uncommitted",
+                story_key=task.story_key,
+                target=target,
+                error=str(e),
+            )
+        self.journal.append(
+            "board-advance-carried",
+            story_key=task.story_key,
+            target=target,
+            status=landed,
         )
 
     def _stash_deferred_artifacts(self, task: StoryTask) -> None:

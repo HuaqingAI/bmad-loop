@@ -162,6 +162,31 @@ def test_sentinel_kind_defaults_empty_for_legacy_state():
     assert StoryTask.from_dict(doc).sentinel_kind == ""
 
 
+def test_board_advance_intended_round_trips_through_json():
+    """#350's carry payload. The JSON leg is the point: this crosses state.json to
+    reach the post-merge carry, and `_replay_unlatched_ledger_carries` reads it from
+    a RELOADED state after a host loss, never from the object that recorded it."""
+    task = StoryTask(story_key="1-1-a", epic=1, board_advance_intended="awaiting-operator")
+    restored = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+    assert restored.board_advance_intended == "awaiting-operator"
+
+
+def test_board_advance_intended_defaults_none_for_legacy_state():
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["board_advance_intended"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).board_advance_intended is None
+
+
+def test_board_advance_intended_keeps_none_distinct_from_a_status():
+    """None means the sync never ran (a sweep bundle, stories mode, the legacy
+    path) and is the whole of the carry's guard — collapsing it to "" would still
+    read falsy, but a str() over None would coin the string "None" and hand the
+    carry a target `advance` would refuse in silence."""
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    assert doc["board_advance_intended"] is None
+    assert StoryTask.from_dict(doc).board_advance_intended is None
+
+
 _DEFERRED_STATE_KEYS = (
     "baseline_ledger_digest",
     "pre_harvest_ledger",
