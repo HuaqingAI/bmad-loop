@@ -1033,6 +1033,91 @@ def test_trusted_config_digest_read_degrades_where_the_write_raises(
         runs.write_trusted_config_digest(project, "r1", "abc123")
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX FIFOs")
+def test_read_trusted_config_digest_refuses_a_planted_fifo_instead_of_hanging(tmp_path):
+    """The read is on a path the driven session can reach, so its *shape* has to be
+    established before any bytes are consumed. A FIFO opened for reading blocks
+    until someone writes — indefinitely — and `resume` is a foreground command a
+    human is waiting on, so this wedges the terminal rather than costing a warning.
+
+    Guarded by `SIGALRM` because the failure mode under test IS a hang: an
+    unguarded call would not fail, it would never return, and the suite would sit
+    there until CI killed the job with no attributable test. The alarm converts
+    "never returns" into a named assertion.
+
+    Deliberately not a `multiprocessing.Process` with a join timeout, which was
+    the first draft: the default start method on Linux is `fork`, and forking a
+    process pytest may already have threaded earns a DeprecationWarning on 3.12+
+    and risks a child deadlock — trading a hang under ablation for a possible hang
+    in the ordinary run. The alarm stays in one process and needs no picklable
+    target. POSIX-only, which this test already is.
+
+    ABLATION: restore `Path.read_text` in the reader, or drop `O_NONBLOCK`, and
+    the alarm fires."""
+    import signal
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    path = runs.config_digest_path_for(project, "r1")
+    path.parent.mkdir(parents=True)
+    os.mkfifo(path)
+
+    def _blew_up(signum, frame):
+        raise AssertionError("the read blocked on the FIFO instead of refusing it")
+
+    previous = signal.signal(signal.SIGALRM, _blew_up)
+    signal.alarm(20)
+    try:
+        assert runs.read_trusted_config_digest(project, "r1") is None
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def test_read_trusted_config_digest_is_bounded(tmp_path):
+    """A link to an endless source (`/dev/zero`) would otherwise read until
+    `MemoryError` — a ValueError-family escape from a function that promises never
+    to raise. The cap removes the condition rather than absorbing it.
+
+    A large regular file stands in for the endless one: same read path, same
+    bound, and it runs on every platform. What is asserted is the BOUND, not just
+    that the call returned — a reader that slurped the whole file and then
+    truncated would satisfy "returns quickly" on a 1 MB file and still blow up on
+    /dev/zero.
+
+    ABLATION: drop `_MAX_DIGEST_BYTES` from the `os.read` and the length assert
+    fails."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    path = runs.config_digest_path_for(project, "r1")
+    path.parent.mkdir(parents=True)
+    path.write_text("a" * (1024 * 1024))
+
+    got = runs.read_trusted_config_digest(project, "r1")
+
+    assert got is not None
+    assert len(got) == runs._MAX_DIGEST_BYTES
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_read_trusted_config_digest_does_not_follow_a_planted_symlink(tmp_path):
+    """`O_NOFOLLOW`: the name is read, not wherever it points. Without it a session
+    aims the orchestrator's read at any file the orchestrator can open, and the
+    "digest" it comes back with is that file's contents.
+
+    ABLATION: drop `O_NOFOLLOW` from the flags and the read returns the target's
+    contents instead of `None`."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    secret = tmp_path / "elsewhere.txt"
+    secret.write_text("not-the-digest")
+    path = runs.config_digest_path_for(project, "r1")
+    path.parent.mkdir(parents=True)
+    path.symlink_to(secret)
+
+    assert runs.read_trusted_config_digest(project, "r1") is None
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_write_trusted_config_digest_replaces_a_planted_symlink(tmp_path):
     """`follow_symlinks=False`, and the reason is that this record lives under a

@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import sys
 import tarfile
 import time
@@ -42,6 +43,11 @@ STOP_REQUEST_FILE = "stop-request.json"
 # `config_digest_path_for`). A bare hex digest, not JSON: one opaque token, and a
 # format an operator can read with `cat`.
 CONFIG_DIGEST_FILE = "config-digest"
+# Read cap for the file above. A sha256 hex digest is 64 bytes; the slack is for
+# a trailing newline and for saying "this is not the digest" out of a file that
+# is merely wrong rather than hostile. The cap's real job is the hostile case —
+# see `read_trusted_config_digest` on why a bound, not a bigger buffer.
+_MAX_DIGEST_BYTES = 256
 _INVALID_PID_IDENTITY = -1.0  # impossible process start/create time; forces "not ours"
 
 
@@ -382,10 +388,57 @@ def read_trusted_config_digest(project: Path, run_id: str) -> str | None:
     costs at most one advisory warning; a resume that *aborts* because an
     advisory could not be read would be the worse failure, and the resume is
     about to resolve the same state root for its events channel anyway, where
-    the error is owned and reported."""
+    the error is owned and reported.
+
+    **Deliberately not ``read_text``**, and for the same reason the write is
+    ``follow_symlinks=False``: this file sits in a directory the driven session
+    can reach (its parent is the ``BMAD_LOOP_EVENTS_DIR`` the engine exports), so
+    the *shape* of what is at the path has to be established before any bytes are
+    consumed. Degrading on a hostile path is not enough when the read itself is
+    the weapon:
+
+    * ``O_NONBLOCK`` + an ``S_ISREG`` check **on the descriptor**. Opening a FIFO
+      for reading otherwise blocks until someone writes — indefinitely — and
+      ``resume`` is a foreground command a human is waiting on, so a planted FIFO
+      wedges the terminal rather than costing a warning. The check is on the fd,
+      not the path, so it cannot be raced: ``fstat`` describes the object actually
+      opened.
+    * ``O_NOFOLLOW``, so the name is read rather than wherever it points.
+    * At most :data:`_MAX_DIGEST_BYTES`. A link to an endless source
+      (``/dev/zero``) reads forever otherwise, and raises ``MemoryError`` — not
+      the ``OSError`` this promises never to leak. The cap removes the condition
+      instead of absorbing it.
+
+    The POSIX-only flags degrade to 0 on win32, which has neither FIFOs at these
+    paths nor ``O_NOFOLLOW``; the size cap and the regular-file check carry there
+    on their own. This mirrors ``tui.launch._read_ctl_window`` deliberately — same
+    hazard, same shape, one idiom. It does **not** collapse empty to ``None`` the
+    way that twin does: here the two are different answers (above).
+
+    None of this makes the baseline tamper-*proof* — a session can still delete
+    the file, and #571 carries that. It stops a tampered path from hanging or
+    exhausting the orchestrator, which is a different and fixable harm."""
     try:
-        return config_digest_path_for(project, run_id).read_text(encoding="utf-8").strip()
-    except (StateRootError, OSError, RuntimeError, UnicodeDecodeError):
+        path = config_digest_path_for(project, run_id)
+    except (StateRootError, OSError, RuntimeError):
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_BINARY", 0)  # win32: no CRLF translation on the raw fd
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        data = os.read(fd, _MAX_DIGEST_BYTES)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    try:
+        return data.decode("utf-8").strip()
+    except UnicodeDecodeError:
         return None
 
 
