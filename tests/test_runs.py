@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tarfile
 from pathlib import Path
+from unittest import mock
 
 import pytest
 from conftest import escalated_run, git, refuse_to_resolve
@@ -1062,7 +1063,10 @@ def test_read_trusted_config_digest_refuses_a_planted_fifo_instead_of_hanging(tm
     target. POSIX-only, which this test already is.
 
     ABLATION: restore `Path.read_text` in the reader, or drop `O_NONBLOCK`, and
-    the alarm fires."""
+    the alarm fires. Dropping the `S_ISREG` check instead fails the assert rather
+    than the alarm — with no writer the FIFO reads EOF, so the reader answers `""`
+    where it owes `None`. Both are graded; the twin below covers the case where a
+    writer makes those bytes attacker-chosen instead of empty."""
     import signal
 
     project = tmp_path / "proj"
@@ -1083,29 +1087,78 @@ def test_read_trusted_config_digest_refuses_a_planted_fifo_instead_of_hanging(tm
         signal.signal(signal.SIGALRM, previous)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX FIFOs")
+def test_read_trusted_config_digest_refuses_a_fed_fifo_instead_of_reading_it(tmp_path):
+    """The twin of the FIFO test above, on the half that is the actual attack. That
+    one plants an idle FIFO, so the harm is a hang and — with the `S_ISREG` check
+    gone — the bytes read are merely empty. Here a writer is holding it open and
+    feeding it, so a reader that got as far as `os.read` would come back with
+    whatever the session piped in and treat it as this run's baseline: feed the
+    digest of the config it just installed and `resume` is satisfied, feed noise
+    and the operator is warned off a change nobody made. Neither is a hang, so the
+    alarm above would never notice.
+
+    Opened `O_RDWR` deliberately: a write-only open on a FIFO blocks until a reader
+    arrives, which would wedge the test itself, and `O_RDWR` never blocks.
+
+    ABLATION: drop the `S_ISREG` check and this returns the piped text instead of
+    `None` — the assert names the value it got."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    path = runs.config_digest_path_for(project, "r1")
+    path.parent.mkdir(parents=True)
+    os.mkfifo(path)
+
+    holder = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+    try:
+        os.write(holder, b"ff" * 32 + b"\n")  # a plausible-looking sha256 hex digest
+        assert runs.read_trusted_config_digest(project, "r1") is None
+    finally:
+        os.close(holder)
+
+
 def test_read_trusted_config_digest_is_bounded(tmp_path):
     """A link to an endless source (`/dev/zero`) would otherwise read until
     `MemoryError` — a ValueError-family escape from a function that promises never
     to raise. The cap removes the condition rather than absorbing it.
 
     A large regular file stands in for the endless one: same read path, same
-    bound, and it runs on every platform. What is asserted is the BOUND, not just
-    that the call returned — a reader that slurped the whole file and then
-    truncated would satisfy "returns quickly" on a 1 MB file and still blow up on
-    /dev/zero.
+    bound, and it runs on every platform.
 
-    ABLATION: drop `_MAX_DIGEST_BYTES` from the `os.read` and the length assert
-    fails."""
+    What is asserted is the BOUND ON THE READ, which is not the same as the length
+    of what comes back, and the difference is the whole point: a reader that
+    slurped the file and only then truncated would return exactly
+    `_MAX_DIGEST_BYTES` too, pass a returned-length assert, and still exhaust
+    memory on /dev/zero — the condition this cap exists to remove rather than
+    absorb. So the requested counts are captured at `os.read` and totalled. (The
+    returned-length assert stays: it is what catches a cap applied to the read but
+    not honoured afterwards.)
+
+    ABLATION: two rows, and the first is the one a length-only assert misses.
+    Slurp the whole file and truncate at the end — the total-bytes assert fails,
+    the length assert does not. Drop `_MAX_DIGEST_BYTES` from the `os.read`
+    outright and both fail."""
     project = tmp_path / "proj"
     project.mkdir()
     path = runs.config_digest_path_for(project, "r1")
     path.parent.mkdir(parents=True)
     path.write_text("a" * (1024 * 1024))
 
-    got = runs.read_trusted_config_digest(project, "r1")
+    requested: list[int] = []
+    real_read = os.read
+
+    def _spy(fd: int, n: int) -> bytes:
+        requested.append(n)
+        return real_read(fd, n)
+
+    with mock.patch.object(runs.os, "read", _spy):
+        got = runs.read_trusted_config_digest(project, "r1")
 
     assert got is not None
     assert len(got) == runs._MAX_DIGEST_BYTES
+    # The read never asks for more than the cap, however many calls it makes.
+    assert requested, "the spy saw no read at all — the assertion below would be vacuous"
+    assert sum(requested) <= runs._MAX_DIGEST_BYTES
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
