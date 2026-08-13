@@ -172,28 +172,63 @@ def story_status(path: Path, key: str) -> str | None:
     return None
 
 
+# Stage 2 of the value/comment split, applied to the remainder after the key's
+# colon and its gap. Which one runs is decided by the remainder's FIRST
+# character, because that is the only place the scalar's own boundary is
+# knowable from a line edit: a quote opens a scalar that owns every `#` to its
+# right, an unquoted scalar cedes the first whitespace-preceded one.
+#
+# `_QUOTED_VALUE_RE` recognizes NO comment (there is no `rest` group to carry):
+# the whole remainder is the value. `_UNQUOTED_VALUE_RE`'s `val` is lazy, so the
+# FIRST ` #` wins rather than the last — the split is where YAML puts it, not
+# wherever the line happens to end. Both arms demand a trailing `\S`, so a line
+# carrying anything after the value that neither arm can account for — trailing
+# whitespace, no comment — is refused whole rather than silently rewritten
+# without it. (That refusal is why the line-ending relay in #576 cannot be fixed
+# by reading bytes alone: a surviving `\r` is trailing whitespace to both arms.)
+_QUOTED_VALUE_RE = re.compile(r"^(?P<val>['\"](?:.*\S)?)$")
+_UNQUOTED_VALUE_RE = re.compile(r"^(?P<val>\S(?:.*?\S)?)(?P<rest>[ \t]+#.*)?$")
+
+
 def _set_mapping_value(lines: list[str], key: str, new_value: str) -> bool:
     """In-place replace the value of the first `key:` line, preserving
     indentation and any trailing ` # comment`. Returns True on a real change. A
     minimal line edit (not a YAML round-trip) so the file's comments and
-    structure — STATUS DEFINITIONS, WORKFLOW NOTES — survive verbatim. The value
-    region may contain spaces (e.g. `last_updated: 01-06-2026 10:00`); a trailing
-    inline comment is recognized only when preceded by whitespace (YAML rule)."""
-    # value = everything after the gap up to an optional ` #...` inline comment
-    pat = re.compile(
-        rf"^(?P<indent>\s*){re.escape(key)}:(?P<gap>[ \t]+)"
-        r"(?P<val>\S(?:.*?\S)?)(?P<rest>[ \t]+#.*)?$"
-    )
+    structure — STATUS DEFINITIONS, WORKFLOW NOTES — survive verbatim.
+
+    The split between value and comment is two-stage: the key prefix is matched
+    first and the whole remainder captured, then that remainder decides for
+    itself. An unquoted value keeps the wide class this board needs — it
+    legitimately contains spaces (`last_updated: 01-06-2026 10:00`), which is why
+    it cannot borrow `frontmatter._VALUE_COMMENT_RE`'s conservative token gate —
+    and cedes an inline comment only at whitespace, as YAML does. A remainder
+    that OPENS WITH A QUOTE is taken whole and no comment is recognized in it at
+    all: a fused pattern would guess the boundary from the last ` #` on the line
+    and turn `status: "a # b"` into `status: done # b"`, promoting scalar text
+    into a comment the board never had (#366). Nothing here can tell where a
+    quoted scalar ends — the closing quote may be escaped, or on another line —
+    so a comment sitting after one is dropped rather than guessed at. Lossy,
+    never wrong, and only a hand-edit reaches it: the writer replaces such a
+    value with a bare token on the next advance.
+
+    A remainder neither arm can read leaves the line alone, exactly like a key
+    that never matched — `advance` reports the unchanged status rather than
+    claiming a write it did not make."""
+    key_pat = re.compile(rf"^(?P<indent>\s*){re.escape(key)}:(?P<gap>[ \t]+)(?P<body>\S.*)$")
     for i, line in enumerate(lines):
-        m = pat.match(line.rstrip("\n"))
+        m = key_pat.match(line.rstrip("\n"))
         if not m:
             continue
-        if m.group("val") == new_value:
+        body = m.group("body")
+        value_pat = _QUOTED_VALUE_RE if body[0] in "'\"" else _UNQUOTED_VALUE_RE
+        vm = value_pat.match(body)
+        if not vm:
+            continue  # unreadable remainder — leave the line as authored
+        if vm.group("val") == new_value:
             return False  # already at target — idempotent no-op
+        rest = vm.groupdict().get("rest") or ""
         nl = "\n" if line.endswith("\n") else ""
-        lines[i] = (
-            f"{m.group('indent')}{key}:{m.group('gap')}{new_value}{m.group('rest') or ''}" + nl
-        )
+        lines[i] = f"{m.group('indent')}{key}:{m.group('gap')}{new_value}{rest}" + nl
         return True
     return False
 

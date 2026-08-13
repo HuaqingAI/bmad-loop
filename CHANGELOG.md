@@ -322,6 +322,13 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
+- **A `#` inside a quoted sprint-status value is no longer rewritten into a comment (#366).** The
+  board writer split value from inline comment with one fused pattern, so `3-2-x: "a # b"` advanced
+  to `3-2-x: done # b"` — scalar text promoted into a comment the board never had. The split is now
+  two-stage and a quote-led value is taken whole, with no comment recognized in it. Unquoted values
+  keep the wide class this board needs (`last_updated: 01-06-2026 10:00`) and still cede the first
+  whitespace-preceded `#` as authored.
+
 - **`resume`'s config-change baseline moves out of the agent-writable tree (#498).** The host-exec
   baseline `resume` compares against — verify commands, launch binary/args/env, plugin allowlist
   — round-tripped through `state.json`, inside the very tree the digest exists to police, so the
