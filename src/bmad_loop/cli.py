@@ -1742,6 +1742,24 @@ def _render_invocation(pol, project: Path, role: str, prompt: str) -> str:
     return " ".join(argv)
 
 
+def _events_dir_preview(project: Path) -> str | None:
+    """``BMAD_LOOP_EVENTS_DIR`` as a real run would set it, with a ``<run-id>``
+    placeholder standing in for the id no dry run has (a preview creates nothing,
+    so the placeholder never reaches a filesystem). Printed once per preview
+    rather than on every story's ``env:`` line: only the run id varies, and the
+    path is long.
+
+    ``None`` — plus the state root's own error on stderr — when no state root can
+    be resolved. A real run resolves the same path while building its adapters, so
+    silently dropping the line would turn a preview into a promise the run cannot
+    keep."""
+    try:
+        return str(runs.events_dir_for(project, "<run-id>"))
+    except runs.StateRootError as e:
+        print(f"warning: {e}", file=sys.stderr)
+        return None
+
+
 def _dry_run(
     paths: bmadconfig.ProjectPaths,
     pol,
@@ -1770,6 +1788,8 @@ def _dry_run(
         print("no actionable stories")
         return 0
     print(f"would process {len(queue)} stories (gates={pol.gates.mode}):")
+    if (events_dir := _events_dir_preview(paths.project)) is not None:
+        print(f"  env (every session): BMAD_LOOP_EVENTS_DIR={events_dir}")
     dev_skill = _dev_skill_for_role(pol, paths.project, "dev")
     review_skill = _dev_skill_for_role(pol, paths.project, "review")
     for story in queue:
@@ -1814,6 +1834,8 @@ def _dry_run_stories(
         f"stories mode: {len(rows)} stories from {folder}/stories.yaml "
         f"(gates={pol.gates.mode}){spec_ok}"
     )
+    if (events_dir := _events_dir_preview(paths.project)) is not None:
+        print(f"  env (every session): BMAD_LOOP_EVENTS_DIR={events_dir}")
     print("linear schedule (list order — no depends_on, strictly serial):")
     dev_skill = _dev_skill_for_role(pol, paths.project, "dev")
     for row in rows:

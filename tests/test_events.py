@@ -56,14 +56,29 @@ def _top_level_sources(path: Path) -> dict[str, str]:
     return found
 
 
-def _relay(event: str, payload, monkeypatch, run_dir: Path | None, task_id: str = "t1") -> int:
-    """Drive `bmad-loop relay <event>` in-process with `payload` on stdin."""
+def _relay(
+    event: str,
+    payload,
+    monkeypatch,
+    run_dir: Path | None,
+    task_id: str = "t1",
+    events_dir: Path | str | None = None,
+) -> int:
+    """Drive `bmad-loop relay <event>` in-process with `payload` on stdin.
+
+    ``events_dir`` sets (or, as None, explicitly CLEARS) BMAD_LOOP_EVENTS_DIR:
+    cleared by default so an operator shell that happens to export it cannot
+    redirect a test's events out from under its assertions."""
     if run_dir is None:
         monkeypatch.delenv("BMAD_LOOP_RUN_DIR", raising=False)
         monkeypatch.delenv("BMAD_LOOP_TASK_ID", raising=False)
     else:
         monkeypatch.setenv("BMAD_LOOP_RUN_DIR", str(run_dir))
         monkeypatch.setenv("BMAD_LOOP_TASK_ID", task_id)
+    if events_dir is None:
+        monkeypatch.delenv("BMAD_LOOP_EVENTS_DIR", raising=False)
+    else:
+        monkeypatch.setenv("BMAD_LOOP_EVENTS_DIR", str(events_dir))
     text = payload if isinstance(payload, str) else json.dumps(payload)
     monkeypatch.setattr(sys, "stdin", io.StringIO(text))
     return cli.main(["relay", event])
@@ -583,5 +598,67 @@ def test_relay_defaults_the_event_name_like_the_hook(tmp_path, monkeypatch, caps
 def _relay_no_event(payload, monkeypatch, run_dir: Path) -> int:
     monkeypatch.setenv("BMAD_LOOP_RUN_DIR", str(run_dir))
     monkeypatch.setenv("BMAD_LOOP_TASK_ID", "t1")
+    monkeypatch.delenv("BMAD_LOOP_EVENTS_DIR", raising=False)
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
     return cli.main(["relay"])
+
+
+# ------------------------------------------- where the event is written (#494)
+
+
+def test_relay_prefers_the_events_dir_env(tmp_path, monkeypatch, capsys):
+    """The relay is the OTHER writer of this control plane, so it resolves the
+    directory exactly as the copied hook script does — the two are pointed at one
+    channel by the same variable, and a preference that held on only one of them
+    would split the channel in half depending on which target a project's hook
+    config happens to name."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    events = tmp_path / "state" / "runs" / "RID" / "events"
+
+    assert _relay("Stop", {"session_id": "s1"}, monkeypatch, run_dir, events_dir=events) == 0
+    assert capsys.readouterr() == ("", "")
+
+    files = list(events.glob("*.json"))
+    assert len(files) == 1 and json.loads(files[0].read_text())["session_id"] == "s1"
+    assert not (run_dir / "events").exists()
+
+
+@pytest.mark.parametrize("value", [None, ""], ids=["unset", "empty"])
+def test_relay_falls_back_to_the_run_dir(tmp_path, monkeypatch, capsys, value):
+    """An orchestrator predating #494 names no events dir; its sessions must still
+    write where it polls. Empty is the same case in disguise — `export
+    BMAD_LOOP_EVENTS_DIR=` leaves an empty value behind, and an empty path names
+    the launch cwd rather than a control plane.
+
+    Ablation guard: swap the `or` for a presence test and the empty case writes
+    into the cwd — this fails."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    assert _relay("Stop", {"session_id": "s1"}, monkeypatch, run_dir, events_dir=value) == 0
+    assert capsys.readouterr() == ("", "")
+
+    files = list((run_dir / "events").glob("*.json"))
+    assert len(files) == 1 and json.loads(files[0].read_text())["session_id"] == "s1"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_relay_refuses_a_symlinked_env_directed_events_dir(tmp_path, monkeypatch, capsys):
+    """The #493 hardening is a property of the directory the relay is pointed at,
+    not of how that directory was derived — so it must hold for an env-named one,
+    with the same silent rc 0 degrade."""
+    target = tmp_path / "attacker"
+    target.mkdir()
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "events").symlink_to(target, target_is_directory=True)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    rc = _relay("Stop", {"session_id": "s1"}, monkeypatch, run_dir, events_dir=state / "events")
+    assert rc == 0
+    assert capsys.readouterr() == ("", "")
+    assert list(target.iterdir()) == []
+    assert list((state / "events").iterdir()) == []
+    assert not (run_dir / "events").exists()  # no silent fallback to the legacy dir

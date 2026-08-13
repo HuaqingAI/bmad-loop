@@ -248,13 +248,16 @@ def relay(event_name: str, stdin: IO[str]) -> int:
         return 0
     ts = time.time_ns()
     event = shape_event(ts, event_name, task_id, _read_payload(stdin))
+    # $BMAD_LOOP_EVENTS_DIR when the orchestrator names one (#494 moved the
+    # channel out of the project tree), else the legacy in-tree location — the
+    # same preference, spelled the same way, as the copied hook script's `main()`.
+    # `or`, not a presence test: an exported-but-empty value names the launch cwd.
+    # The no-op detector above stays RUN_DIR + TASK_ID for the reason the hook's
+    # docstring gives: an older orchestrator sets neither the new variable nor any
+    # expectation that this relay needs it, and its sessions must still complete.
+    events_dir = os.environ.get("BMAD_LOOP_EVENTS_DIR") or os.path.join(run_dir, "events")
     try:
-        # The events dir is derived from the run dir here; #494 Phase 3 gives it
-        # its own env var and prefers that, keeping this as the fallback for
-        # hooks installed before the move.
-        _write_event(
-            os.path.join(run_dir, "events"), event_file_name(ts, task_id, event_name), event
-        )
+        _write_event(events_dir, event_file_name(ts, task_id, event_name), event)
     except OSError:
         # A hostile or broken events dir must degrade to the orchestrator's normal
         # session_timeout_min path, never surface as a hook failure that fails the

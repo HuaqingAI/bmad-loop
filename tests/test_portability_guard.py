@@ -131,6 +131,7 @@ REGISTRY_NAMES = {
 # and these scripts read back what was handed to them.
 SESSION_PROTOCOL_ENV = (
     "BMAD_LOOP_RUN_DIR",
+    "BMAD_LOOP_EVENTS_DIR",
     "BMAD_LOOP_TASK_ID",
     "BMAD_LOOP_WORKTREE",
     "BMAD_LOOP_REPO_ROOT",
@@ -167,7 +168,7 @@ ENV_READ_ALLOW = {
     # `events.py` is the ONE in-package entry here, and the "cannot import
     # bmad_loop" justification above does not reach it — it obviously can. It is
     # exempt as the importable PARITY TWIN of the stdlib-only hook relay: the same
-    # two session-protocol vars, read at the same point in the same protocol, by
+    # session-protocol vars, read at the same points in the same protocol, by
     # the code the hook config points at when it points at `bmad-loop relay`
     # instead of the copied script. Routing one twin through `envvars` and leaving
     # the other on `os.environ` would put the reads out of parity, and parity is

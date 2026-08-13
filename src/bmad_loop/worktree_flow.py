@@ -483,8 +483,12 @@ def provision_worktree(
       project that commits its own skill tree (e.g. .agents/) or config keeps it
       untouched (no diff merged back);
     - the hook points at the MAIN repo's already-installed relay via an absolute
-      path (the relay locates the run dir from $BMAD_LOOP_RUN_DIR, not its own
-      location), so nothing is written into the worktree's .bmad-loop/;
+      path (the relay locates its events directory from $BMAD_LOOP_EVENTS_DIR,
+      falling back to $BMAD_LOOP_RUN_DIR/events — never from its own location),
+      so nothing is written into the worktree's .bmad-loop/. Since #494 the
+      primary channel is out of the project tree entirely, so a worktree cannot
+      carry a run's control plane at all — but the fallback still resolves under
+      the MAIN run dir, so the guarantee holds for an older installed relay too;
     - everything we wrote is excluded from git, in a file private to THIS worktree
       (`.git/worktrees/<id>/info/exclude`, activated per-worktree) that dies with it
       when the worktree is removed. It is never the repository-wide

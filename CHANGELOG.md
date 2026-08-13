@@ -23,12 +23,22 @@ whose seams had diverged enough that several ports needed a different fix, and t
   neither a broken `policy.toml` nor an unexpected exception can turn a session's Stop signal into a
   failed hook. First phase of moving `events/` to a control-plane root outside the project tree.
 
-  The root itself lands next: a user-scoped state directory (`$XDG_STATE_HOME/bmad-loop` or
+  The root itself is a user-scoped state directory (`$XDG_STATE_HOME/bmad-loop` or
   `~/.local/state/bmad-loop`; `%LOCALAPPDATA%\bmad-loop\state` on Windows), keyed
   `<root>/<project>/<run-id>/` by the same project identity that scopes session ownership, so two
   spellings of one project cannot end up with two control planes. `BMAD_LOOP_STATE_DIR` overrides
-  the whole cascade for a host where none of those is derivable or writable. Nothing reads the root
-  yet — the events channel moves into it in the next phase.
+  the whole cascade for a host where none of those is derivable or writable.
+
+  **The events channel now lives there**, at `<root>/<project>/<run-id>/events/` — out of the
+  project tree, where a branch switch, a worktree mount or a rollback cannot take a live run's
+  control plane away. Every engine-driven session is told the directory through
+  `BMAD_LOOP_EVENTS_DIR`, and both relays (the copied hook script and `bmad-loop relay`) prefer it,
+  falling back to the legacy in-tree `<run-dir>/events`. The orchestrator keeps polling that legacy
+  location too, and the fallback pair is load-bearing rather than tidy: the hook script is COPIED
+  into the project by `init`, so an upgraded orchestrator routinely drives sessions whose relay
+  predates the move — without both halves every such session would observe no Stop and stall to
+  `session_timeout_min`. Re-run `bmad-loop init` to refresh the relay. `--dry-run` previews the
+  directory the run would use.
 
 - **Coding-CLI adapter registry: a new adapter class ships out-of-tree (#226).** The transport axis
   has long been extensible out-of-tree; the CLI axis had no equivalent, so a CLI needing its own

@@ -10,9 +10,23 @@ transcriptPath, agy's conversationId/transcriptPath — protojson encoding); the
 field extraction below tries each. agy alone carries no cwd, sending the
 workspacePaths list instead. Reads the hook payload
 from stdin and writes one event file
-into the orchestrator's run directory. No-ops (exit 0) unless the session was
+into the orchestrator's events directory. No-ops (exit 0) unless the session was
 spawned by bmad-loop (detected via env vars set on the tmux window), so
 normal interactive sessions are unaffected.
+
+Where that directory is: $BMAD_LOOP_EVENTS_DIR when the orchestrator names one,
+else the legacy $BMAD_LOOP_RUN_DIR/events. The channel moved out of the project
+tree in #494 so a branch switch or a worktree mount cannot take a live run's
+control plane away, and this script is COPIED into the target project at init
+time — so an upgraded orchestrator regularly drives sessions whose installed
+copy is this file's older self, which knows only the legacy path. That pairing
+is what the orchestrator's own dual poll (signals.SignalWatcher) covers.
+
+$BMAD_LOOP_EVENTS_DIR is deliberately NOT part of the no-op detector above: the
+mirror-image skew — an older orchestrator that sets only RUN_DIR/TASK_ID driving
+a session whose installed relay is this newer file — must still write its
+events, and requiring the new variable would silently stall every one of those
+runs instead.
 """
 
 import json
@@ -195,8 +209,13 @@ def main() -> int:
         # agy sends no cwd — it sends workspacePaths, a list of workspace roots.
         "cwd": payload.get("cwd") or _first_workspace(payload),
     }
+    # The orchestrator's own events dir when it named one, else the legacy
+    # in-tree location this file's older selves are still installed at (see the
+    # module docstring). `or`, not a presence test: an exported-but-empty value
+    # names the launch cwd, which is not a control plane.
+    events_dir = os.environ.get("BMAD_LOOP_EVENTS_DIR") or os.path.join(run_dir, "events")
     try:
-        _write_event(os.path.join(run_dir, "events"), f"{ts}-{task_id}-{event_name}.json", event)
+        _write_event(events_dir, f"{ts}-{task_id}-{event_name}.json", event)
     except OSError:
         # A hostile or broken events dir must degrade to the orchestrator's
         # normal session_timeout_min path, never surface as a hook failure that

@@ -40,20 +40,32 @@ HAVE_TMUX = sys.platform != "win32" and shutil.which("tmux") is not None
 # raises UnicodeDecodeError — a ValueError, NOT an OSError.
 _BAD_UTF8 = b"\xff\xfe\x00\x01 not utf-8 \x80\x81"
 
+# The line that decides where the fake relay writes its events. Swapped below to
+# build the version-skew twin, so the two scripts differ in nothing else.
+_EVENTS_LINE = 'ed="$BMAD_LOOP_EVENTS_DIR"'
+_LEGACY_EVENTS_LINE = 'ed="$BMAD_LOOP_RUN_DIR/events"'
+
 FAKE_CLI = """#!/bin/bash
 # fake CLI: last positional arg is the prompt; env comes from tmux -e
 prompt="${@: -1}"
 ts=$(date +%s%N)
-mkdir -p "$BMAD_LOOP_RUN_DIR/events" "$BMAD_LOOP_RUN_DIR/tasks/$BMAD_LOOP_TASK_ID"
+ed="$BMAD_LOOP_EVENTS_DIR"
+mkdir -p "$ed" "$BMAD_LOOP_RUN_DIR/tasks/$BMAD_LOOP_TASK_ID"
 printf '{"ts": %s, "event": "SessionStart", "task_id": "%s", "session_id": "fake-1"}' \\
-    "$ts" "$BMAD_LOOP_TASK_ID" > "$BMAD_LOOP_RUN_DIR/events/$ts-$BMAD_LOOP_TASK_ID-SessionStart.json"
+    "$ts" "$BMAD_LOOP_TASK_ID" > "$ed/$ts-$BMAD_LOOP_TASK_ID-SessionStart.json"
 echo "{\\"workflow\\": \\"auto-dev\\", \\"prompt\\": \\"$prompt\\"}" \\
     > "$BMAD_LOOP_RUN_DIR/tasks/$BMAD_LOOP_TASK_ID/result.json"
 ts2=$(( ts + 1 ))
 printf '{"ts": %s, "event": "Stop", "task_id": "%s", "session_id": "fake-1"}' \\
-    "$ts2" "$BMAD_LOOP_TASK_ID" > "$BMAD_LOOP_RUN_DIR/events/$ts2-$BMAD_LOOP_TASK_ID-Stop.json"
+    "$ts2" "$BMAD_LOOP_TASK_ID" > "$ed/$ts2-$BMAD_LOOP_TASK_ID-Stop.json"
 sleep 60  # stay alive like an idle interactive session
 """
+
+# What a relay installed before #494 knows: only the in-tree location. Pairing it
+# with a current orchestrator is the version-skew case the dual poll covers, and
+# it is the ordinary state of any project whose `.bmad-loop/bmad_loop_hook.py`
+# copy predates the move.
+LEGACY_EVENTS_FAKE_CLI = FAKE_CLI.replace(_EVENTS_LINE, _LEGACY_EVENTS_LINE)
 
 
 def make_adapter(
@@ -73,6 +85,12 @@ def make_adapter(
         binary=binary,
         extra_args=extra_args,
         mux=mux,
+        # As `runsetup.make_adapters` does: the primary channel is out of the
+        # project tree (#494), keyed by run. Under `tmp_path` rather than the real
+        # state root only because these are unit tests; what matters is that it is
+        # NOT `run_dir / "events"`, so every test here drives the production shape
+        # (out-of-tree primary, in-tree legacy still under poll).
+        events_dir=tmp_path / "state" / run_dir.name / "events",
     )
 
 
@@ -2976,9 +2994,9 @@ def test_read_usage_none_without_transcript(tmp_path):
     assert adapter.read_usage(SessionResult(status="completed")) is None
 
 
-def _write_fake_cli(tmp_path):
+def _write_fake_cli(tmp_path, script: str = FAKE_CLI):
     fake = tmp_path / "fake-cli"
-    fake.write_text(FAKE_CLI)
+    fake.write_text(script)
     fake.chmod(0o755)
     return fake
 
@@ -2995,6 +3013,7 @@ def test_tmux_end_to_end_with_fake_cli(tmp_path, profile_name):
     spec_env = {
         "BMAD_LOOP_MODE": "1",
         "BMAD_LOOP_RUN_DIR": str(adapter.run_dir),
+        "BMAD_LOOP_EVENTS_DIR": str(adapter.watcher.events_dir),
         "BMAD_LOOP_TASK_ID": "t-int-1",
     }
     spec = SessionSpec(
@@ -3042,7 +3061,11 @@ def test_tmux_reused_task_id_ignores_stale_artifacts(tmp_path):
         role="dev",
         prompt="/bmad-dev-auto 1-1-a",
         cwd=tmp_path,
-        env={"BMAD_LOOP_RUN_DIR": str(adapter.run_dir), "BMAD_LOOP_TASK_ID": task_id},
+        env={
+            "BMAD_LOOP_RUN_DIR": str(adapter.run_dir),
+            "BMAD_LOOP_EVENTS_DIR": str(adapter.watcher.events_dir),
+            "BMAD_LOOP_TASK_ID": task_id,
+        },
         timeout_s=30.0,
     )
     try:
@@ -3053,6 +3076,49 @@ def test_tmux_reused_task_id_ignores_stale_artifacts(tmp_path):
     assert result.status == "completed"
     assert result.result_json["workflow"] == "auto-dev"  # fresh, not "STALE"
     assert result.session_id == "fake-1"  # fresh session, not "old"
+
+
+@pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
+def test_tmux_end_to_end_with_a_relay_that_only_knows_the_legacy_dir(tmp_path):
+    """The version-skew guard, end to end through real tmux: a CURRENT
+    orchestrator (it exports BMAD_LOOP_EVENTS_DIR and waits on the out-of-tree
+    channel) driving a session whose relay is an OLD copy that writes only to
+    `<run_dir>/events`. That pairing is not exotic — the relay is copied into the
+    target project at init, so every project not re-inited after an upgrade is in
+    it, and without the watcher's legacy poll EVERY such session stalls to
+    `session_timeout_min` instead of completing.
+
+    Ablation guard: drop `legacy_dir` from `SignalWatcher._dirs()` and this fails
+    (as a 30s timeout, not an assertion — which is precisely the production
+    symptom)."""
+    assert "$BMAD_LOOP_EVENTS_DIR" not in LEGACY_EVENTS_FAKE_CLI, "the twin still reads the new var"
+    assert LEGACY_EVENTS_FAKE_CLI != FAKE_CLI, "the swap did not take"
+
+    fake = _write_fake_cli(tmp_path, LEGACY_EVENTS_FAKE_CLI)
+    adapter = make_adapter(tmp_path, binary=str(fake), extra_args=())
+    spec = SessionSpec(
+        task_id="t-legacy-1",
+        role="dev",
+        prompt="/bmad-dev-auto 1-1-a",
+        cwd=tmp_path,
+        env={
+            "BMAD_LOOP_RUN_DIR": str(adapter.run_dir),
+            "BMAD_LOOP_EVENTS_DIR": str(adapter.watcher.events_dir),
+            "BMAD_LOOP_TASK_ID": "t-legacy-1",
+        },
+        timeout_s=30.0,
+    )
+    try:
+        result = adapter.run(spec)
+    finally:
+        subprocess.run(["tmux", "kill-session", "-t", adapter.session_name], capture_output=True)
+
+    assert result.status == "completed"
+    assert result.session_id == "fake-1"
+    # the premise, asserted rather than assumed: the events really did land in the
+    # legacy location and nowhere else, so the completion came through the fallback
+    assert list((adapter.run_dir / "events").glob("*.json"))
+    assert not list(adapter.watcher.events_dir.glob("*.json"))
 
 
 @pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")

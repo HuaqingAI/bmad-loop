@@ -693,6 +693,70 @@ def test_make_adapters_unknown_kind_systemexit_names_profile(fresh_adapter_regis
         runsetup.make_adapters(project.project, _run_dir(project.project), pol)
 
 
+def test_make_adapters_hands_every_kind_the_run_events_dir(
+    fresh_adapter_registry, project, monkeypatch
+):
+    """#494: the events channel lives outside the project tree now, so an adapter
+    can no longer derive it — the only path it holds is a run dir, and the key
+    needs the PROJECT too. `make_adapters` is the one layer with both, so it
+    resolves the directory and hands it down.
+
+    To EVERY kind, unlike `mux`: a path costs nothing to carry, probes no host and
+    can refuse no run, so gating it would make the bootstrap branch per family over
+    a value it can always compute. Both variants are checked because they take
+    separate `__init__` paths (the dev one threads `paths` as well)."""
+    from bmad_loop import runs
+
+    registry = fresh_adapter_registry
+    registry.register_adapter("noxport", needs_mux=False, load=lambda: _stub_builder())
+    monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: pytest.fail("no mux for this kind"))
+    install_bmad_config(project)
+    _write_profile(project.project, "noxport", adapter="noxport")
+    _write_policy(project.project, '[adapter]\nname = "noxport"\n')
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+
+    run_dir = _run_dir(project.project)
+    adapters = runsetup.make_adapters(project.project, run_dir, pol)
+
+    expected = runs.events_dir_for(project.project, run_dir.name)
+    assert adapters["dev"].kwargs["events_dir"] == expected  # dev variant
+    assert adapters["triage"].kwargs["events_dir"] == expected  # plain variant
+    # and it is genuinely out of the project tree — the whole point of the move
+    assert not expected.is_relative_to(project.project)
+
+
+def test_the_generic_watcher_polls_the_state_root_first_and_the_legacy_dir_too(
+    fresh_adapter_registry, project, monkeypatch
+):
+    """The consumer half, on the real builtin family: the watcher's PRIMARY is the
+    out-of-tree channel this run's sessions are pointed at, and the pre-#494 in-tree
+    dir stays under poll so a project whose installed relay predates the move still
+    completes its sessions.
+
+    This is also the producer/consumer agreement. Both sides derive the primary
+    from `runs.events_dir_for(project, run_id)` — this one and
+    `test_session_env_names_the_out_of_tree_events_dir` in test_engine.py, which
+    asserts the engine exports that same call's result. A run whose two halves
+    disagreed would poll a directory nothing writes to and stall every session to
+    `session_timeout_min` with the Stop sitting on disk.
+
+    Ablation guard: drop `events_dir` from `make_adapters`' kwargs and the primary
+    falls back to the in-tree dir — the first assertion fails."""
+    from bmad_loop import runs
+
+    monkeypatch.setattr(mux_mod, "_usable", lambda mux: True)
+    install_bmad_config(project)
+    run_dir = _run_dir(project.project)
+
+    adapters = runsetup.make_adapters(project.project, run_dir, policy_mod.load(None))
+
+    watcher = adapters["dev"].watcher
+    assert watcher.events_dir == runs.events_dir_for(project.project, run_dir.name)
+    assert watcher.legacy_dir == run_dir / "events"
+    assert watcher.events_dir.is_dir()  # created for the relay to write into
+    assert not (run_dir / "events").exists()  # never re-created in the project tree
+
+
 def test_make_adapters_generic_shares_synthesizing_but_not_triage(
     fresh_adapter_registry, project, monkeypatch
 ):

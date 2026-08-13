@@ -331,6 +331,85 @@ def test_event_file_mode_is_0600(tmp_path):
     assert stat.S_IMODE(written.stat().st_mode) == 0o600
 
 
+# --------------------------------------------- where the event is written (#494)
+
+
+def test_the_events_dir_env_wins_over_the_run_dir(tmp_path):
+    """#494: the channel moved out of the project tree, and this variable is how
+    the orchestrator names it. Nothing may land in the legacy in-tree location
+    when it is set — an event written there is only found by the orchestrator's
+    compatibility poll, and the whole point is that a branch switch or a worktree
+    mount cannot take the live channel away."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    events = tmp_path / "state" / "runs" / "RID" / "events"
+    env = {
+        "BMAD_LOOP_RUN_DIR": str(run_dir),
+        "BMAD_LOOP_EVENTS_DIR": str(events),
+        "BMAD_LOOP_TASK_ID": "t1",
+    }
+    proc = run_hook("Stop", env, {"session_id": "s1"})
+
+    assert proc.returncode == 0
+    files = list(events.glob("*.json"))
+    assert len(files) == 1 and json.loads(files[0].read_text())["session_id"] == "s1"
+    assert not (run_dir / "events").exists()
+
+
+@pytest.mark.parametrize("value", [None, ""], ids=["unset", "empty"])
+def test_the_events_dir_falls_back_to_the_run_dir(tmp_path, value):
+    """The version-skew half, from the producing side: an orchestrator that
+    predates #494 sets no BMAD_LOOP_EVENTS_DIR, and its sessions must still write
+    their events somewhere the orchestrator polls — the legacy location it knows.
+
+    The empty case is not hypothetical: `export BMAD_LOOP_EVENTS_DIR=` is what an
+    unset-looking export leaves behind, and an empty path names the launch cwd,
+    which is not a control plane.
+
+    Ablation guard: change the `or` to a presence test (`is not None`) and the
+    empty case writes into the CLI's working directory instead — this fails."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    env = {"BMAD_LOOP_RUN_DIR": str(run_dir), "BMAD_LOOP_TASK_ID": "t1"}
+    if value is not None:
+        env["BMAD_LOOP_EVENTS_DIR"] = value
+    proc = run_hook("Stop", env, {"session_id": "s1"})
+
+    assert proc.returncode == 0
+    files = list((run_dir / "events").glob("*.json"))
+    assert len(files) == 1 and json.loads(files[0].read_text())["session_id"] == "s1"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_a_symlinked_env_directed_events_dir_writes_nothing_and_exits_zero(tmp_path):
+    """The #493 hardening is about the DIRECTORY the relay is pointed at, so it
+    has to hold for the one an env var names just as it did for the one derived
+    from the run dir. Under isolation a driven session can write into the project
+    but not into the state root — yet the variable itself is inherited env, and a
+    session that can plant a link at the named path must still not redirect the
+    control plane through it."""
+    target = tmp_path / "attacker"
+    target.mkdir()
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "events").symlink_to(target, target_is_directory=True)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    env = {
+        "BMAD_LOOP_RUN_DIR": str(run_dir),
+        "BMAD_LOOP_EVENTS_DIR": str(state / "events"),
+        "BMAD_LOOP_TASK_ID": "t1",
+    }
+    proc = run_hook("Stop", env, {"session_id": "s1"})
+
+    assert proc.returncode == 0
+    assert list(target.iterdir()) == []
+    assert list((state / "events").iterdir()) == []
+    # and it did not silently fall back to the legacy location either
+    assert not (run_dir / "events").exists()
+
+
 def test_installed_copy_matches_source(tmp_path):
     from bmad_loop.install import install_into
 

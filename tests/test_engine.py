@@ -2012,6 +2012,38 @@ def test_happy_path(project):
     assert adapter.sessions[1].prompt.startswith("/bmad-dev-auto ")
 
 
+def test_session_env_names_the_out_of_tree_events_dir(project):
+    """#494 producer side: every engine-driven session is told where to write its
+    hook events, and the answer is the out-of-tree channel — not `<run_dir>/events`,
+    which a branch switch, a worktree mount or a rollback can take away mid-run.
+
+    `Engine._run_session`'s env dict is the ONE required producer site: dev,
+    review, sweep bundles, stories and injected plugin-workflow sessions are all
+    dispatched through it, so both roles below carry the variable from one edit.
+
+    The value is `runs.events_dir_for(project, run_id)` — the same call
+    `runsetup.make_adapters` points this run's SignalWatcher at (see
+    `test_the_generic_watcher_polls_the_state_root_first_and_the_legacy_dir_too`).
+    That agreement is the invariant: a producer and consumer that disagreed would
+    leave every Stop unobserved and stall the run to `session_timeout_min`.
+
+    Ablation guard: delete the env entry and this fails; point it at
+    `self.run_dir / "events"` and it fails on the value."""
+    from bmad_loop import runs
+
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+    )
+    engine.run()
+
+    expected = str(runs.events_dir_for(project.project, engine.run_dir.name))
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]
+    assert {s.env["BMAD_LOOP_EVENTS_DIR"] for s in adapter.sessions} == {expected}
+    assert not Path(expected).is_relative_to(project.project)
+
+
 def test_post_kill_rescued_result_flows_and_journals(project):
     """A result rescued by the adapter's post-kill reconcile (#61) reaches the
     engine as an ordinary completed result — it must flow the completed path
