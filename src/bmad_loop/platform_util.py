@@ -502,9 +502,16 @@ def _mkstemp_beside(target: Path) -> tuple[int, str]:
     only while it actually shortens, and a bare ``mkstemp`` — the shortest name
     this function can produce — always ends the ladder.
 
-    Only a failure at that last rung propagates, and by then the claim it carries
-    is true: no choice of prefix can fix it, so what does not fit is the
-    DIRECTORY."""
+    Only a failure at that last rung propagates. No choice of *prefix* can fix
+    that one — there is no prefix left — but that is a narrower statement than "the
+    directory is too long", and the difference is #596: ``mkstemp`` will not
+    generate a name below 12 characters (8 random, plus the ``.tmp`` this helper
+    needs to stay out of ``devcontract``'s ``*.md`` scans). What does not fit at
+    the last rung is therefore the directory PLUS those 12, which a target with a
+    shorter basename can still clear on a direct write. Shrinking below the floor
+    means abandoning ``mkstemp``, and with it the entropy that keeps the staged
+    name unpredictable where a less-trusted writer can reach it — see #591 for the
+    cost of a guessable temp name."""
     directory = str(target.parent)
     digest = hashlib.blake2b(os.fsencode(target.name), digest_size=8).hexdigest()
     rungs = [target.name + "."]
