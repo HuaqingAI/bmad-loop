@@ -7,106 +7,109 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Changed
+
+- **Files the orchestrator replaces by name now land at `0600`.** Those writes pass
+  `follow_symlinks=False`, and that mode deliberately carries nothing over from the target — not
+  its permission bits, not its xattrs — so the new contents arrive at `mkstemp`'s private default.
+  Affected: `.bmad-loop/decisions.json`, `.bmad-loop/policy.toml`, the park records under
+  `.bmad-loop/operator/`, and any story spec written through `set_frontmatter_status`,
+  `set_frontmatter_field` or `devcontract`. Most were already being reset to `0644` on every
+  rewrite — the hand-rolled temp they replaced was created at `0666 & ~umask` and `os.replace`
+  swapped _that_ inode into place — so for those the delta is `0644` → `0600`. Git records no mode
+  but the exec bit, so nothing downstream of a commit notices.
+
+  The no-follow choice is made per **file**, not per call site: once one writer of a file replaces
+  it by name, every writer of that file has to, or they disagree about what the path means.
+  Applying it that way brought four writers into line that had been direct
+  `write_text`/`write_bytes` calls — `verify.safe_rollback`, the engine's park-record restore,
+  `set_frontmatter_status` and `set_frontmatter_field`. Those four opened the name, and so wrote
+  _through_ any symlink planted at it; they now replace it. That is a real change at those four,
+  and what makes it safe is the same per-file rule: each of those files already had a
+  name-replacing sibling writer (`policy.write_mux_backend`, `record_park`,
+  `devcontract._atomic_write_spec`), so no link at those names survived the orchestrator anyway.
+  Files with no name-replacing sibling keep following symlinks — `sprint-status.yaml` and your
+  CLI's `settings.json`, both operator-curated, so a board or a config kept outside the tree and
+  linked in keeps being a link.
+
+- **`atomic_write_bytes` accepts `follow_symlinks`, as its text sibling already did.** The default
+  stays `True`, which the private-git-exclude writer depends on: it pre-creates the target
+  precisely so the helper has a umask mode to carry over, and git silently ignores an exclude file
+  it cannot read.
+
 ### Fixed
 
-- **Five writers under `.bmad-loop/` can no longer leave an untracked temp file behind (#363, #379).**
-  Each wrote a fixed-name temp and then `os.replace`d it, and `atomic_replace` does no cleanup of
-  its own — so a failed replace stranded the temp. No ignore rule covers those names (`init` writes
-  `.bmad-loop/runs/`, `.bmad-loop/cache/`, `.bmad-loop/policy.toml` and `_bmad/render/`), which left
-  an untracked file holding `verify.worktree_clean` False until a human deleted it by hand. Under a
-  monorepo `repo_root:` override that surfaces as a failing `validate` and TUI rather than a blocked
-  `run`, which probe the repo root instead.
+- **A failed write can no longer truncate the sprint board, a story spec, your CLI settings or your
+  policy file (#379).** Seven writers read a file, merged into it, and wrote the whole thing back
+  through a truncating `Path.write_*` — so a fault partway through (ENOSPC, EIO, a quota) published
+  a _prefix_ of the file and destroyed the rest. All seven now go through
+  `platform_util.atomic_write_text` / `atomic_write_bytes`: contents to a temp, fsync, replace.
 
-  - Four now route through `atomic_write_text`/`atomic_write_bytes`, which name the temp uniquely per
-    write, fsync before the replace, and remove the temp on any raise: the pre-answer store
-    (`decisions.json`), both of the sweep's `decisions.json` writes, `policy.toml`'s `[mux] backend`
-    writer, and the TUI settings editor's save. The last two built the _same_
-    `.bmad-loop/policy.toml.tmp` path, so they could also collide with each other.
+  Most of these fail _quietly_ — the file still parses afterwards, so nothing downstream raises:
+
+  - **The sprint board.** `sprintstatus.advance` is the orchestrator's sole write path to
+    `sprint-status.yaml`. YAML cut at a line boundary is still a valid mapping, just a smaller one,
+    so the epics past the tear ceased to exist and the run walked off the end of the sprint instead
+    of erroring.
+  - **A story spec.** A spec is laid out `before + edited + after`, so a write that faulted after
+    the frontmatter had landed left intact frontmatter saying `status: done` over a decapitated
+    body — a spec that lies, which the loop then commits. `set_frontmatter_status`,
+    `set_frontmatter_field` and `devcontract`'s four in-place rewriters now share one call.
+    `devcontract` was already atomic and recorded the measured cost: fault injection on the old
+    truncating write cut a 46-byte spec to 12.
+  - **`.bmad-loop/policy.toml`.** `safe_rollback` captures it before the `git reset --hard` and
+    writes it back after, so your orchestration config survives a rollback whether or not it was
+    committed. A truncated TOML is not a smaller config — it is a parse error the next `run`
+    refuses on, which is the failure the whole restore exists to prevent.
+  - **The park records.** The engine restores a story's record when the commit it was written for
+    fails. A record left truncated reads as a park owing nothing, while the board still says a
+    human owes something.
+
+  Your CLI's `settings.json` is the loud one. Both writers that register the completion hook —
+  `init` and each isolated worktree's provisioning — parse the whole config, merge the relay into
+  it, and write all of it back, so your permission allowlist, `env`, MCP entries and your own hooks
+  survived only by round-tripping through that one call. JSON has no partial read — a prefix of an
+  object is a parse error, not a smaller object — so this was never silent, just unrecoverable:
+  `init` refused on the next run with `is not valid JSON; fix it and re-run init`, pointing you at
+  a file it had shredded itself, and refusing _before_ the merge meant re-running could not rebuild
+  it. In a worktree it was quieter and worse — nothing re-reads that copy, so the session started
+  against unparseable settings, the CLI fell back to its defaults, the Stop hook was never
+  registered, and the run idled to timeout with nothing naming the cause.
+
+  Three of the seven are **put-backs**: they restore a file _after_ something has already failed,
+  which is the worst possible moment for a second loss. One of them, the engine's restore of a park
+  record after a failed commit, now journals its own failure as `park-record-rollback-failed`
+  rather than dropping it. Nothing else would ever surface that — `validate` reports a board parked
+  with no record, but never a record left over for a park that is in no commit.
+
+- **Five writers under `.bmad-loop/` no longer strand an untracked temp when their replace fails
+  (#363).** Each built a fixed-name temp and then `os.replace`d it, and `atomic_replace` does no
+  cleanup of its own. No ignore rule covers those names — `init` writes `.bmad-loop/runs/`,
+  `.bmad-loop/cache/`, `.bmad-loop/policy.toml` and `_bmad/render/` — so a failed replace left an
+  untracked file holding `verify.worktree_clean` False until a human deleted it by hand.
+
+  - Four route through the helpers, which name the temp uniquely per write and remove it on any
+    raise: the pre-answer store (`decisions.json`), both of the sweep's `decisions.json` writes,
+    `policy.toml`'s `[mux] backend` writer, and the TUI settings editor's save. The last two built
+    the _same_ `.bmad-loop/policy.toml.tmp` path, so they could also collide with each other.
   - `archive_run` keeps writing its own tarball — the path goes to `tarfile.open`, so there is no
     payload for a helper to take — and gains the unlink-on-raise guard instead. Its temp was also
     misnamed: `with_suffix` replaces only the last suffix, so `<id>.tar.gz` yielded
     `<id>.tar.tar.gz.tmp`. It is now `<id>.tar.gz.tmp`.
-  - These five files land at `0600` rather than `0644` from now on. The hand-rolled temp was created
-    at `0666 & ~umask` and `os.replace` swapped _that_ inode into place, so they were already being
-    reset to `0644` on every rewrite; the replacement carries no mode over, which tightens them to
-    `mkstemp`'s private default.
 
-  Scope: this closes the _raise_ path. A `SIGKILL` mid-write can still strand a temp, and on Windows
-  `os.replace` is not guaranteed atomic — what is guaranteed is that a failed write cannot truncate
-  the original.
+  Under a monorepo `repo_root:` override this surfaces as a failing `validate` and TUI rather than
+  a blocked `run`: `run` and `sweep` probe the repo root, `validate` and the TUI probe the project.
 
-- **`atomic_write_bytes` accepts `follow_symlinks`, as its text sibling already did.** Without it the
-  bytes helper could not express the no-follow choice the `policy.toml` writer needs — that writer
-  reads and writes bytes on purpose, to preserve a CRLF file's line endings. The default stays
-  `True`, which the private-git-exclude caller depends on.
+  Three more temp-and-replace writers were hardened the same way without having been exposed — the
+  two park-record writers behind `bmad-loop confirm` and `drop`, and `devcontract`'s spec writer.
+  They gain the fsync before the replace, a unique temp name in place of a fixed `.tmp` sibling two
+  concurrent writers would collide on, and the shared unlink-on-raise in place of a hand-rolled one.
 
-- **A failed write can no longer silently shrink the sprint board or behead a spec (#379).** Both are
-  read-modify-rewrites that went out through a truncating write, and both fail _quietly_ — the file
-  still parses afterwards, so nothing downstream raises.
-
-  - `sprintstatus.advance` is the orchestrator's sole write path to `sprint-status.yaml`. A board cut
-    at a line boundary is still a valid mapping, just a smaller one, so the epics past the tear cease
-    to exist and the run walks off the end of the sprint instead of erroring. It now writes through
-    `atomic_write_text`, following symlinks as the write it replaced did — a board kept outside the
-    tree and symlinked in keeps being a symlink.
-  - The three writers of a story spec — `set_frontmatter_status`, `set_frontmatter_field` and
-    `devcontract`'s four in-place rewriters — now share one call: `atomic_write_bytes` with
-    `follow_symlinks=False`. A spec is laid out `before + edited + after`, so a torn write could
-    publish intact frontmatter saying `status: done` over a truncated body — a spec that lies, which
-    the loop then commits. The bytes helper, never the text one: these writers are byte-verbatim by
-    contract, and text mode would relay every line ending in the file on Windows.
-
-  `devcontract` was already atomic and keeps its behaviour; it drops its hand-rolled temp for the
-  shared helper, which adds an fsync before the replace and a temp name unique per write instead of a
-  fixed `<spec>.md.tmp` that two concurrent writers would collide on. Specs written by these paths
-  land at `0600` rather than `0644`, the same tightening the five writers above took.
-
-- **A failed write can no longer shred your CLI settings file (#379).** Both writers that register the
-  completion hook — `init` and each isolated worktree's provisioning — parse the whole config, merge
-  the relay into it, and write all of it back through a truncating write. Your permission allowlist,
-  `env`, MCP entries and your own hooks survive only by round-tripping through that one call, so a
-  short write (a full disk, a quota) published a _prefix_ of the JSON. Both now go through
-  `atomic_write_text`, which writes a temp and replaces it, leaving the original whole on any fault.
-
-  JSON has no partial read — a prefix of an object is a parse error, not a smaller object — so unlike
-  the board and the ledgers this loss was never silent, just unrecoverable. `init` refused on the next
-  run with `is not valid JSON; fix it and re-run init`, pointing the operator at a file it had shredded
-  itself, and refusing before the merge meant re-running could not rebuild it. In a worktree it was
-  quieter and worse: nothing re-reads that copy, so the session simply started against unparseable
-  settings, the CLI fell back to its defaults, the Stop hook was never registered and the run idled to
-  timeout with nothing naming the cause.
-
-  Both keep following symlinks, as the writes they replace did. `init` resolves the config path and
-  refuses anything landing outside the project, so the only links reaching it point back inside — an
-  in-repo indirection that would otherwise be replaced by a regular file on the first run. Provisioning
-  refuses a linked config outright, before the write. These two files also land at `0600` rather than
-  `0644` from now on, the same tightening as above.
-
-- **The put-backs are atomic too (#363, #379).** Four write sites that restore a file _after_
-  something already failed, the last of the family. Each of them runs at the worst possible moment
-  for a second loss.
-
-  - `safe_rollback` captures `.bmad-loop/policy.toml` before the `git reset --hard` and writes it
-    back after, so an operator's config survives a rollback whether it was committed or not. That
-    put-back now goes through `atomic_write_bytes`. It lands immediately after a rollback that has
-    already discarded the attempt's work, and a truncated TOML is not a smaller config — it is a
-    parse error the next `run` refuses on.
-  - The park records `bmad-loop confirm` reads — the per-story file and the legacy machine-local
-    index `drop` prunes — were already temp-and-replace and keep that behaviour. They gain the fsync
-    before the replace, a temp named uniquely per write in place of the fixed `.tmp` sibling two
-    writers would collide on, and the shared unlink-on-raise in place of their hand-rolled one. A
-    record left truncated by a lost host reads as a park owing nothing while the board still says a
-    human owes something.
-  - The engine's restore of a park record after a failed commit writes atomically as well, and
-    journals its own failure as `park-record-rollback-failed` rather than dropping it. Nothing else
-    would surface that: `validate` reports a board parked with no record, never a record left over
-    for a park that is in no commit.
-
-  All four replace the file _by name_ (`follow_symlinks=False`), matching `policy.write_mux_backend`
-  and `record_park`, the other writers of the same two files. For the two that were direct writes
-  this is a change rather than a preservation — they opened the name, and so wrote through any link
-  planted at it, on paths a driven session can reach. Both files land at `0600` rather than `0644`
-  from now on, the same tightening as above.
+  **Scope, for both entries above.** This closes the _raise_ path, and only that. The helpers stage
+  at `mkstemp(dir=target.parent, suffix=".tmp")`, so a `SIGKILL` mid-write still strands a temp
+  that `worktree_clean` reads as dirty; and on Windows `os.replace` is
+  `MoveFileEx(MOVEFILE_REPLACE_EXISTING)`, which is not guaranteed atomic and may fall back to a
+  non-atomic copy. What holds everywhere is that a failed write cannot truncate the original.
 
 ## [0.10.0] — 2026-08-14
 
