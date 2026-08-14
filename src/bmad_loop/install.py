@@ -31,7 +31,7 @@ from typing import Any, NamedTuple
 
 from .adapters.profile import ALIASES, CLIProfile, ProfileError, load_profiles
 from .checks import Finding
-from .platform_util import atomic_write_bytes, file_lock
+from .platform_util import atomic_write_bytes, atomic_write_text, file_lock
 from .policy import POLICY_TEMPLATE
 from .process_host import get_process_host
 from .verify import GitError, git_bytes
@@ -1252,7 +1252,22 @@ def _register_hooks(project: Path, profile: CLIProfile) -> int:
     }
     config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
     if changed:
-        config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+        # atomic_write_text, never write_text (#379), the same rule
+        # `_worktree_local_exclude` states for its bytes sibling. This is a
+        # read-modify-REWRITE of a file `init` does not own: the parse above kept
+        # the operator's permission allowlist, env, MCP entries and their own
+        # hooks, and every one of them is re-serialized here. `"w"` TRUNCATES
+        # before writing, so a short write (ENOSPC, a full quota) publishes a
+        # PREFIX of that JSON — and unlike the ledgers, this failure is loud in
+        # the worst way: the next `init` reads it back, fails json.loads, and
+        # prints "is not valid JSON; fix it and re-run init" (above) at a human
+        # whose file this tool just shredded. The helper leaves the original
+        # untouched on any raise. follow_symlinks stays at the default, matching
+        # the `write_text` it replaces: `_confined_to` above resolves the path and
+        # refuses anything landing outside the project, so the only links reaching
+        # this write point back INSIDE it — an in-repo indirection the operator
+        # arranged, which a name-replacement would orphan on the first init.
+        atomic_write_text(config_path, json.dumps(config, indent=2) + "\n")
         print(f"  hooks registered ({profile.name}): {config_path}")
     else:
         print(f"  hooks already registered ({profile.name})")

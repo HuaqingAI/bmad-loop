@@ -1,4 +1,5 @@
 import json
+import sys
 
 import pytest
 
@@ -1001,6 +1002,98 @@ def test_write_mux_backend_preserves_crlf_line_ending(tmp_path):
     p.write_bytes(b'[mux]\r\nbackend = "old"\r\n')
     policy.write_mux_backend(p, "new")
     assert b'backend = "new"\r\n' in p.read_bytes()
+
+
+def test_write_mux_backend_hands_the_helper_bytes(tmp_path, monkeypatch):
+    """#363. The CRLF pin above does NOT grade the bytes-vs-text choice on Linux:
+    `atomic_write_text` passes `newline=None`, whose translation is a no-op wherever
+    `os.linesep == "\\n"`, so swapping the text helper in reddens that row on WINDOWS
+    ONLY and CI's Linux leg would call the swap green.
+
+    This grades it platform-independently by inspecting the payload the helper is
+    handed, upstream of any newline translation: bytes, carrying CRLF verbatim. The
+    binding is WRAPPED rather than replaced so the real write still happens and the
+    surrounding round-trip behaviour is unchanged.
+
+    Ablation: swap `atomic_write_bytes` for `atomic_write_text` in
+    `write_mux_backend` (dropping the `.encode`) and this reddens on every platform,
+    on the `isinstance(..., bytes)` row. The exact-length assertion also pins
+    "exactly one write", so a retry loop cannot creep in unnoticed."""
+    seen: list[bytes] = []
+    real = policy.atomic_write_bytes
+
+    def record(path, data, *, follow_symlinks=True):
+        seen.append(data)
+        real(path, data, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(policy, "atomic_write_bytes", record)
+    p = tmp_path / "policy.toml"
+    p.write_bytes(b'[mux]\r\nbackend = "old"\r\n')
+
+    policy.write_mux_backend(p, "new")
+
+    assert len(seen) == 1
+    assert isinstance(seen[0], bytes)
+    assert b'backend = "new"\r\n' in seen[0]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_write_mux_backend_replaces_a_planted_symlink(tmp_path):
+    """#363. The one row that grades this SITE's `follow_symlinks=False` argument
+    rather than the helper's implementation of it — everything else about no-follow
+    is pinned in test_platform_util.py, where the helper is called directly.
+
+    It is behaviour-preserving first: `os.replace` never dereferenced this
+    destination either, so passing the default True here would have CHANGED what
+    the function does, not merely relaxed it. It is also the security choice —
+    `runsetup` states a driven session can write `.bmad-loop/policy.toml`, so
+    writing THROUGH a link planted at that name would hand the session a host-side
+    write to any operator-writable path.
+
+    Ablation: drop `follow_symlinks=False` at the `write_mux_backend` call and this
+    reddens alone (the link survives and the planted target is rewritten). Without
+    this row that mutation is a KNOWN GREEN ablation — no other consumer test
+    plants a symlink at the paths these five sites write."""
+    real = tmp_path / "someone-elses-file"
+    real.write_bytes(b'[mux]\nbackend = "old"\n')
+    link = tmp_path / "policy.toml"
+    link.symlink_to(real)
+
+    policy.write_mux_backend(link, "new")
+
+    assert not link.is_symlink()  # the NAME was replaced
+    assert policy.load(link).mux.backend == "new"
+    assert real.read_bytes() == b'[mux]\nbackend = "old"\n'  # not written through
+
+
+def test_write_mux_backend_write_failure_raises_and_keeps_the_file(tmp_path, monkeypatch):
+    """#363. The hand-rolled temp this replaced was the fixed name
+    `.bmad-loop/policy.toml.tmp`, which nothing gitignores — the init line is the
+    anchored literal `.bmad-loop/policy.toml`, which does not cover a `.tmp` suffix —
+    so a failed replace stranded an untracked file that held `worktree_clean` False.
+    The helper removes its own temp on any raise, and the raise still propagates.
+
+    Patched at policy's OWN binding: the helper writes through an `mkstemp` fd via
+    `os.fdopen`, so a `Path.write_bytes` patch never fires and passes vacuously.
+
+    Ablation A5: revert `write_mux_backend` to `tmp.write_bytes(...)` +
+    `atomic_replace` and this reddens together with the bytes pin above — both as
+    an AttributeError from `monkeypatch.setattr`, since the `atomic_write_bytes`
+    binding they share disappears with the revert. The pre-existing CRLF row stays
+    green, which is the point of the bytes pin: CRLF alone does not grade this."""
+    p = tmp_path / "policy.toml"
+    p.write_bytes(b'[mux]\nbackend = "old"\n')
+    before = p.read_bytes()
+
+    def boom(path, data, *, follow_symlinks=True):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(policy, "atomic_write_bytes", boom)
+    with pytest.raises(OSError, match="disk full"):
+        policy.write_mux_backend(p, "new")
+
+    assert p.read_bytes() == before
+    assert b'backend = "new"' not in p.read_bytes()  # the mutation that must not land
 
 
 def test_write_mux_backend_rejects_bad_name(tmp_path):

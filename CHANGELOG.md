@@ -7,6 +7,123 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Changed
+
+- **Files the orchestrator replaces by name now land at `0600`.** Those writes pass
+  `follow_symlinks=False`, and that mode deliberately carries nothing over from the target — not
+  its permission bits, not its xattrs — so the new contents arrive at `mkstemp`'s private default.
+  Affected: `.bmad-loop/decisions.json`, `.bmad-loop/policy.toml`, the park records under
+  `.bmad-loop/operator/`, and any story spec written through `set_frontmatter_status`,
+  `set_frontmatter_field` or `devcontract`. Most were already being reset to `0644` on every
+  rewrite — the hand-rolled temp they replaced was created at `0666 & ~umask` and `os.replace`
+  swapped _that_ inode into place — so for those the delta is `0644` → `0600`. Git records no mode
+  but the exec bit, so nothing downstream of a commit notices.
+
+  The no-follow choice is made per **file**, not per call site: once one writer of a file replaces
+  it by name, every writer of that file has to, or they disagree about what the path means.
+  Applying it that way brought four writers into line that had been direct
+  `write_text`/`write_bytes` calls — `verify.safe_rollback`, the engine's park-record restore,
+  `set_frontmatter_status` and `set_frontmatter_field`. Those four opened the name, and so wrote
+  _through_ any symlink planted at it; they now replace it. That is a real change at those four,
+  and what makes it safe is the same per-file rule: each of those files already had a
+  name-replacing sibling writer (`policy.write_mux_backend`, `record_park`,
+  `devcontract._atomic_write_spec`), so no link at those names survived the orchestrator anyway.
+  Files with no name-replacing sibling keep following symlinks — `sprint-status.yaml` and your
+  CLI's `settings.json`, both operator-curated, so a board or a config kept outside the tree and
+  linked in keeps being a link.
+
+- **`atomic_write_bytes` accepts `follow_symlinks`, as its text sibling already did.** The default
+  stays `True`, which the private-git-exclude writer depends on: it pre-creates the target
+  precisely so the helper has a umask mode to carry over, and git silently ignores an exclude file
+  it cannot read.
+
+### Fixed
+
+- **A failed write can no longer truncate the sprint board, a story spec, your CLI settings or your
+  policy file (#379).** Seven writers read a file, merged into it, and wrote the whole thing back
+  through a truncating `Path.write_*` — so a fault partway through (ENOSPC, EIO, a quota) published
+  a _prefix_ of the file and destroyed the rest. All seven now go through
+  `platform_util.atomic_write_text` / `atomic_write_bytes`: contents to a temp, fsync, replace.
+
+  Most of these fail _quietly_ — the file still parses afterwards, so nothing downstream raises:
+
+  - **The sprint board.** `sprintstatus.advance` is the orchestrator's sole write path to
+    `sprint-status.yaml`. YAML cut at a line boundary is still a valid mapping, just a smaller one,
+    so the epics past the tear ceased to exist and the run walked off the end of the sprint instead
+    of erroring.
+  - **A story spec.** A spec is laid out `before + edited + after`, so a write that faulted after
+    the frontmatter had landed left intact frontmatter saying `status: done` over a decapitated
+    body — a spec that lies, which the loop then commits. `set_frontmatter_status`,
+    `set_frontmatter_field` and `devcontract`'s four in-place rewriters now share one call.
+    `devcontract` was already atomic and recorded the measured cost: fault injection on the old
+    truncating write cut a 46-byte spec to 12.
+  - **`.bmad-loop/policy.toml`.** `safe_rollback` captures it before the `git reset --hard` and
+    writes it back after, so your orchestration config survives a rollback whether or not it was
+    committed. A truncated TOML is not a smaller config — it is a parse error the next `run`
+    refuses on, which is the failure the whole restore exists to prevent.
+  - **The park records.** The engine restores a story's record when the commit it was written for
+    fails. A record left truncated reads as a park owing nothing, while the board still says a
+    human owes something.
+
+  Your CLI's `settings.json` is the loud one. Both writers that register the completion hook —
+  `init` and each isolated worktree's provisioning — parse the whole config, merge the relay into
+  it, and write all of it back, so your permission allowlist, `env`, MCP entries and your own hooks
+  survived only by round-tripping through that one call. JSON has no partial read — a prefix of an
+  object is a parse error, not a smaller object — so this was never silent, just unrecoverable:
+  `init` refused on the next run with `is not valid JSON; fix it and re-run init`, pointing you at
+  a file it had shredded itself, and refusing _before_ the merge meant re-running could not rebuild
+  it. In a worktree it was quieter and worse — nothing re-reads that copy, so the session started
+  against unparseable settings, the CLI fell back to its defaults, the Stop hook was never
+  registered, and the run idled to timeout with nothing naming the cause.
+
+  Three of the seven are **put-backs**: they restore a file _after_ something has already failed,
+  which is the worst possible moment for a second loss. One of them, the engine's restore of a park
+  record after a failed commit, now journals its own failure as `park-record-rollback-failed`
+  rather than dropping it. Nothing else would ever surface that — `validate` reports a board parked
+  with no record, but never a record left over for a park that is in no commit.
+
+- **Four writers under `.bmad-loop/` no longer strand an untracked temp when their replace fails
+  (#363).** Each built a fixed-name temp and then `os.replace`d it, and `atomic_replace` does no
+  cleanup of its own. No ignore rule covers those names — `init` writes `.bmad-loop/runs/`,
+  `.bmad-loop/cache/`, `.bmad-loop/policy.toml` and `_bmad/render/` — so a failed replace left an
+  untracked file holding `verify.worktree_clean` False until a human deleted it by hand.
+
+  - Three route through the helpers, which name the temp uniquely per write and remove it on any
+    raise: the pre-answer store (`.bmad-loop/decisions.json`), `policy.toml`'s `[mux] backend`
+    writer, and the TUI settings editor's save. The last two built the _same_
+    `.bmad-loop/policy.toml.tmp` path, so they could also collide with each other.
+  - `archive_run` keeps writing its own tarball — the path goes to `tarfile.open`, so there is no
+    payload for a helper to take — and gains the unlink-on-raise guard instead. Its temp was also
+    misnamed: `with_suffix` replaces only the last suffix, so `<id>.tar.gz` yielded
+    `<id>.tar.tar.gz.tmp`. It is now `<id>.tar.gz.tmp`.
+
+  Under a monorepo `repo_root:` override this surfaces as a failing `validate` and TUI rather than
+  a blocked `run`: `run` and `sweep` probe the repo root, `validate` and the TUI probe the project.
+
+  Five more temp-and-replace writers took the same helper without having been exposed: the sweep's
+  two `decisions.json` writes, whose file is the per-run one under the gitignored
+  `.bmad-loop/runs/<id>/` and not the project-level store named above; the two park-record writers
+  behind `bmad-loop confirm` and `drop`, which already carried a hand-rolled guard; and
+  `devcontract`'s spec writer. All five gain the fsync before the replace and a unique temp name in
+  place of a fixed `.tmp` sibling that two concurrent writers would collide on.
+
+  **Scope, for both entries above.** This closes the _raise_ path, and only that. The helpers stage
+  at `mkstemp(dir=target.parent, suffix=".tmp")`, so a `SIGKILL` mid-write still strands a temp
+  that `worktree_clean` reads as dirty; and on Windows `os.replace` is
+  `MoveFileEx(MOVEFILE_REPLACE_EXISTING)`, which is not guaranteed atomic and may fall back to a
+  non-atomic copy. What holds everywhere is that a failed write cannot truncate the original.
+
+- **An atomic write no longer fails on a file whose name fills the filesystem's limit.** The helpers
+  stage a temp named after their target, and `mkstemp` inserts eight random characters, so the temp
+  ran `len(name) + 13` — long enough that a target with a perfectly legal name produced an illegal
+  _temp_ name and the write died with `ENAMETOOLONG` — or, on Windows, with `ENOENT` carrying
+  `winerror` 206, which is the same condition under a different name. On ext4 the cutoff was a
+  243-byte basename.
+  Latent in the helpers since they were written, and reachable from this release because the story
+  spec writers moved onto them: a spec is named by your planning skills, and nothing bounds that
+  name. When the readable temp name cannot fit, the helpers now fall back to a short digest of it
+  rather than failing — the OS decides, so there is no guess at a per-filesystem byte limit.
+
 ## [0.10.0] — 2026-08-14
 
 Much of this section is the `release/0.9.x` hotfix line brought forward onto `main` (#433).

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import math
@@ -1035,10 +1036,26 @@ def archive_run(project: Path, run_dir: Path, *, force: bool = False) -> Path:
     archive_dir = project / ARCHIVE_DIR
     archive_dir.mkdir(parents=True, exist_ok=True)
     dest = archive_dir / f"{run_dir.name}.tar.gz"
-    tmp = dest.with_suffix(".tar.gz.tmp")
-    with tarfile.open(tmp, "w:gz") as tar:
-        tar.add(run_dir, arcname=run_dir.name)
-    atomic_replace(tmp, dest)
+    # `with_name`, not `with_suffix`: the latter replaces only the LAST suffix, so
+    # on `<id>.tar.gz` (stem `<id>.tar`) it produced `<id>.tar.tar.gz.tmp` — not the
+    # name this docstring implies, and not one any cleanup could be written against.
+    tmp = dest.with_name(dest.name + ".tmp")
+    # #363: the guard, not a helper — the path is handed to `tarfile.open`, so there
+    # is no payload for `atomic_write_*` to take. Nothing gitignores this directory:
+    # init writes `.bmad-loop/runs/`, `.bmad-loop/cache/`, `.bmad-loop/policy.toml`
+    # and `_bmad/render/`, and `archive/` matches none of them. So a stranded temp
+    # here is an untracked file holding `worktree_clean` False until a human removes
+    # it — the same exposure `decisions._write_store`, `policy.write_mux_backend` and
+    # `tui.settings.PolicyDoc.save` had. (Not the sweep's two `decisions.json`
+    # writes, which look like the same fix but write under the ignored run dir.)
+    try:
+        with tarfile.open(tmp, "w:gz") as tar:
+            tar.add(run_dir, arcname=run_dir.name)
+        atomic_replace(tmp, dest)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+        raise
     shutil.rmtree(run_dir)
     _discard_state_dir(project, run_dir.name)  # same tail as delete_run
     return dest

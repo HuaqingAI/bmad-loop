@@ -52,7 +52,6 @@ drifted entries itself, so nothing gates on the record.
 
 from __future__ import annotations
 
-import contextlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,7 +59,7 @@ from pathlib import Path
 from . import devcontract, sprintstatus, verify
 from .bmadconfig import ProjectPaths
 from .frontmatter import operator_actions_of, read_frontmatter, status_of
-from .platform_util import atomic_replace, safe_segment
+from .platform_util import atomic_write_text, safe_segment
 
 RECORDS_REL = Path(".bmad-loop") / "operator"
 LEGACY_STORE_REL = Path(".bmad-loop") / "operator-actions.json"
@@ -147,9 +146,23 @@ def record_park(
     overwrites rather than accumulates: a story owes whatever its latest park
     says it owes, and a stale action list is worse than none.
 
-    The write is atomic (temp + replace) and the temp file is unlinked on any
-    raise: this runs just ahead of ``finalize_commit``'s ``git add -A``, and a
-    stranded ``.tmp`` would ride the story's own commit."""
+    The write goes through :func:`platform_util.atomic_write_text` (#379), which
+    carries the unlink-on-raise this used to hand-roll — hence no try/except here;
+    two nested guards would only obscure which one runs — and adds the two things
+    the hand-rolled version lacked. The temp is *uniquely* named instead of the
+    fixed ``.tmp`` sibling: this runs just ahead of ``finalize_commit``'s ``git
+    add -A``, so a stranded temp rides the story's own commit forever, and one
+    fixed name is what two writers of the same key would collide on. And the
+    contents are fsynced *before* the replace publishes them — a host losing power
+    just after the rename otherwise comes back with the record's name pointing at
+    blocks that were never written, which :func:`load` reads as an entry owing
+    nothing while the board still says a human owes something.
+
+    ``follow_symlinks=False`` preserves what the bare ``os.replace`` did (it never
+    dereferenced this destination) and matches what the record is: machine-minted,
+    under a project root a driven session can write. The record now lands at
+    ``mkstemp``'s ``0600`` rather than the hand-rolled temp's ``0644``; git carries
+    no mode but the exec bit, so nothing downstream of the commit notices."""
     path = record_path(project, story_key)
     path.parent.mkdir(parents=True, exist_ok=True)
     record = {
@@ -159,14 +172,7 @@ def record_park(
         "run_id": run_id,
         "parked_at": parked_at,
     }
-    tmp = path.with_suffix(".tmp")
-    try:
-        tmp.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
-        atomic_replace(tmp, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            tmp.unlink(missing_ok=True)
-        raise
+    atomic_write_text(path, json.dumps(record, indent=2, sort_keys=True), follow_symlinks=False)
     return path
 
 
@@ -205,29 +211,25 @@ def _drop_legacy(project: Path, story_key: str) -> bool:
     rewritten as ``{}``: nothing writes the legacy file anymore, and an empty
     husk would read as "an index with nothing parked" forever.
 
-    The rewrite unlinks its temp on any raise, like `record_park` — but for the
-    opposite reason. `drop` runs out of band from `confirm`, not inside a commit
-    window, so the hazard is not a temp RIDING a commit but one OUTLIVING the
-    failure: `.bmad-loop/` is not ignored (`install` excludes only `runs/`,
-    `cache/` and `policy.toml`, and the pre-#356 exclude line was the anchored
-    literal `operator-actions.json`, never its `.tmp` sibling), so a stranded
-    `.bmad-loop/operator-actions.tmp` is an untracked file to
-    `verify.worktree_clean` — a dirty tree blocking the next run's preflight and
-    the epic-boundary auto-sweep, over a prune of a store nothing writes."""
+    The rewrite goes through the same helper `record_park` uses and inherits its
+    unlink-on-raise — but the temp matters here for the opposite reason. `drop`
+    runs out of band from `confirm`, not inside a commit window, so the hazard is
+    not a temp RIDING a commit but one OUTLIVING the failure: `.bmad-loop/` is not
+    ignored (`install` excludes only `runs/`, `cache/` and `policy.toml`, and the
+    pre-#356 exclude line was the anchored literal `operator-actions.json`, never
+    its `.tmp` sibling), so a stranded `.bmad-loop/operator-actions.tmp` is an
+    untracked file to `verify.worktree_clean` — a dirty tree blocking the next
+    run's preflight and the epic-boundary auto-sweep, over a prune of a store
+    nothing writes. The helper's temp carries a random infix, so even that
+    surviving name is no longer one a second `drop` of a different key collides
+    on mid-write."""
     path = legacy_store_path(project)
     data = _load_legacy(project)
     if story_key not in data:
         return False
     del data[story_key]
     if data:
-        tmp = path.with_suffix(".tmp")
-        try:
-            tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-            atomic_replace(tmp, path)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                tmp.unlink(missing_ok=True)
-            raise
+        atomic_write_text(path, json.dumps(data, indent=2, sort_keys=True), follow_symlinks=False)
     else:
         path.unlink(missing_ok=True)
     return True

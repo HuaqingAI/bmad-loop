@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import tomllib
 
+import pytest
 from test_tui_app import until
 from textual.widgets import Collapsible, Input, Select, Switch
 
 from bmad_loop import policy as policy_mod
 from bmad_loop.plugins import load_plugins
 from bmad_loop.policy import POLICY_FILE, POLICY_TEMPLATE
+from bmad_loop.tui import settings as settings_mod
 from bmad_loop.tui.app import BmadLoopApp
 from bmad_loop.tui.screens.dashboard import DashboardScreen
 from bmad_loop.tui.screens.settings_screen import SettingsScreen
@@ -127,7 +129,47 @@ def test_save_creates_parent_and_leaves_no_tmp(tmp_path):
     doc.set("limits", "max_dev_attempts", 3)
     doc.save(path)
     assert policy_mod.load(path).limits.max_dev_attempts == 3
+    # name-agnostic on purpose: it grades "nothing left behind", not which name the
+    # temp had, so it survived the #363 move from a fixed `.toml.tmp` to the helper's
+    # mkstemp name unchanged.
     assert list(path.parent.iterdir()) == [path]
+
+
+def test_save_failure_raises_and_keeps_the_file(tmp_path, monkeypatch):
+    """#363. `save` is a read-modify-rewrite of `.bmad-loop/policy.toml`, and its
+    hand-rolled temp was the fixed name `policy.toml.tmp` — gitignored by nothing,
+    and byte-identical to the one `policy.write_mux_backend` built, so the settings
+    editor and the mux writer raced on one name. The helper's per-write `mkstemp`
+    name removes the collision and the temp on any raise.
+
+    It must RAISE rather than degrade: `settings_screen` catches OSError to show
+    "save failed: …", so a swallowed error would render a success the operator's
+    file does not have.
+
+    Patched at the settings module's OWN binding, never `Path.write_text`: the
+    helper writes through an `mkstemp` fd via `os.fdopen`, so a `Path` patch never
+    fires and the test would pass having exercised nothing.
+
+    Ablation A6: revert `save` to `tmp.write_text(...)` + `atomic_replace` and this
+    reddens alone, as an AttributeError from `monkeypatch.setattr` — the binding
+    disappears with the revert."""
+    path = tmp_path / ".bmad-loop" / "policy.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("[limits]\nmax_dev_attempts = 3\n", encoding="utf-8")
+    before = path.read_bytes()
+
+    doc = PolicyDoc.load(path)
+    doc.set("limits", "max_dev_attempts", 9)
+
+    def boom(path, text, *, follow_symlinks=True):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(settings_mod, "atomic_write_text", boom)
+    with pytest.raises(OSError, match="disk full"):
+        doc.save(path)
+
+    assert path.read_bytes() == before
+    assert b"max_dev_attempts = 9" not in path.read_bytes()  # the mutation, not landed
 
 
 def test_validate_with_project_enforces_plugin_coupling(tmp_path):

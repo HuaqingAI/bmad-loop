@@ -30,6 +30,7 @@ from .frontmatter import (
     status_of,
 )
 from .model import StoryTask, VerifyOutcome
+from .platform_util import atomic_write_bytes
 from .policy import POLICY_FILE, Policy
 from .sprintstatus import STATUS_ORDER, story_status
 
@@ -999,7 +1000,19 @@ def safe_rollback(
         current = policy_path.read_bytes() if policy_path.is_file() else None
         if current != policy_content:
             policy_path.parent.mkdir(parents=True, exist_ok=True)
-            policy_path.write_bytes(policy_content)
+            # Atomic, and by NAME (#379). This is a put-back after a rollback has
+            # already discarded the run's work, so a torn write costs the operator
+            # their orchestration config on top of it — and a truncated policy.toml
+            # is not a smaller config but a parse error the next `bmad-loop run`
+            # refuses on, which is the failure the whole restore exists to avoid.
+            # `follow_symlinks=False` is a real change here (a bare `write_bytes`
+            # opens the name and so writes THROUGH a link), and it is the right
+            # one twice over: `policy.write_mux_backend` already replaces this same
+            # file by name, so no link at this path survives the orchestrator
+            # anyway; and `runsetup` states a driven session can write
+            # `.bmad-loop/policy.toml`, so honouring a link planted there would aim
+            # a host-side write at a path of that session's choosing.
+            atomic_write_bytes(policy_path, policy_content, follow_symlinks=False)
     if baseline_untracked is None:
         return  # no snapshot to diff against: never delete untracked files
     created = untracked_files(repo) - set(baseline_untracked)
@@ -1375,10 +1388,16 @@ def set_frontmatter_field(path: Path, key: str, value: str) -> bool:
     appended, so the spec carried the key twice and the reader resolved the
     wrong one.
 
-    Byte-preserving on the same terms as its sibling: ``read_bytes().decode`` in,
-    ``write_bytes`` out, so a CRLF spec is not relaid to LF (nor an LF one to
-    CRLF on Windows) by a write contracted to move one field. The INSERTED line
-    takes the block's own ending, not a bare ``\\n``.
+    Byte-preserving on the same terms as its sibling: ``read_bytes().decode`` in
+    and bytes out, so a CRLF spec is not relaid to LF (nor an LF one to CRLF on
+    Windows) by a write contracted to move one field. The INSERTED line takes the
+    block's own ending, not a bare ``\\n``.
+
+    Atomic on the same terms too (#379) — `platform_util.atomic_write_bytes`,
+    ``follow_symlinks=False``, matching what `devcontract._atomic_write_spec`
+    already does to the same files. Use the BYTES helper and not the text one:
+    `atomic_write_text` keeps ``Path.write_text``'s translating newline default,
+    which would relay ``\\n``→``\\r\\n`` on Windows and undo the paragraph above.
     """
     if not path.is_file():
         return False
@@ -1390,7 +1409,7 @@ def set_frontmatter_field(path: Path, key: str, value: str) -> bool:
     edited = _edit_frontmatter_block(block, key, value, insert=True)
     if edited is None:
         return False
-    path.write_bytes((before + edited + after).encode("utf-8"))
+    atomic_write_bytes(path, (before + edited + after).encode("utf-8"), follow_symlinks=False)
     return True
 
 

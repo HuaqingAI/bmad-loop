@@ -825,6 +825,165 @@ def test_register_hooks_refuses_a_config_path_symlinked_out_of_the_project(tmp_p
     assert "escapes the project" in capsys.readouterr().out
 
 
+# ------------------------------------------------ atomic hook-config rewrite (#379)
+#
+# `_register_hooks` and `provision_worktree` both PARSE the operator's hook config,
+# merge the relay registration into the parsed object, and write the whole thing
+# back. The permission allowlist, `env`, the MCP entries and the project's own hooks
+# survive only because they round-trip through that one rewrite — so a truncating
+# write does not lose "the hooks", it loses the file.
+
+_OPERATOR_SETTINGS = (
+    json.dumps(
+        {
+            "permissions": {"allow": ["Bash(git status:*)", "Read(//srv/notes/**)"], "deny": []},
+            "env": {"HOUSE_TOKEN": "keep-me"},
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "make lint"}]}
+                ]
+            },
+            "mcpServers": {"house": {"command": "node", "args": ["mcp.js"]}},
+        },
+        indent=2,
+    )
+    + "\n"
+)
+
+
+def _operator_keys(path: Path) -> dict:
+    """Everything in the operator's settings that is not ours to touch."""
+    parsed = json.loads(path.read_text(encoding="utf-8"))
+    return {
+        "permissions": parsed["permissions"],
+        "env": parsed["env"],
+        "mcpServers": parsed["mcpServers"],
+        "PreToolUse": parsed["hooks"]["PreToolUse"],
+    }
+
+
+def test_register_hooks_merge_preserves_the_operators_own_settings(tmp_path):
+    """The positive control for the two rows below, and the statement of what is at
+    risk: the merge keeps every key it did not come for.
+
+    Without this, the write-failure row could pass over a rewrite that had already
+    lost the allowlist before any fault — "the bytes did not change" says nothing
+    about what the successful path writes."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    claude = get_profile("claude")
+    config = project / claude.hooks.config_path
+    config.parent.mkdir(parents=True)
+    config.write_text(_OPERATOR_SETTINGS, encoding="utf-8")
+    before = _operator_keys(config)
+
+    assert _register_hooks(project, claude) == 0
+
+    assert _operator_keys(config) == before
+    hooks = json.loads(config.read_text(encoding="utf-8"))["hooks"]
+    assert set(claude.hooks.events) <= set(hooks)
+    # names the relay marker the write-failure row asserts ABSENT, so that row's
+    # negative is graded against a string this path provably produces
+    assert "bmad_loop_hook" in hooks["Stop"][0]["hooks"][0]["command"]
+
+
+def test_a_truncated_hook_config_makes_the_next_init_refuse(tmp_path, capsys):
+    """The PRE-FIX failure mode this phase makes unreachable, pinned as a property
+    of the FILE FORMAT rather than of the writer — deliberately green on both sides
+    of the fix, because nothing else in the suite states what a short write here
+    costs.
+
+    JSON has no partial-read: a prefix of an object is not a smaller object, it is
+    a parse error. So unlike the board and the ledgers, this truncation is LOUD —
+    and loud in the worst way. `init` refuses, and the message it prints tells the
+    human to go fix a file that this very tool shredded on its last run, with no
+    copy of the lost content anywhere. The re-run cannot repair it either: the
+    refusal comes before the merge, so init never writes again."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    claude = get_profile("claude")
+    config = project / claude.hooks.config_path
+    config.parent.mkdir(parents=True)
+    config.write_text(_OPERATOR_SETTINGS, encoding="utf-8")
+    assert _register_hooks(project, claude) == 0  # whole file: merged and moved on
+    whole = config.read_text(encoding="utf-8")
+    capsys.readouterr()
+
+    # a short write, cut deterministically inside the object rather than at a
+    # fraction of the length: what a torn ENOSPC write publishes is a prefix.
+    config.write_text(whole[: whole.index('"env"')], encoding="utf-8")
+
+    assert _register_hooks(project, claude) == 1
+
+    assert "is not valid JSON; fix it and re-run init" in capsys.readouterr().out
+    assert "HOUSE_TOKEN" not in config.read_text(encoding="utf-8")  # and it is gone
+
+
+def test_register_hooks_write_failure_raises_and_leaves_the_config_entire(tmp_path, monkeypatch):
+    """#379. The registration is a read-modify-rewrite, so the truncating
+    `write_text` it replaced could publish the prefix the row above characterizes.
+    The helper writes a temp and replaces it, so a fault leaves the original whole.
+
+    The raise is deliberate and is NOT caught into the `return 1` arm above: that
+    arm's message is "your file is broken, fix it", which would be a lie about a
+    file still sitting intact on disk. A write that could not happen is init
+    failing, and init already fails by exception elsewhere.
+
+    Patched at install's OWN binding of the helper, never `Path.write_text`: the
+    helper writes through an `mkstemp` fd via `os.fdopen`, so a `Path` patch never
+    fires and this would pass having exercised nothing.
+
+    Ablation: restore `config_path.write_text(...)` at the call site and this
+    reddens alone."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    claude = get_profile("claude")
+    config = project / claude.hooks.config_path
+    config.parent.mkdir(parents=True)
+    config.write_text(_OPERATOR_SETTINGS, encoding="utf-8")
+    before = config.read_bytes()
+
+    def boom(path, text, *, follow_symlinks=True):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(install_mod, "atomic_write_text", boom)
+    with pytest.raises(OSError, match="no space left"):
+        _register_hooks(project, claude)
+
+    assert config.read_bytes() == before
+    assert _operator_keys(config)["env"] == {"HOUSE_TOKEN": "keep-me"}
+    assert "bmad_loop_hook" not in config.read_text(encoding="utf-8")  # the lost mutation
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_register_hooks_writes_through_a_config_symlinked_inside_the_project(tmp_path):
+    """The row that grades this SITE's `follow_symlinks` argument — the default,
+    which is what preserves the behaviour of the `write_text` it replaced.
+
+    An out-of-project link is refused above by `_confined_to`, which resolves before
+    it compares, so the only links that REACH this write point back inside the
+    project: an in-repo indirection the operator arranged. Replacing the name
+    instead would turn the link into a regular file on the first `init` and leave
+    them editing a settings file nothing reads.
+
+    Ablation: pass `follow_symlinks=False` at the call site and this reddens
+    alone — the link becomes a regular file and `real` keeps its pre-init bytes."""
+    project = tmp_path / "proj"
+    claude = get_profile("claude")
+    link = project / claude.hooks.config_path
+    link.parent.mkdir(parents=True)
+    real = project / "config" / "claude-settings.json"
+    real.parent.mkdir(parents=True)
+    real.write_text(_OPERATOR_SETTINGS, encoding="utf-8")
+    link.symlink_to(real)
+
+    assert _register_hooks(project, claude) == 0
+
+    assert link.is_symlink()  # still a link, not turned into a regular file
+    assert set(claude.hooks.events) <= set(json.loads(real.read_text())["hooks"])
+    assert _operator_keys(real)["env"] == {"HOUSE_TOKEN": "keep-me"}
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
 def test_provision_refuses_a_live_hook_config_symlink(tmp_path):
     wt, repo = tmp_path / "wt", tmp_path / "repo"
@@ -883,6 +1042,81 @@ def test_provision_refuses_a_cyclic_hook_config_symlink(tmp_path):
     provision_worktree(wt, [claude], repo)
 
     assert config.is_symlink()
+
+
+def test_provision_worktree_merge_preserves_the_operators_own_settings(tmp_path):
+    """The positive control for the row below, and the reason the write matters at
+    all here: the config being rewritten is the SEEDED copy of the operator's own,
+    so the allowlist, `env` and the MCP entries the isolated session needs all
+    round-trip through this one call.
+
+    It also establishes the precondition the fault row depends on — the write is
+    guarded by `if config != baseline_config`, so a shape where strip-then-merge
+    nets to zero never reaches it and any fault injected there passes vacuously.
+    This shape provably does reach it: the file changed."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    claude = get_profile("claude")
+    config = wt / claude.hooks.config_path
+    config.parent.mkdir(parents=True)
+    config.write_text(_OPERATOR_SETTINGS, encoding="utf-8")
+    before = _operator_keys(config)
+
+    provision_worktree(wt, [claude], repo)
+
+    assert _operator_keys(config) == before
+    hooks = json.loads(config.read_text(encoding="utf-8"))["hooks"]
+    assert set(claude.hooks.events) <= set(hooks)
+    assert str(repo / ".bmad-loop" / "bmad_loop_hook.py") in hooks["Stop"][0]["hooks"][0]["command"]
+
+
+def test_provision_worktree_write_failure_raises_and_leaves_the_config_entire(
+    tmp_path, monkeypatch
+):
+    """#379, the second of the two hook-config rewriters. Same read-modify-rewrite
+    as `_register_hooks`, worse consequence: nothing re-reads this file to complain.
+    The isolated session simply starts against a settings file whose JSON no longer
+    parses, the CLI falls back to its defaults, the Stop hook is not registered, and
+    the run idles to timeout with no diagnostic naming the cause.
+
+    Patched at worktree_flow's OWN binding: the site reached is the module's only
+    user of `atomic_write_text`, so no filename filter is needed to know which write
+    the fault landed on — but it must not be `Path.write_text`, which the helper's
+    `mkstemp` fd never goes through.
+
+    That the raise arrives at all is the non-vacuity proof: the boom is unreachable
+    unless `config != baseline_config` let control past the guard, which is the
+    precondition the row above pins independently.
+
+    No symlink row pairs with this one, unlike `_register_hooks`: the component-wise
+    refusal walk above the write skips the profile entirely when any component of
+    the path is a link, so `follow_symlinks` is unobservable at this site and the
+    four `test_provision_refuses_*_symlink` rows are what grade it.
+
+    Ablation: restore `config_path.write_text(...)` at the call site and this
+    reddens alone."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    claude = get_profile("claude")
+    config = wt / claude.hooks.config_path
+    config.parent.mkdir(parents=True)
+    config.write_text(_OPERATOR_SETTINGS, encoding="utf-8")
+    before = config.read_bytes()
+
+    import bmad_loop.worktree_flow as wtf
+
+    def boom(path, text, *, follow_symlinks=True):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(wtf, "atomic_write_text", boom)
+    with pytest.raises(OSError, match="no space left"):
+        provision_worktree(wt, [claude], repo)
+
+    assert config.read_bytes() == before
+    assert _operator_keys(config)["mcpServers"] == {
+        "house": {"command": "node", "args": ["mcp.js"]}
+    }
+    assert "bmad_loop_hook" not in config.read_text(encoding="utf-8")  # the lost mutation
 
 
 def test_provision_worktree_empty_profiles_is_noop(tmp_path):

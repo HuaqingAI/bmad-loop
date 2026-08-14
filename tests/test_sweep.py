@@ -24,7 +24,9 @@ from conftest import (
     write_spec,
 )
 
-from bmad_loop import deferredwork, runs, verify
+from bmad_loop import deferredwork, runs
+from bmad_loop import sweep as sweep_mod
+from bmad_loop import verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.journal import Journal, load_state, save_state
@@ -2153,6 +2155,133 @@ def test_preanswered_keep_open_suppresses_prompt_and_persists(project):
     assert decisions.load_pre_answers(project.project)["DW-1"]["effect"] == "keep-open"
 
 
+# ------------------------------- the two per-run `decisions.json` writes (cf. #363)
+#
+# `sweep.atomic_write_text` is ONE module binding shared by FOUR call sites: the
+# `_ensure_migration` ledger restore, the two `_decisions_phase` writes below, and
+# `_write_bundle_intent`. A bare module-wide boom would make the "revert this site"
+# ablation pass for the WRONG REASON — the run still crashes on "disk full", just
+# raised from somewhere else — so both stubs below filter on the FILENAME and
+# delegate otherwise, and both plans carry ZERO bundles so the bundle-intent write
+# is unreachable too.
+#
+# The filter is safe against the project-level pre-answer store, which is also named
+# `decisions.json`: that goes through `decisions.atomic_write_text`, a different
+# module's binding, which these patches do not touch.
+
+
+def test_seeded_decisions_write_failure_strands_nothing(project, monkeypatch):
+    """The pre-answer-seeded write. Before the move to the helper this was a
+    hand-rolled `decisions.json.tmp` + `atomic_replace`, and a failed replace left
+    the temp behind.
+
+    NOT #363's exposure, despite the shared helper and the shared filename. This
+    `decisions.json` is `engine.run_dir / "decisions.json"` — under
+    `.bmad-loop/runs/<id>/`, which `init` gitignores — so a stranded temp here was
+    never untracked and never held `worktree_clean` False. #363's file is the
+    project-level `.bmad-loop/decisions.json` (`decisions._write_store`), a
+    different file one directory up. What this row pins is the helper's
+    unlink-on-raise on a site that took it for the fsync and the unique temp name.
+
+    The `decision-preanswered` journal line is a PRECONDITION, not decoration: it is
+    appended before the write, so without it `assert not ... .exists()` would pass
+    for the entirely different reason that the phase was never entered.
+
+    Ablation A4: revert this site to `tmp.write_text(...)` + `atomic_replace` and
+    this reddens on the assertions (not, as in the decisions/policy/tui-settings
+    rows, on an AttributeError) — the `sweep.atomic_write_text` binding survives the
+    revert because three other sites still use it. That is exactly why the stub
+    filters by filename: a module-wide boom would keep this green through the
+    revert, crashing on a write this test is not about."""
+    from bmad_loop import decisions
+    from bmad_loop.sweep import DecisionOption
+
+    write_ledger(project, {"DW-1": "open"})
+    decisions.record_pre_answer(
+        project.project,
+        "DW-1",
+        DecisionOption(key="2", label="Keep", effect="keep-open"),
+        date="2026-06-12",
+    )
+    plan = triage_result(  # keep-open only: no bundle, so no bundle-intent write
+        ["DW-1"],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {"key": "1", "label": "Build", "effect": "build", "intent": "x"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+                recommendation="2",
+            )
+        ],
+    )
+    engine, _ = make_sweep(project, [triage_effect(plan)], prompting=False)
+
+    real = sweep_mod.atomic_write_text
+
+    def boom(path, text, *, follow_symlinks=True):
+        if Path(path).name == "decisions.json":
+            raise OSError("disk full")
+        real(path, text, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(sweep_mod, "atomic_write_text", boom)
+    summary = engine.run()
+
+    assert summary.crashed and "disk full" in str(summary.crash_error)
+    assert '"decision-preanswered"' in journal_text(engine)  # PRECONDITION: site reached
+    assert not (engine.run_dir / "decisions.json").exists()
+    assert list(engine.run_dir.glob("decisions*.tmp")) == []  # no stranded temp
+
+
+def test_interactive_decision_write_failure_strands_nothing(project, monkeypatch):
+    """The interactive write — the same hand-rolled shape as the seeded one above,
+    on the same path, a few lines further down, and covered by the same correction
+    in that docstring: this is the per-run `decisions.json`, not #363's
+    project-level store.
+
+    Two preconditions rather than one. `decision-pending` is appended before
+    `prompter.ask`, so it proves the phase was entered; `decision-answered` is
+    appended AFTER the write, so its ABSENCE places the raise between the ask and
+    that append — i.e. exactly at the site under test, not somewhere upstream that
+    would have skipped the write entirely.
+
+    Ablation A7: revert this site and it reddens on the assertions, for the reason
+    the seeded twin's docstring gives — the shared binding survives the revert, so
+    only the filename filter makes the row grade this site."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(  # close-only: no bundle, so no bundle-intent write
+        ["DW-1"],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {"key": "1", "label": "Close it", "effect": "close", "resolution": "moot"},
+                    {"key": "2", "label": "Keep open", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    engine, _ = make_sweep(project, [triage_effect(plan)], answers=["1"], prompting=True)
+
+    real = sweep_mod.atomic_write_text
+
+    def boom(path, text, *, follow_symlinks=True):
+        if Path(path).name == "decisions.json":
+            raise OSError("disk full")
+        real(path, text, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(sweep_mod, "atomic_write_text", boom)
+    summary = engine.run()
+
+    journal = journal_text(engine)
+    assert summary.crashed and "disk full" in str(summary.crash_error)
+    assert '"decision-pending"' in journal  # PRECONDITION: the prompt was reached
+    assert '"decision-answered"' not in journal  # the raise landed AT the write
+    assert not (engine.run_dir / "decisions.json").exists()
+    assert list(engine.run_dir.glob("decisions*.tmp")) == []  # no stranded temp
+
+
 def test_max_bundles_truncation(project):
     write_ledger(project, {"DW-1": "open", "DW-2": "open", "DW-3": "open"})
     plan = triage_result(
@@ -2863,10 +2992,23 @@ def test_migration_restore_write_failure_propagates_and_keeps_the_ledger(project
     before the failure did — the run crashed with the ledger at zero bytes, and
     the `_safe_reset` that would have restored it was already spent.
 
-    The patch is module-wide but reaches exactly one call — probed on this
-    harness, `_ensure_migration`'s restore is the only `sweep.atomic_write_text`
-    a failed migration reaches; the bundle-intent write needs a triage plan this
-    run never gets to."""
+    The patch is module-wide but reaches exactly one call — re-probed on this
+    harness by COUNTING calls through the stub, not by reading line order. The
+    raising stub fires once, on the ledger restore.
+
+    `sweep.atomic_write_text` has four call sites and the other three are all out
+    of reach here: the two `_decisions_phase` writes (#363) and the bundle-intent
+    write each need a triage plan carrying decisions or bundles, and this run
+    crashes in `_ensure_migration` before the decisions phase is entered.
+    Delegating instead of raising confirms it — the run then reaches two writes,
+    both the ledger, one per migration attempt.
+
+    The stub takes `**_kw` because those decisions writes pass
+    `follow_symlinks=False`. Two positional parameters are enough for the restore
+    (it passes neither keyword), but should a keyword-passing site ever become
+    reachable here, a narrow stub would meet it as a TypeError — the run would
+    still crash, just on the wrong fault, reddening the "disk full" assertion in a
+    way that points nowhere near the cause."""
     write_legacy_ledger(project, LEGACY_LEDGER)
     manifest = legacy_manifest()
     half = (
@@ -2879,7 +3021,7 @@ def test_migration_restore_write_failure_propagates_and_keeps_the_ledger(project
     bad = migrate_effect(project, half, [{"key": manifest[0]["key"], "dw_id": "DW-1"}])
     engine, _ = make_sweep(project, [bad, bad])
 
-    def boom(path, text):
+    def boom(path, text, **_kw):
         raise OSError("disk full")
 
     monkeypatch.setattr("bmad_loop.sweep.atomic_write_text", boom)

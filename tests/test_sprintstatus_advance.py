@@ -1,6 +1,9 @@
 """Tests for the orchestrator-owned sprint-status writer (generic-skill path)."""
 
+import sys
 from pathlib import Path
+
+import pytest
 
 from bmad_loop import sprintstatus
 
@@ -276,3 +279,80 @@ def test_a_line_with_trailing_whitespace_and_no_comment_is_refused(tmp_path):
         lines = [line]
         assert sprintstatus._set_mapping_value(lines, "3-2-x", "done") is False
         assert "".join(lines) == line
+
+
+# ------------------------------------------------------------ atomic rewrite (#379)
+
+
+def test_a_truncated_board_still_parses_and_yields_fewer_keys(tmp_path):
+    """The PRE-FIX failure mode this phase exists to make unreachable, pinned as a
+    property of the FILE FORMAT rather than of the writer — deliberately green on
+    both sides of the fix, because nothing else in the suite states why the board
+    needed atomicity more than the ledgers did.
+
+    A ledger cut mid-write reads as an obviously shorter ledger. A board cut at a
+    line boundary is still a valid YAML mapping with a valid `development_status`,
+    so `load` RAISES NOTHING: the epics past the tear simply cease to exist, and
+    AGENTS.md makes `advance` the sole write path, so nothing downstream is holding
+    a second copy that would contradict the shortened one. The run walks off the end
+    of the sprint instead of erroring."""
+    p = _write(tmp_path)
+    whole = sprintstatus.load(p)
+    assert set(whole.epics) == {3, 4} and len(whole.stories) == 3
+
+    torn = SPRINT[: SPRINT.index("  epic-4:")]  # a short write ending at a line boundary
+    p.write_text(torn, encoding="utf-8")
+
+    shrunk = sprintstatus.load(p)  # NOT a SprintStatusError — that is the whole problem
+    assert set(shrunk.epics) == {3}  # epic 4 silently gone
+    assert len(shrunk.stories) == 2 and sprintstatus.story_status(p, "4-1-thing") is None
+
+
+def test_advance_write_failure_raises_and_leaves_the_board_entire(tmp_path, monkeypatch):
+    """#379. `advance` is a read-modify-rewrite, so the truncating `write_text` it
+    replaced could publish the prefix the row above characterizes. The helper writes
+    a temp and replaces it, so a fault leaves the original whole, and the raise still
+    reaches the caller — repair writes must raise (AGENTS.md).
+
+    Patched at sprintstatus' OWN binding of the helper, never `Path.write_text`: the
+    helper writes through an `mkstemp` fd via `os.fdopen`, so a `Path` patch never
+    fires and this would pass having exercised nothing.
+
+    Ablation: restore `path.write_text(...)` at the call site and this reddens
+    alone."""
+    p = _write(tmp_path)
+    before = p.read_bytes()
+
+    def boom(path, text, *, follow_symlinks=True):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(sprintstatus, "atomic_write_text", boom)
+    with pytest.raises(OSError, match="no space left"):
+        sprintstatus.advance(p, "3-2-digest-delivery", "in-progress")
+
+    assert p.read_bytes() == before
+    assert b"3-2-digest-delivery: in-progress" not in p.read_bytes()  # the lost mutation
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_advance_writes_through_a_symlinked_board(tmp_path):
+    """The row that grades this SITE's `follow_symlinks` argument — the DEFAULT
+    here, unlike the three spec writers, which pass False to match the
+    name-replacing `atomic_replace` they already had.
+
+    The default is what preserves behaviour: `write_text` opened through a link, so
+    a repo that keeps its board outside the tree and symlinks it in kept being a
+    symlink. Replacing the NAME instead would silently orphan the real file on the
+    first advance and leave the operator editing a board nothing reads.
+
+    Ablation: pass `follow_symlinks=False` at the call and this reddens alone."""
+    real = tmp_path / "elsewhere" / "sprint-status.yaml"
+    real.parent.mkdir()
+    real.write_text(SPRINT, encoding="utf-8")
+    link = tmp_path / "sprint-status.yaml"
+    link.symlink_to(real)
+
+    assert sprintstatus.advance(link, "3-2-digest-delivery", "in-progress") == "in-progress"
+
+    assert link.is_symlink()  # still a link, not turned into a regular file
+    assert sprintstatus.story_status(real, "3-2-digest-delivery") == "in-progress"

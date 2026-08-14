@@ -19,6 +19,7 @@ the same key must run both.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import random
@@ -43,6 +44,14 @@ from .process_host import get_process_host
 _REPLACE_ATTEMPTS = 12
 _REPLACE_BASE_S = 0.02
 _REPLACE_CAP_S = 0.7
+
+# Windows-only: the "name does not fit" errno is not ENAMETOOLONG. CPython's
+# PC/errmap.h maps ERROR_FILENAME_EXCED_RANGE (206) to ENOENT and does not map
+# ERROR_BUFFER_OVERFLOW (111) at all — it falls to the EINVAL default — so
+# ENAMETOOLONG is effectively unreachable there and only .winerror tells.
+# ERROR_INVALID_NAME (123) is deliberately NOT here: it also fires for a name
+# holding characters win32 forbids outright, which no shorter prefix fixes.
+_WINERROR_FILENAME_EXCED_RANGE = 206
 
 # Reserved on Windows regardless of extension: CON.txt is as illegal as CON. The
 # COM0/LPT0 and superscript (COM¹/COM²/COM³) forms are reserved by the same rule,
@@ -407,20 +416,115 @@ def atomic_write_text(path: Path, text: str, *, follow_symlinks: bool = True) ->
     _atomic_write(path, text, mode="w", encoding="utf-8", follow_symlinks=follow_symlinks)
 
 
-def atomic_write_bytes(path: Path, data: bytes) -> None:
+def atomic_write_bytes(path: Path, data: bytes, *, follow_symlinks: bool = True) -> None:
     """Replace ``path``'s contents with ``data`` atomically — the byte-exact
     sibling of :func:`atomic_write_text`, whose docstring carries the shared
-    contract (symlinks followed, mode and xattrs preserved when the target already
-    exists, a fresh target left at ``mkstemp``'s private ``0600``, fsync before the
-    replace, temp removed on any failure).
+    contract (mode and xattrs preserved when the target already exists and
+    symlinks are followed, a fresh target left at ``mkstemp``'s private ``0600``,
+    fsync before the replace, temp removed on any failure).
 
-    The one difference is the whole point: ``data`` lands byte-for-byte. No encode
-    and no newline translation, so a payload carrying LF keeps LF on Windows and
-    bytes that are not valid text in any codec survive the round trip. Callers
-    handling filesystem-derived content want this variant — a POSIX filename is
-    arbitrary bytes, and an operator's git exclude file may be in any legacy
-    encoding at all."""
-    _atomic_write(path, data, mode="wb", encoding=None)
+    ``follow_symlinks`` behaves exactly as it does there. The default resolves
+    ``path`` first, so a file symlinked into the repo keeps being a symlink and
+    the real file is what gets rewritten — a replace against the link itself would
+    turn it into a regular file and orphan the target. ``follow_symlinks=False``
+    inverts that: the *name* is replaced, whatever it points at, and mode and
+    xattrs are then not inherited at all. Right for a machine-minted file living
+    somewhere a less-trusted writer can reach, where honouring a planted link
+    would aim this write at a path of that writer's choosing; wrong for the
+    operator-curated files the default was built for — including the private git
+    exclude ``install._worktree_local_exclude`` writes, which pre-creates the
+    target precisely so this helper has a umask mode to carry over.
+
+    The one difference from the text sibling is the whole point: ``data`` lands
+    byte-for-byte. No encode and no newline translation, so a payload carrying LF
+    keeps LF on Windows and bytes that are not valid text in any codec survive the
+    round trip. Callers handling filesystem-derived content want this variant — a
+    POSIX filename is arbitrary bytes, and an operator's git exclude file may be
+    in any legacy encoding at all — as do callers who read bytes to preserve a
+    file's existing line endings (``policy.write_mux_backend``)."""
+    _atomic_write(path, data, mode="wb", encoding=None, follow_symlinks=follow_symlinks)
+
+
+def _is_name_too_long(exc: OSError) -> bool:
+    """True if ``exc`` is the filesystem refusing a name for its LENGTH, under
+    either platform's spelling of that condition.
+
+    Two spellings because win32 does not use the POSIX one: CPython's
+    ``PC/errmap.h`` maps ``ERROR_FILENAME_EXCED_RANGE`` to ``ENOENT``, so there
+    the errno is indistinguishable from an absent directory and only
+    ``.winerror`` tells them apart (see ``_WINERROR_FILENAME_EXCED_RANGE``)."""
+    if exc.errno == errno.ENAMETOOLONG:
+        return True
+    return getattr(exc, "winerror", None) == _WINERROR_FILENAME_EXCED_RANGE
+
+
+def _mkstemp_beside(target: Path) -> tuple[int, str]:
+    """``mkstemp`` in ``target``'s own directory, prefixed with its name so the
+    temp is recognisably that target's staging file — and so it ends in ``.tmp``
+    rather than the target's extension, which `devcontract._atomic_write_spec`
+    depends on to keep its temps out of the ``*.md`` artifact scans.
+
+    ``mkstemp`` inserts 8 random characters between prefix and suffix, so the temp
+    name runs ``len(target.name) + 13``. A basename within 13 bytes of the
+    filesystem's ``NAME_MAX`` therefore makes the TEMP name illegal at a path the
+    target itself is perfectly legal at. Measured on ext4 (``NAME_MAX`` 255): a
+    242-byte basename stages fine, 243 raises ``ENAMETOOLONG`` while the direct
+    write it replaced succeeded through 255 (#595).
+
+    The fallback replaces the readable prefix with a digest of it rather than
+    truncating it. Truncation is the obvious fix and it is wrong: ``NAME_MAX``
+    counts BYTES while Python slices CHARACTERS, so a bounded character slice
+    neither guarantees a legal name nor avoids splitting a UTF-8 sequence — and
+    the limit is not portably knowable anyway (``os.pathconf`` is POSIX-only,
+    NTFS counts UTF-16 code units, and win32 is usually bound by ``MAX_PATH`` on
+    the whole path instead). Letting the OS answer needs none of that arithmetic:
+    the common path keeps the readable name, and only a basename that cannot fit
+    degrades to a fixed-width digest.
+
+    ``os.fsencode``, not ``str.encode``: a POSIX filename is arbitrary bytes and
+    may carry surrogates that a strict UTF-8 encode would raise on.
+
+    The retry keys on TWO spellings of one condition, because win32 does not use
+    the POSIX one: ``ERROR_FILENAME_EXCED_RANGE`` arrives as ``ENOENT`` and is
+    distinguishable only by ``.winerror`` (see
+    ``_WINERROR_FILENAME_EXCED_RANGE``). Keying on ``ENAMETOOLONG`` alone left
+    this whole fallback dead on Windows — where, per the ``MAX_PATH`` note above,
+    it is if anything easier to reach than on ext4.
+
+    The rungs STRICTLY SHORTEN, and the last one carries no prefix at all. A
+    digest is 16 characters, so on its own it is not a fallback — against a
+    basename of 16 or fewer it stages a name no shorter than the one that just
+    failed, and retrying at the same width cannot succeed. That is unreachable
+    where the binding limit is per-component (a POSIX ``NAME_MAX`` rung is only
+    reached past 242 characters, far above the digest) and reachable where it is
+    the whole path, which is the win32 case: a short basename in a directory near
+    ``MAX_PATH`` overflows on the staging suffix alone. So the digest rung is used
+    only while it actually shortens, and a bare ``mkstemp`` — the shortest name
+    this function can produce — always ends the ladder.
+
+    Only a failure at that last rung propagates. No choice of *prefix* can fix
+    that one — there is no prefix left — but that is a narrower statement than "the
+    directory is too long", and the difference is #596: ``mkstemp`` will not
+    generate a name below 12 characters (8 random, plus the ``.tmp`` this helper
+    needs to stay out of ``devcontract``'s ``*.md`` scans). What does not fit at
+    the last rung is therefore the directory PLUS those 12, which a target with a
+    shorter basename can still clear on a direct write. Shrinking below the floor
+    means abandoning ``mkstemp``, and with it the entropy that keeps the staged
+    name unpredictable where a less-trusted writer can reach it — see #591 for the
+    cost of a guessable temp name."""
+    directory = str(target.parent)
+    digest = hashlib.blake2b(os.fsencode(target.name), digest_size=8).hexdigest()
+    rungs = [target.name + "."]
+    if len(digest) < len(target.name):
+        rungs.append(digest + ".")
+    rungs.append("")
+    for prefix in rungs[:-1]:
+        try:
+            return tempfile.mkstemp(dir=directory, prefix=prefix, suffix=".tmp")
+        except OSError as e:
+            if not _is_name_too_long(e):
+                raise
+    return tempfile.mkstemp(dir=directory, prefix=rungs[-1], suffix=".tmp")
 
 
 def _atomic_write(
@@ -458,7 +562,7 @@ def _atomic_write(
     private ``0600`` is the right mode for the machine-minted file this mode
     exists for."""
     target = path.resolve() if follow_symlinks else path
-    fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=target.name + ".", suffix=".tmp")
+    fd, tmp_name = _mkstemp_beside(target)
     tmp = Path(tmp_name)
     try:
         with os.fdopen(fd, mode, encoding=encoding) as fh:

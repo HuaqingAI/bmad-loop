@@ -1,6 +1,7 @@
 """Tests for the generic bmad-dev-auto -> result.json translation shim."""
 
 import os
+import sys
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -1212,21 +1213,96 @@ def test_append_bare_cr_terminated_spec_makes_heading_visible(tmp_path):
     ids=["append", "strip", "reset"],
 )
 def test_repair_write_failure_never_truncates_spec(tmp_path, monkeypatch, writer, original):
-    """#276: the three in-place spec rewriters are atomic (tmp + ``atomic_replace``).
-    A failed rename (disk-full, interruption, short write) leaves the original spec
-    byte-for-byte intact with no ``.tmp`` litter — the "a failed repair never loses
-    work" invariant (fault injection on the old truncating write reduced a 46-byte
-    spec to 12)."""
+    """#276: the three in-place spec rewriters are atomic. A failed write (disk-full,
+    interruption, short write) leaves the original spec byte-for-byte intact with no
+    ``.tmp`` litter — the "a failed repair never loses work" invariant (fault
+    injection on the old truncating write reduced a 46-byte spec to 12).
+
+    #379 moved `_atomic_write_spec` onto `platform_util.atomic_write_bytes`, so the
+    fault is injected at devcontract's OWN binding of that helper. The litter
+    assertion still grades this module: it fires if a rewriter ever mints a temp of
+    its own before delegating. The helper's internal unlink-on-raise is graded where
+    it lives, by test_platform_util's `os.replace` boom rows."""
     sp = _write(tmp_path, "spec-a.md", original)
 
-    def boom(tmp, target):
+    def boom(path, data, *, follow_symlinks=True):
         raise OSError("no space left on device")
 
-    monkeypatch.setattr(devcontract, "atomic_replace", boom)
+    monkeypatch.setattr(devcontract, "atomic_write_bytes", boom)
     with pytest.raises(OSError, match="no space left"):
         writer(sp)
     assert sp.read_text(encoding="utf-8") == original  # original untouched
-    assert list(tmp_path.glob("*.tmp")) == []  # temp file cleaned up, no litter
+    assert list(tmp_path.glob("*.tmp")) == []  # no temp minted here, no litter
+
+
+def test_atomic_write_spec_hands_the_helper_bytes_not_text(tmp_path, monkeypatch):
+    """#379 moved this writer onto `platform_util.atomic_write_bytes`. Grades the
+    BYTES half of that choice platform-independently: `test_..._preserves_crlf`
+    below already forbids relaying a CRLF spec, but `atomic_write_text` keeps
+    `Path.write_text`'s translating newline default and on POSIX
+    `os.linesep == "\\n"`, so swapping the text helper in reddens that row on
+    WINDOWS ONLY and CI's Linux leg would call the swap green.
+
+    So inspect the payload the helper is handed, upstream of any translation. The
+    binding is WRAPPED rather than replaced, so the real write still happens.
+
+    BOTH helper names are wrapped into the same list, the text one with
+    `raising=False` since this module does not import it. That is what makes the
+    `isinstance` line the assertion that fires: wrapping only the bytes name would
+    grade "the bytes helper was called", so the swap would redden on an empty `seen`
+    and this row would be claiming more than it checked.
+
+    Ablation: swap `atomic_write_bytes` for `atomic_write_text` in
+    `_atomic_write_spec` (dropping the `.encode`) and this reddens on every
+    platform, on the `isinstance` row."""
+    seen: list[bytes | str] = []
+    real = devcontract.atomic_write_bytes
+
+    def record(path, data, *, follow_symlinks=True):
+        seen.append(data)
+        blob = data if isinstance(data, bytes) else data.encode("utf-8")
+        real(path, blob, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(devcontract, "atomic_write_bytes", record)
+    monkeypatch.setattr(devcontract, "atomic_write_text", record, raising=False)
+    sp = tmp_path / "spec-a.md"
+    sp.write_bytes(b"---\r\nstatus: done\r\n---\r\n\r\n# Story\r\n\r\nbody\r\n")
+
+    devcontract.append_auto_run_result(sp, "done")
+
+    assert len(seen) == 1  # exactly one write — no retry loop crept in
+    assert isinstance(seen[0], bytes)
+    assert b"## Auto Run Result\r\n" in seen[0]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_atomic_write_spec_replaces_a_planted_symlink(tmp_path):
+    """The row that grades this SITE's `follow_symlinks=False` argument rather than
+    the helper's implementation of it (pinned in test_platform_util.py, where the
+    helper is called directly).
+
+    Behaviour-preserving, not a tightening: the `atomic_replace` this replaced never
+    dereferenced its destination either, so passing the default True would have
+    CHANGED what these four rewriters do. It is also the security choice — the spec
+    path reaches them from a scan of a directory a driven session owns, so writing
+    THROUGH a link planted at that name would hand the session a host-side write to
+    any operator-writable path.
+
+    Ablation: drop `follow_symlinks=False` in `_atomic_write_spec` and this reddens
+    alone — alone in both directions, since it does not reach the two
+    `frontmatter`-side writers of these same specs. Each of those passes its own
+    literal and carries its own row (tests/test_frontmatter.py,
+    tests/test_resolve.py)."""
+    original = "---\nstatus: done\n---\n\nbody\n"
+    real = _write(tmp_path, "someone-elses-file", original)
+    link = tmp_path / "spec-a.md"
+    link.symlink_to(real)
+
+    assert devcontract.reset_spec_status(link, "in-progress") is True
+
+    assert not link.is_symlink()  # the NAME was replaced
+    assert verify.read_frontmatter(link)["status"] == "in-progress"
+    assert real.read_text(encoding="utf-8") == original  # not written through
 
 
 # ------------------------------ append_operator_confirmation (#335 part 3)
@@ -1337,10 +1413,10 @@ def test_operator_confirmation_write_failure_raises_and_keeps_the_spec(tmp_path,
     never made."""
     sp = _write(tmp_path, "spec-a.md", _PARKED)
 
-    def boom(tmp, target):
+    def boom(path, data, *, follow_symlinks=True):
         raise OSError("no space left on device")
 
-    monkeypatch.setattr(devcontract, "atomic_replace", boom)
+    monkeypatch.setattr(devcontract, "atomic_write_bytes", boom)
     with pytest.raises(OSError, match="no space left"):
         devcontract.append_operator_confirmation(sp, _ACTIONS, date="2026-07-28")
     assert sp.read_text(encoding="utf-8") == _PARKED

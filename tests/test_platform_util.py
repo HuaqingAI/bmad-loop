@@ -7,11 +7,13 @@ the legacy ``platform_util`` entry points still delegate, plus the real
 
 from __future__ import annotations
 
+import errno
 import ntpath
 import os
 import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path, PureWindowsPath
 
 import pytest
@@ -676,6 +678,75 @@ def test_atomic_write_bytes_writes_through_a_symlink(tmp_path):
     assert real.read_bytes() == b"after"
 
 
+# The no-follow trio for the BYTES helper (#363), mirroring the text trio above.
+# The bytes sibling grew `follow_symlinks` when `policy.write_mux_backend` moved onto
+# it: that site reads and writes bytes to preserve a CRLF policy.toml's endings, and
+# needs no-follow because a driven session can write `.bmad-loop/policy.toml`.
+#
+# ABLATION A1: drop the `follow_symlinks=follow_symlinks` forward in
+# `atomic_write_bytes` (leave the parameter, so callers still typecheck) and these
+# three redden together while the TEXT trio and the True-default pins above stay
+# green — the disjointness is what shows the forward, not the shared `_atomic_write`
+# body, is what these grade.
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_atomic_write_bytes_no_follow_replaces_the_link(tmp_path):
+    """The inverse of the sibling above: the *name* is replaced, whatever it points
+    at. Honouring a planted link would aim a machine-minted write at a path of the
+    planter's choosing, and no preflight check is what makes this safe — `os.replace`
+    does not dereference its destination, so a link planted after any check would
+    have run is clobbered rather than written through."""
+    real = tmp_path / "someone-elses-file"
+    real.write_bytes(b"before")
+    link = tmp_path / "record"
+    link.symlink_to(real)
+
+    platform_util.atomic_write_bytes(link, b"after", follow_symlinks=False)
+
+    assert not link.is_symlink()
+    assert link.read_bytes() == b"after"
+    assert real.read_bytes() == b"before"  # untouched
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+def test_atomic_write_bytes_no_follow_does_not_inherit_a_link_targets_mode(tmp_path):
+    """A name being replaced rather than updated carries nothing of whatever it used
+    to point at — inheriting the target's mode would let a planted link choose the
+    new record's permissions."""
+    real = tmp_path / "someone-elses-file"
+    real.write_bytes(b"before")
+    real.chmod(0o666)
+    link = tmp_path / "record"
+    link.symlink_to(real)
+
+    platform_util.atomic_write_bytes(link, b"after", follow_symlinks=False)
+
+    assert stat.S_IMODE(link.stat().st_mode) == 0o600  # mkstemp's private default
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+def test_atomic_write_bytes_no_follow_does_not_inherit_a_plain_files_mode(tmp_path):
+    """No-follow inherits nothing and takes no probe to decide it — the sibling above
+    covers the link, this covers the plain file, which is the case a probe would have
+    said yes to. 0o640 for the reason every mode pin here gives: `mkstemp` already
+    ARRIVES at 0600, so only a mode it does not arrive with can tell inheritance from
+    its absence.
+
+    Ablation A2: change `_atomic_write`'s `if follow_symlinks and target.exists():`
+    to `if target.exists():` and this reddens together with the three other
+    "does_not_inherit" rows (both helpers), while both "replaces_the_link" rows stay
+    green — so it bites on inheritance itself, not on anything else no-follow does."""
+    target = tmp_path / "record"
+    target.write_bytes(b"before")
+    target.chmod(0o640)
+
+    platform_util.atomic_write_bytes(target, b"after", follow_symlinks=False)
+
+    assert target.read_bytes() == b"after"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
 def test_atomic_write_bytes_preserves_extended_attributes(tmp_path):
     """Skipped where the platform or filesystem has no user xattrs, exactly as the
     text sibling is — the helper is best-effort there by design."""
@@ -800,6 +871,224 @@ def test_atomic_write_bytes_creates_a_missing_target_at_the_private_mode(tmp_pat
     assert target.read_bytes() == b"fresh"
     if sys.platform != "win32":
         assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pathconf(PC_NAME_MAX)")
+def test_atomic_write_bytes_stages_a_basename_that_fills_name_max(tmp_path, monkeypatch):
+    """A target whose basename is the longest the filesystem allows still writes
+    (#595). `mkstemp` inserts 8 random chars between prefix and suffix, so the temp
+    runs `len(basename) + 13` — meaning a target that is itself perfectly legal
+    produced an ILLEGAL temp name and the write died with ENAMETOOLONG.
+
+    A regression, not a pre-existing limit: the direct `write_bytes` that
+    `set_frontmatter_status`/`set_frontmatter_field` used before this branch
+    accepted the same name, and specs are named by BMAD's planning skills, not by
+    anything here that bounds them (`safe_segment`'s MAX_SEGMENT caps story keys
+    and run-dir segments, not spec basenames).
+
+    Sized from the filesystem's own `PC_NAME_MAX` rather than a hardcoded 255,
+    which is per-filesystem — on a box where it is smaller a fixed 252 would fail
+    while CREATING the fixture, reddening this row for a reason that is not the
+    property.
+
+    The staged name is recorded and asserted legal rather than compared to the
+    digest: what has to hold is that the temp fits, not which scheme produced it.
+
+    Ablation: delete the `except OSError` fallback in `_mkstemp_beside` and this
+    fails alone, on `OSError: [Errno 36] File name too long` raised before any
+    assertion. `..._temp_name_is_unique_per_call` and
+    `..._stages_in_the_targets_own_directory` stay green under it — both use short
+    names, which never reach the fallback."""
+    name_max = os.pathconf(str(tmp_path), "PC_NAME_MAX")
+    target = tmp_path / ("s" * (name_max - len(".md")) + ".md")
+    assert len(os.fsencode(target.name)) == name_max  # PRECONDITION: the limit itself
+    staged: list[str] = []
+    real_replace = os.replace
+
+    def record(src, dst):
+        staged.append(os.path.basename(str(src)))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(platform_util.os, "replace", record)
+
+    platform_util.atomic_write_bytes(target, b"payload")
+
+    assert target.read_bytes() == b"payload"
+    assert len(staged) == 1
+    assert len(os.fsencode(staged[0])) <= name_max
+    assert staged[0].endswith(".tmp")  # devcontract's *.md scans must skip it
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def _exceed_range() -> OSError:
+    """Win32's "the name does not fit", which arrives as ENOENT and is told apart
+    from a missing directory only by `.winerror` — see `_is_name_too_long`."""
+    exceeded = OSError(errno.ENOENT, "The filename or extension is too long")
+    exceeded.winerror = 206  # pyright: ignore[reportAttributeAccessIssue]
+    return exceeded
+
+
+def _failing_mkstemp(prefixes: list[str], fail_first: int):
+    """A `mkstemp` that records each prefix it is handed and refuses the first
+    `fail_first` attempts with win32's too-long error, then delegates."""
+    real_mkstemp = tempfile.mkstemp
+
+    def fake_mkstemp(*, dir, prefix, suffix):
+        prefixes.append(prefix)
+        if len(prefixes) <= fail_first:
+            raise _exceed_range()
+        return real_mkstemp(dir=dir, prefix=prefix, suffix=suffix)
+
+    return fake_mkstemp
+
+
+def test_atomic_write_bytes_stages_via_digest_when_win32_reports_exceed_range(
+    tmp_path, monkeypatch
+):
+    """The #595 fallback also fires for win32's spelling of "the name does not
+    fit", which is NOT ENAMETOOLONG.
+
+    CPython's `PC/errmap.h` maps `ERROR_FILENAME_EXCED_RANGE` (206) to ENOENT, and
+    does not map `ERROR_BUFFER_OVERFLOW` (111) at all — it falls to the EINVAL
+    default. So on Windows nothing raises ENAMETOOLONG and only `.winerror`
+    carries the distinction: keying the retry on the errno alone left the whole
+    fallback DEAD on the one platform where, per `MAX_PATH`, the staged name is
+    easiest to overflow.
+
+    Driven through an injected error rather than a real long name because this
+    runs on POSIX too, where no path produces winerror 206 — and a
+    `skipif(win32)` row would leave the branch unexercised on every CI leg but
+    two. The injection is the mechanism the code actually reads
+    (`_is_name_too_long`), so it is the predicate under test, not a stand-in.
+
+    The basename is deliberately LONGER than a 16-character digest, which is what
+    puts the digest rung on the ladder at all — see the row below for the short
+    basename that skips it.
+
+    Asserts the retry STRICTLY SHORTENED rather than matching the digest: what
+    has to hold is that the next attempt is narrower than the one that failed,
+    not which scheme produced it.
+
+    Ablation: drop the `.winerror` arm of `_is_name_too_long` and all THREE
+    win32-injected rows redden together, on the injected `OSError` propagating out
+    of `atomic_write_bytes` before any assertion — they share that predicate, so
+    no one of them can fail alone under it. The disjointness proof is the row that
+    stays GREEN: POSIX `..._fills_name_max` arrives on the errno arm, which this
+    ablation leaves intact, so the two arms genuinely cover different conditions
+    rather than one masking the other."""
+    target = tmp_path / ("s" * 40 + ".md")
+    prefixes: list[str] = []
+    monkeypatch.setattr(platform_util.tempfile, "mkstemp", _failing_mkstemp(prefixes, 1))
+
+    platform_util.atomic_write_bytes(target, b"payload")
+
+    assert target.read_bytes() == b"payload"
+    assert len(prefixes) == 2  # the retry happened at all
+    assert prefixes[0] == target.name + "."
+    assert prefixes[1] != ""  # the DIGEST rung, not the bare one
+    assert len(prefixes[1]) < len(prefixes[0])  # strictly shorter than what failed
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_atomic_write_bytes_skips_the_digest_rung_when_it_would_not_shorten(tmp_path, monkeypatch):
+    """A digest is 16 characters, so against a basename that short or shorter it
+    is not a fallback at all — it stages a name no NARROWER than the one that
+    just failed, and a retry at the same width cannot succeed.
+
+    Unreachable where the binding limit is per-component: a POSIX `NAME_MAX` rung
+    is only reached past a 242-character basename, far above the digest. Reachable
+    where the limit is the whole path, which is the win32 `MAX_PATH` case — a
+    short basename in a deep directory overflows on the staging suffix alone, and
+    a 29-character digest temp is then LONGER than the readable one it replaced.
+
+    So the ladder drops that rung and goes straight to a bare `mkstemp`, the
+    shortest name this function can produce.
+
+    Ablation: append the digest rung unconditionally and this reddens alone, on
+    `prefixes[1] == ""` — the digest is attempted for a 7-character basename it
+    cannot help. The long-basename row above stays green, because there the
+    digest genuinely shortens and the rung belongs on the ladder."""
+    target = tmp_path / "spec.md"  # 7 chars — a 16-char digest is no improvement
+    prefixes: list[str] = []
+    monkeypatch.setattr(platform_util.tempfile, "mkstemp", _failing_mkstemp(prefixes, 1))
+
+    platform_util.atomic_write_bytes(target, b"payload")
+
+    assert target.read_bytes() == b"payload"
+    assert prefixes[0] == "spec.md."
+    assert len(prefixes) == 2  # no wasted attempt at a name that cannot fit
+    assert prefixes[1] == ""  # straight to the shortest name available
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_atomic_write_bytes_ends_the_ladder_at_a_bare_temp(tmp_path, monkeypatch):
+    """When the digest rung ALSO cannot fit, the ladder still has one rung left.
+
+    This is the case that makes the docstring's closing claim true. Keying the
+    fallback on a single digest retry meant a second failure was reported as "the
+    directory is too long, which no prefix can fix" while a shorter prefix — the
+    empty one — would in fact have fit. Only once the last rung carries no prefix
+    at all is a failure there genuinely about the directory.
+
+    Ablation: delete the trailing bare rung so the ladder ends at the digest and
+    TWO rows redden — this one, on the second injected `OSError` propagating, and
+    the skip row above. Measured, not assumed: the bare rung is the fallback for
+    both of them, since a basename too short for the digest has no other rung to
+    fall to. They stay separate rows because they reach it for different reasons —
+    one because the digest was skipped, one because the digest was tried and also
+    failed — and only this one pins that a THIRD attempt exists at all."""
+    target = tmp_path / ("s" * 40 + ".md")
+    prefixes: list[str] = []
+    monkeypatch.setattr(platform_util.tempfile, "mkstemp", _failing_mkstemp(prefixes, 2))
+
+    platform_util.atomic_write_bytes(target, b"payload")
+
+    assert target.read_bytes() == b"payload"
+    assert len(prefixes) == 3
+    assert prefixes[2] == ""  # the shortest name the function can stage
+    # every rung strictly narrower than the one it replaced
+    assert [len(p) for p in prefixes] == sorted((len(p) for p in prefixes), reverse=True)
+    assert len(set(prefixes)) == 3
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_atomic_write_bytes_propagates_a_staging_error_that_is_not_a_long_name(
+    tmp_path, monkeypatch
+):
+    """The retry stays NARROW: an `OSError` that is not "the name does not fit"
+    propagates on the first attempt instead of being retried under a digest.
+
+    The negative control for the row above. Widening the predicate to a bare
+    `except OSError` — or folding in `ERROR_INVALID_NAME` (123), which also fires
+    for characters win32 forbids outright and no shorter prefix can rescue — would
+    turn an unrelated staging failure into a second doomed `mkstemp` and surface
+    the RETRY's exception rather than the real one. `install.py` already assigns
+    123 the opposite meaning (`_ABSENCE_WINERRORS`), so admitting it here would
+    make one winerror mean two things in one codebase.
+
+    Ablation: relax the guard so nothing re-raises and this reddens alone, on
+    `len(calls) == 1` reading 2 — the second, doomed `mkstemp` runs under the next
+    rung, which for this 7-character basename is the BARE one (a 16-character
+    digest cannot shorten it). Note which assertion does NOT catch it:
+    `caught.value.errno ==
+    EACCES` still passes, because the retry fails the same way the first attempt
+    did. The call count is the load-bearing assertion here; an errno check alone
+    would pass through the widened guard and pin nothing."""
+    target = tmp_path / "spec.md"
+    calls: list[str] = []
+
+    def fake_mkstemp(*, dir, prefix, suffix):
+        calls.append(prefix)
+        raise OSError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(platform_util.tempfile, "mkstemp", fake_mkstemp)
+
+    with pytest.raises(OSError) as caught:
+        platform_util.atomic_write_bytes(target, b"payload")
+
+    assert caught.value.errno == errno.EACCES  # the REAL error, not the retry's
+    assert len(calls) == 1  # never retried
+    assert not target.exists()
 
 
 # --------------------------------------------------------------- retrying_unlink

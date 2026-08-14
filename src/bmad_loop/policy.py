@@ -19,7 +19,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .platform_util import atomic_replace, has_parent_ref, is_absolute_path, names_tree_root
+from .platform_util import atomic_write_bytes, has_parent_ref, is_absolute_path, names_tree_root
 
 POLICY_FILE = Path(".bmad-loop") / "policy.toml"
 
@@ -1393,6 +1393,13 @@ def write_mux_backend(path: Path, name: str | None) -> None:
         )
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".toml.tmp")
-    tmp.write_bytes(result.encode("utf-8"))
-    atomic_replace(tmp, path)
+    # #363: the helper removes its temp on any raise — the hand-rolled tmp here was
+    # the fixed name `.bmad-loop/policy.toml.tmp`, which nothing gitignores (the
+    # ignore line is the anchored literal `.bmad-loop/policy.toml`) and which
+    # `tui.settings.PolicyDoc.save` built identically, so the two could collide.
+    # The BYTES helper, not the text one: this function reads bytes and writes bytes
+    # on purpose (see the decode above) so a CRLF policy.toml keeps its endings.
+    # follow_symlinks=False replaces the name, as the bare replace did; a driven
+    # session can write this exact path (runsetup), so a link planted here must be
+    # clobbered rather than written through.
+    atomic_write_bytes(path, result.encode("utf-8"), follow_symlinks=False)

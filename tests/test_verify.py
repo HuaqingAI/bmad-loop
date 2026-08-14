@@ -1905,6 +1905,85 @@ def test_safe_rollback_restores_committed_policy_on_clean_tree(project):
     assert pol.read_text() == "[scm]\nrollback_on_failure = true\n"  # survived
 
 
+def test_safe_rollback_restores_the_policy_through_the_atomic_helper(project, monkeypatch):
+    """#379. The put-back was a bare `policy_path.write_bytes`, which truncates
+    the file to zero and refills it in place: a host lost mid-write comes back
+    with the operator's config neither reverted nor restored, and a truncated
+    TOML is not a smaller config but a parse error the next `bmad-loop run`
+    refuses on — arriving immediately after a rollback that already discarded the
+    attempt's work. The helper fsyncs before the replace, so the crash window
+    yields the old file or the whole new one.
+
+    Graded by WRAPPING the binding rather than replacing it: the real write still
+    lands, so the content assertion below is not measuring the stub. Recording
+    the call also pins "exactly one write", which the guard above it is there to
+    guarantee — a retry loop or a second unconditional write could not creep in
+    unnoticed.
+
+    Ablation: revert the call to `policy_path.write_bytes(policy_content)` and
+    this reddens on `len(seen) == 1` — the helper is never reached."""
+    repo = project.project
+    baseline = verify.rev_parse_head(repo)  # baseline predates policy.toml
+    pol = repo / ".bmad-loop" / "policy.toml"
+    pol.parent.mkdir(parents=True, exist_ok=True)
+    pol.write_bytes(b"[scm]\nrollback_on_failure = true\n")
+    git(repo, "add", "-f", str(pol))
+    git(repo, "commit", "-q", "-m", "add policy after baseline")
+    seen: list[tuple[Path, bytes]] = []
+    real = verify.atomic_write_bytes
+
+    def record(path, data, *, follow_symlinks=True):
+        seen.append((Path(path), data))
+        real(path, data, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(verify, "atomic_write_bytes", record)
+
+    verify.safe_rollback(repo, baseline, baseline_untracked=None, keep=(".bmad-loop",))
+
+    assert len(seen) == 1
+    assert seen[0] == (pol, b"[scm]\nrollback_on_failure = true\n")
+    assert pol.read_bytes() == b"[scm]\nrollback_on_failure = true\n"  # and it landed
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_safe_rollback_replaces_a_policy_symlink_by_name(project):
+    """#379. The one row that grades this SITE's `follow_symlinks=False` argument.
+    Unlike the other writers moved to the helper on this branch, the expression
+    replaced here was a direct `write_bytes` — which opens the name and so writes
+    THROUGH a planted link — so no-follow is a genuine change of behaviour, not a
+    preservation of what `os.replace` already did.
+
+    It is still the right change. `policy.write_mux_backend` already replaces this
+    same file by name, so a link at `.bmad-loop/policy.toml` does not survive the
+    orchestrator anyway; and `runsetup` states a driven session can write that
+    path, which makes the link a session-chosen redirect for a host-side write.
+    The reachable exploit is narrow but real, and it is exactly what this row
+    builds: the restore only fires when the reset CHANGED what the name reads, so
+    the redirect has to aim at a tracked in-repo file — which the reset then
+    reverts and this write immediately clobbers with policy bytes.
+
+    Ablation: drop `follow_symlinks=False` and this reddens alone — the link
+    survives and `shared.toml` is the file that gets rewritten."""
+    repo = project.project
+    shared = repo / "shared.toml"  # tracked, and NOT the operator's policy
+    shared.write_bytes(b"[scm]\nrollback_on_failure = false\n")
+    git(repo, "add", str(shared))
+    git(repo, "commit", "-q", "-m", "a tracked file a session could aim at")
+    baseline = verify.rev_parse_head(repo)
+    pol = repo / ".bmad-loop" / "policy.toml"
+    pol.parent.mkdir(parents=True, exist_ok=True)
+    pol.symlink_to(Path("..") / "shared.toml")
+    # the capture reads THROUGH the link, and the reset reverts what it points at,
+    # so the put-back is reached with the link still standing
+    shared.write_bytes(b"[scm]\nrollback_on_failure = true\n")
+
+    verify.safe_rollback(repo, baseline, baseline_untracked=None, keep=(".bmad-loop",))
+
+    assert not pol.is_symlink()  # the NAME was replaced
+    assert pol.read_bytes() == b"[scm]\nrollback_on_failure = true\n"
+    assert shared.read_bytes() == b"[scm]\nrollback_on_failure = false\n"  # not through
+
+
 def test_attempt_dirty_ignores_lone_policy_edit(project):
     """A diff confined to policy.toml is operator config, not the attempt's
     dirtiness — so a stopped attempt whose only residue is a policy edit reads as
@@ -1944,6 +2023,90 @@ def test_worktree_clean_ignores_policy_file(project):
 def test_worktree_clean_flags_untracked_non_policy(project):
     (project.project / "stray.txt").write_text("untracked\n")
     assert not verify.worktree_clean(project.project)
+
+
+def _porcelain(repo) -> set[str]:
+    """`git status --porcelain` as a set of RAW records.
+
+    Not conftest's `git()`: that returns `stdout.strip()`, which eats the leading
+    status space of the FIRST line only — so ` M path` arrives as `M path` or not,
+    depending on sort order. These assertions are about the exact two-character
+    status field, so they need the bytes git actually emitted."""
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return set(proc.stdout.splitlines())
+
+
+def test_worktree_clean_flags_a_stranded_policy_temp(project):
+    """#363's PREMISE, not its fix — nothing here exercises the atomic-write
+    change. It pins the reason the issue matters: a `.bmad-loop/policy.toml.tmp`
+    left behind by a failed replace is an UNTRACKED file that no ignore rule
+    covers, so `worktree_clean` goes False and stays False until a human deletes
+    it. Deleting the temp is what flips the verdict back, with the policy edit
+    still on disk.
+
+    Every porcelain assertion below is a PRECONDITION, deliberately spelled as an
+    exhaustive set rather than a fixture. `conftest._isolate_ambient_git_ignores`
+    is session-scoped and autouse, so it is inherited with no opt-in — but it
+    deliberately does NOT set `GIT_CONFIG_NOSYSTEM` (that would suppress
+    Git-for-Windows' system `core.autocrlf`), which leaves a system
+    `core.excludesFile`, a system `status.showUntrackedFiles=no`, and
+    `.git/info/exclude` all reachable. Step 6's single line closes every one of
+    them at once — plus untracked-dir collapsing — and does it as a LOUD red on
+    the precondition rather than a silent green on the verdict.
+
+    Ablation A10: change verify.py's `:(exclude){POLICY_FILE_REL}` to
+    `:(exclude){POLICY_FILE_REL}*` and step 7 reddens ALONE — the trailing glob
+    swallows the `.tmp` sibling too, which is the fake-green this test exists to
+    catch. `test_worktree_clean_ignores_policy_file` and
+    `test_worktree_clean_flags_untracked_non_policy` stay green.
+
+    Ablation A11: delete the `:(exclude)` element entirely and the OTHER direction
+    reddens — `test_worktree_clean_ignores_policy_file` goes red, and here it is
+    step 5's CONTROL that fires, ABORTING this test before step 7 is ever reached.
+    Read that precisely: under A11 step 7 does not "stay green", it does not run.
+    The pair is graded by WHICH STEP each ablation reddens — 7 for A10, 5 for A11 —
+    because steps 4-5 and 6-8 present git-visible states identical but for one
+    file and demand OPPOSITE verdicts. That is what makes this grade which NAME the
+    exclude covers, in both directions, rather than merely that it has one."""
+    repo = project.project
+    pol = repo / ".bmad-loop" / "policy.toml"
+    tmp = repo / ".bmad-loop" / "policy.toml.tmp"
+
+    # 1. track the policy file — this also makes `.bmad-loop/` a TRACKED directory,
+    #    so git can never collapse the untracked record below to `?? .bmad-loop/`
+    pol.parent.mkdir(parents=True, exist_ok=True)
+    pol.write_text('[gates]\nmode = "none"\n')
+    git(repo, "add", "-f", str(pol))
+    git(repo, "commit", "-q", "-m", "track policy")
+
+    assert _porcelain(repo) == set()  # 2. no ambient dirt
+    assert verify.worktree_clean(repo)  # 3. baseline verdict
+
+    # 4. PRECONDITION: git DOES see the edit
+    pol.write_text('[gates]\nmode = "per-epic"\n')
+    assert _porcelain(repo) == {" M .bmad-loop/policy.toml"}
+
+    assert verify.worktree_clean(repo)  # 5. CONTROL: policy.toml itself reads CLEAN
+
+    # 6. PRECONDITION: untracked reporting is ON, at FILE granularity, and nothing
+    #    ignores `*.tmp` — one line closing showUntrackedFiles=no, a system
+    #    excludesFile, .git/info/exclude and dir-collapsing together
+    tmp.write_text('[gates]\nmode = "per-epic"\n')
+    assert _porcelain(repo) == {
+        " M .bmad-loop/policy.toml",
+        "?? .bmad-loop/policy.toml.tmp",
+    }
+
+    assert not verify.worktree_clean(repo)  # 7. THE GRADED ASSERTION
+
+    # 8. differential: the verdict flips back with the policy edit still on disk
+    tmp.unlink()
+    assert verify.worktree_clean(repo)
 
 
 # ------------------------------------------------- git pathspec hardening (#423)

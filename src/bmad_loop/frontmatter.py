@@ -1,16 +1,23 @@
 """Pure spec-frontmatter parsing: read the YAML ``---``…``---`` block, normalize
 the status token, and rewrite ``status:`` in place.
 
-Zero git/subprocess dependencies (only stdlib + PyYAML) so pure domain modules
-(``stories``, ``devcontract``) can read spec status without importing ``verify``
-and dragging in its whole git surface (assessment finding F-1). ``verify``
-re-exports these names, so every existing ``verify.<name>`` / ``from .verify
-import <name>`` call site stays valid. (The same docstring rule bars importing
-``platform_util`` here — it pulls in ``subprocess`` — so this module's writes are
-a plain ``write_bytes``, not ``atomic_replace``: byte-preserving, but not atomic.
-``read_bytes().decode`` on the way in for the same reason — ``read_text``'s
-universal-newline translation would hand the writer an all-LF copy of a CRLF
-spec, and every line ending in the file would be relaid on the way back out.)
+No git dependency, so a pure domain module can read spec status without importing
+``verify`` and dragging in its whole git surface (assessment finding F-1).
+``stories`` still collects on that: ``import bmad_loop.stories`` genuinely leaves
+``bmad_loop.verify`` out of ``sys.modules``. ``devcontract`` no longer does — it
+imports ``verify`` directly for `read_frontmatter` and `operator_actions_of` — so
+the rule now has one beneficiary, not the two it was written for. ``verify``
+re-exports these names either way, so every existing ``verify.<name>`` /
+``from .verify import <name>`` call site stays valid.
+
+That rule is about ``verify``, NOT about ``subprocess``: this module imports
+``platform_util`` (#379), which pulls ``subprocess`` in, and both named modules
+already paid that cost anyway — ``devcontract`` imports it directly and
+``stories`` reaches it through ``deferredwork``. So the writes here are atomic as
+well as byte-verbatim: ``read_bytes().decode`` in, ``atomic_write_bytes`` out.
+The byte path is load-bearing on its own — ``read_text``'s universal-newline
+translation would hand the writer an all-LF copy of a CRLF spec, and every line
+ending in the file would be relaid on the way back out.
 
 READER AND WRITER DEGRADE IN OPPOSITE DIRECTIONS, deliberately. `read_frontmatter`
 turns an unparseable or undecodable block into ``{}``: it runs on the observation
@@ -30,6 +37,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+from .platform_util import atomic_write_bytes
 
 
 def _split_frontmatter(text: str) -> tuple[str, str, str] | None:
@@ -365,8 +374,21 @@ def set_frontmatter_status(path: Path, status: str) -> bool:
     through ``read_text``/``write_text`` instead relaid the whole file — CRLF in,
     LF out on POSIX, and every LF out as CRLF on Windows — which is the largest
     violation a writer contracted to "only the status value changes" can commit.
-    Not atomic (see the module docstring); a torn write is a separate concern
-    from a byte-preserving one.
+
+    The rewrite is also atomic (#379): the bytes go out through
+    `platform_util.atomic_write_bytes`, which is byte-verbatim on the same terms
+    as `write_bytes` and additionally leaves either the old file or the whole new
+    one. That matters most here, where the layout is ``before + edited + after``
+    — a truncating write that faults after the frontmatter has landed leaves
+    intact frontmatter saying ``status: done`` over a decapitated body, a spec
+    that lies and that the loop then commits. `devcontract._atomic_write_spec`
+    reached the same conclusion on the same files, with fault injection: it cut a
+    46-byte spec to 12.
+
+    ``follow_symlinks=False``, matching that sibling's name-replacing
+    `atomic_replace`. A spec path is handed to this writer from a session-driven
+    scan, so honouring a link planted there would aim a host-side write wherever
+    that session chose.
 
     Returns True when the file was rewritten. Returns False for **nothing to
     change** only: no file, no frontmatter block, no top-level `status` for
@@ -393,5 +415,5 @@ def set_frontmatter_status(path: Path, status: str) -> bool:
     edited = _edit_frontmatter_block(block, "status", status, pattern=_STATUS_KEY_RE)
     if edited is None:
         return False
-    path.write_bytes((before + edited + after).encode("utf-8"))
+    atomic_write_bytes(path, (before + edited + after).encode("utf-8"), follow_symlinks=False)
     return True

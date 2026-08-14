@@ -1755,11 +1755,84 @@ def test_archive_run(tmp_path):
     assert dest == tmp_path / ".bmad-loop" / "archive" / "20260611-100000-aaaa.tar.gz"
     assert dest.is_file()
     assert not run_dir.exists()  # original removed
-    assert not dest.with_suffix(".tar.gz.tmp").exists()  # temp cleaned via replace
+    # An exhaustive listing, not `not dest.with_suffix(".tar.gz.tmp").exists()`: that
+    # spelling was the SAME buggy expression as the source it graded (`with_suffix`
+    # replaces only the last suffix, so on `<id>.tar.gz` it yields
+    # `<id>.tar.tar.gz.tmp`), and right only by accident. After the #363 filename fix
+    # it named a path existing under neither spelling and would have gone silently
+    # vacuous. Listing the directory cannot: it names every leftover, whatever it is
+    # called.
+    assert [p.name for p in dest.parent.iterdir()] == ["20260611-100000-aaaa.tar.gz"]
     with tarfile.open(dest) as tar:
         names = tar.getnames()
     assert "20260611-100000-aaaa/state.json" in names
     assert "20260611-100000-aaaa/journal.jsonl" in names
+
+
+def test_archive_run_names_its_temp_after_the_destination(tmp_path, monkeypatch):
+    """#363's filename half, and it needs its own test because NOTHING else grades
+    it: on the happy path `atomic_replace` consumes the temp under either spelling,
+    and the new `except BaseException` guard unlinks it whatever it is named — so
+    reverting the fix reddens no other row in this file. Recording the name handed to
+    `os.replace` is the only place the spelling is observable.
+
+    `dest.with_suffix(".tar.gz.tmp")` yielded `<id>.tar.tar.gz.tmp`, because
+    `with_suffix` replaces only the LAST suffix and `<id>.tar.gz` has stem
+    `<id>.tar` — not the name the docstring implied, and not one any cleanup could
+    have been written against.
+
+    `run_dir` is built BEFORE the patch on purpose: `save_state` writes through the
+    same `os.replace`, and building it after would pollute `seen` with a call that
+    has nothing to do with the archive.
+
+    Ablation A9: restore `dest.with_suffix(".tar.gz.tmp")` and this reddens alone —
+    `test_archive_run` and the guard test below stay GREEN, which is exactly why
+    this row exists rather than being folded into either."""
+    run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
+    seen: list[str] = []
+    real = os.replace
+
+    def record(src, dst):
+        seen.append(os.path.basename(src))
+        real(src, dst)
+
+    monkeypatch.setattr(platform_util.os, "replace", record)
+    dest = runs.archive_run(tmp_path, run_dir)
+
+    # an exact list, so it also pins "exactly one replace" — a retry loop or a second
+    # write creeping in here would redden rather than pass on a substring match
+    assert seen == [dest.name + ".tmp"]
+
+
+def test_archive_run_failed_replace_strands_no_temp(tmp_path, monkeypatch):
+    """#363. `.bmad-loop/archive/` is gitignored by NOTHING — `bmad-loop init` writes
+    `.bmad-loop/runs/`, `.bmad-loop/cache/`, `.bmad-loop/policy.toml` and
+    `_bmad/render/` — so a temp stranded here is an untracked file that holds
+    `verify.worktree_clean` False until a human deletes it by hand.
+
+    This site cannot use `atomic_write_*`: the path is handed to `tarfile.open`, so
+    there is no payload for a helper to take. It gets the house guard instead, the
+    one `operatoractions.record_park` uses.
+
+    A PLAIN OSError, never PermissionError: `_retry_on_sharing_violation` treats
+    PermissionError (and winerror 5/32) as the transient Windows sharing violation
+    and would burn ~5 s of jittered backoff before propagating it.
+
+    Ablation A8: delete the `except BaseException` guard and ONLY the third assertion
+    reddens — the first two are pinned by statement ordering (`shutil.rmtree` runs
+    after the replace), not by the guard, so the leftover-temp row is the one that
+    grades it."""
+    run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
+
+    def boom(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(platform_util.os, "replace", boom)
+    with pytest.raises(OSError, match="disk full"):
+        runs.archive_run(tmp_path, run_dir)
+
+    assert (run_dir / "state.json").is_file()  # the run survives a failed archive
+    assert list((tmp_path / ".bmad-loop" / "archive").iterdir()) == []  # no temp left
 
 
 def test_archive_run_refuses_while_the_agent_session_is_live(tmp_path, monkeypatch):
