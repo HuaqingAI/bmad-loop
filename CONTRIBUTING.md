@@ -92,20 +92,21 @@ Linting and formatting run through [trunk](https://trunk.io) (ruff, black, isort
 
 ```bash
 trunk fmt        # auto-format changed files
-trunk check      # lint + format verification, no path filter (what CI runs)
+trunk check      # lint + format verification on changed files, as CI does
+trunk check --all # the whole repo — catches files your change didn't touch
 ```
 
 ### CHANGELOG
 
 **Every user-visible change needs a CHANGELOG entry.** Add it under the `## [Unreleased]` heading in [CHANGELOG.md](CHANGELOG.md), and only under one of the six [Keep a Changelog](https://keepachangelog.com) subsections — `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, `Security`. Keep entries terse, scannable, and imperative.
 
-Never open a new `## [X.Y.Z]` section yourself: a release _promotes_ `## [Unreleased]` into the version heading and reopens an empty one. `scripts/release.py check` enforces this contract in CI (the `version-sync` job). The full rule is in [AGENTS.md](AGENTS.md#repo-hygiene).
+Never open a new `## [X.Y.Z]` section yourself: a release _promotes_ `## [Unreleased]` into the version heading and reopens an empty one above it. CI's `version-sync` job (`scripts/release.py check`) holds the reopened heading and its `compare/v<version>...HEAD` link — it does not reject a hand-authored version section, so this one is on you. The full rule is in [AGENTS.md](AGENTS.md#repo-hygiene).
 
 ### Releases
 
 Releases are cut by maintainers with `scripts/release.py`, which is two-phase:
 
-- **`prepare X.Y.Z`** runs on a release branch — it validates that the CHANGELOG's `## [Unreleased]` section was promoted into `## [X.Y.Z]`, stamps the version everywhere via `sync_version.py`, regenerates TUI assets when they changed, and commits, leaving the branch ready for a PR.
+- **`prepare X.Y.Z`** runs on a release branch. **Promote the CHANGELOG by hand first** — rename `## [Unreleased]` to `## [X.Y.Z] — <ISO date>` and reopen an empty `## [Unreleased]` above it; `prepare` does not do this for you and refuses to run until it is done. It then stamps the version everywhere via `sync_version.py`, regenerates TUI assets when they changed, and commits, leaving the branch ready for a PR.
 - **`publish`** runs on `main` after that PR merges (driven by `.github/workflows/release.yml`) — it creates the tag and GitHub release from the CHANGELOG, and is idempotent.
 
 Version strings are stamped only by `scripts/sync_version.py`; never hand-edit them in `pyproject.toml`, `module.yaml`, `marketplace.json`, or `uv.lock`. The version is validated in CI — if you touch it, run `uv run --no-project python scripts/sync_version.py --check`.
@@ -139,7 +140,7 @@ We will reject PRs that read like raw LLM output: bulk refactors nobody asked fo
 3. **Create a branch**: `git checkout -b fix/description` or `git checkout -b feature/description`
 4. **Make changes** — keep them focused
 5. **Changelog**: add an entry under `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md) for any user-visible change
-6. **Verify**: `trunk check`, `uv run pytest -q`, and `uv run pyright` all pass — CI runs all three
+6. **Verify**: `trunk check`, `uv run pytest -q`, and `uv run pyright` all pass — CI runs all three, plus packaging, version/changelog sync, Windows, and Python 3.11–3.14 ([docs/testing.md](docs/testing.md#ci-flakes-and-deliberate-absences))
 7. **Commit**: `git commit -m "fix: correct typo in README"`
 8. **Push**: `git push origin fix/description`
 9. **Open PR** from your fork on GitHub
