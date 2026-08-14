@@ -2667,8 +2667,6 @@ for antigravity`, immediately after a successful `init --cli antigravity`). Both
   Still pending live E2E and a `usage_parser` — `probe-adapter` captures the token schema to write
   one.
 
-### Docs
-
 - **Adapter authoring guide.** New [adapter authoring guide](docs/adapter-authoring-guide.md)
   walks through finalizing a CLI profile with `probe-adapter` (scan vs probe, the PII model, and
   the parser-writing loop); `probe-adapter` is added to both command references.
@@ -2741,6 +2739,9 @@ for antigravity`, immediately after a successful `init --cli antigravity`). Both
 - **MIT license + open-source community files.** The project is now MIT-licensed (© BMad Code, LLC)
   with a trademark notice, and ships `CONTRIBUTING`, `SECURITY`, `CODE_OF_CONDUCT`, and GitHub
   issue/PR templates as it becomes a first-class citizen in the BMAD org.
+- **Uninstall procedure.** The [setup guide](docs/setup-guide.md#uninstalling) now documents a
+  full teardown — reclaim disk, remove `.automator/`, skills, hooks, and gitignore lines, then
+  `uv tool uninstall`.
 
 ### Changed
 
@@ -2750,12 +2751,6 @@ for antigravity`, immediately after a successful `init --cli antigravity`). Both
   (`bmad-auto-*`), tmux sessions, and `BMAD_AUTO_*` env vars are unchanged. The separate legacy
   [bmad-automator](https://github.com/bmad-code-org/bmad-automator) project is unrelated and stays
   as-is. Re-run `uv tool upgrade bmad-auto --reinstall` to move an existing install onto the new name.
-
-### Docs
-
-- **Uninstall procedure.** The [setup guide](docs/setup-guide.md#uninstalling) now documents a
-  full teardown — reclaim disk, remove `.automator/`, skills, hooks, and gitignore lines, then
-  `uv tool uninstall`.
 
 ## [0.5.0] — 2026-06-20
 
@@ -3131,4 +3126,4 @@ enforced in CI.
 [0.3.1]: https://github.com/bmad-code-org/bmad-loop/commit/37dd884efaff
 [0.3.0]: https://github.com/bmad-code-org/bmad-loop/commit/11a9d5a067a6
 [0.2.0]: https://github.com/bmad-code-org/bmad-loop/commit/823adae1c047
-[0.1.0]: https://github.com/bmad-code-org/bmad-loop/commit/f0550a842210
+[0.1.0]: https://github.com/bmad-code-org/bmad-loop/commit/274f0f5b6fd2
