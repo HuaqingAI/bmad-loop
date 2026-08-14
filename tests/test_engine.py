@@ -1536,6 +1536,112 @@ def test_a_failed_commit_restores_the_park_record(project):
     assert not operatoractions.records_dir(project.project).exists()
 
 
+def _park_over_an_earlier_record(project, actions):
+    """A story that has been parked BEFORE, its record committed. Reaches the
+    restore's other branch: with a prior on disk `_write_park_record` captures
+    it, so the failure arms take the put-back write rather than the unlink the
+    row above covers."""
+    from bmad_loop import operatoractions
+
+    operatoractions.record_park(
+        project.project,
+        "1-1-a",
+        actions=actions,
+        spec_file="docs/spec-1-1-a.md",
+        run_id="run-0",
+        parked_at="2026-07-01",
+    )
+    record = operatoractions.record_path(project.project, "1-1-a")
+    git(project.project, "add", str(record))
+    git(project.project, "commit", "-q", "-m", "an earlier park's record")
+    engine = _park_engine(project)
+    _reject_commits(project)
+    return engine, record
+
+
+def test_a_failed_commit_puts_an_earlier_park_record_back(project):
+    """The restore's OTHER branch, and it was untested: a re-park over a record
+    that already exists must put the PRIOR text back, not just delete what this
+    attempt wrote. Left alone the committed record claims this run's actions for
+    a commit that does not exist, so `confirm` would discharge a park against a
+    tracked file whose content no history carries.
+
+    Byte-for-byte, and the put-back is atomic (#379): a torn restore leaves the
+    record neither version, and `load` reads a truncated record as an entry
+    owing nothing — the park silently discharged by the rollback.
+
+    Ablation: replace the `atomic_write_text` call with `pass` and this fails —
+    the record keeps this attempt's actions."""
+    from bmad_loop import operatoractions
+
+    prior_actions = ["the earlier park's action"]
+    engine, record = _park_over_an_earlier_record(project, prior_actions)
+    before = record.read_text(encoding="utf-8")
+
+    summary = engine.run()
+
+    assert summary.awaiting_operator == 0 and summary.paused  # the commit really did fail
+    assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
+    assert record.read_text(encoding="utf-8") == before  # byte-for-byte
+    assert operatoractions.load(project.project)["1-1-a"]["actions"] == prior_actions
+    # and it did not raise on the way: the restore reports its own failures
+    kinds = {e["kind"] for e in engine.journal.entries()}
+    assert "park-record-rollback-failed" not in kinds
+
+
+def test_a_failed_park_record_rollback_is_journaled_not_raised(project, monkeypatch):
+    """The restore runs INSIDE the commit window's except arms, so anything it
+    raises displaces what those arms exist to carry: the `GitError` arm would
+    skip `_escalate` and strand the story in COMMITTING with no diagnosis, and
+    the `BaseException` arm would skip its bare `raise` and swap a graceful
+    `RunStopped` for a write complaint.
+
+    The oracle is NOT a `pytest.raises` — the whole property is that nothing
+    escapes. It is the run's disposition (the failed COMMIT's, not the failed
+    rollback's) plus the journal line, because a bare suppress would leave this
+    invisible: `validate` reports a board parked with no record, never a record
+    left over for a park in no commit.
+
+    `OSError` is the injected type deliberately. Unlike `_restore_deferred_closes`
+    this site passes `follow_symlinks=False`, so no `Path.resolve` runs and the
+    pre-3.13 `RuntimeError`-on-symlink-loop cannot arise — widening the guard here
+    would be copying a fix for a call this one does not make.
+
+    Patched as bound in `engine` and FILTERED BY FILENAME: the module has four
+    `atomic_write_text` sites on one binding, so a module-wide boom survives a
+    revert of this site and would go green by crashing from a different one.
+
+    Ablation: delete the `self.journal.append` and this fails on the journal row
+    alone; delete the whole `except OSError` arm and it fails on `not
+    summary.crashed` — the escaping OSError preempts the escalation."""
+    from bmad_loop import operatoractions
+
+    engine, record = _park_over_an_earlier_record(project, ["the earlier park's action"])
+    real = platform_util.atomic_write_text
+
+    def boom(path, text, *, follow_symlinks=True):
+        if Path(path).name == record.name:
+            raise OSError(30, "Read-only file system")
+        return real(path, text, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr("bmad_loop.engine.atomic_write_text", boom)
+
+    summary = engine.run()
+
+    # the disposition is the failed COMMIT's, not the failed rollback's
+    assert summary.paused and not summary.crashed
+    assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
+    reasons = [e["reason"] for e in engine.journal.entries() if e["kind"] == "story-escalated"]
+    assert len(reasons) == 1 and reasons[0].startswith("commit failed:")
+    # the rollback's own failure is on the record, naming the type — `str(e)`
+    # alone cannot say whether the disk or the path was at fault
+    failed = [e for e in engine.journal.entries() if e["kind"] == "park-record-rollback-failed"]
+    assert len(failed) == 1 and failed[0]["error"].startswith("OSError: ")
+    # honest about what did NOT happen: the restore never landed, so the record
+    # still claims a park no commit carries. Advisory, journaled, human-attended.
+    assert operatoractions.load(project.project)["1-1-a"]["actions"] == ACTIONS
+
+
 def test_an_unresolvable_spec_path_still_records_the_park(project, monkeypatch):
     """`_park_spec_relpath` resolves inside a try catching `(OSError, ValueError)`,
     and below 3.13 `Path.resolve` reports a symlink loop as `RuntimeError` —

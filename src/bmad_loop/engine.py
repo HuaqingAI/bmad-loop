@@ -2524,7 +2524,7 @@ class Engine:
             task.restore_patch = None
         except verify.GitError as e:
             self._restore_deferred_closes(task, snapshot)
-            self._restore_park_record(park_record)
+            self._restore_park_record(task, park_record)
             self._escalate(task, f"commit failed: {e}")
         except BaseException:
             # A failed commit is not the only way out of this window: the signal
@@ -2535,7 +2535,7 @@ class Engine:
             # ledger flipped — and the park record written — for a commit that
             # does not exist. Restore, then re-raise untouched.
             self._restore_deferred_closes(task, snapshot)
-            self._restore_park_record(park_record)
+            self._restore_park_record(task, park_record)
             raise
         # Final-phase rule: AWAITING_OPERATOR iff the task carries actions,
         # otherwise DONE. Derived from PERSISTED task state, never from a local
@@ -2628,24 +2628,61 @@ class Engine:
             return None
         return (path, prior)
 
-    def _restore_park_record(self, record: tuple[Path, str | None] | None) -> None:
+    def _restore_park_record(self, task: StoryTask, record: tuple[Path, str | None] | None) -> None:
         """Put the park record back the way `_write_park_record` found it, for
         the failure arms of the commit window: a `GitError` escalation or a
         pass-through raise must not leave a record — untracked, in a tree the
         next story's `git add -A` would sweep — for a commit that does not
-        exist. Best-effort like `_restore_deferred_closes`: the restore runs
-        under an exception already in flight and must never replace it."""
+        exist. Best-effort like `_restore_deferred_closes`, and for the same two
+        reasons that arm imposes: in the `BaseException` arm an exception is
+        genuinely travelling and this must not replace it, while in the
+        `GitError` arm the error is already HANDLED and `_escalate` raises a
+        fresh `RunPaused` — so the hazard there is preempting the escalation,
+        which would strand the story in COMMITTING with no diagnosis on the
+        record. Either way, this never raises.
+
+        The put-back is atomic (#379). A torn restore leaves the record neither
+        as the park wrote it nor as it was found, and `load` reads a truncated
+        record as an entry owing nothing — a park silently discharged by a
+        rollback of the commit it was written for.
+
+        `OSError` stays the guard, and stays wide enough BECAUSE of
+        `follow_symlinks=False`: no-follow skips `Path.resolve` entirely, so the
+        pre-3.13 `RuntimeError`-on-symlink-loop that forced
+        `_restore_deferred_closes` (and `tui.launch`) to widen to `Exception`
+        cannot arise on this path. That widening is a property of the resolve,
+        not of the helper — do not copy it back here. The no-follow itself is
+        right for the same reason it is right in `operatoractions.record_park`,
+        which writes this exact file: machine-minted, under a project root a
+        driven session writes all run long.
+
+        A failure is journaled rather than dropped, matching the model above:
+        `validate` reports a board parked with no record but never a record left
+        over for a park that is in no commit, so nothing else would ever surface
+        this. The journal call is itself suppressed — a restore that must not
+        raise cannot be allowed to raise on the way to saying it failed."""
         if record is None:
             return
         path, prior = record
-        with contextlib.suppress(OSError):
+        try:
             if prior is None:
                 path.unlink(missing_ok=True)
                 parent = path.parent
                 if parent.is_dir() and not any(parent.iterdir()):
                     parent.rmdir()
             else:
-                path.write_text(prior, encoding="utf-8")
+                atomic_write_text(path, prior, follow_symlinks=False)
+        except OSError as e:
+            with contextlib.suppress(Exception):
+                self.journal.append(
+                    "park-record-rollback-failed",
+                    story_key=task.story_key,
+                    record=str(path),
+                    # named, not bare `str(e)`: an errno message alone cannot say
+                    # whether the disk or the path was at fault. Matches
+                    # `deferred-close-rollback-failed`.
+                    error=f"{e.__class__.__name__}: {e}",
+                )
 
     def _notify_park(self, task: StoryTask) -> None:
         """Tell the human a story is waiting on them, and exactly what for.

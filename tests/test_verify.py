@@ -1905,6 +1905,85 @@ def test_safe_rollback_restores_committed_policy_on_clean_tree(project):
     assert pol.read_text() == "[scm]\nrollback_on_failure = true\n"  # survived
 
 
+def test_safe_rollback_restores_the_policy_through_the_atomic_helper(project, monkeypatch):
+    """#379. The put-back was a bare `policy_path.write_bytes`, which truncates
+    the file to zero and refills it in place: a host lost mid-write comes back
+    with the operator's config neither reverted nor restored, and a truncated
+    TOML is not a smaller config but a parse error the next `bmad-loop run`
+    refuses on — arriving immediately after a rollback that already discarded the
+    attempt's work. The helper fsyncs before the replace, so the crash window
+    yields the old file or the whole new one.
+
+    Graded by WRAPPING the binding rather than replacing it: the real write still
+    lands, so the content assertion below is not measuring the stub. Recording
+    the call also pins "exactly one write", which the guard above it is there to
+    guarantee — a retry loop or a second unconditional write could not creep in
+    unnoticed.
+
+    Ablation: revert the call to `policy_path.write_bytes(policy_content)` and
+    this reddens on `len(seen) == 1` — the helper is never reached."""
+    repo = project.project
+    baseline = verify.rev_parse_head(repo)  # baseline predates policy.toml
+    pol = repo / ".bmad-loop" / "policy.toml"
+    pol.parent.mkdir(parents=True, exist_ok=True)
+    pol.write_bytes(b"[scm]\nrollback_on_failure = true\n")
+    git(repo, "add", "-f", str(pol))
+    git(repo, "commit", "-q", "-m", "add policy after baseline")
+    seen: list[tuple[Path, bytes]] = []
+    real = verify.atomic_write_bytes
+
+    def record(path, data, *, follow_symlinks=True):
+        seen.append((Path(path), data))
+        real(path, data, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(verify, "atomic_write_bytes", record)
+
+    verify.safe_rollback(repo, baseline, baseline_untracked=None, keep=(".bmad-loop",))
+
+    assert len(seen) == 1
+    assert seen[0] == (pol, b"[scm]\nrollback_on_failure = true\n")
+    assert pol.read_bytes() == b"[scm]\nrollback_on_failure = true\n"  # and it landed
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_safe_rollback_replaces_a_policy_symlink_by_name(project):
+    """#379. The one row that grades this SITE's `follow_symlinks=False` argument.
+    Unlike the other writers moved to the helper on this branch, the expression
+    replaced here was a direct `write_bytes` — which opens the name and so writes
+    THROUGH a planted link — so no-follow is a genuine change of behaviour, not a
+    preservation of what `os.replace` already did.
+
+    It is still the right change. `policy.write_mux_backend` already replaces this
+    same file by name, so a link at `.bmad-loop/policy.toml` does not survive the
+    orchestrator anyway; and `runsetup` states a driven session can write that
+    path, which makes the link a session-chosen redirect for a host-side write.
+    The reachable exploit is narrow but real, and it is exactly what this row
+    builds: the restore only fires when the reset CHANGED what the name reads, so
+    the redirect has to aim at a tracked in-repo file — which the reset then
+    reverts and this write immediately clobbers with policy bytes.
+
+    Ablation: drop `follow_symlinks=False` and this reddens alone — the link
+    survives and `shared.toml` is the file that gets rewritten."""
+    repo = project.project
+    shared = repo / "shared.toml"  # tracked, and NOT the operator's policy
+    shared.write_bytes(b"[scm]\nrollback_on_failure = false\n")
+    git(repo, "add", str(shared))
+    git(repo, "commit", "-q", "-m", "a tracked file a session could aim at")
+    baseline = verify.rev_parse_head(repo)
+    pol = repo / ".bmad-loop" / "policy.toml"
+    pol.parent.mkdir(parents=True, exist_ok=True)
+    pol.symlink_to(Path("..") / "shared.toml")
+    # the capture reads THROUGH the link, and the reset reverts what it points at,
+    # so the put-back is reached with the link still standing
+    shared.write_bytes(b"[scm]\nrollback_on_failure = true\n")
+
+    verify.safe_rollback(repo, baseline, baseline_untracked=None, keep=(".bmad-loop",))
+
+    assert not pol.is_symlink()  # the NAME was replaced
+    assert pol.read_bytes() == b"[scm]\nrollback_on_failure = true\n"
+    assert shared.read_bytes() == b"[scm]\nrollback_on_failure = false\n"  # not through
+
+
 def test_attempt_dirty_ignores_lone_policy_edit(project):
     """A diff confined to policy.toml is operator config, not the attempt's
     dirtiness — so a stopped attempt whose only residue is a policy edit reads as

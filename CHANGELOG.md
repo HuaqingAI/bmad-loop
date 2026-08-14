@@ -82,6 +82,32 @@ breaking changes may land in a minor release.
   refuses a linked config outright, before the write. These two files also land at `0600` rather than
   `0644` from now on, the same tightening as above.
 
+- **The put-backs are atomic too (#363, #379).** Four write sites that restore a file _after_
+  something already failed, the last of the family. Each of them runs at the worst possible moment
+  for a second loss.
+
+  - `safe_rollback` captures `.bmad-loop/policy.toml` before the `git reset --hard` and writes it
+    back after, so an operator's config survives a rollback whether it was committed or not. That
+    put-back now goes through `atomic_write_bytes`. It lands immediately after a rollback that has
+    already discarded the attempt's work, and a truncated TOML is not a smaller config — it is a
+    parse error the next `run` refuses on.
+  - The park records `bmad-loop confirm` reads — the per-story file and the legacy machine-local
+    index `drop` prunes — were already temp-and-replace and keep that behaviour. They gain the fsync
+    before the replace, a temp named uniquely per write in place of the fixed `.tmp` sibling two
+    writers would collide on, and the shared unlink-on-raise in place of their hand-rolled one. A
+    record left truncated by a lost host reads as a park owing nothing while the board still says a
+    human owes something.
+  - The engine's restore of a park record after a failed commit writes atomically as well, and
+    journals its own failure as `park-record-rollback-failed` rather than dropping it. Nothing else
+    would surface that: `validate` reports a board parked with no record, never a record left over
+    for a park that is in no commit.
+
+  All four replace the file _by name_ (`follow_symlinks=False`), matching `policy.write_mux_backend`
+  and `record_park`, the other writers of the same two files. For the two that were direct writes
+  this is a change rather than a preservation — they opened the name, and so wrote through any link
+  planted at it, on paths a driven session can reach. Both files land at `0600` rather than `0644`
+  from now on, the same tightening as above.
+
 ## [0.10.0] — 2026-08-14
 
 Much of this section is the `release/0.9.x` hotfix line brought forward onto `main` (#433).

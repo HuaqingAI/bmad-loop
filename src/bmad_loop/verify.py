@@ -1000,7 +1000,19 @@ def safe_rollback(
         current = policy_path.read_bytes() if policy_path.is_file() else None
         if current != policy_content:
             policy_path.parent.mkdir(parents=True, exist_ok=True)
-            policy_path.write_bytes(policy_content)
+            # Atomic, and by NAME (#379). This is a put-back after a rollback has
+            # already discarded the run's work, so a torn write costs the operator
+            # their orchestration config on top of it — and a truncated policy.toml
+            # is not a smaller config but a parse error the next `bmad-loop run`
+            # refuses on, which is the failure the whole restore exists to avoid.
+            # `follow_symlinks=False` is a real change here (a bare `write_bytes`
+            # opens the name and so writes THROUGH a link), and it is the right
+            # one twice over: `policy.write_mux_backend` already replaces this same
+            # file by name, so no link at this path survives the orchestrator
+            # anyway; and `runsetup` states a driven session can write
+            # `.bmad-loop/policy.toml`, so honouring a link planted there would aim
+            # a host-side write at a path of that session's choosing.
+            atomic_write_bytes(policy_path, policy_content, follow_symlinks=False)
     if baseline_untracked is None:
         return  # no snapshot to diff against: never delete untracked files
     created = untracked_files(repo) - set(baseline_untracked)

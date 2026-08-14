@@ -10,6 +10,7 @@ drifted.
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 from conftest import git, install_bmad_config, spec_path, write_spec, write_sprint
@@ -163,15 +164,23 @@ def test_the_record_is_written_atomically_and_parsable(project):
 
 def test_a_failed_record_write_leaves_no_tmp_residue(project, monkeypatch):
     """The record is written just ahead of `finalize_commit`'s `git add -A`, so
-    a stranded `.tmp` would ride the story's own commit — one story's half-write
+    a stranded temp would ride the story's own commit — one story's half-write
     polluting its own history forever.
 
-    Ablation: drop the unlink in `record_park`'s except arm and this fails."""
+    The fault is injected at `platform_util.atomic_replace`, one layer BELOW the
+    helper `record_park` now delegates to (#379), and that placement is the whole
+    test: stubbing `atomic_write_text` itself would mean no temp was ever
+    created, so "no residue" would pass for that reason rather than for the
+    unlink. Faulting the publish instead runs the helper's real body — mkstemp,
+    write, fsync — so the assertion grades a temp that genuinely existed.
+
+    Ablation: drop the `tmp.unlink()` in `platform_util._atomic_write`'s except
+    arm and this fails."""
 
     def boom(tmp, target):
         raise OSError(28, "No space left on device")
 
-    monkeypatch.setattr(operatoractions, "atomic_replace", boom)
+    monkeypatch.setattr("bmad_loop.platform_util.atomic_replace", boom)
     with pytest.raises(OSError):
         operatoractions.record_park(
             project.project,
@@ -183,6 +192,35 @@ def test_a_failed_record_write_leaves_no_tmp_residue(project, monkeypatch):
         )
     records = operatoractions.records_dir(project.project)
     assert not list(records.glob("*.tmp")) and not list(records.glob("*.json"))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_the_record_replaces_a_planted_symlink_by_name(project, tmp_path):
+    """#379. The one row that grades this SITE's `follow_symlinks=False` argument
+    rather than the helper's implementation of it, which `test_platform_util.py`
+    pins by calling the helper directly.
+
+    Behaviour-preserving: the hand-rolled write this replaced ended in
+    `os.replace`, which never dereferenced its destination either, so passing the
+    default True here would have CHANGED what `record_park` does rather than
+    merely relaxing it. It is also what the record IS — a machine-minted file
+    under a project root a driven session writes all run long — so honouring a
+    link planted at the record's own name would turn the park's bookkeeping into
+    a host-side write at a path of that session's choosing.
+
+    Ablation: drop `follow_symlinks=False` in `record_park` and this reddens
+    alone — the link survives and the planted target is what gets rewritten."""
+    outside = tmp_path / "someone-elses-file"
+    outside.write_text("not a park record\n", encoding="utf-8")
+    link = operatoractions.record_path(project.project, "1-1-a")
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(outside)
+
+    _record_only(project)
+
+    assert not link.is_symlink()  # the NAME was replaced
+    assert operatoractions.load(project.project)["1-1-a"]["actions"] == ACTIONS
+    assert outside.read_text(encoding="utf-8") == "not a park record\n"  # not through
 
 
 # ------------------------------------------------------- git sees the record
@@ -268,11 +306,15 @@ def test_a_failed_legacy_prune_leaves_no_tmp_residue(project, monkeypatch):
     blocks the next run's preflight and the epic-boundary auto-sweep.
 
     TWO entries, deliberately: with one, the prune takes the `else` arm and
-    unlinks the store outright, never reaching `atomic_replace`. That is what
-    the `pytest.raises` is for — it fails LOUDLY on `DID NOT RAISE` rather than
+    unlinks the store outright, never reaching the rewrite. That is what the
+    `pytest.raises` is for — it fails LOUDLY on `DID NOT RAISE` rather than
     letting the residue assertion pass over a rewrite that never ran.
 
-    Ablation: drop the unlink in `_drop_legacy`'s except arm and this fails."""
+    Faulted at `platform_util.atomic_replace` for its sibling row's reason (#379):
+    below the helper, so a temp is really created and really unlinked.
+
+    Ablation: drop the `tmp.unlink()` in `platform_util._atomic_write`'s except
+    arm and this fails."""
 
     def boom(tmp, target):
         raise OSError(28, "No space left on device")
@@ -283,7 +325,7 @@ def test_a_failed_legacy_prune_leaves_no_tmp_residue(project, monkeypatch):
     before = sorted(p.name for p in store.parent.iterdir())
     assert before == ["operator-actions.json"]  # a snapshot with something IN it
 
-    monkeypatch.setattr(operatoractions, "atomic_replace", boom)
+    monkeypatch.setattr("bmad_loop.platform_util.atomic_replace", boom)
     with pytest.raises(OSError):
         operatoractions.drop(project.project, "1-1-a")
 
@@ -293,6 +335,34 @@ def test_a_failed_legacy_prune_leaves_no_tmp_residue(project, monkeypatch):
     # the entry stays confirmable once whatever broke the write is fixed.
     assert sorted(p.name for p in store.parent.iterdir()) == before
     assert sorted(operatoractions.load(project.project)) == ["1-1-a", "2-2-b"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_the_legacy_prune_replaces_a_planted_symlink_by_name(project, tmp_path):
+    """The `_drop_legacy` half of the record row above (#379): same argument, a
+    different write, and its own ablation. Reachable for a different reason too —
+    `drop` is what `bmad-loop confirm` calls, out of band and on a machine whose
+    repo a driven session has been writing all run long.
+
+    TWO entries again, so the prune takes the rewrite arm; the one-entry `else`
+    arm unlinks the store outright and never reaches the helper at all.
+
+    Ablation: drop `follow_symlinks=False` in `_drop_legacy` and this reddens
+    alone — the link survives and the planted target is what gets rewritten."""
+    _legacy_entry(project, "1-1-a")
+    _legacy_entry(project, "2-2-b")
+    store = operatoractions.legacy_store_path(project.project)
+    kept = store.read_text(encoding="utf-8")
+    outside = tmp_path / "someone-elses-file"
+    outside.write_text(kept, encoding="utf-8")  # the store's real bytes, behind the link
+    store.unlink()
+    store.symlink_to(outside)
+
+    assert operatoractions.drop(project.project, "1-1-a") is True
+
+    assert not store.is_symlink()  # the NAME was replaced
+    assert sorted(operatoractions.load(project.project)) == ["2-2-b"]
+    assert outside.read_text(encoding="utf-8") == kept  # not written through
 
 
 def test_drop_matches_the_records_own_key_not_its_filename(project):
