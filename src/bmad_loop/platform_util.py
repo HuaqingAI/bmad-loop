@@ -445,6 +445,19 @@ def atomic_write_bytes(path: Path, data: bytes, *, follow_symlinks: bool = True)
     _atomic_write(path, data, mode="wb", encoding=None, follow_symlinks=follow_symlinks)
 
 
+def _is_name_too_long(exc: OSError) -> bool:
+    """True if ``exc`` is the filesystem refusing a name for its LENGTH, under
+    either platform's spelling of that condition.
+
+    Two spellings because win32 does not use the POSIX one: CPython's
+    ``PC/errmap.h`` maps ``ERROR_FILENAME_EXCED_RANGE`` to ``ENOENT``, so there
+    the errno is indistinguishable from an absent directory and only
+    ``.winerror`` tells them apart (see ``_WINERROR_FILENAME_EXCED_RANGE``)."""
+    if exc.errno == errno.ENAMETOOLONG:
+        return True
+    return getattr(exc, "winerror", None) == _WINERROR_FILENAME_EXCED_RANGE
+
+
 def _mkstemp_beside(target: Path) -> tuple[int, str]:
     """``mkstemp`` in ``target``'s own directory, prefixed with its name so the
     temp is recognisably that target's staging file — and so it ends in ``.tmp``
@@ -478,19 +491,33 @@ def _mkstemp_beside(target: Path) -> tuple[int, str]:
     this whole fallback dead on Windows — where, per the ``MAX_PATH`` note above,
     it is if anything easier to reach than on ext4.
 
-    A second failure propagates — that one is the DIRECTORY being too long, which
-    no choice of prefix can fix."""
+    The rungs STRICTLY SHORTEN, and the last one carries no prefix at all. A
+    digest is 16 characters, so on its own it is not a fallback — against a
+    basename of 16 or fewer it stages a name no shorter than the one that just
+    failed, and retrying at the same width cannot succeed. That is unreachable
+    where the binding limit is per-component (a POSIX ``NAME_MAX`` rung is only
+    reached past 242 characters, far above the digest) and reachable where it is
+    the whole path, which is the win32 case: a short basename in a directory near
+    ``MAX_PATH`` overflows on the staging suffix alone. So the digest rung is used
+    only while it actually shortens, and a bare ``mkstemp`` — the shortest name
+    this function can produce — always ends the ladder.
+
+    Only a failure at that last rung propagates, and by then the claim it carries
+    is true: no choice of prefix can fix it, so what does not fit is the
+    DIRECTORY."""
     directory = str(target.parent)
-    try:
-        return tempfile.mkstemp(dir=directory, prefix=target.name + ".", suffix=".tmp")
-    except OSError as e:
-        too_long = e.errno == errno.ENAMETOOLONG or (
-            getattr(e, "winerror", None) == _WINERROR_FILENAME_EXCED_RANGE
-        )
-        if not too_long:
-            raise
     digest = hashlib.blake2b(os.fsencode(target.name), digest_size=8).hexdigest()
-    return tempfile.mkstemp(dir=directory, prefix=digest + ".", suffix=".tmp")
+    rungs = [target.name + "."]
+    if len(digest) < len(target.name):
+        rungs.append(digest + ".")
+    rungs.append("")
+    for prefix in rungs[:-1]:
+        try:
+            return tempfile.mkstemp(dir=directory, prefix=prefix, suffix=".tmp")
+        except OSError as e:
+            if not _is_name_too_long(e):
+                raise
+    return tempfile.mkstemp(dir=directory, prefix=rungs[-1], suffix=".tmp")
 
 
 def _atomic_write(

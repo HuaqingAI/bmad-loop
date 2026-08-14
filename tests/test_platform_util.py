@@ -920,6 +920,28 @@ def test_atomic_write_bytes_stages_a_basename_that_fills_name_max(tmp_path, monk
     assert list(tmp_path.glob("*.tmp")) == []
 
 
+def _exceed_range() -> OSError:
+    """Win32's "the name does not fit", which arrives as ENOENT and is told apart
+    from a missing directory only by `.winerror` — see `_is_name_too_long`."""
+    exceeded = OSError(errno.ENOENT, "The filename or extension is too long")
+    exceeded.winerror = 206  # pyright: ignore[reportAttributeAccessIssue]
+    return exceeded
+
+
+def _failing_mkstemp(prefixes: list[str], fail_first: int):
+    """A `mkstemp` that records each prefix it is handed and refuses the first
+    `fail_first` attempts with win32's too-long error, then delegates."""
+    real_mkstemp = tempfile.mkstemp
+
+    def fake_mkstemp(*, dir, prefix, suffix):
+        prefixes.append(prefix)
+        if len(prefixes) <= fail_first:
+            raise _exceed_range()
+        return real_mkstemp(dir=dir, prefix=prefix, suffix=suffix)
+
+    return fake_mkstemp
+
+
 def test_atomic_write_bytes_stages_via_digest_when_win32_reports_exceed_range(
     tmp_path, monkeypatch
 ):
@@ -936,38 +958,97 @@ def test_atomic_write_bytes_stages_via_digest_when_win32_reports_exceed_range(
     Driven through an injected error rather than a real long name because this
     runs on POSIX too, where no path produces winerror 206 — and a
     `skipif(win32)` row would leave the branch unexercised on every CI leg but
-    two. The injection is the mechanism the code actually reads (`getattr(e,
-    "winerror", None)`), so it is the predicate under test, not a stand-in for it.
+    two. The injection is the mechanism the code actually reads
+    (`_is_name_too_long`), so it is the predicate under test, not a stand-in.
 
-    Asserts the SECOND prefix stopped being the readable one rather than matching
-    the digest: what has to hold is that the retry re-prefixed, not which scheme
-    produced it — same reason as the row above.
+    The basename is deliberately LONGER than a 16-character digest, which is what
+    puts the digest rung on the ladder at all — see the row below for the short
+    basename that skips it.
 
-    Ablation: drop the `getattr(e, "winerror", ...)` disjunct in `_mkstemp_beside`
-    and this fails alone, on the injected `OSError` propagating out of
-    `atomic_write_bytes` before any assertion. The POSIX `..._fills_name_max` row
-    stays green under it — it arrives on the errno arm, which the ablation leaves
-    intact."""
-    target = tmp_path / "spec.md"
-    real_mkstemp = tempfile.mkstemp
+    Asserts the retry STRICTLY SHORTENED rather than matching the digest: what
+    has to hold is that the next attempt is narrower than the one that failed,
+    not which scheme produced it.
+
+    Ablation: drop the `.winerror` arm of `_is_name_too_long` and all THREE
+    win32-injected rows redden together, on the injected `OSError` propagating out
+    of `atomic_write_bytes` before any assertion — they share that predicate, so
+    no one of them can fail alone under it. The disjointness proof is the row that
+    stays GREEN: POSIX `..._fills_name_max` arrives on the errno arm, which this
+    ablation leaves intact, so the two arms genuinely cover different conditions
+    rather than one masking the other."""
+    target = tmp_path / ("s" * 40 + ".md")
     prefixes: list[str] = []
-
-    def fake_mkstemp(*, dir, prefix, suffix):
-        prefixes.append(prefix)
-        if len(prefixes) == 1:
-            exceeded = OSError(errno.ENOENT, "The filename or extension is too long")
-            exceeded.winerror = 206  # pyright: ignore[reportAttributeAccessIssue]
-            raise exceeded
-        return real_mkstemp(dir=dir, prefix=prefix, suffix=suffix)
-
-    monkeypatch.setattr(platform_util.tempfile, "mkstemp", fake_mkstemp)
+    monkeypatch.setattr(platform_util.tempfile, "mkstemp", _failing_mkstemp(prefixes, 1))
 
     platform_util.atomic_write_bytes(target, b"payload")
 
     assert target.read_bytes() == b"payload"
     assert len(prefixes) == 2  # the retry happened at all
+    assert prefixes[0] == target.name + "."
+    assert prefixes[1] != ""  # the DIGEST rung, not the bare one
+    assert len(prefixes[1]) < len(prefixes[0])  # strictly shorter than what failed
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_atomic_write_bytes_skips_the_digest_rung_when_it_would_not_shorten(tmp_path, monkeypatch):
+    """A digest is 16 characters, so against a basename that short or shorter it
+    is not a fallback at all — it stages a name no NARROWER than the one that
+    just failed, and a retry at the same width cannot succeed.
+
+    Unreachable where the binding limit is per-component: a POSIX `NAME_MAX` rung
+    is only reached past a 242-character basename, far above the digest. Reachable
+    where the limit is the whole path, which is the win32 `MAX_PATH` case — a
+    short basename in a deep directory overflows on the staging suffix alone, and
+    a 29-character digest temp is then LONGER than the readable one it replaced.
+
+    So the ladder drops that rung and goes straight to a bare `mkstemp`, the
+    shortest name this function can produce.
+
+    Ablation: append the digest rung unconditionally and this reddens alone, on
+    `prefixes[1] == ""` — the digest is attempted for a 7-character basename it
+    cannot help. The long-basename row above stays green, because there the
+    digest genuinely shortens and the rung belongs on the ladder."""
+    target = tmp_path / "spec.md"  # 7 chars — a 16-char digest is no improvement
+    prefixes: list[str] = []
+    monkeypatch.setattr(platform_util.tempfile, "mkstemp", _failing_mkstemp(prefixes, 1))
+
+    platform_util.atomic_write_bytes(target, b"payload")
+
+    assert target.read_bytes() == b"payload"
     assert prefixes[0] == "spec.md."
-    assert prefixes[1] != "spec.md."  # the digest replaced the readable prefix
+    assert len(prefixes) == 2  # no wasted attempt at a name that cannot fit
+    assert prefixes[1] == ""  # straight to the shortest name available
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_atomic_write_bytes_ends_the_ladder_at_a_bare_temp(tmp_path, monkeypatch):
+    """When the digest rung ALSO cannot fit, the ladder still has one rung left.
+
+    This is the case that makes the docstring's closing claim true. Keying the
+    fallback on a single digest retry meant a second failure was reported as "the
+    directory is too long, which no prefix can fix" while a shorter prefix — the
+    empty one — would in fact have fit. Only once the last rung carries no prefix
+    at all is a failure there genuinely about the directory.
+
+    Ablation: delete the trailing bare rung so the ladder ends at the digest and
+    TWO rows redden — this one, on the second injected `OSError` propagating, and
+    the skip row above. Measured, not assumed: the bare rung is the fallback for
+    both of them, since a basename too short for the digest has no other rung to
+    fall to. They stay separate rows because they reach it for different reasons —
+    one because the digest was skipped, one because the digest was tried and also
+    failed — and only this one pins that a THIRD attempt exists at all."""
+    target = tmp_path / ("s" * 40 + ".md")
+    prefixes: list[str] = []
+    monkeypatch.setattr(platform_util.tempfile, "mkstemp", _failing_mkstemp(prefixes, 2))
+
+    platform_util.atomic_write_bytes(target, b"payload")
+
+    assert target.read_bytes() == b"payload"
+    assert len(prefixes) == 3
+    assert prefixes[2] == ""  # the shortest name the function can stage
+    # every rung strictly narrower than the one it replaced
+    assert [len(p) for p in prefixes] == sorted((len(p) for p in prefixes), reverse=True)
+    assert len(set(prefixes)) == 3
     assert list(tmp_path.glob("*.tmp")) == []
 
 
@@ -986,8 +1067,10 @@ def test_atomic_write_bytes_propagates_a_staging_error_that_is_not_a_long_name(
     make one winerror mean two things in one codebase.
 
     Ablation: relax the guard so nothing re-raises and this reddens alone, on
-    `len(calls) == 1` reading 2 — the second, doomed `mkstemp` runs under the
-    digest prefix. Note which assertion does NOT catch it: `caught.value.errno ==
+    `len(calls) == 1` reading 2 — the second, doomed `mkstemp` runs under the next
+    rung, which for this 7-character basename is the BARE one (a 16-character
+    digest cannot shorten it). Note which assertion does NOT catch it:
+    `caught.value.errno ==
     EACCES` still passes, because the retry fails the same way the first attempt
     did. The call count is the load-bearing assertion here; an errno check alone
     would pass through the widened guard and pin nothing."""
