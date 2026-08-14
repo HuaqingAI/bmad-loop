@@ -322,10 +322,11 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
-- **The settings editor's `review.trigger` help no longer names the pre-rename dev primitive.**
-  Its `recommended` blurb read "only when bmad-dev-auto flags it", a name upstream retired in BMAD
-  6.10.1, so the TUI named a skill a current install does not have. It now says `bmad-build-auto`,
-  matching the `docs/tui-guide.md` table it mirrors.
+- **The settings editor's `review.trigger` help no longer names a dev primitive that may be absent.**
+  Its `recommended` blurb said "only when bmad-dev-auto flags it", a name upstream retired in BMAD
+  6.10.1 but still correct on the 6.10.0 support floor — either spelling is wrong for the other era.
+  It now says "the dev pass", matching the adjacent `review.enabled` description and the
+  `docs/tui-guide.md` table it mirrors; the `policy.toml` template `init` writes got the same fix.
 
 - **The `version-sync` gate no longer passes on a marketplace.json it could not read.**
   `sync_version.check()` iterated `market.get("plugins", [])`, so a renamed, deleted or emptied

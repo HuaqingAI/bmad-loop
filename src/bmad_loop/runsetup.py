@@ -438,6 +438,8 @@ def make_adapters(
         # config. `synthesizes` is a bmad-build-auto pipeline concept (which variant
         # of a family to build + whether to thread `paths`), NOT a per-family
         # branch — it stays a documented contract for every registered adapter.
+        # `policy.dev.skill` below is the stable adapter DISCRIMINATOR (see
+        # policy.DevPolicy), NOT the invoked name — it keeps the pre-rename spelling.
         synthesizes = role in ("dev", "review") and policy.dev.skill == "bmad-dev-auto"
         key = (cfg, synthesizes)
         if key not in by_cfg:

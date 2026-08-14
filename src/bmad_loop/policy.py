@@ -1157,13 +1157,13 @@ desktop = true               # notify-send (Linux) / osascript (macOS) / PowerSh
 file = true                  # ATTENTION file in the run dir
 
 [review]
-# enabled = true  -> run a follow-up review session (bmad-build-auto re-invoked on
-#                    the done spec for a fresh review pass) after a dev pass.
-# enabled = false -> skip that session; the bmad-build-auto pass's own inline review
+# enabled = true  -> run a follow-up review session (the dev primitive re-invoked
+#                    on the done spec for a fresh review pass) after a dev pass.
+# enabled = false -> skip that session; the dev pass's own inline review
 #                    is the only review and it finalizes the story straight to done.
 enabled = true
 # trigger (only consulted when enabled = true) decides WHEN that session runs:
-#   "recommended" -> only when the bmad-build-auto pass flags the story with
+#   "recommended" -> only when the dev pass flags the story with
 #                    `followup_review_recommended: true` (it self-reviews inline
 #                    and flags this when its changes warrant an independent pass).
 #   "always"      -> run the second-opinion review on every story.
