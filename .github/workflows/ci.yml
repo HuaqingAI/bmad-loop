@@ -55,10 +55,11 @@ jobs:
     # Real-Windows runner for the deterministic suite (live psmux e2e stays a manual gate).
     name: test (windows, py${{ matrix.python-version }})
     runs-on: windows-latest
-    # 20, not the 15 the Linux test job uses: the slowest observed Windows run
+    # 20, not the 15 the Linux test job uses: the slowest pre-lever Windows run
     # took 888s against a 900s cap, so one slow runner was a bad minute away from
-    # a timeout that reads as a test failure. The levers above should pull the
-    # mean well down; this keeps the tail from failing the build first.
+    # a timeout that reads as a test failure. The levers below cut the measured
+    # mean to ~316s, but the leg still spreads 220-348s run to run; the extra
+    # headroom keeps that tail from failing the build first.
     timeout-minutes: 20
     # The suite reads/writes UTF-8 files; Windows' cp1252 default would break plain
     # text I/O. UTF-8 mode (PEP 686's Python 3.15 default) makes the runner match the
@@ -87,10 +88,10 @@ jobs:
 
       - name: Run tests
         # pytest roots `tmp_path` at `tempfile.gettempdir()`, which follows
-        # TMP/TEMP on Windows. The user-profile temp has historically sat on the
-        # slow C: volume while the workspace and RUNNER_TEMP sit on D:, so every
-        # per-test sandbox copy crossed to the slower disk; pin both to the
-        # workspace volume. A no-op if the default temp is already there.
+        # TMP/TEMP on Windows. Measured on the windows-2025 image (2026-08-14):
+        # the default is C:\Users\RUNNER~1\AppData\Local\Temp while the workspace
+        # and RUNNER_TEMP sit on D:\a — so every per-test sandbox copy crossed to
+        # the slower volume. Pinning both to RUNNER_TEMP keeps them on D:.
         # Step-level, not job-level: the `runner` context is unavailable in a
         # job `env:` block, where this would silently expand to empty.
         env:
