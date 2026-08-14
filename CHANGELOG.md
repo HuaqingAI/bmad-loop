@@ -322,6 +322,20 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
+- **Contributor docs now name every obligation CI enforces.** `CONTRIBUTING.md` never mentioned
+  `pyright` or the CHANGELOG, so its verify step — "`trunk check` and `uv run pytest -q` both
+  pass" — sent contributors into a CI failure on the dedicated typecheck job. It now carries
+  `uv run pyright`, the `## [Unreleased]` CHANGELOG contract, the Windows `PYTHONUTF8=1`
+  requirement and the Python 3.11 floor, the real extras (`tui`, `non-linux`, `opencode` — it
+  claimed only `tui`), and `scripts/release.py`'s two-phase `prepare`/`publish` flow. The pull
+  request template gains a matching Changelog section.
+- **Documentation accuracy pass.** `bmad-loop adapters` was a real command missing from the
+  README's table (`relay` stays out on purpose, with a note saying why — it is a hook target, and
+  no installed hook reaches the console script yet). The README's docs list omitted five guides
+  and never linked `docs/README.md`, the full index. The `[dev]` policy section was documented
+  nowhere; `docs/FEATURES.md` now lists all 15 sections rather than 12. The roadmap's native-Windows
+  entry was marked `planned` ("agreed, not started") while its own body said psmux had shipped.
+  `AGENTS.md`'s leaf-module count was `~25`; it is 28.
 - **A failed ledger write can no longer empty the deferred-work ledger (#328).** `Path.write_text`
   truncates the file and only then encodes, so any failure in that window — an unencodable value,
   `ENOSPC`, `EIO` — left a zero-byte ledger with every entry gone. `append_decision`,

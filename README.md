@@ -79,6 +79,7 @@ bmad-loop tui                    # …or drive everything from the dashboard
 | `bmad-loop init`                                         | Install the bundled `bmad-loop-*` skills, the hook relay, `.bmad-loop/policy.toml`, and a gitignore for the runs dir, plugin caches, and policy.toml itself (policy is per-machine — see the CHANGELOG migration note for repos initialized before this). `--cli <profile>` (repeatable) targets specific agents; `--no-skills` / `--force-skills` control skill copying.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `bmad-loop validate`                                     | Preflight every prerequisite: BMAD config, sprint-status, git, CLI binary, hook registration, and a platform check that reports the selected multiplexer's readiness and process host (listing every registered backend when more than one is detected). `--spec <folder>` validates that folder's `stories.yaml` for a stories-mode run instead of the sprint-status queue. `--json` emits the preflight as a stable machine-readable document (see [Scripting `validate`](#scripting-validate)).                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `bmad-loop mux`                                          | List registered terminal-multiplexer backends — platform match, availability, version, and which one is selected (and why). `mux set <name>` persists a machine-scoped choice into `.bmad-loop/policy.toml` (`--clear` reverts to auto-select, `--force` allows a name that only registers on the target machine); the `BMAD_LOOP_MUX_BACKEND` env var outranks it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `bmad-loop adapters`                                     | List registered coding-CLI adapter **kinds** — name, builtin/external, whether the family drives a multiplexer, and which profiles select each — the CLI axis's counterpart to `mux`. Unlike `mux` there is no global choice to persist: a kind is selected per profile by its `adapter` field. A profile naming an unregistered kind, and any out-of-tree adapter/profile package that failed to load, get a `warning:` on stderr.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `bmad-loop run`                                          | Drive the dev → review → verify → commit loop. `--epic N`, `--story KEY`, `--max-stories N`, `--dry-run`. `--spec <folder>` forces **stories mode** (folder+id dispatch off `<folder>/stories.yaml`), overriding `[stories].source`; `--story` then filters by story id.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `bmad-loop sweep`                                        | Triage + execute open `deferred-work.md` entries. `--no-prompt`, `--decisions-only`, `--max-bundles N`, `--repeat`, `--max-cycles N`, `--dry-run`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `bmad-loop resume <run-id>`                              | Continue a run paused at a gate, escalation, or interruption.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
@@ -100,6 +101,12 @@ bmad-loop tui                    # …or drive everything from the dashboard
 Every command takes `--project <dir>` (default: the current directory). Any `<run-id>` may be a
 partial — the tail after the last `-` (e.g. `a1b2`), shortened to any prefix that stays unique;
 `bmad-loop list` shows each run's short ref.
+
+> One subcommand is deliberately left out of the table: `bmad-loop relay <Event>` writes a single
+> session event file from a coding-CLI hook payload on stdin. Its own help calls it "a hook target
+> for machines, not a command to run by hand" — it takes no `--project`, and `bmad-loop init`
+> currently registers the copied workspace relay (`.bmad-loop/bmad_loop_hook.py`) instead, so no
+> installed hook reaches the console script today. Never invoke it yourself.
 
 ## The TUI
 
@@ -419,6 +426,14 @@ on_status_contradiction = "escalate"
                            # sign-off the orchestrator recorded at dev time) pauses the run naming
                            # both sides; "retry" = legacy — burn review cycles, then defer + roll back
 
+[dev]                      # which inner dev skill the orchestrator drives
+skill = "bmad-dev-auto"    # the only supported value — the generic upstream dev primitive.
+                           # Retained as the seam for a future alternative dev skill, and it is
+                           # NOT the name sessions are dispatched with: upstream renamed the
+                           # primitive to bmad-build-auto, so the invoked name is resolved from
+                           # what is on disk and projects on either era work with this untouched.
+                           # No settings-schema entry: edit it here, not in the TUI editor.
+
 [adapter]
 name = "claude"            # CLI profile: claude | codex | gemini | copilot | antigravity | opencode-http (alias: opencode) | custom
 model = ""                 # empty = CLI default (opencode-http wants "provider/model")
@@ -663,14 +678,21 @@ The hero **demo GIF** (`docs/images/demo.gif`) is generated the same headless wa
 
 ## Documentation
 
+**[docs/README.md](docs/README.md) is the full index** — every guide, grouped by when you need it. The highlights:
+
 - **[docs/FEATURES.md](docs/FEATURES.md)** — full feature & functionality list and the capability matrix (feature → problem addressed).
 - **[docs/setup-guide.md](docs/setup-guide.md)** — installing the module + the `/bmad-loop-setup` walkthrough.
 - **[docs/tui-guide.md](docs/tui-guide.md)** — the complete TUI reference.
 - **[src/bmad_loop/data/skills/README.md](src/bmad_loop/data/skills/README.md)** — the `bmad-loop` skill module overview.
 - **[docs/ROADMAP.md](docs/ROADMAP.md)** — planned/deferred orchestrator work and the rationale behind it.
+- **[docs/multiplexer-backends.md](docs/multiplexer-backends.md)** — which backend drives your agent sessions, how selection resolves, and how external backends register.
 - **[docs/adapter-authoring-guide.md](docs/adapter-authoring-guide.md)** — authoring CLI adapters & profiles (and transport backends).
 - **[docs/plugin-authoring-guide.md](docs/plugin-authoring-guide.md)** — authoring plugins (hooks, workflows, settings).
 - **[docs/game-engine-plugin-guide.md](docs/game-engine-plugin-guide.md)** — the game-engine plugin shape (Unity reference).
+- **[docs/game-engine-mcp-guide.md](docs/game-engine-mcp-guide.md)** — Editor-MCP specifics for the bundled Unity plugin, and its `BMAD_LOOP_*` env-var reference.
+- **[docs/tea-plugin-guide.md](docs/tea-plugin-guide.md)** — the bundled `tea` plugin and the test-architecture steps it injects.
+- **[docs/porting-to-a-new-os.md](docs/porting-to-a-new-os.md)** — the four OS seams and what a native-Windows port costs end to end.
+- **[docs/testing.md](docs/testing.md)** — the layer model, fixture/ablation doctrines, quality guards, and the zero-token invariant.
 
 ## Contributing
 

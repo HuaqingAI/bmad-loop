@@ -50,7 +50,7 @@ Two orthogonal seams: **which CLI** (adapter axis: `adapters/base.py` `CodingCLI
 | `tui/`                                     | Textual dashboard (`tui` extra); observer/launcher only — never runs engines in-process     |
 | `plugins/`                                 | manifest-driven extension layer (`plugin.toml`, trust tiers, hook bus)                      |
 
-~25 further leaf modules — read the module docstring before assuming. Deeper maps: [docs/FEATURES.md](docs/FEATURES.md), [docs/adapter-authoring-guide.md](docs/adapter-authoring-guide.md), [docs/multiplexer-backends.md](docs/multiplexer-backends.md).
+28 further leaf modules — read the module docstring before assuming. Deeper maps: [docs/FEATURES.md](docs/FEATURES.md), [docs/adapter-authoring-guide.md](docs/adapter-authoring-guide.md), [docs/multiplexer-backends.md](docs/multiplexer-backends.md).
 
 ## Testing
 
