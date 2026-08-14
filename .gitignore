@@ -5,6 +5,7 @@ __pycache__/
 .ruff_cache/
 *.egg-info/
 .bmad-loop/runs/
+.bmad-loop/archive/
 .claude/
 .agents/
 build/
