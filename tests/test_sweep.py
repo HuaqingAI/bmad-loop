@@ -2155,7 +2155,7 @@ def test_preanswered_keep_open_suppresses_prompt_and_persists(project):
     assert decisions.load_pre_answers(project.project)["DW-1"]["effect"] == "keep-open"
 
 
-# ------------------------------------------- #363: the two `decisions.json` writes
+# ------------------------------- the two per-run `decisions.json` writes (cf. #363)
 #
 # `sweep.atomic_write_text` is ONE module binding shared by FOUR call sites: the
 # `_ensure_migration` ledger restore, the two `_decisions_phase` writes below, and
@@ -2171,9 +2171,17 @@ def test_preanswered_keep_open_suppresses_prompt_and_persists(project):
 
 
 def test_seeded_decisions_write_failure_strands_nothing(project, monkeypatch):
-    """#363, the pre-answer-seeded write. Before the move to the helper this was a
-    hand-rolled `decisions.json.tmp` + `atomic_replace`; a failed replace left the
-    temp behind, and under `.bmad-loop/` nothing gitignores it.
+    """The pre-answer-seeded write. Before the move to the helper this was a
+    hand-rolled `decisions.json.tmp` + `atomic_replace`, and a failed replace left
+    the temp behind.
+
+    NOT #363's exposure, despite the shared helper and the shared filename. This
+    `decisions.json` is `engine.run_dir / "decisions.json"` — under
+    `.bmad-loop/runs/<id>/`, which `init` gitignores — so a stranded temp here was
+    never untracked and never held `worktree_clean` False. #363's file is the
+    project-level `.bmad-loop/decisions.json` (`decisions._write_store`), a
+    different file one directory up. What this row pins is the helper's
+    unlink-on-raise on a site that took it for the fsync and the unique temp name.
 
     The `decision-preanswered` journal line is a PRECONDITION, not decoration: it is
     appended before the write, so without it `assert not ... .exists()` would pass
@@ -2227,8 +2235,10 @@ def test_seeded_decisions_write_failure_strands_nothing(project, monkeypatch):
 
 
 def test_interactive_decision_write_failure_strands_nothing(project, monkeypatch):
-    """#363, the interactive write — the same hand-rolled shape as the seeded one
-    above, on the same path, a few lines further down.
+    """The interactive write — the same hand-rolled shape as the seeded one above,
+    on the same path, a few lines further down, and covered by the same correction
+    in that docstring: this is the per-run `decisions.json`, not #363's
+    project-level store.
 
     Two preconditions rather than one. `decision-pending` is appended before
     `prompter.ask`, so it proves the phase was entered; `decision-answered` is

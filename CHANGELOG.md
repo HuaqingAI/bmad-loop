@@ -82,16 +82,16 @@ breaking changes may land in a minor release.
   rather than dropping it. Nothing else would ever surface that — `validate` reports a board parked
   with no record, but never a record left over for a park that is in no commit.
 
-- **Five writers under `.bmad-loop/` no longer strand an untracked temp when their replace fails
+- **Four writers under `.bmad-loop/` no longer strand an untracked temp when their replace fails
   (#363).** Each built a fixed-name temp and then `os.replace`d it, and `atomic_replace` does no
   cleanup of its own. No ignore rule covers those names — `init` writes `.bmad-loop/runs/`,
   `.bmad-loop/cache/`, `.bmad-loop/policy.toml` and `_bmad/render/` — so a failed replace left an
   untracked file holding `verify.worktree_clean` False until a human deleted it by hand.
 
-  - Four route through the helpers, which name the temp uniquely per write and remove it on any
-    raise: the pre-answer store (`decisions.json`), both of the sweep's `decisions.json` writes,
-    `policy.toml`'s `[mux] backend` writer, and the TUI settings editor's save. The last two built
-    the _same_ `.bmad-loop/policy.toml.tmp` path, so they could also collide with each other.
+  - Three route through the helpers, which name the temp uniquely per write and remove it on any
+    raise: the pre-answer store (`.bmad-loop/decisions.json`), `policy.toml`'s `[mux] backend`
+    writer, and the TUI settings editor's save. The last two built the _same_
+    `.bmad-loop/policy.toml.tmp` path, so they could also collide with each other.
   - `archive_run` keeps writing its own tarball — the path goes to `tarfile.open`, so there is no
     payload for a helper to take — and gains the unlink-on-raise guard instead. Its temp was also
     misnamed: `with_suffix` replaces only the last suffix, so `<id>.tar.gz` yielded
@@ -100,10 +100,12 @@ breaking changes may land in a minor release.
   Under a monorepo `repo_root:` override this surfaces as a failing `validate` and TUI rather than
   a blocked `run`: `run` and `sweep` probe the repo root, `validate` and the TUI probe the project.
 
-  Three more temp-and-replace writers were hardened the same way without having been exposed — the
-  two park-record writers behind `bmad-loop confirm` and `drop`, and `devcontract`'s spec writer.
-  They gain the fsync before the replace, a unique temp name in place of a fixed `.tmp` sibling two
-  concurrent writers would collide on, and the shared unlink-on-raise in place of a hand-rolled one.
+  Five more temp-and-replace writers took the same helper without having been exposed: the sweep's
+  two `decisions.json` writes, whose file is the per-run one under the gitignored
+  `.bmad-loop/runs/<id>/` and not the project-level store named above; the two park-record writers
+  behind `bmad-loop confirm` and `drop`, which already carried a hand-rolled guard; and
+  `devcontract`'s spec writer. All five gain the fsync before the replace and a unique temp name in
+  place of a fixed `.tmp` sibling that two concurrent writers would collide on.
 
   **Scope, for both entries above.** This closes the _raise_ path, and only that. The helpers stage
   at `mkstemp(dir=target.parent, suffix=".tmp")`, so a `SIGKILL` mid-write still strands a temp

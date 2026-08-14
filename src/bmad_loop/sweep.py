@@ -951,8 +951,15 @@ class SweepEngine(Engine):
             )
             seeded = True
         if seeded:
-            # #363: the helper unlinks its temp on any raise. follow_symlinks=False
-            # replaces the NAME, which is what the bare replace did too.
+            # Same helper as `decisions._write_store` (#363), but NOT for #363's
+            # reason: `decisions_path` here is the PER-RUN file under
+            # `.bmad-loop/runs/<id>/`, which init gitignores, so a stranded temp
+            # was never untracked and never held `worktree_clean` False. The
+            # project-level `.bmad-loop/decisions.json` is a different file with a
+            # near-identical temp name — that is the exposed one. Taken anyway for
+            # the fsync and the unique temp name, which two writers of one key
+            # would otherwise collide on. follow_symlinks=False replaces the NAME,
+            # which is what the bare replace did too.
             atomic_write_text(decisions_path, json.dumps(answers, indent=2), follow_symlinks=False)
         pending = [d for d in plan.decisions if d.id not in answers]
         answered_interactively = False
@@ -989,7 +996,7 @@ class SweepEngine(Engine):
                     "effect": option.effect,
                     "answered_at": self._today(),
                 }
-                atomic_write_text(  # #363, as the seeded write above
+                atomic_write_text(  # same file, same reasoning as the seeded write above (#363)
                     decisions_path, json.dumps(answers, indent=2), follow_symlinks=False
                 )
                 self.journal.append(
