@@ -1,6 +1,7 @@
 """Escalation-resolution: context build, re-arm, spec field writer, session."""
 
 import json
+import sys
 
 import pytest
 import yaml
@@ -186,6 +187,108 @@ def test_set_frontmatter_field_inserts_without_introducing_a_foreign_line_ending
     assert text == "---\rtitle: t\rstatus: done\rbaseline_revision: abc123\r---\r\rbody\r"
     assert "\n" not in text
     assert verify.read_frontmatter(spec)["baseline_revision"] == "abc123"
+
+
+# --- set_frontmatter_field: atomic write (#379) ---
+#
+# Three rows for the three distinct choices at this call site — that it routes
+# through the helper at all, that it is the BYTES helper, and that it does not
+# follow a link. `verify` holds its own binding of `atomic_write_bytes`, separate
+# from `frontmatter`'s; tests/test_frontmatter.py grades the sibling status writer
+# through that other binding, and neither set reaches the other's site.
+
+
+def test_set_frontmatter_field_write_failure_raises_and_keeps_the_spec(tmp_path, monkeypatch):
+    """A spec is laid out `before + edited + after`, so the truncating `write_bytes`
+    this replaced could publish intact frontmatter over a decapitated body. Worse
+    here than for the status sibling: the field this writer re-stamps is
+    `baseline_revision`, the anchor the patch-restore re-arm computes every later
+    diff against, so a spec that keeps the key while losing the body is one the
+    re-arm then treats as authoritative.
+
+    Patched at verify's OWN binding, never `Path.write_bytes`: the helper writes
+    through an `mkstemp` fd via `os.fdopen`, so a `Path` patch never fires and this
+    would pass having exercised nothing.
+
+    Ablation: restore `path.write_bytes(...)` at the call site and this reddens
+    alone, on `pytest.raises` not raising — the import stays, so the stub still
+    installs, it simply never gets called."""
+    spec = tmp_path / "spec.md"
+    spec.write_text(SPEC, encoding="utf-8")
+    before = spec.read_bytes()
+
+    def boom(path, data, *, follow_symlinks=True):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(verify, "atomic_write_bytes", boom)
+    with pytest.raises(OSError, match="no space left"):
+        verify.set_frontmatter_field(spec, "baseline_revision", "abc123")
+
+    assert spec.read_bytes() == before
+    assert b"baseline_revision" not in spec.read_bytes()  # the insert that must not land
+
+
+def test_set_frontmatter_field_hands_the_helper_bytes_not_text(tmp_path, monkeypatch):
+    """Grades BYTES-vs-text at this site, platform-independently.
+    `test_set_frontmatter_field_replaces_without_relaying_crlf` above already forbids
+    relaying — but `atomic_write_text` keeps `Path.write_text`'s translating newline
+    default and on POSIX `os.linesep == "\\n"`, so swapping the text helper in
+    reddens that row on WINDOWS ONLY and CI's Linux leg would call the swap green.
+
+    So inspect the payload the helper is handed, upstream of any translation. The
+    binding is WRAPPED rather than replaced, so the real write still happens.
+
+    BOTH helper names are wrapped into the same list, the text one with
+    `raising=False` since `verify` does not import it. That is what makes the
+    `isinstance` line the assertion that fires: wrapping only the bytes name would
+    grade "the bytes helper was called", so the swap would redden on an empty `seen`
+    and this row would be claiming more than it checked.
+
+    Ablation: swap `atomic_write_bytes` for `atomic_write_text` (dropping the
+    `.encode`) and this reddens on every platform, on the `isinstance` row."""
+    seen: list[bytes | str] = []
+    real = verify.atomic_write_bytes
+
+    def record(path, data, *, follow_symlinks=True):
+        seen.append(data)
+        blob = data if isinstance(data, bytes) else data.encode("utf-8")
+        real(path, blob, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(verify, "atomic_write_bytes", record)
+    monkeypatch.setattr(verify, "atomic_write_text", record, raising=False)
+    spec = tmp_path / "spec.md"
+    spec.write_bytes(b"---\r\ntitle: t\r\nstatus: done\r\n---\r\n\r\nbody\r\n")
+
+    assert verify.set_frontmatter_field(spec, "baseline_revision", "abc123") is True
+
+    assert len(seen) == 1  # exactly one write — no retry loop crept in
+    assert isinstance(seen[0], bytes)
+    assert b"baseline_revision: abc123\r\n" in seen[0]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_set_frontmatter_field_replaces_a_planted_symlink(tmp_path):
+    """The row that grades this SITE's `follow_symlinks=False` argument rather than
+    the helper's implementation of it (pinned in test_platform_util.py, where the
+    helper is called directly).
+
+    Same reasoning as the two sibling writers of these files: no-follow matches the
+    name-replacing `atomic_replace` `devcontract._atomic_write_spec` already used,
+    and the spec path reaches this writer from a scan of a directory a driven session
+    owns — writing THROUGH a planted link would hand that session a host-side write
+    to any operator-writable path.
+
+    Ablation: drop `follow_symlinks=False` at the call and this reddens alone."""
+    real = tmp_path / "someone-elses-file"
+    real.write_text(SPEC, encoding="utf-8")
+    link = tmp_path / "spec.md"
+    link.symlink_to(real)
+
+    assert verify.set_frontmatter_field(link, "baseline_revision", "abc123") is True
+
+    assert not link.is_symlink()  # the NAME was replaced
+    assert verify.read_frontmatter(link)["baseline_revision"] == "abc123"
+    assert real.read_text(encoding="utf-8") == SPEC  # not written through
 
 
 # ----------------------------------------------------------- build_context

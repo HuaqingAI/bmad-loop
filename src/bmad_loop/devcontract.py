@@ -30,7 +30,7 @@ from typing import Any
 from . import deferredwork
 from .fences import fenced as _fenced
 from .frontmatter import _edit_frontmatter_block, status_of
-from .platform_util import atomic_replace
+from .platform_util import atomic_write_bytes
 from .verify import DEV_WORKFLOW, operator_actions_of, read_frontmatter
 
 # The section the skill appends on EVERY terminal path (success and blocked),
@@ -556,22 +556,23 @@ def _atomic_write_spec(spec_path: Path, text: str) -> None:
     rename, so an interrupted / short / disk-full write can never truncate the
     canonical spec — a failed repair must lose no work (fault injection on the old
     truncating ``write_text`` reduced a 46-byte spec to 12). Bytes are written
-    verbatim (``write_bytes``, not ``write_text``): every caller here has already
-    captured and preserved the file's own line endings, and ``write_text``'s
+    verbatim (``atomic_write_bytes``, not the text sibling): every caller here has
+    already captured and preserved the file's own line endings, and text mode's
     ``newline=None`` default would re-translate ``\\n``→``\\r\\n`` on Windows. The
-    ``.tmp`` sibling ends in ``.tmp`` (not ``.md``), so the ``*.md`` artifact scans
-    never see it. On any failure the temp file is removed and the error re-raised —
-    the callers impose best-effort, the writer never swallows."""
-    tmp = spec_path.with_suffix(spec_path.suffix + ".tmp")
-    try:
-        tmp.write_bytes(text.encode("utf-8"))
-        atomic_replace(tmp, spec_path)
-    except BaseException:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        raise
+    temp ends in ``.tmp`` (not ``.md``), so the ``*.md`` artifact scans never see
+    it. On any failure the temp file is removed and the error re-raised — the
+    callers impose best-effort, the writer never swallows.
+
+    Now a thin name over `platform_util.atomic_write_bytes` (#379) rather than a
+    hand-rolled temp: same shape, plus an fsync before the replace and a temp name
+    unique per write instead of a fixed ``<spec>.md.tmp`` two concurrent writers
+    would collide on. ``follow_symlinks=False`` keeps the name-replacing semantics
+    the `atomic_replace` here always had — the spec path comes from a
+    session-driven scan, so writing THROUGH a planted link would hand that session
+    a host-side write wherever it chose. The two `frontmatter`-side writers of
+    these same files land on the identical call (#379); this wrapper stays for its
+    callers' ``str``-in signature and this docstring."""
+    atomic_write_bytes(spec_path, text.encode("utf-8"), follow_symlinks=False)
 
 
 def _render_status_line(line: str, m: re.Match[str], value: str) -> str:

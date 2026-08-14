@@ -15,6 +15,8 @@ from pathlib import Path
 
 import yaml
 
+from .platform_util import atomic_write_text
+
 EPIC_RE = re.compile(r"^epic-(\d+)$")
 RETRO_RE = re.compile(r"^epic-(\d+)-retrospective$")
 RETRO_ITEM_RE = re.compile(r"^epic-(\d+)-retro-item-(\d+)-(.+)$")
@@ -243,6 +245,19 @@ def advance(path: Path, story_key: str, target: str, *, now: str | None = None) 
     refresh `last_updated` when `now` is given. Comments/structure are preserved
     via line edits. Returns the story's status after the call (== `target` on a
     write), or None when nothing was eligible.
+
+    The rewrite is atomic (#379). This is a read-modify-rewrite of the board, and
+    a truncating `write_text` that faults partway through corrupts it SILENTLY:
+    YAML cut at a line boundary is still a valid mapping, just a smaller one, so
+    the epics past the tear cease to exist rather than raising. AGENTS.md makes
+    this the orchestrator's sole write path to sprint-status.yaml, so nothing
+    downstream would contradict the shortened board — the run would simply walk
+    off the end of the sprint. `atomic_write_text` keeps the file entire: either
+    the old contents or the whole new ones, never a prefix.
+
+    Symlinks are FOLLOWED (the helper's default), which is what the truncating
+    write did too — the board is an operator-curated file at a project-relative
+    path, and a repo that symlinks it somewhere must keep being a symlink.
     """
     if not path.is_file():
         return None
@@ -279,7 +294,7 @@ def advance(path: Path, story_key: str, target: str, *, now: str | None = None) 
         changed = _set_mapping_value(lines, "last_updated", now) or changed
 
     if changed:
-        path.write_text("".join(lines), encoding="utf-8")
+        atomic_write_text(path, "".join(lines))
     return target
 
 

@@ -30,6 +30,7 @@ from .frontmatter import (
     status_of,
 )
 from .model import StoryTask, VerifyOutcome
+from .platform_util import atomic_write_bytes
 from .policy import POLICY_FILE, Policy
 from .sprintstatus import STATUS_ORDER, story_status
 
@@ -1375,10 +1376,16 @@ def set_frontmatter_field(path: Path, key: str, value: str) -> bool:
     appended, so the spec carried the key twice and the reader resolved the
     wrong one.
 
-    Byte-preserving on the same terms as its sibling: ``read_bytes().decode`` in,
-    ``write_bytes`` out, so a CRLF spec is not relaid to LF (nor an LF one to
-    CRLF on Windows) by a write contracted to move one field. The INSERTED line
-    takes the block's own ending, not a bare ``\\n``.
+    Byte-preserving on the same terms as its sibling: ``read_bytes().decode`` in
+    and bytes out, so a CRLF spec is not relaid to LF (nor an LF one to CRLF on
+    Windows) by a write contracted to move one field. The INSERTED line takes the
+    block's own ending, not a bare ``\\n``.
+
+    Atomic on the same terms too (#379) — `platform_util.atomic_write_bytes`,
+    ``follow_symlinks=False``, matching what `devcontract._atomic_write_spec`
+    already does to the same files. Use the BYTES helper and not the text one:
+    `atomic_write_text` keeps ``Path.write_text``'s translating newline default,
+    which would relay ``\\n``→``\\r\\n`` on Windows and undo the paragraph above.
     """
     if not path.is_file():
         return False
@@ -1390,7 +1397,7 @@ def set_frontmatter_field(path: Path, key: str, value: str) -> bool:
     edited = _edit_frontmatter_block(block, key, value, insert=True)
     if edited is None:
         return False
-    path.write_bytes((before + edited + after).encode("utf-8"))
+    atomic_write_bytes(path, (before + edited + after).encode("utf-8"), follow_symlinks=False)
     return True
 
 

@@ -40,6 +40,27 @@ breaking changes may land in a minor release.
   reads and writes bytes on purpose, to preserve a CRLF file's line endings. The default stays
   `True`, which the private-git-exclude caller depends on.
 
+- **A failed write can no longer silently shrink the sprint board or behead a spec (#379).** Both are
+  read-modify-rewrites that went out through a truncating write, and both fail _quietly_ — the file
+  still parses afterwards, so nothing downstream raises.
+
+  - `sprintstatus.advance` is the orchestrator's sole write path to `sprint-status.yaml`. A board cut
+    at a line boundary is still a valid mapping, just a smaller one, so the epics past the tear cease
+    to exist and the run walks off the end of the sprint instead of erroring. It now writes through
+    `atomic_write_text`, following symlinks as the write it replaced did — a board kept outside the
+    tree and symlinked in keeps being a symlink.
+  - The three writers of a story spec — `set_frontmatter_status`, `set_frontmatter_field` and
+    `devcontract`'s four in-place rewriters — now share one call: `atomic_write_bytes` with
+    `follow_symlinks=False`. A spec is laid out `before + edited + after`, so a torn write could
+    publish intact frontmatter saying `status: done` over a truncated body — a spec that lies, which
+    the loop then commits. The bytes helper, never the text one: these writers are byte-verbatim by
+    contract, and text mode would relay every line ending in the file on Windows.
+
+  `devcontract` was already atomic and keeps its behaviour; it drops its hand-rolled temp for the
+  shared helper, which adds an fsync before the replace and a temp name unique per write instead of a
+  fixed `<spec>.md.tmp` that two concurrent writers would collide on. Specs written by these paths
+  land at `0600` rather than `0644`, the same tightening the five writers above took.
+
 ## [0.10.0] — 2026-08-14
 
 Much of this section is the `release/0.9.x` hotfix line brought forward onto `main` (#433).
