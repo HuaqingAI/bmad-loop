@@ -15,7 +15,7 @@ from typing import Any
 import tomlkit
 
 from .. import policy as policy_mod
-from ..platform_util import atomic_replace
+from ..platform_util import atomic_write_text
 
 STAGES = ("dev", "review", "triage")
 
@@ -104,7 +104,11 @@ class PolicyDoc:
         return tomlkit.dumps(self._doc)
 
     def save(self, path: Path) -> None:
+        """#363: via the helper, which removes its temp on any raise. The
+        hand-rolled temp was the fixed name `.bmad-loop/policy.toml.tmp` —
+        gitignored by nothing, and byte-identical to the one
+        `policy.write_mux_backend` built, so the settings editor and the mux
+        writer raced on one name. Raises rather than degrades: the screen catches
+        OSError to show "save failed", which requires the raise to reach it."""
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".toml.tmp")
-        tmp.write_text(self.dumps(), encoding="utf-8")
-        atomic_replace(tmp, path)
+        atomic_write_text(path, self.dumps(), follow_symlinks=False)

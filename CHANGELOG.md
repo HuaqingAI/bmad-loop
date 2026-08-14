@@ -7,6 +7,39 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Five writers under `.bmad-loop/` can no longer leave an untracked temp file behind (#363, #379).**
+  Each wrote a fixed-name temp and then `os.replace`d it, and `atomic_replace` does no cleanup of
+  its own — so a failed replace stranded the temp. No ignore rule covers those names (`init` writes
+  `.bmad-loop/runs/`, `.bmad-loop/cache/`, `.bmad-loop/policy.toml` and `_bmad/render/`), which left
+  an untracked file holding `verify.worktree_clean` False until a human deleted it by hand. Under a
+  monorepo `repo_root:` override that surfaces as a failing `validate` and TUI rather than a blocked
+  `run`, which probe the repo root instead.
+
+  - Four now route through `atomic_write_text`/`atomic_write_bytes`, which name the temp uniquely per
+    write, fsync before the replace, and remove the temp on any raise: the pre-answer store
+    (`decisions.json`), both of the sweep's `decisions.json` writes, `policy.toml`'s `[mux] backend`
+    writer, and the TUI settings editor's save. The last two built the _same_
+    `.bmad-loop/policy.toml.tmp` path, so they could also collide with each other.
+  - `archive_run` keeps writing its own tarball — the path goes to `tarfile.open`, so there is no
+    payload for a helper to take — and gains the unlink-on-raise guard instead. Its temp was also
+    misnamed: `with_suffix` replaces only the last suffix, so `<id>.tar.gz` yielded
+    `<id>.tar.tar.gz.tmp`. It is now `<id>.tar.gz.tmp`.
+  - These five files land at `0600` rather than `0644` from now on. The hand-rolled temp was created
+    at `0666 & ~umask` and `os.replace` swapped _that_ inode into place, so they were already being
+    reset to `0644` on every rewrite; the replacement carries no mode over, which tightens them to
+    `mkstemp`'s private default.
+
+  Scope: this closes the _raise_ path. A `SIGKILL` mid-write can still strand a temp, and on Windows
+  `os.replace` is not guaranteed atomic — what is guaranteed is that a failed write cannot truncate
+  the original.
+
+- **`atomic_write_bytes` accepts `follow_symlinks`, as its text sibling already did.** Without it the
+  bytes helper could not express the no-follow choice the `policy.toml` writer needs — that writer
+  reads and writes bytes on purpose, to preserve a CRLF file's line endings. The default stays
+  `True`, which the private-git-exclude caller depends on.
+
 ## [0.10.0] — 2026-08-14
 
 Much of this section is the `release/0.9.x` hotfix line brought forward onto `main` (#433).

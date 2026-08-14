@@ -1946,6 +1946,90 @@ def test_worktree_clean_flags_untracked_non_policy(project):
     assert not verify.worktree_clean(project.project)
 
 
+def _porcelain(repo) -> set[str]:
+    """`git status --porcelain` as a set of RAW records.
+
+    Not conftest's `git()`: that returns `stdout.strip()`, which eats the leading
+    status space of the FIRST line only — so ` M path` arrives as `M path` or not,
+    depending on sort order. These assertions are about the exact two-character
+    status field, so they need the bytes git actually emitted."""
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return set(proc.stdout.splitlines())
+
+
+def test_worktree_clean_flags_a_stranded_policy_temp(project):
+    """#363's PREMISE, not its fix — nothing here exercises the atomic-write
+    change. It pins the reason the issue matters: a `.bmad-loop/policy.toml.tmp`
+    left behind by a failed replace is an UNTRACKED file that no ignore rule
+    covers, so `worktree_clean` goes False and stays False until a human deletes
+    it. Deleting the temp is what flips the verdict back, with the policy edit
+    still on disk.
+
+    Every porcelain assertion below is a PRECONDITION, deliberately spelled as an
+    exhaustive set rather than a fixture. `conftest._isolate_ambient_git_ignores`
+    is session-scoped and autouse, so it is inherited with no opt-in — but it
+    deliberately does NOT set `GIT_CONFIG_NOSYSTEM` (that would suppress
+    Git-for-Windows' system `core.autocrlf`), which leaves a system
+    `core.excludesFile`, a system `status.showUntrackedFiles=no`, and
+    `.git/info/exclude` all reachable. Step 6's single line closes every one of
+    them at once — plus untracked-dir collapsing — and does it as a LOUD red on
+    the precondition rather than a silent green on the verdict.
+
+    Ablation A10: change verify.py's `:(exclude){POLICY_FILE_REL}` to
+    `:(exclude){POLICY_FILE_REL}*` and step 7 reddens ALONE — the trailing glob
+    swallows the `.tmp` sibling too, which is the fake-green this test exists to
+    catch. `test_worktree_clean_ignores_policy_file` and
+    `test_worktree_clean_flags_untracked_non_policy` stay green.
+
+    Ablation A11: delete the `:(exclude)` element entirely and the OTHER direction
+    reddens — `test_worktree_clean_ignores_policy_file` goes red, and here it is
+    step 5's CONTROL that fires, ABORTING this test before step 7 is ever reached.
+    Read that precisely: under A11 step 7 does not "stay green", it does not run.
+    The pair is graded by WHICH STEP each ablation reddens — 7 for A10, 5 for A11 —
+    because steps 4-5 and 6-8 present git-visible states identical but for one
+    file and demand OPPOSITE verdicts. That is what makes this grade which NAME the
+    exclude covers, in both directions, rather than merely that it has one."""
+    repo = project.project
+    pol = repo / ".bmad-loop" / "policy.toml"
+    tmp = repo / ".bmad-loop" / "policy.toml.tmp"
+
+    # 1. track the policy file — this also makes `.bmad-loop/` a TRACKED directory,
+    #    so git can never collapse the untracked record below to `?? .bmad-loop/`
+    pol.parent.mkdir(parents=True, exist_ok=True)
+    pol.write_text('[gates]\nmode = "none"\n')
+    git(repo, "add", "-f", str(pol))
+    git(repo, "commit", "-q", "-m", "track policy")
+
+    assert _porcelain(repo) == set()  # 2. no ambient dirt
+    assert verify.worktree_clean(repo)  # 3. baseline verdict
+
+    # 4. PRECONDITION: git DOES see the edit
+    pol.write_text('[gates]\nmode = "per-epic"\n')
+    assert _porcelain(repo) == {" M .bmad-loop/policy.toml"}
+
+    assert verify.worktree_clean(repo)  # 5. CONTROL: policy.toml itself reads CLEAN
+
+    # 6. PRECONDITION: untracked reporting is ON, at FILE granularity, and nothing
+    #    ignores `*.tmp` — one line closing showUntrackedFiles=no, a system
+    #    excludesFile, .git/info/exclude and dir-collapsing together
+    tmp.write_text('[gates]\nmode = "per-epic"\n')
+    assert _porcelain(repo) == {
+        " M .bmad-loop/policy.toml",
+        "?? .bmad-loop/policy.toml.tmp",
+    }
+
+    assert not verify.worktree_clean(repo)  # 7. THE GRADED ASSERTION
+
+    # 8. differential: the verdict flips back with the policy edit still on disk
+    tmp.unlink()
+    assert verify.worktree_clean(repo)
+
+
 # ------------------------------------------------- git pathspec hardening (#423)
 #
 # Every fixture below is built in PYTHON, never through a shell: fish and zsh

@@ -407,20 +407,33 @@ def atomic_write_text(path: Path, text: str, *, follow_symlinks: bool = True) ->
     _atomic_write(path, text, mode="w", encoding="utf-8", follow_symlinks=follow_symlinks)
 
 
-def atomic_write_bytes(path: Path, data: bytes) -> None:
+def atomic_write_bytes(path: Path, data: bytes, *, follow_symlinks: bool = True) -> None:
     """Replace ``path``'s contents with ``data`` atomically — the byte-exact
     sibling of :func:`atomic_write_text`, whose docstring carries the shared
-    contract (symlinks followed, mode and xattrs preserved when the target already
-    exists, a fresh target left at ``mkstemp``'s private ``0600``, fsync before the
-    replace, temp removed on any failure).
+    contract (mode and xattrs preserved when the target already exists and
+    symlinks are followed, a fresh target left at ``mkstemp``'s private ``0600``,
+    fsync before the replace, temp removed on any failure).
 
-    The one difference is the whole point: ``data`` lands byte-for-byte. No encode
-    and no newline translation, so a payload carrying LF keeps LF on Windows and
-    bytes that are not valid text in any codec survive the round trip. Callers
-    handling filesystem-derived content want this variant — a POSIX filename is
-    arbitrary bytes, and an operator's git exclude file may be in any legacy
-    encoding at all."""
-    _atomic_write(path, data, mode="wb", encoding=None)
+    ``follow_symlinks`` behaves exactly as it does there. The default resolves
+    ``path`` first, so a file symlinked into the repo keeps being a symlink and
+    the real file is what gets rewritten — a replace against the link itself would
+    turn it into a regular file and orphan the target. ``follow_symlinks=False``
+    inverts that: the *name* is replaced, whatever it points at, and mode and
+    xattrs are then not inherited at all. Right for a machine-minted file living
+    somewhere a less-trusted writer can reach, where honouring a planted link
+    would aim this write at a path of that writer's choosing; wrong for the
+    operator-curated files the default was built for — including the private git
+    exclude ``install._worktree_local_exclude`` writes, which pre-creates the
+    target precisely so this helper has a umask mode to carry over.
+
+    The one difference from the text sibling is the whole point: ``data`` lands
+    byte-for-byte. No encode and no newline translation, so a payload carrying LF
+    keeps LF on Windows and bytes that are not valid text in any codec survive the
+    round trip. Callers handling filesystem-derived content want this variant — a
+    POSIX filename is arbitrary bytes, and an operator's git exclude file may be
+    in any legacy encoding at all — as do callers who read bytes to preserve a
+    file's existing line endings (``policy.write_mux_backend``)."""
+    _atomic_write(path, data, mode="wb", encoding=None, follow_symlinks=follow_symlinks)
 
 
 def _atomic_write(

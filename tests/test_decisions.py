@@ -68,6 +68,45 @@ def test_load_pre_answers_tolerates_garbage(project):
     assert decisions.load_pre_answers(project.project) == {}
 
 
+def test_record_pre_answer_write_failure_raises_and_keeps_the_store(project, monkeypatch):
+    """#363. `_write_store` is a read-modify-rewrite of a file nothing gitignores,
+    so its temp must not outlive a failed write: a stranded
+    `.bmad-loop/decisions.tmp` is an untracked file that holds `worktree_clean`
+    False until a human deletes it. Routing through the helper is what closes that
+    — it unlinks its own temp on any raise — and the raise still reaches the caller.
+
+    Patched at decisions' OWN binding, never `Path.write_text`: the helper writes
+    through an `mkstemp` fd via `os.fdopen`, so a `Path` patch never fires and the
+    test would pass having exercised nothing.
+
+    Ablation A3: revert `_write_store` to the hand-rolled `tmp.write_text(...)` +
+    `atomic_replace` and this reddens alone — loudly, as an AttributeError from
+    `monkeypatch.setattr`, because the module binding disappears with the revert."""
+    path = decisions.store_path(project.project)
+    decisions.record_pre_answer(
+        project.project,
+        "DW-7",
+        DecisionOption(key="1", label="Build it", effect="build", intent="do it"),
+        date="2026-06-13",
+    )
+    before = path.read_bytes()
+
+    def boom(path, text, *, follow_symlinks=True):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(decisions, "atomic_write_text", boom)
+    with pytest.raises(OSError, match="disk full"):
+        decisions.record_pre_answer(
+            project.project,
+            "DW-9",
+            DecisionOption(key="2", label="Keep as is", effect="keep-open"),
+            date="2026-06-14",
+        )
+
+    assert path.read_bytes() == before
+    assert b"DW-9" not in path.read_bytes()  # the specific mutation that must not land
+
+
 # ------------------------------------------------------- discovery
 
 

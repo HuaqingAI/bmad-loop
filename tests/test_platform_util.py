@@ -676,6 +676,75 @@ def test_atomic_write_bytes_writes_through_a_symlink(tmp_path):
     assert real.read_bytes() == b"after"
 
 
+# The no-follow trio for the BYTES helper (#363), mirroring the text trio above.
+# The bytes sibling grew `follow_symlinks` when `policy.write_mux_backend` moved onto
+# it: that site reads and writes bytes to preserve a CRLF policy.toml's endings, and
+# needs no-follow because a driven session can write `.bmad-loop/policy.toml`.
+#
+# ABLATION A1: drop the `follow_symlinks=follow_symlinks` forward in
+# `atomic_write_bytes` (leave the parameter, so callers still typecheck) and these
+# three redden together while the TEXT trio and the True-default pins above stay
+# green — the disjointness is what shows the forward, not the shared `_atomic_write`
+# body, is what these grade.
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_atomic_write_bytes_no_follow_replaces_the_link(tmp_path):
+    """The inverse of the sibling above: the *name* is replaced, whatever it points
+    at. Honouring a planted link would aim a machine-minted write at a path of the
+    planter's choosing, and no preflight check is what makes this safe — `os.replace`
+    does not dereference its destination, so a link planted after any check would
+    have run is clobbered rather than written through."""
+    real = tmp_path / "someone-elses-file"
+    real.write_bytes(b"before")
+    link = tmp_path / "record"
+    link.symlink_to(real)
+
+    platform_util.atomic_write_bytes(link, b"after", follow_symlinks=False)
+
+    assert not link.is_symlink()
+    assert link.read_bytes() == b"after"
+    assert real.read_bytes() == b"before"  # untouched
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+def test_atomic_write_bytes_no_follow_does_not_inherit_a_link_targets_mode(tmp_path):
+    """A name being replaced rather than updated carries nothing of whatever it used
+    to point at — inheriting the target's mode would let a planted link choose the
+    new record's permissions."""
+    real = tmp_path / "someone-elses-file"
+    real.write_bytes(b"before")
+    real.chmod(0o666)
+    link = tmp_path / "record"
+    link.symlink_to(real)
+
+    platform_util.atomic_write_bytes(link, b"after", follow_symlinks=False)
+
+    assert stat.S_IMODE(link.stat().st_mode) == 0o600  # mkstemp's private default
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+def test_atomic_write_bytes_no_follow_does_not_inherit_a_plain_files_mode(tmp_path):
+    """No-follow inherits nothing and takes no probe to decide it — the sibling above
+    covers the link, this covers the plain file, which is the case a probe would have
+    said yes to. 0o640 for the reason every mode pin here gives: `mkstemp` already
+    ARRIVES at 0600, so only a mode it does not arrive with can tell inheritance from
+    its absence.
+
+    Ablation A2: change `_atomic_write`'s `if follow_symlinks and target.exists():`
+    to `if target.exists():` and this reddens together with the three other
+    "does_not_inherit" rows (both helpers), while both "replaces_the_link" rows stay
+    green — so it bites on inheritance itself, not on anything else no-follow does."""
+    target = tmp_path / "record"
+    target.write_bytes(b"before")
+    target.chmod(0o640)
+
+    platform_util.atomic_write_bytes(target, b"after", follow_symlinks=False)
+
+    assert target.read_bytes() == b"after"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
 def test_atomic_write_bytes_preserves_extended_attributes(tmp_path):
     """Skipped where the platform or filesystem has no user xattrs, exactly as the
     text sibling is — the helper is best-effort there by design."""

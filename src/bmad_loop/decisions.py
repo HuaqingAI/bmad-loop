@@ -27,7 +27,7 @@ import re
 from pathlib import Path
 
 from . import bmadconfig, deferredwork, runs, verify
-from .platform_util import atomic_replace
+from .platform_util import atomic_write_text
 from .sweep import Decision, DecisionOption, validate_triage
 
 STORE_REL = Path(".bmad-loop") / "decisions.json"
@@ -55,11 +55,18 @@ def load_pre_answers(project: Path) -> dict[str, dict]:
 
 
 def _write_store(project: Path, data: dict) -> None:
+    """#363: via the helper, not a hand-rolled tmp+replace. The store lives at a
+    path nothing gitignores, so a failed replace used to strand
+    `.bmad-loop/decisions.tmp` as an untracked file and hold `worktree_clean`
+    False until a human deleted it; the helper removes its temp on any raise.
+
+    ``follow_symlinks=False`` is the behaviour-preserving choice — `os.replace`
+    never dereferenced this destination either — and the security one: a driven
+    session can write under `.bmad-loop/`, so honouring a link planted here would
+    hand it a host-side write to any operator-writable path."""
     path = store_path(project)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-    atomic_replace(tmp, path)
+    atomic_write_text(path, json.dumps(data, indent=2, sort_keys=True), follow_symlinks=False)
 
 
 def record_pre_answer(project: Path, dw_id: str, option: DecisionOption, *, date: str) -> None:
