@@ -3,13 +3,13 @@
 Forward-looking work for the orchestrator itself — design intent and rationale for features
 we've deliberately deferred, so the "why" survives between sessions.
 
-Status legend: **planned** (agreed, not started) · **exploring** (shape still open) · **blocked** (waiting on an external dependency).
+Status legend: **planned** (agreed, not started) · **in progress** (started; some pieces shipped, the headline goal not yet met) · **exploring** (shape still open) · **blocked** (waiting on an external dependency).
 
 ---
 
 ## Native Windows multiplexer backend
 
-**Status:** planned · **Foundation:** the full platform-seam series landed (multiplexer registry + `BaseTmuxBackend` + `ProcessHost` + hook interpreter + validate preflight, v0.7.6; availability-aware backend selection + `bmad-loop mux`, #87; out-of-tree backend discovery via `bmad_loop.mux_backends` entry points; original seam v0.7.0) · a first non-tmux-family, native-Windows-capable backend — **herdr** — ships end-to-end on POSIX as the external [bmad-loop-adapter-herdr](https://github.com/pbean/bmad-loop-adapter-herdr) (the win32 `agent.start` launch path is tracked there)
+**Status:** in progress — the platform seams and a native-Windows backend (`psmux`, held by a real-Windows live gate) have **shipped in-tree**; still open are the second tmux-family backend `tmux-windows` (#85), herdr's win32 launch path, and the open questions at the end of this section · **Foundation:** the full platform-seam series landed (multiplexer registry + `BaseTmuxBackend` + `ProcessHost` + hook interpreter + validate preflight, v0.7.6; availability-aware backend selection + `bmad-loop mux`, #87; out-of-tree backend discovery via `bmad_loop.mux_backends` entry points; original seam v0.7.0) · a first non-tmux-family, native-Windows-capable backend — **herdr** — ships end-to-end on POSIX as the external [bmad-loop-adapter-herdr](https://github.com/pbean/bmad-loop-adapter-herdr) (the win32 `agent.start` launch path is tracked there)
 
 The orchestrator no longer fuses tmux into the engine. All session/window/pane operations
 go through a single `TerminalMultiplexer` ABC (`src/bmad_loop/adapters/multiplexer.py`),
