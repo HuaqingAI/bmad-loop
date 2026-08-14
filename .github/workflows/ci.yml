@@ -55,7 +55,11 @@ jobs:
     # Real-Windows runner for the deterministic suite (live psmux e2e stays a manual gate).
     name: test (windows, py${{ matrix.python-version }})
     runs-on: windows-latest
-    timeout-minutes: 15
+    # 20, not the 15 the Linux test job uses: the slowest observed Windows run
+    # took 888s against a 900s cap, so one slow runner was a bad minute away from
+    # a timeout that reads as a test failure. The levers above should pull the
+    # mean well down; this keeps the tail from failing the build first.
+    timeout-minutes: 20
     # The suite reads/writes UTF-8 files; Windows' cp1252 default would break plain
     # text I/O. UTF-8 mode (PEP 686's Python 3.15 default) makes the runner match the
     # files under test; the conftest guard enforces the same for local win32 runs.
