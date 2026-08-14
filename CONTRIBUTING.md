@@ -163,6 +163,10 @@ Fixes #[issue number]
 ## Testing
 
 [1-2 sentences on how you tested this]
+
+## Changelog
+
+[Entry added under `## [Unreleased]` in CHANGELOG.md, under one of: Added, Changed, Deprecated, Removed, Fixed, Security. Write "n/a" if nothing user-visible changed.]
 ```
 
 **Keep it under 200 words.**
