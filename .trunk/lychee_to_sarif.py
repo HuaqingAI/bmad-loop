@@ -15,6 +15,10 @@ import os
 import sys
 
 RULE_ID = "broken-link"
+# SARIF 2.1.0 requires `run.tool.driver.name`. trunk composes its own label from the
+# trunk.yaml linter name plus `ruleId` and never reads this, but a conformant consumer
+# rejects a run without it.
+TOOL_NAME = "lychee"
 
 
 def relativize(path: str, root: str) -> str:
@@ -74,9 +78,9 @@ def main() -> int:
         for entry in entries
     ]
     sarif = {
-        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
         "version": "2.1.0",
-        "runs": [{"results": results}],
+        "runs": [{"tool": {"driver": {"name": TOOL_NAME}}, "results": results}],
     }
     print(json.dumps(sarif, indent=2))
     return 0
