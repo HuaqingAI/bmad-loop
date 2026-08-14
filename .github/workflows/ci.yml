@@ -82,6 +82,16 @@ jobs:
         run: uv sync --locked --all-extras
 
       - name: Run tests
+        # pytest roots `tmp_path` at `tempfile.gettempdir()`, which follows
+        # TMP/TEMP on Windows. The user-profile temp has historically sat on the
+        # slow C: volume while the workspace and RUNNER_TEMP sit on D:, so every
+        # per-test sandbox copy crossed to the slower disk; pin both to the
+        # workspace volume. A no-op if the default temp is already there.
+        # Step-level, not job-level: the `runner` context is unavailable in a
+        # job `env:` block, where this would silently expand to empty.
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
         run: uv run pytest -q -n auto --durations=15
 
   version-sync:
