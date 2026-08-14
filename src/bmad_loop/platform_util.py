@@ -45,6 +45,14 @@ _REPLACE_ATTEMPTS = 12
 _REPLACE_BASE_S = 0.02
 _REPLACE_CAP_S = 0.7
 
+# Windows-only: the "name does not fit" errno is not ENAMETOOLONG. CPython's
+# PC/errmap.h maps ERROR_FILENAME_EXCED_RANGE (206) to ENOENT and does not map
+# ERROR_BUFFER_OVERFLOW (111) at all — it falls to the EINVAL default — so
+# ENAMETOOLONG is effectively unreachable there and only .winerror tells.
+# ERROR_INVALID_NAME (123) is deliberately NOT here: it also fires for a name
+# holding characters win32 forbids outright, which no shorter prefix fixes.
+_WINERROR_FILENAME_EXCED_RANGE = 206
+
 # Reserved on Windows regardless of extension: CON.txt is as illegal as CON. The
 # COM0/LPT0 and superscript (COM¹/COM²/COM³) forms are reserved by the same rule,
 # as are the console device names CONIN$/CONOUT$.
@@ -463,13 +471,23 @@ def _mkstemp_beside(target: Path) -> tuple[int, str]:
     ``os.fsencode``, not ``str.encode``: a POSIX filename is arbitrary bytes and
     may carry surrogates that a strict UTF-8 encode would raise on.
 
-    A second ``ENAMETOOLONG`` propagates — that one is the DIRECTORY being too
-    long, which no choice of prefix can fix."""
+    The retry keys on TWO spellings of one condition, because win32 does not use
+    the POSIX one: ``ERROR_FILENAME_EXCED_RANGE`` arrives as ``ENOENT`` and is
+    distinguishable only by ``.winerror`` (see
+    ``_WINERROR_FILENAME_EXCED_RANGE``). Keying on ``ENAMETOOLONG`` alone left
+    this whole fallback dead on Windows — where, per the ``MAX_PATH`` note above,
+    it is if anything easier to reach than on ext4.
+
+    A second failure propagates — that one is the DIRECTORY being too long, which
+    no choice of prefix can fix."""
     directory = str(target.parent)
     try:
         return tempfile.mkstemp(dir=directory, prefix=target.name + ".", suffix=".tmp")
     except OSError as e:
-        if e.errno != errno.ENAMETOOLONG:
+        too_long = e.errno == errno.ENAMETOOLONG or (
+            getattr(e, "winerror", None) == _WINERROR_FILENAME_EXCED_RANGE
+        )
+        if not too_long:
             raise
     digest = hashlib.blake2b(os.fsencode(target.name), digest_size=8).hexdigest()
     return tempfile.mkstemp(dir=directory, prefix=digest + ".", suffix=".tmp")

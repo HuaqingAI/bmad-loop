@@ -7,11 +7,13 @@ the legacy ``platform_util`` entry points still delegate, plus the real
 
 from __future__ import annotations
 
+import errno
 import ntpath
 import os
 import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path, PureWindowsPath
 
 import pytest
@@ -916,6 +918,94 @@ def test_atomic_write_bytes_stages_a_basename_that_fills_name_max(tmp_path, monk
     assert len(os.fsencode(staged[0])) <= name_max
     assert staged[0].endswith(".tmp")  # devcontract's *.md scans must skip it
     assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_atomic_write_bytes_stages_via_digest_when_win32_reports_exceed_range(
+    tmp_path, monkeypatch
+):
+    """The #595 fallback also fires for win32's spelling of "the name does not
+    fit", which is NOT ENAMETOOLONG.
+
+    CPython's `PC/errmap.h` maps `ERROR_FILENAME_EXCED_RANGE` (206) to ENOENT, and
+    does not map `ERROR_BUFFER_OVERFLOW` (111) at all — it falls to the EINVAL
+    default. So on Windows nothing raises ENAMETOOLONG and only `.winerror`
+    carries the distinction: keying the retry on the errno alone left the whole
+    fallback DEAD on the one platform where, per `MAX_PATH`, the staged name is
+    easiest to overflow.
+
+    Driven through an injected error rather than a real long name because this
+    runs on POSIX too, where no path produces winerror 206 — and a
+    `skipif(win32)` row would leave the branch unexercised on every CI leg but
+    two. The injection is the mechanism the code actually reads (`getattr(e,
+    "winerror", None)`), so it is the predicate under test, not a stand-in for it.
+
+    Asserts the SECOND prefix stopped being the readable one rather than matching
+    the digest: what has to hold is that the retry re-prefixed, not which scheme
+    produced it — same reason as the row above.
+
+    Ablation: drop the `getattr(e, "winerror", ...)` disjunct in `_mkstemp_beside`
+    and this fails alone, on the injected `OSError` propagating out of
+    `atomic_write_bytes` before any assertion. The POSIX `..._fills_name_max` row
+    stays green under it — it arrives on the errno arm, which the ablation leaves
+    intact."""
+    target = tmp_path / "spec.md"
+    real_mkstemp = tempfile.mkstemp
+    prefixes: list[str] = []
+
+    def fake_mkstemp(*, dir, prefix, suffix):
+        prefixes.append(prefix)
+        if len(prefixes) == 1:
+            exceeded = OSError(errno.ENOENT, "The filename or extension is too long")
+            exceeded.winerror = 206  # pyright: ignore[reportAttributeAccessIssue]
+            raise exceeded
+        return real_mkstemp(dir=dir, prefix=prefix, suffix=suffix)
+
+    monkeypatch.setattr(platform_util.tempfile, "mkstemp", fake_mkstemp)
+
+    platform_util.atomic_write_bytes(target, b"payload")
+
+    assert target.read_bytes() == b"payload"
+    assert len(prefixes) == 2  # the retry happened at all
+    assert prefixes[0] == "spec.md."
+    assert prefixes[1] != "spec.md."  # the digest replaced the readable prefix
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_atomic_write_bytes_propagates_a_staging_error_that_is_not_a_long_name(
+    tmp_path, monkeypatch
+):
+    """The retry stays NARROW: an `OSError` that is not "the name does not fit"
+    propagates on the first attempt instead of being retried under a digest.
+
+    The negative control for the row above. Widening the predicate to a bare
+    `except OSError` — or folding in `ERROR_INVALID_NAME` (123), which also fires
+    for characters win32 forbids outright and no shorter prefix can rescue — would
+    turn an unrelated staging failure into a second doomed `mkstemp` and surface
+    the RETRY's exception rather than the real one. `install.py` already assigns
+    123 the opposite meaning (`_ABSENCE_WINERRORS`), so admitting it here would
+    make one winerror mean two things in one codebase.
+
+    Ablation: relax the guard so nothing re-raises and this reddens alone, on
+    `len(calls) == 1` reading 2 — the second, doomed `mkstemp` runs under the
+    digest prefix. Note which assertion does NOT catch it: `caught.value.errno ==
+    EACCES` still passes, because the retry fails the same way the first attempt
+    did. The call count is the load-bearing assertion here; an errno check alone
+    would pass through the widened guard and pin nothing."""
+    target = tmp_path / "spec.md"
+    calls: list[str] = []
+
+    def fake_mkstemp(*, dir, prefix, suffix):
+        calls.append(prefix)
+        raise OSError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(platform_util.tempfile, "mkstemp", fake_mkstemp)
+
+    with pytest.raises(OSError) as caught:
+        platform_util.atomic_write_bytes(target, b"payload")
+
+    assert caught.value.errno == errno.EACCES  # the REAL error, not the retry's
+    assert len(calls) == 1  # never retried
+    assert not target.exists()
 
 
 # --------------------------------------------------------------- retrying_unlink

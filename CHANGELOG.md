@@ -116,7 +116,9 @@ breaking changes may land in a minor release.
 - **An atomic write no longer fails on a file whose name fills the filesystem's limit.** The helpers
   stage a temp named after their target, and `mkstemp` inserts eight random characters, so the temp
   ran `len(name) + 13` — long enough that a target with a perfectly legal name produced an illegal
-  _temp_ name and the write died with `ENAMETOOLONG`. On ext4 the cutoff was a 243-byte basename.
+  _temp_ name and the write died with `ENAMETOOLONG` — or, on Windows, with `ENOENT` carrying
+  `winerror` 206, which is the same condition under a different name. On ext4 the cutoff was a
+  243-byte basename.
   Latent in the helpers since they were written, and reachable from this release because the story
   spec writers moved onto them: a spec is named by your planning skills, and nothing bounds that
   name. When the readable temp name cannot fit, the helpers now fall back to a short digest of it
