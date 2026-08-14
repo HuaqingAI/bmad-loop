@@ -107,11 +107,15 @@ def test_relativize_maps_scan_paths_into_the_repo(
     assert lychee_to_sarif.relativize(outside, "") == outside
 
 
-def test_empty_input_yields_a_conformant_empty_run(
+def test_clean_report_yields_a_conformant_empty_run(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A no-op invocation emits valid SARIF instead of crashing the lint."""
-    rc, sarif = _run(monkeypatch, capsys, "")
+    """A clean lychee run — `error_map: {}` — stays a valid zero-result run.
+
+    0.24.2 emits the full report with an empty error_map both on a clean tree and
+    when an input source matches no files, so this is the common path.
+    """
+    rc, sarif = _run(monkeypatch, capsys, json.dumps({"total": 0, "error_map": {}}))
 
     assert rc == 0
     assert sarif["version"] == "2.1.0"
@@ -121,3 +125,37 @@ def test_empty_input_yields_a_conformant_empty_run(
     # from the trunk.yaml linter name plus ruleId and never reads this, but a
     # conformant consumer rejects a run without it.
     assert run["tool"]["driver"]["name"] == "lychee"
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ("", "no report"),
+        ("not json", "not JSON"),
+        ('{"total": 0, "failure_map": {}}', "error_map"),
+        ('{"error_map": []}', "not an object"),
+    ],
+    ids=["empty", "not-json", "renamed-key", "wrong-type"],
+)
+def test_unusable_report_fails_the_parser(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    payload: str,
+    expected: str,
+) -> None:
+    """An unreadable report must turn the lint red, not emit a clean empty run.
+
+    `success_codes: [0, 2]` leaves a zero-result SARIF indistinguishable from "no
+    broken links", so failing open here hides every broken link in the repo. trunk
+    turns a nonzero parser exit into a visible tool failure and copies the
+    parser's stderr into its failure report, so stderr + rc 1 is the loud path.
+    """
+    monkeypatch.setattr(sys, "argv", ["lychee_to_sarif.py"])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(payload))
+
+    rc = lychee_to_sarif.main()
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.out == ""  # no SARIF at all, so trunk cannot read zero results
+    assert expected in captured.err
