@@ -137,7 +137,21 @@ def check() -> int:
         problems.append(f"module.yaml module_version = {mv_val!r} (expected {canonical!r})")
 
     market = json.loads(MARKETPLACE.read_text())
-    for i, plugin in enumerate(market.get("plugins", [])):
+    # Refuse to pass vacuously. `market.get("plugins", [])` iterates zero times when the
+    # key is renamed, dropped or emptied, so the loop below would report agreement it
+    # never checked — green on exactly the corruption this gate exists to catch. Same
+    # shape the tracked-files preflight in .github/workflows/ci.yml already guards.
+    plugins = market.get("plugins")
+    if not isinstance(plugins, list) or not plugins:
+        problems.append(
+            f"marketplace.json has no non-empty `plugins` list (got {plugins!r}) — "
+            "this check would pass vacuously"
+        )
+        plugins = []
+    for i, plugin in enumerate(plugins):
+        if not isinstance(plugin, dict):
+            problems.append(f"marketplace.json plugins[{i}] is not an object (got {plugin!r})")
+            continue
         if plugin.get("version") != canonical:
             problems.append(
                 f"marketplace.json plugins[{i}].version = {plugin.get('version')!r} "

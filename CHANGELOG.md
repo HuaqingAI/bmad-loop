@@ -322,6 +322,13 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
+- **The `version-sync` gate no longer passes on a marketplace.json it could not read.**
+  `sync_version.check()` iterated `market.get("plugins", [])`, so a renamed, deleted or emptied
+  `plugins` key made the loop run zero times and the gate print "ok: every version field agrees"
+  — green on exactly the corruption it exists to catch, including when a real stale version sat
+  behind the renamed key. It now refuses a `plugins` value that is not a non-empty list, and
+  reports a non-object entry instead of raising. Covered by a new `tests/test_sync_version.py`.
+
 - **A failed ledger write can no longer empty the deferred-work ledger (#328).** `Path.write_text`
   truncates the file and only then encodes, so any failure in that window — an unencodable value,
   `ENOSPC`, `EIO` — left a zero-byte ledger with every entry gone. `append_decision`,
