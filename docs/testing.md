@@ -19,10 +19,13 @@ and every negative assertion proven by ablation.**
 - Configuration is two settings under `[tool.pytest.ini_options]` in `pyproject.toml`:
   `testpaths = ["tests"]` and `asyncio_mode = "auto"`. There is no `addopts`, no marker
   registry, no `filterwarnings` (the last is under triage — #548).
-- `uv run pytest -q` runs everything runnable on the host; `-n auto` (pytest-xdist) is
+- `uv run pytest -q` runs everything runnable on the host; `-n logical` (pytest-xdist) is
   supported because every test builds its state from per-test fixtures (the template repo is
-  per-worker). A test that fails only under xdist load is a flake, which is a bug — #360 is
-  the open instance. Live/E2E modules skip themselves when their host requirements are
+  per-worker). Prefer `logical` over `auto`: `psutil` is installed on every platform here
+  (the `non-linux` extra carries no environment marker, and CI syncs `--all-extras`), so
+  xdist's `auto` resolves to the _physical_ core count — half the vCPUs on the hosted
+  runners. CI passes `-n logical` in both test jobs for that reason. A test that fails only
+  under xdist load is a flake, which is a bug — #360 is the open instance. Live/E2E modules skip themselves when their host requirements are
   absent — selection is in-file, never in config.
 - Only builtin pytest marks appear: `parametrize`, `skipif`, `usefixtures`, and exactly one
   `xfail(strict=True)` (a pinned known defect, see [Ablation records](#ablation-records)).
