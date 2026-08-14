@@ -64,7 +64,9 @@ Two orthogonal seams: **which CLI** (adapter axis: `adapters/base.py` `CodingCLI
 
 ## Repo hygiene
 
-- CHANGELOG entries: terse, scannable, imperative, under the Unreleased heading.
+- CHANGELOG entries: terse, scannable, imperative, under the `## [Unreleased]` heading. That heading is the contract, not a staging area:
+  - Every entry lands under `## [Unreleased]`, and only under the six Keep a Changelog subsections — `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, `Security`.
+  - A release **promotes** that section: `## [Unreleased]` is renamed to `## [X.Y.Z] — <ISO date>` and a fresh empty `## [Unreleased]` opens above it. The release never authors a new version section from the git log, and never leaves a populated `Unreleased` behind — `scripts/release.py prepare` refuses both, and `release.py check` (CI job `version-sync`) holds the reopened heading and its `compare/v<version>...HEAD` link.
 - Never commit session notes, probe records, or run artifacts. Durable facts belong in docstrings; records in git history.
 - Review non-convergence is evidence about the approach, not just a defect queue — escalate rather than grind.
 

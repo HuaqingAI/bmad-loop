@@ -8,9 +8,10 @@ asset generators, the CHANGELOG, git, and ``gh``.
 
 The flow is two-phase:
 
-* ``prepare X.Y.Z`` runs on a feature/release branch. It validates the CHANGELOG
-  section for the target version (the human curates it *before* calling this),
-  stamps the version everywhere via ``sync_version.py``,
+* ``prepare X.Y.Z`` runs on a feature/release branch. It validates that the
+  CHANGELOG's ``## [Unreleased]`` section was *promoted* into ``## [X.Y.Z]`` —
+  populated version section, emptied Unreleased — which the human does *before*
+  calling this, stamps the version everywhere via ``sync_version.py``,
   regenerates screenshots + demo *only* when ``src/bmad_loop/tui`` changed since
   the last tag, and commits the result — leaving the branch ready for a PR.
 * ``publish`` runs on ``main`` after the PR merges (driven by
@@ -25,7 +26,7 @@ Usage::
     python scripts/release.py commits                  # commits since last tag, grouped
     python scripts/release.py publish                  # tag + gh release (idempotent)
     python scripts/release.py publish --dry-run        # show the tag + notes it would create
-    python scripts/release.py check                    # local mirror of the CI guards
+    python scripts/release.py check                    # version + CHANGELOG guards (also run by CI)
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ import re
 import shutil
 import subprocess
 import sys
+from datetime import date
 from pathlib import Path
 
 # sync_version is the canonical owner of the version value + format. Import it
@@ -139,20 +141,73 @@ def has_curated_section(text: str, version: str) -> bool:
     return bool(body)
 
 
+# The shape a promoted heading must take: `## [X.Y.Z] — YYYY-MM-DD`. `section_re`
+# accepts any suffix after `]`, so nothing else notices a dateless or garbled one.
+# Every release heading in CHANGELOG.md matches this — the sole exception is the
+# pre-dating `## [0.1.0]`, which no release re-prepares.
+RELEASE_HEADING_RE = re.compile(
+    r"(?m)^##\s+\[(?P<version>[^\]]+)\]\s+—\s+(?P<date>\d{4}-\d{2}-\d{2})\s*$"
+)
+# Any `[Unreleased]:` link-reference line. Deliberately shape-blind: `ensure_link_ref`
+# rewrites whatever is there in place, so a hand-mangled line is repaired rather than
+# duplicated by an insert.
+UNRELEASED_REF_RE = re.compile(r"(?m)^\[Unreleased\]:[^\n]*$")
+# ...and the base version that line's compare link must name. `cmd_check` reads the
+# group; matching only this shape is what makes a stale base detectable at all.
+UNRELEASED_COMPARE_RE = re.compile(
+    r"(?m)^\[Unreleased\]:\s*(?P<repo>\S+)/compare/v(?P<base>\S+)\.\.\.HEAD\s*$"
+)
+
+
+def is_promoted_heading(m: re.Match[str], version: str) -> bool:
+    """Whether a ``## [...] — <date>`` match is *this* release's heading, dated.
+
+    ``RELEASE_HEADING_RE`` pins digit widths only, so ``2026-02-31`` and ``2026-99-99``
+    are correctly shaped. ``date.fromisoformat`` is what makes "ISO date" mean a real
+    calendar date rather than a digit pattern.
+    """
+    if m.group("version") != version:
+        return False
+    try:
+        date.fromisoformat(m.group("date"))
+    except ValueError:
+        return False
+    return True
+
+
 def ensure_link_ref(text: str, version: str, repo_url: str) -> str:
     """Insert ``[version]: <repo_url>/releases/tag/vversion`` into the trailing
-    link-reference block if it is absent. Newest refs sit on top, matching the
-    existing descending order. Returns the (possibly unchanged) text."""
+    link-reference block if it is absent, and re-point ``[Unreleased]:`` at
+    ``compare/vversion...HEAD``. Newest refs sit on top, matching the existing
+    descending order. Returns the (possibly unchanged) text.
+
+    The two halves are independent on purpose: an already-present ``[version]:``
+    ref must not short-circuit the ``[Unreleased]:`` rewrite, or a re-run of
+    ``prepare`` would leave the compare base pinned to the *previous* release —
+    the drift this function exists to stop.
+    """
     ref_line = f"[{version}]: {repo_url}/releases/tag/v{version}"
-    if re.search(rf"(?m)^\[{re.escape(version)}\]:\s", text):
-        return text
     ref_pat = re.compile(r"(?m)^\[\d+\.\d+\.\d+(?:[.-][0-9A-Za-z.-]+)?\]:\s")
+
+    if not re.search(rf"(?m)^\[{re.escape(version)}\]:\s", text):
+        m = ref_pat.search(text)
+        if m:
+            text = text[: m.start()] + ref_line + "\n" + text[m.start() :]
+        else:
+            # No link-ref block yet: append one.
+            sep = "" if text.endswith("\n") else "\n"
+            text = text + sep + "\n" + ref_line + "\n"
+
+    # `[Unreleased]:` always compares the just-cut release against HEAD. A plain
+    # string replacement would interpret backslash escapes in the URL, so
+    # substitute through a callable.
+    unreleased_line = f"[Unreleased]: {repo_url}/compare/v{version}...HEAD"
+    if UNRELEASED_REF_RE.search(text):
+        return UNRELEASED_REF_RE.sub(lambda _m: unreleased_line, text, count=1)
     m = ref_pat.search(text)
-    if m:
-        return text[: m.start()] + ref_line + "\n" + text[m.start() :]
-    # No link-ref block yet: append one.
-    sep = "" if text.endswith("\n") else "\n"
-    return text + sep + "\n" + ref_line + "\n"
+    if m:  # sits above the version refs, matching the block's descending order
+        return text[: m.start()] + unreleased_line + "\n" + text[m.start() :]
+    return text
 
 
 def group_commits(lines: list[str]) -> dict[str, list[str]]:
@@ -316,6 +371,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     last_tag = last_release_tag()
 
     # --- preconditions ----------------------------------------------------- #
+    changelog = CHANGELOG.read_text()
     problems: list[str] = []
     if branch == "main":
         problems.append("on `main`; run prepare from a release/feature branch")
@@ -323,11 +379,60 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         problems.append(f"tag {tag} already exists")
     if not version_gt(version, canonical):
         problems.append(f"{version} is not greater than the current version {canonical}")
-    if not has_curated_section(CHANGELOG.read_text(), version):
+    if not has_curated_section(changelog, version):
         problems.append(
             f"CHANGELOG.md has no non-empty `## [{version}]` section — "
             "curate the release notes there first"
         )
+    # Paired with the guard above, these prove a *promotion* happened: the notes left
+    # `## [Unreleased]` and arrived under `## [X.Y.Z]`, and an empty Unreleased was
+    # reopened above it.
+    #
+    # Missing and empty are separate failures, not one: `has_curated_section` reports
+    # False for both, and only `prepare` can tell them apart in time. `release.yml`
+    # fires on a push to `main`/`release/*` with no dependency on the CI workflow, so
+    # it can tag and publish while `version-sync` is still running — this precondition
+    # is the last gate before that irreversible step, not a duplicate of `check`.
+    # The release date is part of the promoted shape, and only this notices it missing.
+    if section_re(version).search(changelog) and not any(
+        is_promoted_heading(m, version) for m in RELEASE_HEADING_RE.finditer(changelog)
+    ):
+        problems.append(
+            f"CHANGELOG.md heading for {version} is not `## [{version}] — <ISO date>` "
+            "with a real calendar date — the promotion stamps the release date on the "
+            "heading it renames"
+        )
+    # Every heading, not just the first: `extract_section` searches, so a leftover
+    # populated Unreleased *below* a freshly-inserted empty one would hide behind it
+    # and its entries would never ship.
+    unreleased = list(section_re("Unreleased").finditer(changelog))
+    if not unreleased:
+        problems.append(
+            "CHANGELOG.md has no `## [Unreleased]` heading — a release renames the old "
+            f"one to `## [{version}]`, so a fresh empty one must be reopened above it"
+        )
+    elif len(unreleased) > 1:
+        problems.append(
+            f"CHANGELOG.md has {len(unreleased)} `## [Unreleased]` headings — the "
+            "promotion renames the existing one rather than inserting a second; the "
+            "leftover still holds entries that would never ship"
+        )
+    elif unreleased[0].group("body").strip():
+        problems.append(
+            "CHANGELOG.md `## [Unreleased]` still has content — a release *promotes* "
+            f"that section (rename its heading to `## [{version}] — <ISO date>`, then "
+            "reopen an empty `## [Unreleased]` above it), it does not author a new "
+            "section beside it"
+        )
+    else:
+        # Reopened, but it has to sit above the section it was promoted into — Keep a
+        # Changelog is newest-first, and `publish` reads sections by heading, not order.
+        v = section_re(version).search(changelog)
+        if v and unreleased[0].start() > v.start():
+            problems.append(
+                f"CHANGELOG.md `## [Unreleased]` sits below `## [{version}]` — reopen it "
+                "above the section it was promoted into"
+            )
     # Only CHANGELOG.md + regenerated assets are expected to be dirty pre-prepare.
     expected_dirty = {"CHANGELOG.md"}
     unexpected = [
@@ -455,16 +560,69 @@ def cmd_publish(args: argparse.Namespace) -> int:
 
 
 def cmd_check(args: argparse.Namespace) -> int:
+    """Run the CI release guards locally — and, via the `version-sync` job, in CI.
+
+    A strict superset of ``sync_version.py --check``: it calls that check in-process,
+    then holds the CHANGELOG release contract. Every problem is reported before
+    returning, so one run shows the whole picture. It installs nothing — that
+    in-process call rather than a ``uv run`` child is what lets CI invoke it under
+    ``--no-project``. It does read ``origin`` (via :func:`repo_url`), so it wants a
+    git checkout, which every context that runs it has; on a clone whose ``origin``
+    is a fork the compare-link arm reports the fork, which is accurate rather than
+    spurious. ``actions/checkout`` sets ``origin`` to the *base* repo even for a
+    fork PR, so CI is unaffected.
+    The `version-sync` job name is load-bearing for branch protection — when wiring
+    this in, change the step's command, never the job.
+
+    The CHANGELOG arms assert what *promote-and-reopen* leaves behind, not the
+    prepare-time precondition: between releases a populated `## [Unreleased]` is
+    the correct state, so its emptiness is checked only by ``prepare``.
+    """
     rc = 0
     print("version-sync:")
-    if _run(["uv", "run", "python", str(SYNC_VERSION), "--check"], check=False).returncode != 0:
+    if sync_version.check() != 0:
         rc = 1
     version = sync_version.read_canonical()
-    if has_curated_section(CHANGELOG.read_text(), version):
+    text = CHANGELOG.read_text()
+    if has_curated_section(text, version):
         print(f"changelog: `## [{version}]` section present")
     else:
         print(f"changelog: MISSING `## [{version}]` section", file=sys.stderr)
         rc = 1
+    if extract_section(text, "Unreleased") is None:
+        print(
+            "changelog: MISSING `## [Unreleased]` heading — a release promotes that "
+            "section and must reopen an empty one above it",
+            file=sys.stderr,
+        )
+        rc = 1
+    else:
+        print("changelog: `## [Unreleased]` heading present")
+    m = UNRELEASED_COMPARE_RE.search(text)
+    url = repo_url()
+    if m is None:
+        print(
+            "changelog: MISSING `[Unreleased]:` compare link ref "
+            f"(expected one naming `compare/v{version}...HEAD`)",
+            file=sys.stderr,
+        )
+        rc = 1
+    elif m.group("repo") != url:
+        print(
+            f"changelog: `[Unreleased]:` compares against {m.group('repo')} "
+            f"— expected this repository, {url}",
+            file=sys.stderr,
+        )
+        rc = 1
+    elif m.group("base") != version:
+        print(
+            f"changelog: STALE `[Unreleased]:` compare base v{m.group('base')} "
+            f"— expected v{version}",
+            file=sys.stderr,
+        )
+        rc = 1
+    else:
+        print(f"changelog: `[Unreleased]:` compares against v{version}")
     return rc
 
 
@@ -493,7 +651,9 @@ def build_parser() -> argparse.ArgumentParser:
     pp.add_argument("--dry-run", action="store_true", help="show the tag + notes, create nothing")
     pp.set_defaults(func=cmd_publish)
 
-    cc = sub.add_parser("check", help="local mirror of the CI release guards")
+    cc = sub.add_parser(
+        "check", help="version + CHANGELOG release guards (the CI `version-sync` job runs this)"
+    )
     cc.set_defaults(func=cmd_check)
     return p
 
