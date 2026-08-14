@@ -19,6 +19,7 @@ the same key must run both.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import random
@@ -436,6 +437,44 @@ def atomic_write_bytes(path: Path, data: bytes, *, follow_symlinks: bool = True)
     _atomic_write(path, data, mode="wb", encoding=None, follow_symlinks=follow_symlinks)
 
 
+def _mkstemp_beside(target: Path) -> tuple[int, str]:
+    """``mkstemp`` in ``target``'s own directory, prefixed with its name so the
+    temp is recognisably that target's staging file — and so it ends in ``.tmp``
+    rather than the target's extension, which `devcontract._atomic_write_spec`
+    depends on to keep its temps out of the ``*.md`` artifact scans.
+
+    ``mkstemp`` inserts 8 random characters between prefix and suffix, so the temp
+    name runs ``len(target.name) + 13``. A basename within 13 bytes of the
+    filesystem's ``NAME_MAX`` therefore makes the TEMP name illegal at a path the
+    target itself is perfectly legal at. Measured on ext4 (``NAME_MAX`` 255): a
+    242-byte basename stages fine, 243 raises ``ENAMETOOLONG`` while the direct
+    write it replaced succeeded through 255 (#595).
+
+    The fallback replaces the readable prefix with a digest of it rather than
+    truncating it. Truncation is the obvious fix and it is wrong: ``NAME_MAX``
+    counts BYTES while Python slices CHARACTERS, so a bounded character slice
+    neither guarantees a legal name nor avoids splitting a UTF-8 sequence — and
+    the limit is not portably knowable anyway (``os.pathconf`` is POSIX-only,
+    NTFS counts UTF-16 code units, and win32 is usually bound by ``MAX_PATH`` on
+    the whole path instead). Letting the OS answer needs none of that arithmetic:
+    the common path keeps the readable name, and only a basename that cannot fit
+    degrades to a fixed-width digest.
+
+    ``os.fsencode``, not ``str.encode``: a POSIX filename is arbitrary bytes and
+    may carry surrogates that a strict UTF-8 encode would raise on.
+
+    A second ``ENAMETOOLONG`` propagates — that one is the DIRECTORY being too
+    long, which no choice of prefix can fix."""
+    directory = str(target.parent)
+    try:
+        return tempfile.mkstemp(dir=directory, prefix=target.name + ".", suffix=".tmp")
+    except OSError as e:
+        if e.errno != errno.ENAMETOOLONG:
+            raise
+    digest = hashlib.blake2b(os.fsencode(target.name), digest_size=8).hexdigest()
+    return tempfile.mkstemp(dir=directory, prefix=digest + ".", suffix=".tmp")
+
+
 def _atomic_write(
     path: Path,
     payload: str | bytes,
@@ -471,7 +510,7 @@ def _atomic_write(
     private ``0600`` is the right mode for the machine-minted file this mode
     exists for."""
     target = path.resolve() if follow_symlinks else path
-    fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=target.name + ".", suffix=".tmp")
+    fd, tmp_name = _mkstemp_beside(target)
     tmp = Path(tmp_name)
     try:
         with os.fdopen(fd, mode, encoding=encoding) as fh:

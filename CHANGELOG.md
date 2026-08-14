@@ -113,6 +113,15 @@ breaking changes may land in a minor release.
   `MoveFileEx(MOVEFILE_REPLACE_EXISTING)`, which is not guaranteed atomic and may fall back to a
   non-atomic copy. What holds everywhere is that a failed write cannot truncate the original.
 
+- **An atomic write no longer fails on a file whose name fills the filesystem's limit.** The helpers
+  stage a temp named after their target, and `mkstemp` inserts eight random characters, so the temp
+  ran `len(name) + 13` — long enough that a target with a perfectly legal name produced an illegal
+  _temp_ name and the write died with `ENAMETOOLONG`. On ext4 the cutoff was a 243-byte basename.
+  Latent in the helpers since they were written, and reachable from this release because the story
+  spec writers moved onto them: a spec is named by your planning skills, and nothing bounds that
+  name. When the readable temp name cannot fit, the helpers now fall back to a short digest of it
+  rather than failing — the OS decides, so there is no guess at a per-filesystem byte limit.
+
 ## [0.10.0] — 2026-08-14
 
 Much of this section is the `release/0.9.x` hotfix line brought forward onto `main` (#433).

@@ -871,6 +871,53 @@ def test_atomic_write_bytes_creates_a_missing_target_at_the_private_mode(tmp_pat
         assert stat.S_IMODE(target.stat().st_mode) == 0o600
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pathconf(PC_NAME_MAX)")
+def test_atomic_write_bytes_stages_a_basename_that_fills_name_max(tmp_path, monkeypatch):
+    """A target whose basename is the longest the filesystem allows still writes
+    (#595). `mkstemp` inserts 8 random chars between prefix and suffix, so the temp
+    runs `len(basename) + 13` — meaning a target that is itself perfectly legal
+    produced an ILLEGAL temp name and the write died with ENAMETOOLONG.
+
+    A regression, not a pre-existing limit: the direct `write_bytes` that
+    `set_frontmatter_status`/`set_frontmatter_field` used before this branch
+    accepted the same name, and specs are named by BMAD's planning skills, not by
+    anything here that bounds them (`safe_segment`'s MAX_SEGMENT caps story keys
+    and run-dir segments, not spec basenames).
+
+    Sized from the filesystem's own `PC_NAME_MAX` rather than a hardcoded 255,
+    which is per-filesystem — on a box where it is smaller a fixed 252 would fail
+    while CREATING the fixture, reddening this row for a reason that is not the
+    property.
+
+    The staged name is recorded and asserted legal rather than compared to the
+    digest: what has to hold is that the temp fits, not which scheme produced it.
+
+    Ablation: delete the `except OSError` fallback in `_mkstemp_beside` and this
+    fails alone, on `OSError: [Errno 36] File name too long` raised before any
+    assertion. `..._temp_name_is_unique_per_call` and
+    `..._stages_in_the_targets_own_directory` stay green under it — both use short
+    names, which never reach the fallback."""
+    name_max = os.pathconf(str(tmp_path), "PC_NAME_MAX")
+    target = tmp_path / ("s" * (name_max - len(".md")) + ".md")
+    assert len(os.fsencode(target.name)) == name_max  # PRECONDITION: the limit itself
+    staged: list[str] = []
+    real_replace = os.replace
+
+    def record(src, dst):
+        staged.append(os.path.basename(str(src)))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(platform_util.os, "replace", record)
+
+    platform_util.atomic_write_bytes(target, b"payload")
+
+    assert target.read_bytes() == b"payload"
+    assert len(staged) == 1
+    assert len(os.fsencode(staged[0])) <= name_max
+    assert staged[0].endswith(".tmp")  # devcontract's *.md scans must skip it
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
 # --------------------------------------------------------------- retrying_unlink
 
 
