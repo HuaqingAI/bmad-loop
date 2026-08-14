@@ -49,7 +49,7 @@ jobs:
         run: uv sync --locked --all-extras
 
       - name: Run tests
-        run: uv run pytest -q -n auto --durations=15
+        run: uv run pytest -q -n logical --durations=15
 
   test-windows:
     # Real-Windows runner for the deterministic suite (live psmux e2e stays a manual gate).
@@ -92,7 +92,7 @@ jobs:
         env:
           TMP: ${{ runner.temp }}
           TEMP: ${{ runner.temp }}
-        run: uv run pytest -q -n auto --durations=15
+        run: uv run pytest -q -n logical --durations=15
 
   version-sync:
     name: version-sync
