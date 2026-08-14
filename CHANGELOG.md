@@ -2101,6 +2101,23 @@ for antigravity`, immediately after a successful `init --cli antigravity`). Both
 
 ## [0.8.1] — 2026-07-05
 
+### Added
+
+- **Attempt-preserve recovery refs are now bounded.** With `scm.rollback_on_failure` on, auto-rollback
+  parks a failed attempt's committed work under `attempt-preserve/*` and its dirty worktree snapshot
+  under `attempt-preserve-dirty/*`; nothing pruned them, so they grew unbounded. Run start now keeps
+  only the newest `scm.preserve_keep` (default 20, `0` = never prune) per family by committer date and
+  best-effort-deletes the tail — a stuck ref never wedges the ones behind it, and prune failures are
+  journaled but never block the run. (#50 #54, closes #32 #49)
+
+### Changed
+
+- **The adapter shell-dialect seam is now an explicit, documented contract.** `new_window` /
+  `new_parked_window` factor their shell-dialect fragments into overridable hooks (POSIX output stays
+  byte-identical), and the `command` parameter's semantics are pinned in the ABC docstring
+  (shlex-joined argv; operator handling is backend-defined). Relevant only to authors porting the
+  adapter to a non-POSIX backend. (#47 #60)
+
 ### Fixed
 
 - **A session that finished its work but crashed before the run recorded it no longer loses that work
@@ -2126,24 +2143,16 @@ for antigravity`, immediately after a successful `init --cli antigravity`). Both
   timestamp and kind columns.** Each row renders as a fixed-width grid whose fields cell folds within
   its own column.
 
+## [0.8.0] — 2026-07-03
+
 ### Added
 
-- **Attempt-preserve recovery refs are now bounded.** With `scm.rollback_on_failure` on, auto-rollback
-  parks a failed attempt's committed work under `attempt-preserve/*` and its dirty worktree snapshot
-  under `attempt-preserve-dirty/*`; nothing pruned them, so they grew unbounded. Run start now keeps
-  only the newest `scm.preserve_keep` (default 20, `0` = never prune) per family by committer date and
-  best-effort-deletes the tail — a stuck ref never wedges the ones behind it, and prune failures are
-  journaled but never block the run. (#50 #54, closes #32 #49)
-
-### Changed
-
-- **The adapter shell-dialect seam is now an explicit, documented contract.** `new_window` /
-  `new_parked_window` factor their shell-dialect fragments into overridable hooks (POSIX output stays
-  byte-identical), and the `command` parameter's semantics are pinned in the ABC docstring
-  (shlex-joined argv; operator handling is backend-defined). Relevant only to authors porting the
-  adapter to a non-POSIX backend. (#47 #60)
-
-## [0.8.0] — 2026-07-03
+- **New `pre_commit_gate` plugin workflow-injection stage.** Gate workflows can bind to
+  `pre_commit_gate`, which fires unconditionally just before every commit — on the review-converged,
+  review-skipped, and review-budget-rescue paths alike — while the phase can still legally defer.
+  TEA's trace/nfr/review gates rebind to it, fixing blocking gates that were previously inert
+  whenever a dev session recommended no review follow-up (so `on_pre_commit` fail-opened on the
+  missing artifacts).
 
 ### Changed
 
@@ -2160,15 +2169,6 @@ for antigravity`, immediately after a successful `init --cli antigravity`). Both
   prefixes `bmad-auto-*` → `bmad-loop-*`; worktree branches `automator/<run-id>` →
   `bmad-loop/<run-id>`; TUI class `BmadAutoApp` → `BmadLoopApp`. Custom plugins, CLI profiles, and
   policy files that reference any of these must be updated.
-
-### Added
-
-- **New `pre_commit_gate` plugin workflow-injection stage.** Gate workflows can bind to
-  `pre_commit_gate`, which fires unconditionally just before every commit — on the review-converged,
-  review-skipped, and review-budget-rescue paths alike — while the phase can still legally defer.
-  TEA's trace/nfr/review gates rebind to it, fixing blocking gates that were previously inert
-  whenever a dev session recommended no review follow-up (so `on_pre_commit` fail-opened on the
-  missing artifacts).
 
 ### Fixed
 
@@ -3077,7 +3077,7 @@ enforced in CI.
 - Replaced stale `pip install` instructions across docs, CLI hints, the setup skill, the
   eval-runner Dockerfile, and the module greeting with their uv equivalents.
 
-## [0.1.0]
+## [0.1.0] — 2026-06-10
 
 - Initial release: deterministic dev → review → verify → commit orchestrator for the BMAD
   implementation phase, driven by a Python control loop with hook-based session transport and
@@ -3088,21 +3088,33 @@ enforced in CI.
 [0.9.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.9.0
 [0.8.1]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.8.1
 [0.8.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.8.0
-[0.7.12]: https://github.com/bmad-code-org/bmad-auto/releases/tag/v0.7.12
-[0.7.11]: https://github.com/bmad-code-org/bmad-auto/releases/tag/v0.7.11
-[0.7.10]: https://github.com/bmad-code-org/bmad-auto/releases/tag/v0.7.10
-[0.7.9]: https://github.com/bmad-code-org/bmad-auto/releases/tag/v0.7.9
-[0.7.8]: https://github.com/bmad-code-org/bmad-auto/releases/tag/v0.7.8
-[0.7.7]: https://github.com/bmad-code-org/bmad-auto/releases/tag/v0.7.7
-[0.7.6]: https://github.com/bmad-code-org/bmad-auto/releases/tag/v0.7.6
-[0.7.5]: https://github.com/bmad-code-org/bmad-auto/releases/tag/v0.7.5
-[0.7.4]: https://github.com/bmad-code-org/bmad-auto/releases/tag/v0.7.4
-[0.7.3]: https://github.com/bmad-code-org/bmad-auto/releases/tag/v0.7.3
-[0.7.2]: https://github.com/bmad-code-org/bmad-auto/releases/tag/v0.7.2
-[0.7.1]: https://github.com/bmad-code-org/bmad-auto/releases/tag/v0.7.1
-[0.7.0]: https://github.com/bmad-code-org/bmad-auto/releases/tag/v0.7.0
-[0.6.4]: https://github.com/bmad-code-org/bmad-auto/releases/tag/v0.6.4
-[0.6.3]: https://github.com/bmad-code-org/bmad-auto/releases/tag/v0.6.3
-[0.6.2]: https://github.com/bmad-code-org/bmad-auto/releases/tag/v0.6.2
-[0.6.1]: https://github.com/bmad-code-org/bmad-auto/releases/tag/v0.6.1
-[0.6.0]: https://github.com/bmad-code-org/bmad-auto/releases/tag/v0.6.0
+[0.7.12]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.7.12
+[0.7.11]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.7.11
+[0.7.10]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.7.10
+[0.7.9]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.7.9
+[0.7.8]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.7.8
+[0.7.7]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.7.7
+[0.7.6]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.7.6
+[0.7.5]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.7.5
+[0.7.4]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.7.4
+[0.7.3]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.7.3
+[0.7.2]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.7.2
+[0.7.1]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.7.1
+[0.7.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.7.0
+[0.6.4]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.6.4
+[0.6.3]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.6.3
+[0.6.2]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.6.2
+[0.6.1]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.6.1
+[0.6.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.6.0
+[0.5.1]: https://github.com/bmad-code-org/bmad-loop/commit/06d089d734c6
+[0.5.0]: https://github.com/bmad-code-org/bmad-loop/commit/c6a4e4f09e7c
+[0.4.4]: https://github.com/bmad-code-org/bmad-loop/commit/37a2886eee7c
+[0.4.3]: https://github.com/bmad-code-org/bmad-loop/commit/e1c3f17e989a
+[0.4.2]: https://github.com/bmad-code-org/bmad-loop/commit/e4cce98fc6b6
+[0.4.1]: https://github.com/bmad-code-org/bmad-loop/commit/d34e8bd609f3
+[0.4.0]: https://github.com/bmad-code-org/bmad-loop/commit/ad6a292c0f41
+[0.3.2]: https://github.com/bmad-code-org/bmad-loop/commit/243ea6f80b77
+[0.3.1]: https://github.com/bmad-code-org/bmad-loop/commit/37dd884efaff
+[0.3.0]: https://github.com/bmad-code-org/bmad-loop/commit/11a9d5a067a6
+[0.2.0]: https://github.com/bmad-code-org/bmad-loop/commit/823adae1c047
+[0.1.0]: https://github.com/bmad-code-org/bmad-loop/commit/f0550a842210

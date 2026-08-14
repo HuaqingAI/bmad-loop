@@ -4,7 +4,7 @@
 does: watching runs, launching new ones, resuming paused ones, answering sweep
 decisions, and editing policy. This guide covers every screen, key, and
 message. For the one-page summary, see the [TUI section of the
-README](../README.md#tui).
+README](../README.md#the-tui).
 
 ## Installation and launch
 
