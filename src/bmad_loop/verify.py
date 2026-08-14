@@ -59,7 +59,7 @@ _DIFF_ABSENT = "/dev/null"  # portability: git diff-format token, not a real pat
 
 # result.json `workflow` value for the dev pass. A machine contract: the
 # orchestrator forges this value in `devcontract` when synthesizing the dev
-# result from the spec the bmad-dev-auto session leaves on disk; a mismatch
+# result from the spec the bmad-build-auto session leaves on disk; a mismatch
 # means the wrong artifacts, so we reject rather than trust them. (Sweep's
 # triage/migrate workflows have their
 # own constants in sweep.py; the review skill is verified by on-disk artifacts
@@ -1562,7 +1562,7 @@ def _verify_shared_gates(
             f"spec status is {status!r}, expected {expected_status!r}: {spec_path}"
         )
 
-    # The generic bmad-dev-auto skill stamps `baseline_revision`, never
+    # The generic bmad-build-auto skill stamps `baseline_revision`, never
     # `baseline_commit` — that name exists only in the result.json devcontract
     # synthesizes, which this gate does not consult (it re-reads frontmatter).
     # An absent key skips the check below, so reading `baseline_commit` alone
@@ -1572,7 +1572,7 @@ def _verify_shared_gates(
     if task.baseline_commit and claimed_baseline not in ("", "NO_VCS"):
         if not same_commit(claimed_baseline, task.baseline_commit):
             # A deferred-work bundle may legitimately adopt a pre-existing story
-            # spec: bmad-dev-auto routes a "follow-up review of story X" bundle
+            # spec: bmad-build-auto routes a "follow-up review of story X" bundle
             # into that story's done spec, whose baseline_revision is the
             # story's original dev baseline — necessarily older than the unit
             # worktree cut for the bundle (#161). An *ancestor* baseline means
@@ -1723,7 +1723,7 @@ def verify_dev_bundle(
 ) -> VerifyOutcome:
     """verify_dev for a deferred-work bundle: bundles have no sprint-status
     entry. The orchestrator owns the bundle→dw-id binding (``task.dw_ids``,
-    marked done by ``SweepEngine``'s ledger sync); the generic ``bmad-dev-auto``
+    marked done by ``SweepEngine``'s ledger sync); the generic ``bmad-build-auto``
     primitive never authors dw ids. So the dw_ids cross-check is enforced only
     when the session actually claims them — an empty/absent claim is the normal
     generic path and passes.
@@ -2202,7 +2202,7 @@ def verify_review_stories(task: StoryTask, paths: ProjectPaths, policy: Policy) 
 def verify_review_bundle(task: StoryTask, paths: ProjectPaths, policy: Policy) -> VerifyOutcome:
     """verify_review for a deferred-work bundle: no sprint-status check, but
     every dw id the bundle owns must be marked done in the ledger on disk. The
-    legacy --dw-bundle skill flips them; on the generic bmad-dev-auto path the
+    legacy --dw-bundle skill flips them; on the generic bmad-build-auto path the
     orchestrator flips them after dev and, if review rewrites the ledger diff,
     again immediately before this review gate. Either way this gate is why we
     can trust it happened."""
@@ -2252,7 +2252,7 @@ def commit_story(repo: Path, message: str) -> str:
 def finalize_commit(repo: Path, baseline: str | None, message: str) -> str | None:
     """Collapse everything since `baseline` into ONE commit with `message`.
 
-    bmad-dev-auto now commits its own work at the end of each iteration (one
+    bmad-build-auto now commits its own work at the end of each iteration (one
     commit for the dev pass, one for each follow-up review pass), while the
     orchestrator still writes its own bookkeeping (sprint-status.yaml for
     stories, the deferred-work ledger for sweep bundles) into the working tree
@@ -2331,7 +2331,7 @@ def apply_patch(repo: Path, patch_path: Path) -> None:
     """Apply a saved patch to `repo`'s working tree (`git apply`), raising on failure.
 
     The intent-gap patch-restore re-drive (BMAD-METHOD #2564) uses this to re-lay
-    the attempted change bmad-dev-auto saved before reverting. New files in the
+    the attempted change bmad-build-auto saved before reverting. New files in the
     patch are created (they land untracked, matching how the original attempt sat
     before its revert).
 

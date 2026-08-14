@@ -175,9 +175,9 @@ class StoryTask:
     # rather than burning another cycle. Reset to 0 by runs.rearm_escalation so a
     # human-resolved re-drive gets a fresh damping budget. Survives the round-trip.
     followup_reviews_spent: int = 0
-    # set from the bmad-dev-auto session's `followup_review_recommended`
+    # set from the bmad-build-auto session's `followup_review_recommended`
     # frontmatter (PR #2505): when True and review.trigger = "recommended", the
-    # orchestrator runs a follow-up review pass (bmad-dev-auto re-invoked on the
+    # orchestrator runs a follow-up review pass (bmad-build-auto re-invoked on the
     # done spec); otherwise it skips it.
     followup_review_recommended: bool = False
     baseline_commit: str | None = None
@@ -299,7 +299,7 @@ class StoryTask:
     # kept, never deleted. "" = not a sentinel. Survives the round-trip.
     sentinel_kind: str = ""
     # intent-gap patch-restore re-drive (BMAD-METHOD #2564): a repo-relative-or-
-    # absolute path to the patch file bmad-dev-auto saved of the reverted attempt.
+    # absolute path to the patch file bmad-build-auto saved of the reverted attempt.
     # Latched by runs.rearm_escalation when the human confirms the attempted reading
     # was correct; the engine re-applies it onto the baseline after every reset of
     # the re-drive so the re-driven session resumes review (step-04) on the restored

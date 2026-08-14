@@ -1578,7 +1578,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
 
 
 class OpencodeDevAdapter(_DevSynthesisMixin, OpencodeHttpAdapter):
-    """Dev/review adapter for the generic ``bmad-dev-auto`` skill over HTTP.
+    """Dev/review adapter for the generic ``bmad-build-auto`` skill over HTTP.
 
     That skill writes NO ``result.json`` — its outcome lives in the terminal
     spec it leaves on disk, which :class:`_DevSynthesisMixin` locates and

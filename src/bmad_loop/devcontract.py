@@ -1,7 +1,7 @@
-"""Translate the generic `bmad-dev-auto` skill's output into the orchestrator's
+"""Translate the generic `bmad-build-auto` skill's output into the orchestrator's
 result.json contract.
 
-Alex Verhovsky's upstream `bmad-dev-auto` skill (BMAD-METHOD PR #2500) is a
+Alex Verhovsky's upstream `bmad-build-auto` skill (BMAD-METHOD PR #2500) is a
 decoupled autonomous-coding primitive: it writes NO result.json. Its outcome
 lives in the spec it produced — `status:` in the frontmatter (the machine-
 consumable signal) plus an appended `## Auto Run Result` prose section (intended
@@ -88,7 +88,7 @@ _FRONTMATTER_RE = re.compile(r"\A(---\r?\n)(.*?\r?\n)(---[ \t]*\r?\n)", re.DOTAL
 # A frontmatter `status:` line, preserving indent, the `: ` gap, optional quotes,
 # and any trailing inline comment. Only the value token is rewritten. The value is
 # `*` (not `+`) so a present-but-empty status (`status:` / `status: ""`) is matched
-# and filled — a bmad-dev-auto template can leave it blank.
+# and filled — a bmad-build-auto template can leave it blank.
 _FM_STATUS_RE = re.compile(
     r"^(?P<pre>[ \t]*status[ \t]*:[ \t]*)(?P<q>['\"]?)(?P<val>[A-Za-z-]*)(?P=q)(?P<rest>.*)$",
     re.MULTILINE,
@@ -363,7 +363,7 @@ def synthesize_result(
         # merely had open for writing.
         return SynthResult(result_json=None, status_consistent=True)
     # Through `status_of`, never a local `str(...)`: it normalizes a YAML-null
-    # `status:` (the blank line a bmad-dev-auto template legitimately leaves — see
+    # `status:` (the blank line a bmad-build-auto template legitimately leaves — see
     # `_FM_STATUS_RE`) to `""` alongside the missing key. A local stringification
     # made that `"none"`, which is truthy, so the prose fallback below never fired
     # and a blank-frontmatter/prose-`done` spec synthesized `status="none"` with
@@ -404,7 +404,7 @@ def synthesize_result(
     }
     if dw_ids:
         result["dw_ids"] = list(dw_ids)
-    # bmad-dev-auto (BMAD-METHOD PR #2505) self-reviews inline and, on a `done`
+    # bmad-build-auto (BMAD-METHOD PR #2505) self-reviews inline and, on a `done`
     # exit, sets `followup_review_recommended: true` when its review-driven
     # changes warrant an independent second-opinion pass. The skill never sets it
     # on a blocked exit, so only carry it through on `done`.
@@ -433,12 +433,14 @@ def find_result_artifact(impl_artifacts: Path, *, since_ns: int) -> Path | None:
     writes no result.json, so on the session's Stop event we locate the spec it
     produced. The common case is a `spec-*.md` carrying a terminal `## Auto Run
     Result` section (appended by the skill's HALT on success AND blocked, when a
-    spec exists). The skill's no-spec fallback — `bmad-dev-auto-result-*.md`,
-    written when intent was too unclear to even create a spec — carries a
-    terminal frontmatter `status:` but NO `## Auto Run Result` heading, so it is
-    matched by filename instead. Scans `impl_artifacts` for the most-recently-
-    modified qualifying markdown modified at/after `since_ns` (the session launch
-    floor, so a stale prior artifact can't be mistaken for this run's output).
+    spec exists). The skill's no-spec fallback — `bmad-build-auto-result-*.md`,
+    or `bmad-dev-auto-result-*.md` pre-rename, written when intent was too
+    unclear to even create a spec — carries a terminal frontmatter `status:` but
+    NO `## Auto Run Result` heading, so it is matched by filename instead. Both
+    spellings match: see `FALLBACK_RESULT_PREFIXES`. Scans `impl_artifacts` for
+    the most-recently-modified qualifying markdown modified at/after `since_ns`
+    (the session launch floor, so a stale prior artifact can't be mistaken for
+    this run's output).
     Returns None when nothing qualifies.
     """
     if not impl_artifacts.is_dir():
@@ -599,7 +601,7 @@ def _render_status_line(line: str, m: re.Match[str], value: str) -> str:
 def reset_spec_status(spec_path: Path, new_status: str) -> bool:
     """Rewrite the frontmatter ``status:`` value of a spec in place.
 
-    Used by the generic-skill repair path: bmad-dev-auto self-finalizes a spec to
+    Used by the generic-skill repair path: bmad-build-auto self-finalizes a spec to
     ``done``/``in-review``, and its step-01 routes such a spec to "ingest as
     context, do not resume" — so to repair in place the orchestrator must re-open
     the spec by flipping its status back to ``in-progress``. A minimal line edit

@@ -1450,7 +1450,7 @@ def rearm_escalation(
             task.sentinel_kind = ""  # verdict discharged; the re-dispatch is clean
         else:
             try:
-                # Route /bmad-dev-auto via the spec's frontmatter status (decision
+                # Route /bmad-build-auto via the spec's frontmatter status (decision
                 # table): patch-restore -> in-review -> step-04 (resume review on
                 # the restored diff); from-scratch -> ready-for-dev -> step-03
                 # (re-implement). Independent of the resolve agent having set it.
