@@ -129,7 +129,7 @@ NUDGE_TEXT = (
 # has no background-completion re-invocation, so a turn ended to await a slow
 # background process (a Unity PlayMode run, a long test) would otherwise wait
 # forever; this nudge IS that re-invocation. Skill-agnostic: it must not assume a
-# result.json (the bmad-dev-auto skill writes none — see GenericDevAdapter).
+# result.json (the bmad-build-auto skill writes none — see GenericDevAdapter).
 STALL_NUDGE_TEXT = (
     "You appear idle in bmad-loop automation mode, which cannot re-invoke you when "
     "a background process finishes. If you are waiting on one (e.g. a Unity PlayMode "
@@ -1166,7 +1166,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
 
 
 class _DevSynthesisMixin(_ResultFileMixin):
-    """Result synthesis for the generic ``bmad-dev-auto`` skill, shared by
+    """Result synthesis for the generic ``bmad-build-auto`` skill, shared by
     every transport that drives it (tmux today; see GenericDevAdapter for the
     skill contract). Locates the terminal spec the skill leaves on disk and
     synthesizes the legacy result dict via :mod:`devcontract`. Hosts provide
@@ -1194,7 +1194,7 @@ class _DevSynthesisMixin(_ResultFileMixin):
     _READBACK_NEEDS_PROOF_OF_WORK = True
 
     def _configure_dev_knobs(self) -> None:
-        """Override the base result-file knobs for the bmad-dev-auto contract;
+        """Override the base result-file knobs for the bmad-build-auto contract;
         hosts call this at the end of ``__init__``."""
         # The generic skill never writes result.json, so the base "write the
         # result JSON file" nudge is meaningless — and actively misleading — for
@@ -1873,14 +1873,15 @@ class _DevSynthesisMixin(_ResultFileMixin):
 
 
 class GenericDevAdapter(_DevSynthesisMixin, GenericAdapter):
-    """Dev adapter for Alex Verhovsky's generic ``bmad-dev-auto`` skill.
+    """Dev adapter for Alex Verhovsky's generic ``bmad-build-auto`` skill.
 
     That skill writes NO ``result.json`` — its outcome lives in the spec it
     leaves on disk (frontmatter ``status:`` plus an appended ``## Auto Run
-    Result``, or, when it never created a spec, a ``bmad-dev-auto-result-*.md``
-    fallback). On the Stop event we locate that artifact and synthesize the
-    legacy result dict from it via :mod:`devcontract`, so verify/escalation and
-    the rest of the pipeline consume it unchanged. Selected by
+    Result``, or, when it never created a spec, a ``bmad-build-auto-result-*.md``
+    — ``bmad-dev-auto-result-*.md`` pre-rename — fallback). On the Stop event we
+    locate that artifact and synthesize the legacy result dict from it via
+    :mod:`devcontract`, so verify/escalation and the rest of the pipeline
+    consume it unchanged. Selected by
     ``policy.dev.skill == "bmad-dev-auto"`` (see ``cli._make_adapters``).
     """
 

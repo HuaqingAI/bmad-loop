@@ -80,7 +80,7 @@ class AdapterBuilder:
     """The classes and failure modes of one adapter family.
 
     ``plain`` and ``dev`` are the two variants ``runsetup.make_adapters`` picks
-    between on the ``synthesizes`` axis (a ``bmad-dev-auto`` dev/review session
+    between on the ``synthesizes`` axis (a ``bmad-build-auto`` dev/review session
     gets ``dev``, which takes an extra ``paths=`` kwarg; every other role gets
     ``plain``). ``construct_error`` is the tuple of exception types the family's
     constructor raises when the session cannot be built — empty for a family that

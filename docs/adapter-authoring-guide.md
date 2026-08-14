@@ -586,7 +586,7 @@ decisions worth stealing:
   and copy normally — opencode discovers `.claude/skills/<name>/SKILL.md`
   natively.
 - **Reuse the synthesis mixins, never fork them.** `_ResultFileMixin`
-  (`result.json` read-back) and `_DevSynthesisMixin` (the whole bmad-dev-auto
+  (`result.json` read-back) and `_DevSynthesisMixin` (the whole bmad-build-auto
   dev/review synthesis machinery) live in
   [`adapters/generic.py`](../src/bmad_loop/adapters/generic.py).
   `OpencodeDevAdapter(_DevSynthesisMixin, OpencodeHttpAdapter)` plugs into two

@@ -1254,7 +1254,7 @@ class SweepEngine(Engine):
 
     def _post_dev_accepted_sync(self, task: StoryTask, result_json: dict | None) -> None:
         """Generic-path ledger single-writer for bundles. The decoupled
-        bmad-dev-auto skill does not touch the ledger, so the orchestrator marks
+        bmad-build-auto skill does not touch the ledger, so the orchestrator marks
         each dw id the bundle owns ``done`` once the bundle's spec reaches the
         terminal status for the current stage. No-op on the legacy path.
 

@@ -1,6 +1,6 @@
 """Model of sprint-status.yaml — the single source of workflow truth.
 
-The dev primitive `bmad-dev-auto` deliberately does not touch sprint-status
+The dev primitive `bmad-build-auto` deliberately does not touch sprint-status
 ("the orchestrator's business"), so the orchestrator is the single writer via
 :func:`advance` — idempotent, never-regress, epic-lift. The orchestrator
 otherwise only re-reads this file to pick the next story and verify what a

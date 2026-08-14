@@ -205,7 +205,7 @@ An entry may also carry **`closes_deferred`** — the `DW-<n>` ledger ids that s
   closes_deferred: [DW-5, DW-6]
 ```
 
-Declaring it here rather than in the story spec is what lets the annotation happen without touching each generated spec: `bmad-dev-auto` generates the spec and knows nothing of the ledger, whereas the breakdown is authored while the ledger is in view. A spec that _does_ carry the field in frontmatter is honored too — the two are unioned.
+Declaring it here rather than in the story spec is what lets the annotation happen without touching each generated spec: `bmad-build-auto` generates the spec and knows nothing of the ledger, whereas the breakdown is authored while the ledger is in view. A spec that _does_ carry the field in frontmatter is honored too — the two are unioned.
 
 Like `spec_checkpoint` and `done_checkpoint`, this is a **human-authored, caller-only field**. Breakdown time, with the ledger open, is where it belongs — but it is not a deadline: the declaration is read when the story commits, so adding one to a story spec's frontmatter mid-run is honored, and withdrawing one before the commit means it is not closed. Upstream Story Breakdown does not emit it yet ([BMAD-METHOD#2619](https://github.com/bmad-code-org/BMAD-METHOD/issues/2619)), and re-deriving `stories.yaml` rewrites the file — so record the intent in `.memlog.md` alongside the story, or the declaration is lost on the next re-derive.
 
@@ -246,7 +246,7 @@ sprint-status.yaml: 1-2-account-mgmt: ready-for-dev
 
 **Resolving a CRITICAL escalation:** the escalated story is parked in a terminal `escalated` phase — `resume` skips it. To un-stick it, run `bmad-loop resolve <run-id>` (or press `R` in the TUI). That opens an interactive **resolve agent** seeded with the escalation and the frozen spec; you converse with it to disambiguate the spec, it records the resolution, and on your confirmation the orchestrator re-arms the story (`escalated → pending`, spec status reset to `ready-for-dev`) and resumes — a clean rebuild against the corrected spec, then on through the rest of the sprint. Already fixed the spec yourself? `bmad-loop resolve <run-id> --no-interactive` skips straight to re-arm + resume.
 
-**Intent-gap patch-restore.** When review halted on an **intent gap** — the implementation was sound but read the spec differently than intended — `bmad-dev-auto` saves the attempted change as a patch before reverting ([BMAD-METHOD#2564](https://github.com/bmad-code-org/BMAD-METHOD/issues/2564)). If the attempted reading was in fact correct, `resolve` re-arms the spec to `in-review` and re-applies that patch onto baseline after every reset, so the re-driven session resumes **review** on the restored diff instead of re-implementing from scratch. The interactive agent supplies the patch automatically via `resolution.json`; on the hand-driven path pass `bmad-loop resolve <run-id> --no-interactive --restore-patch <path>`. A patch that fails to apply escalates rather than running on a half-restored tree, and deferred-work `sweep` bundles get the same recovery.
+**Intent-gap patch-restore.** When review halted on an **intent gap** — the implementation was sound but read the spec differently than intended — `bmad-build-auto` saves the attempted change as a patch before reverting ([BMAD-METHOD#2564](https://github.com/bmad-code-org/BMAD-METHOD/issues/2564)). If the attempted reading was in fact correct, `resolve` re-arms the spec to `in-review` and re-applies that patch onto baseline after every reset, so the re-driven session resumes **review** on the restored diff instead of re-implementing from scratch. The interactive agent supplies the patch automatically via `resolution.json`; on the hand-driven path pass `bmad-loop resolve <run-id> --no-interactive --restore-patch <path>`. A patch that fails to apply escalates rather than running on a half-restored tree, and deferred-work `sweep` bundles get the same recovery.
 
 ## Deferred-work sweeps
 
@@ -417,9 +417,9 @@ file = true                # append the same alerts to the run's ATTENTION file
 
 [review]
 enabled = true             # false = skip the separate review session; the dev pass
-                           # runs bmad-dev-auto's own inline review layers and finalizes to done
+                           # runs bmad-build-auto's own inline review layers and finalizes to done
 trigger = "recommended"    # when enabled: "recommended" runs the separate review only when
-                           # bmad-dev-auto flags followup_review_recommended; "always" = every story
+                           # bmad-build-auto flags followup_review_recommended; "always" = every story
                            # (the loop is bounded by limits.max_review_cycles either way)
 on_status_contradiction = "escalate"
                            # a review that writes sprint-status back off "done" (revoking the
@@ -503,7 +503,7 @@ low_frame_rate = false     # true = cap to 15fps + disable animations (= bmad-lo
 
 > In **stories mode** the `stories.yaml` list is flat — there are no epics — so the default `per-epic` gate never fires (nothing to bound). Use the per-story `spec_checkpoint` / `done_checkpoint` flags for HITL there, or `per-story-spec-approval` for a run-global spec gate. `none` and `per-story-spec-approval` behave the same as in sprint mode.
 
-**Review:** `[review].enabled = false` drops the separate fresh-context review session; the dev pass instead runs `bmad-dev-auto`'s own internal review layers (Blind Hunter / Edge Case Hunter / Verification Gap / Intent Alignment) and finalizes the story straight to `done` — one session per story instead of two, verify commands still gating the commit. Governs deferred-work sweeps too. When review is enabled, `[review].trigger` decides _when_ that separate pass runs: `recommended` (default) only when the `bmad-dev-auto` session flags `followup_review_recommended` — it already reviews inline and computes the flag from a severity-weighted score over the final pass's patched findings (BMAD-METHOD#2580); `always` runs it every story. The follow-up loop is bounded by `limits.max_review_cycles` (default 3), which caps oscillation.
+**Review:** `[review].enabled = false` drops the separate fresh-context review session; the dev pass instead runs `bmad-build-auto`'s own internal review layers (Blind Hunter / Edge Case Hunter / Verification Gap / Intent Alignment) and finalizes the story straight to `done` — one session per story instead of two, verify commands still gating the commit. Governs deferred-work sweeps too. When review is enabled, `[review].trigger` decides _when_ that separate pass runs: `recommended` (default) only when the `bmad-build-auto` session flags `followup_review_recommended` — it already reviews inline and computes the flag from a severity-weighted score over the final pass's patched findings (BMAD-METHOD#2580); `always` runs it every story. The follow-up loop is bounded by `limits.max_review_cycles` (default 3), which caps oscillation.
 
 `bmad-loop init` (without `--cli`) registers hooks for every CLI profile the policy references, so a dual-client setup needs no extra flags.
 

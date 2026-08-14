@@ -3,7 +3,7 @@
 Where the default :class:`~bmad_loop.engine.Engine` walks ``sprint-status.yaml``,
 ``StoriesEngine`` drives a typed ``stories.yaml`` (the Story Breakdown output,
 a fixed-name sibling of ``SPEC.md``). Each entry is dispatched by *spec folder +
-story id* rather than a spec path: the inner ``bmad-dev-auto`` skill reads its
+story id* rather than a spec path: the inner ``bmad-build-auto`` skill reads its
 own entry, creates-or-resumes the story spec at ``<spec-folder>/stories/<id>-<slug>.md``,
 and the orchestrator reads that id-keyed path back deterministically — no
 mtime-scan, no shared mutable board.
@@ -443,7 +443,7 @@ class StoriesEngine(Engine):
         """The ``stories.yaml`` entry's ``closes_deferred`` ids.
 
         This is the channel that makes story-declared closure work unattended:
-        ``bmad-dev-auto`` writes the story spec and knows nothing of the ledger,
+        ``bmad-build-auto`` writes the story spec and knows nothing of the ledger,
         so with the spec frontmatter alone a human would have to hand-edit every
         generated spec. The breakdown, by contrast, is authored while the ledger
         is in view. Both channels compose — the base hook unions them.

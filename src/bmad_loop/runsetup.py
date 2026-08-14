@@ -420,7 +420,7 @@ def make_adapters(
     from .adapters.profile import ProfileError, get_profile
     from .adapters.registry import AdapterError, get_adapter_kind
 
-    # The dev skill (bmad-dev-auto) writes no result.json: its adapter
+    # The dev skill (bmad-build-auto) writes no result.json: its adapter
     # synthesizes the result from the spec, and so needs the project paths to
     # find that spec — rebasing onto the active worktree's implementation-
     # artifacts dir under isolation, not just the main checkout's.
@@ -430,12 +430,12 @@ def make_adapters(
     by_cfg: dict = {}
     for role in ROLES:
         cfg = policy.adapter.resolved(role)
-        # Both the dev and review sessions are now bmad-dev-auto runs (the review
+        # Both the dev and review sessions are now bmad-build-auto runs (the review
         # session re-invokes the dev skill on the done spec for a follow-up pass),
         # and the skill writes no result.json — its adapter synthesizes the result
         # from the spec it leaves on disk, so it needs the project paths to find
         # that spec and cannot be shared with the triage role even on identical
-        # config. `synthesizes` is a bmad-dev-auto pipeline concept (which variant
+        # config. `synthesizes` is a bmad-build-auto pipeline concept (which variant
         # of a family to build + whether to thread `paths`), NOT a per-family
         # branch — it stays a documented contract for every registered adapter.
         synthesizes = role in ("dev", "review") and policy.dev.skill == "bmad-dev-auto"

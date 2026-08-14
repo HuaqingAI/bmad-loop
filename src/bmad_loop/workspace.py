@@ -30,7 +30,7 @@ from .platform_util import safe_ref_segment, safe_segment
 # untracked files in the main checkout. Crucially they must NOT live under .git/:
 # a cwd inside .git/ is treated as git-internal by the coding CLIs (Claude Code),
 # which then refuse to load the project's bmad-loop-* skills — breaking every
-# worktree session (`Unknown command: /bmad-dev-auto`).
+# worktree session (`Unknown command: /bmad-build-auto`).
 WORKTREE_DIRNAME = "worktrees"
 
 

@@ -8,7 +8,7 @@ single left-to-right scan, not a DAG. Each entry pins a stable, prefix-free,
 machine-opaque ``id`` plus ``title``/``description`` and the caller-only knobs
 ``spec_checkpoint`` / ``done_checkpoint`` / ``invoke_dev_with`` /
 ``closes_deferred``. ``status`` is deliberately absent: bmad-spec is the sole
-writer of ``stories.yaml`` and bmad-dev-auto is the sole writer of each story
+writer of ``stories.yaml`` and bmad-build-auto is the sole writer of each story
 spec's status — the orchestrator writes neither.
 
 This module is the strict, typed parser the orchestrator reads it through. The

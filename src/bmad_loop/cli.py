@@ -2369,7 +2369,7 @@ def _resolve_restore_patch(
     # collapsed. The resolved absolute path is what gets latched.
     patch = verify.resolve_restore_path(raw, project).resolve()
     # Same trusted-roots shape as the frontmatter reconcile's spec_within_roots:
-    # bmad-dev-auto saves the patch under implementation_artifacts, and artifact
+    # bmad-build-auto saves the patch under implementation_artifacts, and artifact
     # dirs configured OUTSIDE the project tree are a supported layout — a bare
     # is_relative_to(project) check would reject every legitimate restore there.
     try:

@@ -1725,7 +1725,7 @@ class Engine:
                     task.pre_harvest_ledger = self._ledger_text()
                     task.pre_harvest_ledger_captured = True
                     self._save()
-                # bmad-dev-auto sometimes finalizes the spec in prose (## Auto Run
+                # bmad-build-auto sometimes finalizes the spec in prose (## Auto Run
                 # Result: Status done) but leaves the frontmatter status at the
                 # template default. Repair it BEFORE any frontmatter reader runs —
                 # the sync below, verify_dev, and the review-verify gate all key
@@ -1909,19 +1909,19 @@ class Engine:
         if self._park_awaiting_operator(task):
             return
         if not self.policy.review.enabled:
-            # review.enabled = false: the bmad-dev-auto session's own inline
+            # review.enabled = false: the bmad-build-auto session's own inline
             # review is the only review; verify the deterministic gates + commit.
             self._skip_review_and_commit(task)
             return
         # review.enabled = true (default): run a follow-up review session by
-        # re-invoking bmad-dev-auto on the done spec (BMAD-METHOD #2508 routes a
+        # re-invoking bmad-build-auto on the done spec (BMAD-METHOD #2508 routes a
         # `done` spec to a fresh step-04 review pass). The dev session self-
         # finalizes the spec to done (no in-review handoff) and the orchestrator
         # advances sprint-status at dev time (_post_dev_state_sync), so this runs
         # as an independent second-opinion pass on a done spec before commit.
         #
         # review.trigger = "recommended" (default) gates that loop per-story on the
-        # bmad-dev-auto session's `followup_review_recommended` signal (PR #2505):
+        # bmad-build-auto session's `followup_review_recommended` signal (PR #2505):
         # the skill already self-reviews inline every story and recommends an
         # independent pass from a severity-weighted score over its patched
         # findings (upstream #2580). When it didn't, skip the separate session
@@ -1973,7 +1973,7 @@ class Engine:
                 resume_result = None
             else:
                 # Strip the prior pass's stale `## Auto Run Result` before launch:
-                # the review re-invokes bmad-dev-auto on the done spec, and the
+                # the review re-invokes bmad-build-auto on the done spec, and the
                 # session's own entry write would otherwise lift that leftover
                 # marker past the adapter's launch-mtime floor and end the review
                 # on its first result-less Stop (issue #160). Non-replay branch
@@ -2031,7 +2031,7 @@ class Engine:
             rj = result.result_json or {}
             for pref in preference_escalations(rj):
                 self.journal.append("preference-escalation", story_key=task.story_key, **pref)
-            # A review pass is itself a bmad-dev-auto run: it produces a spec
+            # A review pass is itself a bmad-build-auto run: it produces a spec
             # (status done/blocked + a refreshed followup_review_recommended),
             # not a result.json with `clean`. devcontract synthesizes that for us.
             # Convergence = the pass finished `done` and no longer recommends an
@@ -2361,7 +2361,7 @@ class Engine:
         skipping the review loop. Returns True when it did (the caller is done).
 
         The review loop is skipped because there is nothing for it to converge
-        ON. A review pass is bmad-dev-auto re-invoked on the spec to second-guess
+        ON. A review pass is bmad-build-auto re-invoked on the spec to second-guess
         the diff and finalize `done`; a park's outstanding work is not in the diff
         at all — it is outside the repo, in a human's hands — so every cycle would
         either re-park (no progress, budget burned) or "fix" the park away by
@@ -2404,7 +2404,7 @@ class Engine:
 
     def _skip_review_and_commit(self, task: StoryTask, *, kind: str = "review-skipped") -> None:
         """review.enabled = false: no separate review session runs. The
-        bmad-dev-auto session ran its own inline review and finalized the
+        bmad-build-auto session ran its own inline review and finalized the
         story to done. Validate the deterministic gates (verify commands,
         spec/sprint = done) and commit, repairing once if verify is fixable.
 
@@ -2510,7 +2510,7 @@ class Engine:
             # the workspace ahead of the `git add -A`, it reaches every clone the
             # story's commit does — including through the worktree merge-back.
             park_record = self._write_park_record(task)
-            # bmad-dev-auto commits its own work each iteration; the orchestrator
+            # bmad-build-auto commits its own work each iteration; the orchestrator
             # squashes that chain plus its uncommitted bookkeeping back onto the
             # pre-dev baseline as one commit carrying `message`. None means there
             # was nothing to finalize (NO_VCS, or the tree already at baseline).
@@ -2803,7 +2803,7 @@ class Engine:
 
     def _reconcile_generic_terminal_status(self, task: StoryTask, result_json: dict | None) -> None:
         """Repair a generic-skill spec the session finalized in prose but not in
-        frontmatter. ``bmad-dev-auto`` sometimes appends a terminal
+        frontmatter. ``bmad-build-auto`` sometimes appends a terminal
         ``## Auto Run Result`` (``Status: done``) yet leaves the frontmatter
         ``status`` at the template default. The orchestrator reads ONLY
         frontmatter, so without this the sprint sync and accepted bundle close
@@ -3013,7 +3013,7 @@ class Engine:
     def _post_dev_state_sync(self, task: StoryTask, result_json: dict | None) -> None:
         """Single-writer for the on-disk bookkeeping the generic skill never touches.
 
-        For a story that is sprint-status: the decoupled ``bmad-dev-auto`` skill
+        For a story that is sprint-status: the decoupled ``bmad-build-auto`` skill
         knows nothing of the bmad_loop's sprint board, so the orchestrator writes
         it — and must do so
         before ``verify_dev`` checks the sprint stage. Mirrors ``verify_dev``:
@@ -3874,7 +3874,7 @@ class Engine:
         )
 
     def _review_prompt(self, task: StoryTask) -> str:
-        # Re-invoking bmad-dev-auto on a `done` spec resets review_loop_iteration
+        # Re-invoking bmad-build-auto on a `done` spec resets review_loop_iteration
         # and routes to step-04 for a fresh independent review pass (BMAD-METHOD
         # #2508) — so the follow-up review is just another dev-skill run, no
         # separate review skill. task.spec_file is set by verify_dev on success.
@@ -4134,13 +4134,13 @@ class Engine:
         env.update(self._extra_session_env(task, role, label=label))
         if task.dw_ids:
             # Deferred-work bundle: the orchestrator owns the bundle→dw-id binding
-            # (the generic bmad-dev-auto primitive knows nothing of dw ids). Export
+            # (the generic bmad-build-auto primitive knows nothing of dw ids). Export
             # them so the generic adapter can stamp them onto the synthesized
             # result.json, keeping verify_dev_bundle's dw_ids cross-check live.
             env["BMAD_LOOP_DW_IDS"] = ",".join(task.dw_ids)
         if role == "dev" and not self.policy.review.enabled:
             # signals that the orchestrator will run no follow-up review session.
-            # bmad-dev-auto always self-reviews inline (step-03 → step-04) and
+            # bmad-build-auto always self-reviews inline (step-03 → step-04) and
             # commits regardless, so this is a no-op for it; kept for any future
             # dev skill that honors a skip-review mode (cf. the legacy seam).
             env["BMAD_LOOP_SKIP_REVIEW"] = "1"
@@ -4504,7 +4504,7 @@ class Engine:
         return self._generic_dev_prompt(task, feedback)
 
     def _generic_dev_prompt(self, task: StoryTask, feedback: Path | None) -> str:
-        """Invocation for the generic `bmad-dev-auto` dev skill, which has no
+        """Invocation for the generic `bmad-build-auto` dev skill, which has no
         `--feedback` flag: feedback is inlined as freeform intent pointing at the
         existing spec. On a repair re-invocation the spec is first re-opened
         (status → `in-progress`) so the skill's step-01 re-enters implement/review
@@ -4672,7 +4672,7 @@ class Engine:
         ``[operator] enabled``. "" when the feature is off.
 
         Engine-injected rather than skill-owned because the durable home for it is
-        upstream — bmad-dev-auto's spec template and step-03/04 finalize rules —
+        upstream — bmad-build-auto's spec template and step-03/04 finalize rules —
         and that PR is not landed. This is the shipped interim: the same words the
         skill will eventually carry, said by the orchestrator so the state is
         reachable now. When upstream lands, this method is what goes away.
@@ -4706,7 +4706,7 @@ class Engine:
         )
 
     def _reset_spec_for_repair(self, task: StoryTask) -> None:
-        """Re-open a generic-skill spec before a repair re-invocation. bmad-dev-auto
+        """Re-open a generic-skill spec before a repair re-invocation. bmad-build-auto
         self-finalizes to `done` (or `in-review`); its step-01 routes such a spec to
         "ingest as context, do not resume," so a repair must flip the frontmatter
         `status` back to `in-progress` to re-enter implement/review in place against
@@ -4727,7 +4727,7 @@ class Engine:
         """Strip the prior pass's stale `## Auto Run Result` before a review launch,
         then capture a launch-state snapshot of the spec (#276 M1).
 
-        A follow-up review session re-invokes bmad-dev-auto on the FINALIZED spec,
+        A follow-up review session re-invokes bmad-build-auto on the FINALIZED spec,
         which still carries the dev pass's terminal `## Auto Run Result` section.
         The review's own step-04 entry write (it stamps the transient `in-review`
         status) bumps the spec's mtime past `find_result_artifact`'s launch floor,

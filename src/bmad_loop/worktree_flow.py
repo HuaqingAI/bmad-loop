@@ -528,7 +528,7 @@ def provision_worktree(
     the Stop-signal hook never fires, and isolated sessions can't reach their MCP
     server. Lay the bundled skills + signal hook into the worktree for the active
     CLI profiles, and copy the `seed_files` configs in from the main repo. The
-    upstream skills the orchestrator drives (BASE_SKILLS: bmad-dev-auto + the review
+    upstream skills the orchestrator drives (BASE_SKILLS: bmad-build-auto + the review
     hunters, plus whatever review layers this project's own config names) are not
     bundled in the wheel, so they are copied from the MAIN REPO's installed tree
     instead — together with `_bmad/custom/`, the customization those layers resolve

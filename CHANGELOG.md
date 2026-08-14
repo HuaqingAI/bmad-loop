@@ -322,6 +322,11 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
+- **The settings editor's `review.trigger` help no longer names the pre-rename dev primitive.**
+  Its `recommended` blurb read "only when bmad-dev-auto flags it", a name upstream retired in BMAD
+  6.10.1, so the TUI named a skill a current install does not have. It now says `bmad-build-auto`,
+  matching the `docs/tui-guide.md` table it mirrors.
+
 - **The `version-sync` gate no longer passes on a marketplace.json it could not read.**
   `sync_version.check()` iterated `market.get("plugins", [])`, so a renamed, deleted or emptied
   `plugins` key made the loop run zero times and the gate print "ok: every version field agrees"
