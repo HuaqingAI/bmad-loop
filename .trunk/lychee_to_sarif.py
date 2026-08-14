@@ -19,6 +19,11 @@ RULE_ID = "broken-link"
 # trunk.yaml linter name plus `ruleId` and never reads this, but a conformant consumer
 # rejects a run without it.
 TOOL_NAME = "lychee"
+# lychee's own "did this run fail" test is `error_map.is_empty() && timeout_map.is_empty()`,
+# so either counter can be what earned a rc 2. This parser renders `error_map` only, so a
+# nonzero `timeouts` would produce no results at all; unreachable while `--offline` is set
+# (a filesystem check cannot time out) but silently fail-open if that flag were dropped.
+FAILURE_COUNTERS = ("errors", "timeouts")
 
 
 def relativize(path: str, root: str) -> str:
@@ -63,8 +68,8 @@ def to_result(path: str, entry: dict) -> dict:
     }
 
 
-def read_error_map(raw: str) -> dict:
-    """Decode lychee's report and return its `error_map`, refusing any other shape.
+def read_report(raw: str) -> dict:
+    """Decode lychee's report, refusing any shape this parser cannot render.
 
     `success_codes: [0, 2]` makes the SARIF `results` array the only signal that
     can fail this lint, so an unreadable report has to fail the *parser* rather
@@ -85,7 +90,14 @@ def read_error_map(raw: str) -> dict:
     error_map = report["error_map"]
     if not isinstance(error_map, dict):
         raise ValueError(f"lychee 'error_map' is {type(error_map).__name__}, not an object")
-    return error_map
+    # Every 0.24.2 `error_map` value is an array of failure objects — including the
+    # synthetic span-less `url: "error:"` entry lychee writes when it cannot read an
+    # input at all. Any other type either drops silently to zero results (`{}`, `""`)
+    # or dies inside to_result() with a bare AttributeError; name it here instead.
+    for path, entries in error_map.items():
+        if not isinstance(entries, list):
+            raise ValueError(f"lychee 'error_map[{path}]' is {type(entries).__name__}, not a list")
+    return report
 
 
 def main() -> int:
@@ -94,17 +106,29 @@ def main() -> int:
     args = ap.parse_args()
 
     try:
-        error_map = read_error_map(sys.stdin.read().strip())
+        report = read_report(sys.stdin.read().strip())
+        results = [
+            to_result(relativize(path, args.root), entry)
+            for path, entries in report["error_map"].items()
+            for entry in entries
+        ]
+        # A shape check on `error_map` alone still lets an *empty* value through, and
+        # `[]` is a list. lychee counts every failure it found independently, so a
+        # nonzero counter with nothing to show for it means the report carried failures
+        # this parser could not render. Deliberately not `errors == len(results)`:
+        # `error_map` values are Rust HashSets, so two byte-identical failures under one
+        # key collapse, and an exact match would redden a valid report.
+        counted = [name for name in FAILURE_COUNTERS if report.get(name)]
+        if counted and not results:
+            raise ValueError(
+                f"lychee counted failures ({', '.join(counted)}) but the report yielded "
+                "no SARIF results; output format changed?"
+            )
     except ValueError as exc:
         # trunk copies parser stderr verbatim into its failure report and turns a
         # nonzero parser exit into a visible red lint, so this is the loud path.
         print(f"lychee_to_sarif: {exc}", file=sys.stderr)
         return 1
-    results = [
-        to_result(relativize(path, args.root), entry)
-        for path, entries in error_map.items()
-        for entry in entries
-    ]
     sarif = {
         "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
         "version": "2.1.0",

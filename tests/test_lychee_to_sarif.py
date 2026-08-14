@@ -52,6 +52,9 @@ def test_error_map_entry_becomes_a_located_sarif_result(
     """
     root = str(tmp_path)
     report = {
+        # `errors` is carried so this doubles as the positive control for the
+        # counted-failures cross-check: a report that *does* yield results must pass it.
+        "errors": 1,
         "error_map": {
             str(tmp_path / "docs" / "src.md"): [
                 {
@@ -60,7 +63,7 @@ def test_error_map_entry_becomes_a_located_sarif_result(
                     "span": {"line": 3, "column": 37},
                 }
             ]
-        }
+        },
     }
 
     rc, sarif = _run(monkeypatch, capsys, json.dumps(report), root)
@@ -134,8 +137,21 @@ def test_clean_report_yields_a_conformant_empty_run(
         ("not json", "not JSON"),
         ('{"total": 0, "failure_map": {}}', "error_map"),
         ('{"error_map": []}', "not an object"),
+        ('{"error_map": {"docs/a.md": {}}}', "not a list"),
+        ('{"errors": 1, "error_map": {}}', "counted failures"),
+        ('{"errors": 1, "error_map": {"docs/a.md": []}}', "counted failures"),
+        ('{"timeouts": 1, "error_map": {}}', "counted failures"),
     ],
-    ids=["empty", "not-json", "renamed-key", "wrong-type"],
+    ids=[
+        "empty",
+        "not-json",
+        "renamed-key",
+        "wrong-type",
+        "non-list-entries",
+        "count-without-entries",
+        "empty-entries",
+        "timeout-only",
+    ],
 )
 def test_unusable_report_fails_the_parser(
     monkeypatch: pytest.MonkeyPatch,
@@ -149,6 +165,18 @@ def test_unusable_report_fails_the_parser(
     broken links", so failing open here hides every broken link in the repo. trunk
     turns a nonzero parser exit into a visible tool failure and copies the
     parser's stderr into its failure report, so stderr + rc 1 is the loud path.
+
+    The last four rows are the *silent* half of that space. A member value only
+    drops to zero results without a diagnostic when it is an empty container, so
+    `empty-entries` is the row a listness check alone cannot catch — `[]` is a
+    list — and it is why the counted-failures cross-check exists alongside the
+    shape check. `timeout-only` is unreachable while lychee runs `--offline`;
+    it holds the line if that flag is ever dropped, since lychee routes timeouts
+    to `timeout_map` and still exits 2.
+
+    These assert on stderr, not just rc: the non-empty malformed shapes already
+    exit 1 by tripping over a bare AttributeError inside to_result(), so an
+    rc-only assertion would pass with the guards ablated.
     """
     monkeypatch.setattr(sys, "argv", ["lychee_to_sarif.py"])
     monkeypatch.setattr(sys, "stdin", io.StringIO(payload))
