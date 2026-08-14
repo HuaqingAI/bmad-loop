@@ -326,6 +326,13 @@ def _project_template(
     (root / "src.txt").write_text("original\n")
     (root / ".gitignore").write_text(".bmad-loop/runs/\n")  # as `bmad-loop init` would
     git(root, "init", "-q", "-b", "main")
+    # `git init` seeds 14 dead `*.sample` hooks nothing here reads, and every test
+    # replicated all 14 through `project`'s copytree. Drop the files only — NOT via
+    # `git init --template=` (an empty template also drops `.git/hooks/` itself and
+    # `.git/info/exclude`, which tests do depend on: three sites write
+    # `.git/hooks/pre-commit` with no mkdir, and the install tests read info/exclude).
+    for sample in (root / ".git" / "hooks").glob("*.sample"):
+        sample.unlink()
     # Local config: copies (and their worktrees) inherit it via the copied .git/config.
     git(root, "config", "user.email", "test@test")
     git(root, "config", "user.name", "test")
