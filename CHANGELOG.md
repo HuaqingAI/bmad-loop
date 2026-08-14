@@ -322,6 +322,21 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Fixed
 
+- **The `version-sync` gate no longer passes on a marketplace.json it could not read.**
+  `sync_version.check()` iterated `market.get("plugins", [])`, so a renamed, deleted or emptied
+  `plugins` key made the loop run zero times and the gate print "ok: every version field agrees"
+  — green on exactly the corruption it exists to catch, including when a real stale version sat
+  behind the renamed key. It now refuses a `plugins` value that is not a non-empty list, and
+  reports a non-object entry instead of raising. Covered by a new `tests/test_sync_version.py`.
+
+- **`trunk check` is documented as the changed-files check it is.** `AGENTS.md` and
+  `CONTRIBUTING.md` both called it "full lint, no path filter", but bare `trunk check` lints only
+  files changed against the upstream — 7 of 254 on the branch that fixed this — and CI's
+  `trunk-action` defaults the same way. `--all` is the whole-repo run, and both files now say so.
+  `CONTRIBUTING.md` also no longer claims `release.py check` rejects a hand-authored version
+  section (it returns 0 on one), tells maintainers that `prepare` refuses until they promote the
+  CHANGELOG by hand, and stops presenting three commands as the complete set of CI gates.
+
 - **Contributor docs now name every obligation CI enforces.** `CONTRIBUTING.md` never mentioned
   `pyright` or the CHANGELOG, so its verify step — "`trunk check` and `uv run pytest -q` both
   pass" — sent contributors into a CI failure on the dedicated typecheck job. It now carries

@@ -10,7 +10,8 @@ uv run pytest -q              # test suite (-n auto to parallelize)
 uv run pytest tests/test_engine.py -q   # single file
 uv run pyright                # typecheck — same pinned version CI runs
 trunk fmt                     # format changed files
-trunk check                   # full lint, no path filter — run before every push (pre-push hook enforces it)
+trunk check                   # lint changed files, as CI does — run before every push (pre-push hook enforces it)
+trunk check --all             # whole-repo lint; the only way to catch untouched files (e.g. after a linter bump)
 ```
 
 - Never `pip install`; uv owns the environment. Dependency changes: edit pyproject.toml, run `uv lock` (CI uses `uv sync --locked` and fails on a stale lock).
