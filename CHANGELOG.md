@@ -61,6 +61,27 @@ breaking changes may land in a minor release.
   fixed `<spec>.md.tmp` that two concurrent writers would collide on. Specs written by these paths
   land at `0600` rather than `0644`, the same tightening the five writers above took.
 
+- **A failed write can no longer shred your CLI settings file (#379).** Both writers that register the
+  completion hook — `init` and each isolated worktree's provisioning — parse the whole config, merge
+  the relay into it, and write all of it back through a truncating write. Your permission allowlist,
+  `env`, MCP entries and your own hooks survive only by round-tripping through that one call, so a
+  short write (a full disk, a quota) published a _prefix_ of the JSON. Both now go through
+  `atomic_write_text`, which writes a temp and replaces it, leaving the original whole on any fault.
+
+  JSON has no partial read — a prefix of an object is a parse error, not a smaller object — so unlike
+  the board and the ledgers this loss was never silent, just unrecoverable. `init` refused on the next
+  run with `is not valid JSON; fix it and re-run init`, pointing the operator at a file it had shredded
+  itself, and refusing before the merge meant re-running could not rebuild it. In a worktree it was
+  quieter and worse: nothing re-reads that copy, so the session simply started against unparseable
+  settings, the CLI fell back to its defaults, the Stop hook was never registered and the run idled to
+  timeout with nothing naming the cause.
+
+  Both keep following symlinks, as the writes they replace did. `init` resolves the config path and
+  refuses anything landing outside the project, so the only links reaching it point back inside — an
+  in-repo indirection that would otherwise be replaced by a regular file on the first run. Provisioning
+  refuses a linked config outright, before the write. These two files also land at `0600` rather than
+  `0644` from now on, the same tightening as above.
+
 ## [0.10.0] — 2026-08-14
 
 Much of this section is the `release/0.9.x` hotfix line brought forward onto `main` (#433).

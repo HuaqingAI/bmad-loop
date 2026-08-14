@@ -60,6 +60,7 @@ from .install import (
     strip_relay_hooks,
 )
 from .model import Phase
+from .platform_util import atomic_write_text
 from .process_host import get_process_host
 from .workspace import (
     UnitWorkspace,
@@ -825,7 +826,19 @@ def provision_worktree(
         # zero, and a pin would claim orchestrator ownership of a file this run
         # never modified, hiding a story's own edit to it for no benefit.
         if config != baseline_config:
-            config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+            # atomic_write_text, never write_text (#379). `_register_hooks` states
+            # the rule at length; the stakes are higher here. This config is the
+            # SEEDED copy of the operator's own — allowlist, env, MCP entries and
+            # their hooks all round-trip through the parse above — and a truncating
+            # `"w"` publishes a prefix of it on a short write. Nothing downstream
+            # re-reads it to complain, either: the session starts against a settings
+            # file whose JSON no longer parses, so the CLI falls back to its defaults
+            # and the Stop hook never registers. That is #363's stall with no
+            # diagnostic. follow_symlinks stays at the default, matching the
+            # `write_text` it replaces — and the symlink question is already settled
+            # above this line, by the component-wise refusal walk that skips the
+            # profile entirely when any component of the path is a link.
+            atomic_write_text(config_path, json.dumps(config, indent=2) + "\n")
             pin_degrade = _pin_tracked_config_rewrite(worktree, profile.hooks.config_path)
             if pin_degrade is not None and on_degraded is not None:
                 on_degraded(pin_degrade)
