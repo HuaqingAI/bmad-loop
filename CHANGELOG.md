@@ -207,19 +207,14 @@ breaking changes may land in a minor release.
   raising, and a widened tuple would guard a fault nothing could ablate into existence.
 
 - **A session whose log merely writes _about_ a provider error no longer pauses the run (#507).**
-  `claude` shipped one pattern joining a framing token to a cause across an unbounded `.*`, so it
-  matched any line mentioning both — and this adapter scans a tmux pane capture, which carries the
-  model's own output. Measured against the tree the fix landed on, 44 of this repo's own tracked
-  lines classified as a provider outage: a `docs/FEATURES.md` bullet, a comment in
-  `adapters/profile.py`, the pattern's own line in `claude.toml`, and 41 lines of ordinary
-  pytest/grep/diff output. The harm ran the other way — a **genuine** timeout was read as an
-  environment fault, so the budget was re-armed and the run halted for an operator instead of the
-  attempt being charged, masking the timeout that actually happened. The three replacements
-  reproduce only complete error sentences Claude Code was captured printing — 5xx statuses
-  enumerated, never ranged, so an uncaptured `503` stays prose — rather than an error token
-  plus a cause anywhere on the line, so a paraphrase cannot reach them; a standing guard walks
-  `git ls-files` and asserts no tracked line classifies, which is what fails if a future entry writes
-  the framing token and a cause on one line — write them separated (`API Error` … `<cause>`).
+  `claude` shipped one pattern joining a framing token to a cause across an unbounded `.*`, and this
+  adapter scans a tmux pane capture — the model's own output — so any line mentioning both halves
+  classified. 44 of this repo's own tracked lines did, most of them ordinary pytest/grep/diff output.
+  The harm ran the other way: a **genuine** timeout was read as an environment fault, re-arming the
+  budget and halting the run for an operator instead of charging the attempt. The three replacements
+  reproduce only complete error sentences Claude Code was captured printing, 5xx statuses enumerated
+  rather than ranged. A standing guard walks `git ls-files` and asserts no tracked line classifies —
+  write the framing token and a cause separated (`API Error` … `<cause>`) in future entries.
 
 - **A mid-response connection drop or a provider 5xx refusal on the `claude` adapter now pauses the
   run with the matched evidence (#323).** The withdrawn connection-only pattern caught 2 of the 5
