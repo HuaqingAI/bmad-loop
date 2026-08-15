@@ -63,9 +63,11 @@ an entry; entries written by hand do not need it.
 **Every field line is exactly one line, and so is the title.** The format is
 line-oriented: readers find each field by scanning for `<name>:` at the start of
 a line, and an entry ends at whichever comes first — the next `### DW-<n>`
-entry, any other `#` .. `######` heading, or a `- source_spec:` flat-append
-bullet. A value carrying a line break therefore does not wrap; it becomes new
-ledger content, and three things can follow:
+entry, any other `#` .. `######` heading (indented up to three spaces, and
+followed by a space, a tab or the end of the line; four spaces or a leading tab
+makes an indented code block, which ends nothing), or a `- source_spec:`
+flat-append bullet. A value carrying a line break therefore does not wrap; it
+becomes new ledger content, and three things can follow:
 
 - a break followed by `### ` mints an entry nobody filed;
 - a break before a `status:` line leaves one entry carrying two, so the ledger
