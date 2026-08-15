@@ -1452,10 +1452,23 @@ class WorktreeFlow:
         # A per_worktree Unity Editor can leak asset writes into the *main*
         # checkout (see the unity plugin's worktree setup), dirtying the target with the very
         # files this branch already committed. Reconcile that first: clean only
-        # the leaked copies of incoming files; refuse (escalate) if anything dirty
-        # falls outside this branch's path set — that may be real operator work.
+        # the leaked copies of incoming files; nothing outside this branch's path set is
+        # ever touched. Outside it, trackedness decides whether the merge proceeds (#460):
+        # untracked dirt cannot be overwritten or staged in, so it is tolerated and
+        # journaled; uncommitted changes to tracked files can be folded into this story's
+        # commit, so they escalate.
         try:
-            cleaned = verify.clean_incoming_collisions(repo, target, merge_ref)
+            cleaned = verify.clean_incoming_collisions(
+                repo,
+                target,
+                merge_ref,
+                on_tolerated=lambda paths: self.journal.append(
+                    "merge-target-tolerated",
+                    story_key=task.story_key,
+                    branch=unit.branch,
+                    paths=paths,
+                ),
+            )
         except (verify.GitError, OSError) as e:
             # OSError joins GitError because clean_incoming_collisions mutates the
             # checkout directly (unlink/iterdir/rmdir) — a non-spawn FS fault the
@@ -1473,9 +1486,11 @@ class WorktreeFlow:
             else:
                 reason = (
                     f"merge of {unit.branch} into {target} blocked: the target checkout has "
-                    f"uncommitted changes that are not part of this branch (likely a Unity "
-                    f"Editor wrote into the main project) — clean them, then "
-                    f"`bmad-loop resume {self.state.run_id}`. {e}"
+                    f"uncommitted changes to tracked files outside this branch — a merge or "
+                    f"squash would fold them into this story's commit. Commit, stash or revert "
+                    f"them, then `bmad-loop resume {self.state.run_id}`. One cause is a "
+                    f"per_worktree engine Editor writing into the main checkout; another is "
+                    f"ordinary local work. {e}"
                 )
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
             return

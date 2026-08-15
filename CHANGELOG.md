@@ -50,6 +50,22 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **An unrelated untracked file in your main checkout no longer blocks every isolated unit merge
+  (#460).** Under `[scm] isolation = "worktree"` the pre-merge reconcile refused over any dirty path
+  outside the unit branch's incoming set, untracked included, so a single `notes.txt` escalated the
+  story and paused an unattended run. A merge writes only the paths that differ between target and
+  branch and never stages an untracked file into the commit, so untracked dirt outside that set is
+  now left where it is, the merge proceeds, and the run journals `merge-target-tolerated` naming it.
+  Uncommitted changes to **tracked** files still escalate — `merge_strategy = "squash"` would fold
+  them into the story's commit. Reaches dirt that appears after the run starts, and every `resume`.
+
+- **The escalation that remains no longer blames a game engine (#460).** It asserted that "likely a
+  Unity Editor wrote into the main project" on every isolated merge — the guard's origin story
+  rather than a diagnosis, fired on repos with no Unity anywhere and no plugins loaded — and told
+  you to "clean them", which is the exact verb the reconcile performs with `unlink` on its own
+  paths. It now names the tracked files, asks you to commit, stash or revert them, and demotes a
+  `per_worktree` engine Editor to one possible cause beside ordinary local work.
+
 - **A git that warns while still exiting 0 no longer corrupts the answers the orchestrator reads
   back from it (#442).** An unknown `core.fsyncMethod` value or a `core.fsmonitor` hook that cannot
   exec is a property of the host's git config rather than a failure, but the shared git helper handed
