@@ -2525,19 +2525,20 @@ def _classify(adapter, status, *, result_json=None, task_id=_ENV_FAULT_TASK) -> 
 
 def test_classify_env_fault_flags_timeout_from_ansi_log(tmp_path):
     """The headline case: a timeout whose pane log holds an ANSI-colored
-    `API Error … (ConnectionRefused)` line is stamped env_fault, the evidence is
-    the ANSI-stripped line, and an `env-fault-classified` breadcrumb is written."""
+    `API Error … Unable to connect to API (ConnectionRefused)` line is stamped
+    env_fault, the evidence is the ANSI-stripped line, and an
+    `env-fault-classified` breadcrumb is written."""
     adapter = make_adapter(tmp_path)  # claude profile ships the seed pattern
     _write_task_log(
         adapter,
         b"building the diff...\n"
-        b"\x1b[31mAPI Error: Unable to connect (ConnectionRefused)\x1b[0m\n"
+        b"\x1b[31mAPI Error: Unable to connect to API (ConnectionRefused)\x1b[0m\n"
         b"idle...\n",
     )
     result = _classify(adapter, "timeout")
     assert result.env_fault is True
     assert result.status == "timeout"  # the status string is unchanged
-    assert result.env_fault_evidence == "API Error: Unable to connect (ConnectionRefused)"
+    assert result.env_fault_evidence == "API Error: Unable to connect to API (ConnectionRefused)"
     assert "\x1b" not in result.env_fault_evidence  # ANSI stripped
     events = _lifecycle_lines(adapter, _ENV_FAULT_TASK)
     assert [e["event"] for e in events] == ["env-fault-classified"]
@@ -2550,10 +2551,10 @@ def test_classify_env_fault_flags_stalled_and_crashed(tmp_path, status):
     """stalled and crashed join timeout in the eligible set — all three can be a
     lost-connection session dressed up as a non-completed verdict."""
     adapter = make_adapter(tmp_path)
-    _write_task_log(adapter, b"API Error: Connection refused\n")
+    _write_task_log(adapter, b"API Error: Connection closed mid-response\n")
     result = _classify(adapter, status)
     assert result.env_fault is True
-    assert result.env_fault_evidence == "API Error: Connection refused"
+    assert result.env_fault_evidence == "API Error: Connection closed mid-response"
 
 
 def test_classify_env_fault_ignores_completed_and_over_budget(tmp_path):
@@ -2561,7 +2562,7 @@ def test_classify_env_fault_ignores_completed_and_over_budget(tmp_path):
     excluded outright — a budget crossing proves real API traffic. Both pass through
     unchanged (same object), with no breadcrumb."""
     adapter = make_adapter(tmp_path)
-    _write_task_log(adapter, b"API Error: Connection refused\n")
+    _write_task_log(adapter, b"API Error: Connection closed mid-response\n")
     completed = _classify(adapter, "completed", result_json={"ok": True})
     assert completed.env_fault is False and completed.env_fault_evidence is None
     over = _classify(adapter, "over_budget")
@@ -2573,7 +2574,7 @@ def test_classify_env_fault_ignores_result_json_present(tmp_path):
     """The guard is `result_json is None`: an eligible status that somehow carries a
     result dict is trusted work, never re-classified."""
     adapter = make_adapter(tmp_path)
-    _write_task_log(adapter, b"API Error: Connection refused\n")
+    _write_task_log(adapter, b"API Error: Connection closed mid-response\n")
     result = _classify(adapter, "timeout", result_json={"salvaged": True})
     assert result.env_fault is False
     assert _lifecycle_lines(adapter, _ENV_FAULT_TASK) == []
@@ -2595,7 +2596,7 @@ def test_classify_env_fault_inert_without_patterns(tmp_path):
     adapter = make_adapter(tmp_path)
     adapter.profile = dataclasses.replace(adapter.profile, env_fault_patterns=())
     assert adapter._env_fault_patterns == ()
-    _write_task_log(adapter, b"API Error: Connection refused\n")
+    _write_task_log(adapter, b"API Error: Connection closed mid-response\n")
     result = _classify(adapter, "timeout")
     assert result.env_fault is False
     assert _lifecycle_lines(adapter, _ENV_FAULT_TASK) == []
@@ -2629,9 +2630,9 @@ def test_classify_env_fault_last_match_wins_and_truncates(tmp_path):
     _write_task_log(
         adapter,
         (
-            f"API Error: Connection refused FIRST {filler}\n"
+            f"API Error: Connection closed mid-response FIRST {filler}\n"
             f"unrelated line\n"
-            f"API Error: Connection refused LAST {filler}\n"
+            f"API Error: Connection closed mid-response LAST {filler}\n"
         ).encode(),
     )
     result = _classify(adapter, "crashed")
@@ -2648,7 +2649,7 @@ def test_run_classifies_env_fault_after_reconcile(tmp_path):
     adapter, _impl = make_dev_adapter(tmp_path)
     _write_task_log(
         adapter,
-        b"\x1b[31mAPI Error: Unable to connect (ECONNREFUSED)\x1b[0m\n",
+        b"\x1b[31mAPI Error: Unable to connect to API (ECONNREFUSED)\x1b[0m\n",
         task_id="3-1-dev-1",
     )
     adapter.start_session = lambda spec: _dev_handle()
@@ -2672,9 +2673,9 @@ def test_run_reconcile_upgrade_is_not_reclassified(tmp_path):
         # Padded past PROOF_OF_WORK_MIN_LOG_BYTES: this fixture stands in for a
         # session that implemented the story and then lost its Stop, and such a
         # session renders. A log holding ONLY the error line would be a session that
-        # rendered ~44 bytes total, which the #261 gate correctly declines to rescue
+        # rendered ~50 bytes total, which the #261 gate correctly declines to rescue
         # — it would make this ordering test depend on a scenario it is not about.
-        b"working...\n" * 32 + b"API Error: Unable to connect (ECONNREFUSED)\n",
+        b"working...\n" * 32 + b"API Error: Unable to connect to API (ECONNREFUSED)\n",
         task_id="3-1-dev-1",
     )
     adapter.start_session = lambda spec: _dev_handle()
@@ -2721,7 +2722,9 @@ def test_start_session_resets_reused_task_log(tmp_path):
     adapter = make_adapter(tmp_path, mux=mux)
     adapter._ensure_session = lambda cwd: None  # skip the tmux server plumbing
     task_id = _ENV_FAULT_TASK
-    _write_task_log(adapter, b"API Error: Unable to connect (ECONNREFUSED)\n", task_id=task_id)
+    _write_task_log(
+        adapter, b"API Error: Unable to connect to API (ECONNREFUSED)\n", task_id=task_id
+    )
     log_path = adapter.logs_dir / f"{task_id}.log"
     assert log_path.stat().st_size > 0  # the prior cycle's tee is present...
 
@@ -4624,13 +4627,15 @@ def test_classify_env_fault_marks_a_dropped_suffix(tmp_path):
     markers are spent from ENV_FAULT_EVIDENCE_MAX, never added on top of it."""
     adapter = make_adapter(tmp_path)
     lead = "y" * 300  # push the match past the head so both ends are cut
-    _write_task_log(adapter, f"{lead} API Error: Connection refused {'z' * 400}\n".encode())
+    _write_task_log(
+        adapter, f"{lead} API Error: Connection closed mid-response {'z' * 400}\n".encode()
+    )
     result = _classify(adapter, "timeout")
     assert result.env_fault is True
     ev = result.env_fault_evidence
     assert ev.startswith("…") and ev.endswith("…")
     assert len(ev) <= generic.ENV_FAULT_EVIDENCE_MAX
-    assert "API Error: Connection refused" in ev
+    assert "API Error: Connection closed mid-response" in ev
 
 
 def test_classify_env_fault_drops_the_partial_line_at_the_tail_seek(tmp_path):
@@ -4646,7 +4651,7 @@ def test_classify_env_fault_drops_the_partial_line_at_the_tail_seek(tmp_path):
     # fell entirely outside the 64 KiB window, so it went green with the
     # fragment-drop deleted and proved nothing.
     prefix = b"P" * 50
-    straddler = b"J" * 200 + b"API Error: Connection refused\n"  # 230 bytes
+    straddler = b"J" * 200 + b"API Error: Connection closed mid-response\n"  # 242 bytes
     cut_into_line = 10
     filler = b"filler line\n"  # 12 bytes, matches nothing
     tail_bytes = generic.ENV_FAULT_TAIL_BYTES - len(straddler) + cut_into_line
@@ -4660,7 +4665,7 @@ def test_classify_env_fault_drops_the_partial_line_at_the_tail_seek(tmp_path):
     assert len(prefix) < seek < len(prefix) + len(straddler)  # cut is inside the line
     # And the surviving fragment still carries the full pattern, so dropping it is
     # the ONLY reason this must not classify.
-    assert b"API Error: Connection refused" in log.read_bytes()[seek:]
+    assert b"API Error: Connection closed mid-response" in log.read_bytes()[seek:]
 
     result = _classify(adapter, "timeout")
     assert result.env_fault is False
@@ -4681,7 +4686,7 @@ def test_classify_env_fault_keeps_a_boundary_aligned_first_line(tmp_path):
     # the prefix's terminating newline, and the matching line must be the only
     # match anywhere in the file.
     prefix = b"P" * 50 + b"\n"  # 51 bytes, falls outside the window
-    match_line = b"J" * 10 + b"API Error: Connection refused\n"  # 40 bytes
+    match_line = b"J" * 10 + b"API Error: Connection closed mid-response\n"  # 52 bytes
     filler = b"filler line\n"  # 12 bytes, matches nothing
     fill = generic.ENV_FAULT_TAIL_BYTES - len(match_line)
     assert fill % len(filler) == 0  # exact fill; the seek lands where we computed
@@ -4700,7 +4705,7 @@ def test_classify_env_fault_keeps_a_boundary_aligned_first_line(tmp_path):
     assert result.env_fault is True
     # Equality, not containment: the surviving line is the whole line, so this
     # also fails if the fix ever kept a fragment instead.
-    assert result.env_fault_evidence == "J" * 10 + "API Error: Connection refused"
+    assert result.env_fault_evidence == "J" * 10 + "API Error: Connection closed mid-response"
 
 
 def test_classify_env_fault_scans_a_truncated_window_with_no_newline(tmp_path):
@@ -4709,12 +4714,12 @@ def test_classify_env_fault_scans_a_truncated_window_with_no_newline(tmp_path):
     a missed outage, which is the wrong way round. The fragment is scanned; the
     leading ellipsis marks that it is a window, not a whole line."""
     adapter = make_adapter(tmp_path)
-    hit = b"API Error: Connection refused"
+    hit = b"API Error: Connection closed mid-response"
     _write_task_log(adapter, b"x" * (generic.ENV_FAULT_TAIL_BYTES + 10) + hit)
     result = _classify(adapter, "timeout")
     assert result.env_fault is True
     assert result.env_fault_evidence.startswith("…")
-    assert "API Error: Connection refused" in result.env_fault_evidence
+    assert "API Error: Connection closed mid-response" in result.env_fault_evidence
 
 
 @pytest.mark.parametrize("terminator", [b"\n", b"\r"], ids=["lf", "cr"])
@@ -4727,7 +4732,7 @@ def test_classify_env_fault_scans_a_single_oversized_terminated_line(tmp_path, t
     split produced. \\r counts: pane captures are CR-terminated and \\r is
     normalized to \\n before the split."""
     adapter = make_adapter(tmp_path)
-    hit = b"API Error: Connection refused"
+    hit = b"API Error: Connection closed mid-response"
     _write_task_log(adapter, b"x" * (generic.ENV_FAULT_TAIL_BYTES + 10) + hit + terminator)
 
     log = adapter.logs_dir / f"{_ENV_FAULT_TASK}.log"
@@ -4744,4 +4749,4 @@ def test_classify_env_fault_scans_a_single_oversized_terminated_line(tmp_path, t
     result = _classify(adapter, "timeout")
     assert result.env_fault is True
     assert result.env_fault_evidence.startswith("…")
-    assert "API Error: Connection refused" in result.env_fault_evidence
+    assert "API Error: Connection closed mid-response" in result.env_fault_evidence

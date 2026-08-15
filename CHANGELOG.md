@@ -219,6 +219,26 @@ breaking changes may land in a minor release.
   text and probe documents. The `except` tuples are deliberately not widened — the fix is to stop
   raising, and a widened tuple would guard a fault nothing could ablate into existence.
 
+- **A session whose log merely writes _about_ a provider error no longer pauses the run (#507).**
+  `claude` shipped one pattern joining a framing token to a cause across an unbounded `.*`, and this
+  adapter scans a tmux pane capture — the model's own output — so any line mentioning both halves
+  classified. 44 of this repo's own tracked lines did, most of them ordinary pytest/grep/diff output.
+  The harm ran the other way: a **genuine** timeout was read as an environment fault, re-arming the
+  budget and halting the run for an operator instead of charging the attempt. The three replacements
+  reproduce only complete error sentences Claude Code was captured printing, 5xx statuses enumerated
+  rather than ranged. A standing guard walks `git ls-files` and asserts no tracked line classifies —
+  write the framing token and a cause separated (`API Error` … `<cause>`) in future entries.
+
+- **A mid-response connection drop or a provider 5xx refusal on the `claude` adapter now pauses the
+  run with the matched evidence (#323).** The withdrawn connection-only pattern caught 2 of the 5
+  captured Claude Code failure lines, so a session killed by either of those three misses was charged
+  a dev attempt, and `max_dev_attempts` of them deferred a story whose spec and code were fine. All
+  five classify now, and the pause re-arms the budget instead of spending it. A subscription
+  usage-limit / quota refusal is still **not** classified on this adapter: no captured Claude Code
+  quota line exists to seed a pattern from, and on a pane capture that vocabulary is what a story
+  _implementing_ rate limiting prints all day — follow-up: #610. The four unseeded profiles
+  (`codex`, `gemini`, `copilot`, `antigravity`) are unchanged and still ship none.
+
 ## [0.10.0] — 2026-08-14
 
 Much of this section is the `release/0.9.x` hotfix line brought forward onto `main` (#433).

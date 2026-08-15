@@ -16,16 +16,47 @@ seed_files = [
   ".claude/settings.local.json",
 ]
 
-# Transport-failure classification (#194): regexes matched line-by-line against
-# the ANSI-stripped tail of a non-completed (timeout/stalled/crashed) session's
-# pane log. A match reclassifies the session as an environment fault so the
-# orchestrator can PAUSE (and re-arm with a fresh budget) instead of charging a
-# dev attempt for a session that never reached the API. The pattern requires an
-# "API Error" line AND a connection-level cause on the SAME line, so ordinary
-# story test output that merely mentions "API Error" in prose does not trip it.
+# Transport-failure classification (#194, #507, #323): regexes matched
+# line-by-line against the ANSI-stripped 64 KiB tail of a non-completed
+# (timeout/stalled/crashed) session's pane log, once the verdict has settled. A
+# match reclassifies the session as an environment fault so the orchestrator can
+# PAUSE (and re-arm with a fresh budget) instead of charging a dev attempt for a
+# session that never got usable work out of the API.
+#
+# The scanned file is a tmux pane capture, so it carries THE MODEL'S OWN OUTPUT:
+# an assertion, an acceptance criterion or a doc bullet that merely writes ABOUT
+# a provider error lands in the scanned bytes. So every alternative below
+# reproduces one COMPLETE Claude Code error sentence rather than a framing token
+# plus a loose cause — a paraphrase cannot reach it. Every one is a captured line:
+#   * `API Error` … `Unable to connect to API` — #194's evidence, run
+#     20260718-191419-44e7 on this adapter.
+#   * `API Error` … `Connection closed mid-response`, and the 5xx pair
+#     (`529 Overloaded` / `500 Internal server error`) — Claude Code transcript
+#     entries structurally tagged "isApiErrorMessage": true.
+#
+# The 5xx statuses are ENUMERATED, not ranged. A `5[0-9][0-9]` range admits 100
+# codes against either reason phrase when exactly two pairings were ever
+# captured, so an unverified string — `API Error` … `503 Internal server error`,
+# which is what a story writing an HTTP error path prints — would pause the run.
+# Same evidentiary bar as the quota note below: seed the captured pairing, never
+# the plausible one.
+#
+# The single-character classes (`t[o]`, `respons[e]`, `5[2]9`, `5[0]0`) are
+# load-bearing, not typos: each makes its pattern fail to match its OWN line
+# here, so a session that prints or diffs this profile does not read its own
+# configuration as a provider outage (#507). Pinned by
+# test_shipped_patterns_do_not_match_their_own_profile_line.
+#
+# No usage-limit / quota cause is seeded: no captured Claude Code quota line
+# exists, and on a pane capture that vocabulary is what a story IMPLEMENTING
+# rate limiting prints all day. Seed one only from a captured line, citing the
+# run it came from — the bar test_unseeded_profiles_stay_inert states.
+#
 # To disable or extend, copy this profile into .bmad-loop/profiles/ and edit.
 env_fault_patterns = [
-  "API Error.*(Unable to connect|Connection ?(error|refused|reset|timed ?out)|ConnectionRefused|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN)",
+  "API Error: Unable to connect t[o] API",
+  "API Error: Connection closed mid-respons[e]",
+  "API Error: (5[2]9 Overloaded|5[0]0 Internal server error)",
 ]
 
 # Force Claude Code's classic (inline/scrollback) renderer. The fullscreen TUI
