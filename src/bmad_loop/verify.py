@@ -480,10 +480,16 @@ def _path_under_any(path: str, prefixes: tuple[str, ...]) -> bool:
 def untracked_files(repo: Path) -> set[str]:
     """Untracked, non-ignored paths (repo-relative posix), mirroring what a
     plain `git clean -fd` (no -x) treats as removable. Ignored files are
-    excluded, so they are never rollback candidates."""
-    rc, out = _git(repo, "ls-files", "--others", "--exclude-standard")
+    excluded, so they are never rollback candidates.
+
+    Reads stdout ALONE (`_git_out`): `ls-files` exits 0 while still writing to
+    stderr, and against `_git`'s merged stream that chatter splits into a phantom
+    untracked path — a PRISTINE tree answers with one, and because this function's
+    contract is what `git clean -fd` would remove, the phantom is a rollback
+    candidate. Silent, on every host whose git config warns (#442)."""
+    rc, out, detail = _git_out(repo, "ls-files", "--others", "--exclude-standard")
     if rc != 0:
-        raise GitError(f"git ls-files --others failed in {repo}: {out}")
+        raise GitError(f"git ls-files --others failed in {repo}: {detail}")
     return {line.strip() for line in out.splitlines() if line.strip()}
 
 
@@ -664,10 +670,15 @@ def commits_above(repo: Path, baseline: str) -> list[str]:
     not assume a strict newest-first / HEAD-first ordering across merges or clock
     skew; callers that need the tip should read HEAD directly). Empty when HEAD is
     at or behind baseline. Raises GitError on a git failure (a bad baseline is a
-    real error, never quietly "no commits")."""
-    rc, out = _git(repo, "rev-list", f"{baseline}..HEAD")
+    real error, never quietly "no commits").
+
+    Reads stdout ALONE (`_git_out`): git exits 0 while still warning on stderr, and
+    against the merged stream that warning is a phantom sha handed to
+    :func:`preserve_commits` — "Empty when HEAD is at or behind baseline" stops
+    holding on any host whose git config warns (#442)."""
+    rc, out, detail = _git_out(repo, "rev-list", f"{baseline}..HEAD")
     if rc != 0:
-        raise GitError(f"git rev-list {baseline}..HEAD failed in {repo}: {out}")
+        raise GitError(f"git rev-list {baseline}..HEAD failed in {repo}: {detail}")
     return [line for line in out.splitlines() if line]
 
 
@@ -733,10 +744,16 @@ def _prune_refs(
     :class:`PrunePreserveError` — after attempting every tail ref — when any
     individual delete failed. One stuck ref must not wedge the retention for
     everything behind it, so deletes are per-ref best-effort and the error
-    carries both what was deleted and what was not."""
+    carries both what was deleted and what was not.
+
+    Reads stdout ALONE (`_git_out`): `for-each-ref` exits 0 while still warning on
+    stderr, and against `_git`'s merged stream that warning enters ``refs``, lands
+    in the ``refs[keep:]`` tail and is handed to ``delete`` — which fails, so
+    retention raises :class:`PrunePreserveError` on every host whose git config
+    warns (#442)."""
     if keep <= 0:
         return []
-    rc, out = _git(
+    rc, out, detail = _git_out(
         repo,
         "for-each-ref",
         # ties on committerdate (same-second rollbacks) break by ascending
@@ -750,7 +767,7 @@ def _prune_refs(
         prefix,
     )
     if rc != 0:
-        raise GitError(f"git for-each-ref {label} failed in {repo}: {out}")
+        raise GitError(f"git for-each-ref {label} failed in {repo}: {detail}")
     refs = [line.removeprefix(strip) for line in out.splitlines() if line]
     deleted: list[str] = []
     failed: list[str] = []
@@ -1178,10 +1195,17 @@ def worktree_prune(repo: Path) -> None:
 
 
 def worktree_list(repo: Path) -> list[Path]:
-    """Paths of every worktree attached to `repo` (the main checkout first)."""
-    rc, out = _git(repo, "worktree", "list", "--porcelain")
+    """Paths of every worktree attached to `repo` (the main checkout first).
+
+    Reads stdout ALONE (`_git_out`) so the record parse does not depend on no
+    stderr line ever starting with ``"worktree "``. The advisories measured for
+    #442 — an unknown `core.fsyncMethod` value and its family — do NOT start that
+    way, so the `startswith` filter screens them out and this parse was correct by
+    accident rather than by construction; the filter stays as a second, independent
+    screen."""
+    rc, out, detail = _git_out(repo, "worktree", "list", "--porcelain")
     if rc != 0:
-        raise GitError(f"git worktree list failed in {repo}: {out}")
+        raise GitError(f"git worktree list failed in {repo}: {detail}")
     paths = []
     for line in out.splitlines():
         if line.startswith("worktree "):
@@ -1356,7 +1380,14 @@ def capture_diff(repo: Path, baseline: str, *, max_file_bytes: int | None = None
     for forensics. Returns "" when there is nothing to capture.
 
     Unlike `_git`, the tracked diff is read from stdout alone and left verbatim
-    (no strip, no stderr merge) so the patch stays applyable.
+    (no strip, no stderr merge) so the patch stays applyable, as is the
+    `--no-index` spawn below it. The untracked leg now matches those two
+    (`_git_out`, #442): its `ls-files` exits 0 while still
+    warning on stderr, so against the merged stream the warning splits off as a
+    phantom rel. Measured, that phantom is inert here — `diff --no-index` cannot
+    access it and exits 1, exactly the code the loop below already tolerates as
+    "the files differ", with empty stdout — so this leg is converted for the same
+    reason its two neighbours read stdout alone, not on a demonstrated corruption.
 
     max_file_bytes caps the size of each *untracked* file included: a file larger
     than the cap is skipped and replaced with a one-line marker naming it and its
@@ -1368,9 +1399,9 @@ def capture_diff(repo: Path, baseline: str, *, max_file_bytes: int | None = None
         raise GitError(f"git diff {baseline} failed in {repo}: {proc.stderr.strip()}")
     parts = [proc.stdout]
 
-    rc, out = _git(repo, "ls-files", "--others", "--exclude-standard")
+    rc, out, detail = _git_out(repo, "ls-files", "--others", "--exclude-standard")
     if rc != 0:
-        raise GitError(f"git ls-files --others failed in {repo}: {out}")
+        raise GitError(f"git ls-files --others failed in {repo}: {detail}")
     for rel in out.splitlines():
         rel = rel.strip()
         if not rel:

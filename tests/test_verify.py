@@ -2530,6 +2530,99 @@ def test_rev_parse_head_failure_still_carries_git_stderr(tmp_path):
     assert "not a git repository" in str(excinfo.value)
 
 
+def test_untracked_files_reads_stdout_alone_under_host_noise(project):
+    """REAL-GIT axis: the reddening comes from git's own rc-0 stderr
+    (`make_git_noisy`), not a synthetic line. Against `_git`'s merge that warning
+    splits off as a phantom untracked path on a PRISTINE tree, and this probe's
+    contract is what a plain `git clean -fd` would remove — so the phantom is a
+    ROLLBACK CANDIDATE. Silent, on every host whose git config warns.
+
+    Both halves matter: the empty set proves no phantom, and the second proves the
+    fix did not simply blank the probe.
+
+    Ablation target: put `untracked_files` back on `_git` (the merge) and this fails
+    alone, on a set carrying the warning — the four sibling #442 rows added with it
+    (`commits_above`, `prune_preserve_refs`, `worktree_list`, `capture_diff`) stay
+    green, since each site is converted separately."""
+    repo = project.project
+    make_git_noisy(repo)
+
+    assert verify.untracked_files(repo) == set()  # pristine tree, no phantom
+
+    (repo / "new.txt").write_text("real untracked\n")
+    assert verify.untracked_files(repo) == {"new.txt"}  # and it still sees real ones
+
+
+def test_commits_above_reads_stdout_alone_under_host_noise(project):
+    """REAL-GIT axis, same `make_git_noisy` shape. Against the merge the warning is
+    a phantom SHA, handed to `preserve_commits` as an attempt commit — and the
+    docstring's "Empty when HEAD is at or behind baseline" stops holding. Silent.
+
+    `rev_parse_head` is the oracle here because it already reads stdout alone
+    (converted with the same helper), so the baseline it hands back is clean.
+
+    Ablation target: put `commits_above` back on `_git` and this fails alone, on
+    `["warning: ignoring unknown core.fsyncMethod value …"]` where `[]` was
+    expected."""
+    repo = project.project
+    make_git_noisy(repo)
+    baseline = verify.rev_parse_head(repo)
+
+    assert verify.commits_above(repo, baseline) == []  # HEAD at baseline
+
+    (repo / "impl.txt").write_text("work\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "attempt work")
+
+    assert verify.commits_above(repo, baseline) == [verify.rev_parse_head(repo)]
+
+
+def _inject_git_stderr(monkeypatch, line: str) -> None:
+    """Prepend `line` to the stderr of every git spawn verify.py makes, leaving the
+    return code and stdout untouched — the house `monkeypatch.setattr(verify.subprocess,
+    "run", …)` seam (see `test_capture_diff_timeout_becomes_git_error`), wrapping the
+    real `subprocess.run` rather than scripting it.
+
+    A synthetic shape is used only where the real `core.fsyncMethod` warning CANNOT
+    redden the row; each caller's docstring says why. Bytes and `None` stderr pass
+    through untouched, so a `binary=True` spawn is not corrupted into a type error."""
+    real_run = verify.subprocess.run
+
+    def noisy_run(cmd, **kwargs):
+        proc = real_run(cmd, **kwargs)
+        if not isinstance(proc.stderr, str):
+            return proc
+        return verify.subprocess.CompletedProcess(
+            proc.args, proc.returncode, proc.stdout, line + proc.stderr
+        )
+
+    monkeypatch.setattr(verify.subprocess, "run", noisy_run)
+
+
+def test_capture_diff_untracked_leg_reads_stdout_alone(project, monkeypatch):
+    """SEAM axis, deliberately — the real warning cannot redden this row, and a test
+    that cannot redden is not evidence. Measured at git 2.55.0: the phantom rel that
+    the `core.fsyncMethod` warning splits off reaches
+    `git diff --no-index -- /dev/null "<phantom>"`, which exits **1** ("could not
+    access") with EMPTY stdout — and rc 1 is exactly the code this caller already
+    tolerates as "the files differ", so nothing is appended and the patch is
+    unchanged. #442's claim that the phantom "becomes a file that cannot be opened"
+    and corrupts the patch does not hold for that shape.
+
+    The injected line is instead the name of a file that IS tracked and unmodified,
+    so it can never legitimately appear in `ls-files --others` output. Pre-fix that
+    rel is real on disk, `diff --no-index` succeeds against it, and the patch gains
+    an add-from-empty `new file mode` hunk for an already-tracked file.
+
+    Ablation target: put the untracked leg back on `_git` (the merge) and this fails
+    alone, on a patch carrying that hunk for `src.txt` where `""` was expected."""
+    repo = project.project
+    baseline = verify.rev_parse_head(repo)
+    _inject_git_stderr(monkeypatch, "src.txt\n")
+
+    assert verify.capture_diff(repo, baseline) == ""
+
+
 def test_commit_paths_refuses_to_stage_a_glob_neighbour(project):
     """`commit_paths` promises "exactly `paths` (and nothing else)". Unescaped, a
     configured artifacts dir carrying `[` also stages the operator's unrelated
@@ -3446,6 +3539,34 @@ def test_prune_preserve_refs_continues_past_undeletable_ref(project):
     assert isinstance(excinfo.value, verify.PrunePreserveError)
     assert excinfo.value.deleted == ["attempt-preserve/run-1"]
     assert len(excinfo.value.failed) == 1 and "run-0" in excinfo.value.failed[0]
+
+
+def test_prune_preserve_refs_survives_host_noise(project):
+    """REAL-GIT axis (#442): `make_git_noisy` gives the sandbox a git that warns on
+    stderr at rc 0, which is the normal path on a host whose git config the
+    orchestrator does not control. Against `_git`'s stdout+stderr merge the warning
+    enters `_prune_refs`' ref list, lands in the `refs[keep:]` tail and is handed to
+    `delete_branch`, which fails — so retention is WEDGED with a PrunePreserveError
+    on every such host. The loud member of the family.
+
+    The absence of the raise is the assertion, not `pytest.raises`: pre-fix this is
+    the row that blows up. The kept refs are then re-read through `branch_exists`,
+    because "did not raise" alone would also hold for a prune that deleted nothing.
+
+    Ablation target: put `_prune_refs`' listing back on `_git` (the merge) and this
+    fails alone, on the PrunePreserveError naming the warning line as an undeletable
+    ref — the four sibling #442 rows stay green."""
+    repo = project.project
+    make_git_noisy(repo)
+    for i in range(4):
+        _dated_commit(repo, f"attempt {i}", f"2026-01-0{i + 1}T12:00:00")
+        git(repo, "branch", "-f", f"attempt-preserve/run-{i}")
+
+    deleted = verify.prune_preserve_refs(repo, 2)
+
+    assert sorted(deleted) == ["attempt-preserve/run-0", "attempt-preserve/run-1"]
+    assert verify.branch_exists(repo, "attempt-preserve/run-2")
+    assert verify.branch_exists(repo, "attempt-preserve/run-3")
 
 
 def _dirty_ref(repo, name):
