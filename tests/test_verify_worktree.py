@@ -393,6 +393,60 @@ def test_clean_incoming_collisions_tolerates_untracked_stray(project, tmp_path):
     assert (repo / "operator-notes.txt").read_text() == "real work\n"
 
 
+@pytest.mark.parametrize(
+    ("incoming_path", "stray_path"),
+    [
+        ("Assets/Leak.cs", "Assets"),  # untracked FILE standing where the merge needs a DIR
+        ("notes", "notes/keep.txt"),  # untracked DIR standing where the merge needs a FILE
+    ],
+    ids=["file-where-dir-needed", "dir-where-file-needed"],
+)
+def test_clean_incoming_collisions_shape_clash_stops_at_gits_own_preflight(
+    project, tmp_path, incoming_path, stray_path
+):
+    """The BOUNDARY of #460's tolerance, both directions. An untracked stray whose
+    *path* is outside the incoming set can still clash with it STRUCTURALLY — an
+    untracked file standing where the merge needs a directory, or the reverse. Such a
+    path is not inert, and this guard deliberately does not try to detect it: git's
+    own pre-flight is the authority on what a merge would overwrite, it names the
+    exact path, and a hand-rolled ancestor/descendant predicate here could only drift
+    from git's real rules.
+
+    What this test pins is that deferring is SAFE — the halt is not lost, only moved
+    one call later, and the operator's bytes survive it. Were tolerance ever widened
+    to swallow git's refusal too, this test goes red rather than a run silently
+    destroying operator data. The two labelling gaps this shape leaves behind are
+    filed, not fixed here: #619 (the escalation calls a pre-flight refusal a "content
+    conflict") and #623 (`merge-target-tolerated` is journaled for a stray that then
+    blocked the merge)."""
+    repo = project.project
+    _branch_with(repo, tmp_path, adds={incoming_path: "branch\n"})
+    stray = repo / stray_path
+    stray.parent.mkdir(parents=True, exist_ok=True)
+    stray.write_text("operator\n")
+    head_before = git(repo, "rev-parse", "HEAD")
+
+    # Our guard walks past it: the stray's path is not in the incoming set, and it is
+    # untracked, so by the letter of the predicate it is tolerated. Nothing is cleaned.
+    calls: list[list[str]] = []
+    assert verify.clean_incoming_collisions(repo, "main", "feat", on_tolerated=calls.append) == []
+    assert calls == [[stray_path]]
+
+    # ...and git stops it anyway, one call later, naming the colliding path itself.
+    with pytest.raises(verify.GitError) as ei:
+        verify.merge_branch(repo, "feat", strategy="merge")
+    assert stray_path.split("/")[0] in str(ei.value)
+
+    # What makes deferring acceptable: the operator's bytes are intact and the merge
+    # applied NOTHING. Deliberately NOT asserted via `.git/MERGE_HEAD` — that file is
+    # absent after a genuine content conflict too (`merge_branch` runs `merge --abort`),
+    # so it would pass for every reason and discriminate nothing. `is_file()` carries
+    # the shape half: landing this merge has to convert `Assets` file->dir (row 1) or
+    # delete `notes/` to make room for a file (row 2), so either way this goes red.
+    assert stray.is_file() and stray.read_text() == "operator\n"
+    assert git(repo, "rev-parse", "HEAD") == head_before  # and no merge commit exists
+
+
 def test_clean_incoming_collisions_still_refuses_tracked_stray(project, tmp_path):
     """The other half of #460: uncommitted changes to a TRACKED file outside the
     incoming set are not inert — git refuses a merge outright once the change is
