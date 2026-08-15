@@ -80,8 +80,8 @@ def test_builtin_profiles_load():
         assert "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS" not in profiles[name].env
     # transport/provider fault classification (#194): only the two profiles with
     # captured real-world error output seed patterns — claude (three
-    # capture-anchored patterns, each reproducing one COMPLETE Claude Code error
-    # sentence: the "Unable to connect to API" connection failure and the
+    # capture-anchored patterns, reproducing only COMPLETE Claude Code error
+    # sentences: the "Unable to connect to API" connection failure and the
     # provider 5xx pair; still no quota cause, since no captured Claude Code
     # usage-limit line exists) and opencode-http (the serve process's
     # `error.error="AI_APICallError: …"` field). The other four stay inert on

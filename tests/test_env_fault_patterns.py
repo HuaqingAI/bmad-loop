@@ -165,6 +165,19 @@ ANCHOR_REACHING_BAIT = [
     "- [ ] AC-5: show a banner on API Error: Connection timed out",
     'expect(msg).toBe("API Error: Connection error")',
     "// handle API Error: ECONNREFUSED by retrying with backoff",
+    # The 5xx half of the same rule, and the one place a COMPLETE sentence is
+    # still not enough on its own: the status is a field, so ranging over it
+    # (`5[0-9][0-9]`) re-admits the paraphrase the sentence was meant to exclude.
+    # Only two pairings were ever captured (`529 Overloaded`, `500 Internal
+    # server error`); a range accepted 100 codes against either reason phrase,
+    # so all four lines below classified — including the two that CROSS-PAIR the
+    # captured halves into a sentence Claude Code has never printed. Writing an
+    # HTTP error path is ordinary story work, so each is a live pane-capture
+    # line, and a hit halts the run for an operator exactly as #507 describes.
+    'expect(banner).toBe("API Error: 503 Internal server error")',
+    '  assert log == "API Error: 502 Overloaded"',
+    "- [ ] AC-6: retry on API Error: 500 Overloaded and surface a banner",
+    'it("renders API Error: 529 Internal server error", () => {',
 ]
 
 # The limit of content-based matching, pinned rather than papered over.
@@ -452,7 +465,7 @@ def test_shipped_patterns_do_not_match_their_own_profile_line(name: str) -> None
     false positives #507 names, and the most absurd of them.
 
     What prevents it is the single-character classes in the shipped patterns
-    (`t[o]`, `respons[e]`, `5[0-9][0-9]`): they change nothing about what the
+    (`t[o]`, `respons[e]`, `5[2]9`, `5[0]0`): they change nothing about what the
     regex MATCHES, and everything about what the regex's own source line matches.
     This test is why they must not be "cleaned up"."""
     packaged = resources.files("bmad_loop.data").joinpath("profiles").joinpath(f"{name}.toml")

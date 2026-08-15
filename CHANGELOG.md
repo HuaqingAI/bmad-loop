@@ -214,8 +214,9 @@ breaking changes may land in a minor release.
   `adapters/profile.py`, the pattern's own line in `claude.toml`, and 41 lines of ordinary
   pytest/grep/diff output. The harm ran the other way — a **genuine** timeout was read as an
   environment fault, so the budget was re-armed and the run halted for an operator instead of the
-  attempt being charged, masking the timeout that actually happened. The three replacements each
-  reproduce one complete error sentence Claude Code was captured printing rather than an error token
+  attempt being charged, masking the timeout that actually happened. The three replacements
+  reproduce only complete error sentences Claude Code was captured printing — 5xx statuses
+  enumerated, never ranged, so an uncaptured `503` stays prose — rather than an error token
   plus a cause anywhere on the line, so a paraphrase cannot reach them; a standing guard walks
   `git ls-files` and asserts no tracked line classifies, which is what fails if a future entry writes
   the framing token and a cause on one line — write them separated (`API Error` … `<cause>`).
