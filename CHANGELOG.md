@@ -50,6 +50,19 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **An indented, tab-separated or empty heading in the deferred-work ledger no longer lets a `gate:`
+  below it hold a story the entry never named (#516).** A canonical entry ended only at a `#` run at
+  column zero with exactly one space after it, so three shapes CommonMark spells as ATX headings —
+  up to three spaces of indent, a tab as the separator, and an empty heading — ran on past the
+  section header and absorbed the next section's field lines. A later `gate:` then landed in an open
+  entry that had declared nothing: `validate` failed (`deferred.hard-gate`) and `run` paused
+  (`story-gate`) on a story that entry never gated. Two reads move with the boundary: a `status:`
+  below such a heading is now that section's rather than the entry's, so the entry parses with no
+  status and leaves the open set; and a tail below one is no longer masked by an over-long span and
+  reaches the legacy parser again. Four spaces of indent or a leading tab is an indented code block
+  rather than a heading and still ends nothing, and a heading nested in a list item or a blockquote
+  (`- ## Notes`) is still not a boundary either — the same line-scope limitation as #327.
+
 - **Launching with a `--run-id` that already names a run is refused (#602).** The flag pointed at an
   existing run adopted that run's directory and published its own `state.json` over it. The id is
   now claimed exclusively as the directory is created, so a collision aborts the launch before
