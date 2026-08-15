@@ -3,6 +3,7 @@ that simulate the side effects skill sessions would have on disk."""
 
 from __future__ import annotations
 
+import io
 import json
 import shutil
 import subprocess
@@ -33,6 +34,39 @@ if sys.platform == "win32" and not sys.flags.utf8_mode:
         "(e.g. `set PYTHONUTF8=1 && uv run pytest`). The suite assumes UTF-8 to "
         "match the files under test; CI's windows job sets this automatically."
     )
+
+
+def _codec_rejects_bad_byte() -> bool:
+    """Whether byte 0xff is undecodable in the codec ``text=True`` will use.
+
+    Probes ``TextIOWrapper`` with ``encoding=None`` rather than naming a codec,
+    because that is the very default ``subprocess``'s text mode resolves for the
+    child's streams — asking the machinery beats predicting it from the locale.
+    """
+    try:
+        io.TextIOWrapper(io.BytesIO(b"\xff")).read()
+    except UnicodeDecodeError:
+        return True
+    return False
+
+
+# Guard for every test whose subject is a STRICT DECODE of subprocess output.
+# Byte 0xff is undecodable only in UTF-8/ASCII; every ISO-8859-x and cp125x codec
+# maps all 256 byte values, so under such a locale the strict decode never raises
+# and those tests pass *with the bug restored* — a silent vacuity rather than a
+# failure (verified: under LC_ALL=et_EE.iso885915 the #378 ablation passes). No
+# single byte is undecodable everywhere, so this skips instead, leaving each test
+# either exercising the fault or saying plainly that it did not. CI is always on
+# the exercising side: the Linux legs run UTF-8 and the Windows legs set
+# PYTHONUTF8=1 (.github/workflows/ci.yml).
+#
+# Shared here because three test modules need it; test_verify.py predates that and
+# still carries its own local copy.
+needs_strict_codec = pytest.mark.skipif(
+    not _codec_rejects_bad_byte(),
+    reason="host codec decodes 0xff (e.g. an ISO-8859-x locale), so nothing here "
+    "would exercise the strict decode this fix is about",
+)
 
 
 @pytest.fixture

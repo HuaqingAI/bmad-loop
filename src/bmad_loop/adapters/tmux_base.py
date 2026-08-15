@@ -59,10 +59,12 @@ class BaseTmuxBackend(TerminalMultiplexer):
     #: Output decoding for captured tmux text. ``None`` (POSIX) = locale default,
     #: byte-identical to a bare ``text=True``; a Windows leaf sets ``"utf-8"``.
     _ENCODING: str | None = None
-    #: Decode error handling to pair with :attr:`_ENCODING`. ``None`` (POSIX) =
-    #: the default strict handler; a Windows leaf sets ``"backslashreplace"`` so
-    #: a stray non-UTF-8 byte degrades visibly instead of raising mid-capture.
-    _ERRORS: str | None = None
+    #: Decode error handling to pair with :attr:`_ENCODING`. ``"backslashreplace"``
+    #: on every platform (#380): a stray byte the codec cannot decode degrades
+    #: visibly to a ``\xNN`` escape in the captured text instead of raising
+    #: mid-capture. Honored even where :attr:`_ENCODING` is None, so POSIX keeps
+    #: the locale codec and only stops being strict. A leaf may still override.
+    _ERRORS: str | None = "backslashreplace"
     #: Diagnostic from the last :meth:`version` probe (see
     #: :meth:`TerminalMultiplexer.version_error`). A class-level default so an
     #: instance that never probed answers None instead of AttributeError.
@@ -322,12 +324,14 @@ class BaseTmuxBackend(TerminalMultiplexer):
         # answer to "is it alive?" is "unknowable" -> MultiplexerError. A real dead
         # window still returns [] via the returncode != 0 path below (no exception).
         #
-        # UnicodeError is a transport failure too: _run decodes with the strict
-        # POSIX handler (see version()), so an undecodable byte in the capture
-        # raises a ValueError-family error that neither exception arm above names.
-        # It must not escape raw — prune_ctl_windows takes its post-kill verdict
-        # from this probe and only a MultiplexerError lands the candidates in
-        # `unverifiable` rather than aborting cleanup mid-receipt (#435).
+        # UnicodeError is a transport failure too. _run no longer decodes strictly
+        # on any platform (_ERRORS is backslashreplace, #380), so this arm is now
+        # defence for a leaf that overrides _ERRORS back to a strict handler: such
+        # a decode raises a ValueError-family error that neither exception arm
+        # above names. It stays because the seam-honesty contract above is what
+        # callers rely on — prune_ctl_windows takes its post-kill verdict from this
+        # probe and only a MultiplexerError lands the candidates in `unverifiable`
+        # rather than aborting cleanup mid-receipt (#435).
         try:
             probe = self._run(
                 ["list-windows", "-t", f"={session}", "-F", "#{window_id}"], check=False
@@ -502,14 +506,15 @@ class BaseTmuxBackend(TerminalMultiplexer):
             return None
         try:
             raw = self._tmux("-V")
-        # UnicodeError is in the list because _run decodes with the LOCALE codec
-        # and the strict handler on POSIX (_ENCODING/_ERRORS are None there;
-        # the Windows leaf sets utf-8/backslashreplace, so this arm is POSIX-
-        # only). A byte that codec cannot decode — UTF-8 in practice under PEP
-        # 538/540 — raises: a corrupt install, or a binary emitting text in
-        # another encoding, exactly what this diagnostic exists for. It is a
-        # ValueError, outside the SubprocessError/OSError family, so it escaped
-        # as a raw crash for every caller above to guard.
+        # UnicodeError is in the list for a leaf that overrides _ERRORS back to a
+        # strict handler. _run still decodes with the LOCALE codec on POSIX
+        # (_ENCODING is None there), but no longer strictly on any platform
+        # (_ERRORS is backslashreplace, #380), so an undecodable byte — a corrupt
+        # install, or a binary emitting text in another encoding, exactly what
+        # this diagnostic exists for — now degrades to a \xNN escape rather than
+        # raising. Where a leaf does restore strictness it is a ValueError,
+        # outside the SubprocessError/OSError family, so it would escape as a raw
+        # crash for every caller above to guard; this arm keeps that closed.
         except (MultiplexerError, subprocess.SubprocessError, OSError, UnicodeError) as exc:
             # None stays the seam's answer, but the identity of the failure is
             # what separates a crashing binary from one that reports no version

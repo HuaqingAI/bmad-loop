@@ -326,14 +326,19 @@ class _ResultFileMixin:
     def _append_diag_jsonl(self, task_id: str, filename: str, payload: dict) -> None:
         """Append ``payload`` as one JSON line to ``tasks/<task_id>/<filename>``.
         Pure observability, best-effort: an unwritable run dir must never break
-        the completion loop."""
+        the completion loop. ``ensure_ascii=False`` is why the guard names more
+        than OSError: it leaves a lone surrogate — what a POSIX filename holding
+        a non-UTF-8 byte becomes, surrogate-escaped — in the dumped str, which
+        then hits the UTF-8 encode inside ``fh.write`` as a UnicodeEncodeError.
+        That is a ValueError, not an OSError; ``UnicodeError`` covers it and the
+        decode direction both (#380)."""
         try:
             path = self.tasks_dir / task_id / filename
             path.parent.mkdir(parents=True, exist_ok=True)
             line = json.dumps(payload, ensure_ascii=False)
             with path.open("a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
-        except OSError:
+        except (OSError, UnicodeError):
             pass
 
     def _note_resultless_stop(self, task_id: str, verdict: str, detail: str = "") -> None:

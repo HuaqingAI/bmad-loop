@@ -11,8 +11,10 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 
 import pytest
+from conftest import needs_strict_codec
 
 from bmad_loop.adapters import multiplexer, tmux_base
 from bmad_loop.adapters.base import SessionSpec
@@ -259,13 +261,16 @@ def test_seam_methods_never_leak_raw_subprocess_error(boom_run, tmp_path):
 
 
 def test_list_window_ids_decode_fault_raises_the_seam_type(monkeypatch):
-    """A byte the strict POSIX codec cannot decode is a transport failure like a
-    timeout: the liveness probe must answer MultiplexerError ("unknowable"), not
-    leak the raw UnicodeDecodeError — prune_ctl_windows' post-kill verdict and
-    the engine's window_alive catch only the seam type (#435).
+    """A byte the codec cannot decode is a transport failure like a timeout: the
+    liveness probe must answer MultiplexerError ("unknowable"), not leak the raw
+    UnicodeDecodeError — prune_ctl_windows' post-kill verdict and the engine's
+    window_alive catch only the seam type (#435).
 
-    Deliberately scoped to list_window_ids: the sentinel-returner methods still
-    leak a POSIX decode fault, which stays #380's territory.
+    Since #380 `_run` decodes with backslashreplace on every platform, nothing
+    reaches this arm from a stock capture; the fault is injected here instead.
+    The arm still guards a leaf that overrides `_ERRORS` back to a strict handler
+    — which is why the fault below is monkeypatched in rather than produced by a
+    real child, and why this test stays green with or without that fix.
     """
     monkeypatch.setattr(tmux_base.shutil, "which", lambda _name: "/usr/bin/tmux")
 
@@ -277,6 +282,37 @@ def test_list_window_ids_decode_fault_raises_the_seam_type(monkeypatch):
     with pytest.raises(MultiplexerError) as excinfo:
         mux.list_window_ids("s")
     assert not isinstance(excinfo.value, UnicodeError)
+
+
+@needs_strict_codec
+def test_run_decodes_an_undecodable_byte_instead_of_raising():
+    """A capture carrying a byte the codec cannot decode comes back with that byte
+    rendered as a visible \\xNN escape; `_run` does not raise (#380).
+
+    POSIX left `_ERRORS` at None — the STRICT handler — so a stray byte in any
+    tmux capture raised out of the one spawn primitive, and the fourteen guards
+    that catch only (SubprocessError, OSError) let it through. Fixing it here, at
+    the source, rather than at those catch sites is deliberate: most of them
+    return a sentinel ([], None, {}), so catching a decode fault there would turn
+    a crash into a WRONG ANSWER (see the seam-honesty note on list_window_ids).
+
+    Drives a REAL child, never a monkeypatched `subprocess.run`. Only a real spawn
+    executes the stdlib decode this fix changes, so a faked seam would pass
+    identically with `_ERRORS` back at None — the fake-green #378 was bitten by.
+    `sys.executable`, never a bare `python`: the suite runs under uv, where no
+    `python` need be on PATH (see tests/test_verify.py's note on this).
+
+    Ablation: set BaseTmuxBackend._ERRORS back to None and this fails alone, on
+    the UnicodeDecodeError escaping `_run`.
+    """
+
+    class PyBackend(TmuxMultiplexer):
+        # the "tmux binary" is this interpreter, so _run spawns something whose
+        # bytes we choose; everything else about the primitive is untouched.
+        _BINARY = sys.executable
+
+    proc = PyBackend()._run(["-c", 'import sys; sys.stdout.buffer.write(b"ok-\\xff-tail")'])
+    assert proc.stdout == "ok-\\xff-tail"
 
 
 def test_seam_honesty_holds_for_psmux_style_run_override(monkeypatch):
@@ -458,14 +494,16 @@ def test_version_error_records_the_probe_crash_version_swallows(monkeypatch):
 
 
 def test_version_error_records_undecodable_probe_output(monkeypatch):
-    """Pins the `UnicodeError` arm of version()'s catch. A strictly-decoding
-    _run (POSIX: _ENCODING/_ERRORS both None) raises UnicodeDecodeError out of
-    subprocess itself on a binary emitting an undecodable byte — a corrupt
-    install, the very case #428 is about — and it is a ValueError, outside the
-    SubprocessError/OSError family, so without the arm it escapes as a raw crash
-    that every guard above turns back into an unexplained None. The raise is
-    injected rather than decoded for real: this owns the except clause, not the
-    decoding (tmux_base documents that half)."""
+    """Pins the `UnicodeError` arm of version()'s catch. A strictly-decoding _run
+    raises UnicodeDecodeError out of subprocess itself on a binary emitting an
+    undecodable byte — a corrupt install, the very case #428 is about — and it is
+    a ValueError, outside the SubprocessError/OSError family, so without the arm
+    it escapes as a raw crash that every guard above turns back into an
+    unexplained None. Since #380 `_run` is no longer strict on any platform
+    (_ERRORS is backslashreplace), the arm now covers a leaf that overrides it
+    back to a strict handler. The raise is injected rather than decoded for real:
+    this owns the except clause, not the decoding (tmux_base documents that
+    half) — which is also why it is unaffected by that default."""
 
     def boom(argv, **k):
         raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
@@ -554,11 +592,15 @@ def test_run_posix_default_passes_no_encoding_and_no_env(monkeypatch):
 
     TmuxMultiplexer()._run(["list-windows"])
 
-    # byte-identical to today: locale-default decode (encoding=None ≡ bare text=True),
-    # inherit the parent env (env=None).
+    # The locale-default codec (encoding=None ≡ bare text=True) and the inherited
+    # parent env (env=None) are both unchanged; only strictness went away. errors is
+    # backslashreplace on every platform since #380, so an undecodable byte degrades
+    # to a visible \xNN escape instead of raising out of the one spawn primitive.
+    # This pins the KWARG; the decode it actually produces is pinned against a real
+    # child by test_run_decodes_an_undecodable_byte_instead_of_raising.
     assert rec.kwargs["text"] is True
     assert rec.kwargs["encoding"] is None
-    assert rec.kwargs["errors"] is None
+    assert rec.kwargs["errors"] == "backslashreplace"
     assert rec.kwargs["env"] is None
 
 
