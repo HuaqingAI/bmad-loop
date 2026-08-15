@@ -50,20 +50,14 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
-- **A legacy-ledger migration can no longer drop a `gate:` line from an entry it did not author and
-  let the story that entry was holding back dispatch (#519).** `sweep --migrate` snapshotted the
-  pre-existing canonical entries as id → status and checked only that both survived, so a rewrite
-  that removed a `gate:` line and left everything else intact passed deterministic validation, got
-  committed, and the next dispatch found no token to refuse on. The snapshot now also carries the
-  tokens each pre-existing entry declared — read through the same fence-aware accessor every other
-  gate reader uses, so a quoted example in an entry's body is not mistaken for a declaration — and a
-  migration whose rewrite drops one is **refused**: a rewrite that previously passed can now fail.
-  The original ledger is restored and the session is re-prompted with the error, escalating after
-  `max_migration_attempts`. An _added_ token is still accepted, since a dropped token un-gates a
-  story silently while an added one over-blocks loudly and in the safe direction. Reachability is
-  bounded — it takes a project carrying both pre-format legacy content and a gated pre-existing
-  entry — and the enforcement is migration-scoped: every other ledger edit is still held by the
-  format doc's instruction alone.
+- **A `sweep --migrate` rewrite that drops a `gate:` token a pre-existing entry declared is now
+  refused, instead of un-gating that story silently (#519).** Validation held the rewrite to each
+  entry's id and status only, so losing the token passed, got committed, and the next dispatch ran
+  the story the entry existed to hold back. The original ledger is now restored and the session
+  re-prompted with the error, escalating after `max_migration_attempts` — a rewrite that previously
+  passed can now fail. An _added_ token is still accepted, since over-blocking fails loudly and in
+  the safe direction. Migration-scoped: every other ledger edit is still held by the format doc's
+  instruction alone.
 
 - **A git that warns while still exiting 0 no longer corrupts the answers the orchestrator reads
   back from it (#442).** An unknown `core.fsyncMethod` value or a `core.fsmonitor` hook that cannot
