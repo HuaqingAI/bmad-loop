@@ -53,7 +53,7 @@ if TYPE_CHECKING:
 
     from .adapters.base import CodingCLIAdapter
     from .adapters.profile import CLIProfile
-    from .engine import Engine
+    from .engine import Engine, SweepFactory
     from .policy import Policy
     from .stories_engine import StoriesEngine
     from .sweep import SweepEngine
@@ -93,10 +93,11 @@ def resolve_profiles(policy: Policy, project: Path) -> dict[str, CLIProfile]:
     file: a session that leaves a background writer flipping
     ``.bmad-loop/profiles/*.toml`` between a benign and a hostile copy needs only
     the digest's read to catch the benign one and the adapter's read to catch the
-    other. That race is cheap to retry — a lost round raises `sweep-auto-failed`,
-    which `_maybe_auto_sweep` swallows, and the next auto-sweep trigger deals
-    again — so "narrow window" is not a defense. Resolving once and threading the
-    result removes the second read rather than shrinking the window.
+    other. That race is cheap to retry — a lost round raises
+    `sweep-auto-not-started`, which `_maybe_auto_sweep` swallows, and the next
+    auto-sweep trigger deals again — so "narrow window" is not a defense.
+    Resolving once and threading the result removes the second read rather than
+    shrinking the window.
 
     ``cmd_run`` and ``_resume_paused_run`` thread it too, for a DIFFERENT reason —
     they stamp a baseline rather than compare against one, and at launch the
@@ -210,10 +211,12 @@ def config_digest(
     restating two builders' precedence rules inside the control that polices
     them, where drift is silent and lands in the UNDER-covering direction — the
     failure this function has already made four times by reasoning from one
-    builder. Over-coverage fails the other way, loudly: ``sweep-auto-failed`` +
-    notify, with the message naming ``bmad-loop sweep`` as the human-present path.
-    Not free (the refusal burns the trigger for the life of the run, #501), but it
-    needs a writer, and nothing under ``src/`` writes ``.bmad-loop/profiles/*.toml``
+    builder. Over-coverage fails the other way, loudly: ``sweep-auto-not-started``
+    + notify, with the message naming ``bmad-loop sweep`` as the human-present
+    path. Not free — #501 stopped a refusal from *spending* the trigger, but that
+    is honest bookkeeping rather than a reprieve, since the same wrong answer
+    refuses the next trigger too. It needs a writer, though, and nothing under
+    ``src/`` writes ``.bmad-loop/profiles/*.toml``
     at all — that overlay is hand-authored, and the TUI settings screen writes
     ``policy.toml`` (``extra_args`` included). So a dead-field rewrite arriving
     mid-run is a config change nobody automated made under a running loop, which
@@ -268,9 +271,9 @@ def config_digest(
       it — this repo's own ``write_script_launcher`` is a stub that execs an
       interpreter on a sidecar, so hashing the stub misses the payload. Nor is
       the target ours to pin: it is normally a third-party CLI that self-updates,
-      and a mid-run update would move a content hash and burn the auto-sweep
-      trigger for the life of the run (``_maybe_auto_sweep`` records the trigger
-      BEFORE calling the factory, and early-returns on it forever after).
+      and a mid-run update would move a content hash and refuse every auto-sweep
+      for the life of the run (the digest is pinned in memory at launch, so
+      nothing on disk can re-bless it).
       Confinement is the instrument, not hashing — and as a ``validate`` warning
       rather than a refusal, since "resolves inside the project" does not decide
       it either: under an active project venv ``which("python")`` IS
@@ -846,7 +849,7 @@ def compose_run(
     max_stories: int | None,
     stories_on: bool,
     spec_folder: str,
-    sweep_factory: Callable[[str], None],
+    sweep_factory: SweepFactory,
     make_adapters: MakeAdapters,
     engine_cls: type[Engine],
     stories_engine_cls: type[StoriesEngine],
@@ -946,6 +949,7 @@ def compose_sweep(
     sweep_engine_cls: type[SweepEngine],
     trusted_config_digest: str,
     profiles: dict[str, CLIProfile] | None = None,
+    on_started: Callable[[], None] | None = None,
 ) -> ComposedRun:
     """Stand up a sweep run: allocate the run dir, persist state + pid, record the
     sweep options, build the adapters, and wire the ``SweepEngine`` — everything
@@ -962,7 +966,48 @@ def compose_sweep(
     (see :func:`compose_resume`). ``make_adapters`` and ``sweep_engine_cls`` are
     injected so ``cli`` supplies its own module-level names — keeping the test
     suite's ``monkeypatch.setattr(cli, "SweepEngine"/"_make_adapters", ...)``
-    effective."""
+    effective.
+
+    ``on_started`` is the auto-sweep parent's latch (``engine.SweepFactory``'s
+    ``started`` thunk, threaded through ``cli._start_sweep``): a parent run spends
+    its one trigger for this ``trigger`` string only if this fires.
+    ``cmd_sweep`` passes nothing — a human started that one, and there is no
+    trigger to spend.
+
+    It fires as the LAST statement of the composition block, which is the boundary
+    that makes "started" mean something the parent can act on: from here the child
+    owns a published run dir, ``sweep.json`` and a live pid file, so a later
+    failure leaves a run ``bmad-loop resume`` can pick up rather than nothing at
+    all. Before commit ``9c7a284`` the boundary had to sit at ``save_state``
+    instead — an abort anywhere after it stranded a resumable-looking run dir, and
+    :func:`compose_resume` will rebuild a sweep from ``state.json`` alone,
+    tolerating a missing ``sweep.json``, so "it never got far enough to resume"
+    was not true of the intervening steps. What moved it here is that block's
+    ``except BaseException`` arm, added by that commit, which unwinds the whole
+    partial composition.
+
+    That premise has one documented exception, and it is worth reading rather than
+    waving at: :func:`_unwind_composition` is best-effort — ``force=False`` leaves
+    ``runs.delete_run``'s live-session guard armed, and the call sits under
+    ``suppress(Exception)`` — so a refused or failed unwind CAN leave a resumable
+    child behind while ``on_started`` never fired. On the auto path that needs a
+    live ``bmad-loop-<id>`` session at this run's id, and the path mints the id
+    here: ``cli._sweep_factory`` calls ``_start_sweep`` with no ``run_id``, and the
+    only caller that supplies one is ``cmd_sweep`` (``--run-id``), which passes no
+    ``on_started``. So reaching it takes a :func:`runs.new_run_id` collision with a
+    concurrently live run — in which case this composition's own ``save_state``
+    has already overwritten that run's ``state.json`` several statements earlier,
+    a pre-existing hazard of far greater consequence than a re-fired sweep. The
+    latch boundary is not the place to answer it.
+
+    Firing inside the block rather than after it is deliberate for the same
+    reason: should the latch itself raise, the unwind covers it, and the parent's
+    in-memory flag — set BEFORE its write, see ``engine._maybe_auto_sweep`` —
+    refuses a second attempt either way. At-most-once therefore holds independently
+    of the unwind; what the unwind decides is only what that refusal costs. Normally
+    it refuses a child that left nothing behind; under the refused unwind above it
+    refuses one that is composed and resumable, which is the better of the two.
+    Neither is a second launch, and that is the safe direction for a launcher."""
     run_id = run_id or runs.new_run_id()
     run_dir = project / RUNS_DIR / run_id
     journal = Journal(run_dir)
@@ -1013,6 +1058,8 @@ def compose_sweep(
             repeat=repeat,
             max_cycles=max_cycles,
         )
+        if on_started is not None:
+            on_started()
     except BaseException:
         _unwind_composition(project, run_dir)
         raise
@@ -1027,7 +1074,7 @@ def compose_resume(
     state: RunState,
     policy: Policy,
     journal: Journal,
-    sweep_factory: Callable[[str], None],
+    sweep_factory: SweepFactory,
     make_adapters: MakeAdapters,
     engine_cls: type[Engine],
     stories_engine_cls: type[StoriesEngine],

@@ -394,7 +394,7 @@ def test_compose_run_unwinds_the_run_when_the_adapters_abort(unwinding):
             max_stories=None,
             stories_on=False,
             spec_folder="",
-            sweep_factory=lambda _trigger: None,
+            sweep_factory=lambda _trigger, *, started: None,
             make_adapters=unwinding.make_adapters,
             engine_cls=_NeverBuilt,
             stories_engine_cls=_NeverBuilt,

@@ -20,7 +20,7 @@ import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, NoReturn, Sequence
+from typing import TYPE_CHECKING, Callable, NoReturn, Protocol, Sequence
 
 from . import deferredwork, devcontract, envvars, gates, operatoractions, verify
 from .adapters.base import CodingCLIAdapter, SessionResult, SessionSpec, SpecSnapshot
@@ -112,6 +112,27 @@ class RunStopped(Exception):
     def __init__(self, graceful: bool = False):
         super().__init__("graceful stop" if graceful else "stopped")
         self.graceful = graceful
+
+
+class SweepFactory(Protocol):
+    """Call shape of the child-sweep launcher :meth:`Engine._maybe_auto_sweep`
+    drives — in the product, the inner function ``cli._sweep_factory`` returns,
+    injected so this module need not import ``cli``, ``runsetup`` or ``sweep``.
+
+    Spelled as a Protocol rather than a ``Callable[[str], None]`` alias, mirroring
+    :class:`runsetup.MakeAdapters`, only because the keyword-only ``started``
+    thunk is part of the contract and a positional callable alias cannot say so.
+
+    ``started`` fires once the child sweep is composed and its run dir published
+    (:func:`runsetup.compose_sweep`), and is what lets the engine spend the run's
+    trigger on a child that actually started. It is **required, with no default**:
+    the engine reads "raised without calling it" as "no child was ever launched"
+    and leaves the trigger unspent, so a defaulted no-op would let an un-updated
+    implementation make that claim for a child that ran — the one direction that
+    costs a duplicate sweep. It is idempotent, so an implementation in doubt
+    should call it."""
+
+    def __call__(self, trigger: str, *, started: Callable[[], None]) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -338,7 +359,7 @@ class Engine:
         epic_filter: int | None = None,
         story_filter: str | None = None,
         review_adapter: CodingCLIAdapter | None = None,
-        sweep_factory: Callable[[str], None] | None = None,
+        sweep_factory: SweepFactory | None = None,
         registry: PluginRegistry | None = None,
     ):
         self.paths = paths
@@ -5619,6 +5640,44 @@ class Engine:
         The child is its own resumable run; a paused or failed child is
         journaled + notified but never interrupts this run.
 
+        ``state.sweeps_triggered`` spends the trigger only once a child sweep has
+        actually started. The ``started`` thunk handed to the factory
+        (:class:`SweepFactory`) fires at ``compose_sweep``'s success boundary, and
+        a plain return latches too — so the thunk's only job is to classify a
+        *raise*, and a raise that never reached that boundary leaves the trigger
+        unspent.
+
+        What that is worth, stated precisely, because the intuitive answer is
+        wrong. It is NOT "the trigger gets retried later": at both call sites the
+        retry closes within a few statements of an un-latched return.
+
+        - ``run-end`` fires from :meth:`_loop`, whose return lands directly on
+          ``self.state.finished = True`` in :meth:`_run_inner`; a finished run is
+          refused outright by ``cli._resume_paused_run``. There is no later ask.
+        - ``per-epic`` fires from :meth:`_epic_boundary`, and that boundary is
+          detected as ``state.current_epic != story.epic`` — a field that advances
+          within the same frame, either before the gate's ``RunPaused`` or on
+          return into ``_loop``. Nothing in between can pause the run: ``gates``
+          notification never raises (it swallows its own ``OSError``), and
+          :meth:`_emit` isolates both hook kinds (``_HookError`` for a declarative
+          hook, ``except Exception`` for an in-process one) and *returns* vetoes
+          rather than raising them — which this caller does not even resolve.
+
+        So the retry survives only in a crash window: a process death, or a
+        ``BaseException``, between the un-latched return and the state write that
+        closes the boundary. Do not widen that claim in a comment or a changelog.
+        What the ordering buys on every non-crashing run is that
+        ``sweeps_triggered`` is *true* — it is durable run state, rendered by
+        ``bmad-loop diagnose`` (``diagnostics.py``), and a record's whole value is
+        that it does not claim work that never happened.
+
+        The worktree check therefore sits AHEAD of the latch rather than behind
+        it. ``verify.worktree_clean`` fails closed on a ``GitError`` and
+        ``_run_git`` maps a ``subprocess.TimeoutExpired`` onto exactly that, so a
+        `git status` that merely timed out used to spend the run's one and only
+        sweep trigger, permanently and silently. Both refusals carry a ``reason``
+        so the journal separates a genuinely dirty tree from a git fault.
+
         That contract is stated over "a paused or failed child" while the guard
         below was written over ``Exception``, and the two sets differ in BOTH
         directions — which is why the arms are shaped the way they are:
@@ -5650,31 +5709,70 @@ class Engine:
             # A pending graceful stop suppresses new child sweeps. Return (not
             # raise): at the run-end call site the story queue is already empty,
             # so finishing this run as `finished` is truthful — the finally clears
-            # the superseded control file. Crucially this precedes the append
-            # below, so the trigger stays UNrecorded and a later resume (after the
-            # request is cleared) can still fire the sweep it would have run.
+            # the superseded control file. The trigger stays unspent, which is
+            # honest bookkeeping rather than a deferral: see the docstring's
+            # crash-window verdict, which covers this return like the two below.
             self.journal.append("sweep-auto-suppressed", trigger=trigger)
             return
-        self.state.sweeps_triggered.append(trigger)
-        self._save()
         try:
             clean = verify.worktree_clean(self.workspace.root)
-        except verify.GitError:
-            clean = False
+        except verify.GitError as e:
+            # Fails closed — but ahead of the latch, because unlike the dirty-tree
+            # arm this one is transient-reachable: `_run_git` reports a
+            # `subprocess.TimeoutExpired` as GitError (verify.py), so a slow
+            # `git status` used to permanently spend this run's sweep trigger.
+            self.journal.append(
+                "sweep-auto-skipped-dirty", trigger=trigger, reason="git-error", error=str(e)
+            )
+            return
         if not clean:
             # should not happen at these call sites (everything committed or
             # reset); refuse rather than sweep on top of stray changes
-            self.journal.append("sweep-auto-skipped-dirty", trigger=trigger)
+            self.journal.append("sweep-auto-skipped-dirty", trigger=trigger, reason="dirty")
             return
+
+        latched = False
+
+        def latch() -> None:
+            """Spend this run's trigger. Idempotent, so the factory may call it
+            without knowing whether the plain-return arm below already will. The
+            in-memory flag and the state list are set BEFORE the write: a `_save`
+            that fails must not re-open a trigger whose child is already composed
+            and resumable."""
+            nonlocal latched
+            if latched:
+                return
+            latched = True
+            self.state.sweeps_triggered.append(trigger)
+            self._save()
+
         self.journal.append("sweep-auto-trigger", trigger=trigger)
         try:
-            self.sweep_factory(trigger)
-            self.journal.append("sweep-auto-finished", trigger=trigger)
+            self.sweep_factory(trigger, started=latch)
         except RunStopped:
             raise  # a stop is not a failed child — let the owner record it
         except (Exception, SystemExit) as e:  # child must never break the parent
-            self.journal.append("sweep-auto-failed", trigger=trigger, error=str(e))
-            gates.notify(self.policy, self.run_dir, "auto sweep failed", f"{trigger}: {e}")
+            if latched:
+                self.journal.append("sweep-auto-failed", trigger=trigger, error=str(e))
+                gates.notify(self.policy, self.run_dir, "auto sweep failed", f"{trigger}: {e}")
+            else:
+                # The raise beat composition, so there is no child run dir and
+                # nothing to resume — recording the trigger would be a claim about
+                # work that does not exist. Still notified, and with its own
+                # wording rather than none: the loudest raise that lands here is
+                # the #461 config-integrity refusal, a security event that must not
+                # go quiet just because it stopped being permanent.
+                self.journal.append("sweep-auto-not-started", trigger=trigger, error=str(e))
+                gates.notify(
+                    self.policy, self.run_dir, "auto sweep did not start", f"{trigger}: {e}"
+                )
+        else:
+            # A plain return is a child that ran, whether or not the factory
+            # bothered with the thunk — the thunk exists to classify raises.
+            # Outside the try on purpose: `latch` writes the PARENT's state, and a
+            # failure there is this run's, not a child failure to swallow.
+            latch()
+            self.journal.append("sweep-auto-finished", trigger=trigger)
 
     def _epic_boundary(self, finished_epic: int, next_epic: int) -> None:
         self.journal.append("epic-boundary", finished=finished_epic, next=next_epic)

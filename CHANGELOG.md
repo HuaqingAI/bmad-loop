@@ -66,6 +66,26 @@ breaking changes may land in a minor release.
   `_stopping` before raising, so every later SIGTERM returned at that latch. `KeyboardInterrupt`
   deliberately still escapes; the nested-child re-raise depends on it.
 
+- **A run's `sweeps_triggered` records only auto-sweeps that actually started (#501).** The trigger
+  was recorded — and the record persisted — before anything had been attempted, so every way a
+  child sweep could decline to launch still spent it: the `[verify]`/profile/plugin
+  config-integrity refusal, the worktree-isolation refusal, an unparseable `policy.toml`, an
+  unusable multiplexer. Worst of the set was the tree check, which fails closed on a git error and
+  reaches one on a plain `git status` timeout — so a slow filesystem, not a dirty tree, could
+  silently consume a run's one and only sweep. The check now runs ahead of the record and journals
+  a `reason` telling a git fault from real local changes, and the launcher signals the engine once
+  the child owns a published run dir, which is what the record now means.
+
+  Not a retry mechanism, and it should not be read as one: both triggers close their own boundary
+  within a few statements — a `run-end` return lands on `finished`, which `resume` refuses, and the
+  per-epic boundary disappears as soon as `current_epic` advances. What changes is that
+  `bmad-loop diagnose` stops reporting sweeps that never happened, and that a crash in that narrow
+  window leaves the trigger recoverable rather than spent. A child that fails _after_ its run dir
+  exists still spends it — that run is resumable, so re-firing would duplicate it — and is
+  journaled `sweep-auto-failed` as before; the never-launched case is the new
+  `sweep-auto-not-started`, which keeps its own notification, because the loudest thing reaching it
+  is a config-integrity refusal.
+
 - **A failed write can no longer truncate the sprint board, a story spec, your CLI settings or your
   policy file (#379).** Seven writers read a file, merged into it, and wrote the whole thing back
   through a truncating `Path.write_*` — so a fault partway through (ENOSPC, EIO, a quota) published

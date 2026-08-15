@@ -7654,17 +7654,21 @@ def test_auto_sweep_refuses_worktree_isolation_under_a_repo_root_override(projec
     the parent's own start was allowed not to check.
 
     It RAISES rather than returning, which is the whole point: `_maybe_auto_sweep`
-    has already journaled `sweep-auto-trigger` and latched the trigger by the time it
-    calls the factory, and it reads a plain return as success — so a quiet decline is
-    recorded as `sweep-auto-finished`, a child sweep that ran and finished when none
-    was launched. Raising lands on the `sweep-auto-failed` + notify path instead,
+    has already journaled `sweep-auto-trigger` by the time it calls the factory, and
+    it reads a plain return as a child that ran — so a quiet decline is recorded as
+    `sweep-auto-finished`, a child sweep that ran and finished when none was
+    launched. Raising lands on the `sweep-auto-not-started` + notify path instead,
     which is the same one an unparseable policy.toml already takes, and the parent
-    run is still unaffected (`_maybe_auto_sweep` swallows it)."""
+    run is still unaffected (`_maybe_auto_sweep` swallows it).
+
+    The `started` thunk turns "no launch" into a positive assertion rather than an
+    absence: the refusal has to precede the boundary `compose_sweep` fires it at,
+    or the parent spends a trigger on a child that never existed (#501)."""
     from bmad_loop import bmadconfig
 
     _split_root_project(project)
-    started = []
-    monkeypatch.setattr(cli, "_start_sweep", lambda *a, **kw: started.append(kw) or 0)
+    launched = []
+    monkeypatch.setattr(cli, "_start_sweep", _stub_start_sweep(launched))
 
     # Hand it a MATCHING config digest so the #461 gate (which sits ahead of the
     # isolation check) stays quiet and this test still measures the isolation
@@ -7675,8 +7679,8 @@ def test_auto_sweep_refuses_worktree_isolation_under_a_repo_root_override(projec
         _config_pin(project),
     )
     with pytest.raises(RuntimeError, match=REFUSAL):
-        factory("epic-boundary")
-    assert started == []
+        factory("epic-boundary", started=_never_started)
+    assert launched == []
 
 
 # --- #461 point 4: the auto-sweep child's config re-read is integrity-pinned ---
@@ -7706,6 +7710,40 @@ events = { SessionStart = "SessionStart", Stop = "Stop" }
 DIGEST_REFUSAL = "changed under a running loop before an auto-sweep"
 
 
+def _never_started() -> None:
+    """The `started` thunk for every factory call that must be refused. Firing it
+    means the child sweep reached `compose_sweep`'s success boundary and the parent
+    would spend its trigger (#501), so a refusal that signals first is a bug even
+    when it goes on to raise — an assertion this makes positive, where `launched ==
+    []` alone would pass for any reason `_start_sweep` did not run.
+
+    Armed only because `_stub_start_sweep` relays the thunk: a stub that recorded
+    its kwargs and dropped them would make this decorative, since nothing could
+    then call it.
+
+    Ablation, one for all four rows that use it: move `_sweep_factory`'s digest
+    gate BELOW its `_start_sweep` call (the refusal still raises, just too late)
+    and the three `DIGEST_REFUSAL` rows fail with "started before the gate" —
+    naming the boundary, where the `launched == []` assert alone would only say
+    something launched."""
+    pytest.fail("started before the gate")
+
+
+def _stub_start_sweep(launched: list):
+    """A `cli._start_sweep` stand-in that records its kwargs AND relays
+    `on_started`, the way the real one does through `compose_sweep`. Relaying is
+    the point: it is what lets a refusal test assert the gate ran first rather
+    than merely that nothing launched."""
+
+    def stub(*_a, **kw):
+        launched.append(kw)
+        if kw.get("on_started") is not None:
+            kw["on_started"]()
+        return 0
+
+    return stub
+
+
 def _pin_profile(project, text=PIN_PROFILE) -> None:
     profiles = project.project / ".bmad-loop" / "profiles"
     profiles.mkdir(parents=True, exist_ok=True)
@@ -7716,19 +7754,25 @@ def _pinned_sweep_factory(project, monkeypatch, *, policy_text=PIN_POLICY):
     """A child-sweep factory pinned to the config as it stands right now — the
     launch baseline `cmd_run` hands it. Anything a test writes AFTER this returns
     is exactly the mid-run rewrite #461 point 4 describes: no human asked for it,
-    and the factory re-reads both files off disk on the engine's next trigger."""
+    and the factory re-reads both files off disk on the engine's next trigger.
+
+    Returns the factory plus the `_start_sweep` kwargs it reached, one entry per
+    launch. The stub relays `on_started` (see `_stub_start_sweep`) so the refusal
+    rows can assert the gate ran BEFORE it; the real boundary inside
+    `compose_sweep` is driven by
+    `test_auto_sweep_launches_the_profile_bytes_the_gate_validated`."""
     from bmad_loop import bmadconfig
 
     install_bmad_config(project)
     _write_policy(project.project, policy_text)
     _pin_profile(project)
     write_sprint(project, {"1-1-a": "ready-for-dev"})
-    started = []
-    monkeypatch.setattr(cli, "_start_sweep", lambda *a, **kw: started.append(kw) or 0)
+    launched = []
+    monkeypatch.setattr(cli, "_start_sweep", _stub_start_sweep(launched))
     factory = cli._sweep_factory(
         project.project, bmadconfig.load_paths(project.project), _config_pin(project)
     )
-    return factory, started
+    return factory, launched
 
 
 def test_auto_sweep_refuses_a_rewritten_verify_command(project, monkeypatch):
@@ -7736,12 +7780,12 @@ def test_auto_sweep_refuses_a_rewritten_verify_command(project, monkeypatch):
     sandbox — and policy.toml sits in the workspace every driven session can write.
     The parent loop froze its Policy at launch, so this factory's fresh reload is
     the one path where that rewrite reaches execution with no human in the loop."""
-    factory, started = _pinned_sweep_factory(project, monkeypatch)
+    factory, launched = _pinned_sweep_factory(project, monkeypatch)
     _write_policy(project.project, PIN_POLICY.replace('["true"]', '["touch pwned"]'))
 
     with pytest.raises(RuntimeError, match=DIGEST_REFUSAL):
-        factory("epic-boundary")
-    assert started == []
+        factory("epic-boundary", started=_never_started)
+    assert launched == []
 
 
 def test_auto_sweep_refuses_a_rewritten_profile_binary(project, monkeypatch):
@@ -7749,24 +7793,24 @@ def test_auto_sweep_refuses_a_rewritten_profile_binary(project, monkeypatch):
     is read from profiles/*.toml through get_profile and never appears in the
     snapshot at all. This is why config_digest resolves profiles rather than
     hashing the policy dict."""
-    factory, started = _pinned_sweep_factory(project, monkeypatch)
+    factory, launched = _pinned_sweep_factory(project, monkeypatch)
     _pin_profile(project, PIN_PROFILE.replace('binary = "mycli"', 'binary = "rogue-cli"'))
 
     with pytest.raises(RuntimeError, match=DIGEST_REFUSAL):
-        factory("epic-boundary")
-    assert started == []
+        factory("epic-boundary", started=_never_started)
+    assert launched == []
 
 
 def test_auto_sweep_refuses_a_widened_plugin_allowlist(project, monkeypatch):
     """`[plugins] enabled` is the trust gate for in-process Python import
     (plugins/trust.py) — adding a name to it mid-run is a straight path from a
     workspace write to code running inside the orchestrator itself."""
-    factory, started = _pinned_sweep_factory(project, monkeypatch)
+    factory, launched = _pinned_sweep_factory(project, monkeypatch)
     _write_policy(project.project, PIN_POLICY + '\n[plugins]\nenabled = ["rogue"]\n')
 
     with pytest.raises(RuntimeError, match=DIGEST_REFUSAL):
-        factory("epic-boundary")
-    assert started == []
+        factory("epic-boundary", started=_never_started)
+    assert launched == []
 
 
 def test_auto_sweep_proceeds_after_a_benign_limits_edit(project, monkeypatch):
@@ -7774,23 +7818,27 @@ def test_auto_sweep_proceeds_after_a_benign_limits_edit(project, monkeypatch):
     live-editing `[limits]` under a running loop as supported; a file hash would
     refuse every auto-sweep after one, turning a correctness feature into a
     regression. Nothing in `[limits]` reaches host exec, so nothing here fires."""
-    factory, started = _pinned_sweep_factory(project, monkeypatch)
+    factory, launched = _pinned_sweep_factory(project, monkeypatch)
     _write_policy(project.project, PIN_POLICY + "\n[limits]\ncache_read_weight = 0.5\n")
+    signalled: list[str] = []
 
-    factory("epic-boundary")  # no raise
+    factory("epic-boundary", started=lambda: signalled.append("started"))  # no raise
 
-    assert len(started) == 1
+    assert len(launched) == 1
+    # The thunk reaches `_start_sweep` rather than being dropped at this frame —
+    # the stub relays it, standing in for `compose_sweep`'s boundary (#501).
+    assert signalled == ["started"]
 
 
 def test_auto_sweep_proceeds_when_the_pinned_config_is_untouched(project, monkeypatch):
     """The gate's own null case — and the one that would catch a digest that is
     unstable across two reads of an unchanged tree, which would refuse every
     auto-sweep in the product."""
-    factory, started = _pinned_sweep_factory(project, monkeypatch)
+    factory, launched = _pinned_sweep_factory(project, monkeypatch)
 
-    factory("epic-boundary")  # no raise
+    factory("epic-boundary", started=lambda: None)  # no raise
 
-    assert len(started) == 1
+    assert len(launched) == 1
 
 
 def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monkeypatch):
@@ -7799,7 +7847,7 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
     file the driven sessions can write. A session that leaves a background writer
     behind swaps the overlay the instant the compare succeeds — modelled here by
     flipping it from inside `config_digest`'s own return — and the window is not a
-    defense, because a lost round only raises `sweep-auto-failed`, which
+    defense, because a lost round only raises `sweep-auto-not-started`, which
     `_maybe_auto_sweep` swallows before the next trigger deals again.
 
     So `_sweep_factory` resolves the profiles ONCE and threads that mapping through
@@ -7807,8 +7855,18 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
     harm, not the plumbing: the adapter must carry the validated `binary`, and the
     child must not re-baseline itself onto the swapped config.
 
+    Doubles as the one place the `started` boundary runs FOR REAL — `_start_sweep`
+    is not stubbed here, so `compose_sweep` fires the thunk itself once the child
+    owns a published run dir. Every other #501 site either stubs `_start_sweep`
+    (kwargs only) or asserts the thunk never fires.
+
     ABLATION: drop `profiles=` from either `runsetup.make_adapters` or
-    `_trusted_config_digest` in `_start_sweep` and the matching assert fails."""
+    `_trusted_config_digest` in `_start_sweep` and the matching assert fails. Two
+    more lanes for the #501 thunk, and they redden different sets: dropping
+    `compose_sweep`'s `on_started()` call fails this row alone, while dropping
+    `on_started=` from the factory's `_start_sweep` call also reddens
+    `test_auto_sweep_proceeds_after_a_benign_limits_edit` — which is the seam
+    below this one, and the reason both exist."""
     from bmad_loop import bmadconfig, runs
     from bmad_loop.adapters import profile as profile_mod
 
@@ -7843,13 +7901,16 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
 
     monkeypatch.setattr(cli, "SweepEngine", _Recorder)
 
+    signalled: list[str] = []
     factory = cli._sweep_factory(project.project, bmadconfig.load_paths(project.project), pin)
-    factory("epic-boundary")  # the gate saw the honest bytes and passed
+    # the gate saw the honest bytes and passed
+    factory("epic-boundary", started=lambda: signalled.append("started"))
 
     assert (
         profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
     ), "the swap must actually have landed on disk, or this test proves nothing"
     assert captured["adapter"].profile.binary == "mycli"
+    assert signalled == ["started"]  # #501: the child composed, so the parent may latch
     run_id = captured["state"].run_id
     assert runs.read_trusted_config_digest(project.project, run_id) == pin
     # Both copies, and the same validated bytes in each: the in-tree secondary is
@@ -7869,8 +7930,8 @@ def test_run_pins_the_profile_bytes_it_launches(project, monkeypatch):
     all. The harm is over-refusal: the pin is the one baseline a session cannot
     reach (`_sweep_factory` holds children to it from memory), so a pin over
     unlaunched bytes makes those children refuse the config the parent is running —
-    and `engine._maybe_auto_sweep` records the trigger BEFORE calling the factory,
-    so the refusal burns it for the life of the run.
+    every trigger, for the life of the run. (#501 stopped a refusal from *spending*
+    each trigger; nothing about a wrong pin gets better for that.)
 
     Asserts the invariant, not the plumbing: the stamp and the adapter agree.
 

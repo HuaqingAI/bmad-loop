@@ -91,6 +91,8 @@ from .stories_engine import StoriesEngine
 from .sweep import SweepEngine
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     # Type-only: annotate the profile-lookup map without a module-level adapter
     # import (cli.py imports the adapter package lazily inside functions).
     from .adapters.profile import CLIProfile
@@ -216,10 +218,10 @@ def _launch_profiles(pol, project: Path) -> dict[str, CLIProfile]:
     baseline a session cannot reach (`_sweep_factory` holds every later auto-sweep
     to it from MEMORY, unlike resume's disk-backed advisory), so a pin describing
     bytes the run did not launch makes those children refuse the config the parent
-    has been running all along. `engine._maybe_auto_sweep` appends the trigger to
-    `sweeps_triggered` BEFORE calling the factory and returns early on an
-    already-recorded one, so that refusal burns the trigger for the life of the run
-    — it is not retried, not even across a resume.
+    has been running all along — every trigger, for the life of the run. The
+    refusal no longer *burns* each trigger (#501: `sweeps_triggered` records only
+    a child that started), but that buys nothing here: a wrong pin refuses the next
+    trigger exactly as it refused the last.
 
     `cmd_sweep` deliberately keeps its fresh read: a human started it, and the pin
     it stamps gates no child.
@@ -1920,6 +1922,7 @@ def _start_sweep(
     trigger: str,
     run_id: str | None = None,
     profiles=None,
+    on_started: Callable[[], None] | None = None,
 ) -> int:
     # The composition (run dir + state + pid + sweep.json + adapters + engine)
     # lives in runsetup; this stays compose -> render. SweepEngine and
@@ -1930,6 +1933,10 @@ def _start_sweep(
     # both stamps the pin and builds the adapters, so neither re-reads
     # profiles/*.toml after the gate compared it. `cmd_sweep` passes None: a human
     # started that one, so a fresh read is the point.
+    #
+    # `on_started` is the auto-sweep parent's latch, likewise absent for
+    # `cmd_sweep`; `compose_sweep` fires it at the boundary where this child owns a
+    # published, resumable run dir.
     composed = runsetup.compose_sweep(
         project=project,
         paths=paths,
@@ -1945,6 +1952,7 @@ def _start_sweep(
         sweep_engine_cls=SweepEngine,
         trusted_config_digest=_trusted_config_digest(pol, project, profiles=profiles),
         profiles=profiles,
+        on_started=on_started,
     )
     print(f"sweep {composed.run_id} starting (attach: bmad-loop attach)")
     summary = composed.engine.run()
@@ -1956,6 +1964,10 @@ def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest
     """Child-sweep launcher injected into story-run engines. Auto-triggered
     sweeps are unattended: never prompt, never run decision bundles.
 
+    The returned callable implements :class:`engine.SweepFactory`: every refusal
+    below raises *before* the keyword-only ``started`` thunk can fire, which is
+    what leaves the parent run's trigger unspent for a child that never launched.
+
     ``trusted_digest`` is the caller's launch-time :func:`runsetup.config_digest`
     — the integrity pin for the config this factory re-reads from disk below.
     Required, with no default: an omitted baseline would silently disable the
@@ -1963,7 +1975,7 @@ def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest
     re-read happens once and is frozen, so the gate validates the bytes the child
     actually launches from rather than a separate read of the same files."""
 
-    def factory(trigger: str) -> None:
+    def factory(trigger: str, *, started: Callable[[], None]) -> None:
         pol = policy_mod.load(_policy_path(project))
         # Read the agent-writable config EXACTLY ONCE, here, and run the child off
         # these two objects: `pol` and `profiles` are threaded through the gate
@@ -1995,14 +2007,15 @@ def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest
                 " Run `bmad-loop sweep` yourself to proceed under the new config."
             )
         # Raise rather than return the rc the other three sites return. By the time
-        # the engine calls this it has already latched the trigger and journaled
-        # `sweep-auto-trigger`, and it reads a plain return as success — so a bare
-        # decline would be recorded as `sweep-auto-finished`, which `engine.py`
-        # defines as "a clean completion from the parent's perspective": a child
-        # sweep that ran and finished when none was ever launched. Raising lands on
-        # the same `sweep-auto-failed` + notify path the `load` above already takes
-        # on an unparseable policy.toml, which is the same kind of event — the
-        # config on disk changed under a run that had already started.
+        # the engine calls this it has journaled `sweep-auto-trigger`, and it reads
+        # a plain return as a child that ran — latching the trigger on one whether
+        # or not `started` fired — so a bare decline would be recorded as
+        # `sweep-auto-finished`, which `engine.py` defines as "a clean completion
+        # from the parent's perspective": a child sweep that ran and finished when
+        # none was ever launched. Raising lands on the `sweep-auto-not-started` +
+        # notify path the `load` above already takes on an unparseable policy.toml,
+        # which is the same kind of event — the config on disk changed under a run
+        # that had already started.
         conflict = bmadconfig.worktree_isolation_conflict(paths, pol.scm.isolation)
         if conflict is not None:
             raise RuntimeError(conflict)
@@ -2015,6 +2028,7 @@ def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest
             max_bundles=None,
             trigger=trigger,
             profiles=profiles,
+            on_started=started,
         )
 
     return factory
