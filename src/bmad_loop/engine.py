@@ -44,6 +44,9 @@ from .model import (
     PAUSE_ESCALATION,
     PAUSE_SPEC_APPROVAL,
     PAUSE_STORY_GATE,
+    SWEEP_REFUSED_DIRTY,
+    SWEEP_REFUSED_FAILED,
+    SWEEP_REFUSED_NOT_STARTED,
     Phase,
     RunState,
     SessionRecord,
@@ -158,6 +161,16 @@ class RunSummary:
     awaiting_operator: int = 0
     crashed: bool = False
     crash_error: str | None = None
+    # auto-sweep triggers this run did not deliver, as (trigger, SWEEP_REFUSED_*)
+    # pairs (#501). Defaulted for the same reason as awaiting_operator: empty is
+    # the honest value on every run that refused nothing.
+    #
+    # A tuple of pairs, NOT the dict `RunState` holds it in, because this class is
+    # `frozen=True`: a dict field leaves the "snapshot" mutable through its own
+    # container, and — silently — makes every RunSummary unhashable, since
+    # frozen+eq synthesizes `__hash__` from the field tuple. Nothing hashes one
+    # today, which is exactly why that would go unnoticed. `summary()` converts.
+    sweeps_refused: tuple[tuple[str, str], ...] = ()
 
     def render(self) -> str:
         # Lead with weighted (what spend actually costs) and name both units:
@@ -185,6 +198,19 @@ class RunSummary:
             lines.append(f"CRASHED: {self.crash_error}")
         if self.paused:
             lines.append(f"PAUSED: {self.paused_reason}")
+        # Appended only when it fired, like `parked` above. Under
+        # `[sweep] auto = "run-end"` there is exactly one trigger per run and it
+        # is never re-asked once the run finishes (see `_maybe_auto_sweep`), so
+        # this line IS the remedy — the refusal is otherwise journal-only, and
+        # the operator never learns the deferred work went untouched. The clean
+        # worktree is named because `cmd_sweep` hard-refuses an unclean tree:
+        # without it the follow-up lands the operator in a second refusal.
+        if self.sweeps_refused:
+            detail = ", ".join(f"{trigger} ({why})" for trigger, why in self.sweeps_refused)
+            lines.append(
+                f"SWEEP NOT RUN: {detail} — deferred work is untouched; "
+                "run `bmad-loop sweep` with a clean worktree"
+            )
         return "\n".join(lines)
 
 
@@ -819,6 +845,10 @@ class Engine:
             weighted_tokens=sum(t.tokens.weighted_total(weight) for t in tasks),
             crashed=self.state.crashed,
             crash_error=self.state.crash_error,
+            # Snapshotted, not aliased: this dict is still live on the engine's
+            # state, and the tuple makes the copy structural rather than a
+            # convention a later edit could drop.
+            sweeps_refused=tuple(self.state.sweeps_refused.items()),
         )
 
     def _remaining_estimate(self) -> int | None:
@@ -5635,6 +5665,25 @@ class Engine:
         self._save()
         raise RunPaused(reason, PAUSE_ESCALATION, task.story_key)
 
+    def _record_sweep_refusal(self, trigger: str, reason: str) -> None:
+        """Record, durably, that this trigger's auto-sweep did not deliver.
+
+        The remedy for #501's closing note: every refusal below was journal-only,
+        so a run whose one sweep trigger was refused finished looking exactly like
+        a run that swept — nothing in ``summary().render()``, ``status`` or
+        ``status --json`` said otherwise, and under ``auto = "run-end"`` there is
+        no later ask to notice the gap.
+
+        ``reason`` must be one of the ``SWEEP_REFUSED_*`` slugs, never a formatted
+        exception — see their definition in ``model.py`` for why a free-form
+        string breaks ``bmad-loop diagnose`` outright rather than being redacted.
+
+        Written before the arm's journal/notify calls, mirroring ``latch``: the
+        durable record is the point, and it must not be lost to an OSError from a
+        journal append."""
+        self.state.sweeps_refused[trigger] = reason
+        self._save()
+
     def _maybe_auto_sweep(self, kind: str, trigger: str) -> None:
         """Run a child deferred-work sweep when policy [sweep].auto matches.
         The child is its own resumable run; a paused or failed child is
@@ -5721,6 +5770,7 @@ class Engine:
             # arm this one is transient-reachable: `_run_git` reports a
             # `subprocess.TimeoutExpired` as GitError (verify.py), so a slow
             # `git status` used to permanently spend this run's sweep trigger.
+            self._record_sweep_refusal(trigger, SWEEP_REFUSED_DIRTY)
             self.journal.append(
                 "sweep-auto-skipped-dirty", trigger=trigger, reason="git-error", error=str(e)
             )
@@ -5728,6 +5778,7 @@ class Engine:
         if not clean:
             # should not happen at these call sites (everything committed or
             # reset); refuse rather than sweep on top of stray changes
+            self._record_sweep_refusal(trigger, SWEEP_REFUSED_DIRTY)
             self.journal.append("sweep-auto-skipped-dirty", trigger=trigger, reason="dirty")
             return
 
@@ -5743,6 +5794,13 @@ class Engine:
             if latched:
                 return
             latched = True
+            # Clear any refusal this trigger carries from an earlier ask, so the
+            # two records cannot contradict each other. Reachable only through the
+            # narrow crash window the docstring above bounds — a per-epic trigger
+            # refused, the process dying before the boundary closed, and a resume
+            # re-asking it. Not a retry path; a guard against a stale claim if one
+            # happens. The `failed` arm re-records after this, by design.
+            self.state.sweeps_refused.pop(trigger, None)
             self.state.sweeps_triggered.append(trigger)
             self._save()
 
@@ -5753,6 +5811,7 @@ class Engine:
             raise  # a stop is not a failed child — let the owner record it
         except (Exception, SystemExit) as e:  # child must never break the parent
             if latched:
+                self._record_sweep_refusal(trigger, SWEEP_REFUSED_FAILED)
                 self.journal.append("sweep-auto-failed", trigger=trigger, error=str(e))
                 gates.notify(self.policy, self.run_dir, "auto sweep failed", f"{trigger}: {e}")
             else:
@@ -5762,6 +5821,7 @@ class Engine:
                 # wording rather than none: the loudest raise that lands here is
                 # the #461 config-integrity refusal, a security event that must not
                 # go quiet just because it stopped being permanent.
+                self._record_sweep_refusal(trigger, SWEEP_REFUSED_NOT_STARTED)
                 self.journal.append("sweep-auto-not-started", trigger=trigger, error=str(e))
                 gates.notify(
                     self.policy, self.run_dir, "auto sweep did not start", f"{trigger}: {e}"

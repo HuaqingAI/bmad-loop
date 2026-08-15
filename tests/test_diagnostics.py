@@ -65,13 +65,24 @@ CANARIES = [
 ]
 
 
-def _seed_run(root, run_id="20260627-120000-aaaa", *, extra_journal=None, sweeps_triggered=()):
+def _seed_run(
+    root,
+    run_id="20260627-120000-aaaa",
+    *,
+    extra_journal=None,
+    sweeps_triggered=(),
+    sweeps_refused=None,
+):
     """Build a run dir loaded with canaries in every readable sink.
 
     ``sweeps_triggered`` seeds a routing gap the MARKDOWN report can reach: the
     collector passes identifier-shaped entries through verbatim, and the report
     renders them inline. (``extra_journal`` seeds a gap only the JSON document
     reaches — markdown renders journal aggregates, never per-entry fields.)
+
+    ``sweeps_refused`` is the #501 sibling and reaches both renders the same way,
+    except that it is a mapping — so a seed can aim a canary at the key half, the
+    value half, or both independently.
     """
     run_dir = root / ".bmad-loop" / "runs" / run_id
 
@@ -128,6 +139,7 @@ def _seed_run(root, run_id="20260627-120000-aaaa", *, extra_journal=None, sweeps
         plugin_shared={"unity": {"creds": SECRET_AWS}},
         tasks={STORY_KEY: task},
         sweeps_triggered=list(sweeps_triggered),
+        sweeps_refused=dict(sweeps_refused or {}),
     )
     save_state(run_dir, state)
 
@@ -201,6 +213,48 @@ def test_known_safe_values_survive(project):
     assert "20260627-120000-aaaa" in combined  # run id is opaque/safe
     assert "escalated" in combined  # phase enum survives
     assert "input_tokens" in combined  # token count keys survive
+
+
+def test_sweeps_refused_redacts_both_halves(project):
+    """#501: `sweeps_refused` is a mapping, so it has two redaction surfaces.
+
+    The value is a closed `SWEEP_REFUSED_*` slug wherever the orchestrator wrote
+    it — but neither half is re-validated on load, and the key is a trigger string
+    off state.json, the same untrusted footing as `sweeps_triggered`. This matters
+    more than a usual scrub: a home path reaching `sanitize.guard` is not redacted
+    there, it RAISES `LeakDetected` and the whole dump is refused. Filtering here
+    is what keeps a malformed run diagnosable at all.
+
+    The structure is asserted before rendering on purpose. Under ablation the
+    render would raise `LeakDetected` rather than fail an assert, which says "a
+    dump was refused" and not which half leaked.
+
+    Ablation, three axes, verified by reading the diff and not just the red:
+    drop the key's `looks_like_identifier` branch and ONLY the path-shaped-key
+    entry differs (pytest reports the other two as identical); drop the value's
+    and only the `run-end` entry does; delete the markdown `sweeps_refused` row
+    and only the render asserts at the end fail."""
+    run_dir = _seed_run(
+        project.project,
+        sweeps_refused={HOME_PATH: "dirty", "run-end": HOME_PATH, "epic-1": "not-started"},
+    )
+    pseudo = sanitize.Pseudonymizer()
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=ANY_PROJECT)
+
+    (r,) = diag.runs
+    assert r.sweeps_refused == {
+        "<redacted:str>": "dirty",  # path-shaped KEY
+        "run-end": "<redacted:str>",  # path-shaped VALUE
+        "epic-1": "not-started",  # the well-formed pair is untouched
+    }
+
+    md = diagnostics.render_markdown(diag, pseudo=pseudo)
+    js = diagnostics.render_json(diag, pseudo=pseudo)
+    assert HOME_PATH not in md + js
+    # and the row actually renders — a field collected but never surfaced would
+    # satisfy every leak assertion above while shipping nothing.
+    assert "**sweeps_refused:**" in md and "`epic-1`: not-started" in md
+    assert json.loads(js)["runs"][0]["sweeps_refused"]["epic-1"] == "not-started"
 
 
 def test_env_names_the_platform_and_the_win32_on_wsl_path_verdict(project, monkeypatch):

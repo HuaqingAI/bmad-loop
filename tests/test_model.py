@@ -4,7 +4,15 @@ import json
 
 import pytest
 
-from bmad_loop.model import Phase, RunState, SessionRecord, StoryTask, TokenUsage
+from bmad_loop.model import (
+    SWEEP_REFUSED_DIRTY,
+    SWEEP_REFUSED_NOT_STARTED,
+    Phase,
+    RunState,
+    SessionRecord,
+    StoryTask,
+    TokenUsage,
+)
 
 
 def _state(**kw) -> RunState:
@@ -36,6 +44,44 @@ def test_run_state_stories_fields_default_when_absent_from_dict():
     del d["spec_folder"]
     back = RunState.from_dict(d)
     assert back.source == "sprint-status" and back.spec_folder == ""
+
+
+def test_sweeps_refused_round_trips():
+    """#501's visibility record: trigger -> a closed SWEEP_REFUSED_* slug.
+
+    Kept apart from `sweeps_triggered` deliberately — that list is the re-fire
+    latch, and a refusal must not spend it. The two are independent here."""
+    state = _state()
+    state.sweeps_refused["run-end"] = SWEEP_REFUSED_DIRTY
+    state.sweeps_refused["epic-1"] = SWEEP_REFUSED_NOT_STARTED
+    back = RunState.from_dict(json.loads(json.dumps(state.to_dict())))
+    assert back.sweeps_refused == {"run-end": "dirty", "epic-1": "not-started"}
+    assert back.sweeps_triggered == []
+
+
+def test_sweeps_refused_defaults_when_absent_from_dict():
+    """A state.json written before #501 carries no `sweeps_refused` key at all.
+
+    Ablation: change from_dict's `d.get("sweeps_refused", {})` to
+    `d["sweeps_refused"]`. This test fails with KeyError; the round-trip above
+    stays green, because to_dict always writes the key. The two tests cover
+    disjoint halves — neither substitutes for the other."""
+    d = _state().to_dict()
+    del d["sweeps_refused"]
+    assert RunState.from_dict(d).sweeps_refused == {}
+
+
+def test_sweeps_refused_coerces_both_halves():
+    """Both halves are coerced with str(). The value is the JSON-reachable one —
+    a number survives a dumps/loads round trip as a number — and the key is
+    reachable from a hand-edited or foreign state file. Coercion here is the
+    precondition for diagnostics' `looks_like_identifier` filter, which is typed
+    over strings on both sides.
+
+    Ablation: drop either `str()` in from_dict and the matching half fails."""
+    d = _state().to_dict()
+    d["sweeps_refused"] = {1: 2}
+    assert RunState.from_dict(d).sweeps_refused == {"1": "2"}
 
 
 def test_attach_session_usage_folds_usage_into_record_and_totals():

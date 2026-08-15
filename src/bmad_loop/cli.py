@@ -2981,6 +2981,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         print("status: in progress — graceful stop pending (will stop after the current item)")
     else:
         print("status: in progress (or interrupted)")
+    if state.sweeps_refused:
+        detail = ", ".join(f"{trigger} ({why})" for trigger, why in state.sweeps_refused.items())
+        print(f"auto-sweep not run: {detail} — deferred work is untouched")
+        print("  run `bmad-loop sweep` with a clean worktree")
     raw_total, weighted_total, weight = run_token_totals(state)
     if raw_total:
         print(

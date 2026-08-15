@@ -7,6 +7,17 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Added
+
+- **A refused auto-sweep is now visible outside the journal (#501).** A run whose deferred-work
+  sweep was refused ended looking exactly like one that swept, and under `[sweep] auto = "run-end"`
+  there is one trigger per run that is never re-asked once the run finishes — so the journal was
+  the only trace. Runs now record `sweeps_refused` (trigger → reason), surfaced by the end-of-run
+  summary, `bmad-loop status`, `status --json` and `bmad-loop diagnose`; the follow-up they name
+  is `bmad-loop sweep`, which needs a clean worktree. The reason is a fixed slug — `not-started`,
+  `failed` or `dirty` — never an exception message, which `diagnose` would refuse to emit at all.
+  The `--json` key is additive and always present, so `STATUS_SCHEMA_VERSION` is unchanged.
+
 ### Changed
 
 - **Files the orchestrator replaces by name now land at `0600`.** Those writes pass

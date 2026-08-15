@@ -232,6 +232,7 @@ class RunDiag:
     current_epic: int | None
     sweep_cycle: int
     sweeps_triggered: list[str]
+    sweeps_refused: dict[str, str]
     plugin_shared_keys: int
     policy: dict
     n_tasks: int
@@ -596,6 +597,17 @@ def collect_run(run_dir: Path, *, pseudo: sanitize.Pseudonymizer, cap: int) -> R
             s if sanitize.looks_like_identifier(str(s)) else "<redacted:str>"
             for s in state.sweeps_triggered
         ],
+        # BOTH halves are filtered. The value is a closed SWEEP_REFUSED_* slug by
+        # construction, but the key is a trigger string off state.json — the same
+        # untrusted footing as sweeps_triggered above — and a hand-edited or
+        # foreign state file must not be able to route a home path into a report
+        # that `sanitize.guard` would then refuse to emit at all.
+        sweeps_refused={
+            (k if sanitize.looks_like_identifier(str(k)) else "<redacted:str>"): (
+                v if sanitize.looks_like_identifier(str(v)) else "<redacted:str>"
+            )
+            for k, v in state.sweeps_refused.items()
+        },
         plugin_shared_keys=len(state.plugin_shared),
         policy=_scrub_policy(state.policy_snapshot),
         n_tasks=len(tasks),
@@ -645,6 +657,7 @@ def _unreadable_run(run_dir: Path, err: Exception) -> RunDiag:
         current_epic=None,
         sweep_cycle=0,
         sweeps_triggered=[],
+        sweeps_refused={},
         plugin_shared_keys=0,
         policy={},
         n_tasks=0,
@@ -745,6 +758,13 @@ def render_markdown(
         out.append(_fmt_kv("epic / sweep_cycle", f"{r.current_epic} / {r.sweep_cycle}"))
         if r.sweeps_triggered:
             out.append(_fmt_kv("sweeps_triggered", ", ".join(f"`{s}`" for s in r.sweeps_triggered)))
+        if r.sweeps_refused:
+            out.append(
+                _fmt_kv(
+                    "sweeps_refused",
+                    ", ".join(f"`{k}`: {v}" for k, v in r.sweeps_refused.items()),
+                )
+            )
         out.append(_fmt_kv("tasks", r.n_tasks))
         out.append(_fmt_kv("phase histogram", _dict_inline(r.phase_histogram)))
         out.append(_fmt_kv("token totals", _dict_inline(r.token_totals)))

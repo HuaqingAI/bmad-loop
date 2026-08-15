@@ -2,6 +2,7 @@
 
 import dataclasses
 import hashlib
+import json
 import os
 import re
 import signal
@@ -42,6 +43,9 @@ from bmad_loop.model import (
     PAUSE_ESCALATION,
     PAUSE_SPEC_APPROVAL,
     PAUSE_STORY_GATE,
+    SWEEP_REFUSED_DIRTY,
+    SWEEP_REFUSED_FAILED,
+    SWEEP_REFUSED_NOT_STARTED,
     Phase,
     RunState,
     SessionRecord,
@@ -1233,6 +1237,62 @@ def test_run_summary_render_names_parked_stories_only_when_there_are_any(project
     )
 
     assert "1 awaiting operator" in engine.summary().render()
+
+
+def test_run_summary_projects_and_renders_a_refused_auto_sweep(project):
+    """#501's closing note: a refused auto-sweep was journal-only, so the run's
+    terminal output was byte-identical to a run that swept. Under
+    `[sweep] auto = "run-end"` there is one trigger per run and it is not re-asked
+    once the run finishes, so this line is the whole remedy.
+
+    The clean-worktree clause is not decoration: `cmd_sweep` hard-refuses an
+    unclean tree, so a `dirty` refusal whose follow-up omitted it would walk the
+    operator straight into a second refusal.
+
+    Ablation, three disjoint axes: (a) drop `sweeps_refused=` from `summary()` and
+    both the projection and the render assert fail while the absence assert stays
+    green; (b) delete the `if self.sweeps_refused:` block in `render()` and only
+    the render asserts fail; (c) delete the `sweep` clause from that block's text
+    and only the last assert fails."""
+    engine = _cache_heavy_engine(project, snapshot_weight=0.5, live_weight=0.5, usage=TokenUsage())
+    assert "SWEEP NOT RUN" not in engine.summary().render()  # absent when nothing refused
+
+    engine.state.sweeps_refused["run-end"] = SWEEP_REFUSED_DIRTY
+
+    summary = engine.summary()
+    assert summary.sweeps_refused == (("run-end", SWEEP_REFUSED_DIRTY),)
+    rendered = summary.render()
+    assert "SWEEP NOT RUN: run-end (dirty)" in rendered
+    assert "bmad-loop sweep" in rendered and "clean worktree" in rendered
+
+
+def test_run_summary_snapshots_rather_than_aliases_the_refusal_record(project):
+    """`summary()` is a pure projection of `self.state` (see its docstring), and a
+    snapshot that keeps mutating with the engine is not one.
+
+    `RunSummary` is `frozen=True`, so the field is a tuple of pairs rather than
+    the dict `RunState` holds — which buys two things a dict cannot. The copy is
+    structural, not a `dict(...)` convention a later edit could quietly drop; and
+    the class stays hashable, since frozen+eq synthesizes `__hash__` over the
+    fields and a dict field makes that raise. Nothing hashes a RunSummary today —
+    precisely why that regression would ship unnoticed — so it is pinned here.
+
+    Ablation: change `sweeps_refused=tuple(self.state.sweeps_refused.items())` to
+    `sweeps_refused=self.state.sweeps_refused`. This reddens EIGHT tests, not one
+    — recorded as measured, not as first guessed. Only two fail on the snapshot
+    claim; the other six die in `render()` with `ValueError: too many values to
+    unpack`, because iterating a dict yields bare keys and the line unpacks pairs.
+    That is the same "a dict yields keys" degradation that keeps this field out of
+    `sweeps_triggered`, and it means the ablation is loud rather than subtle. This
+    test is the one that grades the snapshot semantics specifically."""
+    engine = _cache_heavy_engine(project, snapshot_weight=0.5, live_weight=0.5, usage=TokenUsage())
+    engine.state.sweeps_refused["run-end"] = SWEEP_REFUSED_DIRTY
+    summary = engine.summary()
+
+    engine.state.sweeps_refused["epic-1"] = SWEEP_REFUSED_FAILED
+
+    assert summary.sweeps_refused == (("run-end", SWEEP_REFUSED_DIRTY),)
+    assert hash(summary)  # frozen means hashable; a dict field would TypeError
 
 
 # ---------------------------------------- awaiting-operator park path (#335)
@@ -7732,7 +7792,12 @@ def test_auto_sweep_that_started_then_failed_keeps_the_trigger_spent(project):
 
     assert summary.done == 1 and engine.state.finished  # parent unaffected
     assert calls == ["run-end"]
-    assert load_state(engine.run_dir).sweeps_triggered == ["run-end"]
+    saved = load_state(engine.run_dir)
+    assert saved.sweeps_triggered == ["run-end"]
+    # The one shape that lands in BOTH records, and the reason `sweeps_refused`
+    # is a sibling of the latch rather than a widening of it: the trigger really
+    # was spent (a resumable child exists), and the sweep really did not deliver.
+    assert saved.sweeps_refused == {"run-end": SWEEP_REFUSED_FAILED}
     journal = (engine.run_dir / "journal.jsonl").read_text()
     assert "sweep-auto-failed" in journal  # it ran, and then it failed
     assert "sweep-auto-not-started" not in journal
@@ -7854,7 +7919,13 @@ def test_auto_sweep_skips_a_dirty_tree_and_keeps_the_trigger(project):
 
     assert calls == []
     assert [e["reason"] for e in _skipped_dirty(engine)] == ["dirty"]
-    assert load_state(engine.run_dir).sweeps_triggered == []
+    saved = load_state(engine.run_dir)
+    assert saved.sweeps_triggered == []
+    # ...and, since #501's visibility phase, the refusal is durable rather than
+    # journal-only. Third ablation axis: delete the `_record_sweep_refusal` call
+    # from the `if not clean:` block and this line fails while the two above stay
+    # green — they grade the refusal, this one grades the record of it.
+    assert saved.sweeps_refused == {"run-end": SWEEP_REFUSED_DIRTY}
 
 
 def test_auto_sweep_skips_a_git_fault_and_keeps_the_trigger(project, monkeypatch):
@@ -7887,7 +7958,13 @@ def test_auto_sweep_skips_a_git_fault_and_keeps_the_trigger(project, monkeypatch
     skipped = _skipped_dirty(engine)
     assert [e["reason"] for e in skipped] == ["git-error"]
     assert "timed out" in skipped[0]["error"]  # the fault is named, not swallowed
-    assert load_state(engine.run_dir).sweeps_triggered == []
+    saved = load_state(engine.run_dir)
+    assert saved.sweeps_triggered == []
+    # The durable record folds this arm in with the dirty twin: the journal keeps
+    # `git-error` vs `dirty` apart for forensics, while the operator-facing slug
+    # answers only "the sweep did not run" — and its next action (`bmad-loop
+    # sweep` on a clean tree) is the same either way.
+    assert saved.sweeps_refused == {"run-end": SWEEP_REFUSED_DIRTY}
 
 
 def test_auto_sweep_system_exit_does_not_kill_the_parent(project):
@@ -7931,7 +8008,13 @@ def test_auto_sweep_system_exit_does_not_kill_the_parent(project):
     journal = (engine.run_dir / "journal.jsonl").read_text()
     assert "sweep-auto-not-started" in journal and "not usable on this host" in journal
     assert "run-complete" in journal
-    assert load_state(engine.run_dir).sweeps_triggered == []
+    saved = load_state(engine.run_dir)
+    assert saved.sweeps_triggered == []
+    # The slug, never `str(e)`: the SystemExit message above is free-form operator
+    # text and could carry a home path, which `sanitize.guard` refuses to redact —
+    # it raises, taking the whole `diagnose` dump down with it. See model.py.
+    assert saved.sweeps_refused == {"run-end": SWEEP_REFUSED_NOT_STARTED}
+    assert "not usable on this host" not in json.dumps(saved.to_dict())
 
 
 def test_auto_sweep_run_stopped_stops_the_parent(project, monkeypatch):
@@ -7970,6 +8053,11 @@ def test_auto_sweep_run_stopped_stops_the_parent(project, monkeypatch):
     assert saved.stopped is True
     assert not saved.finished  # the whole point: a stop must not read as a finish
     assert saved.sweeps_triggered == ["run-end"]  # it ran; the stop does not un-spend it
+    # And it is not a refusal either — the `except RunStopped: raise` arm is ahead
+    # of both recording arms. INVERSE ablation (an absence): add a
+    # `_record_sweep_refusal(trigger, SWEEP_REFUSED_FAILED)` to that arm and this
+    # line fails, while the journal asserts below stay green.
+    assert saved.sweeps_refused == {}
     assert killed == ["test-run"]
     journal = (engine.run_dir / "journal.jsonl").read_text()
     assert "run-stop" in journal
@@ -8722,6 +8810,16 @@ def test_maybe_auto_sweep_suppressed_when_graceful_stop_pending(project):
     assert "sweep-auto-suppressed" in kinds
     assert "sweep-auto-trigger" not in kinds
     assert "run-end" not in engine.state.sweeps_triggered  # nothing started, nothing spent
+    # ...and deliberately NOT in `sweeps_refused` either, unlike every other
+    # non-delivering arm. This return sits AHEAD of the latch, so a resume can
+    # still fire the trigger — recording a refusal here would go stale the moment
+    # it does, which is exactly the dishonesty the record exists to prevent. The
+    # operator already has a louder signal: they asked for the stop.
+    #
+    # INVERSE ablation (the guard is an absence — deleting code cannot reproduce
+    # it): add `self._record_sweep_refusal(trigger, SWEEP_REFUSED_DIRTY)` above
+    # the suppressed journal append and this line fails alone.
+    assert engine.state.sweeps_refused == {}
 
 
 def test_pause_wins_over_pending_graceful_stop(project, monkeypatch):

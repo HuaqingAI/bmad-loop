@@ -1317,6 +1317,74 @@ def test_status_reports_a_parked_story_on_both_surfaces(project, capsys):
     assert parked_line.index("dev×") == done_line.index("dev×")
 
 
+def _run_with_refusals(project, refusals):
+    """A finished run carrying `sweeps_refused`. Written through load/mutate/save
+    rather than by widening `_make_run_with_tokens`, which a dozen weight tests
+    share and none of them need this field."""
+    from bmad_loop.journal import load_state, save_state
+    from bmad_loop.model import Phase, StoryTask
+
+    done = StoryTask(story_key="1-1-login", epic=1, phase=Phase.DONE)
+    run_dir = _make_run_with_tokens(project, {"1-1-login": done}, weight=0.1)
+    state = load_state(run_dir)
+    state.sweeps_refused.update(refusals)
+    save_state(run_dir, state)
+    return run_dir
+
+
+def test_status_reports_a_refused_auto_sweep_on_both_surfaces(project, capsys):
+    """#501's closing note: the refusal lived only in the journal, so neither
+    surface distinguished a run whose deferred-work sweep was refused from one
+    that swept cleanly. Under `[sweep] auto = "run-end"` the trigger is not
+    re-asked once the run finishes, so surfacing it IS the fix.
+
+    Additive per machine.py — a new key is not a breaking change — so
+    STATUS_SCHEMA_VERSION does not move, and this asserts it stayed at 1.
+
+    The text side names the clean worktree because `cmd_sweep` hard-refuses an
+    unclean tree; without it the operator's next command is a second refusal.
+
+    Ablation: delete the `"sweeps_refused"` entry from `documents.status_document`
+    and the json asserts fail; delete the `if state.sweeps_refused:` block in
+    `cmd_status` and only the text asserts fail. Disjoint — the read model and
+    the human surface are separate code paths."""
+    _run_with_refusals(project, {"run-end": "dirty"})
+
+    doc = _status_json(project, capsys)
+    assert doc["sweeps_refused"] == {"run-end": "dirty"}
+    assert doc["schema_version"] == 1  # additive: no consumer breaks
+
+    assert cli.main(["status", "--project", str(project.project)]) == 0  # exit code unchanged
+    out = capsys.readouterr().out
+    assert "auto-sweep not run: run-end (dirty)" in out
+    assert "bmad-loop sweep" in out and "clean worktree" in out
+
+
+def test_status_json_carries_sweeps_refused_even_when_nothing_was_refused(project, capsys):
+    """Always present, `{}` on a clean run. A key that appears only on the failing
+    run leaves "absent" ambiguous between "swept fine" and "state.json predates
+    #501", and a consumer cannot tell those apart — which is the whole point of a
+    document it can rely on.
+
+    The text line is the opposite call and follows the `awaiting operator` idiom:
+    printed only when it fires, because a standing "auto-sweep not run: none"
+    trains the reader to skip the line that matters.
+
+    Ablation for the text half: drop the `if state.sweeps_refused:` guard (print
+    unconditionally) and the last assert fails while the json assert stays green."""
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase, StoryTask
+
+    done = StoryTask(story_key="1-1-login", epic=1, phase=Phase.DONE)
+    run_dir = _make_run_with_tokens(project, {"1-1-login": done}, weight=0.1)
+    assert load_state(run_dir).sweeps_refused == {}  # the run really refused nothing
+
+    assert _status_json(project, capsys)["sweeps_refused"] == {}
+
+    assert cli.main(["status", "--project", str(project.project)]) == 0
+    assert "auto-sweep not run" not in capsys.readouterr().out
+
+
 def test_status_json_stories_mode_is_pure_json(project, capsys):
     """--json must skip every text trailer (stories board, backlog, decisions
     nudge) — the stories-mode board would otherwise corrupt the document."""
