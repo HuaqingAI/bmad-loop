@@ -426,3 +426,96 @@ def test_compose_sweep_unwinds_the_run_when_the_adapters_abort(unwinding):
             trusted_config_digest="deadbeef",
         )
     _assert_unwound(unwinding)
+
+
+PRIOR_STATE = '{"run_id": "prior", "finished": true}'
+PRIOR_JOURNAL = '{"kind": "run-complete"}\n'
+PRIOR_STAMP = "prior-digest"
+
+
+def _seed_prior_run(project):
+    """A finished run already occupying RUN_ID — dir, state, journal, and the
+    out-of-tree state dir the unwind's `_discard_state_dir` also reaches.
+
+    Finished, deliberately: `delete_run`'s only guard refuses a LIVE session, so a
+    run that has none is exactly the case that guard does not cover."""
+    run_dir = runs.run_dir_for(project, RUN_ID)
+    run_dir.mkdir(parents=True)
+    (run_dir / "state.json").write_text(PRIOR_STATE, encoding="utf-8")
+    (run_dir / "journal.jsonl").write_text(PRIOR_JOURNAL, encoding="utf-8")
+    state_dir = runs.state_dir_for(project, RUN_ID)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "config-digest").write_text(PRIOR_STAMP, encoding="utf-8")
+    return run_dir, state_dir
+
+
+def _assert_prior_run_untouched(probe, run_dir, state_dir):
+    """The prior run survives BYTE-IDENTICAL, and the refusal beat publication.
+
+    `probe.published == {}` is the positive control and the load-bearing half: an
+    "is it still there" assertion alone passes just as happily for a composer that
+    published over the run and then failed to unwind it. An empty dict says
+    `make_adapters` was never reached, so `save_state` never ran and the
+    `except BaseException` arm was never entered — which is the claim, since the
+    guard's whole placement requirement is that it sits OUTSIDE that try."""
+    assert probe.published == {}
+    assert (run_dir / "state.json").read_text(encoding="utf-8") == PRIOR_STATE
+    assert (run_dir / "journal.jsonl").read_text(encoding="utf-8") == PRIOR_JOURNAL
+    assert (state_dir / "config-digest").read_text(encoding="utf-8") == PRIOR_STAMP
+
+
+def test_compose_run_refuses_a_run_id_that_already_exists(unwinding):
+    """`--run-id` naming an existing run must be refused before anything is
+    published, leaving that run untouched.
+
+    Without the claim this was destructive, not merely sloppy: `Journal.__init__`
+    mkdirs with `exist_ok=True`, so the composer adopted the existing directory,
+    `save_state` overwrote its `state.json`, and the reachable `make_adapters`
+    SystemExit then drove `_unwind_composition` — which `rmtree`s the whole run dir
+    and discards its out-of-tree state. A paused, stopped or finished run has no
+    live session, so `delete_run`'s guard never fires: the prior run's journal,
+    logs, tasks and state were erased permanently."""
+    run_dir, state_dir = _seed_prior_run(unwinding.project)
+    with pytest.raises(SystemExit, match="already exists"):
+        runsetup.compose_run(
+            project=unwinding.project,
+            paths=_fake_paths(unwinding.project),
+            policy=policy_mod.loads(""),
+            run_id=RUN_ID,
+            epic_filter=None,
+            story_filter=None,
+            max_stories=None,
+            stories_on=False,
+            spec_folder="",
+            sweep_factory=lambda _trigger, *, started: None,
+            make_adapters=unwinding.make_adapters,
+            engine_cls=_NeverBuilt,
+            stories_engine_cls=_NeverBuilt,
+            trusted_config_digest="deadbeef",
+        )
+    _assert_prior_run_untouched(unwinding, run_dir, state_dir)
+
+
+def test_compose_sweep_refuses_a_run_id_that_already_exists(unwinding):
+    """The sweep composer carries its own copy of the claim, so it gets its own
+    row — `cmd_sweep --run-id` is a caller-supplied id on the same hidden flag, and
+    a shared guard that only one composer actually calls is the failure mode a
+    single test here would hide."""
+    run_dir, state_dir = _seed_prior_run(unwinding.project)
+    with pytest.raises(SystemExit, match="already exists"):
+        runsetup.compose_sweep(
+            project=unwinding.project,
+            paths=_fake_paths(unwinding.project),
+            policy=policy_mod.loads(""),
+            run_id=RUN_ID,
+            prompting=False,
+            decisions_only=False,
+            max_bundles=None,
+            repeat=None,
+            max_cycles=None,
+            trigger="auto",
+            make_adapters=unwinding.make_adapters,
+            sweep_engine_cls=_NeverBuilt,
+            trusted_config_digest="deadbeef",
+        )
+    _assert_prior_run_untouched(unwinding, run_dir, state_dir)

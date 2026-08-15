@@ -791,9 +791,54 @@ class ComposedRun:
     journal: Journal
 
 
+def _claim_run_dir(run_dir: Path) -> None:
+    """Take exclusive ownership of a fresh run directory, refusing an id that
+    already names a run.
+
+    A **claim**, not a check, and that distinction is the whole point:
+    ``exist_ok=False`` makes the directory's creation and the collision refusal one
+    atomic operation, so what follows may treat "this run dir is ours" as PROVEN
+    rather than inferred. :func:`_unwind_composition` deletes this directory
+    wholesale on a failed composition, and inference is not good enough to license
+    an ``rmtree``.
+
+    The hazard is not hypothetical. ``run_id`` is caller-supplied through the
+    hidden ``--run-id`` flag on both ``run`` and ``sweep``, and the composers ran
+    straight into ``Journal(run_dir)``, whose ``mkdir(parents=True,
+    exist_ok=True)`` adopts an existing directory without complaint. So pointing
+    ``--run-id`` at a *pre-existing* paused, stopped or finished run published this
+    composition's ``state.json`` over that run's, and then — once ``make_adapters``
+    raised its reachable ``SystemExit`` — unwound the whole thing: journal, logs,
+    tasks and out-of-tree state, permanently. ``delete_run``'s guard does not cover
+    it, since that guard refuses only a *live* session and a paused or finished run
+    has none.
+
+    Refusing before anything is published is what makes that unreachable, so this
+    MUST stay outside the composers' ``try`` — a refusal that reached the unwind
+    arm would delete the very run it exists to protect. ``SystemExit`` matches the
+    other launch-time refusals an operator reads as an ``error:`` line
+    (``_reject_bad_run_id``, and ``make_adapters``' five sites).
+
+    Applied to a minted id too, not just a supplied one. ``new_run_id`` is a
+    timestamp plus two random bytes, so a same-second collision is remote rather
+    than impossible — and a guard that holds for every id lets callers state the
+    freshness of their run dir flatly instead of qualifying it by provenance."""
+    try:
+        run_dir.mkdir(parents=True, exist_ok=False)
+    except FileExistsError as e:
+        raise SystemExit(
+            f"error: run {run_dir.name} already exists — refusing to compose over it. "
+            "`--run-id` must name a run that does not exist yet."
+        ) from e
+
+
 def _unwind_composition(project: Path, run_dir: Path) -> None:
     """Remove the run a failed ``compose_*`` had already published, so a launch
     that aborts partway leaves nothing behind.
+
+    Safe as a wholesale removal only because :func:`_claim_run_dir` created this
+    directory with ``exist_ok=False`` moments earlier: the run being deleted is
+    provably this composition's, never a pre-existing one the caller named.
 
     Reached from an ``except BaseException`` arm, because the failure it exists
     for is a :class:`SystemExit`: :func:`make_adapters` raises one at five sites
@@ -813,13 +858,15 @@ def _unwind_composition(project: Path, run_dir: Path) -> None:
     *operator's* explicit override, and there is no operator here — this is an
     automatic unwind. What it would skip is the one guard protecting the one state
     where a run dir is load-bearing: an untagged live ``bmad-loop-<id>`` session,
-    for which that directory is the only ownership proof a later prune can read. A
-    run id is caller-supplied (``--run-id``), so such a session can exist at the id
-    this launch just claimed, and it cannot be this launch's — no session was ever
-    spawned. Deleting the directory would leak it for the life of the machine.
-    When the guard does fire the cost is exactly the pre-fix behavior, a stranded
-    run dir, which is no worse than what this replaces; ``force=True`` would trade
-    that bounded cost for an unbounded one.
+    for which that directory is the only ownership proof a later prune can read.
+    :func:`_claim_run_dir` rules out a session belonging to a *pre-existing run* at
+    this id — there is no such run — but not an orphaned session outliving the run
+    dir it was named for, which this launch would then be deleting the only
+    ownership proof of while never having spawned a session of its own. Narrower
+    than the case this paragraph used to argue, and still real. When the guard does
+    fire the cost is exactly the pre-fix behavior, a stranded run dir, which is no
+    worse than what this replaces; ``force=True`` would trade that bounded cost for
+    an unbounded one.
 
     Best-effort, and that is the whole point of the suppression: the caller is
     already unwinding an exception the operator has to see, and a cleanup failure
@@ -878,6 +925,9 @@ def compose_run(
     """
     run_id = run_id or runs.new_run_id()
     run_dir = project / RUNS_DIR / run_id
+    # Outside the try below, and it must stay there: a collision refusal that
+    # reached `_unwind_composition` would delete the run it exists to protect.
+    _claim_run_dir(run_dir)
     journal = Journal(run_dir)
     state = build_run_state(
         run_id=run_id,
@@ -994,11 +1044,11 @@ def compose_sweep(
     live ``bmad-loop-<id>`` session at this run's id, and the path mints the id
     here: ``cli._sweep_factory`` calls ``_start_sweep`` with no ``run_id``, and the
     only caller that supplies one is ``cmd_sweep`` (``--run-id``), which passes no
-    ``on_started``. So reaching it takes a :func:`runs.new_run_id` collision with a
-    concurrently live run — in which case this composition's own ``save_state``
-    has already overwritten that run's ``state.json`` several statements earlier,
-    a pre-existing hazard of far greater consequence than a re-fired sweep. The
-    latch boundary is not the place to answer it.
+    ``on_started``. So reaching it needs a live session at an id that names no run
+    of its own — an orphan outliving its run dir — because a collision with a run
+    that still EXISTS is now refused before anything is published
+    (:func:`_claim_run_dir`), and a :func:`runs.new_run_id` collision is remote to
+    begin with. The latch boundary is not the place to answer what is left.
 
     Firing inside the block rather than after it is deliberate for the same
     reason: should the latch itself raise, the unwind covers it, and the parent's
@@ -1010,6 +1060,8 @@ def compose_sweep(
     Neither is a second launch, and that is the safe direction for a launcher."""
     run_id = run_id or runs.new_run_id()
     run_dir = project / RUNS_DIR / run_id
+    # Same claim, same reason, same placement outside the try as in `compose_run`.
+    _claim_run_dir(run_dir)
     journal = Journal(run_dir)
     state = RunState(
         run_id=run_id,

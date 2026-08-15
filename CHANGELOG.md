@@ -39,6 +39,16 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **Launching with a `--run-id` that already names a run is refused instead of composing over it
+  (#501).** Both composers went straight into a journal whose `mkdir` accepts an existing directory,
+  so the hidden `--run-id` flag pointed at a previous run adopted that run's directory and published
+  its own `state.json` over it. The id is now claimed exclusively when the run directory is created,
+  and a collision aborts the launch before anything is written, leaving the earlier run untouched.
+  This also bounds the unwind below: the directory it removes on a failed composition is one this
+  launch is known to have created, never a pre-existing run — which for a paused, stopped or
+  finished run would have taken its journal, logs and state with it, since the removal's only guard
+  refuses a _live_ session.
+
 - **A launch that aborts while standing up its adapters no longer strands an empty run (#501).**
   Both composers published the run directory, its `state.json` and the out-of-tree config-digest
   stamp before calling `make_adapters` — which raises `SystemExit` from five sites (an unresolvable
