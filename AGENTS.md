@@ -6,7 +6,7 @@ bmad-loop is a deterministic Python orchestrator that drives unattended BMAD-met
 
 ```bash
 uv sync --all-extras          # setup (extras: tui, non-linux, opencode)
-uv run pytest -q              # test suite (-n auto to parallelize)
+uv run pytest -q              # test suite (-n logical to parallelize)
 uv run pytest tests/test_engine.py -q   # single file
 uv run pyright                # typecheck — same pinned version CI runs
 trunk fmt                     # format changed files

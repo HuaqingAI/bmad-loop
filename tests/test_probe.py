@@ -178,8 +178,23 @@ def test_discover_missing_override_notes(tmp_path):
 
 
 def test_discover_location_redacts_username(tmp_path, monkeypatch):
-    # a munged-cwd dir embedding a username must not survive verbatim
+    """A munged-cwd dir embedding a username must not survive verbatim.
+
+    Ablation target: drop the `not sanitize.looks_like_identifier(c)` leg from
+    `_redact_location`'s `comp()` and this fails alone, on the
+    `".secret-home-dir" not in found.location` assertion. That leg is the only
+    one that redacts this component — the name is not identifier-shaped, and the
+    `embeds_current_username` leg beside it does not match it — so the negative
+    assertion is answering about the gate it names and not about some unrelated
+    reason the string could be absent."""
     monkeypatch.setenv("HOME", str(tmp_path))
+    # `_redact_location` resolves the home it collapses to `~` via
+    # os.path.expanduser, which reads HOME on POSIX but USERPROFILE (then
+    # HOMEDRIVE+HOMEPATH) on Windows — never HOME. Setting only HOME left the
+    # win32 leg asserting the `~` branch while merely *happening* to be in it,
+    # because pytest's tmp_path sat under the real profile dir; it broke the
+    # moment TMP moved to another volume. Set both, as test_sanitize.py does.
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     path = _write_jsonl(tmp_path / ".secret-home-dir" / "abc-123.jsonl", CLAUDE_ROWS)
     found = probe.discover_transcript("none", cli="x", hints=probe.Hints(transcript=str(path)))
     assert found.location.startswith("~/")
