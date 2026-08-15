@@ -3725,7 +3725,13 @@ def test_prune_preserve_dirty_refs_deletes_oldest_beyond_keep(project):
 
 
 def test_prune_preserve_dirty_refs_keep_zero_never_runs_git(project, monkeypatch):
-    """keep=0 means "never prune" — return [] without even invoking git."""
+    """keep=0 means "never prune" — return [] without even invoking git.
+
+    Both helpers are patched, not just `_git`: the `for-each-ref` LISTING moved to
+    `_git_out` (#442) while the deletes still route via `_git`, so a `_git`-only
+    guard stays green against a regression that lists and then deletes nothing.
+    Measured, not assumed — with the early return deleted and no dirty ref present,
+    the `_git`-only form passes and this form fails on the listing."""
     repo = project.project
     _dirty_ref(repo, "run-0")
 
@@ -3733,6 +3739,7 @@ def test_prune_preserve_dirty_refs_keep_zero_never_runs_git(project, monkeypatch
         raise AssertionError("git must not run when keep=0")
 
     monkeypatch.setattr(verify, "_git", _boom)
+    monkeypatch.setattr(verify, "_git_out", _boom)
     assert verify.prune_preserve_dirty_refs(repo, keep=0) == []
     monkeypatch.undo()
     assert _dirty_ref_names(repo) == ["refs/attempt-preserve-dirty/run-0"]
