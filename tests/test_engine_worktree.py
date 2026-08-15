@@ -2751,9 +2751,11 @@ def test_per_worktree_setup_then_gate_then_teardown_and_seed(project):
     # (docs/FEATURES.md), and this fixture has to say so itself: until #384 the
     # git-add shield wrote its patterns into the repo-wide `.git/info/exclude`, so
     # the untracked dir below was hidden in the MAIN checkout too and the pre-merge
-    # cleanliness gate never saw it. The shield is per-worktree now, and an
-    # untracked file in the operator's own checkout blocks a merge as it always has
-    # (`verify.dirty_paths` counts untracked). Committed before the dir exists.
+    # cleanliness gate never saw it. The shield is per-worktree now, so the gitignore
+    # line below is what keeps the dir out of `verify.dirty_paths` entirely — the gate
+    # never sees it. (Since #460 an untracked file the operator leaves in their own
+    # checkout is tolerated at merge rather than blocking it, so this fixture no longer
+    # depends on that refusal either way.) Committed before the dir exists.
     gitignore = project.project / ".gitignore"
     gitignore.write_text(gitignore.read_text() + ".claude/skills/\n", encoding="utf-8")
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
@@ -2915,15 +2917,41 @@ def test_merge_auto_recovers_editor_dirtied_target(project):
     assert cleaned["paths"] == ["Leak.cs"]
 
 
+def _operator_edit_dev_effect(project, story_key, *, rel_path, marker):
+    """A dev effect that does the normal worktree work AND appends `marker` to a
+    TRACKED file in the *main* checkout that the branch never touches — the operator
+    editing their own working copy mid-run. Appends rather than overwrites so the
+    edit stays inert in whatever file it lands on."""
+    base = wt_dev_effect(project, story_key)
+
+    def effect(spec):
+        result = base(spec)
+        fp = project.project / rel_path
+        fp.write_text(fp.read_text(encoding="utf-8") + marker, encoding="utf-8")
+        return result
+
+    return effect
+
+
 def test_merge_stray_dirt_escalates_with_clear_message(project):
     """Dirt in the main checkout that is NOT part of the branch's incoming files
     (possible real operator work) is never cleaned: the unit escalates with the
-    Editor-leak message and keeps its branch."""
+    Editor-leak message and keeps its branch.
+
+    Since #460 that refusal is scoped to TRACKED dirt — an untracked stray is inert
+    and tolerated (`test_merge_tolerates_untracked_stray_in_main_checkout`) — so the
+    stray here is an appended comment line in the repo's tracked `.gitignore`: the
+    branch never touches it, and a trailing comment changes no ignore behavior."""
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    # The target must really be tracked, or this test silently degrades into the
+    # tolerated case it is no longer about. `git` raises on a nonzero rc.
+    git(project.project, "ls-files", "--error-unmatch", ".gitignore")
     engine, _ = make_engine(
         project,
         [
-            _leaking_dev_effect(project, "1-1-a", leak_name="stray.txt", in_branch_set=False),
+            _operator_edit_dev_effect(
+                project, "1-1-a", rel_path=".gitignore", marker="# operator edit\n"
+            ),
             wt_review_effect(project, "1-1-a", clean=True),
         ],
     )
@@ -2933,11 +2961,40 @@ def test_merge_stray_dirt_escalates_with_clear_message(project):
     task = engine.state.tasks["1-1-a"]
     assert task.phase == Phase.ESCALATED
     reason = engine.state.paused_reason or ""
-    assert "not part of this branch" in reason and "stray.txt" in reason
-    # branch kept for manual merge; the stray file was left untouched
+    assert "not part of this branch" in reason and ".gitignore" in reason
+    # branch kept for manual merge; the operator's edit was left untouched
     assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
-    assert (project.project / "stray.txt").read_text() == "editor leaked\n"
+    assert (project.project / ".gitignore").read_text().endswith("# operator edit\n")
     assert "merge-target-cleaned" not in journal_kinds(engine)
+
+
+def test_merge_tolerates_untracked_stray_in_main_checkout(project):
+    """#460's headline row. An untracked file the operator left in the MAIN
+    checkout, unrelated to the run, no longer stops it: a merge writes only paths
+    that differ between target and branch, and git never stages an untracked file
+    into a merge or squash commit, so the file cannot be overwritten or swept in.
+    Before #460 this exact run ended `done=0 paused=True escalated=1` — one stray
+    `notes.txt` halted an unattended loop at its first story."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            _leaking_dev_effect(
+                project, "1-1-a", leak_name="operator-notes.txt", in_branch_set=False
+            ),
+            wt_review_effect(project, "1-1-a", clean=True),
+        ],
+    )
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused and summary.escalated == 0
+    assert engine.state.tasks["1-1-a"].phase == Phase.DONE
+    kinds = journal_kinds(engine)
+    assert "unit-merged" in kinds and "story-escalated" not in kinds
+    # tolerated, NOT cleaned: the guard skips the stray entirely rather than
+    # deleting the operator file it just decided to let through.
+    assert (project.project / "operator-notes.txt").read_text() == "editor leaked\n"
+    assert "merge-target-cleaned" not in kinds
 
 
 @pytest.mark.parametrize(

@@ -319,17 +319,45 @@ def test_clean_incoming_collisions_cleans_within_branch_set(project, tmp_path):
     assert (repo / "leak.cs").read_text() == "branch\n"
 
 
-def test_clean_incoming_collisions_refuses_stray_dirt(project, tmp_path):
+def test_clean_incoming_collisions_tolerates_untracked_stray(project, tmp_path):
+    """#460: an UNTRACKED dirty path outside the branch's incoming set is inert —
+    the merge writes only paths that differ between target and branch, and git
+    never stages an untracked file into a merge or squash commit. It is left
+    exactly where it is and does not stop the merge."""
     repo = project.project
     _branch_with(repo, tmp_path, adds={"leak.cs": "branch\n"})
     (repo / "leak.cs").write_text("editor leaked\n")  # within branch set
-    (repo / "operator.txt").write_text("real work\n")  # stray, NOT in branch set
+    (repo / "operator-notes.txt").write_text("real work\n")  # untracked, NOT in the set
+
+    cleaned = verify.clean_incoming_collisions(repo, "main", "feat")  # no GitError
+    assert cleaned == ["leak.cs"]  # only the leak; the stray is not even reported
+    assert not (repo / "leak.cs").exists()
+    assert (repo / "operator-notes.txt").read_text() == "real work\n"  # bytes intact
+    # The merge is the point of this test: surviving *our* guard is not enough, the
+    # tolerated file must also not trip git's OWN merge pre-flight. If it did, the
+    # narrowing would have moved the halt rather than removed it.
+    verify.merge_branch(repo, "feat", strategy="merge")
+    assert (repo / "leak.cs").read_text() == "branch\n"
+    assert (repo / "operator-notes.txt").read_text() == "real work\n"
+
+
+def test_clean_incoming_collisions_still_refuses_tracked_stray(project, tmp_path):
+    """The other half of #460: uncommitted changes to a TRACKED file outside the
+    incoming set are not inert — git refuses a merge outright once the change is
+    staged, and `merge --squash` + `commit` folds it into the story's commit — so
+    they still refuse, and still clean nothing."""
+    repo = project.project
+    _branch_with(repo, tmp_path, adds={"leak.cs": "branch\n"})  # `feat` never touches src.txt
+    (repo / "leak.cs").write_text("editor leaked\n")  # within branch set
+    (repo / "src.txt").write_text("operator edit\n")  # tracked-modified, NOT in the set
 
     with pytest.raises(verify.GitError) as ei:
         verify.clean_incoming_collisions(repo, "main", "feat")
-    assert "operator.txt" in str(ei.value)
-    # nothing was cleaned — both files remain
-    assert (repo / "leak.cs").exists() and (repo / "operator.txt").exists()
+    assert "src.txt" in str(ei.value)
+    assert "tracked" in str(ei.value)  # the refusal names which half it is about
+    # nothing was cleaned — the leak still sits there and the edit is unreverted
+    assert (repo / "leak.cs").exists()
+    assert (repo / "src.txt").read_text() == "operator edit\n"
 
 
 def test_clean_incoming_collisions_clean_tree_noop(project, tmp_path):
@@ -358,6 +386,26 @@ def test_clean_incoming_collisions_prunes_emptied_dirs(project, tmp_path):
     cleaned = verify.clean_incoming_collisions(repo, "main", "feat")
     assert cleaned == ["Assets/Tests/Leak.cs"]
     assert not (repo / "Assets").exists()  # emptied dirs pruned back to root
+
+
+def test_clean_incoming_collisions_prune_keeps_dir_holding_a_stray(project, tmp_path):
+    """The directory-prune half of #460's tolerance. A passing
+    `..._tolerates_untracked_stray` does not imply this one: that stray sits at the
+    repo root, where the `rmdir` walk-up never runs. Here the tolerated stray shares
+    a directory with the cleaned leak, so the prune tail walks straight into it."""
+    repo = project.project
+    _branch_with(repo, tmp_path, adds={"Assets/Tests/Leak.cs": "branch\n"})
+    leak = repo / "Assets" / "Tests" / "Leak.cs"
+    leak.parent.mkdir(parents=True, exist_ok=True)
+    leak.write_text("editor leaked\n")  # untracked, within the branch set
+    keep = repo / "Assets" / "Tests" / "keep.txt"
+    keep.write_text("operator\n")  # untracked stray in the SAME directory
+
+    cleaned = verify.clean_incoming_collisions(repo, "main", "feat")
+    assert cleaned == ["Assets/Tests/Leak.cs"]
+    assert not leak.exists()
+    assert keep.read_text() == "operator\n"  # tolerated, bytes intact
+    assert keep.parent.is_dir()  # the prune stopped at a directory that is not empty
 
 
 # ---------------------------------------------------------------- capture_diff
