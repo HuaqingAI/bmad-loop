@@ -5687,7 +5687,10 @@ class Engine:
     def _maybe_auto_sweep(self, kind: str, trigger: str) -> None:
         """Run a child deferred-work sweep when policy [sweep].auto matches.
         The child is its own resumable run; a paused or failed child is
-        journaled + notified but never interrupts this run.
+        journaled + notified but never interrupts this run — "failed" including a
+        ``SystemExit`` (#501). A stop or a ``KeyboardInterrupt`` delivered through
+        the child is the deliberate exception and propagates to the owner; the
+        arms below carry why, in both directions.
 
         ``state.sweeps_triggered`` spends the trigger only once a child sweep has
         actually started. The ``started`` thunk handed to the factory

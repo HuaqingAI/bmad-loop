@@ -93,9 +93,13 @@ def resolve_profiles(policy: Policy, project: Path) -> dict[str, CLIProfile]:
     file: a session that leaves a background writer flipping
     ``.bmad-loop/profiles/*.toml`` between a benign and a hostile copy needs only
     the digest's read to catch the benign one and the adapter's read to catch the
-    other. That race is cheap to retry — a lost round raises
-    `sweep-auto-not-started`, which `_maybe_auto_sweep` swallows, and the next
-    auto-sweep trigger deals again — so "narrow window" is not a defense.
+    other. That race is cheap to repeat — a lost round raises
+    `sweep-auto-not-started`, which `_maybe_auto_sweep` swallows, so the parent
+    runs on and the next epic boundary deals a fresh hand — so "narrow window" is
+    not a defense. The repeat is the writer's, never the orchestrator's: #501
+    leaves a refused trigger unspent, but nothing re-asks that trigger (see
+    `_maybe_auto_sweep`'s docstring), and under ``[sweep] auto = "run-end"`` a run
+    has exactly one. It is `per-epic` that hands out the further rounds.
     Resolving once and threading the result removes the second read rather than
     shrinking the window.
 
