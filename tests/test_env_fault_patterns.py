@@ -35,14 +35,29 @@ production.
 
 from __future__ import annotations
 
+import subprocess
+from importlib import resources
+from pathlib import Path
+
 import pytest
 import regex
 
 from bmad_loop.adapters.profile import get_profile
 
-# The one profile whose patterns are backed by captured output from a real outage
-# AND whose log the model cannot write to. Held to the full BAIT corpus.
-SEEDED_PROFILES = ("opencode",)
+# The profiles whose patterns are backed by captured output from a real outage.
+# They are safe for DIFFERENT reasons, and both reasons are load-bearing:
+# `opencode` because the file it scans (`<task_id>.server.out`) is the serve
+# process's own stdout, which the model cannot write to at all; `claude` because
+# its log IS model-written (a tmux pane capture) and each of its patterns instead
+# reproduces one complete captured CLI sentence, which a paraphrase cannot reach.
+# Both are held to the full BAIT corpus.
+SEEDED_PROFILES = ("opencode", "claude")
+# The seeded profiles whose scanned log is a tmux PANE CAPTURE — bytes the model
+# itself wrote. Their patterns are the ones that have to survive contact with
+# ordinary prose, so the two repo-scanning guards below are scoped to them.
+# opencode is deliberately out of scope there: it scans `<task_id>.server.out`,
+# the serve process's own stdout, which the model cannot write to.
+PANE_CAPTURE_PROFILES = ("claude",)
 # Profiles that deliberately seed NOTHING, so classification stays inert for them.
 # Patterns were drafted for these and withdrawn: they could only be written from
 # error strings scraped off public issue trackers, for CLIs nobody here has run.
@@ -50,10 +65,7 @@ SEEDED_PROFILES = ("opencode",)
 # pauses the whole run, which is worse than the fault it was meant to catch.
 # Seeding nothing costs only the status quo. See test_unseeded_profiles_stay_inert.
 UNSEEDED_PROFILES = ("codex", "gemini", "copilot", "antigravity")
-# claude ships #194's original connection pattern, which predates this module and
-# is NOT held to BAIT — it cannot pass. See test_claude_pattern_is_known_to_false_positive.
-LEGACY_PROFILES = ("claude",)
-ALL_PROFILES = SEEDED_PROFILES + UNSEEDED_PROFILES + LEGACY_PROFILES
+ALL_PROFILES = SEEDED_PROFILES + UNSEEDED_PROFILES
 
 # The two logfmt shapes `opencode serve` emitted during a real 5-hour provider
 # quota outage on the opencode-http adapter (zai-coding-plan/glm-5.2). The line
@@ -72,15 +84,32 @@ OPENCODE_REAL = [
     'API: The socket connection was closed unexpectedly."',
 ]
 
-# Claude Code surfaces provider failures behind its own "API Error" prefix. Only
-# the CONNECTION class is covered — claude.toml ships #194's original pattern and
-# nothing more. A quota/rate-limit pattern of the same shape was drafted for this
-# profile and withdrawn: no captured Claude Code quota line exists here, and the
-# "API Error" anchor is too weak to add a second cause class safely (see
-# test_claude_pattern_is_known_to_false_positive). So an Anthropic plan's usage
-# limit is still unclassified on this adapter — a real, deliberately-left gap.
+# Claude Code surfaces provider failures behind its own "API Error" prefix, and
+# claude.toml reproduces each of these sentences WHOLE rather than pairing the
+# prefix with a loose cause — that completeness is the only thing separating an
+# emitted line from a story writing about one, because this profile's log is a
+# pane capture of the model's own output (#507).
+#
+# Provenance, since a pattern here may only be seeded from a captured line: the
+# first two were captured in issue #194, run `20260718-191419-44e7`, on the
+# `claude` adapter. The last three come from Claude Code's own JSONL transcripts,
+# from entries structurally tagged `"isApiErrorMessage": true`.
+#
+# The quota class is still ABSENT, and deliberately so: no captured Claude Code
+# usage-limit line exists — not in this repo, not in #194/#323/#507, not in the
+# local transcripts. Seeding one needs a captured line with its run cited, the
+# bar test_unseeded_profiles_stay_inert states; a plausible-looking string is
+# exactly what that bar refuses. So an Anthropic plan's usage limit is still
+# unclassified on this adapter — a real, deliberately-left gap (#323).
 CLAUDE_REAL = [
-    "API Error: Connection error (ECONNREFUSED)",
+    "API Error: Unable to connect to API (ConnectionRefused)",
+    "API Error: Unable to connect to API: Self-signed certificate detected. "
+    "Please check your network settings.",
+    "API Error: Connection closed mid-response. The response above may be incomplete.",
+    "API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again "
+    "in a moment. If it persists, check https://status.claude.com.",
+    "API Error: 500 Internal server error. This is a server-side issue, usually temporary — "
+    "try again in a moment. If it persists, check https://status.claude.com.",
 ]
 
 # Every profile with patterns, paired with the lines its own CLI actually emits.
@@ -114,12 +143,28 @@ ANCHOR_REACHING_BAIT = [
     'error.error="AI_APICallError: Model not found" note=see-the-rate-limit-docs',
     # The anchor named but not completed — prose about the field, not the field.
     "docs: the server writes error.error= with an AI_APICallError when the quota trips",
-    # claude's framing, kept for the day a claude pattern is seeded again.
+    # claude's framing. These were written for the day a claude pattern was
+    # seeded again — that day is now, so they are live assertions against the
+    # shipped profile rather than a corpus held in reserve.
     '// TODO: surface "API Error: 429" to the user with a Retry-After hint',
     'expect(banner).toBe("API Error: 429 rate_limit_error")',
     "docs: document the API Error 429 quota path per AC-3",
     '  it("renders API Error: overloaded", () => {',
     "- [ ] AC-2: map API Error: 429 to a friendly rate limit message",
+    # The five lines below WERE the strict-xfail corpus of
+    # test_claude_pattern_is_known_to_false_positive: prose that the withdrawn
+    # `API Error.*<cause>` pattern matched, because an unbounded gap between the
+    # framing token and the cause makes any line MENTIONING both a hit (#507).
+    # They are the reason this test bites for claude at all — the shipped
+    # patterns matched none of BAIT and none of the nine lines above even
+    # BEFORE the fix, so promoting claude into SEEDED_PROFILES proves nothing on
+    # its own. Do not "simplify" them back out of the corpus: they are the
+    # paraphrases the complete-sentence patterns exist to reject.
+    '  assert log == "API Error: Connection refused"',
+    'docs: explain the "API Error: Unable to connect" retry path',
+    "- [ ] AC-5: show a banner on API Error: Connection timed out",
+    'expect(msg).toBe("API Error: Connection error")',
+    "// handle API Error: ECONNREFUSED by retrying with backoff",
 ]
 
 # The limit of content-based matching, pinned rather than papered over.
@@ -151,7 +196,10 @@ INSEPARABLE_VERBATIM_CITATIONS = [
 
 # The literal each seeded profile's patterns key on. Used to prove the corpus
 # above actually reaches them, rather than trusting that it does.
-PROFILE_ANCHOR_LITERAL = {"opencode": 'error.error="AI_APICallError: '}
+PROFILE_ANCHOR_LITERAL = {
+    "opencode": 'error.error="AI_APICallError: ',
+    "claude": "API Error: ",
+}
 
 # Ordinary output from a healthy session working on a story that involves rate
 # limiting. Every one of these is reachable in a tmux pane capture. None may
@@ -396,37 +444,114 @@ def test_patterns_require_an_anchor_not_a_bare_cause(name: str) -> None:
         assert not _matches(name, bare), f"{name}.toml classifies the bare cause {bare!r}"
 
 
-CLAUDE_KNOWN_FALSE_POSITIVES = [
-    '  assert log == "API Error: Connection refused"',
-    'docs: explain the "API Error: Unable to connect" retry path',
-    "- [ ] AC-5: show a banner on API Error: Connection timed out",
-    'expect(msg).toBe("API Error: Connection error")',
-    "// handle API Error: ECONNREFUSED by retrying with backoff",
-]
+@pytest.mark.parametrize("name", PANE_CAPTURE_PROFILES)
+def test_shipped_patterns_do_not_match_their_own_profile_line(name: str) -> None:
+    """A profile must not classify ITSELF. The pane log carries the model's own
+    output, so a session that prints, greps or diffs its profile would otherwise
+    read its own configuration as a provider outage — one of the four non-test
+    false positives #507 names, and the most absurd of them.
+
+    What prevents it is the single-character classes in the shipped patterns
+    (`t[o]`, `respons[e]`, `5[0-9][0-9]`): they change nothing about what the
+    regex MATCHES, and everything about what the regex's own source line matches.
+    This test is why they must not be "cleaned up"."""
+    packaged = resources.files("bmad_loop.data").joinpath("profiles").joinpath(f"{name}.toml")
+    # Compiled ONCE rather than per line via _matches: that helper re-resolves the
+    # profile and recompiles its patterns on every call, which is free for a
+    # one-line corpus entry and minutes across a whole file.
+    patterns = _patterns(name)
+    hits = [
+        f"{name}.toml:{n}: {line.strip()[:120]}"
+        for n, line in enumerate(packaged.read_text(encoding="utf-8").splitlines(), 1)
+        if any(p.search(line) for p in patterns)
+    ]
+    assert not hits, f"{name}.toml classifies its own lines:\n" + "\n".join(hits)
 
 
-@pytest.mark.parametrize("line", CLAUDE_KNOWN_FALSE_POSITIVES)
-@pytest.mark.xfail(strict=True, reason="pre-existing #194 defect: claude's pattern matches prose")
-def test_claude_pattern_is_known_to_false_positive(line: str) -> None:
-    """Documents debt rather than hiding it. claude.toml's `API Error.*<cause>`
-    predates this module and cannot pass BAIT: its pane log is a tmux capture of
-    the model's own output, so a story that merely writes ABOUT provider errors —
-    a TODO, an assertion, an acceptance criterion — reads as an environment fault
-    and pauses a healthy run.
+# Files that hold matching lines ON PURPOSE, and are therefore excluded from the
+# repo-wide guard below.
+#
+# * this module is the corpus: CLAUDE_REAL quotes the captured CLI sentences
+#   verbatim, because a pattern may only be seeded from a captured line and the
+#   false-negative half has to assert against the real thing.
+# * test_generic_tmux.py drives the REAL classifier end to end, so its fixture
+#   logs must be lines the shipped patterns actually match.
+#
+# Both are pinned as non-vacuous below: an entry only stays legitimate while the
+# file really does carry a matching line, so the list cannot be padded to silence
+# a genuine regression.
+DELIBERATE_CORPUS_FILES = ("tests/test_env_fault_patterns.py", "tests/test_generic_tmux.py")
 
-    It also fires on this repo's own tracked files (CHANGELOG.md, docs/FEATURES.md
-    and the profile comment describing the pattern), so a bmad-loop session
-    working on bmad-loop is exposed.
 
-    Left in place here, not widened: a quota pattern of the same shape was drafted
-    for this profile and withdrawn for exactly this reason, so the gap is real —
-    an Anthropic plan's usage limit is still unclassified. Fixing it needs a
-    captured Claude Code quota line and a stronger anchor than "API Error", which
-    is a separate change from the one this branch makes.
+def test_pane_capture_patterns_do_not_match_this_repo() -> None:
+    """#507's own methodology, kept as a standing guard: compile the pane-capture
+    profiles' patterns and scan every tracked file line-by-line.
 
-    strict=True on purpose: the day the pattern is fixed, this test fails and
-    forces the debt note to be removed with it."""
-    assert not _matches("claude", line)
+    bmad-loop is developed by bmad-loop, so this repo's own text is pane-log
+    input. Measured against the tree this guard landed on, the withdrawn
+    `API Error.*<cause>` pattern matched 44 tracked lines: three outside the test
+    suite (a docs/FEATURES.md bullet, a comment in adapters/profile.py, and the
+    pattern's OWN line in claude.toml) plus 41 lines of ordinary
+    pytest/grep/diff output. So a session working on this repo could classify
+    itself as a provider outage, re-arm the budget and halt the run for an
+    operator. (#507 counted 37 when it was filed, and named a CHANGELOG entry
+    that has since been reworded out of range — the count moves with the tree,
+    which is why this asserts zero rather than a number.)
+
+    This is what fails if a future CHANGELOG entry, doc bullet or profile comment
+    writes the framing token and a cause on the SAME line; write them separated
+    (`API Error` … `<cause>`) instead. Only DELIBERATE_CORPUS_FILES are exempt.
+
+    opencode is out of scope on purpose, not by oversight: the file its patterns
+    are matched against is `<task_id>.server.out` (see
+    EnvFaultMixin.ENV_FAULT_LOG_SUFFIX), the `opencode serve` process's own
+    stdout, which the model cannot write to — so a tracked line matching them is
+    inert. Its own profile comment (opencode.toml) does self-quote, and that is
+    why that is not a bug.
+
+    git is spawned directly rather than through verify._run_git: that chokepoint
+    is orchestrator-scoped, and a harness must not depend on the artifact it
+    validates (AGENTS.md)."""
+    root = Path(__file__).resolve().parents[1]
+    listed = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=root,
+        capture_output=True,
+        check=True,
+        timeout=120,
+    ).stdout.decode("utf-8", errors="replace")
+    tracked = [rel for rel in listed.split("\0") if rel]
+    assert len(tracked) > 100, "git ls-files answered implausibly few files; guard would be vacuous"
+
+    # Compiled ONCE, not per line via _matches: that helper re-resolves the
+    # profile and recompiles its patterns on every call, which costs nothing for a
+    # one-line corpus entry and minutes across every tracked line in the repo.
+    patterns = [p for name in PANE_CAPTURE_PROFILES for p in _patterns(name)]
+    assert patterns, "no pane-capture patterns compiled; this guard would be vacuous"
+
+    hits: list[str] = []
+    corpus_hits: dict[str, int] = dict.fromkeys(DELIBERATE_CORPUS_FILES, 0)
+    for rel in tracked:
+        path = root / rel
+        if not path.is_file():
+            continue  # a submodule, or a symlink pointing outside the tree
+        text = path.read_bytes().decode("utf-8", errors="replace")
+        for n, line in enumerate(text.splitlines(), 1):
+            if not any(p.search(line) for p in patterns):
+                continue
+            if rel in corpus_hits:
+                corpus_hits[rel] += 1
+                continue
+            hits.append(f"{rel}:{n}: {line.strip()[:120]}")
+    assert not hits, (
+        "tracked lines classify as an environment fault on a pane-capture profile; "
+        "split the framing token from the cause:\n" + "\n".join(hits)
+    )
+    # Non-vacuity for the exemptions themselves: each excluded file must still be
+    # carrying the matching lines it was excluded FOR. A file that stops matching
+    # has either lost its fixtures or no longer needs the exemption.
+    for rel, count in corpus_hits.items():
+        assert count, f"{rel} is exempt but holds no matching line — drop the exemption"
 
 
 @pytest.mark.parametrize("name", UNSEEDED_PROFILES)
