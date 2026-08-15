@@ -6,7 +6,7 @@ helpers carry no engine wiring yet — they are the plumbing Phase 3 builds on.
 """
 
 import pytest
-from conftest import git
+from conftest import git, make_git_noisy
 
 from bmad_loop import verify
 
@@ -22,6 +22,27 @@ def commit(repo, name, content="x\n", msg="work"):
 
 def test_current_branch(project):
     assert verify.current_branch(project.project) == "main"
+
+
+def test_current_branch_reads_stdout_alone_under_host_noise(project):
+    """git exits 0 while still writing an advisory to stderr, so against `_git`'s
+    stdout+stderr merge the branch name comes back with the warning appended (#442).
+    `make_git_noisy` sets an unknown VALUE for a known config KEY, which is exactly
+    that shape and not an error path.
+
+    The substring assertion is not implied by the equality: it is what distinguishes
+    "the value is clean" from "the oracle is corrupted the same way".
+
+    Ablation target: put `current_branch` back on `_git` (the merge) and this fails
+    alone — the two sibling rows in tests/test_verify.py stay green, since each site
+    is converted separately."""
+    repo = project.project
+    warning = make_git_noisy(repo)
+
+    branch = verify.current_branch(repo)
+
+    assert branch == "main"
+    assert warning not in branch
 
 
 def test_branch_exists(project):

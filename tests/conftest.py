@@ -203,6 +203,39 @@ def git(repo: Path, *args: str) -> str:
     return proc.stdout.strip()
 
 
+NOISY_GIT_KEY = "core.fsyncMethod"
+NOISY_GIT_VALUE = "bmad-loop-not-a-method"
+
+
+def make_git_noisy(repo: Path) -> str:
+    """Give `repo` a git config that writes to stderr while still exiting 0, and
+    return the warning text.
+
+    The suite's only host-noise dimension. An unknown VALUE for a known KEY is a
+    `warning:` on stderr at rc 0, not an error — measured at git 2.55.0 for every
+    subcommand verify.py reads text from. Without it no row in the #442 family is
+    falsifiable, because a quiet git makes the merged and stdout-alone reads
+    indistinguishable.
+
+    Measures rather than predicting. `core.fsyncMethod` only exists from git 2.36,
+    and below that the key is simply UNKNOWN, which git ignores in silence — so on an
+    older git every caller of this helper would pass with the bug restored. That is a
+    vacuous green, not a pass, so this skips instead, naming the version it saw. CI is
+    always on the exercising side. Same argument as `needs_strict_codec` in
+    tests/test_verify.py, which probes the codec rather than inferring it from the
+    locale."""
+    git(repo, "config", NOISY_GIT_KEY, NOISY_GIT_VALUE)
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True
+    )
+    if proc.returncode != 0 or not proc.stderr.strip():
+        version = subprocess.run(
+            ["git", "-C", str(repo), "version"], capture_output=True, text=True
+        ).stdout.strip()
+        pytest.skip(f"{version} does not warn at rc 0 for an unknown {NOISY_GIT_KEY} value")
+    return proc.stderr.strip()
+
+
 # ------------------------------------------------ machine-readable CLI output
 
 

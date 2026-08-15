@@ -12,6 +12,7 @@ from conftest import (
     MISSING_TOOL_CMD,
     fault_read_text,
     git,
+    make_git_noisy,
     spec_path,
     write_spec,
     write_sprint,
@@ -2462,6 +2463,71 @@ def test_worktree_clean_ignores_stderr_chatter_on_success(project, monkeypatch):
     assert verify.worktree_clean(project.project)
     (project.project / "stray.txt").write_text("real change\n")
     assert not verify.worktree_clean(project.project)  # a genuine change still shows
+
+
+# ------------------------------------------ probes that return git's text (#442)
+#
+# The rest of the family #441 documented and did not widen to. A real git config
+# does the reddening here rather than a synthetic stderr, so the row stands on
+# git's own behavior: `make_git_noisy` sets an unknown VALUE for a known KEY,
+# which warns on stderr at rc 0 — the normal path on a host whose git config the
+# orchestrator does not control.
+
+
+def test_rev_parse_head_reads_stdout_alone_under_host_noise(project):
+    """A warning-suffixed "sha" is not a sha. It reaches `same_commit` comparisons
+    and the baselines persisted in run state, so a resume grades a warning-carrying
+    string against a clean one and reads "moved" — silent, with a plausible-looking
+    value.
+
+    The third assertion is not implied by the first: equality alone would also hold
+    if the conftest oracle were corrupted the same way, and it reads stdout alone.
+
+    Ablation target: put `rev_parse_head` back on `_git` (the stdout+stderr merge)
+    and this fails alone, on a return carrying the warning — while
+    `test_last_commit_for_reads_stdout_alone_under_host_noise` and
+    `test_current_branch_reads_stdout_alone_under_host_noise` stay green, since each
+    site is converted separately."""
+    repo = project.project
+    warning = make_git_noisy(repo)
+
+    head = verify.rev_parse_head(repo)
+
+    assert head == git(repo, "rev-parse", "HEAD")  # conftest git() = stdout.strip()
+    assert len(head) == 40 and all(c in "0123456789abcdef" for c in head)
+    assert warning not in head
+
+
+def test_last_commit_for_reads_stdout_alone_under_host_noise(project):
+    """Same shape as its `rev-parse` sibling, one caller further out: this sha backs
+    an operator-park record's provenance (operatoractions.py), which is written into
+    the very commit it rides and so cannot be re-derived later.
+
+    Ablation target: put `last_commit_for` back on `_git` and this fails alone."""
+    repo = project.project
+    warning = make_git_noisy(repo)
+
+    sha = verify.last_commit_for(repo, repo / "src.txt")
+
+    assert sha == git(repo, "log", "-n", "1", "--format=%H", "--", "src.txt")
+    assert len(sha) == 40 and all(c in "0123456789abcdef" for c in sha)
+    assert warning not in sha
+
+
+def test_rev_parse_head_failure_still_carries_git_stderr(tmp_path):
+    """The other direction of the split: reading stdout alone for the VALUE must not
+    cost the ERROR path its diagnostic. git puts "not a git repository" on stderr, so
+    a message built from stdout alone would name the directory and say nothing about
+    why — which is the whole content of this failure.
+
+    Ablation target: in `rev_parse_head`, swap the raise's `detail` back to `out`
+    (leaving `_git_out` and the `return out` in place) and this fails alone, on an
+    empty message — while `test_rev_parse_head_reads_stdout_alone_under_host_noise`
+    stays green. That disjointness is what proves this is not a restatement of it."""
+    with pytest.raises(verify.GitError) as excinfo:
+        verify.rev_parse_head(tmp_path)
+
+    assert "not a git repository" in str(excinfo.value)
 
 
 def test_commit_paths_refuses_to_stage_a_glob_neighbour(project):

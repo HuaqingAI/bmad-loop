@@ -179,6 +179,34 @@ def _git_raw(repo: Path, *args: str) -> tuple[int, str]:
     return proc.returncode, proc.stdout
 
 
+def _git_out(repo: Path, *args: str, env: dict[str, str] | None = None) -> tuple[int, str, str]:
+    """Like `_git`, but hands the VALUE and the DIAGNOSTIC back separately —
+    `(returncode, stdout.strip(), (stdout + stderr).strip())`.
+
+    For every caller that reads git's text as the ANSWER rather than only checking
+    the return code. `_git`'s merge is right for the "raise with a message" callers,
+    where stderr is the informative half, and wrong for these: git writes advisories
+    to stderr while still exiting 0 — an unknown `core.fsyncMethod` value, a
+    `core.fsmonitor` hook that cannot exec, a stale-index advisory, `core.hooksPath`
+    pointing at a missing directory — so against the merged stream a warning is
+    indistinguishable from data (#442). A sha probe answers "<sha>\\nwarning: ...", an
+    emptiness read answers non-empty, and a line-splitting read grows a phantom record.
+    None of that is an error path; it is the normal path on a host whose git config the
+    orchestrator does not control.
+
+    The third element keeps the error messages unchanged: a caller raises with the
+    merged text exactly as `_git` did, so a failure still carries stderr. Reach for
+    this whenever the text is the answer; leave `_git` to the rc-only callers.
+    `worktree_clean` and `path_tracked` (#441) predate this helper and spell the same
+    split inline against `_run_git`; `_git_raw` is the third variant, for `-z` output
+    whose records can begin with a space and which `.strip()` would corrupt.
+
+    `env` mirrors `_git_env`, for the snapshot path's throwaway `GIT_INDEX_FILE` and
+    synthetic-identity calls that also read a sha back."""
+    proc = _run_git(["git", "-C", str(repo), *args], repo, env=env)
+    return proc.returncode, proc.stdout.strip(), (proc.stdout + proc.stderr).strip()
+
+
 def _git_env(repo: Path, *args: str, env: dict[str, str]) -> tuple[int, str]:
     """Like `_git` but runs with an explicit environment — used to point git at a
     throwaway `GIT_INDEX_FILE` so a snapshot can stage the tree without touching
@@ -215,9 +243,12 @@ def git_bytes(
 
 
 def rev_parse_head(repo: Path) -> str:
-    rc, out = _git(repo, "rev-parse", "HEAD")
+    """The sha HEAD resolves to. Reads stdout alone (`_git_out`): git exits 0 while
+    still warning on stderr, and a warning-suffixed "sha" flows into `same_commit`
+    comparisons and into persisted run baselines (#442)."""
+    rc, out, detail = _git_out(repo, "rev-parse", "HEAD")
     if rc != 0:
-        raise GitError(f"git rev-parse HEAD failed in {repo}: {out}")
+        raise GitError(f"git rev-parse HEAD failed in {repo}: {detail}")
     return out
 
 
@@ -227,14 +258,16 @@ def last_commit_for(repo: Path, path: Path) -> str:
     the repo. Backs the derived provenance of an operator park record, which is
     written into the very commit it rides and so cannot store its own sha. Git
     failures raise :class:`GitError` like every sibling; only the path relation
-    degrades silently, mirroring `commit_paths`' outside-the-repo contract."""
+    degrades silently, mirroring `commit_paths`' outside-the-repo contract. Reads
+    stdout alone (`_git_out`), since a git that warns at rc 0 would otherwise make
+    this answer a warning-suffixed "sha" (#442)."""
     try:
         rel = Path(path).resolve().relative_to(repo.resolve()).as_posix()
     except (OSError, RuntimeError, ValueError):
         return ""
-    rc, out = _git(repo, "log", "-n", "1", "--format=%H", "--", rel)
+    rc, out, detail = _git_out(repo, "log", "-n", "1", "--format=%H", "--", rel)
     if rc != 0:
-        raise GitError(f"git log failed in {repo}: {out}")
+        raise GitError(f"git log failed in {repo}: {detail}")
     return out
 
 
@@ -1050,10 +1083,12 @@ def _prune_empty_parents(start: Path, repo: Path) -> None:
 
 
 def current_branch(repo: Path) -> str:
-    """The branch name HEAD points at, or "HEAD" when detached."""
-    rc, out = _git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    """The branch name HEAD points at, or "HEAD" when detached. Reads stdout alone
+    (`_git_out`): git exits 0 while still warning on stderr, and the merged stream
+    would answer a branch name with the warning appended (#442)."""
+    rc, out, detail = _git_out(repo, "rev-parse", "--abbrev-ref", "HEAD")
     if rc != 0:
-        raise GitError(f"git rev-parse --abbrev-ref HEAD failed in {repo}: {out}")
+        raise GitError(f"git rev-parse --abbrev-ref HEAD failed in {repo}: {detail}")
     return out
 
 
