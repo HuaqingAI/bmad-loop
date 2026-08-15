@@ -3,9 +3,10 @@ CLI plumbing, and end-to-end scrub-through. No live CLI required."""
 
 import json
 import re
+import sys
 
 import pytest
-from conftest import machine_json
+from conftest import machine_json, needs_strict_codec
 from test_probe_hook import run_hook
 
 from bmad_loop import cli, probe, sanitize
@@ -705,3 +706,47 @@ def test_redact_location_drops_the_root_anchor_on_every_flavour(monkeypatch):
     assert probe._redact_location(PureWindowsPath("C:/build/s-1/t.jsonl")) == (
         "/<redacted>/build/s-1/t.jsonl"
     )
+
+
+# ----------------------------------------------------------- version / help
+
+
+@needs_strict_codec
+def test_run_capture_replaces_undecodable_banner_bytes(tmp_path):
+    """A --version/--help banner carrying a byte the locale codec cannot decode
+    is decoded with replacement, not strictly, so `run_version_help`'s documented
+    "Never raises" stays true: a strict decode raises UnicodeDecodeError, a
+    ValueError, which `_run_capture`'s `(OSError, subprocess.SubprocessError)`
+    guard does not name.
+
+    U+FFFD is asserted rather than inferred from "did not raise" — under
+    `needs_strict_codec` the codec provably cannot decode the byte, so
+    `errors="replace"` must have put it there. Its *count* stays unasserted, that
+    being what varies by codec, and the ASCII on both sides pins that only the
+    offending byte was replaced.
+
+    Driven through a real child on purpose: a monkeypatched `subprocess.run`
+    never runs the stdlib decode, so such a test passes with the bug restored.
+
+    Ablation: remove `errors="replace"` from `_run_capture` and this fails with a
+    raised UnicodeDecodeError — not with a None return, which the guard above
+    would have to catch to produce."""
+    # Interpreter is `sys.executable`, never a bare `python`: the tests run under
+    # uv, where no `python` need be on PATH.
+    script = tmp_path / "emit383.py"
+    script.write_text(
+        "import sys\n"
+        "sys.stdout.buffer.write(b'before \\xff after\\n')\n"
+        "sys.stdout.buffer.flush()\n",
+        encoding="utf-8",
+    )
+
+    out = probe._run_capture([sys.executable, str(script)], 10)
+
+    # Load-bearing, not decoration: None is this function's failure sentinel, so
+    # this is the assertion that separates "decoded with replacement" from
+    # "swallowed the fault and reported no banner at all". Do not weaken it to a
+    # bare "did not raise" — that passes on the sentinel too.
+    assert out is not None
+    assert "�" in out  # the replacement, not a survivor
+    assert "before" in out and "after" in out

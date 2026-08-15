@@ -182,7 +182,12 @@ class Hints:
 
 def _run_capture(argv: list[str], timeout_s: float) -> str | None:
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s)
+        # errors="replace" is what keeps run_version_help's documented "Never
+        # raises" true (#383): a banner byte the locale codec cannot decode is a
+        # UnicodeDecodeError — a ValueError, outside the guard below.
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, errors="replace", timeout=timeout_s
+        )
     except (OSError, subprocess.SubprocessError):
         return None
     out = (proc.stdout or "") + (proc.stderr or "")

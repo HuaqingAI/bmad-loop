@@ -45,7 +45,14 @@ def _run_subprocess(
 ) -> tuple[int, str]:
     """Default declarative-hook transport: a shell command with the plugin env,
     capturing output. shell=True is intentional (mirrors the deterministic verify
-    commands + the legacy engine ``*_cmd`` hooks)."""
+    commands + the legacy engine ``*_cmd`` hooks).
+
+    Output decodes with ``errors="replace"`` (#383): a hook's output is arbitrary
+    operator-tool text whose bytes are not ours to constrain, and a strict decode
+    raised ``UnicodeDecodeError`` — a ``ValueError``, named by neither ``except``
+    arm below — which escaped ``_HookError``, the bus's designed
+    transport-failure channel, and crashed the run, losing even a passing hook's
+    exit code. Same fix and reasoning as ``verify.run_verify_commands`` (#378)."""
     try:
         proc = subprocess.run(  # nosec B602 - operator-authored plugin command
             cmd,
@@ -54,6 +61,7 @@ def _run_subprocess(
             env=env,
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=timeout,
         )
     except subprocess.TimeoutExpired as e:

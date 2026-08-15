@@ -18,7 +18,13 @@ from __future__ import annotations
 import sys
 
 import pytest
-from conftest import committing_crash_state, dev_effect, review_effect, write_sprint
+from conftest import (
+    committing_crash_state,
+    dev_effect,
+    needs_strict_codec,
+    review_effect,
+    write_sprint,
+)
 
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import Engine
@@ -244,6 +250,48 @@ def test_real_subprocess_runner_reports_exit_code(tmp_path):
     cmd = "echo hi& exit 7" if sys.platform == "win32" else "printf hi; exit 7"
     rc, out = _run_subprocess(cmd, cwd=str(tmp_path), env={}, timeout=10)
     assert rc == 7 and "hi" in out
+
+
+@needs_strict_codec
+def test_real_subprocess_runner_replaces_undecodable_output(tmp_path):
+    """A hook child emitting a byte the locale codec cannot decode is decoded
+    with replacement, not strictly: the strict decode raised UnicodeDecodeError —
+    a ValueError, named by neither `except` arm — which escaped `_HookError`, the
+    bus's designed transport-failure channel, and crashed the run instead of
+    being classified.
+
+    The exit code is asserted because it pins the sharpest consequence: the hook
+    had already run to completion, so a *passing* hook took the run down and its
+    verdict was lost with it. U+FFFD is asserted rather than merely "did not
+    raise" — under `needs_strict_codec` the codec provably cannot decode the
+    byte, so `errors="replace"` is the only thing that could have produced that
+    character. Its *count* stays unasserted (that is what varies by codec), and
+    the ASCII on both sides pins that only the offending byte was replaced.
+
+    Driven through a real child on purpose: a monkeypatched `subprocess.run`
+    never runs the stdlib decode, so such a test passes with the bug restored.
+
+    Ablation: remove `errors="replace"` from `_run_subprocess` and this fails
+    with UnicodeDecodeError."""
+    # Interpreter is `sys.executable`, never a bare `python`: the tests run under
+    # uv, where no `python` need be on PATH. The double quotes are honored by
+    # both sh and cmd, so the one string works on either host shell.
+    script = tmp_path / "emit383.py"
+    script.write_text(
+        "import sys\n"
+        "sys.stdout.buffer.write(b'before \\xff after\\n')\n"
+        "sys.stdout.buffer.flush()\n"
+        "sys.exit(7)\n",
+        encoding="utf-8",
+    )
+
+    rc, out = _run_subprocess(
+        f'"{sys.executable}" "{script}"', cwd=str(tmp_path), env={}, timeout=10
+    )
+
+    assert rc == 7  # the hook verdict a strict decode used to lose entirely
+    assert "�" in out  # the replacement, not a survivor
+    assert "before" in out and "after" in out
 
 
 def test_shared_persists_across_stages():
