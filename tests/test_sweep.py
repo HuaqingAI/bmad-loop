@@ -30,7 +30,7 @@ from bmad_loop import verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.journal import Journal, load_state, save_state
-from bmad_loop.model import Phase, RunState, StoryTask, TokenUsage
+from bmad_loop.model import PAUSE_ESCALATION, Phase, RunState, StoryTask, TokenUsage
 from bmad_loop.policy import (
     AdapterPolicy,
     DevPolicy,
@@ -53,6 +53,7 @@ from bmad_loop.sweep import (
     ResolvedEntry,
     SweepEngine,
     TriagePlan,
+    duplicate_ids,
     snapshot_canonical,
     validate_migration,
     validate_triage,
@@ -372,13 +373,13 @@ def migrate_result(mapping) -> dict:
     return {"workflow": "deferred-sweep-migrate", "mapping": list(mapping), "escalations": []}
 
 
-def _gated_dw1(*gate_lines: str, status: str = "open") -> str:
+def _gated_dw1(*gate_lines: str) -> str:
     """The pre-existing canonical DW-1 both migration halves below carry, so the
     two texts differ ONLY in their second half by construction rather than by
     inspection — an accepted rewrite really did leave the entry untouched."""
     return (
         "### DW-1: item DW-1\n\norigin: test, 2026-06-01\nlocation: src.txt:1\n"
-        f"reason: test entry.\nstatus: {status}\n" + "".join(f"{line}\n" for line in gate_lines)
+        "reason: test entry.\nstatus: open\n" + "".join(f"{line}\n" for line in gate_lines)
     )
 
 
@@ -394,12 +395,12 @@ def pre_gated_ledger(*gate_lines: str) -> str:
     )
 
 
-def rewritten_gated_ledger(*gate_lines: str, status: str = "open") -> str:
+def rewritten_gated_ledger(*gate_lines: str) -> str:
     """The rewrite the migration session hands back: DW-1 preserved with the
     given `gate:` lines (pass none for the drop this guards against), the legacy
     item converted to DW-2."""
     return (
-        "# Deferred Work\n\n" + _gated_dw1(*gate_lines, status=status) + "\n"
+        "# Deferred Work\n\n" + _gated_dw1(*gate_lines) + "\n"
         "### DW-2: Open legacy thing here\n\n"
         "origin: migrated from legacy ledger, 2026-06-12\nlocation: src.txt\n"
         "reason: mishandles em-dashes.\nstatus: open\n"
@@ -502,78 +503,32 @@ def test_validate_migration_allows_an_added_gate_token():
     assert validate_migration(rj, manifest, pre, rewritten_gated_ledger("gate: 3-2, 3-4")) == []
 
 
-def test_validate_migration_refuses_a_gate_dropped_by_collapsing_duplicate_ids():
-    """#519. A corrupt ledger where one id names two entries (#286) is exactly the
-    mess a migration is run to clean up, and collapsing the pair is a legitimate
-    rewrite — but it must not lose a token on the way. Snapshotting id -> tokens
-    with last-write-wins would hold the survivor to the LAST duplicate's gates
-    alone, and the surviving entry is single, so the `duplicate DW ids` check has
-    nothing left to catch. `snapshot_canonical` unions across the duplicates.
+def test_duplicate_ids_names_every_repeated_id_once():
+    """#519 (user-approved scope addition). The predicate both sides of a
+    migration are refused on — the ledger it starts from and the ledger it
+    produces — so it is graded once here rather than twice through its callers.
 
-    Ablation: restore the last-write-wins body of `snapshot_canonical`
-    (`snapshot[e.id] = PreCanonical(e.status, g.tokens + g.malformed)`) and this
-    test fails ALONE — every other #519 test uses a single-entry fixture."""
-    before = (
-        "# Deferred Work\n\n" + _gated_dw1("gate: 3-2") + "\n" + _gated_dw1("gate: 3-3") + "\n"
-        "## Deferred from: epic 1 review (2026-04-06)\n\n"
-        "- **Open legacy thing here** — `src.txt` mishandles em-dashes\n"
-    )
-    manifest = legacy_manifest(before)
-    assert len(manifest) == 1  # neither canonical entry parsed as legacy
-    rj = migrate_result([{"key": manifest[0]["key"], "dw_id": "DW-2"}])
-    pre = snapshot_canonical(before)
-    # the union, not the last entry's `("3-3",)` — a failure below cannot be
-    # blamed on the fixture having only ever carried one token
-    assert pre["DW-1"].gate_tokens == ("3-2", "3-3")
+    A repeated id is named ONCE however many times it repeats: the message tells
+    an operator which id to go renumber, and `DW-1, DW-1` would read as two
+    separate problems.
 
-    # the paired positive control: collapsing the duplicates while keeping BOTH
-    # tokens is accepted, so the refusal below is the lost token and not the
-    # collapse itself.
-    assert validate_migration(rj, manifest, pre, rewritten_gated_ledger("gate: 3-2, 3-3")) == []
-
-    errors = validate_migration(rj, manifest, pre, rewritten_gated_ledger("gate: 3-3"))
-    assert any("DW-1 lost gate token" in e and "3-2" in e for e in errors)
-
-
-def test_validate_migration_refuses_a_gate_retired_by_collapsing_duplicate_statuses():
-    """#519. Keeping the tokens is not the same as keeping the gate. Only an
-    explicit `status: done` retires one, so folding an `open` DW-1 and a `done`
-    DW-1 into a single done entry un-gates the story with every token still on
-    the page — `_refuse_gated_story` skips the entry on `not entry.done` before
-    it ever reads a token. A `done` duplicate therefore never displaces a status
-    that still gates, and the rewrite is held to the gating one.
-
-    Ablation: make the `chosen[e.id]` write unconditional in
-    `snapshot_canonical` (plain last-write-wins on status) and this test fails
-    ALONE — the token tests never vary a status, and the single-entry fixtures
-    have no duplicate for the ordering to matter to."""
-    before = (
+    Ablation: this pins a pure predicate, so its ablation is its callers' —
+    `test_migration_refuses_a_ledger_carrying_duplicate_dw_ids` deletes the
+    `_ensure_migration` guard, and the pre-existing `duplicate DW ids` unit
+    coverage holds the rewrite side."""
+    entries = deferredwork.parse_ledger(
         "# Deferred Work\n\n"
         + _gated_dw1("gate: 3-2")
         + "\n"
-        + _gated_dw1(status="done 2026-06-01")
+        + _gated_dw1("gate: 3-3")
         + "\n"
-        "## Deferred from: epic 1 review (2026-04-06)\n\n"
-        "- **Open legacy thing here** — `src.txt` mishandles em-dashes\n"
+        + _gated_dw1("gate: 3-4")
+        + "\n"
     )
-    manifest = legacy_manifest(before)
-    assert len(manifest) == 1  # neither canonical entry parsed as legacy
-    rj = migrate_result([{"key": manifest[0]["key"], "dw_id": "DW-2"}])
-    pre = snapshot_canonical(before)
-    # the gating status, not the later `done` one
-    assert pre["DW-1"].status == "open"
-
-    # the paired positive control: the same collapse that keeps DW-1 open is
-    # accepted, so the refusal below is the retired gate and not the collapse.
-    assert validate_migration(rj, manifest, pre, rewritten_gated_ledger("gate: 3-2")) == []
-
-    errors = validate_migration(
-        rj, manifest, pre, rewritten_gated_ledger("gate: 3-2", status="done 2026-06-01")
-    )
-    assert any("DW-1 status changed" in e for e in errors)
-    # and this axis is disjoint from the token one: every token was retained, so
-    # the token check stays silent and only the status half can have fired.
-    assert not any("lost gate token" in e for e in errors)
+    assert len(entries) == 3  # the fixture really does carry three parsed entries
+    assert duplicate_ids(entries) == ["DW-1"]
+    # and a ledger with no repeat is not refused
+    assert duplicate_ids(deferredwork.parse_ledger(pre_gated_ledger("gate: 3-2"))) == []
 
 
 def test_validate_migration_happy():
@@ -3350,6 +3305,58 @@ def test_migration_dropping_a_gate_restores_the_ledger_then_escalates(project):
     assert len(prompts) == 2
     feedback = open(prompts[1].split("--feedback ", 1)[1]).read()
     assert "lost gate token" in feedback and "3-2" in feedback
+
+
+def test_migration_refuses_a_ledger_carrying_duplicate_dw_ids(project):
+    """#519, user-approved scope addition: a migration of a ledger where one id
+    names two entries is refused BEFORE a rewrite is dispatched, rather than
+    graded after one comes back.
+
+    There is no automatic outcome that is right. Migration mode requires
+    pre-existing entries to survive byte-identical, so the only rewrite that
+    keeps both twins trips `duplicate DW ids` in `validate_migration`, and the
+    only rewrite that passes is a collapse that drops one twin's `gate:`
+    silently — #519's own failure. Grading the collapse cannot be made safe: a
+    snapshot keyed by id describes a merged entry that never existed, so
+    hardening the token half alone lets a `done` twin retire the gate, and
+    hardening both halves independently pairs one twin's status with the
+    other's token. A human renumbers instead, which is the call
+    `_apply_deferred_closes` already makes on a duplicate id (#286).
+
+    `adapter.sessions == []` is the load-bearing assertion — it is what
+    separates "refused up front" from "refused after burning a session", and
+    the pause alone would pass either way.
+
+    The task stays PENDING rather than ESCALATED, like `_refuse_gated_story`'s
+    pause: the operator renumbers and resumes, and the migration then runs with
+    its full attempt budget intact.
+
+    Ablation: delete the `dupes`/`RunPaused` guard in `_ensure_migration` and
+    this test fails; the `validate_migration` gate-token unit tests stay green,
+    since they build their snapshots from single-entry fixtures."""
+    before = (
+        "# Deferred Work\n\n" + _gated_dw1("gate: 3-2") + "\n" + _gated_dw1("gate: 3-3") + "\n"
+        "## Deferred from: epic 1 review (2026-04-06)\n\n"
+        "- **Open legacy thing here** — `src.txt` mishandles em-dashes\n"
+    )
+    write_legacy_ledger(project, before)
+    # no scripted sessions at all: reaching one would raise rather than pass
+    engine, adapter = make_sweep(project, [])
+    summary = engine.run()
+
+    assert summary.paused
+    # PENDING, not ESCALATED: the refusal is re-askable after a renumber
+    assert engine.state.tasks["sweep-migrate"].phase == Phase.PENDING
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    # refused BEFORE the rewrite — no migration session was ever dispatched
+    assert adapter.sessions == []
+    # the ledger is untouched (text, not bytes: the fixture reached disk through
+    # `write_text`, so a byte assertion would read CRLF on Windows only)
+    assert project.deferred_work.read_text(encoding="utf-8") == before
+    assert worktree_clean(project.project)
+    # and the operator is told which id to go renumber
+    assert "duplicate DW ids" in journal_text(engine)
+    assert "DW-1" in journal_text(engine)
 
 
 # ------------------------------------------ review-budget commit-instead-of-rollback

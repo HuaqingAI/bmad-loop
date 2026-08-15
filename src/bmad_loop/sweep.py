@@ -15,12 +15,12 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from . import deferredwork, gates, verify
-from .engine import Engine
+from .engine import Engine, RunPaused
 from .escalation import critical_escalations, env_fault_pause_reason, session_failure_reason
-from .model import Phase, StoryTask
+from .model import PAUSE_ESCALATION, Phase, StoryTask
 from .platform_util import atomic_write_text, neutralize_surrogates
 from .statemachine import advance
 from .workspace import discard_worktree
@@ -279,40 +279,34 @@ def snapshot_canonical(text: str) -> dict[str, PreCanonical]:
     really produces for that entry, and the bug being fixed here lived in the
     snapshot, not in the comparison.
 
-    One id naming two entries is a corrupt ledger the repo already knows about
-    (#286, ``deferred-close-duplicate-id``) and exactly the mess a migration is
-    run to clean up, so the tokens are UNIONED across the duplicates rather than
-    taken from the last one seen. Keyed by id, ``validate_migration`` only ever
-    sees the collapsed entry: last-write-wins would hold that entry to the last
-    duplicate's tokens alone, and a rewrite folding two ``DW-1``s into one
-    would drop the first's gate with no post-rewrite duplicate left for the
-    ``duplicate DW ids`` check to catch. The union over-blocks in the safe
-    direction — the same asymmetry the added-token bound rests on.
-
-    ``status`` collapses the same way and for the same reason: a status that
-    still gates is never displaced by a ``done`` one. Only ``done`` retires a
-    gate, so an ``open`` ``DW-1`` and a ``done`` ``DW-1`` folded into one done
-    entry un-gates the story even with every token retained — the tokens survive
-    on an entry that no longer enforces them. Snapshotting the gating status
-    holds the rewrite to it through the existing ``status changed`` error rather
-    than a new one. Between two statuses of the same standing the last still
-    wins, as it always has; only the gating-over-done case is ordered, because
-    only it decides whether a story runs.
-
-    Both axes are therefore conservative in one direction — whatever gated
-    before the migration still gates after it, or the migration is refused.
+    Keying by id is safe only because ``_ensure_migration`` refuses a ledger
+    that carries duplicate canonical ids before any rewrite is attempted. Do
+    not soften that refusal into per-id collapse-hardening here: tokens and
+    status snapshotted independently describe an entry that never existed, and
+    each half patched on its own opens the next cross-product (a token
+    harvested from a ``done`` twin paired with an ``open`` twin's status both
+    refuses a faithful rewrite and newly gates a story that was not gated).
     """
-    chosen: dict[str, deferredwork.DWEntry] = {}
-    tokens: dict[str, dict[str, None]] = {}
+    snapshot: dict[str, PreCanonical] = {}
     for e in deferredwork.parse_ledger(text):
         g = deferredwork.gates(e)
-        tokens.setdefault(e.id, {}).update(dict.fromkeys(g.tokens + g.malformed))
-        prior = chosen.get(e.id)
-        # last-write-wins, except that a `done` duplicate never displaces a
-        # status that still gates
-        if prior is None or not (e.done and not prior.done):
-            chosen[e.id] = e
-    return {i: PreCanonical(e.status, tuple(tokens[i])) for i, e in chosen.items()}
+        snapshot[e.id] = PreCanonical(e.status, g.tokens + g.malformed)
+    return snapshot
+
+
+def duplicate_ids(entries: Iterable[deferredwork.DWEntry]) -> list[str]:
+    """The DW ids naming more than one entry, sorted.
+
+    One function for both sides of a migration on purpose: the rewrite is
+    refused when the ledger it STARTED from carries duplicates and when the
+    ledger it produced does, and two detectors that disagreed about what counts
+    as a duplicate would leave exactly the gap between them open.
+    """
+    seen: set[str] = set()
+    dupes: set[str] = set()
+    for e in entries:
+        (dupes if e.id in seen else seen).add(e.id)
+    return sorted(dupes)
 
 
 def validate_migration(
@@ -336,14 +330,11 @@ def validate_migration(
         listed = "; ".join(f"{e.section or 'top level'}: {e.title[:60]}" for e in leftovers[:10])
         errors.append(f"{len(leftovers)} legacy item(s) still parse as legacy: {listed}")
 
-    entries: dict[str, deferredwork.DWEntry] = {}
-    dupes: set[str] = set()
-    for e in deferredwork.parse_ledger(new_text):
-        if e.id in entries:
-            dupes.add(e.id)
-        entries[e.id] = e
+    parsed = deferredwork.parse_ledger(new_text)
+    entries: dict[str, deferredwork.DWEntry] = {e.id: e for e in parsed}
+    dupes = duplicate_ids(parsed)
     if dupes:
-        errors.append("duplicate DW ids: " + ", ".join(sorted(dupes)))
+        errors.append("duplicate DW ids: " + ", ".join(dupes))
 
     def first_word(status: str) -> str:
         return status.split()[0] if status.split() else ""
@@ -799,6 +790,40 @@ class SweepEngine(Engine):
         if not task.baseline_commit:
             task.baseline_commit = verify.rev_parse_head(self.workspace.root)
             task.baseline_untracked = sorted(verify.untracked_files(self.workspace.root))
+
+        # Refused BEFORE a rewrite is dispatched, not after one is graded (#519).
+        # A ledger where one id names two entries is corrupt in a way the format
+        # cannot express, and there is no automatic outcome that is right: this
+        # mode is required to keep pre-existing entries byte-identical, so the
+        # only rewrite that preserves the pair trips `duplicate DW ids` in
+        # validate_migration, and the only rewrite that passes is a collapse
+        # that drops one twin's `gate:` silently. Grading the collapse instead
+        # cannot be made safe — a snapshot keyed by id describes a merged entry
+        # that never existed, and each half hardened on its own opens the next
+        # cross-product. So a human renumbers, which is the call
+        # `_apply_deferred_closes` already makes on a duplicate id (#286).
+        # Paused rather than ESCALATED, and the task stays PENDING on purpose:
+        # that is what makes the refusal re-askable the way `_refuse_gated_story`
+        # is. The operator renumbers the ids and resumes, and this re-reads the
+        # ledger and lets the migration run — an ESCALATED task would also spend
+        # the migration attempt budget on a rewrite that never happened.
+        dupes = duplicate_ids(deferredwork.parse_ledger(text))
+        if dupes:
+            reason = (
+                f"{ledger.name} carries duplicate DW ids: {', '.join(dupes)} — one id "
+                "names more than one entry, so no migration of it can both preserve "
+                "the entries and produce a valid ledger; renumber or merge them by "
+                "hand, then re-run the sweep"
+            )
+            self.journal.append("migrate-duplicate-ids", story_key=MIGRATE_KEY, dw_ids=list(dupes))
+            gates.notify(
+                self.policy,
+                self.run_dir,
+                f"migration refused: {ledger.name}",
+                f"{reason} — then `bmad-loop resume {self.state.run_id}`",
+            )
+            self._save()
+            raise RunPaused(reason, PAUSE_ESCALATION, MIGRATE_KEY)
 
         legacy = deferredwork.parse_legacy(text)
         pre_canonical = snapshot_canonical(text)

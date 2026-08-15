@@ -59,6 +59,14 @@ breaking changes may land in a minor release.
   the safe direction. Migration-scoped: every other ledger edit is still held by the format doc's
   instruction alone.
 
+- **`sweep --migrate` now refuses a ledger that already carries duplicate `DW-<n>` ids, rather than
+  migrating it into silent data loss (#519).** One id naming two entries cannot survive a migration
+  either way: the rewrite that keeps both is rejected as duplicate, and the one that passes collapses
+  them and drops a twin's `gate:`. The sweep now pauses before any rewrite is dispatched, naming the
+  ids to renumber, and resumes with its migration budget intact. **A deliberate behavior change
+  beyond #519's original scope:** such a migration completes today by losing that data, and will now
+  stop instead. Bounded to ledgers that already carry duplicate ids.
+
 - **A git that warns while still exiting 0 no longer corrupts the answers the orchestrator reads
   back from it (#442).** An unknown `core.fsyncMethod` value or a `core.fsmonitor` hook that cannot
   exec is a property of the host's git config rather than a failure, but the shared git helper handed
