@@ -5617,7 +5617,31 @@ class Engine:
     def _maybe_auto_sweep(self, kind: str, trigger: str) -> None:
         """Run a child deferred-work sweep when policy [sweep].auto matches.
         The child is its own resumable run; a paused or failed child is
-        journaled + notified but never interrupts this run."""
+        journaled + notified but never interrupts this run.
+
+        That contract is stated over "a paused or failed child" while the guard
+        below was written over ``Exception``, and the two sets differ in BOTH
+        directions — which is why the arms are shaped the way they are:
+
+        - ``SystemExit`` is a failed child the guard did not cover. It is a
+          ``BaseException``, so it was missed here, by every arm of
+          :meth:`_run_inner`, and by ``cli.main`` — it unwound through the
+          ``finally`` (persisting this trigger's already-burned latch) and
+          killed the process at exit 1, leaving the parent neither ``finished``
+          nor ``crashed``, with no ``run-complete`` and an orphaned session.
+          ``runsetup.make_adapters`` raises it, reachably: the unusable-mux
+          refusal sits behind ``mux_usable``, a live uncached ``shutil.which``
+          re-run on every call.
+        - ``RunStopped`` is the reverse — an ``Exception`` that is not a failure
+          at all. The child's hard-stop arm re-raises it precisely so the owner
+          records the stop; swallowing it as ``sweep-auto-failed`` let the
+          parent run on to ``finished`` AND left it unstoppable, since the
+          signal handler latches ``_stopping`` before raising and every later
+          SIGTERM then returns early.
+
+        Deliberately NOT ``BaseException``: ``KeyboardInterrupt`` must keep
+        escaping, because the nested-child re-raise in :meth:`_run_inner`
+        depends on it reaching the owner."""
         if self.policy.sweep.auto != kind or self.sweep_factory is None:
             return
         if trigger in self.state.sweeps_triggered:
@@ -5646,7 +5670,9 @@ class Engine:
         try:
             self.sweep_factory(trigger)
             self.journal.append("sweep-auto-finished", trigger=trigger)
-        except Exception as e:  # child must never break the parent
+        except RunStopped:
+            raise  # a stop is not a failed child — let the owner record it
+        except (Exception, SystemExit) as e:  # child must never break the parent
             self.journal.append("sweep-auto-failed", trigger=trigger, error=str(e))
             gates.notify(self.policy, self.run_dir, "auto sweep failed", f"{trigger}: {e}")
 

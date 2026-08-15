@@ -39,6 +39,20 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **A failing auto-sweep can no longer kill its parent run, and a stop during one is no longer
+  swallowed (#501).** The child-sweep guard promised never to interrupt the parent, but was written
+  over `Exception`, and that set differs from "a paused or failed child" in both directions. A
+  `SystemExit` — what `runsetup.make_adapters` raises for an unusable multiplexer, an unresolvable
+  profile or an adapter kind that fails to load — is a `BaseException`, so it escaped the guard,
+  every arm of the engine's run handler, and `main()`, ending the process at exit 1 with the parent
+  left neither `finished` nor `crashed`, no `run-complete`, and an orphaned agent session. The
+  unusable-multiplexer gate re-probes live on every call, so a child could hit it in a run that
+  launched fine. In the other direction `RunStopped` _is_ an `Exception` but is not a failure: the
+  child re-raises it so the owner records the stop, and eating it as `sweep-auto-failed` let the
+  parent run on to `finished` — and left it unstoppable, since the signal handler latches
+  `_stopping` before raising, so every later SIGTERM returned at that latch. `KeyboardInterrupt`
+  deliberately still escapes; the nested-child re-raise depends on it.
+
 - **A failed write can no longer truncate the sprint board, a story spec, your CLI settings or your
   policy file (#379).** Seven writers read a file, merged into it, and wrote the whole thing back
   through a truncating `Path.write_*` — so a fault partway through (ENOSPC, EIO, a quota) published

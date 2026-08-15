@@ -7616,6 +7616,117 @@ def test_auto_sweep_failure_does_not_pause_parent(project):
     assert "sweep-auto-failed" in journal and "child sweep blew up" in journal
 
 
+def test_auto_sweep_system_exit_does_not_kill_the_parent(project):
+    """#501: a child sweep that dies on `SystemExit` is a failed child like any
+    other, and the "never interrupts this run" contract has to cover it. It is a
+    `BaseException`, so a guard written over `Exception` missed it here, in every
+    arm of `_run_inner`, and in `cli.main`: it unwound to process exit 1 with the
+    parent left neither `finished` nor `crashed`, no `run-complete`, and an
+    orphaned agent session.
+
+    Not a hypothetical shape — `runsetup.make_adapters` raises exactly this for
+    an unresolvable profile, an unknown/unloadable adapter kind, a failed adapter
+    construction, and an unusable multiplexer; that last gate re-probes live
+    (`mux_usable` bottoms out in a bare `shutil.which`) on every call, so a child
+    sweep can hit it in a parent run that launched fine.
+
+    Ablation: drop `SystemExit` from the `except (Exception, SystemExit)` tuple
+    in `_maybe_auto_sweep` and this test fails alone — the SystemExit escapes
+    `engine.run()` instead of being journaled."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    policy = Policy(gates=GatesPolicy(mode="none"), notify=QUIET, sweep=SweepPolicy(auto="run-end"))
+
+    def exiting(trigger):
+        raise SystemExit("error: multiplexer backend is not usable on this host")
+
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=policy,
+        sweep_factory=exiting,
+    )
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    assert engine.state.finished
+    journal = (engine.run_dir / "journal.jsonl").read_text()
+    assert "sweep-auto-failed" in journal and "not usable on this host" in journal
+    assert "run-complete" in journal
+
+
+def test_auto_sweep_run_stopped_stops_the_parent(project, monkeypatch):
+    """#501, the mirror image: `RunStopped` subclasses `Exception` but is not a
+    failed child at all. The child's hard-stop arm re-raises it *so the owner
+    records the stop*, so swallowing it as `sweep-auto-failed` was doubly wrong —
+    the parent ran on to `finished`, and it became unstoppable, because the
+    signal handler latches `_stopping = True` before raising and every later
+    SIGTERM then returns at that latch.
+
+    Ablation: delete the `except RunStopped: raise` arm from `_maybe_auto_sweep`
+    and this test fails alone — the stop is swallowed and the parent finishes."""
+    killed = []
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: killed.append(rid))
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    policy = Policy(gates=GatesPolicy(mode="none"), notify=QUIET, sweep=SweepPolicy(auto="run-end"))
+
+    def stopping(trigger):
+        raise RunStopped()  # hard (graceful=False), as the child's stop arm re-raises
+
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=policy,
+        sweep_factory=stopping,
+    )
+    engine.run()
+
+    saved = load_state(engine.run_dir)
+    assert saved.stopped is True
+    assert not saved.finished  # the whole point: a stop must not read as a finish
+    assert killed == ["test-run"]
+    journal = (engine.run_dir / "journal.jsonl").read_text()
+    assert "run-stop" in journal
+    assert "sweep-auto-failed" not in journal  # a stop is not a failure
+    assert "run-complete" not in journal
+
+
+def test_auto_sweep_keyboard_interrupt_still_propagates(project, monkeypatch):
+    """#501, the control on the fix's shape: the two arms above must never be
+    widened to a bare `BaseException`. `KeyboardInterrupt` has to keep escaping
+    `_maybe_auto_sweep`, because `_run_inner`'s own KeyboardInterrupt arm is what
+    records the controlled stop — and, for a nested child, re-raises it for the
+    owning engine.
+
+    INVERSE ablation (the guard here is an *absence* — deleting code cannot
+    reproduce the bug): widen the clause to `except (BaseException) as e:` and
+    this test fails alone — the interrupt is swallowed as `sweep-auto-failed`
+    and the parent finishes instead of stopping."""
+    killed = []
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: killed.append(rid))
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    policy = Policy(gates=GatesPolicy(mode="none"), notify=QUIET, sweep=SweepPolicy(auto="run-end"))
+
+    def interrupting(trigger):
+        raise KeyboardInterrupt()
+
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=policy,
+        sweep_factory=interrupting,
+    )
+    engine.run()
+
+    saved = load_state(engine.run_dir)
+    assert saved.stopped is True
+    assert not saved.finished
+    assert killed == ["test-run"]
+    entries = engine.journal.entries()
+    stops = [e for e in entries if e["kind"] == "run-stop"]
+    assert stops and stops[0]["reason"] == "KeyboardInterrupt"
+    assert not [e for e in entries if e["kind"] == "sweep-auto-failed"]
+
+
 def test_auto_sweep_config_digest_refusal_journals_and_spares_the_parent(project):
     """#461 point 4, end to end through the REAL factory rather than a stand-in
     exploder: the config-integrity gate's raise has to land on the same
