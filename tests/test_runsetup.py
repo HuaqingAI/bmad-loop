@@ -6,15 +6,25 @@ every field that reaches exec, and hold still for everything else. A digest that
 under-covers lets a mid-run rewrite through the auto-sweep gate; one that
 over-covers refuses every auto-sweep after a `[limits]` live-edit #189 documents
 as supported. Both halves are pinned below.
+
+The second concern here is composition atomicity: `compose_run` and
+`compose_sweep` publish a run dir before they can know the run will start, and
+`make_adapters` raises `SystemExit` from five sites after that point. The unwind
+that keeps a failed launch from stranding a resumable-looking empty run is pinned
+at the end of the file.
 """
 
 import dataclasses
+import shutil
+import types
 
 import pytest
 
+from bmad_loop import bmadconfig
 from bmad_loop import policy as policy_mod
-from bmad_loop import runsetup
+from bmad_loop import runs, runsetup
 from bmad_loop.adapters.profile import ProfileError
+from bmad_loop.journal import Journal
 
 # A profile overlay carrying the whole launch surface the digest covers. It lives
 # under .bmad-loop/profiles/, inside the tree every driven session can write.
@@ -293,3 +303,445 @@ def test_digest_raises_on_an_unresolvable_profile(pinned):
     hashing a hole where the launch surface should be."""
     with pytest.raises(ProfileError):
         _digest(pinned, '[adapter]\nname = "no-such-cli"\n')
+
+
+# --------------------------------------------------------- composition unwind
+
+# A fixed, well-formed run id, so the assertions can name the two directories a
+# composer publishes rather than fish them back out of the failed call.
+RUN_ID = "20260812-101500-ab12"
+
+# The message `make_adapters` raises for an unusable multiplexer — the one of its
+# five SystemExit sites that is reachable in a run that launched fine, since
+# `mux_usable` bottoms out in a live `shutil.which` on every call.
+BOOM = "error: multiplexer backend TmuxBackend is not usable on this host"
+
+
+class _NeverBuilt:
+    """Engine stand-in for the composers' `*_cls` seams.
+
+    Raises on construction rather than being a no-op: every test below fails at
+    `make_adapters`, which both composers call before they build an engine, so a
+    class that cannot be built is a second assertion that the failure landed where
+    the test says it did."""
+
+    def __init__(self, *args, **kwargs):
+        raise AssertionError("engine construction reached despite a failed make_adapters")
+
+
+def _fake_paths(project):
+    """A hand-built ProjectPaths rather than `bmadconfig.load_paths`, which would
+    need a `_bmad/bmm/config.yaml` on disk. `paths` is read only when the engine is
+    constructed — after `make_adapters` — so nothing here ever dereferences it."""
+    return bmadconfig.ProjectPaths(
+        project=project,
+        implementation_artifacts=project / "impl",
+        planning_artifacts=project / "plan",
+    )
+
+
+@pytest.fixture
+def unwinding(tmp_path):
+    """A project plus a `make_adapters` that fails the way the real one does.
+
+    `runsetup.make_adapters` raises `SystemExit` at five sites (an unresolvable
+    profile, an unknown adapter kind, a kind that fails to load, a construction
+    failure, an unusable multiplexer), and every one lands *after* the composer has
+    published the run dir, its `state.json` and the out-of-tree config-digest stamp.
+    The fake records that all three exist at the moment it is called, so the
+    assertions after the raise grade a *removal* — an "is it gone" assertion passes
+    just as happily for a run dir that was never written.
+
+    `tmp_path` rather than the `project` sandbox, on the same reasoning the `pinned`
+    fixture states: the composers touch only `.bmad-loop/runs/` and the out-of-tree
+    state root (which conftest's `_isolate_state_root` already redirects), so the
+    sandbox's git repo and BMAD artifact dirs would buy nothing. The end-to-end
+    launch path is covered on the real sandbox in tests/test_cli.py."""
+    published: dict[str, bool] = {}
+
+    def make_adapters(project, run_dir, policy, *, profiles=None):
+        published["run_dir"] = run_dir.is_dir()
+        published["state"] = (run_dir / "state.json").is_file()
+        published["state_dir"] = runs.state_dir_for(tmp_path, RUN_ID).is_dir()
+        raise SystemExit(BOOM)
+
+    return types.SimpleNamespace(project=tmp_path, make_adapters=make_adapters, published=published)
+
+
+def _assert_unwound(probe):
+    """Composition published all three artifacts, then left none of them."""
+    assert probe.published == {"run_dir": True, "state": True, "state_dir": True}
+    assert not runs.run_dir_for(probe.project, RUN_ID).exists()
+    assert not runs.state_dir_for(probe.project, RUN_ID).exists()
+
+
+def test_compose_run_unwinds_the_run_when_the_adapters_abort(unwinding):
+    """A failed `make_adapters` must leave no run behind, and must still abort.
+
+    Without the unwind the run dir survives carrying `state.json` with
+    `finished=False` and `crashed=False` and no `run-start` line — and nothing
+    reconciles that shape, since `runs.reconcile_stale_worktrees` only visits
+    `is_finished` runs. It lingers as a resumable-looking empty run.
+
+    The `SystemExit` itself is re-raised unchanged: the cleanup is best-effort
+    precisely so it can never replace the failure the operator has to read."""
+    with pytest.raises(SystemExit, match="not usable on this host"):
+        runsetup.compose_run(
+            project=unwinding.project,
+            paths=_fake_paths(unwinding.project),
+            policy=policy_mod.loads(""),
+            run_id=RUN_ID,
+            epic_filter=None,
+            story_filter=None,
+            max_stories=None,
+            stories_on=False,
+            spec_folder="",
+            sweep_factory=lambda _trigger, *, started: None,
+            make_adapters=unwinding.make_adapters,
+            engine_cls=_NeverBuilt,
+            stories_engine_cls=_NeverBuilt,
+            trusted_config_digest="deadbeef",
+        )
+    _assert_unwound(unwinding)
+
+
+def test_compose_sweep_unwinds_the_run_when_the_adapters_abort(unwinding):
+    """The sweep composer publishes the same artifacts (plus `sweep.json`) ahead of
+    the same `make_adapters` call, so it owns its own unwind — separately, since a
+    sweep is the run type most likely to hit the reachable SystemExit: an
+    auto-triggered child re-probes the multiplexer live in a parent that started
+    fine."""
+    with pytest.raises(SystemExit, match="not usable on this host"):
+        runsetup.compose_sweep(
+            project=unwinding.project,
+            paths=_fake_paths(unwinding.project),
+            policy=policy_mod.loads(""),
+            run_id=RUN_ID,
+            prompting=False,
+            decisions_only=False,
+            max_bundles=None,
+            repeat=None,
+            max_cycles=None,
+            trigger="auto",
+            make_adapters=unwinding.make_adapters,
+            sweep_engine_cls=_NeverBuilt,
+            trusted_config_digest="deadbeef",
+        )
+    _assert_unwound(unwinding)
+
+
+def test_compose_run_unwinds_a_claim_abandoned_before_save_state(unwinding, monkeypatch):
+    """The guard opens on the statement after the claim, not at `save_state`.
+
+    `_claim_run_dir` publishes the first artifact — the run DIRECTORY — so an abort
+    between it and `save_state` used to strand an empty dir the guard never saw. It
+    is invisible to `bmad-loop list` (state.json-gated), which is precisely why it
+    is worth removing: nothing surfaces it, and a later launch reusing that
+    `--run-id` is refused by a directory holding nothing.
+
+    A `KeyboardInterrupt` because that is the only realistic way in: `Journal`
+    mkdirs `exist_ok=True` over a directory this frame just created and
+    `build_run_state` is a pure constructor, so neither fails on its own — but a
+    signal lands between arbitrary statements, and the arm is `BaseException`.
+
+    `seen` is the positive control, on the fixture's own doctrine: "is it gone"
+    passes just as happily for a directory that was never created.
+
+    Ablation: move the `try` back below `build_run_state` and this fails alone."""
+    seen: dict[str, bool] = {}
+
+    def exploding_build_run_state(**kwargs):
+        seen["run_dir"] = runs.run_dir_for(unwinding.project, RUN_ID).is_dir()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(runsetup, "build_run_state", exploding_build_run_state)
+    with pytest.raises(KeyboardInterrupt):
+        runsetup.compose_run(
+            project=unwinding.project,
+            paths=_fake_paths(unwinding.project),
+            policy=policy_mod.loads(""),
+            run_id=RUN_ID,
+            epic_filter=None,
+            story_filter=None,
+            max_stories=None,
+            stories_on=False,
+            spec_folder="",
+            sweep_factory=lambda _trigger, *, started: None,
+            make_adapters=unwinding.make_adapters,
+            engine_cls=_NeverBuilt,
+            stories_engine_cls=_NeverBuilt,
+            trusted_config_digest="deadbeef",
+        )
+    assert seen == {"run_dir": True}  # the claim published it...
+    assert not runs.run_dir_for(unwinding.project, RUN_ID).exists()  # ...the unwind took it back
+    assert unwinding.published == {}  # and it aborted well ahead of `make_adapters`
+
+
+def test_compose_sweep_unwinds_when_the_journal_itself_cannot_be_built(unwinding, monkeypatch):
+    """The same window in the sweep composer, at its earliest statement — which is
+    also the one case that reaches `_unwind_composition` with NO journal.
+
+    That is why this drives `Journal` rather than the `RunState` build: the unwind
+    writes a `composition-unwind-failed` entry through the journal it is handed, so
+    a `None` there has to be handled rather than left to the surrounding
+    `suppress(Exception)` (an `AttributeError` on `None` is an `Exception`, so the
+    code would work by accident while reading as though a journal were guaranteed).
+
+    Ablation: restore `_unwind_composition`'s `journal: Journal` annotation and drop
+    the `if journal is not None` guard — this stays GREEN, because the suppress
+    absorbs the AttributeError. The guard is graded by the annotation and by this
+    docstring, not by an exit code; what this test does pin is that the run dir is
+    removed on this path at all, which fails alone if the `try` moves back down."""
+    built: dict[str, bool] = {}
+
+    def exploding_journal(run_dir):
+        built["run_dir"] = run_dir.is_dir()
+        raise OSError("journal unavailable")
+
+    monkeypatch.setattr(runsetup, "Journal", exploding_journal)
+    with pytest.raises(OSError, match="journal unavailable"):
+        runsetup.compose_sweep(
+            project=unwinding.project,
+            paths=_fake_paths(unwinding.project),
+            policy=policy_mod.loads(""),
+            run_id=RUN_ID,
+            prompting=False,
+            decisions_only=False,
+            max_bundles=None,
+            repeat=None,
+            max_cycles=None,
+            trigger="auto",
+            make_adapters=unwinding.make_adapters,
+            sweep_engine_cls=_NeverBuilt,
+            trusted_config_digest="deadbeef",
+        )
+    assert built == {"run_dir": True}
+    assert not runs.run_dir_for(unwinding.project, RUN_ID).exists()
+    assert unwinding.published == {}
+
+
+PRIOR_STATE = '{"run_id": "prior", "finished": true}'
+PRIOR_JOURNAL = '{"kind": "run-complete"}\n'
+PRIOR_STAMP = "prior-digest"
+
+
+def _seed_prior_run(project):
+    """A finished run already occupying RUN_ID — dir, state, journal, and the
+    out-of-tree state dir the unwind's `_discard_state_dir` also reaches.
+
+    Finished, deliberately: `delete_run`'s only guard refuses a LIVE session, so a
+    run that has none is exactly the case that guard does not cover."""
+    run_dir = runs.run_dir_for(project, RUN_ID)
+    run_dir.mkdir(parents=True)
+    (run_dir / "state.json").write_text(PRIOR_STATE, encoding="utf-8")
+    (run_dir / "journal.jsonl").write_text(PRIOR_JOURNAL, encoding="utf-8")
+    state_dir = runs.state_dir_for(project, RUN_ID)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "config-digest").write_text(PRIOR_STAMP, encoding="utf-8")
+    return run_dir, state_dir
+
+
+def _assert_prior_run_untouched(probe, run_dir, state_dir):
+    """The prior run survives BYTE-IDENTICAL, and the refusal beat publication.
+
+    `probe.published == {}` is the positive control and the load-bearing half: an
+    "is it still there" assertion alone passes just as happily for a composer that
+    published over the run and then failed to unwind it. An empty dict says
+    `make_adapters` was never reached, so `save_state` never ran and the
+    `except BaseException` arm was never entered — which is the claim, since the
+    guard's whole placement requirement is that it sits OUTSIDE that try."""
+    assert probe.published == {}
+    assert (run_dir / "state.json").read_text(encoding="utf-8") == PRIOR_STATE
+    assert (run_dir / "journal.jsonl").read_text(encoding="utf-8") == PRIOR_JOURNAL
+    assert (state_dir / "config-digest").read_text(encoding="utf-8") == PRIOR_STAMP
+
+
+def test_compose_run_refuses_a_run_id_that_already_exists(unwinding):
+    """`--run-id` naming an existing run must be refused before anything is
+    published, leaving that run untouched.
+
+    Without the claim this was destructive, not merely sloppy: `Journal.__init__`
+    mkdirs with `exist_ok=True`, so the composer adopted the existing directory,
+    `save_state` overwrote its `state.json`, and the reachable `make_adapters`
+    SystemExit then drove `_unwind_composition` — which `rmtree`s the whole run dir
+    and discards its out-of-tree state. A paused, stopped or finished run has no
+    live session, so `delete_run`'s guard never fires: the prior run's journal,
+    logs, tasks and state were erased permanently."""
+    run_dir, state_dir = _seed_prior_run(unwinding.project)
+    with pytest.raises(SystemExit, match="already exists"):
+        runsetup.compose_run(
+            project=unwinding.project,
+            paths=_fake_paths(unwinding.project),
+            policy=policy_mod.loads(""),
+            run_id=RUN_ID,
+            epic_filter=None,
+            story_filter=None,
+            max_stories=None,
+            stories_on=False,
+            spec_folder="",
+            sweep_factory=lambda _trigger, *, started: None,
+            make_adapters=unwinding.make_adapters,
+            engine_cls=_NeverBuilt,
+            stories_engine_cls=_NeverBuilt,
+            trusted_config_digest="deadbeef",
+        )
+    _assert_prior_run_untouched(unwinding, run_dir, state_dir)
+
+
+class _BuiltEngine:
+    """Engine stand-in that constructs cleanly — the inverse of `_NeverBuilt`, for
+    the one test that must get PAST `make_adapters`."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+def test_compose_sweep_unwinds_when_the_started_latch_raises(tmp_path):
+    """`on_started` fires as the LAST statement inside the composition block, so a
+    latch that raises must unwind the child like any other escape.
+
+    This is the one arm the adapter-abort rows above cannot reach: they fail early
+    in the try, at `make_adapters`, so they would stay green if the block's extent
+    were narrowed to end before the latch. It is also the case `compose_sweep`'s
+    docstring reasons about — the parent's in-memory flag is set before its write,
+    so at-most-once holds, and what the unwind decides is only whether the refused
+    retry cost nothing or a composed, resumable child. That argument is prose until
+    something pins the unwind actually covering a raising latch."""
+    published: dict[str, bool] = {}
+
+    def make_adapters(project, run_dir, policy, *, profiles=None):
+        return {"dev": object(), "review": object(), "triage": object()}
+
+    def boom() -> None:
+        published["run_dir"] = runs.run_dir_for(tmp_path, RUN_ID).is_dir()
+        published["state"] = (runs.run_dir_for(tmp_path, RUN_ID) / "state.json").is_file()
+        published["sweep"] = (runs.run_dir_for(tmp_path, RUN_ID) / "sweep.json").is_file()
+        published["state_dir"] = runs.state_dir_for(tmp_path, RUN_ID).is_dir()
+        raise RuntimeError("latch write failed")
+
+    with pytest.raises(RuntimeError, match="latch write failed"):
+        runsetup.compose_sweep(
+            project=tmp_path,
+            paths=_fake_paths(tmp_path),
+            policy=policy_mod.loads(""),
+            run_id=RUN_ID,
+            prompting=False,
+            decisions_only=False,
+            max_bundles=None,
+            repeat=None,
+            max_cycles=None,
+            trigger="auto",
+            make_adapters=make_adapters,
+            sweep_engine_cls=_BuiltEngine,
+            trusted_config_digest="deadbeef",
+            on_started=boom,
+        )
+    # Graded as a removal, not an absence: the latch saw all four artifacts.
+    assert published == {"run_dir": True, "state": True, "sweep": True, "state_dir": True}
+    assert not runs.run_dir_for(tmp_path, RUN_ID).exists()
+    assert not runs.state_dir_for(tmp_path, RUN_ID).exists()
+
+
+def test_compose_sweep_refuses_a_run_id_that_already_exists(unwinding):
+    """The sweep composer carries its own copy of the claim, so it gets its own
+    row — `cmd_sweep --run-id` is a caller-supplied id on the same hidden flag, and
+    a shared guard that only one composer actually calls is the failure mode a
+    single test here would hide."""
+    run_dir, state_dir = _seed_prior_run(unwinding.project)
+    with pytest.raises(SystemExit, match="already exists"):
+        runsetup.compose_sweep(
+            project=unwinding.project,
+            paths=_fake_paths(unwinding.project),
+            policy=policy_mod.loads(""),
+            run_id=RUN_ID,
+            prompting=False,
+            decisions_only=False,
+            max_bundles=None,
+            repeat=None,
+            max_cycles=None,
+            trigger="auto",
+            make_adapters=unwinding.make_adapters,
+            sweep_engine_cls=_NeverBuilt,
+            trusted_config_digest="deadbeef",
+        )
+    _assert_prior_run_untouched(unwinding, run_dir, state_dir)
+
+
+def _run_compose_sweep(project, make_adapters, engine_cls=_NeverBuilt):
+    """Drive `compose_sweep` to whatever the injected `make_adapters` decides."""
+    return runsetup.compose_sweep(
+        project=project,
+        paths=_fake_paths(project),
+        policy=policy_mod.loads(""),
+        run_id=RUN_ID,
+        prompting=False,
+        decisions_only=False,
+        max_bundles=None,
+        repeat=None,
+        max_cycles=None,
+        trigger="auto",
+        make_adapters=make_adapters,
+        sweep_engine_cls=engine_cls,
+        trusted_config_digest="deadbeef",
+    )
+
+
+def test_a_failed_unwind_is_reported_and_does_not_replace_the_launch_error(
+    unwinding, monkeypatch, capsys
+):
+    """A cleanup that fails must be SURFACED, and must still not become the error
+    the operator reads.
+
+    "Repair writes must raise" (AGENTS.md) cannot be honored literally here —
+    raising is exactly what would swallow the launch failure — so the obligation is
+    discharged by reporting. Suppressing silently left the resumable-looking ghost
+    run this unwind exists to prevent, detectable only as the ABSENCE of an effect.
+
+    The `match=` is the load-bearing half: it pins that the SystemExit reaching the
+    operator is still `make_adapters`', not the cleanup's. A bare `pytest.raises`
+    would pass just as happily for a cleanup failure that replaced it."""
+
+    def boom(project, run_dir, *, force=False):
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(runs, "delete_run", boom)
+    with pytest.raises(SystemExit, match="not usable on this host"):
+        _run_compose_sweep(unwinding.project, unwinding.make_adapters)
+
+    warning = capsys.readouterr().err
+    assert "warning: could not remove the partially composed run" in warning
+    assert RUN_ID in warning
+    assert f"bmad-loop delete {RUN_ID}" in warning
+    # The ghost the operator was just warned about is really there, and the run's
+    # own journal carries the record — which is where anyone investigating it looks.
+    run_dir = runs.run_dir_for(unwinding.project, RUN_ID)
+    assert run_dir.is_dir()
+    kinds = [e["kind"] for e in Journal(run_dir).entries()]
+    assert "composition-unwind-failed" in kinds
+
+
+def test_a_failed_unwind_still_reports_when_the_run_dir_is_already_gone(
+    unwinding, monkeypatch, capsys
+):
+    """The other failure mode, split into its own row: `delete_run` removes the run
+    dir and THEN raises (`_discard_state_dir` is the real site — it runs after the
+    `rmtree`).
+
+    `Journal.append` opens with "a" and does not mkdir, so appending here raises
+    `FileNotFoundError`. Unsuppressed that would propagate out of the unwind and
+    replace the launch error — the one outcome this whole arm forbids — so the
+    suppression around the journal write is load-bearing and gets its own test.
+    The stderr report must still land, since it is now the only channel left."""
+
+    def boom(project, run_dir, *, force=False):
+        shutil.rmtree(run_dir)
+        raise RuntimeError("state dir removal failed")
+
+    monkeypatch.setattr(runs, "delete_run", boom)
+    with pytest.raises(SystemExit, match="not usable on this host"):
+        _run_compose_sweep(unwinding.project, unwinding.make_adapters)
+
+    warning = capsys.readouterr().err
+    assert "warning: could not remove the partially composed run" in warning
+    assert "state dir removal failed" in warning
+    assert not runs.run_dir_for(unwinding.project, RUN_ID).exists()

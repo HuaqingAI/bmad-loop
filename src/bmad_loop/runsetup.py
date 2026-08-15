@@ -34,6 +34,7 @@ import hashlib
 import json
 import sys
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -52,7 +53,7 @@ if TYPE_CHECKING:
 
     from .adapters.base import CodingCLIAdapter
     from .adapters.profile import CLIProfile
-    from .engine import Engine
+    from .engine import Engine, SweepFactory
     from .policy import Policy
     from .stories_engine import StoriesEngine
     from .sweep import SweepEngine
@@ -92,10 +93,15 @@ def resolve_profiles(policy: Policy, project: Path) -> dict[str, CLIProfile]:
     file: a session that leaves a background writer flipping
     ``.bmad-loop/profiles/*.toml`` between a benign and a hostile copy needs only
     the digest's read to catch the benign one and the adapter's read to catch the
-    other. That race is cheap to retry — a lost round raises `sweep-auto-failed`,
-    which `_maybe_auto_sweep` swallows, and the next auto-sweep trigger deals
-    again — so "narrow window" is not a defense. Resolving once and threading the
-    result removes the second read rather than shrinking the window.
+    other. That race is cheap to repeat — a lost round raises
+    `sweep-auto-not-started`, which `_maybe_auto_sweep` swallows, so the parent
+    runs on and the next epic boundary deals a fresh hand — so "narrow window" is
+    not a defense. The repeat is the writer's, never the orchestrator's: #501
+    leaves a refused trigger unspent, but nothing re-asks that trigger (see
+    `_maybe_auto_sweep`'s docstring), and under ``[sweep] auto = "run-end"`` a run
+    has exactly one. It is `per-epic` that hands out the further rounds.
+    Resolving once and threading the result removes the second read rather than
+    shrinking the window.
 
     ``cmd_run`` and ``_resume_paused_run`` thread it too, for a DIFFERENT reason —
     they stamp a baseline rather than compare against one, and at launch the
@@ -209,10 +215,12 @@ def config_digest(
     restating two builders' precedence rules inside the control that polices
     them, where drift is silent and lands in the UNDER-covering direction — the
     failure this function has already made four times by reasoning from one
-    builder. Over-coverage fails the other way, loudly: ``sweep-auto-failed`` +
-    notify, with the message naming ``bmad-loop sweep`` as the human-present path.
-    Not free (the refusal burns the trigger for the life of the run, #501), but it
-    needs a writer, and nothing under ``src/`` writes ``.bmad-loop/profiles/*.toml``
+    builder. Over-coverage fails the other way, loudly: ``sweep-auto-not-started``
+    + notify, with the message naming ``bmad-loop sweep`` as the human-present
+    path. Not free — #501 stopped a refusal from *spending* the trigger, but that
+    is honest bookkeeping rather than a reprieve, since the same wrong answer
+    refuses the next trigger too. It needs a writer, though, and nothing under
+    ``src/`` writes ``.bmad-loop/profiles/*.toml``
     at all — that overlay is hand-authored, and the TUI settings screen writes
     ``policy.toml`` (``extra_args`` included). So a dead-field rewrite arriving
     mid-run is a config change nobody automated made under a running loop, which
@@ -267,9 +275,9 @@ def config_digest(
       it — this repo's own ``write_script_launcher`` is a stub that execs an
       interpreter on a sidecar, so hashing the stub misses the payload. Nor is
       the target ours to pin: it is normally a third-party CLI that self-updates,
-      and a mid-run update would move a content hash and burn the auto-sweep
-      trigger for the life of the run (``_maybe_auto_sweep`` records the trigger
-      BEFORE calling the factory, and early-returns on it forever after).
+      and a mid-run update would move a content hash and refuse every auto-sweep
+      for the life of the run (the digest is pinned in memory at launch, so
+      nothing on disk can re-bless it).
       Confinement is the instrument, not hashing — and as a ``validate`` warning
       rather than a refusal, since "resolves inside the project" does not decide
       it either: under an active project venv ``which("python")`` IS
@@ -465,8 +473,13 @@ def make_adapters(
             # dependency they pull in — are first imported, and it is deliberately
             # never invoked by `validate` or `bmad-loop adapters` (both stay free
             # of heavy imports), so a thunk that raises has had no earlier gate.
-            # By here `compose_run` has already written the run state and pid, so
-            # an escaping ImportError strands a run directory behind a traceback.
+            # By here `compose_run` has already written the run state and pid. An
+            # escaping ImportError used to strand that run directory behind a
+            # traceback, recorded as an accepted consequence; it no longer does —
+            # both composers unwind the whole composition on any escape (see
+            # `_unwind_composition`), and this raise is one of the five SystemExits
+            # that path exists for. What that changes is the run dir, not the
+            # message: the narrowing below is a separate decision and still holds.
             # ImportError ONLY, on the same rule as `construct_error` below: a
             # missing dependency is a lazy loader's DECLARED failure, while
             # anything else is a bug in that package and must surface as itself
@@ -782,6 +795,132 @@ class ComposedRun:
     journal: Journal
 
 
+def _claim_run_dir(run_dir: Path) -> None:
+    """Take exclusive ownership of a fresh run directory, refusing an id that
+    already names a run.
+
+    A **claim**, not a check, and that distinction is the whole point:
+    ``exist_ok=False`` makes the directory's creation and the collision refusal one
+    atomic operation, so what follows may treat "this run dir is ours" as PROVEN
+    rather than inferred. :func:`_unwind_composition` deletes this directory
+    wholesale on a failed composition, and inference is not good enough to license
+    an ``rmtree``.
+
+    The hazard is not hypothetical. ``run_id`` is caller-supplied through the
+    hidden ``--run-id`` flag on both ``run`` and ``sweep``, and the composers ran
+    straight into ``Journal(run_dir)``, whose ``mkdir(parents=True,
+    exist_ok=True)`` adopts an existing directory without complaint. So pointing
+    ``--run-id`` at a *pre-existing* paused, stopped or finished run published this
+    composition's ``state.json`` over that run's, and then — once ``make_adapters``
+    raised its reachable ``SystemExit`` — unwound the whole thing: journal, logs,
+    tasks and out-of-tree state, permanently. ``delete_run``'s guard does not cover
+    it, since that guard refuses only a *live* session and a paused or finished run
+    has none.
+
+    Refusing before anything is published is what makes that unreachable, so this
+    MUST stay outside the composers' ``try`` — a refusal that reached the unwind
+    arm would delete the very run it exists to protect. ``SystemExit`` matches the
+    other launch-time refusals an operator reads as an ``error:`` line
+    (``_reject_bad_run_id``, and ``make_adapters``' five sites).
+
+    Applied to a minted id too, not just a supplied one. ``new_run_id`` is a
+    timestamp plus two random bytes, so a same-second collision is remote rather
+    than impossible — and a guard that holds for every id lets callers state the
+    freshness of their run dir flatly instead of qualifying it by provenance."""
+    try:
+        run_dir.mkdir(parents=True, exist_ok=False)
+    except FileExistsError as e:
+        raise SystemExit(
+            f"error: run {run_dir.name} already exists — refusing to compose over it. "
+            "`--run-id` must name a run that does not exist yet."
+        ) from e
+
+
+def _unwind_composition(project: Path, run_dir: Path, journal: Journal | None) -> None:
+    """Remove the run a failed ``compose_*`` had already published, so a launch
+    that aborts partway leaves nothing behind.
+
+    Safe as a wholesale removal only because :func:`_claim_run_dir` created this
+    directory with ``exist_ok=False`` moments earlier: the run being deleted is
+    provably this composition's, never a pre-existing one the caller named.
+
+    Reached from an ``except BaseException`` arm, because the failure it exists
+    for is a :class:`SystemExit`: :func:`make_adapters` raises one at five sites
+    (unresolvable profile, unknown adapter kind, a kind that fails to load, a
+    construction failure, an unusable multiplexer), every one of them *after*
+    ``save_state`` has published a run dir carrying ``finished=False`` /
+    ``crashed=False`` and no ``run-start``. Nothing reconciles that shape —
+    :func:`runs.reconcile_stale_worktrees` only touches ``is_finished`` runs — so
+    it lingers as a resumable-looking empty run.
+
+    :func:`runs.delete_run` is the right primitive rather than a bare ``rmtree``
+    because it also drops the run's out-of-tree state dir (``_discard_state_dir``),
+    which is what covers the config-digest stamp the composers write between the
+    state and the pid.
+
+    ``force=False``, deliberately. ``force`` is documented there as the
+    *operator's* explicit override, and there is no operator here — this is an
+    automatic unwind. What it would skip is the one guard protecting the one state
+    where a run dir is load-bearing: an untagged live ``bmad-loop-<id>`` session,
+    for which that directory is the only ownership proof a later prune can read.
+    :func:`_claim_run_dir` rules out a session belonging to a *pre-existing run* at
+    this id — there is no such run — but not an orphaned session outliving the run
+    dir it was named for, which this launch would then be deleting the only
+    ownership proof of while never having spawned a session of its own. Narrower
+    than the case this paragraph used to argue, and still real. When the guard does
+    fire the cost is exactly the pre-fix behavior, a stranded run dir, which is no
+    worse than what this replaces; ``force=True`` would trade that bounded cost for
+    an unbounded one.
+
+    Best-effort, and never raising: the caller is already unwinding an exception
+    the operator has to see, and a cleanup failure replacing it is the one outcome
+    that must not happen. The enumerable failures are :class:`runs.LiveSessionError`
+    (the guard refusing), ``OSError`` (the removal, or ``project.resolve()`` on a
+    path the OS cannot canonicalize) and ``RuntimeError`` (how ``Path.resolve``
+    reports a symlink loop below 3.13 — see ``runs._discard_state_dir``). It is not
+    written as that tuple because ``delete_run`` reaches the multiplexer registry
+    through :func:`runs.live_session_may_be_ours`, an extension point an out-of-tree
+    backend can make raise anything, so an enumerated list is one a third-party
+    backend falsifies. ``Exception`` and not ``BaseException``: a
+    ``KeyboardInterrupt`` arriving during the cleanup still belongs to the operator.
+
+    But not *silent*, which is a separate decision from not *raising* and was
+    previously conflated with it. "Repair writes must raise" (AGENTS.md) cannot be
+    honored literally here — raising is precisely what would swallow the launch
+    error — so the obligation it encodes is discharged by reporting instead.
+    Swallowing a failed unwind leaves exactly the resumable-looking ghost run this
+    function exists to prevent, and leaves it inferable only from the ABSENCE of an
+    effect: the operator reads the launch error, and nothing anywhere says the
+    cleanup after it did not happen."""
+    try:
+        runs.delete_run(project, run_dir)
+    except Exception as e:
+        detail = f"{type(e).__name__}: {e}"
+        print(
+            f"warning: could not remove the partially composed run {run_dir.name}: "
+            f"{detail} — it may look resumable; remove it with "
+            f"`bmad-loop delete {run_dir.name}`",
+            file=sys.stderr,
+        )
+        # The journal lives INSIDE the run dir, so this lands for every failure that
+        # leaves one behind — the guard refusing, or a failed `rmtree` — which is
+        # also the only case where a ghost run is what the operator will find. When
+        # `_discard_state_dir` is instead what failed the dir is already gone, and
+        # `Journal.append` opens with "a" WITHOUT a mkdir, so it raises rather than
+        # resurrecting the run it just removed. Suppressed, and the stderr line
+        # above still carries the report.
+        #
+        # ``journal`` is None when the composer aborted between claiming the run dir
+        # and building the Journal — a window only a signal can realistically land
+        # in. Guarded explicitly rather than left to the ``suppress`` above: an
+        # AttributeError on None IS an Exception and would be swallowed, so the
+        # code would work by accident while reading as though a Journal were
+        # guaranteed. The stderr report is the part that matters and is unaffected.
+        if journal is not None:
+            with suppress(Exception):
+                journal.append("composition-unwind-failed", run_id=run_dir.name, error=detail)
+
+
 def compose_run(
     *,
     project: Path,
@@ -793,7 +932,7 @@ def compose_run(
     max_stories: int | None,
     stories_on: bool,
     spec_folder: str,
-    sweep_factory: Callable[[str], None],
+    sweep_factory: SweepFactory,
     make_adapters: MakeAdapters,
     engine_cls: type[Engine],
     stories_engine_cls: type[StoriesEngine],
@@ -822,51 +961,69 @@ def compose_run(
     """
     run_id = run_id or runs.new_run_id()
     run_dir = project / RUNS_DIR / run_id
-    journal = Journal(run_dir)
-    state = build_run_state(
-        run_id=run_id,
-        project=project,
-        policy=policy,
-        epic_filter=epic_filter,
-        story_filter=story_filter,
-        max_stories=max_stories,
-        stories_on=stories_on,
-        spec_folder=spec_folder,
-        trusted_config_digest=trusted_config_digest,
-    )
-    save_state(run_dir, state)
-    # After the run dir exists (Journal mkdir'd it above) and before the pid lands:
-    # the ordering `reconcile_orphan_state_dirs` reads runs in, and a stamp that
-    # cannot be written fails the launch before an observer can see a live run.
-    runs.write_trusted_config_digest(project, run_id, trusted_config_digest)
-    runs.write_pid(run_dir)
-    adapters = make_adapters(project, run_dir, policy, profiles=profiles)
-    journal.append(
-        "run-start",
-        run_id=run_id,
-        source=state.source,
-        adapter_dev=policy.adapter.resolved("dev").name,
-        adapter_review=policy.adapter.resolved("review").name,
-    )
-    common = dict(
-        paths=paths,
-        policy=policy,
-        adapter=adapters["dev"],
-        review_adapter=adapters["review"],
-        run_dir=run_dir,
-        journal=journal,
-        state=state,
-        max_stories=max_stories,
-        epic_filter=epic_filter,
-        story_filter=story_filter,
-        sweep_factory=sweep_factory,
-    )
-    # heterogeneous **kwargs: pyright unions the dict values; per-arg error is spurious
-    engine: Engine = (
-        stories_engine_cls(**common, spec_folder=spec_folder)
-        if stories_on
-        else engine_cls(**common)  # pyright: ignore[reportArgumentType]
-    )
+    # Outside the try below, and it must stay there: a collision refusal that
+    # reached `_unwind_composition` would delete the run it exists to protect.
+    _claim_run_dir(run_dir)
+    # Composition is atomic from the first published artifact onward: everything
+    # below either lands whole or is unwound (see :func:`_unwind_composition`,
+    # which also states why the arm is `BaseException` and not `Exception`).
+    # The guard opens on the statement immediately after the claim, because the
+    # claim is what publishes that first artifact — the run DIRECTORY itself, which
+    # is what a later `--run-id` collides with. Neither statement below can
+    # realistically fail (`Journal` mkdirs `exist_ok=True` over a directory this
+    # frame just created, and `build_run_state` is a pure constructor), but a
+    # signal can land between any two statements, and the arm is `BaseException`
+    # exactly so that case unwinds instead of stranding an empty run dir.
+    journal: Journal | None = None
+    try:
+        journal = Journal(run_dir)
+        state = build_run_state(
+            run_id=run_id,
+            project=project,
+            policy=policy,
+            epic_filter=epic_filter,
+            story_filter=story_filter,
+            max_stories=max_stories,
+            stories_on=stories_on,
+            spec_folder=spec_folder,
+            trusted_config_digest=trusted_config_digest,
+        )
+        save_state(run_dir, state)
+        # After the run dir exists (Journal mkdir'd it above) and before the pid lands:
+        # the ordering `reconcile_orphan_state_dirs` reads runs in, and a stamp that
+        # cannot be written fails the launch before an observer can see a live run.
+        runs.write_trusted_config_digest(project, run_id, trusted_config_digest)
+        runs.write_pid(run_dir)
+        adapters = make_adapters(project, run_dir, policy, profiles=profiles)
+        journal.append(
+            "run-start",
+            run_id=run_id,
+            source=state.source,
+            adapter_dev=policy.adapter.resolved("dev").name,
+            adapter_review=policy.adapter.resolved("review").name,
+        )
+        common = dict(
+            paths=paths,
+            policy=policy,
+            adapter=adapters["dev"],
+            review_adapter=adapters["review"],
+            run_dir=run_dir,
+            journal=journal,
+            state=state,
+            max_stories=max_stories,
+            epic_filter=epic_filter,
+            story_filter=story_filter,
+            sweep_factory=sweep_factory,
+        )
+        # heterogeneous **kwargs: pyright unions the dict values; per-arg error is spurious
+        engine: Engine = (
+            stories_engine_cls(**common, spec_folder=spec_folder)
+            if stories_on
+            else engine_cls(**common)  # pyright: ignore[reportArgumentType]
+        )
+    except BaseException:
+        _unwind_composition(project, run_dir, journal)
+        raise
     return ComposedRun(engine=engine, run_id=run_id, run_dir=run_dir, state=state, journal=journal)
 
 
@@ -886,6 +1043,7 @@ def compose_sweep(
     sweep_engine_cls: type[SweepEngine],
     trusted_config_digest: str,
     profiles: dict[str, CLIProfile] | None = None,
+    on_started: Callable[[], None] | None = None,
 ) -> ComposedRun:
     """Stand up a sweep run: allocate the run dir, persist state + pid, record the
     sweep options, build the adapters, and wire the ``SweepEngine`` — everything
@@ -902,54 +1060,107 @@ def compose_sweep(
     (see :func:`compose_resume`). ``make_adapters`` and ``sweep_engine_cls`` are
     injected so ``cli`` supplies its own module-level names — keeping the test
     suite's ``monkeypatch.setattr(cli, "SweepEngine"/"_make_adapters", ...)``
-    effective."""
+    effective.
+
+    ``on_started`` is the auto-sweep parent's latch (``engine.SweepFactory``'s
+    ``started`` thunk, threaded through ``cli._start_sweep``): a parent run spends
+    its one trigger for this ``trigger`` string only if this fires.
+    ``cmd_sweep`` passes nothing — a human started that one, and there is no
+    trigger to spend.
+
+    It fires as the LAST statement of the composition block, which is the boundary
+    that makes "started" mean something the parent can act on: from here the child
+    owns a published run dir, ``sweep.json`` and a live pid file, so a later
+    failure leaves a run ``bmad-loop resume`` can pick up rather than nothing at
+    all. Before commit ``9c7a284`` the boundary had to sit at ``save_state``
+    instead — an abort anywhere after it stranded a resumable-looking run dir, and
+    :func:`compose_resume` will rebuild a sweep from ``state.json`` alone,
+    tolerating a missing ``sweep.json``, so "it never got far enough to resume"
+    was not true of the intervening steps. What moved it here is that block's
+    ``except BaseException`` arm, added by that commit, which unwinds the whole
+    partial composition.
+
+    That premise has one documented exception, and it is worth reading rather than
+    waving at: :func:`_unwind_composition` is best-effort — ``force=False`` leaves
+    ``runs.delete_run``'s live-session guard armed, and the call sits under
+    ``suppress(Exception)`` — so a refused or failed unwind CAN leave a resumable
+    child behind while ``on_started`` never fired. On the auto path that needs a
+    live ``bmad-loop-<id>`` session at this run's id, and the path mints the id
+    here: ``cli._sweep_factory`` calls ``_start_sweep`` with no ``run_id``, and the
+    only caller that supplies one is ``cmd_sweep`` (``--run-id``), which passes no
+    ``on_started``. So reaching it needs a live session at an id that names no run
+    of its own — an orphan outliving its run dir — because a collision with a run
+    that still EXISTS is now refused before anything is published
+    (:func:`_claim_run_dir`), and a :func:`runs.new_run_id` collision is remote to
+    begin with. The latch boundary is not the place to answer what is left.
+
+    Firing inside the block rather than after it is deliberate for the same
+    reason: should the latch itself raise, the unwind covers it, and the parent's
+    in-memory flag — set BEFORE its write, see ``engine._maybe_auto_sweep`` —
+    refuses a second attempt either way. At-most-once therefore holds independently
+    of the unwind; what the unwind decides is only what that refusal costs. Normally
+    it refuses a child that left nothing behind; under the refused unwind above it
+    refuses one that is composed and resumable, which is the better of the two.
+    Neither is a second launch, and that is the safe direction for a launcher."""
     run_id = run_id or runs.new_run_id()
     run_dir = project / RUNS_DIR / run_id
-    journal = Journal(run_dir)
-    state = RunState(
-        run_id=run_id,
-        project=str(project),
-        started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
-        policy_snapshot=policy.to_dict(),
-        run_type="sweep",
-        trusted_config_digest=trusted_config_digest,
-    )
-    save_state(run_dir, state)
-    # Out of the tree, same ordering and same reason as compose_run's stamp.
-    runs.write_trusted_config_digest(project, run_id, trusted_config_digest)
-    runs.write_pid(run_dir)
-    options = {
-        "prompting": prompting,
-        "decisions_only": decisions_only,
-        "max_bundles": max_bundles,
-        "repeat": repeat,
-        "max_cycles": max_cycles,
-        "trigger": trigger,
-    }
-    # Persist the sweep options atomically (tmp + os.replace), the way save_state
-    # writes state.json: a resume reads this back to rebuild the SweepEngine, so a
-    # crash mid-write must not leave a torn file the recovery path then chokes on.
-    sweep_path = run_dir / "sweep.json"
-    sweep_tmp = sweep_path.with_suffix(".json.tmp")
-    sweep_tmp.write_text(json.dumps(options, indent=2), encoding="utf-8")
-    atomic_replace(sweep_tmp, sweep_path)
-    adapters = make_adapters(project, run_dir, policy, profiles=profiles)
-    journal.append("run-start", run_id=run_id, run_type="sweep", trigger=trigger)
-    engine: Engine = sweep_engine_cls(
-        paths=paths,
-        policy=policy,
-        adapter=adapters["dev"],
-        review_adapter=adapters["review"],
-        triage_adapter=adapters["triage"],
-        run_dir=run_dir,
-        journal=journal,
-        state=state,
-        prompting=prompting,
-        decisions_only=decisions_only,
-        max_bundles=max_bundles,
-        repeat=repeat,
-        max_cycles=max_cycles,
-    )
+    # Same claim, same reason, same placement outside the try as in `compose_run`.
+    _claim_run_dir(run_dir)
+    # Atomic from the first published artifact onward, exactly as in `compose_run`
+    # — same reason, same opening on the statement after the claim, and one more
+    # artifact to unwind (`sweep.json`).
+    journal: Journal | None = None
+    try:
+        journal = Journal(run_dir)
+        state = RunState(
+            run_id=run_id,
+            project=str(project),
+            started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+            policy_snapshot=policy.to_dict(),
+            run_type="sweep",
+            trusted_config_digest=trusted_config_digest,
+        )
+        save_state(run_dir, state)
+        # Out of the tree, same ordering and same reason as compose_run's stamp.
+        runs.write_trusted_config_digest(project, run_id, trusted_config_digest)
+        runs.write_pid(run_dir)
+        options = {
+            "prompting": prompting,
+            "decisions_only": decisions_only,
+            "max_bundles": max_bundles,
+            "repeat": repeat,
+            "max_cycles": max_cycles,
+            "trigger": trigger,
+        }
+        # Persist the sweep options atomically (tmp + os.replace), the way save_state
+        # writes state.json: a resume reads this back to rebuild the SweepEngine, so a
+        # crash mid-write must not leave a torn file the recovery path then chokes on.
+        sweep_path = run_dir / "sweep.json"
+        sweep_tmp = sweep_path.with_suffix(".json.tmp")
+        sweep_tmp.write_text(json.dumps(options, indent=2), encoding="utf-8")
+        atomic_replace(sweep_tmp, sweep_path)
+        adapters = make_adapters(project, run_dir, policy, profiles=profiles)
+        journal.append("run-start", run_id=run_id, run_type="sweep", trigger=trigger)
+        engine: Engine = sweep_engine_cls(
+            paths=paths,
+            policy=policy,
+            adapter=adapters["dev"],
+            review_adapter=adapters["review"],
+            triage_adapter=adapters["triage"],
+            run_dir=run_dir,
+            journal=journal,
+            state=state,
+            prompting=prompting,
+            decisions_only=decisions_only,
+            max_bundles=max_bundles,
+            repeat=repeat,
+            max_cycles=max_cycles,
+        )
+        if on_started is not None:
+            on_started()
+    except BaseException:
+        _unwind_composition(project, run_dir, journal)
+        raise
     return ComposedRun(engine=engine, run_id=run_id, run_dir=run_dir, state=state, journal=journal)
 
 
@@ -961,7 +1172,7 @@ def compose_resume(
     state: RunState,
     policy: Policy,
     journal: Journal,
-    sweep_factory: Callable[[str], None],
+    sweep_factory: SweepFactory,
     make_adapters: MakeAdapters,
     engine_cls: type[Engine],
     stories_engine_cls: type[StoriesEngine],

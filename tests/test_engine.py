@@ -2,6 +2,7 @@
 
 import dataclasses
 import hashlib
+import json
 import os
 import re
 import signal
@@ -42,6 +43,9 @@ from bmad_loop.model import (
     PAUSE_ESCALATION,
     PAUSE_SPEC_APPROVAL,
     PAUSE_STORY_GATE,
+    SWEEP_REFUSED_DIRTY,
+    SWEEP_REFUSED_FAILED,
+    SWEEP_REFUSED_NOT_STARTED,
     Phase,
     RunState,
     SessionRecord,
@@ -1233,6 +1237,62 @@ def test_run_summary_render_names_parked_stories_only_when_there_are_any(project
     )
 
     assert "1 awaiting operator" in engine.summary().render()
+
+
+def test_run_summary_projects_and_renders_a_refused_auto_sweep(project):
+    """#501's closing note: a refused auto-sweep was journal-only, so the run's
+    terminal output was byte-identical to a run that swept. Under
+    `[sweep] auto = "run-end"` there is one trigger per run and it is not re-asked
+    once the run finishes, so this line is the whole remedy.
+
+    The clean-worktree clause is not decoration: `cmd_sweep` hard-refuses an
+    unclean tree, so a `dirty` refusal whose follow-up omitted it would walk the
+    operator straight into a second refusal.
+
+    Ablation, three disjoint axes: (a) drop `sweeps_refused=` from `summary()` and
+    both the projection and the render assert fail while the absence assert stays
+    green; (b) delete the `if self.sweeps_refused:` block in `render()` and only
+    the render asserts fail; (c) delete the `sweep` clause from that block's text
+    and only the last assert fails."""
+    engine = _cache_heavy_engine(project, snapshot_weight=0.5, live_weight=0.5, usage=TokenUsage())
+    assert "SWEEP NOT RUN" not in engine.summary().render()  # absent when nothing refused
+
+    engine.state.sweeps_refused["run-end"] = SWEEP_REFUSED_DIRTY
+
+    summary = engine.summary()
+    assert summary.sweeps_refused == (("run-end", SWEEP_REFUSED_DIRTY),)
+    rendered = summary.render()
+    assert "SWEEP NOT RUN: run-end (dirty)" in rendered
+    assert "bmad-loop sweep" in rendered and "clean worktree" in rendered
+
+
+def test_run_summary_snapshots_rather_than_aliases_the_refusal_record(project):
+    """`summary()` is a pure projection of `self.state` (see its docstring), and a
+    snapshot that keeps mutating with the engine is not one.
+
+    `RunSummary` is `frozen=True`, so the field is a tuple of pairs rather than
+    the dict `RunState` holds — which buys two things a dict cannot. The copy is
+    structural, not a `dict(...)` convention a later edit could quietly drop; and
+    the class stays hashable, since frozen+eq synthesizes `__hash__` over the
+    fields and a dict field makes that raise. Nothing hashes a RunSummary today —
+    precisely why that regression would ship unnoticed — so it is pinned here.
+
+    Ablation: change `sweeps_refused=tuple(self.state.sweeps_refused.items())` to
+    `sweeps_refused=self.state.sweeps_refused`. This reddens EIGHT tests, not one
+    — recorded as measured, not as first guessed. Only two fail on the snapshot
+    claim; the other six die in `render()` with `ValueError: too many values to
+    unpack`, because iterating a dict yields bare keys and the line unpacks pairs.
+    That is the same "a dict yields keys" degradation that keeps this field out of
+    `sweeps_triggered`, and it means the ablation is loud rather than subtle. This
+    test is the one that grades the snapshot semantics specifically."""
+    engine = _cache_heavy_engine(project, snapshot_weight=0.5, live_weight=0.5, usage=TokenUsage())
+    engine.state.sweeps_refused["run-end"] = SWEEP_REFUSED_DIRTY
+    summary = engine.summary()
+
+    engine.state.sweeps_refused["epic-1"] = SWEEP_REFUSED_FAILED
+
+    assert summary.sweeps_refused == (("run-end", SWEEP_REFUSED_DIRTY),)
+    assert hash(summary)  # frozen means hashable; a dict field would TypeError
 
 
 # ---------------------------------------- awaiting-operator park path (#335)
@@ -7505,6 +7565,23 @@ def test_max_stories_survives_a_pause_resume(project):
     assert set(final.tasks) == {"1-1-a", "2-1-b"}  # 2-2-c never dispatched — cap durable
 
 
+def recording_factory(calls: list):
+    """An `engine.SweepFactory` double for a child sweep that composes fine:
+    records the trigger and signals `started`, the way `runsetup.compose_sweep`
+    does once the child owns a published run dir.
+
+    It signals deliberately rather than leaning on the engine's latch-on-plain-
+    return arm — a double that never called `started` would quietly measure the
+    nothing-was-launched path in every test that uses it. The plain-return arm has
+    its own test (`test_auto_sweep_latches_a_factory_that_never_signalled`)."""
+
+    def factory(trigger: str, *, started) -> None:
+        started()
+        calls.append(trigger)
+
+    return factory
+
+
 def test_run_end_auto_sweep_fires_once(project):
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     policy = Policy(gates=GatesPolicy(mode="none"), notify=QUIET, sweep=SweepPolicy(auto="run-end"))
@@ -7513,7 +7590,7 @@ def test_run_end_auto_sweep_fires_once(project):
         project,
         [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
         policy=policy,
-        sweep_factory=calls.append,
+        sweep_factory=recording_factory(calls),
     )
     summary = engine.run()
     assert summary.done == 1 and not summary.paused
@@ -7544,7 +7621,7 @@ def test_per_epic_auto_sweep_fires_at_boundary(project):
             review_effect(project, "2-1-b", clean=True),
         ],
         policy=policy,
-        sweep_factory=calls.append,
+        sweep_factory=recording_factory(calls),
     )
     summary = engine.run()
     assert summary.done == 2
@@ -7552,8 +7629,16 @@ def test_per_epic_auto_sweep_fires_at_boundary(project):
 
 
 def test_auto_sweep_no_refire_on_resume(project):
-    """The per-epic trigger is recorded before the gate pause, so resuming
-    the run must not fire the same sweep again."""
+    """The per-epic trigger is recorded before the gate pause, so resuming the run
+    must not fire the same sweep again.
+
+    Green-ablation record, so this row is not miscounted as coverage of the latch:
+    it stays green with `sweeps_triggered` never written at all, because
+    `_epic_boundary` also advances `state.current_epic` before pausing and the
+    resumed run therefore never re-detects the epic-1 boundary. Both mechanisms
+    hold here; only one of them is the latch.
+    `test_auto_sweep_that_started_then_failed_keeps_the_trigger_spent` isolates
+    it."""
     write_sprint(
         project,
         {
@@ -7573,7 +7658,7 @@ def test_auto_sweep_no_refire_on_resume(project):
         project,
         [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
         policy=policy,
-        sweep_factory=calls.append,
+        sweep_factory=recording_factory(calls),
     )
     assert engine.run().paused
     assert calls == ["epic-1"]
@@ -7590,17 +7675,28 @@ def test_auto_sweep_no_refire_on_resume(project):
         run_dir=engine.run_dir,
         journal=engine.journal,
         state=state,
-        sweep_factory=calls.append,
+        sweep_factory=recording_factory(calls),
     )
     assert resumed.run().done == 2
     assert calls == ["epic-1"]  # not re-fired
 
 
 def test_auto_sweep_failure_does_not_pause_parent(project):
+    """A child that raises before signalling `started` never composed, so the
+    parent journals `sweep-auto-not-started` and leaves the trigger unspent —
+    read back off disk, because the whole subject is durable run state and an
+    in-memory list can agree with a state.json that does not.
+
+    Ablation: make the `except (Exception, SystemExit)` arm call `latch()` before
+    its `if latched:` branch — spending the trigger on any raise, which is what
+    #501 changed — and the reloaded-state assert fails. Not alone: it shares that
+    mutation with the three other never-started rows (`..._re_asks_...`,
+    `..._system_exit_...`, `..._config_digest_refusal_...`), which is coverage
+    rather than duplication, since each names a different way a child declines."""
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     policy = Policy(gates=GatesPolicy(mode="none"), notify=QUIET, sweep=SweepPolicy(auto="run-end"))
 
-    def exploding(trigger):
+    def exploding(trigger, *, started):
         raise RuntimeError("child sweep blew up")
 
     engine, _ = make_engine(
@@ -7613,19 +7709,417 @@ def test_auto_sweep_failure_does_not_pause_parent(project):
     assert summary.done == 1 and not summary.paused
     assert engine.state.finished
     journal = (engine.run_dir / "journal.jsonl").read_text()
-    assert "sweep-auto-failed" in journal and "child sweep blew up" in journal
+    assert "sweep-auto-not-started" in journal and "child sweep blew up" in journal
+    assert "sweep-auto-failed" not in journal  # nothing ran, so nothing failed
+    assert load_state(engine.run_dir).sweeps_triggered == []
+
+
+def test_auto_sweep_latches_a_factory_that_never_signalled(project):
+    """The at-most-once control on the other side: a factory that returns
+    normally has run a child sweep, whether or not it bothered to call `started`
+    — the thunk exists to classify a *raise*. Without this the plain-return arm
+    could be dropped and every remaining test would still pass, because the
+    product's own factory signals.
+
+    Ablation: delete the `latch()` call from `_maybe_auto_sweep`'s `else` arm and
+    this test fails alone."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    policy = Policy(gates=GatesPolicy(mode="none"), notify=QUIET, sweep=SweepPolicy(auto="run-end"))
+    calls = []
+
+    def silent(trigger, *, started):
+        calls.append(trigger)  # deliberately never calls `started`
+
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=policy,
+        sweep_factory=silent,
+    )
+    engine.run()
+
+    assert calls == ["run-end"]
+    assert load_state(engine.run_dir).sweeps_triggered == ["run-end"]
+    assert "sweep-auto-finished" in (engine.run_dir / "journal.jsonl").read_text()
+
+
+def _re_ask(project, engine, policy, factory) -> Engine:
+    """A second engine over the run's state as it was persisted — the shape a
+    resume rebuilds, and the only way an already-answered trigger gets asked
+    again (see `_maybe_auto_sweep`'s crash-window verdict). Returned unrun so the
+    caller drives `_maybe_auto_sweep` directly: reaching the same trigger through
+    a whole second `run()` would depend on `finished`/`current_epic`, which is
+    exactly what these two tests must not measure."""
+    return Engine(
+        paths=project,
+        policy=policy,
+        adapter=MockAdapter([]),
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=load_state(engine.run_dir),
+        sweep_factory=factory,
+    )
+
+
+def test_auto_sweep_that_started_then_failed_keeps_the_trigger_spent(project):
+    """The at-most-once control, without which the fix is indistinguishable from
+    "never latch on a failure". Once `started` fires the child owns a published,
+    resumable run dir, so a failure after that point must still spend the trigger
+    — and durably, since the re-ask arrives through a rebuilt engine.
+
+    Ablation: empty out `latch()` (keep the def, drop its body) and this test
+    fails — the re-ask fires a second child. Not alone: that mutation stops the
+    trigger being recorded at all, so it also reddens `test_run_end_auto_sweep_fires_once`,
+    `..._latches_a_factory_that_never_signalled` and `..._run_stopped_stops_the_parent`.
+    Those three grade "it is recorded"; only this one grades "it survives a
+    failure that came after."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    policy = Policy(gates=GatesPolicy(mode="none"), notify=QUIET, sweep=SweepPolicy(auto="run-end"))
+    calls = []
+
+    def started_then_failed(trigger, *, started):
+        started()
+        calls.append(trigger)
+        raise RuntimeError("child sweep died after its run dir was published")
+
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=policy,
+        sweep_factory=started_then_failed,
+    )
+    summary = engine.run()
+
+    assert summary.done == 1 and engine.state.finished  # parent unaffected
+    assert calls == ["run-end"]
+    saved = load_state(engine.run_dir)
+    assert saved.sweeps_triggered == ["run-end"]
+    # The one shape that lands in BOTH records, and the reason `sweeps_refused`
+    # is a sibling of the latch rather than a widening of it: the trigger really
+    # was spent (a resumable child exists), and the sweep really did not deliver.
+    assert saved.sweeps_refused == {"run-end": SWEEP_REFUSED_FAILED}
+    journal = (engine.run_dir / "journal.jsonl").read_text()
+    assert "sweep-auto-failed" in journal  # it ran, and then it failed
+    assert "sweep-auto-not-started" not in journal
+
+    _re_ask(project, engine, policy, started_then_failed)._maybe_auto_sweep("run-end", "run-end")
+    assert calls == ["run-end"]  # refused by the persisted latch
+
+
+def test_auto_sweep_re_asks_a_trigger_whose_child_never_started(project):
+    """The twin, and the narrow thing the reordering actually buys: a trigger the
+    factory refused before composing is still askable. Not a retry the product
+    schedules — `_maybe_auto_sweep`'s docstring establishes that both call sites
+    close their own boundary within a few statements — but it is what makes the
+    crash window recoverable rather than a permanently spent trigger, and it is
+    the observable that grades the whole change.
+
+    Two ablations, and the second is the sharper one. Restore the pre-#501
+    ordering — insert `sweeps_triggered.append(trigger)` + `_save()` above the
+    `verify.worktree_clean` block — and this test fails, along with nine other
+    rows, because that mutation also double-records every successful sweep. Make
+    the `except (Exception, SystemExit)` arm call `latch()` unconditionally
+    instead, which is the same semantics without the noise, and it fails with
+    four (see `test_auto_sweep_failure_does_not_pause_parent`). Neither is
+    "alone"; what is unique to this row is the second ask."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    policy = Policy(gates=GatesPolicy(mode="none"), notify=QUIET, sweep=SweepPolicy(auto="run-end"))
+    calls = []
+
+    def refusing(trigger, *, started):
+        calls.append(trigger)
+        raise RuntimeError("policy.toml changed under a running loop")
+
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=policy,
+        sweep_factory=refusing,
+    )
+    engine.run()
+    assert calls == ["run-end"]
+    assert load_state(engine.run_dir).sweeps_triggered == []
+
+    _re_ask(project, engine, policy, refusing)._maybe_auto_sweep("run-end", "run-end")
+    assert calls == ["run-end", "run-end"]  # asked again, because nothing was spent
+
+
+def test_auto_sweep_not_started_still_notifies_with_its_own_wording(project, monkeypatch):
+    """`sweep-auto-not-started` keeps a `gates.notify`, and keeps a distinct one.
+    Recoverable is not the same as unremarkable: the loudest raise that reaches
+    this arm is #461 point 4's config-integrity refusal — a session rewrote the
+    verify commands, the launch binary or the plugin allowlist under a running
+    loop — and that is a security event whether or not the trigger survived it.
+    Losing the alert while gaining the retry would be a bad trade.
+
+    Ablation: delete the `gates.notify` call from the not-started arm and this
+    test fails alone. Ablate the WORDING instead — pass the failed arm's "auto
+    sweep failed" — and it fails alone again, on the title assert, which is the
+    point of asserting the title at all: the two arms describe different things to
+    a human deciding whether to intervene."""
+    notes = []
+    monkeypatch.setattr(
+        "bmad_loop.gates.notify",
+        lambda policy, rd, title, message: notes.append((title, message)),
+    )
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    policy = Policy(gates=GatesPolicy(mode="none"), notify=QUIET, sweep=SweepPolicy(auto="run-end"))
+
+    def refusing(trigger, *, started):
+        raise RuntimeError("policy.toml/profiles changed under a running loop")
+
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=policy,
+        sweep_factory=refusing,
+    )
+    engine.run()
+
+    # filtered off the run-finished notice the clean-finish path also emits
+    sweep_notes = [n for n in notes if "sweep" in n[0]]
+    assert len(sweep_notes) == 1
+    title, message = sweep_notes[0]
+    assert title == "auto sweep did not start"
+    assert title != "auto sweep failed"  # the failed arm's wording, deliberately not reused
+    assert "run-end" in message and "changed under a running loop" in message
+
+
+def _sweep_gate_engine(project, sweep_factory):
+    """An engine parked at the auto-sweep gate: `run-end` policy, a published
+    state.json (so the reload asserts below read a real file rather than error),
+    and no story loop — the two refusals under test are driven by calling
+    `_maybe_auto_sweep` directly, which is where they are decided."""
+    policy = Policy(gates=GatesPolicy(mode="none"), notify=QUIET, sweep=SweepPolicy(auto="run-end"))
+    engine, _ = make_engine(project, [], policy=policy, sweep_factory=sweep_factory)
+    engine._save()
+    return engine
+
+
+def _skipped_dirty(engine) -> list[dict]:
+    return [e for e in engine.journal.entries() if e["kind"] == "sweep-auto-skipped-dirty"]
+
+
+def test_auto_sweep_skips_a_dirty_tree_and_keeps_the_trigger(project):
+    """First test to reach `sweep-auto-skipped-dirty` at all. A stray uncommitted
+    change should not happen at either call site — both sit after a commit or a
+    reset — so this arm is a backstop, and until #501 it was a backstop that spent
+    the run's one sweep trigger on its way out.
+
+    Ablation: delete the `if not clean:` block and this test fails alone — the
+    factory runs on top of the stray change. Second axis, for the ordering rather
+    than the refusal: restore the pre-#501 `sweeps_triggered.append` above the
+    check and the trigger assert fails (in a set of ten — see
+    `test_auto_sweep_re_asks_a_trigger_whose_child_never_started`)."""
+    calls = []
+    (project.project / "stray.txt").write_text("uncommitted\n", encoding="utf-8")
+    engine = _sweep_gate_engine(project, recording_factory(calls))
+
+    engine._maybe_auto_sweep("run-end", "run-end")
+
+    assert calls == []
+    assert [e["reason"] for e in _skipped_dirty(engine)] == ["dirty"]
+    saved = load_state(engine.run_dir)
+    assert saved.sweeps_triggered == []
+    # ...and, since #501's visibility phase, the refusal is durable rather than
+    # journal-only. Third ablation axis: delete the `_record_sweep_refusal` call
+    # from the `if not clean:` block and this line fails while the two above stay
+    # green — they grade the refusal, this one grades the record of it.
+    assert saved.sweeps_refused == {"run-end": SWEEP_REFUSED_DIRTY}
+
+
+def test_auto_sweep_skips_a_git_fault_and_keeps_the_trigger(project, monkeypatch):
+    """The arm that motivated the reordering, and the one a `reason` field now
+    tells apart from a genuinely dirty tree. `verify.worktree_clean` fails closed
+    on a `GitError` — right, since an unknown tree state is no basis for a sweep —
+    but `_run_git` reports a `subprocess.TimeoutExpired` as exactly that, so a
+    `git status` that merely ran long used to spend this run's only sweep trigger,
+    permanently and with nothing in the journal to say a *fault* had happened.
+
+    Driven through a real `TimeoutExpired` out of `subprocess.run` rather than a
+    stubbed `worktree_clean`, because the translation IS the claim: stubbing the
+    GitError would assume the very step that makes this arm transient-reachable.
+
+    Ablation: delete the `except verify.GitError` arm and this test fails alone —
+    the GitError escapes `_maybe_auto_sweep` and crashes the run. Second axis, as
+    for the dirty twin: restore the pre-#501 `sweeps_triggered.append` above the
+    check and the trigger assert fails (in a set of ten)."""
+    calls = []
+    engine = _sweep_gate_engine(project, recording_factory(calls))
+
+    def timing_out(cmd, **kwargs):
+        raise verify.subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 1))
+
+    monkeypatch.setattr(verify.subprocess, "run", timing_out)
+
+    engine._maybe_auto_sweep("run-end", "run-end")
+
+    assert calls == []
+    skipped = _skipped_dirty(engine)
+    assert [e["reason"] for e in skipped] == ["git-error"]
+    assert "timed out" in skipped[0]["error"]  # the fault is named, not swallowed
+    saved = load_state(engine.run_dir)
+    assert saved.sweeps_triggered == []
+    # The durable record folds this arm in with the dirty twin: the journal keeps
+    # `git-error` vs `dirty` apart for forensics, while the operator-facing slug
+    # answers only "the sweep did not run" — and its next action (`bmad-loop
+    # sweep` on a clean tree) is the same either way.
+    assert saved.sweeps_refused == {"run-end": SWEEP_REFUSED_DIRTY}
+
+
+def test_auto_sweep_system_exit_does_not_kill_the_parent(project):
+    """#501: a child sweep that dies on `SystemExit` is a failed child like any
+    other, and the "never interrupts this run" contract has to cover it. It is a
+    `BaseException`, so a guard written over `Exception` missed it here, in every
+    arm of `_run_inner`, and in `cli.main`: it unwound to process exit 1 with the
+    parent left neither `finished` nor `crashed`, no `run-complete`, and an
+    orphaned agent session.
+
+    Not a hypothetical shape — `runsetup.make_adapters` raises exactly this for
+    an unresolvable profile, an unknown/unloadable adapter kind, a failed adapter
+    construction, and an unusable multiplexer; that last gate re-probes live
+    (`mux_usable` bottoms out in a bare `shutil.which`) on every call, so a child
+    sweep can hit it in a parent run that launched fine.
+
+    Every one of those five sites is inside `compose_sweep`, ahead of the
+    `on_started` boundary, so this models the raise WITHOUT signalling and the
+    record is `sweep-auto-not-started`: no child run dir survives an adapter build
+    that exits.
+
+    Ablation: drop `SystemExit` from the `except (Exception, SystemExit)` tuple
+    in `_maybe_auto_sweep` and this test fails alone — the SystemExit escapes
+    `engine.run()` instead of being journaled."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    policy = Policy(gates=GatesPolicy(mode="none"), notify=QUIET, sweep=SweepPolicy(auto="run-end"))
+
+    def exiting(trigger, *, started):
+        raise SystemExit("error: multiplexer backend is not usable on this host")
+
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=policy,
+        sweep_factory=exiting,
+    )
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    assert engine.state.finished
+    journal = (engine.run_dir / "journal.jsonl").read_text()
+    assert "sweep-auto-not-started" in journal and "not usable on this host" in journal
+    assert "run-complete" in journal
+    saved = load_state(engine.run_dir)
+    assert saved.sweeps_triggered == []
+    # The slug, never `str(e)`: the SystemExit message above is free-form operator
+    # text and could carry a home path, which `sanitize.guard` refuses to redact —
+    # it raises, taking the whole `diagnose` dump down with it. See model.py.
+    assert saved.sweeps_refused == {"run-end": SWEEP_REFUSED_NOT_STARTED}
+    assert "not usable on this host" not in json.dumps(saved.to_dict())
+
+
+def test_auto_sweep_run_stopped_stops_the_parent(project, monkeypatch):
+    """#501, the mirror image: `RunStopped` subclasses `Exception` but is not a
+    failed child at all. The child's hard-stop arm re-raises it *so the owner
+    records the stop*, so swallowing it as `sweep-auto-failed` was doubly wrong —
+    the parent ran on to `finished`, and it became unstoppable, because the
+    signal handler latches `_stopping = True` before raising and every later
+    SIGTERM then returns at that latch.
+
+    Signals `started` first, as the real shape does: a child only reaches its own
+    stop arm by running, which is well past `compose_sweep`'s boundary. So the
+    trigger stays spent here — the stop arm is the one raise that neither
+    classifies as a failure nor un-spends anything.
+
+    Ablation: delete the `except RunStopped: raise` arm from `_maybe_auto_sweep`
+    and this test fails alone — the stop is swallowed and the parent finishes."""
+    killed = []
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: killed.append(rid))
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    policy = Policy(gates=GatesPolicy(mode="none"), notify=QUIET, sweep=SweepPolicy(auto="run-end"))
+
+    def stopping(trigger, *, started):
+        started()
+        raise RunStopped()  # hard (graceful=False), as the child's stop arm re-raises
+
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=policy,
+        sweep_factory=stopping,
+    )
+    engine.run()
+
+    saved = load_state(engine.run_dir)
+    assert saved.stopped is True
+    assert not saved.finished  # the whole point: a stop must not read as a finish
+    assert saved.sweeps_triggered == ["run-end"]  # it ran; the stop does not un-spend it
+    # And it is not a refusal either — the `except RunStopped: raise` arm is ahead
+    # of both recording arms. INVERSE ablation (an absence): add a
+    # `_record_sweep_refusal(trigger, SWEEP_REFUSED_FAILED)` to that arm and this
+    # line fails, while the journal asserts below stay green.
+    assert saved.sweeps_refused == {}
+    assert killed == ["test-run"]
+    journal = (engine.run_dir / "journal.jsonl").read_text()
+    assert "run-stop" in journal
+    assert "sweep-auto-failed" not in journal  # a stop is not a failure
+    assert "sweep-auto-not-started" not in journal
+    assert "run-complete" not in journal
+
+
+def test_auto_sweep_keyboard_interrupt_still_propagates(project, monkeypatch):
+    """#501, the control on the fix's shape: the two arms above must never be
+    widened to a bare `BaseException`. `KeyboardInterrupt` has to keep escaping
+    `_maybe_auto_sweep`, because `_run_inner`'s own KeyboardInterrupt arm is what
+    records the controlled stop — and, for a nested child, re-raises it for the
+    owning engine.
+
+    INVERSE ablation (the guard here is an *absence* — deleting code cannot
+    reproduce the bug): widen the clause to `except (BaseException) as e:` and
+    this test fails alone — the interrupt is swallowed as `sweep-auto-failed`
+    and the parent finishes instead of stopping."""
+    killed = []
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: killed.append(rid))
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    policy = Policy(gates=GatesPolicy(mode="none"), notify=QUIET, sweep=SweepPolicy(auto="run-end"))
+
+    def interrupting(trigger, *, started):
+        started()  # Ctrl-C reaches a child that is already running
+        raise KeyboardInterrupt()
+
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=policy,
+        sweep_factory=interrupting,
+    )
+    engine.run()
+
+    saved = load_state(engine.run_dir)
+    assert saved.stopped is True
+    assert not saved.finished
+    assert killed == ["test-run"]
+    entries = engine.journal.entries()
+    stops = [e for e in entries if e["kind"] == "run-stop"]
+    assert stops and stops[0]["reason"] == "KeyboardInterrupt"
+    assert not [e for e in entries if e["kind"] in ("sweep-auto-failed", "sweep-auto-not-started")]
 
 
 def test_auto_sweep_config_digest_refusal_journals_and_spares_the_parent(project):
     """#461 point 4, end to end through the REAL factory rather than a stand-in
-    exploder: the config-integrity gate's raise has to land on the same
-    `sweep-auto-failed` + notify path every other child-sweep failure takes, and
-    the parent story loop has to finish anyway.
+    exploder: the config-integrity gate's raise has to land on the journal +
+    notify path every other unlaunched child takes, and the parent story loop has
+    to finish anyway.
 
     Pinning it here rather than trusting the exploder test above is the point —
     that one proves `_maybe_auto_sweep` catches *something*; this proves the gate
     raises (rather than returning quietly, which the engine would record as
-    `sweep-auto-finished`: a child sweep that ran when none was ever launched)."""
+    `sweep-auto-finished`: a child sweep that ran when none was ever launched).
+
+    The gate sits ahead of `_start_sweep`, so it cannot have signalled `started`
+    and the trigger survives the refusal — #501. A security refusal is still the
+    loudest thing here, which is why `sweep-auto-not-started` keeps its own
+    `gates.notify` (pinned by
+    `test_auto_sweep_not_started_still_notifies_with_its_own_wording`)."""
     from bmad_loop import cli
 
     write_sprint(project, {"1-1-a": "ready-for-dev"})
@@ -7645,9 +8139,10 @@ def test_auto_sweep_config_digest_refusal_journals_and_spares_the_parent(project
     assert summary.done == 1 and not summary.paused
     assert engine.state.finished
     journal = (engine.run_dir / "journal.jsonl").read_text()
-    assert "sweep-auto-failed" in journal
+    assert "sweep-auto-not-started" in journal
     assert "changed under a running loop before an auto-sweep" in journal
     assert "sweep-auto-finished" not in journal
+    assert load_state(engine.run_dir).sweeps_triggered == []
 
 
 def test_no_auto_sweep_by_default(project):
@@ -7656,7 +8151,7 @@ def test_no_auto_sweep_by_default(project):
     engine, _ = make_engine(
         project,
         [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
-        sweep_factory=calls.append,
+        sweep_factory=recording_factory(calls),
     )
     engine.run()
     assert calls == []
@@ -8282,7 +8777,7 @@ def test_epic_boundary_auto_sweep_suppressed_by_graceful_stop(project, monkeypat
             review_effect(project, "1-1-a", clean=True),
         ],
         policy=policy,
-        sweep_factory=calls.append,
+        sweep_factory=recording_factory(calls),
     )
     engine.run()
 
@@ -8295,13 +8790,17 @@ def test_epic_boundary_auto_sweep_suppressed_by_graceful_stop(project, monkeypat
 
 def test_maybe_auto_sweep_suppressed_when_graceful_stop_pending(project):
     """The run-end race: a request landing after the loop-head check reaches
-    _maybe_auto_sweep, which suppresses the sweep (return, not raise) and — because
-    the guard precedes the sweeps_triggered append — leaves the trigger unrecorded
-    so a later resume can still fire it."""
+    _maybe_auto_sweep, which suppresses the sweep (return, not raise) and leaves
+    the trigger unspent.
+
+    Unspent is honest bookkeeping, NOT a promised retry — at this call site the
+    return lands in `_loop`'s exit and then `finished = True`, which
+    `cli._resume_paused_run` refuses to resume. See `_maybe_auto_sweep`'s
+    docstring for the same verdict at both call sites."""
     policy = Policy(gates=GatesPolicy(mode="none"), notify=QUIET, sweep=SweepPolicy(auto="run-end"))
     calls = []
     run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
-    engine, _ = make_engine(project, [], policy=policy, sweep_factory=calls.append)
+    engine, _ = make_engine(project, [], policy=policy, sweep_factory=recording_factory(calls))
     _lodge_stop_request(run_dir)
 
     engine._maybe_auto_sweep("run-end", "run-end")
@@ -8310,7 +8809,17 @@ def test_maybe_auto_sweep_suppressed_when_graceful_stop_pending(project):
     kinds = [e["kind"] for e in engine.journal.entries()]
     assert "sweep-auto-suppressed" in kinds
     assert "sweep-auto-trigger" not in kinds
-    assert "run-end" not in engine.state.sweeps_triggered  # unrecorded → resumable
+    assert "run-end" not in engine.state.sweeps_triggered  # nothing started, nothing spent
+    # ...and deliberately NOT in `sweeps_refused` either, unlike every other
+    # non-delivering arm. This return sits AHEAD of the latch, so a resume can
+    # still fire the trigger — recording a refusal here would go stale the moment
+    # it does, which is exactly the dishonesty the record exists to prevent. The
+    # operator already has a louder signal: they asked for the stop.
+    #
+    # INVERSE ablation (the guard is an absence — deleting code cannot reproduce
+    # it): add `self._record_sweep_refusal(trigger, SWEEP_REFUSED_DIRTY)` above
+    # the suppressed journal append and this line fails alone.
+    assert engine.state.sweeps_refused == {}
 
 
 def test_pause_wins_over_pending_graceful_stop(project, monkeypatch):

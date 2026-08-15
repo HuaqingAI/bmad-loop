@@ -63,6 +63,18 @@ PAUSE_STORY_GATE = "story-gate"
 PAUSE_PLAN_CHECKPOINT = "plan-checkpoint"
 PAUSE_STORY_CHECKPOINT = "story-checkpoint"
 
+# Reasons recorded in RunState.sweeps_refused (trigger -> reason). A CLOSED
+# vocabulary of short slugs, deliberately not a formatted exception: `bmad-loop
+# diagnose` renders run state through `sanitize.guard`, which *raises*
+# LeakDetected on a home-path hit rather than redacting it (genuine PII never
+# auto-repairs — sanitize.py). A free-form `str(e)` here would therefore make the
+# dump fail outright on exactly the runs worth dumping, and the per-value
+# `looks_like_identifier` filter would blank it anyway. Add a slug, never a
+# message.
+SWEEP_REFUSED_NOT_STARTED = "not-started"  # the launch raised before a child existed
+SWEEP_REFUSED_FAILED = "failed"  # a child started, then failed
+SWEEP_REFUSED_DIRTY = "dirty"  # the worktree was unclean, or `git status` faulted
+
 
 @dataclass
 class TokenUsage:
@@ -546,6 +558,12 @@ class RunState:
     # auto-sweep triggers already fired this run (e.g. "epic-1", "run-end");
     # guards re-fire on resume
     sweeps_triggered: list[str] = field(default_factory=list)
+    # auto-sweep triggers this run did NOT deliver, trigger -> SWEEP_REFUSED_*.
+    # Kept apart from sweeps_triggered rather than folded into it: that list is
+    # the re-fire latch, and widening it to a mapping would silently degrade the
+    # per-element sanitizer loop in diagnostics.py. A trigger may appear in both
+    # (SWEEP_REFUSED_FAILED = a child that started and then failed).
+    sweeps_refused: dict[str, str] = field(default_factory=dict)
     # worktree-isolation mode only: the branch every unit merges back into,
     # resolved once at run start (default = the branch checked out then) and
     # pinned so resume keeps targeting the same branch.
@@ -614,6 +632,7 @@ class RunState:
             "spec_folder": self.spec_folder,
             "sweep_cycle": self.sweep_cycle,
             "sweeps_triggered": self.sweeps_triggered,
+            "sweeps_refused": self.sweeps_refused,
             "target_branch": self.target_branch,
             "plugin_shared": self.plugin_shared,
             "tasks": {k: t.to_dict() for k, t in self.tasks.items()},
@@ -643,6 +662,7 @@ class RunState:
             spec_folder=str(d.get("spec_folder", "")),
             sweep_cycle=int(d.get("sweep_cycle", 1)),
             sweeps_triggered=[str(s) for s in d.get("sweeps_triggered", [])],
+            sweeps_refused={str(k): str(v) for k, v in d.get("sweeps_refused", {}).items()},
             target_branch=str(d.get("target_branch", "")),
             plugin_shared=dict(d.get("plugin_shared", {})),
             tasks={k: StoryTask.from_dict(t) for k, t in d.get("tasks", {}).items()},

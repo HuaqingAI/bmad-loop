@@ -7,6 +7,17 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Added
+
+- **A refused auto-sweep is now visible outside the journal (#501).** A run whose deferred-work
+  sweep was refused ended looking exactly like one that swept, and under `[sweep] auto = "run-end"`
+  there is one trigger per run that is never re-asked once the run finishes — so the journal was
+  the only trace. Runs now record `sweeps_refused` (trigger → reason), surfaced by the end-of-run
+  summary, `bmad-loop status`, `status --json` and `bmad-loop diagnose`; the follow-up they name
+  is `bmad-loop sweep`, which needs a clean worktree. The reason is a fixed slug — `not-started`,
+  `failed` or `dirty` — never an exception message, which `diagnose` would refuse to emit at all.
+  The `--json` key is additive and always present, so `STATUS_SCHEMA_VERSION` is unchanged.
+
 ### Changed
 
 - **Files the orchestrator replaces by name now land at `0600`.** Those writes pass
@@ -38,6 +49,34 @@ breaking changes may land in a minor release.
   it cannot read.
 
 ### Fixed
+
+- **Launching with a `--run-id` that already names a run is refused (#602).** The flag pointed at an
+  existing run adopted that run's directory and published its own `state.json` over it. The id is
+  now claimed exclusively as the directory is created, so a collision aborts the launch before
+  anything is written and the earlier run is left untouched.
+
+- **A launch that aborts while standing up its adapters no longer strands an empty run (#602).** An
+  adapter failure left a run directory with no `run-start` that nothing reconciled, so it lingered
+  in `bmad-loop list` looking resumable. Composition is now atomic from the first published
+  artifact: on any escape the run directory and its out-of-tree state are removed and the original
+  error is re-raised unchanged. The removal keeps the live-session guard, and a removal that itself
+  fails is now reported instead of passing silently.
+
+- **A failing auto-sweep can no longer kill its parent run, and a stop during one is no longer
+  swallowed (#600, #601).** A `SystemExit` from the child — what an unusable multiplexer or an
+  unresolvable profile raises — escaped every handler and ended the process at exit 1, leaving the
+  parent neither `finished` nor `crashed` with an orphaned agent session. In the other direction a
+  stop was recorded as a child failure, letting the parent run on to `finished` and leaving it
+  unstoppable. `KeyboardInterrupt` deliberately still escapes.
+
+- **A run's `sweeps_triggered` records only auto-sweeps that actually started (#501).** The trigger
+  was spent before anything had been attempted, so every way a child could decline to launch
+  consumed it — including a plain `git status` timeout, which fails closed and could silently burn
+  a run's one and only sweep. The tree check now runs ahead of the record and journals a `reason`
+  distinguishing a git fault from real local changes. Not a retry: what this buys is that
+  `bmad-loop diagnose` stops reporting sweeps that never ran. A child that fails after its run
+  directory exists still spends the trigger; the never-launched case journals
+  `sweep-auto-not-started` and keeps its own notification.
 
 - **A failed write can no longer truncate the sprint board, a story spec, your CLI settings or your
   policy file (#379).** Seven writers read a file, merged into it, and wrote the whole thing back

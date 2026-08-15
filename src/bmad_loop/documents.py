@@ -329,6 +329,12 @@ def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> 
             "weighted": weighted_total,
         },
         "adapters": adapters,
+        # auto-sweep triggers the run did not deliver, trigger -> reason slug
+        # (model.SWEEP_REFUSED_*). Always present, `{}` when nothing was refused:
+        # a key that appears only on the failing run makes "absent" ambiguous
+        # between "swept fine" and "old state.json". Additive per machine.py, so
+        # STATUS_SCHEMA_VERSION does not move.
+        "sweeps_refused": dict(state.sweeps_refused),
         "tasks": tasks,
     }
 
