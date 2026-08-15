@@ -39,62 +39,33 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
-- **Launching with a `--run-id` that already names a run is refused instead of composing over it
-  (#501).** Both composers went straight into a journal whose `mkdir` accepts an existing directory,
-  so the hidden `--run-id` flag pointed at a previous run adopted that run's directory and published
-  its own `state.json` over it. The id is now claimed exclusively when the run directory is created,
-  and a collision aborts the launch before anything is written, leaving the earlier run untouched.
-  This also bounds the unwind below: the directory it removes on a failed composition is one this
-  launch is known to have created, never a pre-existing run — which for a paused, stopped or
-  finished run would have taken its journal, logs and state with it, since the removal's only guard
-  refuses a _live_ session.
+- **Launching with a `--run-id` that already names a run is refused (#501).** The flag pointed at an
+  existing run adopted that run's directory and published its own `state.json` over it. The id is
+  now claimed exclusively as the directory is created, so a collision aborts the launch before
+  anything is written and the earlier run is left untouched.
 
-- **A launch that aborts while standing up its adapters no longer strands an empty run (#501).**
-  Both composers published the run directory, its `state.json` and the out-of-tree config-digest
-  stamp before calling `make_adapters` — which raises `SystemExit` from five sites (an unresolvable
-  profile, an unknown adapter kind, a kind that fails to load, a construction failure, an unusable
-  multiplexer). An escape there left a run carrying `finished=False`, `crashed=False` and no
-  `run-start`, and nothing reconciled it: the stale-worktree sweep only visits finished runs, so it
-  lingered in `bmad-loop list` looking resumable. Composition is now atomic from the first published
-  artifact onward — on any escape the run dir and its out-of-tree state dir are both removed and the
-  original exception is re-raised unchanged. The removal is best-effort and keeps the live-session
-  guard (no `force`), so on the one state where a run dir is load-bearing — an untagged live agent
-  session, for which it is the only ownership proof — the dir is left alone rather than leaking the
-  session.
+- **A launch that aborts while standing up its adapters no longer strands an empty run (#501).** An
+  adapter failure left a run directory with no `run-start` that nothing reconciled, so it lingered
+  in `bmad-loop list` looking resumable. Composition is now atomic from the first published
+  artifact: on any escape the run directory and its out-of-tree state are removed and the original
+  error is re-raised unchanged. The removal keeps the live-session guard, and a removal that itself
+  fails is now reported instead of passing silently.
 
 - **A failing auto-sweep can no longer kill its parent run, and a stop during one is no longer
-  swallowed (#501).** The child-sweep guard promised never to interrupt the parent, but was written
-  over `Exception`, and that set differs from "a paused or failed child" in both directions. A
-  `SystemExit` — what `runsetup.make_adapters` raises for an unusable multiplexer, an unresolvable
-  profile or an adapter kind that fails to load — is a `BaseException`, so it escaped the guard,
-  every arm of the engine's run handler, and `main()`, ending the process at exit 1 with the parent
-  left neither `finished` nor `crashed`, no `run-complete`, and an orphaned agent session. The
-  unusable-multiplexer gate re-probes live on every call, so a child could hit it in a run that
-  launched fine. In the other direction `RunStopped` _is_ an `Exception` but is not a failure: the
-  child re-raises it so the owner records the stop, and eating it as `sweep-auto-failed` let the
-  parent run on to `finished` — and left it unstoppable, since the signal handler latches
-  `_stopping` before raising, so every later SIGTERM returned at that latch. `KeyboardInterrupt`
-  deliberately still escapes; the nested-child re-raise depends on it.
+  swallowed (#501).** A `SystemExit` from the child — what an unusable multiplexer or an
+  unresolvable profile raises — escaped every handler and ended the process at exit 1, leaving the
+  parent neither `finished` nor `crashed` with an orphaned agent session. In the other direction a
+  stop was recorded as a child failure, letting the parent run on to `finished` and leaving it
+  unstoppable. `KeyboardInterrupt` deliberately still escapes.
 
 - **A run's `sweeps_triggered` records only auto-sweeps that actually started (#501).** The trigger
-  was recorded — and the record persisted — before anything had been attempted, so every way a
-  child sweep could decline to launch still spent it: the `[verify]`/profile/plugin
-  config-integrity refusal, the worktree-isolation refusal, an unparseable `policy.toml`, an
-  unusable multiplexer. Worst of the set was the tree check, which fails closed on a git error and
-  reaches one on a plain `git status` timeout — so a slow filesystem, not a dirty tree, could
-  silently consume a run's one and only sweep. The check now runs ahead of the record and journals
-  a `reason` telling a git fault from real local changes, and the launcher signals the engine once
-  the child owns a published run dir, which is what the record now means.
-
-  Not a retry mechanism, and it should not be read as one: both triggers close their own boundary
-  within a few statements — a `run-end` return lands on `finished`, which `resume` refuses, and the
-  per-epic boundary disappears as soon as `current_epic` advances. What changes is that
-  `bmad-loop diagnose` stops reporting sweeps that never happened, and that a crash in that narrow
-  window leaves the trigger recoverable rather than spent. A child that fails _after_ its run dir
-  exists still spends it — that run is resumable, so re-firing would duplicate it — and is
-  journaled `sweep-auto-failed` as before; the never-launched case is the new
-  `sweep-auto-not-started`, which keeps its own notification, because the loudest thing reaching it
-  is a config-integrity refusal.
+  was spent before anything had been attempted, so every way a child could decline to launch
+  consumed it — including a plain `git status` timeout, which fails closed and could silently burn
+  a run's one and only sweep. The tree check now runs ahead of the record and journals a `reason`
+  distinguishing a git fault from real local changes. Not a retry: what this buys is that
+  `bmad-loop diagnose` stops reporting sweeps that never ran. A child that fails after its run
+  directory exists still spends the trigger; the never-launched case journals
+  `sweep-auto-not-started` and keeps its own notification.
 
 - **A failed write can no longer truncate the sprint board, a story spec, your CLI settings or your
   policy file (#379).** Seven writers read a file, merged into it, and wrote the whole thing back

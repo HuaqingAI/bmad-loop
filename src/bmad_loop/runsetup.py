@@ -832,7 +832,7 @@ def _claim_run_dir(run_dir: Path) -> None:
         ) from e
 
 
-def _unwind_composition(project: Path, run_dir: Path) -> None:
+def _unwind_composition(project: Path, run_dir: Path, journal: Journal) -> None:
     """Remove the run a failed ``compose_*`` had already published, so a launch
     that aborts partway leaves nothing behind.
 
@@ -868,21 +868,45 @@ def _unwind_composition(project: Path, run_dir: Path) -> None:
     worse than what this replaces; ``force=True`` would trade that bounded cost for
     an unbounded one.
 
-    Best-effort, and that is the whole point of the suppression: the caller is
-    already unwinding an exception the operator has to see, and a cleanup failure
-    replacing it is the one outcome that must not happen. The enumerable failures
-    are :class:`runs.LiveSessionError` (the guard refusing), ``OSError`` (the
-    removal, or ``project.resolve()`` on a path the OS cannot canonicalize) and
-    ``RuntimeError`` (how ``Path.resolve`` reports a symlink loop below 3.13 — see
-    ``runs._discard_state_dir``). It is not written as that tuple because
-    ``delete_run`` reaches the multiplexer registry through
-    :func:`runs.live_session_may_be_ours`, an extension point an out-of-tree
+    Best-effort, and never raising: the caller is already unwinding an exception
+    the operator has to see, and a cleanup failure replacing it is the one outcome
+    that must not happen. The enumerable failures are :class:`runs.LiveSessionError`
+    (the guard refusing), ``OSError`` (the removal, or ``project.resolve()`` on a
+    path the OS cannot canonicalize) and ``RuntimeError`` (how ``Path.resolve``
+    reports a symlink loop below 3.13 — see ``runs._discard_state_dir``). It is not
+    written as that tuple because ``delete_run`` reaches the multiplexer registry
+    through :func:`runs.live_session_may_be_ours`, an extension point an out-of-tree
     backend can make raise anything, so an enumerated list is one a third-party
     backend falsifies. ``Exception`` and not ``BaseException``: a
-    ``KeyboardInterrupt`` arriving during the cleanup still belongs to the
-    operator."""
-    with suppress(Exception):
+    ``KeyboardInterrupt`` arriving during the cleanup still belongs to the operator.
+
+    But not *silent*, which is a separate decision from not *raising* and was
+    previously conflated with it. "Repair writes must raise" (AGENTS.md) cannot be
+    honored literally here — raising is precisely what would swallow the launch
+    error — so the obligation it encodes is discharged by reporting instead.
+    Swallowing a failed unwind leaves exactly the resumable-looking ghost run this
+    function exists to prevent, and leaves it inferable only from the ABSENCE of an
+    effect: the operator reads the launch error, and nothing anywhere says the
+    cleanup after it did not happen."""
+    try:
         runs.delete_run(project, run_dir)
+    except Exception as e:
+        detail = f"{type(e).__name__}: {e}"
+        print(
+            f"warning: could not remove the partially composed run {run_dir.name}: "
+            f"{detail} — it may look resumable; remove it with "
+            f"`bmad-loop delete {run_dir.name}`",
+            file=sys.stderr,
+        )
+        # The journal lives INSIDE the run dir, so this lands for every failure that
+        # leaves one behind — the guard refusing, or a failed `rmtree` — which is
+        # also the only case where a ghost run is what the operator will find. When
+        # `_discard_state_dir` is instead what failed the dir is already gone, and
+        # `Journal.append` opens with "a" WITHOUT a mkdir, so it raises rather than
+        # resurrecting the run it just removed. Suppressed, and the stderr line
+        # above still carries the report.
+        with suppress(Exception):
+            journal.append("composition-unwind-failed", run_id=run_dir.name, error=detail)
 
 
 def compose_run(
@@ -978,7 +1002,7 @@ def compose_run(
             else engine_cls(**common)  # pyright: ignore[reportArgumentType]
         )
     except BaseException:
-        _unwind_composition(project, run_dir)
+        _unwind_composition(project, run_dir, journal)
         raise
     return ComposedRun(engine=engine, run_id=run_id, run_dir=run_dir, state=state, journal=journal)
 
@@ -1113,7 +1137,7 @@ def compose_sweep(
         if on_started is not None:
             on_started()
     except BaseException:
-        _unwind_composition(project, run_dir)
+        _unwind_composition(project, run_dir, journal)
         raise
     return ComposedRun(engine=engine, run_id=run_id, run_dir=run_dir, state=state, journal=journal)
 

@@ -15,6 +15,7 @@ at the end of the file.
 """
 
 import dataclasses
+import shutil
 import types
 
 import pytest
@@ -23,6 +24,7 @@ from bmad_loop import bmadconfig
 from bmad_loop import policy as policy_mod
 from bmad_loop import runs, runsetup
 from bmad_loop.adapters.profile import ProfileError
+from bmad_loop.journal import Journal
 
 # A profile overlay carrying the whole launch surface the digest covers. It lives
 # under .bmad-loop/profiles/, inside the tree every driven session can write.
@@ -573,3 +575,83 @@ def test_compose_sweep_refuses_a_run_id_that_already_exists(unwinding):
             trusted_config_digest="deadbeef",
         )
     _assert_prior_run_untouched(unwinding, run_dir, state_dir)
+
+
+def _run_compose_sweep(project, make_adapters, engine_cls=_NeverBuilt):
+    """Drive `compose_sweep` to whatever the injected `make_adapters` decides."""
+    return runsetup.compose_sweep(
+        project=project,
+        paths=_fake_paths(project),
+        policy=policy_mod.loads(""),
+        run_id=RUN_ID,
+        prompting=False,
+        decisions_only=False,
+        max_bundles=None,
+        repeat=None,
+        max_cycles=None,
+        trigger="auto",
+        make_adapters=make_adapters,
+        sweep_engine_cls=engine_cls,
+        trusted_config_digest="deadbeef",
+    )
+
+
+def test_a_failed_unwind_is_reported_and_does_not_replace_the_launch_error(
+    unwinding, monkeypatch, capsys
+):
+    """A cleanup that fails must be SURFACED, and must still not become the error
+    the operator reads.
+
+    "Repair writes must raise" (AGENTS.md) cannot be honored literally here —
+    raising is exactly what would swallow the launch failure — so the obligation is
+    discharged by reporting. Suppressing silently left the resumable-looking ghost
+    run this unwind exists to prevent, detectable only as the ABSENCE of an effect.
+
+    The `match=` is the load-bearing half: it pins that the SystemExit reaching the
+    operator is still `make_adapters`', not the cleanup's. A bare `pytest.raises`
+    would pass just as happily for a cleanup failure that replaced it."""
+
+    def boom(project, run_dir, *, force=False):
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(runs, "delete_run", boom)
+    with pytest.raises(SystemExit, match="not usable on this host"):
+        _run_compose_sweep(unwinding.project, unwinding.make_adapters)
+
+    warning = capsys.readouterr().err
+    assert "warning: could not remove the partially composed run" in warning
+    assert RUN_ID in warning
+    assert f"bmad-loop delete {RUN_ID}" in warning
+    # The ghost the operator was just warned about is really there, and the run's
+    # own journal carries the record — which is where anyone investigating it looks.
+    run_dir = runs.run_dir_for(unwinding.project, RUN_ID)
+    assert run_dir.is_dir()
+    kinds = [e["kind"] for e in Journal(run_dir).entries()]
+    assert "composition-unwind-failed" in kinds
+
+
+def test_a_failed_unwind_still_reports_when_the_run_dir_is_already_gone(
+    unwinding, monkeypatch, capsys
+):
+    """The other failure mode, split into its own row: `delete_run` removes the run
+    dir and THEN raises (`_discard_state_dir` is the real site — it runs after the
+    `rmtree`).
+
+    `Journal.append` opens with "a" and does not mkdir, so appending here raises
+    `FileNotFoundError`. Unsuppressed that would propagate out of the unwind and
+    replace the launch error — the one outcome this whole arm forbids — so the
+    suppression around the journal write is load-bearing and gets its own test.
+    The stderr report must still land, since it is now the only channel left."""
+
+    def boom(project, run_dir, *, force=False):
+        shutil.rmtree(run_dir)
+        raise RuntimeError("state dir removal failed")
+
+    monkeypatch.setattr(runs, "delete_run", boom)
+    with pytest.raises(SystemExit, match="not usable on this host"):
+        _run_compose_sweep(unwinding.project, unwinding.make_adapters)
+
+    warning = capsys.readouterr().err
+    assert "warning: could not remove the partially composed run" in warning
+    assert "state dir removal failed" in warning
+    assert not runs.run_dir_for(unwinding.project, RUN_ID).exists()
