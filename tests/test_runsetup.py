@@ -496,6 +496,60 @@ def test_compose_run_refuses_a_run_id_that_already_exists(unwinding):
     _assert_prior_run_untouched(unwinding, run_dir, state_dir)
 
 
+class _BuiltEngine:
+    """Engine stand-in that constructs cleanly — the inverse of `_NeverBuilt`, for
+    the one test that must get PAST `make_adapters`."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+def test_compose_sweep_unwinds_when_the_started_latch_raises(tmp_path):
+    """`on_started` fires as the LAST statement inside the composition block, so a
+    latch that raises must unwind the child like any other escape.
+
+    This is the one arm the adapter-abort rows above cannot reach: they fail early
+    in the try, at `make_adapters`, so they would stay green if the block's extent
+    were narrowed to end before the latch. It is also the case `compose_sweep`'s
+    docstring reasons about — the parent's in-memory flag is set before its write,
+    so at-most-once holds, and what the unwind decides is only whether the refused
+    retry cost nothing or a composed, resumable child. That argument is prose until
+    something pins the unwind actually covering a raising latch."""
+    published: dict[str, bool] = {}
+
+    def make_adapters(project, run_dir, policy, *, profiles=None):
+        return {"dev": object(), "review": object(), "triage": object()}
+
+    def boom() -> None:
+        published["run_dir"] = runs.run_dir_for(tmp_path, RUN_ID).is_dir()
+        published["state"] = (runs.run_dir_for(tmp_path, RUN_ID) / "state.json").is_file()
+        published["sweep"] = (runs.run_dir_for(tmp_path, RUN_ID) / "sweep.json").is_file()
+        published["state_dir"] = runs.state_dir_for(tmp_path, RUN_ID).is_dir()
+        raise RuntimeError("latch write failed")
+
+    with pytest.raises(RuntimeError, match="latch write failed"):
+        runsetup.compose_sweep(
+            project=tmp_path,
+            paths=_fake_paths(tmp_path),
+            policy=policy_mod.loads(""),
+            run_id=RUN_ID,
+            prompting=False,
+            decisions_only=False,
+            max_bundles=None,
+            repeat=None,
+            max_cycles=None,
+            trigger="auto",
+            make_adapters=make_adapters,
+            sweep_engine_cls=_BuiltEngine,
+            trusted_config_digest="deadbeef",
+            on_started=boom,
+        )
+    # Graded as a removal, not an absence: the latch saw all four artifacts.
+    assert published == {"run_dir": True, "state": True, "sweep": True, "state_dir": True}
+    assert not runs.run_dir_for(tmp_path, RUN_ID).exists()
+    assert not runs.state_dir_for(tmp_path, RUN_ID).exists()
+
+
 def test_compose_sweep_refuses_a_run_id_that_already_exists(unwinding):
     """The sweep composer carries its own copy of the claim, so it gets its own
     row — `cmd_sweep --run-id` is a caller-supplied id on the same hidden flag, and
