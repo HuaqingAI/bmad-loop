@@ -50,12 +50,12 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
-- **Launching with a `--run-id` that already names a run is refused (#501).** The flag pointed at an
+- **Launching with a `--run-id` that already names a run is refused (#602).** The flag pointed at an
   existing run adopted that run's directory and published its own `state.json` over it. The id is
   now claimed exclusively as the directory is created, so a collision aborts the launch before
   anything is written and the earlier run is left untouched.
 
-- **A launch that aborts while standing up its adapters no longer strands an empty run (#501).** An
+- **A launch that aborts while standing up its adapters no longer strands an empty run (#602).** An
   adapter failure left a run directory with no `run-start` that nothing reconciled, so it lingered
   in `bmad-loop list` looking resumable. Composition is now atomic from the first published
   artifact: on any escape the run directory and its out-of-tree state are removed and the original
@@ -63,7 +63,7 @@ breaking changes may land in a minor release.
   fails is now reported instead of passing silently.
 
 - **A failing auto-sweep can no longer kill its parent run, and a stop during one is no longer
-  swallowed (#501).** A `SystemExit` from the child — what an unusable multiplexer or an
+  swallowed (#600, #601).** A `SystemExit` from the child — what an unusable multiplexer or an
   unresolvable profile raises — escaped every handler and ended the process at exit 1, leaving the
   parent neither `finished` nor `crashed` with an orphaned agent session. In the other direction a
   stop was recorded as a child failure, letting the parent run on to `finished` and leaving it
