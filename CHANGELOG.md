@@ -206,6 +206,30 @@ breaking changes may land in a minor release.
   text and probe documents. The `except` tuples are deliberately not widened — the fix is to stop
   raising, and a widened tuple would guard a fault nothing could ablate into existence.
 
+- **A session whose log merely writes _about_ a provider error no longer pauses the run (#507).**
+  `claude` shipped one pattern joining a framing token to a cause across an unbounded `.*`, so it
+  matched any line mentioning both — and this adapter scans a tmux pane capture, which carries the
+  model's own output. Measured against the tree the fix landed on, 44 of this repo's own tracked
+  lines classified as a provider outage: a `docs/FEATURES.md` bullet, a comment in
+  `adapters/profile.py`, the pattern's own line in `claude.toml`, and 41 lines of ordinary
+  pytest/grep/diff output. The harm ran the other way — a **genuine** timeout was read as an
+  environment fault, so the budget was re-armed and the run halted for an operator instead of the
+  attempt being charged, masking the timeout that actually happened. The three replacements each
+  reproduce one complete error sentence Claude Code was captured printing rather than an error token
+  plus a cause anywhere on the line, so a paraphrase cannot reach them; a standing guard walks
+  `git ls-files` and asserts no tracked line classifies, which is what fails if a future entry writes
+  the framing token and a cause on one line — write them separated (`API Error` … `<cause>`).
+
+- **A mid-response connection drop or a provider 5xx refusal on the `claude` adapter now pauses the
+  run with the matched evidence (#323).** The withdrawn connection-only pattern caught 2 of the 5
+  captured Claude Code failure lines, so a session killed by either of those three misses was charged
+  a dev attempt, and `max_dev_attempts` of them deferred a story whose spec and code were fine. All
+  five classify now, and the pause re-arms the budget instead of spending it. A subscription
+  usage-limit / quota refusal is still **not** classified on this adapter: no captured Claude Code
+  quota line exists to seed a pattern from, and on a pane capture that vocabulary is what a story
+  _implementing_ rate limiting prints all day — follow-up: #610. The four unseeded profiles
+  (`codex`, `gemini`, `copilot`, `antigravity`) are unchanged and still ship none.
+
 ## [0.10.0] — 2026-08-14
 
 Much of this section is the `release/0.9.x` hotfix line brought forward onto `main` (#433).
