@@ -1017,6 +1017,37 @@ def test_resultless_stop_breadcrumb_write_failure_is_swallowed(tmp_path):
     adapter._note_resultless_stop("3-1-dev-1", "pending", "detail")  # must not raise
 
 
+def test_resultless_stop_breadcrumb_surrogate_detail_is_swallowed(tmp_path):
+    """The other half of the same promise: a lone surrogate must not escape
+    `_append_diag_jsonl` either, and it is NOT an OSError like the sibling above.
+
+    `ensure_ascii=False` leaves the surrogate in the dumped str, so it reaches the
+    UTF-8 encode inside `fh.write` as a UnicodeEncodeError — a ValueError, which
+    the pre-#380 `except OSError` did not name. "/tmp/bad\\udcff.md" is exactly the
+    shape a POSIX filename holding a non-UTF-8 byte takes once the filesystem API
+    surrogate-escapes it, and six `_note_resultless_stop` call sites interpolate
+    such a path straight into `detail`.
+
+    NOT codec-conditional, and must never grow a locale skipif: the fault is an
+    ENCODE to UTF-8, pinned by `encoding="utf-8"` in `path.open`, so a lone
+    surrogate is unencodable on every host whatever that host's locale decodes.
+
+    Ablation: narrow the guard back to `except OSError:` and this fails alone, on
+    the UnicodeEncodeError escaping the writer.
+    """
+    adapter, _ = make_dev_adapter(tmp_path)
+    adapter._note_resultless_stop("3-1-dev-1", "pending", "/tmp/bad\udcff.md")  # must not raise
+
+    # Dropped, not written — and that absence is the anti-vacuity half. "Did not
+    # raise" alone would pass just as well if the encode had never failed; the
+    # missing line is what proves the fault fired and the widened guard ate it.
+    assert _breadcrumbs(adapter) == []
+
+    # ...and the swallow left the writer usable for the next breadcrumb.
+    adapter._note_resultless_stop("3-1-dev-1", "pending", "plain")
+    assert [crumb["detail"] for crumb in _breadcrumbs(adapter)] == ["plain"]
+
+
 def test_generic_dev_disables_nudges(tmp_path):
     adapter, _ = make_dev_adapter(tmp_path)
     assert adapter._stop_nudges == 0

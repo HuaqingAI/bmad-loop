@@ -176,6 +176,36 @@ breaking changes may land in a minor release.
   name. When the readable temp name cannot fit, the helpers now fall back to a short digest of it
   rather than failing — the OS decides, so there is no guess at a per-filesystem byte limit.
 
+- **A best-effort diagnostic write no longer takes the run down, and POSIX tmux captures no longer
+  raise on an undecodable byte (#380).** Both halves are one defect: an exception net that names one
+  direction of the Unicode hierarchy while the other escapes it. `_append_diag_jsonl` serializes
+  with `ensure_ascii=False` and writes through a UTF-8 handle, so a story spec whose filename holds
+  a byte the filesystem codec could not decode arrived surrogate-escaped and failed at the encode
+  with `UnicodeEncodeError` — a `UnicodeError`, so a `ValueError`, not an `OSError` — straight past
+  a guard whose stated contract is that an unwritable run dir must never break the completion loop.
+  The guard is now `(OSError, UnicodeError)` and the breadcrumb is dropped instead of crashing the
+  run. Separately and visibly: `tmux_base`'s `_ERRORS` was the strict handler on POSIX while the
+  Windows backend already set `"backslashreplace"`, so a capture holding such a byte raised out of
+  the one place tmux is spawned; it now comes back with that byte rendered as a `\xNN` escape, and a
+  session name or window title carrying one reads back escaped. Fixing the decode at its source
+  rather than at the fourteen catch sites is deliberate — most of them return a sentinel, so
+  catching there would have converted a crash into a wrong answer (`[]` reads as "window dead").
+  `_ENCODING` stays `None`, so POSIX keeps the locale codec and only stops being strict. This closes
+  the diagnostic writer and the capture decode; it does not sweep the wider `except`-tuple family.
+
+- **A plugin hook or version probe whose child emits a non-UTF-8 byte no longer crashes the run
+  (#383).** `subprocess.run(..., text=True)` decodes with the locale codec at `errors="strict"`, and
+  the `UnicodeDecodeError` that raises is neither an `OSError` nor a `SubprocessError`, so it
+  escaped both captures' guards. The declarative-hook transport is the run-crashing half: `_HookError`
+  is the bus's designed channel for "the hook could not run to completion", and the decode happens
+  after the child has exited — so a hook that actually **passed** took its exit code down with the
+  run instead of being classified. `probe.run_version_help` documents "Never raises", and a
+  `--version`/`--help` banner carrying such a byte made that false. Both now decode with
+  `errors="replace"`, so the hook's verdict survives and a fault is classified through the normal
+  channel. Visible change: those bytes now show as `�` (U+FFFD) in journal entries, hook advisory
+  text and probe documents. The `except` tuples are deliberately not widened — the fix is to stop
+  raising, and a widened tuple would guard a fault nothing could ablate into existence.
+
 ## [0.10.0] — 2026-08-14
 
 Much of this section is the `release/0.9.x` hotfix line brought forward onto `main` (#433).
