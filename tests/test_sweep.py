@@ -502,6 +502,39 @@ def test_validate_migration_allows_an_added_gate_token():
     assert validate_migration(rj, manifest, pre, rewritten_gated_ledger("gate: 3-2, 3-4")) == []
 
 
+def test_validate_migration_refuses_a_gate_dropped_by_collapsing_duplicate_ids():
+    """#519. A corrupt ledger where one id names two entries (#286) is exactly the
+    mess a migration is run to clean up, and collapsing the pair is a legitimate
+    rewrite — but it must not lose a token on the way. Snapshotting id -> tokens
+    with last-write-wins would hold the survivor to the LAST duplicate's gates
+    alone, and the surviving entry is single, so the `duplicate DW ids` check has
+    nothing left to catch. `snapshot_canonical` unions across the duplicates.
+
+    Ablation: restore the last-write-wins body of `snapshot_canonical`
+    (`snapshot[e.id] = PreCanonical(e.status, g.tokens + g.malformed)`) and this
+    test fails ALONE — every other #519 test uses a single-entry fixture."""
+    before = (
+        "# Deferred Work\n\n" + _gated_dw1("gate: 3-2") + "\n" + _gated_dw1("gate: 3-3") + "\n"
+        "## Deferred from: epic 1 review (2026-04-06)\n\n"
+        "- **Open legacy thing here** — `src.txt` mishandles em-dashes\n"
+    )
+    manifest = legacy_manifest(before)
+    assert len(manifest) == 1  # neither canonical entry parsed as legacy
+    rj = migrate_result([{"key": manifest[0]["key"], "dw_id": "DW-2"}])
+    pre = snapshot_canonical(before)
+    # the union, not the last entry's `("3-3",)` — a failure below cannot be
+    # blamed on the fixture having only ever carried one token
+    assert pre["DW-1"].gate_tokens == ("3-2", "3-3")
+
+    # the paired positive control: collapsing the duplicates while keeping BOTH
+    # tokens is accepted, so the refusal below is the lost token and not the
+    # collapse itself.
+    assert validate_migration(rj, manifest, pre, rewritten_gated_ledger("gate: 3-2, 3-3")) == []
+
+    errors = validate_migration(rj, manifest, pre, rewritten_gated_ledger("gate: 3-3"))
+    assert any("DW-1 lost gate token" in e and "3-2" in e for e in errors)
+
+
 def test_validate_migration_happy():
     manifest = legacy_manifest()
     done_key, open_key = manifest[0]["key"], manifest[1]["key"]

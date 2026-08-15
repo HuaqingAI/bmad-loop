@@ -278,12 +278,28 @@ def snapshot_canonical(text: str) -> dict[str, PreCanonical]:
     ``{"DW-1": PreCanonical("open", ("3-2",))}`` would pass whatever the parser
     really produces for that entry, and the bug being fixed here lived in the
     snapshot, not in the comparison.
+
+    One id naming two entries is a corrupt ledger the repo already knows about
+    (#286, ``deferred-close-duplicate-id``) and exactly the mess a migration is
+    run to clean up, so the tokens are UNIONED across the duplicates rather than
+    taken from the last one seen. Keyed by id, ``validate_migration`` only ever
+    sees the collapsed entry: last-write-wins would hold that entry to the last
+    duplicate's tokens alone, and a rewrite folding two ``DW-1``s into one
+    would drop the first's gate with no post-rewrite duplicate left for the
+    ``duplicate DW ids`` check to catch. The union over-blocks in the safe
+    direction — the same asymmetry the added-token bound rests on. Refusing the
+    migration outright instead would refuse the cleanup on the one path that
+    exists to perform it. ``status`` deliberately keeps the pre-existing
+    last-write-wins reading: it is unchanged by #519, and there is no union of
+    two statuses that is not an invention.
     """
-    snapshot: dict[str, PreCanonical] = {}
+    statuses: dict[str, str] = {}
+    tokens: dict[str, dict[str, None]] = {}
     for e in deferredwork.parse_ledger(text):
         g = deferredwork.gates(e)
-        snapshot[e.id] = PreCanonical(e.status, g.tokens + g.malformed)
-    return snapshot
+        statuses[e.id] = e.status
+        tokens.setdefault(e.id, {}).update(dict.fromkeys(g.tokens + g.malformed))
+    return {i: PreCanonical(s, tuple(tokens[i])) for i, s in statuses.items()}
 
 
 def validate_migration(
