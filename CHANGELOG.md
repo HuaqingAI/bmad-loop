@@ -65,6 +65,19 @@ breaking changes may land in a minor release.
   entry — and the enforcement is migration-scoped: every other ledger edit is still held by the
   format doc's instruction alone.
 
+- **A git that warns while still exiting 0 no longer corrupts the answers the orchestrator reads
+  back from it (#442).** An unknown `core.fsyncMethod` value or a `core.fsmonitor` hook that cannot
+  exec is a property of the host's git config rather than a failure, but the shared git helper handed
+  callers `stdout` and `stderr` merged — so every probe that read git's text as the ANSWER took the
+  advisory for data. Silently: a rollback candidate list grew a phantom path, a commit list grew a
+  phantom sha, and the sha and branch probes answered with the warning appended — the last of which
+  reached the baselines persisted in run state, so a resume graded a warning-carrying string against
+  a clean one and read "moved". Loudly: preserve-ref retention raised `PrunePreserveError`,
+  `commit_paths` raised where its contract reports nothing to commit, and the worktree snapshot
+  failed outright — which since #340 is a gate and not a safety net, so a noisy host had no working
+  rollback at all. Thirteen value-reading probes now take stdout alone; the ~45 call sites that only
+  check a return code are unchanged, and a failing git call still carries its stderr.
+
 - **An indented, tab-separated or empty heading in the deferred-work ledger no longer lets a `gate:`
   below it hold a story the entry never named (#516).** A canonical entry ended only at a `#` run at
   column zero with exactly one space after it, so three shapes CommonMark spells as ATX headings —
