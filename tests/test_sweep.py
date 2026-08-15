@@ -49,9 +49,11 @@ from bmad_loop.sweep import (
     Decision,
     DecisionOption,
     DecisionPrompter,
+    PreCanonical,
     ResolvedEntry,
     SweepEngine,
     TriagePlan,
+    snapshot_canonical,
     validate_migration,
     validate_triage,
 )
@@ -370,6 +372,136 @@ def migrate_result(mapping) -> dict:
     return {"workflow": "deferred-sweep-migrate", "mapping": list(mapping), "escalations": []}
 
 
+def _gated_dw1(*gate_lines: str) -> str:
+    """The pre-existing canonical DW-1 both migration halves below carry, so the
+    two texts differ ONLY in their second half by construction rather than by
+    inspection — an accepted rewrite really did leave the entry untouched."""
+    return (
+        "### DW-1: item DW-1\n\norigin: test, 2026-06-01\nlocation: src.txt:1\n"
+        "reason: test entry.\nstatus: open\n" + "".join(f"{line}\n" for line in gate_lines)
+    )
+
+
+def pre_gated_ledger(*gate_lines: str) -> str:
+    """The ledger a migration is handed: one pre-existing canonical DW-1
+    carrying the given `gate:` lines verbatim, plus the one legacy item to
+    convert. Mirrors `test_mixed_ledger_migration_preserves_canonical_open_set`,
+    which is the shape a real pre-DW-format project reaches migration in."""
+    return (
+        "# Deferred Work\n\n" + _gated_dw1(*gate_lines) + "\n"
+        "## Deferred from: epic 1 review (2026-04-06)\n\n"
+        "- **Open legacy thing here** — `src.txt` mishandles em-dashes\n"
+    )
+
+
+def rewritten_gated_ledger(*gate_lines: str) -> str:
+    """The rewrite the migration session hands back: DW-1 preserved with the
+    given `gate:` lines (pass none for the drop this guards against), the legacy
+    item converted to DW-2."""
+    return (
+        "# Deferred Work\n\n" + _gated_dw1(*gate_lines) + "\n"
+        "### DW-2: Open legacy thing here\n\n"
+        "origin: migrated from legacy ledger, 2026-06-12\nlocation: src.txt\n"
+        "reason: mishandles em-dashes.\nstatus: open\n"
+    )
+
+
+def _gated_migration_case(*gate_lines: str):
+    """(manifest, result.json, snapshot) for a migration handed
+    `pre_gated_ledger(*gate_lines)`. The `len(manifest) == 1` precondition rides
+    here so no caller can omit it: without it a fixture whose canonical entry
+    accidentally parsed as legacy would make the whole test mean something
+    else."""
+    before = pre_gated_ledger(*gate_lines)
+    manifest = legacy_manifest(before)
+    assert len(manifest) == 1  # the canonical entry is not a legacy item
+    rj = migrate_result([{"key": manifest[0]["key"], "dw_id": "DW-2"}])
+    return manifest, rj, snapshot_canonical(before)
+
+
+def test_validate_migration_refuses_a_dropped_gate_token():
+    """#519. A rewrite that drops a `gate:` line a pre-existing entry declared is
+    refused, so a migration cannot silently un-gate the story that entry exists
+    to hold back.
+
+    Ablation: delete the `post`/`kept`/`lost` block in `validate_migration` and
+    this test fails alone on the final assertion — the positive control above it
+    stays green, which is what separates "the guard fired" from "the fixture is
+    broken"."""
+    manifest, rj, pre = _gated_migration_case("gate: 3-2")
+    # the SNAPSHOT carries the token at all, so a failure below cannot be
+    # blamed on the fixture
+    assert pre["DW-1"].gate_tokens == ("3-2",)
+    # the paired positive control: the same rewrite with the gate KEPT is fully
+    # accepted. Without it the refusal could be produced by any unrelated defect
+    # in the fixture and this test would prove nothing.
+    assert validate_migration(rj, manifest, pre, rewritten_gated_ledger("gate: 3-2")) == []
+
+    errors = validate_migration(rj, manifest, pre, rewritten_gated_ledger())
+    assert any("DW-1 lost gate token" in e and "3-2" in e for e in errors)
+
+
+def test_validate_migration_refuses_an_altered_gate_token():
+    """#519. Editing a token is a drop plus an add, and the drop half is what the
+    guard reads — so a rewrite that renames `3-2` to a different story is refused
+    exactly like one that deleted the line.
+
+    Ablation: delete the `post`/`kept`/`lost` block in `validate_migration` and
+    this test fails."""
+    manifest, rj, pre = _gated_migration_case("gate: 3-2")
+    # `3-20` is the control: a token that merely shares a prefix must not keep
+    # `3-2` alive, which is what stops the comparison ever being written as a
+    # `startswith` (`3-20-later` is a different story).
+    errors = validate_migration(rj, manifest, pre, rewritten_gated_ledger("gate: 3-20"))
+    assert any("DW-1 lost gate token" in e and "3-2" in e for e in errors)
+
+
+def test_validate_migration_refuses_a_dropped_malformed_gate_token():
+    """#519. `gate: 3.2` is `malformed` — no story key spells its numbers with a
+    `.` — and dropping it is refused all the same. It gated nothing, but it reads
+    to anyone scanning the entry as a gate in force and `bmad-loop validate`
+    reports it (`deferred.hard-gate-unstructured`); a migration that deletes it
+    silently retires that report, which is the same failure one level down.
+
+    Ablation: change `snapshot_canonical` to snapshot `g.tokens` alone and this
+    test fails ALONE — the enforceable-token tests never touch `malformed`."""
+    manifest, rj, pre = _gated_migration_case("gate: 3.2")
+    assert pre["DW-1"].gate_tokens == ("3.2",)  # the malformed half really is snapshotted
+
+    errors = validate_migration(rj, manifest, pre, rewritten_gated_ledger())
+    assert any("DW-1 lost gate token" in e and "3.2" in e for e in errors)
+
+
+def test_validate_migration_allows_a_reflowed_gate_declaration():
+    """#519. Two `gate:` lines folded onto one, reordered, lose nothing — and a
+    migration legitimately reformats. This is the control that keeps the three
+    refusal tests above from being satisfiable by a byte comparison or an
+    ordered-tuple comparison, either of which would refuse this rewrite.
+
+    Ablation: compare `pre.gate_tokens` against `post.tokens + post.malformed`
+    as a sequence instead of by membership and this test fails while the refusal
+    tests stay green."""
+    manifest, rj, pre = _gated_migration_case("gate: 3-2", "gate: 3-3")
+    assert pre["DW-1"].gate_tokens == ("3-2", "3-3")
+
+    assert validate_migration(rj, manifest, pre, rewritten_gated_ledger("gate: 3-3, 3-2")) == []
+
+
+def test_validate_migration_allows_an_added_gate_token():
+    """#519. The asymmetry is a deliberate bound, not an oversight: a dropped
+    token un-gates a story silently, while an added one over-blocks loudly and in
+    the safe direction — the operator meets a refusal naming the entry. Only the
+    drop is refused, so a migration attempt is never spent on the one direction
+    that cannot cause the failure the guard exists to stop.
+
+    Green-ablation record: no mutation of the #519 guard reddens this test,
+    because it pins the guard's BOUND rather than the guard. The drop direction
+    is pinned by `test_validate_migration_refuses_a_dropped_gate_token`."""
+    manifest, rj, pre = _gated_migration_case("gate: 3-2")
+
+    assert validate_migration(rj, manifest, pre, rewritten_gated_ledger("gate: 3-2, 3-4")) == []
+
+
 def test_validate_migration_happy():
     manifest = legacy_manifest()
     done_key, open_key = manifest[0]["key"], manifest[1]["key"]
@@ -389,7 +521,8 @@ def test_validate_migration_rejects_leftover_legacy():
 
 def test_validate_migration_guards_pre_existing_canonical():
     manifest = legacy_manifest()
-    pre = {"DW-1": "open", "DW-9": "open"}  # DW-1 regressed to done; DW-9 vanished
+    # DW-1 regressed to done; DW-9 vanished
+    pre = {"DW-1": PreCanonical("open", ()), "DW-9": PreCanonical("open", ())}
     rj = migrate_result(
         [{"key": manifest[0]["key"], "dw_id": "DW-1"}, {"key": manifest[1]["key"], "dw_id": "DW-2"}]
     )
@@ -3103,6 +3236,46 @@ def test_mixed_ledger_migration_preserves_canonical_open_set(project):
     assert engine.state.tasks["sweep-migrate"].phase == Phase.DONE
     assert engine.state.tasks["sweep-triage"].phase == Phase.DONE
     assert ledger_entries(project)["DW-1"].open  # skipped, untouched
+
+
+def test_migration_dropping_a_gate_restores_the_ledger_then_escalates(project):
+    """#519 at the seam that runs: the widened snapshot has to be the one
+    `_ensure_migration` actually builds.
+
+    The six `validate_migration` unit tests each construct their own snapshot, so
+    every one of them stays green if the call site is left on the old inline
+    `{e.id: e.status for e in ...}` form — the exact shape the bug lived in. This
+    test is the only one that can see that, which is what earns it its place
+    beside the cheaper unit tests.
+
+    Ablation: revert the `snapshot_canonical(text)` call site in
+    `_ensure_migration` to a gateless snapshot of the same type
+    (`{e.id: PreCanonical(e.status, ()) for e in deferredwork.parse_ledger(text)}`)
+    and this test fails ALONE."""
+    before = pre_gated_ledger("gate: 3-2")
+    write_legacy_ledger(project, before)
+    manifest = legacy_manifest(before)
+    assert len(manifest) == 1  # the canonical entry is not a legacy item
+    # converts the legacy item correctly, but drops DW-1's `gate:` line with it
+    bad = migrate_effect(
+        project, rewritten_gated_ledger(), [{"key": manifest[0]["key"], "dw_id": "DW-2"}]
+    )
+    # two scripted sessions: SweepPolicy.max_migration_attempts defaults to 2
+    engine, adapter = make_sweep(project, [bad, bad])
+    summary = engine.run()
+
+    assert summary.paused
+    assert engine.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
+    # the un-gating rewrite never sticks: original ledger text restored. Compared
+    # as TEXT, not bytes — the fixture reached disk through `write_text`, so a
+    # byte assertion would read CRLF on Windows and redden there only.
+    assert project.deferred_work.read_text(encoding="utf-8") == before
+    assert worktree_clean(project.project)
+    # and the refusal reached the session, naming the token it dropped
+    prompts = [s.prompt for s in adapter.sessions]
+    assert len(prompts) == 2
+    feedback = open(prompts[1].split("--feedback ", 1)[1]).read()
+    assert "lost gate token" in feedback and "3-2" in feedback
 
 
 # ------------------------------------------ review-budget commit-instead-of-rollback

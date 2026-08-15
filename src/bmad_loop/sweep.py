@@ -242,17 +242,61 @@ def validate_triage(
 # ---------------------------------------------------------- migration plan
 
 
+@dataclass(frozen=True)
+class PreCanonical:
+    """What a pre-existing canonical entry is held to across a migration.
+
+    Status alone was the whole snapshot until #519, and that is what let a
+    rewrite drop a ``gate:`` line and pass: the gate is the one field whose loss
+    is both silent and unsafe. ``deferred-work-format.md`` calls removing it
+    "the exact failure this field exists to prevent", and
+    ``Engine._refuse_gated_story`` then dispatches the story the entry was
+    holding back.
+
+    ``gate_tokens`` unions :attr:`~bmad_loop.deferredwork.EntryGates.tokens`
+    with ``malformed`` because the question is "did a token the entry declared
+    survive", not "was it enforceable". A malformed ``gate: 3.2`` gates nothing,
+    but it reads to anyone scanning the entry as a gate in force and ``validate``
+    reports it (``deferred.hard-gate-unstructured``); dropping it retires that
+    report silently, which is the same failure one level down.
+
+    The counts ``EntryGates`` also carries — ``lines``, ``empty``, ``near_miss``
+    — are deliberately NOT snapshotted. None of them names a story, so losing one
+    cannot change which story is gated, and they are exactly what a legitimate
+    reflow of a multi-line declaration moves.
+    """
+
+    status: str
+    gate_tokens: tuple[str, ...]
+
+
+def snapshot_canonical(text: str) -> dict[str, PreCanonical]:
+    """The pre-migration state ``validate_migration`` holds the rewrite to.
+
+    A named function rather than a comprehension inlined at its one call site so
+    that the tests grade the snapshot production actually builds: a hand-written
+    ``{"DW-1": PreCanonical("open", ("3-2",))}`` would pass whatever the parser
+    really produces for that entry, and the bug being fixed here lived in the
+    snapshot, not in the comparison.
+    """
+    snapshot: dict[str, PreCanonical] = {}
+    for e in deferredwork.parse_ledger(text):
+        g = deferredwork.gates(e)
+        snapshot[e.id] = PreCanonical(e.status, g.tokens + g.malformed)
+    return snapshot
+
+
 def validate_migration(
     rj: dict[str, Any] | None,
     manifest: list[dict[str, Any]],
-    pre_canonical: dict[str, str],
+    pre_canonical: dict[str, PreCanonical],
     new_text: str,
 ) -> list[str]:
     """Deterministic validation of a legacy-ledger migration session: the
     rewritten ledger must contain zero legacy items, preserve every
-    pre-existing canonical entry's status, continue DW numbering, and the
-    result.json mapping must cover the manifest exactly. Returns errors,
-    empty on success."""
+    pre-existing canonical entry's status and every ``gate:`` token it
+    declared, continue DW numbering, and the result.json mapping must cover
+    the manifest exactly. Returns errors, empty on success."""
     rj = rj or {}
     if rj.get("workflow") != MIGRATE_WORKFLOW:
         return [f"workflow must be {MIGRATE_WORKFLOW!r}: got {rj.get('workflow')!r}"]
@@ -276,12 +320,26 @@ def validate_migration(
         return status.split()[0] if status.split() else ""
 
     pre_max = max((int(i.split("-")[1]) for i in pre_canonical), default=0)
-    for dw_id, status in pre_canonical.items():
+    for dw_id, pre in pre_canonical.items():
         e = entries.get(dw_id)
         if e is None:
             errors.append(f"pre-existing {dw_id} disappeared")
-        elif first_word(e.status) != first_word(status):
-            errors.append(f"pre-existing {dw_id} status changed: {status!r} -> {e.status!r}")
+            continue
+        if first_word(e.status) != first_word(pre.status):
+            errors.append(f"pre-existing {dw_id} status changed: {pre.status!r} -> {e.status!r}")
+        # Drops and edits only; an ADDED token is deliberately accepted. The two
+        # directions are not the same failure: a dropped token un-gates a story
+        # silently, which is what #519 is about, while an added one over-blocks
+        # loudly and in the safe direction — the operator meets a refusal naming
+        # the entry. Refusing an addition would spend one of the two migration
+        # attempts on the only direction that cannot cause the failure this
+        # guard exists to stop. An EDITED token is caught here anyway: an edit
+        # is a drop plus an add, and the drop half is what this reads.
+        post = deferredwork.gates(e)
+        kept = set(post.tokens) | set(post.malformed)
+        lost = [t for t in pre.gate_tokens if t not in kept]
+        if lost:
+            errors.append(f"pre-existing {dw_id} lost gate token(s): {', '.join(lost)}")
     for dw_id, e in entries.items():
         if dw_id in pre_canonical:
             continue
@@ -714,7 +772,7 @@ class SweepEngine(Engine):
             task.baseline_untracked = sorted(verify.untracked_files(self.workspace.root))
 
         legacy = deferredwork.parse_legacy(text)
-        pre_canonical = {e.id: e.status for e in deferredwork.parse_ledger(text)}
+        pre_canonical = snapshot_canonical(text)
         manifest = [
             {
                 "key": e.key,
