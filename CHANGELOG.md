@@ -39,6 +39,19 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **A launch that aborts while standing up its adapters no longer strands an empty run (#501).**
+  Both composers published the run directory, its `state.json` and the out-of-tree config-digest
+  stamp before calling `make_adapters` — which raises `SystemExit` from five sites (an unresolvable
+  profile, an unknown adapter kind, a kind that fails to load, a construction failure, an unusable
+  multiplexer). An escape there left a run carrying `finished=False`, `crashed=False` and no
+  `run-start`, and nothing reconciled it: the stale-worktree sweep only visits finished runs, so it
+  lingered in `bmad-loop list` looking resumable. Composition is now atomic from the first published
+  artifact onward — on any escape the run dir and its out-of-tree state dir are both removed and the
+  original exception is re-raised unchanged. The removal is best-effort and keeps the live-session
+  guard (no `force`), so on the one state where a run dir is load-bearing — an untagged live agent
+  session, for which it is the only ownership proof — the dir is left alone rather than leaking the
+  session.
+
 - **A failing auto-sweep can no longer kill its parent run, and a stop during one is no longer
   swallowed (#501).** The child-sweep guard promised never to interrupt the parent, but was written
   over `Exception`, and that set differs from "a paused or failed child" in both directions. A

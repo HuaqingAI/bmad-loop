@@ -34,6 +34,7 @@ import hashlib
 import json
 import sys
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -465,8 +466,13 @@ def make_adapters(
             # dependency they pull in — are first imported, and it is deliberately
             # never invoked by `validate` or `bmad-loop adapters` (both stay free
             # of heavy imports), so a thunk that raises has had no earlier gate.
-            # By here `compose_run` has already written the run state and pid, so
-            # an escaping ImportError strands a run directory behind a traceback.
+            # By here `compose_run` has already written the run state and pid. An
+            # escaping ImportError used to strand that run directory behind a
+            # traceback, recorded as an accepted consequence; it no longer does —
+            # both composers unwind the whole composition on any escape (see
+            # `_unwind_composition`), and this raise is one of the five SystemExits
+            # that path exists for. What that changes is the run dir, not the
+            # message: the narrowing below is a separate decision and still holds.
             # ImportError ONLY, on the same rule as `construct_error` below: a
             # missing dependency is a lazy loader's DECLARED failure, while
             # anything else is a bug in that package and must surface as itself
@@ -782,6 +788,53 @@ class ComposedRun:
     journal: Journal
 
 
+def _unwind_composition(project: Path, run_dir: Path) -> None:
+    """Remove the run a failed ``compose_*`` had already published, so a launch
+    that aborts partway leaves nothing behind.
+
+    Reached from an ``except BaseException`` arm, because the failure it exists
+    for is a :class:`SystemExit`: :func:`make_adapters` raises one at five sites
+    (unresolvable profile, unknown adapter kind, a kind that fails to load, a
+    construction failure, an unusable multiplexer), every one of them *after*
+    ``save_state`` has published a run dir carrying ``finished=False`` /
+    ``crashed=False`` and no ``run-start``. Nothing reconciles that shape —
+    :func:`runs.reconcile_stale_worktrees` only touches ``is_finished`` runs — so
+    it lingers as a resumable-looking empty run.
+
+    :func:`runs.delete_run` is the right primitive rather than a bare ``rmtree``
+    because it also drops the run's out-of-tree state dir (``_discard_state_dir``),
+    which is what covers the config-digest stamp the composers write between the
+    state and the pid.
+
+    ``force=False``, deliberately. ``force`` is documented there as the
+    *operator's* explicit override, and there is no operator here — this is an
+    automatic unwind. What it would skip is the one guard protecting the one state
+    where a run dir is load-bearing: an untagged live ``bmad-loop-<id>`` session,
+    for which that directory is the only ownership proof a later prune can read. A
+    run id is caller-supplied (``--run-id``), so such a session can exist at the id
+    this launch just claimed, and it cannot be this launch's — no session was ever
+    spawned. Deleting the directory would leak it for the life of the machine.
+    When the guard does fire the cost is exactly the pre-fix behavior, a stranded
+    run dir, which is no worse than what this replaces; ``force=True`` would trade
+    that bounded cost for an unbounded one.
+
+    Best-effort, and that is the whole point of the suppression: the caller is
+    already unwinding an exception the operator has to see, and a cleanup failure
+    replacing it is the one outcome that must not happen. The enumerable failures
+    are :class:`runs.LiveSessionError` (the guard refusing), ``OSError`` (the
+    removal, or ``project.resolve()`` on a path the OS cannot canonicalize) and
+    ``RuntimeError`` (how ``Path.resolve`` reports a symlink loop below 3.13 — see
+    ``runs._discard_state_dir``). It is not written as that tuple because
+    ``delete_run`` reaches the multiplexer registry through
+    :func:`runs.live_session_may_be_ours`, an extension point an out-of-tree
+    backend can make raise anything, so an enumerated list is one a third-party
+    backend falsifies. ``Exception`` and not ``BaseException``: a
+    ``KeyboardInterrupt`` arriving during the cleanup still belongs to the
+    operator."""
+    with suppress(Exception):
+        runs.delete_run(project, run_dir)
+
+
 def compose_run(
     *,
     project: Path,
@@ -834,39 +887,46 @@ def compose_run(
         spec_folder=spec_folder,
         trusted_config_digest=trusted_config_digest,
     )
-    save_state(run_dir, state)
-    # After the run dir exists (Journal mkdir'd it above) and before the pid lands:
-    # the ordering `reconcile_orphan_state_dirs` reads runs in, and a stamp that
-    # cannot be written fails the launch before an observer can see a live run.
-    runs.write_trusted_config_digest(project, run_id, trusted_config_digest)
-    runs.write_pid(run_dir)
-    adapters = make_adapters(project, run_dir, policy, profiles=profiles)
-    journal.append(
-        "run-start",
-        run_id=run_id,
-        source=state.source,
-        adapter_dev=policy.adapter.resolved("dev").name,
-        adapter_review=policy.adapter.resolved("review").name,
-    )
-    common = dict(
-        paths=paths,
-        policy=policy,
-        adapter=adapters["dev"],
-        review_adapter=adapters["review"],
-        run_dir=run_dir,
-        journal=journal,
-        state=state,
-        max_stories=max_stories,
-        epic_filter=epic_filter,
-        story_filter=story_filter,
-        sweep_factory=sweep_factory,
-    )
-    # heterogeneous **kwargs: pyright unions the dict values; per-arg error is spurious
-    engine: Engine = (
-        stories_engine_cls(**common, spec_folder=spec_folder)
-        if stories_on
-        else engine_cls(**common)  # pyright: ignore[reportArgumentType]
-    )
+    # Composition is atomic from the first published artifact onward: everything
+    # below either lands whole or is unwound (see :func:`_unwind_composition`,
+    # which also states why the arm is `BaseException` and not `Exception`).
+    try:
+        save_state(run_dir, state)
+        # After the run dir exists (Journal mkdir'd it above) and before the pid lands:
+        # the ordering `reconcile_orphan_state_dirs` reads runs in, and a stamp that
+        # cannot be written fails the launch before an observer can see a live run.
+        runs.write_trusted_config_digest(project, run_id, trusted_config_digest)
+        runs.write_pid(run_dir)
+        adapters = make_adapters(project, run_dir, policy, profiles=profiles)
+        journal.append(
+            "run-start",
+            run_id=run_id,
+            source=state.source,
+            adapter_dev=policy.adapter.resolved("dev").name,
+            adapter_review=policy.adapter.resolved("review").name,
+        )
+        common = dict(
+            paths=paths,
+            policy=policy,
+            adapter=adapters["dev"],
+            review_adapter=adapters["review"],
+            run_dir=run_dir,
+            journal=journal,
+            state=state,
+            max_stories=max_stories,
+            epic_filter=epic_filter,
+            story_filter=story_filter,
+            sweep_factory=sweep_factory,
+        )
+        # heterogeneous **kwargs: pyright unions the dict values; per-arg error is spurious
+        engine: Engine = (
+            stories_engine_cls(**common, spec_folder=spec_folder)
+            if stories_on
+            else engine_cls(**common)  # pyright: ignore[reportArgumentType]
+        )
+    except BaseException:
+        _unwind_composition(project, run_dir)
+        raise
     return ComposedRun(engine=engine, run_id=run_id, run_dir=run_dir, state=state, journal=journal)
 
 
@@ -914,42 +974,48 @@ def compose_sweep(
         run_type="sweep",
         trusted_config_digest=trusted_config_digest,
     )
-    save_state(run_dir, state)
-    # Out of the tree, same ordering and same reason as compose_run's stamp.
-    runs.write_trusted_config_digest(project, run_id, trusted_config_digest)
-    runs.write_pid(run_dir)
-    options = {
-        "prompting": prompting,
-        "decisions_only": decisions_only,
-        "max_bundles": max_bundles,
-        "repeat": repeat,
-        "max_cycles": max_cycles,
-        "trigger": trigger,
-    }
-    # Persist the sweep options atomically (tmp + os.replace), the way save_state
-    # writes state.json: a resume reads this back to rebuild the SweepEngine, so a
-    # crash mid-write must not leave a torn file the recovery path then chokes on.
-    sweep_path = run_dir / "sweep.json"
-    sweep_tmp = sweep_path.with_suffix(".json.tmp")
-    sweep_tmp.write_text(json.dumps(options, indent=2), encoding="utf-8")
-    atomic_replace(sweep_tmp, sweep_path)
-    adapters = make_adapters(project, run_dir, policy, profiles=profiles)
-    journal.append("run-start", run_id=run_id, run_type="sweep", trigger=trigger)
-    engine: Engine = sweep_engine_cls(
-        paths=paths,
-        policy=policy,
-        adapter=adapters["dev"],
-        review_adapter=adapters["review"],
-        triage_adapter=adapters["triage"],
-        run_dir=run_dir,
-        journal=journal,
-        state=state,
-        prompting=prompting,
-        decisions_only=decisions_only,
-        max_bundles=max_bundles,
-        repeat=repeat,
-        max_cycles=max_cycles,
-    )
+    # Atomic from the first published artifact onward, exactly as in `compose_run`
+    # — same reason, and one more artifact to unwind (`sweep.json`).
+    try:
+        save_state(run_dir, state)
+        # Out of the tree, same ordering and same reason as compose_run's stamp.
+        runs.write_trusted_config_digest(project, run_id, trusted_config_digest)
+        runs.write_pid(run_dir)
+        options = {
+            "prompting": prompting,
+            "decisions_only": decisions_only,
+            "max_bundles": max_bundles,
+            "repeat": repeat,
+            "max_cycles": max_cycles,
+            "trigger": trigger,
+        }
+        # Persist the sweep options atomically (tmp + os.replace), the way save_state
+        # writes state.json: a resume reads this back to rebuild the SweepEngine, so a
+        # crash mid-write must not leave a torn file the recovery path then chokes on.
+        sweep_path = run_dir / "sweep.json"
+        sweep_tmp = sweep_path.with_suffix(".json.tmp")
+        sweep_tmp.write_text(json.dumps(options, indent=2), encoding="utf-8")
+        atomic_replace(sweep_tmp, sweep_path)
+        adapters = make_adapters(project, run_dir, policy, profiles=profiles)
+        journal.append("run-start", run_id=run_id, run_type="sweep", trigger=trigger)
+        engine: Engine = sweep_engine_cls(
+            paths=paths,
+            policy=policy,
+            adapter=adapters["dev"],
+            review_adapter=adapters["review"],
+            triage_adapter=adapters["triage"],
+            run_dir=run_dir,
+            journal=journal,
+            state=state,
+            prompting=prompting,
+            decisions_only=decisions_only,
+            max_bundles=max_bundles,
+            repeat=repeat,
+            max_cycles=max_cycles,
+        )
+    except BaseException:
+        _unwind_composition(project, run_dir)
+        raise
     return ComposedRun(engine=engine, run_id=run_id, run_dir=run_dir, state=state, journal=journal)
 
 

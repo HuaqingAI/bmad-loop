@@ -6,14 +6,22 @@ every field that reaches exec, and hold still for everything else. A digest that
 under-covers lets a mid-run rewrite through the auto-sweep gate; one that
 over-covers refuses every auto-sweep after a `[limits]` live-edit #189 documents
 as supported. Both halves are pinned below.
+
+The second concern here is composition atomicity: `compose_run` and
+`compose_sweep` publish a run dir before they can know the run will start, and
+`make_adapters` raises `SystemExit` from five sites after that point. The unwind
+that keeps a failed launch from stranding a resumable-looking empty run is pinned
+at the end of the file.
 """
 
 import dataclasses
+import types
 
 import pytest
 
+from bmad_loop import bmadconfig
 from bmad_loop import policy as policy_mod
-from bmad_loop import runsetup
+from bmad_loop import runs, runsetup
 from bmad_loop.adapters.profile import ProfileError
 
 # A profile overlay carrying the whole launch surface the digest covers. It lives
@@ -293,3 +301,128 @@ def test_digest_raises_on_an_unresolvable_profile(pinned):
     hashing a hole where the launch surface should be."""
     with pytest.raises(ProfileError):
         _digest(pinned, '[adapter]\nname = "no-such-cli"\n')
+
+
+# --------------------------------------------------------- composition unwind
+
+# A fixed, well-formed run id, so the assertions can name the two directories a
+# composer publishes rather than fish them back out of the failed call.
+RUN_ID = "20260812-101500-ab12"
+
+# The message `make_adapters` raises for an unusable multiplexer — the one of its
+# five SystemExit sites that is reachable in a run that launched fine, since
+# `mux_usable` bottoms out in a live `shutil.which` on every call.
+BOOM = "error: multiplexer backend TmuxBackend is not usable on this host"
+
+
+class _NeverBuilt:
+    """Engine stand-in for the composers' `*_cls` seams.
+
+    Raises on construction rather than being a no-op: every test below fails at
+    `make_adapters`, which both composers call before they build an engine, so a
+    class that cannot be built is a second assertion that the failure landed where
+    the test says it did."""
+
+    def __init__(self, *args, **kwargs):
+        raise AssertionError("engine construction reached despite a failed make_adapters")
+
+
+def _fake_paths(project):
+    """A hand-built ProjectPaths rather than `bmadconfig.load_paths`, which would
+    need a `_bmad/bmm/config.yaml` on disk. `paths` is read only when the engine is
+    constructed — after `make_adapters` — so nothing here ever dereferences it."""
+    return bmadconfig.ProjectPaths(
+        project=project,
+        implementation_artifacts=project / "impl",
+        planning_artifacts=project / "plan",
+    )
+
+
+@pytest.fixture
+def unwinding(tmp_path):
+    """A project plus a `make_adapters` that fails the way the real one does.
+
+    `runsetup.make_adapters` raises `SystemExit` at five sites (an unresolvable
+    profile, an unknown adapter kind, a kind that fails to load, a construction
+    failure, an unusable multiplexer), and every one lands *after* the composer has
+    published the run dir, its `state.json` and the out-of-tree config-digest stamp.
+    The fake records that all three exist at the moment it is called, so the
+    assertions after the raise grade a *removal* — an "is it gone" assertion passes
+    just as happily for a run dir that was never written.
+
+    `tmp_path` rather than the `project` sandbox, on the same reasoning the `pinned`
+    fixture states: the composers touch only `.bmad-loop/runs/` and the out-of-tree
+    state root (which conftest's `_isolate_state_root` already redirects), so the
+    sandbox's git repo and BMAD artifact dirs would buy nothing. The end-to-end
+    launch path is covered on the real sandbox in tests/test_cli.py."""
+    published: dict[str, bool] = {}
+
+    def make_adapters(project, run_dir, policy, *, profiles=None):
+        published["run_dir"] = run_dir.is_dir()
+        published["state"] = (run_dir / "state.json").is_file()
+        published["state_dir"] = runs.state_dir_for(tmp_path, RUN_ID).is_dir()
+        raise SystemExit(BOOM)
+
+    return types.SimpleNamespace(project=tmp_path, make_adapters=make_adapters, published=published)
+
+
+def _assert_unwound(probe):
+    """Composition published all three artifacts, then left none of them."""
+    assert probe.published == {"run_dir": True, "state": True, "state_dir": True}
+    assert not runs.run_dir_for(probe.project, RUN_ID).exists()
+    assert not runs.state_dir_for(probe.project, RUN_ID).exists()
+
+
+def test_compose_run_unwinds_the_run_when_the_adapters_abort(unwinding):
+    """A failed `make_adapters` must leave no run behind, and must still abort.
+
+    Without the unwind the run dir survives carrying `state.json` with
+    `finished=False` and `crashed=False` and no `run-start` line — and nothing
+    reconciles that shape, since `runs.reconcile_stale_worktrees` only visits
+    `is_finished` runs. It lingers as a resumable-looking empty run.
+
+    The `SystemExit` itself is re-raised unchanged: the cleanup is best-effort
+    precisely so it can never replace the failure the operator has to read."""
+    with pytest.raises(SystemExit, match="not usable on this host"):
+        runsetup.compose_run(
+            project=unwinding.project,
+            paths=_fake_paths(unwinding.project),
+            policy=policy_mod.loads(""),
+            run_id=RUN_ID,
+            epic_filter=None,
+            story_filter=None,
+            max_stories=None,
+            stories_on=False,
+            spec_folder="",
+            sweep_factory=lambda _trigger: None,
+            make_adapters=unwinding.make_adapters,
+            engine_cls=_NeverBuilt,
+            stories_engine_cls=_NeverBuilt,
+            trusted_config_digest="deadbeef",
+        )
+    _assert_unwound(unwinding)
+
+
+def test_compose_sweep_unwinds_the_run_when_the_adapters_abort(unwinding):
+    """The sweep composer publishes the same artifacts (plus `sweep.json`) ahead of
+    the same `make_adapters` call, so it owns its own unwind — separately, since a
+    sweep is the run type most likely to hit the reachable SystemExit: an
+    auto-triggered child re-probes the multiplexer live in a parent that started
+    fine."""
+    with pytest.raises(SystemExit, match="not usable on this host"):
+        runsetup.compose_sweep(
+            project=unwinding.project,
+            paths=_fake_paths(unwinding.project),
+            policy=policy_mod.loads(""),
+            run_id=RUN_ID,
+            prompting=False,
+            decisions_only=False,
+            max_bundles=None,
+            repeat=None,
+            max_cycles=None,
+            trigger="auto",
+            make_adapters=unwinding.make_adapters,
+            sweep_engine_cls=_NeverBuilt,
+            trusted_config_digest="deadbeef",
+        )
+    _assert_unwound(unwinding)
