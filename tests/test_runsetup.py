@@ -430,6 +430,96 @@ def test_compose_sweep_unwinds_the_run_when_the_adapters_abort(unwinding):
     _assert_unwound(unwinding)
 
 
+def test_compose_run_unwinds_a_claim_abandoned_before_save_state(unwinding, monkeypatch):
+    """The guard opens on the statement after the claim, not at `save_state`.
+
+    `_claim_run_dir` publishes the first artifact — the run DIRECTORY — so an abort
+    between it and `save_state` used to strand an empty dir the guard never saw. It
+    is invisible to `bmad-loop list` (state.json-gated), which is precisely why it
+    is worth removing: nothing surfaces it, and a later launch reusing that
+    `--run-id` is refused by a directory holding nothing.
+
+    A `KeyboardInterrupt` because that is the only realistic way in: `Journal`
+    mkdirs `exist_ok=True` over a directory this frame just created and
+    `build_run_state` is a pure constructor, so neither fails on its own — but a
+    signal lands between arbitrary statements, and the arm is `BaseException`.
+
+    `seen` is the positive control, on the fixture's own doctrine: "is it gone"
+    passes just as happily for a directory that was never created.
+
+    Ablation: move the `try` back below `build_run_state` and this fails alone."""
+    seen: dict[str, bool] = {}
+
+    def exploding_build_run_state(**kwargs):
+        seen["run_dir"] = runs.run_dir_for(unwinding.project, RUN_ID).is_dir()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(runsetup, "build_run_state", exploding_build_run_state)
+    with pytest.raises(KeyboardInterrupt):
+        runsetup.compose_run(
+            project=unwinding.project,
+            paths=_fake_paths(unwinding.project),
+            policy=policy_mod.loads(""),
+            run_id=RUN_ID,
+            epic_filter=None,
+            story_filter=None,
+            max_stories=None,
+            stories_on=False,
+            spec_folder="",
+            sweep_factory=lambda _trigger, *, started: None,
+            make_adapters=unwinding.make_adapters,
+            engine_cls=_NeverBuilt,
+            stories_engine_cls=_NeverBuilt,
+            trusted_config_digest="deadbeef",
+        )
+    assert seen == {"run_dir": True}  # the claim published it...
+    assert not runs.run_dir_for(unwinding.project, RUN_ID).exists()  # ...the unwind took it back
+    assert unwinding.published == {}  # and it aborted well ahead of `make_adapters`
+
+
+def test_compose_sweep_unwinds_when_the_journal_itself_cannot_be_built(unwinding, monkeypatch):
+    """The same window in the sweep composer, at its earliest statement — which is
+    also the one case that reaches `_unwind_composition` with NO journal.
+
+    That is why this drives `Journal` rather than the `RunState` build: the unwind
+    writes a `composition-unwind-failed` entry through the journal it is handed, so
+    a `None` there has to be handled rather than left to the surrounding
+    `suppress(Exception)` (an `AttributeError` on `None` is an `Exception`, so the
+    code would work by accident while reading as though a journal were guaranteed).
+
+    Ablation: restore `_unwind_composition`'s `journal: Journal` annotation and drop
+    the `if journal is not None` guard — this stays GREEN, because the suppress
+    absorbs the AttributeError. The guard is graded by the annotation and by this
+    docstring, not by an exit code; what this test does pin is that the run dir is
+    removed on this path at all, which fails alone if the `try` moves back down."""
+    built: dict[str, bool] = {}
+
+    def exploding_journal(run_dir):
+        built["run_dir"] = run_dir.is_dir()
+        raise OSError("journal unavailable")
+
+    monkeypatch.setattr(runsetup, "Journal", exploding_journal)
+    with pytest.raises(OSError, match="journal unavailable"):
+        runsetup.compose_sweep(
+            project=unwinding.project,
+            paths=_fake_paths(unwinding.project),
+            policy=policy_mod.loads(""),
+            run_id=RUN_ID,
+            prompting=False,
+            decisions_only=False,
+            max_bundles=None,
+            repeat=None,
+            max_cycles=None,
+            trigger="auto",
+            make_adapters=unwinding.make_adapters,
+            sweep_engine_cls=_NeverBuilt,
+            trusted_config_digest="deadbeef",
+        )
+    assert built == {"run_dir": True}
+    assert not runs.run_dir_for(unwinding.project, RUN_ID).exists()
+    assert unwinding.published == {}
+
+
 PRIOR_STATE = '{"run_id": "prior", "finished": true}'
 PRIOR_JOURNAL = '{"kind": "run-complete"}\n'
 PRIOR_STAMP = "prior-digest"

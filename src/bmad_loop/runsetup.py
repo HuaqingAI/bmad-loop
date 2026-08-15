@@ -836,7 +836,7 @@ def _claim_run_dir(run_dir: Path) -> None:
         ) from e
 
 
-def _unwind_composition(project: Path, run_dir: Path, journal: Journal) -> None:
+def _unwind_composition(project: Path, run_dir: Path, journal: Journal | None) -> None:
     """Remove the run a failed ``compose_*`` had already published, so a launch
     that aborts partway leaves nothing behind.
 
@@ -909,8 +909,16 @@ def _unwind_composition(project: Path, run_dir: Path, journal: Journal) -> None:
         # `Journal.append` opens with "a" WITHOUT a mkdir, so it raises rather than
         # resurrecting the run it just removed. Suppressed, and the stderr line
         # above still carries the report.
-        with suppress(Exception):
-            journal.append("composition-unwind-failed", run_id=run_dir.name, error=detail)
+        #
+        # ``journal`` is None when the composer aborted between claiming the run dir
+        # and building the Journal — a window only a signal can realistically land
+        # in. Guarded explicitly rather than left to the ``suppress`` above: an
+        # AttributeError on None IS an Exception and would be swallowed, so the
+        # code would work by accident while reading as though a Journal were
+        # guaranteed. The stderr report is the part that matters and is unaffected.
+        if journal is not None:
+            with suppress(Exception):
+                journal.append("composition-unwind-failed", run_id=run_dir.name, error=detail)
 
 
 def compose_run(
@@ -956,22 +964,30 @@ def compose_run(
     # Outside the try below, and it must stay there: a collision refusal that
     # reached `_unwind_composition` would delete the run it exists to protect.
     _claim_run_dir(run_dir)
-    journal = Journal(run_dir)
-    state = build_run_state(
-        run_id=run_id,
-        project=project,
-        policy=policy,
-        epic_filter=epic_filter,
-        story_filter=story_filter,
-        max_stories=max_stories,
-        stories_on=stories_on,
-        spec_folder=spec_folder,
-        trusted_config_digest=trusted_config_digest,
-    )
     # Composition is atomic from the first published artifact onward: everything
     # below either lands whole or is unwound (see :func:`_unwind_composition`,
     # which also states why the arm is `BaseException` and not `Exception`).
+    # The guard opens on the statement immediately after the claim, because the
+    # claim is what publishes that first artifact — the run DIRECTORY itself, which
+    # is what a later `--run-id` collides with. Neither statement below can
+    # realistically fail (`Journal` mkdirs `exist_ok=True` over a directory this
+    # frame just created, and `build_run_state` is a pure constructor), but a
+    # signal can land between any two statements, and the arm is `BaseException`
+    # exactly so that case unwinds instead of stranding an empty run dir.
+    journal: Journal | None = None
     try:
+        journal = Journal(run_dir)
+        state = build_run_state(
+            run_id=run_id,
+            project=project,
+            policy=policy,
+            epic_filter=epic_filter,
+            story_filter=story_filter,
+            max_stories=max_stories,
+            stories_on=stories_on,
+            spec_folder=spec_folder,
+            trusted_config_digest=trusted_config_digest,
+        )
         save_state(run_dir, state)
         # After the run dir exists (Journal mkdir'd it above) and before the pid lands:
         # the ordering `reconcile_orphan_state_dirs` reads runs in, and a stamp that
@@ -1090,18 +1106,20 @@ def compose_sweep(
     run_dir = project / RUNS_DIR / run_id
     # Same claim, same reason, same placement outside the try as in `compose_run`.
     _claim_run_dir(run_dir)
-    journal = Journal(run_dir)
-    state = RunState(
-        run_id=run_id,
-        project=str(project),
-        started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
-        policy_snapshot=policy.to_dict(),
-        run_type="sweep",
-        trusted_config_digest=trusted_config_digest,
-    )
     # Atomic from the first published artifact onward, exactly as in `compose_run`
-    # — same reason, and one more artifact to unwind (`sweep.json`).
+    # — same reason, same opening on the statement after the claim, and one more
+    # artifact to unwind (`sweep.json`).
+    journal: Journal | None = None
     try:
+        journal = Journal(run_dir)
+        state = RunState(
+            run_id=run_id,
+            project=str(project),
+            started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+            policy_snapshot=policy.to_dict(),
+            run_type="sweep",
+            trusted_config_digest=trusted_config_digest,
+        )
         save_state(run_dir, state)
         # Out of the tree, same ordering and same reason as compose_run's stamp.
         runs.write_trusted_config_digest(project, run_id, trusted_config_digest)
