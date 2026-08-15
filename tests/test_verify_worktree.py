@@ -6,7 +6,7 @@ helpers carry no engine wiring yet — they are the plumbing Phase 3 builds on.
 """
 
 import pytest
-from conftest import git
+from conftest import git, make_git_noisy
 
 from bmad_loop import verify
 
@@ -22,6 +22,27 @@ def commit(repo, name, content="x\n", msg="work"):
 
 def test_current_branch(project):
     assert verify.current_branch(project.project) == "main"
+
+
+def test_current_branch_reads_stdout_alone_under_host_noise(project):
+    """git exits 0 while still writing an advisory to stderr, so against `_git`'s
+    stdout+stderr merge the branch name comes back with the warning appended (#442).
+    `make_git_noisy` sets an unknown VALUE for a known config KEY, which is exactly
+    that shape and not an error path.
+
+    The substring assertion is not implied by the equality: it is what distinguishes
+    "the value is clean" from "the oracle is corrupted the same way".
+
+    Ablation target: put `current_branch` back on `_git` (the merge) and this fails
+    alone — the two sibling rows in tests/test_verify.py stay green, since each site
+    is converted separately."""
+    repo = project.project
+    warning = make_git_noisy(repo)
+
+    branch = verify.current_branch(repo)
+
+    assert branch == "main"
+    assert warning not in branch
 
 
 def test_branch_exists(project):
@@ -61,6 +82,37 @@ def test_worktree_add_list_remove(project, tmp_path):
     verify.worktree_remove(repo, wt)
     assert not wt.exists()
     assert wt.resolve() not in [p.resolve() for p in verify.worktree_list(repo)]
+
+
+def test_worktree_list_reads_stdout_alone(project, monkeypatch):
+    """SEAM axis, deliberately — unlike its `current_branch` neighbour above, this row
+    cannot be reddened by the real host noise, and a test that cannot redden is not
+    evidence. `make_git_noisy`'s warning does not start with `"worktree "`, so the
+    `startswith` filter screens it out and the parse is correct BY ACCIDENT; #442's
+    claim that this probe gains "an unparseable extra record" does not hold for that
+    shape (measured at git 2.55.0). The synthetic stderr line is chosen to survive the
+    filter, which is exactly what the filter cannot promise about every future advisory.
+
+    The filter stays in place as a second, independent screen; this asserts the read
+    no longer DEPENDS on it.
+
+    Ablation target: put `worktree_list` back on `_git` (the stdout+stderr merge) and
+    this fails alone, on a `/phantom` path appended to the list — the four sibling #442
+    rows in tests/test_verify.py stay green, since each site is converted separately."""
+    repo = project.project
+    real_run = verify.subprocess.run
+
+    def noisy_run(cmd, **kwargs):
+        proc = real_run(cmd, **kwargs)
+        if not isinstance(proc.stderr, str):  # a binary=True spawn passes through
+            return proc
+        return verify.subprocess.CompletedProcess(
+            proc.args, proc.returncode, proc.stdout, "worktree /phantom\n" + proc.stderr
+        )
+
+    monkeypatch.setattr(verify.subprocess, "run", noisy_run)
+
+    assert [p.resolve() for p in verify.worktree_list(repo)] == [repo.resolve()]
 
 
 def test_worktree_add_create_defaults_to_head(project, tmp_path):

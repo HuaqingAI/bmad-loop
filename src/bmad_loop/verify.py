@@ -179,6 +179,34 @@ def _git_raw(repo: Path, *args: str) -> tuple[int, str]:
     return proc.returncode, proc.stdout
 
 
+def _git_out(repo: Path, *args: str, env: dict[str, str] | None = None) -> tuple[int, str, str]:
+    """Like `_git`, but hands the VALUE and the DIAGNOSTIC back separately —
+    `(returncode, stdout.strip(), (stdout + stderr).strip())`.
+
+    For every caller that reads git's text as the ANSWER rather than only checking
+    the return code. `_git`'s merge is right for the "raise with a message" callers,
+    where stderr is the informative half, and wrong for these: git writes advisories
+    to stderr while still exiting 0 — an unknown `core.fsyncMethod` value, a
+    `core.fsmonitor` hook that cannot exec, a stale-index advisory, `core.hooksPath`
+    pointing at a missing directory — so against the merged stream a warning is
+    indistinguishable from data (#442). A sha probe answers "<sha>\\nwarning: ...", an
+    emptiness read answers non-empty, and a line-splitting read grows a phantom record.
+    None of that is an error path; it is the normal path on a host whose git config the
+    orchestrator does not control.
+
+    The third element keeps the error messages unchanged: a caller raises with the
+    merged text exactly as `_git` did, so a failure still carries stderr. Reach for
+    this whenever the text is the answer; leave `_git` to the rc-only callers.
+    `worktree_clean` and `path_tracked` (#441) predate this helper and spell the same
+    split inline against `_run_git`; `_git_raw` is the third variant, for `-z` output
+    whose records can begin with a space and which `.strip()` would corrupt.
+
+    `env` mirrors `_git_env`, for the snapshot path's throwaway `GIT_INDEX_FILE` and
+    synthetic-identity calls that also read a sha back."""
+    proc = _run_git(["git", "-C", str(repo), *args], repo, env=env)
+    return proc.returncode, proc.stdout.strip(), (proc.stdout + proc.stderr).strip()
+
+
 def _git_env(repo: Path, *args: str, env: dict[str, str]) -> tuple[int, str]:
     """Like `_git` but runs with an explicit environment — used to point git at a
     throwaway `GIT_INDEX_FILE` so a snapshot can stage the tree without touching
@@ -215,9 +243,12 @@ def git_bytes(
 
 
 def rev_parse_head(repo: Path) -> str:
-    rc, out = _git(repo, "rev-parse", "HEAD")
+    """The sha HEAD resolves to. Reads stdout alone (`_git_out`): git exits 0 while
+    still warning on stderr, and a warning-suffixed "sha" flows into `same_commit`
+    comparisons and into persisted run baselines (#442)."""
+    rc, out, detail = _git_out(repo, "rev-parse", "HEAD")
     if rc != 0:
-        raise GitError(f"git rev-parse HEAD failed in {repo}: {out}")
+        raise GitError(f"git rev-parse HEAD failed in {repo}: {detail}")
     return out
 
 
@@ -227,14 +258,16 @@ def last_commit_for(repo: Path, path: Path) -> str:
     the repo. Backs the derived provenance of an operator park record, which is
     written into the very commit it rides and so cannot store its own sha. Git
     failures raise :class:`GitError` like every sibling; only the path relation
-    degrades silently, mirroring `commit_paths`' outside-the-repo contract."""
+    degrades silently, mirroring `commit_paths`' outside-the-repo contract. Reads
+    stdout alone (`_git_out`), since a git that warns at rc 0 would otherwise make
+    this answer a warning-suffixed "sha" (#442)."""
     try:
         rel = Path(path).resolve().relative_to(repo.resolve()).as_posix()
     except (OSError, RuntimeError, ValueError):
         return ""
-    rc, out = _git(repo, "log", "-n", "1", "--format=%H", "--", rel)
+    rc, out, detail = _git_out(repo, "log", "-n", "1", "--format=%H", "--", rel)
     if rc != 0:
-        raise GitError(f"git log failed in {repo}: {out}")
+        raise GitError(f"git log failed in {repo}: {detail}")
     return out
 
 
@@ -447,10 +480,16 @@ def _path_under_any(path: str, prefixes: tuple[str, ...]) -> bool:
 def untracked_files(repo: Path) -> set[str]:
     """Untracked, non-ignored paths (repo-relative posix), mirroring what a
     plain `git clean -fd` (no -x) treats as removable. Ignored files are
-    excluded, so they are never rollback candidates."""
-    rc, out = _git(repo, "ls-files", "--others", "--exclude-standard")
+    excluded, so they are never rollback candidates.
+
+    Reads stdout ALONE (`_git_out`): `ls-files` exits 0 while still writing to
+    stderr, and against `_git`'s merged stream that chatter splits into a phantom
+    untracked path — a PRISTINE tree answers with one, and because this function's
+    contract is what `git clean -fd` would remove, the phantom is a rollback
+    candidate. Silent, on every host whose git config warns (#442)."""
+    rc, out, detail = _git_out(repo, "ls-files", "--others", "--exclude-standard")
     if rc != 0:
-        raise GitError(f"git ls-files --others failed in {repo}: {out}")
+        raise GitError(f"git ls-files --others failed in {repo}: {detail}")
     return {line.strip() for line in out.splitlines() if line.strip()}
 
 
@@ -631,10 +670,15 @@ def commits_above(repo: Path, baseline: str) -> list[str]:
     not assume a strict newest-first / HEAD-first ordering across merges or clock
     skew; callers that need the tip should read HEAD directly). Empty when HEAD is
     at or behind baseline. Raises GitError on a git failure (a bad baseline is a
-    real error, never quietly "no commits")."""
-    rc, out = _git(repo, "rev-list", f"{baseline}..HEAD")
+    real error, never quietly "no commits").
+
+    Reads stdout ALONE (`_git_out`): git exits 0 while still warning on stderr, and
+    against the merged stream that warning is a phantom sha handed to
+    :func:`preserve_commits` — "Empty when HEAD is at or behind baseline" stops
+    holding on any host whose git config warns (#442)."""
+    rc, out, detail = _git_out(repo, "rev-list", f"{baseline}..HEAD")
     if rc != 0:
-        raise GitError(f"git rev-list {baseline}..HEAD failed in {repo}: {out}")
+        raise GitError(f"git rev-list {baseline}..HEAD failed in {repo}: {detail}")
     return [line for line in out.splitlines() if line]
 
 
@@ -700,10 +744,16 @@ def _prune_refs(
     :class:`PrunePreserveError` — after attempting every tail ref — when any
     individual delete failed. One stuck ref must not wedge the retention for
     everything behind it, so deletes are per-ref best-effort and the error
-    carries both what was deleted and what was not."""
+    carries both what was deleted and what was not.
+
+    Reads stdout ALONE (`_git_out`): `for-each-ref` exits 0 while still warning on
+    stderr, and against `_git`'s merged stream that warning enters ``refs``, lands
+    in the ``refs[keep:]`` tail and is handed to ``delete`` — which fails, so
+    retention raises :class:`PrunePreserveError` on every host whose git config
+    warns (#442)."""
     if keep <= 0:
         return []
-    rc, out = _git(
+    rc, out, detail = _git_out(
         repo,
         "for-each-ref",
         # ties on committerdate (same-second rollbacks) break by ascending
@@ -717,7 +767,7 @@ def _prune_refs(
         prefix,
     )
     if rc != 0:
-        raise GitError(f"git for-each-ref {label} failed in {repo}: {out}")
+        raise GitError(f"git for-each-ref {label} failed in {repo}: {detail}")
     refs = [line.removeprefix(strip) for line in out.splitlines() if line]
     deleted: list[str] = []
     failed: list[str] = []
@@ -834,6 +884,16 @@ def snapshot_worktree(
     reset past work it could not park (only a re-drive, whose caller contract
     forbids pausing, still journals and lets the human-directed reset run).
 
+    The three reads whose text IS the answer — ``write-tree``,
+    ``rev-parse <head>^{tree}`` and ``commit-tree`` — take stdout ALONE
+    (``_git_out``, #442). Git exits 0 while still warning on stderr, and against
+    the merged stream all three answer a warning-suffixed "sha": the
+    ``tree == head_tree`` comparison then reads unequal on a tree identical to
+    HEAD, and ``update-ref`` is handed a non-ref. Because of the gate above, that
+    leaves a host whose git config warns with no working rollback at all. The
+    rc-only ``_git_env`` calls stay on the merge — they spend their output on a
+    raise and never read it as a value.
+
     Not every failure here is a :class:`GitError`: spawn faults arrive typed as
     :class:`GitSpawnError` since #343, but the ``TemporaryDirectory`` below can
     raise a plain ``OSError`` outright (ENOSPC/EMFILE) — a filesystem fault no
@@ -856,14 +916,13 @@ def snapshot_worktree(
             rc, out = _git_env(repo, "add", "--", *new, env=env)
             if rc != 0:
                 raise GitError(f"git add (snapshot untracked) failed in {repo}: {out}")
-        rc, tree = _git_env(repo, "write-tree", env=env)
+        rc, tree, detail = _git_out(repo, "write-tree", env=env)
         if rc != 0:
-            raise GitError(f"git write-tree (snapshot) failed in {repo}: {tree}")
-    tree = tree.strip()
-    rc, head_tree = _git(repo, "rev-parse", f"{head}^{{tree}}")
+            raise GitError(f"git write-tree (snapshot) failed in {repo}: {detail}")
+    rc, head_tree, detail = _git_out(repo, "rev-parse", f"{head}^{{tree}}")
     if rc != 0:
-        raise GitError(f"git rev-parse {head}^{{tree}} failed in {repo}: {head_tree}")
-    if tree == head_tree.strip():
+        raise GitError(f"git rev-parse {head}^{{tree}} failed in {repo}: {detail}")
+    if tree == head_tree:
         return None  # working tree identical to HEAD — nothing uncommitted to park
     # A synthetic identity (merged over os.environ) so the snapshot commit succeeds
     # with no git user.name/user.email configured — else the best-effort caller would
@@ -875,12 +934,11 @@ def snapshot_worktree(
         "GIT_COMMITTER_NAME": "bmad-loop",
         "GIT_COMMITTER_EMAIL": "bmad-loop@localhost",
     }
-    rc, snap = _git_env(
+    rc, snap, detail = _git_out(
         repo, "commit-tree", tree, "-p", head, "-m", "attempt worktree snapshot", env=ident
     )
     if rc != 0:
-        raise GitError(f"git commit-tree (snapshot) failed in {repo}: {snap}")
-    snap = snap.strip()
+        raise GitError(f"git commit-tree (snapshot) failed in {repo}: {detail}")
     rc, out = _git(repo, "update-ref", ref_name, snap)
     if rc != 0:
         raise GitError(f"git update-ref {ref_name} {snap[:12]} failed in {repo}: {out}")
@@ -961,7 +1019,7 @@ def safe_rollback(
     policy_path = repo / POLICY_FILE_REL
     policy_content = policy_path.read_bytes() if policy_path.is_file() else None
 
-    rc, out = _git(repo, "stash", "create")
+    rc, out, detail = _git_out(repo, "stash", "create")
     # A failed `stash create` silently empties `snapshot`, which disables the whole
     # preserve restore below — the reset would then revert the very paths the caller
     # asked to keep (a resolved re-drive's corrected spec), with no error anywhere.
@@ -969,9 +1027,13 @@ def safe_rollback(
     # no `preserve` the snapshot is unused, so the degrade stays correct there (both
     # sweep callers rely on it). A clean tree is not a failure — it exits rc 0 with
     # empty output, which the line below keeps handling as "nothing to restore from".
+    # Reading stdout ALONE is what makes that last sentence true on a host whose git
+    # warns at rc 0 (#442): against the merge the warning IS the "snapshot", so the
+    # restore below ran `checkout warning:… -- <dir>` after the reset had already
+    # destroyed the preserved content — destructive first, then loud.
     if rc != 0 and preserve:
-        raise GitError(f"git stash create failed in {repo}: {out}")
-    snapshot = out.strip() if rc == 0 else ""
+        raise GitError(f"git stash create failed in {repo}: {detail}")
+    snapshot = out if rc == 0 else ""
     rc, out = _git(repo, "reset", "--hard", baseline)
     if rc != 0:
         raise GitError(f"git reset --hard {baseline} failed: {out}")
@@ -994,6 +1056,13 @@ def safe_rollback(
         # dir restores everything beneath it exactly as before.
         for d in preserve:
             rc, out = _git(repo, "checkout", snapshot, "--", *_literal_specs([d]))
+            # Deliberately still the MERGED read (#442), unlike the `stash create`
+            # above: this inspects text on the ERROR path, where git's "did not
+            # match" lands on STDERR — stdout alone can never contain it, so the
+            # substring would stop matching and a benign empty preserve dir would
+            # raise. INVERSE ablation: convert this `_git` to `_git_out` and read
+            # the stdout half here, and `test_safe_rollback_tolerates_empty_preserve_dir`
+            # fails on an unexpected GitError.
             if rc != 0 and "did not match" not in out:
                 raise GitError(f"git checkout {snapshot[:12]} -- {d} failed: {out}")
     if policy_content is not None:
@@ -1050,10 +1119,12 @@ def _prune_empty_parents(start: Path, repo: Path) -> None:
 
 
 def current_branch(repo: Path) -> str:
-    """The branch name HEAD points at, or "HEAD" when detached."""
-    rc, out = _git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    """The branch name HEAD points at, or "HEAD" when detached. Reads stdout alone
+    (`_git_out`): git exits 0 while still warning on stderr, and the merged stream
+    would answer a branch name with the warning appended (#442)."""
+    rc, out, detail = _git_out(repo, "rev-parse", "--abbrev-ref", "HEAD")
     if rc != 0:
-        raise GitError(f"git rev-parse --abbrev-ref HEAD failed in {repo}: {out}")
+        raise GitError(f"git rev-parse --abbrev-ref HEAD failed in {repo}: {detail}")
     return out
 
 
@@ -1143,10 +1214,17 @@ def worktree_prune(repo: Path) -> None:
 
 
 def worktree_list(repo: Path) -> list[Path]:
-    """Paths of every worktree attached to `repo` (the main checkout first)."""
-    rc, out = _git(repo, "worktree", "list", "--porcelain")
+    """Paths of every worktree attached to `repo` (the main checkout first).
+
+    Reads stdout ALONE (`_git_out`) so the record parse does not depend on no
+    stderr line ever starting with ``"worktree "``. The advisories measured for
+    #442 — an unknown `core.fsyncMethod` value and its family — do NOT start that
+    way, so the `startswith` filter screens them out and this parse was correct by
+    accident rather than by construction; the filter stays as a second, independent
+    screen."""
+    rc, out, detail = _git_out(repo, "worktree", "list", "--porcelain")
     if rc != 0:
-        raise GitError(f"git worktree list failed in {repo}: {out}")
+        raise GitError(f"git worktree list failed in {repo}: {detail}")
     paths = []
     for line in out.splitlines():
         if line.startswith("worktree "):
@@ -1352,7 +1430,14 @@ def capture_diff(repo: Path, baseline: str, *, max_file_bytes: int | None = None
     for forensics. Returns "" when there is nothing to capture.
 
     Unlike `_git`, the tracked diff is read from stdout alone and left verbatim
-    (no strip, no stderr merge) so the patch stays applyable.
+    (no strip, no stderr merge) so the patch stays applyable, as is the
+    `--no-index` spawn below it. The untracked leg now matches those two
+    (`_git_out`, #442): its `ls-files` exits 0 while still
+    warning on stderr, so against the merged stream the warning splits off as a
+    phantom rel. Measured, that phantom is inert here — `diff --no-index` cannot
+    access it and exits 1, exactly the code the loop below already tolerates as
+    "the files differ", with empty stdout — so this leg is converted for the same
+    reason its two neighbours read stdout alone, not on a demonstrated corruption.
 
     max_file_bytes caps the size of each *untracked* file included: a file larger
     than the cap is skipped and replaced with a one-line marker naming it and its
@@ -1364,9 +1449,9 @@ def capture_diff(repo: Path, baseline: str, *, max_file_bytes: int | None = None
         raise GitError(f"git diff {baseline} failed in {repo}: {proc.stderr.strip()}")
     parts = [proc.stdout]
 
-    rc, out = _git(repo, "ls-files", "--others", "--exclude-standard")
+    rc, out, detail = _git_out(repo, "ls-files", "--others", "--exclude-standard")
     if rc != 0:
-        raise GitError(f"git ls-files --others failed in {repo}: {out}")
+        raise GitError(f"git ls-files --others failed in {repo}: {detail}")
     for rel in out.splitlines():
         rel = rel.strip()
         if not rel:
@@ -2509,9 +2594,14 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
     rc, out = _git(repo, "add", "--", *specs)
     if rc != 0:
         raise GitError(f"git add failed: {out}")
-    rc, out = _git(repo, "status", "--porcelain", "--", *specs)
+    # Stdout ALONE (`_git_out`, #442): this is an EMPTINESS test, and `status` exits 0
+    # while still warning on stderr — against the merge an unchanged path set reads
+    # non-empty, the early-out below is skipped, and `git commit` runs with nothing
+    # staged and raises where the contract says return None. The `add` above and the
+    # `commit` below stay on `_git`: both are rc-only, and stderr is their diagnostic.
+    rc, out, detail = _git_out(repo, "status", "--porcelain", "--", *specs)
     if rc != 0:
-        raise GitError(f"git status failed: {out}")
+        raise GitError(f"git status failed: {detail}")
     if not out:
         return None  # nothing changed in these paths
     # pathspec form commits only `rels`, ignoring any other staged changes
