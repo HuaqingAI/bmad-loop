@@ -51,18 +51,13 @@ breaking changes may land in a minor release.
 ### Fixed
 
 - **An unrelated untracked file in your main checkout no longer blocks every isolated unit merge
-  (#460).** Under `[scm] isolation = "worktree"` the pre-merge reconcile refused whenever any dirty
-  path fell outside the unit branch's incoming set, untracked included — so one `notes.txt`, one
-  editor `.orig` backup, one stray build artifact anywhere in the main checkout escalated the story,
-  kept its branch and paused an unattended run, with nothing about that file colliding with
-  anything. A merge writes only the paths that differ between the target and the branch, and git
-  never stages an untracked file into a merge or a squash commit, so untracked dirt outside that set
-  is now left exactly where it is, the merge proceeds, and the run journals `merge-target-tolerated`
-  naming the files it merged around. Uncommitted changes to **tracked** files outside the set still
-  escalate: git refuses the merge outright once such a change is staged, and
-  `merge_strategy = "squash"` folds it into the story's commit either way. What this reaches is dirt
-  that appears after the run starts — `run` still refuses to begin on a dirty main tree — and every
-  `resume`, which has no such gate.
+  (#460).** Under `[scm] isolation = "worktree"` the pre-merge reconcile refused over any dirty path
+  outside the unit branch's incoming set, untracked included, so a single `notes.txt` escalated the
+  story and paused an unattended run. A merge writes only the paths that differ between target and
+  branch and never stages an untracked file into the commit, so untracked dirt outside that set is
+  now left where it is, the merge proceeds, and the run journals `merge-target-tolerated` naming it.
+  Uncommitted changes to **tracked** files still escalate — `merge_strategy = "squash"` would fold
+  them into the story's commit. Reaches dirt that appears after the run starts, and every `resume`.
 
 - **The escalation that remains no longer blames a game engine (#460).** It asserted that "likely a
   Unity Editor wrote into the main project" on every isolated merge — the guard's origin story
