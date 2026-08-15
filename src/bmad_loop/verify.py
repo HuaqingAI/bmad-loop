@@ -884,6 +884,16 @@ def snapshot_worktree(
     reset past work it could not park (only a re-drive, whose caller contract
     forbids pausing, still journals and lets the human-directed reset run).
 
+    The three reads whose text IS the answer — ``write-tree``,
+    ``rev-parse <head>^{tree}`` and ``commit-tree`` — take stdout ALONE
+    (``_git_out``, #442). Git exits 0 while still warning on stderr, and against
+    the merged stream all three answer a warning-suffixed "sha": the
+    ``tree == head_tree`` comparison then reads unequal on a tree identical to
+    HEAD, and ``update-ref`` is handed a non-ref. Because of the gate above, that
+    leaves a host whose git config warns with no working rollback at all. The
+    rc-only ``_git_env`` calls stay on the merge — they spend their output on a
+    raise and never read it as a value.
+
     Not every failure here is a :class:`GitError`: spawn faults arrive typed as
     :class:`GitSpawnError` since #343, but the ``TemporaryDirectory`` below can
     raise a plain ``OSError`` outright (ENOSPC/EMFILE) — a filesystem fault no
@@ -906,14 +916,13 @@ def snapshot_worktree(
             rc, out = _git_env(repo, "add", "--", *new, env=env)
             if rc != 0:
                 raise GitError(f"git add (snapshot untracked) failed in {repo}: {out}")
-        rc, tree = _git_env(repo, "write-tree", env=env)
+        rc, tree, detail = _git_out(repo, "write-tree", env=env)
         if rc != 0:
-            raise GitError(f"git write-tree (snapshot) failed in {repo}: {tree}")
-    tree = tree.strip()
-    rc, head_tree = _git(repo, "rev-parse", f"{head}^{{tree}}")
+            raise GitError(f"git write-tree (snapshot) failed in {repo}: {detail}")
+    rc, head_tree, detail = _git_out(repo, "rev-parse", f"{head}^{{tree}}")
     if rc != 0:
-        raise GitError(f"git rev-parse {head}^{{tree}} failed in {repo}: {head_tree}")
-    if tree == head_tree.strip():
+        raise GitError(f"git rev-parse {head}^{{tree}} failed in {repo}: {detail}")
+    if tree == head_tree:
         return None  # working tree identical to HEAD — nothing uncommitted to park
     # A synthetic identity (merged over os.environ) so the snapshot commit succeeds
     # with no git user.name/user.email configured — else the best-effort caller would
@@ -925,12 +934,11 @@ def snapshot_worktree(
         "GIT_COMMITTER_NAME": "bmad-loop",
         "GIT_COMMITTER_EMAIL": "bmad-loop@localhost",
     }
-    rc, snap = _git_env(
+    rc, snap, detail = _git_out(
         repo, "commit-tree", tree, "-p", head, "-m", "attempt worktree snapshot", env=ident
     )
     if rc != 0:
-        raise GitError(f"git commit-tree (snapshot) failed in {repo}: {snap}")
-    snap = snap.strip()
+        raise GitError(f"git commit-tree (snapshot) failed in {repo}: {detail}")
     rc, out = _git(repo, "update-ref", ref_name, snap)
     if rc != 0:
         raise GitError(f"git update-ref {ref_name} {snap[:12]} failed in {repo}: {out}")
@@ -1011,7 +1019,7 @@ def safe_rollback(
     policy_path = repo / POLICY_FILE_REL
     policy_content = policy_path.read_bytes() if policy_path.is_file() else None
 
-    rc, out = _git(repo, "stash", "create")
+    rc, out, detail = _git_out(repo, "stash", "create")
     # A failed `stash create` silently empties `snapshot`, which disables the whole
     # preserve restore below — the reset would then revert the very paths the caller
     # asked to keep (a resolved re-drive's corrected spec), with no error anywhere.
@@ -1019,9 +1027,13 @@ def safe_rollback(
     # no `preserve` the snapshot is unused, so the degrade stays correct there (both
     # sweep callers rely on it). A clean tree is not a failure — it exits rc 0 with
     # empty output, which the line below keeps handling as "nothing to restore from".
+    # Reading stdout ALONE is what makes that last sentence true on a host whose git
+    # warns at rc 0 (#442): against the merge the warning IS the "snapshot", so the
+    # restore below ran `checkout warning:… -- <dir>` after the reset had already
+    # destroyed the preserved content — destructive first, then loud.
     if rc != 0 and preserve:
-        raise GitError(f"git stash create failed in {repo}: {out}")
-    snapshot = out.strip() if rc == 0 else ""
+        raise GitError(f"git stash create failed in {repo}: {detail}")
+    snapshot = out if rc == 0 else ""
     rc, out = _git(repo, "reset", "--hard", baseline)
     if rc != 0:
         raise GitError(f"git reset --hard {baseline} failed: {out}")
@@ -1044,6 +1056,13 @@ def safe_rollback(
         # dir restores everything beneath it exactly as before.
         for d in preserve:
             rc, out = _git(repo, "checkout", snapshot, "--", *_literal_specs([d]))
+            # Deliberately still the MERGED read (#442), unlike the `stash create`
+            # above: this inspects text on the ERROR path, where git's "did not
+            # match" lands on STDERR — stdout alone can never contain it, so the
+            # substring would stop matching and a benign empty preserve dir would
+            # raise. INVERSE ablation: convert this `_git` to `_git_out` and read
+            # the stdout half here, and `test_safe_rollback_tolerates_empty_preserve_dir`
+            # fails on an unexpected GitError.
             if rc != 0 and "did not match" not in out:
                 raise GitError(f"git checkout {snapshot[:12]} -- {d} failed: {out}")
     if policy_content is not None:
@@ -2544,9 +2563,14 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
     rc, out = _git(repo, "add", "--", *specs)
     if rc != 0:
         raise GitError(f"git add failed: {out}")
-    rc, out = _git(repo, "status", "--porcelain", "--", *specs)
+    # Stdout ALONE (`_git_out`, #442): this is an EMPTINESS test, and `status` exits 0
+    # while still warning on stderr — against the merge an unchanged path set reads
+    # non-empty, the early-out below is skipped, and `git commit` runs with nothing
+    # staged and raises where the contract says return None. The `add` above and the
+    # `commit` below stay on `_git`: both are rc-only, and stderr is their diagnostic.
+    rc, out, detail = _git_out(repo, "status", "--porcelain", "--", *specs)
     if rc != 0:
-        raise GitError(f"git status failed: {out}")
+        raise GitError(f"git status failed: {detail}")
     if not out:
         return None  # nothing changed in these paths
     # pathspec form commits only `rels`, ignoring any other staged changes

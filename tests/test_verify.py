@@ -1772,7 +1772,12 @@ def test_safe_rollback_raises_when_the_preserve_snapshot_cannot_be_taken(project
     Raise before the reset instead.
 
     Ablation target: drop the `if rc != 0 and preserve: raise` from safe_rollback
-    and this fails — the spec comes back reverted, quietly."""
+    and this fails — the spec comes back reverted, quietly.
+
+    The fake stands on `_git_out`, which is the helper the `stash create` site reads
+    through since #442 — on `_git` it would simply never fire, and the test would go
+    green because nothing raised anywhere. The `pytest.raises` below is what proves
+    it fired."""
     repo = project.project
     spec = project.implementation_artifacts / "spec-1-1-a.md"
     spec.write_text("frozen: original\n")
@@ -1783,14 +1788,14 @@ def test_safe_rollback_raises_when_the_preserve_snapshot_cannot_be_taken(project
     artifact_rel = project.implementation_artifacts.relative_to(repo).as_posix()
     spec.write_text("frozen: corrected\n")
 
-    real_git = verify._git
+    real_git_out = verify._git_out
 
-    def fake_git(r, *args):
+    def fake_git_out(r, *args, env=None):
         if args[:2] == ("stash", "create"):
-            return 1, "fatal: unable to write temporary index"
-        return real_git(r, *args)
+            return 1, "", "fatal: unable to write temporary index"
+        return real_git_out(r, *args, env=env)
 
-    monkeypatch.setattr(verify, "_git", fake_git)
+    monkeypatch.setattr(verify, "_git_out", fake_git_out)
     with pytest.raises(verify.GitError, match="git stash create"):
         verify.safe_rollback(
             repo,
@@ -1808,22 +1813,31 @@ def test_safe_rollback_degrades_stash_failure_when_nothing_to_preserve(project, 
     the snapshot is unused, so a `stash create` failure stays a non-event — both
     sweep call sites reset with no preserve and must not start failing.
 
-    INVERSE ablation: drop the `and preserve` guard and this fails."""
+    INVERSE ablation: drop the `and preserve` guard and this fails.
+
+    The fake stands on `_git_out`, the helper the `stash create` site reads through
+    since #442. `fired` is not decoration: this test's whole assertion is that
+    NOTHING happened, so a fake patched onto the wrong helper would leave it green
+    while proving nothing at all — the failure it exists to catch and the fake going
+    inert are indistinguishable from the outside."""
     repo = project.project
     baseline = verify.rev_parse_head(repo)
     snap = sorted(verify.untracked_files(repo))
     (repo / "src.txt").write_text("dev attempt\n")
 
-    real_git = verify._git
+    real_git_out = verify._git_out
+    fired: list[str] = []
 
-    def fake_git(r, *args):
+    def fake_git_out(r, *args, env=None):
         if args[:2] == ("stash", "create"):
-            return 1, "fatal: unable to write temporary index"
-        return real_git(r, *args)
+            fired.append("stash")
+            return 1, "", "fatal: unable to write temporary index"
+        return real_git_out(r, *args, env=env)
 
-    monkeypatch.setattr(verify, "_git", fake_git)
+    monkeypatch.setattr(verify, "_git_out", fake_git_out)
     verify.safe_rollback(repo, baseline, baseline_untracked=snap)  # no preserve
 
+    assert fired == ["stash"]  # the injected failure actually reached the site
     assert (repo / "src.txt").read_text() == "original\n"  # reset still happened
 
 
@@ -1843,6 +1857,95 @@ def test_safe_rollback_tolerates_empty_preserve_dir(project):
         preserve=("_bmad-output",),  # no tracked files here at snapshot time
     )
     assert (repo / "src.txt").read_text() == "original\n"  # source still reverted
+
+
+def test_safe_rollback_restores_a_preserve_dir_under_host_noise(project):
+    """REAL-GIT axis (#442), on the family's most destructive row. `git stash create`
+    exits 0 while still warning on stderr, so against `_git`'s merge `snapshot` became
+    "<sha>\\nwarning: …" — a non-ref. The restore below then ran
+    `git checkout '<non-ref>' -- <dir>`, which fails "fatal: invalid reference" (NOT
+    the tolerated "did not match"), so safe_rollback raised — after the
+    `git reset --hard` had already discarded the content `preserve` names. Destructive
+    first, then loud.
+
+    Both halves are load-bearing: the absent raise, and the corrected content on disk.
+    A fix that merely stopped raising would leave the spec reverted just as silently
+    as the failure this restore exists to prevent.
+
+    Ablation target: put the `stash create` back on `_git` (the merge) and this fails,
+    on `GitError: git checkout … fatal: invalid reference` — together with
+    `test_safe_rollback_degrades_on_a_clean_tree_under_host_noise`, which grades the
+    same site from its empty-stdout side. Measured, that revert reddens two further
+    rows: `…_raises_when_the_preserve_snapshot_cannot_be_taken` and
+    `…_degrades_stash_failure_when_nothing_to_preserve`, whose injected failures are
+    patched onto `_git_out` because the site reads through it. Four rows, one site."""
+    repo = project.project
+    make_git_noisy(repo)
+    spec = project.implementation_artifacts / "spec-1-1-a.md"
+    spec.write_text("frozen: original\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "spec")
+    baseline = verify.rev_parse_head(repo)
+    snap = sorted(verify.untracked_files(repo))
+    artifact_rel = project.implementation_artifacts.relative_to(repo).as_posix()
+
+    spec.write_text("frozen: corrected\n")  # the resolve workflow's correction
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "spec correction")  # committed above baseline
+    (repo / "src.txt").write_text("dev attempt\n")  # dirt, so `stash create` has a tree
+
+    verify.safe_rollback(
+        repo,
+        baseline,
+        baseline_untracked=snap,
+        keep=(".bmad-loop", artifact_rel),
+        preserve=(artifact_rel,),
+    )
+
+    assert (repo / "src.txt").read_text() == "original\n"  # the reset ran
+    assert spec.read_text() == "frozen: corrected\n"  # and the restore ran after it
+
+
+def test_safe_rollback_degrades_on_a_clean_tree_under_host_noise(project):
+    """The empty-stdout row of that same site. `git stash create` on a clean tree exits
+    0 with EMPTY stdout, so under host noise the merged read was the warning and
+    nothing else — making `snapshot` a non-ref exactly where the code's own comment
+    promises "nothing to restore from", and turning the documented degrade into a
+    raise (after the reset).
+
+    "Treated as empty" is observed through behavior rather than by reaching into the
+    function: with no restore attempted the preserve dir comes back at BASELINE
+    content — the clean-tree degrade policy.toml is restored separately to work
+    around. A restore driven by a corrupt snapshot cannot produce that; pre-fix it
+    raises before it could.
+
+    Ablation target: put the `stash create` back on `_git` (the merge) and this fails,
+    on `GitError: git checkout … fatal: invalid reference` — together with
+    `test_safe_rollback_restores_a_preserve_dir_under_host_noise`."""
+    repo = project.project
+    make_git_noisy(repo)
+    spec = project.implementation_artifacts / "spec-1-1-a.md"
+    spec.write_text("frozen: original\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "spec")
+    baseline = verify.rev_parse_head(repo)
+    snap = sorted(verify.untracked_files(repo))
+    artifact_rel = project.implementation_artifacts.relative_to(repo).as_posix()
+
+    spec.write_text("frozen: corrected\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "spec correction")  # committed: no working-tree dirt
+    assert git(repo, "status", "--porcelain", "--untracked-files=no") == ""  # nothing to stash
+
+    verify.safe_rollback(
+        repo,
+        baseline,
+        baseline_untracked=snap,
+        keep=(".bmad-loop", artifact_rel),
+        preserve=(artifact_rel,),
+    )
+
+    assert spec.read_text() == "frozen: original\n"  # empty snapshot => no restore
 
 
 def test_safe_rollback_preserves_uncommitted_policy_edit(project):
@@ -2833,6 +2936,30 @@ def test_commit_paths_noop_when_unchanged(project):
     assert verify.commit_paths(project.project, "noop", [project.project.parent / "x"]) is None
 
 
+def test_commit_paths_noops_on_unchanged_paths_under_host_noise(project):
+    """REAL-GIT axis (#442), the same no-op contract as its sibling above, on a host
+    whose git warns. `status --porcelain` exits 0 while writing that warning to
+    stderr, so against `_git`'s merge an UNCHANGED path set reads NON-EMPTY: the
+    `if not out: return None` early-out is skipped and `git commit` runs with nothing
+    staged, exiting 1. The function then raised
+    `GitError("git commit failed: … nothing to commit …")` precisely where its
+    contract promises None — and every caller committing an optional artifact (an
+    operator park record, a ledger carry) took that raise.
+
+    The HEAD assertion is the second half: a fix that returned None while still
+    committing would satisfy the first alone.
+
+    Ablation target: put the `status` read back on `_git` (the merge) and this fails
+    alone, on that GitError."""
+    repo = project.project
+    make_git_noisy(repo)
+    head = verify.rev_parse_head(repo)
+
+    assert verify.commit_paths(repo, "noop", [repo / "src.txt"]) is None
+
+    assert verify.rev_parse_head(repo) == head  # and nothing was committed
+
+
 def test_apply_patch_replays_saved_diff(project):
     """A patch saved off the baseline re-applies cleanly onto that same baseline —
     tracked edits AND new (untracked) files — reproducing the reverted attempt."""
@@ -3813,6 +3940,70 @@ def test_snapshot_worktree_unknown_baseline_skips_untracked(project):
     tree = git(repo, "ls-tree", "-r", "--name-only", ref)
     assert "src.txt" in tree  # tracked edit captured
     assert "user_untracked.txt" not in tree  # unknown-baseline untracked left untouched
+
+
+def test_snapshot_worktree_parks_a_dirty_tree_under_host_noise(project):
+    """REAL-GIT axis (#442): `write-tree` and `commit-tree` exit 0 while still warning
+    on stderr, so against `_git`'s merge both answered a warning-suffixed "sha" —
+    `commit-tree` was handed a non-object, or `update-ref` a non-commit, and
+    snapshot_worktree raised. Since #340 that ref is a GATE, not a safety net: a plain
+    rollback refuses to reset past work it could not park. So a host whose git config
+    warns had no working rollback at all, on every attempt.
+
+    The tree comparison is what stops this passing on a ref that exists but points at
+    nothing useful — a snapshot whose tree equals HEAD's has parked none of the work
+    it was called to save.
+
+    Ablation targets, reverted singly and measured — the two are NOT symmetric:
+
+    * `write-tree` back on `_git_env` (the merge): this fails on
+      `GitError: git commit-tree (snapshot) failed … fatal: not a valid object
+      name`, the corrupt tree carried into the next call. It reddens
+      `test_snapshot_worktree_still_noops_on_a_clean_tree_under_host_noise` too, and
+      not incidentally: a corrupt `tree` cannot equal a clean `head_tree`, so the
+      clean-tree no-op stops returning early and walks into the same call. Recorded
+      because the overlap is real, and because miscounting it would credit that row
+      with coverage of this site.
+    * `commit-tree` back on `_git_env`: this fails ALONE, on
+      `GitError: git update-ref refs/attempt-preserve-dirty/run-noisy … not a valid
+      SHA1` — a clean tree returns before ever reaching it."""
+    repo = project.project
+    make_git_noisy(repo)
+    ref_name = "refs/attempt-preserve-dirty/run-noisy"
+    (repo / "src.txt").write_text("attempt work\n")  # the uncommitted edit to park
+
+    ref = verify.snapshot_worktree(repo, ref_name, baseline_untracked=[])
+
+    assert ref == ref_name
+    assert verify.ref_exists(repo, ref_name) is True
+    # and it parked the work: the snapshot's tree is not just a copy of HEAD's
+    assert git(repo, "rev-parse", f"{ref_name}^{{tree}}") != git(repo, "rev-parse", "HEAD^{tree}")
+    assert git(repo, "show", f"{ref_name}:src.txt") == "attempt work"
+
+
+def test_snapshot_worktree_still_noops_on_a_clean_tree_under_host_noise(project):
+    """The comparison row. `rev-parse <head>^{tree}` also exits 0 while warning on
+    stderr, so against the merge `head_tree` carried the warning and
+    `tree == head_tree` read UNEQUAL on a tree identical to HEAD: the clean-tree no-op
+    became a snapshot ref parking nothing, created on every non-destructive rollback.
+
+    Only a test that demands `None` can catch a comparison corrupted on one side. The
+    ref it wrongly creates is well-formed and its commit is real — there is nothing
+    malformed downstream for another assertion to trip over.
+
+    Ablation target: put the `rev-parse <head>^{tree}` read back on `_git` and restore
+    its `head_tree.strip()`, and this fails alone, on the ref name where None was
+    expected — `test_snapshot_worktree_parks_a_dirty_tree_under_host_noise` stays
+    green, since a dirty tree differs from HEAD's under either read. Reverting
+    `write-tree` reddens this row as well, for a different reason; that test's record
+    carries the measurement."""
+    repo = project.project
+    make_git_noisy(repo)
+    ref_name = "refs/attempt-preserve-dirty/run-clean-noisy"
+
+    assert verify.snapshot_worktree(repo, ref_name, baseline_untracked=[]) is None
+
+    assert verify.ref_exists(repo, ref_name) is False  # and no ref was created
 
 
 def test_engine_written_is_keyword_only_on_all_dev_verifiers():
