@@ -1195,7 +1195,13 @@ def branch_incoming_paths(repo: Path, target: str, branch: str) -> set[str]:
     return {p for p in out.split("\0") if p}
 
 
-def clean_incoming_collisions(repo: Path, target: str, branch: str) -> list[str]:
+def clean_incoming_collisions(
+    repo: Path,
+    target: str,
+    branch: str,
+    *,
+    on_tolerated: Callable[[list[str]], None] | None = None,
+) -> list[str]:
     """Reconcile a target checkout dirtied by a per-worktree Unity Editor so the
     merge of `branch` can proceed, returning the cleaned paths (empty when the
     tree was already clean).
@@ -1216,6 +1222,11 @@ def clean_incoming_collisions(repo: Path, target: str, branch: str) -> list[str]
     refuses a merge outright when the change is staged, and `merge --squash` + `commit`
     folds it into the story's commit either way — so those still raise GitError naming
     the paths, without touching anything.
+
+    ``on_tolerated``, when given, is called once with the sorted list of untracked
+    stray paths the guard walked past — the mirror of the returned ``cleaned`` list,
+    so a merge that proceeded over operator dirt leaves the same kind of trace as one
+    that cleaned a leak. Not called when there are no such paths.
     """
     dirty = dirty_paths(repo)
     if not dirty:
@@ -1236,6 +1247,9 @@ def clean_incoming_collisions(repo: Path, target: str, branch: str) -> list[str]
             "the target checkout has uncommitted changes to tracked files outside "
             f"this branch's files (not introduced by the merge): {', '.join(blocking)}"
         )
+    tolerated = [p for p in stray if dirty[p].startswith("??")]
+    if tolerated and on_tolerated is not None:
+        on_tolerated(tolerated)
     repo_res = repo.resolve()
     cleaned: list[str] = []
     for path, xy in sorted(dirty.items()):

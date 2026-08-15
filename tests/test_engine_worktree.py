@@ -1418,9 +1418,11 @@ def test_host_loss_after_merge_before_evidence_replays_gitignored_harvest(
     real_clean = verify.clean_incoming_collisions
     real_merge = verify.merge_branch
 
-    def record_collision_ref(repo, target, merge_ref):
+    def record_collision_ref(repo, target, merge_ref, **kwargs):
         replay_collision_refs.append(merge_ref)
-        return real_clean(repo, target, merge_ref)
+        # forward the keywords rather than dropping them: dropping `on_tolerated`
+        # would silently disable the journal event on the replay path (#460).
+        return real_clean(repo, target, merge_ref, **kwargs)
 
     def record_merge_ref(repo, merge_ref, **kwargs):
         replay_merge_refs.append(merge_ref)
@@ -2935,8 +2937,9 @@ def _operator_edit_dev_effect(project, story_key, *, rel_path, marker):
 
 def test_merge_stray_dirt_escalates_with_clear_message(project):
     """Dirt in the main checkout that is NOT part of the branch's incoming files
-    (possible real operator work) is never cleaned: the unit escalates with the
-    Editor-leak message and keeps its branch.
+    (possible real operator work) is never cleaned: the unit escalates and keeps its
+    branch, with a message that names tracked dirt as the hazard and offers the two
+    SAFE resolutions rather than blaming a Unity Editor and saying "clean them" (#460).
 
     Since #460 that refusal is scoped to TRACKED dirt — an untracked stray is inert
     and tolerated (`test_merge_tolerates_untracked_stray_in_main_checkout`) — so the
@@ -2961,7 +2964,20 @@ def test_merge_stray_dirt_escalates_with_clear_message(project):
     task = engine.state.tasks["1-1-a"]
     assert task.phase == Phase.ESCALATED
     reason = engine.state.paused_reason or ""
-    assert "not part of this branch" in reason and ".gitignore" in reason
+    # Each promise gets its own assertion so a failure names which one broke.
+    # The two NEGATIVE assertions are the whole of #460's second complaint and must
+    # not be "simplified" away by a later session: the old message asserted a Unity
+    # Editor as the likely cause on every isolated merge — including repos with no
+    # Unity anywhere — and told the operator to "clean" their own uncommitted work,
+    # which is the exact verb (`unlink`) this guard performs on incoming strays.
+    assert "Unity" not in reason
+    assert "clean them" not in reason
+    assert "Commit, stash or revert" in reason  # the two SAFE resolutions, named
+    assert ".gitignore" in reason  # the inner GitError still names the exact path
+    # The composed message says which half of the dirt actually blocks a merge. Note
+    # the inner GitError carries "tracked" too, so this one does not by itself pin the
+    # OUTER wording — "Commit, stash or revert" above is the assertion that does.
+    assert "tracked" in reason
     # branch kept for manual merge; the operator's edit was left untouched
     assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
     assert (project.project / ".gitignore").read_text().endswith("# operator edit\n")
@@ -2995,6 +3011,14 @@ def test_merge_tolerates_untracked_stray_in_main_checkout(project):
     # deleting the operator file it just decided to let through.
     assert (project.project / "operator-notes.txt").read_text() == "editor leaked\n"
     assert "merge-target-cleaned" not in kinds
+    # ...and walking past it is not silent. A merge that proceeded over operator dirt
+    # leaves the same kind of trace as one that cleaned a leak, so an operator reading
+    # the journal can see which of their files the run merged around.
+    assert "merge-target-tolerated" in kinds
+    tolerated = next(e for e in engine.journal.entries() if e["kind"] == "merge-target-tolerated")
+    assert tolerated["paths"] == ["operator-notes.txt"]
+    assert tolerated["story_key"] == "1-1-a"
+    assert tolerated["branch"] == "bmad-loop/test-run/1-1-a"
 
 
 @pytest.mark.parametrize(
@@ -3037,9 +3061,11 @@ def test_merge_env_fault_during_target_clean_keeps_branch_and_escalates(
     assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
     reason = engine.state.paused_reason or ""
     assert "Permission denied" in reason
-    # environment fault, not the stray-files refusal: no "clean them" guidance
+    # environment fault, not the stray-dirt refusal. The second assertion is the
+    # discriminator and must name a phrase only the stray-dirt arm carries — there
+    # may be no stray files at all here, so that arm's remediation must not leak in.
     assert "could not reconcile" in reason
-    assert "clean them" not in reason
+    assert "Commit, stash or revert" not in reason
     # branch kept for manual merge — the unit's work is not stranded
     assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
 

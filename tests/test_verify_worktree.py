@@ -360,6 +360,49 @@ def test_clean_incoming_collisions_still_refuses_tracked_stray(project, tmp_path
     assert (repo / "src.txt").read_text() == "operator edit\n"
 
 
+def test_clean_incoming_collisions_reports_tolerated_paths(project, tmp_path):
+    """#460's observability half. The strays the guard walks past are handed to
+    `on_tolerated` — the mirror of the returned `cleaned` list — so a merge that
+    proceeded over operator dirt leaves the same kind of trace as one that cleaned a
+    leak, instead of walking past it silently."""
+    repo = project.project
+    _branch_with(repo, tmp_path, adds={"leak.cs": "branch\n"})
+    (repo / "leak.cs").write_text("editor leaked\n")  # within branch set — cleaned
+    # written out of alphabetical order: the callback's list must be sorted by the
+    # helper, not by the order the filesystem happens to hand them back.
+    (repo / "b-notes.txt").write_text("real work\n")
+    (repo / "a-notes.txt").write_text("more real work\n")
+
+    calls: list[list[str]] = []
+    cleaned = verify.clean_incoming_collisions(repo, "main", "feat", on_tolerated=calls.append)
+
+    assert len(calls) == 1  # exactly once, not once per stray
+    assert calls[0] == ["a-notes.txt", "b-notes.txt"]  # sorted; the leak is NOT here
+    assert cleaned == ["leak.cs"]  # the two lists are disjoint halves of the dirt
+    assert (repo / "a-notes.txt").exists() and (repo / "b-notes.txt").exists()
+
+
+def test_clean_incoming_collisions_no_tolerated_callback_when_clean(project, tmp_path):
+    """`on_tolerated` fires only when there is something to report. An empty call
+    would journal a no-op `merge-target-tolerated` on every clean merge, which is
+    noise an operator would learn to ignore. Two rows: a clean tree (row a), and a
+    tree whose only dirt IS the incoming leak (row b) — the second is the one that
+    reaches the callback site at all, since a clean tree returns before it."""
+    repo = project.project
+    _branch_with(repo, tmp_path, adds={"leak.cs": "branch\n"})
+    calls: list[list[str]] = []
+
+    # row (a): nothing dirty at all
+    assert verify.clean_incoming_collisions(repo, "main", "feat", on_tolerated=calls.append) == []
+    assert calls == []
+
+    # row (b): dirty, but every dirty path is inside the branch's incoming set
+    (repo / "leak.cs").write_text("editor leaked\n")
+    cleaned = verify.clean_incoming_collisions(repo, "main", "feat", on_tolerated=calls.append)
+    assert cleaned == ["leak.cs"]
+    assert calls == []
+
+
 def test_clean_incoming_collisions_clean_tree_noop(project, tmp_path):
     repo = project.project
     _branch_with(repo, tmp_path, adds={"leak.cs": "branch\n"})
