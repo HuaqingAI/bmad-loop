@@ -287,19 +287,32 @@ def snapshot_canonical(text: str) -> dict[str, PreCanonical]:
     duplicate's tokens alone, and a rewrite folding two ``DW-1``s into one
     would drop the first's gate with no post-rewrite duplicate left for the
     ``duplicate DW ids`` check to catch. The union over-blocks in the safe
-    direction — the same asymmetry the added-token bound rests on. Refusing the
-    migration outright instead would refuse the cleanup on the one path that
-    exists to perform it. ``status`` deliberately keeps the pre-existing
-    last-write-wins reading: it is unchanged by #519, and there is no union of
-    two statuses that is not an invention.
+    direction — the same asymmetry the added-token bound rests on.
+
+    ``status`` collapses the same way and for the same reason: a status that
+    still gates is never displaced by a ``done`` one. Only ``done`` retires a
+    gate, so an ``open`` ``DW-1`` and a ``done`` ``DW-1`` folded into one done
+    entry un-gates the story even with every token retained — the tokens survive
+    on an entry that no longer enforces them. Snapshotting the gating status
+    holds the rewrite to it through the existing ``status changed`` error rather
+    than a new one. Between two statuses of the same standing the last still
+    wins, as it always has; only the gating-over-done case is ordered, because
+    only it decides whether a story runs.
+
+    Both axes are therefore conservative in one direction — whatever gated
+    before the migration still gates after it, or the migration is refused.
     """
-    statuses: dict[str, str] = {}
+    chosen: dict[str, deferredwork.DWEntry] = {}
     tokens: dict[str, dict[str, None]] = {}
     for e in deferredwork.parse_ledger(text):
         g = deferredwork.gates(e)
-        statuses[e.id] = e.status
         tokens.setdefault(e.id, {}).update(dict.fromkeys(g.tokens + g.malformed))
-    return {i: PreCanonical(s, tuple(tokens[i])) for i, s in statuses.items()}
+        prior = chosen.get(e.id)
+        # last-write-wins, except that a `done` duplicate never displaces a
+        # status that still gates
+        if prior is None or not (e.done and not prior.done):
+            chosen[e.id] = e
+    return {i: PreCanonical(e.status, tuple(tokens[i])) for i, e in chosen.items()}
 
 
 def validate_migration(

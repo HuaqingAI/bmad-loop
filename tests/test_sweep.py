@@ -372,13 +372,13 @@ def migrate_result(mapping) -> dict:
     return {"workflow": "deferred-sweep-migrate", "mapping": list(mapping), "escalations": []}
 
 
-def _gated_dw1(*gate_lines: str) -> str:
+def _gated_dw1(*gate_lines: str, status: str = "open") -> str:
     """The pre-existing canonical DW-1 both migration halves below carry, so the
     two texts differ ONLY in their second half by construction rather than by
     inspection — an accepted rewrite really did leave the entry untouched."""
     return (
         "### DW-1: item DW-1\n\norigin: test, 2026-06-01\nlocation: src.txt:1\n"
-        "reason: test entry.\nstatus: open\n" + "".join(f"{line}\n" for line in gate_lines)
+        f"reason: test entry.\nstatus: {status}\n" + "".join(f"{line}\n" for line in gate_lines)
     )
 
 
@@ -394,12 +394,12 @@ def pre_gated_ledger(*gate_lines: str) -> str:
     )
 
 
-def rewritten_gated_ledger(*gate_lines: str) -> str:
+def rewritten_gated_ledger(*gate_lines: str, status: str = "open") -> str:
     """The rewrite the migration session hands back: DW-1 preserved with the
     given `gate:` lines (pass none for the drop this guards against), the legacy
     item converted to DW-2."""
     return (
-        "# Deferred Work\n\n" + _gated_dw1(*gate_lines) + "\n"
+        "# Deferred Work\n\n" + _gated_dw1(*gate_lines, status=status) + "\n"
         "### DW-2: Open legacy thing here\n\n"
         "origin: migrated from legacy ledger, 2026-06-12\nlocation: src.txt\n"
         "reason: mishandles em-dashes.\nstatus: open\n"
@@ -533,6 +533,47 @@ def test_validate_migration_refuses_a_gate_dropped_by_collapsing_duplicate_ids()
 
     errors = validate_migration(rj, manifest, pre, rewritten_gated_ledger("gate: 3-3"))
     assert any("DW-1 lost gate token" in e and "3-2" in e for e in errors)
+
+
+def test_validate_migration_refuses_a_gate_retired_by_collapsing_duplicate_statuses():
+    """#519. Keeping the tokens is not the same as keeping the gate. Only an
+    explicit `status: done` retires one, so folding an `open` DW-1 and a `done`
+    DW-1 into a single done entry un-gates the story with every token still on
+    the page — `_refuse_gated_story` skips the entry on `not entry.done` before
+    it ever reads a token. A `done` duplicate therefore never displaces a status
+    that still gates, and the rewrite is held to the gating one.
+
+    Ablation: make the `chosen[e.id]` write unconditional in
+    `snapshot_canonical` (plain last-write-wins on status) and this test fails
+    ALONE — the token tests never vary a status, and the single-entry fixtures
+    have no duplicate for the ordering to matter to."""
+    before = (
+        "# Deferred Work\n\n"
+        + _gated_dw1("gate: 3-2")
+        + "\n"
+        + _gated_dw1(status="done 2026-06-01")
+        + "\n"
+        "## Deferred from: epic 1 review (2026-04-06)\n\n"
+        "- **Open legacy thing here** — `src.txt` mishandles em-dashes\n"
+    )
+    manifest = legacy_manifest(before)
+    assert len(manifest) == 1  # neither canonical entry parsed as legacy
+    rj = migrate_result([{"key": manifest[0]["key"], "dw_id": "DW-2"}])
+    pre = snapshot_canonical(before)
+    # the gating status, not the later `done` one
+    assert pre["DW-1"].status == "open"
+
+    # the paired positive control: the same collapse that keeps DW-1 open is
+    # accepted, so the refusal below is the retired gate and not the collapse.
+    assert validate_migration(rj, manifest, pre, rewritten_gated_ledger("gate: 3-2")) == []
+
+    errors = validate_migration(
+        rj, manifest, pre, rewritten_gated_ledger("gate: 3-2", status="done 2026-06-01")
+    )
+    assert any("DW-1 status changed" in e for e in errors)
+    # and this axis is disjoint from the token one: every token was retained, so
+    # the token check stays silent and only the status half can have fired.
+    assert not any("lost gate token" in e for e in errors)
 
 
 def test_validate_migration_happy():
