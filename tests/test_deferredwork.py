@@ -2144,6 +2144,105 @@ def test_gates_stop_at_the_canonical_span_boundary():
     assert deferredwork.gates(entry).tokens == ()
 
 
+# ------------------------------------------- ATX heading boundary shapes (#516)
+
+
+@pytest.mark.parametrize(
+    ("heading", "bounds"),
+    [
+        ("## Notes", True),  # control: the column-zero shape that always bounded
+        (" ## Notes", True),  # CommonMark allows one...
+        ("  ## Notes", True),  # ...two...
+        ("   ## Notes", True),  # ...or three spaces of indent
+        ("    ## Notes", False),  # a fourth space is an indented code block
+        ("\t## Notes", False),  # a leading tab is four columns, so also code
+        ("##\tNotes", True),  # a tab is a legal separator
+        ("##", True),  # an empty heading is legal; end of line separates it
+        ("## ", True),  # control: a separator and no title, already bounded
+        ("## Notes ##", True),  # control: a closed ATX heading, already bounded
+        ("##Notes", False),  # no separator at all, so not a heading
+        ("####### Notes", False),  # more than six hashes is not a heading
+    ],
+)
+def test_an_entry_ends_at_every_commonmark_atx_heading_shape(heading, bounds):
+    """`ANY_HEADING_RE` is where a canonical entry stops, so a shape it fails to
+    recognize is one whose section then reads as part of the entry above it: the
+    `gate: 3-2` below lands in an open DW-1 that never named a story, and dispatch
+    hard-pauses on an entry the operator will find no gate in (#516).
+
+    The four ABSORBS rows are the load-bearing half of this table. Each names a
+    line CommonMark says is NOT a heading, and together they are what stops a
+    later simplification of the regex to `^ *#+` — which would bound entries at
+    section headers that do not exist. They are controls, not oversights; a
+    session tidying this table must keep them."""
+    text = (
+        "### DW-1: an unlanded entry\nstatus: open\nsummary: s\nevidence: e\n\n"
+        f"{heading}\n\ngate: 3-2\n"
+    )
+
+    (entry,) = parse_ledger(text)
+
+    assert deferredwork.gates(entry).tokens == (() if bounds else ("3-2",))
+
+
+@pytest.mark.parametrize("heading", [" ## Notes", "   ## Notes", "##\tNotes", "##"])
+def test_a_fenced_heading_of_a_new_shape_does_not_bound_the_entry_either(heading):
+    """The shapes #516 added inherit the fence rule
+    `test_a_fenced_heading_does_not_bound_the_entry_that_quotes_it` pins for the
+    column-zero one: a heading quoted inside an example is documentation, not a
+    boundary, so the live `gate:` below the fence still reaches the entry.
+
+    Asserted against the unfenced control in the same row, because the fenced
+    half alone would pass for the wrong reason — before #516 these shapes bounded
+    nothing anywhere, so a green fenced assertion proved only that the regex had
+    never seen them. The pair is what makes the fence the difference."""
+    quoted = (
+        "# Deferred Work\n\n### DW-01: a real entry\nstatus: open\n\n"
+        f"```markdown\n{heading}\nstatus: done 2026-01-01\n```\n\ngate: 3-2\n"
+    )
+    live = (
+        "# Deferred Work\n\n### DW-01: a real entry\nstatus: open\n\n"
+        f"{heading}\nstatus: done 2026-01-01\n\ngate: 3-2\n"
+    )
+
+    (fenced_entry,) = parse_ledger(quoted)
+    (live_entry,) = parse_ledger(live)
+
+    assert deferredwork.gates(fenced_entry).tokens == ("3-2",)
+    assert deferredwork.gates(live_entry).tokens == ()
+
+
+def test_a_status_under_an_indented_heading_is_the_section_s_and_not_the_entry_s():
+    """A visible behavior change, pinned so it stands as a decision on the record
+    rather than turning up as a surprise. Widening `ANY_HEADING_RE` (#516) ends
+    DW-1's span at the indented heading, which is above the `status:` line — and
+    read against the documented format that is the right answer, because a
+    `status:` below a heading belongs to that section and not to the entry before
+    it. The entry parses with status "" and leaves `open_ids` entirely; it used to
+    read as open."""
+    text = "### DW-1: e\n\n  ## Notes\n\nstatus: open\n"
+
+    (entry,) = parse_ledger(text)
+
+    assert entry.status == ""
+    assert entry.open is False
+    assert open_ids(text) == set()
+
+
+def test_a_tail_below_an_indented_heading_reaches_the_legacy_parser():
+    """The second visible change, and the reason the two parsers cannot be moved
+    independently: `parse_legacy` blanks out every span `parse_ledger` returns
+    before it scans, so one boundary serves both and moving it moves text between
+    them. Before #516 DW-1's span ran past the indented heading and masked the
+    bullet below, hiding a real legacy finding from every reader of the ledger.
+    With the boundary where CommonMark puts it, the tail is legacy's again."""
+    text = "### DW-1: e\nstatus: open\n\n  ## Old stuff\n\n- D-1: a legacy finding\n"
+
+    (legacy,) = parse_legacy(text)
+
+    assert legacy.title == "a legacy finding"
+
+
 @pytest.mark.parametrize(
     ("token", "story_key", "gated"),
     [

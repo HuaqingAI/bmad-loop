@@ -27,7 +27,23 @@ from .fences import fenced_spans
 from .platform_util import atomic_write_text, neutralize_surrogates
 
 HEADING_RE = re.compile(r"^### (DW-\d+): (.+?)\s*$", re.MULTILINE)
-ANY_HEADING_RE = re.compile(r"^#{1,6} ", re.MULTILINE)
+# Where a canonical entry ENDS, in every shape CommonMark spells an ATX heading:
+# up to three spaces of indent, a space OR a tab after the hashes, and an empty
+# heading (`##` alone — the separator may be the end of the line). A fourth space
+# of indent is an indented code block rather than a heading, so those lines
+# deliberately keep absorbing, and the indent class is spaces only for that same
+# reason — a leading tab is four columns, so `\t## Notes` is a code block too.
+# Read as permissively as the syntax is, because a missed boundary here does not
+# merely lose a section header: the span runs on and the next section's
+# `status:`/`gate:` lines are read as this entry's, so an open entry that never
+# declared a gate takes a story hostage and the operator finds no gate in the
+# entry the refusal names (#516). Where a miss would WRITE, the strict
+# column-zero reading is the right one (`devcontract`'s destructive edits pin it
+# deliberately); this only decides how far a read reaches.
+# A lookahead rather than a consuming group: `parse_ledger` reads `.start()`, and
+# holding the match to the opener leaves nothing free to grow a dependency on
+# where the separator ended.
+ANY_HEADING_RE = re.compile(r"^ {0,3}#{1,6}(?=[ \t]|$)", re.MULTILINE)
 # The flat appender's opening line, in the two forms this module needs it: as a
 # bullet in the raw ledger (FLAT_ENTRY_RE, the canonical-span boundary in
 # parse_ledger) and as bullet *content* after `_BULLET_RE` has stripped the
