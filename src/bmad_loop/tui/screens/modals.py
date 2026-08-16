@@ -38,6 +38,14 @@ class BaseDialog(ModalScreen):
     }
     BaseDialog #dialog {
         width: 64;
+        /* the clamp lives on the SHARED rule on purpose: the five subclasses that
+           widen the dialog (Decision 86, Escalation 90, DeferredEntry/Validate/
+           TextOutput 96, SpecReview 100) override only `width`, never `max-width`,
+           so this one declaration covers all ten and a subclass cannot silently
+           opt out of it. Without it a fixed column count is laid out wider than a
+           narrow terminal and the right-hand side — i.e. the docked button row,
+           which is align-horizontal: right — is clipped off-screen (#281). */
+        max-width: 100%;
         /* height is intentionally auto (not a definite %). Two-tier by design:
            list-heavy modals (Decision/Escalation/StartRun/...) override #dialog
            with a definite height + a 1fr body; the bounded modals (Confirm/
@@ -63,7 +71,79 @@ class BaseDialog(ModalScreen):
     BaseDialog .buttons Button {
         margin-left: 2;
     }
+    /* Clamping #dialog is not enough on its own: Textual's Button is
+       `width: auto; min-width: 16` and the rule above adds a 2-column margin per
+       button, so a three-button row demands 3*16 + 3*2 = 54 columns while a
+       dialog clamped to a 50-column terminal only has 50 - 2 (thick border)
+       - 4 (padding `1 2`) = 44 columns of content — the row still overflows and
+       the right-most button is clipped. Dropping the floor lets each button size
+       to its own label instead. Scoped to `-narrow` so terminals 60 columns and
+       wider keep today's button sizing byte-for-byte. */
+    BaseDialog.-narrow .buttons Button {
+        min-width: 4;
+        margin-left: 1;
+    }
+    /* The vertical twin. Before any body content a dialog spends 10 rows of
+       chrome: 2 border (1 per side — every Textual border STYLE is exactly one
+       cell, so `thick` -> `round` would save nothing), 2 padding, 1 title,
+       1 title margin-bottom, 1 .buttons margin-top and 3 for the button row
+       (Textual's Button is `border: tall`, so a one-line label is 3 rows).
+       `max-height: 90%` then turns those 10 rows into a per-modal terminal-height
+       floor of 12-14. Under `-short` the chrome collapses to 4 rows — padding
+       0 1, no title margin, no button margin, a 1-row borderless button — and
+       max-height goes to 100% so the dialog may use the last row. The `#dialog`
+       BORDER IS DELIBERATELY KEPT: it is the only thing separating the dialog
+       from the dashboard rendered behind a ModalScreen, and the 2 rows it costs
+       are not needed to clear the floor. Nothing here sets a definite `height`
+       — that would balloon the bounded tier, see
+       test_short_confirm_modal_stays_compact — and nothing here touches `width`,
+       which is the `-narrow` axis above. */
+    BaseDialog.-short #dialog {
+        max-height: 100%;
+        padding: 0 1;
+    }
+    BaseDialog.-short .title {
+        margin-bottom: 0;
+    }
+    BaseDialog.-short .buttons {
+        margin-top: 0;
+    }
+    BaseDialog.-short .buttons Button {
+        height: 1;
+        border: none;
+    }
     """
+
+    # Textual applies the matching breakpoint class to the Screen itself on
+    # resize, and BaseDialog IS a ModalScreen — so `-narrow` lands on the dialog
+    # screen and CSS can select `BaseDialog.-narrow ...`. `-narrow` therefore
+    # means "the terminal is under 60 columns". 60 is where an un-narrowed
+    # three-button row (3 * Textual's `min-width: 16` + 3 * `margin-left: 2`
+    # = 54) still fits a clamped dialog's content region (60 - 2 border
+    # - 4 padding = 54). Declaring this here scopes it to dialogs: the App and
+    # DashboardScreen leave their breakpoints at the default, so the dashboard
+    # is unaffected.
+    HORIZONTAL_BREAKPOINTS = [(0, "-narrow"), (60, "-wide")]
+
+    # Same mechanism on the other axis: `-short` means "the terminal is under 20
+    # rows". 20 is chosen to sit clear of the tallest measured pre-fix frame
+    # floor — the height at which every docked control of a modal is fully
+    # on-screen: ConfirmModal 12, StartSweep 13, StoryCheckpoint 13, and 14 for
+    # ConfirmModal WITH a warning (the ConfirmResumeModal case, whose
+    # double-drive warning gates a destructive confirm and is docked outside
+    # #body). The compact layout has to engage before anything clips, not at the
+    # moment it does, so the threshold is above 14 rather than on it. It is also
+    # below the 24 rows of a default terminal, so an ordinary window still gets
+    # the full chrome. Every figure above is a CHROME measurement, taken with
+    # short titles: a title, header, warning or path is docked outside the
+    # scrolling body, so a long enough one wraps and costs rows this layout
+    # cannot reclaim — the body is already at its 1-row minimum. Nothing bounds
+    # that caller-supplied text, so a long enough value clips the docked controls
+    # at ANY fixed size and those dialogs have no floor to state. That is why
+    # docs/tui-guide.md gives its figures as sizes measured to be sufficient for
+    # the content it exercised rather than as a minimum — 80x24 included
+    # (#628, #629).
+    VERTICAL_BREAKPOINTS = [(0, "-short"), (20, "-tall")]
 
     BINDINGS = [Binding("escape", "cancel", "cancel")]
 

@@ -144,21 +144,51 @@ async def until(pilot, condition, timeout: float = 10.0) -> None:
         waited += 0.05
 
 
-async def ready(pilot, selector: str):
+async def ready(pilot, selector: str, timeout: float = 10.0):
     """Wait until a modal widget is mounted *and* laid out on-screen, then return it.
 
     A screen-type `until` returns the instant push_screen swaps app.screen — before
     the modal's children mount (query NoMatches) or receive a layout region (click
     OutOfBounds, region still 0). Gating on a real on-screen region makes the
     following query_one / click / value-set safe on slow CI runners. A modal's
-    widgets mount and lay out together, so one gate covers every field in it."""
+    widgets mount and lay out together, so one gate covers every field in it.
+
+    That gate alone stopped being enough once BaseDialog grew breakpoints (#281).
+    The breakpoint class is on the screen by the time the first widget has a
+    region — but the stylesheet reapply it triggers is still QUEUED, so the first
+    laid-out pass carries the un-classed metrics and the real layout arrives a
+    frame later. Measured on StoryCheckpointModal at 45 columns, the docked row
+    reads Textual's default `Button min-width: 16` on that first pass
+    (x=5/23/41, each 16 wide, so the last ends at column 57 — off a 45-column
+    screen) and the `-narrow` metrics (14/10/7) on the next.
+
+    So this also pumps the queue until the screen's layout stops moving. It is
+    the message pump, not a sleep, that does the work: the pending reapply is a
+    message, and each `pause` drains it. Requiring the regions to repeat lets a
+    slow runner take as many frames as it needs. Everything downstream — a
+    reachability assert, a `scroll_visible` target, a click coordinate — is then
+    computed against the settled layout rather than a doomed intermediate one.
+    Under load this is worth 2-3 failures per 25 runs on the tests it covers."""
 
     def _hit():
         hits = pilot.app.screen.query(selector)
         node = hits.first() if hits else None
         return node if node is not None and node.region.area > 0 else None
 
-    await until(pilot, lambda: _hit() is not None)
+    await until(pilot, lambda: _hit() is not None, timeout)
+
+    def _layout():
+        return tuple(w.region for w in pilot.app.screen.query("*"))
+
+    previous, stable, waited = None, 0, 0.0
+    while stable < 3:
+        if waited >= timeout:
+            raise AssertionError("screen layout never settled")
+        await pilot.pause(0.05)
+        waited += 0.05
+        current = _layout()
+        stable = stable + 1 if current == previous else 0
+        previous = current
     return _hit()
 
 
@@ -1341,9 +1371,16 @@ async def test_confirm_modal_scrolls_long_body(project):
 async def test_start_sweep_and_checkpoint_buttons_reachable(project):
     """On a short terminal the bounded modals keep their docked action buttons
     on-screen: the body scrolls to absorb the overflow instead of pushing the
-    button row off the bottom. The height (14) sits just above the frame floor —
-    a thick-bordered dialog with a title and a 3-row button row needs ~13 rows
-    before any body content — so the assertion isolates the body-scroll fix."""
+    button row off the bottom. The height (14) sits just above the frame floor,
+    so the assertion isolates the body-scroll fix.
+
+    The frame floor is not a chrome count and it is not one number. The chrome is
+    10 rows — 2 border, 2 padding, 1 title, 1 title margin, 1 button-row margin
+    and 3 for the button row, Textual's Button being `border: tall`. `#dialog` is
+    then capped at `max-height: 90%`, which turns those 10 rows into a per-modal
+    TERMINAL-height floor of 12-14: ConfirmModal 12, StartSweep 13,
+    StoryCheckpoint 13, ConfirmModal-with-a-warning 14. 14 was chosen because it
+    clears the 13-row floor of the two modals this test drives (#281 measured)."""
     app = BmadLoopApp(project.project)
     async with app.run_test(size=(64, 14)) as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
@@ -1481,6 +1518,436 @@ async def test_settings_binding_opens_editor(project):
         assert isinstance(app.screen, SettingsScreen)
         await pilot.press("escape")
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+
+# ---- #281 modal dialogs shrink to fit narrow terminals (horizontal axis)
+#
+# Measured minimum terminal WIDTH at which every docked button is fully
+# on-screen — before this fix / after it: DecisionModal 83 -> 12,
+# EscalationModal 87 -> 39, ConfirmModal 61 -> 22, StartSweepModal 61 -> 20,
+# StoryCheckpointModal 61 -> 37. EscalationModal's 87 means a standard
+# 80-column terminal clipped it.
+
+
+async def test_decision_modal_clamps_to_narrow_terminal(project):
+    """A 50-column terminal is narrower than DecisionModal's declared width: 86.
+    `max-width: 100%` on the shared BaseDialog #dialog rule clamps it to the
+    screen, so the docked skip button is reachable instead of being laid out past
+    the right edge (#281). The width assertion pins the clamp; the reachability
+    assertion is what the user actually feels."""
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(50, 30)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app.push_screen(DecisionModal(_long_decision()))
+        await until(pilot, lambda: isinstance(app.screen, DecisionModal))
+        await ready(pilot, "#body")
+        # clamped to the terminal, not laid out at its declared 86 columns
+        assert app.screen.query_one("#dialog").region.width == 50
+        assert _on_screen(app, app.screen.query_one("#cancel", Button))
+
+
+async def test_escalation_modal_three_buttons_reachable_when_narrow(project):
+    """The three-button escalation row at 45 columns — the case the clamp alone
+    does NOT fix, so this is the test that earns the `-narrow` rule.
+
+    At 45 columns the clamped dialog has 45 - 2 (thick border) - 4 (padding) = 39
+    columns of content, while Textual's default `Button min-width: 16` plus
+    BaseDialog's `margin-left: 2` demands 3*16 + 3*2 = 54 for three buttons — the
+    row overflows and the right-most button is clipped. Measured: with the clamp
+    but WITHOUT `BaseDialog.-narrow .buttons Button`, this modal still needs 58
+    columns. So this test covers the `-narrow` rule, not merely `max-width` —
+    deleting that rule must redden this test, and T1 does not cover it."""
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(45, 30)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app.push_screen(
+            EscalationModal(
+                story_key="e-1-s",
+                title="t",
+                description="d",
+                blocking="b",
+                sentinel_kind="",
+                resolution_ready=True,
+                engine_live=False,
+                restore_recorded=True,
+            )
+        )
+        await until(pilot, lambda: isinstance(app.screen, EscalationModal))
+        await ready(pilot, "#body")
+        for bid in ("#act-resolve", "#act-rearm", "#cancel"):
+            assert _on_screen(app, app.screen.query_one(bid, Button)), bid
+
+
+async def test_story_checkpoint_three_buttons_reachable_when_narrow(project):
+    """The other three-button row, same 45-column bound as the escalation case:
+    measured at 57 columns with the clamp alone, so this too rests on `-narrow`."""
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(45, 30)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app.push_screen(
+            StoryCheckpointModal(
+                story_key="e-1-s",
+                title="t",
+                commit="abc123",
+                verify_line="v",
+                tokens="0",
+            )
+        )
+        await until(pilot, lambda: isinstance(app.screen, StoryCheckpointModal))
+        await ready(pilot, "#body")
+        for bid in ("#act-continue", "#act-stop", "#cancel"):
+            assert _on_screen(app, app.screen.query_one(bid, Button)), bid
+
+
+async def test_wide_terminal_dialog_width_unchanged(project):
+    """The clamp must not shrink a dialog that already fits: at 120 columns a
+    ConfirmModal still lays out at its declared 64, and 120 is above the 60-column
+    `-narrow` breakpoint so the button row keeps today's sizing. Guards the fix
+    against becoming a visible regression for normal-width terminals (#281)."""
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(120, 30)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app.push_screen(ConfirmModal("t", "body"))
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await ready(pilot, "#body")
+        assert app.screen.query_one("#dialog").region.width == 64
+        assert "-narrow" not in app.screen.classes  # the breakpoint did not engage
+
+
+# ---- #281 modal dialogs degrade to a compact layout on short terminals
+#      (vertical axis)
+#
+# Measured minimum terminal HEIGHT at which a modal's title, one row of body and
+# every docked control (buttons + any docked warning) are fully on-screen —
+# before this fix / after it, at 90-100 columns: ConfirmModal 12 -> 4,
+# ConfirmModal-with-a-warning 14 -> 5, StartSweepModal 13 -> 4,
+# StoryCheckpointModal 13 -> 4, EscalationModal 12 -> 6, DecisionModal 9 -> 4.
+# EscalationModal's floor is width-dependent because its #hint warning wraps:
+# at 39 columns (phase 1's narrowest measured width) it is 15 -> 9, which is the
+# 39x9 pair docs/tui-guide.md records as measured, not as a minimum.
+
+
+async def test_compact_layout_makes_a_short_terminal_usable(project):
+    """The payoff test for the vertical axis: at 8 rows a ConfirmModal with a
+    docked warning is fully operable.
+
+    8 is well BELOW this exact modal's pre-fix floor of 14 rows (measured at 64
+    columns, the same modal and body), so a green assertion here cannot be
+    explained by a roomy terminal — it is the `-short` compact layout doing the
+    work. Post-fix the same modal bottoms out at 5 rows. The warning is included
+    on purpose: it gates a destructive confirm (ConfirmResumeModal inherits it),
+    is docked outside #body, and is what pushes this modal's floor above the
+    other bounded modals'."""
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(64, 8)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app.push_screen(ConfirmModal("t", "line\n" * 80, warning="w"))
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await ready(pilot, "#body")
+        assert _on_screen(app, app.screen.query_one("#ok", Button))
+        assert _on_screen(app, app.screen.query_one("#cancel", Button))
+        assert _on_screen(app, app.screen.query_one("#warning", Static))
+
+
+async def test_short_breakpoint_engages_only_below_the_threshold(project):
+    """Pins the mechanism itself, so deleting `VERTICAL_BREAKPOINTS` fails loudly
+    instead of drifting the layout: Textual puts the matching class on the Screen,
+    and BaseDialog IS a ModalScreen, so `-short`/`-tall` land on the dialog screen
+    where the CSS selects them. 19 and 20 are the two sides of the threshold."""
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(64, 19)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app.push_screen(ConfirmModal("t", "Stop the run?"))
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await ready(pilot, "#body")
+        assert "-short" in app.screen.classes
+        assert "-tall" not in app.screen.classes
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(64, 40)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app.push_screen(ConfirmModal("t", "Stop the run?"))
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await ready(pilot, "#body")
+        assert "-tall" in app.screen.classes
+        assert "-short" not in app.screen.classes
+
+
+async def test_tall_terminal_dialog_height_unchanged(project):
+    """The compact rules must not leak upward. At 40 rows a one-line confirm lays
+    out at exactly 11 — 2 border + 2 padding + 1 title + 1 title margin + 1 body
+    + 1 button-row margin + 3 button — which is what it measures both with and
+    without this fix. `test_short_confirm_modal_stays_compact` does NOT cover
+    this: it asserts `< 12`, and a leaked `-short` (which takes this dialog to 5)
+    would satisfy that bound too. The equality is the point."""
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(64, 40)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app.push_screen(ConfirmModal("t", "Stop the run?"))
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await ready(pilot, "#body")
+        assert app.screen.query_one("#dialog").region.height == 11
+
+
+# ---- #281 the measured 39x9 pair, where BOTH breakpoints are engaged
+#
+# Everything above exercises one axis at a time. This is the corner where
+# `-narrow` and `-short` apply together, and it is the only test of the pair
+# docs/tui-guide.md records — so a rule that is correct on each axis alone but
+# wrong at the intersection reddens here and nowhere else. It also keeps the
+# published figure honest: it is asserted for every dialog it covers, so a modal
+# cannot quietly stop meeting the size the guide says it was measured at.
+#
+# What was measured is a dialog's own CHROME, not the text it is handed, and the
+# cases below are parametrised with short titles for exactly that reason.
+# Titles, headers, warnings and paths dock OUTSIDE the scrolling body, so every
+# line they wrap to costs a row the body cannot give back — it floors at 1 — and
+# the `-short`/`-narrow` rules cannot shrink content the way they shrink padding.
+# Nothing bounds that caller-supplied text, so a dialog handed a long enough
+# value has no floor to state at all. Measured at 39 columns: a ~150-character
+# deferred-work heading still fits 9 rows, ~300 characters wraps to 9 rows of
+# title and clips the close button; the validate header grows with its
+# document's spec folder; the spec viewer's `copy path` plus its action verbs
+# overflow 39 columns outright. That is one family with three faces, not three
+# defects — tracked in #628 (row too wide) and #629 (docked wrapping text steals
+# rows). The tests below pin the bounded case here, each unbounded case at a
+# size measured to work, and 80x24 as a size that was sufficient for the
+# examples measured — not one an unbounded value cannot overrun.
+
+_MIN_COLS, _MIN_ROWS = 39, 9
+
+_MIN_SIZE_CASES = (
+    "confirm",
+    "confirm-warning",
+    "start-run",
+    "start-sweep",
+    "decision",
+    "deferred-entry",
+    "story-checkpoint",
+    "escalation",
+    "text-output",
+)
+
+
+def _minimum_size_case(name: str, project):
+    """(modal, docked controls that must stay reachable, its scrolling body).
+
+    The controls are the ones docked OUTSIDE the body — buttons plus any warning
+    docked beside them — because those are what the doc promises stay on-screen.
+    `DecisionModal`'s per-option `opt-N` buttons are deliberately not listed:
+    they live inside the scrolling `#body` and are reached by scrolling, which
+    test_decision_modal_scrolls_when_content_long already covers."""
+    if name == "confirm":
+        return ConfirmModal("t", "line\n" * 80), ("#ok", "#cancel"), "#body"
+    if name == "confirm-warning":
+        # the docked warning gates a destructive confirm (ConfirmResumeModal
+        # inherits it), so losing it off-screen is a safety defect, not cosmetic
+        return (
+            ConfirmModal("t", "line\n" * 80, warning="w"),
+            ("#ok", "#cancel", "#warning"),
+            "#body",
+        )
+    if name == "start-run":
+        return StartRunModal(project.project), ("#ok", "#cancel"), "#fields"
+    if name == "start-sweep":
+        return StartSweepModal(), ("#ok", "#cancel"), "#body"
+    if name == "decision":
+        return DecisionModal(_long_decision()), ("#cancel",), "#body"
+    if name == "deferred-entry":
+        item = data.DeferredItem(
+            id="DW-1",
+            title="a deferred item",
+            status="open",
+            done=False,
+            severity="high",
+            body="line\n" * 40,
+        )
+        return DeferredEntryModal(item), ("#ok",), "#entry"
+    if name == "story-checkpoint":
+        return (
+            StoryCheckpointModal(
+                story_key="e-1-s", title="t", commit="abc123", verify_line="v", tokens="0"
+            ),
+            ("#act-continue", "#act-stop", "#cancel"),
+            "#body",
+        )
+    if name == "escalation":
+        return (
+            EscalationModal(
+                story_key="e-1-s",
+                title="t",
+                description="d",
+                blocking="b",
+                sentinel_kind="",
+                resolution_ready=True,
+                engine_live=False,
+                restore_recorded=True,
+            ),
+            ("#act-resolve", "#act-rearm", "#cancel", "#hint"),
+            "#body",
+        )
+    assert name == "text-output", name
+    return TextOutputModal("validate", 0, "out\n" * 40), ("#ok",), "#output"
+
+
+@pytest.mark.parametrize("case", _MIN_SIZE_CASES)
+async def test_measured_terminal_size_keeps_dialogs_operable(project, case):
+    """At the 39x9 pair the guide records as measured, every covered dialog still
+    shows its title, a row of body and all of its docked controls (#281). Short
+    titles, so this pins the chrome; caller text is unbounded and has no floor.
+
+    Both breakpoint classes are asserted present first, so the test fails loudly
+    if a future threshold change means this size no longer exercises the compact
+    layout at all — otherwise the assertions below could pass for the wrong
+    reason, on a dialog that simply never engaged either rule."""
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(_MIN_COLS, _MIN_ROWS)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        modal, controls, body = _minimum_size_case(case, project)
+        app.push_screen(modal)
+        await until(pilot, lambda: app.screen is modal)
+        await ready(pilot, body)
+        assert "-narrow" in app.screen.classes, case
+        assert "-short" in app.screen.classes, case
+        assert _on_screen(app, app.screen.query(".title").first()), case
+        assert app.screen.query_one(body).region.height >= 1, case
+        for selector in controls:
+            assert _on_screen(app, app.screen.query_one(selector)), f"{case} {selector}"
+
+
+@pytest.mark.parametrize(
+    ("actions", "controls"),
+    [
+        (
+            [("resume", "Approve & resume", "primary")],
+            ("#copy-path", "#act-resume", "#cancel"),
+        ),
+        (
+            [
+                ("approve", "Approve & resume", "primary"),
+                ("replan", "Request replan", "warning"),
+            ],
+            ("#copy-path", "#act-approve", "#act-replan", "#cancel"),
+        ),
+    ],
+    ids=["gate", "plan-checkpoint"],
+)
+async def test_spec_review_modal_operable_on_a_standard_terminal(project, actions, controls):
+    """The spec viewer is the one dialog outside the measured 39x9 pair, so pin
+    what WAS measured: a standard 80x24 terminal shows either action row in full
+    at the path length used here. That is sufficiency for this case, not a size
+    the dialog will meet for every spec path — nothing bounds one (#629).
+
+    It has no single floor to pin instead. Two things push it around, and one of
+    them is not a width at all: the docked `copy path` button plus the caller's
+    action verbs overflow a 39-column dialog horizontally, AND the full spec path
+    printed above the body wraps, so a long path costs rows and can drop the
+    action row off the bottom of a 9-row screen (measured: a 59-character path
+    puts the row at y=9 on a 9-row screen, while a short one leaves it at y=8).
+    Its floor is therefore a function of the path and the verbs, which is why
+    docs/tui-guide.md quotes this size rather than a minimum, and why wrapping
+    the row is tracked in #628 instead of being pinned here.
+
+    Asserting a size that WORKS, rather than that a narrower one fails, keeps the
+    contract pinned without freezing the defect: fixing #628 cannot redden it."""
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        modal = SpecReviewModal(
+            title="review the spec",
+            subtitle="epic-1 story-2",
+            spec_path=project.project / "spec.md",
+            spec_text="line\n" * 40,
+            actions=actions,
+        )
+        app.push_screen(modal)
+        await until(pilot, lambda: app.screen is modal)
+        await ready(pilot, "#spec")
+        for selector in controls:
+            assert _on_screen(app, app.screen.query_one(selector)), selector
+
+
+_LONG_SPEC_FOLDER = "docs/specs/epics/epic-1/stories/generated/very-long-folder-name"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "size"),
+    [
+        ({}, (_MIN_COLS, _MIN_ROWS + 1)),
+        ({"stories_on": True, "spec_folder": _LONG_SPEC_FOLDER}, (_MIN_COLS, _MIN_ROWS + 3)),
+        ({"stories_on": True, "spec_folder": _LONG_SPEC_FOLDER}, (80, 24)),
+    ],
+    ids=["plain-39x10", "long-spec-folder-39x12", "long-spec-folder-80x24"],
+)
+async def test_validate_findings_modal_floor_moves_with_its_header(project, kwargs, size):
+    """The other documented exception, and its floor is content-dependent (#629).
+
+    `.title` is `widgets.validate_header(doc)`, docked outside the scrolling
+    `#findings` body, so every line it wraps to costs the button row a row that
+    `-short` cannot buy back — collapsing padding and margins does not shrink
+    content. At 39 columns a plain document's header wraps to 5 rows and puts
+    the button row at y=9 on a screen whose rows are 0-8, so it needs 10.
+
+    But the header also carries `spec: <spec_folder>`, and that path is
+    user-controlled (widgets.py:582-585). A 63-character folder takes the header
+    to 7 rows and the floor with it: `#ok` is still clipped at BOTH 39x10 and
+    39x11, and only clears at 39x12. So the three cases here pin the dependence
+    itself rather than a single minimum — which is why docs/tui-guide.md
+    describes this floor as content-dependent and quotes the standard 80x24
+    terminal, the last case, which absorbed both headers measured here. A longer
+    folder would move it again; nothing bounds one (#629)."""
+    cols, rows = size
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(cols, rows)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        modal = ValidateFindingsModal(
+            make_validate_document([("bmad-config", "problem", "a finding", None)], **kwargs)
+        )
+        app.push_screen(modal)
+        await until(pilot, lambda: app.screen is modal)
+        await ready(pilot, "#findings")
+        # the header is the thing that moves this floor, so assert it too: a
+        # regression that clipped it would otherwise leave #ok reachable and
+        # pass
+        assert _on_screen(app, app.screen.query(".title").first())
+        assert _on_screen(app, app.screen.query_one("#ok"))
+
+
+@pytest.mark.parametrize("chars", [150, 300], ids=["fits-the-floor", "overflows-the-floor"])
+async def test_long_docked_title_still_fits_a_standard_terminal(project, chars):
+    """The third face of the same family, and the size the guide falls back on:
+    80x24 absorbed a docked title no 39-column screen could — at these lengths.
+
+    `DeferredEntryModal` renders the ledger heading as the docked `.title`,
+    outside the scrolling `#entry`, and `parse_ledger` does not bound that text.
+    At 39 columns a ~150-character heading still clears the floor, but ~300
+    characters wraps to nine rows of title and pushes `#ok` off a nine-row
+    screen — `#entry` is already at its one-row minimum and has nothing left to
+    give. Both lengths are asserted at 80x24 rather than at 39 columns, because
+    the point is the fallback size, not another content-specific minimum that a
+    longer heading would falsify (#629). A longer heading falsifies 80x24 too —
+    `parse_ledger` bounds nothing — which is why the guide states 80x24 as
+    sufficient for the lengths measured here rather than as a size to rely on."""
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        modal = DeferredEntryModal(
+            data.DeferredItem(
+                id="DW-1",
+                title=("word " * 200)[:chars].strip(),
+                status="open",
+                done=False,
+                severity="high",
+                body="line\n" * 40,
+            )
+        )
+        app.push_screen(modal)
+        await until(pilot, lambda: app.screen is modal)
+        await ready(pilot, "#entry")
+        # the wrapped heading is what costs the rows here, so a clipped title is
+        # the regression this test exists to catch, not just an unreachable #ok
+        assert _on_screen(app, app.screen.query(".title").first())
+        assert _on_screen(app, app.screen.query_one("#ok"))
 
 
 # ------------------------------------------------------------- run control

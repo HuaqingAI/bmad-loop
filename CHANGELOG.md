@@ -319,6 +319,30 @@ breaking changes may land in a minor release.
   rather than a declared failure, and relabelling it as a signature mismatch would bury it. This is
   message quality only — an error escaping here already unwound the composition it had started.
 
+- **A modal dialog on a terminal narrower than its declared width now shrinks to fit instead of
+  being clipped, so its action buttons stay reachable (#281).** The docked button row is
+  right-aligned, so the buttons were exactly what fell off the right edge — the horizontal twin of
+  the vertical defect #275/#280 fixed. `EscalationModal` needed 87 columns, so a standard
+  80-column terminal already clipped it outright; `DecisionModal` needed 83 and the bounded
+  confirms 61. Below 60 columns those buttons additionally render smaller and tighter, because
+  clamping the dialog alone still leaves a three-button row demanding 54 columns inside a content
+  region narrower than that.
+
+  On the other axis, below 20 rows a dialog now renders in a compact layout — collapsed padding,
+  no title margin, a one-row button row — rather than clipping its docked buttons and safety
+  warnings. `docs/tui-guide.md` accordingly records the terminal sizes these dialogs were measured
+  at — **39 columns × 9 rows** for a dialog's own chrome — stated as sizes measured to be
+  sufficient rather than as a supported minimum, and scoped to the dialogs, not the dashboard
+  behind them. `EscalationModal` sets that figure and it is width-dependent, its docked warning
+  wrapping to 9 rows at 39 columns but 6 at 80. Titles, headers and paths dock outside the
+  scrolling body, so a long enough one wraps and costs rows the body cannot give back: a
+  ~300-character deferred-work heading clips the close button, the validate viewer grows with its
+  document's spec folder (#629), and the spec viewer's `copy path` button plus its action verbs
+  simply do not fit 39 columns (#628). Nothing bounds that caller-supplied text, so no fixed size
+  is a minimum these dialogs will always meet; a standard 80 × 24 terminal absorbed every measured
+  example and the guide quotes it on those terms. At 60 columns and 20 rows and above the full
+  chrome renders exactly as it does today.
+
 ## [0.10.0] — 2026-08-14
 
 Much of this section is the `release/0.9.x` hotfix line brought forward onto `main` (#433).
