@@ -137,9 +137,12 @@ class BaseDialog(ModalScreen):
     # the full chrome. Every figure above is a CHROME measurement, taken with
     # short titles: a title, header, warning or path is docked outside the
     # scrolling body, so a long enough one wraps and costs rows this layout
-    # cannot reclaim — the body is already at its 1-row minimum. Those dialogs
-    # have no fixed floor; docs/tui-guide.md says so and names 80x24 as the size
-    # to rely on instead (#628, #629).
+    # cannot reclaim — the body is already at its 1-row minimum. Nothing bounds
+    # that caller-supplied text, so a long enough value clips the docked controls
+    # at ANY fixed size and those dialogs have no floor to state. That is why
+    # docs/tui-guide.md gives its figures as sizes measured to be sufficient for
+    # the content it exercised rather than as a minimum — 80x24 included
+    # (#628, #629).
     VERTICAL_BREAKPOINTS = [(0, "-short"), (20, "-tall")]
 
     BINDINGS = [Binding("escape", "cancel", "cancel")]

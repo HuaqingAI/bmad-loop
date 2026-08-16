@@ -1623,8 +1623,8 @@ async def test_wide_terminal_dialog_width_unchanged(project):
 # ConfirmModal-with-a-warning 14 -> 5, StartSweepModal 13 -> 4,
 # StoryCheckpointModal 13 -> 4, EscalationModal 12 -> 6, DecisionModal 9 -> 4.
 # EscalationModal's floor is width-dependent because its #hint warning wraps:
-# at 39 columns (phase 1's narrowest supported width) it is 15 -> 9, which is
-# the 39x9 joint minimum documented in docs/tui-guide.md.
+# at 39 columns (phase 1's narrowest measured width) it is 15 -> 9, which is the
+# 39x9 pair docs/tui-guide.md records as measured, not as a minimum.
 
 
 async def test_compact_layout_makes_a_short_terminal_usable(project):
@@ -1689,29 +1689,30 @@ async def test_tall_terminal_dialog_height_unchanged(project):
         assert app.screen.query_one("#dialog").region.height == 11
 
 
-# ---- #281 the documented 39x9 minimum, where BOTH breakpoints are engaged
+# ---- #281 the measured 39x9 pair, where BOTH breakpoints are engaged
 #
 # Everything above exercises one axis at a time. This is the corner where
-# `-narrow` and `-short` apply together, and it is the only test of the number
-# docs/tui-guide.md publishes as a user-facing contract — so a rule that is
-# correct on each axis alone but wrong at the intersection reddens here and
-# nowhere else. It is also what keeps the published floor honest: the claim is
-# asserted for every dialog it covers, so a modal cannot quietly stop meeting it.
+# `-narrow` and `-short` apply together, and it is the only test of the pair
+# docs/tui-guide.md records — so a rule that is correct on each axis alone but
+# wrong at the intersection reddens here and nowhere else. It also keeps the
+# published figure honest: it is asserted for every dialog it covers, so a modal
+# cannot quietly stop meeting the size the guide says it was measured at.
 #
-# What the floor covers is a dialog's own CHROME, not the text it is handed, and
-# the cases below are parametrised with short titles for exactly that reason.
+# What was measured is a dialog's own CHROME, not the text it is handed, and the
+# cases below are parametrised with short titles for exactly that reason.
 # Titles, headers, warnings and paths dock OUTSIDE the scrolling body, so every
 # line they wrap to costs a row the body cannot give back — it floors at 1 — and
 # the `-short`/`-narrow` rules cannot shrink content the way they shrink padding.
-# So any dialog handed long enough caller-supplied text has no fixed minimum.
-# Measured at 39 columns: a ~150-character deferred-work heading still fits 9
-# rows, ~300 characters wraps to 9 rows of title and clips the close button; the
-# validate header grows with its document's spec folder; the spec viewer's
-# `copy path` plus its action verbs overflow 39 columns outright. That is one
-# family with three faces, not three defects — tracked in #628 (row too wide)
-# and #629 (docked wrapping text steals rows). The tests below pin the bounded
-# case here, each unbounded case at a size measured to work, and 80x24 as the
-# size to rely on when the content is not bounded.
+# Nothing bounds that caller-supplied text, so a dialog handed a long enough
+# value has no floor to state at all. Measured at 39 columns: a ~150-character
+# deferred-work heading still fits 9 rows, ~300 characters wraps to 9 rows of
+# title and clips the close button; the validate header grows with its
+# document's spec folder; the spec viewer's `copy path` plus its action verbs
+# overflow 39 columns outright. That is one family with three faces, not three
+# defects — tracked in #628 (row too wide) and #629 (docked wrapping text steals
+# rows). The tests below pin the bounded case here, each unbounded case at a
+# size measured to work, and 80x24 as a size that was sufficient for the
+# examples measured — not one an unbounded value cannot overrun.
 
 _MIN_COLS, _MIN_ROWS = 39, 9
 
@@ -1790,9 +1791,10 @@ def _minimum_size_case(name: str, project):
 
 
 @pytest.mark.parametrize("case", _MIN_SIZE_CASES)
-async def test_documented_minimum_terminal_size_keeps_dialogs_operable(project, case):
-    """At the published 39x9 floor every covered dialog still shows its title, a
-    row of body and all of its docked controls (#281).
+async def test_measured_terminal_size_keeps_dialogs_operable(project, case):
+    """At the 39x9 pair the guide records as measured, every covered dialog still
+    shows its title, a row of body and all of its docked controls (#281). Short
+    titles, so this pins the chrome; caller text is unbounded and has no floor.
 
     Both breakpoint classes are asserted present first, so the test fails loudly
     if a future threshold change means this size no longer exercises the compact
@@ -1831,8 +1833,10 @@ async def test_documented_minimum_terminal_size_keeps_dialogs_operable(project, 
     ids=["gate", "plan-checkpoint"],
 )
 async def test_spec_review_modal_operable_on_a_standard_terminal(project, actions, controls):
-    """The spec viewer is the one dialog outside the 39x9 floor, so pin what it
-    does guarantee: a standard 80x24 terminal shows either action row in full.
+    """The spec viewer is the one dialog outside the measured 39x9 pair, so pin
+    what WAS measured: a standard 80x24 terminal shows either action row in full
+    at the path length used here. That is sufficiency for this case, not a size
+    the dialog will meet for every spec path — nothing bounds one (#629).
 
     It has no single floor to pin instead. Two things push it around, and one of
     them is not a width at all: the docked `copy path` button plus the caller's
@@ -1890,7 +1894,8 @@ async def test_validate_findings_modal_floor_moves_with_its_header(project, kwar
     39x11, and only clears at 39x12. So the three cases here pin the dependence
     itself rather than a single minimum — which is why docs/tui-guide.md
     describes this floor as content-dependent and quotes the standard 80x24
-    terminal, the last case, which absorbs either header."""
+    terminal, the last case, which absorbed both headers measured here. A longer
+    folder would move it again; nothing bounds one (#629)."""
     cols, rows = size
     app = BmadLoopApp(project.project)
     async with app.run_test(size=(cols, rows)) as pilot:
@@ -1910,8 +1915,8 @@ async def test_validate_findings_modal_floor_moves_with_its_header(project, kwar
 
 @pytest.mark.parametrize("chars", [150, 300], ids=["fits-the-floor", "overflows-the-floor"])
 async def test_long_docked_title_still_fits_a_standard_terminal(project, chars):
-    """The third face of the same family, and the guarantee the guide falls back
-    on: 80x24 absorbs a docked title no 39-column screen could.
+    """The third face of the same family, and the size the guide falls back on:
+    80x24 absorbed a docked title no 39-column screen could — at these lengths.
 
     `DeferredEntryModal` renders the ledger heading as the docked `.title`,
     outside the scrolling `#entry`, and `parse_ledger` does not bound that text.
@@ -1920,7 +1925,9 @@ async def test_long_docked_title_still_fits_a_standard_terminal(project, chars):
     screen — `#entry` is already at its one-row minimum and has nothing left to
     give. Both lengths are asserted at 80x24 rather than at 39 columns, because
     the point is the fallback size, not another content-specific minimum that a
-    longer heading would falsify (#629)."""
+    longer heading would falsify (#629). A longer heading falsifies 80x24 too —
+    `parse_ledger` bounds nothing — which is why the guide states 80x24 as
+    sufficient for the lengths measured here rather than as a size to rely on."""
     app = BmadLoopApp(project.project)
     async with app.run_test(size=(80, 24)) as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))

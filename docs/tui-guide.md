@@ -22,28 +22,37 @@ Linux, so tmux works there unchanged; native Windows awaits a Windows-capable ba
 `bmad-loop mux` shows which backend is selected and why, and the Settings editor's
 `mux.backend` (or the `BMAD_LOOP_MUX_BACKEND` env var) forces the choice per machine.
 
-**Minimum terminal size.** The modal dialogs — confirmations, the start/sweep
-option forms, the escalation and checkpoint viewers — are the tightest thing the
-TUI draws, and **39 columns × 9 rows** is the floor at which a dialog's own
-chrome still fits: its border, padding, title line and margins, a row of body,
-and the whole docked button row. That is a floor for the **dialogs**, not for
+**Terminal sizes, as measured.** The modal dialogs — confirmations, the
+start/sweep option forms, the escalation and checkpoint viewers — are the
+tightest thing the TUI draws. The figures below describe those **dialogs**, not
 the dashboard behind them, which simply shows fewer rows as the window shrinks.
-`EscalationModal` sets it, and its height floor is width-dependent because its
-docked warning wraps — 9 rows at 39 columns but only 6 at 80 — so a roomier
-window buys height as well as width.
+**39 columns × 9 rows** is the size at which a dialog's own chrome was measured
+to fit: its border, padding, title line and margins, a row of body, and the
+whole docked button row. `EscalationModal` is what sets it, and its height is
+width-dependent because its docked warning wraps — 9 rows at 39 columns but only
+6 at 80 — so a roomier window buys height as well as width.
 
-That floor covers the chrome, not the text a dialog is handed. Titles, headers,
-warnings and file paths are docked _outside_ the scrolling body, so each line
-they wrap to costs a row the body cannot give back, the body having floored at
-one row. A dialog showing long enough caller-supplied text therefore has no
-fixed minimum. Measured at 39 columns: a deferred-work heading of about 150
-characters still fits, while about 300 characters wraps to nine rows of title
-and pushes the close button off; the validate-findings viewer needs one extra
-row for a plain result and three when the document carries a long spec folder;
-and the spec viewer's `copy path` button alongside its action verbs is wider
-than a 39-column dialog can hold whatever the button metrics do, over and above
-a spec path that wraps. All of them fit a standard **80 × 24** terminal, which
-is the size to rely on wherever the content is not bounded (#628, #629).
+That is a measurement of the chrome, not of the text a dialog is handed, and it
+is not a size you can rely on. Titles, headers, warnings and file paths are
+docked _outside_ the scrolling body, so each line they wrap to costs a row the
+body cannot give back, the body having floored at one row. That text comes from
+the caller and **nothing bounds its length** — a deferred-work ledger title, a
+`spec:` folder, a spec path. A long enough value therefore consumes the frame
+and clips the docked controls at **any** fixed size, so no figure here — 39 × 9,
+80 × 24, or larger — is a minimum these dialogs will always meet. Bounding that
+text is tracked in #629, and the spec viewer's over-wide action row in #628.
+
+What the figures do say is that these sizes were sufficient for the dialogs as
+measured, at the content lengths the test suite exercises. Measured at 39
+columns: a deferred-work heading of about 150 characters still fits, while about
+300 characters wraps to nine rows of title and pushes the close button off; the
+validate-findings viewer needs one extra row for a plain result and three when
+the document carries a long spec folder; and the spec viewer's `copy path`
+button alongside its action verbs is wider than a 39-column dialog can hold
+whatever the button metrics do, over and above a spec path that wraps. A
+standard **80 × 24** terminal was sufficient for every one of those measured
+examples, which is why it is the size quoted wherever the content is unbounded —
+as one that worked for what was measured, not as one that cannot be overrun.
 
 Below **60 columns or 20 rows** the dialogs degrade to a compact layout rather
 than clipping: the dialog clamps to the screen width, the action buttons shrink
