@@ -38,6 +38,14 @@ class BaseDialog(ModalScreen):
     }
     BaseDialog #dialog {
         width: 64;
+        /* the clamp lives on the SHARED rule on purpose: the five subclasses that
+           widen the dialog (Decision 86, Escalation 90, DeferredEntry/Validate/
+           TextOutput 96, SpecReview 100) override only `width`, never `max-width`,
+           so this one declaration covers all ten and a subclass cannot silently
+           opt out of it. Without it a fixed column count is laid out wider than a
+           narrow terminal and the right-hand side — i.e. the docked button row,
+           which is align-horizontal: right — is clipped off-screen (#281). */
+        max-width: 100%;
         /* height is intentionally auto (not a definite %). Two-tier by design:
            list-heavy modals (Decision/Escalation/StartRun/...) override #dialog
            with a definite height + a 1fr body; the bounded modals (Confirm/
@@ -63,7 +71,30 @@ class BaseDialog(ModalScreen):
     BaseDialog .buttons Button {
         margin-left: 2;
     }
+    /* Clamping #dialog is not enough on its own: Textual's Button is
+       `width: auto; min-width: 16` and the rule above adds a 2-column margin per
+       button, so a three-button row demands 3*16 + 3*2 = 54 columns while a
+       dialog clamped to a 50-column terminal only has 50 - 2 (thick border)
+       - 4 (padding `1 2`) = 44 columns of content — the row still overflows and
+       the right-most button is clipped. Dropping the floor lets each button size
+       to its own label instead. Scoped to `-narrow` so terminals 60 columns and
+       wider keep today's button sizing byte-for-byte. */
+    BaseDialog.-narrow .buttons Button {
+        min-width: 4;
+        margin-left: 1;
+    }
     """
+
+    # Textual applies the matching breakpoint class to the Screen itself on
+    # resize, and BaseDialog IS a ModalScreen — so `-narrow` lands on the dialog
+    # screen and CSS can select `BaseDialog.-narrow ...`. `-narrow` therefore
+    # means "the terminal is under 60 columns". 60 is where an un-narrowed
+    # three-button row (3 * Textual's `min-width: 16` + 3 * `margin-left: 2`
+    # = 54) still fits a clamped dialog's content region (60 - 2 border
+    # - 4 padding = 54). Declaring this here scopes it to dialogs: the App and
+    # DashboardScreen leave their breakpoints at the default, so the dashboard
+    # is unaffected.
+    HORIZONTAL_BREAKPOINTS = [(0, "-narrow"), (60, "-wide")]
 
     BINDINGS = [Binding("escape", "cancel", "cancel")]
 

@@ -1483,6 +1483,100 @@ async def test_settings_binding_opens_editor(project):
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
 
 
+# ---- #281 modal dialogs shrink to fit narrow terminals (horizontal axis)
+#
+# Measured minimum terminal WIDTH at which every docked button is fully
+# on-screen — before this fix / after it: DecisionModal 83 -> 12,
+# EscalationModal 87 -> 39, ConfirmModal 61 -> 22, StartSweepModal 61 -> 20,
+# StoryCheckpointModal 61 -> 37. EscalationModal's 87 means a standard
+# 80-column terminal clipped it.
+
+
+async def test_decision_modal_clamps_to_narrow_terminal(project):
+    """A 50-column terminal is narrower than DecisionModal's declared width: 86.
+    `max-width: 100%` on the shared BaseDialog #dialog rule clamps it to the
+    screen, so the docked skip button is reachable instead of being laid out past
+    the right edge (#281). The width assertion pins the clamp; the reachability
+    assertion is what the user actually feels."""
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(50, 30)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app.push_screen(DecisionModal(_long_decision()))
+        await until(pilot, lambda: isinstance(app.screen, DecisionModal))
+        await ready(pilot, "#body")
+        # clamped to the terminal, not laid out at its declared 86 columns
+        assert app.screen.query_one("#dialog").region.width == 50
+        assert _on_screen(app, app.screen.query_one("#cancel", Button))
+
+
+async def test_escalation_modal_three_buttons_reachable_when_narrow(project):
+    """The three-button escalation row at 45 columns — the case the clamp alone
+    does NOT fix, so this is the test that earns the `-narrow` rule.
+
+    At 45 columns the clamped dialog has 45 - 2 (thick border) - 4 (padding) = 39
+    columns of content, while Textual's default `Button min-width: 16` plus
+    BaseDialog's `margin-left: 2` demands 3*16 + 3*2 = 54 for three buttons — the
+    row overflows and the right-most button is clipped. Measured: with the clamp
+    but WITHOUT `BaseDialog.-narrow .buttons Button`, this modal still needs 58
+    columns. So this test covers the `-narrow` rule, not merely `max-width` —
+    deleting that rule must redden this test, and T1 does not cover it."""
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(45, 30)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app.push_screen(
+            EscalationModal(
+                story_key="e-1-s",
+                title="t",
+                description="d",
+                blocking="b",
+                sentinel_kind="",
+                resolution_ready=True,
+                engine_live=False,
+                restore_recorded=True,
+            )
+        )
+        await until(pilot, lambda: isinstance(app.screen, EscalationModal))
+        await ready(pilot, "#body")
+        for bid in ("#act-resolve", "#act-rearm", "#cancel"):
+            assert _on_screen(app, app.screen.query_one(bid, Button)), bid
+
+
+async def test_story_checkpoint_three_buttons_reachable_when_narrow(project):
+    """The other three-button row, same 45-column bound as the escalation case:
+    measured at 57 columns with the clamp alone, so this too rests on `-narrow`."""
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(45, 30)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app.push_screen(
+            StoryCheckpointModal(
+                story_key="e-1-s",
+                title="t",
+                commit="abc123",
+                verify_line="v",
+                tokens="0",
+            )
+        )
+        await until(pilot, lambda: isinstance(app.screen, StoryCheckpointModal))
+        await ready(pilot, "#body")
+        for bid in ("#act-continue", "#act-stop", "#cancel"):
+            assert _on_screen(app, app.screen.query_one(bid, Button)), bid
+
+
+async def test_wide_terminal_dialog_width_unchanged(project):
+    """The clamp must not shrink a dialog that already fits: at 120 columns a
+    ConfirmModal still lays out at its declared 64, and 120 is above the 60-column
+    `-narrow` breakpoint so the button row keeps today's sizing. Guards the fix
+    against becoming a visible regression for normal-width terminals (#281)."""
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(120, 30)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app.push_screen(ConfirmModal("t", "body"))
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await ready(pilot, "#body")
+        assert app.screen.query_one("#dialog").region.width == 64
+        assert "-narrow" not in app.screen.classes  # the breakpoint did not engage
+
+
 # ------------------------------------------------------------- run control
 
 
