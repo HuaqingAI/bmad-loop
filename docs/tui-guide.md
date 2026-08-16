@@ -24,31 +24,32 @@ Linux, so tmux works there unchanged; native Windows awaits a Windows-capable ba
 
 **Minimum terminal size.** The modal dialogs — confirmations, the start/sweep
 option forms, the escalation and checkpoint viewers — are the tightest thing the
-TUI draws, and **39 columns × 9 rows** is the floor at which every one of them
-still shows its title, a row of body, and all of its docked action buttons. That
-is a floor for the dialogs specifically, not for the dashboard behind them,
-which simply shows fewer rows as the window shrinks. Two viewers sit outside
-that floor, both because they dock chrome that wraps: wrapped lines are content,
-so the compact layout cannot collapse them the way it collapses padding. Neither
-has a fixed minimum — each one's floor moves with what it is being asked to
-show — and a standard **80 × 24** terminal displays both in full. The
-validate-findings viewer's header carries the run mode and the spec folder, and
-that folder is user-controlled, so how far it wraps is a property of the
-document: a plain result needs one row more than the floor at 39 columns, and a
-long spec folder needs three (#629). The spec viewer docks a `copy path` button
-alongside its action verbs, whose labels alone are wider than a 39-column
-dialog's content region, and it prints the full spec path above the body, so a
-path long enough to wrap can push the action row off a 9-row screen altogether;
-its floor follows that path and the action verbs the caller supplies (#628).
-Below **60 columns or 20
-rows** the dialogs degrade to a compact layout rather than clipping: the dialog
-clamps to the screen width, the action buttons shrink and tighten, and vertically
-the padding, the title margin and the button-row margin collapse while the
-buttons render one row tall instead of three. At 60 columns and 20 rows and above
-you get the full chrome, unchanged. The height floor is width-dependent where a
-dialog docks a wrapping warning — the escalation viewer needs 9 rows at 39
-columns but only 6 at 80 — so a roomier window buys height as well as width
-(#281).
+TUI draws, and **39 columns × 9 rows** is the floor at which a dialog's own
+chrome still fits: its border, padding, title line and margins, a row of body,
+and the whole docked button row. That is a floor for the **dialogs**, not for
+the dashboard behind them, which simply shows fewer rows as the window shrinks.
+`EscalationModal` sets it, and its height floor is width-dependent because its
+docked warning wraps — 9 rows at 39 columns but only 6 at 80 — so a roomier
+window buys height as well as width.
+
+That floor covers the chrome, not the text a dialog is handed. Titles, headers,
+warnings and file paths are docked _outside_ the scrolling body, so each line
+they wrap to costs a row the body cannot give back, the body having floored at
+one row. A dialog showing long enough caller-supplied text therefore has no
+fixed minimum. Measured at 39 columns: a deferred-work heading of about 150
+characters still fits, while about 300 characters wraps to nine rows of title
+and pushes the close button off; the validate-findings viewer needs one extra
+row for a plain result and three when the document carries a long spec folder;
+and the spec viewer's `copy path` button alongside its action verbs is wider
+than a 39-column dialog can hold whatever the button metrics do, over and above
+a spec path that wraps. All of them fit a standard **80 × 24** terminal, which
+is the size to rely on wherever the content is not bounded (#628, #629).
+
+Below **60 columns or 20 rows** the dialogs degrade to a compact layout rather
+than clipping: the dialog clamps to the screen width, the action buttons shrink
+and tighten, and vertically the padding, the title margin and the button-row
+margin collapse while the buttons render one row tall instead of three. At 60
+columns and 20 rows and above you get the full chrome, unchanged (#281).
 
 Over a slow or high-latency link (SSH, Tailscale), a 60fps update stream can't
 drain in time and partial frames paint over old ones. Launch with

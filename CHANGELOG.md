@@ -325,11 +325,14 @@ breaking changes may land in a minor release.
   no title margin, a one-row button row — rather than clipping its docked buttons and safety
   warnings. `docs/tui-guide.md` accordingly documents a supported minimum terminal size, **39
   columns × 9 rows**, which is a new user-facing contract; it is a floor for the dialogs
-  specifically, not for the dashboard behind them, and it excludes the two viewers that dock chrome
-  which wraps, whose floors move with what they display rather than being fixed — the
-  validate-findings header grows with the document's own spec folder (#629), and the spec viewer's
-  `copy path` button plus its action verbs are wider than a 39-column dialog can hold (#628). Both
-  fit a standard 80 × 24 terminal. At 60 columns and 20 rows and above the full chrome renders
+  specifically, not for the dashboard behind them, and it is the floor for a dialog's own chrome
+  rather than for the text it is handed. `EscalationModal` sets it and its height floor is
+  width-dependent, its docked warning wrapping to 9 rows at 39 columns but 6 at 80. Titles,
+  headers and paths dock outside the scrolling body, so a long enough one wraps and costs rows the
+  body cannot give back: a ~300-character deferred-work heading clips the close button, the
+  validate viewer grows with its document's spec folder (#629), and the spec viewer's `copy path`
+  button plus its action verbs simply do not fit 39 columns (#628). A standard 80 × 24 terminal
+  absorbs all of them. At 60 columns and 20 rows and above the full chrome renders
   exactly as it does today.
 
 ## [0.10.0] — 2026-08-14

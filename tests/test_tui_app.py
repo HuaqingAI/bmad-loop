@@ -1698,14 +1698,20 @@ async def test_tall_terminal_dialog_height_unchanged(project):
 # nowhere else. It is also what keeps the published floor honest: the claim is
 # asserted for every dialog it covers, so a modal cannot quietly stop meeting it.
 #
-# Two dialogs are documented exceptions and deliberately absent from this table,
-# each with its own test below. The spec viewer docks `copy path` alongside its
-# action verbs, so its labels alone overflow a 39-column dialog whatever the
-# button metrics do (#628). The validate viewer's header is docked outside the
-# scrolling body and wraps, and each wrapped line costs the button row a row
-# (#629). Both are the same shape of defect: chrome docked outside the body,
-# which the `-short`/`-narrow` rules cannot shrink because it is content, not
-# padding.
+# What the floor covers is a dialog's own CHROME, not the text it is handed, and
+# the cases below are parametrised with short titles for exactly that reason.
+# Titles, headers, warnings and paths dock OUTSIDE the scrolling body, so every
+# line they wrap to costs a row the body cannot give back — it floors at 1 — and
+# the `-short`/`-narrow` rules cannot shrink content the way they shrink padding.
+# So any dialog handed long enough caller-supplied text has no fixed minimum.
+# Measured at 39 columns: a ~150-character deferred-work heading still fits 9
+# rows, ~300 characters wraps to 9 rows of title and clips the close button; the
+# validate header grows with its document's spec folder; the spec viewer's
+# `copy path` plus its action verbs overflow 39 columns outright. That is one
+# family with three faces, not three defects — tracked in #628 (row too wide)
+# and #629 (docked wrapping text steals rows). The tests below pin the bounded
+# case here, each unbounded case at a size measured to work, and 80x24 as the
+# size to rely on when the content is not bounded.
 
 _MIN_COLS, _MIN_ROWS = 39, 9
 
@@ -1895,6 +1901,38 @@ async def test_validate_findings_modal_floor_moves_with_its_header(project, kwar
         app.push_screen(modal)
         await until(pilot, lambda: app.screen is modal)
         await ready(pilot, "#findings")
+        assert _on_screen(app, app.screen.query_one("#ok"))
+
+
+@pytest.mark.parametrize("chars", [150, 300], ids=["fits-the-floor", "overflows-the-floor"])
+async def test_long_docked_title_still_fits_a_standard_terminal(project, chars):
+    """The third face of the same family, and the guarantee the guide falls back
+    on: 80x24 absorbs a docked title no 39-column screen could.
+
+    `DeferredEntryModal` renders the ledger heading as the docked `.title`,
+    outside the scrolling `#entry`, and `parse_ledger` does not bound that text.
+    At 39 columns a ~150-character heading still clears the floor, but ~300
+    characters wraps to nine rows of title and pushes `#ok` off a nine-row
+    screen — `#entry` is already at its one-row minimum and has nothing left to
+    give. Both lengths are asserted at 80x24 rather than at 39 columns, because
+    the point is the fallback size, not another content-specific minimum that a
+    longer heading would falsify (#629)."""
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        modal = DeferredEntryModal(
+            data.DeferredItem(
+                id="DW-1",
+                title=("word " * 200)[:chars].strip(),
+                status="open",
+                done=False,
+                severity="high",
+                body="line\n" * 40,
+            )
+        )
+        app.push_screen(modal)
+        await until(pilot, lambda: app.screen is modal)
+        await ready(pilot, "#entry")
         assert _on_screen(app, app.screen.query_one("#ok"))
 
 

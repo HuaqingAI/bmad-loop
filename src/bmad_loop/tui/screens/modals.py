@@ -134,7 +134,12 @@ class BaseDialog(ModalScreen):
     # #body). The compact layout has to engage before anything clips, not at the
     # moment it does, so the threshold is above 14 rather than on it. It is also
     # below the 24 rows of a default terminal, so an ordinary window still gets
-    # the full chrome.
+    # the full chrome. Every figure above is a CHROME measurement, taken with
+    # short titles: a title, header, warning or path is docked outside the
+    # scrolling body, so a long enough one wraps and costs rows this layout
+    # cannot reclaim — the body is already at its 1-row minimum. Those dialogs
+    # have no fixed floor; docs/tui-guide.md says so and names 80x24 as the size
+    # to rely on instead (#628, #629).
     VERTICAL_BREAKPOINTS = [(0, "-short"), (20, "-tall")]
 
     BINDINGS = [Binding("escape", "cancel", "cancel")]
