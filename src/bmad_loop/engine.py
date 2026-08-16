@@ -5468,11 +5468,13 @@ class Engine:
         ``_carry_harvested_deferrals`` — and, as with
         ``_carry_review_budget_followups``, because the commit can only ever FAIL
         here rather than because failure is rare. Of the three shapes the main
-        ledger can take, only a gitignored one reaches ``commit_paths`` at all: a
-        tracked one is already closed by the merge, and an untracked-but-not-ignored
-        one never reaches this frame because ``clean_incoming_collisions`` refuses
-        the merge first. ``git add`` then refuses that ignored path with rc 1 every
-        time, so a commit-pending latch would only retry a refusal.
+        ledger can take, a tracked one is already closed by the merge; a
+        gitignored one reaches ``commit_paths`` and ``git add`` refuses that
+        ignored path with rc 1 every time, so a commit-pending latch would only
+        retry a refusal. An untracked-but-not-ignored one used to be unreachable
+        — ``clean_incoming_collisions`` refused the merge over it — and since
+        #460 it reaches here too, where ``git add`` accepts it and the carry
+        commits it, which is the leg that issue reported as never happening.
 
         ``self.paths``, not ``self.workspace.paths``, states the intent — the MAIN
         checkout's ledger. The two are the same path at every call site that

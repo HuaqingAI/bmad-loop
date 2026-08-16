@@ -67,6 +67,22 @@ breaking changes may land in a minor release.
   beyond #519's original scope:** such a migration completes today by losing that data, and will now
   stop instead. Bounded to ledgers that already carry duplicate ids.
 
+- **An unrelated untracked file in your main checkout no longer blocks every isolated unit merge
+  (#460).** Under `[scm] isolation = "worktree"` the pre-merge reconcile refused over any dirty path
+  outside the unit branch's incoming set, untracked included, so a single `notes.txt` escalated the
+  story and paused an unattended run. A merge writes only the paths that differ between target and
+  branch and never stages an untracked file into the commit, so untracked dirt outside that set is
+  now left where it is, the merge proceeds, and the run journals `merge-target-tolerated` naming it.
+  Uncommitted changes to **tracked** files still escalate — `merge_strategy = "squash"` would fold
+  them into the story's commit. Reaches dirt that appears after the run starts, and every `resume`.
+
+- **The escalation that remains no longer blames a game engine (#460).** It asserted that "likely a
+  Unity Editor wrote into the main project" on every isolated merge — the guard's origin story
+  rather than a diagnosis, fired on repos with no Unity anywhere and no plugins loaded — and told
+  you to "clean them", which is the exact verb the reconcile performs with `unlink` on its own
+  paths. It now names the tracked files, asks you to commit, stash or revert them, and demotes a
+  `per_worktree` engine Editor to one possible cause beside ordinary local work.
+
 - **A git that warns while still exiting 0 no longer corrupts the answers the orchestrator reads
   back from it (#442).** An unknown `core.fsyncMethod` value or a `core.fsmonitor` hook that cannot
   exec is a property of the host's git config rather than a failure, but the shared git helper handed
@@ -235,6 +251,26 @@ breaking changes may land in a minor release.
   channel. Visible change: those bytes now show as `�` (U+FFFD) in journal entries, hook advisory
   text and probe documents. The `except` tuples are deliberately not widened — the fix is to stop
   raising, and a widened tuple would guard a fault nothing could ablate into existence.
+
+- **A session whose log merely writes _about_ a provider error no longer pauses the run (#507).**
+  `claude` shipped one pattern joining a framing token to a cause across an unbounded `.*`, and this
+  adapter scans a tmux pane capture — the model's own output — so any line mentioning both halves
+  classified. 44 of this repo's own tracked lines did, most of them ordinary pytest/grep/diff output.
+  The harm ran the other way: a **genuine** timeout was read as an environment fault, re-arming the
+  budget and halting the run for an operator instead of charging the attempt. The three replacements
+  reproduce only complete error sentences Claude Code was captured printing, 5xx statuses enumerated
+  rather than ranged. A standing guard walks `git ls-files` and asserts no tracked line classifies —
+  write the framing token and a cause separated (`API Error` … `<cause>`) in future entries.
+
+- **A mid-response connection drop or a provider 5xx refusal on the `claude` adapter now pauses the
+  run with the matched evidence (#323).** The withdrawn connection-only pattern caught 2 of the 5
+  captured Claude Code failure lines, so a session killed by either of those three misses was charged
+  a dev attempt, and `max_dev_attempts` of them deferred a story whose spec and code were fine. All
+  five classify now, and the pause re-arms the budget instead of spending it. A subscription
+  usage-limit / quota refusal is still **not** classified on this adapter: no captured Claude Code
+  quota line exists to seed a pattern from, and on a pane capture that vocabulary is what a story
+  _implementing_ rate limiting prints all day — follow-up: #610. The four unseeded profiles
+  (`codex`, `gemini`, `copilot`, `antigravity`) are unchanged and still ship none.
 
 ## [0.10.0] — 2026-08-14
 

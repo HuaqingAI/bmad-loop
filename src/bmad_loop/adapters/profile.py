@@ -148,11 +148,18 @@ class CLIProfile:
     # for opencode-http (whose .log is a model-written transcript). Compiled and
     # validated at parse time (an invalid regex is a profile error); empty = inert.
     #
-    # Write them anchored: require an error-shaped token AND a cause on the SAME
-    # line. A pane capture contains the model's own output, so a bare `quota` or
-    # `429` matches a story that merely *implements* rate limiting and would
-    # pause a healthy run — a pattern is only sound against a log the model
-    # cannot write to. Override/extend via a project profile in
+    # A pattern is only sound against a log the model cannot write to. A pane
+    # capture is not one: it carries the model's own output, so a bare `quota`
+    # or `429` matches a story that merely *implements* rate limiting, and an
+    # error-shaped token joined to a cause on the SAME line is precisely what a
+    # story writing ABOUT the error emits — the doctrine that used to live here,
+    # withdrawn because it classified 44 of this repo's own tracked lines (#507).
+    # So a pane-capture profile's pattern must reproduce one COMPLETE error
+    # sentence its CLI was captured printing, and must not match its own line in
+    # the profile file — hence the shipped single-character classes (`t[o]`,
+    # `respons[e]`), which change what the source line matches and nothing else.
+    # Both halves are pinned in tests/test_env_fault_patterns.py, the second
+    # across every tracked file. Override/extend via a project profile in
     # .bmad-loop/profiles/.
     env_fault_patterns: tuple[str, ...] = ()
 

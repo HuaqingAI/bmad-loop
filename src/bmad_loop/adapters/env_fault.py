@@ -24,9 +24,15 @@ Note the two log flavors differ in how *dirty* they are, which is why the
 shipped patterns are anchored the way they are. A tmux pane capture contains the
 model's own output — a story that implements rate limiting will print "429" and
 "quota" in ordinary healthy work — whereas the opencode server log carries only
-server and provider lines. A pattern loose enough to be wrong on the pane log is
-wrong everywhere, so the profiles require an error-shaped anchor AND a cause on
-the same line rather than relying on the cleaner log to save them.
+server and provider lines. That difference sets the bar per profile, and the two
+bars are NOT the same. On a pane capture a pattern must reproduce a COMPLETE
+captured CLI error sentence: an error-shaped token plus a cause on the same line
+is precisely the shape a story writing ABOUT the error emits, so that weaker rule
+classified 44 of this repo's own tracked lines and had to be withdrawn (#507).
+The opencode server log tolerates the anchor-plus-cause form only because the
+model cannot write to it. Seed either from a captured line, never a plausible
+one; the profiles' own comments carry the provenance and
+tests/test_env_fault_patterns.py pins both halves.
 """
 
 from __future__ import annotations

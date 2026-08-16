@@ -371,17 +371,142 @@ def test_clean_incoming_collisions_cleans_within_branch_set(project, tmp_path):
     assert (repo / "leak.cs").read_text() == "branch\n"
 
 
-def test_clean_incoming_collisions_refuses_stray_dirt(project, tmp_path):
+def test_clean_incoming_collisions_tolerates_untracked_stray(project, tmp_path):
+    """#460: an UNTRACKED dirty path outside the branch's incoming set is inert —
+    the merge writes only paths that differ between target and branch, and git
+    never stages an untracked file into a merge or squash commit. It is left
+    exactly where it is and does not stop the merge."""
     repo = project.project
     _branch_with(repo, tmp_path, adds={"leak.cs": "branch\n"})
     (repo / "leak.cs").write_text("editor leaked\n")  # within branch set
-    (repo / "operator.txt").write_text("real work\n")  # stray, NOT in branch set
+    (repo / "operator-notes.txt").write_text("real work\n")  # untracked, NOT in the set
+
+    cleaned = verify.clean_incoming_collisions(repo, "main", "feat")  # no GitError
+    assert cleaned == ["leak.cs"]  # only the leak; the stray is not even reported
+    assert not (repo / "leak.cs").exists()
+    assert (repo / "operator-notes.txt").read_text() == "real work\n"  # bytes intact
+    # The merge is the point of this test: surviving *our* guard is not enough, the
+    # tolerated file must also not trip git's OWN merge pre-flight. If it did, the
+    # narrowing would have moved the halt rather than removed it.
+    verify.merge_branch(repo, "feat", strategy="merge")
+    assert (repo / "leak.cs").read_text() == "branch\n"
+    assert (repo / "operator-notes.txt").read_text() == "real work\n"
+
+
+@pytest.mark.parametrize(
+    ("incoming_path", "stray_path"),
+    [
+        ("Assets/Leak.cs", "Assets"),  # untracked FILE standing where the merge needs a DIR
+        ("notes", "notes/keep.txt"),  # untracked DIR standing where the merge needs a FILE
+    ],
+    ids=["file-where-dir-needed", "dir-where-file-needed"],
+)
+def test_clean_incoming_collisions_shape_clash_stops_at_gits_own_preflight(
+    project, tmp_path, incoming_path, stray_path
+):
+    """The BOUNDARY of #460's tolerance, both directions. An untracked stray whose
+    *path* is outside the incoming set can still clash with it STRUCTURALLY — an
+    untracked file standing where the merge needs a directory, or the reverse. Such a
+    path is not inert, and this guard deliberately does not try to detect it: git's
+    own pre-flight is the authority on what a merge would overwrite, it names the
+    exact path, and a hand-rolled ancestor/descendant predicate here could only drift
+    from git's real rules.
+
+    What this test pins is that deferring is SAFE — the halt is not lost, only moved
+    one call later, and the operator's bytes survive it. Were tolerance ever widened
+    to swallow git's refusal too, this test goes red rather than a run silently
+    destroying operator data. The two labelling gaps this shape leaves behind are
+    filed, not fixed here: #619 (the escalation calls a pre-flight refusal a "content
+    conflict") and #623 (`merge-target-tolerated` is journaled for a stray that then
+    blocked the merge)."""
+    repo = project.project
+    _branch_with(repo, tmp_path, adds={incoming_path: "branch\n"})
+    stray = repo / stray_path
+    stray.parent.mkdir(parents=True, exist_ok=True)
+    stray.write_text("operator\n")
+    head_before = git(repo, "rev-parse", "HEAD")
+
+    # Our guard walks past it: the stray's path is not in the incoming set, and it is
+    # untracked, so by the letter of the predicate it is tolerated. Nothing is cleaned.
+    calls: list[list[str]] = []
+    assert verify.clean_incoming_collisions(repo, "main", "feat", on_tolerated=calls.append) == []
+    assert calls == [[stray_path]]
+
+    # ...and git stops it anyway, one call later, naming the colliding path itself.
+    with pytest.raises(verify.GitError) as ei:
+        verify.merge_branch(repo, "feat", strategy="merge")
+    assert stray_path.split("/")[0] in str(ei.value)
+
+    # What makes deferring acceptable: the operator's bytes are intact and the merge
+    # applied NOTHING. Deliberately NOT asserted via `.git/MERGE_HEAD` — that file is
+    # absent after a genuine content conflict too (`merge_branch` runs `merge --abort`),
+    # so it would pass for every reason and discriminate nothing. `is_file()` carries
+    # the shape half: landing this merge has to convert `Assets` file->dir (row 1) or
+    # delete `notes/` to make room for a file (row 2), so either way this goes red.
+    assert stray.is_file() and stray.read_text() == "operator\n"
+    assert git(repo, "rev-parse", "HEAD") == head_before  # and no merge commit exists
+
+
+def test_clean_incoming_collisions_still_refuses_tracked_stray(project, tmp_path):
+    """The other half of #460: uncommitted changes to a TRACKED file outside the
+    incoming set are not inert — git refuses a merge outright once the change is
+    staged, and `merge --squash` + `commit` folds it into the story's commit — so
+    they still refuse, and still clean nothing."""
+    repo = project.project
+    _branch_with(repo, tmp_path, adds={"leak.cs": "branch\n"})  # `feat` never touches src.txt
+    (repo / "leak.cs").write_text("editor leaked\n")  # within branch set
+    (repo / "src.txt").write_text("operator edit\n")  # tracked-modified, NOT in the set
 
     with pytest.raises(verify.GitError) as ei:
         verify.clean_incoming_collisions(repo, "main", "feat")
-    assert "operator.txt" in str(ei.value)
-    # nothing was cleaned — both files remain
-    assert (repo / "leak.cs").exists() and (repo / "operator.txt").exists()
+    assert "src.txt" in str(ei.value)
+    assert "tracked" in str(ei.value)  # the refusal names which half it is about
+    # nothing was cleaned — the leak still sits there and the edit is unreverted
+    assert (repo / "leak.cs").exists()
+    assert (repo / "src.txt").read_text() == "operator edit\n"
+
+
+def test_clean_incoming_collisions_reports_tolerated_paths(project, tmp_path):
+    """#460's observability half. The strays the guard walks past are handed to
+    `on_tolerated` — the mirror of the returned `cleaned` list — so a merge that
+    proceeded over operator dirt leaves the same kind of trace as one that cleaned a
+    leak, instead of walking past it silently."""
+    repo = project.project
+    _branch_with(repo, tmp_path, adds={"leak.cs": "branch\n"})
+    (repo / "leak.cs").write_text("editor leaked\n")  # within branch set — cleaned
+    # written out of alphabetical order: the callback's list must be sorted by the
+    # helper, not by the order the filesystem happens to hand them back.
+    (repo / "b-notes.txt").write_text("real work\n")
+    (repo / "a-notes.txt").write_text("more real work\n")
+
+    calls: list[list[str]] = []
+    cleaned = verify.clean_incoming_collisions(repo, "main", "feat", on_tolerated=calls.append)
+
+    assert len(calls) == 1  # exactly once, not once per stray
+    assert calls[0] == ["a-notes.txt", "b-notes.txt"]  # sorted; the leak is NOT here
+    assert cleaned == ["leak.cs"]  # the two lists are disjoint halves of the dirt
+    assert (repo / "a-notes.txt").exists() and (repo / "b-notes.txt").exists()
+
+
+def test_clean_incoming_collisions_no_tolerated_callback_when_clean(project, tmp_path):
+    """`on_tolerated` fires only when there is something to report. An empty call
+    would journal a no-op `merge-target-tolerated` on every clean merge, which is
+    noise an operator would learn to ignore. Two rows: a clean tree (row a), and a
+    tree whose only dirt IS the incoming leak (row b) — the second is the one that
+    reaches the callback site at all, since a clean tree returns before it."""
+    repo = project.project
+    _branch_with(repo, tmp_path, adds={"leak.cs": "branch\n"})
+    calls: list[list[str]] = []
+
+    # row (a): nothing dirty at all
+    assert verify.clean_incoming_collisions(repo, "main", "feat", on_tolerated=calls.append) == []
+    assert calls == []
+
+    # row (b): dirty, but every dirty path is inside the branch's incoming set
+    (repo / "leak.cs").write_text("editor leaked\n")
+    cleaned = verify.clean_incoming_collisions(repo, "main", "feat", on_tolerated=calls.append)
+    assert cleaned == ["leak.cs"]
+    assert calls == []
 
 
 def test_clean_incoming_collisions_clean_tree_noop(project, tmp_path):
@@ -410,6 +535,26 @@ def test_clean_incoming_collisions_prunes_emptied_dirs(project, tmp_path):
     cleaned = verify.clean_incoming_collisions(repo, "main", "feat")
     assert cleaned == ["Assets/Tests/Leak.cs"]
     assert not (repo / "Assets").exists()  # emptied dirs pruned back to root
+
+
+def test_clean_incoming_collisions_prune_keeps_dir_holding_a_stray(project, tmp_path):
+    """The directory-prune half of #460's tolerance. A passing
+    `..._tolerates_untracked_stray` does not imply this one: that stray sits at the
+    repo root, where the `rmdir` walk-up never runs. Here the tolerated stray shares
+    a directory with the cleaned leak, so the prune tail walks straight into it."""
+    repo = project.project
+    _branch_with(repo, tmp_path, adds={"Assets/Tests/Leak.cs": "branch\n"})
+    leak = repo / "Assets" / "Tests" / "Leak.cs"
+    leak.parent.mkdir(parents=True, exist_ok=True)
+    leak.write_text("editor leaked\n")  # untracked, within the branch set
+    keep = repo / "Assets" / "Tests" / "keep.txt"
+    keep.write_text("operator\n")  # untracked stray in the SAME directory
+
+    cleaned = verify.clean_incoming_collisions(repo, "main", "feat")
+    assert cleaned == ["Assets/Tests/Leak.cs"]
+    assert not leak.exists()
+    assert keep.read_text() == "operator\n"  # tolerated, bytes intact
+    assert keep.parent.is_dir()  # the prune stopped at a directory that is not empty
 
 
 # ---------------------------------------------------------------- capture_diff

@@ -1273,7 +1273,13 @@ def branch_incoming_paths(repo: Path, target: str, branch: str) -> set[str]:
     return {p for p in out.split("\0") if p}
 
 
-def clean_incoming_collisions(repo: Path, target: str, branch: str) -> list[str]:
+def clean_incoming_collisions(
+    repo: Path,
+    target: str,
+    branch: str,
+    *,
+    on_tolerated: Callable[[list[str]], None] | None = None,
+) -> list[str]:
     """Reconcile a target checkout dirtied by a per-worktree Unity Editor so the
     merge of `branch` can proceed, returning the cleaned paths (empty when the
     tree was already clean).
@@ -1285,23 +1291,48 @@ def clean_incoming_collisions(repo: Path, target: str, branch: str) -> list[str]
     content already committed on `branch`, so cleaning them is safe — the merge
     re-creates the canonical versions.
 
-    Guard: only paths that lie within the branch's incoming set are cleaned. Any
-    dirty path *outside* that set could be real operator work, so we refuse and
-    raise GitError naming the stray paths without touching anything.
+    Guard: only paths that lie within the branch's incoming set are cleaned. A dirty
+    path *outside* that set is real operator work and is never touched. Whether it also
+    BLOCKS the merge depends on trackedness (#460): the merge writes only paths that
+    differ between `target` and `branch`, so an untracked stray can be neither
+    overwritten nor staged into the commit — it is tolerated and the merge proceeds.
+    Uncommitted changes to TRACKED files outside the set do threaten the commit — git
+    refuses a merge outright when the change is staged, and `merge --squash` + `commit`
+    folds it into the story's commit either way — so those still raise GitError naming
+    the paths, without touching anything.
+
+    ``on_tolerated``, when given, is called once with the sorted list of untracked
+    stray paths the guard walked past — the mirror of the returned ``cleaned`` list,
+    so a merge that proceeded over operator dirt leaves the same kind of trace as one
+    that cleaned a leak. Not called when there are no such paths.
     """
     dirty = dirty_paths(repo)
     if not dirty:
         return []
     incoming = branch_incoming_paths(repo, target, branch)
     stray = sorted(p for p in dirty if p not in incoming)
-    if stray:
+    # A merge writes only paths that differ between `target` and `branch`, so a dirty
+    # path outside `incoming` can never be created or overwritten by it, and git never
+    # stages an untracked file into a merge or squash commit. Untracked strays are
+    # therefore inert and are left exactly where they are (#460) — refusing over one
+    # stopped unattended runs at the first story with no hazard to point at.
+    # Tracked dirt is NOT inert: a staged change makes `git merge` refuse outright, and
+    # `merge --squash` + `git commit` folds it into the story's commit. That half keeps
+    # refusing.
+    blocking = [p for p in stray if not dirty[p].startswith("??")]
+    if blocking:
         raise GitError(
-            "the target checkout has uncommitted changes outside this branch's "
-            f"files (not introduced by the merge): {', '.join(stray)}"
+            "the target checkout has uncommitted changes to tracked files outside "
+            f"this branch's files (not introduced by the merge): {', '.join(blocking)}"
         )
+    tolerated = [p for p in stray if dirty[p].startswith("??")]
+    if tolerated and on_tolerated is not None:
+        on_tolerated(tolerated)
     repo_res = repo.resolve()
     cleaned: list[str] = []
     for path, xy in sorted(dirty.items()):
+        if path not in incoming:
+            continue  # tolerated untracked stray — never cleaned, never reported (#460)
         if xy.startswith("??"):  # untracked: delete it, then prune emptied dirs
             fp = repo / path
             fp.unlink(missing_ok=True)
