@@ -272,6 +272,46 @@ breaking changes may land in a minor release.
   _implementing_ rate limiting prints all day — follow-up: #610. The four unseeded profiles
   (`codex`, `gemini`, `copilot`, `antigravity`) are unchanged and still ship none.
 
+- **An out-of-tree module that claims a bundled transport's name is no longer driven in the bundled
+  backend's place (#565).** Backend selection breaks ties on registration order, and the bundled
+  `tmux` / `psmux` entries were seeded only on the first multiplexer resolution — so any
+  registration that landed before it owned that name, and the whole process silently ran on a
+  third-party transport. The trigger is reachable rather than theoretical: a plugin's `[python]`
+  module is executed in-process by the plugin registry, which has no ordering relationship to when
+  the mux is first resolved. Registering a backend now seeds the bundled ones first, making
+  builtins-first an invariant of the registration itself rather than a property of which import ran
+  first — the same fix the adapter registry already carries. A shadowing external is still
+  registered, just behind the bundled entry.
+
+- **Two broken distributions that publish the same entry-point name no longer collapse to a single
+  recorded error (#566).** `importlib.metadata` does not deduplicate entry points across
+  distributions, and all three external-load scans — adapters, profiles and mux backends — recorded
+  failures by assignment into a name-keyed map, so the second failing package overwrote the first.
+  You fixed the one failure you were shown, then met the other on the next run with nothing saying
+  it had ever been there. Both reasons now surface, and every recorded external-load failure names
+  its **distribution** when one is resolvable — in `bmad-loop adapters`, `bmad-loop mux`,
+  `validate`'s human output and `validate --json` — because the entry-point name is not the
+  distribution you uninstall.
+
+  The limit, plainly: two failing same-named distributions still produce **one** finding and one
+  warning line, whose text now carries both reasons `"; "`-joined. The row count does not double.
+  That is what keeps the change contract-preserving — `detail`'s key set and value types are
+  unchanged, so `VALIDATE_SCHEMA_VERSION` stays 1.
+
+  **A deliberate scope addition:** the multiplexer's entry-point scan is now ordered by (name,
+  distribution), as the adapter and profile scans already were, so which of two same-named
+  distributions is recorded first is a fact about the packages rather than about `sys.path`.
+
+- **A run launch whose adapter class rejects a bootstrap keyword now aborts on a clean `error:`
+  line instead of a bare traceback (#569).** The construct call converted only the failures an
+  adapter family declares, and a signature mismatch is refused by the interpreter rather than by
+  the family — so an out-of-tree class whose `__init__` does not accept a keyword the bootstrap
+  passes escaped uncaught. The abort now names the profile, the adapter kind and the rejected
+  keyword; the exit code is unchanged at 1. Deliberately unchanged: a `TypeError` raised from
+  inside a working `__init__` still surfaces as itself, because that is a bug in that package
+  rather than a declared failure, and relabelling it as a signature mismatch would bury it. This is
+  message quality only — an error escaping here already unwound the composition it had started.
+
 ## [0.10.0] — 2026-08-14
 
 Much of this section is the `release/0.9.x` hotfix line brought forward onto `main` (#433).
