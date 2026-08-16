@@ -15,7 +15,7 @@ from pathlib import Path
 
 import yaml
 
-from .platform_util import atomic_write_text
+from .platform_util import atomic_write_bytes
 
 EPIC_RE = re.compile(r"^epic-(\d+)$")
 RETRO_RE = re.compile(r"^epic-(\d+)-retrospective$")
@@ -186,8 +186,9 @@ def story_status(path: Path, key: str) -> str | None:
 # wherever the line happens to end. Both arms demand a trailing `\S`, so a line
 # carrying anything after the value that neither arm can account for — trailing
 # whitespace, no comment — is refused whole rather than silently rewritten
-# without it. (That refusal is why the line-ending relay in #576 cannot be fixed
-# by reading bytes alone: a surviving `\r` is trailing whitespace to both arms.)
+# without it. Line terminators are excluded before either scalar matcher runs
+# and carried separately per line, so CRLF's `\r` is never mistaken for trailing
+# scalar whitespace (#576).
 _QUOTED_VALUE_RE = re.compile(r"^(?P<val>['\"](?:.*\S)?)$")
 _UNQUOTED_VALUE_RE = re.compile(r"^(?P<val>\S(?:.*?\S)?)(?P<rest>[ \t]+#.*)?$")
 
@@ -215,10 +216,12 @@ def _set_mapping_value(lines: list[str], key: str, new_value: str) -> bool:
 
     A remainder neither arm can read leaves the line alone, exactly like a key
     that never matched — `advance` reports the unchanged status rather than
-    claiming a write it did not make."""
+    claiming a write it did not make. Each line's terminator is excluded from
+    the scalar match and then reattached exactly as authored (#576)."""
     key_pat = re.compile(rf"^(?P<indent>\s*){re.escape(key)}:(?P<gap>[ \t]+)(?P<body>\S.*)$")
     for i, line in enumerate(lines):
-        m = key_pat.match(line.rstrip("\n"))
+        stripped = line.rstrip("\r\n")
+        m = key_pat.match(stripped)
         if not m:
             continue
         body = m.group("body")
@@ -229,7 +232,7 @@ def _set_mapping_value(lines: list[str], key: str, new_value: str) -> bool:
         if vm.group("val") == new_value:
             return False  # already at target — idempotent no-op
         rest = vm.groupdict().get("rest") or ""
-        nl = "\n" if line.endswith("\n") else ""
+        nl = line[len(stripped) :]
         lines[i] = f"{m.group('indent')}{key}:{m.group('gap')}{new_value}{rest}" + nl
         return True
     return False
@@ -246,18 +249,23 @@ def advance(path: Path, story_key: str, target: str, *, now: str | None = None) 
     via line edits. Returns the story's status after the call (== `target` on a
     write), or None when nothing was eligible.
 
-    The rewrite is atomic (#379). This is a read-modify-rewrite of the board, and
-    a truncating `write_text` that faults partway through corrupts it SILENTLY:
-    YAML cut at a line boundary is still a valid mapping, just a smaller one, so
-    the epics past the tear cease to exist rather than raising. AGENTS.md makes
-    this the orchestrator's sole write path to sprint-status.yaml, so nothing
-    downstream would contradict the shortened board — the run would simply walk
-    off the end of the sprint. `atomic_write_text` keeps the file entire: either
-    the old contents or the whole new ones, never a prefix.
+    The rewrite is atomic and symlink-following (#379), and every existing CRLF,
+    LF, bare CR, or mixed per-line terminator is preserved (#576). The board is
+    read as raw UTF-8 bytes, each edited line carries its own terminator, and
+    `atomic_write_bytes` publishes the byte-exact result. This is a
+    read-modify-rewrite of the board, and a truncating write that faults partway
+    through corrupts it SILENTLY: YAML cut at a line boundary is still a valid
+    mapping, just a smaller one, so the epics past the tear cease to exist rather
+    than raising. AGENTS.md makes this the orchestrator's sole write path to
+    sprint-status.yaml, so nothing downstream would contradict the shortened
+    board — the run would simply walk off the end of the sprint. The atomic
+    helper keeps the file entire: either the old contents or the whole new ones,
+    never a prefix.
 
-    Symlinks are FOLLOWED (the helper's default), which is what the truncating
-    write did too — the board is an operator-curated file at a project-relative
-    path, and a repo that symlinks it somewhere must keep being a symlink.
+    Symlinks are FOLLOWED (the helper's default), which is what the old
+    truncating write did too — the board is an operator-curated file at a
+    project-relative path, and a repo that symlinks it somewhere must keep being
+    a symlink.
     """
     if not path.is_file():
         return None
@@ -271,7 +279,7 @@ def advance(path: Path, story_key: str, target: str, *, now: str | None = None) 
     ):
         return current  # already at or past target — never regress
 
-    text = path.read_text(encoding="utf-8")
+    text = path.read_bytes().decode("utf-8")
     lines = text.splitlines(keepends=True)
     # story_status() resolves keys via a full YAML parse, but _set_mapping_value
     # rewrites via a line regex that can't touch every shape it finds (quoted or
@@ -294,7 +302,7 @@ def advance(path: Path, story_key: str, target: str, *, now: str | None = None) 
         changed = _set_mapping_value(lines, "last_updated", now) or changed
 
     if changed:
-        atomic_write_text(path, "".join(lines))
+        atomic_write_bytes(path, "".join(lines).encode("utf-8"))
     return target
 
 

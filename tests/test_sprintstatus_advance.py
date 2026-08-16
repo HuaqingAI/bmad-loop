@@ -4,8 +4,10 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 from bmad_loop import sprintstatus
+from bmad_loop.platform_util import atomic_write_bytes as real_atomic_write_bytes
 
 SPRINT = """\
 # Sprint status — do not hand-edit casually
@@ -198,14 +200,10 @@ def test_a_hash_inside_a_quoted_value_never_becomes_a_comment(tmp_path):
     ever a comment.
 
     Compares the full resulting TEXT, not its bytes. Full-content equality is the
-    point — a substring or a re-parse is blind to a fabricated comment — but
-    `advance` writes through `Path.write_text`, whose `newline=None` relays every
-    line ending in the board to `os.linesep`, so a byte comparison also asserts
-    line endings and fails on Windows for a reason that has nothing to do with
-    #366. That relay is real and known (#576); it is not this test's subject, and
-    pinning it here would put a second, accidental contract on the row that guards
-    the value/comment split. Reading back with universal newlines drops exactly
-    that difference and nothing else."""
+    point — a substring or a re-parse is blind to a fabricated comment — while
+    the dedicated #576 rows below own byte-exact line-ending preservation. Keeping
+    this oracle text-focused avoids putting a second, accidental contract on the
+    row that guards only the value/comment split."""
     p = tmp_path / "sprint-status.yaml"
     board = (
         'last_updated: 01-06-2026 10:00\ndevelopment_status:\n  3-2-x: "a # b"\n  3-3-y: backlog\n'
@@ -281,6 +279,118 @@ def test_a_line_with_trailing_whitespace_and_no_comment_is_refused(tmp_path):
         assert "".join(lines) == line
 
 
+# --------------------------------------------------- line-ending preservation (#576)
+
+
+def test_a_crlf_board_keeps_every_crlf_and_only_intended_values_change(tmp_path):
+    """POSIX oracle for the raw-read, CRLF matcher, and per-line emit sites."""
+    board = (
+        b"# Sprint status\r\n"
+        b"last_updated: 01-06-2026 10:00\r\n"
+        b"development_status:\r\n"
+        b"  epic-3: backlog\r\n"
+        b"  3-1-login: backlog\r\n"
+        b"  3-2-finished: done\r\n"
+    )
+    expected = board.replace(b"  epic-3: backlog\r\n", b"  epic-3: in-progress\r\n").replace(
+        b"  3-1-login: backlog\r\n", b"  3-1-login: in-progress\r\n"
+    )
+    p = tmp_path / "sprint-status.yaml"
+    p.write_bytes(board)
+
+    assert sprintstatus.advance(p, "3-1-login", "in-progress") == "in-progress"
+
+    actual = p.read_bytes()
+    assert actual == expected
+    assert b"\n" not in actual.replace(b"\r\n", b"")  # no bare LF was introduced
+    assert sprintstatus.story_status(p, "3-1-login") == "in-progress"
+    assert sprintstatus.load(p).epics[3] == "in-progress"
+
+
+def test_an_lf_board_keeps_every_lf_and_only_intended_values_change(tmp_path):
+    """Windows-CI oracle for the old translating text-writer half of #576."""
+    board = (
+        b"# Sprint status\n"
+        b"last_updated: 01-06-2026 10:00\n"
+        b"development_status:\n"
+        b"  epic-3: backlog\n"
+        b"  3-1-login: backlog\n"
+        b"  3-2-finished: done\n"
+    )
+    expected = board.replace(b"  epic-3: backlog\n", b"  epic-3: in-progress\n").replace(
+        b"  3-1-login: backlog\n", b"  3-1-login: in-progress\n"
+    )
+    p = tmp_path / "sprint-status.yaml"
+    p.write_bytes(board)
+
+    assert sprintstatus.advance(p, "3-1-login", "in-progress") == "in-progress"
+
+    actual = p.read_bytes()
+    assert actual == expected
+    assert b"\r" not in actual
+
+
+def test_a_mixed_ending_board_keeps_each_line_its_own_ending(tmp_path):
+    """POSIX oracle spanning the raw-read and per-line emit sites with all endings."""
+    board = (
+        b"last_updated: 01-06-2026 10:00\r\n"
+        b"development_status:\r\n"
+        b"  epic-3: backlog\n"
+        b"  3-1-login: backlog\r"
+        b"  3-2-untouched: backlog\r\n"
+    )
+    now = "22-06-2026 14:30"
+    expected = (
+        board.replace(
+            b"last_updated: 01-06-2026 10:00\r\n",
+            b"last_updated: 22-06-2026 14:30\r\n",
+        )
+        .replace(b"  epic-3: backlog\n", b"  epic-3: in-progress\n")
+        .replace(b"  3-1-login: backlog\r", b"  3-1-login: in-progress\r")
+    )
+    p = tmp_path / "sprint-status.yaml"
+    p.write_bytes(board)
+
+    assert sprintstatus.advance(p, "3-1-login", "in-progress", now=now) == "in-progress"
+
+    actual = p.read_bytes()
+    assert actual == expected
+    assert sprintstatus.story_status(p, "3-1-login") == "in-progress"
+    assert sprintstatus.load(p).epics[3] == "in-progress"
+    assert yaml.safe_load(actual.decode("utf-8"))["last_updated"] == now
+
+
+def test_advance_sends_bytes_to_the_atomic_writer(tmp_path, monkeypatch):
+    """All-platform oracle for the atomic-writer binding and payload type site."""
+    board = (
+        b"last_updated: 01-06-2026 10:00\r\n"
+        b"development_status:\r\n"
+        b"  epic-3: backlog\r\n"
+        b"  3-1-login: backlog\r\n"
+    )
+    p = tmp_path / "sprint-status.yaml"
+    p.write_bytes(board)
+    writes: list[bytes | str] = []
+
+    def record(path: Path, payload: bytes | str, *, follow_symlinks: bool = True) -> None:
+        writes.append(payload)
+        raw = payload if isinstance(payload, bytes) else payload.encode("utf-8")
+        real_atomic_write_bytes(path, raw, follow_symlinks=follow_symlinks)
+
+    # Wrap both names so the writer-choice ablation still reaches the payload
+    # assertion instead of escaping through whichever module binding it restores.
+    monkeypatch.setattr(sprintstatus, "atomic_write_bytes", record, raising=False)
+    monkeypatch.setattr(sprintstatus, "atomic_write_text", record, raising=False)
+
+    assert sprintstatus.advance(p, "3-1-login", "in-progress") == "in-progress"
+
+    assert len(writes) == 1
+    payload = writes[0]
+    assert isinstance(payload, bytes)
+    assert b"  epic-3: in-progress\r\n" in payload
+    assert b"  3-1-login: in-progress\r\n" in payload
+
+
 # ------------------------------------------------------------ atomic rewrite (#379)
 
 
@@ -323,10 +433,10 @@ def test_advance_write_failure_raises_and_leaves_the_board_entire(tmp_path, monk
     p = _write(tmp_path)
     before = p.read_bytes()
 
-    def boom(path, text, *, follow_symlinks=True):
+    def boom(path, data: bytes, *, follow_symlinks=True):
         raise OSError("no space left on device")
 
-    monkeypatch.setattr(sprintstatus, "atomic_write_text", boom)
+    monkeypatch.setattr(sprintstatus, "atomic_write_bytes", boom)
     with pytest.raises(OSError, match="no space left"):
         sprintstatus.advance(p, "3-2-digest-delivery", "in-progress")
 
