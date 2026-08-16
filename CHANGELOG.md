@@ -312,6 +312,22 @@ breaking changes may land in a minor release.
   rather than a declared failure, and relabelling it as a signature mismatch would bury it. This is
   message quality only — an error escaping here already unwound the composition it had started.
 
+- **A modal dialog on a terminal narrower than its declared width now shrinks to fit instead of
+  being clipped, so its action buttons stay reachable (#281).** The docked button row is
+  right-aligned, so the buttons were exactly what fell off the right edge — the horizontal twin of
+  the vertical defect #275/#280 fixed. `EscalationModal` needed 87 columns, so a standard
+  80-column terminal already clipped it outright; `DecisionModal` needed 83 and the bounded
+  confirms 61. Below 60 columns those buttons additionally render smaller and tighter, because
+  clamping the dialog alone still leaves a three-button row demanding 54 columns inside a content
+  region narrower than that.
+
+  On the other axis, below 20 rows a dialog now renders in a compact layout — collapsed padding,
+  no title margin, a one-row button row — rather than clipping its docked buttons and safety
+  warnings. `docs/tui-guide.md` accordingly documents a supported minimum terminal size, **39
+  columns × 9 rows**, which is a new user-facing contract; it is a floor for the dialogs
+  specifically, not for the dashboard behind them. At 60 columns and 20 rows and above the full
+  chrome renders exactly as it does today.
+
 ## [0.10.0] — 2026-08-14
 
 Much of this section is the `release/0.9.x` hotfix line brought forward onto `main` (#433).
