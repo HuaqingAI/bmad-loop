@@ -50,6 +50,13 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **Advancing a sprint board now preserves every authored line ending (#576).** A valid UTF-8
+  board keeps each CRLF, LF, bare-CR or mixed per-line terminator while the requested story,
+  conditional parent-epic and optional `last_updated` values still change. Previously the
+  read/write relay could translate the whole board to the platform line ending, producing
+  newline-only diff noise outside those intended value edits; parsed YAML content was not
+  corrupted.
+
 - **A `sweep --migrate` rewrite that drops a `gate:` token a pre-existing entry declared is now
   refused, instead of un-gating that story silently (#519).** Validation held the rewrite to each
   entry's id and status only, so losing the token passed, got committed, and the next dispatch ran
