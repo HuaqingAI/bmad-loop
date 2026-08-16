@@ -24,6 +24,7 @@ from conftest import (
     git,
     ignore_before_commit,
     install_build_auto_skill,
+    refuse_to_resolve,
     set_sprint,
     write_ledger,
     write_spec,
@@ -1014,6 +1015,40 @@ def test_tracked_harvest_carry_commit_failure_propagates(project, monkeypatch):
     assert "harvest-carried" not in journal_kinds(engine)
     assert "harvest-carry-uncommitted" not in journal_kinds(engine)
     assert load_state(engine.run_dir).tasks[task.story_key].harvest_carry_commit_pending
+
+
+def test_uncertain_harvest_ledger_keeps_its_pending_commit(project, monkeypatch):
+    """Resolution uncertainty cannot turn a tracked carry into advisory success."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    record = _harvest_record()
+    deferredwork.append_entry(
+        project.deferred_work,
+        title=record["title"],
+        origin=record["origin"],
+        location=record["location"],
+        source_spec=record["source_spec"],
+        reason=record["reason"],
+        severity=record["severity"],
+    )
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        harvested_deferrals=[record],
+        harvest_carry_commit_pending=True,
+    )
+    engine.state.tasks[task.story_key] = task
+    engine._save()
+    refuse_to_resolve(monkeypatch, project.deferred_work)
+
+    with pytest.raises(verify.GitError, match="no exact commit operand remains"):
+        engine._carry_harvested_deferrals(task)
+
+    assert load_state(engine.run_dir).tasks[task.story_key].harvest_carry_commit_pending
+    assert "harvest-carried" not in journal_kinds(engine)
+    assert "harvest-carry-uncommitted" not in journal_kinds(engine)
 
 
 def test_untracked_nonignored_harvest_carry_commit_failure_propagates(project, monkeypatch):
@@ -3025,25 +3060,26 @@ def test_merge_tolerates_untracked_stray_in_main_checkout(project):
     "make_exc",
     [
         lambda: OSError(13, "Permission denied"),
+        lambda: RuntimeError("Permission denied while resolving collision cleanup"),
         lambda: verify.GitSpawnError("git status failed to spawn: Permission denied"),
     ],
-    ids=["fs-oserror", "git-spawn"],
+    ids=["fs-oserror", "fs-runtimeerror", "git-spawn"],
 )
 def test_merge_env_fault_during_target_clean_keeps_branch_and_escalates(
     project, monkeypatch, make_exc
 ):
     """#343: `clean_incoming_collisions` mutates the checkout directly
-    (unlink/rmdir), so a non-spawn FS fault arrives as a plain OSError no
-    chokepoint can translate — and its git reads can raise a typed
-    GitSpawnError. The guard must treat both like any other reconcile
+    (resolve/unlink/rmdir), so non-spawn FS faults arrive as plain OSError or
+    RuntimeError values no chokepoint can translate — and its git reads can raise
+    a typed GitSpawnError. The guard must treat all three like any other reconcile
     failure: keep the branch and escalate rather than crash a DONE unit
     mid-merge — and the escalation must name the environment fault, not
     claim stray uncommitted files that may not exist.
 
-    Ablation targets: narrow the guard in `merge_local` back to
-    `verify.GitError` and the fs-oserror case fails — the OSError crashes the
-    run. Revert the reason branch to the unconditional stray-files text and
-    both cases fail on the message assertions."""
+    Ablation targets: remove `RuntimeError` only from `merge_local`'s catch and the
+    fs-runtimeerror row fails because the run crashes. Keep that catch but remove
+    `RuntimeError` only from its environmental `isinstance` arm and the same row
+    fails on stray-dirt guidance; the underlying-fault guidance is required."""
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
     engine, _ = make_engine(
         project,

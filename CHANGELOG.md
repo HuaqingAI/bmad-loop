@@ -50,6 +50,23 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **Path-resolution refusals no longer tear down worktree runs mid-provisioning (#556).**
+  Observation probes report coarse unknown entries, each refused seed is skipped independently,
+  provisioning-root uncertainty raises a typed escalation and pauses before any write or session,
+  and mount uncertainty defers only the affected unit. Required upstream-skill absence still
+  escalates; this boundary does not include `ProjectPaths` or confined cleanup resolution.
+
+- **Rollback path uncertainty now triggers a pre-destructive rollback pause (#557).** Trusted
+  spec containment fails closed, observational exclude and story derivation use explicit
+  fail-open or empty fallbacks, collision uncertainty keeps and escalates the branch, and exact
+  commits omit only an uncertain candidate after a trusted root is established. This is limited
+  to the audited verify and recovery boundaries, not every path-resolution call.
+
+- **The dashboard now survives project-root resolution refusal with unavailable panes (#558).**
+  Startup and polling retain empty or unavailable views through one stable lexical/canonical
+  cache spelling. This preserves the dashboard around a dead provider; it does not recover the
+  provider or make it operational.
+
 - **Advancing a sprint board now preserves every authored line ending (#576).** A valid UTF-8
   board keeps each CRLF, LF, bare-CR or mixed per-line terminator while the requested story,
   conditional parent-epic and optional `last_updated` values still change. Previously the

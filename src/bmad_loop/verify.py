@@ -88,6 +88,10 @@ class GitSpawnError(GitError):
     (#343). The underlying errno stays reachable via ``exc.__cause__.errno``."""
 
 
+class RollbackPreflightError(GitError):
+    """Rollback cleanup paths could not be proven safe before mutation."""
+
+
 @overload
 def _run_git(
     cmd: list[str],
@@ -646,10 +650,10 @@ def path_ignored(repo: Path, path: Path) -> bool:
     Raises GitError like every other probe in this module. Its caller degrades by
     treating the path as NOT ignored, which keeps it in the commit — the behavior
     before this function existed, and the direction that cannot lose a write."""
-    repo_root = repo.resolve()
     try:
+        repo_root = repo.resolve()
         rel = Path(path).resolve().relative_to(repo_root).as_posix()
-    except ValueError:
+    except (OSError, RuntimeError, ValueError):
         return False
     # `./` disarms pathspec magic on a rel beginning with `:` — see the docstring;
     # it is not decoration. `rel` is already posix-separated and relative, so the
@@ -974,6 +978,66 @@ def ref_exists(repo: Path, refname: str) -> bool:
     return rc == 0
 
 
+@dataclass(frozen=True)
+class _RollbackCleanupTarget:
+    """One canonical, confined untracked path and its canonical prune bounds."""
+
+    path: Path
+    prune_start: Path
+    prune_stop: Path
+
+
+@dataclass(frozen=True)
+class _RollbackCleanupPlan:
+    """Canonical cleanup inputs computed before rollback mutates the checkout."""
+
+    repo_root: Path | None
+    keep_roots: tuple[Path, ...]
+    targets: tuple[_RollbackCleanupTarget, ...]
+
+
+def _rollback_cleanup_plan(
+    repo: Path,
+    *,
+    baseline_untracked: list[str] | None,
+    keep: tuple[str, ...],
+) -> _RollbackCleanupPlan:
+    """Resolve every later cleanup operand before the rollback mutation boundary."""
+    if baseline_untracked is None:
+        return _RollbackCleanupPlan(repo_root=None, keep_roots=(), targets=())
+
+    created = untracked_files(repo) - set(baseline_untracked)
+    try:
+        repo_root = repo.resolve()
+        keep_roots = tuple((repo_root / rel).resolve() for rel in keep)
+        targets: list[_RollbackCleanupTarget] = []
+        for rel in sorted(created):
+            path = (repo_root / rel).resolve()
+            # A created path reached through a symlinked parent can canonicalize
+            # outside the checkout. Never turn that uncertainty into an external
+            # deletion; the rollback cleanup is confined to descendants of root.
+            if path == repo_root or not path.is_relative_to(repo_root):
+                continue
+            if any(path == root or path.is_relative_to(root) for root in keep_roots):
+                continue
+            targets.append(
+                _RollbackCleanupTarget(
+                    path=path,
+                    prune_start=path.parent,
+                    prune_stop=repo_root,
+                )
+            )
+    except (OSError, RuntimeError) as e:
+        raise RollbackPreflightError(
+            f"cannot preflight rollback cleanup paths safely in {repo}: {e}"
+        ) from e
+    return _RollbackCleanupPlan(
+        repo_root=repo_root,
+        keep_roots=keep_roots,
+        targets=tuple(targets),
+    )
+
+
 def safe_rollback(
     repo: Path,
     baseline: str,
@@ -1014,10 +1078,21 @@ def safe_rollback(
     would skip the restore and be lost. Instead we read policy.toml's on-disk
     content before the reset and write it straight back after — independent of
     the snapshot, covering both the uncommitted and committed cases.
+
+    Before either stash creation or reset, every path needed by the later
+    untracked cleanup is canonicalized into a confined plan, including its prune
+    bounds. Resolution uncertainty raises ``RollbackPreflightError`` with the
+    filesystem fault as its cause, so the caller can pause while the tree is
+    untouched; the post-reset cleanup consumes the plan without resolving again.
     """
     # policy.toml: capture on-disk content now, restore unconditionally below.
     policy_path = repo / POLICY_FILE_REL
     policy_content = policy_path.read_bytes() if policy_path.is_file() else None
+    cleanup = _rollback_cleanup_plan(
+        repo,
+        baseline_untracked=baseline_untracked,
+        keep=keep,
+    )
 
     rc, out, detail = _git_out(repo, "stash", "create")
     # A failed `stash create` silently empties `snapshot`, which disables the whole
@@ -1082,25 +1157,17 @@ def safe_rollback(
             # `.bmad-loop/policy.toml`, so honouring a link planted there would aim
             # a host-side write at a path of that session's choosing.
             atomic_write_bytes(policy_path, policy_content, follow_symlinks=False)
-    if baseline_untracked is None:
-        return  # no snapshot to diff against: never delete untracked files
-    created = untracked_files(repo) - set(baseline_untracked)
-    repo = repo.resolve()
-    keep_roots = [(repo / k).resolve() for k in keep]
-    for rel in sorted(created):
-        path = (repo / rel).resolve()
-        if any(path == root or path.is_relative_to(root) for root in keep_roots):
-            continue
+    for target in cleanup.targets:
         try:
-            path.unlink(missing_ok=True)
+            target.path.unlink(missing_ok=True)
         except OSError:
             continue
-        _prune_empty_parents(path.parent, repo)
+        _prune_empty_parents(target.prune_start, target.prune_stop)
 
 
 def _prune_empty_parents(start: Path, repo: Path) -> None:
-    """Remove now-empty directories from `start` up to (not including) `repo`."""
-    d = start.resolve()
+    """Prune canonical parents supplied by the pre-mutation cleanup plan."""
+    d = start
     while d != repo and d.is_relative_to(repo):
         try:
             d.rmdir()  # succeeds only when empty
@@ -1328,7 +1395,21 @@ def clean_incoming_collisions(
     tolerated = [p for p in stray if dirty[p].startswith("??")]
     if tolerated and on_tolerated is not None:
         on_tolerated(tolerated)
+    # Resolve every untracked cleanup parent before deleting or checking out any
+    # path. A later resolution fault must not leave an earlier collision cleaned
+    # and the checkout only partly reconciled.
     repo_res = repo.resolve()
+    prune_starts: dict[str, Path] = {}
+    for path, xy in sorted(dirty.items()):
+        if path not in incoming or not xy.startswith("??"):
+            continue
+        parent = (repo / path).parent.resolve()
+        if parent != repo_res and not parent.is_relative_to(repo_res):
+            raise OSError(
+                f"refusing to clean incoming collision outside repository {repo_res}: "
+                f"{repo / path}"
+            )
+        prune_starts[path] = parent
     cleaned: list[str] = []
     for path, xy in sorted(dirty.items()):
         if path not in incoming:
@@ -1336,8 +1417,8 @@ def clean_incoming_collisions(
         if xy.startswith("??"):  # untracked: delete it, then prune emptied dirs
             fp = repo / path
             fp.unlink(missing_ok=True)
-            parent = fp.parent
-            while parent.resolve() != repo_res and parent.is_dir() and not any(parent.iterdir()):
+            parent = prune_starts[path]
+            while parent != repo_res and parent.is_dir() and not any(parent.iterdir()):
                 parent.rmdir()
                 parent = parent.parent
         else:  # tracked-modified: restore to the target's committed version
@@ -1591,12 +1672,12 @@ def verify_dev_exclude_relpaths(
     if restore_patch:
         candidates.append(resolve_restore_path(restore_patch, paths.project))
     out: list[str] = []
-    project = paths.project.resolve()
+    project = paths.project
     for path in candidates:
         try:
             rel = path.resolve().relative_to(project).as_posix()
-        except ValueError:
-            continue  # outside the project tree; nothing to exclude here
+        except (OSError, RuntimeError, ValueError):
+            continue  # outside or uncertain; nothing safe to exclude here
         if rel and rel != ".":
             out.append(rel)
     return tuple(out)
@@ -1609,14 +1690,17 @@ def spec_within_roots(spec_path: Path, paths: ProjectPaths) -> bool:
     these roots, so a surprising path can never be silently rewritten. Artifact
     dirs configured outside ``project`` are roots too, so a legitimately
     out-of-project spec is still allowed."""
-    sp = spec_path.resolve()
-    roots = (
-        paths.project,
-        paths.output_folder,
-        paths.implementation_artifacts,
-        paths.planning_artifacts,
-    )
-    return any(sp == r.resolve() or sp.is_relative_to(r.resolve()) for r in roots)
+    try:
+        sp = spec_path.resolve()
+        roots = (
+            paths.project,
+            paths.output_folder,
+            paths.implementation_artifacts,
+            paths.planning_artifacts,
+        )
+        return any(sp == r.resolve() or sp.is_relative_to(r.resolve()) for r in roots)
+    except (OSError, RuntimeError):
+        return False
 
 
 def resolve_spec_path(spec_file: str, paths: ProjectPaths) -> Path:
@@ -2013,7 +2097,7 @@ def _stories_relpaths(project: Path, spec_folder: Path) -> tuple[str, ...]:
 
     try:
         rel = spec_folder.resolve().relative_to(project.resolve()).as_posix()
-    except ValueError:
+    except (OSError, RuntimeError, ValueError):
         return ()
     base = "" if rel == "." else f"{rel}/"
     return (f"{base}{STORIES_SUBDIR}", f"{base}{STORIES_FILENAME}")
@@ -2547,9 +2631,18 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
     optional path would otherwise sink the whole commit (a swallowed `GitError`
     in `confirm` silently losing the spec+board commit over a park record that
     was never committed). A missing-but-TRACKED path stays in: that is a
-    deletion to stage."""
+    deletion to stage. An uncertain repo root raises before staging; uncertainty
+    in one candidate omits only that candidate, preserving the partial-path
+    contract for healthy siblings. If no usable operand survives that uncertainty,
+    the call raises instead of reporting a successful no-op."""
     rels: list[str] = []
-    repo_root = repo.resolve()
+    resolution_fault: tuple[Path, OSError | RuntimeError] | None = None
+    try:
+        repo_root = repo.resolve()
+    except (OSError, RuntimeError) as e:
+        raise GitError(
+            f"cannot resolve repository root for exact commit safely ({repo}): {e}"
+        ) from e
     for p in paths:
         try:
             # `.as_posix()`, not `str()`: every rel here becomes a git pathspec and is
@@ -2557,6 +2650,10 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
             # every platform. `str()` yields backslashes on Windows, which git reads as
             # wildmatch ESCAPES rather than separators.
             rels.append(Path(p).resolve().relative_to(repo_root).as_posix())
+        except (OSError, RuntimeError) as e:
+            if resolution_fault is None:
+                resolution_fault = (Path(p), e)
+            continue
         except ValueError:
             continue
     missing = [r for r in rels if not ((repo_root / r).exists() or (repo_root / r).is_symlink())]
@@ -2567,6 +2664,12 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
         tracked = {t for t in out.split("\0") if t}
         rels = [r for r in rels if r not in missing or r in tracked]
     if not rels:
+        if resolution_fault is not None:
+            failed_path, error = resolution_fault
+            raise GitError(
+                "no exact commit operand remains after path resolution failed "
+                f"for {failed_path}: {error}"
+            ) from error
         return None
     # Every operand is forced LITERAL: git reads a positional operand as a PATHSPEC,
     # and `implementation_artifacts` reaches here verbatim out of the operator's

@@ -10,9 +10,9 @@ import sys
 from pathlib import Path
 
 import pytest
-from conftest import install_bmad_config, write_sprint
+from conftest import install_bmad_config, refuse_to_resolve, write_sprint
 
-from bmad_loop import deferredwork, policy
+from bmad_loop import bmadconfig, deferredwork, policy
 from bmad_loop.adapters import tmux_base
 from bmad_loop.journal import Journal, save_state
 from bmad_loop.model import RunState
@@ -82,6 +82,32 @@ def test_pending_missed_decisions_reads_and_caches(project, monkeypatch):
     assert [d.id for d in pending] == ["DW-1"]
     # cached: same object back while ledger/store/run-set are unchanged
     assert data.pending_missed_decisions(project.project) is pending
+
+
+def test_pending_missed_decisions_uses_loaded_project_root(project, monkeypatch):
+    """The canonical root from ProjectPaths is both the reader and cache key.
+
+    INVERSE ablation: restore the second ``project.resolve()`` in
+    ``pending_missed_decisions`` and this test raises the stubbed WinError 64
+    instead of returning the cached decision from the already-loaded root.
+    """
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    run_dir = make_run(project.project, "20260101-000000-aaaa")
+    _write_triage_decision(run_dir)
+    paths = bmadconfig.load_paths(project.project)
+    original_spelling = project.project / "unresolved-alias" / ".."
+    monkeypatch.setattr(data, "_project_paths", lambda _project: paths)
+    refuse_to_resolve(monkeypatch, original_spelling)
+
+    pending = data.pending_missed_decisions(original_spelling)
+
+    assert [decision.id for decision in pending] == ["DW-1"]
+    assert data.pending_missed_decisions(original_spelling) is pending
+    assert paths.project in data._missed_cache
+    assert original_spelling not in data._missed_cache
 
 
 def test_pending_missed_decisions_empty_for_uninitialized(tmp_path):
@@ -951,6 +977,52 @@ def test_pending_decision_missing_fields():
 
 
 # ------------------------------------------------------------ sprint overview
+
+
+def test_project_paths_degrades_and_recovers_from_root_resolve_refusal(project, monkeypatch):
+    """A dead provider yields unavailable readers without poisoning recovery.
+
+    INVERSE ablation: restore bare ``project.resolve()`` in ``_project_paths``
+    and this test raises the stubbed WinError 64 on its first observation rather
+    than returning empty panes and recovering after the provider is healthy.
+    """
+    install_bmad_config(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    root = project.project
+
+    with monkeypatch.context() as refusal:
+        refuse_to_resolve(refusal, root)
+        assert data._project_paths(root) is None
+        assert data.sprint_overview(root) is None
+        assert data.deferred_entries(root) is None
+        assert data.pending_missed_decisions(root) == []
+        assert root not in data._paths_cache
+
+    paths = data._project_paths(root)
+    assert paths is not None
+    assert paths.project == root
+    assert data._paths_cache[root][1] is paths
+    assert data.sprint_overview(root) is not None
+
+
+def test_project_paths_uses_one_canonical_cache_key(project):
+    """Healthy aliases share one ProjectPaths snapshot under the canonical root.
+
+    INVERSE ablation: key ``_paths_cache`` with the pre-canonical spelling while
+    loading from the stable root and this test finds the ``..`` spelling as a
+    second cache key instead of reusing the canonical entry.
+    """
+    install_bmad_config(project)
+    root = project.project.resolve()
+    alternate_spelling = root / ".." / root.name
+
+    paths = data._project_paths(alternate_spelling)
+
+    assert paths is not None
+    assert paths.project == root
+    assert data._project_paths(root) is paths
+    assert root in data._paths_cache
+    assert alternate_spelling not in data._paths_cache
 
 
 def test_sprint_overview(project):

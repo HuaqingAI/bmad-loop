@@ -15,7 +15,13 @@ import tomllib
 from pathlib import Path
 
 import pytest
-from conftest import git, install_bmad_config, make_validate_document, write_sprint
+from conftest import (
+    git,
+    install_bmad_config,
+    make_validate_document,
+    refuse_to_resolve,
+    write_sprint,
+)
 from rich.console import Console
 from rich.text import Text
 from textual.events import MouseMove
@@ -205,6 +211,30 @@ async def test_empty_project_shows_hint(project):
         assert screen.query_one("#runs", DataTable).row_count == 0
         header = str(screen.query_one("#runheader", RunHeader).content)
         assert "no runs found" in header
+
+
+async def test_dashboard_survives_project_root_resolve_refusal(project, monkeypatch):
+    """The app mounts and completes a poll while the project root is unavailable.
+
+    INVERSE ablation: restore bare ``project.resolve()`` in ``BmadLoopApp.__init__``
+    and construction raises the stubbed WinError 64 before Textual can start.
+    """
+    applied_polls = 0
+    apply_snapshot = DashboardScreen._apply
+
+    def track_poll(self, snapshot):
+        nonlocal applied_polls
+        apply_snapshot(self, snapshot)
+        applied_polls += 1
+
+    monkeypatch.setattr(DashboardScreen, "_apply", track_poll)
+    refuse_to_resolve(monkeypatch, project.project)
+    app = BmadLoopApp(project.project)
+
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: applied_polls > 0)
+        assert dashboard(app).is_running
 
 
 async def test_run_table_populates_and_selects_newest(project):

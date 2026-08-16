@@ -31,6 +31,7 @@ from ..adapters.multiplexer import MultiplexerError, get_multiplexer, mux_usable
 from ..gates import ATTENTION_FILE
 from ..journal import JOURNAL_FILE, LOGS_DIR, STATE_FILE, load_state
 from ..model import RunState
+from ..platform_util import resolve_or_lexical
 from ..process_host import ProcessHostError
 from ..runs import (
     STOP_REQUEST_FILE,
@@ -811,7 +812,7 @@ _missed_cache: dict[Path, tuple[Any, list]] = {}
 def _project_paths(project: Path) -> bmadconfig.ProjectPaths | None:
     """BMAD artifact paths, stat-gated on config.yaml; None when the project
     is not initialized (or the config is unreadable)."""
-    project = project.resolve()
+    project = resolve_or_lexical(project)
     config_sig = _stat_sig(project / "_bmad" / "bmm" / "config.yaml")
     cached_paths = _paths_cache.get(project)
     if config_sig is not None and cached_paths is not None and cached_paths[0] == config_sig:
@@ -946,7 +947,7 @@ def pending_missed_decisions(project: Path) -> list:
     paths = _project_paths(project)
     if paths is None:
         return []
-    project = project.resolve()
+    project = paths.project
     sig = (
         _stat_sig(paths.deferred_work),
         _stat_sig(decisions.store_path(project)),

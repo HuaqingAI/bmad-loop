@@ -20,6 +20,7 @@ from conftest import (
     git,
     install_build_auto_skill,
     install_dev_shim,
+    refuse_to_resolve,
 )
 
 import bmad_loop.install as install_mod
@@ -3272,6 +3273,85 @@ def test_provision_worktree_seed_rejects_escaping_path(tmp_path):
     (tmp_path / "outside.txt").write_text("SECRET", encoding="utf-8")
     provision_worktree(wt, [], repo, seed_files=["../outside.txt"])
     assert not wt.exists()  # nothing copied, no dirs created
+
+
+@pytest.mark.parametrize("refused_root", ["worktree", "repo"])
+def test_provision_worktree_root_resolution_fault_is_typed_and_precedes_writes(
+    tmp_path, monkeypatch, refused_root
+):
+    """Provisioning cannot write against roots whose identity is uncertain.
+
+    Ablation: delete the provisioning-root translation and this raises raw
+    ``OSError`` instead of typed ``GitError`` before the seed or hook config write.
+    """
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    repo.mkdir()
+    (repo / "seed.json").write_text("FROM_REPO\n", encoding="utf-8")
+    profile = get_profile("claude")
+    refused = wt if refused_root == "worktree" else repo
+    refuse_to_resolve(monkeypatch, refused)
+
+    with pytest.raises(verify.GitError) as excinfo:
+        provision_worktree(wt, [profile], repo, seed_files=["seed.json"])
+
+    assert "provisioning roots" in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, OSError)
+    assert not (wt / "seed.json").exists()
+    assert not (wt / profile.hooks.config_path).exists()
+
+
+@pytest.mark.parametrize("refused_side", ["source", "destination"])
+def test_provision_worktree_refuses_one_explicit_seed_but_copies_healthy_sibling(
+    tmp_path, monkeypatch, refused_side
+):
+    """Resolution uncertainty is scoped to one explicit seed entry.
+
+    Ablation: delete the explicit-entry resolution guard and the provider fault
+    aborts provisioning before the healthy sibling can be copied.
+    """
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    repo.mkdir()
+    (repo / "refused.json").write_text("REFUSED\n", encoding="utf-8")
+    (repo / "healthy.json").write_text("HEALTHY\n", encoding="utf-8")
+    refused = repo / "refused.json" if refused_side == "source" else wt / "refused.json"
+    refuse_to_resolve(monkeypatch, refused)
+
+    provision_worktree(
+        wt,
+        [],
+        repo,
+        seed_files=["refused.json", "healthy.json"],
+    )
+
+    assert not (wt / "refused.json").exists()
+    assert (wt / "healthy.json").read_text(encoding="utf-8") == "HEALTHY\n"
+
+
+@pytest.mark.parametrize("refused_side", ["source", "destination"])
+def test_provision_worktree_refuses_one_glob_match_but_copies_healthy_sibling(
+    tmp_path, monkeypatch, refused_side
+):
+    """One uncertain glob match cannot abort the rest of a stable expansion.
+
+    Ablation: delete the glob-entry resolution guard and the provider fault aborts
+    provisioning before the healthy match can be copied.
+    """
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    matches = repo / "plugins"
+    matches.mkdir(parents=True)
+    (matches / "a-refused.json").write_text("REFUSED\n", encoding="utf-8")
+    (matches / "z-healthy.json").write_text("HEALTHY\n", encoding="utf-8")
+    refused = (
+        matches / "a-refused.json"
+        if refused_side == "source"
+        else wt / "plugins" / "a-refused.json"
+    )
+    refuse_to_resolve(monkeypatch, refused)
+
+    provision_worktree(wt, [], repo, seed_globs=["plugins/*.json"])
+
+    assert not (wt / "plugins" / "a-refused.json").exists()
+    assert (wt / "plugins" / "z-healthy.json").read_text(encoding="utf-8") == "HEALTHY\n"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
@@ -7109,6 +7189,31 @@ def test_walk_keeps_sibling_symlinks_to_one_shared_tree(tmp_path):
     ]
 
 
+def test_walk_resolution_refusal_obeys_the_existing_suppression_split(tmp_path, monkeypatch):
+    """Cycle-key uncertainty is a named leaf only for observation/copy walks.
+
+    Ablation: delete the cycle-key resolution guard and the suppressing walk raises
+    instead of yielding ``refused``; forcing suppression in both arms makes the
+    repair walk fail to re-raise the original provider ``OSError``.
+    """
+    from bmad_loop.install import _walk_traversable_files
+
+    root = tmp_path / "tree"
+    refused = root / "refused"
+    refused.mkdir(parents=True)
+    (refused / "hidden.md").write_text("hidden\n", encoding="utf-8")
+    (root / "sibling.md").write_text("sibling\n", encoding="utf-8")
+    refuse_to_resolve(monkeypatch, refused)
+
+    walked = dict(_walk_traversable_files(root, _suppress_errors=True))
+    assert sorted(walked) == ["refused", "sibling.md"]
+    assert walked["refused"] == refused
+
+    with pytest.raises(OSError) as excinfo:
+        list(_walk_traversable_files(root, _suppress_errors=False))
+    assert "stubbed: the provider is registered but not serving" in str(excinfo.value)
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
 def test_guarded_copy_treats_a_dangling_destination_leaf_as_occupied(tmp_path):
     repo, wt = tmp_path / "repo", tmp_path / "wt"
@@ -7472,6 +7577,35 @@ def test_base_skills_seed_incomplete_ignores_inactive_catalog_symlink(tmp_path):
     assert base_skills_seed_incomplete(wt, repo, [tree]) == []
 
 
+def test_provision_worktree_refuses_one_upstream_skill_and_preserves_required_result_gate(
+    tmp_path, monkeypatch
+):
+    """An uncertain upstream source is skipped while healthy skills still copy.
+
+    Ablation: delete the upstream-skill resolution guard and the provider fault
+    aborts provisioning instead of reaching the required-skill result re-probe.
+    """
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    tree = ".claude/skills"
+    required_review = "bmad-review"
+    _install_dev_auto(
+        repo,
+        tree,
+        skill=DEV_PRIMITIVE_NEW,
+        customize="[workflow]\n" + _layer("blind", required_review),
+    )
+    _install_skills(repo, tree, {required_review: ()})
+    refuse_to_resolve(monkeypatch, repo / tree / required_review)
+
+    skipped = provision_worktree(wt, [get_profile("claude")], repo)
+
+    missing_rel = f"{tree}/{required_review}"
+    assert (wt / tree / DEV_PRIMITIVE_NEW / "SKILL.md").is_file()
+    assert not (wt / tree / required_review).exists()
+    assert missing_rel in skipped
+    assert base_skills_seed_incomplete(wt, repo, [tree]) == [missing_rel]
+
+
 def test_advisory_review_skill_is_copied_best_effort_but_not_fatal(tmp_path):
     """Conditional review skills remain copy candidates, never hard requirements."""
     wt, repo = tmp_path / "wt", tmp_path / "repo"
@@ -7663,6 +7797,30 @@ def test_worktree_seed_undelivered_names_an_escaped_source_despite_stale_destina
     assert worktree_seed_undelivered(wt, repo, seed_files=[".mcp.json"]) == [".mcp.json"]
 
 
+@pytest.mark.parametrize("refused_root", ["worktree", "repo"])
+def test_worktree_seed_undelivered_reports_coarse_names_when_a_root_is_unresolvable(
+    tmp_path, monkeypatch, refused_root
+):
+    """The journal-only probe reports uncertainty without becoming a run failure.
+
+    Ablation: delete the root-resolution guard and this raises the scoped provider
+    fault instead of returning the configured and safely enumerable coarse names.
+    """
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    (repo / "plugins").mkdir(parents=True)
+    (repo / "plugins" / "b.json").write_text("{}\n", encoding="utf-8")
+    (repo / "plugins" / "a.json").write_text("{}\n", encoding="utf-8")
+    refused = wt if refused_root == "worktree" else repo
+    refuse_to_resolve(monkeypatch, refused)
+
+    assert worktree_seed_undelivered(
+        wt,
+        repo,
+        seed_files=["configured.json", "configured.json"],
+        seed_globs=["plugins/*.json"],
+    ) == ["configured.json", "plugins/a.json", "plugins/b.json"]
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 @pytest.mark.parametrize("escaped_kind", ["file", "directory"])
 def test_worktree_seed_undelivered_rejects_stale_nested_escaped_source(tmp_path, escaped_kind):
@@ -7785,6 +7943,26 @@ def test_module_skills_seed_undelivered_reports_only_missing_content(tmp_path):
     assert module_skills_seed_undelivered(wt, [_MODULE_SKILL_TREE]) == [
         f"{_MODULE_SKILL_TREE}/bmad-loop-resolve",
         f"{_MODULE_SKILL_TREE}/bmad-loop-sweep",
+    ]
+
+
+def test_module_skills_seed_undelivered_reports_coarse_names_when_root_is_unresolvable(
+    tmp_path, monkeypatch
+):
+    """The journal-only wheel probe names existing skills in stable tree order.
+
+    Ablation: delete the worktree-root guard and this raises the provider fault
+    instead of reporting coarse uncertainty for the bundled skill surface.
+    """
+    wt = tmp_path / "wt"
+    refuse_to_resolve(monkeypatch, wt)
+
+    assert module_skills_seed_undelivered(
+        wt, [_MODULE_SKILL_TREE, ".agents/skills", _MODULE_SKILL_TREE]
+    ) == [
+        f"{tree}/{skill}"
+        for tree in (_MODULE_SKILL_TREE, ".agents/skills")
+        for skill in MODULE_SKILLS
     ]
 
 

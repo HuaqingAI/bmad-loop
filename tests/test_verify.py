@@ -10,9 +10,11 @@ from conftest import (
     _FAIL,
     _OK,
     MISSING_TOOL_CMD,
+    UNRESOLVABLE,
     fault_read_text,
     git,
     make_git_noisy,
+    refuse_to_resolve,
     spec_path,
     write_spec,
     write_sprint,
@@ -1458,6 +1460,18 @@ def test_verify_dev_stories_spec_only_change_outside_artifacts_is_not_work(proje
     assert out2.ok
 
 
+@pytest.mark.parametrize("refused", ["project", "spec_folder"])
+def test_stories_relpaths_is_empty_when_resolution_is_uncertain(project, monkeypatch, refused):
+    """An uncertain observation supplies no story excludes. Ablation target: narrow
+    `_stories_relpaths`' resolution guard back to `ValueError`, and either refusal
+    row raises instead of returning the documented empty tuple."""
+    spec_folder = project.planning_artifacts / "epic-a"
+    target = project.project if refused == "project" else spec_folder
+    refuse_to_resolve(monkeypatch, target)
+
+    assert verify._stories_relpaths(project.project, spec_folder) == ()
+
+
 def test_verify_dev_stories_plan_halt_expects_ready_for_dev(project):
     # plan-halt leg: the spec is at ready-for-dev (the plan), not done, and there
     # is NO code change — proof-of-work is skipped and the plan spec is recorded.
@@ -1704,6 +1718,118 @@ def test_safe_rollback_prunes_emptied_dirs(project):
 
     verify.safe_rollback(repo, baseline, baseline_untracked=snap, keep=(".bmad-loop",))
     assert not (repo / "tmpdir").exists()  # emptied parent dirs pruned
+
+
+def test_safe_rollback_resolution_failure_precedes_every_mutation(project, monkeypatch):
+    """A cleanup target that cannot be canonicalized fails typed before stash,
+    reset, unlink, or directory pruning, preserving both the checkout and the
+    original path fault as the diagnostic cause.
+
+    Ablation target: move `_rollback_cleanup_plan` below `stash create` or
+    `reset --hard`, and this test fails on the recorded destructive git call before
+    the injected resolution failure; narrow its exception translation and the
+    `GitError`/cause assertions fail instead.
+    """
+    repo = project.project
+    baseline = verify.rev_parse_head(repo)
+    snap = sorted(verify.untracked_files(repo))
+    created = repo / "uncertain" / "created.txt"
+    created.parent.mkdir()
+    created.write_text("run-created\n")
+    (repo / "src.txt").write_text("tracked attempt\n")
+    refuse_to_resolve(monkeypatch, created)
+
+    git_calls: list[tuple[str, ...]] = []
+    removals: list[tuple[str, Path]] = []
+    real_git = verify._git
+    real_git_out = verify._git_out
+    real_unlink = Path.unlink
+    real_rmdir = Path.rmdir
+
+    def spy_git(r, *args):
+        git_calls.append(args)
+        return real_git(r, *args)
+
+    def spy_git_out(r, *args, env=None):
+        git_calls.append(args)
+        return real_git_out(r, *args, env=env)
+
+    def spy_unlink(self, *args, **kwargs):
+        removals.append(("unlink", self))
+        return real_unlink(self, *args, **kwargs)
+
+    def spy_rmdir(self, *args, **kwargs):
+        removals.append(("rmdir", self))
+        return real_rmdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(verify, "_git", spy_git)
+    monkeypatch.setattr(verify, "_git_out", spy_git_out)
+    monkeypatch.setattr(Path, "unlink", spy_unlink)
+    monkeypatch.setattr(Path, "rmdir", spy_rmdir)
+
+    with pytest.raises(verify.GitError, match="preflight rollback cleanup") as caught:
+        verify.safe_rollback(repo, baseline, baseline_untracked=snap)
+
+    assert isinstance(caught.value.__cause__, OSError)
+    assert UNRESOLVABLE in str(caught.value.__cause__)
+    assert not any(
+        args[:2] in {("stash", "create"), ("reset", "--hard")} for args in git_calls
+    )  # the read-only untracked probe ran, but no git mutation crossed the boundary
+    assert removals == []  # no unlink/rmdir ran on an uncertain plan
+    assert created.read_text() == "run-created\n"
+    assert (repo / "src.txt").read_text() == "tracked attempt\n"
+
+
+def test_safe_rollback_consumes_only_the_precomputed_confined_plan(project, tmp_path, monkeypatch):
+    """A healthy plan removes and prunes a confined created path, preserves a kept
+    path and an external symlink target, and performs no second resolution after
+    `reset --hard` crosses the mutation boundary.
+
+    INVERSE ablation: restore the post-reset `repo.resolve()`/per-target resolve
+    loop or make `_prune_empty_parents` resolve its start again, and the exact-path
+    refusal installed by the reset spy makes this test fail before the planned
+    cleanup is consumed.
+    """
+    repo = project.project
+    baseline = verify.rev_parse_head(repo)
+    snap = sorted(verify.untracked_files(repo))
+    created = repo / "tmpdir" / "sub" / "created.txt"
+    created.parent.mkdir(parents=True)
+    created.write_text("remove me\n")
+    kept = repo / ".bmad-loop" / "keep.txt"
+    kept.parent.mkdir()
+    kept.write_text("keep me\n")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("operator data\n")
+    external_link = repo / "external-link.txt"
+    external_link.symlink_to(outside)
+    (repo / "src.txt").write_text("tracked attempt\n")
+
+    real_git = verify._git
+
+    def refuse_after_reset(r, *args):
+        result = real_git(r, *args)
+        if args[:2] == ("reset", "--hard"):
+            refuse_to_resolve(
+                monkeypatch,
+                repo,
+                repo / ".bmad-loop",
+                created,
+                created.parent,
+                external_link,
+            )
+        return result
+
+    monkeypatch.setattr(verify, "_git", refuse_after_reset)
+
+    verify.safe_rollback(repo, baseline, baseline_untracked=snap)
+
+    assert (repo / "src.txt").read_text() == "original\n"
+    assert not created.exists()
+    assert not (repo / "tmpdir").exists()  # precomputed parents were pruned
+    assert kept.read_text() == "keep me\n"
+    assert external_link.is_symlink()  # external canonical targets are never removed
+    assert outside.read_text() == "operator data\n"
 
 
 def test_safe_rollback_preserves_tracked_artifact(project):
@@ -2538,6 +2664,26 @@ def test_path_ignored_is_false_outside_the_repo(project, tmp_path):
     assert not verify.path_ignored(project.project, tmp_path / "elsewhere" / "board.yaml")
 
 
+@pytest.mark.parametrize("refused", ["repo", "candidate"])
+def test_path_ignored_is_false_when_resolution_is_uncertain(project, monkeypatch, refused):
+    """Resolution uncertainty keeps the path eligible for the exact commit and never
+    fabricates a lexical git operand. Ablation target: move the repo resolve outside
+    the guard or narrow it back to `ValueError`, and the matching row raises instead
+    of returning False before the empty git-call assertion."""
+    repo = project.project
+    candidate = repo / "board.yaml"
+    refuse_to_resolve(monkeypatch, repo if refused == "repo" else candidate)
+    git_calls = []
+
+    def spy_git(*args, **kwargs):
+        git_calls.append((args, kwargs))
+
+    monkeypatch.setattr(verify, "_run_git", spy_git)
+
+    assert verify.path_ignored(repo, candidate) is False
+    assert git_calls == []
+
+
 def test_path_ignored_raises_on_git_failure(project):
     """Raises GitError like every other probe here. Its caller degrades by keeping
     the path IN the commit list — uncertainty must not silently drop a write.
@@ -2930,6 +3076,89 @@ def test_commit_paths_commits_only_listed(project):
     assert "src.txt" not in status
 
 
+def test_commit_paths_repo_resolution_failure_precedes_staging(project, monkeypatch):
+    """An uncertain repository root is a typed exact-write failure before any
+    candidate can be staged; it is never converted into an empty successful commit.
+
+    Ablation target: remove the repo-root translation guard and this test fails on
+    the raw OSError instead of `GitError`; replace it with a lexical/empty fallback
+    and the no-staging/no-success assertions fail.
+    """
+    repo = project.project
+    target = repo / "src.txt"
+    target.write_text("exact write\n")
+    refuse_to_resolve(monkeypatch, repo)
+    git_calls: list[tuple[str, ...]] = []
+    real_git = verify._git
+
+    def spy_git(r, *args):
+        git_calls.append(args)
+        return real_git(r, *args)
+
+    monkeypatch.setattr(verify, "_git", spy_git)
+
+    with pytest.raises(verify.GitError, match="repository root for exact commit") as caught:
+        verify.commit_paths(repo, "chore: exact", [target])
+
+    assert isinstance(caught.value.__cause__, OSError)
+    assert not any(args[:1] == ("add",) for args in git_calls)
+    assert target.read_text() == "exact write\n"
+
+
+def test_commit_paths_omits_only_an_uncertain_candidate(project, monkeypatch):
+    """Per-path uncertainty drops that candidate while a healthy sibling retains
+    its input order and is the only path staged and committed.
+
+    Ablation target: narrow the candidate guard back to `ValueError` and this test
+    fails on the injected OSError before the healthy sibling can be committed.
+    """
+    repo = project.project
+    uncertain = repo / "src.txt"
+    uncertain.write_text("operator edit\n")
+    healthy = repo / "healthy.txt"
+    healthy.write_text("commit me\n")
+    refuse_to_resolve(monkeypatch, uncertain)
+
+    sha = verify.commit_paths(repo, "chore: healthy only", [uncertain, healthy])
+
+    assert sha is not None
+    assert git(repo, "show", "--format=", "--name-only", sha).splitlines() == ["healthy.txt"]
+    status = git(repo, "status", "--porcelain")
+    assert "src.txt" in status  # uncertain path stayed uncommitted
+    assert "healthy.txt" not in status
+
+
+@pytest.mark.parametrize("error_type", [OSError, RuntimeError])
+def test_commit_paths_raises_when_no_operand_survives_resolution(project, monkeypatch, error_type):
+    """A sole uncertain candidate is a typed exact-write failure, not a no-op.
+
+    The harvested-deferral carry clears its durable commit-pending latch after a
+    successful return, so returning ``None`` here would permanently suppress the
+    retry even though the ledger could still be dirty. Ablation target: remove
+    the no-operands resolution guard and both rows return ``None`` instead of
+    raising before staging.
+    """
+    repo = project.project
+    uncertain = repo / "src.txt"
+    uncertain.write_text("uncommitted exact write\n")
+    _refuse_resolution_as(monkeypatch, uncertain, error_type)
+    git_calls: list[tuple[str, ...]] = []
+    real_git = verify._git
+
+    def spy_git(r, *args):
+        git_calls.append(args)
+        return real_git(r, *args)
+
+    monkeypatch.setattr(verify, "_git", spy_git)
+
+    with pytest.raises(verify.GitError, match="no exact commit operand remains") as caught:
+        verify.commit_paths(repo, "chore: exact", [uncertain])
+
+    assert isinstance(caught.value.__cause__, error_type)
+    assert not any(args[:1] == ("add",) for args in git_calls)
+    assert uncertain.read_text() == "uncommitted exact write\n"
+
+
 def test_commit_paths_noop_when_unchanged(project):
     assert verify.commit_paths(project.project, "noop", [project.project / "src.txt"]) is None
     # a path outside the repo is ignored, not an error
@@ -3275,6 +3504,24 @@ def test_verify_dev_exclude_relpaths_includes_latched_restore_patch(project):
     assert rel not in verify.verify_dev_exclude_relpaths(project, sp)
 
 
+def test_verify_dev_exclude_relpaths_omits_only_an_uncertain_candidate(project, monkeypatch):
+    """A refused exclude is dropped while healthy siblings retain order and normalized
+    relpaths, using the canonical project snapshot without resolving it again.
+
+    ABLATION A1: restore `paths.project.resolve()` and this test raises on the scoped
+    project-root refusal before producing excludes. ABLATION A2: narrow the candidate
+    guard back to `ValueError` and it raises on the refused spec instead of omitting it.
+    """
+    refused_spec = spec_path(project, "1-1-a")
+    patch = project.implementation_artifacts / "attempt.patch"
+    refuse_to_resolve(monkeypatch, project.project, refused_spec)
+
+    assert verify.verify_dev_exclude_relpaths(project, refused_spec, str(patch)) == (
+        "_bmad-output/implementation-artifacts/sprint-status.yaml",
+        "_bmad-output/implementation-artifacts/attempt.patch",
+    )
+
+
 def test_verify_dev_latched_restore_patch_is_not_proof_of_work(project):
     """T4 (patch-restore x #79): the latched patch file is untracked halt residue
     under the protected artifact dirs — it survives every reset, so counting it
@@ -3486,6 +3733,50 @@ def test_spec_within_roots(project, tmp_path):
     outside = tmp_path / "outside" / "spec.md"
     assert verify.spec_within_roots(outside, project) is False
     assert verify.spec_within_roots(Path("/etc/passwd"), project) is False
+
+
+def _refuse_resolution_as(monkeypatch, target: Path, error_type: type[Exception]) -> None:
+    if error_type is OSError:
+        refuse_to_resolve(monkeypatch, target)
+        return
+    real_resolve = Path.resolve
+
+    def stub(self, strict: bool = False):
+        if str(self) == str(target):
+            raise error_type("injected resolution uncertainty")
+        return real_resolve(self, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", stub)
+
+
+@pytest.mark.parametrize("error_type", [OSError, RuntimeError])
+def test_spec_within_roots_refuses_uncertain_reported_path(
+    project, tmp_path, monkeypatch, error_type
+):
+    """A session-reported spec is untrusted when it cannot be resolved. Ablation
+    target: move the reported-path resolve above the centralized guard and each
+    error row raises instead of returning the fail-closed False."""
+    reported = tmp_path / "reported" / "spec.md"
+    _refuse_resolution_as(monkeypatch, reported, error_type)
+
+    assert verify.spec_within_roots(reported, project) is False
+
+
+@pytest.mark.parametrize("error_type", [OSError, RuntimeError])
+@pytest.mark.parametrize(
+    "root_name",
+    ["project", "output_folder", "implementation_artifacts", "planning_artifacts"],
+)
+def test_spec_within_roots_refuses_uncertain_trusted_root(
+    project, tmp_path, monkeypatch, error_type, root_name
+):
+    """Every trusted root must resolve before containment can be trusted. Ablation
+    target: move trusted-root resolution outside the centralized guard and the
+    corresponding root/error row raises instead of returning fail-closed False."""
+    reported = tmp_path / "outside" / "spec.md"
+    _refuse_resolution_as(monkeypatch, getattr(project, root_name), error_type)
+
+    assert verify.spec_within_roots(reported, project) is False
 
 
 def test_commits_above_empty_at_baseline(project):

@@ -118,7 +118,13 @@ def open_unit_workspace(
     keeps the commits earlier units already landed on it.
     """
     branch = unit_branch_name(run_id, unit_key, branch_per)
-    wt = (unit_worktrees_dir(run_dir) / safe_segment(unit_key)).resolve()
+    unresolved_wt = unit_worktrees_dir(run_dir) / safe_segment(unit_key)
+    try:
+        wt = unresolved_wt.resolve()
+    except (OSError, RuntimeError) as e:
+        raise verify.GitError(
+            f"cannot resolve worktree mount path for {unit_key} ({unresolved_wt}): {e}"
+        ) from e
     wt.parent.mkdir(parents=True, exist_ok=True)
     if verify.branch_exists(repo_root, branch):
         verify.worktree_add(repo_root, wt, branch, create=False)

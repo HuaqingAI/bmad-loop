@@ -373,8 +373,21 @@ def worktree_seed_undelivered(
     source escape, a symlinked destination, or destination escape proves the seed was
     refused. This report is informational and is never an escalation gate.
     """
-    worktree = worktree.resolve()
-    repo_root = repo_root.resolve()
+    unresolved_repo_root = repo_root
+    try:
+        worktree = worktree.resolve()
+        repo_root = repo_root.resolve()
+    except (OSError, RuntimeError):
+        # Observation only: root uncertainty cannot prove delivery, but it must
+        # not turn an informational journal probe into a run-wide failure.
+        rels = [str(rel) for rel in seed_files]
+        for pattern in seed_globs:
+            try:
+                matches = sorted(unresolved_repo_root.glob(pattern))
+            except (OSError, RuntimeError):
+                continue
+            rels.extend(match.relative_to(unresolved_repo_root).as_posix() for match in matches)
+        return list(dict.fromkeys(rels))
     rels = [str(rel) for rel in seed_files]
     for pattern in seed_globs:
         rels.extend(
@@ -477,7 +490,17 @@ def module_skills_seed_undelivered(
     """
     if skills_root is None:
         skills_root = resources.files("bmad_loop.data").joinpath("skills")
-    worktree = worktree.resolve()
+    try:
+        worktree = worktree.resolve()
+    except (OSError, RuntimeError):
+        # This is a journal-only observation. Root uncertainty means every
+        # bundled skill the wheel actually carries is coarsely undelivered.
+        return [
+            f"{tree}/{skill}"
+            for tree in dict.fromkeys(trees)
+            for skill in MODULE_SKILLS
+            if _is_file(skills_root.joinpath(skill)) or _is_dir(skills_root.joinpath(skill))
+        ]
 
     def contained(target: Path) -> bool:
         try:
@@ -592,8 +615,16 @@ def provision_worktree(
     """
     if not profiles and not seed_files and not seed_globs and not _is_dir(repo_root / BMAD_DIR):
         return []
-    worktree = worktree.resolve()
-    repo_root = repo_root.resolve()
+    unresolved_worktree = worktree
+    unresolved_repo_root = repo_root
+    try:
+        worktree = worktree.resolve()
+        repo_root = repo_root.resolve()
+    except (OSError, RuntimeError) as e:
+        raise verify.GitError(
+            "cannot resolve worktree provisioning roots safely "
+            f"(worktree={unresolved_worktree}, repo_root={unresolved_repo_root}): {e}"
+        ) from e
     relay = repo_root / HOOK_SCRIPT_REL
     skills_root = resources.files("bmad_loop.data").joinpath("skills")
 
@@ -609,9 +640,12 @@ def provision_worktree(
     # misconfiguration, exactly like the glob-expanded matches below.
     skipped: list[str] = []
     for rel in seed_files:
-        src = (repo_root / rel).resolve()
         raw = worktree / rel
-        dst = raw.resolve()
+        try:
+            src = (repo_root / rel).resolve()
+            dst = raw.resolve()
+        except (OSError, RuntimeError):
+            continue
         if not src.is_relative_to(repo_root) or not dst.is_relative_to(worktree):
             continue
         if not (_is_file(src) or _is_dir(src)):
@@ -672,9 +706,12 @@ def provision_worktree(
     for pattern in seed_globs:
         for match in sorted(repo_root.glob(pattern)):
             rel = match.relative_to(repo_root)
-            src = match.resolve()
             raw = worktree / rel
-            dst = raw.resolve()
+            try:
+                src = match.resolve()
+                dst = raw.resolve()
+            except (OSError, RuntimeError):
+                continue
             if not src.is_relative_to(repo_root) or not dst.is_relative_to(worktree):
                 continue
             if not (_is_file(src) or _is_dir(src)) or _occupied(dst):
@@ -745,7 +782,10 @@ def provision_worktree(
         # never there.
         for skill in _worktree_skill_copy_candidates(repo_root, tree):
             dst = tree_dir / skill
-            src = (repo_root / tree / skill).resolve()
+            try:
+                src = (repo_root / tree / skill).resolve()
+            except (OSError, RuntimeError):
+                continue
             if not src.is_relative_to(repo_root) or not _is_dir(src):
                 continue
             _copy_traversable(
@@ -1219,14 +1259,21 @@ class WorktreeFlow:
         seeds.extend(self._registry.seed_files())
         seed_files = list(dict.fromkeys(seeds))  # dedupe, preserve order
         seed_globs = self._registry.seed_globs()
-        skipped_seeds = provision_worktree(
-            unit.path,
-            profiles,
-            self.paths.repo_root,
-            seed_files=seed_files,
-            seed_globs=seed_globs,
-            on_degraded=lambda msg: self._exclude_degraded(task.story_key, msg),
-        )
+        try:
+            skipped_seeds = provision_worktree(
+                unit.path,
+                profiles,
+                self.paths.repo_root,
+                seed_files=seed_files,
+                seed_globs=seed_globs,
+                on_degraded=lambda msg: self._exclude_degraded(task.story_key, msg),
+            )
+        except verify.GitError as e:
+            reason = (
+                f"cannot safely provision the worktree for {task.story_key} because "
+                f"a provisioning root could not be resolved: {e}"
+            )
+            self.escalate_unit(task, reason)  # always raises RunPaused
         if skipped_seeds:
             # A seed entry whose destination already exists is a no-op. Harmless for
             # a file the checkout legitimately carries, but a directory entry is
@@ -1469,12 +1516,12 @@ class WorktreeFlow:
                     paths=paths,
                 ),
             )
-        except (verify.GitError, OSError) as e:
-            # OSError joins GitError because clean_incoming_collisions mutates the
-            # checkout directly (unlink/iterdir/rmdir) — a non-spawn FS fault the
-            # #343 chokepoint cannot translate. Crashing here would strand a DONE
-            # unit mid-merge; the keep-branch escalation is the point of this guard.
-            if isinstance(e, (verify.GitSpawnError, OSError)):
+        except (verify.GitError, OSError, RuntimeError) as e:
+            # OSError/RuntimeError join GitError because clean_incoming_collisions
+            # mutates the checkout directly (resolve/unlink/iterdir/rmdir) — non-spawn
+            # FS faults the #343 chokepoint cannot translate. Crashing here would
+            # strand a DONE unit mid-merge; keep-branch escalation is this boundary.
+            if isinstance(e, (verify.GitSpawnError, OSError, RuntimeError)):
                 # environment fault (spawn failure or direct-FS error) — there may
                 # be no stray files at all, so no "clean them" guidance: the inner
                 # error is the diagnosis.
