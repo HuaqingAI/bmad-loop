@@ -7977,11 +7977,12 @@ def test_auto_sweep_system_exit_does_not_kill_the_parent(project):
 
     Not a hypothetical shape — `runsetup.make_adapters` raises exactly this for
     an unresolvable profile, an unknown/unloadable adapter kind, a failed adapter
-    construction, and an unusable multiplexer; that last gate re-probes live
-    (`mux_usable` bottoms out in a bare `shutil.which`) on every call, so a child
-    sweep can hit it in a parent run that launched fine.
+    construction, an adapter class that rejects a bootstrap keyword, and an
+    unusable multiplexer; that last gate re-probes live (`mux_usable` bottoms out
+    in a bare `shutil.which`) on every call, so a child sweep can hit it in a
+    parent run that launched fine.
 
-    Every one of those five sites is inside `compose_sweep`, ahead of the
+    Every one of those six sites is inside `compose_sweep`, ahead of the
     `on_started` boundary, so this models the raise WITHOUT signalling and the
     record is `sweep-auto-not-started`: no child run dir survives an adapter build
     that exits.

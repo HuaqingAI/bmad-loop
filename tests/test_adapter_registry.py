@@ -695,6 +695,178 @@ def test_make_adapters_unrelated_construct_failure_is_not_swallowed(
         runsetup.make_adapters(project.project, _run_dir(project.project), pol)
 
 
+def test_make_adapters_signature_mismatch_becomes_systemexit(fresh_adapter_registry, project):
+    """#569: an out-of-tree class whose `__init__` refuses a keyword the bootstrap
+    passes is refused by the INTERPRETER, not by the family, so `TypeError` is a
+    failure no `construct_error` declares and it escaped as a bare traceback. It now
+    reads like the rest of the bootstrap: one `error:` line naming the profile, the
+    kind and — carried verbatim out of CPython's own message — the keyword itself.
+
+    ABLATION (wiring): delete the whole `except TypeError` arm in `make_adapters`
+    and this reddens, the bare TypeError propagating instead of a SystemExit. T2/T3
+    (`..._from_the_constructor_body_...`, `..._raised_deeper_...`) stay GREEN under
+    that same ablation — a bare TypeError is exactly what they assert — which is how
+    you can tell they pin the discriminator and not the wiring."""
+    built: list[object] = []
+
+    class _Narrow:
+        # rejects `profile`, `extra_args`, `events_dir`, ... — every other keyword
+        # `make_adapters` builds into `common`.
+        def __init__(self, *, run_dir, policy):
+            built.append(self)
+
+    fresh_adapter_registry.register_adapter(
+        "narrowkind",
+        needs_mux=False,
+        load=lambda: AdapterBuilder(plain=_Narrow, dev=_Narrow, construct_error=()),
+    )
+    install_bmad_config(project)
+    _write_profile(project.project, "narrowcli", adapter="narrowkind")
+    _write_policy(project.project, '[adapter]\nname = "narrowcli"\n')
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+
+    with pytest.raises(SystemExit, match=r"narrowcli.*narrowkind.*unexpected keyword argument"):
+        runsetup.make_adapters(project.project, _run_dir(project.project), pol)
+
+    # Re-raised for the field assertions the `match=` regex cannot make: the message
+    # reads as an `error:` line, and the keyword CPython named is one this class
+    # really does reject — pinning that `{e}` carries the offending keyword verbatim
+    # without depending on which of them CPython reports first.
+    with pytest.raises(SystemExit) as excinfo:
+        runsetup.make_adapters(project.project, _run_dir(project.project), pol)
+    message = str(excinfo.value)
+    assert message.startswith("error: ")
+    assert "'narrowcli'" in message and "'narrowkind'" in message
+    named = message.split("unexpected keyword argument ")[1].strip().strip("'\"")
+    assert named in {
+        "profile",
+        "extra_args",
+        "usage_grace_s",
+        "stop_without_result_nudges",
+        "events_dir",
+        "paths",
+    }
+    # Binding fails before the constructor body runs, so nothing was ever built —
+    # the raise is the whole outcome, and no half-built adapter reached a caller.
+    assert built == []
+
+
+def test_make_adapters_typeerror_from_the_constructor_body_is_not_relabelled(
+    fresh_adapter_registry, project
+):
+    """The other half of #569, and the same rule the `ImportError` arm states: a
+    DECLARED failure gets a clean `error:` line, and anything else is a bug in that
+    package that must surface as itself. A `TypeError` raised from inside a working
+    `__init__` is that second thing, and relabelling it "rejected this run's adapter
+    keywords" would hand an adapter author a misleading message where the traceback
+    was the whole diagnosis.
+
+    The discriminator is traceback DEPTH, not the exception text: argument binding
+    fails before any `__init__` frame is pushed, so a mismatch carries this frame
+    alone (`tb_next is None`) while a raise from inside the body carries that frame
+    too. It is only valid because the `except` shares a frame with the `cls(...)`
+    call — extracting that call into a helper would silently break it.
+
+    Do not "improve" the check into `tb_next.tb_next is None` or any fixed depth.
+    Its errors already run in the safe direction: a genuine mismatch hidden behind a
+    Python-level metaclass `__call__`, or one raised by a `super().__init__()` call
+    in the body, reads as deeper and re-raises — a false NEGATIVE that is exactly
+    today's pre-fix behavior. The dangerous direction is the one this check refuses.
+
+    ABLATION (predicate): delete the two discriminator lines (`if e.__traceback__ is
+    None or e.__traceback__.tb_next is not None: raise`) so every TypeError becomes
+    a SystemExit, and this reddens together with T3 while T1
+    (`..._signature_mismatch_...`) stays green."""
+
+    class _Exploding:
+        def __init__(self, **kwargs):
+            raise TypeError("a real bug, not a signature mismatch")
+
+    fresh_adapter_registry.register_adapter(
+        "bodyboom",
+        needs_mux=False,
+        load=lambda: AdapterBuilder(plain=_Exploding, dev=_Exploding, construct_error=()),
+    )
+    install_bmad_config(project)
+    _write_profile(project.project, "bodyboom", adapter="bodyboom")
+    _write_policy(project.project, '[adapter]\nname = "bodyboom"\n')
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+
+    with pytest.raises(TypeError, match="a real bug, not a signature mismatch"):
+        runsetup.make_adapters(project.project, _run_dir(project.project), pol)
+
+
+def test_make_adapters_typeerror_raised_deeper_in_the_constructor_is_not_relabelled(
+    fresh_adapter_registry, project
+):
+    """Same rule as the test above, one frame further down: the `TypeError` comes
+    from a helper the constructor calls, so the traceback is three frames deep
+    rather than two.
+
+    This test exists so a later session cannot "simplify" the discriminator to a
+    fixed depth such as `tb_next.tb_next is None` — that spelling would pass the
+    two-frame test above and relabel this one, and a real bug in an adapter would
+    start reading as a signature mismatch. Only `tb_next is None` distinguishes
+    "no `__init__` frame was ever pushed" from "some number of them were".
+
+    ABLATION (predicate): the same one T2 records — delete the two discriminator
+    lines and this reddens with it, while T1 stays green."""
+
+    def _helper():
+        raise TypeError("a real bug two frames in")
+
+    class _Exploding:
+        def __init__(self, **kwargs):
+            _helper()
+
+    fresh_adapter_registry.register_adapter(
+        "deepboom",
+        needs_mux=False,
+        load=lambda: AdapterBuilder(plain=_Exploding, dev=_Exploding, construct_error=()),
+    )
+    install_bmad_config(project)
+    _write_profile(project.project, "deepboom", adapter="deepboom")
+    _write_policy(project.project, '[adapter]\nname = "deepboom"\n')
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+
+    with pytest.raises(TypeError, match="a real bug two frames in"):
+        runsetup.make_adapters(project.project, _run_dir(project.project), pol)
+
+
+def test_make_adapters_declared_typeerror_keeps_the_construct_error_line(
+    fresh_adapter_registry, project
+):
+    """Pins the ARM ORDER. `except builder.construct_error` stays FIRST, so a family
+    that names `TypeError` in its own `construct_error` keeps the plain `error: {e}`
+    line it has always had — the new arm must not steal a declared failure and
+    re-word it as a signature mismatch. No bundled family declares `TypeError`
+    today (`()` for generic, `(OpencodeServerError,)` for opencode), so this pins
+    the contract for a future one rather than current behavior.
+
+    ABLATION (arm order): swap the two `except` arms so `except TypeError` runs
+    first and this reddens alone — the body-raised TypeError is deeper than one
+    frame, so that arm re-raises it instead of letting the declared arm convert
+    it."""
+
+    class _Exploding:
+        def __init__(self, **kwargs):
+            raise TypeError("the server refused the handshake")
+
+    fresh_adapter_registry.register_adapter(
+        "declaredtype",
+        needs_mux=False,
+        load=lambda: AdapterBuilder(plain=_Exploding, dev=_Exploding, construct_error=(TypeError,)),
+    )
+    install_bmad_config(project)
+    _write_profile(project.project, "declaredtype", adapter="declaredtype")
+    _write_policy(project.project, '[adapter]\nname = "declaredtype"\n')
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+
+    with pytest.raises(SystemExit, match="the server refused the handshake") as excinfo:
+        runsetup.make_adapters(project.project, _run_dir(project.project), pol)
+    assert "rejected this run's adapter keywords" not in str(excinfo.value)
+
+
 def test_make_adapters_load_thunk_failure_becomes_systemexit(fresh_adapter_registry, project):
     """A load thunk that raises — the family's own module missing an optional
     dependency is the ordinary case — aborts with a clean SystemExit naming the

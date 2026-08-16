@@ -9,7 +9,7 @@ as supported. Both halves are pinned below.
 
 The second concern here is composition atomicity: `compose_run` and
 `compose_sweep` publish a run dir before they can know the run will start, and
-`make_adapters` raises `SystemExit` from five sites after that point. The unwind
+`make_adapters` raises `SystemExit` from six sites after that point. The unwind
 that keeps a failed launch from stranding a resumable-looking empty run is pinned
 at the end of the file.
 """
@@ -312,7 +312,7 @@ def test_digest_raises_on_an_unresolvable_profile(pinned):
 RUN_ID = "20260812-101500-ab12"
 
 # The message `make_adapters` raises for an unusable multiplexer — the one of its
-# five SystemExit sites that is reachable in a run that launched fine, since
+# six SystemExit sites that is reachable in a run that launched fine, since
 # `mux_usable` bottoms out in a live `shutil.which` on every call.
 BOOM = "error: multiplexer backend TmuxBackend is not usable on this host"
 
@@ -344,9 +344,10 @@ def _fake_paths(project):
 def unwinding(tmp_path):
     """A project plus a `make_adapters` that fails the way the real one does.
 
-    `runsetup.make_adapters` raises `SystemExit` at five sites (an unresolvable
+    `runsetup.make_adapters` raises `SystemExit` at six sites (an unresolvable
     profile, an unknown adapter kind, a kind that fails to load, a construction
-    failure, an unusable multiplexer), and every one lands *after* the composer has
+    failure, an adapter class that rejects a bootstrap keyword, an unusable
+    multiplexer), and every one lands *after* the composer has
     published the run dir, its `state.json` and the out-of-tree config-digest stamp.
     The fake records that all three exist at the moment it is called, so the
     assertions after the raise grade a *removal* — an "is it gone" assertion passes
