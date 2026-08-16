@@ -12,10 +12,13 @@ and slots in without the rest of the codebase shelling out to ``tmux`` directly.
 ``TerminalMultiplexer`` is the contract a backend author implements. Operation
 names mirror today's call sites verbatim so the migration is mechanical. Backends
 register themselves through :func:`register_multiplexer` (bundled ones from
-:func:`_load_builtin_backends`; out-of-tree ones at import time, triggered by the
-``bmad_loop.mux_backends`` entry-point scan in :func:`_load_external_backends` —
-so a pip/uv co-installed adapter package is selectable with no config step); the
-process-wide backend is selected by registry and returned by :func:`get_multiplexer`.
+:func:`_load_builtin_backends`, which :func:`register_multiplexer` seeds first so
+a bundled name keeps first-wins no matter who registers earliest; out-of-tree
+ones at import time — usually the ``bmad_loop.mux_backends`` entry-point scan in
+:func:`_load_external_backends`, so a pip/uv co-installed adapter package is
+selectable with no config step, but *any* import reaches it, a plugin's
+``[python]`` module included); the process-wide backend is selected by registry
+and returned by :func:`get_multiplexer`.
 
 Selection precedence (issue #87): the ``BMAD_LOOP_MUX_BACKEND`` env var, then the
 policy ``[mux] backend`` choice (installed once per CLI invocation via
@@ -430,8 +433,24 @@ def register_multiplexer(
 ) -> None:
     """Register a transport backend. ``matches(sys.platform)`` decides automatic
     selection; ``name`` is the key for the ``BMAD_LOOP_MUX_BACKEND`` override.
-    Bundled backends register from :func:`_load_builtin_backends`; an out-of-tree
-    backend calls this at import time — no core edit required."""
+    Bundled backends register from :func:`_load_builtin_backends`, seeded here
+    rather than only by the resolution entry points, so an out-of-tree package can
+    never shadow a bundled name. An out-of-tree backend calls this at import time
+    — no core edit required.
+
+    Seeding on *this* side is what makes first-wins an invariant instead of an
+    ordering coincidence. ``_BACKENDS`` is an ordered list and every consumer
+    takes the first entry under a name (:func:`_factory_by_name` and all three
+    :func:`_select` loops), so whichever registration lands first owns the name.
+    An external module runs its ``register_multiplexer`` calls as an import side
+    effect, and that import is not always triggered by a mux resolution: a
+    plugin's ``[python]`` module is exec'd in-process by ``plugins/registry.py``,
+    which has no ordering relationship to the first :func:`get_multiplexer` call.
+    Arriving first, it would land ahead of the bundled tmux entry and be selected
+    in its place. Seeding keeps the bundled entry first; the external stays behind
+    it, since this list appends rather than dedups — which is exactly what a
+    shadowed name should look like."""
+    _load_builtin_backends()
     _BACKENDS.append((name, matches, factory))
     get_multiplexer.cache_clear()  # a later registration must not be shadowed by a cached pick
 
@@ -440,17 +459,29 @@ def _load_builtin_backends() -> None:
     """Register the bundled backends — tmux (POSIX) and psmux (native Windows);
     every other backend is out-of-tree and arrives via
     :func:`_load_external_backends` or a manual import. Idempotent and lazy
-    (called from :func:`get_multiplexer`, not at
-    module import) to stay cycle-safe. Registers inline rather than via
+    (called from :func:`get_multiplexer` and from :func:`register_multiplexer`,
+    not at module import) to stay cycle-safe. Registers inline rather than via
     tmux_backend's import side effect so the registry can be cleared and
     re-loaded deterministically (a re-import is a no-op once cached) —
-    mirroring ``process_host._load_builtin_hosts``."""
+    mirroring ``process_host._load_builtin_hosts``.
+
+    The flag sits between the imports and the registrations, and both halves of
+    that position are load-bearing: below the imports so a transient import
+    failure leaves the seeding retryable, above the registrations because they
+    re-enter this function through :func:`register_multiplexer`. The adapter twin
+    sets it at the very top only because its builtins are lazy thunks with
+    nothing to import first."""
     global _BUILTINS_LOADED
     if _BUILTINS_LOADED:
         return
     from .psmux_backend import PsmuxMultiplexer
     from .tmux_backend import TmuxMultiplexer
 
+    # Set after the imports but BEFORE the registrations. Below the imports so a
+    # transient import failure still retries; above the registrations because they
+    # re-enter this function through register_multiplexer, and a flag set
+    # afterwards would recurse without end.
+    _BUILTINS_LOADED = True
     # tmux is the default everywhere except native Windows (no tmux binary there);
     # get_multiplexer still falls back to tmux when no backend matches. Builtins
     # register before externals, so tmux keeps first-wins on any name collision.
@@ -458,7 +489,6 @@ def _load_builtin_backends() -> None:
     # psmux speaks the tmux CLI through its own distinctly-named binary, so
     # native Windows gets the tmux-family backend with a PowerShell dialect.
     register_multiplexer("psmux", lambda platform: platform == "win32", PsmuxMultiplexer)
-    _BUILTINS_LOADED = True  # set only after a successful import so a transient failure retries
 
 
 # The entry-point group an out-of-tree backend package advertises its module

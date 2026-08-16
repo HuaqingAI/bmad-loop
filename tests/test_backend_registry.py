@@ -505,3 +505,97 @@ def test_win32_bottoms_out_at_psmux_with_no_externals(fresh_registry, monkeypatc
     assert (name, reason) == ("psmux", "fallback")
     # psmux is both the win32 platform default and the sole bundled win32 match
     assert fresh_registry._PLATFORM_DEFAULTS.get("win32") == "psmux"
+
+
+# Builtin seeding inside `register_multiplexer` (#565). First-wins only protects a
+# bundled name if the bundled entry is guaranteed to be registered first; these pin
+# that guarantee and the flag position that makes the seeding safe to re-enter.
+
+
+def test_builtins_win_over_an_external_registered_before_any_resolution(
+    fresh_registry, monkeypatch
+):
+    """The shadowing hole that first-wins ALONE does not close.
+
+    An out-of-tree backend registers as an import side effect, and that import is
+    not always triggered by a mux resolution: a plugin's ``[python]`` module is
+    exec'd in-process by ``plugins/registry.py``, with no ordering relationship to
+    the first ``get_multiplexer()`` call. Arriving first under a bundled name, it
+    would sit ahead of the bundled tmux entry in the ordered ``_BACKENDS`` list and
+    every first-match consumer would pick it — the whole process silently driving a
+    third-party transport. Only ``register_multiplexer`` seeding the builtins on
+    its own side makes first-wins an invariant instead of an ordering coincidence.
+
+    ABLATION: drop the ``_load_builtin_backends()`` call from
+    ``register_multiplexer`` and this reddens — while
+    ``tests/test_external_backends.py``'s ``test_externals_load_after_builtins``
+    stays green, because ``_select`` seeds the builtins on that path before the
+    scan's registration ever runs. That asymmetry is the finding: the existing test
+    pins the scan path and cannot see this hole at all."""
+    sentinel = object()
+    # The plugin trigger: a direct registration under a bundled name, with no
+    # entry-point scan involved (the fixture parks `_EXTERNALS_LOADED = True`).
+    fresh_registry.register_multiplexer("tmux", lambda p: True, lambda: sentinel)
+
+    # (a) the bundled backend still wins the name. Forcing by name bypasses both
+    # the platform predicate and available(), so this is deterministic on the
+    # Linux and Windows CI legs alike.
+    monkeypatch.setenv("BMAD_LOOP_MUX_BACKEND", "tmux")
+    fresh_registry.get_multiplexer.cache_clear()
+    assert isinstance(fresh_registry.get_multiplexer(), TmuxMultiplexer)
+
+    # (b) the ordering that makes (a) true: the bundled entry is first and the
+    # external is still present behind it — an append-only list, not a dedup'ing
+    # dict, so a shadowed name legitimately appears twice.
+    names = [name for name, _, _ in fresh_registry._BACKENDS]
+    assert names[0] == "tmux" and names.count("tmux") == 2
+    # Names alone do not discriminate: the shadowing external registers under
+    # "tmux" too, so both assertions above still hold under the ABLATION. The
+    # first entry being the *bundled* factory is the half that carries the
+    # guarantee, so pin it explicitly rather than inferring it from the name.
+    first_tmux = next(factory for name, _, factory in fresh_registry._BACKENDS if name == "tmux")
+    assert first_tmux is TmuxMultiplexer
+
+
+def test_builtin_seeding_is_reentrant_and_registers_each_builtin_once(fresh_registry):
+    """One ordinary registration seeds the builtins exactly once and terminates.
+
+    ``_load_builtin_backends`` registers its two backends by calling
+    ``register_multiplexer``, which now calls ``_load_builtin_backends`` — so the
+    seeding re-enters itself, and only the flag's position stops it.
+
+    ABLATION: move ``_BUILTINS_LOADED = True`` back below the two
+    ``register_multiplexer(...)`` calls and this reddens with a RecursionError."""
+    # Without the flag move, the `register_multiplexer` calls inside
+    # `_load_builtin_backends` re-enter it with the flag still False, and it
+    # recurses without end.
+    fresh_registry.register_multiplexer("extra", lambda p: False, lambda: object())
+    names = [name for name, _, _ in fresh_registry._BACKENDS]
+    # Seeded once, in bundled order, with the caller's own entry appended last.
+    assert names == ["tmux", "psmux", "extra"]
+
+
+def test_a_failed_builtin_import_leaves_the_seeding_retryable(fresh_registry, monkeypatch):
+    """A transient import failure must not permanently poison the registry.
+
+    ABLATION: move ``_BUILTINS_LOADED = True`` to the very top of
+    ``_load_builtin_backends``, above the two imports, and this reddens — the flag
+    reads True after the failed import and the retry early-outs on a registry that
+    is permanently missing both bundled backends."""
+    # The flag sits BELOW the two backend imports precisely so a transient import
+    # failure retries; the function's docstring and comment both claim exactly
+    # that property. The adapter twin sets its flag at the very top only because
+    # its builtins are lazy thunks with nothing to import first.
+    key = "bmad_loop.adapters.psmux_backend"
+    # A None value in sys.modules makes `from ... import ...` raise
+    # ModuleNotFoundError (an ImportError subclass) without touching the disk.
+    monkeypatch.setitem(sys.modules, key, None)
+    with pytest.raises(ImportError):
+        fresh_registry._load_builtin_backends()
+    assert fresh_registry._BACKENDS == []
+    assert fresh_registry._BUILTINS_LOADED is False
+
+    # Let the import succeed again and confirm the retry seeds both builtins.
+    monkeypatch.delitem(sys.modules, key)
+    fresh_registry._load_builtin_backends()
+    assert [name for name, _, _ in fresh_registry._BACKENDS] == ["tmux", "psmux"]
