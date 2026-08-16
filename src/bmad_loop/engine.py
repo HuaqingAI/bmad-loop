@@ -5287,12 +5287,19 @@ class Engine:
         self._carry_board_advance(task)
 
     def _harvest_carry_commit_may_degrade(self, ledger: Path) -> bool:
-        """Whether a carry may remain uncommitted because git cannot own its path."""
+        """Whether a carry may remain uncommitted because git cannot own its path.
+
+        Only a path proven external may degrade. Resolution uncertainty must keep
+        the durable commit-pending latch set rather than guess that git cannot own
+        a possibly tracked ledger and silently disable its retry.
+        """
         repo = self.paths.repo_root
         try:
             rel = ledger.resolve().relative_to(repo.resolve()).as_posix()
-        except (OSError, RuntimeError, ValueError):
-            return True  # external or unresolvable ledgers are advisory artifacts
+        except (OSError, RuntimeError):
+            return False
+        except ValueError:
+            return True  # a proven external ledger is an advisory artifact
         if verify.path_tracked(repo, rel):
             return False
         return rel not in verify.untracked_files(repo)

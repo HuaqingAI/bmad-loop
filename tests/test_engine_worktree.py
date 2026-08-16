@@ -24,6 +24,7 @@ from conftest import (
     git,
     ignore_before_commit,
     install_build_auto_skill,
+    refuse_to_resolve,
     set_sprint,
     write_ledger,
     write_spec,
@@ -1014,6 +1015,40 @@ def test_tracked_harvest_carry_commit_failure_propagates(project, monkeypatch):
     assert "harvest-carried" not in journal_kinds(engine)
     assert "harvest-carry-uncommitted" not in journal_kinds(engine)
     assert load_state(engine.run_dir).tasks[task.story_key].harvest_carry_commit_pending
+
+
+def test_uncertain_harvest_ledger_keeps_its_pending_commit(project, monkeypatch):
+    """Resolution uncertainty cannot turn a tracked carry into advisory success."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    record = _harvest_record()
+    deferredwork.append_entry(
+        project.deferred_work,
+        title=record["title"],
+        origin=record["origin"],
+        location=record["location"],
+        source_spec=record["source_spec"],
+        reason=record["reason"],
+        severity=record["severity"],
+    )
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        harvested_deferrals=[record],
+        harvest_carry_commit_pending=True,
+    )
+    engine.state.tasks[task.story_key] = task
+    engine._save()
+    refuse_to_resolve(monkeypatch, project.deferred_work)
+
+    with pytest.raises(verify.GitError, match="no exact commit operand remains"):
+        engine._carry_harvested_deferrals(task)
+
+    assert load_state(engine.run_dir).tasks[task.story_key].harvest_carry_commit_pending
+    assert "harvest-carried" not in journal_kinds(engine)
+    assert "harvest-carry-uncommitted" not in journal_kinds(engine)
 
 
 def test_untracked_nonignored_harvest_carry_commit_failure_propagates(project, monkeypatch):

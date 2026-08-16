@@ -3128,6 +3128,37 @@ def test_commit_paths_omits_only_an_uncertain_candidate(project, monkeypatch):
     assert "healthy.txt" not in status
 
 
+@pytest.mark.parametrize("error_type", [OSError, RuntimeError])
+def test_commit_paths_raises_when_no_operand_survives_resolution(project, monkeypatch, error_type):
+    """A sole uncertain candidate is a typed exact-write failure, not a no-op.
+
+    The harvested-deferral carry clears its durable commit-pending latch after a
+    successful return, so returning ``None`` here would permanently suppress the
+    retry even though the ledger could still be dirty. Ablation target: remove
+    the no-operands resolution guard and both rows return ``None`` instead of
+    raising before staging.
+    """
+    repo = project.project
+    uncertain = repo / "src.txt"
+    uncertain.write_text("uncommitted exact write\n")
+    _refuse_resolution_as(monkeypatch, uncertain, error_type)
+    git_calls: list[tuple[str, ...]] = []
+    real_git = verify._git
+
+    def spy_git(r, *args):
+        git_calls.append(args)
+        return real_git(r, *args)
+
+    monkeypatch.setattr(verify, "_git", spy_git)
+
+    with pytest.raises(verify.GitError, match="no exact commit operand remains") as caught:
+        verify.commit_paths(repo, "chore: exact", [uncertain])
+
+    assert isinstance(caught.value.__cause__, error_type)
+    assert not any(args[:1] == ("add",) for args in git_calls)
+    assert uncertain.read_text() == "uncommitted exact write\n"
+
+
 def test_commit_paths_noop_when_unchanged(project):
     assert verify.commit_paths(project.project, "noop", [project.project / "src.txt"]) is None
     # a path outside the repo is ignored, not an error

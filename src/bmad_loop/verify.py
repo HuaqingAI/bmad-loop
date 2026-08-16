@@ -2633,8 +2633,10 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
     was never committed). A missing-but-TRACKED path stays in: that is a
     deletion to stage. An uncertain repo root raises before staging; uncertainty
     in one candidate omits only that candidate, preserving the partial-path
-    contract for healthy siblings."""
+    contract for healthy siblings. If no usable operand survives that uncertainty,
+    the call raises instead of reporting a successful no-op."""
     rels: list[str] = []
+    resolution_fault: tuple[Path, OSError | RuntimeError] | None = None
     try:
         repo_root = repo.resolve()
     except (OSError, RuntimeError) as e:
@@ -2648,7 +2650,11 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
             # every platform. `str()` yields backslashes on Windows, which git reads as
             # wildmatch ESCAPES rather than separators.
             rels.append(Path(p).resolve().relative_to(repo_root).as_posix())
-        except (OSError, RuntimeError, ValueError):
+        except (OSError, RuntimeError) as e:
+            if resolution_fault is None:
+                resolution_fault = (Path(p), e)
+            continue
+        except ValueError:
             continue
     missing = [r for r in rels if not ((repo_root / r).exists() or (repo_root / r).is_symlink())]
     if missing:
@@ -2658,6 +2664,12 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
         tracked = {t for t in out.split("\0") if t}
         rels = [r for r in rels if r not in missing or r in tracked]
     if not rels:
+        if resolution_fault is not None:
+            failed_path, error = resolution_fault
+            raise GitError(
+                "no exact commit operand remains after path resolution failed "
+                f"for {failed_path}: {error}"
+            ) from error
         return None
     # Every operand is forced LITERAL: git reads a positional operand as a PATHSPEC,
     # and `implementation_artifacts` reaches here verbatim out of the operator's
