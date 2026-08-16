@@ -13,6 +13,7 @@ from conftest import (
     fault_read_text,
     git,
     make_git_noisy,
+    refuse_to_resolve,
     spec_path,
     write_spec,
     write_sprint,
@@ -1458,6 +1459,18 @@ def test_verify_dev_stories_spec_only_change_outside_artifacts_is_not_work(proje
     assert out2.ok
 
 
+@pytest.mark.parametrize("refused", ["project", "spec_folder"])
+def test_stories_relpaths_is_empty_when_resolution_is_uncertain(project, monkeypatch, refused):
+    """An uncertain observation supplies no story excludes. Ablation target: narrow
+    `_stories_relpaths`' resolution guard back to `ValueError`, and either refusal
+    row raises instead of returning the documented empty tuple."""
+    spec_folder = project.planning_artifacts / "epic-a"
+    target = project.project if refused == "project" else spec_folder
+    refuse_to_resolve(monkeypatch, target)
+
+    assert verify._stories_relpaths(project.project, spec_folder) == ()
+
+
 def test_verify_dev_stories_plan_halt_expects_ready_for_dev(project):
     # plan-halt leg: the spec is at ready-for-dev (the plan), not done, and there
     # is NO code change — proof-of-work is skipped and the plan spec is recorded.
@@ -2538,6 +2551,26 @@ def test_path_ignored_is_false_outside_the_repo(project, tmp_path):
     assert not verify.path_ignored(project.project, tmp_path / "elsewhere" / "board.yaml")
 
 
+@pytest.mark.parametrize("refused", ["repo", "candidate"])
+def test_path_ignored_is_false_when_resolution_is_uncertain(project, monkeypatch, refused):
+    """Resolution uncertainty keeps the path eligible for the exact commit and never
+    fabricates a lexical git operand. Ablation target: move the repo resolve outside
+    the guard or narrow it back to `ValueError`, and the matching row raises instead
+    of returning False before the empty git-call assertion."""
+    repo = project.project
+    candidate = repo / "board.yaml"
+    refuse_to_resolve(monkeypatch, repo if refused == "repo" else candidate)
+    git_calls = []
+
+    def spy_git(*args, **kwargs):
+        git_calls.append((args, kwargs))
+
+    monkeypatch.setattr(verify, "_run_git", spy_git)
+
+    assert verify.path_ignored(repo, candidate) is False
+    assert git_calls == []
+
+
 def test_path_ignored_raises_on_git_failure(project):
     """Raises GitError like every other probe here. Its caller degrades by keeping
     the path IN the commit list — uncertainty must not silently drop a write.
@@ -3275,6 +3308,24 @@ def test_verify_dev_exclude_relpaths_includes_latched_restore_patch(project):
     assert rel not in verify.verify_dev_exclude_relpaths(project, sp)
 
 
+def test_verify_dev_exclude_relpaths_omits_only_an_uncertain_candidate(project, monkeypatch):
+    """A refused exclude is dropped while healthy siblings retain order and normalized
+    relpaths, using the canonical project snapshot without resolving it again.
+
+    ABLATION A1: restore `paths.project.resolve()` and this test raises on the scoped
+    project-root refusal before producing excludes. ABLATION A2: narrow the candidate
+    guard back to `ValueError` and it raises on the refused spec instead of omitting it.
+    """
+    refused_spec = spec_path(project, "1-1-a")
+    patch = project.implementation_artifacts / "attempt.patch"
+    refuse_to_resolve(monkeypatch, project.project, refused_spec)
+
+    assert verify.verify_dev_exclude_relpaths(project, refused_spec, str(patch)) == (
+        "_bmad-output/implementation-artifacts/sprint-status.yaml",
+        "_bmad-output/implementation-artifacts/attempt.patch",
+    )
+
+
 def test_verify_dev_latched_restore_patch_is_not_proof_of_work(project):
     """T4 (patch-restore x #79): the latched patch file is untracked halt residue
     under the protected artifact dirs — it survives every reset, so counting it
@@ -3486,6 +3537,50 @@ def test_spec_within_roots(project, tmp_path):
     outside = tmp_path / "outside" / "spec.md"
     assert verify.spec_within_roots(outside, project) is False
     assert verify.spec_within_roots(Path("/etc/passwd"), project) is False
+
+
+def _refuse_resolution_as(monkeypatch, target: Path, error_type: type[Exception]) -> None:
+    if error_type is OSError:
+        refuse_to_resolve(monkeypatch, target)
+        return
+    real_resolve = Path.resolve
+
+    def stub(self, strict: bool = False):
+        if str(self) == str(target):
+            raise error_type("injected resolution uncertainty")
+        return real_resolve(self, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", stub)
+
+
+@pytest.mark.parametrize("error_type", [OSError, RuntimeError])
+def test_spec_within_roots_refuses_uncertain_reported_path(
+    project, tmp_path, monkeypatch, error_type
+):
+    """A session-reported spec is untrusted when it cannot be resolved. Ablation
+    target: move the reported-path resolve above the centralized guard and each
+    error row raises instead of returning the fail-closed False."""
+    reported = tmp_path / "reported" / "spec.md"
+    _refuse_resolution_as(monkeypatch, reported, error_type)
+
+    assert verify.spec_within_roots(reported, project) is False
+
+
+@pytest.mark.parametrize("error_type", [OSError, RuntimeError])
+@pytest.mark.parametrize(
+    "root_name",
+    ["project", "output_folder", "implementation_artifacts", "planning_artifacts"],
+)
+def test_spec_within_roots_refuses_uncertain_trusted_root(
+    project, tmp_path, monkeypatch, error_type, root_name
+):
+    """Every trusted root must resolve before containment can be trusted. Ablation
+    target: move trusted-root resolution outside the centralized guard and the
+    corresponding root/error row raises instead of returning fail-closed False."""
+    reported = tmp_path / "outside" / "spec.md"
+    _refuse_resolution_as(monkeypatch, getattr(project, root_name), error_type)
+
+    assert verify.spec_within_roots(reported, project) is False
 
 
 def test_commits_above_empty_at_baseline(project):

@@ -646,10 +646,10 @@ def path_ignored(repo: Path, path: Path) -> bool:
     Raises GitError like every other probe in this module. Its caller degrades by
     treating the path as NOT ignored, which keeps it in the commit — the behavior
     before this function existed, and the direction that cannot lose a write."""
-    repo_root = repo.resolve()
     try:
+        repo_root = repo.resolve()
         rel = Path(path).resolve().relative_to(repo_root).as_posix()
-    except ValueError:
+    except (OSError, RuntimeError, ValueError):
         return False
     # `./` disarms pathspec magic on a rel beginning with `:` — see the docstring;
     # it is not decoration. `rel` is already posix-separated and relative, so the
@@ -1591,12 +1591,12 @@ def verify_dev_exclude_relpaths(
     if restore_patch:
         candidates.append(resolve_restore_path(restore_patch, paths.project))
     out: list[str] = []
-    project = paths.project.resolve()
+    project = paths.project
     for path in candidates:
         try:
             rel = path.resolve().relative_to(project).as_posix()
-        except ValueError:
-            continue  # outside the project tree; nothing to exclude here
+        except (OSError, RuntimeError, ValueError):
+            continue  # outside or uncertain; nothing safe to exclude here
         if rel and rel != ".":
             out.append(rel)
     return tuple(out)
@@ -1609,14 +1609,17 @@ def spec_within_roots(spec_path: Path, paths: ProjectPaths) -> bool:
     these roots, so a surprising path can never be silently rewritten. Artifact
     dirs configured outside ``project`` are roots too, so a legitimately
     out-of-project spec is still allowed."""
-    sp = spec_path.resolve()
-    roots = (
-        paths.project,
-        paths.output_folder,
-        paths.implementation_artifacts,
-        paths.planning_artifacts,
-    )
-    return any(sp == r.resolve() or sp.is_relative_to(r.resolve()) for r in roots)
+    try:
+        sp = spec_path.resolve()
+        roots = (
+            paths.project,
+            paths.output_folder,
+            paths.implementation_artifacts,
+            paths.planning_artifacts,
+        )
+        return any(sp == r.resolve() or sp.is_relative_to(r.resolve()) for r in roots)
+    except (OSError, RuntimeError):
+        return False
 
 
 def resolve_spec_path(spec_file: str, paths: ProjectPaths) -> Path:
@@ -2013,7 +2016,7 @@ def _stories_relpaths(project: Path, spec_folder: Path) -> tuple[str, ...]:
 
     try:
         rel = spec_folder.resolve().relative_to(project.resolve()).as_posix()
-    except ValueError:
+    except (OSError, RuntimeError, ValueError):
         return ()
     base = "" if rel == "." else f"{rel}/"
     return (f"{base}{STORIES_SUBDIR}", f"{base}{STORIES_FILENAME}")
