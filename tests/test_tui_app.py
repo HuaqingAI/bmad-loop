@@ -1857,30 +1857,44 @@ async def test_spec_review_modal_operable_on_a_standard_terminal(project, action
             assert _on_screen(app, app.screen.query_one(selector)), selector
 
 
-async def test_validate_findings_modal_clears_the_floor_one_row_higher(project):
-    """The other documented exception: this modal needs 39x10, not 39x9 (#629).
+_LONG_SPEC_FOLDER = "docs/specs/epics/epic-1/stories/generated/very-long-folder-name"
 
-    Its `.title` is `widgets.validate_header(doc)` — a multi-line header docked
-    outside the scrolling `#findings` body — and at 39 columns it wraps to five
-    rows, which puts the button row at y=9 on a screen whose rows are 0-8. The
-    `-short` rules cannot buy that back: they collapse padding and margins, and
-    this cost is content. One more row clears it.
 
-    The 10 is specific to the document built here, since a header that wraps to
-    more lines costs more rows, so this asserts the size works rather than
-    treating 10 as the modal's universal floor. 39 is held fixed so the test
-    still runs in the narrow band the wrap depends on."""
+@pytest.mark.parametrize(
+    ("kwargs", "size"),
+    [
+        ({}, (_MIN_COLS, _MIN_ROWS + 1)),
+        ({"stories_on": True, "spec_folder": _LONG_SPEC_FOLDER}, (_MIN_COLS, _MIN_ROWS + 3)),
+        ({"stories_on": True, "spec_folder": _LONG_SPEC_FOLDER}, (80, 24)),
+    ],
+    ids=["plain-39x10", "long-spec-folder-39x12", "long-spec-folder-80x24"],
+)
+async def test_validate_findings_modal_floor_moves_with_its_header(project, kwargs, size):
+    """The other documented exception, and its floor is content-dependent (#629).
+
+    `.title` is `widgets.validate_header(doc)`, docked outside the scrolling
+    `#findings` body, so every line it wraps to costs the button row a row that
+    `-short` cannot buy back — collapsing padding and margins does not shrink
+    content. At 39 columns a plain document's header wraps to 5 rows and puts
+    the button row at y=9 on a screen whose rows are 0-8, so it needs 10.
+
+    But the header also carries `spec: <spec_folder>`, and that path is
+    user-controlled (widgets.py:582-585). A 63-character folder takes the header
+    to 7 rows and the floor with it: `#ok` is still clipped at BOTH 39x10 and
+    39x11, and only clears at 39x12. So the three cases here pin the dependence
+    itself rather than a single minimum — which is why docs/tui-guide.md
+    describes this floor as content-dependent and quotes the standard 80x24
+    terminal, the last case, which absorbs either header."""
+    cols, rows = size
     app = BmadLoopApp(project.project)
-    async with app.run_test(size=(_MIN_COLS, _MIN_ROWS + 1)) as pilot:
+    async with app.run_test(size=(cols, rows)) as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         modal = ValidateFindingsModal(
-            make_validate_document([("bmad-config", "problem", "a finding", None)])
+            make_validate_document([("bmad-config", "problem", "a finding", None)], **kwargs)
         )
         app.push_screen(modal)
         await until(pilot, lambda: app.screen is modal)
         await ready(pilot, "#findings")
-        assert "-narrow" in app.screen.classes
-        assert "-short" in app.screen.classes
         assert _on_screen(app, app.screen.query_one("#ok"))
 
 

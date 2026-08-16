@@ -29,17 +29,18 @@ still shows its title, a row of body, and all of its docked action buttons. That
 is a floor for the dialogs specifically, not for the dashboard behind them,
 which simply shows fewer rows as the window shrinks. Two viewers sit outside
 that floor, both because they dock chrome that wraps: wrapped lines are content,
-so the compact layout cannot collapse them the way it collapses padding. The
-validate-findings viewer's header wraps to five lines at 39 columns and so needs
-**one more row** — 39 × 10 — while a wider window that lets the header wrap less
-needs no extra row at all (#629). The spec viewer docks a `copy path` button
-alongside its action verbs,
-whose labels alone are wider than a 39-column dialog's content region, and it
-prints the full spec path above the body, so a path long enough to wrap can push
-the action row off a 9-row screen altogether. Its floor is therefore a function
-of the spec path and of which action verbs the caller supplies rather than a
-single number, and a standard **80 × 24** terminal shows either variant in full.
-Wrapping that row is tracked separately (#628). Below **60 columns or 20
+so the compact layout cannot collapse them the way it collapses padding. Neither
+has a fixed minimum — each one's floor moves with what it is being asked to
+show — and a standard **80 × 24** terminal displays both in full. The
+validate-findings viewer's header carries the run mode and the spec folder, and
+that folder is user-controlled, so how far it wraps is a property of the
+document: a plain result needs one row more than the floor at 39 columns, and a
+long spec folder needs three (#629). The spec viewer docks a `copy path` button
+alongside its action verbs, whose labels alone are wider than a 39-column
+dialog's content region, and it prints the full spec path above the body, so a
+path long enough to wrap can push the action row off a 9-row screen altogether;
+its floor follows that path and the action verbs the caller supplies (#628).
+Below **60 columns or 20
 rows** the dialogs degrade to a compact layout rather than clipping: the dialog
 clamps to the screen width, the action buttons shrink and tighten, and vertically
 the padding, the title margin and the button-row margin collapse while the
