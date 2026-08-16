@@ -12,7 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from conftest import git
+from conftest import git, refuse_to_resolve
 
 from bmad_loop import verify
 from bmad_loop.bmadconfig import ProjectPaths
@@ -20,6 +20,12 @@ from bmad_loop.gates import ATTENTION_FILE
 from bmad_loop.install import provision_worktree as install_provision_worktree
 from bmad_loop.model import Phase, StoryTask
 from bmad_loop.policy import GatesPolicy, LimitsPolicy, NotifyPolicy, Policy, ScmPolicy
+from bmad_loop.workspace import (
+    UnitWorkspace,
+    Workspace,
+    open_unit_workspace,
+    unit_worktrees_dir,
+)
 from bmad_loop.worktree_flow import WorktreeFlow, _setup_mcp_agent_id, provision_worktree
 
 QUIET = NotifyPolicy(desktop=False, file=True)
@@ -439,6 +445,56 @@ def test_run_isolated_defers_on_open_failure(tmp_path):
     assert not any(e.startswith("unit-") for e in flow.journal.events())
 
 
+def test_mount_resolution_fault_is_typed_and_defers_only_the_unit(tmp_path, monkeypatch):
+    """An uncertain mount is an ordinary per-unit open failure, not a spawn fault.
+
+    Ablation: delete the mount-resolution translation and the raw provider fault
+    escapes ``run_isolated`` instead of reaching DEFERRED/worktree-open-failed.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    paths = ProjectPaths(
+        project=repo,
+        implementation_artifacts=repo / "_bmad-output/implementation-artifacts",
+        planning_artifacts=repo / "_bmad-output/planning-artifacts",
+    )
+    mount = unit_worktrees_dir(tmp_path) / "1-1"
+    refuse_to_resolve(monkeypatch, mount)
+
+    with pytest.raises(verify.GitError) as excinfo:
+        open_unit_workspace(repo, paths, "run-1", "1-1", "main", "story", tmp_path)
+    assert "worktree mount path" in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, OSError)
+
+    state = SimpleNamespace(
+        target_branch="main",
+        run_id="run-1",
+        source="sprint",
+        tasks={},
+        crashed=False,
+    )
+    flow = _make_flow(
+        tmp_path,
+        paths=paths,
+        state=state,
+        open_unit_workspace=open_unit_workspace,
+    )
+    task = StoryTask(story_key="1-1", epic=1)
+    drove = []
+
+    flow.run_isolated(task, lambda candidate: drove.append(candidate))
+
+    assert task.phase == Phase.DEFERRED
+    assert task.defer_reason.startswith("could not open worktree")
+    assert "worktree mount path" in task.defer_reason
+    assert flow.journal.events() == ["worktree-open-failed"]
+    assert flow.calls.saves == 1
+    assert flow.calls.pauses == []  # ordinary GitError, never machine-wide spawn pause
+    assert drove == []
+    assert state.crashed is False
+    assert not mount.exists()
+
+
 def test_run_isolated_spawn_fault_pauses_instead_of_deferring(tmp_path):
     """#343: a spawn fault is machine-wide, not this unit's — deferring would
     march the whole queue into DEFERRED one notification at a time and end the
@@ -462,6 +518,72 @@ def test_run_isolated_spawn_fault_pauses_instead_of_deferring(tmp_path):
     assert flow.calls.pauses == [(excinfo.value.reason, "1-1")]
     assert "cannot spawn git" in excinfo.value.reason
     assert drove == []  # drive body never ran
+
+
+def test_run_isolated_escalates_provisioning_root_failure_before_result_probes(
+    tmp_path, monkeypatch
+):
+    """An opened worktree stays mounted when repair cannot identify its roots.
+
+    Ablation: delete the provisioning ``GitError`` catch in ``run_isolated`` and
+    this escapes without marking ESCALATED, notifying, saving, or pausing.
+    """
+    import bmad_loop.worktree_flow as worktree_flow
+
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    repo.mkdir()
+    wt.mkdir()
+    paths = ProjectPaths(
+        project=repo,
+        implementation_artifacts=repo / "_bmad-output/implementation-artifacts",
+        planning_artifacts=repo / "_bmad-output/planning-artifacts",
+    )
+    unit = UnitWorkspace(
+        workspace=Workspace(root=wt, paths=paths.rebased(wt)),
+        repo_root=repo,
+        branch="bmad-loop/run-1/1-1",
+        path=wt,
+        baseline="abc123",
+    )
+    cause = OSError(0, "provider unavailable", None, 64)
+
+    def provisioning_root_failure(*_args, **_kwargs):
+        raise verify.GitError("cannot resolve worktree provisioning roots safely") from cause
+
+    monkeypatch.setattr(worktree_flow, "provision_worktree", provisioning_root_failure)
+    for probe in (
+        "worktree_seed_undelivered",
+        "module_skills_seed_undelivered",
+        "base_skills_seed_incomplete",
+    ):
+        monkeypatch.setattr(
+            worktree_flow,
+            probe,
+            lambda *_args, _probe=probe, **_kwargs: pytest.fail(
+                f"result probe {_probe} ran after provisioning failed"
+            ),
+        )
+    state = SimpleNamespace(target_branch="main", run_id="run-1", source="sprint", tasks={})
+    flow = _make_flow(
+        tmp_path,
+        paths=paths,
+        state=state,
+        open_unit_workspace=lambda *_args, **_kwargs: unit,
+    )
+    task = StoryTask(story_key="1-1", epic=1)
+    drove = []
+
+    with pytest.raises(_Pause) as excinfo:
+        flow.run_isolated(task, lambda candidate: drove.append(candidate))
+
+    assert task.phase == Phase.ESCALATED
+    assert "provisioning root could not be resolved" in excinfo.value.reason
+    assert flow.journal.events() == ["worktree-opened", "story-escalated"]
+    assert flow.calls.saves == 1
+    assert flow.calls.pauses == [(excinfo.value.reason, "1-1")]
+    assert drove == []
+    assert task.worktree_path == str(wt)
+    assert wt.is_dir()  # retained for inspection; no integration/teardown ran
 
 
 def test_escalate_unit_marks_escalated_notifies_and_pauses(tmp_path):

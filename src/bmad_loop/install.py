@@ -1300,7 +1300,13 @@ def _walk_traversable_files(
     an unreadable source directory never leaves an empty destination behind.
     """
     if _is_dir(src):
-        real = str(src.resolve()) if isinstance(src, Path) else None
+        try:
+            real = str(src.resolve()) if isinstance(src, Path) else None
+        except (OSError, RuntimeError):
+            if not _suppress_errors:
+                raise
+            yield rel, src
+            return
         if real is not None and real in _seen:
             return
         if _should_descend is not None and not _should_descend(rel, src):
