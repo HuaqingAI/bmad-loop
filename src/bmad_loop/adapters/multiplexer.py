@@ -40,6 +40,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .. import envvars
+from .entrypoints import record_load_error
 
 
 class MultiplexerError(Exception):
@@ -510,13 +511,32 @@ def _load_external_backends() -> None:
     and the ``validate`` preflight via :func:`external_backend_errors`), not
     raised. Unlike ``_BUILTINS_LOADED``, the loaded-flag is set up front: a
     third-party import failure is not transient, and retrying on every
-    selection would re-import (and re-fail) each time."""
+    selection would re-import (and re-fail) each time.
+
+    Entry points are visited in (name, distribution) order. ``importlib.metadata``
+    yields them in distribution-discovery order, which varies with ``sys.path``, so
+    without an explicit sort two hosts carrying the same packages could register a
+    collision in a different order — and the order failures are recorded in would
+    be a fact about the install rather than about the packages.
+
+    The distribution belongs in the key because the name alone is NOT a total
+    order. ``entry_points(group=...)`` does not dedup across distributions, so two
+    packages advertising the same entry-point name come back as two entries, and
+    ``sorted`` is stable — a name-only key resolves that tie straight back into
+    ``sys.path`` order.
+
+    Such a same-named failure now ACCUMULATES rather than overwriting: recording
+    goes through :func:`~.entrypoints.record_load_error`, which appends under the
+    entry-point name and labels each reason with its distribution."""
     global _EXTERNALS_LOADED
     if _EXTERNALS_LOADED:
         return
     _EXTERNALS_LOADED = True
     try:
-        eps = importlib.metadata.entry_points(group=MUX_BACKENDS_GROUP)
+        eps = sorted(
+            importlib.metadata.entry_points(group=MUX_BACKENDS_GROUP),
+            key=lambda e: (e.name, getattr(e.dist, "name", "") or ""),
+        )
     except Exception as exc:  # diagnostics path, never crash selection
         _EXTERNAL_ERRORS["<entry-point scan>"] = f"{type(exc).__name__}: {exc}"
         return
@@ -524,12 +544,17 @@ def _load_external_backends() -> None:
         try:
             ep.load()  # module import runs register_multiplexer(...)
         except Exception as exc:  # one bad package must not hide the rest
-            _EXTERNAL_ERRORS[ep.name] = f"{type(exc).__name__}: {exc}"
+            record_load_error(_EXTERNAL_ERRORS, ep, exc)
 
 
 def external_backend_errors() -> dict[str, str]:
-    """Entry-point name -> failure reason for every external backend that failed
-    to load this process (empty when all loaded). For diagnostics surfaces."""
+    """Entry-point name -> failure reason(s) for every external backend that failed
+    to load this process (empty when all loaded). For diagnostics surfaces.
+
+    One value may carry MORE than one reason, ``"; "``-joined: two distributions
+    may advertise the same entry-point name, and each of their failures is kept
+    (see :func:`~.entrypoints.record_load_error`). Each reason is labelled with
+    its distribution whenever one is resolvable."""
     return dict(_EXTERNAL_ERRORS)
 
 

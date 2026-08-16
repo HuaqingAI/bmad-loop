@@ -698,6 +698,45 @@ def test_profile_provider_returning_a_non_iterable_is_rejected(profile_scan):
     assert "iterable of CLIProfile" in profile_mod.external_profile_errors()["acme"]
 
 
+def test_same_named_broken_distributions_both_record_a_reason(profile_scan):
+    """Two distributions may advertise the SAME entry-point name in this group, and
+    both may be broken. A name-keyed assignment let the second overwrite the first:
+    the operator fixed the package they were shown and met the other one on the next
+    run, with nothing saying it had ever been there. Both reasons are kept now, each
+    labelled with its distribution — the entry-point name is not the name you
+    `pip uninstall`, and two providers failing identically would otherwise render as
+    the same sentence twice.
+
+    The fixture trap #566 itself flags: asserting only "two reasons are present"
+    passes for the wrong reason if the two entry points accidentally got DIFFERENT
+    names. Pinning the single shared key forecloses that, and is the shape
+    decision's own assertion besides — see the comment below.
+
+    Ablation: restore the single-key write
+    (`_PROFILE_LOAD_ERRORS[ep.name] = f"{type(exc).__name__}: {exc}"`) in
+    `_load_external_profiles` and this test fails on the missing `alpha-profiles`
+    half, while the adapter and mux twins stay green."""
+
+    def boom(msg):
+        def load():
+            raise RuntimeError(msg)
+
+        return load
+
+    profile_scan(
+        _FakeEntryPoint("acme", boom("alpha half-installed"), dist="alpha-profiles"),
+        _FakeEntryPoint("acme", boom("zeta half-installed"), dist="zeta-profiles"),
+    )
+    assert "claude" in load_profiles()  # built-ins unaffected
+    reason = profile_mod.external_profile_errors()["acme"]
+    assert "alpha-profiles" in reason and "zeta-profiles" in reason
+    assert "alpha half-installed" in reason and "zeta half-installed" in reason
+    # Still ONE key — the shape decision. The key set is what reaches
+    # `detail["entry_point"]` in `validate --json`, so it deliberately does not grow;
+    # only the human-facing reason string widens.
+    assert list(profile_mod.external_profile_errors()) == ["acme"]
+
+
 def test_profile_scan_failure_degrades(profile_scan):
     """The enumeration itself blowing up leaves built-in loading working, with the
     scan failure recorded."""

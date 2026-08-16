@@ -29,12 +29,22 @@ from bmad_loop.adapters import multiplexer as m
 from bmad_loop.adapters.tmux_backend import TmuxMultiplexer
 
 
-class _FakeEntryPoint:
-    """Duck-typed stand-in for importlib.metadata.EntryPoint: the loader only
-    touches ``.name`` and ``.load()``."""
+class _FakeDist:
+    """Stands in for ``EntryPoint.dist``; the scan orders on its ``.name``."""
 
-    def __init__(self, name, load):
+    def __init__(self, name):
         self.name = name
+
+
+class _FakeEntryPoint:
+    """Duck-typed stand-in for importlib.metadata.EntryPoint: the loader touches
+    ``.name``, ``.dist`` (the scan's tiebreak — see `_load_external_backends`) and
+    ``.load()``. ``dist`` defaults to a distinct-per-name stand-in so the ordering
+    of same-named entries is only ever decided by a test that sets it."""
+
+    def __init__(self, name, load, dist=None):
+        self.name = name
+        self.dist = _FakeDist(dist if dist is not None else f"{name}-dist")
         self._load = load
 
     def load(self):
@@ -161,6 +171,94 @@ def test_scan_runs_once_per_process(scan_registry):
     registry.get_multiplexer.cache_clear()
     registry._select()
     assert len(calls) == 1
+
+
+def test_same_named_broken_distributions_both_record_a_reason(scan_registry, monkeypatch):
+    """Two distributions may advertise the SAME entry-point name in this group, and
+    both may be broken. A name-keyed assignment let the second overwrite the first:
+    the operator fixed the package they were shown and met the other one on the next
+    run, with nothing saying it had ever been there. Both reasons are kept now, each
+    labelled with its distribution — the entry-point name is not the name you
+    `pip uninstall`, and two packages failing identically would otherwise render as
+    the same sentence twice. (#566 names the adapter and profile scans only; this
+    third site is the one it omits.)
+
+    The fixture trap #566 itself flags: asserting only "two reasons are present"
+    passes for the wrong reason if the two entry points accidentally got DIFFERENT
+    names. Pinning the single shared key forecloses that, and is the shape
+    decision's own assertion besides — see the comment below.
+
+    Ablation: restore the single-key write
+    (`_EXTERNAL_ERRORS[ep.name] = f"{type(exc).__name__}: {exc}"`) in
+    `_load_external_backends` and this test fails on the missing `alpha-backend`
+    half, while the adapter and profile twins stay green — that per-site
+    independence is what proves the fix reached all three scans rather than one."""
+    registry, arm = scan_registry
+
+    def boom(msg):
+        def load():
+            raise ImportError(msg)
+
+        return load
+
+    arm(
+        _FakeEntryPoint("acme", boom("No module named 'alpha_dep'"), dist="alpha-backend"),
+        _FakeEntryPoint("acme", boom("No module named 'zeta_dep'"), dist="zeta-backend"),
+    )
+    monkeypatch.setattr(sys, "platform", "linux")
+    backend, name, _reason = registry._select()
+    assert isinstance(backend, TmuxMultiplexer) and name == "tmux"  # selection still works
+    reason = registry.external_backend_errors()["acme"]
+    assert "alpha-backend" in reason and "zeta-backend" in reason
+    assert "alpha_dep" in reason and "zeta_dep" in reason
+    # Still ONE key — the shape decision. The key set is what reaches
+    # `detail["entry_point"]` in `validate --json`, so it deliberately does not grow;
+    # only the human-facing reason string widens.
+    assert list(registry.external_backend_errors()) == ["acme"]
+
+
+@pytest.mark.parametrize(
+    "order", [("alpha", "zeta"), ("zeta", "alpha")], ids=["alpha-discovered-first", "zeta-first"]
+)
+def test_same_named_entry_points_are_visited_in_distribution_order(
+    scan_registry, monkeypatch, order
+):
+    """The mux analogue of the adapter scan's
+    `test_same_named_entry_points_resolve_by_distribution_not_install_order`: this
+    scan was left unsorted when commit 90a7ca9 ordered the other two.
+
+    It matters here because the accumulated reason is now READ in append order. A
+    bare `entry_points(group=...)` yields distributions in `sys.path` order, so
+    without the sort the assertion below would be a fact about the machine running
+    the test — the same two packages would render their two reasons in the opposite
+    order on another host, and the accumulation test above would be
+    non-deterministic by construction. Sorting on (name, distribution) is what makes
+    the recording a fact about the packages.
+
+    Both parameters arm the identical pair and differ only in the order the scan
+    yields them; `alpha-backend`'s reason must come first either way.
+
+    ABLATION: drop the `getattr(e.dist, ...)` half of the sort key in
+    `_load_external_backends` and the `zeta-first` case reddens while
+    `alpha-discovered-first` stays green — which is the finding: the name-only key
+    is right only when the install happens to agree with it."""
+    registry, arm = scan_registry
+
+    def boom(msg):
+        def load():
+            raise ImportError(msg)
+
+        return load
+
+    eps = {
+        "alpha": _FakeEntryPoint("acme", boom("alpha broke"), dist="alpha-backend"),
+        "zeta": _FakeEntryPoint("acme", boom("zeta broke"), dist="zeta-backend"),
+    }
+    arm(*(eps[k] for k in order))
+    monkeypatch.setattr(sys, "platform", "linux")
+    registry._select()
+
+    assert registry.external_backend_errors()["acme"].startswith("alpha-backend: ")
 
 
 def test_mux_command_surfaces_load_failures(scan_registry, monkeypatch, capsys, tmp_path):

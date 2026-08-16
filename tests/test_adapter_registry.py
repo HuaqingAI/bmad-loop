@@ -421,6 +421,68 @@ def test_same_named_entry_points_resolve_by_distribution_not_install_order(
     assert registry.get_adapter_kind("acme").needs_mux is False  # alpha-adapter's
 
 
+def test_same_named_broken_distributions_both_record_a_reason(scan_adapter_registry):
+    """Two distributions may advertise the SAME entry-point name, and both may be
+    broken. A name-keyed assignment let the second overwrite the first: the
+    operator fixed the package they were shown and met the other one on the next
+    run, with nothing saying it had ever been there. Both reasons are kept now,
+    each labelled with its distribution — the entry-point name is not the name you
+    `pip uninstall`, and two packages failing identically would otherwise render as
+    the same sentence twice.
+
+    The fixture trap #566 itself flags: a test that only asserts "two reasons are
+    present" passes for the wrong reason if the two entry points accidentally got
+    DIFFERENT names (`_FakeEntryPoint` defaults `dist` per name, not the reverse).
+    Pinning the single shared key is what forecloses that — and it is the shape
+    decision's own assertion besides, per the comment below.
+
+    Ablation: restore the single-key write
+    (`_EXTERNAL_ERRORS[ep.name] = f"{type(exc).__name__}: {exc}"`) in
+    `_load_external_adapters` and this test fails on the missing `alpha-adapter`
+    half, while the profile and mux twins stay green — that per-site independence
+    is what proves the fix reached all three scans rather than one."""
+    registry, arm = scan_adapter_registry
+
+    def boom(msg):
+        def load():
+            raise ImportError(msg)
+
+        return load
+
+    arm(
+        _FakeEntryPoint("acme", boom("No module named 'alpha_dep'"), dist="alpha-adapter"),
+        _FakeEntryPoint("acme", boom("No module named 'zeta_dep'"), dist="zeta-adapter"),
+    )
+    assert registry.get_adapter_kind("generic").needs_mux is True  # selection still works
+    reason = registry.external_adapter_errors()["acme"]
+    assert "alpha-adapter" in reason and "zeta-adapter" in reason
+    assert "alpha_dep" in reason and "zeta_dep" in reason
+    # Still ONE key — the shape decision. The key set is what reaches
+    # `detail["entry_point"]` in `validate --json`, so it deliberately does not grow;
+    # only the human-facing reason string widens.
+    assert list(registry.external_adapter_errors()) == ["acme"]
+
+
+def test_a_lone_failure_records_exactly_one_reason(scan_adapter_registry):
+    """The accumulation must not cost a lone failure a leading separator or a
+    duplicate: one broken entry point still records exactly one reason. Spelled out
+    in full rather than substring-matched, because a substring check is blind to
+    precisely the leading `"; "` this guards.
+
+    Ablation: make `record_load_error` append unconditionally
+    (`prior = errors.get(ep.name, "")` then `f"{prior}; {reason}"`) and this test
+    fails on the leading separator."""
+    registry, arm = scan_adapter_registry
+
+    def boom():
+        raise ImportError("No module named 'ghost_dependency'")
+
+    arm(_FakeEntryPoint("lonely", boom, dist="lonely-adapter"))
+    errors = registry.external_adapter_errors()
+    assert errors["lonely"] == ("lonely-adapter: ImportError: No module named 'ghost_dependency'")
+    assert "; " not in errors["lonely"]
+
+
 def test_real_dist_info_metadata_is_discovered(fresh_adapter_registry, monkeypatch, tmp_path):
     """End-to-end against genuine packaging metadata: a real ``*.dist-info`` +
     module on sys.path is found by the unpatched importlib scan and its import

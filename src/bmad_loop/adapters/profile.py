@@ -16,7 +16,8 @@ companion to the ``bmad_loop.adapters`` registry (:mod:`~.registry`), so a
 co-installed adapter package ships both its class and the profile that selects
 it with zero project config. Precedence is packaged < entry-point < project (a
 project TOML always wins). A broken entry point degrades to a recorded reason
-(:func:`external_profile_errors`), never a crash.
+(:func:`external_profile_errors`), never a crash — one per failing distribution,
+kept even when two of them advertise the same name (:mod:`~.entrypoints`).
 
 Which adapter *class* drives a profile is the ``adapter`` field, resolved against
 the :mod:`~.registry` — it is read here but intentionally **not** checked against
@@ -40,6 +41,7 @@ from pathlib import Path
 import regex
 
 from ..platform_util import has_parent_ref, is_absolute_path, names_tree_root
+from .entrypoints import record_load_error
 
 USAGE_PARSERS = {"claude-jsonl", "codex-rollout", "gemini-chat", "copilot-events", "none"}
 HOOK_DIALECTS = {
@@ -523,13 +525,19 @@ def _load_external_profiles() -> dict[str, CLIProfile]:
             for profile in _coerce_profiles(produced, ep.name):
                 _EXTERNAL_PROFILES.setdefault(profile.name, profile)
         except Exception as exc:  # noqa: BLE001 — one bad package must not hide the rest
-            _PROFILE_LOAD_ERRORS[ep.name] = f"{type(exc).__name__}: {exc}"
+            record_load_error(_PROFILE_LOAD_ERRORS, ep, exc)
     return _EXTERNAL_PROFILES
 
 
 def external_profile_errors() -> dict[str, str]:
-    """Entry-point name -> failure reason for every external profile provider that
-    failed to load this process (empty when all loaded). For diagnostics surfaces.
+    """Entry-point name -> failure reason(s) for every external profile provider
+    that failed to load this process (empty when all loaded). For diagnostics
+    surfaces.
+
+    One value may carry MORE than one reason, ``"; "``-joined: two distributions
+    may advertise the same entry-point name, and each of their failures is kept
+    (see :func:`~.entrypoints.record_load_error`). Each reason is labelled with
+    its distribution whenever one is resolvable.
 
     Performs the scan rather than assuming a neighbouring call already did. The
     only other trigger is :func:`load_profiles`, which ``validate`` reaches through

@@ -34,7 +34,8 @@ pip/uv co-installed adapter package is selectable with no config step. Builtins
 are seeded by :func:`register_adapter` itself, so an external can never shadow a
 bundled name however early its import lands. A broken third-party distribution
 degrades to a recorded, surfaced reason (:func:`external_adapter_errors`) and can
-never break selection.
+never break selection — one reason per failing distribution, kept even when two of
+them advertise the same entry-point name (:mod:`~.entrypoints`).
 
 **Two deliberate asymmetries versus the multiplexer seam** (this is not a
 copy-paste omission):
@@ -57,6 +58,8 @@ from __future__ import annotations
 import importlib.metadata
 from collections.abc import Callable
 from dataclasses import dataclass
+
+from .entrypoints import record_load_error
 
 # The two bundled kind names, as constants rather than literals scattered across
 # modules. `validate`'s httpx check keys on OPENCODE_HTTP because httpx is *that
@@ -241,12 +244,17 @@ def _load_external_adapters() -> None:
         try:
             ep.load()  # module import runs register_adapter(...)
         except Exception as exc:  # noqa: BLE001 — one bad package must not hide the rest
-            _EXTERNAL_ERRORS[ep.name] = f"{type(exc).__name__}: {exc}"
+            record_load_error(_EXTERNAL_ERRORS, ep, exc)
 
 
 def external_adapter_errors() -> dict[str, str]:
-    """Entry-point name -> failure reason for every external adapter that failed
+    """Entry-point name -> failure reason(s) for every external adapter that failed
     to load this process (empty when all loaded). For diagnostics surfaces.
+
+    One value may carry MORE than one reason, ``"; "``-joined: two distributions
+    may advertise the same entry-point name, and each of their failures is kept
+    (see :func:`~.entrypoints.record_load_error`). Each reason is labelled with
+    its distribution whenever one is resolvable.
 
     Performs the scan itself rather than relying on a neighbouring
     ``known_adapter_kinds`` / ``detect_adapters`` call having run first — an
