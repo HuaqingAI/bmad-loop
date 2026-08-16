@@ -787,14 +787,20 @@ class SweepEngine(Engine):
                 self._safe_reset(task)  # a session died mid-rewrite; restore our ledger
                 text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
             task.phase = Phase.PENDING  # deliberate reset, not a normal transition
-        # **Placement is load-bearing**: this sits ABOVE the baseline stamp
-        # below, so a refusal that dispatches nothing leaves no baseline behind.
-        # Stamped first, the pause would strand `baseline_commit` on the
-        # pre-repair HEAD; the operator renumbers and resumes, and if that
-        # migration session then env-faults, the next resume's `_safe_reset`
-        # rewinds the tree to that stale baseline and destroys the repair,
-        # landing back on this same pause. It still sits BELOW the resume/reset
-        # block, because the ledger this reads must be the restored one.
+        # **The invariant: a refusal that dispatches nothing leaves this task
+        # owning NO baseline.** It takes both halves below. Sitting above the
+        # stamp keeps a fresh entry from taking one; clearing handles the entry
+        # that arrives already holding one, which the resume-after-escalation
+        # branch above does. Either way the next resume re-stamps the repaired
+        # HEAD. Leave a baseline behind and it names the PRE-repair tree: the
+        # operator renumbers and resumes, and when that migration session
+        # env-faults, the next resume's `_safe_reset` rewinds to that stale
+        # baseline — destroying the repair and any commits beside it, and
+        # landing back on this same pause. Safe to clear because nothing of
+        # ours is outstanding here: no session has run, and the branch above
+        # has already restored the tree if a previous one died mid-rewrite.
+        # This still sits BELOW that branch, because the ledger it reads must
+        # be the restored one.
         #
         # Refused BEFORE a rewrite is dispatched, not after one is graded (#519).
         # A ledger where one id names two entries is corrupt in a way the format
@@ -838,6 +844,8 @@ class SweepEngine(Engine):
                 f"migration refused: {ledger.name}",
                 f"{reason} — then `bmad-loop resume {self.state.run_id}`",
             )
+            task.baseline_commit = None
+            task.baseline_untracked = None
             self._save()
             raise RunPaused(reason, PAUSE_STORY_GATE, MIGRATE_KEY)
 

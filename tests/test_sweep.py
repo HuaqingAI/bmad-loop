@@ -3303,7 +3303,10 @@ def test_migration_dropping_a_gate_restores_the_ledger_then_escalates(project):
     # and the refusal reached the session, naming the token it dropped
     prompts = [s.prompt for s in adapter.sessions]
     assert len(prompts) == 2
-    feedback = open(prompts[1].split("--feedback ", 1)[1]).read()
+    # explicit encoding, for the same reason the ledger assertion above pins it:
+    # the platform default is not UTF-8 on Windows, so a feedback file carrying a
+    # non-ASCII byte would redden there and nowhere else
+    feedback = Path(prompts[1].split("--feedback ", 1)[1]).read_text(encoding="utf-8")
     assert "lost gate token" in feedback and "3-2" in feedback
 
 
@@ -3370,6 +3373,51 @@ def test_migration_refuses_a_ledger_carrying_duplicate_dw_ids(project):
     # and the operator is told which id to go renumber
     assert "duplicate DW ids" in journal_text(engine)
     assert "DW-1" in journal_text(engine)
+
+
+def test_migration_duplicate_refusal_clears_a_baseline_it_arrived_holding(project):
+    """#519. The refusal's invariant is that it leaves the task owning NO
+    baseline, and placing it above the stamp only covers half of that: a task
+    that arrives ALREADY holding one keeps it. That is the
+    resume-after-escalation path — a first migration attempt stamped a baseline
+    and escalated, and the operator's hand-edit between attempts is what puts
+    duplicate ids in front of this guard.
+
+    A kept baseline names the PRE-repair tree. The operator renumbers, commits,
+    resumes; the migration session then fails dirty, and the next resume's
+    `_safe_reset` rewinds to that stale baseline — destroying the repair and any
+    commits beside it, and landing back on this same pause.
+
+    Ablation: drop the two `task.baseline_commit`/`baseline_untracked` clears
+    from the guard and this test fails ALONE. Its sibling
+    `test_migration_refuses_a_ledger_carrying_duplicate_dw_ids` enters with a
+    FRESH task, where placement above the stamp already prevents a baseline —
+    which is exactly why that case cannot see this one."""
+    before = (
+        "# Deferred Work\n\n" + _gated_dw1("gate: 3-2") + "\n" + _gated_dw1("gate: 3-3") + "\n"
+        "## Deferred from: epic 1 review (2026-04-06)\n\n"
+        "- **Open legacy thing here** — `src.txt` mishandles em-dashes\n"
+    )
+    write_legacy_ledger(project, before)
+    engine, adapter = make_sweep(project, [])
+    # a first attempt already stamped a baseline and escalated. The sha is never
+    # resolved: the tree is clean, so the recovery branch's `_safe_reset` is not
+    # reached — this fixture pins the CLEAR, not the reset.
+    engine.state.tasks["sweep-migrate"] = StoryTask(
+        story_key="sweep-migrate",
+        epic=0,
+        phase=Phase.ESCALATED,
+        baseline_commit="0" * 40,
+        baseline_untracked=[],
+    )
+    summary = engine.run()
+
+    assert summary.paused
+    assert adapter.sessions == []
+    task = engine.state.tasks["sweep-migrate"]
+    # the stale baseline is gone, so the next resume re-stamps the repaired HEAD
+    assert task.baseline_commit is None
+    assert task.baseline_untracked is None
 
 
 # ------------------------------------------ review-budget commit-instead-of-rollback
