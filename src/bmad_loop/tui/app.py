@@ -35,6 +35,7 @@ from ..model import (
     PAUSE_STORY_GATE,
     RunState,
 )
+from ..platform_util import resolve_or_lexical
 from ..policy import POLICY_FILE
 from ..process_host import ProcessHostError
 from ..runs import RUNS_DIR, RearmError, StopRunError
@@ -144,7 +145,7 @@ class BmadLoopApp(App[None]):
 
     def __init__(self, project: Path):
         super().__init__()
-        self.project = project.resolve()
+        self.project = resolve_or_lexical(project)
         self.sub_title = str(self.project)
         self._dashboard = DashboardScreen(self.project)
 
