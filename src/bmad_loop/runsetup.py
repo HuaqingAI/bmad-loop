@@ -477,7 +477,7 @@ def make_adapters(
             # escaping ImportError used to strand that run directory behind a
             # traceback, recorded as an accepted consequence; it no longer does —
             # both composers unwind the whole composition on any escape (see
-            # `_unwind_composition`), and this raise is one of the five SystemExits
+            # `_unwind_composition`), and this raise is one of the six SystemExits
             # that path exists for. What that changes is the run dir, not the
             # message: the narrowing below is a separate decision and still holds.
             # ImportError ONLY, on the same rule as `construct_error` below: a
@@ -535,6 +535,15 @@ def make_adapters(
             # `(OpencodeServerError,)` for one that can — and becomes a SystemExit
             # so a run aborts with a clean message instead of a traceback.
             # `except ():` catches nothing, which is exactly right for the `()` case.
+            # A SIGNATURE mismatch is not a declared failure and no family names it,
+            # so it escaped both arms as a bare traceback until the second one below
+            # (#569): the bootstrap keyword set grows, and an out-of-tree class whose
+            # `__init__` does not accept a keyword this function passes is refused by
+            # the interpreter, not by the family. That arm keys on traceback DEPTH
+            # because depth is what separates the two TypeErrors — binding fails
+            # before any `__init__` frame is pushed, a raise from inside one carries
+            # that frame. ORDER MATTERS: a family that declares `TypeError` in its own
+            # `construct_error` keeps the `error: {e}` line above, unchanged.
             cls = builder.dev if synthesizes else builder.plain
             build_kwargs = {**common, "paths": paths} if synthesizes else common
             try:
@@ -542,6 +551,25 @@ def make_adapters(
                 by_cfg[key] = cls(**build_kwargs)  # pyright: ignore[reportArgumentType]
             except builder.construct_error as e:
                 raise SystemExit(f"error: {e}") from e
+            except TypeError as e:
+                # A binding failure is raised by the interpreter BEFORE any __init__
+                # frame is pushed, so the traceback holds this frame alone. A
+                # TypeError from inside a working __init__ carries that frame too and
+                # is a bug in that package: it must surface as itself, on the same
+                # rule the ImportError arm above states. Errs toward re-raising — a
+                # mismatch behind a Python-level metaclass `__call__` or a
+                # `super().__init__` call reads as deeper and re-raises, which is
+                # today's behavior; relabelling a real bug is the direction that would
+                # cost a diagnosis. Only valid while this `except` sits in the SAME
+                # FRAME as the call — do not extract the construct call into a helper
+                # or widen the `try`, either breaks it silently.
+                if e.__traceback__ is None or e.__traceback__.tb_next is not None:
+                    raise
+                raise SystemExit(
+                    f"error: profile {profile.name!r}: adapter kind "
+                    f"{profile.adapter!r} rejected this run's adapter keywords: "
+                    f"{type(e).__name__}: {e}"
+                ) from e
         adapters[role] = by_cfg[key]
     return adapters
 
@@ -821,7 +849,7 @@ def _claim_run_dir(run_dir: Path) -> None:
     MUST stay outside the composers' ``try`` — a refusal that reached the unwind
     arm would delete the very run it exists to protect. ``SystemExit`` matches the
     other launch-time refusals an operator reads as an ``error:`` line
-    (``_reject_bad_run_id``, and ``make_adapters``' five sites).
+    (``_reject_bad_run_id``, and ``make_adapters``' six sites).
 
     Applied to a minted id too, not just a supplied one. ``new_run_id`` is a
     timestamp plus two random bytes, so a same-second collision is remote rather
@@ -845,11 +873,12 @@ def _unwind_composition(project: Path, run_dir: Path, journal: Journal | None) -
     provably this composition's, never a pre-existing one the caller named.
 
     Reached from an ``except BaseException`` arm, because the failure it exists
-    for is a :class:`SystemExit`: :func:`make_adapters` raises one at five sites
+    for is a :class:`SystemExit`: :func:`make_adapters` raises one at six sites
     (unresolvable profile, unknown adapter kind, a kind that fails to load, a
-    construction failure, an unusable multiplexer), every one of them *after*
-    ``save_state`` has published a run dir carrying ``finished=False`` /
-    ``crashed=False`` and no ``run-start``. Nothing reconciles that shape —
+    construction failure, an adapter class that rejects a bootstrap keyword, an
+    unusable multiplexer), every one of them *after* ``save_state`` has published
+    a run dir carrying ``finished=False`` / ``crashed=False`` and no
+    ``run-start``. Nothing reconciles that shape —
     :func:`runs.reconcile_stale_worktrees` only touches ``is_finished`` runs — so
     it lingers as a resumable-looking empty run.
 
