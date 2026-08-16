@@ -144,21 +144,51 @@ async def until(pilot, condition, timeout: float = 10.0) -> None:
         waited += 0.05
 
 
-async def ready(pilot, selector: str):
+async def ready(pilot, selector: str, timeout: float = 10.0):
     """Wait until a modal widget is mounted *and* laid out on-screen, then return it.
 
     A screen-type `until` returns the instant push_screen swaps app.screen — before
     the modal's children mount (query NoMatches) or receive a layout region (click
     OutOfBounds, region still 0). Gating on a real on-screen region makes the
     following query_one / click / value-set safe on slow CI runners. A modal's
-    widgets mount and lay out together, so one gate covers every field in it."""
+    widgets mount and lay out together, so one gate covers every field in it.
+
+    That gate alone stopped being enough once BaseDialog grew breakpoints (#281).
+    The breakpoint class is on the screen by the time the first widget has a
+    region — but the stylesheet reapply it triggers is still QUEUED, so the first
+    laid-out pass carries the un-classed metrics and the real layout arrives a
+    frame later. Measured on StoryCheckpointModal at 45 columns, the docked row
+    reads Textual's default `Button min-width: 16` on that first pass
+    (x=5/23/41, each 16 wide, so the last ends at column 57 — off a 45-column
+    screen) and the `-narrow` metrics (14/10/7) on the next.
+
+    So this also pumps the queue until the screen's layout stops moving. It is
+    the message pump, not a sleep, that does the work: the pending reapply is a
+    message, and each `pause` drains it. Requiring the regions to repeat lets a
+    slow runner take as many frames as it needs. Everything downstream — a
+    reachability assert, a `scroll_visible` target, a click coordinate — is then
+    computed against the settled layout rather than a doomed intermediate one.
+    Under load this is worth 2-3 failures per 25 runs on the tests it covers."""
 
     def _hit():
         hits = pilot.app.screen.query(selector)
         node = hits.first() if hits else None
         return node if node is not None and node.region.area > 0 else None
 
-    await until(pilot, lambda: _hit() is not None)
+    await until(pilot, lambda: _hit() is not None, timeout)
+
+    def _layout():
+        return tuple(w.region for w in pilot.app.screen.query("*"))
+
+    previous, stable, waited = None, 0, 0.0
+    while stable < 3:
+        if waited >= timeout:
+            raise AssertionError("screen layout never settled")
+        await pilot.pause(0.05)
+        waited += 0.05
+        current = _layout()
+        stable = stable + 1 if current == previous else 0
+        previous = current
     return _hit()
 
 
