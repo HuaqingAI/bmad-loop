@@ -50,6 +50,23 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **A `sweep --migrate` rewrite that drops a `gate:` token a pre-existing entry declared is now
+  refused, instead of un-gating that story silently (#519).** Validation held the rewrite to each
+  entry's id and status only, so losing the token passed, got committed, and the next dispatch ran
+  the story the entry existed to hold back. The original ledger is now restored and the session
+  re-prompted with the error, escalating after `max_migration_attempts` — a rewrite that previously
+  passed can now fail. An _added_ token is still accepted, since over-blocking fails loudly and in
+  the safe direction. Migration-scoped: every other ledger edit is still held by the format doc's
+  instruction alone.
+
+- **`sweep --migrate` now refuses a ledger that already carries duplicate `DW-<n>` ids, rather than
+  migrating it into silent data loss (#519).** One id naming two entries cannot survive a migration
+  either way: the rewrite that keeps both is rejected as duplicate, and the one that passes collapses
+  them and drops a twin's `gate:`. The sweep now pauses before any rewrite is dispatched, naming the
+  ids to renumber, and resumes with its migration budget intact. **A deliberate behavior change
+  beyond #519's original scope:** such a migration completes today by losing that data, and will now
+  stop instead. Bounded to ledgers that already carry duplicate ids.
+
 - **An unrelated untracked file in your main checkout no longer blocks every isolated unit merge
   (#460).** Under `[scm] isolation = "worktree"` the pre-merge reconcile refused over any dirty path
   outside the unit branch's incoming set, untracked included, so a single `notes.txt` escalated the

@@ -15,12 +15,12 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from . import deferredwork, gates, verify
-from .engine import Engine
+from .engine import Engine, RunPaused
 from .escalation import critical_escalations, env_fault_pause_reason, session_failure_reason
-from .model import Phase, StoryTask
+from .model import PAUSE_STORY_GATE, Phase, StoryTask
 from .platform_util import atomic_write_text, neutralize_surrogates
 from .statemachine import advance
 from .workspace import discard_worktree
@@ -242,17 +242,84 @@ def validate_triage(
 # ---------------------------------------------------------- migration plan
 
 
+@dataclass(frozen=True)
+class PreCanonical:
+    """What a pre-existing canonical entry is held to across a migration.
+
+    Status alone was the whole snapshot until #519, and that is what let a
+    rewrite drop a ``gate:`` line and pass: the gate is the one field whose loss
+    is both silent and unsafe. ``deferred-work-format.md`` calls removing it
+    "the exact failure this field exists to prevent", and
+    ``Engine._refuse_gated_story`` then dispatches the story the entry was
+    holding back.
+
+    ``gate_tokens`` unions :attr:`~bmad_loop.deferredwork.EntryGates.tokens`
+    with ``malformed`` because the question is "did a token the entry declared
+    survive", not "was it enforceable". A malformed ``gate: 3.2`` gates nothing,
+    but it reads to anyone scanning the entry as a gate in force and ``validate``
+    reports it (``deferred.hard-gate-unstructured``); dropping it retires that
+    report silently, which is the same failure one level down.
+
+    The counts ``EntryGates`` also carries — ``lines``, ``empty``, ``near_miss``
+    — are deliberately NOT snapshotted. None of them names a story, so losing one
+    cannot change which story is gated, and they are exactly what a legitimate
+    reflow of a multi-line declaration moves.
+    """
+
+    status: str
+    gate_tokens: tuple[str, ...]
+
+
+def snapshot_canonical(text: str) -> dict[str, PreCanonical]:
+    """The pre-migration state ``validate_migration`` holds the rewrite to.
+
+    A named function rather than a comprehension inlined at its one call site so
+    that the tests grade the snapshot production actually builds: a hand-written
+    ``{"DW-1": PreCanonical("open", ("3-2",))}`` would pass whatever the parser
+    really produces for that entry, and the bug being fixed here lived in the
+    snapshot, not in the comparison.
+
+    Keying by id is safe only because ``_ensure_migration`` refuses a ledger
+    that carries duplicate canonical ids before any rewrite is attempted. Do
+    not soften that refusal into per-id collapse-hardening here: tokens and
+    status snapshotted independently describe an entry that never existed, and
+    each half patched on its own opens the next cross-product (a token
+    harvested from a ``done`` twin paired with an ``open`` twin's status both
+    refuses a faithful rewrite and newly gates a story that was not gated).
+    """
+    snapshot: dict[str, PreCanonical] = {}
+    for e in deferredwork.parse_ledger(text):
+        g = deferredwork.gates(e)
+        snapshot[e.id] = PreCanonical(e.status, g.tokens + g.malformed)
+    return snapshot
+
+
+def duplicate_ids(entries: Iterable[deferredwork.DWEntry]) -> list[str]:
+    """The DW ids naming more than one entry, sorted.
+
+    One function for both sides of a migration on purpose: the rewrite is
+    refused when the ledger it STARTED from carries duplicates and when the
+    ledger it produced does, and two detectors that disagreed about what counts
+    as a duplicate would leave exactly the gap between them open.
+    """
+    seen: set[str] = set()
+    dupes: set[str] = set()
+    for e in entries:
+        (dupes if e.id in seen else seen).add(e.id)
+    return sorted(dupes)
+
+
 def validate_migration(
     rj: dict[str, Any] | None,
     manifest: list[dict[str, Any]],
-    pre_canonical: dict[str, str],
+    pre_canonical: dict[str, PreCanonical],
     new_text: str,
 ) -> list[str]:
     """Deterministic validation of a legacy-ledger migration session: the
     rewritten ledger must contain zero legacy items, preserve every
-    pre-existing canonical entry's status, continue DW numbering, and the
-    result.json mapping must cover the manifest exactly. Returns errors,
-    empty on success."""
+    pre-existing canonical entry's status and every ``gate:`` token it
+    declared, continue DW numbering, and the result.json mapping must cover
+    the manifest exactly. Returns errors, empty on success."""
     rj = rj or {}
     if rj.get("workflow") != MIGRATE_WORKFLOW:
         return [f"workflow must be {MIGRATE_WORKFLOW!r}: got {rj.get('workflow')!r}"]
@@ -263,25 +330,36 @@ def validate_migration(
         listed = "; ".join(f"{e.section or 'top level'}: {e.title[:60]}" for e in leftovers[:10])
         errors.append(f"{len(leftovers)} legacy item(s) still parse as legacy: {listed}")
 
-    entries: dict[str, deferredwork.DWEntry] = {}
-    dupes: set[str] = set()
-    for e in deferredwork.parse_ledger(new_text):
-        if e.id in entries:
-            dupes.add(e.id)
-        entries[e.id] = e
+    parsed = deferredwork.parse_ledger(new_text)
+    entries: dict[str, deferredwork.DWEntry] = {e.id: e for e in parsed}
+    dupes = duplicate_ids(parsed)
     if dupes:
-        errors.append("duplicate DW ids: " + ", ".join(sorted(dupes)))
+        errors.append("duplicate DW ids: " + ", ".join(dupes))
 
     def first_word(status: str) -> str:
         return status.split()[0] if status.split() else ""
 
     pre_max = max((int(i.split("-")[1]) for i in pre_canonical), default=0)
-    for dw_id, status in pre_canonical.items():
+    for dw_id, pre in pre_canonical.items():
         e = entries.get(dw_id)
         if e is None:
             errors.append(f"pre-existing {dw_id} disappeared")
-        elif first_word(e.status) != first_word(status):
-            errors.append(f"pre-existing {dw_id} status changed: {status!r} -> {e.status!r}")
+            continue
+        if first_word(e.status) != first_word(pre.status):
+            errors.append(f"pre-existing {dw_id} status changed: {pre.status!r} -> {e.status!r}")
+        # Drops and edits only; an ADDED token is deliberately accepted. The two
+        # directions are not the same failure: a dropped token un-gates a story
+        # silently, which is what #519 is about, while an added one over-blocks
+        # loudly and in the safe direction — the operator meets a refusal naming
+        # the entry. Refusing an addition would spend one of the two migration
+        # attempts on the only direction that cannot cause the failure this
+        # guard exists to stop. An EDITED token is caught here anyway: an edit
+        # is a drop plus an add, and the drop half is what this reads.
+        post = deferredwork.gates(e)
+        kept = set(post.tokens) | set(post.malformed)
+        lost = [t for t in pre.gate_tokens if t not in kept]
+        if lost:
+            errors.append(f"pre-existing {dw_id} lost gate token(s): {', '.join(lost)}")
     for dw_id, e in entries.items():
         if dw_id in pre_canonical:
             continue
@@ -709,12 +787,74 @@ class SweepEngine(Engine):
                 self._safe_reset(task)  # a session died mid-rewrite; restore our ledger
                 text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
             task.phase = Phase.PENDING  # deliberate reset, not a normal transition
+        # **The invariant: a refusal that dispatches nothing leaves this task
+        # owning NO baseline.** It takes both halves below. Sitting above the
+        # stamp keeps a fresh entry from taking one; clearing handles the entry
+        # that arrives already holding one, which the resume-after-escalation
+        # branch above does. Either way the next resume re-stamps the repaired
+        # HEAD. Leave a baseline behind and it names the PRE-repair tree: the
+        # operator renumbers and resumes, and when that migration session
+        # env-faults, the next resume's `_safe_reset` rewinds to that stale
+        # baseline — destroying the repair and any commits beside it, and
+        # landing back on this same pause. Safe to clear because nothing of
+        # ours is outstanding here: no session has run, and the branch above
+        # has already restored the tree if a previous one died mid-rewrite.
+        # This still sits BELOW that branch, because the ledger it reads must
+        # be the restored one.
+        #
+        # Refused BEFORE a rewrite is dispatched, not after one is graded (#519).
+        # A ledger where one id names two entries is corrupt in a way the format
+        # cannot express, and there is no automatic outcome that is right: this
+        # mode is required to keep pre-existing entries byte-identical, so the
+        # only rewrite that preserves the pair trips `duplicate DW ids` in
+        # validate_migration, and the only rewrite that passes is a collapse
+        # that drops one twin's `gate:` silently. Grading the collapse instead
+        # cannot be made safe — a snapshot keyed by id describes a merged entry
+        # that never existed, and each half hardened on its own opens the next
+        # cross-product. So a human renumbers, which is the call
+        # `_apply_deferred_closes` already makes on a duplicate id (#286).
+        # Paused rather than ESCALATED, and the task stays PENDING on purpose:
+        # that is what makes the refusal re-askable the way `_refuse_gated_story`
+        # is. The operator renumbers the ids and resumes, and this re-reads the
+        # ledger and lets the migration run — an ESCALATED task would also spend
+        # the migration attempt budget on a rewrite that never happened.
+        #
+        # PAUSE_STORY_GATE, NOT PAUSE_ESCALATION, and the pairing is the point:
+        # the stage picks the recovery UI, and every escalation action
+        # (`runs.rearm_story`, the TUI's Resolve) requires the task to be
+        # Phase.ESCALATED, which this one deliberately is not — so an escalation
+        # stage here would offer the operator only actions that must fail. The
+        # gate stage routes to a viewer whose single action is "resume", which
+        # is the whole remedy once the ids are renumbered. `_refuse_gated_story`
+        # already pauses this way with a task that is not escalated: same
+        # contract — the deferred-work ledger blocks the run, a human edits it,
+        # the resume re-reads it.
+        dupes = duplicate_ids(deferredwork.parse_ledger(text))
+        if dupes:
+            reason = (
+                f"{ledger.name} carries duplicate DW ids: {', '.join(dupes)} — one id "
+                "names more than one entry, so no migration of it can both preserve "
+                "the entries and produce a valid ledger; renumber or merge them by "
+                "hand and COMMIT the fix, then resume"
+            )
+            self.journal.append("migrate-duplicate-ids", story_key=MIGRATE_KEY, dw_ids=list(dupes))
+            gates.notify(
+                self.policy,
+                self.run_dir,
+                f"migration refused: {ledger.name}",
+                f"{reason} — then `bmad-loop resume {self.state.run_id}`",
+            )
+            task.baseline_commit = None
+            task.baseline_untracked = None
+            self._save()
+            raise RunPaused(reason, PAUSE_STORY_GATE, MIGRATE_KEY)
+
         if not task.baseline_commit:
             task.baseline_commit = verify.rev_parse_head(self.workspace.root)
             task.baseline_untracked = sorted(verify.untracked_files(self.workspace.root))
 
         legacy = deferredwork.parse_legacy(text)
-        pre_canonical = {e.id: e.status for e in deferredwork.parse_ledger(text)}
+        pre_canonical = snapshot_canonical(text)
         manifest = [
             {
                 "key": e.key,
