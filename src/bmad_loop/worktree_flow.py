@@ -1516,12 +1516,12 @@ class WorktreeFlow:
                     paths=paths,
                 ),
             )
-        except (verify.GitError, OSError) as e:
-            # OSError joins GitError because clean_incoming_collisions mutates the
-            # checkout directly (unlink/iterdir/rmdir) — a non-spawn FS fault the
-            # #343 chokepoint cannot translate. Crashing here would strand a DONE
-            # unit mid-merge; the keep-branch escalation is the point of this guard.
-            if isinstance(e, (verify.GitSpawnError, OSError)):
+        except (verify.GitError, OSError, RuntimeError) as e:
+            # OSError/RuntimeError join GitError because clean_incoming_collisions
+            # mutates the checkout directly (resolve/unlink/iterdir/rmdir) — non-spawn
+            # FS faults the #343 chokepoint cannot translate. Crashing here would
+            # strand a DONE unit mid-merge; keep-branch escalation is this boundary.
+            if isinstance(e, (verify.GitSpawnError, OSError, RuntimeError)):
                 # environment fault (spawn failure or direct-FS error) — there may
                 # be no stray files at all, so no "clean them" guidance: the inner
                 # error is the diagnosis.

@@ -10,6 +10,7 @@ from conftest import (
     _FAIL,
     _OK,
     MISSING_TOOL_CMD,
+    UNRESOLVABLE,
     fault_read_text,
     git,
     make_git_noisy,
@@ -1719,6 +1720,118 @@ def test_safe_rollback_prunes_emptied_dirs(project):
     assert not (repo / "tmpdir").exists()  # emptied parent dirs pruned
 
 
+def test_safe_rollback_resolution_failure_precedes_every_mutation(project, monkeypatch):
+    """A cleanup target that cannot be canonicalized fails typed before stash,
+    reset, unlink, or directory pruning, preserving both the checkout and the
+    original path fault as the diagnostic cause.
+
+    Ablation target: move `_rollback_cleanup_plan` below `stash create` or
+    `reset --hard`, and this test fails on the recorded destructive git call before
+    the injected resolution failure; narrow its exception translation and the
+    `GitError`/cause assertions fail instead.
+    """
+    repo = project.project
+    baseline = verify.rev_parse_head(repo)
+    snap = sorted(verify.untracked_files(repo))
+    created = repo / "uncertain" / "created.txt"
+    created.parent.mkdir()
+    created.write_text("run-created\n")
+    (repo / "src.txt").write_text("tracked attempt\n")
+    refuse_to_resolve(monkeypatch, created)
+
+    git_calls: list[tuple[str, ...]] = []
+    removals: list[tuple[str, Path]] = []
+    real_git = verify._git
+    real_git_out = verify._git_out
+    real_unlink = Path.unlink
+    real_rmdir = Path.rmdir
+
+    def spy_git(r, *args):
+        git_calls.append(args)
+        return real_git(r, *args)
+
+    def spy_git_out(r, *args, env=None):
+        git_calls.append(args)
+        return real_git_out(r, *args, env=env)
+
+    def spy_unlink(self, *args, **kwargs):
+        removals.append(("unlink", self))
+        return real_unlink(self, *args, **kwargs)
+
+    def spy_rmdir(self, *args, **kwargs):
+        removals.append(("rmdir", self))
+        return real_rmdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(verify, "_git", spy_git)
+    monkeypatch.setattr(verify, "_git_out", spy_git_out)
+    monkeypatch.setattr(Path, "unlink", spy_unlink)
+    monkeypatch.setattr(Path, "rmdir", spy_rmdir)
+
+    with pytest.raises(verify.GitError, match="preflight rollback cleanup") as caught:
+        verify.safe_rollback(repo, baseline, baseline_untracked=snap)
+
+    assert isinstance(caught.value.__cause__, OSError)
+    assert UNRESOLVABLE in str(caught.value.__cause__)
+    assert not any(
+        args[:2] in {("stash", "create"), ("reset", "--hard")} for args in git_calls
+    )  # the read-only untracked probe ran, but no git mutation crossed the boundary
+    assert removals == []  # no unlink/rmdir ran on an uncertain plan
+    assert created.read_text() == "run-created\n"
+    assert (repo / "src.txt").read_text() == "tracked attempt\n"
+
+
+def test_safe_rollback_consumes_only_the_precomputed_confined_plan(project, tmp_path, monkeypatch):
+    """A healthy plan removes and prunes a confined created path, preserves a kept
+    path and an external symlink target, and performs no second resolution after
+    `reset --hard` crosses the mutation boundary.
+
+    INVERSE ablation: restore the post-reset `repo.resolve()`/per-target resolve
+    loop or make `_prune_empty_parents` resolve its start again, and the exact-path
+    refusal installed by the reset spy makes this test fail before the planned
+    cleanup is consumed.
+    """
+    repo = project.project
+    baseline = verify.rev_parse_head(repo)
+    snap = sorted(verify.untracked_files(repo))
+    created = repo / "tmpdir" / "sub" / "created.txt"
+    created.parent.mkdir(parents=True)
+    created.write_text("remove me\n")
+    kept = repo / ".bmad-loop" / "keep.txt"
+    kept.parent.mkdir()
+    kept.write_text("keep me\n")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("operator data\n")
+    external_link = repo / "external-link.txt"
+    external_link.symlink_to(outside)
+    (repo / "src.txt").write_text("tracked attempt\n")
+
+    real_git = verify._git
+
+    def refuse_after_reset(r, *args):
+        result = real_git(r, *args)
+        if args[:2] == ("reset", "--hard"):
+            refuse_to_resolve(
+                monkeypatch,
+                repo,
+                repo / ".bmad-loop",
+                created,
+                created.parent,
+                external_link,
+            )
+        return result
+
+    monkeypatch.setattr(verify, "_git", refuse_after_reset)
+
+    verify.safe_rollback(repo, baseline, baseline_untracked=snap)
+
+    assert (repo / "src.txt").read_text() == "original\n"
+    assert not created.exists()
+    assert not (repo / "tmpdir").exists()  # precomputed parents were pruned
+    assert kept.read_text() == "keep me\n"
+    assert external_link.is_symlink()  # external canonical targets are never removed
+    assert outside.read_text() == "operator data\n"
+
+
 def test_safe_rollback_preserves_tracked_artifact(project):
     """`preserve` keeps a *tracked* artifact edit (the resolve workflow's corrected
     spec) alive through the hard reset, while a tracked source edit is still
@@ -2961,6 +3074,58 @@ def test_commit_paths_commits_only_listed(project):
     status = git(project.project, "status", "--porcelain")
     assert "other.txt" in status
     assert "src.txt" not in status
+
+
+def test_commit_paths_repo_resolution_failure_precedes_staging(project, monkeypatch):
+    """An uncertain repository root is a typed exact-write failure before any
+    candidate can be staged; it is never converted into an empty successful commit.
+
+    Ablation target: remove the repo-root translation guard and this test fails on
+    the raw OSError instead of `GitError`; replace it with a lexical/empty fallback
+    and the no-staging/no-success assertions fail.
+    """
+    repo = project.project
+    target = repo / "src.txt"
+    target.write_text("exact write\n")
+    refuse_to_resolve(monkeypatch, repo)
+    git_calls: list[tuple[str, ...]] = []
+    real_git = verify._git
+
+    def spy_git(r, *args):
+        git_calls.append(args)
+        return real_git(r, *args)
+
+    monkeypatch.setattr(verify, "_git", spy_git)
+
+    with pytest.raises(verify.GitError, match="repository root for exact commit") as caught:
+        verify.commit_paths(repo, "chore: exact", [target])
+
+    assert isinstance(caught.value.__cause__, OSError)
+    assert not any(args[:1] == ("add",) for args in git_calls)
+    assert target.read_text() == "exact write\n"
+
+
+def test_commit_paths_omits_only_an_uncertain_candidate(project, monkeypatch):
+    """Per-path uncertainty drops that candidate while a healthy sibling retains
+    its input order and is the only path staged and committed.
+
+    Ablation target: narrow the candidate guard back to `ValueError` and this test
+    fails on the injected OSError before the healthy sibling can be committed.
+    """
+    repo = project.project
+    uncertain = repo / "src.txt"
+    uncertain.write_text("operator edit\n")
+    healthy = repo / "healthy.txt"
+    healthy.write_text("commit me\n")
+    refuse_to_resolve(monkeypatch, uncertain)
+
+    sha = verify.commit_paths(repo, "chore: healthy only", [uncertain, healthy])
+
+    assert sha is not None
+    assert git(repo, "show", "--format=", "--name-only", sha).splitlines() == ["healthy.txt"]
+    status = git(repo, "status", "--porcelain")
+    assert "src.txt" in status  # uncertain path stayed uncommitted
+    assert "healthy.txt" not in status
 
 
 def test_commit_paths_noop_when_unchanged(project):

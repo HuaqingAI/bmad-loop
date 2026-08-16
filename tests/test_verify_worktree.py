@@ -6,7 +6,7 @@ helpers carry no engine wiring yet — they are the plumbing Phase 3 builds on.
 """
 
 import pytest
-from conftest import git, make_git_noisy
+from conftest import git, make_git_noisy, refuse_to_resolve
 
 from bmad_loop import verify
 
@@ -535,6 +535,32 @@ def test_clean_incoming_collisions_prunes_emptied_dirs(project, tmp_path):
     cleaned = verify.clean_incoming_collisions(repo, "main", "feat")
     assert cleaned == ["Assets/Tests/Leak.cs"]
     assert not (repo / "Assets").exists()  # emptied dirs pruned back to root
+
+
+@pytest.mark.parametrize("refused", ["repo-root", "prune-parent"])
+def test_clean_incoming_collisions_resolution_fault_precedes_deletion(
+    project, tmp_path, monkeypatch, refused
+):
+    """Repo-root and prune-parent uncertainty propagate as direct filesystem
+    failures before the incoming untracked path is unlinked.
+
+    Ablation target: move the prune-parent resolve back below `fp.unlink`, and the
+    `prune-parent` row fails because the injected fault arrives after the leak was
+    deleted; move repo-root resolution below cleanup and the `repo-root` row fails
+    for the same destructive-first reason.
+    """
+    repo = project.project
+    _branch_with(repo, tmp_path, adds={"Assets/Tests/Leak.cs": "branch\n"})
+    leak = repo / "Assets" / "Tests" / "Leak.cs"
+    leak.parent.mkdir(parents=True, exist_ok=True)
+    leak.write_text("editor leaked\n")
+    refuse_to_resolve(monkeypatch, repo if refused == "repo-root" else leak.parent)
+
+    with pytest.raises(OSError):
+        verify.clean_incoming_collisions(repo, "main", "feat")
+
+    assert leak.read_text() == "editor leaked\n"  # uncertain cleanup never ran
+    assert leak.parent.is_dir()  # nor did its prune chain start
 
 
 def test_clean_incoming_collisions_prune_keeps_dir_holding_a_stray(project, tmp_path):

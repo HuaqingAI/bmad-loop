@@ -12,7 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from conftest import git
+from conftest import git, refuse_to_resolve
 
 from bmad_loop import verify
 from bmad_loop.gates import ATTENTION_FILE
@@ -104,7 +104,7 @@ def _make_flow(
         raise _Pause(reason, task.story_key)
 
     def _pause(reason, story_key="", *, cause=None):
-        calls.pauses.append((reason, story_key))
+        calls.pauses.append((reason, story_key, cause))
         raise _Pause(reason, story_key)
 
     flow = RecoveryFlow(
@@ -901,6 +901,43 @@ def test_safe_reset_reverts_tracked_and_keeps_baseline(project):
     flow.safe_reset(task)
 
     assert rev_parse_head(repo) == task.baseline_commit
+
+
+def test_safe_reset_preflight_failure_journals_and_pauses_redrive(project, monkeypatch):
+    """A typed cleanup-preflight refusal is journaled and passed to the injected
+    pause as its exact cause; the resolved re-drive stops before post-rollback or
+    any destructive reset can run.
+
+    Ablation target: delete the `except RollbackPreflightError` journal/pause block
+    and this test fails on the uncaught typed error; delete only `_pause` and it
+    fails because `post_rollback` continues and the expected pause is absent.
+    """
+    repo = project.project
+    ws = Workspace.default(project)
+    flow = _make_flow(workspace=ws)
+    task = _task(repo)
+    created = repo / "uncertain" / "created.txt"
+    created.parent.mkdir()
+    created.write_text("run-created\n")
+    (repo / "src.txt").write_text("tracked attempt\n")
+    refuse_to_resolve(monkeypatch, created)
+    monkeypatch.setattr(flow, "preserve_attempt_commits", lambda *args, **kwargs: None)
+    monkeypatch.setattr(flow, "preserve_attempt_worktree", lambda *args, **kwargs: None)
+
+    with pytest.raises(_Pause):
+        flow.rollback_or_pause(task, cause="resolved")
+
+    failure = flow.journal.fields("rollback-reset-failed")
+    assert "preflight rollback cleanup" in failure["error"]
+    assert len(flow.calls.pauses) == 1
+    reason, story_key, cause = flow.calls.pauses[0]
+    assert story_key == task.story_key
+    assert isinstance(cause, verify.RollbackPreflightError)
+    assert cause is not None and cause.__cause__ is not None
+    assert str(cause) in reason
+    assert flow.calls.emits == ["pre_rollback"]  # no post-reset re-drive continuation
+    assert (repo / "src.txt").read_text() == "tracked attempt\n"
+    assert created.read_text() == "run-created\n"
 
 
 # --------------------------------------------------------------- prune

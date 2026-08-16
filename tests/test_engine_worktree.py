@@ -3025,25 +3025,26 @@ def test_merge_tolerates_untracked_stray_in_main_checkout(project):
     "make_exc",
     [
         lambda: OSError(13, "Permission denied"),
+        lambda: RuntimeError("Permission denied while resolving collision cleanup"),
         lambda: verify.GitSpawnError("git status failed to spawn: Permission denied"),
     ],
-    ids=["fs-oserror", "git-spawn"],
+    ids=["fs-oserror", "fs-runtimeerror", "git-spawn"],
 )
 def test_merge_env_fault_during_target_clean_keeps_branch_and_escalates(
     project, monkeypatch, make_exc
 ):
     """#343: `clean_incoming_collisions` mutates the checkout directly
-    (unlink/rmdir), so a non-spawn FS fault arrives as a plain OSError no
-    chokepoint can translate — and its git reads can raise a typed
-    GitSpawnError. The guard must treat both like any other reconcile
+    (resolve/unlink/rmdir), so non-spawn FS faults arrive as plain OSError or
+    RuntimeError values no chokepoint can translate — and its git reads can raise
+    a typed GitSpawnError. The guard must treat all three like any other reconcile
     failure: keep the branch and escalate rather than crash a DONE unit
     mid-merge — and the escalation must name the environment fault, not
     claim stray uncommitted files that may not exist.
 
-    Ablation targets: narrow the guard in `merge_local` back to
-    `verify.GitError` and the fs-oserror case fails — the OSError crashes the
-    run. Revert the reason branch to the unconditional stray-files text and
-    both cases fail on the message assertions."""
+    Ablation targets: remove `RuntimeError` only from `merge_local`'s catch and the
+    fs-runtimeerror row fails because the run crashes. Keep that catch but remove
+    `RuntimeError` only from its environmental `isinstance` arm and the same row
+    fails on stray-dirt guidance; the underlying-fault guidance is required."""
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
     engine, _ = make_engine(
         project,

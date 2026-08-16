@@ -230,15 +230,26 @@ class RecoveryFlow:
         pause. The BMAD artifact folders are always kept from untracked deletion;
         ``preserve`` (set only on a resolved re-drive) additionally keeps their
         *tracked* content alive through the reset, so a just-corrected spec is not
-        reverted. Sweep passes no ``preserve`` — it wants the broken ledger gone."""
+        reverted. Sweep passes no ``preserve`` — it wants the broken ledger gone.
+        A cleanup-preflight refusal is journaled and routed through the injected
+        pause before the re-drive can continue."""
         workspace = self._workspace_get()
-        verify.safe_rollback(
-            workspace.root,
-            task.baseline_commit or "",
-            baseline_untracked=task.baseline_untracked,
-            keep=(".bmad-loop", *self.protected_relpaths()),
-            preserve=preserve,
-        )
+        try:
+            verify.safe_rollback(
+                workspace.root,
+                task.baseline_commit or "",
+                baseline_untracked=task.baseline_untracked,
+                keep=(".bmad-loop", *self.protected_relpaths()),
+                preserve=preserve,
+            )
+        except verify.RollbackPreflightError as e:
+            self.journal.append("rollback-reset-failed", story_key=task.story_key, error=str(e))
+            self._pause(
+                f"automatic rollback for {task.story_key} could not safely start: {e}. "
+                "Fix the underlying filesystem fault, then resume the run.",
+                task.story_key,
+                cause=e,
+            )
 
     def restore_patch(self, task: StoryTask) -> None:
         """Re-apply the latched intent-gap patch (BMAD-METHOD #2564) onto the
