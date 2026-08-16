@@ -83,6 +83,35 @@ class BaseDialog(ModalScreen):
         min-width: 4;
         margin-left: 1;
     }
+    /* The vertical twin. Before any body content a dialog spends 10 rows of
+       chrome: 2 border (1 per side — every Textual border STYLE is exactly one
+       cell, so `thick` -> `round` would save nothing), 2 padding, 1 title,
+       1 title margin-bottom, 1 .buttons margin-top and 3 for the button row
+       (Textual's Button is `border: tall`, so a one-line label is 3 rows).
+       `max-height: 90%` then turns those 10 rows into a per-modal terminal-height
+       floor of 12-14. Under `-short` the chrome collapses to 4 rows — padding
+       0 1, no title margin, no button margin, a 1-row borderless button — and
+       max-height goes to 100% so the dialog may use the last row. The `#dialog`
+       BORDER IS DELIBERATELY KEPT: it is the only thing separating the dialog
+       from the dashboard rendered behind a ModalScreen, and the 2 rows it costs
+       are not needed to clear the floor. Nothing here sets a definite `height`
+       — that would balloon the bounded tier, see
+       test_short_confirm_modal_stays_compact — and nothing here touches `width`,
+       which is the `-narrow` axis above. */
+    BaseDialog.-short #dialog {
+        max-height: 100%;
+        padding: 0 1;
+    }
+    BaseDialog.-short .title {
+        margin-bottom: 0;
+    }
+    BaseDialog.-short .buttons {
+        margin-top: 0;
+    }
+    BaseDialog.-short .buttons Button {
+        height: 1;
+        border: none;
+    }
     """
 
     # Textual applies the matching breakpoint class to the Screen itself on
@@ -95,6 +124,18 @@ class BaseDialog(ModalScreen):
     # DashboardScreen leave their breakpoints at the default, so the dashboard
     # is unaffected.
     HORIZONTAL_BREAKPOINTS = [(0, "-narrow"), (60, "-wide")]
+
+    # Same mechanism on the other axis: `-short` means "the terminal is under 20
+    # rows". 20 is chosen to sit clear of the tallest measured pre-fix frame
+    # floor — the height at which every docked control of a modal is fully
+    # on-screen: ConfirmModal 12, StartSweep 13, StoryCheckpoint 13, and 14 for
+    # ConfirmModal WITH a warning (the ConfirmResumeModal case, whose
+    # double-drive warning gates a destructive confirm and is docked outside
+    # #body). The compact layout has to engage before anything clips, not at the
+    # moment it does, so the threshold is above 14 rather than on it. It is also
+    # below the 24 rows of a default terminal, so an ordinary window still gets
+    # the full chrome.
+    VERTICAL_BREAKPOINTS = [(0, "-short"), (20, "-tall")]
 
     BINDINGS = [Binding("escape", "cancel", "cancel")]
 

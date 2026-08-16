@@ -22,6 +22,21 @@ Linux, so tmux works there unchanged; native Windows awaits a Windows-capable ba
 `bmad-loop mux` shows which backend is selected and why, and the Settings editor's
 `mux.backend` (or the `BMAD_LOOP_MUX_BACKEND` env var) forces the choice per machine.
 
+**Minimum terminal size.** The modal dialogs — confirmations, the start/sweep
+option forms, the escalation and checkpoint viewers — are the tightest thing the
+TUI draws, and **39 columns × 9 rows** is the floor at which every one of them
+still shows its title, a row of body, and all of its docked action buttons. That
+is a floor for the dialogs specifically, not for the dashboard behind them,
+which simply shows fewer rows as the window shrinks. Below **60 columns or 20
+rows** the dialogs degrade to a compact layout rather than clipping: the dialog
+clamps to the screen width, the action buttons shrink and tighten, and vertically
+the padding, the title margin and the button-row margin collapse while the
+buttons render one row tall instead of three. At 60 columns and 20 rows and above
+you get the full chrome, unchanged. The height floor is width-dependent where a
+dialog docks a wrapping warning — the escalation viewer needs 9 rows at 39
+columns but only 6 at 80 — so a roomier window buys height as well as width
+(#281).
+
 Over a slow or high-latency link (SSH, Tailscale), a 60fps update stream can't
 drain in time and partial frames paint over old ones. Launch with
 `bmad-loop tui --low-frame-rate` to cap Textual to 15fps and disable
