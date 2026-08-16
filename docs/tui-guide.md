@@ -27,7 +27,13 @@ option forms, the escalation and checkpoint viewers — are the tightest thing t
 TUI draws, and **39 columns × 9 rows** is the floor at which every one of them
 still shows its title, a row of body, and all of its docked action buttons. That
 is a floor for the dialogs specifically, not for the dashboard behind them,
-which simply shows fewer rows as the window shrinks. Below **60 columns or 20
+which simply shows fewer rows as the window shrinks. One dialog is outside that
+floor: the spec viewer's plan-checkpoint variant docks four buttons (`copy
+path`, `Approve & resume`, `Request replan`, `close`) whose labels alone are
+wider than a 39-column dialog's content region, so no amount of shrinking the
+button metrics makes them fit. It needs 77 columns — with one isolated
+59-column window where the narrow metrics happen to line up — and wrapping that
+row is tracked separately (#628). Below **60 columns or 20
 rows** the dialogs degrade to a compact layout rather than clipping: the dialog
 clamps to the screen width, the action buttons shrink and tighten, and vertically
 the padding, the title margin and the button-row margin collapse while the
