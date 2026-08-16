@@ -325,9 +325,11 @@ breaking changes may land in a minor release.
   no title margin, a one-row button row — rather than clipping its docked buttons and safety
   warnings. `docs/tui-guide.md` accordingly documents a supported minimum terminal size, **39
   columns × 9 rows**, which is a new user-facing contract; it is a floor for the dialogs
-  specifically, not for the dashboard behind them, and it excludes the spec viewer's
-  plan-checkpoint variant, whose four button labels are wider than a 39-column dialog can hold
-  (#628). At 60 columns and 20 rows and above the full chrome renders exactly as it does today.
+  specifically, not for the dashboard behind them, and it excludes the two viewers that dock
+  chrome which wraps — the validate-findings header needs one more row at 39 columns (#629), and
+  the spec viewer's `copy path` button plus its action verbs are wider than a 39-column dialog can
+  hold (#628). At 60 columns and 20 rows and above the full chrome renders exactly as it does
+  today.
 
 ## [0.10.0] — 2026-08-14
 

@@ -27,13 +27,19 @@ option forms, the escalation and checkpoint viewers — are the tightest thing t
 TUI draws, and **39 columns × 9 rows** is the floor at which every one of them
 still shows its title, a row of body, and all of its docked action buttons. That
 is a floor for the dialogs specifically, not for the dashboard behind them,
-which simply shows fewer rows as the window shrinks. One dialog is outside that
-floor: the spec viewer's plan-checkpoint variant docks four buttons (`copy
-path`, `Approve & resume`, `Request replan`, `close`) whose labels alone are
-wider than a 39-column dialog's content region, so no amount of shrinking the
-button metrics makes them fit. It needs 77 columns — with one isolated
-59-column window where the narrow metrics happen to line up — and wrapping that
-row is tracked separately (#628). Below **60 columns or 20
+which simply shows fewer rows as the window shrinks. Two viewers sit outside
+that floor, both because they dock chrome that wraps: wrapped lines are content,
+so the compact layout cannot collapse them the way it collapses padding. The
+validate-findings viewer's header wraps to five lines at 39 columns and so needs
+**one more row** — 39 × 10 — while a wider window that lets the header wrap less
+needs no extra row at all (#629). The spec viewer docks a `copy path` button
+alongside its action verbs,
+whose labels alone are wider than a 39-column dialog's content region, and it
+prints the full spec path above the body, so a path long enough to wrap can push
+the action row off a 9-row screen altogether. Its floor is therefore a function
+of the spec path and of which action verbs the caller supplies rather than a
+single number, and a standard **80 × 24** terminal shows either variant in full.
+Wrapping that row is tracked separately (#628). Below **60 columns or 20
 rows** the dialogs degrade to a compact layout rather than clipping: the dialog
 clamps to the screen width, the action buttons shrink and tighten, and vertically
 the padding, the title margin and the button-row margin collapse while the
