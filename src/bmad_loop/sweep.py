@@ -20,7 +20,7 @@ from typing import Any, Callable, Iterable
 from . import deferredwork, gates, verify
 from .engine import Engine, RunPaused
 from .escalation import critical_escalations, env_fault_pause_reason, session_failure_reason
-from .model import PAUSE_ESCALATION, Phase, StoryTask
+from .model import PAUSE_STORY_GATE, Phase, StoryTask
 from .platform_util import atomic_write_text, neutralize_surrogates
 from .statemachine import advance
 from .workspace import discard_worktree
@@ -807,6 +807,17 @@ class SweepEngine(Engine):
         # is. The operator renumbers the ids and resumes, and this re-reads the
         # ledger and lets the migration run — an ESCALATED task would also spend
         # the migration attempt budget on a rewrite that never happened.
+        #
+        # PAUSE_STORY_GATE, NOT PAUSE_ESCALATION, and the pairing is the point:
+        # the stage picks the recovery UI, and every escalation action
+        # (`runs.rearm_story`, the TUI's Resolve) requires the task to be
+        # Phase.ESCALATED, which this one deliberately is not — so an escalation
+        # stage here would offer the operator only actions that must fail. The
+        # gate stage routes to a viewer whose single action is "resume", which
+        # is the whole remedy once the ids are renumbered. `_refuse_gated_story`
+        # already pauses this way with a task that is not escalated: same
+        # contract — the deferred-work ledger blocks the run, a human edits it,
+        # the resume re-reads it.
         dupes = duplicate_ids(deferredwork.parse_ledger(text))
         if dupes:
             reason = (
@@ -823,7 +834,7 @@ class SweepEngine(Engine):
                 f"{reason} — then `bmad-loop resume {self.state.run_id}`",
             )
             self._save()
-            raise RunPaused(reason, PAUSE_ESCALATION, MIGRATE_KEY)
+            raise RunPaused(reason, PAUSE_STORY_GATE, MIGRATE_KEY)
 
         legacy = deferredwork.parse_legacy(text)
         pre_canonical = snapshot_canonical(text)

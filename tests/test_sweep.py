@@ -30,7 +30,7 @@ from bmad_loop import verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.journal import Journal, load_state, save_state
-from bmad_loop.model import PAUSE_ESCALATION, Phase, RunState, StoryTask, TokenUsage
+from bmad_loop.model import PAUSE_STORY_GATE, Phase, RunState, StoryTask, TokenUsage
 from bmad_loop.policy import (
     AdapterPolicy,
     DevPolicy,
@@ -3347,7 +3347,10 @@ def test_migration_refuses_a_ledger_carrying_duplicate_dw_ids(project):
     assert summary.paused
     # PENDING, not ESCALATED: the refusal is re-askable after a renumber
     assert engine.state.tasks["sweep-migrate"].phase == Phase.PENDING
-    assert engine.state.paused_stage == PAUSE_ESCALATION
+    # the GATE stage, not the escalation one: every escalation recovery action
+    # requires Phase.ESCALATED, which this task deliberately is not, so an
+    # escalation stage would offer the operator only actions that must fail
+    assert engine.state.paused_stage == PAUSE_STORY_GATE
     # refused BEFORE the rewrite — no migration session was ever dispatched
     assert adapter.sessions == []
     # the ledger is untouched (text, not bytes: the fixture reached disk through
