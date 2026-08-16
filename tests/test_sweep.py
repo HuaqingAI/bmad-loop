@@ -3331,9 +3331,14 @@ def test_migration_refuses_a_ledger_carrying_duplicate_dw_ids(project):
     pause: the operator renumbers and resumes, and the migration then runs with
     its full attempt budget intact.
 
-    Ablation: delete the `dupes`/`RunPaused` guard in `_ensure_migration` and
-    this test fails; the `validate_migration` gate-token unit tests stay green,
-    since they build their snapshots from single-entry fixtures."""
+    Ablation, two independent axes:
+    - delete the `dupes`/`RunPaused` guard in `_ensure_migration` and this test
+      fails; the `validate_migration` gate-token unit tests stay green, since
+      they build their snapshots from single-entry fixtures.
+    - move the guard back BELOW the `if not task.baseline_commit:` stamp and
+      only the `baseline_commit is None` assertion fails — the pause itself is
+      unaffected, which is why that assertion has to be here rather than being
+      read off the refusal."""
     before = (
         "# Deferred Work\n\n" + _gated_dw1("gate: 3-2") + "\n" + _gated_dw1("gate: 3-3") + "\n"
         "## Deferred from: epic 1 review (2026-04-06)\n\n"
@@ -3353,6 +3358,11 @@ def test_migration_refuses_a_ledger_carrying_duplicate_dw_ids(project):
     assert engine.state.paused_stage == PAUSE_STORY_GATE
     # refused BEFORE the rewrite — no migration session was ever dispatched
     assert adapter.sessions == []
+    # ...and before the baseline stamp, so the pause strands nothing for a later
+    # `_safe_reset` to rewind to. Stamped first, an operator who renumbers and
+    # resumes loses that repair the moment the migration session env-faults: the
+    # next resume resets the tree to this pre-repair HEAD and lands back here.
+    assert engine.state.tasks["sweep-migrate"].baseline_commit is None
     # the ledger is untouched (text, not bytes: the fixture reached disk through
     # `write_text`, so a byte assertion would read CRLF on Windows only)
     assert project.deferred_work.read_text(encoding="utf-8") == before

@@ -787,10 +787,15 @@ class SweepEngine(Engine):
                 self._safe_reset(task)  # a session died mid-rewrite; restore our ledger
                 text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
             task.phase = Phase.PENDING  # deliberate reset, not a normal transition
-        if not task.baseline_commit:
-            task.baseline_commit = verify.rev_parse_head(self.workspace.root)
-            task.baseline_untracked = sorted(verify.untracked_files(self.workspace.root))
-
+        # **Placement is load-bearing**: this sits ABOVE the baseline stamp
+        # below, so a refusal that dispatches nothing leaves no baseline behind.
+        # Stamped first, the pause would strand `baseline_commit` on the
+        # pre-repair HEAD; the operator renumbers and resumes, and if that
+        # migration session then env-faults, the next resume's `_safe_reset`
+        # rewinds the tree to that stale baseline and destroys the repair,
+        # landing back on this same pause. It still sits BELOW the resume/reset
+        # block, because the ledger this reads must be the restored one.
+        #
         # Refused BEFORE a rewrite is dispatched, not after one is graded (#519).
         # A ledger where one id names two entries is corrupt in a way the format
         # cannot express, and there is no automatic outcome that is right: this
@@ -824,7 +829,7 @@ class SweepEngine(Engine):
                 f"{ledger.name} carries duplicate DW ids: {', '.join(dupes)} — one id "
                 "names more than one entry, so no migration of it can both preserve "
                 "the entries and produce a valid ledger; renumber or merge them by "
-                "hand, then re-run the sweep"
+                "hand and COMMIT the fix, then resume"
             )
             self.journal.append("migrate-duplicate-ids", story_key=MIGRATE_KEY, dw_ids=list(dupes))
             gates.notify(
@@ -835,6 +840,10 @@ class SweepEngine(Engine):
             )
             self._save()
             raise RunPaused(reason, PAUSE_STORY_GATE, MIGRATE_KEY)
+
+        if not task.baseline_commit:
+            task.baseline_commit = verify.rev_parse_head(self.workspace.root)
+            task.baseline_untracked = sorted(verify.untracked_files(self.workspace.root))
 
         legacy = deferredwork.parse_legacy(text)
         pre_canonical = snapshot_canonical(text)
