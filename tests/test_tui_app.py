@@ -1901,6 +1901,10 @@ async def test_validate_findings_modal_floor_moves_with_its_header(project, kwar
         app.push_screen(modal)
         await until(pilot, lambda: app.screen is modal)
         await ready(pilot, "#findings")
+        # the header is the thing that moves this floor, so assert it too: a
+        # regression that clipped it would otherwise leave #ok reachable and
+        # pass
+        assert _on_screen(app, app.screen.query(".title").first())
         assert _on_screen(app, app.screen.query_one("#ok"))
 
 
@@ -1933,6 +1937,9 @@ async def test_long_docked_title_still_fits_a_standard_terminal(project, chars):
         app.push_screen(modal)
         await until(pilot, lambda: app.screen is modal)
         await ready(pilot, "#entry")
+        # the wrapped heading is what costs the rows here, so a clipped title is
+        # the regression this test exists to catch, not just an unreachable #ok
+        assert _on_screen(app, app.screen.query(".title").first())
         assert _on_screen(app, app.screen.query_one("#ok"))
 
 
