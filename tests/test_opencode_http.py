@@ -2115,14 +2115,14 @@ def test_dev_activity_rearms_launch_stall_grace(tmp_path, monkeypatch):
 
 
 def test_dev_busy_status_rearms_launch_stall_grace_without_nudging(tmp_path, monkeypatch):
-    """OpenCode busy/retry proof protects work until the absolute timeout.
+    """OpenCode busy/retry proof protects work after the nudge budget is spent.
 
-    Ablation target: force the busy-status guard to fall through and this test
-    records a nudge or stalls instead of reaching the timeout with no send.
+    Ablation target: move the busy-status guard back under the positive nudge-
+    budget branch and this test stalls instead of reaching the timeout.
     """
     adapter, _ = make_dev_adapter(tmp_path)
     adapter._stall_grace_s = 10.0
-    adapter._stall_nudges = 2
+    adapter._stall_nudges = 0
     adapter.silence_threshold_s = float("inf")
     clock = _install_clock(monkeypatch)
     (adapter.tasks_dir / "t-1").mkdir(parents=True)

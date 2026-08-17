@@ -1263,20 +1263,21 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                             stall_deadline = time.monotonic() + self._stall_grace_s
                             continue
                         if time.monotonic() >= stall_deadline:
+                            if self._session_status(sess):
+                                # Provably mid-turn (a busy child/parent the
+                                # SSE missed): re-arm rather than injecting a
+                                # prompt into a working session or declaring
+                                # it stalled after the nudge budget is spent.
+                                stall_deadline = time.monotonic() + self._stall_grace_s
+                                continue
                             if stall_nudges_left > 0 and (
                                 spec.stall_nudges_cap is None
                                 or stall_nudges_sent < spec.stall_nudges_cap
                             ):
-                                if self._session_status(sess):
-                                    # Provably mid-turn (a busy child/parent the
-                                    # SSE missed): re-arm rather than injecting a
-                                    # prompt into a working session. Unknown
-                                    # (None) proceeds to the nudge — a transport
-                                    # too broken to answer the probe would fail
-                                    # the nudge too, and burning the bounded
-                                    # budget converges to an honest stall.
-                                    stall_deadline = time.monotonic() + self._stall_grace_s
-                                    continue
+                                # Unknown status (None) proceeds to the nudge —
+                                # a transport too broken to answer the probe
+                                # would fail the nudge too, and burning the
+                                # bounded budget converges to an honest stall.
                                 stall_nudges_left -= 1
                                 stall_nudges_sent += 1
                                 self.send_text(handle, STALL_NUDGE_TEXT)
