@@ -1108,6 +1108,172 @@ def test_dev_stall_grace_defaults_from_policy(tmp_path):
     assert base._stall_grace_s == 0.0
 
 
+# -------------------- launch-stall + dead-window nudge parity (#470/#504)
+#
+# Two-way contract-parity link: tests/test_opencode_http.py carries identically
+# named tests under its matching header (phase 2 adds that reciprocal link).
+# Changes to the shared completion-loop behavior must update both transports or
+# record the deliberate divergence.
+
+
+def _frozen_stall_clock(monkeypatch):
+    clock = {"t": 1000.0}
+
+    class _Clock:
+        monotonic = staticmethod(lambda: clock["t"])
+        time = staticmethod(lambda: 0.0)  # wall co-bound stays frozen
+        sleep = staticmethod(lambda *_: None)
+        time_ns = staticmethod(lambda: 0)
+
+    monkeypatch.setattr(generic, "time", _Clock)
+    return clock
+
+
+def test_dev_stall_arms_at_launch_without_stop(tmp_path, monkeypatch):
+    """A silent dev/review turn is bounded even if no Stop hook ever arrives.
+
+    Ablation target: restore launch initialization of ``stall_deadline`` and
+    ``last_activity`` to ``None`` and this test times out with zero stall nudges.
+    """
+    mux = _UnitMux()
+    adapter, _ = make_dev_adapter(tmp_path, mux=mux)
+    adapter._stall_grace_s = 10.0
+    adapter._stall_nudges = 2
+    adapter._window_alive = lambda handle: True
+    log_path = adapter.logs_dir / "3-1-dev-1.log"
+    log_path.write_bytes(b"launch baseline\n")
+    clock = _frozen_stall_clock(monkeypatch)
+
+    heartbeats: list[dict] = []
+    adapter._write_heartbeat = lambda task_id, payload: heartbeats.append(payload)
+
+    def advance(call_n):
+        clock["t"] += 11.0
+
+    adapter.watcher = _ScriptedWatcher([], on_call=advance)
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=100.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+
+    assert (result.status, [text for _, text in mux.sent]) == (
+        "stalled",
+        [generic.STALL_NUDGE_TEXT] * 2,
+    )
+    assert heartbeats[0]["stall_armed"] is True
+
+
+def test_dev_activity_rearms_launch_stall_grace(tmp_path, monkeypatch):
+    """Two productive launch ticks re-arm grace; the first silent full grace stalls.
+
+    Ablation target: restore a disarmed launch deadline and this no-Stop test
+    reaches the wall timeout instead of tracking activity and stalling on call 3.
+    """
+    mux = _UnitMux()
+    adapter, _ = make_dev_adapter(tmp_path, mux=mux)
+    adapter._stall_grace_s = 10.0
+    adapter._stall_nudges = 0
+    adapter._window_alive = lambda handle: True
+    log_path = adapter.logs_dir / "3-1-dev-1.log"
+    log_path.write_bytes(b"launch baseline\n")
+    clock = _frozen_stall_clock(monkeypatch)
+
+    def advance_and_stream(call_n):
+        clock["t"] += 11.0
+        if call_n <= 2:
+            with log_path.open("ab") as stream:
+                stream.write(b"productive tick\n")
+
+    adapter.watcher = _ScriptedWatcher([], on_call=advance_and_stream)
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=100.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+
+    assert result.status == "stalled"
+    assert adapter.watcher.calls == 3
+    assert mux.sent == []
+
+
+def test_dev_stall_nudge_send_failure_reaches_liveness_verdict(tmp_path, monkeypatch):
+    """A failed launch-stall nudge defers the verdict to the next liveness probe.
+
+    Ablation target: remove the stall-nudge ``MultiplexerError`` guard and this
+    test fails on ``window gone`` before the ordinary crash path can run.
+    """
+    mux = _UnitMux()
+
+    def fail_send(window_id, text):
+        mux.sent.append((window_id, text))
+        raise MultiplexerError("window gone")
+
+    mux.send_text = fail_send
+    adapter, _ = make_dev_adapter(tmp_path, mux=mux)
+    adapter._stall_grace_s = 10.0
+    adapter._stall_nudges = 2
+    result_reads: list[bool] = []
+    real_result_json = adapter._result_json
+
+    def spy_result_json(handle, spec, *, wait):
+        result_reads.append(wait)
+        return real_result_json(handle, spec, wait=wait)
+
+    monkeypatch.setattr(adapter, "_result_json", spy_result_json)
+    clock = _frozen_stall_clock(monkeypatch)
+    alive = iter((True, False))
+    adapter._window_alive = lambda handle: next(alive)
+
+    def cross_first_grace(call_n):
+        if call_n == 1:
+            clock["t"] += 11.0
+
+    adapter.watcher = _ScriptedWatcher([], on_call=cross_first_grace)
+    result = adapter.wait_for_completion(
+        _dev_handle(), dataclasses.replace(_dev_spec(tmp_path), timeout_s=100.0)
+    )
+
+    assert result.status == "crashed"
+    assert mux.sent == [("@1", generic.STALL_NUDGE_TEXT)]
+    assert adapter.watcher.calls == 2
+    assert result_reads == [False]  # dead-window _final performed ordinary artifact read-back
+
+
+def test_resultless_stop_nudge_send_failure_reaches_liveness_verdict(tmp_path, monkeypatch):
+    """A failed result-less-Stop nudge also leaves liveness in charge of verdicts.
+
+    Ablation target: remove the result-less-Stop ``MultiplexerError`` guard and
+    this test fails on ``window gone`` instead of returning the crash verdict.
+    """
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    mux = _UnitMux()
+
+    def fail_send(window_id, text):
+        mux.sent.append((window_id, text))
+        raise MultiplexerError("window gone")
+
+    mux.send_text = fail_send
+    adapter = make_adapter(tmp_path, mux=mux)
+    adapter._stop_nudges = 1
+    result_reads: list[bool] = []
+
+    def no_result(handle, spec, *, wait):
+        result_reads.append(wait)
+        return None
+
+    monkeypatch.setattr(adapter, "_result_json", no_result)
+    adapter._window_alive = lambda handle: False
+    _frozen_stall_clock(monkeypatch)
+    adapter.watcher = _ScriptedWatcher(
+        [_stop_event("3-1-dev-1", "sess", "/run/events.jsonl"), None]
+    )
+
+    result = adapter.wait_for_completion(
+        _dev_handle(), dataclasses.replace(_dev_spec(tmp_path), timeout_s=100.0)
+    )
+
+    assert result.status == "crashed"
+    assert mux.sent == [("@1", generic.NUDGE_TEXT)]
+    assert adapter.watcher.calls == 2
+    assert result_reads == [True, False]  # Stop await, then dead-window artifact read-back
+
+
 def test_dev_result_less_stop_awaits_reinvocation_then_completes(tmp_path, monkeypatch):
     """A dev session that ends its turn awaiting a background process emits a
     result-less Stop, then a later Stop once the work lands. With grace > 0 the
@@ -1718,7 +1884,7 @@ def test_heartbeat_written_and_throttled(tmp_path, monkeypatch):
     assert writes[0] == {
         "ts": 5000.0,
         "remaining_s": 100.0,
-        "stall_armed": False,
+        "stall_armed": True,
         "stall_nudges_sent": 0,
     }
     assert [w["remaining_s"] for w in writes] == [100.0, 59.0]  # tick 2 was throttled
