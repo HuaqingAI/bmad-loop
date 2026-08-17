@@ -50,6 +50,11 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **Overlong lowercase/kebab sweep bundle labels now proceed deterministically (#503).** An
+  otherwise valid name over 40 characters is truncated to 40, journaled and persisted before
+  validation, so the sweep proceeds without spending a feedback retry or pausing the run.
+  Post-truncation collisions and other invalid shapes still fail validation.
+
 - **Silent OpenCode parent sessions now enter bounded recovery from launch (#411).** Parent/child
   SSE activity and a provably busy or retrying parent re-arm the grace; true silence spends the
   bounded nudge budget and is classified `stalled`. This neither prevents upstream subagent
