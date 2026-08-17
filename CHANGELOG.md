@@ -79,6 +79,11 @@ breaking changes may land in a minor release.
   verification-feedback routes retain their existing wording and precedence. A filesystem fault
   while observing the dispatch binding leaves that attempt unbound instead of aborting the run.
 
+- **Overlong lowercase/kebab sweep bundle labels now proceed deterministically (#503).** An
+  otherwise valid name over 40 characters is truncated to 40, journaled and persisted before
+  validation, so the sweep proceeds without spending a feedback retry or pausing the run.
+  Post-truncation collisions and other invalid shapes still fail validation.
+
 - **Silent OpenCode parent sessions now enter bounded recovery from launch (#411).** Parent/child
   SSE activity and a provably busy or retrying parent re-arm the grace; true silence spends the
   bounded nudge budget and is classified `stalled`. This neither prevents upstream subagent
@@ -404,6 +409,18 @@ breaking changes may land in a minor release.
   is a minimum these dialogs will always meet; a standard 80 × 24 terminal absorbed every measured
   example and the guide quotes it on those terms. At 60 columns and 20 rows and above the full
   chrome renders exactly as it does today.
+
+- **A deferred-work bundle whose name or key ends in a newline is now rejected instead of becoming a
+  directory (#330).** Both sweep regexes anchored with `$`, which in Python also matches just before
+  a single trailing newline, and every call site uses `.match()`. So a bundle named `fix-it\n`
+  validated clean and was used unsanitized as both the `run_dir/bundles/<name>/` path segment —
+  invalid on native Windows — and the `dw-<name>` story key, while a key of `dw-foo\n` silently
+  rebuilt a degraded bundle's intent under the different directory `foo`. Both patterns now anchor
+  with `\Z`. Only a name or key ending in exactly one bare LF flips to rejected; `\r\n`, `\n\n`, a
+  bare `\r`, a trailing space and any interior newline already were. A cached triage carrying such a
+  name now re-runs instead of crashing, and a pre-fix run-state task keyed that way becomes inert
+  rather than re-driven under a silently different name. Sweep-scoped: a bundle name is still not
+  guaranteed safe as a path segment.
 
 ## [0.10.0] — 2026-08-14
 

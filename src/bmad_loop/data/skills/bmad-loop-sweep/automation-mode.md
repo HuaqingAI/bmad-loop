@@ -57,8 +57,10 @@ field-by-field, and will kill this session after your final turn.
     orchestrator parses the ledger itself and compares.
   - Every open id appears in exactly ONE of already_resolved / bundles /
     blocked / skip / decisions. No misses, no duplicates, no invented ids.
-  - Bundle names: `^[a-z0-9][a-z0-9-]{1,39}$`, unique, non-empty `dw_ids`,
-    non-empty `intent`.
+  - Bundle names: `^[a-z0-9][a-z0-9-]{1,39}\Z`, unique, non-empty `dw_ids`,
+    non-empty `intent`. An otherwise-valid overlong bundle name or decision
+    option `bundle_name` is truncated to 40 characters and journaled before
+    validation; post-truncation name collisions still fail validation.
   - Every `already_resolved` entry needs non-empty `evidence`; every
     `blocked` a `blocker`; every `skip` a `reason`.
   - Decisions: >= 2 options with unique keys, `effect` one of
