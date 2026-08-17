@@ -136,6 +136,9 @@ def ledger_entries(project) -> dict:
 
 # ------------------------------------------------------- validate_triage
 
+_OVERLONG_BUNDLE_NAME = "integration-double-checkout-shared-client"
+_NORMALIZED_BUNDLE_NAME = _OVERLONG_BUNDLE_NAME[:40]
+
 
 def test_validate_triage_happy():
     rj = triage_result(
@@ -281,6 +284,196 @@ def test_bundle_key_re_refuses_a_trailing_newline():
     assert BUNDLE_KEY_RE.match("dw-foo").groups() == ("", "foo")
     assert BUNDLE_KEY_RE.match("dw2-foo").groups() == ("2", "foo")
     assert BUNDLE_KEY_RE.match("dw-c2-foo").group(2) == "c2-foo"
+
+
+def test_validate_triage_truncates_overlong_bundle_name():
+    """ABLATION A1: delete direct-bundle normalization and this fails on validation."""
+    rj = triage_result(
+        ["DW-1"],
+        bundles=[{"name": _OVERLONG_BUNDLE_NAME, "dw_ids": ["DW-1"], "intent": "fix it"}],
+    )
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert errors == []
+    assert plan is not None
+    assert plan.bundles[0].name == _NORMALIZED_BUNDLE_NAME
+    assert rj["bundles"][0]["name"] == _NORMALIZED_BUNDLE_NAME
+
+
+def test_validate_triage_truncates_overlong_decision_bundle_name():
+    """ABLATION A2: delete decision-option normalization and this fails validation."""
+    rj = triage_result(
+        ["DW-1"],
+        decisions=[
+            {
+                "id": "DW-1",
+                "question": "build it?",
+                "options": [
+                    {
+                        "key": "1",
+                        "label": "build",
+                        "effect": "build",
+                        "intent": "fix it",
+                        "bundle_name": _OVERLONG_BUNDLE_NAME,
+                    },
+                    {"key": "2", "label": "keep", "effect": "keep-open"},
+                ],
+                "recommendation": "1",
+            }
+        ],
+    )
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert errors == []
+    assert plan is not None
+    assert plan.decisions[0].option("1").bundle_name == _NORMALIZED_BUNDLE_NAME
+    assert rj["decisions"][0]["options"][0]["bundle_name"] == _NORMALIZED_BUNDLE_NAME
+
+
+def test_validate_triage_rejects_post_truncation_bundle_name_collision():
+    """ABLATION A1: delete direct normalization and the duplicate error disappears."""
+    shared_prefix = "a" * 40
+    rj = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[
+            {"name": shared_prefix + "x", "dw_ids": ["DW-1"], "intent": "fix one"},
+            {"name": shared_prefix + "y", "dw_ids": ["DW-2"], "intent": "fix two"},
+        ],
+    )
+
+    plan, errors = validate_triage(rj, {"DW-1", "DW-2"})
+
+    assert plan is None
+    assert f"duplicate bundle name {shared_prefix!r}" in errors
+
+
+@pytest.mark.parametrize("with_direct_bundle", [True, False], ids=["direct-decision", "decisions"])
+def test_validate_triage_rejects_post_truncation_decision_bundle_name_collision(
+    with_direct_bundle,
+):
+    """Selected build options cannot alias a direct or another decision bundle task."""
+    shared_prefix = "a" * 40
+
+    def decision(dw_id, suffix):
+        return {
+            "id": dw_id,
+            "question": "build it?",
+            "options": [
+                {
+                    "key": "1",
+                    "label": "build",
+                    "effect": "build",
+                    "intent": "fix it",
+                    "bundle_name": shared_prefix + suffix,
+                },
+                {"key": "2", "label": "keep", "effect": "keep-open"},
+            ],
+            "recommendation": "1",
+        }
+
+    bundles = (
+        [{"name": shared_prefix + "x", "dw_ids": ["DW-1"], "intent": "fix one"}]
+        if with_direct_bundle
+        else []
+    )
+    decisions = [decision("DW-2", "y")]
+    if not with_direct_bundle:
+        decisions.insert(0, decision("DW-1", "x"))
+    rj = triage_result(["DW-1", "DW-2"], bundles=bundles, decisions=decisions)
+
+    plan, errors = validate_triage(rj, {"DW-1", "DW-2"})
+
+    assert plan is None
+    assert errors.count(f"duplicate bundle name {shared_prefix!r}") == 1
+
+
+def test_validate_triage_allows_post_truncation_collision_between_sibling_options():
+    """Mutually exclusive options in one decision cannot materialize together."""
+    shared_prefix = "a" * 40
+    rj = triage_result(
+        ["DW-1"],
+        decisions=[
+            {
+                "id": "DW-1",
+                "question": "which fix?",
+                "options": [
+                    {
+                        "key": "1",
+                        "label": "first",
+                        "effect": "build",
+                        "intent": "fix it first",
+                        "bundle_name": shared_prefix + "x",
+                    },
+                    {
+                        "key": "2",
+                        "label": "second",
+                        "effect": "build",
+                        "intent": "fix it second",
+                        "bundle_name": shared_prefix + "y",
+                    },
+                ],
+                "recommendation": "1",
+            }
+        ],
+    )
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert errors == []
+    assert plan is not None
+    assert [option.bundle_name for option in plan.decisions[0].options] == [
+        shared_prefix,
+        shared_prefix,
+    ]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "A" + "a" * 40,
+        "a" * 40 + "/",
+        "a" * 40 + " ",
+        "a" * 40 + "_",
+    ],
+    ids=["uppercase", "slash", "whitespace", "underscore"],
+)
+def test_validate_triage_does_not_repair_overlong_malformed_bundle_name(value):
+    """Ablation target: delete the direct-name regex gate and this accepts each value."""
+    rj = triage_result(["DW-1"], bundles=[{"name": value, "dw_ids": ["DW-1"], "intent": "fix it"}])
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    assert any(f"bundle name {value!r} invalid" in error for error in errors)
+    assert rj["bundles"][0]["name"] == value
+
+
+@pytest.mark.parametrize(
+    ("updates", "expected_error"),
+    [
+        ({"workflow": "wrong", "bundles": None}, "workflow must be"),
+        ({"open_ids": ["DW-2"], "bundles": [None]}, "open_ids do not match"),
+        ({"open_ids": ["DW-2"], "decisions": [None]}, "open_ids do not match"),
+        (
+            {"open_ids": ["DW-2"], "decisions": [{"options": [None]}]},
+            "open_ids do not match",
+        ),
+    ],
+    ids=["null-container", "non-object-bundle", "non-object-decision", "non-object-option"],
+)
+def test_validate_triage_malformed_name_containers_do_not_preempt_early_feedback(
+    updates, expected_error
+):
+    """Normalization must not crash before the validator's established early feedback."""
+    rj = triage_result(["DW-1"])
+    rj.update(updates)
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    assert expected_error in errors[0]
 
 
 # --------------------------------- line breaks in ledger-bound text (#305)
@@ -1878,6 +2071,46 @@ def test_triage_validation_failure_retries_with_feedback_then_escalates(project)
     assert "--feedback" not in prompts[0] and "--feedback" in prompts[1]
     feedback_path = prompts[1].split("--feedback ", 1)[1]
     assert "not triaged: DW-1" in open(feedback_path).read()
+
+
+def test_overlong_bundle_name_is_normalized_without_triage_retry(project):
+    """ABLATION A1: delete direct normalization and the first triage attempt fails."""
+    write_ledger(project, {"DW-1": "open"})
+    result = triage_result(
+        ["DW-1"],
+        bundles=[{"name": _OVERLONG_BUNDLE_NAME, "dw_ids": ["DW-1"], "intent": "fix it"}],
+    )
+    engine, adapter = make_sweep(
+        project,
+        [
+            triage_effect(result),
+            bundle_dev_effect(project, _NORMALIZED_BUNDLE_NAME, ["DW-1"]),
+            bundle_review_effect(project, _NORMALIZED_BUNDLE_NAME),
+        ],
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused
+    triage_sessions = [session for session in adapter.sessions if session.role == "triage"]
+    assert len(triage_sessions) == 1
+    assert "--feedback" not in triage_sessions[0].prompt
+    persisted = json.loads((engine.run_dir / "triage.json").read_text(encoding="utf-8"))
+    assert persisted["bundles"][0]["name"] == _NORMALIZED_BUNDLE_NAME
+    repairs = [
+        entry
+        for entry in engine.journal.entries()
+        if entry["kind"] == "sweep-bundle-name-normalized"
+    ]
+    assert len(repairs) == 1
+    assert repairs[0]["field"] == "bundles[0].name"
+    assert repairs[0]["original"] == _OVERLONG_BUNDLE_NAME
+    assert repairs[0]["normalized"] == _NORMALIZED_BUNDLE_NAME
+    assert engine.state.tasks[f"dw-{_NORMALIZED_BUNDLE_NAME}"].phase == Phase.DONE
+    intent_path = engine.run_dir / "bundles" / _NORMALIZED_BUNDLE_NAME / "intent.md"
+    assert intent_path.is_file()
+    assert _NORMALIZED_BUNDLE_NAME in intent_path.read_text(encoding="utf-8")
+    assert not (engine.run_dir / "bundles" / _OVERLONG_BUNDLE_NAME).exists()
 
 
 def test_triage_session_env_fault_escalates_then_resume_restores_budget(project):
