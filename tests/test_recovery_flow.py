@@ -619,10 +619,24 @@ def test_plain_auto_reset_restores_unchanged_prelaunch_operator_spec(project):
 
 
 def test_plain_manual_pause_restores_operator_spec_child_put_at_baseline_with_sibling(project):
-    """A sibling does not hide a provably baseline-shaped child spec deletion."""
+    """A sibling does not hide a provably baseline-shaped child spec deletion.
+
+    Git-for-Windows materializes the tracked LF blob as CRLF under its system
+    ``core.autocrlf=true`` default. The baseline oracle must compare the file to
+    that filtered checkout form, not to raw object bytes. Ablation: switch the
+    recovery read back to ``file_bytes_at_revision`` and this test reaches the
+    generic manual pause without restoring the operator snapshot.
+    """
     repo = project.project
+    git(repo, "config", "core.autocrlf", "true")
     spec = _tracked_spec(project)
+    spec_rel = spec.relative_to(repo).as_posix()
+    spec.unlink()
+    git(repo, "checkout", "--", spec_rel)
     baseline = spec.read_bytes()
+    assert b"\r\n" in baseline
+    baseline_blob = verify.file_bytes_at_revision(repo, verify.rev_parse_head(repo), spec_rel)
+    assert baseline_blob is not None and b"\r\n" not in baseline_blob
     operator = baseline.replace(b"baseline intent", b"operator input outside HEAD")
     task = _task(repo)
     task.dispatched_spec_file = str(spec)
@@ -1133,7 +1147,9 @@ def test_latched_redrive_without_snapshot_refuses_reset_of_sibling_residue(proje
     corrected = b"---\nstatus: ready-for-dev\n---\n\noperator restored intent\n"
     spec.write_bytes(corrected)
     flow.rollback_or_pause(task)
-    assert spec.read_bytes() == corrected
+    # The now-unbound whole-folder preserve runs through Git checkout filters;
+    # content and lifecycle survive, while LF may correctly materialize as CRLF.
+    assert spec.read_text() == corrected.decode()
     assert flow.journal.events().count("rollback-owned-spec-manual-required") == 1
     assert "rollback-auto" in flow.journal.events()
 
@@ -1507,6 +1523,42 @@ def test_owned_spec_with_unsafe_status_shape_propagates_writer_error(project):
     assert _status(spec) == "in-progress"
     assert "rollback-skipped-clean" not in flow.journal.events()
     assert "rollback-owned-spec-normalized" not in flow.journal.events()
+
+
+def test_pre_repair_owned_spec_read_fault_pauses_without_mutation(project, monkeypatch):
+    """An observational read fault degrades to convergent manual recovery.
+
+    Ablation: remove the OSError guard around the pre-repair ``read_bytes`` and
+    this test leaks the injected PermissionError instead of the typed pause.
+    """
+    repo = project.project
+    spec = _tracked_spec(project)
+    task = _task(repo)
+    task.dispatched_spec_file = str(spec)
+    verify.set_frontmatter_status(spec, "in-progress")
+    real_read_bytes = Path.read_bytes
+    before = real_read_bytes(spec)
+    canonical = spec.resolve()
+
+    def fail_owned_read(path):
+        if path == canonical:
+            raise PermissionError("owned spec read denied")
+        return real_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", fail_owned_read)
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
+    )
+
+    with pytest.raises(_Pause, match="could not be read before lifecycle repair"):
+        flow.rollback_or_pause(task)
+
+    assert real_read_bytes(spec) == before
+    assert "rollback-owned-spec-unreadable" in flow.journal.events()
+    assert "rollback-owned-spec-manual-required" in flow.journal.events()
+    assert "rollback-auto" not in flow.journal.events()
+    assert task.dispatched_spec_file is None
+    assert task.dispatched_spec_snapshot is None
 
 
 def test_owned_spec_outside_trusted_roots_is_not_excluded_or_mutated(project):

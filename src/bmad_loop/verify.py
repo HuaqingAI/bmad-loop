@@ -502,6 +502,39 @@ def file_bytes_at_revision(repo: Path, revision: str, rel: str) -> bytes | None:
     return proc.stdout
 
 
+def worktree_file_bytes_at_revision(repo: Path, revision: str, rel: str) -> bytes | None:
+    """Materialize one revision blob with the path's working-tree filters.
+
+    Unlike :func:`file_bytes_at_revision`, this applies Git's smudge, EOL, and
+    working-tree-encoding conversions. Recovery uses it only when comparing a
+    live checkout file to its baseline: on Git for Windows, a byte-exact LF blob
+    may legitimately be a CRLF working-tree file under ``core.autocrlf=true``.
+    Absence and non-blobs return ``None``; observation failures raise so callers
+    cannot mistake an unproven baseline for restoration authority.
+    """
+    entry = _entry_at_revision(repo, revision, rel)
+    if entry is None or entry[1] != "blob":
+        return None
+    oid = entry[2]
+    proc = _run_git(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "cat-file",
+            "--filters",
+            f"--path={rel}",
+            oid,
+        ],
+        repo,
+        binary=True,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stdout + proc.stderr).decode("utf-8", "replace").strip()
+        raise GitError(f"git cat-file --filters {oid[:12]} for {rel!r} failed in {repo}: {detail}")
+    return proc.stdout
+
+
 def path_has_non_tree_ancestor_at_revision(repo: Path, revision: str, rel: str) -> bool:
     """Whether a parent of ``rel`` is a tracked non-directory at ``revision``.
 

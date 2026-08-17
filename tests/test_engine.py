@@ -4409,23 +4409,76 @@ def test_record_dev_spec_refuses_the_no_spec_fallback_marker(project, prefix):
     assert task.spec_file == str(real)
 
 
-def test_review_launch_snapshot_degrades_on_unreadable_spec(project):
-    """A spec path that cannot be read degrades the snapshot capture to None and
-    journals `spec-read-failed` at site `review-launch-snapshot`. A directory where
-    a file is expected is the trigger: it slips past the strip's `is_file()` guard
-    (the strip's raise-on-unreadable doctrine is untouched), then `read_bytes` raises
-    IsADirectoryError, which the capture catches."""
+def test_review_launch_snapshot_degrades_on_unreadable_spec(project, monkeypatch):
+    """A post-strip snapshot fault degrades to None and is journaled.
+
+    The first read belongs to the required stale-result strip and must still
+    raise if it fails; fault only the second read, which is the best-effort
+    launch snapshot. Ablation: remove that capture's OSError guard and this test
+    fails with the injected PermissionError.
+    """
     engine, _ = make_engine(project, [])
     bad = project.implementation_artifacts / "spec-1-1-a.md"
-    bad.mkdir(parents=True, exist_ok=True)
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    bad.write_text("---\nstatus: done\n---\n\nreview input\n")
     task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(bad))
+    real_read_bytes = Path.read_bytes
+    reads = 0
+
+    def fail_snapshot_read(path):
+        nonlocal reads
+        if path == bad:
+            reads += 1
+            if reads == 2:
+                raise PermissionError("snapshot read denied")
+        return real_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", fail_snapshot_read)
 
     snap = engine._reset_spec_for_review(task)
 
     assert snap is None
+    assert reads == 2
     events = [e for e in engine.journal.entries() if e["kind"] == "spec-read-failed"]
     assert events and events[-1]["site"] == "review-launch-snapshot"
     assert events[-1]["story_key"] == "1-1-a"
+    assert "PermissionError" in events[-1]["error"]
+
+
+def test_review_launch_missing_spec_degrades_like_snapshot_read_failure(project):
+    """Strict resolution preserves the documented missing-spec degradation.
+
+    Ablation: remove the FileNotFoundError arm around ``resolve(strict=True)``
+    and this test raises the unsafe-path RuntimeError without journaling the read.
+    """
+    engine, _ = make_engine(project, [])
+    missing = project.implementation_artifacts / "missing-review-spec.md"
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(missing))
+
+    assert engine._reset_spec_for_review(task) is None
+
+    events = [e for e in engine.journal.entries() if e["kind"] == "spec-read-failed"]
+    assert events and events[-1]["site"] == "review-launch-snapshot"
+    assert events[-1]["story_key"] == "1-1-a"
+    assert events[-1]["spec"] == str(missing)
+    assert "FileNotFoundError" in events[-1]["error"]
+
+
+def test_review_launch_refuses_directory_before_snapshot_capture(project):
+    """Only a trusted regular file can become the review prompt's spec.
+
+    Ablation: remove the review path's ``resolved.is_file()`` guard and this test
+    degrades to a snapshot-less launch instead of refusing the directory.
+    """
+    engine, _ = make_engine(project, [])
+    directory = project.implementation_artifacts / "directory-review-spec"
+    directory.mkdir(parents=True)
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(directory))
+
+    with pytest.raises(RuntimeError, match="before review prompt construction"):
+        engine._reset_spec_for_review(task)
+
+    assert not [e for e in engine.journal.entries() if e["kind"] == "spec-read-failed"]
 
 
 def test_review_launch_snapshot_reads_bare_status_as_blank(project):
@@ -6930,6 +6983,74 @@ def test_review_fix_validates_retained_binding_before_prompt_mutation(project):
     assert task.attempt == 2
     assert sp.is_symlink()
     assert victim.read_bytes() == victim_bytes
+
+
+def _spec_beneath_symlinked_parent(project, *, status: str) -> tuple[Path, Path]:
+    """Return one trusted regular spec through alias and canonical spellings."""
+    real_parent = project.project / "canonical-spec-parent"
+    real_parent.mkdir()
+    alias_parent = project.project / "aliased-spec-parent"
+    alias_parent.symlink_to(real_parent, target_is_directory=True)
+    real = real_parent / "spec-1-1-a.md"
+    write_spec(real, status, rev_parse_head(project.project))
+    return alias_parent / real.name, real
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="directory symlink creation may need elevation")
+def test_retained_snapshot_validation_accepts_symlinked_ancestor(project):
+    """A canonical leaf may be named through a trusted symlinked ancestor.
+
+    Ablation: compare the resolved leaf directly with its unresolved accepted
+    spelling and this test rejects the retained authority.
+    """
+    alias, real = _spec_beneath_symlinked_parent(project, status="ready-for-dev")
+    engine, _ = make_engine(project, [])
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        spec_file=str(alias),
+        dispatched_spec_file=str(real.resolve()),
+        dispatched_spec_snapshot=real.read_bytes(),
+    )
+
+    assert engine._validate_dispatched_spec_snapshot(task)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="directory symlink creation may need elevation")
+def test_repair_reset_accepts_symlinked_ancestor(project):
+    """Repair mutates the regular leaf, not the spelling of its parent.
+
+    Ablation: restore the raw resolved-vs-spec_path comparison and this test
+    raises before reopening the trusted target.
+    """
+    alias, real = _spec_beneath_symlinked_parent(project, status="done")
+    real.write_text(real.read_text() + "\n## Auto Run Result\n\n- Status: done\n")
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(alias))
+
+    engine._reset_spec_for_repair(task)
+
+    assert verify.status_of(verify.read_frontmatter(real)) == "in-progress"
+    assert "## Auto Run Result" not in real.read_text()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="directory symlink creation may need elevation")
+def test_review_reset_accepts_symlinked_ancestor(project):
+    """Review snapshots the canonical regular leaf through a parent alias.
+
+    Ablation: restore the raw resolved-vs-spec_path comparison and this test
+    raises before stripping or snapshotting the trusted target.
+    """
+    alias, real = _spec_beneath_symlinked_parent(project, status="done")
+    real.write_text(real.read_text() + "\n## Auto Run Result\n\n- Status: done\n")
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(alias))
+
+    snapshot = engine._reset_spec_for_review(task)
+
+    assert snapshot is not None
+    assert snapshot.path == str(real.resolve())
+    assert "## Auto Run Result" not in real.read_text()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="file symlink creation may need elevation")

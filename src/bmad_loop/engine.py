@@ -1771,8 +1771,9 @@ class Engine:
             if accepted.is_symlink():
                 return False
             resolved = accepted.resolve(strict=True)
+            accepted_target = accepted.parent.resolve(strict=True) / accepted.name
             if (
-                resolved != accepted
+                resolved != accepted_target
                 or not resolved.is_file()
                 or not verify.spec_within_roots(resolved, self.workspace.paths)
             ):
@@ -5093,8 +5094,9 @@ class Engine:
             if spec_path.is_symlink():
                 raise RuntimeError("repair spec became a symlink")
             resolved = spec_path.resolve(strict=True)
+            expected = spec_path.parent.resolve(strict=True) / spec_path.name
             if (
-                resolved != spec_path
+                resolved != expected
                 or not resolved.is_file()
                 or not verify.spec_within_roots(resolved, self.workspace.paths)
             ):
@@ -5169,10 +5171,21 @@ class Engine:
             if spec_path.is_symlink():
                 raise RuntimeError("review spec became a symlink")
             resolved = spec_path.resolve(strict=True)
-            if resolved != spec_path or not verify.spec_within_roots(
-                resolved, self.workspace.paths
+            expected = spec_path.parent.resolve(strict=True) / spec_path.name
+            if (
+                resolved != expected
+                or not resolved.is_file()
+                or not verify.spec_within_roots(resolved, self.workspace.paths)
             ):
                 raise RuntimeError("review spec is no longer a trusted regular file")
+        except FileNotFoundError as exc:
+            self._journal_spec_read_failed(
+                spec_path,
+                task.story_key,
+                "review-launch-snapshot",
+                exc,
+            )
+            return None
         except (OSError, RuntimeError) as exc:
             raise RuntimeError(
                 "recorded spec became unsafe before review prompt construction"

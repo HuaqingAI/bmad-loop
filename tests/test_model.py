@@ -1,5 +1,6 @@
 """RunState serialization + lifecycle-flag tests."""
 
+import binascii
 import json
 
 import pytest
@@ -215,6 +216,30 @@ def test_dispatched_spec_snapshot_defaults_none_for_legacy_state():
     doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
     del doc["dispatched_spec_snapshot"]
     assert StoryTask.from_dict(doc).dispatched_spec_snapshot is None
+
+
+@pytest.mark.parametrize(
+    ("encoded", "cause_type"),
+    [("%%%", binascii.Error), ("é", UnicodeEncodeError)],
+    ids=["malformed-base64", "non-ascii"],
+)
+def test_dispatched_spec_snapshot_decode_error_names_story_and_field(encoded, cause_type):
+    """Corrupt persisted authority fails with stable task and field context.
+
+    Ablation: restore the inline unguarded decode and both rows leak their
+    low-level exception type and message instead of this contextual ValueError.
+    """
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    doc["dispatched_spec_snapshot"] = encoded
+
+    with pytest.raises(
+        ValueError,
+        match=r"story '1-1-a': dispatched_spec_snapshot is not valid base64",
+    ) as caught:
+        StoryTask.from_dict(doc)
+
+    assert type(caught.value) is ValueError
+    assert isinstance(caught.value.__cause__, cause_type)
 
 
 def test_plan_checkpoint_pending_round_trips():

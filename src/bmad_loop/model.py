@@ -445,6 +445,16 @@ class StoryTask:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "StoryTask":
         dispatched_spec_snapshot = d.get("dispatched_spec_snapshot")
+        if dispatched_spec_snapshot is not None:
+            try:
+                dispatched_spec_snapshot = base64.b64decode(
+                    str(dispatched_spec_snapshot).encode("ascii"),
+                    validate=True,
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"story {d.get('story_key')!r}: dispatched_spec_snapshot " "is not valid base64"
+                ) from exc
         return cls(
             story_key=d["story_key"],
             epic=int(d["epic"]),
@@ -490,14 +500,7 @@ class StoryTask:
             isolated_ledger_carried=bool(d.get("isolated_ledger_carried", False)),
             spec_file=d.get("spec_file"),
             dispatched_spec_file=d.get("dispatched_spec_file"),
-            dispatched_spec_snapshot=(
-                base64.b64decode(
-                    str(dispatched_spec_snapshot).encode("ascii"),
-                    validate=True,
-                )
-                if dispatched_spec_snapshot is not None
-                else None
-            ),
+            dispatched_spec_snapshot=dispatched_spec_snapshot,
             commit_sha=d.get("commit_sha"),
             operator_actions=[str(a) for a in d.get("operator_actions", [])],
             defer_reason=d.get("defer_reason"),

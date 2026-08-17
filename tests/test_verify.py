@@ -91,13 +91,41 @@ def test_file_bytes_at_revision_distinguishes_blob_absence_tree_and_git_failure(
     baseline = verify.rev_parse_head(repo)
 
     assert verify.file_bytes_at_revision(repo, baseline, "oracle/spec.bin") == expected
+    assert verify.worktree_file_bytes_at_revision(repo, baseline, "oracle/spec.bin") == expected
     assert verify.file_bytes_at_revision(repo, baseline, "missing.bin") is None
+    assert verify.worktree_file_bytes_at_revision(repo, baseline, "missing.bin") is None
     assert verify.file_bytes_at_revision(repo, baseline, "oracle") is None
+    assert verify.worktree_file_bytes_at_revision(repo, baseline, "oracle") is None
     assert not verify.path_is_non_regular_at_revision(repo, baseline, "oracle/spec.bin")
     assert not verify.path_is_non_regular_at_revision(repo, baseline, "missing.bin")
     assert verify.path_is_non_regular_at_revision(repo, baseline, "oracle")
     with pytest.raises(verify.GitError, match="ls-tree"):
         verify.file_bytes_at_revision(repo, "not-a-revision", "oracle/spec.bin")
+    with pytest.raises(verify.GitError, match="ls-tree"):
+        verify.worktree_file_bytes_at_revision(repo, "not-a-revision", "oracle/spec.bin")
+
+
+def test_worktree_file_bytes_at_revision_applies_checkout_eol_filters(project):
+    """The live-baseline oracle materializes bytes as Git checkout would.
+
+    Ablation: replace ``cat-file --filters --path`` with raw ``cat-file blob``
+    and the filtered assertion returns LF instead of the CRLF checkout form.
+    """
+    repo = project.project
+    git(repo, "config", "core.autocrlf", "true")
+    rel = "filtered-baseline.md"
+    path = repo / rel
+    blob_bytes = b"line one\nline two\n"
+    path.write_bytes(blob_bytes)
+    git(repo, "add", rel)
+    git(repo, "commit", "-q", "-m", "filtered baseline fixture")
+    baseline = verify.rev_parse_head(repo)
+    path.unlink()
+    git(repo, "checkout", "--", rel)
+
+    assert path.read_bytes() == b"line one\r\nline two\r\n"
+    assert verify.file_bytes_at_revision(repo, baseline, rel) == blob_bytes
+    assert verify.worktree_file_bytes_at_revision(repo, baseline, rel) == path.read_bytes()
 
 
 @pytest.mark.parametrize("baseline_present", [False, True], ids=["absent", "tracked"])

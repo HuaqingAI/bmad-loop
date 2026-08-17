@@ -426,7 +426,7 @@ class RecoveryFlow:
                     )
                 if task.baseline_commit and owned_exclude:
                     try:
-                        owned_baseline_bytes = verify.file_bytes_at_revision(
+                        owned_baseline_bytes = verify.worktree_file_bytes_at_revision(
                             workspace.root,
                             task.baseline_commit,
                             owned_exclude[0],
@@ -542,7 +542,20 @@ class RecoveryFlow:
                 )
         if task.baseline_commit and dirty_probe_succeeded and not dirty and owned_spec:
             spec_path, spec_rel = owned_spec
-            original_spec = spec_path.read_bytes()
+            try:
+                original_spec = spec_path.read_bytes()
+            except OSError as exc:
+                self.journal.append(
+                    "rollback-owned-spec-unreadable",
+                    story_key=task.story_key,
+                    spec=str(spec_path),
+                    error=str(exc),
+                )
+                self.pause_for_owned_spec_recovery(
+                    task,
+                    str(spec_path),
+                    "its current bytes could not be read before lifecycle repair",
+                )
             if redrive:
                 target_status = "in-review" if task.restore_patch else "ready-for-dev"
             else:
