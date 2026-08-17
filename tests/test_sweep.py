@@ -349,6 +349,86 @@ def test_validate_triage_rejects_post_truncation_bundle_name_collision():
     assert f"duplicate bundle name {shared_prefix!r}" in errors
 
 
+@pytest.mark.parametrize("with_direct_bundle", [True, False], ids=["direct-decision", "decisions"])
+def test_validate_triage_rejects_post_truncation_decision_bundle_name_collision(
+    with_direct_bundle,
+):
+    """Selected build options cannot alias a direct or another decision bundle task."""
+    shared_prefix = "a" * 40
+
+    def decision(dw_id, suffix):
+        return {
+            "id": dw_id,
+            "question": "build it?",
+            "options": [
+                {
+                    "key": "1",
+                    "label": "build",
+                    "effect": "build",
+                    "intent": "fix it",
+                    "bundle_name": shared_prefix + suffix,
+                },
+                {"key": "2", "label": "keep", "effect": "keep-open"},
+            ],
+            "recommendation": "1",
+        }
+
+    bundles = (
+        [{"name": shared_prefix + "x", "dw_ids": ["DW-1"], "intent": "fix one"}]
+        if with_direct_bundle
+        else []
+    )
+    decisions = [decision("DW-2", "y")]
+    if not with_direct_bundle:
+        decisions.insert(0, decision("DW-1", "x"))
+    rj = triage_result(["DW-1", "DW-2"], bundles=bundles, decisions=decisions)
+
+    plan, errors = validate_triage(rj, {"DW-1", "DW-2"})
+
+    assert plan is None
+    assert errors.count(f"duplicate bundle name {shared_prefix!r}") == 1
+
+
+def test_validate_triage_allows_post_truncation_collision_between_sibling_options():
+    """Mutually exclusive options in one decision cannot materialize together."""
+    shared_prefix = "a" * 40
+    rj = triage_result(
+        ["DW-1"],
+        decisions=[
+            {
+                "id": "DW-1",
+                "question": "which fix?",
+                "options": [
+                    {
+                        "key": "1",
+                        "label": "first",
+                        "effect": "build",
+                        "intent": "fix it first",
+                        "bundle_name": shared_prefix + "x",
+                    },
+                    {
+                        "key": "2",
+                        "label": "second",
+                        "effect": "build",
+                        "intent": "fix it second",
+                        "bundle_name": shared_prefix + "y",
+                    },
+                ],
+                "recommendation": "1",
+            }
+        ],
+    )
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert errors == []
+    assert plan is not None
+    assert [option.bundle_name for option in plan.decisions[0].options] == [
+        shared_prefix,
+        shared_prefix,
+    ]
+
+
 @pytest.mark.parametrize(
     "value",
     [
@@ -368,6 +448,32 @@ def test_validate_triage_does_not_repair_overlong_malformed_bundle_name(value):
     assert plan is None
     assert any(f"bundle name {value!r} invalid" in error for error in errors)
     assert rj["bundles"][0]["name"] == value
+
+
+@pytest.mark.parametrize(
+    ("updates", "expected_error"),
+    [
+        ({"workflow": "wrong", "bundles": None}, "workflow must be"),
+        ({"open_ids": ["DW-2"], "bundles": [None]}, "open_ids do not match"),
+        ({"open_ids": ["DW-2"], "decisions": [None]}, "open_ids do not match"),
+        (
+            {"open_ids": ["DW-2"], "decisions": [{"options": [None]}]},
+            "open_ids do not match",
+        ),
+    ],
+    ids=["null-container", "non-object-bundle", "non-object-decision", "non-object-option"],
+)
+def test_validate_triage_malformed_name_containers_do_not_preempt_early_feedback(
+    updates, expected_error
+):
+    """Normalization must not crash before the validator's established early feedback."""
+    rj = triage_result(["DW-1"])
+    rj.update(updates)
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    assert expected_error in errors[0]
 
 
 # --------------------------------- line breaks in ledger-bound text (#305)

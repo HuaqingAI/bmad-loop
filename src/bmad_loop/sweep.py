@@ -71,15 +71,27 @@ def _normalize_bundle_names(rj: dict[str, Any] | None) -> tuple[_BundleNameRepai
         container[key] = normalized
         repairs.append(_BundleNameRepair(field, raw, normalized))
 
-    for bundle_index, bundle in enumerate(rj.get("bundles", [])):
-        normalize(bundle, "name", f"bundles[{bundle_index}].name")
-    for decision_index, decision in enumerate(rj.get("decisions", [])):
-        for option_index, option in enumerate(decision.get("options", [])):
-            normalize(
-                option,
-                "bundle_name",
-                f"decisions[{decision_index}].options[{option_index}].bundle_name",
-            )
+    bundles = rj.get("bundles", [])
+    if isinstance(bundles, list):
+        for bundle_index, bundle in enumerate(bundles):
+            if isinstance(bundle, dict):
+                normalize(bundle, "name", f"bundles[{bundle_index}].name")
+
+    decisions = rj.get("decisions", [])
+    if isinstance(decisions, list):
+        for decision_index, decision in enumerate(decisions):
+            if not isinstance(decision, dict):
+                continue
+            options = decision.get("options", [])
+            if not isinstance(options, list):
+                continue
+            for option_index, option in enumerate(options):
+                if isinstance(option, dict):
+                    normalize(
+                        option,
+                        "bundle_name",
+                        f"decisions[{decision_index}].options[{option_index}].bundle_name",
+                    )
     return tuple(repairs)
 
 
@@ -223,6 +235,7 @@ def validate_triage(
             errors.append(f"decision {dw_id} has no question")
         options = []
         keys: set[str] = set()
+        decision_bundle_names: set[str] = set()
         for raw in item.get("options", []):
             key = str(raw.get("key", ""))
             effect = str(raw.get("effect", ""))
@@ -237,6 +250,10 @@ def validate_triage(
             bundle_name = str(raw.get("bundle_name", ""))
             if bundle_name and not BUNDLE_NAME_RE.match(bundle_name):
                 errors.append(f"decision {dw_id} option {key}: bad bundle_name {bundle_name!r}")
+            if effect == "build" and bundle_name:
+                if bundle_name in names:
+                    errors.append(f"duplicate bundle name {bundle_name!r}")
+                decision_bundle_names.add(bundle_name)
             options.append(
                 DecisionOption(
                     key=key,
@@ -247,6 +264,7 @@ def validate_triage(
                     bundle_name=bundle_name,
                 )
             )
+        names.update(decision_bundle_names)
         if len(options) < 2:
             errors.append(f"decision {dw_id} needs at least 2 options")
         recommendation = str(item.get("recommendation", ""))
