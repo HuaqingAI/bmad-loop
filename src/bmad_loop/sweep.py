@@ -34,11 +34,11 @@ TRIAGE_KEY = "sweep-triage"
 TRIAGE_WORKFLOW = "deferred-sweep-triage"
 MIGRATE_KEY = "sweep-migrate"
 MIGRATE_WORKFLOW = "deferred-sweep-migrate"
-BUNDLE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,39}$")
+BUNDLE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,39}\Z")
 # the inverse of SweepEngine._bundle_key: "dw-<name>" (cycle 1) / "dw<N>-<name>".
 # A cycle-1 key always has "-" straight after "dw", so the cycle group matches
 # empty and the split stays unambiguous even for a bundle named "2fix".
-BUNDLE_KEY_RE = re.compile(r"^dw(\d*)-(.+)$")
+BUNDLE_KEY_RE = re.compile(r"^dw(\d*)-(.+)\Z")
 DECISION_EFFECTS = ("build", "close", "keep-open")
 
 

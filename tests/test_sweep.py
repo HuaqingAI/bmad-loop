@@ -45,6 +45,7 @@ from bmad_loop.policy import (
     VerifyPolicy,
 )
 from bmad_loop.sweep import (
+    BUNDLE_KEY_RE,
     Bundle,
     Decision,
     DecisionOption,
@@ -209,6 +210,77 @@ def test_validate_triage_bad_fields():
     assert "needs intent" in joined
     assert "at least 2 options" in joined
     assert "recommendation" in joined
+
+
+# --------------------------------- trailing newline in an identifier (#330)
+#
+# The other axis from the free-text block below. A bundle name and a bundle key
+# are identifiers: the name becomes a path segment (run_dir/bundles/<name>/) and
+# a story key, with no sanitizer on either path, so unlike free text they are
+# gated. `$` matches before a trailing newline and every call site uses
+# `.match()`, so one bare LF slipped through both patterns until `\Z` closed it.
+
+
+def test_validate_triage_rejects_a_trailing_newline_in_bundle_name():
+    rj = triage_result(
+        ["DW-1"],
+        bundles=[{"name": "fix-it\n", "dw_ids": ["DW-1"], "intent": "do x"}],
+    )
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    # The error text assertion is load-bearing, not decoration: validate_triage
+    # returns None whenever *any* error is present, so a bare `plan is None`
+    # would pass for reasons unrelated to the name. Do not simplify it away.
+    joined = "; ".join(errors)
+    assert repr("fix-it\n") in joined
+    assert "invalid" in joined
+
+
+def test_validate_triage_rejects_a_trailing_newline_in_option_bundle_name():
+    rj = triage_result(
+        ["DW-1"],
+        decisions=[
+            {
+                "id": "DW-1",
+                "question": "renegotiate?",
+                "options": [
+                    {
+                        "key": "1",
+                        "label": "build it",
+                        "effect": "build",
+                        "intent": "do x",
+                        "bundle_name": "fix-it\n",
+                    },
+                    {"key": "2", "label": "keep", "effect": "keep-open"},
+                ],
+                "recommendation": "1",
+            }
+        ],
+    )
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    # Same reason as above: `plan is None` alone would pass on any unrelated
+    # error, so the option's own message is what pins the second call site.
+    assert "bad bundle_name" in "; ".join(errors)
+
+
+def test_bundle_key_re_refuses_a_trailing_newline():
+    # The hazard this records: before the `\Z` anchor, "dw-foo\n" *matched* with
+    # group(2) == "foo", because `.` does not match a newline. _ensure_bundle_intent
+    # rebuilds the intent path from that reconstructed name, so a degraded bundle
+    # keyed "dw-foo\n" silently regenerated its intent under the different
+    # directory "foo", without a word in the journal. That is why this test exists.
+    assert BUNDLE_KEY_RE.match("dw-foo\n") is None
+    assert BUNDLE_KEY_RE.match("dw2-foo\n") is None
+
+    # Well-formed keys still round-trip through the inverse of _bundle_key.
+    assert BUNDLE_KEY_RE.match("dw-foo").groups() == ("", "foo")
+    assert BUNDLE_KEY_RE.match("dw2-foo").groups() == ("2", "foo")
+    assert BUNDLE_KEY_RE.match("dw-c2-foo").group(2) == "c2-foo"
 
 
 # --------------------------------- line breaks in ledger-bound text (#305)
