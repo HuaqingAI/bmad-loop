@@ -330,11 +330,101 @@ def test_bound_lifecycle_only_spec_is_normalized_and_reads_git_clean(project):
     assert flow.calls.emits == []
 
 
+@pytest.mark.parametrize("status", ["draft", "in-progress", "in-review"])
+def test_bound_unchanged_resumable_spec_is_never_normalized(project, status):
+    """A bound Stories spec is not itself proof that the attempt changed it.
+
+    Ablation: delete the first real-checkout clean return in ``rollback_or_pause``
+    and this test fails because the exact-file exclusion rewrites the unchanged
+    baseline status to ready-for-dev.
+    """
+    repo = project.project
+    spec = _tracked_spec(project, status=status)
+    task = _task(repo)
+    task.dispatched_spec_file = str(spec)
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
+    )
+
+    flow.rollback_or_pause(task)
+
+    assert _status(spec) == status
+    assert git(repo, "status", "--porcelain") == ""
+    assert flow.journal.events() == ["rollback-skipped-clean"]
+    assert flow.calls.pauses == []
+    assert flow.calls.emits == []
+
+
+@pytest.mark.parametrize(
+    ("baseline_status", "attempt_status"),
+    [("draft", "in-progress"), ("in-progress", "in-review"), ("in-review", "done")],
+)
+def test_plain_bound_lifecycle_change_restores_baseline_status(
+    project, baseline_status, attempt_status
+):
+    """A plain lifecycle-only attempt returns to its exact baseline route.
+
+    Ablation: replace the baseline-status oracle with the hard-coded
+    ``ready-for-dev`` target and the non-ready rows fail by pausing on the dirty
+    rewritten spec instead of converging cleanly.
+    """
+    repo = project.project
+    spec = _tracked_spec(project, status=baseline_status)
+    task = _task(repo)
+    task.dispatched_spec_file = str(spec)
+    verify.set_frontmatter_status(spec, attempt_status)
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
+    )
+
+    flow.rollback_or_pause(task)
+
+    assert _status(spec) == baseline_status
+    assert git(repo, "status", "--porcelain") == ""
+    assert flow.journal.events() == ["rollback-skipped-clean"]
+    assert flow.calls.pauses == []
+
+
+def test_plain_bound_lifecycle_commit_is_parked_and_reset_before_retry(project):
+    """A baseline-shaped checkout is not clean while attempt commits remain.
+
+    Ablation: remove the normalized-commit-only auto-recovery arm and this test
+    fails by demanding manual recovery instead of parking the lifecycle commit
+    and resetting it automatically.
+    """
+    repo = project.project
+    spec = _tracked_spec(project, status="draft")
+    task = _task(repo)
+    baseline = task.baseline_commit
+    task.dispatched_spec_file = str(spec)
+    verify.set_frontmatter_status(spec, "in-progress")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "attempt lifecycle flip")
+    attempt_head = rev_parse_head(repo)
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
+    )
+
+    flow.rollback_or_pause(task)
+
+    assert rev_parse_head(repo) == baseline
+    assert _status(spec) == "draft"
+    assert git(repo, "status", "--porcelain") == ""
+    assert task.preserve_ref is not None
+    assert git(repo, "rev-parse", task.preserve_ref) == attempt_head
+    assert "attempt-commits-preserved" in flow.journal.events()
+    assert "rollback-auto" in flow.journal.events()
+    assert "rollback-skipped-clean" not in flow.journal.events()
+    assert flow.calls.emits == ["pre_rollback", "post_rollback"]
+    assert flow.calls.pauses == []
+
+
 def test_plain_owned_spec_with_substantive_residue_still_pauses(project):
     """T9: status normalization does not authorize a plain attempt's body edit.
 
-    Ablation: remove the `redrive` term from the owned-dirty event guard and this
-    test fails because the plain attempt returns instead of pausing.
+    Ablation: delete the byte-for-byte restoration after the normalized checkout
+    remains dirty and this test fails because recovery changes the spec before
+    handing the untouched-tree manual-recovery policy back to the operator.
     """
     repo = project.project
     spec = _tracked_spec(project)
@@ -348,7 +438,7 @@ def test_plain_owned_spec_with_substantive_residue_still_pauses(project):
     with pytest.raises(_Pause):
         flow.rollback_or_pause(task)
 
-    assert _status(spec) == "ready-for-dev"
+    assert _status(spec) == "in-progress"
     assert "human substantive correction" in spec.read_text()
     assert "rollback-owned-spec-normalized" not in flow.journal.events()
     assert "rollback-skipped-clean" not in flow.journal.events()
@@ -482,11 +572,47 @@ def test_latched_redrive_reports_owned_corrected_spec_as_still_dirty(project):
     assert flow.calls.emits == []
 
 
+def test_latched_redrive_reset_normalizes_preserved_spec_after_sibling_residue(project):
+    """A non-fixable retry re-establishes the route its next prompt declares.
+
+    The reset removes the rejected implementation edit while preserving the
+    human-corrected artifact tree. Ablation: delete the post-reset owned-spec
+    normalization and this test fails with the retained ``done`` status.
+    """
+    repo = project.project
+    source = repo / "redrive-source.txt"
+    source.write_text("baseline source\n")
+    spec = _tracked_spec(project)
+    task = _task(repo)
+    task.dispatched_spec_file = str(spec)
+    task.resolved_redrive = True
+    source.write_text("rejected implementation\n")
+    spec.write_text("---\nstatus: done\n---\n\nhuman corrected intent\n")
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=True)
+    )
+
+    flow.rollback_or_pause(task)
+
+    assert source.read_text() == "baseline source\n"
+    assert _status(spec) == "ready-for-dev"
+    assert "human corrected intent" in spec.read_text()
+    assert flow.journal.fields("rollback-owned-spec-normalized") == {
+        "story_key": task.story_key,
+        "spec": str(spec.resolve()),
+        "status": "ready-for-dev",
+        "checkout_dirty": True,
+    }
+    assert "rollback-auto" in flow.journal.events()
+    assert flow.calls.emits == ["pre_rollback", "post_rollback"]
+
+
 def test_post_normalization_probe_fault_cannot_authorize_owned_dirty(project, monkeypatch):
-    """A failed real-checkout re-probe stays fail-safe dirty on a resolved reset.
+    """A failed pre-reset re-probe cannot bypass the resolved reset.
 
     Ablation: remove `dirty_probe_succeeded` from the owned-dirty event guard and
     this test fails because an unproven checkout bypasses the actual rollback.
+    After that rollback, a fresh successful probe may report the retained spec.
     """
     repo = project.project
     spec = _tracked_spec(project)
@@ -496,25 +622,25 @@ def test_post_normalization_probe_fault_cannot_authorize_owned_dirty(project, mo
     real_attempt_dirty = verify.attempt_dirty
     probes = 0
 
-    def fault_second_probe(*args, **kwargs):
+    def fault_post_normalization_probe(*args, **kwargs):
         nonlocal probes
         probes += 1
-        if probes == 2:
+        if probes == 3:
             raise verify.GitError("post-normalization probe failed")
         return real_attempt_dirty(*args, **kwargs)
 
-    monkeypatch.setattr(verify, "attempt_dirty", fault_second_probe)
+    monkeypatch.setattr(verify, "attempt_dirty", fault_post_normalization_probe)
     flow = _make_flow(
         workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
     )
 
     flow.rollback_or_pause(task, cause="resolved")
 
-    assert probes == 2
+    assert probes == 4
     assert "rollback-dirty-check-failed" in flow.journal.events()
     assert "rollback-auto" in flow.journal.events()
     assert "rollback-skipped-clean" not in flow.journal.events()
-    assert "rollback-owned-spec-normalized" not in flow.journal.events()
+    assert flow.journal.fields("rollback-owned-spec-normalized")["checkout_dirty"] is True
     assert flow.calls.emits == ["pre_rollback", "post_rollback"]
     assert verify.attempt_dirty(repo, task.baseline_commit, task.baseline_untracked)
 
@@ -733,14 +859,15 @@ def test_binding_resolution_fault_is_fail_safe_dirty(project, monkeypatch):
     assert "rollback-owned-spec-normalized" not in flow.journal.events()
 
 
-def test_external_configured_artifact_spec_is_trusted_without_git_exclusion(
+def test_external_configured_artifact_spec_is_not_rewritten_without_git_evidence(
     project, tmp_path, monkeypatch
 ):
-    """A configured external artifact root is writable but never a Git pathspec.
+    """A configured external artifact root is trusted but never a Git pathspec.
 
-    Ablations: restrict trusted roots to the project tree, or return the external
-    absolute path as a Git exclusion; either makes this test fail before both the
-    trusted normalization and empty-exclusion assertions can hold.
+    The checkout is genuinely clean, so the binding alone cannot prove the
+    external spec's status was attempt-authored. INVERSE ablation: normalize a
+    trusted binding before the real-checkout clean return and this test fails by
+    rewriting the external spec to ready-for-dev.
     """
     repo = project.project
     external_impl = tmp_path / "external-artifacts"
@@ -772,8 +899,8 @@ def test_external_configured_artifact_spec_is_trusted_without_git_exclusion(
 
     flow.rollback_or_pause(task)
 
-    assert _status(spec) == "ready-for-dev"
-    assert seen_excludes == [(), ()]
+    assert _status(spec) == "in-progress"
+    assert seen_excludes == [()]
     assert flow.journal.events() == ["rollback-skipped-clean"]
     assert flow.calls.pauses == []
 

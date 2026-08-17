@@ -1891,6 +1891,42 @@ def test_safe_rollback_preserves_tracked_artifact_deletion(project):
     assert (repo / "src.txt").read_text() == "original\n"  # source still reverts
 
 
+def test_safe_rollback_preserves_file_to_directory_replacement(project):
+    """A snapshot tree at a deleted baseline file path already replaces that file.
+
+    Ablation: delete the snapshot-present filter from the preserved-deletion
+    inventory and this test fails when ``git rm -f`` is handed the restored
+    replacement directory without ``-r``.
+    """
+    repo = project.project
+    artifact = project.implementation_artifacts / "result"
+    artifact.write_text("baseline file\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "artifact file")
+    baseline = verify.rev_parse_head(repo)
+    snap = sorted(verify.untracked_files(repo))
+    artifact_rel = project.implementation_artifacts.relative_to(repo).as_posix()
+
+    artifact.unlink()
+    artifact.mkdir()
+    nested = artifact / "payload.md"
+    nested.write_text("preserved replacement\n")
+    git(repo, "add", "-A", "--", artifact_rel)
+    (repo / "src.txt").write_text("dev attempt\n")
+
+    verify.safe_rollback(
+        repo,
+        baseline,
+        baseline_untracked=snap,
+        keep=(".bmad-loop", artifact_rel),
+        preserve=(artifact_rel,),
+    )
+
+    assert artifact.is_dir()
+    assert nested.read_text() == "preserved replacement\n"
+    assert (repo / "src.txt").read_text() == "original\n"
+
+
 def test_safe_rollback_raises_on_genuine_restore_failure(project, monkeypatch):
     """A non-benign `git checkout` failure while restoring a `preserve` path must
     raise — not silently drop the correction (which would loop the re-drive). The

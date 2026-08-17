@@ -579,10 +579,11 @@ def test_fresh_dev_attempt_persists_resolved_spec_binding_before_launch(project,
 
 
 def test_fresh_dev_attempt_clears_stale_binding_when_recorded_spec_is_invalid(project, monkeypatch):
-    """A new attempt with no valid recorded spec cannot inherit old ownership.
+    """A new attempt with no valid recorded spec stays bare and unpinned.
 
-    Ablation: change the direct assignment to an ``or`` fallback retaining the
-    old value and this test fails on the stale path observed at adapter launch.
+    Ablations: retain the old binding in `_dev_phase`, or remove the current-attempt
+    binding gate in `_generic_dev_prompt`; either makes this test quote and pin the
+    vanished path instead of falling back to a bare story key.
     """
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")])
@@ -606,6 +607,32 @@ def test_fresh_dev_attempt_clears_stale_binding_when_recorded_spec_is_invalid(pr
 
     assert observed == [None]
     assert task.dispatched_spec_file is None
+    dev_session = adapter.sessions[0]
+    assert dev_session.prompt.startswith(f"/bmad-dev-auto {task.story_key} —")
+    assert str(project.project / "missing-spec.md") not in dev_session.prompt
+    assert dev_session.expected_spec is None
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [OSError(36, "File name too long"), RuntimeError("symlink loop")],
+    ids=["oserror", "runtime-error"],
+)
+def test_dispatched_spec_observation_fault_leaves_attempt_unbound(project, monkeypatch, fault):
+    """A filesystem observation fault cannot abort before DEV_RUNNING is saved.
+
+    Ablation: delete the typed guard in ``_dispatched_spec_for_attempt`` and both
+    rows raise instead of returning the deliberately unbound fallback.
+    """
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file="recorded-spec.md")
+
+    def fail_observation(*_args, **_kwargs):
+        raise fault
+
+    monkeypatch.setattr(verify, "resolve_spec_path", fail_observation)
+
+    assert engine._dispatched_spec_for_attempt(task) is None
 
 
 def test_resume_continues_from_completed_review_session(project):
@@ -3748,7 +3775,7 @@ def test_expected_spec_pinned_only_when_the_prompt_names_the_spec(project):
     write_spec(owed_path, "done", "abc123")  # the repair leg re-opens it in place
     owed = str(owed_path)
     engine, _ = make_engine(project, [])
-    task = StoryTask(story_key="1-1-a", epic=1, spec_file=owed)
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=owed, dispatched_spec_file=owed)
     feedback = project.project / "feedback.md"
 
     # Pinned: every dispatch that hands the session the path.
@@ -3986,7 +4013,7 @@ def test_board_clause_rides_every_dev_leg_ahead_of_the_park_clause(project, tmp_
     write_spec(spec_path(project, "1-1-a"), "done", "abc123")  # the repair leg re-opens it
     engine, _ = make_engine(project, [])
     owed = str(spec_path(project, "1-1-a"))
-    task = StoryTask(story_key="1-1-a", epic=1, spec_file=owed)
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=owed, dispatched_spec_file=owed)
     assert engine._operator_park_instruction()  # else every ordering check is vacuous
     feedback = tmp_path / "feedback.md"
     feedback.write_text("verification evidence")
@@ -4040,7 +4067,7 @@ def test_no_dev_leg_invites_blocked(project, tmp_path):
     write_spec(spec_path(project, "1-1-a"), "done", "abc123")
     engine, _ = make_engine(project, [])
     owed = str(spec_path(project, "1-1-a"))
-    task = StoryTask(story_key="1-1-a", epic=1, spec_file=owed)
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=owed, dispatched_spec_file=owed)
     park = engine._operator_park_instruction()
     assert park.count("blocked") == 2  # else the count comparison below is vacuous
     feedback = tmp_path / "feedback.md"
@@ -4069,7 +4096,7 @@ def test_no_assembled_prompt_mixes_the_park_contract_with_the_blocked_redirect(p
     write_spec(spec_path(project, "1-1-a"), "done", "abc123")
     engine, _ = make_engine(project, [])
     owed = str(spec_path(project, "1-1-a"))
-    task = StoryTask(story_key="1-1-a", epic=1, spec_file=owed)
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=owed, dispatched_spec_file=owed)
     feedback = tmp_path / "feedback.md"
     feedback.write_text("verification evidence")
 
@@ -9605,7 +9632,9 @@ def test_dev_prompts_spell_the_post_rename_primitive(project):
     assert "bmad-dev-auto" not in fresh
 
     spec = str(spec_path(project, "1-1-a"))
-    explicit = engine._generic_dev_prompt(_prompt_task(spec_file=spec), None)
+    explicit = engine._generic_dev_prompt(
+        _prompt_task(spec_file=spec, dispatched_spec_file=spec), None
+    )
     assert explicit.startswith(
         "/bmad-build-auto Resume the autonomous dev session on the ready-for-dev spec"
     )

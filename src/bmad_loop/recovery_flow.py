@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Callable, NoReturn
 
 from . import gates, verify
 from .model import Phase
-from .platform_util import safe_ref_segment
+from .platform_util import atomic_write_bytes, safe_ref_segment
 from .statemachine import advance
 
 if TYPE_CHECKING:
@@ -154,19 +154,34 @@ class RecoveryFlow:
             return spec_path, None
         return spec_path, rel if rel and rel != "." else None
 
+    @staticmethod
+    def _normalize_attempt_owned_spec(spec_path: Path, target_status: str) -> None:
+        """Write and verify the lifecycle route recovery promises to dispatch."""
+        verify.set_frontmatter_status(spec_path, target_status)
+        if verify.status_of(verify.read_frontmatter(spec_path)) != target_status:
+            raise verify.FrontmatterWriteError(
+                f"could not normalize attempt-owned spec {spec_path} "
+                f"to status {target_status!r}"
+            )
+
     def rollback_or_pause(self, task: StoryTask, *, cause: str = "stopped") -> None:
         """Recover from an attempt that won't proceed.
 
-        No-op when the tree is proven to be at the attempt's baseline: neither a
-        reset nor a pause is needed. The one recognition exception is the exact
-        regular file bound in ``task.dispatched_spec_file`` for this attempt. If
-        no other debris exists, its lifecycle status is normalized and the real
-        checkout is probed again without exclusions. A genuinely clean checkout
-        emits ``rollback-skipped-clean``. A resolved re-drive whose authorized
-        human-corrected spec remains dirty instead emits
-        ``rollback-owned-spec-normalized`` and continues without pretending the
-        checkout is clean. A plain attempt's substantive spec residue still
-        follows the ordinary reset/pause policy.
+        No-op when the real tree is proven to be at the attempt's baseline:
+        neither a reset nor a pause is needed, and an unchanged bound spec is
+        never rewritten. The one recognition exception is the exact regular file
+        bound in ``task.dispatched_spec_file`` for this attempt. If the real tree
+        is dirty but no debris remains after excluding that file, its lifecycle
+        status is normalized and the real checkout is probed again without
+        exclusions. A genuinely clean checkout with no commits above the attempt
+        baseline emits ``rollback-skipped-clean``. If a lifecycle-only attempt
+        committed its flip, recovery parks that commit and resets HEAD before
+        retrying instead of mistaking the baseline-shaped worktree for a clean
+        branch.
+        A resolved re-drive whose authorized human-corrected spec remains dirty
+        instead emits ``rollback-owned-spec-normalized`` and continues without
+        pretending the checkout is clean. A plain attempt's substantive spec
+        residue still follows the ordinary reset/pause policy.
 
         The clean outcome also lets manual-recovery instructions terminate —
         after the operator resets and resumes, the now-clean tree skips straight
@@ -216,7 +231,34 @@ class RecoveryFlow:
         dirty = True
         dirty_probe_succeeded = False
         normalized_status: str | None = None
+        normalized_commits_present = False
         if task.baseline_commit:
+            try:
+                dirty = verify.attempt_dirty(
+                    workspace.root,
+                    task.baseline_commit,
+                    task.baseline_untracked,
+                )
+                dirty_probe_succeeded = True
+            except (verify.GitError, OSError) as exc:
+                self.journal.append(
+                    "rollback-dirty-check-failed", story_key=task.story_key, error=str(exc)
+                )
+        # Establish that this attempt actually changed the checkout before the
+        # bound spec can confer any normalization authority. Stories may dispatch
+        # an already-resumable draft/in-progress/in-review spec; a session that
+        # dies without touching it must not rewrite that clean baseline.
+        if task.baseline_commit and dirty_probe_succeeded and not dirty:
+            self.journal.append("rollback-skipped-clean", story_key=task.story_key)
+            return
+
+        # The real tree is dirty. Only now ask whether the exact in-workspace
+        # binding accounts for all of it. An out-of-workspace trusted spec has no
+        # Git pathspec and therefore cannot manufacture evidence of a lifecycle
+        # delta that Git cannot observe.
+        if task.baseline_commit and dirty_probe_succeeded and owned_spec and owned_exclude:
+            dirty = True
+            dirty_probe_succeeded = False
             try:
                 dirty = verify.attempt_dirty(
                     workspace.root,
@@ -230,33 +272,86 @@ class RecoveryFlow:
                     "rollback-dirty-check-failed", story_key=task.story_key, error=str(exc)
                 )
         if task.baseline_commit and dirty_probe_succeeded and not dirty and owned_spec:
-            spec_path, _ = owned_spec
-            target_status = "in-review" if task.restore_patch else "ready-for-dev"
-            verify.set_frontmatter_status(spec_path, target_status)
-            if verify.status_of(verify.read_frontmatter(spec_path)) != target_status:
-                raise verify.FrontmatterWriteError(
-                    f"could not normalize attempt-owned spec {spec_path} "
-                    f"to status {target_status!r}"
-                )
-            normalized_status = target_status
+            spec_path, spec_rel = owned_spec
+            original_spec = spec_path.read_bytes()
+            if redrive:
+                target_status = "in-review" if task.restore_patch else "ready-for-dev"
+            else:
+                try:
+                    target_status = (
+                        verify.frontmatter_status_at_revision(
+                            workspace.root, task.baseline_commit, spec_rel
+                        )
+                        if spec_rel
+                        else None
+                    )
+                except verify.GitError as exc:
+                    self.journal.append(
+                        "rollback-owned-spec-baseline-status-failed",
+                        story_key=task.story_key,
+                        error=str(exc),
+                    )
+                    target_status = None
+            if target_status is None:
+                # The exclusion proved only that the bound spec accounts for the
+                # checkout diff. Without a readable baseline status, that is not
+                # authority to mutate it or to call the real checkout clean.
+                dirty = True
+                normalized_status = None
+            else:
+                self._normalize_attempt_owned_spec(spec_path, target_status)
+                normalized_status = target_status
 
-            # The exclusion answered only whether anything besides the owned spec
-            # changed.  Re-probe the real checkout after repair before calling it
-            # clean or choosing a recovery policy.
-            dirty = True
-            dirty_probe_succeeded = False
-            try:
-                dirty = verify.attempt_dirty(
-                    workspace.root,
-                    task.baseline_commit,
-                    task.baseline_untracked,
-                )
-                dirty_probe_succeeded = True
-            except (verify.GitError, OSError) as exc:
-                self.journal.append(
-                    "rollback-dirty-check-failed", story_key=task.story_key, error=str(exc)
-                )
-        if task.baseline_commit and not dirty:
+                # The exclusion answered only whether anything besides the owned
+                # spec changed. Re-probe the real checkout after repair before
+                # calling it clean or choosing a recovery policy.
+                dirty = True
+                dirty_probe_succeeded = False
+                try:
+                    dirty = verify.attempt_dirty(
+                        workspace.root,
+                        task.baseline_commit,
+                        task.baseline_untracked,
+                    )
+                    dirty_probe_succeeded = True
+                except (verify.GitError, OSError) as exc:
+                    self.journal.append(
+                        "rollback-dirty-check-failed", story_key=task.story_key, error=str(exc)
+                    )
+                if not dirty and dirty_probe_succeeded:
+                    # `attempt_dirty(baseline)` compares the resulting checkout
+                    # tree with the baseline, not branch ancestry. A session may
+                    # have committed the lifecycle flip that was just normalized:
+                    # the worktree then matches the baseline while HEAD still
+                    # carries attempt commits and is dirty relative to its own tip.
+                    # Observe that range before authorizing the clean return. The
+                    # auto-recovery arm below parks and resets it; an observation
+                    # failure degrades to ordinary dirty policy, never false-clean.
+                    try:
+                        normalized_commits_present = bool(
+                            verify.commits_above(workspace.root, task.baseline_commit)
+                        )
+                    except (verify.GitError, OSError) as exc:
+                        dirty = True
+                        dirty_probe_succeeded = False
+                        self.journal.append(
+                            "rollback-dirty-check-failed",
+                            story_key=task.story_key,
+                            error=str(exc),
+                        )
+                if dirty and not redrive:
+                    # A plain attempt may be inspected or parked by the ordinary
+                    # recovery policy below. If baseline-status normalization did
+                    # not prove the checkout clean, put its spec back byte-for-byte
+                    # before that policy claims the tree was left untouched.
+                    atomic_write_bytes(spec_path, original_spec, follow_symlinks=False)
+                    if spec_path.read_bytes() != original_spec:
+                        raise verify.FrontmatterWriteError(
+                            f"could not restore attempt-owned spec {spec_path} after "
+                            "baseline-status normalization remained dirty"
+                        )
+                    normalized_status = None
+        if task.baseline_commit and not dirty and not normalized_commits_present:
             self.journal.append("rollback-skipped-clean", story_key=task.story_key)
             return
         if (
@@ -284,7 +379,18 @@ class RecoveryFlow:
         # reaches this method *outside* a mounted unit (e.g. resume with no
         # worktree recorded) still targets the main checkout and must pause.
         in_unit_worktree = workspace.root != self.paths.repo_root
-        if resolved or in_unit_worktree or self.policy.scm.rollback_on_failure:
+        normalized_commit_only = (
+            task.baseline_commit is not None
+            and normalized_status is not None
+            and not dirty
+            and normalized_commits_present
+        )
+        if (
+            normalized_commit_only
+            or resolved
+            or in_unit_worktree
+            or self.policy.scm.rollback_on_failure
+        ):
             # `preserve_ref` names where *this* rollback parked the attempt. Clear
             # it first: a later attempt that parks nothing (no commits above
             # baseline, or a preserve failure) must not inherit the previous
@@ -317,8 +423,43 @@ class RecoveryFlow:
             # if preserve_attempt_commits did not pause (plain-rollback preserve
             # failure), and refuses the reset on the same terms when a failed
             # capture would cost unparked work (#340).
-            self.preserve_attempt_worktree(task, allow_pause=not redrive)
+            # After owned-spec normalization proved the checkout byte-equivalent
+            # to the baseline, only branch ancestry remains. Capturing the
+            # worktree here would park the normalization's inverse diff against
+            # the failed HEAD even though the target reset cannot discard any
+            # checkout content. The commits were parked above; reset them directly.
+            if not normalized_commit_only:
+                self.preserve_attempt_worktree(task, allow_pause=not redrive)
             self.safe_reset(task, preserve=protected)
+            if redrive and task.baseline_commit and owned_spec:
+                # A sibling source/artifact change bypasses the earlier spec-only
+                # normalization and reaches this reset. The protected artifact
+                # folders deliberately retain the corrected spec, so re-establish
+                # the route promised by the next prompt after resetting the
+                # sibling residue. Patch restores keep their review route.
+                target_status = "in-review" if task.restore_patch else "ready-for-dev"
+                self._normalize_attempt_owned_spec(owned_spec[0], target_status)
+                try:
+                    checkout_dirty = verify.attempt_dirty(
+                        workspace.root,
+                        task.baseline_commit,
+                        task.baseline_untracked,
+                    )
+                except (verify.GitError, OSError) as exc:
+                    self.journal.append(
+                        "rollback-dirty-check-failed",
+                        story_key=task.story_key,
+                        error=str(exc),
+                    )
+                else:
+                    if checkout_dirty:
+                        self.journal.append(
+                            "rollback-owned-spec-normalized",
+                            story_key=task.story_key,
+                            spec=str(owned_spec[0]),
+                            status=target_status,
+                            checkout_dirty=True,
+                        )
             # Refresh the plugin's view of the now-reset tree (the Unity engine
             # re-imports assets). Observe-only for the same reason as pre_rollback.
             self._emit("post_rollback", task)

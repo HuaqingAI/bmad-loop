@@ -51,17 +51,19 @@ breaking changes may land in a minor release.
 ### Fixed
 
 - **Attempt-owned spec-only retries no longer demand a false manual rollback (#123).** A
-  bound plain attempt whose only residue is its lifecycle flip is restored to `ready-for-dev`
-  and proven Git-clean before retry. A resolved re-drive may instead retain an authorized dirty,
-  human-corrected spec and reports `rollback-owned-spec-normalized` without claiming cleanliness
-  or auto-committing the correction; substantive spec changes and sibling source, artifact, or
-  untracked residue still follow the configured rollback policy.
+  bound plain attempt whose only residue is its lifecycle flip is restored to its pre-attempt
+  lifecycle status and proven Git-clean before retry. A resolved re-drive may instead retain an
+  authorized dirty, human-corrected spec and reports `rollback-owned-spec-normalized` without
+  claiming cleanliness or auto-committing the correction; a later non-fixable retry restores its
+  promised lifecycle route after resetting sibling residue. Substantive spec changes and sibling
+  source, artifact, or untracked residue still follow the configured rollback policy.
 
 - **Recorded sprint re-drives now route directly through their known spec (#630).** Only a
   generic sprint task with a recorded `spec_file` names that `ready-for-dev` spec explicitly and
   pins deterministic read-back to the same file. Fresh sprint tasks with no recorded path remain
   bare-key dispatches; Stories stays folder+id, Sweep stays intent-bundle, and patch-restore plus
-  verification-feedback routes retain their existing wording and precedence.
+  verification-feedback routes retain their existing wording and precedence. A filesystem fault
+  while observing the dispatch binding leaves that attempt unbound instead of aborting the run.
 
 - **Silent OpenCode parent sessions now enter bounded recovery from launch (#411).** Parent/child
   SSE activity and a provably busy or retrying parent re-arm the grace; true silence spends the

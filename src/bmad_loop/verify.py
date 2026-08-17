@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, overload
 
+import yaml
+
 from . import deferredwork
 from .bmadconfig import ProjectPaths
 from .frontmatter import FrontmatterWriteError  # noqa: F401 — re-export
@@ -434,6 +436,40 @@ def attempt_dirty(
     created = untracked_files(repo) - set(baseline_untracked)
     created = {p for p in created if not _path_under_any(p, exclude)}
     return bool(created)
+
+
+def frontmatter_status_at_revision(repo: Path, revision: str, rel: str) -> str | None:
+    """Read one tracked file's normalized frontmatter status from ``revision``.
+
+    This is the baseline oracle for attempt-owned lifecycle recovery. The file
+    content is read through Git's object database, not the mutable checkout, and
+    decoded from bytes so an undecodable historical blob degrades to no usable
+    status instead of escaping the git subprocess chokepoint. Missing files,
+    malformed YAML, non-mapping frontmatter, and missing/blank statuses likewise
+    return ``None``; a caller must not repair from an unproven baseline.
+    """
+    proc = _run_git(
+        ["git", "-C", str(repo), "show", f"{revision}:{rel}"],
+        repo,
+        binary=True,
+    )
+    if proc.returncode != 0:
+        return None
+    try:
+        text = proc.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    split = _split_frontmatter(text)
+    if split is None:
+        return None
+    try:
+        doc = yaml.safe_load(split[1])
+    except yaml.YAMLError:
+        return None
+    if not isinstance(doc, dict) or "status" not in doc:
+        return None
+    status = status_of(doc)
+    return status or None
 
 
 def _exclude_specs(dirs: tuple[str, ...]) -> list[str]:
@@ -1136,6 +1172,39 @@ def safe_rollback(
                 f"failed in {repo}: {detail}"
             )
         deleted_preserve_paths = tuple(path for path in proc.stdout.split("\0") if path)
+        if deleted_preserve_paths:
+            # A blob-to-tree replacement is reported as deletion of the baseline
+            # blob plus additions below that same path. The later snapshot
+            # checkout already installs the replacement tree; replaying the blob
+            # deletion with `git rm -f` would then fail because recursive removal
+            # was neither intended nor authorized. Ask the snapshot which deleted
+            # names still exist there (as a tree or another replacement object)
+            # and leave those exact paths to checkout. This inventory is also
+            # pre-reset so an observation failure remains non-destructive.
+            proc = _run_git(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "ls-tree",
+                    "--name-only",
+                    "-z",
+                    snapshot,
+                    "--",
+                    *_literal_specs(list(deleted_preserve_paths)),
+                ],
+                repo,
+            )
+            if proc.returncode != 0:
+                detail = (proc.stdout + proc.stderr).strip()
+                raise GitError(
+                    f"git ls-tree {snapshot[:12]} for preserved replacements "
+                    f"failed in {repo}: {detail}"
+                )
+            snapshot_replacements = frozenset(path for path in proc.stdout.split("\0") if path)
+            deleted_preserve_paths = tuple(
+                path for path in deleted_preserve_paths if path not in snapshot_replacements
+            )
     rc, out = _git(repo, "reset", "--hard", baseline)
     if rc != 0:
         raise GitError(f"git reset --hard {baseline} failed: {out}")

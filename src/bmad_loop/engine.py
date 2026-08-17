@@ -1659,8 +1659,11 @@ class Engine:
         """
         if not task.spec_file:
             return None
-        spec_path = verify.resolve_spec_path(task.spec_file, self.workspace.paths)
-        return str(spec_path) if spec_path.is_file() else None
+        try:
+            spec_path = verify.resolve_spec_path(task.spec_file, self.workspace.paths)
+            return str(spec_path) if spec_path.is_file() else None
+        except (OSError, RuntimeError):
+            return None
 
     def _dev_phase(self, task: StoryTask, resume_result: SessionResult | None = None) -> bool:
         if resume_result is None:
@@ -4337,13 +4340,13 @@ class Engine:
             # Pinned ONLY when the dispatched prompt NAMES that path — the read-back
             # may demand a file back solely because the session was told to write it.
             # Knowing a spec exists is not the same as having pointed a session at it:
-            # a generic sprint re-drive with `task.spec_file` recorded now names it
-            # explicitly, while a fresh task has no path, a sweep bundle dispatches
-            # `intent.md`, and StoriesEngine dispatches folder+id. Pinning either of
-            # those latter modes would poll a path the session never promised to
-            # rewrite and score its real output as "wrote nothing" — trading #261's
-            # unsafe failure for a work-LOSING one, the exact trade this fix exists
-            # to avoid.
+            # a generic sprint re-drive names a recorded `task.spec_file` only when
+            # `_dev_phase` also bound that regular file to the current attempt. A
+            # fresh or stale-path task has no binding, a sweep bundle dispatches
+            # `intent.md`, and StoriesEngine dispatches folder+id. Pinning any of
+            # those modes would poll a path the session never promised to rewrite
+            # and score its real output as "wrote nothing" — trading #261's unsafe
+            # failure for a work-LOSING one, the exact trade this fix exists to avoid.
             # Testing the prompt keeps the pin and the contract that justifies it in
             # one place across all three engines (each builds its own prompt), and
             # reads the post-gate text, so a plugin rewrite cannot desynchronize them.
@@ -4647,7 +4650,11 @@ class Engine:
                     f"the working tree after an intent-gap resolution; review it "
                     f"against the amended spec."
                 ) + after_sentence
-            if task.spec_file:
+            # The attempt binding was resolved in the active workspace immediately
+            # before DEV_RUNNING became durable. A retained `spec_file` alone may
+            # name a discarded unit worktree, so it cannot authorize this route or
+            # the matching deterministic read-back pin.
+            if task.spec_file and task.dispatched_spec_file:
                 return (
                     f"/{self._dev_skill()} Resume the autonomous dev session on the "
                     f"ready-for-dev spec at `{task.spec_file}`."
