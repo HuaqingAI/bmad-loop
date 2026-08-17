@@ -35,11 +35,52 @@ TRIAGE_WORKFLOW = "deferred-sweep-triage"
 MIGRATE_KEY = "sweep-migrate"
 MIGRATE_WORKFLOW = "deferred-sweep-migrate"
 BUNDLE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,39}\Z")
+_BUNDLE_NAME_MAX_LENGTH = 40
+_BUNDLE_NAME_INITIAL_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789")
+_BUNDLE_NAME_SAFE_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-")
 # the inverse of SweepEngine._bundle_key: "dw-<name>" (cycle 1) / "dw<N>-<name>".
 # A cycle-1 key always has "-" straight after "dw", so the cycle group matches
 # empty and the split stays unambiguous even for a bundle named "2fix".
 BUNDLE_KEY_RE = re.compile(r"^dw(\d*)-(.+)\Z")
 DECISION_EFFECTS = ("build", "close", "keep-open")
+
+
+@dataclass(frozen=True)
+class _BundleNameRepair:
+    field: str
+    original: str
+    normalized: str
+
+
+def _normalize_bundle_names(rj: dict[str, Any] | None) -> tuple[_BundleNameRepair, ...]:
+    """Truncate overlong bundle-name fields only when their shape is already safe."""
+    if rj is None:
+        return ()
+
+    repairs: list[_BundleNameRepair] = []
+
+    def normalize(container: dict[str, Any], key: str, field: str) -> None:
+        raw = container.get(key)
+        if not isinstance(raw, str) or len(raw) <= _BUNDLE_NAME_MAX_LENGTH:
+            return
+        if raw[0] not in _BUNDLE_NAME_INITIAL_CHARS or any(
+            char not in _BUNDLE_NAME_SAFE_CHARS for char in raw[1:]
+        ):
+            return
+        normalized = raw[:_BUNDLE_NAME_MAX_LENGTH]
+        container[key] = normalized
+        repairs.append(_BundleNameRepair(field, raw, normalized))
+
+    for bundle_index, bundle in enumerate(rj.get("bundles", [])):
+        normalize(bundle, "name", f"bundles[{bundle_index}].name")
+    for decision_index, decision in enumerate(rj.get("decisions", [])):
+        for option_index, option in enumerate(decision.get("options", [])):
+            normalize(
+                option,
+                "bundle_name",
+                f"decisions[{decision_index}].options[{option_index}].bundle_name",
+            )
+    return tuple(repairs)
 
 
 # ------------------------------------------------------------- triage plan
@@ -102,6 +143,7 @@ def validate_triage(
     equality check (used when reloading a previously validated plan)."""
     errors: list[str] = []
     rj = rj or {}
+    _normalize_bundle_names(rj)
     if rj.get("workflow") != TRIAGE_WORKFLOW:
         return None, [f"workflow must be {TRIAGE_WORKFLOW!r}: got {rj.get('workflow')!r}"]
 
@@ -1005,7 +1047,15 @@ class SweepEngine(Engine):
             if result.status != "completed":
                 plan, errors = None, [session_failure_reason("triage", result)]
             else:
+                repairs = _normalize_bundle_names(result.result_json)
                 plan, errors = validate_triage(result.result_json, open_now)
+                for repair in repairs:
+                    self.journal.append(
+                        "sweep-bundle-name-normalized",
+                        field=repair.field,
+                        original=repair.original,
+                        normalized=repair.normalized,
+                    )
             self.journal.append(
                 "triage-decision",
                 attempt=task.attempt,
