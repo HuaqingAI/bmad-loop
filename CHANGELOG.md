@@ -376,30 +376,17 @@ breaking changes may land in a minor release.
   example and the guide quotes it on those terms. At 60 columns and 20 rows and above the full
   chrome renders exactly as it does today.
 
-- **A deferred-work bundle whose name ends in a newline is now rejected at triage instead of
-  becoming a directory (#330).** Both of the sweep module's regexes ended in `$`, which in Python
-  matches at the end of the string _or_ just before a single trailing newline, and every call site
-  uses `.match()`, which anchors only the start. So a triage result naming a bundle `fix-it\n`
-  validated clean, and that name is used raw from there — nothing sanitizes it — as the
-  `run_dir/bundles/<name>/` path segment and as the `dw-<name>` story key that lands in run state
-  and the journal. On Linux it silently created a directory whose name ends in a newline; on native
-  Windows a control character in a path segment is invalid, so the sweep failed at bundle start.
-  The bundle-key regex had the same hole with a quieter consequence — `.` does not match a newline,
-  so a key of `dw-foo\n` matched and reconstructed the name as `foo`, and a degraded bundle's intent
-  was regenerated under that different directory without a word in the journal. Both patterns now
-  anchor with `\Z`.
-
-  What flips is narrow: a name or key ending in exactly one bare LF, with nothing after it, moves
-  from accepted to rejected. `\r\n`, `\n\n`, a bare `\r`, a trailing space and any interior newline
-  were already rejected, and every well-formed name and key parses exactly as it did before. Three
-  further effects follow. The validation error text interpolates the pattern, so it now reads
-  `...{1,39}\Z` where it read `...{1,39}$`. A cached `triage.json` carrying a newline-suffixed name
-  now fails its reload re-validation, which degrades rather than crashes: the run journals
-  `sweep-triage-reload-failed` and runs a fresh triage. And a run state persisted by a pre-fix build
-  whose task key ends in a newline is no longer recognised as a bundle by the in-flight-finish or
-  stranded-bundle scans, so such a task becomes inert instead of being re-driven — under a silently
-  different name, which is what the old behavior actually did. This closes the trailing-newline hole
-  in the sweep module only; it does not make a bundle name safe as a path segment in general.
+- **A deferred-work bundle whose name or key ends in a newline is now rejected instead of becoming a
+  directory (#330).** Both sweep regexes anchored with `$`, which in Python also matches just before
+  a single trailing newline, and every call site uses `.match()`. So a bundle named `fix-it\n`
+  validated clean and was used unsanitized as both the `run_dir/bundles/<name>/` path segment —
+  invalid on native Windows — and the `dw-<name>` story key, while a key of `dw-foo\n` silently
+  rebuilt a degraded bundle's intent under the different directory `foo`. Both patterns now anchor
+  with `\Z`. Only a name or key ending in exactly one bare LF flips to rejected; `\r\n`, `\n\n`, a
+  bare `\r`, a trailing space and any interior newline already were. A cached triage carrying such a
+  name now re-runs instead of crashing, and a pre-fix run-state task keyed that way becomes inert
+  rather than re-driven under a silently different name. Sweep-scoped: a bundle name is still not
+  guaranteed safe as a path segment.
 
 ## [0.10.0] — 2026-08-14
 
