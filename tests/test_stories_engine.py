@@ -480,6 +480,11 @@ def test_story_selector_filters_to_one_id(project):
 
 
 def test_dev_prompt_fresh_dispatch_shape(project):
+    """Stories keeps its folder+id route instead of inheriting sprint routing.
+
+    Ablation: route ``StoriesEngine._dev_prompt`` through its superclass and this
+    exact assertion fails on the inherited bare sprint-key prompt.
+    """
     setup_stories(project, [entry("1")])
     engine, _ = make_engine(project, [])
     task = StoryTask(story_key="1", epic=0)
@@ -585,6 +590,12 @@ def test_review_prompt_carries_no_sprint_board_clause(project):
 
 
 def test_dev_prompt_repair_leg_is_explicit_spec_resume(project, tmp_path):
+    """A Stories repair remains its pre-sprint-routing explicit-spec invocation.
+
+    Green ablation: routing ``StoriesEngine._dev_prompt`` through its superclass
+    leaves this test green because the two repair legs are intentionally
+    byte-identical; ``test_dev_prompt_fresh_dispatch_shape`` grades the override.
+    """
     setup_stories(project, [entry("1")])
     engine, _ = make_engine(project, [])
     task = StoryTask(story_key="1", epic=0)
@@ -595,8 +606,13 @@ def test_dev_prompt_repair_leg_is_explicit_spec_resume(project, tmp_path):
     feedback = tmp_path / "fb.md"
     feedback.write_text("boom")
     prompt = engine._dev_prompt(task, feedback)
-    assert prompt.startswith("/bmad-dev-auto Resume the autonomous dev session on the in-progress")
-    assert "Story id:" not in prompt  # repair is an explicit-spec-file invocation
+    assert prompt == (
+        f"/bmad-dev-auto Resume the autonomous dev session on the in-progress spec at "
+        f"`{task.spec_file}`. The previous session's work failed deterministic "
+        f"verification; repair the working tree so verification passes without "
+        f"changing the spec's frozen intent contract. Verification evidence is "
+        f"in `{feedback}`."
+    )
 
 
 def test_dev_prompt_spells_the_post_rename_primitive(project, tmp_path, monkeypatch):

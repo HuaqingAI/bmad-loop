@@ -1859,6 +1859,38 @@ def test_safe_rollback_preserves_tracked_artifact(project):
     assert spec.read_text() == "frozen: corrected\n"  # spec correction preserved
 
 
+def test_safe_rollback_preserves_tracked_artifact_deletion(project):
+    """A protected snapshot is authoritative when it deletes a tracked artifact.
+
+    Restoring only paths present in the snapshot resurrects the baseline file and
+    can re-wedge a resolved Stories sentinel. Ablation: delete the replay of
+    ``deleted_preserve_paths`` after the snapshot checkout and this test fails
+    because the deleted spec exists again.
+    """
+    repo = project.project
+    spec = project.implementation_artifacts / "1-unresolved.md"
+    spec.write_text("blocked sentinel\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "sentinel")
+    baseline = verify.rev_parse_head(repo)
+    snap = sorted(verify.untracked_files(repo))
+    artifact_rel = project.implementation_artifacts.relative_to(repo).as_posix()
+
+    spec.unlink()  # the resolve workflow deliberately cleared this sentinel
+    (repo / "src.txt").write_text("dev attempt\n")
+
+    verify.safe_rollback(
+        repo,
+        baseline,
+        baseline_untracked=snap,
+        keep=(".bmad-loop", artifact_rel),
+        preserve=(artifact_rel,),
+    )
+
+    assert not spec.exists()  # the protected deletion survives the hard reset
+    assert (repo / "src.txt").read_text() == "original\n"  # source still reverts
+
+
 def test_safe_rollback_raises_on_genuine_restore_failure(project, monkeypatch):
     """A non-benign `git checkout` failure while restoring a `preserve` path must
     raise — not silently drop the correction (which would loop the re-drive). The

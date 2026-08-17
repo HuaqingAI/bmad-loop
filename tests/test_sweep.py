@@ -4003,7 +4003,12 @@ def test_bundle_dispatch_does_not_pin_expected_spec(project, tmp_path):
     would poll a path this dispatch never promised to rewrite.
 
     Falls out of the naming rule rather than a sweep-specific carve-out, which is
-    exactly why it needs pinning down: nothing in sweep.py mentions expected_spec."""
+    exactly why it needs pinning down: nothing in sweep.py mentions expected_spec.
+
+    Ablation: route ``SweepEngine._dev_prompt`` through its superclass and this
+    test fails because the inherited known-spec arm names ``task.spec_file`` and
+    pins read-back to it instead of dispatching ``intent.md``.
+    """
     engine, adapter = make_sweep(project, [SessionResult(status="crashed")])
     intent = tmp_path / "bundles" / "fix" / "intent.md"
     intent.parent.mkdir(parents=True)

@@ -1058,14 +1058,15 @@ def safe_rollback(
 
     `preserve` is repo-relative posix dir prefixes (the BMAD artifact folders)
     whose *tracked* content must survive the hard reset — e.g. a frozen spec the
-    resolve workflow just corrected. The `git reset --hard` would otherwise
-    revert them (keep only guards untracked deletion). We snapshot the current
-    tree with `git stash create`, reset, then restore those paths from the
-    snapshot. If that snapshot cannot be taken we raise *before* the reset rather
-    than proceed with an empty one: skipping the restore would revert exactly what
-    `preserve` names, and it would do so silently. Untracked artifacts need no
-    special handling: the reset leaves them alone and the cleanup below skips
-    `keep` dirs.
+    resolve workflow just corrected, or a sentinel it deliberately deleted. The
+    `git reset --hard` would otherwise revert them (keep only guards untracked
+    deletion). We snapshot the current tree with `git stash create`, enumerate
+    tracked deletions inside the preserved prefixes, reset, then restore the
+    snapshot's present paths and replay its deletions. If the snapshot or deletion
+    inventory cannot be read we raise *before* the reset rather than proceed with
+    an incomplete restore: that would revert exactly what `preserve` names, and it
+    would do so silently. Untracked artifacts need no special handling: the reset
+    leaves them alone and the cleanup below skips `keep` dirs.
 
     `policy.toml` (the operator's orchestration config) is *always* restored,
     regardless of `preserve`. It lives inside the kept `.bmad-loop` dir but is
@@ -1109,6 +1110,32 @@ def safe_rollback(
     if rc != 0 and preserve:
         raise GitError(f"git stash create failed in {repo}: {detail}")
     snapshot = out if rc == 0 else ""
+    deleted_preserve_paths: tuple[str, ...] = ()
+    if snapshot and preserve:
+        proc = _run_git(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "diff",
+                "--no-renames",
+                "--name-only",
+                "--diff-filter=D",
+                "-z",
+                baseline,
+                snapshot,
+                "--",
+                *_literal_specs(list(preserve)),
+            ],
+            repo,
+        )
+        if proc.returncode != 0:
+            detail = (proc.stdout + proc.stderr).strip()
+            raise GitError(
+                f"git diff {baseline[:12]}..{snapshot[:12]} for preserved deletions "
+                f"failed in {repo}: {detail}"
+            )
+        deleted_preserve_paths = tuple(path for path in proc.stdout.split("\0") if path)
     rc, out = _git(repo, "reset", "--hard", baseline)
     if rc != 0:
         raise GitError(f"git reset --hard {baseline} failed: {out}")
@@ -1140,6 +1167,22 @@ def safe_rollback(
             # fails on an unexpected GitError.
             if rc != 0 and "did not match" not in out:
                 raise GitError(f"git checkout {snapshot[:12]} -- {d} failed: {out}")
+        # `checkout <tree> -- <dir>` writes every path PRESENT in that tree but
+        # does not remove a baseline path ABSENT from it. Replay those exact,
+        # pre-reset-inventoried deletions so preservation reproduces the snapshot
+        # rather than resurrecting a deliberately cleared sentinel. The operands
+        # remain literal for the same reason as the checkout above.
+        if deleted_preserve_paths:
+            rc, out = _git(
+                repo,
+                "rm",
+                "-f",
+                "--ignore-unmatch",
+                "--",
+                *_literal_specs(list(deleted_preserve_paths)),
+            )
+            if rc != 0:
+                raise GitError(f"git rm of preserved snapshot deletions failed in {repo}: {out}")
     if policy_content is not None:
         current = policy_path.read_bytes() if policy_path.is_file() else None
         if current != policy_content:

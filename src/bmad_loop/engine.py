@@ -4337,12 +4337,13 @@ class Engine:
             # Pinned ONLY when the dispatched prompt NAMES that path — the read-back
             # may demand a file back solely because the session was told to write it.
             # Knowing a spec exists is not the same as having pointed a session at it:
-            # a from-scratch re-drive after an escalation/deferral has `task.spec_file`
-            # recorded (`_record_dev_spec`) but dispatches a bare story key, a sweep
-            # bundle dispatches `intent.md`, and StoriesEngine dispatches folder+id.
-            # Pinning those would poll a path the session never promised to rewrite
-            # and score its real output as "wrote nothing" — trading #261's unsafe
-            # failure for a work-LOSING one, the exact trade this fix exists to avoid.
+            # a generic sprint re-drive with `task.spec_file` recorded now names it
+            # explicitly, while a fresh task has no path, a sweep bundle dispatches
+            # `intent.md`, and StoriesEngine dispatches folder+id. Pinning either of
+            # those latter modes would poll a path the session never promised to
+            # rewrite and score its real output as "wrote nothing" — trading #261's
+            # unsafe failure for a work-LOSING one, the exact trade this fix exists
+            # to avoid.
             # Testing the prompt keeps the pin and the contract that justifies it in
             # one place across all three engines (each builds its own prompt), and
             # reads the post-gate text, so a plugin rewrite cannot desynchronize them.
@@ -4645,6 +4646,11 @@ class Engine:
                     f"`{task.spec_file}`. The attempted change was restored onto "
                     f"the working tree after an intent-gap resolution; review it "
                     f"against the amended spec."
+                ) + after_sentence
+            if task.spec_file:
+                return (
+                    f"/{self._dev_skill()} Resume the autonomous dev session on the "
+                    f"ready-for-dev spec at `{task.spec_file}`."
                 ) + after_sentence
             return f"/{self._dev_skill()} {task.story_key}" + after_key
         self._reset_spec_for_repair(task)

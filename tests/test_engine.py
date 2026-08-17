@@ -3732,14 +3732,17 @@ def _pin_probe(project, prompt: str, *, spec_file: str | None, role="dev", label
 
 def test_expected_spec_pinned_only_when_the_prompt_names_the_spec(project):
     """#261 pins the read-back to the spec the session owes — and the ONLY thing
-    that makes a session owe one is having been pointed at it. Knowing a spec exists
-    is not the same: `_record_dev_spec` sets `task.spec_file` when a story escalates
-    or defers, but the re-drive that follows dispatches a bare story key. Pinning
-    there would poll a stale path while the re-drive's real output went unread —
-    trading #261's unsafe failure for a work-losing one (#298 review).
+    that makes a session owe one is having been pointed at it. Generic sprint
+    re-drives now point at their recorded `task.spec_file`; fresh tasks without a
+    recorded path remain free to create one, while labeled workflows remain outside
+    this read-back contract.
 
     Both directions are asserted against the REAL prompt builders, so the rule and
-    the contract it reads cannot drift apart."""
+    the contract it reads cannot drift apart.
+
+    Ablation: delete the known-spec arm in `_generic_dev_prompt` and the normal
+    re-drive prompt becomes bare, so its expected-spec assertion fails with None.
+    """
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     owed_path = spec_path(project, "1-1-a")
     write_spec(owed_path, "done", "abc123")  # the repair leg re-opens it in place
@@ -3753,16 +3756,28 @@ def test_expected_spec_pinned_only_when_the_prompt_names_the_spec(project):
     assert _pin_probe(project, engine._dev_prompt(task, feedback), spec_file=owed) == owed
     restoring = dataclasses.replace(task, restore_patch="/tmp/attempt.patch")
     assert _pin_probe(project, engine._dev_prompt(restoring, None), spec_file=owed) == owed
+    redrive = engine._dev_prompt(task, None)
+    assert redrive.startswith(
+        f"/bmad-dev-auto Resume the autonomous dev session on the ready-for-dev spec at `{owed}`."
+    )
+    assert _pin_probe(project, redrive, spec_file=owed) == owed
 
-    # NOT pinned: the from-scratch re-drive after an escalation/deferral. The task
-    # carries a recorded spec, but the dispatch is a bare story key — the session is
-    # free to write a different spec, and the scan is the only way to find it.
-    fresh = engine._dev_prompt(task, None)
-    # the dispatch itself is a bare key; the engine-injected awaiting-operator
-    # contract (#335) rides along but names no path, which is the property the
-    # pin reads
-    assert fresh.startswith("/bmad-dev-auto 1-1-a")
-    assert _pin_probe(project, fresh, spec_file=owed) is None
+
+def test_fresh_sprint_prompt_without_recorded_spec_stays_bare_and_unpinned(project):
+    """T19: a fresh sprint task has no spec path to route or pin.
+
+    INVERSE ablation: fabricate a spec filename from the story key before the
+    bare-key fallback and this test fails because the prompt names that invented
+    path instead of dispatching the bare story key.
+    """
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1)
+
+    prompt = engine._dev_prompt(task, None)
+
+    assert prompt.startswith(f"/bmad-dev-auto 1-1-a — {BOARD_OWNED}")
+    assert "ready-for-dev spec at" not in prompt
+    assert _pin_probe(project, prompt, spec_file=None) is None
 
 
 def test_expected_spec_withheld_from_labeled_workflow_session(project):
@@ -3770,7 +3785,11 @@ def test_expected_spec_withheld_from_labeled_workflow_session(project):
     adapter but owes the completion MARKER, not the story spec — and its prompt gets
     the spec path appended to it by nothing, so the naming rule alone would already
     withhold the pin. The explicit `label is None` guard is what keeps that true if a
-    plugin's workflow prompt ever quotes the spec path as context."""
+    plugin's workflow prompt ever quotes the spec path as context.
+
+    Ablation: delete the `label is None` guard and this test fails because the
+    labeled session is pinned to the story spec instead of its completion marker.
+    """
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     owed = str(spec_path(project, "1-1-a"))
     pinned = _pin_probe(
@@ -3950,11 +3969,19 @@ def test_stories_review_prompt_shape_is_reached_when_both_clauses_empty(project,
 
 
 def test_board_clause_rides_every_dev_leg_ahead_of_the_park_clause(project, tmp_path):
-    """All three `_generic_dev_prompt` legs carry the prohibition, and none of them
+    """All four `_generic_dev_prompt` legs carry the prohibition, and none of them
     lets it displace the park contract from the end of the prompt or the feedback path
-    from the last backticked token. The fresh bare-key leg needs it as much as the
-    others: `rearm_escalation` never touches the board, so a story re-dispatched after
-    a resolved escalation re-enters that leg with its row still at `done`."""
+    from the last backticked token. The fresh bare-key and known-spec legs need it as
+    much as the others: `rearm_escalation` never touches the board, so a story
+    re-dispatched after a resolved escalation may find its row still at `done`.
+
+    Ablation: delete the known-spec prompt arm and the exact ready-for-dev invocation
+    fails by falling back to the bare-key head.
+    Ablations: bypass the restore arm and its in-review assertion fails; replace the
+    repair arm's in-progress wording or delete its evidence sentence and the matching
+    repair assertions fail; reverse the clause list and the board-before-park order
+    assertion fails.
+    """
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     write_spec(spec_path(project, "1-1-a"), "done", "abc123")  # the repair leg re-opens it
     engine, _ = make_engine(project, [])
@@ -3964,14 +3991,26 @@ def test_board_clause_rides_every_dev_leg_ahead_of_the_park_clause(project, tmp_
     feedback = tmp_path / "feedback.md"
     feedback.write_text("verification evidence")
 
-    fresh = engine._dev_prompt(task, None)
+    bare = engine._dev_prompt(StoryTask(story_key="1-1-a", epic=1), None)
+    explicit = engine._dev_prompt(task, None)
     restore = engine._dev_prompt(dataclasses.replace(task, restore_patch="/tmp/a.patch"), None)
     repair = engine._dev_prompt(task, feedback)
 
     # after a bare story key the em dash IS the right separator — the one seam
     # neither sentence-joined leg nor the review prompt uses
-    assert fresh.startswith(f"/bmad-dev-auto 1-1-a — {BOARD_OWNED}")
-    for prompt in (fresh, restore, repair):
+    assert bare.startswith(f"/bmad-dev-auto 1-1-a — {BOARD_OWNED}")
+    assert explicit == (
+        f"/bmad-dev-auto Resume the autonomous dev session on the ready-for-dev "
+        f"spec at `{owed}`. {engine._sprint_board_instruction()} "
+        f"{engine._operator_park_instruction()}"
+    )
+    assert restore.startswith(f"/bmad-dev-auto Resume review of the in-review spec at `{owed}`.")
+    assert "ready-for-dev spec" not in restore
+    assert repair.startswith(
+        f"/bmad-dev-auto Resume the autonomous dev session on the in-progress spec at `{owed}`."
+    )
+    assert f"Verification evidence is in `{feedback}`." in repair
+    for prompt in (bare, explicit, restore, repair):
         assert BOARD_OWNED in prompt
         assert PARK_HEAD in prompt
         assert prompt.index(BOARD_OWNED) < prompt.index(PARK_HEAD)
@@ -4008,6 +4047,7 @@ def test_no_dev_leg_invites_blocked(project, tmp_path):
     feedback.write_text("verification evidence")
 
     for prompt in (
+        engine._dev_prompt(StoryTask(story_key="1-1-a", epic=1), None),
         engine._dev_prompt(task, None),
         engine._dev_prompt(dataclasses.replace(task, restore_patch="/tmp/a.patch"), None),
         engine._dev_prompt(task, feedback),
@@ -4035,6 +4075,7 @@ def test_no_assembled_prompt_mixes_the_park_contract_with_the_blocked_redirect(p
 
     prompts = [
         engine._review_prompt(task),
+        engine._dev_prompt(StoryTask(story_key="1-1-a", epic=1), None),
         engine._dev_prompt(task, None),
         engine._dev_prompt(dataclasses.replace(task, restore_patch="/tmp/a.patch"), None),
         engine._dev_prompt(task, feedback),
@@ -6307,6 +6348,129 @@ def test_resolved_escalation_resume_dirty_tree_auto_recovers(project):
     assert summary2.done == 1 and not summary2.paused  # no manual-rollback loop
     kinds = [e["kind"] for e in resumed.journal.entries()]
     assert "rollback-auto" in kinds  # auto-recovered despite OFF
+    assert "rollback-manual-required" not in kinds
+
+
+def test_resolved_redrive_owned_dirty_spec_routes_explicitly_and_converges(project):
+    """T22: #123 ownership recovery and #630 explicit routing converge together.
+
+    The first pass records the existing sprint spec, then a feedback repair owns
+    that exact path and escalates after cleaning its other attempt residue. A human
+    corrects the frozen intent without committing it and re-arms from scratch. The
+    rollback-off resume must classify the still-dirty corrected spec honestly,
+    dispatch that named ready-for-dev spec with pinned read-back, and finish without
+    a manual rollback. MockAdapter proves the orchestrator dispatch contract only;
+    it does not stand in for build-auto's upstream route execution.
+
+    ABLATION A: replace the first recovery probe's exact owned-spec exclusion with
+    `()` and this test fails because `rollback-owned-spec-normalized` is absent.
+    ABLATION B: delete the known-spec arm in `_generic_dev_prompt` and this test
+    fails because the resumed dev prompt is bare and `expected_spec` is None.
+    """
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    repo = project.project
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "ready-for-dev", rev_parse_head(repo))
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "sprint baseline")
+    baseline = rev_parse_head(repo)
+    marker = repo / ".bmad-loop" / "runs" / "test-run" / "verify-fixed.marker"
+
+    def escalate_bound_repair(session):
+        # The first successful artifact pass changed source + board before its
+        # deterministic command failed. Leave only this repair attempt's owned
+        # spec behind, matching the resolved-redrive field report.
+        (repo / "src.txt").write_text("original\n")
+        set_sprint(project, "1-1-a", "ready-for-dev")
+        write_spec(sp, "blocked", baseline)
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": "1-1-a",
+                "spec_file": str(sp),
+                "baseline_commit": baseline,
+                "escalations": [
+                    {
+                        "type": "intent-needs-human",
+                        "severity": "CRITICAL",
+                        "detail": "correct the frozen intent",
+                    }
+                ],
+            },
+        )
+
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=False),
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker),)),
+    )
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), escalate_bound_repair],
+        policy=policy,
+    )
+    first = engine.run()
+
+    assert first.paused and first.escalated == 1
+    escalated = load_state(engine.run_dir).tasks["1-1-a"]
+    assert escalated.phase == Phase.ESCALATED
+    assert escalated.spec_file == str(sp)
+    assert escalated.dispatched_spec_file == str(sp)
+    assert escalated.attempt == 2  # the feedback repair was the path-owning attempt
+
+    corrected = sp.read_text().replace("test spec", "human corrected frozen intent")
+    sp.write_text(corrected)
+    head_before_rearm = rev_parse_head(repo)
+    rearm_escalation(engine.run_dir)
+
+    assert rev_parse_head(repo) == head_before_rearm  # no correction commit at re-arm
+    assert read_frontmatter(sp)["status"] == "ready-for-dev"
+    assert "human corrected frozen intent" in sp.read_text()
+    assert git(repo, "status", "--porcelain")  # corrected spec deliberately remains dirty
+
+    seen_at_dev: list[str] = []
+    dirty_at_dev: list[str] = []
+
+    def finish_corrected_spec(session):
+        seen_at_dev.append(sp.read_text())
+        dirty_at_dev.append(git(repo, "status", "--porcelain"))
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("fixed\n")
+        return dev_effect(project, "1-1-a")(session)
+
+    resumed, adapter = resume_engine(
+        project,
+        engine,
+        [finish_corrected_spec, review_effect(project, "1-1-a", clean=True)],
+        policy=policy,
+    )
+    second = resumed.run()
+
+    assert second.done == 1 and not second.paused
+    assert "human corrected frozen intent" in seen_at_dev[0]
+    assert "_bmad-output/implementation-artifacts/spec-1-1-a.md" in dirty_at_dev[0]
+    dev_session = adapter.sessions[0]
+    assert dev_session.role == "dev"
+    assert dev_session.prompt.startswith(
+        f"/bmad-dev-auto Resume the autonomous dev session on the ready-for-dev spec at `{sp}`."
+    )
+    assert dev_session.expected_spec == str(sp)
+
+    events = resumed.journal.entries()
+    owned = [event for event in events if event["kind"] == "rollback-owned-spec-normalized"]
+    assert {
+        key: owned[-1][key] for key in ("kind", "story_key", "spec", "status", "checkout_dirty")
+    } == {
+        "kind": "rollback-owned-spec-normalized",
+        "story_key": "1-1-a",
+        "spec": str(sp.resolve()),
+        "status": "ready-for-dev",
+        "checkout_dirty": True,
+    }
+    kinds = [event["kind"] for event in events]
+    assert "rollback-skipped-clean" not in kinds
     assert "rollback-manual-required" not in kinds
 
 
@@ -9425,8 +9589,8 @@ def _prompt_task(**kw) -> StoryTask:
 
 
 def test_dev_prompts_spell_the_post_rename_primitive(project):
-    """Every generic-dev leg (fresh, restore, repair) invokes the name resolved
-    from the dev adapter's skill tree — here the post-rename bmad-build-auto."""
+    """Every generic-dev leg (fresh, known spec, restore, repair) invokes the name
+    resolved from the dev adapter's skill tree — here post-rename bmad-build-auto."""
     from conftest import attach_profile, install_build_auto_skill
 
     install_build_auto_skill(project.project, ".claude/skills")
@@ -9441,6 +9605,11 @@ def test_dev_prompts_spell_the_post_rename_primitive(project):
     assert "bmad-dev-auto" not in fresh
 
     spec = str(spec_path(project, "1-1-a"))
+    explicit = engine._generic_dev_prompt(_prompt_task(spec_file=spec), None)
+    assert explicit.startswith(
+        "/bmad-build-auto Resume the autonomous dev session on the ready-for-dev spec"
+    )
+
     restore = engine._generic_dev_prompt(
         _prompt_task(spec_file=spec, restore_patch="/run/attempt.patch"), None
     )
