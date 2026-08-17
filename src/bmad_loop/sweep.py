@@ -1345,6 +1345,10 @@ class SweepEngine(Engine):
 
     # ------------------------------------------------------ override seams
 
+    def _dispatched_spec_for_attempt(self, task: StoryTask) -> str | None:
+        """Sweep dispatch owns intent.md, never an accepted bundle spec."""
+        return None
+
     def _dev_prompt(self, task: StoryTask, feedback: Path | None) -> str:
         return self._generic_bundle_prompt(task, feedback)
 

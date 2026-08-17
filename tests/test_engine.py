@@ -491,7 +491,7 @@ def test_nested_engine_reraises_keyboard_interrupt(project, monkeypatch):
     assert killed == ["test-run"]
 
 
-def test_resume_continues_from_completed_dev_session(project):
+def test_resume_continues_from_completed_dev_session(project, monkeypatch):
     """A host kill inside the post-session window of a completed dev session
     must not roll the work back: resume consumes the durably-recorded result
     and drives verify/decide as if the session had just returned."""
@@ -514,7 +514,20 @@ def test_resume_continues_from_completed_dev_session(project):
     assert crashed_task.sessions[0].result_json is not None
     assert crashed_task.attempt == 1
 
+    # Model the attempt-owned path that was already durable when the host died.
+    # Replay must never resolve or replace it, even though verification later
+    # records the accepted/result spec separately.
+    old_binding = str(project.project / "attempt-1-owned-spec.md")
+    engine.state.tasks["1-1-a"].dispatched_spec_file = old_binding
+    engine._save()
+    crashed_task = load_state(engine.run_dir).tasks["1-1-a"]
+
     resumed, adapter = resume_engine(project, engine, [review_effect(project, "1-1-a", clean=True)])
+
+    def must_not_rebind(_task):
+        raise AssertionError("recorded-result replay must not resolve a new dispatched spec")
+
+    monkeypatch.setattr(resumed, "_dispatched_spec_for_attempt", must_not_rebind)
     summary2 = resumed.run()
 
     assert summary2.done == 1 and not summary2.crashed
@@ -525,11 +538,74 @@ def test_resume_continues_from_completed_dev_session(project):
     # and desync the counter from the recorded session's task_id
     assert final.attempt == 1
     assert final.baseline_commit == crashed_task.baseline_commit
+    assert final.dispatched_spec_file == old_binding
     assert [s.role for s in adapter.sessions] == ["review"]  # dev NOT re-run
     kinds = [e["kind"] for e in resumed.journal.entries()]
     assert "resume-verify" in kinds
     assert "resume-restart" not in kinds
     assert not any(k.startswith("rollback") for k in kinds)
+
+
+def test_fresh_dev_attempt_persists_resolved_spec_binding_before_launch(project, monkeypatch):
+    """A fresh sprint attempt replaces stale ownership with the live recorded spec.
+
+    Ablation: replace the dispatched-spec assignment with ``None`` before
+    DEV_RUNNING and this test fails on the missing path observed at adapter launch.
+    """
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")])
+    recorded = spec_path(project, "1-1-a")
+    write_spec(recorded, "ready-for-dev", rev_parse_head(project.project))
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        spec_file=str(recorded),
+        dispatched_spec_file="stale/from/attempt-0.md",
+    )
+    engine.state.tasks[task.story_key] = task
+    observed: list[str | None] = []
+    original_start = adapter.start_session
+
+    def start_after_durable_binding(session_spec):
+        observed.append(load_state(engine.run_dir).tasks[task.story_key].dispatched_spec_file)
+        return original_start(session_spec)
+
+    monkeypatch.setattr(adapter, "start_session", start_after_durable_binding)
+
+    assert engine._dev_phase(task)
+
+    assert observed == [str(recorded)]
+    assert task.dispatched_spec_file == str(recorded)
+
+
+def test_fresh_dev_attempt_clears_stale_binding_when_recorded_spec_is_invalid(project, monkeypatch):
+    """A new attempt with no valid recorded spec cannot inherit old ownership.
+
+    Ablation: change the direct assignment to an ``or`` fallback retaining the
+    old value and this test fails on the stale path observed at adapter launch.
+    """
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")])
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        spec_file=str(project.project / "missing-spec.md"),
+        dispatched_spec_file="stale/from/attempt-0.md",
+    )
+    engine.state.tasks[task.story_key] = task
+    observed: list[str | None] = []
+    original_start = adapter.start_session
+
+    def start_after_durable_clear(session_spec):
+        observed.append(load_state(engine.run_dir).tasks[task.story_key].dispatched_spec_file)
+        return original_start(session_spec)
+
+    monkeypatch.setattr(adapter, "start_session", start_after_durable_clear)
+
+    assert engine._dev_phase(task)
+
+    assert observed == [None]
+    assert task.dispatched_spec_file is None
 
 
 def test_resume_continues_from_completed_review_session(project):

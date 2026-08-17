@@ -272,6 +272,59 @@ def test_stories_validated_journaled_once(project):
     assert validated[0]["count"] == 2
 
 
+# ----------------------------------------------- dispatched spec ownership
+
+
+def test_dispatched_spec_binding_uses_exact_present_id_keyed_file(project):
+    folder = setup_stories(project, [entry("1")])
+    present = story_spec(project, "1")
+    write_spec(present, "ready-for-dev", rev_parse_head(project.project))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "present story spec")
+    engine, _ = make_engine(project, [])
+
+    assert engine._dispatched_spec_for_attempt(StoryTask("1", 0)) == str(present)
+    assert present.parent == folder / "stories"
+
+
+def test_dispatched_spec_binding_refuses_pending_story(project):
+    """Ablation: delete the StoriesEngine override and the inherited sprint seam
+    binds the valid decoy ``task.spec_file``, failing this PENDING refusal alone."""
+    folder = setup_stories(project, [entry("1")])
+    task = StoryTask("1", 0, spec_file=str(folder / "SPEC.md"))
+    engine, _ = make_engine(project, [])
+
+    assert engine._dispatched_spec_for_attempt(task) is None
+
+
+def test_dispatched_spec_binding_refuses_ambiguous_story(project):
+    """Ablation: delete the StoriesEngine override and the inherited sprint seam
+    binds the valid decoy ``task.spec_file``, failing this AMBIGUOUS refusal alone."""
+    folder = setup_stories(project, [entry("1")])
+    write_spec(story_spec(project, "1"), "ready-for-dev", rev_parse_head(project.project))
+    write_spec(folder / "stories" / "1-other.md", "ready-for-dev", rev_parse_head(project.project))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "ambiguous story specs")
+    task = StoryTask("1", 0, spec_file=str(folder / "SPEC.md"))
+    engine, _ = make_engine(project, [])
+
+    assert engine._dispatched_spec_for_attempt(task) is None
+
+
+def test_dispatched_spec_binding_refuses_sentinel_story(project):
+    """Ablation: delete the StoriesEngine override and the inherited sprint seam
+    binds the valid decoy ``task.spec_file``, failing this SENTINEL refusal alone."""
+    folder = setup_stories(project, [entry("1")])
+    sentinel = folder / "stories" / "1-unresolved.md"
+    write_spec(sentinel, "blocked", rev_parse_head(project.project))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "sentinel story spec")
+    task = StoryTask("1", 0, spec_file=str(folder / "SPEC.md"))
+    engine, _ = make_engine(project, [])
+
+    assert engine._dispatched_spec_for_attempt(task) is None
+
+
 # ------------------------------------------------------------- scheduling
 
 

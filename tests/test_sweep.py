@@ -4021,6 +4021,28 @@ def test_bundle_dispatch_does_not_pin_expected_spec(project, tmp_path):
     assert adapter.sessions[-1].expected_spec is None
 
 
+def test_bundle_dispatch_does_not_bind_accepted_spec_as_attempt_ownership(project):
+    """A bundle carries accepted result history, but dispatch still owns intent.md.
+
+    Ablation: delete the SweepEngine override and the inherited sprint seam binds
+    the existing ``task.spec_file``, failing this absence assertion alone.
+    """
+    engine, _ = make_sweep(project, [])
+    accepted = project.implementation_artifacts / "spec-adopted-elsewhere.md"
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(accepted, "done", "abc")
+    task = StoryTask(
+        story_key="dw-fix",
+        epic=0,
+        spec_file=str(accepted),
+        dispatched_spec_file="stale/from/earlier-attempt.md",
+    )
+
+    task.dispatched_spec_file = engine._dispatched_spec_for_attempt(task)
+
+    assert task.dispatched_spec_file is None
+
+
 # ---------------- frontmatter `deferred:` harvest parity (BMAD-METHOD #2640)
 
 SWEEP_FINDING = {

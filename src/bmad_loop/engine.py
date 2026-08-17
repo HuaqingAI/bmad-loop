@@ -1650,6 +1650,18 @@ class Engine:
             )
         self._review_and_commit(task)
 
+    def _dispatched_spec_for_attempt(self, task: StoryTask) -> str | None:
+        """Resolve the recorded sprint spec this dev attempt will own.
+
+        The result is an observation made immediately before the attempt's
+        durable DEV_RUNNING save. Missing, stale, and non-file paths deliberately
+        leave the attempt unbound.
+        """
+        if not task.spec_file:
+            return None
+        spec_path = verify.resolve_spec_path(task.spec_file, self.workspace.paths)
+        return str(spec_path) if spec_path.is_file() else None
+
     def _dev_phase(self, task: StoryTask, resume_result: SessionResult | None = None) -> bool:
         if resume_result is None:
             # A fresh invocation cannot consume a snapshot armed by an earlier,
@@ -1704,6 +1716,11 @@ class Engine:
                     # there back into a `feedback is not None` iteration, so such an
                     # iteration can never hold a record to preserve.
                     task.refiled_followups = []
+                # Assignment is attempt-scoped: a new unbound attempt must clear
+                # the previous attempt's ownership instead of inheriting it. A
+                # recorded-result replay never enters this branch and therefore
+                # retains the persisted binding unchanged.
+                task.dispatched_spec_file = self._dispatched_spec_for_attempt(task)
             advance(task, Phase.DEV_RUNNING)
             self._save()
             if resume_result is not None:
