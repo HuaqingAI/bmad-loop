@@ -69,8 +69,9 @@ breaking changes may land in a minor release.
   parent directory with a symlink, tree, file, or other unsafe shape. An initial Sprint observation
   fault may leave a bare-key attempt unbound; an existing Stories folder+id target instead aborts
   unless it can be snapshotted. Post-bind faults abort before launch while retaining the authority
-  for recovery. Snapshots are retired after commit. Other substantive changes and sibling source,
-  artifact, or untracked residue still follow the configured rollback policy.
+  for recovery. Protected rollback inventories and deletion replay remain byte-safe for POSIX
+  filenames outside UTF-8. Snapshots are retired after commit. Other substantive changes and
+  sibling source, artifact, or untracked residue still follow the configured rollback policy.
 
 - **Recorded sprint re-drives now route directly through their known spec (#630).** Only a
   generic sprint task with a recorded `spec_file` names that `ready-for-dev` spec explicitly and

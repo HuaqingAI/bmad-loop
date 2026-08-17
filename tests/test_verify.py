@@ -2001,6 +2001,61 @@ def test_safe_rollback_preserves_file_to_directory_replacement(project):
     assert (repo / "src.txt").read_text() == "original\n"
 
 
+@needs_strict_codec
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows filenames are UTF-16; no undecodable path exists"
+)
+@pytest.mark.parametrize("replace_with_directory", [False, True], ids=["deleted", "replaced"])
+def test_safe_rollback_reads_preserved_deletion_inventory_as_bytes(project, replace_with_directory):
+    """Protected deletion inventories keep POSIX filenames as bytes until use.
+
+    The plain-deletion row exercises ``git diff --name-only -z`` and the later
+    ``git rm`` replay; the file-to-directory row also exercises
+    ``git ls-tree --name-only -z``.  All three commands can emit the raw ``0xff``
+    byte in the filename; strict text mode turns that into ``GitError`` either
+    before reset or, for ``git rm``, after the deletion has already been replayed.
+
+    Ablation: remove ``binary=True`` or ``os.fsdecode`` from the corresponding
+    inventory read, or restore text mode for the replay, and one or both rows fail.
+    """
+    repo = project.project
+    artifact_dir = project.implementation_artifacts
+    artifact_rel = artifact_dir.relative_to(repo).as_posix()
+    raw_artifact = os.fsencode(artifact_dir) + b"/result-\xff"
+    assert os.fsencode(os.fsdecode(b"result-\xff")) == b"result-\xff"
+    with open(raw_artifact, "wb") as fh:
+        fh.write(b"baseline file\n")
+    git(repo, "add", "-A", "--", artifact_rel)
+    git(repo, "commit", "-q", "-m", "non-UTF-8 artifact")
+    baseline = verify.rev_parse_head(repo)
+    snap = sorted(verify.untracked_files(repo))
+
+    os.unlink(raw_artifact)
+    raw_nested = raw_artifact + b"/payload.md"
+    if replace_with_directory:
+        os.mkdir(raw_artifact)
+        with open(raw_nested, "wb") as fh:
+            fh.write(b"preserved replacement\n")
+        git(repo, "add", "-A", "--", artifact_rel)
+    (repo / "src.txt").write_text("dev attempt\n")
+
+    verify.safe_rollback(
+        repo,
+        baseline,
+        baseline_untracked=snap,
+        keep=(".bmad-loop", artifact_rel),
+        preserve=(artifact_rel,),
+    )
+
+    if replace_with_directory:
+        assert os.path.isdir(raw_artifact)
+        with open(raw_nested, "rb") as fh:
+            assert fh.read() == b"preserved replacement\n"
+    else:
+        assert not os.path.exists(raw_artifact)
+    assert (repo / "src.txt").read_text() == "original\n"
+
+
 def test_safe_rollback_raises_on_genuine_restore_failure(project, monkeypatch):
     """A non-benign `git checkout` failure while restoring a `preserve` path must
     raise — not silently drop the correction (which would loop the re-drive). The

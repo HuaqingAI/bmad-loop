@@ -1351,14 +1351,17 @@ def safe_rollback(
                 *_literal_specs(list(preserve)),
             ],
             repo,
+            binary=True,
         )
         if proc.returncode != 0:
-            detail = (proc.stdout + proc.stderr).strip()
+            detail = (proc.stdout + proc.stderr).decode("utf-8", "replace").strip()
             raise GitError(
                 f"git diff {baseline[:12]}..{snapshot[:12]} for preserved deletions "
                 f"failed in {repo}: {detail}"
             )
-        deleted_preserve_paths = tuple(path for path in proc.stdout.split("\0") if path)
+        deleted_preserve_paths = tuple(
+            os.fsdecode(path) for path in proc.stdout.split(b"\0") if path
+        )
         if deleted_preserve_paths:
             # A blob-to-tree replacement is reported as deletion of the baseline
             # blob plus additions below that same path. The later snapshot
@@ -1381,14 +1384,17 @@ def safe_rollback(
                     *_literal_specs(list(deleted_preserve_paths)),
                 ],
                 repo,
+                binary=True,
             )
             if proc.returncode != 0:
-                detail = (proc.stdout + proc.stderr).strip()
+                detail = (proc.stdout + proc.stderr).decode("utf-8", "replace").strip()
                 raise GitError(
                     f"git ls-tree {snapshot[:12]} for preserved replacements "
                     f"failed in {repo}: {detail}"
                 )
-            snapshot_replacements = frozenset(path for path in proc.stdout.split("\0") if path)
+            snapshot_replacements = frozenset(
+                os.fsdecode(path) for path in proc.stdout.split(b"\0") if path
+            )
             deleted_preserve_paths = tuple(
                 path for path in deleted_preserve_paths if path not in snapshot_replacements
             )
@@ -1429,16 +1435,23 @@ def safe_rollback(
         # rather than resurrecting a deliberately cleared sentinel. The operands
         # remain literal for the same reason as the checkout above.
         if deleted_preserve_paths:
-            rc, out = _git(
+            proc = _run_git(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "rm",
+                    "-f",
+                    "--ignore-unmatch",
+                    "--",
+                    *_literal_specs(list(deleted_preserve_paths)),
+                ],
                 repo,
-                "rm",
-                "-f",
-                "--ignore-unmatch",
-                "--",
-                *_literal_specs(list(deleted_preserve_paths)),
+                binary=True,
             )
-            if rc != 0:
-                raise GitError(f"git rm of preserved snapshot deletions failed in {repo}: {out}")
+            if proc.returncode != 0:
+                detail = (proc.stdout + proc.stderr).decode("utf-8", "replace").strip()
+                raise GitError(f"git rm of preserved snapshot deletions failed in {repo}: {detail}")
     if policy_content is not None:
         current = policy_path.read_bytes() if policy_path.is_file() else None
         if current != policy_content:
