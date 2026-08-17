@@ -87,10 +87,11 @@ class RecoveryFlow:
 
     def protected_relpaths(self) -> tuple[str, ...]:
         """Repo-relative posix paths of the BMAD artifact folders. These are
-        orchestrator-owned: never counted as a dev attempt's dirtiness (the
-        resolve workflow corrects the frozen spec here) and preserved through
-        rollback. Folders configured outside the repo are skipped — nothing to
-        protect there."""
+        preserved through a resolved re-drive's reset so a human correction is
+        not reverted. They are deliberately not attempt-dirtiness exclusions;
+        only the exact attempt-bound spec can serve that separate recognition
+        job. Folders configured outside the repo are skipped — nothing to
+        preserve through Git there."""
         workspace = self._workspace_get()
         out: list[str] = []
         for protected in (
@@ -102,30 +103,83 @@ class RecoveryFlow:
                 rel = protected.relative_to(workspace.root).as_posix()
             except ValueError:
                 continue  # configured outside the repo; nothing to protect here
-            # "." (folder == repo root) as an exclude/keep prefix would cover the
-            # whole tree — drop it so a misconfig can't disable the dirty check.
+            # "." (folder == repo root) as a keep/preserve prefix would cover the
+            # whole tree — drop it so a misconfig can't disable the reset.
             if rel and rel != ".":
                 out.append(rel)
         return tuple(out)
 
+    def _attempt_owned_spec(self, task: StoryTask) -> tuple[Path, str | None] | None:
+        """Resolve this attempt's bound spec and its exact Git exclusion.
+
+        Relative persisted paths may name either a project-relative file or a
+        basename under the configured implementation-artifacts directory. The
+        binding is usable only when exactly one such regular file exists and its
+        resolved target is inside a trusted project/artifact root.  An artifact
+        root configured outside the Git workspace remains a trusted repair target,
+        but cannot contribute a pathspec to a Git command running in the workspace.
+        """
+        if not task.dispatched_spec_file:
+            return None
+
+        workspace = self._workspace_get()
+        raw = Path(task.dispatched_spec_file)
+        candidates = (
+            (raw,)
+            if raw.is_absolute()
+            else (
+                workspace.paths.project / raw,
+                workspace.paths.implementation_artifacts / raw,
+            )
+        )
+        resolved_files: list[Path] = []
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve()
+                is_file = resolved.is_file()
+            except (OSError, RuntimeError):
+                return None
+            if is_file and resolved not in resolved_files:
+                resolved_files.append(resolved)
+        if len(resolved_files) != 1:
+            return None
+
+        spec_path = resolved_files[0]
+        if not verify.spec_within_roots(spec_path, workspace.paths):
+            return None
+
+        try:
+            rel = spec_path.relative_to(workspace.root.resolve()).as_posix()
+        except (OSError, RuntimeError, ValueError):
+            return spec_path, None
+        return spec_path, rel if rel and rel != "." else None
+
     def rollback_or_pause(self, task: StoryTask, *, cause: str = "stopped") -> None:
         """Recover from an attempt that won't proceed.
 
-        No-op when the tree is already at the attempt's baseline (nothing this
-        attempt touched, ignoring orchestrator-owned artifact folders): neither a
-        reset nor a pause is needed. This is also what lets the manual-recovery
-        instructions terminate — after the operator resets and resumes, the
-        now-clean tree skips straight through instead of re-pausing on the
-        still-set ``baseline_commit``.
+        No-op when the tree is proven to be at the attempt's baseline: neither a
+        reset nor a pause is needed. The one recognition exception is the exact
+        regular file bound in ``task.dispatched_spec_file`` for this attempt. If
+        no other debris exists, its lifecycle status is normalized and the real
+        checkout is probed again without exclusions. A genuinely clean checkout
+        emits ``rollback-skipped-clean``. A resolved re-drive whose authorized
+        human-corrected spec remains dirty instead emits
+        ``rollback-owned-spec-normalized`` and continues without pretending the
+        checkout is clean. A plain attempt's substantive spec residue still
+        follows the ordinary reset/pause policy.
+
+        The clean outcome also lets manual-recovery instructions terminate —
+        after the operator resets and resumes, the now-clean tree skips straight
+        through instead of re-pausing on the still-set ``baseline_commit``.
 
         A ``cause="resolved"`` re-drive is human-initiated (the operator ran the
         resolve workflow and re-armed the story), so it always auto-recovers and
         never pauses, regardless of ``scm.rollback_on_failure``. For the entire
         re-drive (``task.resolved_redrive``, latched at resume and cleared once the
-        correction is committed) the BMAD artifact folders are treated as
-        orchestrator-owned: excluded from the dirty check (the corrected spec must
-        not read as a failed attempt) and preserved through every reset — so a
-        later mid-re-drive retry/defer reset can't silently revert the correction.
+        correction is committed) the BMAD artifact folders are preserved through
+        every reset — so a later mid-re-drive retry/defer reset can't silently
+        revert the correction. Whole folders never participate in the dirtiness
+        decision; sibling artifact residue remains visible there.
 
         Otherwise (a stopped/abandoned attempt) recovery depends on where the
         attempt ran. Inside a mounted unit worktree it auto-recovers instead of
@@ -149,27 +203,77 @@ class RecoveryFlow:
         # preserve the corrected spec for the whole re-drive, not just the first
         # reset; the auto-recover (pause-vs-reset) decision below is unaffected.
         redrive = resolved or task.resolved_redrive
+        # Whole-folder protection is reset-only. Attempt recognition below gets
+        # at most one literal regular-file exclusion from the attempt binding.
         protected = self.protected_relpaths() if redrive else ()
+        owned_spec = self._attempt_owned_spec(task)
+        owned_exclude = (owned_spec[1],) if owned_spec and owned_spec[1] else ()
         # Un-determinable dirty check (git timeout/failure, #156) ⇒ assume dirty:
         # never skip recovery on an unproven "clean", never crash the run. The
         # normal branching below then decides — OFF pauses (worktree kept), ON /
         # resolved auto-recovers behind its preserve steps, keeping the re-drive
         # pause-free contract intact.
         dirty = True
+        dirty_probe_succeeded = False
+        normalized_status: str | None = None
         if task.baseline_commit:
             try:
                 dirty = verify.attempt_dirty(
                     workspace.root,
                     task.baseline_commit,
                     task.baseline_untracked,
-                    exclude=protected,
+                    exclude=owned_exclude,
                 )
+                dirty_probe_succeeded = True
+            except (verify.GitError, OSError) as exc:
+                self.journal.append(
+                    "rollback-dirty-check-failed", story_key=task.story_key, error=str(exc)
+                )
+        if task.baseline_commit and dirty_probe_succeeded and not dirty and owned_spec:
+            spec_path, _ = owned_spec
+            target_status = "in-review" if task.restore_patch else "ready-for-dev"
+            verify.set_frontmatter_status(spec_path, target_status)
+            if verify.status_of(verify.read_frontmatter(spec_path)) != target_status:
+                raise verify.FrontmatterWriteError(
+                    f"could not normalize attempt-owned spec {spec_path} "
+                    f"to status {target_status!r}"
+                )
+            normalized_status = target_status
+
+            # The exclusion answered only whether anything besides the owned spec
+            # changed.  Re-probe the real checkout after repair before calling it
+            # clean or choosing a recovery policy.
+            dirty = True
+            dirty_probe_succeeded = False
+            try:
+                dirty = verify.attempt_dirty(
+                    workspace.root,
+                    task.baseline_commit,
+                    task.baseline_untracked,
+                )
+                dirty_probe_succeeded = True
             except (verify.GitError, OSError) as exc:
                 self.journal.append(
                     "rollback-dirty-check-failed", story_key=task.story_key, error=str(exc)
                 )
         if task.baseline_commit and not dirty:
             self.journal.append("rollback-skipped-clean", story_key=task.story_key)
+            return
+        if (
+            task.baseline_commit
+            and dirty_probe_succeeded
+            and dirty
+            and redrive
+            and owned_spec
+            and normalized_status is not None
+        ):
+            self.journal.append(
+                "rollback-owned-spec-normalized",
+                story_key=task.story_key,
+                spec=str(owned_spec[0]),
+                status=normalized_status,
+                checkout_dirty=True,
+            )
             return
         # A mounted unit worktree is disposable by design: its branch never
         # touches the operator's checkout and the attempt's work is parked on

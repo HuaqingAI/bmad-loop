@@ -15,6 +15,7 @@ import pytest
 from conftest import git, refuse_to_resolve
 
 from bmad_loop import verify
+from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.gates import ATTENTION_FILE
 from bmad_loop.model import Phase, StoryTask
 from bmad_loop.policy import GatesPolicy, LimitsPolicy, NotifyPolicy, Policy, ScmPolicy
@@ -130,6 +131,26 @@ def _task(repo: Path, story_key: str = "1-1-a") -> StoryTask:
     return task
 
 
+def _tracked_spec(
+    project: ProjectPaths,
+    *,
+    name: str = "spec-1-1-a.md",
+    status: str = "ready-for-dev",
+    body: str = "baseline intent\n",
+) -> Path:
+    """Create and commit one ordinary spec, returning the attempt baseline file."""
+    spec = project.implementation_artifacts / name
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec.write_text(f"---\nstatus: {status}\n---\n\n{body}")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "tracked spec baseline")
+    return spec
+
+
+def _status(spec: Path) -> str:
+    return verify.status_of(verify.read_frontmatter(spec))
+
+
 # --------------------------------------------------------------- protected paths
 
 
@@ -155,8 +176,8 @@ def test_protected_relpaths_skips_folders_outside_repo(tmp_path):
 
 
 def test_protected_relpaths_drops_repo_root_prefix(tmp_path):
-    # a folder == repo root would relativize to "." and, used as a keep/exclude
-    # prefix, cover the whole tree — it must be dropped.
+    # A folder == repo root would relativize to "." and, used as a preserve
+    # prefix, keep the whole tree through a reset — it must be dropped.
     ws = _fake_workspace(tmp_path, output=tmp_path)
     flow = _make_flow(workspace=ws)
     assert "." not in flow.protected_relpaths()
@@ -283,6 +304,478 @@ def test_rollback_dirty_check_oserror_degrades_to_dirty(project, monkeypatch):
 
     assert "rollback-dirty-check-failed" in flow.journal.events()
     assert "rollback-skipped-clean" not in flow.journal.events()
+
+
+def test_bound_lifecycle_only_spec_is_normalized_and_reads_git_clean(project):
+    """T8: the one-file attempt binding recognizes only its own lifecycle delta.
+
+    Ablation: replace `owned_exclude` with `()` in the first dirty probe and this
+    test fails by taking the rollback-off manual-pause path.
+    """
+    repo = project.project
+    spec = _tracked_spec(project)
+    task = _task(repo)
+    task.dispatched_spec_file = str(spec)
+    verify.set_frontmatter_status(spec, "in-progress")
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
+    )
+
+    flow.rollback_or_pause(task)
+
+    assert _status(spec) == "ready-for-dev"
+    assert git(repo, "status", "--porcelain") == ""
+    assert flow.journal.events() == ["rollback-skipped-clean"]
+    assert flow.calls.pauses == []
+    assert flow.calls.emits == []
+
+
+def test_plain_owned_spec_with_substantive_residue_still_pauses(project):
+    """T9: status normalization does not authorize a plain attempt's body edit.
+
+    Ablation: remove the `redrive` term from the owned-dirty event guard and this
+    test fails because the plain attempt returns instead of pausing.
+    """
+    repo = project.project
+    spec = _tracked_spec(project)
+    task = _task(repo)
+    task.dispatched_spec_file = str(spec)
+    spec.write_text("---\nstatus: in-progress\n---\n\nhuman substantive correction\n")
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
+    )
+
+    with pytest.raises(_Pause):
+        flow.rollback_or_pause(task)
+
+    assert _status(spec) == "ready-for-dev"
+    assert "human substantive correction" in spec.read_text()
+    assert "rollback-owned-spec-normalized" not in flow.journal.events()
+    assert "rollback-skipped-clean" not in flow.journal.events()
+    assert flow.calls.emits == []
+
+
+def test_bound_spec_exclusion_does_not_hide_sibling_source_residue(project):
+    """T10/source: source debris keeps the ordinary rollback policy reachable.
+
+    INVERSE ablation: replace the exact-file exclusion with `.` and this test
+    fails because the source is initially hidden and the owned status is rewritten.
+    """
+    repo = project.project
+    spec = _tracked_spec(project)
+    task = _task(repo)
+    task.dispatched_spec_file = str(spec)
+    verify.set_frontmatter_status(spec, "in-progress")
+    (repo / "src.txt").write_text("attempt source residue\n")
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
+    )
+
+    with pytest.raises(_Pause):
+        flow.rollback_or_pause(task)
+
+    assert _status(spec) == "in-progress"  # no normalization while sibling debris exists
+    assert "rollback-skipped-clean" not in flow.journal.events()
+
+
+def test_bound_spec_exclusion_does_not_hide_sibling_artifact_residue(project):
+    """T10/artifact: a whole-folder exclusion must not return through this path.
+
+    INVERSE ablation: pass `protected` to the first dirty probe and this test
+    fails because the sibling artifact is initially hidden and the owned status
+    is rewritten despite that residue.
+    """
+    repo = project.project
+    spec = _tracked_spec(project)
+    task = _task(repo)
+    task.dispatched_spec_file = str(spec)
+    verify.set_frontmatter_status(spec, "in-progress")
+    (project.implementation_artifacts / "sibling-result.md").write_text("attempt residue\n")
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
+    )
+
+    with pytest.raises(_Pause):
+        flow.rollback_or_pause(task)
+
+    assert _status(spec) == "in-progress"
+    assert "rollback-skipped-clean" not in flow.journal.events()
+
+
+def test_bound_spec_exclusion_does_not_hide_run_created_untracked_residue(project):
+    """T10/untracked: an unrelated run-created path remains attempt dirtiness.
+
+    INVERSE ablation: add `run-created.tmp` beside the owned-spec exclusion and
+    this test fails because normalization runs while unrelated residue exists.
+    """
+    repo = project.project
+    spec = _tracked_spec(project)
+    task = _task(repo)
+    task.dispatched_spec_file = str(spec)
+    verify.set_frontmatter_status(spec, "in-progress")
+    (repo / "run-created.tmp").write_text("attempt residue\n")
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
+    )
+
+    with pytest.raises(_Pause):
+        flow.rollback_or_pause(task)
+
+    assert _status(spec) == "in-progress"
+    assert (repo / "run-created.tmp").is_file()
+    assert "rollback-skipped-clean" not in flow.journal.events()
+
+
+def test_unbound_spec_flip_retains_existing_dirty_policy(project):
+    """T11: late `spec_file` cannot substitute for attempt-scoped ownership.
+
+    INVERSE ablations: add the implementation-artifacts folder to the first dirty
+    probe's exclusions, or substitute late `task.spec_file` ownership; either makes
+    this test fail by emitting `rollback-skipped-clean`.
+    """
+    repo = project.project
+    spec = _tracked_spec(project)
+    task = _task(repo)
+    task.spec_file = str(spec)  # deliberately late/accepted ownership only
+    verify.set_frontmatter_status(spec, "in-progress")
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
+    )
+
+    with pytest.raises(_Pause):
+        flow.rollback_or_pause(task)
+
+    assert _status(spec) == "in-progress"
+    assert "rollback-skipped-clean" not in flow.journal.events()
+    assert "rollback-owned-spec-normalized" not in flow.journal.events()
+
+
+def test_latched_redrive_reports_owned_corrected_spec_as_still_dirty(project):
+    """T12: a human-corrected spec is authorized, preserved, and never called clean.
+
+    Ablation: delete the owned-dirty event arm and this test fails because the
+    latched redrive falls through to the ordinary reset/pause policy.
+    """
+    repo = project.project
+    spec = _tracked_spec(project)
+    task = _task(repo)
+    task.dispatched_spec_file = str(spec)
+    task.resolved_redrive = True
+    spec.write_text("---\nstatus: ready-for-dev\n---\n\nhuman corrected intent\n")
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
+    )
+
+    flow.rollback_or_pause(task)
+
+    assert _status(spec) == "ready-for-dev"
+    assert "human corrected intent" in spec.read_text()
+    assert verify.attempt_dirty(repo, task.baseline_commit, task.baseline_untracked)
+    assert flow.journal.fields("rollback-owned-spec-normalized") == {
+        "story_key": task.story_key,
+        "spec": str(spec.resolve()),
+        "status": "ready-for-dev",
+        "checkout_dirty": True,
+    }
+    assert "rollback-skipped-clean" not in flow.journal.events()
+    assert flow.calls.pauses == []
+    assert flow.calls.emits == []
+
+
+def test_post_normalization_probe_fault_cannot_authorize_owned_dirty(project, monkeypatch):
+    """A failed real-checkout re-probe stays fail-safe dirty on a resolved reset.
+
+    Ablation: remove `dirty_probe_succeeded` from the owned-dirty event guard and
+    this test fails because an unproven checkout bypasses the actual rollback.
+    """
+    repo = project.project
+    spec = _tracked_spec(project)
+    task = _task(repo)
+    task.dispatched_spec_file = str(spec)
+    spec.write_text("---\nstatus: ready-for-dev\n---\n\nhuman corrected intent\n")
+    real_attempt_dirty = verify.attempt_dirty
+    probes = 0
+
+    def fault_second_probe(*args, **kwargs):
+        nonlocal probes
+        probes += 1
+        if probes == 2:
+            raise verify.GitError("post-normalization probe failed")
+        return real_attempt_dirty(*args, **kwargs)
+
+    monkeypatch.setattr(verify, "attempt_dirty", fault_second_probe)
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
+    )
+
+    flow.rollback_or_pause(task, cause="resolved")
+
+    assert probes == 2
+    assert "rollback-dirty-check-failed" in flow.journal.events()
+    assert "rollback-auto" in flow.journal.events()
+    assert "rollback-skipped-clean" not in flow.journal.events()
+    assert "rollback-owned-spec-normalized" not in flow.journal.events()
+    assert flow.calls.emits == ["pre_rollback", "post_rollback"]
+    assert verify.attempt_dirty(repo, task.baseline_commit, task.baseline_untracked)
+
+
+def test_patch_restore_redrive_normalizes_owned_spec_to_in_review(project):
+    """T13: the restore latch selects `in-review`, never from-scratch readiness.
+
+    Ablation: replace the restore-latched target selection with unconditional
+    `ready-for-dev` and this test fails on both the spec and journal status.
+    """
+    repo = project.project
+    spec = _tracked_spec(project, status="in-review")
+    task = _task(repo)
+    task.dispatched_spec_file = str(spec)
+    task.restore_patch = "intent-gap.patch"
+    task.resolved_redrive = True
+    spec.write_text("---\nstatus: in-progress\n---\n\nrestored human correction\n")
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
+    )
+
+    flow.rollback_or_pause(task)
+
+    assert _status(spec) == "in-review"
+    assert "restored human correction" in spec.read_text()
+    event = flow.journal.fields("rollback-owned-spec-normalized")
+    assert event["status"] == "in-review"
+    assert event["checkout_dirty"] is True
+    assert "rollback-skipped-clean" not in flow.journal.events()
+    assert flow.calls.emits == []
+
+
+def test_owned_spec_without_visible_status_fails_the_post_write_oracle(project):
+    """T14/False: a writer no-op is not repair success without the target oracle.
+
+    Ablation: delete the post-write `status_of(read_frontmatter(...))` comparison
+    and this test fails by reaching ordinary rollback policy instead of the typed
+    repair error.
+    """
+    repo = project.project
+    spec = _tracked_spec(project)
+    task = _task(repo)
+    task.dispatched_spec_file = str(spec)
+    spec.write_text("---\ntitle: no status here\n---\n\nbaseline intent\n")
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
+    )
+
+    with pytest.raises(verify.FrontmatterWriteError, match="could not normalize"):
+        flow.rollback_or_pause(task)
+
+    assert "rollback-skipped-clean" not in flow.journal.events()
+    assert "rollback-owned-spec-normalized" not in flow.journal.events()
+    assert flow.calls.pauses == []
+
+
+def test_owned_spec_with_unsafe_status_shape_propagates_writer_error(project):
+    """T14/write: repair-write refusal is never caught as failed observation.
+
+    Ablation: catch `FrontmatterWriteError` around the normalization write and
+    return from recovery; this test fails because the unsafe-shape error vanishes.
+    """
+    repo = project.project
+    spec = _tracked_spec(project)
+    task = _task(repo)
+    task.dispatched_spec_file = str(spec)
+    spec.write_text("---\n{status: in-progress, keep: 1}\n---\nbaseline intent\n")
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
+    )
+
+    with pytest.raises(verify.FrontmatterWriteError, match="no in-place line edit"):
+        flow.rollback_or_pause(task)
+
+    assert _status(spec) == "in-progress"
+    assert "rollback-skipped-clean" not in flow.journal.events()
+    assert "rollback-owned-spec-normalized" not in flow.journal.events()
+
+
+def test_owned_spec_outside_trusted_roots_is_not_excluded_or_mutated(project):
+    """T15/outside: an in-repo path is not trusted merely because Git can name it.
+
+    Ablation: delete the `spec_within_roots` refusal in `_attempt_owned_spec` and
+    this test fails because the out-of-project file is normalized and called clean.
+    """
+    repo = project.project
+    trusted = repo / "trusted-project"
+    trusted_impl = trusted / "_bmad-output" / "implementation-artifacts"
+    trusted_plan = trusted / "_bmad-output" / "planning-artifacts"
+    trusted_impl.mkdir(parents=True)
+    trusted_plan.mkdir(parents=True)
+    paths = ProjectPaths(
+        project=trusted,
+        implementation_artifacts=trusted_impl,
+        planning_artifacts=trusted_plan,
+        repo_root=repo,
+    )
+    outside = repo / "outside-trusted-project.md"
+    outside.write_text("---\nstatus: ready-for-dev\n---\nbody\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "outside binding baseline")
+    task = _task(repo)
+    task.dispatched_spec_file = str(outside)
+    verify.set_frontmatter_status(outside, "in-progress")
+    flow = _make_flow(
+        workspace=Workspace(root=repo, paths=paths),
+        paths=paths,
+        policy=_policy(rollback_on_failure=False),
+    )
+
+    with pytest.raises(_Pause):
+        flow.rollback_or_pause(task)
+
+    assert _status(outside) == "in-progress"
+    assert "rollback-skipped-clean" not in flow.journal.events()
+    assert "rollback-owned-spec-normalized" not in flow.journal.events()
+
+
+def test_missing_attempt_binding_does_not_fall_back_to_late_spec(project):
+    """T15/missing: a stale attempt binding cannot borrow accepted ownership.
+
+    INVERSE ablation: fall back to `task.spec_file` when the dispatched path is
+    missing and this test fails because the late spec is normalized and called clean.
+    """
+    repo = project.project
+    spec = _tracked_spec(project)
+    task = _task(repo)
+    task.spec_file = str(spec)
+    task.dispatched_spec_file = str(project.implementation_artifacts / "missing.md")
+    verify.set_frontmatter_status(spec, "in-progress")
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
+    )
+
+    with pytest.raises(_Pause):
+        flow.rollback_or_pause(task)
+
+    assert _status(spec) == "in-progress"
+    assert "rollback-skipped-clean" not in flow.journal.events()
+    assert "rollback-owned-spec-normalized" not in flow.journal.events()
+
+
+def test_non_file_attempt_binding_is_refused(project):
+    """T15/non-file: a directory can never become an exact owned-spec exclusion.
+
+    INVERSE ablation: accept the resolved candidate without its `is_file` guard
+    and this test fails on the attempted directory frontmatter repair.
+    """
+    repo = project.project
+    spec = _tracked_spec(project)
+    task = _task(repo)
+    task.dispatched_spec_file = str(project.implementation_artifacts)
+    verify.set_frontmatter_status(spec, "in-progress")
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
+    )
+
+    with pytest.raises(_Pause):
+        flow.rollback_or_pause(task)
+
+    assert _status(spec) == "in-progress"
+    assert "rollback-skipped-clean" not in flow.journal.events()
+    assert "rollback-owned-spec-normalized" not in flow.journal.events()
+
+
+def test_ambiguous_relative_attempt_binding_is_refused(project):
+    """T15/ambiguous: two live interpretations cannot confer attempt ownership.
+
+    Ablation: weaken the unique-candidate guard to accept the first live file and
+    this test fails because the project-relative candidate is normalized as owned.
+    """
+    repo = project.project
+    project_candidate = repo / "spec.md"
+    artifact_candidate = project.implementation_artifacts / "spec.md"
+    for candidate in (project_candidate, artifact_candidate):
+        candidate.write_text("---\nstatus: ready-for-dev\n---\nbody\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "ambiguous spec baseline")
+    task = _task(repo)
+    task.dispatched_spec_file = "spec.md"
+    verify.set_frontmatter_status(project_candidate, "in-progress")
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
+    )
+
+    with pytest.raises(_Pause):
+        flow.rollback_or_pause(task)
+
+    assert _status(project_candidate) == "in-progress"
+    assert _status(artifact_candidate) == "ready-for-dev"
+    assert "rollback-skipped-clean" not in flow.journal.events()
+    assert "rollback-owned-spec-normalized" not in flow.journal.events()
+
+
+def test_binding_resolution_fault_is_fail_safe_dirty(project, monkeypatch):
+    """T15/unsafe: uncertain ownership cannot become a mutation/exclusion grant.
+
+    Ablation: let `_attempt_owned_spec` continue with the unresolved candidate
+    after `Path.resolve` raises and this test fails before the manual-pause policy.
+    """
+    repo = project.project
+    spec = _tracked_spec(project)
+    task = _task(repo)
+    task.dispatched_spec_file = str(spec)
+    verify.set_frontmatter_status(spec, "in-progress")
+    refuse_to_resolve(monkeypatch, spec)
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
+    )
+
+    with pytest.raises(_Pause):
+        flow.rollback_or_pause(task)
+
+    assert _status(spec) == "in-progress"
+    assert "rollback-skipped-clean" not in flow.journal.events()
+    assert "rollback-owned-spec-normalized" not in flow.journal.events()
+
+
+def test_external_configured_artifact_spec_is_trusted_without_git_exclusion(
+    project, tmp_path, monkeypatch
+):
+    """A configured external artifact root is writable but never a Git pathspec.
+
+    Ablations: restrict trusted roots to the project tree, or return the external
+    absolute path as a Git exclusion; either makes this test fail before both the
+    trusted normalization and empty-exclusion assertions can hold.
+    """
+    repo = project.project
+    external_impl = tmp_path / "external-artifacts"
+    external_impl.mkdir()
+    paths = ProjectPaths(
+        project=repo,
+        implementation_artifacts=external_impl,
+        planning_artifacts=project.planning_artifacts,
+        output_folder=project.output_folder,
+        repo_root=repo,
+    )
+    spec = external_impl / "spec-1-1-a.md"
+    spec.write_text("---\nstatus: in-progress\n---\nexternal intent\n")
+    task = _task(repo)
+    task.dispatched_spec_file = str(spec)
+    seen_excludes: list[tuple[str, ...]] = []
+    real_attempt_dirty = verify.attempt_dirty
+
+    def recording_attempt_dirty(*args, **kwargs):
+        seen_excludes.append(kwargs.get("exclude", ()))
+        return real_attempt_dirty(*args, **kwargs)
+
+    monkeypatch.setattr(verify, "attempt_dirty", recording_attempt_dirty)
+    flow = _make_flow(
+        workspace=Workspace(root=repo, paths=paths),
+        paths=paths,
+        policy=_policy(rollback_on_failure=False),
+    )
+
+    flow.rollback_or_pause(task)
+
+    assert _status(spec) == "ready-for-dev"
+    assert seen_excludes == [(), ()]
+    assert flow.journal.events() == ["rollback-skipped-clean"]
+    assert flow.calls.pauses == []
 
 
 # --------------------------------------------------------------- preserve refs
