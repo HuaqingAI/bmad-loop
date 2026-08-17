@@ -50,6 +50,22 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **Silent OpenCode parent sessions now enter bounded recovery from launch (#411).** Parent/child
+  SSE activity and a provably busy or retrying parent re-arm the grace; true silence spends the
+  bounded nudge budget and is classified `stalled`. This neither prevents upstream subagent
+  interruption nor guarantees that best-effort `prompt_async` nudges wake it.
+
+- **Generic and OpenCode dev/review stall grace now arms at launch and re-arms on activity (#470).**
+  Pane/SSE activity and later turn-end evidence restart the grace, so a truly silent live session
+  spends its configured bounded nudges and becomes `stalled` near the grace sequence instead of
+  necessarily consuming all of `session_timeout_min`. Completion still requires Stop/idle evidence
+  or window/server death plus deterministic artifact verification; prose never completes a session.
+
+- **Dead targets no longer abort the generic completion loop from its two nudge sends (#504).** The
+  stall and result-less-Stop sends alone contain `MultiplexerError`, after which deterministic
+  liveness and artifact logic decides `crashed` or `stalled`; this is not blanket multiplexer failure
+  tolerance.
+
 - **Path-resolution refusals no longer tear down worktree runs mid-provisioning (#556).**
   Observation probes report coarse unknown entries, each refused seed is skipped independently,
   provisioning-root uncertainty raises a typed escalation and pauses before any write or session,

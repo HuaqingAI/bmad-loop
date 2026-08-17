@@ -552,14 +552,16 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         session_id: str | None = None
         transcript_path: str | None = None
         nudges_left = self._stop_nudges
-        # set when a result-less Stop opens an idle-grace window (dev adapter
-        # only); a fresh Stop re-arms it, an elapsed window with no terminal
-        # result is a genuine stall. None = no grace pending.
-        stall_deadline: float | None = None
+        # Positive grace arms at launch for dev/review sessions, so a CLI that
+        # goes silent before its first Stop cannot burn the full wall timeout. A
+        # fresh Stop or later pane growth re-arms it; None = grace disabled.
+        stall_deadline = time.monotonic() + self._stall_grace_s if self._stall_grace_s > 0 else None
         # pane-log activity signature captured when the grace window is armed; a
         # session streaming output (a long productive turn, a streaming subagent)
         # advances it and re-arms the window, so only genuine silence stalls.
-        last_activity: tuple[int, int] | None = None
+        last_activity = (
+            self._log_activity_key(handle.task_id) if stall_deadline is not None else None
+        )
         # wake-nudges left to spend when the grace window elapses in silence: the
         # session likely ended its turn awaiting a background process, so we prod
         # it (bmad-loop has no background re-invocation) instead of stalling. A
@@ -822,7 +824,13 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         # agent waking; an unresponsive session keeps draining it.
                         stall_nudges_left -= 1
                         stall_nudges_sent += 1
-                        self.send_text(handle, STALL_NUDGE_TEXT)
+                        try:
+                            self.send_text(handle, STALL_NUDGE_TEXT)
+                        except MultiplexerError:
+                            # A dead/hung window cannot take the nudge. The
+                            # bounded attempt is still spent, and the next tick's
+                            # ordinary liveness probe owns the verdict.
+                            pass
                         stall_deadline = time.monotonic() + self._stall_grace_s
                         last_activity = self._log_activity_key(handle.task_id)
                         continue
@@ -897,7 +905,12 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     )
                 if nudges_left > 0:
                     nudges_left -= 1
-                    self.send_text(handle, NUDGE_TEXT)
+                    try:
+                        self.send_text(handle, NUDGE_TEXT)
+                    except MultiplexerError:
+                        # The next deterministic liveness probe decides whether
+                        # the un-nudgeable window is dead or merely unavailable.
+                        pass
                     continue
                 if self._stall_grace_s <= 0:
                     return self._final(

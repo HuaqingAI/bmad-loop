@@ -95,25 +95,19 @@ class LimitsPolicy:
     # (the rollback lever if escalation ever misfires).
     teardown_grace_s: int = 20
     stop_without_result_nudges: int = 1
-    # how long a dev session may sit on a result-less Stop — i.e. it ended its
-    # turn awaiting a long-running background process (a Unity PlayMode run, a
-    # slow test) and expects to be re-invoked on completion — before it is
-    # declared stalled. The window measures genuine inactivity: any output to the
-    # session's pane log (a long productive turn, a streaming subagent) re-arms
-    # it, as does a fresh Stop, so only a truly idle gap this long with no
-    # terminal spec stalls. Bounded by session_timeout_min. 0 restores the old
-    # fail-fast-on-first-Stop behavior.
+    # how long a dev/review session may stay silent before it is declared
+    # stalled. The grace starts at session launch and re-arms on transport
+    # activity (pane-log output or parent/child OpenCode SSE frames) and fresh
+    # Stop/idle evidence, so productive work keeps extending it. Bounded by
+    # session_timeout_min. 0 disables the launch timer while retaining fail-fast
+    # handling when a turn ends without a terminal spec/result.
     dev_stall_grace_s: int = 600
-    # how many times an idle dev session is woken with a nudge when the
-    # dev_stall_grace_s window elapses with no output — bmad-loop has no
-    # background-completion re-invocation, so a session that ended its turn to
-    # await a background process is nudged back to life before being called
-    # stalled. Fresh pane output re-arms the grace window (an actively streaming
-    # session never reaches grace expiry, so never spends a nudge); a fresh Stop
-    # additionally restores any spent budget. Either way a cooperative-but-slow
-    # session waits up to session_timeout_min; only one that stays silent through
-    # the full grace, nudge after nudge, drains the budget and stalls. 0 = stall
-    # on grace expiry.
+    # how many best-effort wake nudges a silent dev/review session receives on
+    # dev_stall_grace_s expiry before it is called stalled. Transport activity
+    # re-arms the grace without spending a nudge; fresh Stop/idle evidence also
+    # restores this per-silence budget. The monotonic cap below still bounds the
+    # total, because an accepted nudge is not proof that the session woke. 0 =
+    # stall on grace expiry.
     dev_stall_nudges: int = 2
     # monotonic (never-restored) cap on total stall wake-nudges for a dev/review
     # session (SessionSpec.stall_nudges_cap). The per-silence dev_stall_nudges
@@ -1137,9 +1131,9 @@ session_timeout_min = 90
 git_timeout_s = 120          # bound on any single git subprocess; exceeding it pauses/degrades (never crashes the run) — raise on a loaded host or a very large worktree
 teardown_grace_s = 20        # verified teardown: poll a killed session window up to this long, then force-kill its pane pids and re-kill (#157). 0 = single unverified best-effort kill
 stop_without_result_nudges = 1
-dev_stall_grace_s = 600      # grace for a dev session that ended its turn awaiting a background process (e.g. a slow PlayMode/test run) before it is called stalled; each re-invocation resets it. 0 = fail fast on the first result-less Stop
-dev_stall_nudges = 2         # times an idle dev session is nudged awake on grace expiry before it is called stalled (bmad-loop has no background-completion re-invocation); pane output re-arms the grace window and a fresh Stop restores the budget. 0 = stall on grace expiry
-dev_stall_nudges_cap = 6     # total (never-restored) stall nudges for a dev/review session before it is called stalled; bounds a session whose reply to the wake nudge is itself a result-less Stop that would refill the budget forever (#149). 0 = stall on first grace expiry
+dev_stall_grace_s = 600      # silence grace armed at dev/review launch and re-armed by transport activity or fresh Stop/idle evidence before bounded recovery. 0 = no launch timer, but a result-less turn end still fails fast
+dev_stall_nudges = 2         # best-effort wake nudges per silent grace before stalling; fresh Stop/idle evidence restores this budget. 0 = stall on grace expiry
+dev_stall_nudges_cap = 6     # total (never-restored) nudge bound per dev/review session; bounds launch-time recovery and Stop/idle budget refills because an accepted nudge does not guarantee a wake. 0 = stall on first grace expiry
 workflow_stall_nudges_cap = 3 # total (never-restored) stall nudges for an injected plugin-workflow session before it is called stalled; bounds a session that finished its work but never wrote its completion marker. 0 = stall on first grace expiry
 dev_contract_nudge = true    # true: one targeted nudge per session (#276) when a Stop finds a spec finalized to a terminal frontmatter status but missing its `## Auto Run Result` marker, asking the skill to append it and end its turn; sent exactly once, never refilled, touches no stall counters. false: rely only on harness-side frontmatter synthesis
 max_tokens_per_story = 2000000
