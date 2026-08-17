@@ -1020,11 +1020,11 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         wall_deadline = time.time() + spec.timeout_s
         session_id = sess.session_id
         nudges_left = self._stop_nudges
-        # Mirrors generic.wait_for_completion: stall-grace window armed by a
-        # result-less Stop (idle), re-armed by activity, spent via wake-nudges
-        # bounded by the monotonic spec.stall_nudges_cap (#149).
-        stall_deadline: float | None = None
-        last_activity: int | None = None
+        # Mirrors generic.wait_for_completion: stall grace starts at launch,
+        # re-arms on activity or a result-less Stop (idle), and is spent via
+        # wake-nudges bounded by the monotonic spec.stall_nudges_cap (#149).
+        stall_deadline = time.monotonic() + self._stall_grace_s if self._stall_grace_s > 0 else None
+        last_activity = sess.activity
         stall_nudges_left = self._stall_nudges
         stall_nudges_sent = 0
         # Loop-owned silence clock: updated on every dequeue, so a dead reader

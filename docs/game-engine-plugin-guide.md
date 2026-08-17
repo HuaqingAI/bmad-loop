@@ -236,16 +236,16 @@ The canonical example lives at `src/bmad_loop/data/plugins/unity/`:
 
 > **Tuning long PlayMode dev sessions.** The readiness knobs above
 > (`ready_timeout_sec` / `ready_grace_sec`) gate Editor _startup_, not dev-session
-> _completion_. A story whose dev session waits on a long PlayMode run or a slow
-> test is kept alive instead by the core limits `limits.dev_stall_grace_s` (idle
-> grace before an awaiting session is nudged/stalled) and `limits.dev_stall_nudges`
-> (wake-nudges spent on grace expiry before it is called stalled). The grace window
-> measures genuine inactivity — pane output re-arms it — so raise these (not the
-> readiness knobs) if networked/PlayMode-heavy stories are being mis-stalled.
-> `limits.dev_stall_nudges_cap` (default 6) additionally bounds the _total_ nudges
-> a session may ever receive — a very long wait needing more wake cycles than that
-> should raise the cap too (a stalled-but-finished session is still rescued
-> post-kill when its terminal artifact is on disk).
+> _completion_. The core `limits.dev_stall_grace_s` silence grace is active from
+> dev/review session launch, including while a story waits on a long PlayMode run
+> or slow test. Pane output—and OpenCode parent or child SSE activity—re-arms it;
+> fresh Stop/idle evidence re-arms it too and restores the per-silence
+> `limits.dev_stall_nudges` budget. Raise those limits (not the Editor-readiness
+> knobs) if networked/PlayMode-heavy stories are being mis-stalled.
+> `limits.dev_stall_nudges_cap` (default 6) additionally bounds the _total_
+> best-effort nudges a session may ever receive; prompt acceptance does not
+> guarantee a wake. A stalled-but-finished session is still rescued post-kill
+> when its terminal artifact is on disk.
 
 Each script's module docstring documents every env knob it reads — the
 authoritative source if a default ever changes. The [Game Engine MCP guide](game-engine-mcp-guide.md)

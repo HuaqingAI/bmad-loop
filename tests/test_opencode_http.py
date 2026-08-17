@@ -2034,6 +2034,148 @@ def test_timeout_wall_clock_step_back_cannot_extend_deadline(tmp_path, monkeypat
     assert ticks["n"] == 3  # same tick count as an untouched wall clock
 
 
+# -------------------------- launch-stall transport parity (#411/#470)
+#
+# Two-way contract-parity link: tests/test_generic_tmux.py carries identically
+# named T1/T2 tests under its matching launch-stall header. Changes to the
+# shared completion-loop behavior must update both transports or record the
+# deliberate divergence; T3 pins OpenCode's HTTP busy/retry safety branch.
+
+
+def test_dev_stall_arms_at_launch_without_stop(tmp_path, monkeypatch):
+    """A silent dev/review turn is bounded even if no idle event ever arrives.
+
+    INVERSE ablation: restore launch initialization of ``stall_deadline`` and
+    ``last_activity`` to ``None`` and this test times out with zero stall nudges.
+    """
+    adapter, _ = make_dev_adapter(tmp_path)
+    adapter._stall_grace_s = 10.0
+    adapter._stall_nudges = 2
+    adapter.silence_threshold_s = float("inf")
+    clock = _install_clock(monkeypatch)
+    (adapter.tasks_dir / "t-1").mkdir(parents=True)
+
+    def advance():
+        clock["mono"] += 11.0
+
+    sess = _timeout_driven_session(adapter, advance)
+    assert sess.activity == 0
+    monkeypatch.setattr(adapter, "_session_status", lambda _sess: False)
+    sent: list[str] = []
+    monkeypatch.setattr(adapter, "send_text", lambda _handle, text: sent.append(text))
+    heartbeats: list[dict] = []
+    monkeypatch.setattr(
+        adapter, "_write_heartbeat", lambda _task_id, payload: heartbeats.append(payload)
+    )
+
+    result = adapter.wait_for_completion(
+        SessionHandle(task_id="t-1", native_id="ses_1"),
+        _timeout_spec(tmp_path, timeout_s=100.0),
+    )
+
+    assert (result.status, sent) == ("stalled", [STALL_NUDGE_TEXT] * 2)
+    assert heartbeats[0]["stall_armed"] is True
+
+
+def test_dev_activity_rearms_launch_stall_grace(tmp_path, monkeypatch):
+    """Two productive launch ticks re-arm grace; one full silent grace stalls.
+
+    ``test_sse_dispatch_filters_child_sessions`` proves that the manually
+    incremented counter is shared parent/child SSE activity, not an invented
+    test seam. Ablation target: delete the activity-change re-arm branch and
+    this test stalls at the first productive grace crossing instead of tick 3.
+    """
+    adapter, _ = make_dev_adapter(tmp_path)
+    adapter._stall_grace_s = 10.0
+    adapter._stall_nudges = 0
+    adapter.silence_threshold_s = float("inf")
+    clock = _install_clock(monkeypatch)
+    (adapter.tasks_dir / "t-1").mkdir(parents=True)
+    ticks = {"n": 0}
+    sess: _ServerSession
+
+    def advance_and_stream():
+        ticks["n"] += 1
+        clock["mono"] += 11.0
+        if ticks["n"] <= 2:
+            sess.activity += 1
+
+    sess = _timeout_driven_session(adapter, advance_and_stream)
+    monkeypatch.setattr(adapter, "_session_status", lambda _sess: False)
+    sent: list[str] = []
+    monkeypatch.setattr(adapter, "send_text", lambda _handle, text: sent.append(text))
+
+    result = adapter.wait_for_completion(
+        SessionHandle(task_id="t-1", native_id="ses_1"),
+        _timeout_spec(tmp_path, timeout_s=100.0),
+    )
+
+    assert result.status == "stalled"
+    assert (ticks["n"], sess.activity, sent) == (3, 2, [])
+
+
+def test_dev_busy_status_rearms_launch_stall_grace_without_nudging(tmp_path, monkeypatch):
+    """OpenCode busy/retry proof protects work until the absolute timeout.
+
+    Ablation target: force the busy-status guard to fall through and this test
+    records a nudge or stalls instead of reaching the timeout with no send.
+    """
+    adapter, _ = make_dev_adapter(tmp_path)
+    adapter._stall_grace_s = 10.0
+    adapter._stall_nudges = 2
+    adapter.silence_threshold_s = float("inf")
+    clock = _install_clock(monkeypatch)
+    (adapter.tasks_dir / "t-1").mkdir(parents=True)
+    ticks = {"n": 0}
+
+    def advance():
+        ticks["n"] += 1
+        clock["mono"] += 11.0
+
+    sess = _timeout_driven_session(adapter, advance)
+    statuses = iter(("busy", "retry", "busy", "retry"))
+    observed: list[str] = []
+
+    class _StatusClient:
+        def get(self, path):
+            if path == "/session/status":
+                status = next(statuses)
+                observed.append(status)
+                payload = {sess.session_id: {"type": status}}
+            else:
+                payload = []
+
+            class _Resp:
+                status_code = 200
+
+                @staticmethod
+                def json():
+                    return payload
+
+            return _Resp()
+
+        def post(self, path):
+            class _Resp:
+                status_code = 200
+
+            return _Resp()
+
+        def close(self):
+            pass
+
+    sess.client = _StatusClient()
+    sent: list[str] = []
+    monkeypatch.setattr(adapter, "send_text", lambda _handle, text: sent.append(text))
+
+    result = adapter.wait_for_completion(
+        SessionHandle(task_id="t-1", native_id="ses_1"),
+        _timeout_spec(tmp_path, timeout_s=35.0),
+    )
+
+    assert result.status == "timeout"
+    assert (observed, sent, ticks["n"]) == (["busy", "retry", "busy", "retry"], [], 4)
+
+
 def test_e2e_server_death_with_artifact_completes(tmp_path, fake_opencode):
     """Server death ≙ window death: the crash path vouches for a landed
     result.json (accept_result=True), so finished-then-died reads completed."""
