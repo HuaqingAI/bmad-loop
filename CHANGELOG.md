@@ -54,9 +54,23 @@ breaking changes may land in a minor release.
   bound plain attempt whose only residue is its lifecycle flip is restored to its pre-attempt
   lifecycle status and proven Git-clean before retry. A resolved re-drive may instead retain an
   authorized dirty, human-corrected spec and reports `rollback-owned-spec-normalized` without
-  claiming cleanliness or auto-committing the correction; a later non-fixable retry restores its
-  promised lifecycle route after resetting sibling residue. Substantive spec changes and sibling
-  source, artifact, or untracked residue still follow the configured rollback policy.
+  claiming cleanliness or auto-committing the correction. Each bound retry chain now snapshots its
+  first spec input byte-for-byte and retains it across dev- and review-verification repairs, so a
+  later failed child cannot replace that input with its own body edits. Non-fixable retries park the
+  failed child, restore the snapshot, and then re-establish the promised lifecycle route after
+  resetting sibling residue. Repair prompts validate retained authority before they can reset a
+  spec, and a plain child that puts a tracked spec back at Git baseline cannot erase pre-launch
+  operator edits. Pre-existing untracked and ignored bound specs use that snapshot as their
+  independent dirtiness oracle and are force-included only in the private recovery ref before
+  restoration; index-only force-adds and cached removals also trigger cleanup, which restores the
+  baseline index ownership. `rollback-owned-spec-restored` records the repair. Missing, unreadable,
+  retargeted, changed external, or unsafe legacy authority pauses with convergent spec-adoption
+  instructions, and recovery refuses a reset whose baseline would replace the canonical path or a
+  parent directory with a symlink, tree, file, or other unsafe shape. An initial Sprint observation
+  fault may leave a bare-key attempt unbound; an existing Stories folder+id target instead aborts
+  unless it can be snapshotted. Post-bind faults abort before launch while retaining the authority
+  for recovery. Snapshots are retired after commit. Other substantive changes and sibling source,
+  artifact, or untracked residue still follow the configured rollback policy.
 
 - **Recorded sprint re-drives now route directly through their known spec (#630).** Only a
   generic sprint task with a recorded `spec_file` names that `ready-for-dev` spec explicitly and

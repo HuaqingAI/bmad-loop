@@ -10,6 +10,7 @@ import pytest
 import yaml
 from conftest import attach_profile, git, install_build_auto_skill, write_gated_ledger, write_spec
 
+from bmad_loop import stories
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import Engine
@@ -285,6 +286,102 @@ def test_dispatched_spec_binding_uses_exact_present_id_keyed_file(project):
 
     assert engine._dispatched_spec_for_attempt(StoryTask("1", 0)) == str(present)
     assert present.parent == folder / "stories"
+
+
+def test_bound_folder_id_dispatch_aborts_when_final_snapshot_fails(project, monkeypatch):
+    """A Stories prompt stays fail-safe even though it names only folder + id.
+
+    Ablation: require the final snapshot only for prompts containing ``spec_file``
+    and this bound attempt launches despite its failed final observation.
+    """
+    setup_stories(project, [entry("1")])
+    present = story_spec(project, "1")
+    write_spec(present, "ready-for-dev", rev_parse_head(project.project))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "present story spec")
+    engine, adapter = make_engine(project, [stories_dev_effect()])
+    task = StoryTask("1", 0, spec_file=str(present))
+    engine.state.tasks[task.story_key] = task
+    real_refresh = engine._refresh_dispatched_spec_snapshot
+    calls = 0
+
+    def fail_final_snapshot(bound_task, **kwargs):
+        nonlocal calls
+        calls += 1
+        refreshed = real_refresh(bound_task, **kwargs)
+        if calls == 2:
+            return False
+        return refreshed
+
+    monkeypatch.setattr(engine, "_refresh_dispatched_spec_snapshot", fail_final_snapshot)
+
+    with pytest.raises(RuntimeError, match="pre-launch snapshot"):
+        engine._dev_phase(task)
+
+    assert calls == 2
+    assert adapter.sessions == []
+
+
+def test_present_folder_id_dispatch_aborts_when_initial_binding_fails(project, monkeypatch):
+    """An existing Stories target cannot launch unbound after a read fault."""
+    setup_stories(project, [entry("1")])
+    present = story_spec(project, "1")
+    write_spec(present, "ready-for-dev", rev_parse_head(project.project))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "present story spec")
+    engine, adapter = make_engine(project, [stories_dev_effect()])
+    task = StoryTask("1", 0, spec_file=str(present))
+    engine.state.tasks[task.story_key] = task
+    monkeypatch.setattr(engine, "_dispatched_spec_for_attempt", lambda _task: None)
+
+    with pytest.raises(RuntimeError, match="pre-launch snapshot"):
+        engine._dev_phase(task)
+
+    assert task.phase == Phase.DEV_RUNNING
+    assert task.dispatched_spec_file is None
+    assert task.dispatched_spec_snapshot is None
+    assert adapter.sessions == []
+    persisted = load_state(engine.run_dir).tasks[task.story_key]
+    assert persisted.phase == Phase.DEV_RUNNING
+    assert persisted.attempt == task.attempt
+
+
+def test_present_folder_id_dispatch_fails_closed_when_requirement_observation_faults(
+    project, monkeypatch
+):
+    """Two failed resolver observations cannot turn an existing target unbound."""
+    setup_stories(project, [entry("1")])
+    present = story_spec(project, "1")
+    write_spec(present, "ready-for-dev", rev_parse_head(project.project))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "present story spec")
+    engine, adapter = make_engine(project, [stories_dev_effect()])
+    task = StoryTask("1", 0, spec_file=str(present))
+    engine.state.tasks[task.story_key] = task
+    real_resolve = stories.resolve_story_spec
+    calls = 0
+
+    def fail_authority_observations(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls in {1, 3}:
+            raise OSError("transient Stories resolver fault")
+        return real_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "bmad_loop.stories_engine.stories.resolve_story_spec", fail_authority_observations
+    )
+
+    with pytest.raises(RuntimeError, match="pre-launch snapshot"):
+        engine._dev_phase(task)
+
+    assert adapter.sessions == []
+    assert task.dispatched_spec_file is None
+    assert task.dispatched_spec_snapshot is None
+    assert calls == 3
+    persisted = load_state(engine.run_dir).tasks[task.story_key]
+    assert persisted.phase == Phase.DEV_RUNNING
+    assert persisted.attempt == task.attempt
 
 
 def test_dispatched_spec_binding_refuses_pending_story(project):

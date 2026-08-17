@@ -334,6 +334,22 @@ class StoriesEngine(Engine):
         except (OSError, RuntimeError, UnicodeDecodeError):
             return None
 
+    def _requires_dispatched_spec_snapshot(self, task: StoryTask, prompt: str) -> bool:
+        """Require authority when folder+id dispatch targets an existing spec.
+
+        A pending, ambiguous, or sentinel story does not claim file authority
+        through this seam; normal Stories scheduling handles those states. Once
+        resolution identifies one PRESENT spec, however, a transient binding/read
+        fault must abort rather than let the folder+id child mutate an input
+        recovery cannot restore. An uncertain second observation fails closed for
+        the same reason.
+        """
+        try:
+            state = stories.resolve_story_spec(self._stories_folder(), task.story_key)
+        except (OSError, RuntimeError):
+            return True
+        return state.kind == stories.KIND_PRESENT and state.path is not None
+
     def _extra_session_env(
         self, task: StoryTask, role: str, label: str | None = None
     ) -> dict[str, str]:

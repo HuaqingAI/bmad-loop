@@ -202,6 +202,21 @@ def test_dispatched_spec_file_defaults_none_for_legacy_state():
     assert StoryTask.from_dict(doc).dispatched_spec_file is None
 
 
+def test_dispatched_spec_snapshot_round_trips_byte_exactly():
+    snapshot = b"---\r\nstatus: ready-for-dev\r\n---\r\n\xffoperator intent\r\n"
+    task = StoryTask(story_key="1-1-a", epic=1, dispatched_spec_snapshot=snapshot)
+
+    restored = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+
+    assert restored.dispatched_spec_snapshot == snapshot
+
+
+def test_dispatched_spec_snapshot_defaults_none_for_legacy_state():
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["dispatched_spec_snapshot"]
+    assert StoryTask.from_dict(doc).dispatched_spec_snapshot is None
+
+
 def test_plan_checkpoint_pending_round_trips():
     task = StoryTask(story_key="1", epic=0, plan_checkpoint_pending=True)
     assert StoryTask.from_dict(task.to_dict()).plan_checkpoint_pending is True

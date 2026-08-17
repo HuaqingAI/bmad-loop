@@ -79,6 +79,52 @@ def test_attempt_dirty_tracked_change(project):
     assert verify.attempt_dirty(project.project, baseline, []) is True
 
 
+def test_file_bytes_at_revision_distinguishes_blob_absence_tree_and_git_failure(project):
+    """The baseline oracle returns only proven blob bytes, never tree listings."""
+    repo = project.project
+    nested = repo / "oracle" / "spec.bin"
+    nested.parent.mkdir()
+    expected = b"\x00byte-exact\xff\r\n"
+    nested.write_bytes(expected)
+    git(repo, "add", "oracle")
+    git(repo, "commit", "-q", "-m", "binary oracle fixture")
+    baseline = verify.rev_parse_head(repo)
+
+    assert verify.file_bytes_at_revision(repo, baseline, "oracle/spec.bin") == expected
+    assert verify.file_bytes_at_revision(repo, baseline, "missing.bin") is None
+    assert verify.file_bytes_at_revision(repo, baseline, "oracle") is None
+    assert not verify.path_is_non_regular_at_revision(repo, baseline, "oracle/spec.bin")
+    assert not verify.path_is_non_regular_at_revision(repo, baseline, "missing.bin")
+    assert verify.path_is_non_regular_at_revision(repo, baseline, "oracle")
+    with pytest.raises(verify.GitError, match="ls-tree"):
+        verify.file_bytes_at_revision(repo, "not-a-revision", "oracle/spec.bin")
+
+
+@pytest.mark.parametrize("baseline_present", [False, True], ids=["absent", "tracked"])
+def test_reset_index_path_restores_baseline_ownership_without_rewriting_bytes(
+    project, baseline_present
+):
+    repo = project.project
+    path = repo / "index-owned.md"
+    if baseline_present:
+        path.write_text("baseline\n")
+        git(repo, "add", "index-owned.md")
+        git(repo, "commit", "-q", "-m", "tracked index baseline")
+    baseline = verify.rev_parse_head(repo)
+    path.write_text("working bytes\n")
+    if baseline_present:
+        git(repo, "rm", "--cached", "index-owned.md")
+    else:
+        git(repo, "add", "index-owned.md")
+    assert verify.index_path_changed_since(repo, baseline, "index-owned.md")
+
+    verify.reset_index_path(repo, baseline, "index-owned.md")
+
+    assert not verify.index_path_changed_since(repo, baseline, "index-owned.md")
+    assert verify.path_tracked(repo, "index-owned.md") is baseline_present
+    assert path.read_text() == "working bytes\n"
+
+
 def test_attempt_dirty_run_created_untracked(project):
     """An untracked file absent from the baseline snapshot was created by this
     attempt → dirty."""
@@ -4247,6 +4293,31 @@ def test_snapshot_worktree_excludes_gitignored(project):
     tree = git(repo, "ls-tree", "-r", "--name-only", ref)
     assert "src.txt" in tree
     assert "ignored.txt" not in tree
+
+
+@pytest.mark.parametrize("kind", ["baseline-untracked", "ignored"])
+def test_snapshot_worktree_force_includes_one_trusted_git_invisible_path(project, kind):
+    """Recovery can park a byte-snapshotted spec that normal staging excludes."""
+    repo = project.project
+    rel = f"artifacts/{kind}.md"
+    path = repo / rel
+    path.parent.mkdir()
+    if kind == "ignored":
+        (repo / ".gitignore").write_text(f"/{rel}\n")
+        git(repo, "add", ".gitignore")
+        git(repo, "commit", "-q", "-m", "ignore recovery input")
+    path.write_text("failed child bytes\n")
+    baseline_untracked = [rel] if kind == "baseline-untracked" else []
+
+    ref = verify.snapshot_worktree(
+        repo,
+        f"refs/attempt-preserve-dirty/forced-{kind}",
+        baseline_untracked=baseline_untracked,
+        force_include=(rel,),
+    )
+
+    assert ref is not None
+    assert git(repo, "show", f"{ref}:{rel}") == "failed child bytes"
 
 
 def test_snapshot_worktree_succeeds_without_git_identity(project, monkeypatch, tmp_path):

@@ -438,6 +438,119 @@ def attempt_dirty(
     return bool(created)
 
 
+def _entry_at_revision(repo: Path, revision: str, rel: str) -> tuple[str, str, str] | None:
+    """Return ``(mode, type, oid)`` for one literal path at ``revision``.
+
+    ``ls-tree`` gives absence as an empty successful result while keeping an
+    invalid revision or object-database fault as a non-zero command. That
+    distinction is load-bearing for recovery: absence is a proven baseline
+    ownership state; a Git failure is not authority to reset.
+    """
+    proc = _run_git(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "ls-tree",
+            "-z",
+            "--full-tree",
+            revision,
+            "--",
+            *_literal_specs([rel]),
+        ],
+        repo,
+        binary=True,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stdout + proc.stderr).decode("utf-8", "replace").strip()
+        raise GitError(f"git ls-tree {revision[:12]} -- {rel} failed in {repo}: {detail}")
+    records = [record for record in proc.stdout.split(b"\0") if record]
+    if not records:
+        return None
+    if len(records) != 1 or b"\t" not in records[0]:
+        raise GitError(f"git ls-tree returned an ambiguous entry for {rel!r} in {repo}")
+    header, path = records[0].split(b"\t", 1)
+    if path != os.fsencode(rel):
+        raise GitError(f"git ls-tree returned the wrong literal path for {rel!r} in {repo}")
+    fields = header.decode("ascii", "strict").split()
+    if len(fields) != 3:
+        raise GitError(f"git ls-tree returned a malformed entry for {rel!r} in {repo}")
+    return fields[0], fields[1], fields[2]
+
+
+def file_bytes_at_revision(repo: Path, revision: str, rel: str) -> bytes | None:
+    """Read one blob byte-exactly from ``revision``.
+
+    ``None`` means the literal path is absent or names a non-blob (for example a
+    directory) at that revision. Git command/object failures raise, so recovery
+    can distinguish a proven absent baseline file from an unproven observation.
+    Symlinks are blobs too; callers that care about path authority separately
+    validate the live regular file and its ancestors.
+    """
+    entry = _entry_at_revision(repo, revision, rel)
+    if entry is None or entry[1] != "blob":
+        return None
+    oid = entry[2]
+    proc = _run_git(
+        ["git", "-C", str(repo), "cat-file", "blob", oid],
+        repo,
+        binary=True,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stdout + proc.stderr).decode("utf-8", "replace").strip()
+        raise GitError(f"git cat-file blob {oid[:12]} failed in {repo}: {detail}")
+    return proc.stdout
+
+
+def path_has_non_tree_ancestor_at_revision(repo: Path, revision: str, rel: str) -> bool:
+    """Whether a parent of ``rel`` is a tracked non-directory at ``revision``.
+
+    Resetting such a baseline can replace a currently real directory with a
+    symlink, file, or submodule. A pre-reset canonical child path is therefore no
+    longer safe restoration authority after the reset.
+    """
+    parts = Path(rel).parts
+    for end in range(1, len(parts)):
+        entry = _entry_at_revision(repo, revision, Path(*parts[:end]).as_posix())
+        if entry is not None and entry[1] != "tree":
+            return True
+    return False
+
+
+def path_is_non_regular_at_revision(repo: Path, revision: str, rel: str) -> bool:
+    """Whether ``rel`` exists at ``revision`` but is not a regular Git file.
+
+    An absent final path is safe for snapshot restoration: reset may remove the
+    live file and recovery recreates it. A regular blob (mode ``100644`` or
+    ``100755``) is safe for the same reason. Trees, symlinks, gitlinks, and any
+    unknown mode would change the meaning of the canonical live path during a
+    reset, so recovery must refuse before mutating the checkout.
+    """
+    entry = _entry_at_revision(repo, revision, rel)
+    return entry is not None and (entry[1] != "blob" or entry[0] not in {"100644", "100755"})
+
+
+def index_path_changed_since(repo: Path, revision: str, rel: str) -> bool:
+    """Whether one literal index entry differs from ``revision``.
+
+    This sees index-only ownership mutations that a byte snapshot cannot: a
+    failed child force-adding an ignored input, removing a tracked input from the
+    index, or staging different content before restoring the working-tree bytes.
+    """
+    rc, out = _git(
+        repo,
+        "diff",
+        "--cached",
+        "--quiet",
+        revision,
+        "--",
+        *_literal_specs([rel]),
+    )
+    if rc not in (0, 1):
+        raise GitError(f"git diff --cached {revision[:12]} -- {rel} failed in {repo}: {out}")
+    return rc == 1
+
+
 def frontmatter_status_at_revision(repo: Path, revision: str, rel: str) -> str | None:
     """Read one tracked file's normalized frontmatter status from ``revision``.
 
@@ -448,15 +561,11 @@ def frontmatter_status_at_revision(repo: Path, revision: str, rel: str) -> str |
     malformed YAML, non-mapping frontmatter, and missing/blank statuses likewise
     return ``None``; a caller must not repair from an unproven baseline.
     """
-    proc = _run_git(
-        ["git", "-C", str(repo), "show", f"{revision}:{rel}"],
-        repo,
-        binary=True,
-    )
-    if proc.returncode != 0:
+    raw = file_bytes_at_revision(repo, revision, rel)
+    if raw is None:
         return None
     try:
-        text = proc.stdout.decode("utf-8")
+        text = raw.decode("utf-8")
     except UnicodeDecodeError:
         return None
     split = _split_frontmatter(text)
@@ -470,6 +579,32 @@ def frontmatter_status_at_revision(repo: Path, revision: str, rel: str) -> str |
         return None
     status = status_of(doc)
     return status or None
+
+
+def reset_index_path(repo: Path, revision: str, rel: str) -> None:
+    """Restore one literal path's index ownership from ``revision`` only.
+
+    The working-tree file is deliberately left in place. Recovery uses this
+    after a preserved-folder checkout when the attempt baseline had no blob at
+    ``rel``: the pre-launch ignored/untracked spec must not become a staged add
+    merely because a failed child force-added or committed that same name.
+    """
+    proc = _run_git(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "reset",
+            "--quiet",
+            revision,
+            "--",
+            *_literal_specs([rel]),
+        ],
+        repo,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stdout + proc.stderr).strip()
+        raise GitError(f"git reset {revision[:12]} -- {rel} failed in {repo}: {detail}")
 
 
 def _exclude_specs(dirs: tuple[str, ...]) -> list[str]:
@@ -887,7 +1022,11 @@ def prune_preserve_dirty_refs(repo: Path, keep: int) -> list[str]:
 
 
 def snapshot_worktree(
-    repo: Path, ref_name: str, *, baseline_untracked: list[str] | None
+    repo: Path,
+    ref_name: str,
+    *,
+    baseline_untracked: list[str] | None,
+    force_include: tuple[str, ...] = (),
 ) -> str | None:
     """Park the current *uncommitted* working-tree state — tracked edits/deletions
     AND run-created untracked files — under ``ref_name`` as a commit object, so a
@@ -906,9 +1045,13 @@ def snapshot_worktree(
     a pre-existing user untracked file. When ``baseline_untracked`` is ``None`` (a
     pre-upgrade/resumed run with no snapshot) no untracked file is staged — matching
     :func:`safe_rollback`, which then deletes none — so tracked edits are still
-    parked but untracked files are left untouched. Ignored files are excluded throughout
-    (``add -u`` only touches tracked paths; ``untracked_files`` honours
-    ``.gitignore``). A tree is written and ``commit-tree``'d parented at HEAD
+    parked but untracked files are left untouched. Ignored files are excluded
+    throughout unless a caller supplies a trusted literal ``force_include`` path.
+    Recovery uses that narrow exception for an attempt-bound spec whose durable
+    byte snapshot proves the child changed a baseline-untracked or ignored file;
+    ``git add -f`` then parks the child bytes before recovery restores the input.
+    The caller must validate those paths as trusted regular files first. A tree is
+    written and ``commit-tree``'d parented at HEAD
     under a synthetic ``bmad-loop`` identity so the snapshot commit succeeds even
     when no local/global git ``user.name``/``user.email`` is configured, then
     ``ref_name`` is pointed at the result. Compares only against HEAD — committed
@@ -956,6 +1099,17 @@ def snapshot_worktree(
             rc, out = _git_env(repo, "add", "--", *new, env=env)
             if rc != 0:
                 raise GitError(f"git add (snapshot untracked) failed in {repo}: {out}")
+        if force_include:
+            rc, out = _git_env(
+                repo,
+                "add",
+                "-f",
+                "--",
+                *_literal_specs(list(force_include)),
+                env=env,
+            )
+            if rc != 0:
+                raise GitError(f"git add (snapshot forced path) failed in {repo}: {out}")
         rc, tree, detail = _git_out(repo, "write-tree", env=env)
         if rc != 0:
             raise GitError(f"git write-tree (snapshot) failed in {repo}: {detail}")

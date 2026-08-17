@@ -538,7 +538,11 @@ def test_resume_continues_from_completed_dev_session(project, monkeypatch):
     # and desync the counter from the recorded session's task_id
     assert final.attempt == 1
     assert final.baseline_commit == crashed_task.baseline_commit
-    assert final.dispatched_spec_file == old_binding
+    # The replay retained the persisted binding through verification (the spy
+    # above proves it was never rebound), then successful commit retired the
+    # retry-chain authority so final state does not retain full spec contents.
+    assert final.dispatched_spec_file is None
+    assert final.dispatched_spec_snapshot is None
     assert [s.role for s in adapter.sessions] == ["review"]  # dev NOT re-run
     kinds = [e["kind"] for e in resumed.journal.entries()]
     assert "resume-verify" in kinds
@@ -556,6 +560,7 @@ def test_fresh_dev_attempt_persists_resolved_spec_binding_before_launch(project,
     engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")])
     recorded = spec_path(project, "1-1-a")
     write_spec(recorded, "ready-for-dev", rev_parse_head(project.project))
+    expected_snapshot = recorded.read_bytes()
     task = StoryTask(
         story_key="1-1-a",
         epic=1,
@@ -563,19 +568,21 @@ def test_fresh_dev_attempt_persists_resolved_spec_binding_before_launch(project,
         dispatched_spec_file="stale/from/attempt-0.md",
     )
     engine.state.tasks[task.story_key] = task
-    observed: list[str | None] = []
+    observed: list[tuple[str | None, bytes | None]] = []
     original_start = adapter.start_session
 
     def start_after_durable_binding(session_spec):
-        observed.append(load_state(engine.run_dir).tasks[task.story_key].dispatched_spec_file)
+        saved = load_state(engine.run_dir).tasks[task.story_key]
+        observed.append((saved.dispatched_spec_file, saved.dispatched_spec_snapshot))
         return original_start(session_spec)
 
     monkeypatch.setattr(adapter, "start_session", start_after_durable_binding)
 
     assert engine._dev_phase(task)
 
-    assert observed == [str(recorded)]
+    assert observed == [(str(recorded), expected_snapshot)]
     assert task.dispatched_spec_file == str(recorded)
+    assert task.dispatched_spec_snapshot == expected_snapshot
 
 
 def test_fresh_dev_attempt_clears_stale_binding_when_recorded_spec_is_invalid(project, monkeypatch):
@@ -592,25 +599,249 @@ def test_fresh_dev_attempt_clears_stale_binding_when_recorded_spec_is_invalid(pr
         epic=1,
         spec_file=str(project.project / "missing-spec.md"),
         dispatched_spec_file="stale/from/attempt-0.md",
+        dispatched_spec_snapshot=b"stale attempt bytes",
     )
     engine.state.tasks[task.story_key] = task
-    observed: list[str | None] = []
+    observed: list[tuple[str | None, bytes | None]] = []
     original_start = adapter.start_session
 
     def start_after_durable_clear(session_spec):
-        observed.append(load_state(engine.run_dir).tasks[task.story_key].dispatched_spec_file)
+        saved = load_state(engine.run_dir).tasks[task.story_key]
+        observed.append((saved.dispatched_spec_file, saved.dispatched_spec_snapshot))
         return original_start(session_spec)
 
     monkeypatch.setattr(adapter, "start_session", start_after_durable_clear)
 
     assert engine._dev_phase(task)
 
-    assert observed == [None]
+    assert observed == [(None, None)]
     assert task.dispatched_spec_file is None
+    assert task.dispatched_spec_snapshot is None
     dev_session = adapter.sessions[0]
     assert dev_session.prompt.startswith(f"/bmad-dev-auto {task.story_key} —")
     assert str(project.project / "missing-spec.md") not in dev_session.prompt
     assert dev_session.expected_spec is None
+
+
+def test_bare_prompt_path_substring_does_not_require_snapshot(project):
+    """A stale short path cannot turn a bare-key fallback into an explicit route.
+
+    Ablation: match ``spec_file`` as a raw prompt substring and the story key's
+    leading ``1`` makes this unbound attempt abort before the adapter launches.
+    """
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")])
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file="1")
+    engine.state.tasks[task.story_key] = task
+
+    assert engine._dev_phase(task)
+
+    session = adapter.sessions[0]
+    assert session.prompt.startswith(f"/bmad-dev-auto {task.story_key} —")
+    assert session.expected_spec is None
+    assert task.dispatched_spec_file is None
+    assert task.dispatched_spec_snapshot is None
+
+
+def test_final_snapshot_fault_aborts_before_explicit_child_launch(project, monkeypatch):
+    """A prompt that names a spec may not launch after its final snapshot fails.
+
+    Ablation: delete the post-bind refusal in ``_dev_phase`` and the adapter starts
+    despite the failed final observation. The last trusted pair remains durable so
+    crash recovery can refuse a vanished or retargeted file.
+    """
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")])
+    recorded = spec_path(project, "1-1-a")
+    write_spec(recorded, "ready-for-dev", rev_parse_head(project.project))
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(recorded))
+    engine.state.tasks[task.story_key] = task
+    real_refresh = engine._refresh_dispatched_spec_snapshot
+    calls = 0
+
+    def fail_final_snapshot(bound_task, **kwargs):
+        nonlocal calls
+        calls += 1
+        refreshed = real_refresh(bound_task, **kwargs)
+        if calls == 2:
+            return False
+        return refreshed
+
+    monkeypatch.setattr(engine, "_refresh_dispatched_spec_snapshot", fail_final_snapshot)
+
+    with pytest.raises(RuntimeError, match="pre-launch snapshot"):
+        engine._dev_phase(task)
+
+    assert calls == 2
+    assert adapter.sessions == []
+    saved = load_state(engine.run_dir).tasks[task.story_key]
+    assert saved.dispatched_spec_file == str(recorded)
+    assert saved.dispatched_spec_snapshot == recorded.read_bytes()
+
+
+def test_transient_initial_binding_fault_does_not_promote_after_bare_prompt(project, monkeypatch):
+    """Prompt construction and recovery ownership remain one observation.
+
+    Ablation: re-run the full binder after building the prompt and the second
+    observation promotes this attempt even though the child launched by bare key.
+    """
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")])
+    recorded = spec_path(project, "1-1-a")
+    write_spec(recorded, "ready-for-dev", rev_parse_head(project.project))
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(recorded))
+    engine.state.tasks[task.story_key] = task
+    real_resolve = engine._dispatched_spec_for_attempt
+    observations = 0
+
+    def transient_first_fault(bound_task):
+        nonlocal observations
+        observations += 1
+        if observations == 1:
+            return None
+        return real_resolve(bound_task)
+
+    monkeypatch.setattr(engine, "_dispatched_spec_for_attempt", transient_first_fault)
+
+    assert engine._dev_phase(task)
+
+    assert observations == 1
+    assert task.dispatched_spec_file is None
+    assert task.dispatched_spec_snapshot is None
+    assert adapter.sessions[0].prompt.startswith(f"/bmad-dev-auto {task.story_key} —")
+    assert adapter.sessions[0].expected_spec is None
+
+
+def test_unbound_patch_restore_prompt_aborts_before_child_launch(project, monkeypatch):
+    """Every explicit dev route requires durable recoverable input bytes."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")])
+    recorded = spec_path(project, "1-1-a")
+    write_spec(recorded, "in-review", rev_parse_head(project.project))
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        spec_file=str(recorded),
+        restore_patch="intent-gap.patch",
+    )
+    engine.state.tasks[task.story_key] = task
+    monkeypatch.setattr(engine, "_dispatched_spec_for_attempt", lambda _task: None)
+    monkeypatch.setattr(engine, "_restore_patch", lambda _task: None)
+
+    with pytest.raises(RuntimeError, match="pre-launch snapshot"):
+        engine._dev_phase(task)
+
+    assert adapter.sessions == []
+    assert task.dispatched_spec_file is None
+    assert task.dispatched_spec_snapshot is None
+
+
+def test_pre_session_hook_mutation_refreshes_durable_snapshot(project, monkeypatch):
+    """The adapter inherits the post-hook bytes recorded for later recovery."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")])
+    recorded = spec_path(project, "1-1-a")
+    write_spec(recorded, "ready-for-dev", rev_parse_head(project.project))
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(recorded))
+    engine.state.tasks[task.story_key] = task
+    hook_bytes = b"---\nstatus: ready-for-dev\n---\n\npre-session hook intent\n"
+    real_gate = engine._emit_session_gate
+    original_start = adapter.start_session
+    observed: list[bytes | None] = []
+
+    def mutate_before_launch(*args, **kwargs):
+        prompt, env, ctx = real_gate(*args, **kwargs)
+        recorded.write_bytes(hook_bytes)
+        return prompt, env, ctx
+
+    def start_after_hook_snapshot(session_spec):
+        observed.append(load_state(engine.run_dir).tasks[task.story_key].dispatched_spec_snapshot)
+        return original_start(session_spec)
+
+    monkeypatch.setattr(engine, "_emit_session_gate", mutate_before_launch)
+    monkeypatch.setattr(adapter, "start_session", start_after_hook_snapshot)
+
+    assert engine._dev_phase(task)
+
+    assert observed == [hook_bytes]
+
+
+def test_pre_session_hook_deletion_aborts_before_session_start(project, monkeypatch):
+    """A hook cannot launch a child or erase the last trusted recovery authority."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")])
+    recorded = spec_path(project, "1-1-a")
+    write_spec(recorded, "ready-for-dev", rev_parse_head(project.project))
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(recorded))
+    engine.state.tasks[task.story_key] = task
+    real_gate = engine._emit_session_gate
+
+    def delete_before_launch(*args, **kwargs):
+        prompt, env, ctx = real_gate(*args, **kwargs)
+        recorded.unlink()
+        return prompt, env, ctx
+
+    monkeypatch.setattr(engine, "_emit_session_gate", delete_before_launch)
+
+    with pytest.raises(RuntimeError, match="after pre-session hooks"):
+        engine._dev_phase(task)
+
+    assert adapter.sessions == []
+    assert not [e for e in engine.journal.entries() if e["kind"] == "session-start"]
+    saved = load_state(engine.run_dir).tasks[task.story_key]
+    assert saved.dispatched_spec_file == str(recorded)
+    assert saved.dispatched_spec_snapshot is not None
+
+
+def test_snapshot_read_rejects_atomic_regular_file_replacement(project, monkeypatch):
+    """Bytes from an opened old inode cannot be bound to its replacement name."""
+    engine, _ = make_engine(project, [])
+    recorded = spec_path(project, "1-1-a")
+    write_spec(recorded, "ready-for-dev", rev_parse_head(project.project))
+    replacement = recorded.with_suffix(".replacement")
+    replacement.write_bytes(b"---\nstatus: ready-for-dev\n---\n\nreplacement input\n")
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        dispatched_spec_file=str(recorded.resolve()),
+    )
+    real_open = Path.open
+
+    def open_then_replace(path, *args, **kwargs):
+        stream = real_open(path, *args, **kwargs)
+        if path == recorded.resolve():
+            replacement.replace(recorded)
+        return stream
+
+    monkeypatch.setattr(Path, "open", open_then_replace)
+
+    assert engine._read_dispatched_spec_snapshot(task) is None
+
+
+def test_snapshot_read_rejects_in_place_change_after_read(project, monkeypatch):
+    """The pathname contents must still match the bytes read from its inode."""
+    engine, _ = make_engine(project, [])
+    recorded = spec_path(project, "1-1-a")
+    write_spec(recorded, "ready-for-dev", rev_parse_head(project.project))
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        dispatched_spec_file=str(recorded.resolve()),
+    )
+    real_fstat = os.fstat
+    observations = 0
+
+    def mutate_after_final_fstat(fd):
+        nonlocal observations
+        observed = real_fstat(fd)
+        observations += 1
+        if observations == 2:
+            recorded.write_bytes(b"---\nstatus: ready-for-dev\n---\n\nchanged after read\n")
+        return observed
+
+    monkeypatch.setattr(os, "fstat", mutate_after_final_fstat)
+
+    assert engine._read_dispatched_spec_snapshot(task) is None
 
 
 @pytest.mark.parametrize(
@@ -4314,12 +4545,17 @@ def test_generic_repair_reopens_spec_before_reinvocation(project):
     sp = spec_path(project, "1-1-a")
     marker = project.project / "marker.txt"
     seen_status: list[str] = []
+    repair_snapshots: list[bytes] = []
     calls = {"n": 0}
 
     def effect(spec):
         calls["n"] += 1
         if sp.is_file():  # status the repair session sees on entry
             seen_status.append(str(read_frontmatter(sp).get("status", "")).strip())
+            snapshot = load_state(engine.run_dir).tasks["1-1-a"].dispatched_spec_snapshot
+            assert snapshot is not None
+            assert snapshot == sp.read_bytes()
+            repair_snapshots.append(snapshot)
         baseline = rev_parse_head(project.project)
         src = project.project / "src.txt"
         src.write_text(src.read_text() + f"change {calls['n']}\n")
@@ -4353,6 +4589,7 @@ def test_generic_repair_reopens_spec_before_reinvocation(project):
     assert summary.done == 1 and summary.deferred == 0
     # the repair session saw an in-progress spec, not the finalized `done`
     assert seen_status == ["in-progress"]
+    assert len(repair_snapshots) == 1
     # and it was driven by the freeform resume prompt, not /bmad-dev-auto <key>
     assert adapter.sessions[1].prompt.startswith("/bmad-dev-auto Resume the autonomous")
 
@@ -6499,6 +6736,428 @@ def test_resolved_redrive_owned_dirty_spec_routes_explicitly_and_converges(proje
     kinds = [event["kind"] for event in events]
     assert "rollback-skipped-clean" not in kinds
     assert "rollback-manual-required" not in kinds
+
+
+@pytest.mark.parametrize("resolved_redrive", [False, True], ids=["plain", "resolved-redrive"])
+def test_bound_fixable_chain_restores_first_snapshot_before_fresh_retry(project, resolved_redrive):
+    """A repair child cannot replace the correction retained for chain rollback.
+
+    Child A leaves a fixable tree, so child B correctly inherits A's work for its
+    repair pass. When B then crashes, the non-fixable rollback resets the whole
+    chain: child C must receive the operator's original corrected spec and baseline
+    source, not either failed child's body. Ablation: refresh the durable snapshot
+    for child B and A's body survives the rollback into child C.
+    """
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    repo = project.project
+    source = repo / "src.txt"
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "ready-for-dev", rev_parse_head(repo))
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "tracked redrive baseline")
+    baseline = rev_parse_head(repo)
+    sp.write_text(sp.read_text().replace("test spec", "operator corrected intent"))
+    operator_snapshot = sp.read_bytes()
+    marker = repo / "verify-fixed.marker"
+    successful_effect = dev_effect(project, "1-1-a", followup_review=False)
+    repair_inputs: list[bytes] = []
+    repair_snapshots: list[bytes | None] = []
+    fresh_retry_inputs: list[tuple[bytes, str]] = []
+
+    def child_a(session):
+        result = successful_effect(session)
+        sp.write_text(sp.read_text().replace("test spec", "failed child A intent"))
+        return result
+
+    def child_b(_session):
+        repair_inputs.append(sp.read_bytes())
+        repair_snapshots.append(load_state(engine.run_dir).tasks["1-1-a"].dispatched_spec_snapshot)
+        source.write_text(source.read_text() + "failed child B source\n")
+        write_spec(sp, "in-progress", baseline)
+        sp.write_text(sp.read_text().replace("test spec", "failed child B intent"))
+        return SessionResult(status="crashed")
+
+    def child_c(session):
+        fresh_retry_inputs.append((sp.read_bytes(), source.read_text()))
+        marker.write_text("fixed\n")
+        return successful_effect(session)
+
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        verify=VerifyPolicy(commands=(_file_exists_cmd("verify-fixed.marker"),)),
+        limits=LimitsPolicy(max_dev_attempts=3),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, _ = make_engine(project, [child_a, child_b, child_c], policy=policy)
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        spec_file=str(sp),
+        resolved_redrive=resolved_redrive,
+    )
+    engine.state.tasks[task.story_key] = task
+
+    assert engine._dev_phase(task)
+
+    assert b"failed child A intent" in repair_inputs[0]
+    assert repair_snapshots == [operator_snapshot]
+    assert fresh_retry_inputs == [(operator_snapshot, "original\n")]
+    assert b"failed child A intent" not in fresh_retry_inputs[0][0]
+    assert b"failed child B intent" not in fresh_retry_inputs[0][0]
+    assert "rollback-auto" in [event["kind"] for event in engine.journal.entries()]
+
+
+def test_resolved_redrive_fixable_retry_never_rebinds_missing_chain_snapshot(project):
+    """A legacy/missing operator snapshot cannot be replaced with child A bytes."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    repo = project.project
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "ready-for-dev", rev_parse_head(repo))
+
+    def child_a(session):
+        result = dev_effect(project, "1-1-a", followup_review=False)(session)
+        engine.state.tasks["1-1-a"].dispatched_spec_snapshot = None
+        return result
+
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        verify=VerifyPolicy(commands=(_file_exists_cmd("never-created.marker"),)),
+        limits=LimitsPolicy(max_dev_attempts=2),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, adapter = make_engine(project, [child_a], policy=policy)
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        spec_file=str(sp),
+        resolved_redrive=True,
+    )
+    engine.state.tasks[task.story_key] = task
+
+    with pytest.raises(RuntimeError, match="pre-launch snapshot"):
+        engine._dev_phase(task)
+
+    assert len(adapter.sessions) == 1
+    assert task.phase == Phase.DEV_RUNNING
+    assert task.dispatched_spec_file == str(sp.resolve())
+    assert task.dispatched_spec_snapshot is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="file symlink creation may need elevation")
+def test_dev_repair_validates_retained_binding_before_prompt_mutation(project, monkeypatch):
+    """A child-retargeted spec cannot be rewritten while building a repair prompt."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    repo = project.project
+    sp = spec_path(project, "1-1-a")
+    victim = project.implementation_artifacts / "victim.md"
+    write_spec(sp, "ready-for-dev", rev_parse_head(repo))
+    victim_bytes = b"---\nstatus: ready-for-dev\n---\n\nvictim input\n"
+    victim.write_bytes(victim_bytes)
+
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        verify=VerifyPolicy(commands=(_file_exists_cmd("never-created.marker"),)),
+        limits=LimitsPolicy(max_dev_attempts=2),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False)],
+        policy=policy,
+    )
+    real_emit = engine._emit
+
+    def retarget_after_verification(stage, task=None, **fields):
+        if stage == "post_dev_verify":
+            sp.unlink()
+            sp.symlink_to(victim)
+        return real_emit(stage, task, **fields)
+
+    monkeypatch.setattr(engine, "_emit", retarget_after_verification)
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        spec_file=str(sp),
+        resolved_redrive=True,
+    )
+    engine.state.tasks[task.story_key] = task
+
+    with pytest.raises(RuntimeError, match="pre-launch snapshot"):
+        engine._dev_phase(task)
+
+    assert len(adapter.sessions) == 1
+    assert sp.is_symlink()
+    assert victim.read_bytes() == victim_bytes
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="file symlink creation may need elevation")
+def test_review_fix_validates_retained_binding_before_prompt_mutation(project):
+    """The separate review-fix entry point validates before resetting the spec."""
+    repo = project.project
+    sp = spec_path(project, "1-1-a")
+    victim = project.implementation_artifacts / "victim.md"
+    write_spec(sp, "in-review", rev_parse_head(repo))
+    victim_bytes = b"---\nstatus: in-review\n---\n\nvictim input\n"
+    victim.write_bytes(victim_bytes)
+    snapshot = sp.read_bytes()
+    canonical_sp = str(sp.resolve())
+    sp.unlink()
+    sp.symlink_to(victim)
+    engine, adapter = make_engine(project, [])
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=Phase.REVIEW_VERIFY,
+        attempt=1,
+        spec_file=str(sp),
+        dispatched_spec_file=canonical_sp,
+        dispatched_spec_snapshot=snapshot,
+        resolved_redrive=True,
+    )
+    engine.state.tasks[task.story_key] = task
+
+    with pytest.raises(RuntimeError, match="before repair prompt construction"):
+        engine._fix_phase(task, "verification failed")
+
+    assert adapter.sessions == []
+    assert task.phase == Phase.DEV_RUNNING
+    assert task.attempt == 2
+    assert sp.is_symlink()
+    assert victim.read_bytes() == victim_bytes
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="file symlink creation may need elevation")
+def test_review_launch_refuses_retargeted_spec_before_stripping_marker(project):
+    """A review cannot adopt intent through a child-retargeted accepted path."""
+    repo = project.project
+    sp = spec_path(project, "1-1-a")
+    victim = project.implementation_artifacts / "review-victim.md"
+    write_spec(sp, "done", rev_parse_head(repo))
+    victim_bytes = b"---\nstatus: done\n---\n\nvictim input\n## Auto Run Result\ndone\n"
+    victim.write_bytes(victim_bytes)
+    snapshot = sp.read_bytes()
+    canonical_sp = str(sp.resolve())
+    sp.unlink()
+    sp.symlink_to(victim)
+    engine, _ = make_engine(project, [])
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=Phase.REVIEW_RUNNING,
+        spec_file=str(sp),
+        dispatched_spec_file=canonical_sp,
+        dispatched_spec_snapshot=snapshot,
+    )
+
+    with pytest.raises(RuntimeError, match="before review prompt construction"):
+        engine._reset_spec_for_review(task)
+
+    assert sp.is_symlink()
+    assert victim.read_bytes() == victim_bytes
+
+
+def test_review_launch_refuses_distinct_spec_from_retained_authority(project):
+    """A safe alternate file cannot borrow another spec's byte authority."""
+    repo = project.project
+    owned = spec_path(project, "1-1-a")
+    accepted = project.implementation_artifacts / "spec-1-2-b.md"
+    write_spec(owned, "done", rev_parse_head(repo))
+    accepted_bytes = b"---\nstatus: done\n---\n\nalternate\n## Auto Run Result\ndone\n"
+    accepted.write_bytes(accepted_bytes)
+    engine, _ = make_engine(project, [])
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        spec_file=str(accepted),
+        dispatched_spec_file=str(owned.resolve()),
+        dispatched_spec_snapshot=owned.read_bytes(),
+    )
+
+    with pytest.raises(RuntimeError, match="before review prompt construction"):
+        engine._reset_spec_for_review(task)
+
+    assert accepted.read_bytes() == accepted_bytes
+
+
+def test_review_fix_refuses_distinct_spec_from_retained_authority(project):
+    """Repair validation happens before the alternate spec can be reopened."""
+    repo = project.project
+    owned = spec_path(project, "1-1-a")
+    accepted = project.implementation_artifacts / "spec-1-2-b.md"
+    write_spec(owned, "in-progress", rev_parse_head(repo))
+    accepted_bytes = b"---\nstatus: done\n---\n\nalternate input\n"
+    accepted.write_bytes(accepted_bytes)
+    engine, adapter = make_engine(project, [])
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=Phase.REVIEW_VERIFY,
+        attempt=1,
+        spec_file=str(accepted),
+        dispatched_spec_file=str(owned.resolve()),
+        dispatched_spec_snapshot=owned.read_bytes(),
+    )
+    engine.state.tasks[task.story_key] = task
+
+    with pytest.raises(RuntimeError, match="before repair prompt construction"):
+        engine._fix_phase(task, "verification failed")
+
+    assert adapter.sessions == []
+    assert task.phase == Phase.DEV_RUNNING
+    assert accepted.read_bytes() == accepted_bytes
+    persisted = load_state(engine.run_dir).tasks[task.story_key]
+    assert persisted.phase == Phase.DEV_RUNNING
+    assert persisted.attempt == task.attempt
+
+
+def test_review_launch_refuses_path_only_retained_authority(project):
+    """An incomplete legacy authority pair cannot authorize another spec."""
+    repo = project.project
+    owned = spec_path(project, "1-1-a")
+    accepted = project.implementation_artifacts / "spec-1-2-b.md"
+    write_spec(owned, "done", rev_parse_head(repo))
+    accepted_bytes = b"---\nstatus: done\n---\n\nalternate\n## Auto Run Result\ndone\n"
+    accepted.write_bytes(accepted_bytes)
+    engine, _ = make_engine(project, [])
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        spec_file=str(accepted),
+        dispatched_spec_file=str(owned.resolve()),
+        dispatched_spec_snapshot=None,
+    )
+
+    with pytest.raises(RuntimeError, match="before review prompt construction"):
+        engine._reset_spec_for_review(task)
+
+    assert accepted.read_bytes() == accepted_bytes
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="file symlink creation may need elevation")
+def test_unbound_repair_refuses_retargeted_spec_before_shared_reset(project):
+    """Fresh repair binding cannot sanitize a symlink by rewriting through it."""
+    sp = spec_path(project, "1-1-a")
+    victim = project.implementation_artifacts / "victim.md"
+    victim.parent.mkdir(parents=True, exist_ok=True)
+    victim_bytes = b"---\nstatus: done\n---\n\nvictim input\n"
+    victim.write_bytes(victim_bytes)
+    sp.symlink_to(victim)
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(sp))
+
+    with pytest.raises(RuntimeError, match="unsafe before repair prompt construction"):
+        engine._reset_spec_for_repair(task)
+
+    assert task.dispatched_spec_file is None
+    assert task.dispatched_spec_snapshot is None
+    assert sp.is_symlink()
+    assert victim.read_bytes() == victim_bytes
+
+
+@pytest.mark.parametrize("resolved_redrive", [False, True], ids=["plain", "resolved-redrive"])
+def test_review_fix_phase_retains_bound_chain_snapshot(project, resolved_redrive):
+    """Review-verification repair retains the first bound chain input."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    repo = project.project
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "ready-for-dev", rev_parse_head(repo))
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "tracked spec baseline")
+    sp.write_text(sp.read_text().replace("test spec", "operator corrected intent"))
+    operator_snapshot = sp.read_bytes()
+    marker = repo / "review-verify-fixed.marker"
+    observed: list[bytes | None] = []
+
+    def initial_dev(session):
+        marker.write_text("present\n")
+        return dev_effect(project, "1-1-a")(session)
+
+    def breaking_review(session):
+        marker.unlink()
+        return review_effect(project, "1-1-a", clean=True)(session)
+
+    def repair(session):
+        observed.append(load_state(engine.run_dir).tasks["1-1-a"].dispatched_spec_snapshot)
+        marker.write_text("fixed\n")
+        return dev_effect(project, "1-1-a")(session)
+
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker),)),
+        limits=LimitsPolicy(max_dev_attempts=2),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, _ = make_engine(
+        project,
+        [initial_dev, breaking_review, repair, review_effect(project, "1-1-a", clean=True)],
+        policy=policy,
+    )
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        spec_file=str(sp),
+        resolved_redrive=resolved_redrive,
+    )
+    engine.state.tasks[task.story_key] = task
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed
+    assert observed == [operator_snapshot]
+
+
+def test_review_fix_phase_never_rebinds_missing_redrive_snapshot(project):
+    """A review repair cannot promote the preceding child's bytes to authority."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    repo = project.project
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "ready-for-dev", rev_parse_head(repo))
+    marker = repo / "review-verify-never-fixed.marker"
+
+    def initial_dev(session):
+        marker.write_text("present\n")
+        return dev_effect(project, "1-1-a")(session)
+
+    def breaking_review(session):
+        marker.unlink()
+        result = review_effect(project, "1-1-a", clean=True)(session)
+        engine.state.tasks["1-1-a"].dispatched_spec_snapshot = None
+        return result
+
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker),)),
+        limits=LimitsPolicy(max_dev_attempts=2),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, adapter = make_engine(
+        project,
+        [initial_dev, breaking_review, dev_effect(project, "1-1-a")],
+        policy=policy,
+    )
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        spec_file=str(sp),
+        resolved_redrive=True,
+    )
+    engine.state.tasks[task.story_key] = task
+
+    summary = engine.run()
+
+    assert summary.crashed and "before repair prompt construction" in summary.crash_error
+    assert [session.role for session in adapter.sessions] == ["dev", "review"]
+    assert task.phase == Phase.DEV_RUNNING
+    assert task.dispatched_spec_file == str(sp.resolve())
+    assert task.dispatched_spec_snapshot is None
 
 
 def test_dev_escalation_records_spec_for_rearm(project):

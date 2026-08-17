@@ -41,6 +41,10 @@ if TYPE_CHECKING:
 PRESERVE_REF_PROBE_LIMIT = 100
 
 
+class _OwnedSpecAuthorityError(RuntimeError):
+    """A previously canonical owned-spec name became unsafe to restore."""
+
+
 class RecoveryFlow:
     """Roll back or pause a stopped/abandoned attempt, parking any work it did on
     named recovery refs before the reset.
@@ -135,7 +139,19 @@ class RecoveryFlow:
         resolved_files: list[Path] = []
         for candidate in candidates:
             try:
+                # New attempts persist a canonical regular-file path. Refuse a
+                # post-launch symlink replacement before resolving it: following
+                # the link here would let a failed child retarget snapshot restore
+                # into an unrelated file that happens to share a trusted root.
+                if candidate.is_symlink():
+                    return None
                 resolved = candidate.resolve()
+                if raw.is_absolute() and resolved != candidate:
+                    # Snapshot-bearing bindings are persisted canonically. A
+                    # changed result here means a parent component was replaced
+                    # by a symlink after launch, which is the same retargeting
+                    # hazard as a link at the final component.
+                    return None
                 is_file = resolved.is_file()
             except (OSError, RuntimeError):
                 return None
@@ -164,6 +180,109 @@ class RecoveryFlow:
                 f"to status {target_status!r}"
             )
 
+    @staticmethod
+    def _restore_attempt_owned_spec_bytes(spec_path: Path, snapshot: bytes) -> None:
+        """Restore and verify the byte-exact pre-attempt input."""
+        try:
+            parent = spec_path.parent
+            existing_parent = parent
+            while not existing_parent.exists() and not existing_parent.is_symlink():
+                if existing_parent == existing_parent.parent:
+                    break
+                existing_parent = existing_parent.parent
+            if (
+                not spec_path.is_absolute()
+                or not existing_parent.is_dir()
+                or existing_parent.is_symlink()
+                or existing_parent.resolve(strict=True) != existing_parent
+                or spec_path.is_symlink()
+            ):
+                raise _OwnedSpecAuthorityError(
+                    f"attempt-owned spec target became unsafe: {spec_path}"
+                )
+            parent.mkdir(parents=True, exist_ok=True)
+            if not parent.is_dir() or parent.is_symlink() or parent.resolve(strict=True) != parent:
+                raise _OwnedSpecAuthorityError(
+                    f"attempt-owned spec target became unsafe: {spec_path}"
+                )
+            if spec_path.exists() and (
+                not spec_path.is_file() or spec_path.resolve(strict=True) != spec_path
+            ):
+                raise _OwnedSpecAuthorityError(
+                    f"attempt-owned spec target became unsafe: {spec_path}"
+                )
+        except _OwnedSpecAuthorityError:
+            raise
+        except (OSError, RuntimeError) as exc:
+            raise _OwnedSpecAuthorityError(
+                f"attempt-owned spec target could not be revalidated: {spec_path}"
+            ) from exc
+        atomic_write_bytes(spec_path, snapshot, follow_symlinks=False)
+        if spec_path.read_bytes() != snapshot:
+            raise verify.FrontmatterWriteError(
+                f"could not restore pre-attempt contents of owned spec {spec_path}"
+            )
+
+    @classmethod
+    def _restore_attempt_owned_spec(
+        cls,
+        spec_path: Path,
+        snapshot: bytes,
+        target_status: str,
+    ) -> None:
+        """Restore exact pre-attempt bytes, then verify the promised route."""
+        cls._restore_attempt_owned_spec_bytes(spec_path, snapshot)
+        # The durable snapshot should already carry this route. Keep the status
+        # repair as a fail-safe for a legacy or externally edited state record;
+        # it is the only permitted difference from the exact snapshot.
+        cls._normalize_attempt_owned_spec(spec_path, target_status)
+
+    def pause_for_owned_spec_recovery(
+        self,
+        task: StoryTask,
+        spec: str,
+        problem: str,
+    ) -> NoReturn:
+        """Pause once on unsafe snapshot authority, with a convergent remedy.
+
+        The current checkout may contain either operator intent, failed-child
+        output, or a partially completed reset, so recovery cannot infer which
+        paths are safe to mutate next. Clear the unusable authority pair before
+        saving: after the operator restores/verifies the intended spec, resume can
+        recover the remaining tree as an unbound redrive instead of repeating the
+        same impossible snapshot check forever.
+        """
+        task.dispatched_spec_file = None
+        task.dispatched_spec_snapshot = None
+        root = self._workspace_get().root
+        notice = (
+            "**ACTION REQUIRED — attempt-owned spec needs manual recovery**\n"
+            f"Story **{task.story_key}** cannot safely restore its pre-attempt spec "
+            f"at `{spec}`: {problem}. The working tree at `{root}` now requires "
+            "inspection because bmad-loop cannot safely distinguish operator "
+            "intent, failed-session output, and any rollback already completed.\n"
+            "  1. Save any failed-session work you may want to inspect.\n"
+            f"  2. Restore or verify the operator-approved contents of `{spec}` and "
+            "remove/reset any other rejected attempt residue.\n"
+            f"  3. Run `bmad-loop resume {self.state.run_id}`. The unusable binding "
+            "was cleared, so the corrected spec will be observed afresh before the "
+            "next child launches."
+        )
+        self.journal.append(
+            "rollback-owned-spec-manual-required",
+            story_key=task.story_key,
+            spec=spec,
+            problem=problem,
+        )
+        gates.notify(
+            self.policy,
+            self.run_dir,
+            f"ACTION REQUIRED: recover attempt-owned spec for {task.story_key}",
+            notice,
+        )
+        self._save()
+        self._pause(notice, task.story_key)
+
     def rollback_or_pause(self, task: StoryTask, *, cause: str = "stopped") -> None:
         """Recover from an attempt that won't proceed.
 
@@ -180,8 +299,9 @@ class RecoveryFlow:
         branch.
         A resolved re-drive whose authorized human-corrected spec remains dirty
         instead emits ``rollback-owned-spec-normalized`` and continues without
-        pretending the checkout is clean. A plain attempt's substantive spec
-        residue still follows the ordinary reset/pause policy.
+        pretending the checkout is clean. Snapshot-backed changes to a pre-existing
+        untracked/ignored owned spec are parked explicitly and restored byte-exactly;
+        other plain-attempt substantive residue follows ordinary reset/pause policy.
 
         The clean outcome also lets manual-recovery instructions terminate —
         after the operator resets and resumes, the now-clean tree skips straight
@@ -206,8 +326,9 @@ class RecoveryFlow:
         clean reset to baseline. Either way pre-existing untracked files are
         preserved; there is no blanket ``git clean``.
 
-        The two preserve steps are the one thing that can still pause a rollback the
-        branching above chose to auto-recover, worktree included: when the attempt's
+        The preserve steps and unsafe attempt-owned snapshot authority are the only
+        things that can still pause a rollback the branching above chose to
+        auto-recover, worktree included: when the attempt's
         committed or uncommitted work cannot be parked and the reset would destroy
         it, they refuse rather than reset (#340). That is a preservation failure
         rather than a policy decision, so it does not weaken #161 — the notice
@@ -226,12 +347,39 @@ class RecoveryFlow:
         # Un-determinable dirty check (git timeout/failure, #156) ⇒ assume dirty:
         # never skip recovery on an unproven "clean", never crash the run. The
         # normal branching below then decides — OFF pauses (worktree kept), ON /
-        # resolved auto-recovers behind its preserve steps, keeping the re-drive
-        # pause-free contract intact.
+        # resolved auto-recovers behind its preserve steps. A missing, unreadable,
+        # or retargeted owned-spec snapshot is a separate fail-closed boundary.
         dirty = True
         dirty_probe_succeeded = False
         normalized_status: str | None = None
         normalized_commits_present = False
+        owned_snapshot_changed = False
+        owned_snapshot_restored = False
+        owned_current_bytes: bytes | None = None
+        owned_baseline_bytes: bytes | None = None
+        owned_index_changed = False
+        snapshot_restore_pending = False
+        # ``cause=resolved`` is the initial unwind of the abandoned escalated
+        # attempt. Its persisted snapshot predates the operator's correction and
+        # must never overwrite that correction. Only a later failed attempt in
+        # the latched re-drive owns a pre-launch snapshot that is safe to restore.
+        restore_attempt_snapshot = not resolved and task.dispatched_spec_snapshot is not None
+        restore_redrive_snapshot = task.resolved_redrive and restore_attempt_snapshot
+        if not resolved and task.dispatched_spec_file and owned_spec is None:
+            # The bound path was trusted and regular at launch. A child-side
+            # deletion, directory/symlink replacement, or later resolution fault
+            # must not turn that authority into an unowned generic reset: protected
+            # artifact replay could otherwise preserve the replacement or lose the
+            # operator's only corrected copy.
+            self.journal.append(
+                "rollback-owned-spec-unavailable",
+                story_key=task.story_key,
+            )
+            self.pause_for_owned_spec_recovery(
+                task,
+                task.dispatched_spec_file,
+                "the bound path is missing, unreadable, non-regular, or was retargeted",
+            )
         if task.baseline_commit:
             try:
                 dirty = verify.attempt_dirty(
@@ -244,11 +392,132 @@ class RecoveryFlow:
                 self.journal.append(
                     "rollback-dirty-check-failed", story_key=task.story_key, error=str(exc)
                 )
+        if not resolved and owned_spec:
+            if task.dispatched_spec_snapshot is None and task.resolved_redrive:
+                # A pre-upgrade/incomplete state cannot distinguish the operator's
+                # correction from child-authored body edits. Refuse every reset,
+                # even when rollback_on_failure is enabled: either choice could
+                # silently preserve bad bytes or discard the human correction.
+                self.journal.append(
+                    "rollback-owned-spec-snapshot-missing",
+                    story_key=task.story_key,
+                    spec=str(owned_spec[0]),
+                )
+                self.pause_for_owned_spec_recovery(
+                    task,
+                    str(owned_spec[0]),
+                    "the persisted retry chain predates its required byte snapshot",
+                )
+            if task.dispatched_spec_snapshot is not None:
+                try:
+                    owned_current_bytes = owned_spec[0].read_bytes()
+                    owned_snapshot_changed = owned_current_bytes != task.dispatched_spec_snapshot
+                except OSError as exc:
+                    self.journal.append(
+                        "rollback-owned-spec-unreadable",
+                        story_key=task.story_key,
+                        spec=str(owned_spec[0]),
+                        error=str(exc),
+                    )
+                    self.pause_for_owned_spec_recovery(
+                        task,
+                        str(owned_spec[0]),
+                        "its current bytes could not be read for comparison",
+                    )
+                if task.baseline_commit and owned_exclude:
+                    try:
+                        owned_baseline_bytes = verify.file_bytes_at_revision(
+                            workspace.root,
+                            task.baseline_commit,
+                            owned_exclude[0],
+                        )
+                        owned_index_changed = verify.index_path_changed_since(
+                            workspace.root,
+                            task.baseline_commit,
+                            owned_exclude[0],
+                        )
+                        if verify.path_has_non_tree_ancestor_at_revision(
+                            workspace.root,
+                            task.baseline_commit,
+                            owned_exclude[0],
+                        ) or verify.path_is_non_regular_at_revision(
+                            workspace.root,
+                            task.baseline_commit,
+                            owned_exclude[0],
+                        ):
+                            self.pause_for_owned_spec_recovery(
+                                task,
+                                str(owned_spec[0]),
+                                "the attempt baseline would replace its canonical path "
+                                "or one of its parent directories with an unsafe shape",
+                            )
+                    except (verify.GitError, OSError) as exc:
+                        self.journal.append(
+                            "rollback-owned-spec-baseline-read-failed",
+                            story_key=task.story_key,
+                            spec=str(owned_spec[0]),
+                            error=str(exc),
+                        )
+                        self.pause_for_owned_spec_recovery(
+                            task,
+                            str(owned_spec[0]),
+                            "its baseline tracking state could not be verified",
+                        )
+                # Git intentionally ignores the contents of names present in
+                # baseline_untracked. The byte snapshot is the missing oracle for
+                # a child edit to a pre-existing untracked/ignored spec.
+                dirty = dirty or owned_snapshot_changed
+                if owned_snapshot_changed and not owned_exclude:
+                    # An attempt-bound spec under a configured external artifact
+                    # root cannot be captured by a repository recovery ref. A
+                    # reset or direct redrive restoration would otherwise overwrite
+                    # the only failed-child copy with the pre-launch snapshot. Leave
+                    # it for explicit operator adoption instead.
+                    self.journal.append(
+                        "rollback-owned-spec-unpreservable",
+                        story_key=task.story_key,
+                        spec=str(owned_spec[0]),
+                    )
+                    self.pause_for_owned_spec_recovery(
+                        task,
+                        str(owned_spec[0]),
+                        "its failed-session bytes are outside Git and cannot be parked",
+                    )
         # Establish that this attempt actually changed the checkout before the
         # bound spec can confer any normalization authority. Stories may dispatch
         # an already-resumable draft/in-progress/in-review spec; a session that
         # dies without touching it must not rewrite that clean baseline.
         if task.baseline_commit and dirty_probe_succeeded and not dirty:
+            if (
+                not resolved
+                and owned_spec
+                and task.dispatched_spec_file
+                and task.dispatched_spec_snapshot is None
+            ):
+                spec_rel = owned_spec[1]
+                try:
+                    baseline_status = (
+                        verify.frontmatter_status_at_revision(
+                            workspace.root,
+                            task.baseline_commit,
+                            spec_rel,
+                        )
+                        if spec_rel
+                        else None
+                    )
+                except verify.GitError:
+                    baseline_status = None
+                if baseline_status is None:
+                    self.journal.append(
+                        "rollback-owned-spec-snapshot-missing",
+                        story_key=task.story_key,
+                        spec=str(owned_spec[0]),
+                    )
+                    self.pause_for_owned_spec_recovery(
+                        task,
+                        str(owned_spec[0]),
+                        "no byte snapshot or tracked baseline can prove it unchanged",
+                    )
             self.journal.append("rollback-skipped-clean", story_key=task.story_key)
             return
 
@@ -292,41 +561,32 @@ class RecoveryFlow:
                         error=str(exc),
                     )
                     target_status = None
-            if target_status is None:
+            if (
+                target_status is None
+                and restore_attempt_snapshot
+                and owned_snapshot_changed
+                and not redrive
+            ):
+                # A baseline-untracked or ignored spec has no Git blob whose
+                # lifecycle can be normalized. Its durable pre-launch bytes are
+                # authoritative, but preserve the failed child's current bytes on
+                # a recovery ref before restoring them in the auto-recovery arm.
+                snapshot_restore_pending = True
+                dirty = True
+                normalized_status = None
+            elif target_status is None:
                 # The exclusion proved only that the bound spec accounts for the
                 # checkout diff. Without a readable baseline status, that is not
                 # authority to mutate it or to call the real checkout clean.
                 dirty = True
                 normalized_status = None
             else:
-                self._normalize_attempt_owned_spec(spec_path, target_status)
-                normalized_status = target_status
-
-                # The exclusion answered only whether anything besides the owned
-                # spec changed. Re-probe the real checkout after repair before
-                # calling it clean or choosing a recovery policy.
-                dirty = True
-                dirty_probe_succeeded = False
-                try:
-                    dirty = verify.attempt_dirty(
-                        workspace.root,
-                        task.baseline_commit,
-                        task.baseline_untracked,
-                    )
-                    dirty_probe_succeeded = True
-                except (verify.GitError, OSError) as exc:
-                    self.journal.append(
-                        "rollback-dirty-check-failed", story_key=task.story_key, error=str(exc)
-                    )
-                if not dirty and dirty_probe_succeeded:
-                    # `attempt_dirty(baseline)` compares the resulting checkout
-                    # tree with the baseline, not branch ancestry. A session may
-                    # have committed the lifecycle flip that was just normalized:
-                    # the worktree then matches the baseline while HEAD still
-                    # carries attempt commits and is dirty relative to its own tip.
-                    # Observe that range before authorizing the clean return. The
-                    # auto-recovery arm below parks and resets it; an observation
-                    # failure degrades to ordinary dirty policy, never false-clean.
+                repair_probe_succeeded = True
+                if restore_redrive_snapshot:
+                    # Preserve refs must capture the failed child's bytes, not the
+                    # restored operator snapshot. Detect committed child residue
+                    # before mutation and defer restoration until after both
+                    # preserve steps when a reset is required.
                     try:
                         normalized_commits_present = bool(
                             verify.commits_above(workspace.root, task.baseline_commit)
@@ -334,25 +594,151 @@ class RecoveryFlow:
                     except (verify.GitError, OSError) as exc:
                         dirty = True
                         dirty_probe_succeeded = False
+                        repair_probe_succeeded = False
                         self.journal.append(
                             "rollback-dirty-check-failed",
                             story_key=task.story_key,
                             error=str(exc),
                         )
-                if dirty and not redrive:
+                if repair_probe_succeeded:
+                    if restore_redrive_snapshot and (owned_snapshot_changed or owned_index_changed):
+                        # Even a spec-only failed child must be recoverable before
+                        # its body is replaced. Route through the auto arm so both
+                        # committed and uncommitted bytes are parked first.
+                        snapshot_restore_pending = True
+                        dirty = True
+                        normalized_status = target_status
+                    else:
+                        if restore_redrive_snapshot:
+                            assert task.dispatched_spec_snapshot is not None
+                            self._restore_attempt_owned_spec(
+                                spec_path,
+                                task.dispatched_spec_snapshot,
+                                target_status,
+                            )
+                            owned_snapshot_restored = True
+                        else:
+                            self._normalize_attempt_owned_spec(spec_path, target_status)
+                        normalized_status = target_status
+
+                        # The exclusion answered only whether anything besides the
+                        # owned spec changed. Re-probe the real checkout after repair
+                        # before calling it clean or choosing a recovery policy.
+                        dirty = True
+                        dirty_probe_succeeded = False
+                        try:
+                            dirty = verify.attempt_dirty(
+                                workspace.root,
+                                task.baseline_commit,
+                                task.baseline_untracked,
+                            )
+                            dirty_probe_succeeded = True
+                        except (verify.GitError, OSError) as exc:
+                            self.journal.append(
+                                "rollback-dirty-check-failed",
+                                story_key=task.story_key,
+                                error=str(exc),
+                            )
+                        if dirty_probe_succeeded and not restore_redrive_snapshot:
+                            # A plain lifecycle-only attempt can have committed its
+                            # flip. The normalized tree then matches baseline even
+                            # though HEAD still carries abandoned history.
+                            try:
+                                normalized_commits_present = bool(
+                                    verify.commits_above(workspace.root, task.baseline_commit)
+                                )
+                            except (verify.GitError, OSError) as exc:
+                                dirty = True
+                                dirty_probe_succeeded = False
+                                self.journal.append(
+                                    "rollback-dirty-check-failed",
+                                    story_key=task.story_key,
+                                    error=str(exc),
+                                )
+                        if (
+                            dirty_probe_succeeded
+                            and not dirty
+                            and restore_attempt_snapshot
+                            and owned_snapshot_changed
+                            and not redrive
+                        ):
+                            # Git-clean after lifecycle normalization means the
+                            # failed child left only baseline bytes. If this attempt
+                            # began with pre-existing operator dirt, restore that
+                            # exact input instead of accepting the child's deletion
+                            # as a clean rollback. A commit above baseline must be
+                            # parked first; an uncommitted baseline copy is already
+                            # durable in HEAD and needs no redundant recovery ref.
+                            assert task.dispatched_spec_snapshot is not None
+                            if normalized_commits_present:
+                                snapshot_restore_pending = True
+                                dirty = True
+                                normalized_status = None
+                            elif spec_path.read_bytes() != task.dispatched_spec_snapshot:
+                                self._restore_attempt_owned_spec_bytes(
+                                    spec_path, task.dispatched_spec_snapshot
+                                )
+                                owned_snapshot_restored = True
+                                normalized_status = None
+                                dirty = True
+                                dirty_probe_succeeded = False
+                                try:
+                                    dirty = verify.attempt_dirty(
+                                        workspace.root,
+                                        task.baseline_commit,
+                                        task.baseline_untracked,
+                                    )
+                                    dirty_probe_succeeded = True
+                                except (verify.GitError, OSError) as exc:
+                                    self.journal.append(
+                                        "rollback-dirty-check-failed",
+                                        story_key=task.story_key,
+                                        error=str(exc),
+                                    )
+                if (
+                    dirty
+                    and not redrive
+                    and not snapshot_restore_pending
+                    and not owned_snapshot_restored
+                ):
                     # A plain attempt may be inspected or parked by the ordinary
                     # recovery policy below. If baseline-status normalization did
                     # not prove the checkout clean, put its spec back byte-for-byte
                     # before that policy claims the tree was left untouched.
-                    atomic_write_bytes(spec_path, original_spec, follow_symlinks=False)
-                    if spec_path.read_bytes() != original_spec:
-                        raise verify.FrontmatterWriteError(
-                            f"could not restore attempt-owned spec {spec_path} after "
-                            "baseline-status normalization remained dirty"
+                    try:
+                        self._restore_attempt_owned_spec_bytes(spec_path, original_spec)
+                    except _OwnedSpecAuthorityError as exc:
+                        self.pause_for_owned_spec_recovery(
+                            task,
+                            str(spec_path),
+                            "its path became unsafe while undoing a tentative "
+                            f"lifecycle repair ({exc})",
                         )
                     normalized_status = None
+        if (
+            owned_snapshot_restored
+            and not redrive
+            and owned_spec
+            and task.baseline_commit
+            and dirty_probe_succeeded
+        ):
+            self.journal.append(
+                "rollback-owned-spec-restored",
+                story_key=task.story_key,
+                spec=str(owned_spec[0]),
+                checkout_dirty=dirty,
+            )
+            return
         if task.baseline_commit and not dirty and not normalized_commits_present:
-            self.journal.append("rollback-skipped-clean", story_key=task.story_key)
+            if owned_snapshot_restored and owned_spec:
+                self.journal.append(
+                    "rollback-owned-spec-restored",
+                    story_key=task.story_key,
+                    spec=str(owned_spec[0]),
+                    checkout_dirty=False,
+                )
+            else:
+                self.journal.append("rollback-skipped-clean", story_key=task.story_key)
             return
         if (
             task.baseline_commit
@@ -361,6 +747,8 @@ class RecoveryFlow:
             and redrive
             and owned_spec
             and normalized_status is not None
+            and not normalized_commits_present
+            and not snapshot_restore_pending
         ):
             self.journal.append(
                 "rollback-owned-spec-normalized",
@@ -379,14 +767,14 @@ class RecoveryFlow:
         # reaches this method *outside* a mounted unit (e.g. resume with no
         # worktree recorded) still targets the main checkout and must pause.
         in_unit_worktree = workspace.root != self.paths.repo_root
-        normalized_commit_only = (
+        normalized_attempt_commits = (
             task.baseline_commit is not None
             and normalized_status is not None
-            and not dirty
             and normalized_commits_present
         )
         if (
-            normalized_commit_only
+            normalized_attempt_commits
+            or snapshot_restore_pending
             or resolved
             or in_unit_worktree
             or self.policy.scm.rollback_on_failure
@@ -414,10 +802,18 @@ class RecoveryFlow:
             # the returned ctx is ignored and never routed through _vetoed — a failed
             # quiesce must never block a rollback.
             self._emit("pre_rollback", task)
-            # A re-drive (resolved / mid-re-drive) is contractually pause-free, so it
-            # preserves best-effort but never blocks; a plain rollback pauses rather
-            # than reset past work it could not park.
-            self.preserve_attempt_commits(task, allow_pause=not redrive)
+            force_owned_snapshot = (
+                owned_exclude
+                if restore_attempt_snapshot and (owned_snapshot_changed or owned_index_changed)
+                else ()
+            )
+            # A re-drive ordinarily preserves best-effort, but restoration of a
+            # changed bound spec is destructive unless both its committed and
+            # uncommitted child state can be parked first.
+            self.preserve_attempt_commits(
+                task,
+                allow_pause=not redrive or bool(force_owned_snapshot),
+            )
             # Park the attempt's uncommitted diff too, so the reset below (and its
             # untracked cleanup) can't silently destroy in-progress work. Runs only
             # if preserve_attempt_commits did not pause (plain-rollback preserve
@@ -428,9 +824,49 @@ class RecoveryFlow:
             # worktree here would park the normalization's inverse diff against
             # the failed HEAD even though the target reset cannot discard any
             # checkout content. The commits were parked above; reset them directly.
-            if not normalized_commit_only:
-                self.preserve_attempt_worktree(task, allow_pause=not redrive)
+            if restore_redrive_snapshot or not (normalized_attempt_commits and not dirty):
+                self.preserve_attempt_worktree(
+                    task,
+                    allow_pause=not redrive or bool(force_owned_snapshot),
+                    force_include=force_owned_snapshot,
+                )
+            if (
+                restore_attempt_snapshot
+                and (owned_snapshot_changed or owned_index_changed)
+                and owned_spec
+            ):
+                # Both refs now contain the untouched failed attempt. Restore the
+                # pre-launch input before reset. Redrives also re-establish the
+                # route promised by the next prompt; plain attempts restore exact
+                # bytes and repeat that restoration after reset so pre-existing
+                # tracked operator dirt is not erased with the child.
+                assert task.dispatched_spec_snapshot is not None
+                if redrive:
+                    target_status = "in-review" if task.restore_patch else "ready-for-dev"
+                    self._restore_attempt_owned_spec(
+                        owned_spec[0],
+                        task.dispatched_spec_snapshot,
+                        target_status,
+                    )
+                else:
+                    self._restore_attempt_owned_spec_bytes(
+                        owned_spec[0], task.dispatched_spec_snapshot
+                    )
+                owned_snapshot_restored = True
             self.safe_reset(task, preserve=protected)
+            if restore_attempt_snapshot and owned_spec and owned_exclude and not redrive:
+                assert task.dispatched_spec_snapshot is not None
+                try:
+                    self._restore_attempt_owned_spec_bytes(
+                        owned_spec[0], task.dispatched_spec_snapshot
+                    )
+                except _OwnedSpecAuthorityError as exc:
+                    self.pause_for_owned_spec_recovery(
+                        task,
+                        str(owned_spec[0]),
+                        f"its path became unsafe after the baseline reset ({exc})",
+                    )
+                owned_snapshot_restored = True
             if redrive and task.baseline_commit and owned_spec:
                 # A sibling source/artifact change bypasses the earlier spec-only
                 # normalization and reaches this reset. The protected artifact
@@ -438,7 +874,31 @@ class RecoveryFlow:
                 # the route promised by the next prompt after resetting the
                 # sibling residue. Patch restores keep their review route.
                 target_status = "in-review" if task.restore_patch else "ready-for-dev"
-                self._normalize_attempt_owned_spec(owned_spec[0], target_status)
+                if restore_redrive_snapshot and owned_index_changed and owned_spec[1]:
+                    # A whole-folder preserve checkout can stage a spec that the
+                    # failed child force-added or committed even though the
+                    # pre-launch binding was ignored/untracked. Restore baseline
+                    # index ownership before writing the operator snapshot back.
+                    verify.reset_index_path(
+                        workspace.root,
+                        task.baseline_commit,
+                        owned_spec[1],
+                    )
+                if restore_redrive_snapshot and task.dispatched_spec_snapshot is not None:
+                    try:
+                        self._restore_attempt_owned_spec(
+                            owned_spec[0],
+                            task.dispatched_spec_snapshot,
+                            target_status,
+                        )
+                    except _OwnedSpecAuthorityError as exc:
+                        self.pause_for_owned_spec_recovery(
+                            task,
+                            str(owned_spec[0]),
+                            f"its path became unsafe after the baseline reset ({exc})",
+                        )
+                else:
+                    self._normalize_attempt_owned_spec(owned_spec[0], target_status)
                 try:
                     checkout_dirty = verify.attempt_dirty(
                         workspace.root,
@@ -460,11 +920,64 @@ class RecoveryFlow:
                             status=target_status,
                             checkout_dirty=True,
                         )
+                    elif owned_snapshot_restored:
+                        self.journal.append(
+                            "rollback-owned-spec-restored",
+                            story_key=task.story_key,
+                            spec=str(owned_spec[0]),
+                            checkout_dirty=False,
+                        )
+            elif owned_snapshot_restored and owned_spec and task.baseline_commit:
+                try:
+                    checkout_dirty = verify.attempt_dirty(
+                        workspace.root,
+                        task.baseline_commit,
+                        task.baseline_untracked,
+                    )
+                except (verify.GitError, OSError) as exc:
+                    self.journal.append(
+                        "rollback-dirty-check-failed",
+                        story_key=task.story_key,
+                        error=str(exc),
+                    )
+                else:
+                    self.journal.append(
+                        "rollback-owned-spec-restored",
+                        story_key=task.story_key,
+                        spec=str(owned_spec[0]),
+                        checkout_dirty=checkout_dirty,
+                    )
             # Refresh the plugin's view of the now-reset tree (the Unity engine
             # re-imports assets). Observe-only for the same reason as pre_rollback.
             self._emit("post_rollback", task)
             return
-        self.pause_for_manual_recovery(task, task.baseline_commit or "")
+        restored_before_pause: str | None = None
+        if (
+            restore_attempt_snapshot
+            and owned_snapshot_changed
+            and owned_spec
+            and owned_current_bytes is not None
+            and owned_baseline_bytes is not None
+            and owned_current_bytes == owned_baseline_bytes
+        ):
+            # The failed child put a tracked, pre-edited spec back at the exact
+            # baseline blob. Those child bytes are already durable in Git, so
+            # restoring the byte-exact pre-launch operator input cannot destroy
+            # evidence even though sibling residue still requires manual policy.
+            assert task.dispatched_spec_snapshot is not None
+            self._restore_attempt_owned_spec_bytes(owned_spec[0], task.dispatched_spec_snapshot)
+            restored_before_pause = str(owned_spec[0])
+            self.journal.append(
+                "rollback-owned-spec-restored",
+                story_key=task.story_key,
+                spec=restored_before_pause,
+                checkout_dirty=True,
+            )
+        self.pause_for_manual_recovery(
+            task,
+            task.baseline_commit or "",
+            restored_spec=restored_before_pause,
+        )
         return  # unreachable: pause_for_manual_recovery always raises
 
     def safe_reset(self, task: StoryTask, *, preserve: tuple[str, ...] = ()) -> None:
@@ -589,10 +1102,10 @@ class RecoveryFlow:
         If commits exist but the ref cannot be created — or the range cannot be
         enumerated at all, which is the same thing one step earlier: with
         ``allow_pause`` (a plain rollback) refuse to reset — pause for manual
-        recovery rather than destroy the work. On a re-drive (``allow_pause=False``)
-        the caller's contract forbids pausing, so journal the failure and let the
-        reset proceed (the re-drive is a human-directed discard of the failed
-        attempt). The two failures journal under distinct events
+        recovery rather than destroy the work. Ordinary re-drive preservation uses
+        ``allow_pause=False`` and journals before proceeding; a caller that will
+        replace a changed owned-spec snapshot passes True because that destructive
+        write is unsafe until the child commit is parked. The two failures journal under distinct events
         (``attempt-preserve-enumerate-failed`` vs ``attempt-preserve-failed``) so a
         post-mortem can tell "could not count the work" from "counted it but could
         not park it" — only the latter can report a HEAD."""
@@ -652,7 +1165,13 @@ class RecoveryFlow:
             "attempt-commits-preserved", story_key=task.story_key, ref=ref, count=len(commits)
         )
 
-    def preserve_attempt_worktree(self, task: StoryTask, *, allow_pause: bool) -> None:
+    def preserve_attempt_worktree(
+        self,
+        task: StoryTask,
+        *,
+        allow_pause: bool,
+        force_include: tuple[str, ...] = (),
+    ) -> None:
         """Before an auto-rollback's hard reset, park the attempt's *uncommitted*
         working-tree changes (tracked edits + run-created untracked files) under a
         named recovery ref, so `reset --hard baseline` and its untracked cleanup
@@ -669,9 +1188,11 @@ class RecoveryFlow:
         reachable by reflog/`git fsck` until gc, whereas an uncommitted edit a
         `reset --hard` discards is gone permanently. Both paths now refuse on the
         same terms: with ``allow_pause`` (a plain rollback) pause for manual
-        recovery rather than reset; on a re-drive (``allow_pause=False``) the
-        caller's contract forbids pausing, so journal and let the human-directed
-        reset proceed. Both now guard ``(GitError, OSError)`` too: spawn faults
+        recovery rather than reset; ordinary re-drive preservation remains
+        best-effort with ``allow_pause=False``. Snapshot-backed Git-invisible specs
+        pass ``allow_pause=True`` even on a re-drive because restoration would
+        otherwise overwrite the only child copy. Both paths guard
+        ``(GitError, OSError)`` too: spawn faults
         arrive typed as ``GitSpawnError`` since #343, but ``snapshot_worktree``'s
         ``TemporaryDirectory`` can still raise a plain ``OSError`` (ENOSPC),
         which would otherwise crash the rollback rather than refuse it.
@@ -680,8 +1201,8 @@ class RecoveryFlow:
         over a tree with nothing left to lose (commits already parked, nothing
         uncommitted) still resets instead of halting an unattended run. The failure
         is journaled either way, and ``preserve_partial`` is latched either way —
-        on the re-drive path the reset still runs, so the defer notice must still
-        downgrade its claim to the committed half (#338)."""
+        on the best-effort re-drive path the reset still runs, so the defer notice
+        must still downgrade its claim to the committed half (#338)."""
         baseline = task.baseline_commit
         if not baseline:
             return
@@ -742,7 +1263,10 @@ class RecoveryFlow:
                 ref = f"{base_ref}-r{serial}"
                 serial += 1
             parked = verify.snapshot_worktree(
-                workspace.root, ref, baseline_untracked=task.baseline_untracked
+                workspace.root,
+                ref,
+                baseline_untracked=task.baseline_untracked,
+                force_include=force_include,
             )
         except (verify.GitError, OSError) as exc:
             # OSError alongside GitError: spawn faults arrive typed as GitSpawnError
@@ -773,7 +1297,7 @@ class RecoveryFlow:
             # Refuse the reset rather than destroy what the snapshot failed to save
             # (#340) — but only when something unparked is actually at stake, so a
             # git fault over a harmless reset can't halt an unattended run.
-            if self._reset_would_destroy(task):
+            if force_include or self._reset_would_destroy(task):
                 self.pause_for_manual_recovery(task, baseline, snapshot_failed=True)
             return
         if parked:
@@ -823,6 +1347,7 @@ class RecoveryFlow:
         *,
         preserve_failed: bool = False,
         snapshot_failed: bool = False,
+        restored_spec: str | None = None,
     ) -> None:
         """Leave the tree untouched, surface bold manual-recovery instructions, and
         pause the run. Always raises RunPaused. Four notice shapes: (a, default)
@@ -843,9 +1368,11 @@ class RecoveryFlow:
 
         The two flags are mutually exclusive by construction: they are raised from
         different call sites, and `preserve_attempt_commits` pauses before
-        `preserve_attempt_worktree` ever runs. A *resolved* escalation never
-        reaches here — `_rollback_or_pause` auto-recovers that human-initiated
-        re-drive regardless of `scm.rollback_on_failure`."""
+        `preserve_attempt_worktree` ever runs. The initial ``cause=resolved`` unwind
+        never reaches here: it auto-recovers regardless of
+        ``scm.rollback_on_failure``. A later latched re-drive may use the
+        snapshot-failed shape when exact Git-invisible owned-spec bytes could not
+        be parked before recovery overwrites them."""
         workspace = self._workspace_get()
         short = baseline[:12] or "<baseline_commit>"
         # Name the tree every instruction targets. Usually the main checkout,
@@ -855,6 +1382,14 @@ class RecoveryFlow:
         # baseline, making the quoted commit range empty) and invites a
         # destructive reset of a tree the attempt never touched (#161).
         root = workspace.root
+        restored_note = (
+            f"Before pausing, bmad-loop restored the byte-exact pre-launch operator "
+            f"input at `{restored_spec}` because the failed child had put that tracked "
+            "file back at its Git baseline. That restored edit is uncommitted; save it "
+            "alongside any other work before resetting.\n"
+            if restored_spec
+            else ""
+        )
         commits: list[str] = []
         if baseline:
             # Advisory probe: a git fault here must not block the pause itself —
@@ -915,6 +1450,7 @@ class RecoveryFlow:
                 "OFF, and it **committed work above its baseline**. **Your commits "
                 f"are intact at the current HEAD of `{root}`.** They may already be "
                 "integrated or pushed to a remote — do NOT reset before checking.\n"
+                f"{restored_note}"
                 f'  1. **Save them first** — e.g. `git -C "{root}" branch my-rescue '
                 f"HEAD` (the commits are `{short}..HEAD` there).\n"
                 "  2. Check whether they are already integrated (merged, pushed to "
@@ -927,8 +1463,8 @@ class RecoveryFlow:
         else:
             why = (
                 f"Story **{task.story_key}**'s attempt was stopped and auto-rollback "
-                f"is OFF, so the working tree at `{root}` was left exactly as-is "
-                "for you to inspect.\n"
+                f"is OFF, so the working tree at `{root}` was left for you to inspect.\n"
+                f"{restored_note}"
             )
             notice = (
                 "**ACTION REQUIRED — manual rollback needed**\n"
