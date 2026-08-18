@@ -366,6 +366,63 @@ def test_zero_budget_rejected(tmp_path):
         policy.load(p)
 
 
+@pytest.mark.parametrize(
+    ("key", "minimum"),
+    [
+        pytest.param("session_timeout_min", 1, id="timeout-minimum"),
+        pytest.param("stop_without_result_nudges", 0, id="nudges-minimum"),
+    ],
+)
+def test_limits_schema_minimum_boundaries(key, minimum):
+    loaded = policy.loads(f"[limits]\n{key} = {minimum}\n")
+    assert getattr(loaded.limits, key) == minimum
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "expected"),
+    [
+        pytest.param(
+            "session_timeout_min",
+            0,
+            "limits.session_timeout_min must be >= 1: got 0",
+            id="timeout-zero",
+        ),
+        pytest.param(
+            "session_timeout_min",
+            -1,
+            "limits.session_timeout_min must be >= 1: got -1",
+            id="timeout-negative-one",
+        ),
+        pytest.param(
+            "session_timeout_min",
+            -9,
+            "limits.session_timeout_min must be >= 1: got -9",
+            id="timeout-negative-nine",
+        ),
+        pytest.param(
+            "stop_without_result_nudges",
+            -1,
+            "limits.stop_without_result_nudges must be >= 0: got -1",
+            id="nudges-negative-one",
+        ),
+        pytest.param(
+            "stop_without_result_nudges",
+            -9,
+            "limits.stop_without_result_nudges must be >= 0: got -9",
+            id="nudges-negative-nine",
+        ),
+    ],
+)
+def test_limits_schema_minima_reject_below_minimum(key, value, expected):
+    """ABLATION A1: Delete only the `session_timeout_min` gate; the timeout rows
+    fail because invalid values load.
+    ABLATION A2: Delete only the `stop_without_result_nudges` gate; the nudge
+    rows fail because invalid values load."""
+    with pytest.raises(policy.PolicyError) as exc:
+        policy.loads(f"[limits]\n{key} = {value}\n")
+    assert str(exc.value) == expected
+
+
 def test_git_timeout_default_parse_and_template():
     import tomllib
 
