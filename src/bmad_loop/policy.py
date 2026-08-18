@@ -805,10 +805,19 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         raise PolicyError(
             f"limits.max_followup_reviews must be >= 0: got {limits.max_followup_reviews}"
         )
+    if limits.session_timeout_min < 1:
+        raise PolicyError(
+            f"limits.session_timeout_min must be >= 1: got {limits.session_timeout_min}"
+        )
     if limits.git_timeout_s < 1:
         raise PolicyError(f"limits.git_timeout_s must be >= 1: got {limits.git_timeout_s}")
     if limits.teardown_grace_s < 0:
         raise PolicyError(f"limits.teardown_grace_s must be >= 0: got {limits.teardown_grace_s}")
+    if limits.stop_without_result_nudges < 0:
+        raise PolicyError(
+            "limits.stop_without_result_nudges must be >= 0: "
+            f"got {limits.stop_without_result_nudges}"
+        )
     if not 0.0 <= limits.cache_read_weight <= 1.0:
         raise PolicyError(
             f"limits.cache_read_weight must be between 0 and 1: got {limits.cache_read_weight}"

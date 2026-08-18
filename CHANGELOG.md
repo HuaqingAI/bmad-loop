@@ -50,6 +50,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **Policy loading now enforces the declared timeout and result-less Stop nudge minima (#648).**
+  The valid `session_timeout_min = 1` and `stop_without_result_nudges = 0` boundaries remain
+  accepted, while smaller values now raise `PolicyError`.
+
 - **Reject mismatched TOML scalar types for every `limits.*` policy field (#278).**
   Quoted booleans and other coercible values now raise `PolicyError` instead of silently changing
   the configured limit or enabling a disabled behavior.
