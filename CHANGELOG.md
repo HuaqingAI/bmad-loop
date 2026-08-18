@@ -50,6 +50,36 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **Attempt-owned spec-only retries no longer demand a false manual rollback (#123).** A
+  bound plain attempt whose only residue is its lifecycle flip is restored to its pre-attempt
+  lifecycle status and proven Git-clean before retry. A resolved re-drive may instead retain an
+  authorized dirty, human-corrected spec and reports `rollback-owned-spec-normalized` without
+  claiming cleanliness or auto-committing the correction. Each bound retry chain now snapshots its
+  first spec input byte-for-byte and retains it across dev- and review-verification repairs, so a
+  later failed child cannot replace that input with its own body edits. Non-fixable retries park the
+  failed child, restore the snapshot, and then re-establish the promised lifecycle route after
+  resetting sibling residue. Repair prompts validate retained authority before they can reset a
+  spec, and a plain child that puts a tracked spec back at Git baseline cannot erase pre-launch
+  operator edits. Pre-existing untracked and ignored bound specs use that snapshot as their
+  independent dirtiness oracle and are force-included only in the private recovery ref before
+  restoration; index-only force-adds and cached removals also trigger cleanup, which restores the
+  baseline index ownership. `rollback-owned-spec-restored` records the repair. Missing, unreadable,
+  retargeted, changed external, or unsafe legacy authority pauses with convergent spec-adoption
+  instructions, and recovery refuses a reset whose baseline would replace the canonical path or a
+  parent directory with a symlink, tree, file, or other unsafe shape. An initial Sprint observation
+  fault may leave a bare-key attempt unbound; an existing Stories folder+id target instead aborts
+  unless it can be snapshotted. Post-bind faults abort before launch while retaining the authority
+  for recovery. Protected rollback inventories and deletion replay remain byte-safe for POSIX
+  filenames outside UTF-8. Snapshots are retired after commit. Other substantive changes and
+  sibling source, artifact, or untracked residue still follow the configured rollback policy.
+
+- **Recorded sprint re-drives now route directly through their known spec (#630).** Only a
+  generic sprint task with a recorded `spec_file` names that `ready-for-dev` spec explicitly and
+  pins deterministic read-back to the same file. Fresh sprint tasks with no recorded path remain
+  bare-key dispatches; Stories stays folder+id, Sweep stays intent-bundle, and patch-restore plus
+  verification-feedback routes retain their existing wording and precedence. A filesystem fault
+  while observing the dispatch binding leaves that attempt unbound instead of aborting the run.
+
 - **Overlong lowercase/kebab sweep bundle labels now proceed deterministically (#503).** An
   otherwise valid name over 40 characters is truncated to 40, journaled and persisted before
   validation, so the sweep proceeds without spending a feedback retry or pausing the run.

@@ -79,6 +79,80 @@ def test_attempt_dirty_tracked_change(project):
     assert verify.attempt_dirty(project.project, baseline, []) is True
 
 
+def test_file_bytes_at_revision_distinguishes_blob_absence_tree_and_git_failure(project):
+    """The baseline oracle returns only proven blob bytes, never tree listings."""
+    repo = project.project
+    nested = repo / "oracle" / "spec.bin"
+    nested.parent.mkdir()
+    expected = b"\x00byte-exact\xff\r\n"
+    nested.write_bytes(expected)
+    git(repo, "add", "oracle")
+    git(repo, "commit", "-q", "-m", "binary oracle fixture")
+    baseline = verify.rev_parse_head(repo)
+
+    assert verify.file_bytes_at_revision(repo, baseline, "oracle/spec.bin") == expected
+    assert verify.worktree_file_bytes_at_revision(repo, baseline, "oracle/spec.bin") == expected
+    assert verify.file_bytes_at_revision(repo, baseline, "missing.bin") is None
+    assert verify.worktree_file_bytes_at_revision(repo, baseline, "missing.bin") is None
+    assert verify.file_bytes_at_revision(repo, baseline, "oracle") is None
+    assert verify.worktree_file_bytes_at_revision(repo, baseline, "oracle") is None
+    assert not verify.path_is_non_regular_at_revision(repo, baseline, "oracle/spec.bin")
+    assert not verify.path_is_non_regular_at_revision(repo, baseline, "missing.bin")
+    assert verify.path_is_non_regular_at_revision(repo, baseline, "oracle")
+    with pytest.raises(verify.GitError, match="ls-tree"):
+        verify.file_bytes_at_revision(repo, "not-a-revision", "oracle/spec.bin")
+    with pytest.raises(verify.GitError, match="ls-tree"):
+        verify.worktree_file_bytes_at_revision(repo, "not-a-revision", "oracle/spec.bin")
+
+
+def test_worktree_file_bytes_at_revision_applies_checkout_eol_filters(project):
+    """The live-baseline oracle materializes bytes as Git checkout would.
+
+    Ablation: replace ``cat-file --filters --path`` with raw ``cat-file blob``
+    and the filtered assertion returns LF instead of the CRLF checkout form.
+    """
+    repo = project.project
+    git(repo, "config", "core.autocrlf", "true")
+    rel = "filtered-baseline.md"
+    path = repo / rel
+    blob_bytes = b"line one\nline two\n"
+    path.write_bytes(blob_bytes)
+    git(repo, "add", rel)
+    git(repo, "commit", "-q", "-m", "filtered baseline fixture")
+    baseline = verify.rev_parse_head(repo)
+    path.unlink()
+    git(repo, "checkout", "--", rel)
+
+    assert path.read_bytes() == b"line one\r\nline two\r\n"
+    assert verify.file_bytes_at_revision(repo, baseline, rel) == blob_bytes
+    assert verify.worktree_file_bytes_at_revision(repo, baseline, rel) == path.read_bytes()
+
+
+@pytest.mark.parametrize("baseline_present", [False, True], ids=["absent", "tracked"])
+def test_reset_index_path_restores_baseline_ownership_without_rewriting_bytes(
+    project, baseline_present
+):
+    repo = project.project
+    path = repo / "index-owned.md"
+    if baseline_present:
+        path.write_text("baseline\n")
+        git(repo, "add", "index-owned.md")
+        git(repo, "commit", "-q", "-m", "tracked index baseline")
+    baseline = verify.rev_parse_head(repo)
+    path.write_text("working bytes\n")
+    if baseline_present:
+        git(repo, "rm", "--cached", "index-owned.md")
+    else:
+        git(repo, "add", "index-owned.md")
+    assert verify.index_path_changed_since(repo, baseline, "index-owned.md")
+
+    verify.reset_index_path(repo, baseline, "index-owned.md")
+
+    assert not verify.index_path_changed_since(repo, baseline, "index-owned.md")
+    assert verify.path_tracked(repo, "index-owned.md") is baseline_present
+    assert path.read_text() == "working bytes\n"
+
+
 def test_attempt_dirty_run_created_untracked(project):
     """An untracked file absent from the baseline snapshot was created by this
     attempt → dirty."""
@@ -1857,6 +1931,129 @@ def test_safe_rollback_preserves_tracked_artifact(project):
     )
     assert (repo / "src.txt").read_text() == "original\n"  # source reverted
     assert spec.read_text() == "frozen: corrected\n"  # spec correction preserved
+
+
+def test_safe_rollback_preserves_tracked_artifact_deletion(project):
+    """A protected snapshot is authoritative when it deletes a tracked artifact.
+
+    Restoring only paths present in the snapshot resurrects the baseline file and
+    can re-wedge a resolved Stories sentinel. Ablation: delete the replay of
+    ``deleted_preserve_paths`` after the snapshot checkout and this test fails
+    because the deleted spec exists again.
+    """
+    repo = project.project
+    spec = project.implementation_artifacts / "1-unresolved.md"
+    spec.write_text("blocked sentinel\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "sentinel")
+    baseline = verify.rev_parse_head(repo)
+    snap = sorted(verify.untracked_files(repo))
+    artifact_rel = project.implementation_artifacts.relative_to(repo).as_posix()
+
+    spec.unlink()  # the resolve workflow deliberately cleared this sentinel
+    (repo / "src.txt").write_text("dev attempt\n")
+
+    verify.safe_rollback(
+        repo,
+        baseline,
+        baseline_untracked=snap,
+        keep=(".bmad-loop", artifact_rel),
+        preserve=(artifact_rel,),
+    )
+
+    assert not spec.exists()  # the protected deletion survives the hard reset
+    assert (repo / "src.txt").read_text() == "original\n"  # source still reverts
+
+
+def test_safe_rollback_preserves_file_to_directory_replacement(project):
+    """A snapshot tree at a deleted baseline file path already replaces that file.
+
+    Ablation: delete the snapshot-present filter from the preserved-deletion
+    inventory and this test fails when ``git rm -f`` is handed the restored
+    replacement directory without ``-r``.
+    """
+    repo = project.project
+    artifact = project.implementation_artifacts / "result"
+    artifact.write_text("baseline file\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "artifact file")
+    baseline = verify.rev_parse_head(repo)
+    snap = sorted(verify.untracked_files(repo))
+    artifact_rel = project.implementation_artifacts.relative_to(repo).as_posix()
+
+    artifact.unlink()
+    artifact.mkdir()
+    nested = artifact / "payload.md"
+    nested.write_text("preserved replacement\n")
+    git(repo, "add", "-A", "--", artifact_rel)
+    (repo / "src.txt").write_text("dev attempt\n")
+
+    verify.safe_rollback(
+        repo,
+        baseline,
+        baseline_untracked=snap,
+        keep=(".bmad-loop", artifact_rel),
+        preserve=(artifact_rel,),
+    )
+
+    assert artifact.is_dir()
+    assert nested.read_text() == "preserved replacement\n"
+    assert (repo / "src.txt").read_text() == "original\n"
+
+
+@needs_strict_codec
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows filenames are UTF-16; no undecodable path exists"
+)
+@pytest.mark.parametrize("replace_with_directory", [False, True], ids=["deleted", "replaced"])
+def test_safe_rollback_reads_preserved_deletion_inventory_as_bytes(project, replace_with_directory):
+    """Protected deletion inventories keep POSIX filenames as bytes until use.
+
+    The plain-deletion row exercises ``git diff --name-only -z`` and the later
+    ``git rm`` replay; the file-to-directory row also exercises
+    ``git ls-tree --name-only -z``.  All three commands can emit the raw ``0xff``
+    byte in the filename; strict text mode turns that into ``GitError`` either
+    before reset or, for ``git rm``, after the deletion has already been replayed.
+
+    Ablation: remove ``binary=True`` or ``os.fsdecode`` from the corresponding
+    inventory read, or restore text mode for the replay, and one or both rows fail.
+    """
+    repo = project.project
+    artifact_dir = project.implementation_artifacts
+    artifact_rel = artifact_dir.relative_to(repo).as_posix()
+    raw_artifact = os.fsencode(artifact_dir) + b"/result-\xff"
+    assert os.fsencode(os.fsdecode(b"result-\xff")) == b"result-\xff"
+    with open(raw_artifact, "wb") as fh:
+        fh.write(b"baseline file\n")
+    git(repo, "add", "-A", "--", artifact_rel)
+    git(repo, "commit", "-q", "-m", "non-UTF-8 artifact")
+    baseline = verify.rev_parse_head(repo)
+    snap = sorted(verify.untracked_files(repo))
+
+    os.unlink(raw_artifact)
+    raw_nested = raw_artifact + b"/payload.md"
+    if replace_with_directory:
+        os.mkdir(raw_artifact)
+        with open(raw_nested, "wb") as fh:
+            fh.write(b"preserved replacement\n")
+        git(repo, "add", "-A", "--", artifact_rel)
+    (repo / "src.txt").write_text("dev attempt\n")
+
+    verify.safe_rollback(
+        repo,
+        baseline,
+        baseline_untracked=snap,
+        keep=(".bmad-loop", artifact_rel),
+        preserve=(artifact_rel,),
+    )
+
+    if replace_with_directory:
+        assert os.path.isdir(raw_artifact)
+        with open(raw_nested, "rb") as fh:
+            assert fh.read() == b"preserved replacement\n"
+    else:
+        assert not os.path.exists(raw_artifact)
+    assert (repo / "src.txt").read_text() == "original\n"
 
 
 def test_safe_rollback_raises_on_genuine_restore_failure(project, monkeypatch):
@@ -4179,6 +4376,31 @@ def test_snapshot_worktree_excludes_gitignored(project):
     tree = git(repo, "ls-tree", "-r", "--name-only", ref)
     assert "src.txt" in tree
     assert "ignored.txt" not in tree
+
+
+@pytest.mark.parametrize("kind", ["baseline-untracked", "ignored"])
+def test_snapshot_worktree_force_includes_one_trusted_git_invisible_path(project, kind):
+    """Recovery can park a byte-snapshotted spec that normal staging excludes."""
+    repo = project.project
+    rel = f"artifacts/{kind}.md"
+    path = repo / rel
+    path.parent.mkdir()
+    if kind == "ignored":
+        (repo / ".gitignore").write_text(f"/{rel}\n")
+        git(repo, "add", ".gitignore")
+        git(repo, "commit", "-q", "-m", "ignore recovery input")
+    path.write_text("failed child bytes\n")
+    baseline_untracked = [rel] if kind == "baseline-untracked" else []
+
+    ref = verify.snapshot_worktree(
+        repo,
+        f"refs/attempt-preserve-dirty/forced-{kind}",
+        baseline_untracked=baseline_untracked,
+        force_include=(rel,),
+    )
+
+    assert ref is not None
+    assert git(repo, "show", f"{ref}:{rel}") == "failed child bytes"
 
 
 def test_snapshot_worktree_succeeds_without_git_identity(project, monkeypatch, tmp_path):
