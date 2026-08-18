@@ -435,6 +435,55 @@ def test_dev_contract_nudge_default_parse_and_template():
     assert doc["limits"]["dev_contract_nudge"] == policy.LimitsPolicy.dev_contract_nudge
 
 
+def test_dev_contract_nudge_rejects_non_boolean():
+    """Ablation: delete `_limit_bool`'s conditional and raise, retaining
+    `return value`; this test fails because the string is returned unchanged."""
+    with pytest.raises(policy.PolicyError, match=r"limits\.dev_contract_nudge must be a boolean"):
+        policy.loads('[limits]\ndev_contract_nudge = "false"\n')
+
+
+@pytest.mark.parametrize("bad", ["true", "1.5", '"1"'])
+@pytest.mark.parametrize(
+    "key",
+    [
+        "max_review_cycles",
+        "max_dev_attempts",
+        "max_followup_reviews",
+        "session_timeout_min",
+        "git_timeout_s",
+        "teardown_grace_s",
+        "stop_without_result_nudges",
+        "dev_stall_grace_s",
+        "dev_stall_nudges",
+        "dev_stall_nudges_cap",
+        "workflow_stall_nudges_cap",
+        "max_tokens_per_story",
+        "max_tokens_per_session",
+        "session_budget_grace_s",
+    ],
+)
+def test_limits_integer_fields_reject_non_integer(key, bad):
+    """Ablation: delete `_limit_int`'s conditional and raise, retaining
+    `return value`; all rows fail because bad scalars are accepted or reach
+    downstream validation without the required integer `PolicyError`."""
+    with pytest.raises(policy.PolicyError, match=rf"limits\.{key} must be an integer"):
+        policy.loads(f"[limits]\n{key} = {bad}\n")
+
+
+@pytest.mark.parametrize("bad", ["true", '"0.5"'])
+def test_cache_read_weight_rejects_non_number(bad):
+    """Ablation: delete `_limit_float`'s conditional and raise; both rows fail
+    because `float` accepts the boolean and quoted-number values."""
+    with pytest.raises(policy.PolicyError, match=r"limits\.cache_read_weight must be a number"):
+        policy.loads(f"[limits]\ncache_read_weight = {bad}\n")
+
+
+def test_cache_read_weight_accepts_integer_as_float():
+    value = policy.loads("[limits]\ncache_read_weight = 1\n").limits.cache_read_weight
+    assert value == 1.0
+    assert isinstance(value, float)
+
+
 def test_session_budget_mode_default_parse_and_template():
     import tomllib
 
@@ -450,6 +499,13 @@ def test_session_budget_mode_default_parse_and_template():
 def test_invalid_session_budget_mode():
     with pytest.raises(policy.PolicyError, match=r"limits\.session_budget_mode"):
         policy.loads('[limits]\nsession_budget_mode = "sometimes"\n')
+
+
+def test_session_budget_mode_rejects_non_string():
+    """Ablation: delete `_limit_str`'s conditional and raise; this test fails
+    because the downstream options check raises a different `PolicyError`."""
+    with pytest.raises(policy.PolicyError, match=r"limits\.session_budget_mode must be a string"):
+        policy.loads("[limits]\nsession_budget_mode = 1\n")
 
 
 def test_max_tokens_per_story_default_and_parse():

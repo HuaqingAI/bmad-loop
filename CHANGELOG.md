@@ -50,6 +50,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **Reject mismatched TOML scalar types for every `limits.*` policy field (#278).**
+  Quoted booleans and other coercible values now raise `PolicyError` instead of silently changing
+  the configured limit or enabling a disabled behavior.
+
 - **Attempt-owned spec-only retries no longer demand a false manual rollback (#123).** A
   bound plain attempt whose only residue is its lifecycle flip is restored to its pre-attempt
   lifecycle status and proven Git-clean before retry. A resolved re-drive may instead retain an
