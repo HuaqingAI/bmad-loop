@@ -2512,6 +2512,24 @@ def test_happy_path(project):
     assert adapter.sessions[1].prompt.startswith("/bmad-dev-auto ")
 
 
+def test_namespaced_session_env_and_prompt_route_artifacts(project):
+    write_sprint(
+        project,
+        {"L0-epic-1": "backlog", "L0-1-1-a": "ready-for-dev"},
+    )
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "L0-1-1-a"), review_effect(project, "L0-1-1-a", clean=True)],
+        story_namespace="L0",
+    )
+    engine.run()
+
+    dev = adapter.sessions[0]
+    assert dev.env["BMAD_LOOP_STORY_NAMESPACE"] == "L0"
+    assert "implementation-artifacts" in dev.prompt
+    assert "L0" in dev.prompt
+
+
 def test_session_env_names_the_out_of_tree_events_dir(project):
     """#494 producer side: every engine-driven session is told where to write its
     hook events, and the answer is the out-of-tree channel — not `<run_dir>/events`,

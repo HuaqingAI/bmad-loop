@@ -2571,31 +2571,48 @@ def _copy_skills(project: Path, trees: Sequence[str], force: bool) -> bool:
     return skipped_any
 
 
-def _warn_if_policy_tracked(project: Path) -> None:
-    """One-time migration hint: a .gitignore entry does not untrack an
-    already-committed policy.toml, so repos initialized before the file was
-    gitignored keep sharing it (and this machine's [mux] backend choice) until
-    the dev runs `git rm --cached` once. Best-effort — not a repo, or no git,
-    means nothing to warn about."""
+def _tracked(project: Path, rel: str) -> bool:
+    """Best-effort answer for a migration hint; non-repos stay silent."""
     try:
-        tracked = (
+        return (
             git_bytes(
                 project,
                 "ls-files",
                 "--error-unmatch",
-                ".bmad-loop/policy.toml",
-                timeout_s=10,  # the pre-#390 bound: a hint must not stall init
+                rel,
+                timeout_s=10,
             ).returncode
             == 0
         )
     except GitError:
-        return
-    if tracked:
+        return False
+
+
+def _warn_if_local_path_tracked(project: Path, rel: str) -> None:
+    """Explain that gitignore does not untrack an existing checkout-local file."""
+    if _tracked(project, rel):
         print(
-            "  note: .bmad-loop/policy.toml is tracked by git; run "
-            "`git rm --cached .bmad-loop/policy.toml` once to stop sharing it "
+            f"  note: {rel} is tracked by git but is checkout-local; run "
+            f"`git rm --cached {rel}` once to stop sharing it "
             "(your local copy is kept)"
         )
+
+
+def _local_gitignore_patterns(profiles: Sequence[CLIProfile]) -> tuple[str, ...]:
+    """Generated and checkout-local paths for the selected CLI profiles."""
+    hook_configs = tuple(dict.fromkeys(p.hooks.config_path for p in profiles if not p.hookless))
+    return (
+        ".bmad-loop/runs/",
+        ".bmad-loop/archive/",
+        ".bmad-loop/cache/",
+        ".bmad-loop/policy.toml",
+        HOOK_SCRIPT_REL,
+        ".bmad-loop/__pycache__/",
+        f"{RENDER_DIR_REL}/",
+        "_bmad-output/implementation-artifacts/**/bmad-build-auto-result-*.md",
+        "_bmad-output/implementation-artifacts/**/bmad-dev-auto-result-*.md",
+        *hook_configs,
+    )
 
 
 def install_into(
@@ -2604,6 +2621,7 @@ def install_into(
     *,
     skills: bool = True,
     force_skills: bool = False,
+    local_hooks: bool = False,
 ) -> int:
     project = project.resolve()
     try:
@@ -2653,24 +2671,28 @@ def install_into(
         policy_path.write_text(POLICY_TEMPLATE, encoding="utf-8")
         print(f"  policy written: {policy_path}")
 
-    # 5. gitignore generated/machine-local state: per-run state (.bmad-loop/runs/),
-    # the game-engine plugins' rebuildable caches, e.g. the per-worktree Unity
-    # Library (.bmad-loop/cache/), and the policy file itself — policy.toml is
-    # per-machine-per-repo (it carries this machine's [mux] backend choice, and
-    # the TUI settings editor rewrites it), so it must never travel to teammates.
+    # 5. gitignore generated/machine-local state. ``--local-hooks`` additionally
+    # treats the selected CLIs' merged hook configs as checkout-local: non-Claude
+    # dialects embed this checkout's absolute relay path, and every dialect may
+    # share its JSON file with personal permissions, MCP entries or environment.
     gitignore = project / ".gitignore"
     existing = gitignore.read_text(encoding="utf-8") if gitignore.is_file() else ""
     have = set(existing.splitlines())
-    to_add = [
-        line
-        for line in (
+    if local_hooks:
+        patterns = _local_gitignore_patterns(profiles)
+    else:
+        patterns = (
             ".bmad-loop/runs/",
+            ".bmad-loop/archive/",
             ".bmad-loop/cache/",
             ".bmad-loop/policy.toml",
+            HOOK_SCRIPT_REL,
+            ".bmad-loop/__pycache__/",
             f"{RENDER_DIR_REL}/",
+            "_bmad-output/implementation-artifacts/**/bmad-build-auto-result-*.md",
+            "_bmad-output/implementation-artifacts/**/bmad-dev-auto-result-*.md",
         )
-        if line not in have
-    ]
+    to_add = [line for line in patterns if line not in have]
     if to_add:
         with gitignore.open("a", encoding="utf-8") as f:
             if existing and not existing.endswith("\n"):
@@ -2678,7 +2700,11 @@ def install_into(
             f.write("\n".join(to_add) + "\n")
         for line in to_add:
             print(f"  gitignored: {line}")
-    _warn_if_policy_tracked(project)
+    tracked_candidates = [".bmad-loop/policy.toml", HOOK_SCRIPT_REL]
+    if local_hooks:
+        tracked_candidates.extend(p.hooks.config_path for p in profiles if not p.hookless)
+    for rel in dict.fromkeys(tracked_candidates):
+        _warn_if_local_path_tracked(project, rel)
 
     if skills_skipped:
         print("  some skills already present; re-run with --force-skills to overwrite")

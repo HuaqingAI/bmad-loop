@@ -76,6 +76,12 @@ kind = "str"
 default_ref = "StoriesPolicy.spec_folder"
 label = "spec folder"
 description = "stories mode only: project-relative path to the epic spec folder (holds stories.yaml + SPEC.md)"
+[[section.field]]
+key = "namespace"
+kind = "str"
+default_ref = "StoriesPolicy.namespace"
+label = "sprint key namespace"
+description = "sprint mode only: optional key prefix such as L0 for L0-epic-2 and L0-2-1-story; blank keeps standard BMAD keys"
 
 [[section]]
 name = "limits"

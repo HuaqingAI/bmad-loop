@@ -8,6 +8,8 @@ breaking changes may land in a minor release.
 ## [Unreleased]
 
 ### Added
+- Support namespaced sprint boards such as `L0-epic-1` / `L0-1-1-story`, including namespace-pinned resume, TUI filtering, hard gates, and namespaced spec discovery.
+- Add `bmad-loop init --local-hooks` for checkout-local hook configs and lightweight per-clone initialization.
 
 - **A refused auto-sweep is now visible outside the journal (#501).** A run whose deferred-work
   sweep was refused ended looking exactly like one that swept, and under `[sweep] auto = "run-end"`

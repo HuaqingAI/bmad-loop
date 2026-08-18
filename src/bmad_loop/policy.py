@@ -236,6 +236,8 @@ class StoriesPolicy:
 
     source: str = "sprint-status"
     spec_folder: str = ""
+    # Optional prefix before standard sprint-status keys, e.g. L0 / L8B.
+    namespace: str = ""
 
 
 @dataclass(frozen=True)
@@ -874,10 +876,16 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     stories = StoriesPolicy(
         source=str(stories_d.get("source", StoriesPolicy.source)).strip(),
         spec_folder=str(stories_d.get("spec_folder", StoriesPolicy.spec_folder)).strip(),
+        namespace=str(stories_d.get("namespace", StoriesPolicy.namespace)).strip(),
     )
     if stories.source not in STORIES_SOURCES:
         raise PolicyError(
             f"stories.source must be one of {sorted(STORIES_SOURCES)}: got {stories.source!r}"
+        )
+    if stories.namespace and not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", stories.namespace):
+        raise PolicyError(
+            "stories.namespace must contain letters/digits and start with a letter "
+            f"(for example L0 or L8B): got {stories.namespace!r}"
         )
     # source="stories" needs a spec_folder to read stories.yaml from; the reverse
     # (a spec_folder set under sprint-status mode) is a harmless leftover, ignored
@@ -1199,6 +1207,8 @@ source = "sprint-status"     # sprint-status | stories
 # Required (and must parse) when source = "stories": the project-relative path to
 # the epic's spec folder holding stories.yaml + SPEC.md. Ignored under sprint-status.
 spec_folder = ""
+# Sprint mode only: optional key prefix, e.g. L0 for L0-epic-2 / L0-2-1-story.
+namespace = ""
 
 [adapter]
 name = "claude"              # claude | codex | gemini | copilot | antigravity | opencode-http (alias: opencode) | <custom .bmad-loop/profiles/*.toml>

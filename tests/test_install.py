@@ -326,6 +326,74 @@ def test_install_does_not_clobber_existing_policy(tmp_path):
     assert current.read_text() == "CURRENT"
 
 
+def test_install_local_hooks_gitignores_selected_cli_configs(tmp_path):
+    assert (
+        install_into(
+            tmp_path,
+            clis=("claude", "codex"),
+            skills=False,
+            local_hooks=True,
+        )
+        == 0
+    )
+    gitignore = (tmp_path / ".gitignore").read_text()
+    for rel in (
+        ".bmad-loop/runs/",
+        ".bmad-loop/archive/",
+        ".bmad-loop/cache/",
+        ".bmad-loop/policy.toml",
+        ".bmad-loop/bmad_loop_hook.py",
+        ".bmad-loop/__pycache__/",
+        f"{RENDER_DIR_REL}/",
+        ".claude/settings.json",
+        ".codex/hooks.json",
+        "_bmad-output/implementation-artifacts/**/bmad-build-auto-result-*.md",
+        "_bmad-output/implementation-artifacts/**/bmad-dev-auto-result-*.md",
+    ):
+        assert gitignore.count(rel) == 1
+    assert not (tmp_path / ".claude" / "skills" / "bmad-loop-resolve").exists()
+
+    assert (
+        install_into(
+            tmp_path,
+            clis=("claude", "codex"),
+            skills=False,
+            local_hooks=True,
+        )
+        == 0
+    )
+    final = (tmp_path / ".gitignore").read_text()
+    assert final == gitignore
+
+
+def test_install_local_hooks_warns_for_tracked_generated_files(tmp_path, capsys):
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    relay = tmp_path / ".bmad-loop" / "bmad_loop_hook.py"
+    relay.parent.mkdir(parents=True)
+    relay.write_text("old")
+    hooks = tmp_path / ".codex" / "hooks.json"
+    hooks.parent.mkdir(parents=True)
+    hooks.write_text("{}")
+    subprocess.run(
+        ["git", "add", ".bmad-loop/bmad_loop_hook.py", ".codex/hooks.json"],
+        cwd=tmp_path,
+        check=True,
+    )
+
+    assert (
+        install_into(
+            tmp_path,
+            clis=("codex",),
+            skills=False,
+            local_hooks=True,
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "git rm --cached .bmad-loop/bmad_loop_hook.py" in out
+    assert "git rm --cached .codex/hooks.json" in out
+
+
 def test_copilot_profile_render_prompt():
     # {skill} must expand plainly (no codex-style $ prefix) into the SKILL.md path
     profile = get_profile("copilot")
@@ -3747,9 +3815,9 @@ def test_shield_outranked_degrade_leaves_no_permanent_repo_format_change(
     # through the `git` helper, whose `check=True` turns git's own "no such key" into
     # an error — the rc IS the assertion here.
     wt_config = Path(git(wt, "rev-parse", "--absolute-git-dir")) / "config.worktree"
-    assert "excludesFile" in wt_config.read_text(
-        encoding="utf-8"
-    ), "the activation's key should still be on disk — this pins INERT, not removed"
+    assert "excludesFile" in wt_config.read_text(encoding="utf-8"), (
+        "the activation's key should still be on disk — this pins INERT, not removed"
+    )
     left_behind = subprocess.run(
         ["git", "-C", str(wt), "config", "--type=path", "--get", "core.excludesFile"],
         capture_output=True,

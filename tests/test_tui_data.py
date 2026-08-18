@@ -650,7 +650,7 @@ def test_log_view_survives_gemini_startup_preamble(tmp_path):
     # capability negotiation burst, including the crashing `CSI > 4 ; ? m`.
     path = tmp_path / "task.log"
     path.write_bytes(
-        b"\x1b[8m\x1b[?u\x1b]11;?\x1b\\\x1b[>q\x1b[>4;?m\x1b[c\x1b[2K\r\x1b[0m" b"ready to work\r\n"
+        b"\x1b[8m\x1b[?u\x1b]11;?\x1b\\\x1b[>q\x1b[>4;?m\x1b[c\x1b[2K\r\x1b[0mready to work\r\n"
     )
     view = data.LogView(path)
     assert view.read_new() is True
@@ -1316,3 +1316,32 @@ def test_char_style_degrades_unparseable_color_instead_of_raising():
     assert style.color is None and style.bgcolor is None
     assert style.bold and style.underline and not style.italic
     assert data._char_style(key) is style  # fallback is cached like any other
+
+
+def test_sprint_overview_namespaces_are_policy_aware_and_cache_isolated(project):
+    install_bmad_config(project)
+    write_sprint(
+        project,
+        {
+            "epic-1": "in-progress",
+            "1-1-standard": "ready-for-dev",
+            "L0-epic-2": "in-progress",
+            "L0-2-1-platform": "in-progress",
+            "l8b-epic-2": "backlog",
+            "l8b-2-1-customer": "backlog",
+        },
+    )
+    standard = data.sprint_overview(project.project, namespace="")
+    l0 = data.sprint_overview(project.project, namespace="L0")
+    l8b = data.sprint_overview(project.project, namespace="L8B")
+    assert [story.key for story in standard.stories] == ["1-1-standard"]
+    assert [story.key for story in l0.stories] == ["L0-2-1-platform"]
+    assert [story.key for story in l8b.stories] == ["l8b-2-1-customer"]
+    assert data.sprint_overview(project.project, namespace="L0") is l0
+    assert data.sprint_overview(project.project, namespace="L8B") is l8b
+    assert l0 is not l8b
+
+    policy_dir = project.project / ".bmad-loop"
+    policy_dir.mkdir(exist_ok=True)
+    (policy_dir / "policy.toml").write_text('[stories]\nnamespace = "L0"\n')
+    assert data.sprint_overview(project.project).stories is l0.stories

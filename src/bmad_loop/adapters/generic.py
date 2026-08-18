@@ -30,7 +30,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .. import devcontract, gates, runs
+from .. import devcontract, gates, runs, sprintstatus
 from ..bmadconfig import ProjectPaths
 from ..journal import LOGS_DIR
 from ..model import TokenUsage
@@ -1249,18 +1249,24 @@ class _DevSynthesisMixin(_ResultFileMixin):
         dead, so the caller keeps its verdict)."""
         raise NotImplementedError
 
-    def _artifact_dirs(self, cwd: Path) -> list[Path]:
+    def _artifact_dirs(self, cwd: Path, story_key: str = "", namespace: str = "") -> list[Path]:
         # In worktree isolation the skill runs with cwd set to the worktree and
         # writes its terminal spec under the worktree's rebased implementation-
-        # artifacts dir, not the main checkout's. Resolve the search dir from the
-        # live session cwd (a no-op in place, where cwd == the project root, and
-        # for artifact dirs configured outside the project tree, which rebased()
-        # leaves put). Keep the configured dir as a defensive fallback.
+        # artifacts dir. Namespaced stories prefer a sibling namespace directory,
+        # then fall back to the legacy root for pre-migration specs and no-spec
+        # result artifacts.
         primary = self.paths.rebased(cwd).implementation_artifacts
-        dirs = [primary]
+        roots = [primary]
         if self.paths.implementation_artifacts != primary:
-            dirs.append(self.paths.implementation_artifacts)
-        return dirs
+            roots.append(self.paths.implementation_artifacts)
+        selected = sprintstatus.normalize_namespace(namespace)
+        selected = selected or sprintstatus.namespace_from_story_key(story_key)
+        dirs: list[Path] = []
+        for root in roots:
+            if selected:
+                dirs.append(root / selected)
+            dirs.append(root)
+        return list(dict.fromkeys(dirs))
 
     def _result_json(self, handle: SessionHandle, spec: SessionSpec, *, wait: bool) -> dict | None:
         sr = self._synth_result(handle, spec, wait=wait)
@@ -1302,7 +1308,11 @@ class _DevSynthesisMixin(_ResultFileMixin):
         # flushed to disk the instant the Stop event fires, so briefly await it when
         # wait=True instead of reading once and mis-reporting a stall.
         deadline = time.monotonic() + RESULT_GRACE_S
-        search_dirs = self._artifact_dirs(spec.cwd)
+        search_dirs = self._artifact_dirs(
+            spec.cwd,
+            spec.env.get("BMAD_LOOP_STORY_KEY") or "",
+            spec.env.get("BMAD_LOOP_STORY_NAMESPACE") or "",
+        )
         while True:
             for artifacts in search_dirs:
                 spec_path = devcontract.find_result_artifact(artifacts, since_ns=handle.launched_ns)

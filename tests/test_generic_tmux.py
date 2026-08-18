@@ -582,6 +582,33 @@ def _dev_spec(tmp_path, story_key="3-1") -> SessionSpec:
     )
 
 
+def test_generic_dev_synthesizes_namespaced_spec_from_namespace_directory(tmp_path):
+    adapter, impl = make_dev_adapter(tmp_path)
+    namespace_dir = impl / "L0"
+    namespace_dir.mkdir()
+    spec_file = namespace_dir / "spec-L0-2-3-state-model.md"
+    spec_file.write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n"
+        "## Auto Run Result\n\nStatus: done\nImplemented namespaced story.\n"
+    )
+    story_key = "L0-2-3-state-model"
+    assert adapter._artifact_dirs(tmp_path, story_key, "L0") == [namespace_dir, impl]
+    spec = _dev_spec(tmp_path, story_key)
+    spec.env["BMAD_LOOP_STORY_NAMESPACE"] = "L0"
+    result = adapter._result_json(_dev_handle(), spec, wait=True)
+    assert result["status"] == "done"
+    assert result["story_key"] == story_key
+    assert Path(result["spec_file"]) == spec_file
+
+
+def test_generic_dev_prefers_configured_namespace_casing(tmp_path):
+    adapter, impl = make_dev_adapter(tmp_path)
+    assert adapter._artifact_dirs(tmp_path, "l8b-2-3-story", "L8B") == [
+        impl / "L8B",
+        impl,
+    ]
+
+
 def test_generic_dev_synthesizes_done_spec(tmp_path):
     adapter, impl = make_dev_adapter(tmp_path)
     (impl / "spec-3-1-foo.md").write_text(

@@ -107,11 +107,16 @@ Unless the user explicitly asked to skip it (e.g. `skills only` / `--no-tool`), 
 
    # upgrade — refresh the bundled skills in place
    bmad-loop init --project "{project-root}" --cli claude --force-skills
+
+   # lightweight setup in every clone / independently managed checkout
+   bmad-loop init --project "{project-root}" --cli codex --local-hooks --no-skills
    ```
 
    Names must be exactly `claude`, `codex`, `gemini`, `copilot`, or `antigravity` — `init` errors on an unknown profile and lists the valid ones. `init` prints any one-time first-run notes per CLI (e.g. start `claude` once in the project and accept the workspace-trust + hooks-approval dialogs before `bmad-loop run` — spawned sessions can't answer first-run dialogs). Relay those notes to the user.
 
    **Skills are installed automatically:** `init` lays the bundled `bmad-loop-*` skills into the right tree for each selected CLI — `.claude/skills/` for `claude`, `.agents/skills/` for `codex`/`gemini`/`copilot`/`antigravity`. On a fresh install, existing skill dirs are left untouched; on an upgrade, `--force-skills` overwrites them with the bundled copies from the upgraded tool (use `--no-skills` to skip the step and manage skills yourself).
+
+   **Per-checkout hooks:** use `--local-hooks --no-skills` in every clone or separately managed checkout when skills are already present. The relay, local policy and selected CLI hook configs are generated for that directory and added to `.gitignore`; `init` preserves existing JSON settings while merging the bmad-loop handlers. If any generated path is already tracked, follow the printed `git rm --cached <path>` migration hint — `init` never changes the Git index itself.
 
    > **Note:** `--force-skills` also overwrites `bmad-loop-setup` itself (it ships in the same bundle). That's expected and safe — the freshly laid-down setup skill takes effect on the **next** invocation, and your `_bmad/custom/*.toml` overrides (keyed by skill directory name) are untouched.
 
@@ -122,6 +127,8 @@ Unless the user explicitly asked to skip it (e.g. `skills only` / `--no-tool`), 
    ```
 
    `validate` exits non-zero when the project isn't fully ready (e.g. no `sprint-status.yaml` yet, or `bmad-sprint-planning` hasn't run). On a fresh project that is **expected** — report its findings to the user as a readiness checklist, not as an install failure.
+
+   **Namespaced sprint keys:** preserve prefixes such as `L0-epic-2` / `L0-2-1-story` and `L8B-epic-2` / `L8B-2-1-story`. Select one schedule with `validate --namespace L0` and `run --namespace L0 --epic 2`, or set `[stories] namespace = "L0"` in the checkout-local policy. Namespaced specs are routed under `{implementation_artifacts}/<namespace>/`; do not flatten or rename the canonical board.
 
 5. **Point the user at per-role adapter config.** `--cli` in step 3 only registers _hooks_ for each CLI. Which CLI actually **runs** each stage is governed by `{project-root}/.bmad-loop/policy.toml`, written from a template by `init`. The `[adapter] name` (default `claude`) applies to every stage; optional `[adapter.dev]`, `[adapter.review]`, and `[adapter.triage]` tables override individual stages (each takes its own `name` and `extra_args`). So a mixed setup — e.g. `claude` for dev, `codex` for review — needs both the hooks registered (step 3) **and** the role pointed at that CLI in `policy.toml`:
 

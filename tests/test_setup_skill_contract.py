@@ -95,3 +95,9 @@ def test_skill_md_registers_help_at_the_path_v610_reads(skill_md):
 def test_setup_skill_ships_no_scripts(skill_root):
     # all three PEP 723 scripts were retired with #258/#259; nothing left to invoke
     assert not skill_root.joinpath("scripts").is_dir()
+
+
+def test_setup_skill_documents_namespaces_and_checkout_local_hooks(skill_md):
+    assert "--local-hooks --no-skills" in skill_md
+    assert "--namespace L0" in skill_md
+    assert "git rm --cached" in skill_md

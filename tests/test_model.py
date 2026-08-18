@@ -566,3 +566,11 @@ def test_cache_read_weight_defaults_when_limits_not_a_dict():
 def test_cache_read_weight_defaults_when_value_not_a_number():
     state = _state(policy_snapshot={"limits": {"cache_read_weight": "high"}})
     assert state.cache_read_weight() == 0.1
+
+
+def test_story_namespace_round_trips_and_defaults_for_legacy_state():
+    state = _state(story_namespace="L0")
+    assert RunState.from_dict(state.to_dict()).story_namespace == "L0"
+    legacy = state.to_dict()
+    del legacy["story_namespace"]
+    assert RunState.from_dict(legacy).story_namespace == ""

@@ -74,6 +74,10 @@ def test_stories_defaults():
     pol = policy.loads("")
     assert pol.stories.source == "sprint-status"
     assert pol.stories.spec_folder == ""
+    assert pol.stories.namespace == ""
+    import tomllib
+
+    assert tomllib.loads(policy.POLICY_TEMPLATE)["stories"]["namespace"] == ""
 
 
 def test_stories_parse_and_folder():
@@ -681,9 +685,7 @@ def test_scm_defaults_reproduce_today(tmp_path):
 
 def test_scm_worktree_seed_settings(tmp_path):
     p = tmp_path / "policy.toml"
-    p.write_text(
-        "[scm]\nseed_adapter_defaults = false\n" 'worktree_seed = [".mcp.json", ".envrc"]\n'
-    )
+    p.write_text('[scm]\nseed_adapter_defaults = false\nworktree_seed = [".mcp.json", ".envrc"]\n')
     pol = policy.load(p)
     assert pol.scm.seed_adapter_defaults is False
     assert pol.scm.worktree_seed == (".mcp.json", ".envrc")
@@ -892,7 +894,7 @@ def test_deprecated_engine_disabled_when_name_empty(tmp_path):
 def test_explicit_plugin_settings_win_over_folded_engine(tmp_path):
     p = tmp_path / "policy.toml"
     p.write_text(
-        '[engine]\nname = "unity"\nmcp = "ivanmurzak"\n' '[plugins.unity]\nmcp = "coplaydev"\n'
+        '[engine]\nname = "unity"\nmcp = "ivanmurzak"\n[plugins.unity]\nmcp = "coplaydev"\n'
     )
     with pytest.warns(DeprecationWarning):
         pol = policy.load(p)
@@ -1165,3 +1167,10 @@ def test_write_mux_backend_refuses_broken_file(tmp_path):
     with pytest.raises(policy.PolicyError):
         policy.write_mux_backend(p, "tmux")
     assert p.read_text(encoding="utf-8") == "[gates\nmode = "  # never half-writes
+
+
+def test_stories_namespace_parse_and_validate():
+    assert policy.loads('[stories]\nnamespace = "L0"\n').stories.namespace == "L0"
+    assert policy.loads('[stories]\nnamespace = "L8B"\n').stories.namespace == "L8B"
+    with pytest.raises(policy.PolicyError, match="stories.namespace"):
+        policy.loads('[stories]\nnamespace = "L0-extra"\n')

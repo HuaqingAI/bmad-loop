@@ -1041,11 +1041,11 @@ def archive_run(project: Path, run_dir: Path, *, force: bool = False) -> Path:
     # name this docstring implies, and not one any cleanup could be written against.
     tmp = dest.with_name(dest.name + ".tmp")
     # #363: the guard, not a helper — the path is handed to `tarfile.open`, so there
-    # is no payload for `atomic_write_*` to take. Nothing gitignores this directory:
-    # init writes `.bmad-loop/runs/`, `.bmad-loop/cache/`, `.bmad-loop/policy.toml`
-    # and `_bmad/render/`, and `archive/` matches none of them. So a stranded temp
-    # here is an untracked file holding `worktree_clean` False until a human removes
-    # it — the same exposure `decisions._write_store`, `policy.write_mux_backend` and
+    # is no payload for `atomic_write_*` to take. `init` now gitignores archive/, but
+    # the guard remains load-bearing for repos initialized by older versions and for
+    # callers exercising this helper before init: a stranded temp otherwise holds
+    # `worktree_clean` False until a human removes it. This is the same exposure
+    # `decisions._write_store`, `policy.write_mux_backend` and
     # `tui.settings.PolicyDoc.save` had. (Not the sweep's two `decisions.json`
     # writes, which look like the same fix but write under the ignored run dir.)
     try:

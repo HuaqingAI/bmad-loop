@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from conftest import write_sprint
 
 from bmad_loop import sprintstatus
 from bmad_loop.platform_util import atomic_write_bytes as real_atomic_write_bytes
@@ -466,3 +467,24 @@ def test_advance_writes_through_a_symlinked_board(tmp_path):
 
     assert link.is_symlink()  # still a link, not turned into a regular file
     assert sprintstatus.story_status(real, "3-2-digest-delivery") == "in-progress"
+
+
+def test_advance_namespaced_story_lifts_only_its_parent_epic(project):
+    write_sprint(
+        project,
+        {
+            "L0-epic-2": "backlog",
+            "L0-2-1-contracts": "backlog",
+            "L8B-epic-2": "backlog",
+            "L8B-2-1-segments": "backlog",
+        },
+    )
+
+    assert (
+        sprintstatus.advance(project.sprint_status, "L0-2-1-contracts", "in-progress")
+        == "in-progress"
+    )
+    text = project.sprint_status.read_text()
+    assert "L0-epic-2: in-progress" in text
+    assert "L0-2-1-contracts: in-progress" in text
+    assert "L8B-epic-2: backlog" in text

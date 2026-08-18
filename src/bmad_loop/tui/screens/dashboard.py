@@ -437,7 +437,7 @@ class DashboardScreen(Screen[None]):
         # before letting go. If its guards bail (log reset mid-window), the
         # jump stays pending for the next ≤1s tick.
         log.call_after_refresh(
-            lambda: (self._scroll_log_to(finalize=True) if self._pending_jump is jump else None)
+            lambda: self._scroll_log_to(finalize=True) if self._pending_jump is jump else None
         )
 
     def action_unpin_log(self) -> None:
@@ -755,17 +755,23 @@ class DashboardScreen(Screen[None]):
             return
         try:
             snap = _Snapshot(generation=generation)
-            if rescan:
-                snap.runs = data.discover_runs(self.project)
-                snap.project_refreshed = True
-                snap.sprint = data.sprint_overview(self.project)
-                snap.deferred = data.deferred_entries(self.project)
-                snap.missed_decisions = len(data.pending_missed_decisions(self.project))
             if ctx is not None:
                 snap.has_run = True
                 snap.run_id = ctx.run_dir.name
                 snap.state = ctx.watcher.state()
                 snap.status = ctx.watcher.status()
+            if rescan:
+                snap.runs = data.discover_runs(self.project)
+                snap.project_refreshed = True
+                run_namespace = (
+                    snap.state.story_namespace
+                    if snap.state is not None and snap.state.source == "sprint-status"
+                    else None
+                )
+                snap.sprint = data.sprint_overview(self.project, namespace=run_namespace)
+                snap.deferred = data.deferred_entries(self.project)
+                snap.missed_decisions = len(data.pending_missed_decisions(self.project))
+            if ctx is not None:
                 # A graceful stop pending is the control file, meaningful while an
                 # engine is still around to consume it — RUNNING or UNKNOWN (an
                 # unverifiable pid still honors it, matching the CLI's != "dead").

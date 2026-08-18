@@ -98,7 +98,7 @@ _STORIES_ID_RE = re.compile(r"^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$")
 # story *number*, so that is the only token a split can extend. "Ends in a digit"
 # is a weaker test that reads the same shape into a slug — `3-2-v2` would take the
 # arm and refuse `3-2-v2a-followup`, a different and legal key.
-_SPLITTABLE_TOKEN_RE = re.compile(r"^\d+-\d+$")
+_SPLITTABLE_TOKEN_RE = re.compile(r"^(?:[A-Za-z][A-Za-z0-9]*-)?\d+-\d+$")
 # A `gate:` line the strict field pattern above will never see. `GATE_RE` is
 # anchored to a lowercase `gate:` in column 0, exactly like `status:`, and that
 # strictness fails in opposite directions for the two fields: a missed `status:`
@@ -457,7 +457,11 @@ def _matchable_token(token: str) -> bool:
     """
     if not GATE_TOKEN_RE.match(token):
         return False
-    return bool(_STORIES_ID_RE.match(token) or sprintstatus.STORY_RE.match(token))
+    return bool(
+        _STORIES_ID_RE.fullmatch(token)
+        or sprintstatus.STORY_RE.fullmatch(token)
+        or sprintstatus.NAMESPACED_STORY_RE.fullmatch(token)
+    )
 
 
 def gates_story(token: str, story_key: str) -> bool:

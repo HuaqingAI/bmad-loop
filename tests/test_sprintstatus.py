@@ -321,3 +321,66 @@ def test_missing_map_raises(project):
     project.sprint_status.write_text("project: x\n")
     with pytest.raises(sprintstatus.SprintStatusError, match="development_status"):
         sprintstatus.load(project.sprint_status)
+
+
+def test_load_filters_namespaced_keys_case_insensitively(project):
+    write_sprint(
+        project,
+        {
+            "epic-2": "backlog",
+            "2-1-standard": "backlog",
+            "L0-epic-2": "in-progress",
+            "L0-2-1-contracts": "backlog",
+            "L0-2-2-owners": "ready-for-dev",
+            "L0-epic-2-retrospective": "optional",
+            "L0-epic-2-retro-item-1-follow-up": "backlog",
+            "l8b-epic-2": "backlog",
+            "l8b-2-1-segments": "backlog",
+        },
+    )
+
+    l0 = sprintstatus.load(project.sprint_status, namespace="l0")
+
+    assert l0.epics == {2: "in-progress"}
+    assert [story.key for story in l0.stories] == [
+        "L0-2-1-contracts",
+        "L0-2-2-owners",
+    ]
+    assert l0.retros == {2: "optional"}
+    assert [item.key for item in l0.retro_items] == ["L0-epic-2-retro-item-1-follow-up"]
+    assert l0.unknown_keys == ()
+    assert [
+        story.key for story in sprintstatus.load(project.sprint_status, namespace="L8B").stories
+    ] == ["l8b-2-1-segments"]
+
+
+def test_load_without_namespace_keeps_namespaced_keys_unknown(project):
+    write_sprint(
+        project,
+        {"L0-epic-2": "backlog", "L0-2-1-contracts": "backlog"},
+    )
+
+    ss = sprintstatus.load(project.sprint_status)
+
+    assert ss.stories == ()
+    assert ss.unknown_keys == ("L0-epic-2", "L0-2-1-contracts")
+
+
+def test_namespaced_full_key_selector_and_namespace_helpers(project):
+    write_sprint(project, {"L0-epic-2": "backlog", "L0-2-1-contracts": "backlog"})
+    ss = sprintstatus.load(project.sprint_status, namespace="L0")
+
+    assert sprintstatus.normalize_namespace(" L0 ") == "L0"
+    assert sprintstatus.namespace_from_story_key("L0-2-1-contracts") == "L0"
+    assert sprintstatus.namespace_from_story_key("2-1-contracts") is None
+    assert sprintstatus.select_actionable(ss, 2, "L0-2-1-contracts")[0].key == ("L0-2-1-contracts")
+
+    write_sprint(
+        project,
+        {"l8b-epic-2": "backlog", "l8b-2-1-contracts": "backlog"},
+    )
+    l8b = sprintstatus.load(project.sprint_status, namespace="L8B")
+    assert sprintstatus.select_actionable(l8b, 2, "L8B-2-1-contracts")[0].key == "l8b-2-1-contracts"
+
+    with pytest.raises(sprintstatus.SprintStatusError, match="invalid sprint-status namespace"):
+        sprintstatus.normalize_namespace("L0-extra")

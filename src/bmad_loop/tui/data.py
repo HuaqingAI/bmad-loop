@@ -643,9 +643,7 @@ class LogView:
         # their offsets would clamp to line 0 anyway
         # `.dropped` is on the _CountingDeque bmad-loop installs as history.top.
         while (
-            len(self._checkpoints) > 1
-            and self._checkpoints[1][1]
-            <= top.dropped  # pyright: ignore[reportAttributeAccessIssue]
+            len(self._checkpoints) > 1 and self._checkpoints[1][1] <= top.dropped  # pyright: ignore[reportAttributeAccessIssue]
         ):
             self._checkpoints.pop(0)
         return consumed > 0
@@ -800,8 +798,8 @@ def pending_decision(journal_entries: list[dict[str, Any]]) -> tuple[str, str] |
 
 # project root -> (config.yaml sig, ProjectPaths)
 _paths_cache: dict[Path, tuple[_StatSig, bmadconfig.ProjectPaths]] = {}
-# sprint-status.yaml path -> (sig or None for missing, parse or None)
-_sprint_cache: dict[Path, tuple[_StatSig | None, sprintstatus.SprintStatus | None]] = {}
+# (sprint-status.yaml path, normalized namespace) -> cached parse
+_sprint_cache: dict[tuple[Path, str], tuple[_StatSig | None, sprintstatus.SprintStatus | None]] = {}
 # deferred-work.md path -> (sig or None for missing, items or None)
 _deferred_cache: dict[Path, tuple[_StatSig | None, list[DeferredItem] | None]] = {}
 # project root -> (signature, pending decisions) — invalidated when the ledger,
@@ -826,25 +824,42 @@ def _project_paths(project: Path) -> bmadconfig.ProjectPaths | None:
     return paths
 
 
-def sprint_overview(project: Path) -> sprintstatus.SprintStatus | None:
-    """Parsed sprint-status.yaml, or None when unavailable (uninitialized
-    project, missing file, bad YAML). Stat-gated on both config.yaml and the
-    sprint file; the same object is returned while the file is unchanged."""
+def sprint_overview(
+    project: Path, *, namespace: str | None = None
+) -> sprintstatus.SprintStatus | None:
+    """Parsed sprint-status.yaml for one namespace, or None when unavailable.
+
+    ``namespace=None`` follows the project policy; an explicit blank string
+    selects the traditional unprefixed board. A selected run passes its pinned
+    namespace so a policy edit cannot change the visible queue mid-run.
+    """
+    project = resolve_or_lexical(project)
     paths = _project_paths(project)
     if paths is None:
         return None
+    selected = namespace
+    if selected is None:
+        try:
+            selected = policy.load(project / ".bmad-loop" / "policy.toml").stories.namespace
+        except (policy.PolicyError, OSError):
+            selected = ""
+    try:
+        normalized = sprintstatus.normalize_namespace(selected)
+    except sprintstatus.SprintStatusError:
+        return None
     sprint_path = paths.sprint_status
+    cache_key = (sprint_path, (normalized or "").casefold())
     sig = _stat_sig(sprint_path)
-    cached = _sprint_cache.get(sprint_path)
+    cached = _sprint_cache.get(cache_key)
     if cached is not None and cached[0] == sig:
         return cached[1]
     overview: sprintstatus.SprintStatus | None = None
     if sig is not None:
         try:
-            overview = sprintstatus.load(sprint_path)
+            overview = sprintstatus.load(sprint_path, namespace=normalized)
         except (sprintstatus.SprintStatusError, OSError):
             overview = None
-    _sprint_cache[sprint_path] = (sig, overview)
+    _sprint_cache[cache_key] = (sig, overview)
     return overview
 
 

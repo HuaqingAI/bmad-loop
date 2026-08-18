@@ -1579,10 +1579,12 @@ def test_attach_records_return_pane_inside_tmux(project, monkeypatch):
     monkeypatch.setattr(
         launch,
         "attach_plan",
-        lambda proj, rid: planned.append((proj, rid))
-        or (
-            ["tmux", "switch-client", "-t", "=bmad-loop-ctl"],
-            "=bmad-loop-ctl:sweep-RID",
+        lambda proj, rid: (
+            planned.append((proj, rid))
+            or (
+                ["tmux", "switch-client", "-t", "=bmad-loop-ctl"],
+                "=bmad-loop-ctl:sweep-RID",
+            )
         ),
     )
     monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,1,0")
@@ -3259,6 +3261,7 @@ def test_resume_restores_persisted_run_scope(project, monkeypatch):
         paused_stage="escalation",
         epic_filter=9,
         story_filter="9-0",
+        story_namespace="L0",
         max_stories=4,
     )
     captured: dict = {}
@@ -3274,6 +3277,7 @@ def test_resume_restores_persisted_run_scope(project, monkeypatch):
     assert cli._resume_paused_run(project.project, run_dir) == 0
     assert captured["epic_filter"] == 9
     assert captured["story_filter"] == "9-0"
+    assert captured["story_namespace"] == "L0"
     assert captured["max_stories"] == 4
 
 
@@ -4368,17 +4372,38 @@ def _hard_gate_findings(capsys, check="deferred.hard-gate"):
     return [f for f in doc["findings"] if f["check"] == check]
 
 
-def _validate_gated_sprint(project, capsys, board, ledger):
+def _validate_gated_sprint(project, capsys, board, ledger, *, namespace=None):
     """Run validate over a sprint project with `board` on the queue and `ledger`
     (write_gated_ledger's shape) on disk; returns the parsed findings."""
     install_bmad_config(project)
     _write_policy(project.project)
     write_sprint(project, board)
     write_gated_ledger(project, ledger, commit=False)
-    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+    args = argparse.Namespace(
+        project=str(project.project),
+        spec=None,
+        namespace=namespace,
+        json=True,
+    )
 
     cli.cmd_validate(args)  # rc varies by host (binary/skills) — parse the document
     return json.loads(capsys.readouterr().out)["findings"]
+
+
+def test_validate_namespaced_gate_only_sees_selected_schedule(project, capsys):
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {
+            "L0-3-2-invite-link": "ready-for-dev",
+            "L8B-3-2-other-link": "ready-for-dev",
+        },
+        {"DW-1": ("open", ["gate: L0-3-2"])},
+        namespace="L0",
+    )
+    gates = [f for f in findings if f["check"] == "deferred.hard-gate"]
+    assert len(gates) == 1
+    assert gates[0]["detail"]["story_key"] == "L0-3-2-invite-link"
 
 
 def test_validate_fails_when_an_open_entry_gates_an_actionable_story(project, capsys):
@@ -7974,9 +7999,9 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
     # the gate saw the honest bytes and passed
     factory("epic-boundary", started=lambda: signalled.append("started"))
 
-    assert (
-        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
-    ), "the swap must actually have landed on disk, or this test proves nothing"
+    assert profile_mod.get_profile("mycli", project.project).binary == "rogue-cli", (
+        "the swap must actually have landed on disk, or this test proves nothing"
+    )
     assert captured["adapter"].profile.binary == "mycli"
     assert signalled == ["started"]  # #501: the child composed, so the parent may latch
     run_id = captured["state"].run_id
@@ -8053,9 +8078,9 @@ def test_run_pins_the_profile_bytes_it_launches(project, monkeypatch):
 
     assert cli.main(["run", "--project", str(project.project)]) == 0
 
-    assert (
-        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
-    ), "the swap must actually have landed on disk, or this test proves nothing"
+    assert profile_mod.get_profile("mycli", project.project).binary == "rogue-cli", (
+        "the swap must actually have landed on disk, or this test proves nothing"
+    )
     assert captured["adapter"].profile.binary == "mycli"
     run_id = captured["state"].run_id
     assert runs.read_trusted_config_digest(project.project, run_id) == pin
@@ -8113,9 +8138,9 @@ def test_resume_pins_the_profile_bytes_it_launches(project, monkeypatch):
 
     assert cli._resume_paused_run(project.project, run_dir) == 0
 
-    assert (
-        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
-    ), "the swap must actually have landed on disk, or this test proves nothing"
+    assert profile_mod.get_profile("mycli", project.project).binary == "rogue-cli", (
+        "the swap must actually have landed on disk, or this test proves nothing"
+    )
     assert captured["adapter"].profile.binary == "mycli"
     assert runs.read_trusted_config_digest(project.project, run_dir.name) == pin
 
@@ -8251,3 +8276,51 @@ def test_project_degrades_on_a_real_unc_refusal(spelling, monkeypatch, capsys):
     assert str(got) == spelling, "absolute() must hand an already-absolute path back whole"
     assert platform_util.is_wsl_unc_path(got) is True
     assert "cannot canonicalize" in capsys.readouterr().err
+
+
+def test_dry_run_filters_namespaced_epic(project, capsys):
+    write_sprint(
+        project,
+        {
+            "L0-epic-2": "backlog",
+            "L0-2-1-contracts": "backlog",
+            "L0-2-2-owners": "ready-for-dev",
+            "l8b-epic-2": "backlog",
+            "l8b-2-1-segments": "backlog",
+        },
+    )
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(
+        epic=2,
+        story=None,
+        max_stories=None,
+        namespace="L0",
+    )
+
+    assert cli._dry_run(project, pol, args) == 0
+    captured = capsys.readouterr()
+    assert "L0-2-1-contracts" in captured.out
+    assert "L0-2-2-owners" in captured.out
+    assert "l8b-2-1-segments" not in captured.out
+    assert "unparseable sprint-status keys" not in captured.err
+
+
+def test_dry_run_uses_policy_namespace(project, capsys):
+    write_sprint(
+        project,
+        {"L0-epic-2": "backlog", "L0-2-1-contracts": "backlog"},
+    )
+    policy_path = project.project / ".bmad-loop" / "policy.toml"
+    policy_path.parent.mkdir(parents=True, exist_ok=True)
+    policy_path.write_text('[stories]\nnamespace = "L0"\n')
+    pol = policy_mod.load(policy_path)
+    args = argparse.Namespace(
+        epic=2,
+        story=None,
+        max_stories=None,
+        namespace=None,
+    )
+
+    assert cli._dry_run(project, pol, args) == 0
+    assert "L0-2-1-contracts" in capsys.readouterr().out

@@ -453,7 +453,7 @@ class StoryTask:
                 )
             except ValueError as exc:
                 raise ValueError(
-                    f"story {d.get('story_key')!r}: dispatched_spec_snapshot " "is not valid base64"
+                    f"story {d.get('story_key')!r}: dispatched_spec_snapshot is not valid base64"
                 ) from exc
         return cls(
             story_key=d["story_key"],
@@ -563,6 +563,8 @@ class RunState:
     # every epic and can jump out of its scope at the next pick.
     epic_filter: int | None = None
     story_filter: str | None = None
+    # Optional sprint-status key namespace, pinned at launch for safe resume.
+    story_namespace: str = ""
     max_stories: int | None = None
     paused_reason: str | None = None
     paused_stage: str | None = None
@@ -653,6 +655,7 @@ class RunState:
             "current_epic": self.current_epic,
             "epic_filter": self.epic_filter,
             "story_filter": self.story_filter,
+            "story_namespace": self.story_namespace,
             "max_stories": self.max_stories,
             "paused_reason": self.paused_reason,
             "paused_stage": self.paused_stage,
@@ -683,6 +686,7 @@ class RunState:
             current_epic=d.get("current_epic"),
             epic_filter=d.get("epic_filter"),
             story_filter=d.get("story_filter"),
+            story_namespace=str(d.get("story_namespace", "")),
             max_stories=d.get("max_stories"),
             paused_reason=d.get("paused_reason"),
             paused_stage=d.get("paused_stage"),

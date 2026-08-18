@@ -385,6 +385,7 @@ class Engine:
         max_stories: int | None = None,
         epic_filter: int | None = None,
         story_filter: str | None = None,
+        story_namespace: str = "",
         review_adapter: CodingCLIAdapter | None = None,
         sweep_factory: SweepFactory | None = None,
         registry: PluginRegistry | None = None,
@@ -405,6 +406,7 @@ class Engine:
         self.max_stories = max_stories
         self.epic_filter = epic_filter
         self.story_filter = story_filter
+        self.story_namespace = story_namespace or None
         # widen --story interpretation: full key, short ref (3-1/3.1), bare
         # number (+ --epic), or slug fragment. See sprintstatus.StorySelector.
         self._selector = parse_selector(epic_filter, story_filter)
@@ -626,9 +628,7 @@ class Engine:
                 self._stopping = True  # swallow stop signals landing mid-teardown
                 try:
                     kill_session(self.state.run_id)
-                except (
-                    BaseException
-                ):  # nosec B110 - best-effort teardown; the stop must still record
+                except BaseException:  # nosec B110 - best-effort teardown; the stop must still record
                     pass
                 if self._is_nested:
                     raise
@@ -652,9 +652,7 @@ class Engine:
                     pass
                 try:
                     kill_session(self.state.run_id)
-                except (
-                    Exception
-                ):  # nosec B110 - best-effort teardown; a crashing run must still record
+                except Exception:  # nosec B110 - best-effort teardown; a crashing run must still record
                     pass
                 if self._is_nested:
                     raise  # nested auto-sweep: let the owner record the failure
@@ -671,9 +669,7 @@ class Engine:
                         message=message,
                         epic=self.state.current_epic,
                     )
-                except (
-                    Exception
-                ):  # nosec B110 - journal write is best-effort; crash.txt + state flag already persisted
+                except Exception:  # nosec B110 - journal write is best-effort; crash.txt + state flag already persisted
                     pass
             finally:
                 # Any pending stop-request control file that outlived this run
@@ -861,7 +857,7 @@ class Engine:
         sprint-status file returns None rather than derailing a graceful stop.
         StoriesEngine overrides this against the manifest scheduler."""
         try:
-            ss = load_sprint_status(self.paths.sprint_status)
+            ss = load_sprint_status(self.paths.sprint_status, namespace=self.story_namespace)
             return sum(
                 1
                 for s in ss.stories
@@ -1040,7 +1036,7 @@ class Engine:
         raise RunPaused(reason, PAUSE_STORY_GATE, story_key)
 
     def _pick_next(self):
-        ss = load_sprint_status(self.paths.sprint_status)
+        ss = load_sprint_status(self.paths.sprint_status, namespace=self.story_namespace)
         if ss.unknown_keys:
             self.journal.append("sprint-status-unknown-keys", keys=list(ss.unknown_keys))
         base_skip = set(self.state.tasks)  # anything this run already touched
@@ -4452,6 +4448,7 @@ class Engine:
             "BMAD_LOOP_EVENTS_DIR": str(events_dir_for(self.paths.project, self.run_dir.name)),
             "BMAD_LOOP_TASK_ID": task_id,
             "BMAD_LOOP_STORY_KEY": task.story_key,
+            "BMAD_LOOP_STORY_NAMESPACE": self.story_namespace or "",
         }
         # engine-variant env seam: StoriesEngine adds BMAD_LOOP_SPEC_FOLDER so the
         # dev adapter resolves the story spec deterministically by id instead of
@@ -4914,7 +4911,15 @@ class Engine:
                     f"/{self._dev_skill()} Resume the autonomous dev session on the "
                     f"ready-for-dev spec at `{task.spec_file}`."
                 ) + after_sentence
-            return f"/{self._dev_skill()} {task.story_key}" + after_key
+            namespace_note = ""
+            if self.story_namespace:
+                spec_dir = self.workspace.paths.implementation_artifacts / self.story_namespace
+                namespace_note = (
+                    f" Store this namespace's story spec and epic context under "
+                    f"`{spec_dir}`; do not write them into another namespace's "
+                    "artifact directory."
+                )
+            return f"/{self._dev_skill()} {task.story_key}{namespace_note}" + after_key
         self._reset_spec_for_repair(task)
         spec_ref = task.spec_file or task.story_key
         return (
@@ -5510,8 +5515,7 @@ class Engine:
         if not task.preserve_ref:
             return ""
         recover = (
-            f'; recover with `git -C "{self.workspace.root}" '
-            f"merge --ff-only {task.preserve_ref}`"
+            f'; recover with `git -C "{self.workspace.root}" merge --ff-only {task.preserve_ref}`'
         )
         if task.preserve_partial:
             return (

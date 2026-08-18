@@ -25,6 +25,8 @@ RETRO_ITEM_RE = re.compile(r"^epic-(\d+)-retro-item-(\d+)-(.+)$")
 STORY_RE = re.compile(r"^(\d+)-(\d+)([a-z]?)-(.+)$")
 SHORT_REF_RE = re.compile(r"^(\d+)[-.](\d+)([a-z]?)$")  # short story ref: 3-1, 3.1, 3-1a
 BARE_NUM_RE = re.compile(r"^(\d+)([a-z]?)$")  # a lone story number, needs --epic
+NAMESPACE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*$")
+NAMESPACED_STORY_RE = re.compile(r"^([A-Za-z][A-Za-z0-9]*)-(\d+)-(\d+)([a-z]?)-(.+)$")
 
 # Lifecycle order, earliest -> latest. `advance` never moves a story backward
 # through this sequence (matches sync-sprint-status's "never regress"), and it is
@@ -88,7 +90,58 @@ class SprintStatus:
     unknown_keys: tuple[str, ...]
 
 
-def load(path: Path) -> SprintStatus:
+def normalize_namespace(namespace: str | None) -> str | None:
+    """Validate and normalize an optional sprint-status key namespace.
+
+    A namespace is the alphanumeric prefix before the standard BMAD key, for
+    example ``L0`` in ``L0-epic-2`` and ``L0-2-1-story``. Blank values preserve
+    the traditional unprefixed board. Matching is case-insensitive, while the
+    original key spelling is preserved for dispatch and writes.
+    """
+    if namespace is None:
+        return None
+    value = str(namespace).strip()
+    if not value:
+        return None
+    if not NAMESPACE_RE.fullmatch(value):
+        raise SprintStatusError(
+            f"invalid sprint-status namespace {value!r}: expected letters/digits "
+            "starting with a letter (for example L0 or L8B)"
+        )
+    return value
+
+
+def namespace_from_story_key(key: str) -> str | None:
+    """Return a namespaced story key's prefix, or ``None`` for standard keys."""
+    if STORY_RE.fullmatch(key):
+        return None
+    match = NAMESPACED_STORY_RE.fullmatch(key)
+    return match.group(1) if match else None
+
+
+def _story_match(key: str) -> tuple[str | None, re.Match[str]] | None:
+    """Parse either a standard or namespaced full story key."""
+    if match := STORY_RE.fullmatch(key):
+        return None, match
+    if match := NAMESPACED_STORY_RE.fullmatch(key):
+        namespace = match.group(1)
+        standard = STORY_RE.fullmatch(key[len(namespace) + 1 :])
+        if standard is not None:
+            return namespace, standard
+    return None
+
+
+def _key_in_namespace(key: str, namespace: str | None) -> str | None:
+    """Return the standard BMAD tail for ``namespace``, or None when excluded."""
+    if namespace is None:
+        return key
+    prefix = f"{namespace}-"
+    if not key.casefold().startswith(prefix.casefold()):
+        return None
+    return key[len(prefix) :]
+
+
+def load(path: Path, *, namespace: str | None = None) -> SprintStatus:
     if not path.is_file():
         raise SprintStatusError(f"sprint status file not found: {path}")
     try:
@@ -101,6 +154,7 @@ def load(path: Path) -> SprintStatus:
     if not isinstance(dev, dict):
         raise SprintStatusError(f"sprint status missing development_status map: {path}")
 
+    namespace = normalize_namespace(namespace)
     epics: dict[int, str] = {}
     stories: list[Story] = []
     retros: dict[int, str] = {}
@@ -108,8 +162,11 @@ def load(path: Path) -> SprintStatus:
     unknown: list[str] = []
     for key, raw_status in dev.items():
         key = str(key)
+        parse_key = _key_in_namespace(key, namespace)
+        if parse_key is None:
+            continue
         status = str(raw_status).strip()
-        if m := RETRO_ITEM_RE.match(key):
+        if m := RETRO_ITEM_RE.fullmatch(parse_key):
             retro_items.append(
                 RetroItem(
                     key=key,
@@ -119,11 +176,11 @@ def load(path: Path) -> SprintStatus:
                     status=status,
                 )
             )
-        elif m := RETRO_RE.match(key):
+        elif m := RETRO_RE.fullmatch(parse_key):
             retros[int(m.group(1))] = status
-        elif m := EPIC_RE.match(key):
+        elif m := EPIC_RE.fullmatch(parse_key):
             epics[int(m.group(1))] = status
-        elif m := STORY_RE.match(key):
+        elif m := STORY_RE.fullmatch(parse_key):
             status = LEGACY_STORY_STATUSES.get(status, status)
             stories.append(
                 Story(
@@ -167,7 +224,7 @@ def next_actionable(
 
 def story_status(path: Path, key: str) -> str | None:
     """Fresh re-read of one story's status, for post-session verification."""
-    ss = load(path)
+    ss = load(path, namespace=namespace_from_story_key(key))
     for story in ss.stories:
         if story.key == key:
             return story.status
@@ -291,11 +348,13 @@ def advance(path: Path, story_key: str, target: str, *, now: str | None = None) 
     changed = story_changed
 
     if target == "in-progress":
-        m = STORY_RE.match(story_key)
-        if m:
-            epic_key = f"epic-{int(m.group(1))}"
-            ss = load(path)
-            if ss.epics.get(int(m.group(1))) == "backlog":
+        parsed = _story_match(story_key)
+        if parsed:
+            namespace, match = parsed
+            epic = int(match.group(1))
+            epic_key = f"{namespace + '-' if namespace else ''}epic-{epic}"
+            ss = load(path, namespace=namespace)
+            if ss.epics.get(epic) == "backlog":
                 changed = _set_mapping_value(lines, epic_key, "in-progress") or changed
 
     if now is not None:
@@ -334,7 +393,16 @@ class StorySelector:
 
     def matches(self, story: Story) -> bool:
         if self.key is not None:
-            return story.key == self.key
+            if story.key == self.key:
+                return True
+            selected_ns = namespace_from_story_key(self.key)
+            story_ns = namespace_from_story_key(story.key)
+            if selected_ns is None or story_ns is None:
+                return False
+            return (
+                selected_ns.casefold() == story_ns.casefold()
+                and self.key[len(selected_ns) + 1 :] == story.key[len(story_ns) + 1 :]
+            )
         if self.epic is not None and story.epic != self.epic:
             return False
         if self.num is not None and story.num != self.num:
@@ -362,15 +430,19 @@ def parse_selector(epic: int | None, story: str | None) -> StorySelector:
             )
 
     # empty suffix group -> None: a plain `2-6` matches the whole split family
-    if m := STORY_RE.match(text):  # full key 3-1-slug
+    if m := NAMESPACED_STORY_RE.fullmatch(text):  # full key L0-3-1-slug
+        e, n = int(m.group(2)), int(m.group(3))
+        _check_epic(e)
+        return StorySelector(epic=e, num=n, key=text, suffix=m.group(4) or None)
+    if m := STORY_RE.fullmatch(text):  # full key 3-1-slug
         e, n = int(m.group(1)), int(m.group(2))
         _check_epic(e)
         return StorySelector(epic=e, num=n, key=text, suffix=m.group(3) or None)
-    if m := SHORT_REF_RE.match(text):  # 3-1 / 3.1 / 3-1a
+    if m := SHORT_REF_RE.fullmatch(text):  # 3-1 / 3.1 / 3-1a
         e, n = int(m.group(1)), int(m.group(2))
         _check_epic(e)
         return StorySelector(epic=e, num=n, suffix=m.group(3) or None)
-    if m := BARE_NUM_RE.match(text):  # bare story number, needs --epic
+    if m := BARE_NUM_RE.fullmatch(text):  # bare story number, needs --epic
         if epic is None:
             raise SprintStatusError(
                 f"ambiguous story '{text}': use --epic E --story {text}, or E-{text}"
@@ -399,6 +471,6 @@ def select_actionable(ss: SprintStatus, epic: int | None, story: str | None) -> 
     if sel.is_targeted and matches and not actionable:
         s = matches[0]
         raise SprintStatusError(
-            f"story {story} matched {s.key} but its status is " f"'{s.status}' (not actionable)"
+            f"story {story} matched {s.key} but its status is '{s.status}' (not actionable)"
         )
     return actionable

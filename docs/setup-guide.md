@@ -196,6 +196,19 @@ Any CLI named in `policy.toml` must also have been registered with `--cli`. To a
 re-run `bmad-loop init --cli <name>`. If you only use a single CLI, leave `policy.toml`
 untouched — the default is correct.
 
+For team repositories, initialize hooks in each clone or separately managed checkout instead of
+committing the generated hook files:
+
+```bash
+bmad-loop init --project <project-root> --cli codex --local-hooks --no-skills
+```
+
+`--local-hooks` preserves and merges each CLI's existing JSON settings, then gitignores the
+selected hook configs because non-Claude dialects embed the checkout's absolute relay path and
+any dialect may share that file with personal permissions, MCP settings, or environment. If a
+generated path is already tracked, `init` prints the one-time `git rm --cached <path>` command
+but never changes the Git index itself.
+
 ## Installing the tool and TUI
 
 The `[tui]` extra pulls in the Textual dashboard (`textual` + `tomlkit` + `pyte`) so
@@ -245,6 +258,9 @@ bmad-loop init --project <project-root> --cli claude
 
 # multiple, e.g. claude + codex + gemini
 bmad-loop init --project <project-root> --cli claude --cli codex --cli gemini
+
+# lightweight initialization for a clone whose skills are already installed
+bmad-loop init --project <project-root> --cli codex --local-hooks --no-skills
 ```
 
 Run with no `--cli` and `init` registers hooks for every CLI the `policy.toml` references,
@@ -398,10 +414,12 @@ entries to strip; leave every other hook in place.
 
 ### 5. Drop the gitignore lines
 
-`init` appended `.bmad-loop/runs/`, `.bmad-loop/cache/`, and `.bmad-loop/policy.toml` to
-`.gitignore`. Remove those three lines (skip any your project relies on for other reasons). If
-you had run `git rm --cached .bmad-loop/policy.toml` to stop sharing the per-machine policy, the
-file is untracked — re-add it (`git add .bmad-loop/policy.toml`) only if you want it back in version control.
+`init` appends its generated-state rules to `.gitignore`: `.bmad-loop/runs/`,
+`.bmad-loop/archive/`, `.bmad-loop/cache/`, `.bmad-loop/policy.toml`, the copied relay,
+Python cache, renderer output, and no-spec fallback result artifacts. Remove the rules your
+project does not otherwise rely on. With `--local-hooks`, also remove the selected CLI hook-config
+rules. If you previously ran `git rm --cached` for any checkout-local path, re-add it only if you
+deliberately want that generated or personal configuration back in version control.
 
 ### 6. Remove the BMAD module (BMAD-installer projects only)
 

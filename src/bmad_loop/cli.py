@@ -348,15 +348,16 @@ def cmd_validate(args: argparse.Namespace) -> int:
     dev_trees = _skill_trees(project, pol) if pol is not None else []
 
     stories_on, spec_folder = _stories_mode(args, pol)
+    story_namespace = "" if stories_on else _story_namespace(args, pol)
     if paths:
         if stories_on:
             _validate_stories_queue(project, paths, spec_folder, dev_trees, report)
             _validate_deferred_ledger(paths, report, spec_folder=spec_folder)
         else:
-            _validate_deferred_ledger(paths, report)
-            _validate_operator_registry(project, paths, report)
+            _validate_deferred_ledger(paths, report, namespace=story_namespace)
+            _validate_operator_registry(project, paths, report, namespace=story_namespace)
             try:
-                ss = sprintstatus.load(paths.sprint_status)
+                ss = sprintstatus.load(paths.sprint_status, namespace=story_namespace)
                 actionable = [s for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
                 report.ok(
                     "queue.sprint-status",
@@ -409,8 +410,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
         channel = (
             "the ATTENTION file in the run directory is the only alert channel left"
             if pol.notify.file
-            else "notify.file is also off, so no alert channel is configured — "
-            "enable notify.file"
+            else "notify.file is also off, so no alert channel is configured — enable notify.file"
         )
         report.warn(
             "notify.desktop-unavailable",
@@ -1041,6 +1041,20 @@ def _require_base_skills(project: Path, pol, *, require_stories: bool = False) -
     return True
 
 
+def _namespace_arg(value: str) -> str:
+    try:
+        return sprintstatus.normalize_namespace(value) or ""
+    except sprintstatus.SprintStatusError as e:
+        raise argparse.ArgumentTypeError(str(e)) from e
+
+
+def _story_namespace(args: argparse.Namespace, pol) -> str:
+    """Resolve a command override over the project policy namespace."""
+    explicit = getattr(args, "namespace", None)
+    configured = pol.stories.namespace if pol is not None else ""
+    return sprintstatus.normalize_namespace(explicit if explicit is not None else configured) or ""
+
+
 def _stories_mode(args: argparse.Namespace, pol) -> tuple[bool, str]:
     """Resolve whether this run is stories mode and its spec folder.
 
@@ -1146,7 +1160,11 @@ def _spec_closes_deferred(path: Path) -> tuple[tuple[str, ...], str | None]:
 
 
 def _validate_operator_registry(
-    project: Path, paths: bmadconfig.ProjectPaths, report: ValidationReport
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    report: ValidationReport,
+    *,
+    namespace: str = "",
 ) -> None:
     """Report drift between the park records and the committed state they point
     at (#335, #356).
@@ -1218,7 +1236,7 @@ def _validate_operator_registry(
                 {"story_key": story.story_key, "drift": drift},
             )
     try:
-        ss = sprintstatus.load(paths.sprint_status)
+        ss = sprintstatus.load(paths.sprint_status, namespace=namespace)
     except (sprintstatus.SprintStatusError, OSError, UnicodeDecodeError):
         return  # the queue gate below owns board readability — don't double-report
     indexed = {story.story_key for story in parked}
@@ -1247,6 +1265,7 @@ def _validate_deferred_ledger(
     report: ValidationReport,
     *,
     spec_folder: str | None = None,
+    namespace: str = "",
 ) -> None:
     """Read the deferred-work ledger once, then run every check that needs it.
 
@@ -1294,7 +1313,7 @@ def _validate_deferred_ledger(
             {"ledger": str(ledger), "error": str(e)},
         )
         return
-    _validate_hard_gates(paths, text, report, spec_folder=spec_folder)
+    _validate_hard_gates(paths, text, report, spec_folder=spec_folder, namespace=namespace)
     _validate_closes_deferred(paths, text, report, spec_folder=spec_folder)
 
 
@@ -1304,6 +1323,7 @@ def _validate_hard_gates(
     report: ValidationReport,
     *,
     spec_folder: str | None = None,
+    namespace: str = "",
 ) -> None:
     """FAIL when the queue would dispatch a story an unlanded ledger entry gates.
 
@@ -1347,7 +1367,7 @@ def _validate_hard_gates(
     # test so a project that gates nothing pays neither the walk nor its failure modes.
     if not any(entry_gates.tokens for _, entry_gates in declared):
         return
-    story_keys = _actionable_story_keys(paths, spec_folder)
+    story_keys = _actionable_story_keys(paths, spec_folder, namespace=namespace)
     if story_keys is None:
         # The queue could not be read, so nothing was compared. `queue.sprint-status`
         # and `queue.stories-manifest` already fail for it; adding an `ok` here would
@@ -1470,7 +1490,10 @@ def _report_unstructured_gate(
 
 
 def _actionable_story_keys(
-    paths: bmadconfig.ProjectPaths, spec_folder: str | None
+    paths: bmadconfig.ProjectPaths,
+    spec_folder: str | None,
+    *,
+    namespace: str = "",
 ) -> list[str] | None:
     """The story keys this queue could dispatch, in queue order, in either mode.
 
@@ -1520,7 +1543,7 @@ def _actionable_story_keys(
             return None
         return keys
     try:
-        ss = sprintstatus.load(paths.sprint_status)
+        ss = sprintstatus.load(paths.sprint_status, namespace=namespace)
     except (sprintstatus.SprintStatusError, OSError, UnicodeDecodeError):
         return None
     return [s.key for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
@@ -1664,6 +1687,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     paths = bmadconfig.load_paths(project)
     pol = policy_mod.load(_policy_path(project))
     stories_on, spec_folder = _stories_mode(args, pol)
+    story_namespace = "" if stories_on else _story_namespace(args, pol)
+
+    if stories_on and getattr(args, "namespace", None) is not None:
+        print(
+            "note: --namespace is ignored in stories mode; the spec folder is already isolated",
+            file=sys.stderr,
+        )
 
     if stories_on and args.epic is not None:
         # stories mode dispatches the manifest's single flat schedule; StoriesEngine
@@ -1693,7 +1723,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             return 1
     else:
         try:
-            ss = sprintstatus.load(paths.sprint_status)
+            ss = sprintstatus.load(paths.sprint_status, namespace=story_namespace)
             _warn_unknown_keys(ss)
             sprintstatus.select_actionable(ss, args.epic, args.story)
         except sprintstatus.SprintStatusError as e:
@@ -1733,6 +1763,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         run_id=args.run_id,
         epic_filter=args.epic,
         story_filter=args.story,
+        story_namespace=story_namespace,
         max_stories=args.max_stories,
         stories_on=stories_on,
         spec_folder=spec_folder,
@@ -1809,7 +1840,8 @@ def _dry_run(
     def render(role: str, prompt: str) -> str:
         return _render_invocation(pol, paths.project, role, prompt)
 
-    ss = sprintstatus.load(paths.sprint_status)
+    story_namespace = _story_namespace(args, pol)
+    ss = sprintstatus.load(paths.sprint_status, namespace=story_namespace)
     _warn_unknown_keys(ss)
     try:
         queue = sprintstatus.select_actionable(ss, args.epic, args.story)
@@ -3014,7 +3046,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     else:
         try:
             paths = bmadconfig.load_paths(project)
-            ss = sprintstatus.load(paths.sprint_status)
+            ss = sprintstatus.load(paths.sprint_status, namespace=state.story_namespace)
             remaining = [s.key for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
             print(f"sprint backlog remaining: {len(remaining)}")
         except (bmadconfig.BmadConfigError, sprintstatus.SprintStatusError):
@@ -3765,7 +3797,13 @@ def cmd_init(args: argparse.Namespace) -> int:
         # missing policy file yields defaults -> ("claude",)
         pol = policy_mod.load(_policy_path(project))
         clis = tuple(dict.fromkeys(pol.adapter.resolved(role).name for role in ROLES))
-    return install_into(project, clis=clis, skills=args.skills, force_skills=args.force_skills)
+    return install_into(
+        project,
+        clis=clis,
+        skills=args.skills,
+        force_skills=args.force_skills,
+        local_hooks=getattr(args, "local_hooks", False),
+    )
 
 
 def cmd_relay(args: argparse.Namespace) -> int:
@@ -3839,7 +3877,18 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="overwrite bmad-loop-* skill dirs that already exist (default: skip them)",
     )
+    init_p.add_argument(
+        "--local-hooks",
+        action="store_true",
+        help="treat selected CLI hook configs as checkout-local and gitignore them; "
+        "use with --no-skills for lightweight per-clone initialization",
+    )
     validate_p = add("validate", cmd_validate, "preflight checks; exit non-zero on failure")
+    validate_p.add_argument(
+        "--namespace",
+        type=_namespace_arg,
+        help="sprint-status key prefix such as L0 or L8B (overrides [stories].namespace)",
+    )
     validate_p.add_argument(
         "--spec",
         metavar="FOLDER",
@@ -3921,6 +3970,11 @@ def main(argv: list[str] | None = None) -> int:
         "folder+id (overrides [stories].source)",
     )
     run_p.add_argument("--epic", type=int, help="only stories from this epic (sprint mode)")
+    run_p.add_argument(
+        "--namespace",
+        type=_namespace_arg,
+        help="sprint-status key prefix such as L0 or L8B (overrides [stories].namespace)",
+    )
     run_p.add_argument(
         "--story",
         help="story: E-S / E.S (split suffix ok, e.g. 2-6a), a slug fragment, "

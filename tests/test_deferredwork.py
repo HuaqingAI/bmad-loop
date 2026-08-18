@@ -2248,6 +2248,9 @@ def test_a_tail_below_an_indented_heading_reaches_the_legacy_parser():
     [
         ("3-2", "3-2", True),  # stories-mode id: the token IS the key
         ("3-2", "3-2-invite-link-student-surface", True),  # sprint key: `-` prefix
+        ("L0-3-2", "L0-3-2-invite-link", True),  # namespaced sprint key
+        ("L0-3-2", "L8B-3-2-invite-link", False),  # namespace boundary
+        ("L0-3-2", "L0-3-2a-split-half", True),  # namespaced split story
         ("3-2", "3-20-later-story", False),  # the boundary the `-` buys
         # A split story is still the gated story. STORY_RE lets breakdown turn an
         # oversized 3-2 into 3-2a/3-2b, and a token that only knew `-` would lose

@@ -780,6 +780,7 @@ def build_run_state(
     stories_on: bool,
     spec_folder: str,
     trusted_config_digest: str,
+    story_namespace: str = "",
 ) -> RunState:
     """Assemble the launch-time :class:`RunState` for a fresh run.
 
@@ -799,6 +800,7 @@ def build_run_state(
         policy_snapshot=policy.to_dict(),
         epic_filter=epic_filter,
         story_filter=story_filter,
+        story_namespace=story_namespace if not stories_on else "",
         max_stories=max_stories,
         source="stories" if stories_on else "sprint-status",
         spec_folder=spec_folder if stories_on else "",
@@ -967,6 +969,7 @@ def compose_run(
     stories_engine_cls: type[StoriesEngine],
     trusted_config_digest: str,
     profiles: dict[str, CLIProfile] | None = None,
+    story_namespace: str = "",
 ) -> ComposedRun:
     """Stand up a run: allocate the run dir, persist state + pid, build the
     adapters, and wire the engine — everything ``cmd_run`` did inline between its
@@ -1016,6 +1019,7 @@ def compose_run(
             stories_on=stories_on,
             spec_folder=spec_folder,
             trusted_config_digest=trusted_config_digest,
+            story_namespace=story_namespace,
         )
         save_state(run_dir, state)
         # After the run dir exists (Journal mkdir'd it above) and before the pid lands:
@@ -1042,6 +1046,7 @@ def compose_run(
             max_stories=max_stories,
             epic_filter=epic_filter,
             story_filter=story_filter,
+            story_namespace=state.story_namespace,
             sweep_factory=sweep_factory,
         )
         # heterogeneous **kwargs: pyright unions the dict values; per-arg error is spurious
@@ -1268,6 +1273,7 @@ def compose_resume(
             # picking within N instead of silently widening to every epic.
             epic_filter=state.epic_filter,
             story_filter=state.story_filter,
+            story_namespace=state.story_namespace,
             max_stories=state.max_stories,
             sweep_factory=sweep_factory,
         )
