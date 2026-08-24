@@ -46,8 +46,8 @@ if TYPE_CHECKING:
     from .checks import ValidationReport
     from .model import RunState
     from .operatoractions import ParkedStory
+    from .runs import RunInfo
     from .sweep import Decision
-    from .tui.data import RunInfo
 
 
 VALIDATE_SCHEMA_VERSION = 1
@@ -243,9 +243,11 @@ def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> 
     derived from state.json alone — never from live policy or other project
     files — so a consumer can reproduce the document, and the weight matches
     what the run actually enforced (see run_token_totals). The one exception is
-    ``graceful_stop_pending``: liveness plus the presence of the control file is
-    not in state.json, so the caller supplies it (default False keeps the
-    builder a pure projection); ``status`` itself is unaffected.
+    ``graceful_stop_pending``: liveness plus a *graceful*-mode stop-request
+    control file is not in state.json, so the caller supplies it (default False
+    keeps the builder a pure projection); ``status`` itself is unaffected. The
+    mode read is exact — a lodged hard request (#319) is a stop in flight, not a
+    graceful stop pending, and reports False here.
 
     Two adapter-identity keys (#153 phase 3), both derived from the snapshot and
     the recorded sessions — never live policy — and deliberately named apart:
@@ -474,7 +476,7 @@ def clean_document(
     this number, and formatting is the renderer's job. It is the same estimate
     the text prints: measured before mutating (so it holds under --dry-run) and
     approximate by construction, since it sums whole run dirs for archive/delete
-    but only the `worktrees/` tree for a trim.
+    but only the trimmed scaffolding (`runs.heavy_run_entries`) for a trim.
 
     Every list names items the text enumerates or counts: `worktrees` holds
     absolute worktree paths, the rest hold run ids. `protected` is the runs left

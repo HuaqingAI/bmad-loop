@@ -7,9 +7,305 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.11.1] — 2026-08-23
+
 ### Added
 - Support namespaced sprint boards such as `L0-epic-1` / `L0-1-1-story`, including namespace-pinned resume, TUI filtering, hard gates, and namespaced spec discovery.
 - Add `bmad-loop init --local-hooks` for checkout-local hook configs and lightweight per-clone initialization.
+
+- **git 2.34 or newer is now a declared prerequisite**, and the first one the orchestrator
+  enforces. Set to keep Ubuntu 22.04 LTS (stock git 2.34) supported; Ubuntu 20.04 (2.25) and
+  Debian 11 (2.30) fall below it. This is a support floor, not a capability one — nothing
+  bmad-loop runs needs 2.34 — so the project can stop carrying workarounds for untested git.
+  - `bmad-loop validate` checks it, as `git.version`.
+  - `bmad-loop diagnose` records the host's git version in its Environment block.
+
+### Changed
+
+- **`run`, `sweep` and `resume` refuse to start below git 2.34, and `validate` now exits 1
+  there** — a change of exit code on an under-floor host. A git that cannot be run, times out,
+  or answers unparseably is refused the same way. `--dry-run` names the refusal in its
+  "NOT runnable" banner instead of previewing a run that cannot start, and the TUI's
+  pre-launch guard toasts it instead of opening a pane that dies.
+- **The git-add shield's version gate moves from 2.20 to the project floor.** It now refuses as
+  an unsupported-version policy rather than claiming a missing capability, which would be false
+  at 2.34 — git 2.25 has everything the shield uses.
+- **The git-add shield's activation check has git name the winning scope (#692).** The shield
+  already refused to trust a `core.excludesFile` write it could not confirm git reads; the
+  degrade reason now says _which_ configuration scope won, from the same single probe
+  (`git config --show-scope`, git 2.26 — inside the 2.34 floor, which is what unblocked it):
+  an ambient command-scope override (`git -c`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`)
+  now reads differently from a worktree write git does not see at all, which is a different
+  repair. An rc-0 answer that names no scope is a new fail-closed degrade rather than a
+  mismatch mislabelled. The decision is unchanged — a byte-identical answer still activates
+  whatever scope supplied it, every unconfirmed answer still degrades, and the repo-format
+  flag is still rolled back.
+- **A hard stop rides `stop-request.json` with `mode: "hard"` (#319).** It is lodged before the
+  engine is signalled — the atomic write also supersedes a pending graceful request — and honored
+  at item boundaries and mid-session, where both real adapter wait loops poll it twice per iteration,
+  which normally lands well inside the 10s grace window. An iteration blocked on a transport call
+  or waiting for an artifact can exceed it, and the stop then degrades to the force-kill backstop —
+  the pre-#319 outcome, never a worse one. SIGTERM is now the POSIX fast path rather than the mechanism, so a hard stop
+  lands on every platform and multiplexer backend, and reaches a nested auto-sweep through the
+  owning run's channel — hard-only; `stop <child-id>` is unchanged. A run directory that rejects
+  the write degrades to the signal path with the stop still delivered.
+- **`status --json`'s `graceful_stop_pending` is now mode-exact (#319)** — it reports only
+  genuinely graceful requests. A modeless pre-#319 request body still reads graceful.
+- **`stop --graceful` and the TUI report an already-pending request without calling it graceful
+  (#319).** The request standing on disk may be a hard one — `stop` leaves one lodged when it
+  could not prove the engine dead — and the idempotency answer is deliberately mode-blind.
+
+### Removed
+
+- **`verify.same_commit` is gone — nothing called it.** #645's `_canonical_commit_oid` displaced
+  its last call site and compares canonical full object ids exactly. The helper's leftover
+  prefix-tolerant equality — either argument a prefix of the other once both reach 7 characters —
+  would have handed that looseness to whichever caller reached for it next.
+
+### Fixed
+
+- Escape gitignore pattern syntax (wildmatch specials, trailing spaces) when rendering
+  worktree shield patterns, so a seed path carrying such syntax is shielded and its broken
+  pattern can no longer hide an unrelated file (#476)
+- Tokenize settled exclude lines the way git does (`\n`-split, one trailing `\r` trimmed), so
+  an operator line carrying a lone `\r` can no longer make the shield writer skip a needed
+  pattern (#472)
+- Stop shielding a tracked tool directory whole: its pattern is replaced by per-file patterns
+  for the untracked files provisioning wrote, so its tracked children no longer read as ignored
+  to repo-hygiene gates. A file the session itself creates under such a directory can now be
+  staged; an untracked tool directory keeps its ambient pattern unchanged (#484)
+- **A queued release publish can no longer be evicted by a newer push (#468)** — the
+  repo-wide `release-publish` concurrency group now sets `queue: max`; the default
+  single-slot queue cancels an older _pending_ run when a newer one queues, so a
+  maintenance-branch publish could be silently discarded by an unrelated `main` push.
+  Also pins `cmd_publish`'s `check=False` with a regression test (the lost-race swallow
+  was one revert away from dead code with the suite still green) and corrects a comment
+  that still described the group as keying on `github.ref`.
+- TUI: story-gate and epic-boundary pauses open a pause-reason viewer naming the blocking
+  entries and the remedy, instead of an empty spec pane (#515)
+- **Provisioning refuses an unparseable seeded hook config instead of silently replacing it
+  (#592).** An isolated worktree's seeded `.claude/settings.json` that failed to parse was read
+  as an empty document, so the relay merge always ran against a blank baseline and published a
+  hooks-only file — the operator's permission allowlist, `env` and MCP entries gone, with no
+  message and no backup. #590 made that write atomic; the parse still substituted `{}`, and
+  that swallow is what this closes. Provisioning now raises, escalating the story as CRITICAL
+  and pausing the run with the bytes untouched — the policy `init` has always applied to an
+  unparseable config. The refusal names whichever source actually supplied the bytes — read from
+  the seed bookkeeping, which now records each path copied rather than each entry attempted, so a
+  config carried in as a child of a seeded directory is told apart from one merely sitting beside
+  a seeded sibling. Invalid UTF-8 joins the same lane, having previously crashed the engine
+  rather than escalating.
+- **Native Windows: `bmad-loop stop` no longer burns the full 10s grace window into a blind
+  `taskkill /F` (#319).** An inter-process SIGTERM is never delivered to a native-Windows engine,
+  so every stop completed through the external fallback with no engine teardown at all. The engine
+  honors the stop request itself now, so it is the single writer of `stopped` again and
+  `run-stop fallback=True` is no longer stamped on a stop the engine recorded itself — it marks
+  one this tool had to complete from outside.
+- **`bmad-loop stop` no longer reports success when it delivered neither channel (#319).** A run
+  directory that rejects the request write, followed by a signal the OS refuses, left the CLI
+  saying the run had stopped — and stamping `run-stop fallback=True` — over an engine that may
+  still be running with nothing on disk to stop it. It now kills the agent session as a backstop,
+  records the undelivered attempt, and exits non-zero naming the retry.
+- **Two concurrent `stop` invocations against one run no longer collide on a staging temp (#319).**
+  The write staged through a fixed `stop-request.json.tmp`, so the loser's rename raised
+  `FileNotFoundError`. It now stages under a per-writer name: the last write wins and neither
+  caller errors.
+- **`resume` no longer re-arms a run whose stale stop request it could not remove (#319).** It read
+  "could not remove it" as "nothing was pending", wrote the pid, and stopped again at the first
+  item boundary with nothing printed to say why. Resume now refuses before the pid lands and names
+  the file, without re-stamping the host-exec integrity pin for a run it never started.
+  `stop --cancel-graceful` likewise stops reporting "no stop request pending" for a request still
+  on disk and still honorable — same exit code, accurate message.
+- **A `stop` that never proved the engine dead keeps its request lodged (#319).** A `terminate` or
+  `force_kill` refused with `PermissionError`, or a `taskkill /F /T` that failed silently,
+  discarded the hard request while reporting the run stopped — throwing away the only channel left
+  to stop a live engine. Death is now distinguished from refusal, so the stop stays genuinely in
+  flight.
+- **A hard stop arriving as the last item finishes stops the run instead of reporting it completed
+  (#319).** Covers `max-stories-reached` too; a graceful request at an exhausted queue still
+  finishes truthfully.
+- **`stop --graceful` no longer downgrades a hard request that landed while it ran (#319).** The
+  graceful lodge is now an atomic `O_CREAT | O_EXCL` create that answers "already pending" for
+  anything already there, and a symlink planted at the path is refused rather than followed. Two
+  concurrent graceful asks resolve the same way, which is the documented idempotency. A write that
+  fails part-way leaves the request standing instead of rolling back — an unlink there resolves the
+  path, not the file the call created, so it could remove a hard request escalated onto it — and
+  `stop --graceful` reports it as possibly pending rather than as a clean failure.
+- **A policy field of the wrong TOML type now raises `PolicyError` naming `section.key`
+  (#440).** `loads()` coerced with bare `int()`/`float()`/`bool()`/`str()` outside the
+  `PolicyError` funnel, so a wrong-typed value escaped every handler written to degrade on
+  one: `_configure_mux` runs before dispatch on _every_ command, so one bad character in
+  `.bmad-loop/policy.toml` traced back at you; the TUI died at construction instead of
+  falling back to defaults; and `validate --json` exited before printing the document its
+  one-object contract promises, which now carries the fault as an ordinary `policy` finding.
+  Two of these never announced themselves at all: `notify.desktop = "false"` is a truthy
+  string, so it turned the feature **on** (the hazard #278 recorded), and
+  `verify.commands = "pytest"` exploded into six one-character commands that read back as
+  applied configuration. Extends #587's `[limits]` sweep to every remaining section, with
+  `[limits]`' own messages unchanged; allowlisted fields blame the type first. Valid policies
+  parse identically — an unset `extra_args` still means "inherit the profile's flags" where
+  `[]` means "none".
+- **An undecodable or unreadable profile overlay or plugin manifest is a typed error naming
+  the file, not a traceback (#473, #689).** `load_profiles` and the plugin loader read each
+  `*.toml` outside the funnel that converts parse faults, so a non-UTF-8 file escaped as a
+  raw `UnicodeDecodeError` past consumers that all key on the domain error: `validate --json`
+  printed a bare `error:` line and empty stdout instead of an `adapter.profile` finding,
+  `get_profile` carried it into run/sweep preflight, and a bad project `plugin.toml` took the
+  settings screen down at construction. Both loaders now raise `ProfileError`/`PluginError`
+  naming the path, on both arms — a file present but unreadable (permissions, a dead mount)
+  was leaking a bare `OSError` on the same route. The packaged built-ins read through the
+  same guard: a corrupt install is a packaging bug and should say so.
+- **Merge-back failures are classified from the measured tree state, and the catch-all stopped
+  inventing a conflict (#619).** A merge that died part-way through its checkout — all three
+  strategies, `--ff-only` included — now raises `MergeHalfAppliedError` instead of "refused
+  before starting": untracked residue is named for you to clear, and a tracked rewrite is
+  restored automatically by `git checkout HEAD --` over exactly the affected paths.
+  Attribution is per path — before/after deltas intersected with the branch's incoming set —
+  so neither your pre-existing dirt nor an edit you make outside that incoming set while the
+  merge is failing is ever called git's: the repo-wide dirtiness reading this replaces
+  classified that concurrent-edit scene "failed part-way through checkout" and its repo-wide
+  `reset --hard HEAD` destroyed the edit. (An edit racing the very paths the merge is
+  rewriting is indistinguishable from git's write and is restored with them — the stated
+  ceiling.) A post-merge probe that itself fails — the
+  residue probes, the unmerged-stages reading, or the MERGE_HEAD reading — no longer bypasses the
+  merge cleanup or impersonates a verdict: cleanup not gated on the dead reading still runs, the
+  failure raises `MergeResidueUnreadError` (checkout state unverified, run `git status`), and an
+  unread MERGE_HEAD skips the abort it gates and says so. The squash **replay** reading gets the
+  same honesty on the far side of success: unreadable, it used to answer "dirty", and the doomed
+  `git commit` that followed dressed the probe failure as a commit refusal with a
+  `reset --hard HEAD` riding on it — now nothing is committed, nothing is reset, and the
+  escalation names the dead reading. A refused
+  **squash commit** now raises `MergeCommitRefusedError` like the `--no-ff` leg — the squash leg
+  seals its result with its own `git commit`, where commit hooks and signing do run — rolled back
+  by `git reset --hard HEAD` gated on the pre-merge reading having found the tree clean (a dirty
+  checkout is never reset; the
+  escalation then names the staged result and clearing it as your first step). A content conflict
+  is typed too (`MergeConflictError`), so anything unclassified escalates saying just that — run
+  `git status`, git's text names the cause — instead of "resolve the conflict by hand".
+- **psmux: a hand-back that succeeded no longer reports as failed — or undoes itself (#659).**
+  `switch_client` read its verdict off the session's attached-client count, which a same-session
+  move cannot change — and same-session is the common shape for the return path, so a correct
+  hand-back answered "failed". With the last-client fallback enabled (how
+  `return_attached_client` always calls it) that verdict then fired `switch-client -l`, relocating
+  the operator to an unrelated session; the relocation supplied the count change the correct move
+  could not, so the call reported success and cleared its return option. The `-t` verb now takes
+  its exit code as the verdict, gated on a client having been attached, and the fallback fires
+  only when that verb failed.
+- **A sweep whose client has dropped no longer keeps prompting the empty window (#659).** On tmux,
+  `switch-client` spends one nonzero exit on both "that target is unreachable" and "there is no
+  client here at all", so a failed hand-back read as "the human is still in front of me" either
+  way; the session's attached-client count now separates them. `TerminalMultiplexer.switch_client`
+  answers a third value, `None`, for any move it cannot vouch for — that state, a timed-out verb,
+  and on psmux an unreadable gate count — which `return_attached_client` routes to `UNREACHABLE`:
+  the return option survives, but the sweep goes unattended instead of blocking a later `--repeat`
+  cycle on `input()`. `False` now carries the joint claim its caller always read it as. Out-of-tree
+  backends answering a plain bool still work; `detach_client` is unchanged.
+- **A psmux probe now answers for the calling pane, not the focused window (#669).** A target-less
+  `display-message -p` resolves the server's _active_ window, so `current_window_id`,
+  `current_pane_id`, `current_session` and `current_return_target` answered for a foreign window
+  whenever the caller's own window was not the focused one — the ctl prune could kill the window it
+  was running in, and the attach return could record a pane the human never came from. The probes
+  now pin to the calling pane via `TMUX_PANE`, and answer `None` without spawning when that value
+  is absent or not pane-shaped.
+- **An unresolvable restore-patch or spec-folder path is now a named refusal, not a bare
+  `[Errno ...]` (#560).** `_resolve_restore_patch` (`cli --restore-patch`) and
+  `relativize_spec_folder` (`--spec`, `[stories] source`) each called `.resolve()` outside the
+  exception type their handler caught, so a host that cannot canonicalize the path — a dead UNC
+  provider (`WinError 64`), a symlink loop on the 3.11/3.12 floor — escaped by a route neither
+  describes. Both now refuse by name and point at `bmad-loop validate`: the restore patch returns
+  its sibling rejected-latch shape, the spec folder raises `stories.StoriesError`, and `--dry-run`
+  reports it before exiting 1. A spec folder that merely lies outside the project tree still comes
+  back verbatim — that is a supported layout, and only the canonicalization leg refuses.
+- **An unstaged edit in your main checkout no longer escalates the story and pauses an unattended
+  run (#618).** Under `[scm] isolation = "worktree"` the merge pre-flight refused over any dirty
+  _tracked_ path outside the unit branch's incoming set, so a worktree-only porcelain `M` — modified in the
+  working tree, nothing staged — stopped the run over a hazard git itself does not have. The axis
+  is the index column, not trackedness: such a stray is now tolerated and journaled
+  `merge-target-tolerated` alongside untracked dirt. A **staged** stray still escalates.
+- **Dirt on a path the run commits for itself now blocks the merge whatever its index column
+  (#618).** The post-merge carries stage the sprint board and the deferred-work ledger by
+  pathspec, which takes whatever the working tree holds no matter who wrote it, so narrowing the
+  pre-flight to staged strays alone would have let an operator's private edit land in history
+  under a `chore(sprint-status): carry ...` message with the tree left clean. Both paths are now
+  passed to the pre-flight as protected, and a stray among them escalates with its own remedy —
+  such dirt has to leave the path, not merely be unstaged. Tracked artifacts only.
+- **A resumed run no longer commits — or overwrites — board edits you made while it was down
+  (#618).** When the merge was already journaled `unit-merged`, the replay falls through to the
+  carry commits with no pre-flight in front of them. The carry cannot simply refuse on dirt: a
+  crashed pass's own half-written advance is dirt on exactly that path and finishing it is what
+  the leg exists for. It now asks whether the board holds HEAD's content plus this pass's
+  advance — git's own question, so a board spelled CRLF by one host and LF by another still
+  answers yes — and proves the index too, since the carry's `git add` overwrites it as well as
+  the working tree; an ABSENT index entry counts as a staged untracking (`git rm --cached`) rather
+  than as nothing to lose. That guards the commit, which is one write too late for the OWN row:
+  `advance` would already have replaced the edit with the target, leaving precisely the bytes the
+  proof accepts. So that row is now checked BEFORE the advance, and a status that is neither
+  HEAD's nor this pass's own refuses it. Either refusal journals `board-advance-carry-foreign-dirt`.
+- **A merge git refused before it started no longer sends you to resolve a conflict that does not
+  exist (#619).** Every `GitError` out of the merge was labelled "content conflict against the
+  target", but most are git declining at pre-flight — an untracked file the merge would overwrite,
+  a staged change on an incoming path, a file/directory shape clash, an `ff` target that cannot
+  fast-forward — where nothing merged, the target checkout is untouched, and there are no markers
+  to find. Those now raise `verify.MergePreflightError` (a `GitError` subclass, so every existing
+  handler is unchanged) and escalate describing that state, with git's own text naming the cause.
+  A third state needed its own type. A `--no-ff` that merges cleanly and is then refused at the
+  COMMIT — a `pre-merge-commit` or `commit-msg` hook, or a `commit.gpgsign` that cannot sign —
+  leaves no unmerged stages but does leave `MERGE_HEAD`, so reading the index alone called a
+  started merge a pre-flight refusal and sent you to clear a clash that does not exist.
+  `verify.MergeCommitRefusedError` now names it: the merge is aborted and the escalation points at
+  the policy that declined rather than at a tree with nothing wrong. Where the abort ITSELF fails,
+  it says so and sends you to recover the mid-merge checkout first — a resume attempted before
+  that dies on the merge state however well the hook is fixed.
+- **A refused `squash` merge no longer destroys the uncommitted work in your main checkout
+  (#619).** `--squash` has no `--abort`, so the recovery is `git reset --hard HEAD` — gated on a
+  tree-state probe read _after_ the merge and used to answer "did the squash act". A checkout
+  already carrying an unstaged edit reads dirty whether or not git touched a byte, so a merge git
+  refused at pre-flight fired the reset and discarded work the merge never went near. The probe is
+  now read once _before_ the squash and a tree found dirty is never reset. The same root cause
+  corrupted the replay gate that recognises "the squash staged nothing", which now asks the index.
+- **The journal no longer records a path as tolerated when that path is what stopped the merge
+  (#623).** `merge-target-tolerated` is written from inside the pre-flight guard, strictly before
+  the merge runs, so it can only record what the guard decided. A stray outside the incoming set
+  by _path_ can still clash with it by _shape_ — a file where the merge needs a directory, or the
+  reverse — and git then refuses over the very path the event called harmless. The refusal path
+  now appends a corrective `merge-preflight-refused` naming the same paths and carrying git's text.
+- `bmad-loop ls` on a core-only install lists runs again instead of crashing on a missing `pyte`
+  — the run-inventory reader moved into core (#650)
+- A missing `[tui]` extra now prints the install hint whichever dependency fails first, instead of
+  a traceback (#678)
+- The settings schema no longer reaches the `[tui]` extra at module scope, and CI now proves the
+  core CLI works extra-less (#679)
+
+## [0.11.0] — 2026-08-19
+
+### Added
+
+- **Plugins can now observe structured dev verification results (#641).** The existing
+  `post_dev_verify` hook receives immutable per-command results after normal and repair
+  verification, with separate `stdout`/`stderr` alongside the compatible bounded
+  `output_tail`. The context also carries `verification_stage` (`"dev"` or `"fix"`) and
+  `verification_sequence` — the only way to tell a dev verification from a repair one
+  (both emit the same stage from the same phase) and the key that joins the context to
+  its own journal records. Core writes `verify-command-result` journal records with
+  stream pointers under the run's `verify/` directory — its own store, kept out of the
+  adapter-owned, TUI-consumed `logs/`; plugins remain unable to alter verification or
+  commit decisions. Storage, upload, signing, and any policy response stay plugin-owned.
+  Scope is the dev phase: the review gate runs the same `[verify] commands` and retains
+  nothing, so the journal records are not a census of a run's verifier invocations —
+  `docs/plugin-authoring-guide.md` states the boundary, and #656 tracks closing it.
+  Retention is bounded by the new `[verify] stream_capture_kb` (default 256 KiB per
+  stream, `0` = capture nothing): the tail is kept, and the record carries the full
+  byte count plus a `*_truncated` flag so a cut file is never mistaken for a whole
+  one. A concluded run gives the store back: `bmad-loop clean` trims `verify/` with the
+  rest of a run's heavy scaffolding and counts it in the reclaimed total, leaving the
+  run listed and resumable. Separately from that on-disk cap, a hard 32 MiB per-stream
+  ceiling bounds what is held in memory while the remaining commands run, so a
+  pathologically chatty suite cannot grow peak memory with the number of configured
+  verify commands; the record still reports what the command emitted, so a stream the
+  ceiling cut is never mistaken for a whole one. Retaining a stream is observation, so a
+  failed write (ENOSPC, a read-only run dir) degrades — the record still lands, with a
+  null pointer and `capture_error` — instead of taking down a dev pass whose verify
+  commands passed.
 
 - **A refused auto-sweep is now visible outside the journal (#501).** A run whose deferred-work
   sweep was refused ended looking exactly like one that swept, and under `[sweep] auto = "run-end"`
@@ -20,7 +316,74 @@ breaking changes may land in a minor release.
   `failed` or `dirty` — never an exception message, which `diagnose` would refuse to emit at all.
   The `--json` key is additive and always present, so `STATUS_SCHEMA_VERSION` is unchanged.
 
+- **`validate` now reports a binary that is on PATH but will not run (#294).** The
+  `adapter.binary` gate asked `shutil.which`, which a dead WSL/npm shim satisfies — it is a real
+  file with the execute bit — so validate went green on an install that could not start a session,
+  and the opencode adapter's own "binary not found" error sent the user to `bmad-loop validate` to
+  be told everything was fine. Each binary named by a **packaged** profile is now run once as
+  `<binary> --version`; a nonzero exit or a launch fault reports the new check id
+  `adapter.binary-unrunnable`, carrying the resolved path and the return code. A project overlay's
+  profile is resolved and reported found but never launched: its fields are project-supplied, and
+  validate is the command used to decide whether a checkout is safe to run at all, so a clone's own
+  config cannot choose which binary it launches. The gate bounds which NAME is probed, not what
+  that name resolves to — resolution runs through the user's `PATH`, and a probed name resolves to
+  whatever the session launch would itself run. That boundary is the profile's provenance and not
+  the spelling of `binary`, because a bare name still resolves into the checkout whenever a
+  checkout-local directory is on `PATH`. The severity is `warning`, so validate's exit code is
+  unchanged for a live CLI that merely answers `--version` oddly, and `adapter.binary` keeps its
+  existing found/absent meaning. The check id is additive, so `VALIDATE_SCHEMA_VERSION` is
+  unchanged.
+
 ### Changed
+
+- **The psmux live gate now runs in CI instead of before releases (#662).** The `test-windows`
+  job installs psmux from its GitHub release, so `tests/test_psmux_live.py` — prune isolation, the
+  workaround premise probes, the 3.3.8-floor adoption probes — runs on every pull request
+  and on pushes to `main`/`release/*`, rather than on a maintainer's Windows box at release
+  time. It runs as its own serial step: real psmux servers are a single-machine resource,
+  and the gate flaked when interleaved with the parallel run. The step asserts
+  `PsmuxMultiplexer.available()`, not just that the binary resolves: the gate skips itself on
+  an unadmitted version, which would otherwise read green. `test_opencode_live.py` remains the
+  one manual gate.
+
+- **The psmux backend now requires psmux 3.3.8 or newer (#658, closes #222).** `available()`
+  refuses 3.3.7 and below, so **on such a host the backend reports unavailable and selection
+  falls through**. Every verb now assumes 3.3.8's fixes instead of routing around the defects
+  they close, and a 3.3.7 install would fail silently rather than loudly.
+
+- **The retired psmux workarounds change three visible behaviors (#658).** The run-log sink rides
+  the same `-EncodedCommand` transport as every other window command instead of a sidecar
+  `.ps1`, so a log path containing a space, `$` or a backtick no longer breaks or blocks log
+  capture, and nothing is written beside the log. `select-window` takes the session-qualified window id
+  directly, dropping a listing round-trip per focus change. `kill_session` inherits the base's
+  `=name` exact-match target.
+
+- **The psmux option-value gate now refuses only what it cannot read back (#658).** Ordinary
+  Windows paths all pass — spaced, UNC, apostrophed, trailing-separator. What stays refused is
+  what the backend's own listing parse would mangle: a double quote, a line break, edge
+  whitespace, and a `-`-leading value psmux still treats as a flag.
+
+- **`post_dev_verify` now fires on the repair leg too, not only after dev verification (#641).**
+  A plugin written against "once per story, after the dev session" will see the stage again after
+  every repair session's verification, and on the way to a pause: an attempt whose session reported
+  a CRITICAL escalation now emits before the run stops, on either leg, where the repair leg used to
+  escalate without emitting at all. Discriminate the legs with `ctx.verification_stage`
+  (`"dev"` / `"fix"`) and de-duplicate on `ctx.verification_sequence`; handlers that assumed one
+  call per story must be idempotent.
+
+- **`probe-adapter` now bounds how long a single scrubbed line can be (#481).** `scrub_text` capped
+  how many lines it emitted but never how long one of them could be, so a single very long line —
+  from a foreign CLI's `--version`/`--help`, or from a log tail — reached the `probe-adapter`
+  report and its `--json` document verbatim: `max_lines=5` over a 5000-character line still emitted
+  all 5000. Each line is now bounded, and a line that is cut ends with `… (N more chars redacted)`,
+  the same convention as the existing line-count marker. **This is a visible output change** for any
+  line that long. A cut that would land inside anything the egress guard flags — a credential-shaped
+  token, or a URL credential whose match ends at the `@` — retracts out of it and drops it whole:
+  cutting mid-construct could otherwise leave a fragment that keeps the sensitive part while no
+  longer tripping the rule, turning a fail-closed refusal into an emission carrying part of the
+  credential. `probe.SCHEMA_VERSION` is unchanged: no field is removed or renamed and no type
+  changes, and the meaning of the value was already "the CLI's scrubbed output, capped" — adding a
+  second axis to an already-documented lossy cap is the same class of value, not a new one.
 
 - **Files the orchestrator replaces by name now land at `0600`.** Those writes pass
   `follow_symlinks=False`, and that mode deliberately carries nothing over from the target — not
@@ -51,6 +414,47 @@ breaking changes may land in a minor release.
   it cannot read.
 
 ### Fixed
+
+- **A failed `kill-window` that left the window alive is no longer swallowed (#658).**
+  `BaseTmuxBackend.kill_window` ran `check=False` and discarded the result, so a kill that failed
+  with the window still standing left it behind with no trace. A non-zero exit now reads the
+  session's own window list once and warns on stderr only when the target's window is still in
+  it; an already-gone window — what ordinary teardown produces — and a target that names no
+  window at all both stay silent, because neither leaves anything behind. The verdict is
+  unchanged: still returns `None`, still never raises.
+
+- **A plugin can no longer erase a CRITICAL escalation out from under the engine's audit.**
+  `HookContext` copies the session `result_json` precisely so a plugin observes history rather
+  than rewriting it, but `dict()` is shallow: the nested `escalations` list stayed the engine's
+  own object, and both verify legs emit `post_dev_verify` before reading
+  `critical_escalations(result.result_json)`. An in-process plugin that cleared that list
+  therefore erased the escalation before the audit ran, and a verify-green repair proceeded
+  where the run owed a pause. The copy is now deep, so the observe-only guarantee holds at the
+  depth escalations actually live.
+
+- **The egress self-check now sees Windows→WSL UNC home paths (#512).** `diagnose` and
+  `probe-adapter` re-scan their own rendered bytes before emitting and refuse to emit at all on a
+  hit, but the absolute-home-path rule knew only forward-slash spellings — so a path reached through
+  the Windows→WSL UNC bridge (`\\wsl.localhost\<distro>\home\<user>`, the legacy `\\wsl$\...`, the
+  extended-length `\\?\UNC\...` folding) was invisible to it, including through the `--json` render,
+  where every backslash is doubled. **No released version leaked such a path**: since #485
+  `collect_env` reduces the project path to a boolean and no `EnvInfo` field carries it. What was
+  wrong was the claim — the `diagnostics` module docstring described the backstop as fail-closed
+  without qualification — and that docstring is corrected in the same change to say what the guard
+  is, a shape re-scan of the rendered bytes, and what stays outside it: a home spelling it does not
+  know, or a username that is not this process's.
+
+- **The `diagnose` policy snapshot's verbatim-key invariant is now enforced (#202).** The snapshot
+  emits dict keys unredacted, which is correct only while no policy section is a free-keyed table
+  — the one user-keyed table, `plugins.settings`, is intercepted before it reaches the
+  passthrough. Nothing enforced that property, and a value-level check could not: a newly declared
+  free-keyed section defaults to an empty dict, so such a check stays green while the hazard is
+  live. A test now fails at declaration time, the moment such a section appears, and the reason is
+  written down at the passthrough. No behavior change.
+
+- **The zero-token OpenCode live smoke skips stale or broken shims (#294).** Its availability
+  gate now requires `opencode --version` to succeed before starting a server; runnable installs
+  still fail loudly when the pinned API contract drifts.
 
 - **Policy loading now enforces the declared timeout and result-less Stop nudge minima (#648).**
   The valid `session_timeout_min = 1` and `stop_without_result_nudges = 0` boundaries remain
@@ -89,6 +493,18 @@ breaking changes may land in a minor release.
   bare-key dispatches; Stories stays folder+id, Sweep stays intent-bundle, and patch-restore plus
   verification-feedback routes retain their existing wording and precedence. A filesystem fault
   while observing the dispatch binding leaves that attempt unbound instead of aborting the run.
+
+- **Accept canonical reachable-descendant spec baselines without trusting untracked residue.** An
+  exact recorded baseline remains valid; any different real claim must uniquely resolve from 7–64
+  hex characters to a direct immutable commit that descends from the recorded baseline and is
+  reachable from `HEAD`. Symbolic or movable refs, ambiguous prefixes, non-commit objects, older,
+  diverged, unknown, and off-HEAD claims remain refused, apart from the existing deferred-work
+  bundle ancestor exception. Proof is re-anchored after an accepted descendant and counts only
+  tracked, staged, or committed changes because the launch snapshot cannot date untracked files
+  relative to that later claim. Shared-checkout mode proves later tracked work exists but cannot
+  attribute it to one session; worktree isolation preserves that provenance. This accepts a skill
+  stamp made after an intervening commit without letting stale untracked residue satisfy the gate.
+  The same mismatch in the opposite direction is #640.
 
 - **Overlong lowercase/kebab sweep bundle labels now proceed deterministically (#503).** An
   otherwise valid name over 40 characters is truncated to 40, journaled and persisted before
@@ -296,12 +712,12 @@ breaking changes may land in a minor release.
   `MoveFileEx(MOVEFILE_REPLACE_EXISTING)`, which is not guaranteed atomic and may fall back to a
   non-atomic copy. What holds everywhere is that a failed write cannot truncate the original.
 
-- **An atomic write no longer fails on a file whose name fills the filesystem's limit.** The helpers
-  stage a temp named after their target, and `mkstemp` inserts eight random characters, so the temp
-  ran `len(name) + 13` — long enough that a target with a perfectly legal name produced an illegal
-  _temp_ name and the write died with `ENAMETOOLONG` — or, on Windows, with `ENOENT` carrying
-  `winerror` 206, which is the same condition under a different name. On ext4 the cutoff was a
-  243-byte basename.
+- **An atomic write no longer fails on a file whose name fills the filesystem's limit (#595).** The
+  helpers stage a temp named after their target, and `mkstemp` inserts eight random characters, so
+  the temp ran `len(name) + 13` — long enough that a target with a perfectly legal name produced an
+  illegal _temp_ name and the write died with `ENAMETOOLONG` — or, on Windows, with `ENOENT`
+  carrying `winerror` 206, which is the same condition under a different name. On ext4 the cutoff
+  was a 243-byte basename.
   Latent in the helpers since they were written, and reachable from this release because the story
   spec writers moved onto them: a spec is named by your planning skills, and nothing bounds that
   name. When the readable temp name cannot fit, the helpers now fall back to a short digest of it
@@ -3183,7 +3599,9 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/bmad-code-org/bmad-loop/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/bmad-code-org/bmad-loop/compare/v0.11.1...HEAD
+[0.11.1]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.11.1
+[0.11.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.11.0
 [0.10.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.10.0
 [0.9.1]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.9.1
 [0.9.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.9.0

@@ -60,6 +60,7 @@ from bmad_loop.tui.screens.modals import (
     DecisionModal,
     DeferredEntryModal,
     EscalationModal,
+    PauseReasonModal,
     SpecReviewModal,
     StartRunModal,
     StartSweepModal,
@@ -150,6 +151,35 @@ async def until(pilot, condition, timeout: float = 10.0) -> None:
         waited += 0.05
 
 
+async def settle(pilot, timeout: float = 10.0) -> None:
+    """Pump the message queue until the screen's layout stops moving.
+
+    It is the message pump, not a sleep, that does the work: a pending stylesheet
+    reapply, a deferred scroll, a resize of a widget the scroll just exposed —
+    each is a message, and each `pause` drains a round. Requiring the regions to
+    repeat lets a slow runner take as many frames as it needs, and a screen that
+    never settles raises rather than proceeding.
+
+    `ready()` calls this once the modal is mounted (#281). Call it again after
+    anything that moves the layout, before reading a region or a click
+    coordinate: a widget's `region` is served from the compositor map while
+    that map is valid, and a scroll does not invalidate it — so the region
+    holds the old geometry until the screen's next relayout runs (#360)."""
+
+    def _layout():
+        return tuple(w.region for w in pilot.app.screen.query("*"))
+
+    previous, stable, waited = None, 0, 0.0
+    while stable < 3:
+        if waited >= timeout:
+            raise AssertionError("screen layout never settled")
+        await pilot.pause(0.05)
+        waited += 0.05
+        current = _layout()
+        stable = stable + 1 if current == previous else 0
+        previous = current
+
+
 async def ready(pilot, selector: str, timeout: float = 10.0):
     """Wait until a modal widget is mounted *and* laid out on-screen, then return it.
 
@@ -168,13 +198,11 @@ async def ready(pilot, selector: str, timeout: float = 10.0):
     (x=5/23/41, each 16 wide, so the last ends at column 57 — off a 45-column
     screen) and the `-narrow` metrics (14/10/7) on the next.
 
-    So this also pumps the queue until the screen's layout stops moving. It is
-    the message pump, not a sleep, that does the work: the pending reapply is a
-    message, and each `pause` drains it. Requiring the regions to repeat lets a
-    slow runner take as many frames as it needs. Everything downstream — a
-    reachability assert, a `scroll_visible` target, a click coordinate — is then
-    computed against the settled layout rather than a doomed intermediate one.
-    Under load this is worth 2-3 failures per 25 runs on the tests it covers."""
+    So this also `settle`s the screen before returning, so that everything
+    downstream — a reachability assert, a `scroll_visible` target, a click
+    coordinate — is computed against the settled layout rather than a doomed
+    intermediate one. Under load that is worth 2-3 failures per 25 runs on the
+    tests it covers."""
 
     def _hit():
         hits = pilot.app.screen.query(selector)
@@ -182,19 +210,7 @@ async def ready(pilot, selector: str, timeout: float = 10.0):
         return node if node is not None and node.region.area > 0 else None
 
     await until(pilot, lambda: _hit() is not None, timeout)
-
-    def _layout():
-        return tuple(w.region for w in pilot.app.screen.query("*"))
-
-    previous, stable, waited = None, 0, 0.0
-    while stable < 3:
-        if waited >= timeout:
-            raise AssertionError("screen layout never settled")
-        await pilot.pause(0.05)
-        waited += 0.05
-        current = _layout()
-        stable = stable + 1 if current == previous else 0
-        previous = current
+    await settle(pilot, timeout)
     return _hit()
 
 
@@ -1024,6 +1040,15 @@ async def test_poll_skips_while_another_holds_the_lock(project):
     # Regression: exclusive=True cannot stop a running thread worker, so the
     # screen lock must make a second poll bail instead of mutating shared ctx
     # (two threads feeding ctx.log's pyte stream crashed the TUI).
+    #
+    # Ablation target: delete the `if not self._poll_lock.acquire(blocking=False):
+    # return` guard from `_poll` *and* neutralize its paired
+    # `finally: self._poll_lock.release()` to `pass` — one guard, both halves,
+    # not two gates. Dropping only the acquire makes every other tick release a
+    # lock it never took, reddening the whole file on `RuntimeError: release
+    # unlocked lock` instead. With both gone this test fails alone on
+    # `assert ctx.entries == before` — the probe thread runs the body and
+    # appends the checkpoint entry.
     root = project.project
     run_dir = make_run(root, "20260611-100000-aaaa", alive=True)
     write_numbered_log(run_dir, "story-1", count=30)
@@ -1044,9 +1069,26 @@ async def test_poll_skips_while_another_holds_the_lock(project):
         # while waiting on call_from_thread(_apply).
         await until(pilot, lambda: screen._poll_lock.acquire(blocking=False))
         try:
+            gen = screen._generation
             before = list(ctx.entries)
             journal.append("checkpoint", log_task="story-1", log_pos=0)  # new entry on disk
-            worker = screen._poll(ctx, screen._generation, False, None)
+            # Run the undecorated body as our own thread worker, in a group of
+            # our own. Calling the @work-decorated _poll enters group "poll" on
+            # this same node, and the next 1s interval tick's poll cancels that
+            # group on arrival (add_worker -> cancel_group), marking this worker
+            # CANCELLED — so worker.wait() raced the tick and raised
+            # WorkerCancelled on slow Windows runners (#581). A private group is
+            # never a cancel_group candidate, so this awaits to completion;
+            # thread=True keeps it a real second thread entering the guarded body
+            # while the lock is held, which is the point of the test.
+            # exit_on_error=False surfaces a body exception as WorkerFailed at
+            # the await instead of tearing the app down mid-test.
+            worker = screen.run_worker(
+                lambda: DashboardScreen._poll.__wrapped__(screen, ctx, gen, False, None),
+                thread=True,
+                group="poll-probe-581",
+                exit_on_error=False,
+            )
             await worker.wait()
             assert ctx.entries == before  # guarded body never ran
         finally:
@@ -1347,7 +1389,24 @@ async def test_decision_modal_scrolls_when_content_long(project):
         # screen, then click it — the whole point of the scroll fix.
         opt8 = app.screen.query_one("#opt-8", Button)
         opt8.scroll_visible(animate=False)
-        await pilot.pause()
+        # `scroll_visible` only queues the scroll. It runs straight through to
+        # the container's `Widget.scroll_to`, which defers the offset write via
+        # `call_after_refresh`: an InvokeLater the pump forwards to the screen,
+        # where it lands on `Screen._callbacks`. Draining that queue always
+        # costs a later pump hop. The screen's idle handler drains it, but only
+        # once the screen is clean — a dirty one resumes the update timer and
+        # returns — and `_on_timer_update` only `call_next`s the drain rather
+        # than running it. So `pilot.pause()` does not synchronize on the
+        # write: its barrier covers messages queued at call time, and the
+        # `_on_timer_update` it ends with relayouts whatever scroll state
+        # exists right then. Lose that hop and `scroll_y` is still 0,
+        # so the relayout reflows the old offset and `region` keeps its
+        # pre-scroll geometry, putting the option below the fold (#360). Gate
+        # on the write landing — `body.scroll_y` is the one observable here not
+        # read through the compositor map — then let the relayout it triggers
+        # settle before reading a region.
+        await until(pilot, lambda: body.scroll_y > 0)
+        await settle(pilot)
         assert _on_screen(app, opt8)
         await pilot.click("#opt-8")
         await until(pilot, lambda: bool(chosen))
@@ -1513,20 +1572,46 @@ async def test_resume_confirm_rechecks_liveness(project, monkeypatch):
         assert calls == []  # the callback re-checked and refused; nothing launched
 
 
-def test_cli_tui_hint_without_textual(project, monkeypatch, capsys):
-    """`bmad-loop tui` prints the install hint when the extra is missing."""
-    import builtins
+@pytest.mark.parametrize("blocked", ["textual", "rich", "tomlkit", "pyte"])
+def test_cli_tui_hint_without_extra_dependency(project, monkeypatch, capsys, blocked):
+    """`bmad-loop tui` prints the install hint whichever `[tui]` dependency is missing.
 
+    The guard is failure-gated rather than allowlisted (#678): `rich` and `pyte`
+    import *before* `textual` on the TUI chain, so an allowlist naming only textual
+    and tomlkit let those two escape as a traceback.
+
+    Evicting the whole `bmad_loop.tui.*` subtree is load-bearing, not tidiness: the
+    rich/pyte/tomlkit chains run through `tui.data`/`tui.settings`/`tui.screens.*`,
+    which this file's own module-level imports have already cached, and a cached
+    module returns without re-executing -- no third-party import would ever fire.
+
+    INVERSE ablation: restore the ("textual", "tomlkit") allowlist and the rich/pyte
+    params redden -- the error escapes to main's broad backstop as "No module named
+    'rich.text'" / "No module named 'pyte'" with no hint, while textual/tomlkit stay
+    green (rc stays 1 either way, which is why the hint is the assertion that matters).
+    """
+    import builtins
+    import sys
+
+    import bmad_loop
     from bmad_loop import cli
 
     real_import = builtins.__import__
 
     def fake_import(name, *args, **kwargs):
-        if name.partition(".")[0] == "textual":
+        if name.partition(".")[0] == blocked:
             raise ModuleNotFoundError(f"No module named '{name}'", name=name)
         return real_import(name, *args, **kwargs)
 
-    monkeypatch.delitem(__import__("sys").modules, "bmad_loop.tui.app", raising=False)
+    # Evicting the subtree alone leaks: re-importing `bmad_loop.tui` rebinds the
+    # `tui` attribute on the *parent package object* to the new (doomed) module, and
+    # restoring sys.modules does not undo that rebinding. Pin the attribute through
+    # monkeypatch so the original comes back with it -- otherwise every later
+    # `monkeypatch.setattr("bmad_loop.tui.app....")` in this file resolves against a
+    # package that no longer has an `app` attribute.
+    monkeypatch.setattr(bmad_loop, "tui", sys.modules["bmad_loop.tui"])
+    for mod in [m for m in sys.modules if m == "bmad_loop.tui" or m.startswith("bmad_loop.tui.")]:
+        monkeypatch.delitem(sys.modules, mod, raising=False)
     monkeypatch.setattr(builtins, "__import__", fake_import)
     rc = cli.main(["tui", "--project", str(project.project)])
     assert rc == 1
@@ -1755,6 +1840,7 @@ _MIN_SIZE_CASES = (
     "deferred-entry",
     "story-checkpoint",
     "escalation",
+    "pause-reason",
     "text-output",
 )
 
@@ -1815,6 +1901,12 @@ def _minimum_size_case(name: str, project):
             ),
             ("#act-resolve", "#act-rearm", "#cancel", "#hint"),
             "#body",
+        )
+    if name == "pause-reason":
+        return (
+            PauseReasonModal(title="t", subtitle="s", reason="line\n" * 80),
+            ("#act-resume", "#cancel"),
+            "#reason",
         )
     assert name == "text-output", name
     return TextOutputModal("validate", 0, "out\n" * 40), ("#ok",), "#output"
@@ -2116,6 +2208,92 @@ async def test_unreadable_policy_falls_through_the_isolation_guard(project, monk
         await pilot.click(await ready(pilot, "#ok"))
         await until(pilot, lambda: calls)
         assert not any("isolation" in m for m in notifications(app))
+
+
+def _fake_tui_git_version(monkeypatch, reported=None, *, boom=None):
+    """Answer `git version` at the `git_bytes` seam and pass every other git call
+    through to the real one. Both halves are load-bearing: `_commit_subject` shares
+    this seam, and the guard's own clean-tree gate has to keep working or a blocked
+    launch could be blocked for the wrong reason."""
+    real = verify.git_bytes
+
+    def fake(repo, *args, timeout_s=None):
+        if args == ("version",):
+            if boom is not None:
+                raise boom
+            return subprocess.CompletedProcess(
+                args=["git", "version"], returncode=0, stdout=reported.encode(), stderr=b""
+            )
+        return real(repo, *args, timeout_s=timeout_s)
+
+    monkeypatch.setattr(verify, "git_bytes", fake)
+
+
+async def test_an_under_floor_git_blocks_launch(project, monkeypatch):
+    """The host floor, mirrored where the other pre-launch refusals already are.
+    The detached CLI refuses this too and is the authority; without the mirror the
+    operator's only signal was the dashboard's generic "launch may have failed"
+    toast 10s later, which names neither git nor the floor.
+
+    Asserted against the sole producer of the text rather than a literal, like the
+    #414 sibling above — that is what keeps the toast and the CLI's abort from
+    drifting into two different findings about one host.
+
+    The fixture carries the #414 conflicting pair AND leaves the tree dirty, so
+    this pins the ORDER too: either of those gates speaking first would send the
+    operator to fix a project when the problem is the machine."""
+    calls = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "start_run_detached", lambda *a, **kw: calls.append(a))
+    _split_root_tui_project(project)
+    _fake_tui_git_version(monkeypatch, "git version 2.25.1\n")
+    expected = verify.under_floor_git_message("git version 2.25.1")
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("r")
+        await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: expected in notifications(app))
+        assert not any("isolation" in m for m in notifications(app))
+        assert not any("not clean" in m for m in notifications(app))
+        assert not calls
+
+
+async def test_a_git_that_cannot_be_probed_falls_through_the_floor_guard(project, monkeypatch):
+    """The guard's deliberate blind spot, and the reason it has one: this probe runs
+    on the event loop, so it carries a 5s bound the detached CLI does not share. A
+    git slow enough to miss that bound but fast enough for the CLI's would be
+    refused by a toast on a host that runs fine, so "could not look" falls through
+    and lets the CLI answer — where `_reject_under_floor_git` fails CLOSED on the
+    same fault, in the process that actually matters.
+
+    `probes` is the positive control: `calls` alone would go green if the guard
+    stopped probing at all, which is the opposite change."""
+    probes = []
+    calls = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "start_run_detached", lambda *a, **kw: calls.append(a))
+
+    real = verify.git_bytes
+
+    def hung(repo, *args, timeout_s=None):
+        if args == ("version",):
+            probes.append(timeout_s)
+            raise verify.GitTimeoutError("git version timed out after 5s")
+        return real(repo, *args, timeout_s=timeout_s)
+
+    monkeypatch.setattr(verify, "git_bytes", hung)
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("r")
+        await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: bool(calls))
+        assert probes == [5], "the guard must ask, and must ask with its own deadline"
 
 
 async def test_live_run_asks_for_confirmation(project, monkeypatch):
@@ -3009,9 +3187,16 @@ def test_pause_tag_and_label_render():
     assert pause_tag("plan-checkpoint").plain == "plan"
     assert pause_tag("story-checkpoint").plain == "story"
     assert pause_tag("escalation").plain == "esc"
+    assert pause_tag("story-gate").plain == "gate"
+    assert pause_tag("epic-boundary").plain == "epic"
     assert pause_tag("").plain == ""  # not paused → no tag
     label, style = pause_label("escalation")
     assert label == "escalation" and "red" in style
+    # the gate viewers title themselves from pause_label, so these three strings
+    # are load-bearing UI, not just badge text (#515)
+    assert pause_label("story-gate") == ("story gate", "yellow")
+    assert pause_label("epic-boundary")[0] == "epic gate"
+    assert pause_label("spec-approval")[0] == "spec-approval gate"
 
 
 def test_stopping_tag_renders():
@@ -3465,7 +3650,7 @@ async def test_graceful_stop_requests_via_helper(project, monkeypatch):
 @pytest.mark.parametrize(
     "token, needle",
     [
-        ("already-pending", "already has a graceful stop pending"),
+        ("already-pending", "already has a stop request pending"),
         ("requested-unverifiable", "could not confirm a live engine"),
     ],
 )
@@ -3842,6 +4027,118 @@ async def test_gate_pause_resume(project, monkeypatch):
         await _open_review(app, pilot, SpecReviewModal)
         await pilot.click(await ready(pilot, "#act-resume"))
         await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
+
+
+# ------------------------------- #515: spec-less gate pauses show the reason
+#
+# A story gate fires BEFORE the story is registered in state.tasks (deliberate —
+# a resume re-picks the story and re-asks the ledger) and an epic boundary has no
+# story key at all, so _paused_spec returns (None, "") and the spec viewer had
+# nothing to show. These pin that the pause reason — which names the blocking
+# entries and the remedy — is what the operator gets instead.
+
+_GATE_REASON = (
+    "1-1 is gated by unlanded deferred work: DW-1 (gate: 1-1) — close the entry in "
+    "deferred-work.md, or clear its gate, then resume."
+)
+
+
+@pytest.mark.parametrize(
+    ("story_key", "tasks"),
+    [
+        # the engine gate: the story is not in state.tasks yet at all
+        ("1-1", {}),
+        # sweep's ledger-migration gate (sweep.py): the task IS registered, it just
+        # has no spec_file — the other arm of _paused_spec's (None, "") return
+        ("sweep-migrate", {"sweep-migrate": StoryTask(story_key="sweep-migrate", epic=0)}),
+    ],
+    ids=["task-unregistered", "task-without-spec-file"],
+)
+async def test_story_gate_pause_shows_reason_and_resumes(project, monkeypatch, story_key, tasks):
+    calls: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    make_run(
+        project.project,
+        "20260611-100000-aaaa",
+        paused_stage="story-gate",
+        paused_reason=_GATE_REASON,
+        paused_story_key=story_key,
+        tasks=tasks,
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, PauseReasonModal)  # routed away from the spec viewer
+        await ready(pilot, "#reason Static")
+        body = render(app.screen.query_one("#reason Static", Static).content)
+        assert "gated by unlanded deferred work" in body
+        assert "DW-1" in body, "the reason names the blocking entry, not a blank pane"
+        await pilot.click(await ready(pilot, "#act-resume"))
+        await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
+
+
+async def test_epic_boundary_pause_shows_reason_and_run_id_subtitle(project, monkeypatch):
+    """An epic boundary raises with no story key, so the old viewer subtitled it
+    "?". The run id is the only identity there is — assert it positively, so a
+    regression back to _story_subtitle's placeholder reddens this."""
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    make_run(
+        project.project,
+        "20260611-100000-aaaa",
+        paused_stage="epic-boundary",
+        paused_reason="epic 1 boundary — `bmad-loop resume <id>` to continue with epic 2",
+        paused_story_key=None,
+        tasks={},
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, PauseReasonModal)
+        await ready(pilot, "#reason Static")
+        assert "epic 1 boundary" in render(app.screen.query_one("#reason Static", Static).content)
+        subtitle = render(app.screen.query_one("#subtitle", Static).content)
+        assert "run 20260611-100000-aaaa" in subtitle
+
+
+async def test_spec_approval_unreadable_spec_still_uses_spec_viewer(project, monkeypatch):
+    """An unreadable spec file returns (path, "") from _paused_spec — a spec that
+    exists in the task and cannot be read, not a spec-less gate. It keeps the spec
+    viewer (path line + "(empty spec)"), which pins the branch as `spec_path is
+    None` rather than `not spec_text`."""
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_VERIFY)
+    task.spec_file = str(project.project / "gone" / "spec-1-1-a.md")
+    make_run(
+        project.project,
+        "20260611-100000-aaaa",
+        paused_stage="spec-approval",
+        paused_reason="awaiting spec approval",
+        paused_story_key="1-1-a",
+        tasks={"1-1-a": task},
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+
+
+async def test_story_gate_empty_reason_renders_fallback(project, monkeypatch):
+    """RunState.paused is `paused_reason is not None`, so an empty reason is a
+    reachable pause — the viewer says so rather than showing an empty pane."""
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    make_run(
+        project.project,
+        "20260611-100000-aaaa",
+        paused_stage="story-gate",
+        paused_reason="",
+        paused_story_key="1-1",
+        tasks={},
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, PauseReasonModal)
+        await ready(pilot, "#reason Static")
+        body = render(app.screen.query_one("#reason Static", Static).content)
+        assert "(no pause reason recorded)" in body
 
 
 async def test_start_run_modal_stories_source_launches(project, monkeypatch):
@@ -4259,6 +4556,38 @@ async def test_dashboard_survives_undecodable_policy_bytes(project):
     # the CSS default below shows the *decode* was refused, not that the file was inert.
     assert policy_mod.loads(text).tui.left_width == 50
     _write_undecodable_policy(project.project, text)
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(120, 40)) as pilot:
+        screen = await _seeded(pilot, app)
+        assert screen._tui_policy == policy_mod.TuiPolicy()
+        assert screen.query_one("#left").size.width == 34  # CSS default, not the file's 50
+        assert not screen._left_frozen and not screen._detail_frozen
+
+
+async def test_dashboard_survives_a_wrong_typed_policy_value(project):
+    """The same `except (PolicyError, OSError)` handler, reached by a policy file that
+    is perfectly readable — valid UTF-8, valid TOML — and wrong only in a VALUE.
+
+    The two siblings above fault at the FILE level (a monkeypatched OSError raiser,
+    then undecodable bytes). This is the first one to fault at a KEY. `max_parallel`
+    was a bare `int()` until #440, so `"x"` left `policy.load` as a raw ValueError,
+    and a ValueError is neither a PolicyError nor an OSError — it walked past this
+    handler exactly as the undecodable bytes did, crashing at app CONSTRUCTION before
+    run_test could mount a screen. Note the fault sits in [scm], a section the
+    dashboard never reads: `load` parses the whole document, so a wrong-typed key
+    anywhere in the file took the TUI down."""
+    text = '[tui]\nleft_width = 50\n[scm]\nmax_parallel = "x"\n'
+    # Precondition: decodable AND well-formed TOML — that is what makes this a value
+    # test rather than a second copy of the two above.
+    assert tomllib.loads(text)["scm"]["max_parallel"] == "x"
+    # Precondition: the [tui] half alone would seed a 50-column sidebar, so asserting
+    # the CSS default below shows the file was REFUSED, not that it was inert.
+    assert policy_mod.loads("[tui]\nleft_width = 50\n").tui.left_width == 50
+    with pytest.raises(policy_mod.PolicyError):  # and the whole document is refused
+        policy_mod.loads(text)
+    bmad = project.project / ".bmad-loop"
+    bmad.mkdir(parents=True, exist_ok=True)
+    (bmad / "policy.toml").write_text(text, encoding="utf-8")
     app = BmadLoopApp(project.project)
     async with app.run_test(size=(120, 40)) as pilot:
         screen = await _seeded(pilot, app)

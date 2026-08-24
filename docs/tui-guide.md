@@ -9,7 +9,7 @@ README](../README.md#the-tui).
 ## Installation and launch
 
 ```bash
-uv sync --extra tui        # adds textual + tomlkit; the core stays pyyaml-only
+uv sync --extra tui        # adds textual + tomlkit + pyte + rich; core stays pyyaml-only
 cd /path/to/your/bmad/project
 bmad-loop tui              # or: bmad-loop tui --project /path/to/project
 ```
@@ -139,7 +139,7 @@ One row per run dir under `.bmad-loop/runs/`, oldest first (run ids are
 `YYYYMMDD-HHMMSS-<hex>` and sort chronologically). Columns: `st` (status
 glyph, see below), `run` (the id), `type` (`story` or `sweep`), `note` (a
 colored pause-kind badge on a paused run — `plan` / `story` / `spec` / `epic` /
-`gate` / `esc`, or `⏹ stop` when a running run has a graceful stop pending).
+`gate` / `esc`, or `⏹ stop` when a running run has a stop request pending).
 When any run is paused awaiting a human the pane's title shows
 a global **`⚑ N need attention`** count. On first load the newest run is
 auto-selected; arrow keys or mouse select another. A run you just launched is
@@ -221,7 +221,11 @@ situational banners:
 - `⏹ graceful stop pending — will stop after the current item` — a graceful
   stop was requested (`S`, or `bmad-loop stop --graceful`); the run finishes the
   in-flight story/bundle through commit (or, mid-sweep-triage, lets triage
-  complete and starts no bundles), then finalizes and stops (resumable).
+  complete and starts no bundles), then finalizes and stops (resumable). The
+  underlying read is the control file's presence, not its mode, so the same line
+  shows for as long as a **hard** stop's request sits on disk before the engine
+  honors it — usually seconds, longer if the session is blocked in a transport
+  call — and there the current item does not finish.
 - `✖ engine gone — run was interrupted · press e to resume` — the recorded
   engine pid is dead.
 - `⚑ decision needed: DW-<n> — <question> / press a to attach and answer` —
@@ -336,7 +340,7 @@ Journal kinds are styled by substring, first match wins:
 | `R`      | resolve a run paused at an escalation (interactive, then re-arm)           |
 | `d`      | answer deferred-work decisions past sweeps left unanswered (modal walk)    |
 | `a`      | attach to the selected run's live session or orchestrator window           |
-| `x`      | stop the selected live run immediately (confirm modal)                     |
+| `x`      | stop the selected live run, abandoning the in-flight item (confirm modal)  |
 | `S`      | graceful stop: finish the in-flight item, then finalize & stop (confirm)   |
 | `D`      | delete the selected run's directory (confirm modal)                        |
 | `A`      | archive the selected run to `.bmad-loop/archive` (confirm modal)           |
@@ -482,11 +486,13 @@ artifacts the engine already wrote.
   interactive agent as `R`; **Re-arm & resume** (offered once the resolve agent has
   recorded a resolution) re-arms and resumes — deleting a sentinel with a preserved
   copy for a clean re-dispatch. Both refuse a still-live engine.
-- **Spec-approval / epic / story gate** — reuses the spec viewer (view the finalized
-  spec, then **Approve & resume**), so the pre-existing sprint-mode gates inherit the
-  same richer surface. A story gate fires before the story is recorded, so it has no
-  spec to show; read its reason — which names the blocking entries and the remedy — in
-  the run-header banner or the resume confirmation.
+- **Spec-approval / epic / story gate** — a spec-approval gate reuses the spec viewer
+  (view the finalized spec, then **Approve & resume**), so the pre-existing sprint-mode
+  gate inherits the same richer surface. Story-gate and epic-boundary pauses have no
+  spec to show — a story gate fires before the story is recorded, an epic boundary has
+  no story at all — so they open a compact pause-reason viewer instead: the reason names
+  the blocking entries and the remedy, and **Resume** re-picks the story and re-asks the
+  ledger, so a gate that is still open legitimately re-pauses.
 
 `p` and `R` overlap for an escalation (both reach Resolve); `p` also exposes
 Re-arm & resume inline once a resolution exists. Pause badges in the run list and
@@ -609,6 +615,7 @@ behavior.
 | `limits.max_tokens_per_session`       | int ≥ 1                | 4000000            | weighted per-session cap sampled every ~30s mid-session; healthy sessions run ~1–2.5M weighted, so the default trips only true runaways                                                                                                                                                                                            |
 | `limits.session_budget_grace_s`       | int ≥ 0                | 240                | enforce mode: wrap-up window after the nudge before `over_budget` · 0 = terminate at trip, no nudge                                                                                                                                                                                                                                |
 | `verify.commands`                     | one per line           | (none)             | test/lint commands run before commit                                                                                                                                                                                                                                                                                               |
+| `verify.stream_capture_kb`            | int ≥ 0                | 256                | per-stream cap (KiB) on verifier stdout/stderr retained under the run's `verify/` directory; the tail is kept and the journal records the full size plus a truncation flag · 0 = capture nothing                                                                                                                                   |
 | `notify.desktop`                      | switch                 | on                 | desktop notifications                                                                                                                                                                                                                                                                                                              |
 | `notify.file`                         | switch                 | on                 | ATTENTION file logging                                                                                                                                                                                                                                                                                                             |
 | `review.enabled`                      | switch                 | on                 | off = skip the separate review session; dev pass runs its review layers inline                                                                                                                                                                                                                                                     |

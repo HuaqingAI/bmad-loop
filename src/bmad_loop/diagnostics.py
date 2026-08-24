@@ -18,7 +18,13 @@ directly; every value that could carry content is dropped, reduced to a boolean,
 otherwise survive verbatim), or scrubbed. Unknown/future fields default to a
 ``scrub_json`` pass, never raw. As a final backstop the rendered bytes are run
 through :func:`sanitize.guard` — the fail-closed egress self-check shared with
-``probe-adapter`` since #199. A stray pseudonymized original (a
+``probe-adapter`` since #199. That backstop re-scans the rendered bytes for known
+*shapes* — email, URL credentials, credential-shaped tokens, the absolute-home
+spellings in both separator forms (#512 added the backslash WSL-UNC one), and *this
+process's* username — and refuses to emit on a hit; it is not a proof of absence, since
+a home spelling it does not know, or a username that is not this process's (the Linux
+account behind a WSL UNC path), passes it untouched. Per-field routing is the primary
+defense and the guard is defense in depth. A stray pseudonymized original (a
 per-field routing gap — the value is in the legend, so its safe alias is known)
 is **repaired** by substituting the alias, re-verified, and disclosed in the
 dump itself — a "Backstop repairs" section in the markdown report, an optional
@@ -33,8 +39,10 @@ The guiding assumption: the dump will be posted publicly.
 from __future__ import annotations
 
 import json
+import os
 import platform
 import re
+import stat
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
@@ -43,8 +51,9 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__, sanitize
-from .journal import Journal, load_state
+from .journal import VERIFY_DIR, Journal, load_state
 from .model import RunState, StoryTask
+from .platform_util import walk_files_unlinked
 
 # The guard machinery (fail-closed egress self-check + alias-substitution
 # repair) moved to sanitize.py so probe-adapter shares the single audited
@@ -69,7 +78,25 @@ DEFAULT_JOURNAL_CAP = 200
 #
 # All are run-dir-relative EXCEPT "events", which since #494 lives out of the
 # project tree at the user state root — see `_category_roots`.
-_FILE_CATEGORIES = ("logs", "tasks", "feedback", "bundles", "failed", "worktrees", "events")
+#
+# VERIFY_DIR belongs here for the reason the category exists: retained verifier
+# stdout/stderr is a build's own output — off-limits to read, but its SIZE is
+# exactly the diagnostic. `[verify] stream_capture_kb` defaults to 256 KiB per
+# stream, so a run retains up to 512 KiB per command per attempt with no GC
+# behind it yet, which can make this store one of the larger things in a run
+# dir. Omitting it left `diagnose` unable to show a retention or disk-usage
+# problem it is the natural place to notice. Imported, not re-spelled, so the
+# reporter cannot drift from the writer that creates the directory.
+_FILE_CATEGORIES = (
+    "logs",
+    "tasks",
+    "feedback",
+    "bundles",
+    "failed",
+    "worktrees",
+    "events",
+    VERIFY_DIR,
+)
 _EVENTS_CATEGORY = "events"
 
 # Journal fields that name a proprietary identifier — pseudonymized, not dropped,
@@ -120,6 +147,18 @@ _PATH_SEP_RE = re.compile(r"[\\/]")
 # Journal fields that carry free text (LLM/merge prose, prompts, errors). Never
 # emitted — replaced with a boolean presence marker so a maintainer still learns
 # the field was set without seeing it.
+#
+# The `verify-command-result` group at the end is the same convention applied to
+# the verifier records: `command` is operator-authored shell (`[verify] commands`),
+# `output_tail` is a build's own output, `capture_error` is an OSError string
+# carrying a path, and the two pointers embed the story key. Routing them here
+# rather than leaving them to `scrub_json` is deliberate — that fallback fails
+# closed only by accident of shape, since `_IDENTIFIER_RE` forbids `/` and spaces
+# and so collapses paths, argv-ish commands and multi-line tails, while a
+# one-word `command` (`make`) or a one-word tail (`FAILED`) is identifier-shaped
+# and would ship verbatim. The presence boolean is also strictly more useful for
+# the pointers: it separates "a stream was retained" from "the cap is 0 or the
+# write failed", which a redacted string cannot.
 _JOURNAL_DROP_FIELDS = frozenset(
     {
         "prompt",
@@ -132,6 +171,11 @@ _JOURNAL_DROP_FIELDS = frozenset(
         "blocker",
         "commit_message",
         "was_paused",
+        "command",
+        "output_tail",
+        "capture_error",
+        "stdout_path",
+        "stderr_path",
     }
 )
 # Journal fields whose value is a LIST of story keys (sprint unknown-keys).
@@ -156,6 +200,11 @@ class EnvInfo:
     package_version: str
     multiplexer: str
     tmux_version: str | None
+    # The host's git, as git names itself — `verify.GIT_FLOOR` is the floor a run is
+    # refused below, so "which git ran this" is the first thing a dump has to answer
+    # about a refusal. `None` when git could not be asked at all, which is itself the
+    # finding: the same probe that fails here is the one that aborts a run.
+    git_version: str | None
     # `platform.system()` above says "Windows" for both a native shell and a WSL
     # interop launch. `sys_platform` carries the raw token instead, so a dump can be
     # matched character-for-character against validate's `platform default for {token}`
@@ -269,9 +318,12 @@ def collect_env(project: Path) -> EnvInfo:
     The project *path* itself is never emitted: it is a redaction hazard — the
     redactor leaves the Linux username in a ``\\\\wsl.localhost\\...\\home\\<user>\\...``
     path standing (it compares against the *Windows* account), and ``collect_env``
-    has no pseudonymizer to alias it against — so the boolean is what ships. Same
+    has no pseudonymizer to alias it against — so the boolean is what ships, and since
+    #512 that shape trips the egress guard, which refuses the whole dump rather than
+    passing it. Same
     reason ``sys.executable`` is absent despite naming the exact mismatch: the venv
     path carries the project name past the redactor."""
+    from . import verify
     from .adapters.multiplexer import fold_version, get_multiplexer
     from .platform_util import is_wsl_unc_path
 
@@ -290,6 +342,34 @@ def collect_env(project: Path) -> EnvInfo:
         tmux_v = fold_version(sanitize.scrub_text(raw)) if raw else None
     except Exception:  # nosec B110 - env probe is best-effort; absent mux is fine
         pass
+
+    git_v = None
+    try:
+        # Same scrub-then-fold order as the mux probe above, for the same #321
+        # reason: folding first can cut a home path mid-way, leaving a fragment
+        # `redact_home` no longer matches. `git version` is one short line today,
+        # but a vendor build is free to say more and the bound is what makes that
+        # safe. Reported RAW rather than as a verdict — a dump is evidence, and the
+        # floor it is read against can move after the dump was written.
+        # `git_bytes` ANSWERS with a non-zero rc rather than raising, so the rc is
+        # checked here for the same reason `git_below_floor` checks it: stdout on a
+        # failed probe is not a version, and folding it would put a fabricated
+        # answer in the dump. `None` — "could not be asked" — is the honest value.
+        # Bounded rather than inheriting the engine's `GIT_TIMEOUT_S` (120s), via
+        # the #390 per-call seam the other two best-effort probes already use
+        # (`install`'s init hint, the TUI's commit-subject render). `diagnose` is a
+        # FOREGROUND recovery aid — the command you reach for when the host is
+        # already broken — and a git that hangs is one of the states it exists to
+        # be usable in. Inheriting the engine bound made it sit silent for two
+        # minutes and then swallow the fault anyway, so the whole wait bought a
+        # `None` this returns in five seconds. The dump is worth far more than the
+        # one line this probe fills.
+        probed = verify.git_bytes(project, "version", timeout_s=5)
+        if probed.returncode == 0:
+            git_v = fold_version(sanitize.scrub_text(os.fsdecode(probed.stdout))) or None
+    except Exception:  # nosec B110 - env probe is best-effort; absent git is fine
+        pass
+
     return EnvInfo(
         os=platform.system(),
         os_release=sanitize.scrub_text(platform.release()),
@@ -297,6 +377,7 @@ def collect_env(project: Path) -> EnvInfo:
         package_version=__version__,
         multiplexer=mux,
         tmux_version=tmux_v,
+        git_version=git_v,
         sys_platform=sys.platform,
         win32_on_wsl_path=sys.platform == "win32" and is_wsl_unc_path(project),
     )
@@ -329,6 +410,38 @@ def _category_roots(category: str, run_dir: Path, events_dir: Path | None) -> li
     return [events_dir, legacy]
 
 
+def _count_lines(path: Path) -> int:
+    """Lines in a regular file, or 0 — never blocking on a FIFO a session planted.
+
+    ``O_NONBLOCK`` plus an ``S_ISREG`` check **on the descriptor**, the idiom
+    ``runs.read_trusted_config_digest`` and ``tui.launch._read_ctl_window``
+    already carry for the same hazard: the run directory is exported to the
+    driven session as ``BMAD_LOOP_RUN_DIR``, so an lstat taken before the open is
+    a check-then-open race, and ``fstat`` describes the object actually opened.
+    Opening a FIFO read-only without ``O_NONBLOCK`` blocks until a writer
+    arrives — indefinitely, for a diagnostic dump nobody is feeding, and
+    ``diagnose`` is a foreground command a human is waiting on. ``O_NOFOLLOW``
+    keeps the final component from redirecting the read out of the run, which is
+    the one hop :func:`platform_util.walk_files_unlinked` cannot refuse for it.
+    The POSIX-only flags degrade to 0 on win32, where the fd check carries alone.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_BINARY", 0)  # win32: no CRLF translation on the raw fd
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return 0
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return 0
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            return sum(1 for _ in f)
+    except OSError:
+        return 0
+    finally:
+        os.close(fd)
+
+
 def summarize_files(run_dir: Path, *, events_dir: Path | None = None) -> list[FileGroup]:
     """Counts/sizes only — file contents are NEVER opened into the output.
 
@@ -344,20 +457,27 @@ def summarize_files(run_dir: Path, *, events_dir: Path | None = None) -> list[Fi
         for root in _category_roots(category, run_dir, events_dir):
             if not root.is_dir():
                 continue
-            for p in root.rglob("*"):
-                if not p.is_file():
+            # walk_files_unlinked, not rglob: `is_dir()` above FOLLOWS a link, so a
+            # planted redirect at a category root reads as a directory and rglob
+            # then counts the target's tree as this run's retained output.
+            for p in walk_files_unlinked(root):
+                # The regular-file filter `rglob` + `is_file()` used to carry, and
+                # which came off with the switch: `os.walk` reports every
+                # non-directory entry, so `files` holds FIFOs, device nodes and
+                # symlinks too. None of those is retained output of this run, and
+                # the `logs` arm below OPENS what it counts. lstat, not
+                # `is_file()` — that FOLLOWS, so it answers about the target of a
+                # planted link rather than about the entry in this run's tree.
+                try:
+                    info = p.lstat()
+                except OSError:
+                    continue
+                if not stat.S_ISREG(info.st_mode):
                     continue
                 count += 1
-                try:
-                    total_bytes += p.stat().st_size
-                except OSError:
-                    pass
+                total_bytes += info.st_size
                 if category == "logs":
-                    try:
-                        with p.open("rb") as f:
-                            total_lines += sum(1 for _ in f)
-                    except OSError:
-                        pass
+                    total_lines += _count_lines(p)
         if count:
             groups.append(
                 FileGroup(
@@ -425,6 +545,26 @@ def _scrub_policy(obj: Any) -> Any:
                     k for k in (str(x) for x in value) if sanitize.looks_like_identifier(k)
                 )
             else:
+                # Keys pass through VERBATIM here, deliberately — unlike
+                # `sanitize._scrub`, which scrubs keys as well as values. The
+                # warrant is what this snapshot IS: `Policy.to_dict()` is
+                # `asdict()` over frozen dataclasses, so every key is a
+                # compile-time field name — developer-authored, non-PII, and the
+                # point of the dump (a reader diagnosing a run needs to see
+                # `max_review_cycles`, not `<redacted:str>`). The one user-keyed
+                # table, `plugins.settings`, never reaches this branch:
+                # `_POLICY_KEYSET_KEYS` intercepts it above and reduces it to its
+                # identifier-gated plugin-id keyset (#186).
+                #
+                # That rests on an invariant nothing else stated until #202: NO
+                # policy section has a free-keyed table. Add one — say an
+                # `adapter.overrides` keyed by binary path — and its keys ship
+                # verbatim in a dump meant to be shareable.
+                # `test_no_policy_section_has_a_free_keyed_table`
+                # (tests/test_diagnostics.py) enforces it over the field TYPES, so
+                # it fires when such a table is declared rather than when a user
+                # first populates it; route a new one through `_POLICY_KEYSET_KEYS`
+                # or `_POLICY_COUNT_KEYS` rather than widening that test.
                 out[key] = _scrub_policy(value)
         return out
     if isinstance(obj, (list, tuple)):
@@ -737,6 +877,7 @@ def render_markdown(
     out.append(_fmt_kv("win32 on WSL distro path", "yes" if e.win32_on_wsl_path else "no"))
     out.append(_fmt_kv("multiplexer", e.multiplexer))
     out.append(_fmt_kv("tmux", e.tmux_version or "—"))
+    out.append(_fmt_kv("git", e.git_version or "—"))
     out.append(_fmt_kv("schema / generated", f"v{d.schema_version} @ {d.generated_at}"))
     out.append("")
 

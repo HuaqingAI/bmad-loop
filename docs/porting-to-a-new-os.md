@@ -163,9 +163,10 @@ only the platform default / registration order separates them in listings and
 selection. The bundled psmux backend discriminates by construction: it drives
 psmux's distinctly-named binary (`_BINARY = "psmux"`), so it never claims some
 other tmux-family install that owns the `tmux` name. Its probe also
-version-gates — psmux releases up to 3.3.6 can force-kill a recycled PID during
-teardown, so an old or unidentifiable version reads as unavailable (`psmux -V`
-keeps the `tmux X.Y.Z` output format deliberately):
+version-gates — psmux 3.3.8 or newer is required
+([why](multiplexer-backends.md#psmux-native-windows-experimental)), so an old or unidentifiable
+version reads as unavailable (`psmux -V` keeps the `tmux X.Y.Z` output format
+deliberately):
 
 ```python
 class PsmuxMultiplexer(BaseTmuxBackend):
@@ -175,7 +176,7 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         if not all(shutil.which(exe) for exe in ("psmux", "pwsh")):
             return False
         reported = re.match(r"tmux (\d+)\.(\d+)(?:\.(\d+))?", self.version() or "")
-        return bool(reported) and tuple(int(part or 0) for part in reported.groups()) > (3, 3, 6)
+        return bool(reported) and tuple(int(part or 0) for part in reported.groups()) > (3, 3, 7)
 
 # a sibling that owns the `tmux` name (e.g. a tmux-windows port) discriminates
 # against psmux explicitly:
@@ -229,7 +230,10 @@ register_process_host("windows", lambda platform: platform == "win32", WindowsPr
 
 - `terminate(pid)` — politely stop it (POSIX `SIGTERM` / Windows `taskkill`). Raise
   the `OSError` family (`ProcessLookupError` / `PermissionError`) so callers keep
-  their "already gone / not ours" handling.
+  their "already gone / not ours" handling. This is the polite fast path, not the
+  stop guarantee: `bmad-loop stop` also lodges a hard `stop-request.json` the engine
+  reads itself, so a port whose `terminate` cannot actually be delivered still stops
+  runs (#319).
 - `force_kill(pid)` — escalation when `terminate` is ignored (POSIX `SIGKILL` /
   Windows `taskkill /F /T`). Only ever called once identity is confirmed.
 - `is_alive(pid)` — read-only liveness probe, no signal sent.

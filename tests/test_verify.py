@@ -1,5 +1,7 @@
 import dataclasses
+import hashlib
 import io
+import json
 import os
 import subprocess
 import sys
@@ -49,6 +51,46 @@ def _codec_rejects_bad_byte() -> bool:
     return False
 
 
+def _write_ambiguous_commit_prefix(repo: Path) -> tuple[str, tuple[str, str]]:
+    """Write two valid commit objects sharing a seven-hex prefix.
+
+    Generate candidate object bytes in memory so the fixture pays only two Git
+    subprocesses rather than the birthday search's roughly 20,000 attempts.
+    """
+    tree = git(repo, "rev-parse", "HEAD^{tree}")
+    parent = git(repo, "rev-parse", "HEAD")
+    fixed = (
+        f"tree {tree}\n"
+        f"parent {parent}\n"
+        "author Test <test@example.com> 0 +0000\n"
+        "committer Test <test@example.com> 0 +0000\n\n"
+    )
+    seen: dict[str, tuple[str, bytes]] = {}
+    pair: tuple[tuple[str, bytes], tuple[str, bytes]] | None = None
+    for nonce in range(500_000):
+        body = f"{fixed}ambiguous-prefix-{nonce}\n".encode()
+        serialized = f"commit {len(body)}\0".encode() + body
+        oid = hashlib.sha1(serialized, usedforsecurity=False).hexdigest()
+        prefix = oid[:7]
+        previous = seen.get(prefix)
+        if previous is not None and previous[0] != oid:
+            pair = (previous, (oid, body))
+            break
+        seen[prefix] = (oid, body)
+    if pair is None:  # pragma: no cover - collision probability is effectively 1
+        raise AssertionError("failed to generate a seven-hex commit collision")
+
+    for expected_oid, body in pair:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "hash-object", "-t", "commit", "-w", "--stdin"],
+            input=body,
+            capture_output=True,
+            check=True,
+        )
+        assert proc.stdout.decode().strip() == expected_oid
+    return pair[0][0][:7], (pair[0][0], pair[1][0])
+
+
 # Guard for every test whose subject is a STRICT DECODE of subprocess output —
 # the #378 verify-command pair below and the #377 git-chokepoint test above them.
 # Byte 0xff is undecodable only in UTF-8/ASCII; every ISO-8859-x and cp125x codec
@@ -80,7 +122,17 @@ def test_attempt_dirty_tracked_change(project):
 
 
 def test_file_bytes_at_revision_distinguishes_blob_absence_tree_and_git_failure(project):
-    """The baseline oracle returns only proven blob bytes, never tree listings."""
+    """The baseline oracle returns only proven blob bytes, never tree listings.
+
+    Ablation: drop either side of ``entry is None or entry[1] != "blob"`` from
+    either oracle — four mutations, each reddening exactly one of the four ``is
+    None`` assertions. The absence side raises ``TypeError`` on the ``missing.bin``
+    case; the type side reddens the ``oracle`` case, and only there do the two
+    oracles differ. Plain ``cat-file blob`` is refused by git on a tree oid, so
+    that mutation still fails loudly; ``cat-file --filters`` instead renders the
+    tree's listing and hands it back as file content, which nothing but this
+    clause keeps out of a baseline comparison.
+    """
     repo = project.project
     nested = repo / "oracle" / "spec.bin"
     nested.parent.mkdir()
@@ -459,6 +511,26 @@ def test_git_bytes_timeout_still_becomes_git_error(project, monkeypatch):
         verify.git_bytes(project.project, "config", "--get", "core.excludesFile")
 
 
+def test_git_timeout_carries_its_own_type(project, monkeypatch):
+    """A hung git raises `GitTimeoutError` — a `GitError` like every other fault, so
+    no existing guard changes, and a distinct type so the one caller that is about
+    to spawn ANOTHER git can tell "git answered non-zero" (the next command answers
+    just as fast) from "git does not return" (the next command pays the whole
+    deadline again). `cli.cmd_validate` is that caller; the class is the only thing
+    that separates the two, since both arrive as a bare `GitError` message today.
+
+    Both halves are asserted deliberately: the subclass relation is what keeps the
+    taxonomy backward compatible, and losing it would silently break every
+    `except GitError` guard in the tree.
+
+    Ablation: raise a bare `GitError` from `_run_git`'s `TimeoutExpired` arm and the
+    type assertion fails while the `isinstance(..., GitError)` one stays green."""
+    monkeypatch.setattr(verify.subprocess, "run", _timing_out_run)
+    with pytest.raises(verify.GitTimeoutError, match=r"git config timed out after \d+s") as excinfo:
+        verify.git_bytes(project.project, "config", "--get", "core.excludesFile")
+    assert isinstance(excinfo.value, verify.GitError)
+
+
 def test_git_bytes_spawn_oserror_still_becomes_git_spawn_error(project, monkeypatch):
     """Same for a spawn-level OSError — GitSpawnError, errno still reachable.
 
@@ -507,9 +579,9 @@ def test_verify_dev_spawn_fault_escalates(project, monkeypatch):
     """#343 acceptance, escalate class: with the OSError injected at
     `subprocess.run` itself, the shared change-gate's `except GitError` guard
     catches the translated GitSpawnError and escalates (CRITICAL, not
-    retryable) instead of crashing. Everything on the path before
-    `has_changes_since` is filesystem-only, so the blanket injection's first
-    git spawn is exactly the guarded call.
+    retryable) instead of crashing. Baseline canonicalization now performs
+    fail-closed Git reads first, so the injection targets the proof-of-work diff
+    explicitly.
 
     Ablation target: delete the `except OSError` arm in `verify._run_git` and
     this fails with the raw OSError."""
@@ -519,14 +591,53 @@ def test_verify_dev_spawn_fault_escalates(project, monkeypatch):
     write_spec(sp, "in-review", task.baseline_commit)
     (project.project / "src.txt").write_text("changed\n")
 
-    def cannot_spawn(cmd, **kwargs):
-        raise OSError(12, "Cannot allocate memory")
+    real_run = verify.subprocess.run
 
-    monkeypatch.setattr(verify.subprocess, "run", cannot_spawn)
+    def cannot_spawn_diff(cmd, **kwargs):
+        if cmd[3] == "diff" and "--quiet" in cmd:
+            raise OSError(12, "Cannot allocate memory")
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(verify.subprocess, "run", cannot_spawn_diff)
     out = verify.verify_dev(task, project, dev_result(sp))
     assert not out.ok and not out.retryable
     assert out.severity == "CRITICAL"
     assert "failed to spawn" in out.reason
+
+
+@pytest.mark.parametrize("subcommand", ["rev-parse", "cat-file"])
+def test_verify_dev_canonical_baseline_spawn_fault_escalates(project, monkeypatch, subcommand):
+    """Baseline canonicalization is a validation boundary, not a best-effort
+    ancestry probe. A machine fault while resolving or typing the claimed object
+    must escalate instead of masquerading as a retryable baseline mismatch.
+
+    Ablation: catch ``GitError`` in ``_canonical_commit_oid`` and return ``None``;
+    both parameters become retryable mismatches and fail the severity assertions.
+    """
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    (project.project / "src.txt").write_text("changed\n")
+
+    real_run = verify.subprocess.run
+    fault_args = (
+        ["rev-parse", f"--disambiguate={task.baseline_commit}"]
+        if subcommand == "rev-parse"
+        else ["cat-file", "-t", task.baseline_commit]
+    )
+
+    def cannot_spawn_canonicalization(cmd, **kwargs):
+        if cmd[3:] == fault_args:
+            raise OSError(12, "Cannot allocate memory")
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(verify.subprocess, "run", cannot_spawn_canonicalization)
+    out = verify.verify_dev(task, project, dev_result(sp))
+
+    assert not out.ok and not out.retryable
+    assert out.severity == "CRITICAL"
+    assert f"git {subcommand} failed to spawn" in out.reason
 
 
 def test_verify_dev_status_is_case_insensitive(project):
@@ -757,6 +868,336 @@ def test_verify_dev_short_hash_baseline(project):
 
     out = verify.verify_dev(task, project, dev_result(sp))
     assert out.ok
+
+
+def test_canonical_commit_oid_accepts_full_uppercase_and_unique_abbreviation(project):
+    oid = verify.rev_parse_head(project.project)
+
+    assert verify._canonical_commit_oid(project.project, oid) == oid
+    assert verify._canonical_commit_oid(project.project, oid.upper()) == oid
+    assert verify._canonical_commit_oid(project.project, oid[:7]) == oid
+
+
+@pytest.mark.parametrize("object_kind", ["blob", "tree", "tag"])
+def test_canonical_commit_oid_refuses_non_commit_objects(project, object_kind):
+    """Ablation: returning the sole disambiguated object without the
+    ``cat-file -t`` direct-commit check makes every parameter fail."""
+    if object_kind == "blob":
+        oid = git(project.project, "hash-object", "-w", "src.txt")
+    elif object_kind == "tree":
+        oid = git(project.project, "rev-parse", "HEAD^{tree}")
+    else:
+        git(project.project, "tag", "-a", "object-tag", "-m", "tag object", "HEAD")
+        oid = git(project.project, "rev-parse", "object-tag^{tag}")
+
+    assert verify._canonical_commit_oid(project.project, oid) is None
+
+
+def test_canonical_commit_oid_refuses_an_ambiguous_prefix(project):
+    """Ablation: accepting the first disambiguated object instead of requiring
+    ``len(objects) == 1`` makes this assertion fail."""
+    prefix, oids = _write_ambiguous_commit_prefix(project.project)
+
+    assert set(git(project.project, "rev-parse", f"--disambiguate={prefix}").splitlines()) == set(
+        oids
+    )
+    assert verify._canonical_commit_oid(project.project, prefix) is None
+
+
+def test_canonical_commit_oid_accepts_sha256_when_git_supports_it(project):
+    repo = project.project / "sha256-repo"
+    proc = subprocess.run(
+        ["git", "init", "-q", "--object-format=sha256", str(repo)],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        pytest.skip(f"Git does not support SHA-256 repositories: {proc.stderr.strip()}")
+    git(repo, "config", "user.name", "Test")
+    git(repo, "config", "user.email", "test@example.com")
+    (repo / "file.txt").write_text("sha256 fixture\n")
+    git(repo, "add", "file.txt")
+    git(repo, "commit", "-q", "-m", "sha256 commit")
+    oid = verify.rev_parse_head(repo)
+
+    assert len(oid) == 64
+    assert verify._canonical_commit_oid(repo, oid[:12].upper()) == oid
+
+
+def test_verify_dev_accepts_a_reachable_descendant_baseline(project):
+    """A session that commits inside the unit before step-03 stamps
+    `baseline_revision` makes that stamp a DESCENDANT of the baseline the
+    orchestrator recorded — the shape no branch of the gate could accept, so a
+    finished attempt was refused at the door. The immutable descendant is
+    accepted when this checkout's HEAD reaches it and later work is proven."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "spec for 1-1-a")
+    spec_commit = verify.rev_parse_head(project.project)
+
+    # step-03 stamps "current HEAD before making any changes" — the spec commit
+    write_spec(sp, "in-review", spec_commit)
+    (project.project / "src.txt").write_text("changed\n")
+
+    assert verify.is_ancestor(project.project, task.baseline_commit, spec_commit)
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert out.ok
+
+
+def test_verify_dev_uses_canonical_oid_after_same_named_ref_moves(project, monkeypatch):
+    """Once the claim is disambiguated, later ref movement cannot retarget any
+    ancestry or proof-of-work operation back onto the mutable ref name."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "descendant baseline")
+    descendant = verify.rev_parse_head(project.project)
+    claimed_ref = descendant[:12]
+    git(project.project, "branch", claimed_ref, descendant)
+
+    write_spec(sp, "in-review", claimed_ref)
+    (project.project / "src.txt").write_text("work after the descendant\n")
+
+    real_is_ancestor = verify.is_ancestor
+    calls: list[tuple[str, str]] = []
+
+    def move_ref_then_check(repo, ancestor, candidate):
+        if not calls:
+            git(repo, "branch", "-f", claimed_ref, task.baseline_commit)
+        calls.append((ancestor, candidate))
+        return real_is_ancestor(repo, ancestor, candidate)
+
+    monkeypatch.setattr(verify, "is_ancestor", move_ref_then_check)
+    out = verify.verify_dev(task, project, dev_result(sp))
+
+    assert out.ok
+    assert calls == [
+        (task.baseline_commit, descendant),
+        (descendant, descendant),
+    ]
+    assert git(project.project, "rev-parse", f"refs/heads/{claimed_ref}") == task.baseline_commit
+
+
+def test_verify_dev_still_refuses_a_stale_ancestor_baseline(project):
+    """The stale-premise case the gate exists for is untouched: an OLDER
+    baseline outside a deferred-work bundle still fails.
+
+    Ablation: force ``commit_reachable_above_baseline`` to return ``True`` and
+    the attempt passes, failing the refusal assertion.
+    """
+    ancestor = verify.rev_parse_head(project.project)
+    (project.project / "prior.txt").write_text("work that landed first\n")
+    git(project.project, "add", "prior.txt")
+    git(project.project, "commit", "-q", "-m", "prior work")
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)  # baseline = the newer HEAD
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", ancestor)
+    (project.project / "src.txt").write_text("changed\n")
+
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and "does not match" in out.reason
+
+
+def test_verify_dev_still_refuses_a_diverged_commit_baseline(project):
+    """Ablation: force ``commit_reachable_above_baseline`` to return ``True``
+    and this unrelated root passes, failing the refusal assertion."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    tree = git(project.project, "rev-parse", "HEAD^{tree}")
+    diverged = git(project.project, "commit-tree", tree, "-m", "unrelated root")
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", diverged)
+    (project.project / "src.txt").write_text("changed\n")
+
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and "does not match" in out.reason
+
+
+def test_verify_dev_refuses_a_descendant_off_this_worktree(project):
+    """The half that keeps the widening narrow: a commit above the baseline that
+    this checkout's HEAD does not reach is outside the accepted history.
+
+    Ablation: force ``commit_reachable_above_baseline`` to return ``True``
+    (bypassing its final HEAD-ancestry call) and the refusal assertion fails.
+    """
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+
+    git(project.project, "checkout", "-q", "-b", "elsewhere")
+    (project.project / "foreign.txt").write_text("another branch\n")
+    git(project.project, "add", "foreign.txt")
+    git(project.project, "commit", "-q", "-m", "foreign work")
+    foreign = verify.rev_parse_head(project.project)
+    git(project.project, "checkout", "-q", "-")
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", foreign)
+    (project.project / "src.txt").write_text("changed\n")
+
+    assert verify.is_ancestor(project.project, task.baseline_commit, foreign)
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and "does not match" in out.reason
+
+
+def test_verify_dev_descendant_baseline_needs_work_above_it(project):
+    """Accepting a newer claim re-anchors proof-of-work onto it. Under the default
+    `isolation = "none"` the unit works in the shared checkout, so a commit can
+    arrive from outside the session and still be reachable from HEAD; measuring
+    from the recorded baseline would let that commit satisfy proof-of-work on its
+    own, passing an attempt that implemented nothing.
+
+    Ablation: leave ``proof_baseline`` at the recorded baseline after accepting
+    the descendant and this no-work attempt passes, failing the assertion.
+    """
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    (project.project / "someone-elses-work.txt").write_text("not this session\n")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "a commit from outside the session")
+    foreign_but_reachable = verify.rev_parse_head(project.project)
+
+    # the spec claims it, and the session then implements NOTHING
+    write_spec(sp, "in-review", foreign_but_reachable)
+
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok, "a session that implemented nothing passed the gate"
+
+
+def test_verify_dev_descendant_baseline_refuses_untracked_only_residue(project):
+    """The launch-time untracked snapshot says when residue appeared relative
+    to the recorded baseline, not relative to a later claimed descendant. It
+    therefore cannot prove that an untracked file was made after that claim.
+
+    Ablation: keep ``include_untracked_proof`` true for the accepted descendant
+    and the residue makes the attempt pass, failing the refusal assertion.
+    """
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    task.baseline_untracked = []
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    residue = project.project / "intervening-untracked.txt"
+    residue.write_text("created before the descendant claim\n")
+    git(
+        project.project,
+        "add",
+        project.sprint_status.relative_to(project.project).as_posix(),
+        sp.relative_to(project.project).as_posix(),
+    )
+    git(project.project, "commit", "-q", "-m", "descendant baseline")
+    descendant = verify.rev_parse_head(project.project)
+
+    write_spec(sp, "in-review", descendant)
+    out = verify.verify_dev(task, project, dev_result(sp))
+
+    assert residue.is_file()
+    assert not out.ok and "no changes" in out.reason
+
+
+@pytest.mark.parametrize("proof_kind", ["tracked", "staged", "committed"])
+def test_verify_dev_descendant_baseline_accepts_tracked_proof(project, proof_kind):
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "descendant baseline")
+    descendant = verify.rev_parse_head(project.project)
+    write_spec(sp, "in-review", descendant)
+
+    if proof_kind == "tracked":
+        (project.project / "src.txt").write_text("tracked modification\n")
+    elif proof_kind == "staged":
+        (project.project / "staged-proof.txt").write_text("staged new file\n")
+        git(project.project, "add", "staged-proof.txt")
+    else:
+        (project.project / "src.txt").write_text("committed work\n")
+        git(project.project, "add", "src.txt")
+        git(project.project, "commit", "-q", "-m", "work after descendant")
+
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert out.ok
+
+
+def test_verify_dev_equal_baseline_still_accepts_new_untracked_file(project):
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    task.baseline_untracked = []
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    (project.project / "untracked-proof.txt").write_text("new after exact baseline\n")
+
+    assert verify.verify_dev(task, project, dev_result(sp)).ok
+
+
+def test_verify_dev_refuses_a_symbolic_baseline_revision(project):
+    """A spec naming a Git revision expression instead of an immutable object id
+    (`baseline_revision: HEAD`) resolves at verification time, so every ancestry
+    question about it answers yes. It must not buy the relaxation.
+
+    Ablation: restore the old lexical-hex check plus raw-ref ancestry calls and
+    ``HEAD`` makes the attempt pass, failing the refusal assertion.
+    """
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "spec for 1-1-a")
+
+    write_spec(sp, "in-review", "HEAD")
+    (project.project / "src.txt").write_text("changed\n")
+
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and "does not match" in out.reason
+
+
+@pytest.mark.parametrize("ref_kind", ["branch", "tag"])
+def test_verify_dev_refuses_an_all_hex_ref_baseline(project, ref_kind):
+    """Hex spelling alone does not make a claim immutable. Git resolves an
+    all-hex branch or tag when no object has that prefix, so the baseline gate
+    must disambiguate the object id independently of the ref namespace.
+
+    Ablation: restore the old ``_OBJECT_ID``-only gate and raw-ref ancestry
+    calls; both parameters pass verification and fail this refusal assertion.
+    """
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "reachable descendant")
+
+    claimed_ref = "deadbeef"
+    if ref_kind == "branch":
+        git(project.project, "branch", claimed_ref, "HEAD")
+    else:
+        git(project.project, "tag", claimed_ref, "HEAD")
+    assert git(project.project, "rev-parse", claimed_ref) == verify.rev_parse_head(project.project)
+    assert git(project.project, "rev-parse", f"--disambiguate={claimed_ref}") == ""
+
+    write_spec(sp, "in-review", claimed_ref)
+    (project.project / "src.txt").write_text("changed after the claim\n")
+
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and "does not match" in out.reason
 
 
 def test_verify_dev_no_changes(project):
@@ -1125,6 +1566,184 @@ def test_verify_commands_rc1_stays_fixable_retry(tmp_path):
     assert not out.ok and out.fixable and out.retryable and not out.env_fault
 
 
+def test_verify_commands_bound_a_stream_instead_of_holding_it_whole(tmp_path, monkeypatch):
+    """A chatty command's stream is cut to `MAX_STREAM_MEMORY_BYTES` as it is
+    collected, and what it emitted is recorded rather than lost.
+
+    `capture_output=True` always materialises one command's whole output; what
+    this bounds is RETENTION — before it, every command's full streams stayed in
+    the results list while all the later commands ran, so peak memory scaled with
+    the number of configured verify commands instead of with the largest one.
+    Plugins are meant to see streams essentially whole, so the ceiling sits far
+    above `stream_capture_kb` and is a backstop, not a knob; the test lowers it
+    rather than emitting 32 MiB to prove the same branch.
+
+    Ablation: hand the raw `proc.stdout` to CommandResult again and `stdout` comes
+    back 5000 bytes with `stdout_full_bytes` None. Verified.
+    """
+    script = tmp_path / "chatty.py"
+    script.write_text("import sys\nsys.stdout.write('o' * 5000)\n", encoding="utf-8")
+    policy = Policy(verify=VerifyPolicy(commands=(f'"{sys.executable}" "{script}"',)))
+    monkeypatch.setattr(verify, "MAX_STREAM_MEMORY_BYTES", 64)
+
+    (result,) = verify.run_verify_commands(policy, tmp_path)
+
+    assert result.stdout == "o" * 64  # the TAIL survives, as at every other bound
+    assert result.stdout_full_bytes == 5000  # and the emitted size is not lost
+    assert result.stderr == "" and result.stderr_full_bytes == 0
+    assert result.output_tail == "o" * 64  # merged view built from the bounded pair
+
+
+def test_verify_commands_preserve_separate_stdout_and_stderr(tmp_path):
+    """The merged bounded tail remains compatible while the raw streams stay
+    distinguishable for engine-owned journal pointers and plugin observation."""
+    script = tmp_path / "streams.py"
+    script.write_text(
+        "import sys\nprint('stdout proof')\nprint('stderr proof', file=sys.stderr)\n",
+        encoding="utf-8",
+    )
+    policy = Policy(verify=VerifyPolicy(commands=(f'"{sys.executable}" "{script}"',)))
+
+    (result,) = verify.run_verify_commands(policy, tmp_path)
+
+    assert result.returncode == 0
+    assert result.stdout == "stdout proof\n"
+    assert result.stderr == "stderr proof\n"
+    assert result.output_tail == "stdout proof\nstderr proof\n"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, ""), ("already decoded", "already decoded")],
+    ids=["none", "str-passthrough"],
+)
+def test_timeout_stream_shapes_that_carry_no_decode(value, expected):
+    """The two non-bytes shapes of a timeout payload, asserted directly because
+    neither reaches a codec — there is no stdlib decoding for a real child to
+    exercise, so driving one would add cost without adding evidence.
+
+    ``None`` is POSIX's answer when nothing had been buffered on that stream
+    (``_check_timeout`` passes None, not ``b""``, for an empty chunk list); the
+    CommandResult must still carry a str. The str arm is Windows, where
+    ``subprocess.run`` re-collects through ``communicate()`` after ``kill()`` and
+    the text wrapper has already decoded — dropping it would lose that
+    platform's output entirely. The bytes shape, the only one that picks a
+    codec, is covered by the real-child test below."""
+    assert verify._timeout_stream(value) == expected
+
+
+# ---- a timed-out child's output reads like a completed one's (#378, follow-on)
+#
+# Both divergences pinned here are invisible on the hosts the suite usually runs
+# on: `bytes.decode()`'s hardcoded UTF-8 equals the locale codec wherever the
+# locale is UTF-8, and LF-only output has no carriage returns to collapse. Every
+# CI leg is UTF-8 (Linux by locale, Windows by PYTHONUTF8=1), so gating on the
+# host codec — the `needs_strict_codec` shape used above — would skip precisely
+# where the guard is wanted, the inverse of what that marker buys its own tests.
+# The work is therefore driven inside a child interpreter pinned to an ASCII
+# locale. Everything below that boundary is genuine: one real grandchild script
+# emits the bytes on both paths, and CPython's own timeout leg is what hands the
+# hung one over. Monkeypatching `subprocess.run` instead would supply str objects
+# directly and never run the stdlib's decoding at all (see the #378 block below).
+_TIMEOUT_RAW = b"caf\xc3\xa9\r\nsecond\rthird\n"
+"""Undecodable as ASCII and carrying both newline forms, so a single payload
+exercises the codec choice, the CRLF pair and the lone CR at once."""
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="the bytes arm is unreachable on Windows (run() re-collects via "
+    "communicate() after kill(), which returns str, already decoded and "
+    "newline-translated), and LC_ALL is not how Windows resolves the codec",
+)
+def test_verify_commands_timeout_output_matches_the_completed_path(tmp_path):
+    """The same bytes must read back the same whether the command finished or
+    timed out — the tail a human or a repair session sees cannot depend on that.
+
+    POSIX raises TimeoutExpired from ``_check_timeout`` with the raw chunks
+    joined, *before* the text-mode conversion at the end of ``_communicate``, so
+    the timeout arm has to redo that conversion itself. It did neither half:
+    ``bytes.decode()`` hardcoded UTF-8 against run_verify_commands' own rule
+    (#378) that host-tool output stays on the locale codec, and nothing
+    collapsed the newlines that ``Popen._translate_newlines`` collapses.
+
+    The completed result is the reference rather than a literal, so the assertion
+    is against what the stdlib actually does, not against this test's idea of it.
+
+    Ablation, two axes, and each reddens a different assertion: drop the
+    ``locale.getpreferredencoding(False)`` argument and the codec half fails;
+    drop the ``replace`` chain and the newline half does. Note that ``LC_ALL=C``
+    alone does NOT redden the codec axis — the C locale auto-enables UTF-8 mode
+    (PEP 540), putting both spellings back on one codec — so ``PYTHONUTF8=0``
+    below is load-bearing, and the anti-vacuity checks fail loudly if it is
+    ever lost rather than letting the test pass empty."""
+    emit = tmp_path / "emit_timeout.py"
+    emit.write_text(
+        "import sys, time\n"
+        f"sys.stdout.buffer.write({_TIMEOUT_RAW!r})\n"
+        "sys.stdout.buffer.flush()\n"
+        "if sys.argv[1] == 'hang':\n"
+        "    time.sleep(10)\n",
+        encoding="utf-8",
+    )
+    driver = tmp_path / "drive_timeout.py"
+    # One script, two modes: the completed and timed-out runs are byte-identical
+    # by construction, so comparing their results compares only the two paths.
+    # Interpreter is sys.executable, never a bare `python` — the suite runs under
+    # uv, where no `python` need be on PATH. json defaults to ensure_ascii, so the
+    # report survives the ASCII stdout it is printed on.
+    driver.write_text(
+        "import json, locale, sys\n"
+        "from pathlib import Path\n"
+        "from bmad_loop import verify\n"
+        "from bmad_loop.policy import Policy, VerifyPolicy\n"
+        "verify.COMMAND_TIMEOUT_S = 1.0\n"
+        "def run(mode):\n"
+        '    cmd = \'"%s" "%s" %s\' % (sys.executable, sys.argv[1], mode)\n'
+        "    (r,) = verify.run_verify_commands(\n"
+        "        Policy(verify=VerifyPolicy(commands=(cmd,))), Path(sys.argv[2])\n"
+        "    )\n"
+        "    return r\n"
+        "done, hung = run('exit'), run('hang')\n"
+        "json.dump({'encoding': locale.getpreferredencoding(False),\n"
+        "           'completed_rc': done.returncode, 'completed_stdout': done.stdout,\n"
+        "           'timeout_rc': hung.returncode, 'timeout_tail': hung.output_tail,\n"
+        "           'timeout_stdout': hung.stdout, 'timeout_stderr': hung.stderr},\n"
+        "          sys.stdout)\n",
+        encoding="utf-8",
+    )
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONIOENCODING", "LANG", "LC_CTYPE")}
+    env["LC_ALL"] = "C"
+    env["PYTHONUTF8"] = "0"  # without this the C locale would resolve to UTF-8 (PEP 540)
+
+    proc = subprocess.run(
+        [sys.executable, str(driver), str(emit), str(tmp_path)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=env,
+        timeout=120,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    observed = json.loads(proc.stdout)
+    decoded = _TIMEOUT_RAW.decode(observed["encoding"], errors="replace")
+    # One anti-vacuity check per divergence: if the child ever stops resolving a
+    # non-UTF-8 codec, or the payload loses its carriage returns, the equality
+    # below would hold with the bug in place. These fail instead of going quiet.
+    assert decoded != _TIMEOUT_RAW.decode("utf-8", errors="replace")
+    assert "\r" in decoded
+
+    assert observed["completed_rc"] == 0
+    assert observed["completed_stdout"] == decoded.replace("\r\n", "\n").replace("\r", "\n")
+
+    assert observed["timeout_rc"] == -1
+    assert observed["timeout_tail"] == "timed out"
+    assert observed["timeout_stdout"] == observed["completed_stdout"]
+    # The child wrote nothing to stderr, so POSIX handed _timeout_stream None.
+    assert observed["timeout_stderr"] == ""
+
+
 def test_verify_commands_timeout_stays_charged(tmp_path, monkeypatch):
     """A timeout is plausibly the story's own tests hanging — it keeps the
     fixable-retry classification, not the env-fault escalate."""
@@ -1287,6 +1906,165 @@ def test_verify_dev_bundle_ancestor_baseline_passes(project):
     assert task.spec_file == str(sp)
 
 
+def test_verify_dev_bundle_ancestor_baseline_retains_untracked_proof(project):
+    ancestor = verify.rev_parse_head(project.project)
+    (project.project / "story-work.txt").write_text("story work\n")
+    git(project.project, "add", "story-work.txt")
+    git(project.project, "commit", "-q", "-m", "story work")
+    task = make_bundle_task(project, dw_ids=("DW-1",))
+    task.baseline_untracked = []
+    sp = project.implementation_artifacts / "spec-1-1-a.md"
+    write_spec(sp, "in-review", ancestor)
+    (project.project / "untracked-bundle-proof.txt").write_text("new bundle work\n")
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "dw_ids": ["DW-1"]}
+
+    assert verify.verify_dev_bundle(task, project, rj).ok
+
+
+def test_verify_dev_bundle_symbolic_baseline_is_refused(project):
+    """The ancestor relaxation must not be buyable with a claim that pins
+    nothing. `baseline_revision: HEAD` is resolved when the gate runs, not when
+    the session stamped it, so it reads as an ancestor of the unit baseline
+    whenever the checkout's HEAD still equals the recorded baseline — exactly
+    the stale premise this gate exists to refuse. Canonicalization has to happen
+    before the leg, not after.
+
+    Ablation: bypass ``_canonical_commit_oid`` in the ``allow_ancestor_baseline``
+    leg only, letting it consume the raw ``claimed_baseline``, and the attempt
+    passes, failing the refusal assertion. The dev-path twin
+    (``test_verify_dev_refuses_a_symbolic_baseline_revision``) stays green under
+    it: it never sets the flag, and ``_OBJECT_ID`` rejects ``HEAD`` ahead of the
+    newer-baseline leg either way.
+    """
+    (project.project / "story-work.txt").write_text("stories 1.1-1.3\n")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "story work")
+    task = make_bundle_task(project, dw_ids=("DW-1",))  # baseline = new HEAD
+    assert verify.is_ancestor(project.project, "HEAD", task.baseline_commit)
+
+    sp = project.implementation_artifacts / "spec-1-1-a.md"
+    write_spec(sp, "in-review", "HEAD")
+    (project.project / "src.txt").write_text("review fixes\n")
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "dw_ids": ["DW-1"]}
+
+    assert verify._canonical_commit_oid(project.project, "HEAD") is None
+    out = verify.verify_dev_bundle(task, project, rj)
+    assert not out.ok and "does not match" in out.reason
+
+
+@pytest.mark.parametrize("ref_kind", ["branch", "tag"])
+def test_verify_dev_bundle_all_hex_ref_baseline_is_refused(project, ref_kind):
+    """Hex spelling does not make a claim immutable on the bundle path either.
+    An all-hex branch or tag pointing at a genuine ancestor would satisfy the
+    relaxation through the ref namespace, so the gate must disambiguate the
+    object id independently of refs before the leg is reached.
+
+    Ablation: bypass ``_canonical_commit_oid`` in the ``allow_ancestor_baseline``
+    leg only and both parameters pass verification. The dev-path twin
+    (``test_verify_dev_refuses_an_all_hex_ref_baseline``) stays green under that
+    mutation, because it never sets the flag. It does redden under a *full*
+    pre-#645 restore, which strips canonicalization from the newer-baseline leg
+    as well — a strictly larger mutation than the one named here.
+    """
+    ancestor = verify.rev_parse_head(project.project)
+    (project.project / "story-work.txt").write_text("stories 1.1-1.3\n")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "story work")
+    task = make_bundle_task(project, dw_ids=("DW-1",))
+
+    claimed_ref = "abcdef0"
+    if ref_kind == "branch":
+        git(project.project, "branch", claimed_ref, ancestor)
+    else:
+        git(project.project, "tag", claimed_ref, ancestor)
+    assert git(project.project, "rev-parse", claimed_ref) == ancestor
+    assert git(project.project, "rev-parse", f"--disambiguate={claimed_ref}") == ""
+    assert verify.is_ancestor(project.project, claimed_ref, task.baseline_commit)
+
+    sp = project.implementation_artifacts / "spec-1-1-a.md"
+    write_spec(sp, "in-review", claimed_ref)
+    (project.project / "src.txt").write_text("review fixes\n")
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "dw_ids": ["DW-1"]}
+
+    assert verify._canonical_commit_oid(project.project, claimed_ref) is None
+    out = verify.verify_dev_bundle(task, project, rj)
+    assert not out.ok and "does not match" in out.reason
+
+
+def test_verify_dev_bundle_single_char_ref_baseline_is_refused(project):
+    """A ref short enough to be a prefix of its own target defeats any test that
+    reasons about spelling: a branch named for its target's first character does
+    begin with its own name. The claim is refused because it cannot be
+    canonicalized at all — one character is below ``_OBJECT_ID``'s floor and
+    below the four ``rev-parse --disambiguate`` requires — so the ref namespace
+    is never consulted, and the self-prefix property never gets a chance to
+    matter.
+
+    Ablation: bypass ``_canonical_commit_oid`` in the ``allow_ancestor_baseline``
+    leg only and the ref resolves through the namespace to a genuine ancestor,
+    so the attempt passes. Relaxing ``_OBJECT_ID``'s length floor does NOT redden
+    this one — a one-character claim is below every floor git itself will
+    resolve.
+    """
+    ancestor = verify.rev_parse_head(project.project)
+    (project.project / "story-work.txt").write_text("stories 1.1-1.3\n")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "story work")
+    task = make_bundle_task(project, dw_ids=("DW-1",))
+
+    claimed_ref = ancestor[0]
+    git(project.project, "branch", claimed_ref, ancestor)
+    assert git(project.project, "rev-parse", claimed_ref) == ancestor
+    assert ancestor.startswith(claimed_ref)  # the target DOES begin with the name
+    assert verify.is_ancestor(project.project, claimed_ref, task.baseline_commit)
+
+    sp = project.implementation_artifacts / "spec-1-1-a.md"
+    write_spec(sp, "in-review", claimed_ref)
+    (project.project / "src.txt").write_text("review fixes\n")
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "dw_ids": ["DW-1"]}
+
+    assert verify._canonical_commit_oid(project.project, claimed_ref) is None
+    out = verify.verify_dev_bundle(task, project, rj)
+    assert not out.ok and "does not match" in out.reason
+
+
+def test_verify_dev_bundle_below_floor_abbreviation_is_refused(project):
+    """Characterizes the deliberate 7-character floor on the bundle path: an
+    abbreviation git itself resolves is still refused when it is shorter than
+    ``_OBJECT_ID``'s floor. That 7 is the gate's own constant, set where git's
+    auto abbreviation bottoms out (``core.abbrev`` defaults to ``auto``, which
+    scales with repository size and clamps upward to 7 only for small repos, so
+    there is no fixed default to mirror). The stamp is ``git rev-parse HEAD`` output by
+    contract, so the floor costs a well-behaved session nothing, and
+    accepting shorter claims would re-admit prefix collisions the gate cannot
+    distinguish from drift. The refusal is the floor's doing, not an
+    unresolvable string — the premise assertion below pins that.
+
+    Ablation: relax ``_OBJECT_ID``'s length floor from 7 to 4 and the claim
+    canonicalizes to the ancestor, buys the relaxation leg, and the attempt
+    passes. That mutation reddens no other test in the suite, and none of the
+    ref-refusal tests above redden under it.
+    """
+    ancestor = verify.rev_parse_head(project.project)
+    (project.project / "story-work.txt").write_text("stories 1.1-1.3\n")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "story work")
+    task = make_bundle_task(project, dw_ids=("DW-1",))
+
+    claimed = ancestor[:6]
+    assert git(project.project, "rev-parse", claimed) == ancestor  # git resolves it
+    assert verify.is_ancestor(project.project, claimed, task.baseline_commit)
+
+    sp = project.implementation_artifacts / "spec-1-1-a.md"
+    write_spec(sp, "in-review", claimed)
+    (project.project / "src.txt").write_text("review fixes\n")
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "dw_ids": ["DW-1"]}
+
+    assert verify._canonical_commit_oid(project.project, claimed) is None
+    out = verify.verify_dev_bundle(task, project, rj)
+    assert not out.ok and "does not match" in out.reason
+
+
 def test_verify_dev_bundle_foreign_baseline_still_fails(project):
     """The bundle relaxation is ancestor-only: a baseline unknown to (or
     diverged from) the unit's history still fails the gate."""
@@ -1303,7 +2081,12 @@ def test_verify_dev_bundle_ancestor_probe_git_failure_stays_strict(project, monk
     """A git failure inside the ancestor probe (e.g. a timeout, which surfaces
     as GitError since #156's `_run_git` translation) must read as
     not-an-ancestor and fail the gate closed — never propagate out of
-    `_verify_shared_gates` and crash the run."""
+    `_verify_shared_gates` and crash the run. Baseline canonicalization is an
+    earlier escalation boundary, so the injection targets ``merge-base``.
+
+    Ablation: delete the ``except (OSError, GitError)`` guard in ``is_ancestor``;
+    the timeout propagates instead of reading as false and this test errors.
+    """
     ancestor = verify.rev_parse_head(project.project)
     (project.project / "story-work.txt").write_text("stories 1.1-1.3\n")
     git(project.project, "add", "-A")
@@ -1313,7 +2096,15 @@ def test_verify_dev_bundle_ancestor_probe_git_failure_stays_strict(project, monk
     write_spec(sp, "in-review", ancestor)
     (project.project / "src.txt").write_text("review fixes\n")
     rj = {"workflow": "auto-dev", "spec_file": str(sp), "dw_ids": ["DW-1"]}
-    monkeypatch.setattr(verify.subprocess, "run", _timing_out_run)
+
+    real_run = verify.subprocess.run
+
+    def timing_out_merge_base(cmd, **kwargs):
+        if cmd[3] == "merge-base":
+            return _timing_out_run(cmd, **kwargs)
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(verify.subprocess, "run", timing_out_merge_base)
     assert verify.is_ancestor(project.project, ancestor, task.baseline_commit) is False
     out = verify.verify_dev_bundle(task, project, rj)
     assert not out.ok and "baseline" in out.reason
@@ -2572,6 +3363,134 @@ def _metachar_pair(repo, meta: str, victim: str):
     return repo / meta / "f.md", repo / victim / "f.md"
 
 
+def test_file_holds_content_accepts_a_pristine_board_in_either_eol_domain(project):
+    """Sameness here is GIT's question, and a byte compare cannot ask it (#618).
+
+    A board git checked out under a normalizing config is CRLF; one an editor or a
+    byte-writing tool left is LF; git reports the tree clean for both. A byte compare
+    against HEAD therefore has to guess which end of the round trip the file sits at,
+    and each guess refuses a pristine board on the hosts the other guess serves — a raw
+    baseline refuses (a), a smudged baseline refuses (b). Hashing both sides through the
+    path's clean filter draws exactly the distinction git draws.
+
+    (c) is what keeps that from being a rubber stamp: cleaning collapses terminators,
+    never content, so an operator's added row is still not this run's advance.
+    """
+    repo = project.project
+    # `core.autocrlf=true` rather than an `eol=crlf` attribute: it is Git-for-Windows'
+    # system default, and it is the config under which BOTH spellings below read clean.
+    # An explicit `eol=crlf` is stricter and reports the LF file as ` M`, so case (a)
+    # could not arise there at all.
+    git(repo, "config", "core.autocrlf", "true")
+    (repo / "board.yaml").write_bytes(b"development_status:\n  1-1-a: backlog\n")
+    git(repo, "add", "--", "board.yaml")
+    git(repo, "commit", "-q", "-m", "an eol-normalizing board")
+    head = verify.file_bytes_at_revision(repo, "HEAD", "board.yaml")
+    assert head is not None and b"\r\n" not in head  # git stores the LF twin
+    board = repo / "board.yaml"
+
+    # (a) the LF form a byte-writing tool leaves. Ordered FIRST because it is only
+    # reachable before a checkout has smudged the path: git re-reads the file through
+    # the clean filter here and calls it identical, where overwriting an already-CRLF
+    # checkout with LF instead reports ` M` and never reaches this comparison at all.
+    assert b"\r\n" not in board.read_bytes()
+    git(repo, "update-index", "--refresh")  # no stat-cache false green
+    assert not verify.dirty_paths(repo)
+    assert verify.file_holds_content(repo, "board.yaml", board, head)
+
+    # (b) the CRLF form git itself materializes on checkout — equally clean, and the
+    # byte compare that serves (a) refuses this one.
+    board.unlink()
+    git(repo, "checkout", "--", "board.yaml")
+    assert b"\r\n" in board.read_bytes()
+    assert not verify.dirty_paths(repo)
+    assert verify.file_holds_content(repo, "board.yaml", board, head)
+
+    # (c) content is still compared: an operator's row is not this pass's advance
+    board.write_bytes(board.read_bytes() + b"  9-9-operator: backlog\r\n")
+    assert not verify.file_holds_content(repo, "board.yaml", board, head)
+
+
+def test_index_holds_no_foreign_content_guards_the_half_the_working_tree_cannot(project):
+    """A staged edit is destroyed by the carry, not committed by it (#618).
+
+    `commit_paths` runs `git add` for the path, which copies the WORKING TREE into the
+    commit and overwrites the INDEX in place. So an operator who staged an edit and then
+    restored the working copy loses those bytes to a carry that proved only the working
+    tree: absent from the commit, which took the other content, and absent from disk.
+    Nothing surfaces it — the tree reads clean afterwards.
+
+    HEAD's own content and the advance itself are both safe to overwrite: the first is
+    still in history, the second is the write being authorized.
+    """
+    repo = project.project
+    head_bytes = b"development_status:\n  1-1-a: ready-for-dev\n"
+    (repo / "board.yaml").write_bytes(head_bytes)
+    git(repo, "add", "--", "board.yaml")
+    git(repo, "commit", "-q", "-m", "board")
+    advance = head_bytes.replace(b"ready-for-dev", b"done")
+
+    assert verify.index_holds_no_foreign_content(repo, "board.yaml", advance)  # HEAD's own
+
+    (repo / "board.yaml").write_bytes(advance)
+    git(repo, "add", "--", "board.yaml")
+    assert verify.index_holds_no_foreign_content(repo, "board.yaml", advance)  # the advance
+
+    # the operator's own bytes, staged — reachable nowhere else once `git add` runs
+    (repo / "board.yaml").write_bytes(head_bytes + b"  9-9-operator: backlog\n")
+    git(repo, "add", "--", "board.yaml")
+    (repo / "board.yaml").write_bytes(advance)  # ...working tree restored over them
+    assert not verify.index_holds_no_foreign_content(repo, "board.yaml", advance)
+
+    # an untracked, unstaged path has nothing to overwrite
+    assert verify.index_holds_no_foreign_content(repo, "never-staged.yaml", advance)
+
+
+def test_index_holds_no_foreign_content_refuses_a_staged_untracking(project):
+    """An ABSENT index entry is not by itself "nothing to overwrite".
+
+    With HEAD carrying the path, no entry is a staged DELETION — `git rm --cached`,
+    which is how an operator untracks a board they are about to gitignore, and this
+    project documents both board shapes rather than treating that as exotic. The
+    carry's `git add` restores the entry, and the intent then exists nowhere: not in
+    HEAD, which never had it, and not in the index that just lost it. `git status`
+    reads clean afterwards, so nothing surfaces the reversal.
+
+    Reachable in earnest, unlike a bare truth-table hole: the probe that gates this
+    check reports the path (`??`, the file being on disk and no longer in the index),
+    so the ownership proof really is asked and really does answer.
+
+    The sibling row above ends on `never-staged.yaml` — no entry and no HEAD blob —
+    which is the case this must NOT break, and is why the answer keys on HEAD rather
+    than on refusing every empty index.
+
+    Ablation: restore `if not records: return True` and this row fails while that
+    sibling stays green."""
+    repo = project.project
+    head_bytes = b"development_status:\n  1-1-a: ready-for-dev\n"
+    (repo / "board.yaml").write_bytes(head_bytes)
+    git(repo, "add", "--", "board.yaml")
+    git(repo, "commit", "-q", "-m", "board")
+    advance = head_bytes.replace(b"ready-for-dev", b"done")
+
+    git(repo, "rm", "--cached", "-q", "--", "board.yaml")  # untracked, still on disk
+    assert git(repo, "ls-files", "-s", "--", "board.yaml") == ""  # no entry at all
+    assert "board.yaml" in verify.dirty_paths(repo)  # ...and the gate above still asks
+
+    assert not verify.index_holds_no_foreign_content(repo, "board.yaml", advance)
+
+
+def test_file_holds_content_raises_rather_than_answering_when_git_cannot_hash(project):
+    """An id it could not compute must not read as a verdict either way.
+
+    The caller gates a repair write on this, so the answer has to be git's or nobody's.
+    """
+    repo = project.project
+
+    with pytest.raises(verify.GitError, match="hash-object"):
+        verify.file_holds_content(repo, "board.yaml", repo / "never-written.yaml", b"x")
+
+
 def test_path_tracked_reports_index_membership(project):
     """The basic contract: an index entry is True, an untracked file is False."""
     repo = project.project
@@ -2617,13 +3536,17 @@ def test_path_tracked_still_matches_a_directory_prefix(project):
 
 
 def test_path_tracked_file_separates_a_file_from_a_directory_prefix(project):
-    """The whole reason this predicate exists next to its sibling: `path_tracked`
-    answers True for BOTH a tracked file and a tracked directory, and the worktree
-    shield needs opposite behaviour for the two (#392).
+    """Why this predicate is narrower than its sibling: `path_tracked` answers True for
+    BOTH a tracked file and a tracked directory, and its callers have to tell those
+    apart. Since #484 the shield asks `path_tracked_kind` for that — three answers, not
+    two — and this boolean is kept for `_pin_tracked_config_rewrite`, where only a
+    tracked FILE can carry the skip-worktree bit the pin depends on (#392, #484).
 
-    Ablation: return `bool(entries)` instead of comparing the set and the directory
-    assertion flips to True — i.e. the shield would start dropping a tracked skill
-    tree's pattern, which measurably DOES shield new children."""
+    Ablation: return `bool(entries)` instead of comparing the set — the mechanics now
+    live in `path_tracked_kind`, which this delegates to — and the directory assertion
+    flips to True. The shield would then read a tracked skill tree as a tracked FILE and
+    drop its pattern outright, where #484 has it SUBSTITUTE one pattern per file
+    provisioning actually wrote; nothing would shield that tree at all."""
     repo = project.project
     (repo / "_bmad" / "render").mkdir(parents=True, exist_ok=True)
     (repo / "_bmad" / "render" / "render_skill.py").write_text("# renderer\n")
@@ -2663,7 +3586,8 @@ def test_path_tracked_file_reads_a_metachar_name_past_its_glob_neighbour(project
     then keeps an inert pattern and the #392 hygiene failure survives for any project
     whose hook config or skill tree carries `[`, `*` or `?`.
 
-    Ablation: drop the `:(literal)` prefix and the first assertion flips to False."""
+    Ablation: drop the `:(literal)` prefix — the spec now lives in `path_tracked_kind`,
+    which this delegates to — and the first assertion flips to False."""
     repo = project.project
     _metachar_pair(repo, "docs[a]", "docsa")  # both committed, and the glob collides
     assert verify.path_tracked_file(repo, "docs[a]/f.md")
@@ -2685,6 +3609,89 @@ def test_path_tracked_file_raises_on_git_failure(project, monkeypatch):
     monkeypatch.setattr(verify, "git_bytes", boom)
     with pytest.raises(verify.GitError):
         verify.path_tracked_file(repo, "src.txt")
+
+
+def test_path_tracked_kind_separates_untracked_file_and_dir(project):
+    """The tri-state the shield reads (#484). A tracked FILE, a tracked DIRECTORY prefix
+    and a path with no index entry want three different pattern treatments — drop,
+    substitute one pattern per file provisioning wrote, keep — and the boolean sibling
+    collapses the last two into a single False.
+
+    Ablation: in `path_tracked_kind`, discriminate on `bool(entries)` instead of
+    comparing the set against `{os.fsencode(rel)}`, and the directory case answers
+    "file" — the shield would read a tracked skill tree as a tracked file, drop its
+    pattern outright, and put nothing at all in its place."""
+    repo = project.project
+    (repo / "_bmad" / "render").mkdir(parents=True, exist_ok=True)
+    (repo / "_bmad" / "render" / "render_skill.py").write_text("# renderer\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "render")
+    (repo / "stray.txt").write_text("untracked\n")
+
+    assert verify.path_tracked_kind(repo, "src.txt") == "file"
+    assert verify.path_tracked_kind(repo, "_bmad/render/render_skill.py") == "file"
+    # A directory lists the entries BENEATH it, never its own name — at either depth.
+    assert verify.path_tracked_kind(repo, "_bmad/render") == "dir"
+    assert verify.path_tracked_kind(repo, "_bmad") == "dir"
+    # Both untracked directions, which `path_tracked` cannot separate either.
+    assert verify.path_tracked_kind(repo, "stray.txt") == "untracked"
+    assert verify.path_tracked_kind(repo, "never_existed.txt") == "untracked"
+
+
+def test_path_tracked_kind_reads_a_metachar_name_past_its_glob_neighbour(project):
+    """The literal-pathspec hazard, in the direction reading the output's TEXT cannot
+    refuse on its own.
+
+    When the metachar path IS a tracked file and its glob neighbour is tracked too, a
+    bare pathspec returns BOTH names. The set then exceeds the singleton and a genuine
+    tracked FILE reads "dir", so the shield substitutes per-file patterns for a tree it
+    never wrote — for any project whose hook config or skill tree carries `[`, `*` or
+    `?`.
+
+    Ablation: drop the `:(literal)` prefix from `path_tracked_kind`'s spec alone (inline
+    the bare rel in place of `_literal_specs`, so the sibling probes that share that
+    helper stay untouched) and the first assertion flips to "dir". The absent-path
+    assertion below flips too, to "dir" on the neighbour's name alone — where the
+    boolean sibling's own record notes that direction ablates GREEN there, because
+    `{neighbour} != {rel}` reads False whichever way it got there. Widening the answer
+    from two states to three is what gives the second direction teeth."""
+    repo = project.project
+    _metachar_pair(repo, "docs[a]", "docsa")  # both committed, and the glob collides
+    assert verify.path_tracked_kind(repo, "docs[a]/f.md") == "file"
+    assert verify.path_tracked_kind(repo, "docsa/f.md") == "file"
+    git(repo, "rm", "-r", "-q", "--cached", "--", ":(literal)docs[a]")
+    assert verify.path_tracked_kind(repo, "docs[a]/f.md") == "untracked"
+
+
+def test_path_tracked_kind_raises_on_git_failure(project, monkeypatch):
+    """Contracted to raise like every other probe here, so the shield's caller makes its
+    own keep-the-pattern decision rather than inheriting a silent answer. Of the three,
+    a silent "file" drops the pattern and leaks seeded files into a story commit and a
+    silent "dir" substitutes patterns for a tree provisioning never wrote; only
+    "untracked" happens to coincide with the degrade, and a probe must not depend on
+    which fault it draws.
+
+    Pins the rc≠0 branch specifically: `git_bytes` returns the returncode as an ANSWER
+    and never raises on it, so nothing but this check turns a failed spawn into a fault.
+
+    Ablation: delete the `if proc.returncode != 0` raise and the call returns
+    "untracked" — a failed probe reading as a clean answer. That same mutation leaves
+    `test_path_tracked_file_raises_on_git_failure` GREEN, because it monkeypatches
+    `git_bytes` to RAISE rather than to return a bad rc: the sibling pins propagation,
+    not the branch that manufactures the fault, and only this test covers the latter."""
+    repo = project.project
+
+    def failed(_repo, *_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args=["git"], returncode=128, stdout=b"", stderr=b"fatal: bad index file"
+        )
+
+    monkeypatch.setattr(verify, "git_bytes", failed)
+    with pytest.raises(verify.GitError) as excinfo:
+        verify.path_tracked_kind(repo, "src.txt")
+    # The BARE rel is the operator's informative half; the magic prefix is our plumbing.
+    assert "src.txt" in str(excinfo.value)
+    assert "fatal: bad index file" in str(excinfo.value)
 
 
 @RESERVED_IN_WINDOWS_FILENAMES
@@ -2921,7 +3928,7 @@ def test_worktree_clean_ignores_stderr_chatter_on_success(project, monkeypatch):
 
 
 def test_rev_parse_head_reads_stdout_alone_under_host_noise(project):
-    """A warning-suffixed "sha" is not a sha. It reaches `same_commit` comparisons
+    """A warning-suffixed "sha" is not a sha. It reaches every commit comparison
     and the baselines persisted in run state, so a resume grades a warning-carrying
     string against a clean one and reads "moved" — silent, with a plausible-looking
     value.
@@ -3652,6 +4659,7 @@ def test_has_changes_since_subtracts_baseline_untracked(project):
 
     assert verify.has_changes_since(project.project, baseline) is True
     assert verify.has_changes_since(project.project, baseline, baseline_untracked=None) is True
+    assert verify.has_changes_since(project.project, baseline, include_untracked=False) is False
     assert (
         verify.has_changes_since(project.project, baseline, baseline_untracked=["residue.txt"])
         is False
@@ -3670,6 +4678,7 @@ def test_has_changes_since_subtracts_baseline_untracked(project):
         verify.has_changes_since(project.project, baseline, baseline_untracked=["residue.txt"])
         is True
     )
+    assert verify.has_changes_since(project.project, baseline, include_untracked=False) is True
 
 
 def test_verify_dev_exclude_relpaths_is_file_granular(project):
@@ -4534,3 +5543,150 @@ def test_engine_written_is_keyword_only_on_all_dev_verifiers():
         parameter = inspect.signature(fn).parameters["engine_written"]
         assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
     assert "operator_park" in inspect.signature(verify.verify_dev).parameters
+
+
+# --------------------------------------------------- the git support floor (GIT_FLOOR)
+
+
+@pytest.mark.parametrize(
+    ("reported", "supported"),
+    [
+        ("git version 2.34.0\n", True),  # the boundary itself
+        ("git version 2.33.8\n", False),  # one minor below it
+        ("git version 2.9.5\n", False),  # numeric, not lexicographic: "9" > "34" as text
+        ("git version 2.44.0.windows.1\n", True),
+        ("git version 2.39.5 (Apple Git-154)\n", True),
+        ("git version 3.0\n", True),
+        ("git version 2.34\n", True),  # bare major.minor: the end-of-string arm
+        # Trailing garbage where a delimiter belongs. Load-bearing because the DIGITS
+        # clear the floor: without the lookahead this parses as 2.34 and authorizes
+        # both a run and the shield's permanent repo-format write off an answer no
+        # git ever produced. The fail-closed doctrine has to reach it.
+        ("git version 2.34broken\n", False),
+        ("", False),  # nothing at all: a spawn that produced no stdout
+        ("fatal: not a git repository\n", False),
+        # No `git version` prefix. Refused deliberately: a bare-number answer is not
+        # this program's output, and the callers read False as "abort the run" and
+        # "do not touch this repository".
+        ("2.55.0\n", False),
+    ],
+)
+def test_git_version_at_least_reads_only_a_git_version_line(reported, supported):
+    """The PREDICATE behind every floor refusal. Unreadable answers must come back
+    False: both callers read False as a refusal, so an optimistic parse is the only
+    failure mode that costs anything."""
+    assert verify.git_version_at_least(reported, (2, 34)) is supported
+
+
+def test_git_version_at_least_is_inclusive_of_the_floor():
+    """`GIT_FLOOR` is INCLUSIVE — the constant's own docstring says so, because the
+    neighbouring psmux `_LAST_UNSUPPORTED` is exclusive and reads identically."""
+    floor = f"git version {verify.GIT_FLOOR[0]}.{verify.GIT_FLOOR[1]}.0\n"
+    assert verify.git_version_at_least(floor, verify.GIT_FLOOR) is True
+
+
+def test_git_floor_text_renders_the_constant():
+    """One formatter, so the four messages naming the floor cannot drift from it."""
+    assert verify.git_floor_text() == f"{verify.GIT_FLOOR[0]}.{verify.GIT_FLOOR[1]}"
+    assert verify.git_floor_text((2, 7)) == "2.7"
+
+
+def _fake_git_version(monkeypatch, stdout, returncode=0):
+    """Drive `git_below_floor`'s WIRING without touching the real git (2.55 here)."""
+
+    def fake(repo, *args, timeout_s=None):
+        assert args == ("version",)
+        return subprocess.CompletedProcess(
+            args=["git", "version"], returncode=returncode, stdout=stdout.encode(), stderr=b""
+        )
+
+    monkeypatch.setattr(verify, "git_bytes", fake)
+
+
+def test_git_below_floor_passes_a_current_git(project, monkeypatch):
+    _fake_git_version(monkeypatch, "git version 2.55.0\n")
+    assert verify.git_below_floor(project.project) is None
+
+
+def test_git_below_floor_reports_the_version_it_refused(project, monkeypatch):
+    """The REPORTED TEXT, not a bool — every caller names the version in its own
+    message, and a bool would leave them saying only "too old"."""
+    _fake_git_version(monkeypatch, "git version 2.25.1\n")
+    assert verify.git_below_floor(project.project) == "git version 2.25.1"
+
+
+def test_git_below_floor_refuses_an_unparseable_answer(project, monkeypatch):
+    """Fail closed. A git that will not say what it is does not clear the floor —
+    this is the arm that still fires on a perfectly current host."""
+    _fake_git_version(monkeypatch, "2.55.0\n")
+    assert verify.git_below_floor(project.project) == "2.55.0"
+
+
+def test_git_below_floor_refuses_a_non_zero_rc(project, monkeypatch):
+    """`git version` does no repository setup, so a bad rc is a broken binary rather
+    than a repo answer — and an unanswerable probe must refuse, not pass."""
+    _fake_git_version(monkeypatch, "", returncode=127)
+    assert verify.git_below_floor(project.project) == "git exited 127"
+
+
+def test_git_below_floor_refuses_an_empty_answer(project, monkeypatch):
+    """rc 0 with no stdout is still no answer. Tested apart from the rc arm because
+    they reach the refusal down different branches."""
+    _fake_git_version(monkeypatch, "\n")
+    assert verify.git_below_floor(project.project) == "no version reported"
+
+
+def test_git_below_floor_lets_a_spawn_failure_through(project, monkeypatch):
+    """ "Too old" and "could not be run" are different facts and each caller
+    dispositions them differently, so the raise is deliberately not folded in."""
+
+    def boom(repo, *args, timeout_s=None):
+        raise verify.GitSpawnError("git failed to spawn")
+
+    monkeypatch.setattr(verify, "git_bytes", boom)
+    with pytest.raises(verify.GitSpawnError):
+        verify.git_below_floor(project.project)
+
+
+def test_git_below_floor_forwards_a_per_call_timeout(project, monkeypatch):
+    """The #390 seam, forwarded rather than swallowed. The CLI gates keep the engine
+    bound; the TUI guard runs on the event loop and must ask with its own short
+    deadline, which it cannot do if this drops the argument on the floor.
+
+    Both rows are here because a signature that ACCEPTS `timeout_s` and ignores it
+    reads identically at the call site: the None row pins the default the CLI gates
+    depend on, and would stay green on a hard-coded 5.
+
+    Ablation: drop `timeout_s=timeout_s` from the `git_bytes` call and the second
+    row fails."""
+    seen = []
+
+    def fake(repo, *args, timeout_s=None):
+        seen.append(timeout_s)
+        return subprocess.CompletedProcess(
+            args=["git", "version"], returncode=0, stdout=b"git version 2.55.0\n", stderr=b""
+        )
+
+    monkeypatch.setattr(verify, "git_bytes", fake)
+
+    assert verify.git_below_floor(project.project) is None
+    assert verify.git_below_floor(project.project, timeout_s=5) is None
+    assert seen == [None, 5]
+
+
+def test_under_floor_git_message_names_the_floor_and_the_answer(project):
+    """One sentence for four surfaces — the CLI's abort, `validate`'s finding, the
+    dry-run banner and the TUI toast — so they cannot read as different findings
+    about one host. Pinned to the constant rather than to "2.34": the floor is
+    allowed to move, the drift is not."""
+    message = verify.under_floor_git_message("git version 2.25.1")
+    assert "git version 2.25.1" in message
+    assert verify.git_floor_text() in message
+
+
+def test_git_below_floor_honours_the_floor_argument(project, monkeypatch):
+    """The floor is a parameter so the predicate and the wiring can be ablated
+    separately (#464) — and so this test does not have to move when GIT_FLOOR does."""
+    _fake_git_version(monkeypatch, "git version 2.30.0\n")
+    assert verify.git_below_floor(project.project, (2, 20)) is None
+    assert verify.git_below_floor(project.project, (2, 40)) == "git version 2.30.0"

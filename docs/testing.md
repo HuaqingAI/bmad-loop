@@ -25,8 +25,8 @@ and every negative assertion proven by ablation.**
   (the `non-linux` extra carries no environment marker, and CI syncs `--all-extras`), so
   xdist's `auto` resolves to the _physical_ core count — half the vCPUs on the hosted
   runners. CI passes `-n logical` in both test jobs for that reason. A test that fails only
-  under xdist load is a flake, which is a bug — #360 is the open instance. Live/E2E modules skip themselves when their host requirements are
-  absent — selection is in-file, never in config.
+  under xdist load is a flake, which is a bug. Live/E2E modules skip themselves when their
+  host requirements are absent — selection is in-file, never in config.
 - Only builtin pytest marks appear: `parametrize`, `skipif`, `usefixtures`, and exactly one
   `xfail(strict=True)` (a pinned known defect, see [Ablation records](#ablation-records)).
   **No custom markers, deliberately**: a marker registry is a second selection mechanism that
@@ -58,7 +58,9 @@ Placement rules:
 - **Suffix convention is the selection mechanism.** `*_e2e.py` and `*_live.py` name the modules
   with host requirements; each carries a module-level
   `pytestmark = pytest.mark.skipif(...)` naming its requirement (`HAVE_TMUX`, `HAVE_OPENCODE`,
-  `HAVE_PSMUX`; the opencode module adds an `importorskip` on httpx). Ordinary runs collect
+  `HAVE_PSMUX`; the opencode module adds an `importorskip` on httpx, and its `HAVE_OPENCODE` is
+  probe-backed rather than `which`-backed — conftest's `opencode_runs()` runs the binary's
+  `--version`, so a resolvable-but-dead shim skips instead of failing, #294). Ordinary runs collect
   them and skip them; a capable host runs them with no extra flags. Do not add a marker, an env-var opt-in, or a separate pytest invocation for
   these — the filename plus the in-file gate is the whole mechanism.
 - **Prefer a lower layer over a broader one.** If a defect is expressible as a pure-core case,
@@ -127,6 +129,7 @@ A slice of the suite tests the **repo** rather than the product. The inventory:
 | Portability guard     | `tests/test_portability_guard.py`                       | One shared AST scan over every `src/bmad_loop/**/*.py` (data scripts included), carrying ten guards: literal `["tmux", ...]` argvs only in the two backend files (the backends' own `[self._BINARY, ...]` spelling is deliberately unmatched, so this tripwire currently flags nothing — #549); sequence-form git argvs (list or tuple, literal or named constant) only as `_run_git`'s argv argument in `verify.py`, with string-form git spawns refused everywhere, `verify.py` included; no bare `/tmp`-class POSIX paths; no `signal.SIGKILL` attribute; `os.kill(pid, 0)` probes only in `process_host.py`; any `os.kill` at all only there too (a second, distinct guard); `start_new_session` only in the detach helpers; `shell=True` only in its two sanctioned files; `BMAD_LOOP_*` env reads only through the `envvars.py` registry, a plugin's own variable family, or the session-protocol vars the two stand-alone hook relays read back; plus a scanned-file-count floor so a broken scan root cannot pass vacuously |
 | Settings-schema sync  | `tests/test_settings_schema.py`                         | `src/bmad_loop/data/settings/core.toml` stays in lockstep with `policy.py` by reflection, in both directions: every spec maps to a live dataclass field with a matching default wherever one is baked in, every policy field is reachable from exactly one spec (or listed in the explicit `HIDDEN` set), and every `*Policy` dataclass is consciously classified                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | Exit-code allocation  | `tests/test_entry_point.py`                             | `ExitCode` is pinned literally (OK=0, FAILURE=1, USAGE=2, INTERRUPTED=130) **and closed**: the enum's value set equals exactly those four, so codes 3–129/131+ cannot be allocated quietly                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| Extra-less core CLI   | `tests/test_entry_point.py`                             | A fresh interpreter with `pyte`/`rich`/`textual`/`tomlkit` blocked at `find_spec` — the blocker **raises** rather than returning None, so the dev venv's installed copies cannot make it pass vacuously, and an `import pyte` floor proves it bites — imports `bmad_loop.cli` and `bmad_loop.settings_schema`, runs `list` to rc 0, and asserts `tui` degrades to the `bmad-loop[tui]` hint instead of a traceback. Every test job installs `--all-extras`, which is why #650 shipped broken for 23 releases; CI's isolated wheel `list` run is the same floor at install level                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | State-machine table   | `tests/test_statemachine.py`                            | Every `Phase` has a transition row; `TERMINAL_PHASES` (model.py) equals the table's dead ends — a cross-module parity nothing else links; an N×N `parametrize` grid drives every pair (legal pairs land, illegal pairs raise and leave the phase untouched); the awaiting-operator reachability rule is additionally stated independently, because the N² grid reads its expectation out of the table under test                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | Check-id registry     | `checks.py` + `tests/test_cli.py`                       | `ValidationReport.add` asserts its id is in `VALIDATE_CHECKS` at every **executed** call site, and an end-to-end test unions the ids a real passing **and** failing `validate --json` emit and asserts them registered. Both mechanisms are exercised-path enforcement — there is no static call-site scan, so an id on a branch neither reaches can still ship unregistered and raises `AssertionError` only when that branch first executes; a new check site therefore lands together with a test that reaches it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | Skill-drift guard     | `tests/test_module_skills_sync.py`                      | The seeded forks in `.claude/skills/` and `.agents/skills/` are byte-identical to canonical `src/bmad_loop/data/skills/`. **Documented limitation: CI-inert** — both trees are gitignored and absent in CI, so every parametrization skips there; the guard bites on dev boxes only. (The canonical-existence assertion runs before the skip and is CI-live.)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
@@ -163,21 +166,23 @@ Rules for adding or touching a guard:
 the live/E2E gates ("Live/E2E tests must consume zero LLM tokens"); in practice it holds
 everywhere, and the mechanism differs per gate — worth knowing before touching any of them:
 
-| Gate                                                               | Real component                                     | Zero-token mechanism                                                                                                                                                                                                                                                                      | Runs where                                                             |
-| ------------------------------------------------------------------ | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
-| `test_generic_tmux.py` (5 `HAVE_TMUX` test functions, 7 collected) | tmux server                                        | The spawned "CLI" is a tiny shell script written by the test                                                                                                                                                                                                                              | CI Linux job + any POSIX dev box with tmux                             |
-| `test_stories_e2e.py`                                              | tmux + the real `bmad-loop run/resolve/resume` CLI | Scripted fake `claude` variants (bash, defined as string constants in the test module) wired in as a custom TOML profile (`fakestories`); the fake writes its own SessionStart/Stop hook events, so no `bmad-loop init` and no real CLI exists anywhere in the run                        | CI Linux job (Linux-only gate: the fakes use GNU coreutils + `setsid`) |
-| `test_opencode_live.py`                                            | A real `opencode serve` HTTP server                | **Never sends a prompt**: only the spawn/teardown paths are used — nothing that prompts — and the tests touch health/doc/session/event endpoints; the prompt endpoint is asserted against the OpenAPI schema, never called. One test asserts the session's token/cost aggregates are zero | Manual — POSIX box with `opencode` installed                           |
-| `test_psmux_live.py`                                               | A real psmux on Windows                            | **Parked windows only**: every parked window runs `pwsh -NoProfile -Command exit 0`, and no coding CLI is ever launched. Includes `test_premise_*` probes with inverted semantics — a red probe means a workaround became droppable                                                       | Manual — Windows box with psmux on PATH                                |
+| Gate                                                               | Real component                                     | Zero-token mechanism                                                                                                                                                                                                                                                                                                                                                             | Runs where                                                                                                                  |
+| ------------------------------------------------------------------ | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `test_generic_tmux.py` (5 `HAVE_TMUX` test functions, 7 collected) | tmux server                                        | The spawned "CLI" is a tiny shell script written by the test                                                                                                                                                                                                                                                                                                                     | CI Linux job + any POSIX dev box with tmux                                                                                  |
+| `test_stories_e2e.py`                                              | tmux + the real `bmad-loop run/resolve/resume` CLI | Scripted fake `claude` variants (bash, defined as string constants in the test module) wired in as a custom TOML profile (`fakestories`); the fake writes its own SessionStart/Stop hook events, so no `bmad-loop init` and no real CLI exists anywhere in the run                                                                                                               | CI Linux job (Linux-only gate: the fakes use GNU coreutils + `setsid`)                                                      |
+| `test_opencode_live.py`                                            | A real `opencode serve` HTTP server                | **Never sends a prompt**: only the spawn/teardown paths are used — nothing that prompts — and the tests touch health/doc/session/event endpoints; the prompt endpoint is asserted against the OpenAPI schema, never called. One test asserts the session's token/cost aggregates are zero                                                                                        | Manual — POSIX box with a **runnable** `opencode` — the gate probes `--version`, so a resolvable-but-dead shim skips (#294) |
+| `test_psmux_live.py`                                               | A real psmux on Windows                            | **Parked windows only**: every parked window runs `pwsh -NoProfile -Command exit 0`, and no coding CLI is ever launched. Includes `test_premise_*` probes with inverted semantics — a red probe means a workaround became droppable — and `test_adopted_*` probes with ordinary semantics — a red probe means psmux regressed a behavior the 3.3.8 floor lets the backend assume | CI Windows job (the job installs psmux) + any Windows dev box with an admitted psmux (3.3.8+) and `pwsh` on PATH            |
 
 Never "fix" a gate to call a real CLI, and never add a completion path that trusts LLM output —
 sessions complete only on hook Stop events or window death, and the fakes exercise exactly
 those paths.
 
-**Manual-gate cadence:** the two manual gates run before every release — `test_opencode_live.py`
-on a POSIX box with opencode installed, `test_psmux_live.py` on a Windows box with an admitted
-psmux version — and after any change to the adapter or backend they cover. CI cannot see these;
-a release cut without them is trusting stale evidence.
+**Manual-gate cadence:** `test_opencode_live.py` is the one gate CI still cannot see. Run it on a
+POSIX box with opencode installed before every release, and after any change to the adapter it
+covers; a release cut without it is trusting stale evidence. `test_psmux_live.py` left this
+category in #662 — the **test-windows** job installs psmux and runs the gate on every pull
+request and on pushes to `main`/`release/*` (the workflow's own triggers), in its own serial
+step, so its evidence is as fresh as the branch rather than as fresh as someone's memory.
 
 ## Ablation records
 
@@ -245,9 +250,10 @@ fixed, the test fails and forces the debt note to be removed with it.
 ## CI, flakes, and deliberate absences
 
 Six jobs (`.github/workflows/ci.yml`): **test** (ubuntu, Python 3.11–3.14, tmux installed so
-L4 and `stories_e2e` run), **test-windows** (`PYTHONUTF8=1`; PRs run the 3.11/3.14 boundary
-only — Windows failures here have been platform-shaped, not version-shaped — pushes to `main`
-and `release/*` run the full spread), **version-sync**, **lint** (trunk, including actionlint + zizmor over the
+L4 and `stories_e2e` run), **test-windows** (`PYTHONUTF8=1`, psmux installed so the L5
+`test_psmux_live.py` gate runs; PRs run the 3.11/3.14 boundary only — Windows failures here
+have been platform-shaped, not version-shaped — pushes to `main` and `release/*` run the full
+spread), **version-sync**, **lint** (trunk, including actionlint + zizmor over the
 workflows themselves), **typecheck** (the same pinned pyright a contributor runs), and
 **build** (packaging smoke: sdist + wheel, the console script executed from the installed
 wheel, and a wheel data-file inventory against `git ls-files` — every other job runs from the
@@ -256,11 +262,10 @@ source tree, so packaging breaks were invisible until this job existed).
 **Zero-retry flaky policy.** There is no retry mechanism anywhere: no `--reruns`, no retry
 plugin — `pytest-rerunfailures` was removed from the environment precisely because an installed
 retry plugin is an invitation to paper over a real flake. **A flake is a bug**: it gets an
-issue (#360 and #529 are the open instances), a diagnosis, and a deterministic fix — never a
-rerun loop. The main defense is the **frozen-clock pattern, mandatory for time-dependent
-tests**: no unit or seam test sleeps toward a deadline (the real-process gates use short
-settle polls, which is different from waiting out a production timeout). Two sanctioned
-shapes:
+issue, a diagnosis, and a deterministic fix — never a rerun loop. The main defense is the
+**frozen-clock pattern, mandatory for time-dependent tests**: no unit or seam test sleeps
+toward a deadline (the real-process gates use short settle polls, which is different from
+waiting out a production timeout). Two sanctioned shapes:
 
 1. A scoped `_Clock` shim over a mutable dict, monkeypatched in as the module-under-test's
    `time` reference; a scripted watcher callback advances the dict past the deadline
@@ -280,8 +285,12 @@ Deliberate absences — decisions, not gaps:
   guard; macOS-specific traps found in the field get targeted unit tests (the psutil
   `create_time` trap being the canonical example). A macOS job would mostly re-run the Linux
   suite at 10× the queue time.
-- **Live gates stay manual** (table above) — CI has no Windows psmux or opencode install, and
-  faking either would test the fake.
+- **No opencode install in CI** — so `test_opencode_live.py` is the last manual gate (table
+  above), and faking the server would test the fake. psmux is the counter-example rather than
+  the precedent: it is one zip on a GitHub release, so **test-windows** installs it and runs
+  that gate on every PR and every push to `main`/`release/*` (#662). Chocolatey was tried
+  first and dropped — its community feed 503'd on both matrix legs, and Chocolatey document
+  it as unguaranteed and rate-limited per IP, which hosted runners share.
 
 ## TUI testing
 
@@ -304,8 +313,9 @@ Doctrine:
   Deliberate.** The extra is a dev prerequisite (`uv sync --all-extras` in the docs and in
   every CI job that installs the project), so an environment missing it is a broken dev setup
   that should fail loudly, not a legitimate configuration that silently runs ~300 fewer tests
-  (the two Pilot files, `test_tui_data.py` via its `pyte`/`rich` imports, and
-  `test_cleanup.py`, which imports the data layer).
+  (the two Pilot files, and `test_tui_data.py` via its `pyte`/`rich` imports —
+  `test_cleanup.py` left that set in #650, when the run-inventory reader it
+  depends on moved to `runs.py`).
 - **Snapshot testing is rejected, with revisit triggers.** `pytest-textual-snapshot` is
   unverified against the textual 8 line this repo pins, and every TUI gap observed so far has
   been behavioral (data, argv, wiring, liveness gates) — exactly what snapshots do not catch,

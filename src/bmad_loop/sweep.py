@@ -568,7 +568,7 @@ class SweepEngine(Engine):
             # request during a cycle is caught before the next _run_bundle (see
             # _cycle); one landing between cycles stops here before cycle N+1
             # re-triages.
-            self._check_graceful_stop()
+            self._check_stop_request()
             self.state.sweep_cycle = cycle
             self._save()
             text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
@@ -693,7 +693,7 @@ class SweepEngine(Engine):
             # bundles run. Mid-cycle stop is resume-safe: sweep_cycle is
             # persisted, triage.json is cached, closes are idempotent, and
             # terminal tasks are skipped on re-drive.
-            self._check_graceful_stop()
+            self._check_stop_request()
             self._run_bundle(bundle, cycle)
         bundles_done = sum(
             1
@@ -1236,15 +1236,20 @@ class SweepEngine(Engine):
 
         The trigger for that is "nobody can be relied on to answer here any
         more", NOT "the hand-back succeeded" — the two come apart on a failed
-        return, in opposite directions. A failed switch is evidence the client
-        is still in this window with a human in front of it (ATTENDED: keep
-        prompting, which is the whole point of #227). A failed detach reports
-        only that no hand-back was verified — nothing attached, an effect the
-        backend cannot observe, or no detach verb at all — and under that
+        return, in opposite directions. A *refused* switch is evidence the
+        client is still in this window with a human in front of it (ATTENDED:
+        keep prompting, which is the whole point of #227). Everything else
+        reports only that no hand-back was verified — a detach that found
+        nothing attached, an effect the backend cannot observe, no detach verb
+        at all, or a switch the backend cannot vouch for (a timed-out verb, an
+        unreadable client count, nothing attached to move) — and under that
         uncertainty going unattended is the outcome that does not strand a
         --repeat cycle on input(); the decisions it defers stay reachable via
-        `bmad-loop decisions`. Only a real return is announced: UNREACHABLE
-        prints nothing, since there may be no one to read it."""
+        `bmad-loop decisions`. The `sweep-return-no-client` record keeps its
+        name across that widening: it has always meant "no hand-back verified",
+        which is what an unvouched switch reports too. Only a real return is
+        announced: UNREACHABLE prints nothing, since there may be no one to
+        read it."""
         from .tui import launch  # import-light: launch.py has no textual imports
 
         outcome = launch.return_attached_client()

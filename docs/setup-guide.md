@@ -20,6 +20,13 @@ of the README.
 ## Platform prerequisites
 
 - **Python 3.11+** and a supported coding CLI (`claude` by default).
+- **git 2.34 or newer** — every unit of work moves through git, so this one is enforced
+  rather than advised: `bmad-loop run`, `sweep` and `resume` refuse to start below it, and
+  `bmad-loop validate` reports it as a problem (`git.version`, exit 1). It is a **support**
+  floor rather than a capability one — no git command bmad-loop issues needs 2.34 — set so
+  the project stops carrying accommodations for releases it does not test against. 2.34 is
+  Ubuntu 22.04 LTS's stock git; Ubuntu 20.04 (2.25) and Debian 11 (2.30) are below it.
+  `git --version` reports what is on your `PATH`.
 - **A terminal multiplexer** — the orchestrator drives agent sessions through a terminal
   multiplexer: **tmux** (POSIX) and the experimental **psmux** (native Windows) ship
   bundled, and further backends install as separate packages that register themselves
@@ -37,12 +44,16 @@ of the README.
   every POSIX path work unchanged there, so no special setup is needed. **Native Windows is
   experimental** — the bundled `psmux` backend (a ConPTY tmux re-implementation) drives runs
   there and is selected automatically as the win32 default when its prerequisites are present:
-  the `psmux` and `pwsh` (PowerShell) binaries on `PATH`, with `psmux` newer than 3.3.6 (older
-  releases can force-kill a recycled PID during teardown and so read as unavailable). It is
+  the `psmux` and `pwsh` (PowerShell) binaries on `PATH`, with `psmux` 3.3.8 or newer (older
+  releases read as unavailable — see
+  [multiplexer backends](multiplexer-backends.md#psmux-native-windows-experimental) for why). It is
   not yet at the Linux/macOS/WSL support tier — the remaining native-Windows work (window
   hosting, attach/detach, Unity cache paths) is tracked in
   [the roadmap](ROADMAP.md#native-windows-multiplexer-backend); the port path is in
-  [Porting bmad-loop to a new OS](porting-to-a-new-os.md). Inside WSL, install with the
+  [Porting bmad-loop to a new OS](porting-to-a-new-os.md). Stopping a run is not part of
+  that gap: `bmad-loop stop` lodges its request in a control file the engine reads itself,
+  at item boundaries and mid-session, so it no longer depends on Windows signal delivery
+  (#319). Inside WSL, install with the
   **Linux** interpreter — a Windows-installed bmad-loop is reachable from the bash prompt
   and silently behaves as Windows
   ([why](multiplexer-backends.md#psmux-native-windows-experimental)). To check:

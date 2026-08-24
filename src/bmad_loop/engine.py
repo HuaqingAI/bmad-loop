@@ -58,11 +58,24 @@ from .platform_util import atomic_replace, atomic_write_text, retrying_unlink, s
 from .plugins import HookBus, HookContext, PluginRegistry
 from .policy import Policy
 from .recovery_flow import RecoveryFlow
-from .runs import clear_graceful_stop, events_dir_for, graceful_stop_requested, kill_session
-from .sprintstatus import ACTIONABLE_STATUSES, STATUS_ORDER
+from .runs import (
+    clear_graceful_stop,
+    consume_stop_request,
+    events_dir_for,
+    graceful_stop_requested,
+    kill_session,
+    owner_run_dir,
+    read_stop_request_mode,
+    reset_owner_run_dir,
+    set_owner_run_dir,
+)
+from .sprintstatus import ACTIONABLE_STATUSES, STATUS_ORDER, SprintStatusError
 from .sprintstatus import advance as sprint_advance
+from .sprintstatus import advanced_bytes as sprint_advanced_bytes
 from .sprintstatus import load as load_sprint_status
 from .sprintstatus import next_actionable, parse_selector
+from .sprintstatus import status_in_bytes as sprint_status_in_bytes
+from .sprintstatus import story_status as sprint_story_status
 from .statemachine import advance
 from .workspace import UnitWorkspace, Workspace, discard_worktree, open_unit_workspace
 from .worktree_flow import WorktreeFlow
@@ -89,6 +102,60 @@ def _digest_of(text: str | None) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
 
 
+def _bounded_stream_tail(text: str, max_bytes: int) -> tuple[str, int, int]:
+    """Cut a verifier stream down to what ``verify.stream_capture_kb`` retains.
+
+    Returns ``(tail, full_bytes, retained_bytes)``. Both counts measure the
+    DECODED STREAM encoded as UTF-8 — never the file the caller writes it to,
+    whose size differs on Windows because text mode translates ``\\n``. Keeping
+    the counts on one side of that boundary is what makes the journal record
+    unambiguous: ``full_bytes`` is what the command emitted, ``retained_bytes``
+    is how much of it survived the cap, and their inequality IS the truncation.
+
+    The TAIL is kept, the direction every other bound on this output takes
+    (``run_verify_commands``' merged ``[-2000:]``): a failing suite puts its
+    failure at the end.
+
+    A byte cut can land mid-character, so the leading partial is dropped rather
+    than decoded into a ``\\ufffd`` this function would be inventing — the stream
+    already carries whatever replacement chars its own decode produced, and
+    minting one here would put a corruption marker at a boundary WE chose.
+    ``max_bytes <= 0`` needs no branch of its own: the slice is empty by
+    construction, which is exactly "capture nothing".
+    """
+    tail, full_bytes = verify.byte_tail(text, max_bytes)
+    return tail, full_bytes, len(tail.encode("utf-8"))
+
+
+@dataclass(frozen=True)
+class VerifyCommandRecords:
+    """What one verify-command pass published to ``post_dev_verify``.
+
+    The records themselves plus the two keys that say WHICH pass they are:
+    ``stage`` (``"dev"`` | ``"fix"``) and the story's ``sequence`` ordinal. Both
+    already ride the journal's ``verify-command-result`` entries; carrying them
+    on the hook context too is what lets a plugin tell the two legs apart and
+    join back to those entries — neither of which the results alone can do,
+    since both legs emit the same stage from the same phase on one shared
+    ``attempt`` counter.
+
+    The default instance (:data:`NO_VERIFY_COMMANDS`) is the "no pass ran" value
+    the callers start from, so a leg that never reaches verification publishes
+    three explicit ``None``/empty fields rather than three unexplained defaults.
+    ``sequence`` stays ``None`` when the pass ran but recorded nothing (no
+    ``[verify] commands`` configured) — nothing was journalled, so there is no
+    ordinal to join on. See ``HookContext.command_results`` for the full
+    taxonomy a reader has to apply.
+    """
+
+    results: tuple[verify.CommandResult, ...] = ()
+    stage: str | None = None
+    sequence: int | None = None
+
+
+NO_VERIFY_COMMANDS = VerifyCommandRecords()
+
+
 class RunPaused(Exception):
     def __init__(self, reason: str, stage: str, story_key: str | None = None):
         super().__init__(reason)
@@ -103,19 +170,28 @@ class RunStopped(Exception):
 
     Two flavors, distinguished by ``graceful``:
 
-    - ``graceful=False`` (default) — a *hard* stop from the SIGTERM/SIGINT handler.
-      The loop is interrupted mid-session, so the in-flight agent window is still
-      live and must be torn down unconditionally.
+    - ``graceful=False`` (default) — a *hard* stop: the SIGTERM/SIGINT handler, or
+      a ``mode: "hard"`` stop request the engine honored at an item boundary
+      (:meth:`Engine._check_stop_request`) or on either side of a session
+      (:meth:`Engine._run_session`). The loop may have been interrupted
+      mid-session, so the in-flight agent window can still be live and must be
+      torn down unconditionally.
     - ``graceful=True`` — a stop requested via the ``stop-request.json`` control
-      file and detected at an item boundary (:meth:`Engine._check_graceful_stop`).
-      The in-flight item already completed through commit, so ``run()`` runs the
-      wanted subset of the clean-finish path (worktree GC + ``post_run`` +
-      policy-gated session teardown) rather than a hard kill, and the run stays
-      resumable."""
+      file in its default ``graceful`` mode and detected at an item boundary
+      (:meth:`Engine._check_stop_request`). The in-flight item already completed
+      through commit, so ``run()`` runs the wanted subset of the clean-finish path
+      (worktree GC + ``post_run`` + policy-gated session teardown) rather than a
+      hard kill, and the run stays resumable.
 
-    def __init__(self, graceful: bool = False):
+    ``via`` names the channel a hard stop arrived on — ``"stop-request"`` for the
+    control file, ``None`` for a signal — and rides the ``run-stop`` journal entry.
+    It is the only evidence that separates the two on a native-Windows run, where
+    the signal path cannot fire at all (#319)."""
+
+    def __init__(self, graceful: bool = False, via: str | None = None):
         super().__init__("graceful stop" if graceful else "stopped")
         self.graceful = graceful
+        self.via = via
 
 
 class SweepFactory(Protocol):
@@ -456,6 +532,10 @@ class Engine:
         # because under isolation each unit resolves against its OWN worktree and
         # one Engine drives every unit of a run.
         self._dev_skill_cache: dict[tuple[Path, str | None], str] = {}
+        # story_key -> the highest `verify-command-result` sequence allocated so
+        # far. None until the first verify pass seeds it from the journal — see
+        # _next_verification_sequence, which owns the whole invariant.
+        self._verification_sequences: dict[str, int] | None = None
         # Per-unit worktree isolation + integration flow (issue #244 F-3/F-9a).
         # Built from narrow deps + engine callbacks; the same-name Engine._* worktree
         # methods below delegate to it. `emit` is late-bound (a lambda, not the bound
@@ -539,9 +619,19 @@ class Engine:
         depth = _run_depth.get()
         self._is_nested = depth > 0
         token = _run_depth.set(depth + 1)
+        # Publish this run dir as the owner for everything below, so a nested
+        # auto-sweep's adapters poll the file an operator can actually write to
+        # (#319): `stop <parent-id>` lodges here, while the child's own dir stays
+        # empty. Gated on depth, not on `_owns_signals` — a top-level run off the
+        # main thread installs no handlers yet still owns the channel. Reset by
+        # token in the same finally, ahead of the depth, so the nested re-raise arms
+        # unwind through both.
+        owner_token = None if self._is_nested else set_owner_run_dir(self.run_dir)
         try:
             return self._run_inner()
         finally:
+            if owner_token is not None:
+                reset_owner_run_dir(owner_token)
             _run_depth.reset(token)
 
     def _run_inner(self) -> RunSummary:
@@ -563,6 +653,23 @@ class Engine:
                 self._prune_preserve_refs()
                 self._replay_unlatched_ledger_carries()
                 self._loop()
+                # A hard request that landed after `_loop`'s head check reaches none
+                # of the raise sites on an exhausted-queue return: sites A and B live
+                # inside `_run_session`, which the `story is None` branch never
+                # enters, and the run-end auto-sweep predicate is mode-blind, so it
+                # *suppresses* and returns rather than raising. Without this the run
+                # would record `finished` — which `documents.py` ranks above
+                # `stopped` — while the operator's hard stop went unhonored, and
+                # `stop_run`'s fallback would then journal `fallback=True` against a
+                # perfectly responsive engine, contradicting what that flag now means.
+                # Covering it here rather than at the suppression site closes every
+                # `_loop` return path at once (including `max-stories-reached`) and
+                # keeps the per-epic sweep caller untouched. Mode-exact on purpose: a
+                # *graceful* request at an exhausted queue finishes truthfully, which
+                # is long-documented, separately tested behavior this must not disturb.
+                if read_stop_request_mode(self.run_dir) == "hard":
+                    clear_graceful_stop(self.run_dir)
+                    raise RunStopped(via="stop-request")
                 self.state.finished = True
                 self._gc_run_worktrees()
                 self._emit("post_run")
@@ -586,7 +693,7 @@ class Engine:
             except RunStopped as stop:
                 if stop.graceful:
                     # Graceful stop: the request was consumed at an item boundary
-                    # (_check_graceful_stop), so the in-flight item already ran to
+                    # (_check_stop_request), so the in-flight item already ran to
                     # completion through commit — nothing mid-session to kill. Run
                     # the wanted subset of the clean-finish path so a resumable
                     # `stopped` run is finalized as tidily as a finished one.
@@ -612,14 +719,30 @@ class Engine:
                     if self._owns_signals and self.policy.adapter.cleanup_session_on_finish:
                         kill_session(self.state.run_id)
                 else:
-                    # Hard stop: the loop was interrupted inside adapter.run(), so
-                    # the agent window is still live — tear the whole run session
-                    # down.
+                    # Hard stop: the loop was interrupted inside adapter.run() (a
+                    # signal), or unwound on either side of it because a hard stop
+                    # request was honored — so the agent window may still be live.
+                    # Tear the whole run session down.
                     kill_session(self.state.run_id)
                     if self._is_nested:
                         raise  # nested auto-sweep: let the owner record the stop
                     self.state.stopped = True
-                    self.journal.append("run-stop")
+                    # The signal path consumes nothing on its way here, and `stop_run`
+                    # now lodges a hard request *before* it signals — so on POSIX the
+                    # file is still on disk for every routine stop. `run()`'s finally
+                    # would then discard it as *stale* and journal
+                    # `stop-request-discarded`, misreporting the very request this
+                    # stop delivers. Consume it here, on the same rule the boundary and
+                    # in-session sites already follow. Mode-exact: a pending *graceful*
+                    # request really is superseded by a hard stop, so it is left for
+                    # the finally to discard and journal, as it always has been.
+                    if read_stop_request_mode(self.run_dir) == "hard":
+                        clear_graceful_stop(self.run_dir)
+                    # `via` rides only when the control file delivered the stop;
+                    # the signal path keeps journaling a bare `run-stop` (precedent:
+                    # the KeyboardInterrupt arm's `reason=` extra below).
+                    extras = {"via": stop.via} if stop.via is not None else {}
+                    self.journal.append("run-stop", **extras)
             except KeyboardInterrupt:
                 # Some Windows console/control events can still surface as a raw
                 # KeyboardInterrupt without routing through the installed signal
@@ -672,11 +795,16 @@ class Engine:
                 except Exception:  # nosec B110 - journal write is best-effort; crash.txt + state flag already persisted
                     pass
             finally:
-                # Any pending stop-request control file that outlived this run
-                # (the run finished/paused/crashed, or a hard stop superseded it,
-                # before an item boundary consumed it) is discarded here so a later
-                # resume does not re-honor a stale request. The graceful arm already
-                # consumed its own file, so this only fires for a superseded one.
+                # Any pending stop-request control file that outlived this run is
+                # discarded here so a later resume does not re-honor a stale request.
+                # Every arm that *honors* a request consumes its own file first — the
+                # boundary and in-session sites, and the hard arm above, which has to
+                # because `stop_run` lodges before it signals and the signal path
+                # reads nothing. So this fires only for a request no arm honored: the
+                # run finished, paused or crashed with one pending, or a hard stop
+                # superseded a *graceful* one. Journaling those as discarded is
+                # accurate; journaling a request that just stopped the run would not
+                # be, which is the whole reason the honoring arms consume.
                 if clear_graceful_stop(self.run_dir):
                     with contextlib.suppress(Exception):
                         self.journal.append("stop-request-discarded")
@@ -866,21 +994,38 @@ class Engine:
         except Exception:  # a hint must never break the stop
             return None
 
-    def _check_graceful_stop(self) -> None:
-        """Honor a pending graceful-stop request at an item boundary.
+    def _check_stop_request(self) -> None:
+        """Honor a pending stop request at an item boundary, in the mode it asks for.
 
         Consumes (deletes) the ``stop-request.json`` control file and raises
-        :class:`RunStopped` with ``graceful=True`` so ``run()`` unwinds into the
-        clean-finalization arm. An exception, not a sentinel return, because the
-        sweep check fires two frames below ``_loop`` (inside ``_cycle``) where a
-        return could not stop the loop. Called as the first statement of the loop
-        body (and, in the sweep engine, before each bundle): by the time control
-        reaches here the in-flight item has already completed through commit, so
-        the stop takes effect cleanly at the next boundary and the run stays
-        resumable."""
-        if graceful_stop_requested(self.run_dir):
-            clear_graceful_stop(self.run_dir)
-            raise RunStopped(graceful=True)
+        :class:`RunStopped` — ``graceful=True`` for a ``graceful`` request (the
+        default mode, and every pre-#319 modeless body, which
+        :func:`runs.read_stop_request_mode` deliberately reads as graceful) so
+        ``run()`` unwinds into the clean-finalization arm; ``via="stop-request"``
+        for a ``hard`` one so it takes the hard arm instead. An exception, not a
+        sentinel return, because the sweep check fires two frames below ``_loop``
+        (inside ``_cycle``) where a return could not stop the loop. Called as the
+        first statement of the loop body (and, in the sweep engine, before each
+        bundle): by the time control reaches here the in-flight item has already
+        completed through commit, so the stop takes effect cleanly at the next
+        boundary and the run stays resumable.
+
+        A *hard* request that reaches a boundary is honored right here rather than
+        deferred to the adapter's in-session poll — aborting at the boundary is
+        both faster and cleaner than launching the next session only to abort it
+        mid-flight."""
+        # One atomic take, never a read then an unlink: a `stop` escalating to
+        # "hard" between the two would be deleted unread while this engine routed
+        # on the stale graceful mode it already held. Consuming on BOTH arms is
+        # still required — `run()`'s finally discards any surviving file as *stale*
+        # and journals `stop-request-discarded`, which would misreport a request
+        # this engine just honored.
+        mode = consume_stop_request(self.run_dir)
+        if mode is None:
+            return
+        if mode == "hard":
+            raise RunStopped(via="stop-request")
+        raise RunStopped(graceful=True)
 
     def _loop(self) -> None:
         self._finish_inflight()
@@ -889,7 +1034,7 @@ class Engine:
             # boundary this base loop reaches — between stories, right after
             # _finish_inflight on resume, and the epic boundary + run-end (the
             # StoriesEngine has no _loop override, so it is covered here too).
-            self._check_graceful_stop()
+            self._check_stop_request()
             if self.max_stories is not None and self._dispatched_count() >= self.max_stories:
                 self.journal.append("max-stories-reached", count=self._dispatched_count())
                 return
@@ -1952,6 +2097,7 @@ class Engine:
                 )
             advance(task, Phase.DEV_VERIFY)
             outcome = None
+            verified = NO_VERIFY_COMMANDS
             if result.status == "completed":
                 # Everything below this point that appends to the ledger is the
                 # orchestrator, not the session. Preserve attribution on crash
@@ -2033,13 +2179,19 @@ class Engine:
                 if outcome.ok and self._run_verify_commands_after_dev(task, result.result_json):
                     # deterministic gates run here too: a broken build must not
                     # reach the (far more expensive) review loop
-                    outcome = verify.verify_commands_outcome(self.policy, self.workspace.root)
+                    outcome, verified = self._verify_commands_with_results(task, "dev")
             self._emit(
                 "post_dev_verify",
                 task,
                 session_status=result.status,
                 result_json=result.result_json,
                 verify_reason=(outcome.reason if outcome is not None else None),
+                command_results=verified.results,
+                # The dev-vs-repair discriminator + the journal join key. Left at
+                # NO_VERIFY_COMMANDS' Nones on every arm that never reached
+                # verification, which `session_status`/`verify_reason` name.
+                verification_stage=verified.stage,
+                verification_sequence=verified.sequence,
             )
             decision = decide_dev(task, result, outcome, self.policy)
             self.journal.append(
@@ -4006,6 +4158,171 @@ class Engine:
         build/test gate would spuriously fail before the plan review."""
         return True
 
+    def _verify_commands_with_results(
+        self, task: StoryTask, verification_stage: str
+    ) -> tuple[VerifyOutcome, VerifyCommandRecords]:
+        """Execute, retain, and classify verifier results as one engine action.
+
+        Core alone executes and classifies commands.  The returned immutable
+        records are only journalled and exposed to ``post_dev_verify`` plugins.
+
+        ``stage`` is set on the returned records whenever this method ran at all,
+        including the zero-command case: "the pass ran and executed nothing" and
+        "no pass ran" are different facts, and only the caller that never reaches
+        here may publish the second one.
+        """
+        results = tuple(verify.run_verify_commands(self.policy, self.workspace.root))
+        sequence = self._journal_verify_command_results(task, verification_stage, results)
+        outcome = verify.verify_command_results_outcome(list(results), self.workspace.root)
+        return outcome, VerifyCommandRecords(
+            results=results, stage=verification_stage, sequence=sequence
+        )
+
+    def _next_verification_sequence(self, story_key: str) -> int:
+        """Allocate this story's next ``verify-command-result`` sequence.
+
+        The ordinal is a public journal field and a ``post_dev_verify``
+        correlation key, so it has to stay monotonic per story ACROSS A RESUME —
+        a fresh process must not restart at 1 and mint a second record claiming
+        an ordinal an earlier one already used. That property is the whole reason
+        this used to re-derive the ordinal by rescanning the journal on every
+        verification, which read and JSON-parsed the entire file each time — a
+        file this same method keeps appending to, so the cost grew with the run
+        that was paying it.
+
+        The rescan survives here, once: the first allocation of an engine's life
+        seeds the per-story map from the journal, and every later one is an
+        in-memory increment. One scan, not one per verification, and the resume
+        property is unchanged because a resumed run's seed reads the same journal
+        the rescan did.
+
+        Seeding EVERY story in one pass (rather than lazily per story) is sound
+        because :meth:`_journal_verify_command_results` is the sole writer of
+        this record kind and one Engine drives every unit of a run, so after the
+        seed the map — not the file — is authoritative. A nested auto-sweep is
+        not an exception: a child run composes its own run dir and ``Journal``.
+
+        Deliberately an ``Engine`` field and not a ``StoryTask`` one: the value
+        is recoverable from the journal on every resume, so persisting it would
+        add a ``state.json`` field that can only disagree with the record it
+        duplicates. It is also NOT ``attempt`` — a human re-arm reuses attempt
+        numbers, which is exactly why this counter exists beside it.
+        """
+        if self._verification_sequences is None:
+            self._verification_sequences = self._seed_verification_sequences()
+        allocated = self._verification_sequences.get(story_key, 0) + 1
+        self._verification_sequences[story_key] = allocated
+        return allocated
+
+    def _seed_verification_sequences(self) -> dict[str, int]:
+        """The highest sequence already journalled per story — the resume seed.
+
+        Tolerant by design, like every other journal read-back: a truncated or
+        hand-edited line that lost either key is skipped rather than raising, and
+        the worst case is an ordinal reused in a run whose journal was already
+        corrupt. Missing story = 0, so the first allocation is 1.
+        """
+        highest: dict[str, int] = {}
+        for entry in self.journal.entries():
+            if entry.get("kind") != "verify-command-result":
+                continue
+            story_key = entry.get("story_key")
+            sequence = entry.get("verification_sequence")
+            if isinstance(story_key, str) and isinstance(sequence, int):
+                highest[story_key] = max(highest.get(story_key, 0), sequence)
+        return highest
+
+    def _journal_verify_command_results(
+        self,
+        task: StoryTask,
+        verification_stage: str,
+        results: tuple[verify.CommandResult, ...],
+    ) -> int | None:
+        """Record each verifier subprocess result plus bounded log pointers, and
+        return the sequence they were recorded under — ``None`` when there was
+        nothing to record.
+
+        ``attempt`` and ``verification_stage`` make the public journal records
+        correlate to a concrete dev or repair verification pass.  The filenames
+        contain only engine-derived ordinal values; command text never becomes a
+        filesystem path.  Sanitize the whole composition, not the parts, for the
+        reason :func:`_session_task_id` gives: two individually capped parts can
+        still compose past a filename segment limit, and ``safe_segment``'s digest
+        suffix differs between the two orders.
+
+        Retention is bounded by ``verify.stream_capture_kb`` per stream, and the
+        record says so rather than leaving the reader to guess: ``*_bytes`` is
+        what the command emitted, ``*_captured_bytes`` how much of that reached
+        disk, ``*_truncated`` their inequality.  Both counts are UTF-8 lengths of
+        the decoded stream, NOT file sizes — see :func:`_bounded_stream_tail`.  A
+        zero cap writes no file at all and leaves the pointer null; the record
+        still lands, still carrying the full byte count, because "nothing was
+        retained" and "the command was silent" are different facts.
+
+        This is observation, so it degrades and never raises (AGENTS.md).  An
+        ``OSError`` from the write — ENOSPC, a read-only run dir, ENAMETOOLONG on
+        a path this composition did not shorten enough — is journalled as
+        ``capture_error`` beside a null pointer and the verification continues.
+        The alternative is a lost log killing a dev pass whose commands passed,
+        which trades a diagnostic for the run it was there to diagnose.
+
+        No results means no records, and therefore no sequence: the ordinal is
+        allocated only when at least one record lands, so it never runs ahead of
+        the journal it indexes. That is also the pre-existing behaviour — the
+        max-of-journalled rescan this replaced could not observe an ordinal it
+        had not written — and keeping it is what makes a resumed run number its
+        passes identically to an uninterrupted one.
+        """
+        if not results:
+            return None
+        verification_sequence = self._next_verification_sequence(task.story_key)
+        max_bytes = self.policy.verify.stream_capture_kb * 1024
+        for command_index, result in enumerate(results):
+            stem = safe_segment(
+                f"verify-{task.story_key}-"
+                f"{verification_stage}-{task.attempt}-{verification_sequence}-{command_index}"
+            )
+            streams: dict[str, str | int | bool | None] = {}
+            capture_error: str | None = None
+            for kind, text, emitted in (
+                ("stdout", result.stdout, result.stdout_full_bytes),
+                ("stderr", result.stderr, result.stderr_full_bytes),
+            ):
+                tail, full_bytes, captured_bytes = _bounded_stream_tail(text, max_bytes)
+                # `full_bytes` is what we still HOLD; when the in-memory ceiling
+                # already cut this stream, what the command EMITTED is larger and
+                # only the result knows it. Reporting the held size would quietly
+                # under-report emission and, worse, could call a truncated stream
+                # whole — the one thing `*_truncated` exists to prevent.
+                full_bytes = full_bytes if emitted is None else emitted
+                path: str | None = None
+                if max_bytes > 0:
+                    try:
+                        path = self.journal.write_verify_stream(f"{stem}.{kind}.log", tail)
+                    except OSError as exc:
+                        # Nothing published: atomic_write_text removes its temp and
+                        # leaves the target absent, so 0 retained is the literal truth.
+                        captured_bytes = 0
+                        capture_error = capture_error or f"{kind}: {exc}"
+                streams[f"{kind}_path"] = path
+                streams[f"{kind}_bytes"] = full_bytes
+                streams[f"{kind}_captured_bytes"] = captured_bytes
+                streams[f"{kind}_truncated"] = captured_bytes < full_bytes
+            self.journal.append(
+                "verify-command-result",
+                story_key=task.story_key,
+                attempt=task.attempt,
+                verification_stage=verification_stage,
+                verification_sequence=verification_sequence,
+                command_index=command_index,
+                command=result.command,
+                returncode=result.returncode,
+                output_tail=result.output_tail,
+                capture_error=capture_error,
+                **streams,
+            )
+        return verification_sequence
+
     def _resume_after_dev_verify(self, task: StoryTask) -> None:
         """Resume a task the run paused at DEV_VERIFY (dev verified, spec on disk).
         Base: the spec-approval-gate resume — run the review loop + commit.
@@ -4683,6 +5000,20 @@ class Engine:
                 task.ledger_changed_before_harvest = (
                     self._ledger_digest() != task.baseline_ledger_digest
                 )
+            # A hard stop honored *inside* the session: the adapter's wait loop
+            # saw a `mode: "hard"` stop-request.json, tore its window down and
+            # returned this abort verdict. Position is load-bearing at both ends.
+            # Inside the `try`, so the `finally` below journals the paired
+            # session-end with status="aborted" — the same literal the exception
+            # path writes there. Before `record_session`, so NO SessionRecord is
+            # written: an abort is not a session outcome, and this matches the
+            # signal-path hard stop, which interrupts inside `adapter.run()` and
+            # records nothing either. "aborted" therefore never escapes this
+            # method — no downstream status set (env-fault, retry, escalation)
+            # needs to learn it.
+            if result.status == "aborted":
+                clear_graceful_stop(self.run_dir)
+                raise RunStopped(via="stop-request")
             task.record_session(
                 SessionRecord(
                     task_id=task_id,
@@ -4758,6 +5089,33 @@ class Engine:
                     pass
         self._save()
         self._note_story_token_budget(task)
+        # A hard stop request that raise site A could not see as an abort: it
+        # landed in the gap after the wait loop's last poll, or the session DID
+        # abort and `_post_kill_reconcile` rescued it back to `completed` (the
+        # abort tore the window down before a landed Stop event was read). This
+        # check fires regardless of status, and that rescue is exactly why:
+        # without it a hard-stopped run would silently carry on into verify /
+        # review / retry on the strength of a rescued result. The session is fully
+        # recorded, saved and accounted for first, leaving the run byte-equivalent
+        # to the replayable host-death-after-save state documented above — a
+        # resume picks up from a complete session record, not a torn one.
+        if read_stop_request_mode(self.run_dir) == "hard":
+            clear_graceful_stop(self.run_dir)
+            raise RunStopped(via="stop-request")
+        # The same check against the *owning* run, for a nested auto-sweep child
+        # whose own dir is empty because the operator stopped the parent. Without
+        # it the fix above is inert on exactly the shape it exists for: the child's
+        # adapter aborts off the parent's file, `_post_kill_reconcile` rescues that
+        # `aborted` back to `completed`, so raise site A never fires — and the child
+        # would carry on into verify/review on the strength of the rescued result.
+        # Deliberately does NOT consume: the file is the parent's, and the parent's
+        # own hard arm must still find it to record and attribute the stop. The
+        # nested re-raise below hands this exception up before that arm consumes
+        # anything, and `via` rides the exception rather than the file.
+        if self._is_nested:
+            owner = owner_run_dir()
+            if owner is not None and read_stop_request_mode(owner) == "hard":
+                raise RunStopped(via="stop-request")
         self._emit(
             "post_session",
             task,
@@ -5255,11 +5613,8 @@ class Engine:
                 preserve_dispatched_spec_snapshot=preserve_chain_snapshot,
             )
             advance(task, Phase.DEV_VERIFY)
-            crits = critical_escalations(result.result_json)
-            if crits:
-                details = "; ".join(str(e.get("detail", e.get("type", "?"))) for e in crits)
-                self._escalate(task, f"CRITICAL escalation from fix session: {details}")
             outcome = None
+            verified = NO_VERIFY_COMMANDS
             terminal = None
             if result.status == "completed":
                 # A repair is another generic dev-primitive pass: it can leave
@@ -5293,14 +5648,29 @@ class Engine:
                     )
                 else:
                     terminal = None
-                outcome = harvest_outcome or verify.verify_commands_outcome(
-                    self.policy, self.workspace.root
-                )
+                if harvest_outcome is not None:
+                    outcome = harvest_outcome
+                else:
+                    outcome, verified = self._verify_commands_with_results(task, "fix")
                 if not outcome.ok:
                     reason = outcome.reason
             ok = outcome is not None and outcome.ok
             session_failure = (
                 "" if result.status == "completed" else session_failure_reason("fix", result)
+            )
+            self._emit(
+                "post_dev_verify",
+                task,
+                session_status=result.status,
+                result_json=result.result_json,
+                verify_reason=(outcome.reason if outcome is not None else None),
+                command_results=verified.results,
+                # Stage "fix" is the only thing separating this emit from the dev
+                # one: same stage, same DEV_VERIFY phase, same `attempt` counter.
+                # Stays None when the harvest short-circuited above and the
+                # commands never ran — `verify_reason` carries that reason.
+                verification_stage=verified.stage,
+                verification_sequence=verified.sequence,
             )
             self.journal.append(
                 "fix-decision",
@@ -5313,6 +5683,23 @@ class Engine:
                 # it fed, so the fix path is greppable the same way (#489).
                 session_vanished=result.session_vanished,
             )
+            # CRITICAL routing, deliberately AFTER the emit and the journal record
+            # above, and deliberately AHEAD of the env-fault/retryable arms below.
+            # Both halves mirror `decide_dev`, which the dev leg reaches at the
+            # same point in its own loop: it tests `critical_escalations` FIRST,
+            # so a CRITICAL outranks an env fault there too, and its caller has
+            # already emitted `post_dev_verify` and journalled `dev-decision` by
+            # then. Escalating here before the emit — as this leg used to — made
+            # one event class observable on the dev leg and invisible on the
+            # repair leg: `_escalate` raises `RunPaused`, so a repair session
+            # reporting CRITICAL fired no `post_dev_verify` at all, while a dev
+            # session reporting the same thing fired one. The hook is named for
+            # the verification, the verification ran, and a plugin correlating
+            # verify passes cannot have half of them silently withheld.
+            crits = critical_escalations(result.result_json)
+            if crits:
+                details = "; ".join(str(e.get("detail", e.get("type", "?"))) for e in crits)
+                self._escalate(task, f"CRITICAL escalation from fix session: {details}")
             if result.status != "completed" and result.env_fault:
                 # A fix session whose CLI lost its API connection (#194) did no
                 # repair work — another attempt cannot fix the run environment, so
@@ -5870,6 +6257,174 @@ class Engine:
             "story-deferred-close-carried", story_key=task.story_key, dw_ids=carried
         )
 
+    def _board_carry_must_prove_ownership(self, board: Path) -> bool:
+        """Whether anyone other than this pass may already have written ``board``.
+
+        Asked by ``_carry_board_advance`` BEFORE its own advance, which is the whole of
+        why it is a separate frame: a moment later this run's write is on the path and
+        "was anybody else here" has stopped being answerable.
+
+        ``dirty_paths`` — git's own answer — and nothing else decides whether EITHER
+        comparison below runs at all. That ordering is load-bearing rather than an
+        optimization: it is what keeps them from being asked about a board nobody has
+        written, where the only honest answer is git's. It is NOT what makes the byte
+        comparison safe on a repo that normalizes line endings — ``file_holds_content``
+        hashes both sides through the path's clean filter for that, so no eol domain
+        has to be guessed at either end.
+
+        Fail CLOSED. A probe that could not run has not ruled an operator out, and the
+        writes it gates are the ones that leave no trace of what they took. What the
+        conservative answer costs depends on which check then answers, and neither cost
+        is the destructive one: the sibling guarding the COMMIT costs a no-op commit,
+        ``advance`` having already put the status on disk; the row check that PRECEDES
+        ``advance`` costs the carry itself, and with it the next run re-picking the
+        story — the #350 behavior, minus the false claim that it was fixed.
+
+        A board outside the repo is the one False the failure paths do not share: git
+        cannot commit it either way, so there is nothing here to protect and no
+        baseline for either comparison below, and answering True would trade a no-op
+        commit for a real refusal.
+
+        A GITIGNORED board is the ceiling, and it is git's rather than this probe's.
+        ``dirty_paths`` never reports one — ``git status --porcelain`` needs
+        ``--ignored`` to spell it ``!!`` at all — so both comparisons are skipped
+        here. Reporting it would change NOTHING, which is why the probe is left
+        alone: an ignored board is untracked, HEAD carries no blob for it, and both
+        comparisons accept a path HEAD does not carry precisely because there is no
+        baseline to compare against (the #460 boundary). Measured. Nor can the COMMIT
+        half of the hazard arise there — ``git add`` refuses an ignored path with rc 1
+        every time. What is genuinely unprotected is the ADVANCE: a replayed carry can
+        still overwrite a row an operator edited on an ignored board while the host
+        was down, and nothing git holds could prove otherwise."""
+        repo = self.paths.repo_root
+        try:
+            rel = board.resolve().relative_to(repo.resolve()).as_posix()
+        except ValueError:
+            return False  # external board — never git's to commit in the first place
+        except (OSError, RuntimeError):
+            return True
+        try:
+            return rel in verify.dirty_paths(repo)
+        except (verify.GitError, OSError, RuntimeError):
+            return True
+
+    def _board_carry_foreign_row_status(
+        self, board: Path, story_key: str, target: str
+    ) -> str | None:
+        """The status ``story_key``'s row holds for somebody OTHER than this pass.
+
+        ``None`` means the row is this pass's to write. Anything else is a status
+        ``advance`` would overwrite that this run did not put there, and it is handed
+        back rather than a bare False because it is the whole of what the refusal has
+        to report: nothing lands, so there is no ``landed`` to journal in its place.
+
+        The one question the sibling below cannot be asked in time. That one guards the
+        COMMIT and runs after ``advance``, which for the story's OWN row is after the
+        evidence is gone — ``advance`` has replaced the operator's status with the
+        target, so the board then holds precisely HEAD's bytes plus this advance and
+        the proof rightly says so. Nor would refusing the commit at that point have
+        saved anything: the status on disk is the value ``_pick_next`` schedules from.
+        Hence a check that runs BEFORE the write.
+
+        ADDITIVE, and about one ROW rather than the board. A stray on some OTHER row is
+        not this write's to refuse — ``advance`` cannot reach it, and today's outcome
+        there (the advance lands, the sibling declines the commit, ``_pick_next`` stays
+        honest) is the right one. Refusing on a whole-board difference would trade that
+        for a finished story re-picked by every run until a human intervenes.
+
+        Two shapes are this pass's own. A row still holding HEAD's status was written by
+        nobody since the commit ``advance`` recomputes from. A row already AT or PAST
+        ``target`` is the replay leg's reason to exist — a crashed pass's landed advance
+        — and never-regress means ``advance`` writes nothing over it either way, so that
+        shape is settled first and without asking git anything, which keeps a replay off
+        the fail-closed path entirely. An ABSENT row accepts too, and is not this
+        frame's to judge: ``advance`` returns None over it and writes nothing, and
+        ``board-advance-carry-failed`` already names that outcome.
+
+        Fail CLOSED on git, like both siblings and for their reason. The board's own
+        parse is deliberately NOT caught: for a board that carries no
+        ``development_status`` map (or is not YAML at all) the live read here raises
+        ``SprintStatusError`` exactly as ``advance`` would have raised it one call
+        later, and quietly converting that into a refusal would dress a corrupt
+        board as an operator's edit. A MISSING board is a different case and never
+        reaches this frame: over one, ``advance`` returns None where this read's
+        ``load`` raises — the two disagree, which is why the caller refuses the
+        shape up front (``board-advance-carry-failed``) rather than letting the
+        probe die on a file the writer would have shrugged at. A path HEAD does not
+        carry accepts — the #460 boundary the sibling draws, drawn once for both.
+        """
+        live = sprint_story_status(board, story_key)
+        if live is None or _at_or_past(live, target):
+            return None
+        repo = self.paths.repo_root
+        try:
+            rel = board.resolve().relative_to(repo.resolve()).as_posix()
+            head = verify.file_bytes_at_revision(repo, "HEAD", rel)
+            if head is None:
+                return None
+            return None if live == sprint_status_in_bytes(head, story_key) else live
+        except (verify.GitError, OSError, RuntimeError, ValueError, SprintStatusError):
+            return live
+
+    def _board_carry_holds_only_this_advance(
+        self, board: Path, story_key: str, target: str
+    ) -> bool:
+        """Whether ``board``'s bytes are HEAD's plus this pass's advance and no more.
+
+        The discrimination the replay leg needs. Refusing on DIRT alone would break the
+        recovery that leg exists for: a crashed pass's own advance IS uncommitted dirt
+        on exactly this path, and finishing it is the point. So the question asked is
+        not whether the board is dirty but whether what is on it is what this pass
+        intends — recomputed from HEAD's blob through ``advance`` itself, then compared
+        byte for byte. A crashed pass's write matches, ``advance`` being deterministic
+        and never-regressing, so replaying a landed one lands on the same bytes; an
+        operator's edit does not.
+
+        HEAD's blob, not a snapshot taken earlier in the run: the baseline has to
+        predate every writer, and only git holds one that does.
+
+        A path HEAD does not carry answers True, leaving an untracked board committed
+        exactly as before (#460). That is the boundary ``merge_local`` already draws —
+        ``_carried_artifact_rels`` filters ``protected`` to TRACKED paths, because
+        protecting an untracked artifact would halt every run whose project never
+        committed its board — and a second frame drawing it elsewhere would make the
+        pair unreadable.
+
+        BOTH of the places git holds this path are proved, because `commit_paths`
+        overwrites both: the working tree it copies into the commit, and the index it
+        stages over. A staged edit distinct from HEAD and from this advance survives
+        neither, so proving the working tree alone would authorize destroying it.
+
+        Sameness is GIT's question here, not a byte compare's (``file_holds_content``).
+        The baseline is HEAD's raw blob, and the board on disk may be its CRLF twin or
+        its LF one depending on nothing the run controls — git calls the tree clean
+        either way, so a byte compare would have to guess, and either guess refuses a
+        pristine board on the hosts the other guess serves. Both sides hashed through
+        the path's clean filter answers the only question worth asking, and still parts
+        an operator's added row from this pass's advance.
+
+        Fail CLOSED, like its sibling and for its reason, and that covers
+        ``advanced_bytes`` returning None: a row missing from HEAD's board leaves nothing
+        to compare against, and "I could not compute the intended content" must not read
+        as "the tree is mine". A row the writer declines to rewrite is NOT that case — it
+        hands HEAD's bytes back unchanged, and the compare then rightly accepts a board
+        nobody touched."""
+        repo = self.paths.repo_root
+        try:
+            rel = board.resolve().relative_to(repo.resolve()).as_posix()
+            head = verify.file_bytes_at_revision(repo, "HEAD", rel)
+            if head is None:
+                return True
+            intended = sprint_advanced_bytes(head, story_key, target)
+            if intended is None or not verify.file_holds_content(repo, rel, board, intended):
+                return False
+            # The working tree is only half of what the carry overwrites: `commit_paths`
+            # stages it OVER the index, so a staged version distinct from both HEAD and
+            # this advance is destroyed rather than committed.
+            return verify.index_holds_no_foreign_content(repo, rel, intended)
+        except (verify.GitError, OSError, RuntimeError, ValueError):
+            return False
+
     def _carry_board_advance(self, task: StoryTask) -> None:
         """Re-apply the story's sprint-board advance to the main checkout (#350).
 
@@ -5911,23 +6466,47 @@ class Engine:
         anything to write, and ``git add`` refuses an ignored path with rc 1 every
         time — a commit-pending latch would only retry a refusal. The status on disk
         is the value that keeps ``_pick_next`` honest; the commit is bookkeeping.
-        The commit is attempted unconditionally rather than gated on evidence of a
-        write, because ``advance`` cannot report whether it wrote (a never-regress
-        echo returns the target too) — an unchanged board simply gives
-        ``commit_paths`` nothing to commit, and ``clean_incoming_collisions`` has
-        just restored any unrelated dirt on a tracked board, so there is none to
-        sweep in.
+        The commit is not gated on evidence of a WRITE, because ``advance`` cannot
+        report whether it wrote (a never-regress echo returns the target too) — and it
+        does not need to be: an unchanged board simply gives ``commit_paths`` nothing
+        to commit.
+
+        What the commit must NOT be given is somebody else's bytes, and on the LIVE
+        merge path ``clean_incoming_collisions`` has already accounted for those:
+        inside the branch's incoming set unrelated dirt was restored, and outside that
+        set it REFUSED the merge, this frame among everything else it precedes (the
+        board is one of the two paths ``merge_local`` passes as ``protected``,
+        precisely because the pathspec stage below would otherwise commit it). That
+        pre-flight does not precede every caller. ``_replay_unlatched_ledger_carries``
+        falls straight through to the carry for a unit whose ``unit-merged`` was
+        already journaled — it re-runs no merge on that leg, so no pre-flight runs on
+        it either — and an edit the operator made while the host was down would ride
+        out under this method's own message, tree clean behind it. Hence
+        ``_board_carry_must_prove_ownership``, which asks there what the pre-flight
+        asks here.
+
+        Ownership is then asked TWICE, on either side of ``advance``, because the two
+        questions have different deadlines. What the COMMIT must not be handed is
+        answerable afterwards, about the whole board. What ``advance`` ITSELF must not
+        overwrite is answerable only before it, and only about this story's row — so
+        ``_board_carry_foreign_row_status`` leads, and a refusal there returns without
+        journaling ``board-advance-carried``: nothing reached the disk, and that event's
+        claim is precisely that the status did.
 
         What ``advance`` CAN report is that the row did not REACH ``target``, and
         that is a different question from whether it wrote — the one this method has
         to ask before naming its outcome ``board-advance-carried``. It answers
         below-target in two shapes, both of them a carry that did not happen: `None`
-        when the main board or the story's row is gone (deleted or renamed while the
-        isolated session held its own copy, or before a merge-to-carry replay), and
+        when the story's row is gone (deleted or renamed while the isolated session
+        held its own copy, or before a merge-to-carry replay), and
         the current status when the row is there but ``_set_mapping_value``'s line
         regex could not rewrite it — a quoted or block-scalar key, which
         ``story_status``'s full YAML parse resolves and the writer then declines.
-        Latching either as carried would file a success for a main board still
+        A whole board that is gone is the shape ``advance`` cannot be allowed to
+        answer for at all: it returns None over a missing file, but the pre-advance
+        row probe's own read raises ``SprintStatusError`` there — so the caller
+        refuses it before either runs, on the same journal row. Latching any of
+        these as carried would file a success for a main board still
         sitting in ``ACTIONABLE_STATUSES``, and the run would tear the worktree
         holding the advanced copy down on the strength of that record. It journals
         ``board-advance-carry-failed`` instead and skips the commit, which has
@@ -5940,6 +6519,34 @@ class Engine:
         if not target:
             return
         board = self.paths.sprint_status
+        if not board.is_file():
+            # A board that is GONE is refused here, before the ownership probes:
+            # `advance` answers None over a missing file, but the foreign-row
+            # probe's own live read (`sprint_story_status` → `load`) raises
+            # `SprintStatusError` for it — and a deleted TRACKED board is exactly
+            # the shape that turns proving on (` D` in `dirty_paths`), so on the
+            # replay leg that raise escaped `_replay_unlatched_ledger_carries`
+            # and killed every resume before `_loop()`. The is_file-to-advance
+            # window this leaves is #686's TOCTOU, not this guard's.
+            self.journal.append(
+                "board-advance-carry-failed",
+                story_key=task.story_key,
+                target=target,
+                status=None,
+            )
+            return
+        prove = self._board_carry_must_prove_ownership(board)
+        if prove:
+            # `is not None`, not truthiness: an empty status is still somebody's edit.
+            foreign = self._board_carry_foreign_row_status(board, task.story_key, target)
+            if foreign is not None:
+                self.journal.append(
+                    "board-advance-carry-foreign-dirt",
+                    story_key=task.story_key,
+                    target=target,
+                    status=foreign,
+                )
+                return
         landed = sprint_advance(board, task.story_key, target)
         if not _at_or_past(landed, target):
             self.journal.append(
@@ -5949,19 +6556,27 @@ class Engine:
                 status=landed,
             )
             return
-        try:
-            verify.commit_paths(
-                self.paths.repo_root,
-                f"chore(sprint-status): carry {task.story_key} to {target}",
-                [board],
-            )
-        except verify.GitError as e:
+        if prove and not self._board_carry_holds_only_this_advance(board, task.story_key, target):
             self.journal.append(
-                "board-advance-carry-uncommitted",
+                "board-advance-carry-foreign-dirt",
                 story_key=task.story_key,
                 target=target,
-                error=str(e),
+                status=landed,
             )
+        else:
+            try:
+                verify.commit_paths(
+                    self.paths.repo_root,
+                    f"chore(sprint-status): carry {task.story_key} to {target}",
+                    [board],
+                )
+            except verify.GitError as e:
+                self.journal.append(
+                    "board-advance-carry-uncommitted",
+                    story_key=task.story_key,
+                    target=target,
+                    error=str(e),
+                )
         self.journal.append(
             "board-advance-carried",
             story_key=task.story_key,

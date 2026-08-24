@@ -7,9 +7,14 @@ none of them, while still preserving the diagnostic *structure*.
 
 from __future__ import annotations
 
+import dataclasses
 import json
+import os
 import re
 import sys
+import types
+import typing
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -17,6 +22,7 @@ import pytest
 from bmad_loop import diagnostics, sanitize
 from bmad_loop.journal import Journal, save_state
 from bmad_loop.model import Phase, RunState, SessionRecord, StoryTask, TokenUsage
+from bmad_loop.policy import Policy
 
 # Labelled canaries planted across the run dir. NONE may appear in the dump.
 EMAIL = "victim.canary@example.com"
@@ -436,6 +442,66 @@ def test_a_windows_spec_path_normalizes_to_the_same_alias():
     )
     assert trailing["spec"] != ""
     assert re.fullmatch(r"spec-[0-9a-f]{12}", trailing["spec"])
+
+
+def test_verify_command_free_text_drops_to_presence_booleans():
+    """A `verify-command-result` record ships its correlation half, never its text.
+
+    `_scrub_entry` routes by field NAME, and five of this record's fields are free
+    text: `command` is operator-authored shell, `output_tail` is a build's own
+    output, `capture_error` is an OSError string carrying a path, and the two
+    stream pointers embed the story key. Left to the `scrub_json` fallback they
+    fail closed only by ACCIDENT of shape — `_IDENTIFIER_RE` forbids `/` and
+    spaces, so paths, argv-ish commands and multi-line tails collapse — but a
+    one-word command like `make` satisfies it and ships verbatim.
+
+    Ablation: remove the five names from `_JOURNAL_DROP_FIELDS`. `command` comes
+    back as the literal `make` (reddening the presence assertion AND the canary
+    sweep), while `output_tail` / `capture_error` / `stdout_path` merely turn into
+    `<redacted:str>` — which is why `make` is the value under test and not a
+    path-shaped one: only it separates the drop list from the fallback.
+    """
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    out = diagnostics._scrub_entry(
+        {
+            "ts": 1.0,
+            "kind": "verify-command-result",
+            "story_key": STORY_KEY,
+            "attempt": 2,
+            "verification_stage": "dev",
+            "verification_sequence": 3,
+            "command_index": 0,
+            "command": "make",
+            "returncode": 1,
+            "output_tail": CODE,
+            "capture_error": f"stdout: [Errno 28] No space left on device: '{HOME_PATH}/x'",
+            "stdout_path": f"verify/verify-{STORY_KEY}-dev-2-3-0.stdout.log",
+            "stderr_path": None,
+            "stdout_bytes": 12,
+            "stdout_truncated": False,
+        },
+        pseudo,
+        {},
+        1.0,
+    )
+
+    for field in ("command", "output_tail", "capture_error", "stdout_path", "stderr_path"):
+        assert field not in out, f"{field} must never be emitted"
+    assert out["command_present"] is True
+    assert out["output_tail_present"] is True
+    assert out["capture_error_present"] is True
+    # the pointers keep the one fact they are worth: whether a stream was retained
+    # at all — `stream_capture_kb = 0` and a failed write both leave it null.
+    assert out["stdout_path_present"] is True
+    assert out["stderr_path_present"] is False
+    # ... while everything a maintainer correlates on still ships verbatim
+    assert (out["verification_stage"], out["verification_sequence"]) == ("dev", 3)
+    assert (out["command_index"], out["returncode"], out["attempt"]) == (0, 1, 2)
+    assert (out["stdout_bytes"], out["stdout_truncated"]) == (12, False)
+
+    rendered = json.dumps(out)
+    for canary in ("make", CODE, HOME_PATH, PROPRIETARY, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
 
 
 def test_structure_is_preserved(project):
@@ -863,6 +929,412 @@ def test_state_root_path_is_redacted_in_the_dump(project, tmp_path, monkeypatch)
         assert "absolute-home-path" in exc.value.rules
 
 
+# ------------------------------------- the _scrub_policy key invariant (#202)
+#
+# `_scrub_policy` emits dict KEYS verbatim (the else-branch passthrough), unlike
+# `sanitize._scrub`, which scrubs keys as well as values. That is safe only while
+# no policy section is a free-keyed table. These pin the invariant so the rule is
+# discoverable from a failure rather than only from the comment beside the code.
+
+
+def _policy_free_keyed_fields(dc, prefix="", seen=frozenset()):
+    """Dotted paths of every Mapping-typed field in ``dc``'s dataclass tree.
+
+    `policy.py` uses `from __future__ import annotations`, so `field.type` is a
+    STRING and only `typing.get_type_hints` gives back a comparable type."""
+    if dc in seen:  # defensive: the policy tree is a DAG today, not a cycle
+        return
+    seen = seen | {dc}
+    hints = typing.get_type_hints(dc)
+    for fld in dataclasses.fields(dc):
+        yield from _classify_policy_type(hints[fld.name], f"{prefix}{fld.name}", seen)
+
+
+def _classify_policy_type(tp, path, seen):
+    """Walk one resolved annotation, yielding ``path`` when it is a free-keyed
+    table. `get_origin` covers the subscripted `dict[str, X]` case; the bare
+    `dict`/`Mapping` case falls through to `tp` itself."""
+    origin = typing.get_origin(tp)
+    args = typing.get_args(tp)
+    if origin in (typing.Union, types.UnionType):
+        for arg in args:
+            yield from _classify_policy_type(arg, path, seen)
+        return
+    base = origin or tp
+    if isinstance(base, type) and issubclass(base, Mapping):
+        # A free-keyed table: report it and stop. Descending into its value type
+        # would report the same field twice for `dict[str, dict[str, Any]]`.
+        yield path
+        return
+    if dataclasses.is_dataclass(base):
+        yield from _policy_free_keyed_fields(base, f"{path}.", seen)
+        return
+    for arg in args:  # tuple[X, ...] / list[X] could nest a policy dataclass
+        yield from _classify_policy_type(arg, f"{path}[]", seen)
+
+
+def test_no_policy_section_has_a_free_keyed_table():
+    """The invariant `_scrub_policy`'s key passthrough rests on: no policy section
+    is a free-keyed table, so every key in a diagnose dump is a compile-time field
+    name rather than user data. `plugins.settings` is the sole exception and is
+    intercepted by `_POLICY_KEYSET_KEYS` before it can reach the passthrough.
+
+    This walks the field TYPES, and that is the load-bearing half of the pair. A
+    newly added free-keyed section — `adapter.overrides: dict[str, str]` keyed by
+    binary path, say — defaults to an EMPTY dict, so `Policy().to_dict()` yields
+    none of its keys and the value-level twin
+    (`test_every_policy_snapshot_key_is_identifier_shaped`) stays green while the
+    hazard is live. At declaration time the type is the only evidence there is,
+    and this test is what reads it.
+
+    The assertion is an EXACT set rather than a subset for the same reason: a
+    subset check is satisfied by a tree that grew a table, which is precisely the
+    event it would exist to catch.
+
+    When this fails, a new table was added. Either route it through
+    `_POLICY_KEYSET_KEYS` / `_POLICY_COUNT_KEYS` in `diagnostics.py` so its keys
+    are reduced before they ship, or establish that its keys cannot carry user
+    data. Do not simply widen the expected set (#202)."""
+    assert set(_policy_free_keyed_fields(Policy)) == {"plugins.settings"}
+
+
+def test_every_policy_snapshot_key_is_identifier_shaped():
+    """Every key the policy snapshot actually ships is a machine slug, never PII
+    — the value-level companion to the type-level check above (#202)."""
+    offenders: list[str] = []
+
+    def walk(obj, path):
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if not sanitize.looks_like_identifier(str(key)):
+                    offenders.append(f"{path}.{key}")
+                walk(value, f"{path}.{key}")
+        elif isinstance(obj, (list, tuple)):
+            for item in obj:
+                walk(item, f"{path}[]")
+
+    # Belt to `test_no_policy_section_has_a_free_keyed_table`'s braces: this
+    # catches a field NAME that is not slug-shaped, where a leading-underscore
+    # private field is the realistic case (`sanitize._IDENTIFIER_RE` requires the
+    # first character to be alphanumeric). It cannot catch an empty-by-default
+    # free-keyed table — there are no keys to walk — which is why the type-level
+    # test is the load-bearing one and this cannot replace it.
+    walk(Policy().to_dict(), "policy")
+    assert offenders == []
+
+
+def test_scrub_policy_passes_unknown_section_keys_verbatim():
+    """Characterization of the else-branch: an unknown section's keys are emitted
+    VERBATIM — even a home path — while `sanitize.scrub_json` redacts the same key.
+
+    This pins the CURRENT, deliberate behavior (field names are the point of the
+    snapshot, and redacting them would cost the reader the dump's whole index) and
+    is the exact hazard `test_no_policy_section_has_a_free_keyed_table` guards. It
+    is not an endorsement: if `_scrub_policy` is ever changed to scrub keys, this
+    test is expected to change with it rather than to stand in the way (#202).
+
+    The passthrough is KEYS ONLY, and the value row below is what says so."""
+    snapshot = {"future": {HOME_PATH: {"model": HOME_PATH}}}
+    scrubbed = diagnostics._scrub_policy(snapshot)
+    assert list(scrubbed["future"]) == [HOME_PATH]
+    # Keys only. An unknown section's VALUES still go through the standard gate,
+    # so the same home path IS redacted one level down. This row is load-bearing
+    # against the shape of fix a reader reaches for when they want the keys kept:
+    # flattening the else-branch's `_scrub_policy(value)` recursion to a bare
+    # `value` keeps every other assertion here green while turning the whole
+    # branch into a leak, so without it this test would characterize one.
+    assert scrubbed["future"][HOME_PATH]["model"] == "<redacted:str>"
+    # The contrast that makes the passthrough a deliberate divergence rather than
+    # an oversight: the shared value gate would not have let this key through.
+    assert HOME_PATH not in sanitize.scrub_json(snapshot)["future"]
+
+
 # The pure guard-mechanics tests (hard-rule refusal, repair tally, cyclic
 # termination) live in tests/test_sanitize.py since #199 made guard shared API;
 # this file keeps the integration surface: real collectors, real renders.
+
+
+# --------------------------------------------- the verifier stream store
+
+
+def test_verify_streams_are_counted_but_never_read(project, tmp_path):
+    """`verify/` is stat-only: its SIZE is the diagnostic, its contents are not.
+
+    The store can be one of the larger things in a run dir — `stream_capture_kb`
+    defaults to 256 KiB per stream, so up to 512 KiB per command per attempt, with
+    no GC behind it yet — so a dump that omits it cannot show the retention or
+    disk-usage problem a maintainer opens a dump to find. It is equally the one
+    category that must never be READ into the output: retained verifier output is
+    a build's own stdout/stderr and may carry anything the project's test suite
+    prints.
+
+    Ablation guard: drop `VERIFY_DIR` from `_FILE_CATEGORIES` and the group is
+    None — the `is_dir()` guard makes an unregistered category vanish silently
+    rather than redden, which is exactly how this was missed. Verified.
+    """
+    run_dir = _seed_bare_run(project.project)
+    verify_dir = run_dir / "verify"
+    verify_dir.mkdir(parents=True, exist_ok=True)
+    secret = "SUPER-SECRET-BUILD-OUTPUT-DO-NOT-EMIT"
+    (verify_dir / "verify-1-1-a-dev-1-1-0.stdout.log").write_text(secret, encoding="utf-8")
+    (verify_dir / "verify-1-1-a-dev-1-1-0.stderr.log").write_text("err", encoding="utf-8")
+
+    diag = diagnostics.collect(
+        [run_dir], pseudo=sanitize.Pseudonymizer(), project=Path(project.project)
+    )
+    group = next((g for g in diag.runs[0].files if g.category == "verify"), None)
+
+    assert group is not None, "verify/ is not registered as a diagnostic category"
+    assert group.count == 2
+    assert group.total_bytes == len(secret) + len("err")
+
+    # the half that matters as much as the count: the dump STATS, never reads
+    assert secret not in diagnostics.render_markdown(diag)
+    assert secret not in diagnostics.render_json(diag)
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="planting a directory symlink needs privilege on win32"
+)
+def test_a_redirected_verify_root_is_not_counted_as_this_runs_output(project, tmp_path):
+    """A planted redirect at `verify/` must not make `diagnose` report someone
+    else's tree as this run's retained verifier output.
+
+    `summarize_files` admits a category root on `root.is_dir()`, which FOLLOWS a
+    link, and then walked it with `rglob("*")`. Measured before the fix: two files
+    and 3100 bytes from outside the run, attributed to this run. Registering
+    `verify/` as a category — the fix for the earlier "invisible store" gap — is
+    what put a session-plantable directory on that traversal at all; every other
+    category root is engine-created, which is why the hole opened here and not
+    years ago.
+
+    Ablation: walk the root with `rglob("*")` again and the group comes back
+    naming the target's count and bytes. Verified.
+    """
+    run_dir = _seed_bare_run(project.project)
+    outside = tmp_path / "somewhere-else"
+    outside.mkdir()
+    (outside / "a.bin").write_bytes(b"a" * 3000)
+    (outside / "b.bin").write_bytes(b"b" * 100)
+    (run_dir / "verify").symlink_to(outside, target_is_directory=True)
+
+    diag = diagnostics.collect(
+        [run_dir], pseudo=sanitize.Pseudonymizer(), project=Path(project.project)
+    )
+    group = next((g for g in diag.runs[0].files if g.category == "verify"), None)
+
+    assert group is None  # nothing of ours is in there, so there is nothing to report
+    assert (outside / "a.bin").is_file()  # and the dump did not touch what it found
+
+
+# ---------------------------------------------------- planted non-regular files
+#
+# `summarize_files` walks with `walk_files_unlinked`, and `os.walk` reports every
+# NON-DIRECTORY entry — FIFOs and symlinks included. The `is_file()` guard the old
+# `rglob` loop carried came off with that switch, and the `logs` arm OPENS what it
+# counts. Four ablation axes, and each reddens exactly one test below — the
+# loop's `S_ISREG` inventory filter, and `_count_lines`' `O_NONBLOCK`,
+# `O_NOFOLLOW`, and `S_ISREG`-on-the-fd. Disjoint failures are what shows the
+# four guards are not standing in for each other.
+
+_FIFO = pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFOs")
+
+
+@_FIFO
+def test_count_lines_refuses_an_idle_fifo_instead_of_blocking(tmp_path):
+    """A FIFO nobody is feeding: opening it read-only without ``O_NONBLOCK``
+    blocks until a writer arrives, which for a run directory the session owns
+    means `diagnose` never returns and the operator's terminal is wedged.
+
+    Bounded with ``SIGALRM`` rather than a subprocess, following
+    `test_runs.py`'s twin: a hang is the failure under test, so the test needs a
+    deadline of its own or an ablation wedges the suite instead of reddening it.
+
+    ABLATION: drop ``O_NONBLOCK`` from the flags and the alarm fires. Dropping the
+    fd ``S_ISREG`` check instead does NOT show up here — with no writer the read
+    hits EOF and answers 0 either way, which is exactly why the fed twin below
+    exists. Verified."""
+    import signal
+
+    path = tmp_path / "session.log"
+    os.mkfifo(path)
+
+    def _blew_up(signum, frame):
+        raise AssertionError("the line count blocked on the FIFO instead of refusing it")
+
+    previous = signal.signal(signal.SIGALRM, _blew_up)
+    signal.alarm(20)
+    try:
+        assert diagnostics._count_lines(path) == 0
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+@_FIFO
+def test_count_lines_refuses_a_fed_fifo_without_consuming_it(tmp_path):
+    """The half the alarm above cannot see. There the FIFO is idle, so the harm is
+    a hang and the bytes read are merely empty; here a writer holds it open and is
+    feeding it, so a reader that gets past the open never blocks — it counts
+    whatever the session piped in as this run's log lines, and drains the pipe on
+    the way through. Neither shows up as a hang, so the alarm above would never
+    notice.
+
+    ``O_RDWR`` for the holder deliberately — a write-only open on a FIFO blocks
+    until a reader arrives and would wedge the test itself, and ``O_RDWR`` never
+    blocks.
+
+    ABLATION: delete the ``S_ISREG(os.fstat(fd))`` check and this answers **3** —
+    the piped lines, billed to this run. The byte assert grades the second harm on
+    the same axis: the read consumed them, so the holder's own read no longer
+    finds what it wrote. Verified."""
+    path = tmp_path / "session.log"
+    os.mkfifo(path)
+
+    holder = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+    try:
+        os.write(holder, b"one\ntwo\nthree\n")
+        assert diagnostics._count_lines(path) == 0
+        assert os.read(holder, 64) == b"one\ntwo\nthree\n"  # untouched
+    finally:
+        os.close(holder)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink + O_NOFOLLOW")
+def test_count_lines_refuses_a_symlink_instead_of_reading_its_target(tmp_path):
+    """``O_NOFOLLOW``: the walk refuses to descend THROUGH a redirect, but the
+    final component it hands back is still a name, and the inventory filter that
+    normally screens a symlinked entry out is a check-then-open race on a
+    directory the session can write. The read anchors on the flag instead.
+
+    ABLATION: drop ``O_NOFOLLOW`` and this returns 2 — the target's lines,
+    attributed to this run. Verified."""
+    outside = tmp_path / "elsewhere.txt"
+    outside.write_bytes(b"theirs\nnot ours\n")
+    link = tmp_path / "session.log"
+    link.symlink_to(outside)
+
+    assert diagnostics._count_lines(link) == 0
+
+
+@_FIFO
+def test_a_planted_fifo_is_not_counted_as_this_runs_log_output(project, tmp_path):
+    """The inventory half, at the level a maintainer reads: a FIFO and a symlink
+    planted in the run's own `logs/` are not this run's retained output, and
+    counting either bills the report for bytes nobody wrote.
+
+    Alarmed like the unit twin because an ablation that reaches the open would
+    hang `collect` rather than fail it.
+
+    ABLATION: delete the two ``S_ISREG`` inventory lines in `summarize_files` and
+    the group reports 3 files and the symlink target's 3000 bytes instead of the
+    one real log. Verified."""
+    import signal
+
+    run_dir = _seed_bare_run(project.project)
+    logs = run_dir / "logs"
+    logs.mkdir(parents=True)
+    (logs / "dev.log").write_bytes(b"one\ntwo\n")
+    os.mkfifo(logs / "piped.log")
+    outside = tmp_path / "theirs.log"
+    outside.write_bytes(b"t" * 3000)
+    (logs / "linked.log").symlink_to(outside)
+
+    def _blew_up(signum, frame):
+        raise AssertionError("collect blocked on the planted FIFO")
+
+    previous = signal.signal(signal.SIGALRM, _blew_up)
+    signal.alarm(30)
+    try:
+        diag = diagnostics.collect(
+            [run_dir], pseudo=sanitize.Pseudonymizer(), project=Path(project.project)
+        )
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+    group = next(g for g in diag.runs[0].files if g.category == "logs")
+    assert (group.count, group.total_bytes, group.total_lines) == (1, 8, 2)
+
+
+def test_env_git_version_is_recorded(monkeypatch):
+    """The field a floor refusal is read against: a dump has to be able to say which
+    git ran, since `verify.GIT_FLOOR` is what `run` aborts below."""
+    import subprocess
+
+    from bmad_loop import verify
+
+    monkeypatch.setattr(
+        verify,
+        "git_bytes",
+        lambda *a, **k: subprocess.CompletedProcess(
+            args=["git", "version"], returncode=0, stdout=b"git version 2.34.1\n", stderr=b""
+        ),
+    )
+
+    env = diagnostics.collect_env(ANY_PROJECT)
+    assert env.git_version == "git version 2.34.1"
+
+
+def test_env_git_version_probe_is_bounded(monkeypatch):
+    """The probe carries its own short deadline instead of inheriting the engine's
+    `GIT_TIMEOUT_S`. `diagnose` is the command an operator reaches for once the host
+    is already broken, and a git that hangs is one of the states it has to stay
+    usable in — on the engine bound it sat silent for two minutes and then swallowed
+    the fault anyway, so the entire wait bought the same `None` a five-second bound
+    reaches. Asserted through the seam rather than by timing anything, so the row
+    cannot go flaky on a loaded box.
+
+    Both halves matter: `is not None` catches a probe that went back to inheriting,
+    and the comparison catches a "bound" that is no bound at all.
+
+    Ablation: drop `timeout_s=5` in `collect_env` and this fails on the first
+    assertion."""
+    import subprocess
+
+    from bmad_loop import verify
+
+    seen = {}
+
+    def probe(_project, *args, timeout_s=None):
+        seen["args"] = args
+        seen["timeout_s"] = timeout_s
+        return subprocess.CompletedProcess(
+            args=["git", "version"], returncode=0, stdout=b"git version 2.34.1\n", stderr=b""
+        )
+
+    monkeypatch.setattr(verify, "git_bytes", probe)
+
+    env = diagnostics.collect_env(ANY_PROJECT)
+    assert env.git_version == "git version 2.34.1"  # the probe still answers
+    assert seen["args"] == ("version",)
+    assert seen["timeout_s"] is not None, "the probe inherits the engine's git deadline"
+    assert seen["timeout_s"] < verify.GIT_TIMEOUT_S
+
+
+def test_env_git_version_is_none_when_the_probe_fails(monkeypatch):
+    """`verify.git_bytes` ANSWERS a non-zero rc rather than raising, so a failed
+    probe reaches the fold with whatever it wrote to stdout.
+
+    Recording that as the version would put a fabricated fact in a dump read
+    precisely to explain a refusal — worse than the honest `None`, because a
+    plausible-looking version is not obviously absent. The stdout here is
+    deliberately version-SHAPED: an empty one would pass on `or None` even with the
+    rc guard gone, which is the vacuous form of this test.
+
+    Ablation: drop the `probed.returncode == 0` guard in `collect_env` and this
+    fails — the dump reports `git version 9.9.9`."""
+    import subprocess
+
+    from bmad_loop import verify
+
+    monkeypatch.setattr(
+        verify,
+        "git_bytes",
+        lambda *a, **k: subprocess.CompletedProcess(
+            args=["git", "version"], returncode=128, stdout=b"git version 9.9.9\n", stderr=b"fatal"
+        ),
+    )
+
+    env = diagnostics.collect_env(ANY_PROJECT)
+    assert env.git_version is None

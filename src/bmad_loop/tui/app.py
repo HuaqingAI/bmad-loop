@@ -46,6 +46,7 @@ from .screens.modals import (
     ConfirmResumeModal,
     DecisionModal,
     EscalationModal,
+    PauseReasonModal,
     SpecReviewModal,
     StartRunModal,
     StartSweepModal,
@@ -179,9 +180,32 @@ class BmadLoopApp(App[None]):
             return False, None
 
     def _guarded(self, go: Callable[[], None]) -> None:
-        """Pre-launch guard mirroring the CLI: the #414 isolation/repo_root conflict
-        refused first, then a clean worktree required, plus a confirm when another
-        engine is already live."""
+        """Pre-launch guard mirroring the CLI: the git support floor refused first,
+        then the #414 isolation/repo_root conflict, then a clean worktree required,
+        plus a confirm when another engine is already live."""
+        # First, in `cmd_run`'s own order, and for the reason that order exists: this
+        # is a fact about the HOST, so every other answer here would be advice about
+        # the wrong thing. Without it the operator got the generic "launch may have
+        # failed — attach to control session" toast the dashboard raises 10s later,
+        # which names neither git nor the floor and points at a pane to go read.
+        #
+        # `timeout_s` because this runs on the event loop — the same reason the
+        # commit-subject probe below carries one (`_commit_subject`) — and
+        # that bound is exactly why a `GitError` here FALLS THROUGH to launch instead
+        # of refusing: 5s is not the deadline the detached CLI applies, so a merely
+        # slow git would otherwise be refused by a toast on a host the CLI would run
+        # on. The guard never authorizes anything — `_reject_under_floor_git` fails
+        # closed on that same fault a moment later, in the process that matters —
+        # so declining to PRE-EMPT a refusal costs nothing but a slower message.
+        # Same disposition, same reasoning, as the unreadable-policy fall-through
+        # below: the guard cannot tell "fine" from "could not look".
+        try:
+            found = verify.git_below_floor(self.project, timeout_s=5)
+        except verify.GitError:
+            found = None
+        if found is not None:
+            self.notify(verify.under_floor_git_message(found), severity="error")
+            return
         # The detached CLI refuses this combination too, and it is the authority —
         # this only turns a pane that dies immediately into a toast. Ordered ahead of
         # the clean-tree gate for the same reason `cmd_run` orders it ahead: this one
@@ -600,21 +624,39 @@ class BmadLoopApp(App[None]):
         self.push_screen(modal, done)
 
     def _review_gate(self, run_id: str, run_dir: Path, state: RunState) -> None:
-        labels = {
-            PAUSE_SPEC_APPROVAL: "spec-approval gate",
-            PAUSE_EPIC_BOUNDARY: "epic gate",
-            PAUSE_STORY_GATE: "story gate",
-        }
+        label = widgets.pause_label(state.paused_stage or "")[0] or "gate"
         spec_path, spec_text = self._paused_spec(state)
+
+        def done(verb: str | None) -> None:
+            if verb == "resume":
+                self._do_resume(run_id)
+
+        if spec_path is None:
+            # Spec-less gates: story-gate fires before the story is registered in
+            # state.tasks (deliberate, so a resume re-picks and re-asks the ledger)
+            # and epic-boundary has no story key. The pause reason is the payload.
+            subtitle = (
+                self._story_subtitle(state)
+                if state.paused_story_key
+                else Text(f"run {run_id}", style="bold")
+            )
+            self.push_screen(
+                PauseReasonModal(
+                    title=f"{label} — pause reason",
+                    subtitle=subtitle,
+                    reason=state.paused_reason or "",
+                ),
+                done,
+            )
+            return
         modal = SpecReviewModal(
-            # paused_stage may be None; dict.get tolerates a None key (returns the default).
-            title=f"{labels.get(state.paused_stage, 'gate')} — review the finalized spec",  # pyright: ignore[reportArgumentType, reportCallIssue]
+            title=f"{label} — review the finalized spec",
             subtitle=self._story_subtitle(state),
             spec_path=spec_path,
             spec_text=spec_text,
             actions=[("resume", "Approve & resume", "primary")],
         )
-        self.push_screen(modal, lambda verb: self._do_resume(run_id) if verb == "resume" else None)
+        self.push_screen(modal, done)
 
     @staticmethod
     def _checkpoint_gate_line(review_cycle: int) -> str:
@@ -914,12 +956,13 @@ class BmadLoopApp(App[None]):
     def action_graceful_stop_run(self) -> None:
         """Ask the selected live run to stop *gracefully*: finish the in-flight item
         (story dev/review/commit, or a sweep bundle through commit), then finalize
-        cleanly and stop — resumable, unlike the hard SIGTERM `x` delivers.
+        cleanly and stop — resumable, unlike the hard stop `x` delivers, which
+        abandons the in-flight item.
 
         Deliberately no `_mux_missing` gate: unlike `x` (which kills the agent
-        window) this touches no multiplexer — the request is a control file the
-        engine polls at item boundaries — so it must work even with the backend
-        down. The liveness gate is also deliberately looser than `x`'s: it rejects
+        window) this touches no multiplexer — the request rides the same control
+        file a hard stop uses, in its graceful mode, read by the engine at item
+        boundaries — so it must work even with the backend down. The liveness gate is also deliberately looser than `x`'s: it rejects
         only a *provably dead* engine, so an unverifiable (`unknown`) pid — a win32
         access-denied pid, a psmux backend, a run on another host — still lodges the
         request, matching `runs.request_graceful_stop`'s `requested-unverifiable`
@@ -941,7 +984,8 @@ class BmadLoopApp(App[None]):
                 "graceful stop",
                 f"stop run {run_id} after the current item finishes?\n"
                 "the in-flight story/bundle completes through commit, then the run "
-                "finalizes and stops (resumable). `x` stops immediately instead.",
+                "finalizes and stops (resumable). `x` instead abandons the "
+                "in-flight item.",
                 confirm_label="graceful stop",
             ),
             done,
@@ -960,7 +1004,9 @@ class BmadLoopApp(App[None]):
             self.call_from_thread(self.notify, str(e), severity="error")
             return
         if outcome == "already-pending":
-            self.call_from_thread(self.notify, f"run {run_id} already has a graceful stop pending")
+            # Mode-neutral: the pending request may be a hard one, and this token
+            # cannot tell (#319) — same wording as the CLI's `stop --graceful`.
+            self.call_from_thread(self.notify, f"run {run_id} already has a stop request pending")
             return
         if outcome == "requested-unverifiable":
             self.call_from_thread(

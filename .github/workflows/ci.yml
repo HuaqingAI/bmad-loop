@@ -28,21 +28,57 @@ jobs:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v9.0.0
+        uses: astral-sh/setup-uv@v10.0.0
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
 
-      - name: Install tmux (for generic_tmux integration tests)
+      - name: Ensure tmux (for generic_tmux integration tests)
+        # Bounded above the fallback's worst case (~260s) so the loop always
+        # reaches the final `tmux -V` instead of being cancelled mid-attempt.
+        timeout-minutes: 6
         run: |
-          # `apt-get update` can exit non-zero when an unrelated third-party
-          # repo baked into the runner image (e.g. dl.google.com/chrome) serves
-          # a stale index (Hash Sum mismatch). That must not fail our build —
-          # the Ubuntu archive lists still refresh, so tmux installs cleanly.
-          # `tmux -V` then asserts tmux is actually present, so a genuine
-          # install failure still fails the job loudly.
-          sudo apt-get update -o Acquire::Retries=3 || true
-          sudo apt-get install -y tmux
+          # The ubuntu-24.04 runner image already ships tmux. Measured on this
+          # workflow's own run: "tmux is already the newest version
+          # (3.4-1ubuntu0.1) ... 0 upgraded, 0 newly installed". The apt work this
+          # step used to do unconditionally therefore installed nothing, while
+          # taking the full risk of the network to do it:
+          #
+          #   `apt-get update` produced no output for 14 minutes on `test (py3.11)`
+          #   (run 32230727567) until the 15-minute job cap killed the job, with
+          #   `Install the project` and `Run tests` never reached — so the code
+          #   under review never ran and the red was uninformative. It wedged that
+          #   way four times. `|| true` cannot catch it: a command that never exits
+          #   has no exit status to discard. apt's own Acquire timeouts did not
+          #   fire during the stall either.
+          #
+          # So ask first, and touch the network only if the answer is no. What
+          # follows is a fallback for an image that stops shipping tmux, not the
+          # normal path: every call is bounded by `timeout` (the bound that
+          # actually holds here) and retried once. `tmux -V` remains the
+          # assertion, so a genuine failure fails the job loudly rather than
+          # silently skipping the tmux integration tests.
+          if tmux -V; then
+            exit 0
+          fi
+          echo "::warning::tmux absent from the runner image; falling back to apt"
+          for attempt in 1 2; do
+            if [ "$attempt" -gt 1 ]; then
+              sleep 5
+              # The one breakage `timeout` can itself cause is a kill during
+              # unpack, which would fail every later attempt with "dpkg was
+              # interrupted". Bounded too — it is recovery, not a reason to hang.
+              sudo timeout -k 5 20 dpkg --configure -a || true
+            fi
+            sudo timeout -k 5 45 apt-get update \
+              -o Acquire::Retries=3 \
+              -o Acquire::http::Timeout=20 \
+              -o Acquire::https::Timeout=20 || true
+            if sudo timeout -k 5 60 apt-get install -y tmux; then
+              break
+            fi
+            echo "::warning::tmux install attempt ${attempt} failed"
+          done
           tmux -V
 
       - name: Install the project
@@ -52,7 +88,8 @@ jobs:
         run: uv run pytest -q -n logical --durations=15
 
   test-windows:
-    # Real-Windows runner for the deterministic suite (live psmux e2e stays a manual gate).
+    # Real-Windows runner for the deterministic suite plus the live psmux gate,
+    # which this job installs psmux for and runs in its own serial step.
     name: test (windows, py${{ matrix.python-version }})
     runs-on: windows-latest
     # 20, not the 15 the Linux test job uses: the slowest pre-lever Windows run
@@ -78,13 +115,63 @@ jobs:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v9.0.0
+        uses: astral-sh/setup-uv@v10.0.0
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
 
       - name: Install the project
         run: uv sync --locked --all-extras
+
+      - name: Ensure psmux (for the live multiplexer gate)
+        # Bounded, for the reason the Linux `Ensure tmux` step above documents at
+        # length: an unbounded fetch wedged that job for 14 minutes with no exit
+        # status for `|| true` to discard. Here the retries are bounded by
+        # Invoke-WebRequest and everything else by the step timeout.
+        timeout-minutes: 6
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # After `Install the project`, because the assertion below runs `uv run`.
+        # What this buys: the 9 tests of the serial gate step below, measured on
+        # this runner at 9.6s (py3.11) and 12.4s (py3.14) against the job's
+        # 20-minute cap. A dev box took 46-68s for the same nine — the runner is
+        # the faster of the two, so the cap is sized off the slower number.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The release archive, not `choco install`. Chocolatey's community feed
+          # answered the V2 package lookup with 503 on BOTH matrix legs of this
+          # job's first run, while the package itself sat published and healthy.
+          # Chocolatey document that feed as neither supported nor guaranteed and
+          # rate-limited per IP behind Cloudflare, and hosted runners share egress
+          # addresses — other projects track the same feed-503 flake. This is one
+          # GET against the host the job already depends on.
+          #
+          # `releases/latest`, not a pinned tag: the floor assertion below stays
+          # the only version gate, so a psmux release needs no edit here.
+          $url = gh api repos/psmux/psmux/releases/latest --jq '.assets[] | select(.name | endswith("windows-x64.zip")) | .browser_download_url'
+          if (-not $url) { throw 'no windows-x64 asset on the latest psmux release' }
+          $zip = Join-Path $env:RUNNER_TEMP 'psmux.zip'
+          $dir = Join-Path $env:RUNNER_TEMP 'psmux'
+          Invoke-WebRequest -Uri $url -OutFile $zip -MaximumRetryCount 3 -RetryIntervalSec 5
+          Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
+          $exe = Get-ChildItem -Path $dir -Recurse -Filter psmux.exe | Select-Object -First 1
+          if (-not $exe) { throw "no psmux.exe in $url" }
+          # The archive ships tmux.exe beside psmux.exe, which looks alarming on a
+          # PATH but is inert: test_generic_tmux's HAVE_TMUX gates on
+          # `sys.platform != "win32"` before it ever looks for the binary.
+          # PATH for this step, GITHUB_PATH for `Run tests` and the gate step.
+          $env:PATH = "$($exe.Directory.FullName);$env:PATH"
+          Add-Content -Path $env:GITHUB_PATH -Value $exe.Directory.FullName
+          psmux -V
+          # `psmux -V` is not the assertion. test_psmux_live.py skips itself on
+          # PsmuxMultiplexer.available(), so an install at or below the version
+          # floor would leave this job green with the entire live gate never run
+          # — the one failure a "did it install?" check cannot see. Calling
+          # available() also keeps the floor in a single place (it reads
+          # `_LAST_UNSUPPORTED`, so a floor bump needs no edit here) and covers
+          # `pwsh`, which every parked window needs.
+          uv run python -c "import sys; from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer as M; m = M(); sys.exit(0 if m.available() else f'psmux is not an admitted version: {m.version()!r}')"
 
       - name: Run tests
         # pytest roots `tmp_path` at `tempfile.gettempdir()`, which follows
@@ -97,7 +184,23 @@ jobs:
         env:
           TMP: ${{ runner.temp }}
           TEMP: ${{ runner.temp }}
-        run: uv run pytest -q -n logical --durations=15
+        run: uv run pytest -q -n logical --durations=15 --ignore=tests/test_psmux_live.py
+
+      - name: Run the live psmux gate
+        # Serial, and deliberately out of the parallel run above: these nine
+        # tests drive real psmux servers, which are a single-machine resource
+        # rather than per-worker state. Interleaved with the other ~2800 tests
+        # under `-n logical`, the window mint in the prune test came back empty
+        # on a dev box and failed the degraded-mint assertion; the registry
+        # isolation that lands with this step fixes that test's own asymmetry,
+        # and running the gate off the shared workers keeps the whole module
+        # from contending for the machine in the first place. A flake here
+        # cannot be retried away — this repo has no retry mechanism by policy.
+        # Cost: 9.6-12.4s measured here, 46-68s on a dev box.
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+        run: uv run pytest -q tests/test_psmux_live.py --durations=15
 
   version-sync:
     name: version-sync
@@ -109,7 +212,7 @@ jobs:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v9.0.0
+        uses: astral-sh/setup-uv@v10.0.0
 
       - name: Check version fields + the CHANGELOG release contract
         run: uv run --no-project python scripts/release.py check
@@ -144,7 +247,7 @@ jobs:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v9.0.0
+        uses: astral-sh/setup-uv@v10.0.0
         with:
           enable-cache: true
           python-version: '3.11'
@@ -175,7 +278,7 @@ jobs:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v9.0.0
+        uses: astral-sh/setup-uv@v10.0.0
         with:
           # A clean-room build: nothing here should come from a restored cache.
           enable-cache: false
@@ -188,6 +291,14 @@ jobs:
         # rather than from the checkout, so a broken entry point or an import the
         # wheel cannot satisfy fails here instead of at a user's install.
         run: uv run --isolated --no-project --with dist/*.whl -- bmad-loop --version
+
+      - name: Run `bmad-loop list` from the built wheel (core install, no extras)
+        # Pins #650 at the packaging level: `list` must answer from the core
+        # dependencies alone. --version cannot stand in — argparse answers it
+        # before any subcommand code imports.
+        run: |
+          mkdir -p "$RUNNER_TEMP/empty-project"
+          uv run --isolated --no-project --with dist/*.whl -- bmad-loop list --project "$RUNNER_TEMP/empty-project"
 
       - name: Check the wheel carries every packaged data file
         # The step above cannot stand in for this one: argparse answers --version

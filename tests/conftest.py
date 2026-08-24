@@ -69,6 +69,48 @@ needs_strict_codec = pytest.mark.skipif(
 )
 
 
+def opencode_runs() -> bool:
+    """Whether this host has an ``opencode`` binary that actually RUNS.
+
+    ``shutil.which`` proves only that a name resolves to a path, and a path is
+    not a working program: a stale WSL interop stub, or an npm wrapper whose
+    target has been uninstalled, resolves happily and then exits nonzero on
+    every invocation. Gating the live smoke on ``which`` alone therefore drove
+    the whole module against a shim that could never serve a session, turning a
+    host-shaped absence into a spurious failure (#294). Asking the binary to
+    identify itself is the cheapest call that tells the two apart — and it
+    sends no prompt, so the zero-token invariant holds.
+
+    ``stdin=subprocess.DEVNULL`` because a shim that prompts rather than runs
+    otherwise inherits the runner's tty and blocks until the timeout expires
+    (measured: 4.00s stall on an inherited tty, 0.00s with DEVNULL). win32
+    returns before either step: opencode-on-Windows is unverified for this
+    adapter (README adapter table), so there is nothing to probe for.
+
+    Deliberately a function and not a ``skipif`` constant beside
+    ``needs_strict_codec``: a module-level constant here would spawn a
+    subprocess at conftest import — on every pytest invocation, in every xdist
+    worker, whether or not any opencode test was selected. Callers keep their
+    own in-file ``HAVE_OPENCODE`` gate, which the ``*_live.py`` suffix
+    convention requires anyway.
+    """
+    if sys.platform == "win32":
+        return False
+    if (binary := shutil.which("opencode")) is None:
+        return False
+    try:
+        probe = subprocess.run(
+            [binary, "--version"],
+            capture_output=True,
+            timeout=10,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0
+
+
 @pytest.fixture
 def force_tmux_backend(monkeypatch):
     """Pin the tmux transport backend by name, regardless of host platform.
@@ -404,6 +446,16 @@ def _project_template(
     git(root, "config", "user.email", "test@test")
     git(root, "config", "user.name", "test")
     git(root, "config", "core.fsync", "none")  # cheapen commits; old git ignores unknown keys
+    # `git commit` ends by spawning `git maintenance run --auto --quiet --detach`
+    # (traced on git 2.55). That child DETACHES, so it outlives the commit and this
+    # fixture both, and it writes under `.git/objects/` in the template while later
+    # tests are already copytree-ing it: `objects/maintenance.lock` is listed by
+    # scandir, unlinked by the detached child, and gone by the time copy2 opens it,
+    # failing one arbitrary test on `[Errno 2]` for a file nothing asked for. Disable
+    # the writer rather than teach the copy to tolerate it — an `ignore=` pattern on
+    # the copy would also silently skip a lock that did matter. The copies inherit
+    # this via the copied .git/config, so what they commit cannot re-arm it either.
+    git(root, "config", "maintenance.auto", "false")
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", "initial")
     return root

@@ -72,7 +72,7 @@ from .documents import (
 from .engine import Engine
 from .journal import Journal, load_state, save_state
 from .model import RunState
-from .platform_util import MAX_SEGMENT, resolve_or_lexical
+from .platform_util import MAX_SEGMENT, resolve_or_lexical, walk_files_unlinked
 from .process_host import ProcessHostError
 
 # The run-composition helpers now live in runsetup.py (the library layer a non-CLI
@@ -199,6 +199,42 @@ def _reject_isolation_conflict(paths: bmadconfig.ProjectPaths, pol) -> int | Non
         return None
     print(conflict, file=sys.stderr)
     return 1
+
+
+def _reject_under_floor_git(project: Path) -> int | None:
+    """Refuse to start against a git older than `verify.GIT_FLOOR`. Returns
+    `ExitCode.FAILURE` to abort, None to proceed — the `_reject_bad_run_id` shape.
+
+    Called from the same four Engine-construction sites as
+    `_reject_isolation_conflict`, with the same split of dispositions: an rc to a
+    human from `cmd_run`, `cmd_sweep` and `_resume_paused_run`, and a raise from the
+    auto-triggered child sweep in `_sweep_factory`, which has no rc channel.
+
+    Takes the PROJECT root, not `paths.repo_root`. `git version` answers for the
+    git BINARY and reads no repository, so the directory only has to exist — and
+    `repo_root` is an operator-set config key that need not, while `project` is what
+    `_project()` already resolved. Probing the configurable one would spend this
+    refusal on a mistyped `repo_root`, reporting a broken git to someone whose git
+    is fine and burying the isolation refusal that names the real fault. `validate`
+    and `diagnose` probe the project root for the same reason.
+
+    FAIL CLOSED on both arms. An unparseable `git version` is refused by
+    `verify.git_below_floor`, and a git that could not be run at all — absent,
+    unspawnable, timed out — is refused here: a run that cannot ask git its version
+    is not a run that should reach `git worktree add`. Neither degrades to "assume
+    it's fine", which is the only failure mode that matters for a floor.
+
+    Unlike `_reject_isolation_conflict`, `validate` DOES report this one, as a
+    `git.version` problem, so its exit code agrees with this abort."""
+    try:
+        found = verify.git_below_floor(project)
+    except verify.GitError as e:
+        print(f"error: git is required but could not be run: {e}", file=sys.stderr)
+        return ExitCode.FAILURE
+    if found is None:
+        return None
+    print(f"error: {verify.under_floor_git_message(found)}", file=sys.stderr)
+    return ExitCode.FAILURE
 
 
 def _launch_profiles(pol, project: Path) -> dict[str, CLIProfile]:
@@ -373,6 +409,17 @@ def cmd_validate(args: argparse.Namespace) -> int:
             except sprintstatus.SprintStatusError as e:
                 report.fail("queue.sprint-status", str(e))
 
+    # `git_answers` carries ONE fact from this probe to the two below it: not
+    # whether the tree was clean, but whether the binary answered at all. A
+    # non-zero rc IS an answer and leaves it True — the next git command will fail
+    # just as promptly, and the version probe is the one that names WHY the host is
+    # refused, so an rc-level fault here (dubious ownership, a corrupt index, a
+    # directory that is not a repo) must not cost the operator that second finding.
+    # Spawn and timeout are the opposite: git is not going to start, or is not
+    # going to return, and each further probe re-pays the entire `GIT_TIMEOUT_S` to
+    # learn what this one already reported. Three probes against one hung git is
+    # three deadlines — on the 120s default, six minutes to print one line.
+    git_answers = True
     try:
         if not verify.worktree_clean(project):
             report.fail(
@@ -381,22 +428,48 @@ def cmd_validate(args: argparse.Namespace) -> int:
         else:
             report.ok("git.worktree-clean", "git worktree clean")
     except verify.GitError as e:
+        git_answers = not isinstance(e, (verify.GitSpawnError, verify.GitTimeoutError))
         report.fail("git.probe", f"git check failed: {e}")
+
+    # A `problem`, not a warning, and deliberately so: `_reject_under_floor_git`
+    # aborts run/sweep/resume on exactly this condition, and validate's verdict and
+    # their abort must not disagree (the reason the adapter/profile block below is
+    # built the way run's real preflight builds it). Both render
+    # `verify.under_floor_git_message`, so the surfaces cannot drift apart in wording
+    # either.
+    #
+    # Silent on `GitError`: `git.probe` immediately above already owns "git did not
+    # answer" — worktree_clean runs first and raises the same taxonomy from the same
+    # binary, so a second line would double-report one fault. Same disposition as
+    # `git.render-tracked` below. The `git_answers` skip is that same disposition
+    # made cheap, not a new one: what it skips is exactly the branch that was
+    # already silent, so the report reads identically either way.
+    if git_answers:
+        try:
+            if (found := verify.git_below_floor(project)) is not None:
+                report.fail(
+                    "git.version", verify.under_floor_git_message(found), {"reported": found}
+                )
+            else:
+                report.ok("git.version", f"git {verify.git_floor_text()}+ satisfied")
+        except verify.GitError:
+            pass
 
     # An ignore/exclude cannot shield renderer output that is already in the index.
     # This is advisory: tracked output causes churn but does not prevent a session
     # from running. A failed git probe stays silent rather than fabricating an OK.
-    try:
-        if verify.path_tracked(project, install.RENDER_DIR_REL):
-            report.warn(
-                "git.render-tracked",
-                f"{install.RENDER_DIR_REL}/ is tracked by git; run "
-                f"`git rm -r --cached {install.RENDER_DIR_REL}` and commit once to stop "
-                "committing rendered skill output",
-                {"path": install.RENDER_DIR_REL},
-            )
-    except verify.GitError:
-        pass
+    if git_answers:
+        try:
+            if verify.path_tracked(project, install.RENDER_DIR_REL):
+                report.warn(
+                    "git.render-tracked",
+                    f"{install.RENDER_DIR_REL}/ is tracked by git; run "
+                    f"`git rm -r --cached {install.RENDER_DIR_REL}` and commit once to stop "
+                    "committing rendered skill output",
+                    {"path": install.RENDER_DIR_REL},
+                )
+        except verify.GitError:
+            pass
 
     report.extend(_platform_preflight(project))
 
@@ -421,11 +494,75 @@ def cmd_validate(args: argparse.Namespace) -> int:
             {"platform": sys.platform},
         )
 
+    from . import probe as probe_mod
+
+    packaged_binaries = {p.binary for p in profiles if p.packaged}
     for tool in dict.fromkeys(p.binary for p in profiles):
-        if shutil.which(tool):
+        resolved = shutil.which(tool)
+        if resolved:
             report.ok("adapter.binary", f"{tool} found", {"binary": tool})
         else:
             report.fail("adapter.binary", f"{tool} not found on PATH", {"binary": tool})
+            continue
+        # #294: the gate above answers "a file with that name carries the execute
+        # bit", which a dead WSL/npm shim satisfies while every launch of it fails.
+        # So validate went green on an install that could not start a session —
+        # and opencode_http's own "binary not found" remedy points the user at
+        # `bmad-loop validate`, which then told them everything was fine. Probe the
+        # path `which` RETURNED rather than the bare name: re-resolving is a TOCTOU,
+        # and on Windows the PATHEXT shim `which` picked is the very file at issue.
+        # Probe ONLY a binary a PACKAGED profile named. `binary` is
+        # project-controlled end to end — policy.toml picks the profile and
+        # `.bmad-loop/profiles/*.toml` supplies its fields, both arriving with a
+        # clone — and this line EXECUTES it, inside the one command a user runs to
+        # decide whether a checkout is safe to run at all (the TUI runs it too).
+        #
+        # The boundary is provenance because no test on the SPELLING of `binary`
+        # can hold: rejecting a path (`./tool`) still leaves a bare `pwn`, which
+        # `which` resolves to a repository file whenever a checkout-local
+        # directory is on PATH. "Who wrote this profile" is the question actually
+        # being asked, and it has a categorical answer. An overlay or entry-point
+        # profile keeps the pre-#294 behavior: resolved, reported found, never
+        # launched. #294's own case is a packaged profile (opencode), so the dead
+        # WSL/npm shim is still caught.
+        #
+        # What this bounds is WHICH NAME is probed, never what that name resolves
+        # to. Resolution is `shutil.which` against the user's PATH, so a PATH
+        # carrying a checkout-local directory can still answer `claude` with a
+        # file the clone ships. That residual is deliberate and is NOT a hole this
+        # gate is failing to close: the name is ours rather than the project's, and
+        # the same resolution is what the session launch itself performs — the
+        # generic adapter puts this bare `binary` at argv[0] (adapters/generic.py)
+        # and the opencode adapter calls the identical `shutil.which` before
+        # spawning (adapters/opencode_http.py). A PATH that redefines `claude`
+        # has already redefined it for the run, and for the user's own shell.
+        # Refusing checkout-local RESOLUTIONS would be a different guard, over a
+        # predicate (realpath containment) that leaks through symlinks, `..`,
+        # win32 case-folding, UNC paths, and worktree-root vs project-root.
+        if tool not in packaged_binaries:
+            continue
+        rc = probe_mod.binary_runs(resolved)
+        if rc == 0:
+            continue
+        # Any nonzero code, never an allowlist: #294's own transcript reports rc 2
+        # and a reproduction of the same shim exits 127, the code being a property
+        # of the shell and the failure mode. {126, 127} would miss the case fixed.
+        #
+        # `warning`, deliberately, and not to be promoted without evidence: severity
+        # `problem` is validate's exit code (checks.py), and rc is a compatibility
+        # contract (AGENTS.md). Nothing rules out one of claude/codex/gemini/copilot/
+        # antigravity answering `--version` nonzero on a perfectly live install, and
+        # that user must not start failing validate.
+        outcome = "could not be launched" if rc is None else f"exited {rc}"
+        report.warn(
+            "adapter.binary-unrunnable",
+            f"{tool} is on PATH at {resolved} but `{tool} --version` {outcome} — "
+            "the usual cause is a stale or broken install (a dead WSL/npm shim), "
+            "and runs using it would then fail to start; a CLI that does not "
+            "implement `--version` also lands here. Reinstall it or fix PATH, or "
+            "ignore this if that CLI has no `--version`.",
+            {"binary": tool, "path": resolved, "returncode": rc},
+        )
 
     any_hooks_registered = False
     for profile in profiles:
@@ -907,10 +1044,18 @@ def _warn_preflight_would_abort(
     shim's interactive migration gate.
 
     Mirrors the refusals the dry-run's early return skips past, and only those:
-    the finding list `_require_base_skills` gates on, the #414 isolation conflict
+    the under-floor git `_reject_under_floor_git` refuses first, the finding list
+    `_require_base_skills` gates on, the #414 isolation conflict
     `_reject_isolation_conflict` refuses ahead of it, and the unregistered adapter
     kind `make_adapters` aborts on (`_unknown_adapter_kinds` — a preview reads none
-    of the fields that would give the misconfiguration away). Reading the same
+    of the fields that would give the misconfiguration away).
+
+    The git floor belongs here for the reason the dirty-tree and queue gates do
+    NOT: it is a fact about the HOST, so it cannot come true between this preview
+    and the real command the way cleaning a tree can. Both of its arms are
+    mirrored — too old, and could not be run at all — because `cmd_run` aborts on
+    each, and a banner silent on the second would promise a run guaranteed to
+    exit 1. Reading the same
     sources as the gates themselves is what keeps the preview from disagreeing with
     the real command about what "runnable" means. Severity-filtered to `problem`
     for that same reason — `_require_base_skills` ignores warnings, so reporting one
@@ -936,6 +1081,11 @@ def _warn_preflight_would_abort(
     conflict = bmadconfig.worktree_isolation_conflict(paths, pol.scm.isolation)
     if conflict is not None:
         problems.insert(0, conflict)
+    try:
+        if (found := verify.git_below_floor(paths.project)) is not None:
+            problems.insert(0, verify.under_floor_git_message(found))
+    except verify.GitError as e:
+        problems.insert(0, f"git is required but could not be run: {e}")
     problems += _unknown_adapter_kinds(paths.project, pol)
     if not problems:
         return
@@ -1708,6 +1858,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.dry_run:
         return _dry_run(paths, pol, args, stories_on, spec_folder)
 
+    # The HOST refusal leads the configuration ones: an under-floor git is a fact
+    # about the machine that no edit to policy.toml can answer, so telling the
+    # operator to fix their isolation setting first would send them at the wrong
+    # problem. Everything else in this block would be refused again anyway.
+    if (rc := _reject_under_floor_git(paths.project)) is not None:
+        return rc
+
     # First of the configuration refusals (`_reject_bad_run_id` and the two loaders
     # above can abort earlier), and deliberately before the queue and worktree-clean
     # gates: this one says the configuration cannot run at all, so making the
@@ -1885,8 +2042,17 @@ def _dry_run_stories(
     _warn_preflight_would_abort(paths, pol, require_stories=True)
     folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
     # The real dispatch always uses the project-relative folder (the engine
-    # relativizes it); render the identical string here so dry-run and run agree.
-    rel = stories_mod.relativize_spec_folder(paths.project, spec_folder)
+    # relativizes it); render the identical string here so dry-run and run agree —
+    # including the refusal, which is the one answer `run` would not survive. No
+    # `(spec folder: ...)` suffix like the sibling below: the reason already names
+    # the spec folder and the project root, and on this leg `folder` is only
+    # `spec_folder` re-spelled (the raise is reachable from the absolute branch
+    # alone), so the suffix would print the same path a third time.
+    try:
+        rel = stories_mod.relativize_spec_folder(paths.project, spec_folder)
+    except stories_mod.StoriesError as e:
+        print(f"stories mode: {e}", file=sys.stderr)
+        return 1
     try:
         rows = stories_mod.story_rows(folder, selector=args.story, max_stories=args.max_stories)
     except stories_mod.StoriesError as e:
@@ -2051,6 +2217,12 @@ def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest
         conflict = bmadconfig.worktree_isolation_conflict(paths, pol.scm.isolation)
         if conflict is not None:
             raise RuntimeError(conflict)
+        # Same refusal as the three rc-returning sites, same raise-not-return reason
+        # as the two above it. A `GitError` here needs no arm of its own: it is
+        # already an exception, and this factory's contract is that any raise before
+        # `started` leaves the parent's trigger unspent.
+        if (found := verify.git_below_floor(paths.project)) is not None:
+            raise RuntimeError(verify.under_floor_git_message(found))
         _start_sweep(
             project,
             paths,
@@ -2075,6 +2247,9 @@ def cmd_sweep(args: argparse.Namespace) -> int:
 
     if args.dry_run:
         return _sweep_dry_run(paths, pol)
+
+    if (rc := _reject_under_floor_git(paths.project)) is not None:
+        return rc
 
     if (rc := _reject_isolation_conflict(paths, pol)) is not None:
         return rc
@@ -2144,7 +2319,10 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     # Resume re-reads config.yaml and policy.toml from disk, so it is a second
     # entrypoint into the same engine and gets the same refusal — a run started
     # before the override was added must not finish its remaining stories through
-    # provisioning the preflight would now refuse.
+    # provisioning the preflight would now refuse. The git floor rides along for the
+    # same reason: a run started on a supported git can be resumed after a downgrade.
+    if (rc := _reject_under_floor_git(paths.project)) is not None:
+        return rc
     if (rc := _reject_isolation_conflict(paths, pol)) is not None:
         return rc
     if not _require_base_skills(project, pol, require_stories=state.source == "stories"):
@@ -2164,6 +2342,48 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     # does — `_sweep_factory(..., new_digest)` — so the same reasoning applies.
     profiles = _launch_profiles(pol, project)
     new_digest = _trusted_config_digest(pol, project, profiles=profiles)
+    # Discard any stop request left over from a prior stopped run — either mode — so
+    # the re-armed engine does not consume it at the first item boundary and
+    # immediately re-stop. A resume is fresh user intent, which is what makes a
+    # request lodged against the previous one stale.
+    #
+    # Placed here, and not beside write_pid with the rest of the arming, because this
+    # branch RETURNS. `_require_base_skills` above used to be this function's last
+    # early exit — everything below it ran straight through — so a refusal sited
+    # further down leaves persistent side effects behind for a resume that never
+    # happened: the `run-resume` journal entry, and the re-stamped integrity pin.
+    # The pin is the one that bites. `write_trusted_config_digest` below writes the
+    # exact file the NEXT resume reads back as `pinned`, so re-baselining it on a
+    # refusal inverts the advisory: it fires on the attempt that stopped and goes
+    # silent on the attempt that actually armed an engine. The re-stamp's own
+    # justification — that the engine this process is about to arm re-reads the
+    # config from there — is false on a path that arms nothing.
+    #
+    # No earlier than here either: `_launch_profiles` and `_trusted_config_digest`
+    # above both raise SystemExit on a bad profile, and clearing ahead of them would
+    # destroy the operator's lodged request on a resume that then aborts. This window
+    # is the only one past every raise site and ahead of both writes — and it is
+    # still before write_pid, the constraint that governs correctness: the moment the
+    # pid lands the engine is "live" and a lingering request becomes honorable.
+    if runs.clear_graceful_stop(run_dir):
+        print(
+            f"run {run_dir.name}: discarded a stale stop request before resuming",
+            file=sys.stderr,
+        )
+    elif runs.graceful_stop_requested(run_dir):
+        # The clear is never-raise by contract (five callers depend on that), so it
+        # answers False for "nothing was pending" and "could not remove it" alike.
+        # Re-read to tell them apart: a request that survived the clear would be
+        # consumed at the very first item boundary and re-stop the run, and because
+        # the print above never fired the operator would see no reason why — then
+        # resume again, to the same end.
+        print(
+            f"run {run_dir.name}: a stale stop request could not be discarded "
+            f"({runs.STOP_REQUEST_FILE} is not removable); resuming would stop again "
+            "at the first item. Remove it and retry.",
+            file=sys.stderr,
+        )
+        return 1
     # #461 point 4, human-present half. A resume IS a deliberate human choice, so
     # the on-disk config is re-blessed (new_digest is re-stamped below) and the run
     # proceeds — the auto-sweep child is the only path that refuses. But the issue's
@@ -2262,20 +2482,11 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     # different problem with no fix at equal privilege — #571.
     state.trusted_config_digest = new_digest
     state.clear_pause()
-    # A resume is fresh user intent: discard any graceful-stop request left over from
-    # a prior stopped-gracefully run so the re-armed engine does not consume it at the
-    # first item boundary and immediately re-stop. Fire before write_pid — the moment
-    # the pid lands the engine is "live" and a lingering request becomes honorable.
-    if runs.clear_graceful_stop(run_dir):
-        print(
-            f"run {run_dir.name}: discarded a stale graceful-stop request before resuming",
-            file=sys.stderr,
-        )
     runs.write_pid(run_dir)
     # Persist before the engine starts: status, the TUI and diagnose only ever
     # read state.json, and Engine._save() may not fire for minutes. write_pid
     # runs FIRST so no observer catches a window of "not paused + dead pid",
-    # which tui.data classifies as INTERRUPTED.
+    # which runs.discover_runs classifies as INTERRUPTED.
     save_state(run_dir, state)
     # The adapter build + engine selection (sweep vs stories vs plain, from
     # persisted state) lives in runsetup; the re-stamp/pid/save bookkeeping above
@@ -2412,8 +2623,18 @@ def _resolve_restore_patch(
         return None, err
     # `.resolve()` on top of the shared normalizer: this is the one consumer that
     # feeds a containment check (spec_within_roots), which needs `..`/symlinks
-    # collapsed. The resolved absolute path is what gets latched.
-    patch = verify.resolve_restore_path(raw, project).resolve()
+    # collapsed. The resolved absolute path is what gets latched, so this stays a
+    # bare `.resolve()` rather than `resolve_or_lexical`: a degraded, non-canonical
+    # answer here could pass containment on the wrong directory.
+    try:
+        patch = verify.resolve_restore_path(raw, project).resolve()
+    except (OSError, RuntimeError) as e:
+        return None, (
+            f"cannot canonicalize the restore patch path {raw!r}: {e} — whether it "
+            "lies inside or outside the project tree cannot be determined, so the "
+            "restore cannot be latched. Run `bmad-loop validate` for what this host "
+            "is doing."
+        )
     # Same trusted-roots shape as the frontmatter reconcile's spec_within_roots:
     # bmad-build-auto saves the patch under implementation_artifacts, and artifact
     # dirs configured OUTSIDE the project tree are a supported layout — a bare
@@ -2993,11 +3214,14 @@ def cmd_status(args: argparse.Namespace) -> int:
     state = load_state(run_dir)
     # A pending graceful stop is not in state.json (it's the control file + a live
     # engine), so derive it here and hand it to the builder / text branch. Order the
-    # `and` so the cheap file check gates the engine_liveness probe: skip it when the
-    # run is already concluded or no request is on disk.
+    # `and` so the cheap file read gates the engine_liveness probe: skip it when the
+    # run is already concluded or no request is on disk. The mode check is exact —
+    # a lodged `mode: hard` request is a stop in flight, not a *graceful* stop
+    # pending, and reporting it as one would promise an operator the current item
+    # still finishes. Absent and hard both read False here; only "graceful" is True.
     graceful_pending = (
         not (state.finished or state.paused or state.stopped or state.crashed)
-        and runs.graceful_stop_requested(run_dir)
+        and runs.read_stop_request_mode(run_dir) == "graceful"
         and runs.engine_liveness(run_dir) != "dead"
     )
     if args.json:
@@ -3063,10 +3287,8 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    from .tui.data import discover_runs  # import-safe: data.py has no textual imports
-
     project = _project(args)
-    infos = discover_runs(project)  # oldest first
+    infos = runs.discover_runs(project)  # oldest first
     if args.json:
         machine.emit(list_document(infos))
         return 0
@@ -3127,7 +3349,8 @@ def cmd_stop(args: argparse.Namespace) -> int:
         return _cmd_cancel_graceful(run_dir, args.run_id)
     if args.graceful:
         return _cmd_request_graceful(run_dir, args.run_id)
-    # Hard stop (unchanged): SIGTERM the engine, kill its agent window, mark stopped.
+    # Hard stop: lodge a `mode: "hard"` stop request, signal the engine (the POSIX
+    # fast path), and let it tear the run down; kill its agent window either way.
     try:
         stopped = runs.stop_run(run_dir)
     except (runs.StopRunError, ProcessHostError) as e:
@@ -3141,11 +3364,28 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
 
 def _cmd_cancel_graceful(run_dir: Path, run_id: str) -> int:
-    """`stop --cancel-graceful`: discard a pending request so the run keeps going."""
+    """`stop --cancel-graceful`: discard a pending request so the run keeps going.
+
+    Mode-neutral, like the clear it delegates to: the only hard request that can
+    still be on disk for a human to reach is one `stop_run` deliberately left
+    lodged after refusing to force-kill an unverifiable pid, and withdrawing that
+    is a legitimate thing to want. So the messages name a *stop request*, not a
+    graceful one (#319)."""
     if runs.clear_graceful_stop(run_dir):
-        print(f"run {run_id}: graceful stop request cancelled")
+        print(f"run {run_id}: stop request cancelled")
         return 0
-    print(f"run {run_id} has no graceful stop pending", file=sys.stderr)
+    if runs.graceful_stop_requested(run_dir):
+        # The clear answers False for "nothing pending" and "could not remove it"
+        # alike; re-read so we never tell an operator their request is gone while it
+        # is still on disk and still honorable. Exit 1 either way — only the message
+        # differs, so no caller's exit-code expectation moves.
+        print(
+            f"run {run_id}: stop request could not be cancelled "
+            f"({runs.STOP_REQUEST_FILE} is not removable) — it is still pending",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"run {run_id} has no stop request pending", file=sys.stderr)
     return 1
 
 
@@ -3158,8 +3398,28 @@ def _cmd_request_graceful(run_dir: Path, run_id: str) -> int:
     except runs.GracefulStopError as e:
         print(str(e), file=sys.stderr)
         return 1
+    except OSError as e:
+        # The lodge creates the file first and writes the body into it, and it
+        # deliberately does not roll back a failed write (see _create_stop_request:
+        # an unlink there resolves the *name*, so it could delete a hard request a
+        # concurrent `stop` escalated onto it). So a write that failed part-way
+        # still leaves a request standing, and a short body reads as graceful —
+        # the mode we were asked for. Say so rather than reporting a clean failure
+        # the operator would act on by asking again (#319).
+        print(
+            f"run {run_id}: stop request could not be written ({e}) — a graceful "
+            f"request may still be pending; check `bmad-loop status {run_id}` and "
+            f"use `bmad-loop stop {run_id} --cancel-graceful` to withdraw it",
+            file=sys.stderr,
+        )
+        return 1
     if outcome == "already-pending":
-        print(f"run {run_id} already has a graceful stop pending")
+        # Mode-neutral for the same reason `--cancel-graceful` is: the pending
+        # request may be a *hard* one (a `stop` that could not prove the engine
+        # dead leaves it lodged at rest), and the token is deliberately mode-blind.
+        # Naming it "graceful" would report a strictly stronger stop as a weaker
+        # one (#319).
+        print(f"run {run_id} already has a stop request pending")
         return 0
     if outcome == "requested-unverifiable":
         print(
@@ -3340,14 +3600,15 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
 
 
 def _dir_size(path: Path) -> int:
-    """Best-effort total bytes under ``path`` (symlinks not followed)."""
+    """Best-effort total bytes under ``path``, never crossing a redirect out of
+    it — see :func:`walk_files_unlinked` for why plain ``os.walk`` is not enough.
+    Sizes with ``lstat``, so a symlinked file counts as the link it is."""
     total = 0
-    for root, _dirs, files in os.walk(path, onerror=lambda _e: None):
-        for name in files:
-            try:
-                total += (Path(root) / name).lstat().st_size
-            except OSError:
-                pass
+    for f in walk_files_unlinked(path):
+        try:
+            total += f.lstat().st_size
+        except OSError:
+            pass
     return total
 
 
@@ -3426,9 +3687,11 @@ def cmd_clean(args: argparse.Namespace) -> int:
                     f"run {run_dir.name}: engine may still be live (unverifiable pid)",
                     file=sys.stderr,
                 )
-        # measure before mutating so the reclaim estimate holds for --dry-run too
-        wt_dir = run_dir / "worktrees"
-        wt_bytes = _dir_size(wt_dir) if wt_dir.is_dir() else 0
+        # measure before mutating so the reclaim estimate holds for --dry-run too.
+        # Sized over `heavy_run_entries`, not over "worktrees" alone: that is the
+        # exact set `trim_run_dir` removes, so the estimate cannot go stale the
+        # next time an entry joins it (the verifier stream store did).
+        heavy_bytes = sum(_dir_size(p) for p in runs.heavy_run_entries(run_dir) if p.is_dir())
         run_bytes = _dir_size(run_dir)
         # collect, never print-as-you-mutate: the document is emitted once at the
         # end, so every per-item line has to survive the loop as data
@@ -3458,7 +3721,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
                 # concurrent resume — is older than this guard (`reclaimable` is
                 # sampled in the loop above and never re-read) and is tracked in
                 # issue #533.
-                freed += wt_bytes - run_bytes
+                freed += heavy_bytes - run_bytes
                 # Classify by what happened, not by what was intended: the steps
                 # above may already have taken this run's worktree and artifacts,
                 # and `protected` means "left untouched" in the --json contract.
@@ -3472,7 +3735,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
                     )
         elif pol.cleanup.trim_artifacts:
             if runs.trim_run_dir(run_dir, dry_run=dry):
-                freed += wt_bytes
+                freed += heavy_bytes
                 trimmed.append(run_dir.name)
 
     # After the loop, so the counterparts the removals above already took are gone
@@ -3532,7 +3795,12 @@ def cmd_tui(args: argparse.Namespace) -> int:
     try:
         from .tui.app import run_tui
     except ModuleNotFoundError as e:
-        if (e.name or "").partition(".")[0] in ("textual", "tomlkit"):
+        # Failure-gated, not allowlisted (#678): ANY missing third-party module on
+        # the TUI import chain (rich and pyte import before textual; a future dep
+        # would too) means the [tui] extra is absent. Only a missing bmad_loop.*
+        # submodule — a packaging defect, not an install state the hint can fix —
+        # re-raises.
+        if (e.name or "").partition(".")[0] != "bmad_loop":
             print(
                 "error: the TUI requires optional dependencies — uv tool install 'bmad-loop[tui]'",
                 file=sys.stderr,
@@ -4125,7 +4393,7 @@ def main(argv: list[str] | None = None) -> int:
         "--graceful",
         action="store_true",
         help="finish the in-flight item (through commit), then stop cleanly and stay "
-        "resumable — instead of the hard SIGTERM stop; also suppresses pending auto-sweeps",
+        "resumable — instead of the default hard stop; also suppresses pending auto-sweeps",
     )
     stop_grp.add_argument(
         "--cancel-graceful",

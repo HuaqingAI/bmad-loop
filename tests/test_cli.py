@@ -6,6 +6,7 @@ import json
 import ntpath
 import os
 import shutil
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -28,13 +29,15 @@ from conftest import (
     spec_path,
     write_gated_ledger,
     write_ledger,
+    write_script_launcher,
     write_spec,
     write_sprint,
 )
 
 from bmad_loop import cli, platform_util
 from bmad_loop import policy as policy_mod
-from bmad_loop import runsetup
+from bmad_loop import probe as probe_mod
+from bmad_loop import runsetup, verify
 from bmad_loop.adapters import multiplexer as mux_mod
 
 STORIES_SPEC_FOLDER = "_bmad-output/epic-1"
@@ -1549,10 +1552,11 @@ def test_status_document_library_call_matches_the_cli(project, capsys):
 
 
 def test_list_document_library_call_matches_the_cli(project, capsys):
-    # cmd_list sources its RunInfos the same lazy way — data.py has no textual
-    # imports, so this does not drag the TUI into a library consumer's process.
+    # cmd_list sources its RunInfos from the same core reader (#650): the run
+    # inventory lives in bmad_loop.runs, so a library consumer gets identical
+    # documents without the [tui] extra installed.
     from bmad_loop.documents import list_document
-    from bmad_loop.tui.data import discover_runs
+    from bmad_loop.runs import discover_runs
 
     # Deterministic statuses only: running/interrupted probe pid liveness and
     # would flake (see _make_list_run).
@@ -2090,9 +2094,56 @@ def test_stop_graceful_is_idempotent(tmp_path, monkeypatch, capsys):
     run_dir = _pending_graceful_run(tmp_path)  # request already on disk
     before = (run_dir / runs.STOP_REQUEST_FILE).read_text()
     assert cli.main(["stop", "--project", str(tmp_path), "r1", "--graceful"]) == 0
-    assert "already has a graceful stop pending" in capsys.readouterr().out
+    assert "already has a stop request pending" in capsys.readouterr().out
     # left untouched — the original request's timestamp stands
     assert (run_dir / runs.STOP_REQUEST_FILE).read_text() == before
+
+
+def test_stop_graceful_reports_a_pending_hard_request_without_calling_it_graceful(
+    tmp_path, monkeypatch, capsys
+):
+    """A lodged *hard* request answers "already-pending" too, and the message must
+    not describe it as graceful — that reports a strictly stronger stop as a weaker
+    one. Reachable with no race at all: `stop_run` leaves a hard request lodged when
+    it could not prove the engine dead, and it sits there at rest.
+
+    Written directly rather than through `_pending_graceful_run`, which hardcodes
+    the graceful mode.
+    """
+    from bmad_loop import runs
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+    run_dir = _make_run_with_state(tmp_path, "r1")
+    (run_dir / runs.STOP_REQUEST_FILE).write_text(
+        '{"requested_at": "now", "mode": "hard"}', encoding="utf-8"
+    )
+    before = (run_dir / runs.STOP_REQUEST_FILE).read_text()
+    assert cli.main(["stop", "--project", str(tmp_path), "r1", "--graceful"]) == 0
+    out = capsys.readouterr().out
+    assert "already has a stop request pending" in out
+    assert "graceful stop pending" not in out  # the hard request is not a graceful one
+    # and the stronger request still stands, unchanged and un-downgraded
+    assert (run_dir / runs.STOP_REQUEST_FILE).read_text() == before
+    assert runs.read_stop_request_mode(run_dir) == "hard"
+
+
+def test_stop_graceful_reports_a_failed_write_as_possibly_pending(tmp_path, monkeypatch, capsys):
+    """The lodge deliberately does not roll back a failed write — an unlink there
+    resolves the name and could delete a hard request a concurrent `stop` escalated
+    onto it. So a request can be standing even though the write raised, and saying
+    "failed" flatly would invite the operator to ask again for something already
+    pending. Same exit code; accurate message."""
+    from bmad_loop import runs
+
+    def _boom(_run_dir):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(runs, "request_graceful_stop", _boom)
+    _make_run_with_state(tmp_path, "r1")
+    assert cli.main(["stop", "--project", str(tmp_path), "r1", "--graceful"]) == 1
+    err = capsys.readouterr().err
+    assert "may still be pending" in err
+    assert "--cancel-graceful" in err  # names the way to withdraw it
 
 
 def test_stop_cancel_graceful_clears_pending(tmp_path, capsys):
@@ -2107,7 +2158,43 @@ def test_stop_cancel_graceful_clears_pending(tmp_path, capsys):
 def test_stop_cancel_graceful_without_pending_errors(tmp_path, capsys):
     _make_run_with_state(tmp_path, "r1")  # nothing on disk to cancel
     assert cli.main(["stop", "--project", str(tmp_path), "r1", "--cancel-graceful"]) == 1
-    assert "no graceful stop pending" in capsys.readouterr().err
+    assert "no stop request pending" in capsys.readouterr().err
+
+
+def test_stop_cancel_clears_a_pending_hard_request(tmp_path, capsys):
+    """`--cancel-graceful` is mode-neutral by contract (#319): the one hard request a
+    human can still reach is the one `stop_run` deliberately leaves lodged after
+    refusing to force-kill an unverifiable pid, and withdrawing that is a legitimate
+    thing to want. The graceful twin above proves the wiring for one mode only — the
+    function is named `clear_graceful_stop` while its contract is mode-neutral, so
+    mode-gating the clear is a live regression, and this is what reddens on it."""
+    from bmad_loop import runs
+
+    run_dir = _pending_hard_run(tmp_path)
+    assert cli.main(["stop", "--project", str(tmp_path), "r1", "--cancel-graceful"]) == 0
+    assert "cancelled" in capsys.readouterr().out
+    assert not (run_dir / runs.STOP_REQUEST_FILE).exists()
+
+
+def test_stop_cancel_reports_a_request_it_could_not_remove(tmp_path, monkeypatch, capsys):
+    """`clear_graceful_stop` never raises — five callers depend on that — so it
+    answers False for "nothing was pending" and "could not remove it" alike. Cancel
+    must not read the second as the first and tell the operator their request is gone
+    while it is still on disk and still honorable. Exit stays 1 either way; only the
+    message moves."""
+    from bmad_loop import runs
+
+    run_dir = _pending_graceful_run(tmp_path)
+
+    def _refuse(_path):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(runs, "retrying_unlink", _refuse)
+    assert cli.main(["stop", "--project", str(tmp_path), "r1", "--cancel-graceful"]) == 1
+    err = capsys.readouterr().err
+    assert "still pending" in err
+    assert "no stop request pending" not in err  # the misleading line, specifically
+    assert (run_dir / runs.STOP_REQUEST_FILE).exists()  # and it really did survive
 
 
 def test_stop_graceful_and_cancel_are_mutually_exclusive(tmp_path):
@@ -2138,6 +2225,53 @@ def test_status_json_graceful_stop_pending_true(tmp_path, monkeypatch, capsys):
     doc = machine_json(["status", "--project", str(tmp_path), "r1", "--json"], capsys)
     assert doc["graceful_stop_pending"] is True
     assert doc["schema_version"] == 1  # additive field — no schema bump
+
+
+def _pending_hard_run(tmp_path, run_id="r1", **state_kwargs):
+    """A run with a HARD-mode stop request on disk — what `bmad-loop stop` lodges
+    before signalling, still unconsumed because the engine has not reached a
+    boundary (or, on native Windows, was never reachable by the signal at all)."""
+    from bmad_loop import runs
+
+    run_dir = _make_run_with_state(tmp_path, run_id, **state_kwargs)
+    (run_dir / runs.STOP_REQUEST_FILE).write_text(
+        '{"requested_at": "now", "mode": "hard"}', encoding="utf-8"
+    )
+    return run_dir
+
+
+def test_status_json_graceful_stop_pending_false_for_hard_request(tmp_path, monkeypatch, capsys):
+    """A hard stop in flight is not a *graceful* stop pending. The field is
+    mode-exact, not an existence check: reporting True here would promise an
+    operator that the in-flight item still finishes, when a hard request stops the
+    run as soon as the engine sees it.
+
+    Ablation: reverting cli.py's derivation to `runs.graceful_stop_requested`
+    (bare existence) turns this True and fails the assertion — confirmed, restored.
+    """
+    from bmad_loop import runs
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+    _pending_hard_run(tmp_path)
+    doc = machine_json(["status", "--project", str(tmp_path), "r1", "--json"], capsys)
+    assert doc["graceful_stop_pending"] is False
+    assert doc["schema_version"] == 1  # same field, same type — narrowed, not bumped
+
+
+def test_status_text_does_not_claim_graceful_for_hard_request(tmp_path, monkeypatch, capsys):
+    """The text branch reads the same derivation, so it inherits the fix: no
+    "will stop after the current item" promise for a hard request.
+
+    Ablation: with the bare-existence derivation restored this prints the graceful
+    line and fails — confirmed, restored."""
+    from bmad_loop import runs
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+    _pending_hard_run(tmp_path)
+    assert cli.main(["status", "--project", str(tmp_path), "r1"]) == 0
+    out = capsys.readouterr().out
+    assert "graceful stop pending" not in out
+    assert "in progress" in out  # still reported live — only the promise is gone
 
 
 def test_status_json_graceful_stop_pending_false_without_request(tmp_path, capsys):
@@ -2608,6 +2742,135 @@ def test_resolve_restore_patch_outside_project_rejected(tmp_path, monkeypatch, c
     )
     assert rc == 1
     assert "not a file under the project" in capsys.readouterr().err
+    assert called == []  # never resumed
+    task = load_state(run_dir).tasks["s1"]
+    assert task.phase == Phase.ESCALATED and task.restore_patch is None  # not re-armed
+
+
+def test_resolve_restore_patch_unresolvable_rejected(tmp_path, monkeypatch, capsys):
+    """A restore patch path whose `.resolve()` faults (WinError 64 on a dead UNC
+    provider, or a symlink loop on the 3.11/3.12 floor, #560) escaped this
+    function's own try/except (scoped to `bmadconfig.BmadConfigError`) and fell
+    through to `main()`'s generic backstop, which reports a bare `[Errno ...]`
+    string instead of naming the restore-patch path or what failed. Pin the
+    specific message this function now returns, in the shape its five sibling
+    rejection reasons use.
+
+    Measured ablation (delete the `except (OSError, RuntimeError)` arm from
+    `_resolve_restore_patch`, leaving the bare `.resolve()`): this row fails, at
+    `assert f"cannot canonicalize the restore patch path {str(patch)!r}" in err`.
+    Only the two message assertions carry it. The unguarded `OSError` reaches
+    `main()`'s generic `except Exception` backstop, which prints `error: {e}` to
+    stderr and returns `ExitCode.FAILURE` — so ablated, `rc == 1`,
+    `UNRESOLVABLE in err`, `called == []` and both halves of the
+    phase/restore_patch assertion still pass; measured `err` is exactly
+    `error: [Errno 0] stubbed: the provider is registered but not serving`, and
+    with only those two message lines commented out the ablated row goes GREEN.
+    `UNRESOLVABLE in err` can never discriminate this regression — the guard
+    interpolates `{e}` and the backstop prints `{e}` bare, so it is the same
+    substring on both sides. Loosening the message assertion to it would make
+    this row a false green."""
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    _write_bmad_config(tmp_path)
+    run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
+    called: list = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: called.append(rd) or 0)
+    patch = tmp_path / "whatever.patch"
+    refuse_to_resolve(monkeypatch, patch)
+
+    rc = cli.main(
+        [
+            "resolve",
+            "--project",
+            str(tmp_path),
+            "r1",
+            "--no-interactive",
+            "--restore-patch",
+            str(patch),
+            "--resume",
+        ]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert f"cannot canonicalize the restore patch path {str(patch)!r}" in err
+    assert UNRESOLVABLE in err
+    assert "Run `bmad-loop validate` for what this host is doing." in err
+    assert called == []  # never resumed
+    task = load_state(run_dir).tasks["s1"]
+    assert task.phase == Phase.ESCALATED and task.restore_patch is None  # not re-armed
+
+
+def test_resolve_restore_patch_unresolvable_from_resolution_json_rejected(
+    tmp_path, monkeypatch, capsys
+):
+    """The same `.resolve()` guard, reached from the OTHER caller. `cmd_resolve`
+    validates an explicit `--restore-patch` flag BEFORE the interactive session,
+    but a `restore_patch` the agent recorded in resolution.json only exists once
+    that session has written it — so this arm cannot be hoisted, and its abort
+    lands after a whole agent conversation. The sibling flag-arm row above cannot
+    stand in for it: that row passes `--no-interactive`, which short-circuits the
+    resolution.json read (`if raw is None and args.interactive`), leaving `raw`
+    None so `if not raw: return None, None` fires and the guarded `.resolve()` is
+    never reached from this side. `ran == ["s1"]` is what pins that difference —
+    an identity assertion for the row, not a guard assertion (see below). The
+    patch here is a real file under the configured implementation_artifacts root,
+    i.e. an otherwise-honorable restore whose only defect is that this host cannot
+    canonicalize its path.
+
+    Measured ablation (delete the `except (OSError, RuntimeError)` arm from
+    `_resolve_restore_patch`, leaving the bare `.resolve()`): this row fails, at
+    `assert f"cannot canonicalize the restore patch path {str(patch)!r}" in err`.
+    Only the two message assertions carry it — with just those two lines removed
+    the ablated row goes GREEN. The unguarded `OSError` unwinds `cmd_resolve` into
+    `main()`'s generic `except Exception` backstop, which prints `error: {e}` to
+    stderr and returns `ExitCode.FAILURE`, so ablated `rc == 1`, `ran == ["s1"]`
+    (the session had already run), `UNRESOLVABLE in err`, `called == []` and both
+    halves of the phase/restore_patch assertion all still pass; measured `err` is
+    exactly `error: [Errno 0] stubbed: the provider is registered but not
+    serving`. As in the flag-arm row, `UNRESOLVABLE in err` can never discriminate
+    this regression — the guard interpolates `{e}` and the backstop prints `{e}`
+    bare, so it is the same substring on both sides."""
+    from bmad_loop import resolve
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    _write_bmad_config(tmp_path)
+    patch = tmp_path / "artifacts" / "attempt.patch"  # a legitimate restore target
+    patch.parent.mkdir(parents=True)
+    patch.write_text("diff", encoding="utf-8")
+    run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
+    ran: list = []
+
+    def fake_session(adapter, project, rd, story_key, *, model=""):
+        # the resolve agent records a restore_patch in its output marker
+        ran.append(story_key)
+        marker = resolve.resolution_path(rd, story_key)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"restore_patch": str(patch)}), encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: None)
+    monkeypatch.setattr(resolve, "run_session", fake_session)
+    called: list = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: called.append(rd) or 0)
+    refuse_to_resolve(monkeypatch, patch)
+
+    # interactive is the default, and is required: this arm reads the marker the
+    # session writes, so --no-interactive would short-circuit it before the guard
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--resume"])
+    assert rc == 1
+    assert ran == ["s1"]  # the session really ran: this abort is post-session
+    err = capsys.readouterr().err
+    assert f"cannot canonicalize the restore patch path {str(patch)!r}" in err
+    assert UNRESOLVABLE in err
+    assert "Run `bmad-loop validate` for what this host is doing." in err
     assert called == []  # never resumed
     task = load_state(run_dir).tasks["s1"]
     assert task.phase == Phase.ESCALATED and task.restore_patch is None  # not re-armed
@@ -3676,8 +3939,8 @@ def test_resume_under_an_unchanged_host_exec_config_reports_no_security_change(
 
 
 def test_resume_discards_stale_graceful_stop_request(project, monkeypatch, capsys):
-    """A resume is fresh user intent: a graceful-stop request left over from the
-    prior stopped-gracefully run must be cleared before write_pid re-arms the
+    """A resume is fresh user intent: a stop request left over from the prior
+    stopped run — either mode — must be cleared before write_pid re-arms the
     engine, or the re-driven loop would consume it at the first item boundary and
     immediately re-stop. The clear is noted on stderr."""
     from bmad_loop import runs
@@ -3691,7 +3954,101 @@ def test_resume_discards_stale_graceful_stop_request(project, monkeypatch, capsy
     assert cli._resume_paused_run(project.project, run_dir) == 0
 
     assert not (run_dir / runs.STOP_REQUEST_FILE).exists()  # consumed before the engine ran
-    assert "discarded a stale graceful-stop request" in capsys.readouterr().err
+    assert "discarded a stale stop request" in capsys.readouterr().err
+
+
+def test_resume_discards_a_stale_hard_stop_request(project, monkeypatch, capsys):
+    """The mode-neutral half of the docstring above, which the graceful test alone
+    could not prove. A hard request survives `stop_run`'s refusal to force-kill an
+    unverifiable pid, and `_resume_paused_run` gates on `finished`, not `stopped`, so
+    such a run is genuinely resumable with a hard file still on disk.
+
+    Ablation: mode-gate the clear at its call site to
+    `read_stop_request_mode(...) == "graceful"` — this reddens and its graceful twin
+    stays green."""
+    from bmad_loop import runs
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    (run_dir / runs.STOP_REQUEST_FILE).write_text(
+        '{"requested_at": "old", "mode": "hard"}', encoding="utf-8"
+    )
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    assert not (run_dir / runs.STOP_REQUEST_FILE).exists()
+    assert "discarded a stale stop request" in capsys.readouterr().err
+
+
+def test_resume_refuses_when_a_stale_request_cannot_be_discarded(project, monkeypatch, capsys):
+    """Fail closed. The clear conflates "nothing pending" with "could not remove it",
+    so on a removal failure the discard notice never prints and resume used to arm
+    the pid anyway — the engine then consumed the surviving request at the very first
+    item boundary and re-stopped, with nothing on stderr to say why. Resuming again
+    repeats it: a livelock, not a one-shot annoyance.
+
+    The refusal has to land *before* write_pid, or the run is already re-armed."""
+    from bmad_loop import runs
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    (run_dir / runs.STOP_REQUEST_FILE).write_text(
+        '{"requested_at": "old", "mode": "hard"}', encoding="utf-8"
+    )
+
+    def _refuse(_path):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(runs, "retrying_unlink", _refuse)
+    started: list[str] = []
+    monkeypatch.setattr(runs, "write_pid", lambda _d: started.append("armed"))
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    assert started == []  # refused before the engine was re-armed
+    assert "could not be discarded" in capsys.readouterr().err
+
+
+def test_refused_resume_leaves_the_pin_and_the_journal_untouched(project, monkeypatch, capsys):
+    """A refusal past this function's commit point must leave no trace of a resume
+    that did not happen. `_require_base_skills` used to be the last early exit here,
+    so the stale-request refusal above is the first branch that returns from *below*
+    the journal append and the integrity re-stamp — and both of those are persistent
+    writes, not in-memory state.
+
+    The pin is the one that lasts. `write_trusted_config_digest` writes the exact
+    file the next resume reads back as `pinned`, so re-baselining it on a refusal
+    inverts the advisory it feeds: the warning fires on the attempt that stopped and
+    goes silent on the attempt that actually arms an engine — for a config change the
+    operator never accepted by resuming. The re-stamp's stated justification is that
+    the engine this process is about to arm re-reads the config; a path that arms
+    nothing does not earn it.
+
+    Ablation: move the clear/refuse block back below
+    `runs.write_trusted_config_digest`. Both assertions redden, on two independent
+    axes — the pin becomes the freshly computed sha256, and one `run-resume` entry
+    appears — while `test_resume_refuses_when_a_stale_request_cannot_be_discarded`
+    above stays green, which is what separates this guard from that one."""
+    from bmad_loop import runs
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    (run_dir / runs.STOP_REQUEST_FILE).write_text(
+        '{"requested_at": "old", "mode": "hard"}', encoding="utf-8"
+    )
+    # A sentinel the re-stamp cannot reproduce: the real digest is a sha256, so
+    # equality against this is a positive assertion, not "some value is present" —
+    # which `is not None` would have been, and which would survive the ablation.
+    runs.write_trusted_config_digest(project.project, run_dir.name, "OLDPIN")
+
+    def _refuse(_path):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(runs, "retrying_unlink", _refuse)
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    assert "could not be discarded" in capsys.readouterr().err
+    assert runs.read_trusted_config_digest(project.project, run_dir.name) == "OLDPIN"
+    assert _resume_entries(run_dir) == []
 
 
 def test_resume_refuses_live_run(tmp_path, monkeypatch, capsys):
@@ -5207,11 +5564,17 @@ CLAUDE_ONLY_POLICY = '[adapter]\nname = "claude"\nmodel = "opus"\n'
 
 
 def _make_validate_pass(project, monkeypatch, capsys, *, policy=CLAUDE_ONLY_POLICY, skills=None):
-    """Set a project up so every validate gate passes, and pin the two gates whose
+    """Set a project up so every validate gate passes, and pin the three gates whose
     outcome is a property of the *host* rather than of the project: whether the CLI
-    binary is on PATH and whether a multiplexer is installed. Without those pins the
-    rc-0 leg would pass or fail by machine, which is exactly the kind of green that
-    means nothing.
+    binary is on PATH, whether it actually runs, and whether a multiplexer is
+    installed. Without those pins the rc-0 leg would pass or fail by machine, which
+    is exactly the kind of green that means nothing.
+
+    The liveness pin (#294) is doubly load-bearing: `which` is stubbed to
+    `/usr/bin/{tool}`, a path that does not exist on this host, so an unpinned
+    `binary_runs` would have every one of these tests spawn a nonexistent path on
+    every run and report `adapter.binary-unrunnable`. Stubbed to rc 0 — the "the
+    binary is fine" answer — because that is the premise of a pass fixture.
 
     ``policy`` and ``skills`` exist so the dev-primitive-rename tests can vary the
     project's *topology* (which CLIs on which roles, which primitive era in which
@@ -5230,6 +5593,7 @@ def _make_validate_pass(project, monkeypatch, capsys, *, policy=CLAUDE_ONLY_POLI
     git(project.project, "add", "-A")  # every file above is a worktree change
     git(project.project, "commit", "-q", "-m", "validate fixture")
     monkeypatch.setattr(cli.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    monkeypatch.setattr(probe_mod, "binary_runs", lambda *_a, **_kw: 0)
     monkeypatch.setattr(
         cli,
         "_platform_preflight",
@@ -5287,6 +5651,26 @@ def test_validate_reports_an_undecodable_policy_instead_of_crashing(project, cap
     assert "not valid UTF-8" in finding["message"]
 
 
+def test_validate_reports_a_wrong_typed_policy_field_instead_of_crashing(project, capsys):
+    """The undecodable-file leg's twin one layer in (#440, carried by #474): the file
+    decodes and parses as TOML, but a *value* has the wrong type. `int()` on it raised
+    a raw ValueError — again not an OSError, again straight past every
+    `except (PolicyError, OSError)`, including `_configure_mux`'s, which runs before
+    argument dispatch on EVERY command. `_typed_int` converts it, so the offending
+    `section.key` is a named finding like any other bad policy.
+
+    Routed through `machine_json` for the same reason as the leg above: `main`'s bare
+    `except Exception` backstop also returns 1, so an rc-only assertion stays green
+    with the conversion reverted. What bites is the document — stderr carries the
+    backstop's line and stdout carries nothing to parse."""
+    _write_policy(project.project, CLAUDE_ONLY_POLICY + '[scm]\nmax_parallel = "x"\n')
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    finding = next(f for f in doc["findings"] if f["check"] == "policy")
+    assert finding["severity"] == "problem"
+    assert "scm.max_parallel must be an integer" in finding["message"]
+
+
 def test_validate_reports_an_undecodable_bmad_config_instead_of_crashing(project, capsys):
     """The `config.yaml` half of the same conversion. Separate from the policy leg
     because they are separate loaders with separate typed errors, and the callers that
@@ -5301,6 +5685,33 @@ def test_validate_reports_an_undecodable_bmad_config_instead_of_crashing(project
     finding = next(f for f in doc["findings"] if f["check"] == "bmad-config")
     assert finding["severity"] == "problem"
     assert "not valid UTF-8" in finding["message"]
+
+
+def test_validate_reports_an_undecodable_profile_overlay_instead_of_crashing(project, capsys):
+    """#473: the third loader, same conversion. `load_profiles` reads each overlay in
+    `.bmad-loop/profiles/` with `read_text(encoding="utf-8")`, so a non-UTF-8 file
+    raised `UnicodeDecodeError` — a ValueError, not a `ProfileError` — while the role
+    loop here catches only `ProfileError`. It is not the policy leg over again: these
+    are separate loaders with separate typed errors, and `get_profile` backs every
+    adapter resolution, so the raw escape also reached run/sweep preflight.
+
+    Routed through `machine_json` deliberately, for the reason the policy leg gives:
+    `main`'s bare `except Exception` backstop also returns 1, so an rc-only assertion
+    is green with the conversion reverted. What bites is the document — stderr carries
+    the backstop's line and stdout carries nothing to parse."""
+    _write_policy(project.project, '[adapter]\nname = "badcli"\nmodel = "opus"\n')
+    profiles = project.project / ".bmad-loop" / "profiles"
+    profiles.mkdir(parents=True, exist_ok=True)
+    overlay = profiles / "badcli.toml"
+    overlay.write_bytes(b'name = "b\xffad"\n')
+    with pytest.raises(UnicodeDecodeError):  # the fixture is genuinely undecodable
+        overlay.read_text(encoding="utf-8")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    finding = next(f for f in doc["findings"] if f["check"] == "adapter.profile")
+    assert finding["severity"] == "problem"
+    assert "not valid UTF-8" in finding["message"]
+    assert str(overlay) in finding["message"]  # the finding names the file at fault
 
 
 def test_validate_json_counts_and_ok_agree_with_findings(project, capsys):
@@ -5347,7 +5758,8 @@ def test_validate_json_detail_round_trips_for_every_real_shape(capsys):
     `machine.emit(validate_document(...))` still emits one whole, parseable document
     for every detail a caller actually builds. Each case below mirrors a real call
     site (str values, the nested `dict(role_names)` dict, str+int, install.py's
-    `{**detail, "marker": ...}`, and the `detail=None` leg). A future caller that
+    `{**detail, "marker": ...}`, #294's int and null `returncode`, and the
+    `detail=None` leg). A future caller that
     attaches a non-JSON-serializable detail fails here, by name, rather than at
     runtime on stdout.
     """
@@ -5368,6 +5780,16 @@ def test_validate_json_detail_round_trips_for_every_real_shape(capsys):
         "stale",
         {"tree": ".claude", "skill": "s", "file": "f", "marker": "m"},
     )
+    report.warn(  # str + int `returncode` (cli.py, #294)
+        "adapter.binary-unrunnable",
+        "claude will not run",
+        {"binary": "claude", "path": "/usr/bin/claude", "returncode": 127},
+    )
+    report.warn(  # the launch-fault leg: a null INSIDE a detail dict (cli.py, #294)
+        "adapter.binary-unrunnable",
+        "claude will not launch",
+        {"binary": "claude", "path": "/usr/bin/claude", "returncode": None},
+    )
     report.ok("git.worktree-clean", "clean")  # the detail=None leg
 
     # the exact production path: cli.py does `machine.emit(validate_document(...))`.
@@ -5379,6 +5801,10 @@ def test_validate_json_detail_round_trips_for_every_real_shape(capsys):
     assert by_check["queue.stories-manifest"]["detail"]["stories"] == 3  # int, not "3"
     assert by_check["skills.stories-dispatch-stale"]["detail"]["marker"] == "m"
     assert by_check["git.worktree-clean"]["detail"] is None  # None -> null round-trips
+    # Listed, not dict-indexed: both #294 legs share one check id, so a by-check map
+    # would keep only the last and silently stop covering the int shape.
+    unrunnable = [f for f in parsed["findings"] if f["check"] == "adapter.binary-unrunnable"]
+    assert [f["detail"]["returncode"] for f in unrunnable] == [127, None]  # int, and null-in-dict
 
 
 @pytest.mark.parametrize(
@@ -5419,6 +5845,169 @@ def test_validate_json_every_emitted_check_is_registered(project, capsys, monkey
     emitted = {f["check"] for f in (*passing["findings"], *failing["findings"])}
     assert emitted, "the run emitted findings"
     assert emitted <= VALIDATE_CHECKS
+
+
+@pytest.mark.parametrize("exit_code", [2, 127], ids=["rc-2", "rc-127"])
+def test_validate_warns_when_a_binary_on_path_refuses_to_run(
+    project, capsys, monkeypatch, tmp_path, exit_code
+):
+    """#294: `which` answering yes is not the same question as "this install runs".
+
+    A dead WSL/npm shim is a real file with the execute bit — `adapter.binary` went
+    green on it, and `opencode_http`'s own "binary not found" remedy sends the user
+    to `bmad-loop validate`, which then told them everything was fine. Driven with a
+    REAL non-runnable binary on a REAL PATH: a `which` stub cannot exercise the probe
+    at all, which is the whole of what this row is about.
+
+    The two host pins `_make_validate_pass` installs are lifted back off on purpose —
+    they exist so the OTHER rows do not pass or fail by machine, and here they would
+    stub out the code under test. Everything else it sets up stays, so rc 0 below is
+    a statement about this gate rather than about some unrelated one.
+
+    Both codes are #294's OWN evidence, not invented: its transcript reports rc 2 and
+    a reproduction of the same shim (`exec /nonexistent/opencode "$@"`) exits 127. The
+    pair is what pins the gate as `rc != 0` — an allowlist of shell-ish codes looks
+    right and would miss the case the issue is actually about.
+
+    Ablation target: change `report.warn` to `report.fail` in cli.py's
+    `adapter.binary-unrunnable` branch and the rc-0 assertion inside `machine_json`
+    reddens (severity IS the exit code — checks.py); delete the branch entirely and
+    the `len(...) == 1` assertion reddens on an empty list. Neither is redundant: the
+    first is the severity contract, the second is the finding existing at all.
+    Narrow the gate to `rc in {126, 127}` and the rc-2 leg alone reddens.
+    """
+    real_which, real_binary_runs = shutil.which, probe_mod.binary_runs
+    _make_validate_pass(project, monkeypatch, capsys)
+    monkeypatch.setattr(cli.shutil, "which", real_which)
+    monkeypatch.setattr(probe_mod, "binary_runs", real_binary_runs)
+
+    bin_dir = tmp_path / "shimbin"
+    bin_dir.mkdir()
+    launcher = write_script_launcher(bin_dir, "claude", f"import sys\nsys.exit({exit_code})\n")
+    # Prepended, so it shadows any real `claude` this host happens to carry.
+    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
+
+    # rc=0 is machine_json's default and IS the exit-code assertion: a warning must
+    # not flip validate's verdict for a user whose CLI merely answers oddly.
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+
+    assert doc["schema_version"] == 1, "purely additive — a new check id is not a break"
+    assert doc["ok"] is True  # the document's own verdict, not just the rc
+
+    unrunnable = [f for f in doc["findings"] if f["check"] == "adapter.binary-unrunnable"]
+    assert len(unrunnable) == 1, "one finding per binary, not per profile"
+    assert unrunnable[0]["severity"] == "warning"
+    assert unrunnable[0]["detail"]["binary"] == "claude"
+    assert unrunnable[0]["detail"]["returncode"] == exit_code
+    # The RESOLVED path, not the bare name — re-resolving in the probe would be a
+    # TOCTOU, and on Windows the PATHEXT shim `which` picked is the file at issue.
+    assert Path(unrunnable[0]["detail"]["path"]).samefile(launcher)
+
+    # The pre-existing gate is untouched: it still answers "is it on PATH", and the
+    # answer is still yes. A fix that folded liveness into it would redden this.
+    found = [f for f in doc["findings"] if f["check"] == "adapter.binary"]
+    assert len(found) == 1 and found[0]["severity"] == "ok"
+
+
+@pytest.mark.parametrize("shape", ["relative-path", "bare-name-on-path"])
+def test_validate_never_executes_a_binary_an_overlay_profile_named(
+    project, capsys, monkeypatch, tmp_path, shape
+):
+    """#294's liveness probe must not turn validate into a code-execution boundary.
+
+    `binary` is project-controlled all the way down: policy.toml picks the profile
+    and `.bmad-loop/profiles/*.toml` supplies its fields, both of which arrive with
+    a clone. validate is precisely the command a user runs to decide whether a
+    checkout is safe to run at all (the TUI runs it too), so probing a binary an
+    overlay named would execute untrusted code on the strength of reading config.
+
+    The two shapes are the same family reached by different spellings, which is why
+    they are parametrized rather than written as one row:
+
+    - `relative-path` — `shutil.which` returns a caller-supplied path UNCHANGED
+      instead of searching PATH, so `./pwn` names a file the repository carries.
+    - `bare-name-on-path` — the spelling is clean, and `which` still resolves it
+      into the checkout because a checkout-local directory is on PATH. A guard that
+      tested the spelling of `binary` (rejecting a separator) passed this row.
+
+    Only provenance covers both: an overlay profile is never probed whatever it is
+    called. `test_every_packaged_profile_names_a_bare_binary` holds the other half.
+
+    Driven with a REAL executable and a REAL overlay profile, from the project
+    directory as a user who just cloned it would be: a stubbed `which` or
+    `binary_runs` would assert nothing about the boundary this is here to hold.
+
+    The sentinel is the whole assertion — an absent `adapter.binary-unrunnable`
+    finding would also be produced by a probe that ran and returned 0, so it cannot
+    distinguish "not launched" from "launched and happy". Only a file the child
+    alone can create does.
+
+    Ablation target: drop the `if tool not in packaged_binaries` gate in cli.py and
+    BOTH rows create the sentinel. Restore it but gate on `os.path.dirname(tool)`
+    instead and `bare-name-on-path` alone reddens — that is the round-1 fix this
+    row exists to keep dead. The `adapter.binary` assertion below is NOT the gate:
+    it pins the surviving half (a rejected binary is still reported found) and
+    stays green under either ablation.
+    """
+    install_bmad_config(project)
+    _write_policy(project.project, '[adapter]\nname = "pwncli"\n')
+
+    sentinel = tmp_path / "pwned.txt"
+    launcher = write_script_launcher(
+        project.project,
+        "pwn",
+        f"import pathlib\npathlib.Path({str(sentinel)!r}).write_text('executed')\n",
+    )
+    if shape == "relative-path":
+        # `launcher.name`, not a bare "pwn": on Windows the launcher is `pwn.cmd`,
+        # and naming the real file keeps this about the gate, not about PATHEXT.
+        binary = f"./{launcher.name}"
+    else:
+        binary = "pwn"  # resolved through PATH, into the checkout
+        monkeypatch.setenv("PATH", str(project.project) + os.pathsep + os.environ.get("PATH", ""))
+
+    profiles = project.project / ".bmad-loop" / "profiles"
+    profiles.mkdir(parents=True, exist_ok=True)
+    (profiles / "pwncli.toml").write_text(
+        f'name = "pwncli"\nbinary = "{binary}"\nbypass_args = ["--yes"]\n'
+        "\n[hooks]\n"
+        'dialect = "claude-settings-json"\n'
+        'config_path = ".pwncli/settings.json"\n'
+        'events = { SessionStart = "SessionStart", Stop = "Stop" }\n',
+        encoding="utf-8",
+    )
+
+    # A relative `binary` resolves against the PROCESS cwd — the clone the user is
+    # standing in when they run `bmad-loop validate`.
+    monkeypatch.chdir(project.project)
+    cli.main(["validate", "--project", str(project.project), "--json"])
+    doc = json.loads(capsys.readouterr().out)
+
+    assert not sentinel.exists(), "validate executed a repository-supplied binary"
+
+    # The surviving half: still resolved and reported, exactly as before #294.
+    found = [f for f in doc["findings"] if f["check"] == "adapter.binary"]
+    assert len(found) == 1 and found[0]["severity"] == "ok"
+
+
+def test_every_packaged_profile_names_a_bare_binary():
+    """The packaged half of the probe's trust boundary (#294).
+
+    `validate` executes the binary of any profile stamped `packaged`, and it trusts
+    provenance rather than spelling — so nothing in cli.py stops a packaged profile
+    whose `binary` carried a path from being launched out of the working directory.
+    Nothing needs to, as long as no packaged profile ships one, and that is a
+    property of the shipped TOML rather than of the code: pin it where it is true.
+
+    A future bundled profile that sets `binary = "./vendor/cli"` reddens here, at
+    the file that introduced it, rather than silently widening what a diagnostic
+    executes.
+    """
+    from bmad_loop.adapters.profile import load_profiles
+
+    packaged = {n: p for n, p in load_profiles(project=None).items() if p.packaged}
+    assert packaged, "no packaged profiles loaded — the gate would be vacuous"
+    assert [p.binary for p in packaged.values() if os.path.dirname(p.binary)] == []
 
 
 @pytest.mark.parametrize("passing", [True, False], ids=["rc-0", "rc-1"])
@@ -5606,6 +6195,43 @@ def test_dry_run_stories_relativizes_absolute_folder(project, capsys):
     out = capsys.readouterr().out
     assert "Spec folder: _bmad-output/epic-1. Story id: 1." in out
     assert f"Spec folder: {abs_folder}" not in out  # not the raw absolute path
+
+
+def test_dry_run_stories_unresolvable_absolute_folder_refused(project, monkeypatch, capsys):
+    """`relativize_spec_folder` reaches the CLI only here, and the refusal it
+    now raises (#560) is the one answer the dry-run cannot render: an absolute
+    `--spec` inside the project whose `.resolve()` faults has no knowable
+    location, so there is no folder string to preview. Print the reason and exit
+    1, in the shape of its `story_rows` sibling just below — minus that sibling's
+    `(spec folder: ...)` suffix, which would be a third printing of a path the
+    reason already names twice (this leg is reachable only from the absolute
+    branch, where `folder` is `spec_folder` re-spelled).
+
+    Measured ablations:
+    - B3 (delete the `try`/`except stories_mod.StoriesError` around the
+      `relativize_spec_folder` call in `cli._dry_run_stories`): FAILS at `assert
+      cli._dry_run(project, pol, args, True, abs_folder) == 1` — the
+      `StoriesError` propagates out of `_dry_run` uncaught, so the row errors on
+      that line and the two stderr assertions are never reached. That line alone
+      carries this row.
+    - B1 (collapse `relativize_spec_folder` back to one degrade arm): FAILS on
+      the same line with `assert 0 == 1`, and the captured stdout is the
+      regression itself — a rendered `BMAD_LOOP_SPEC_FOLDER=<absolute path into
+      the main checkout>` previewed as runnable.
+    - B2 (blanket raise): green — this row travels the `OSError` leg, which B2
+      leaves refusing."""
+    _setup_stories_fixture(project, [_stories_entry("1")])
+    abs_folder = str(project.project / STORIES_SPEC_FOLDER)
+    pol = policy_mod.loads("")
+    args = argparse.Namespace(spec=abs_folder, epic=None, story=None, max_stories=None)
+    refuse_to_resolve(monkeypatch, Path(abs_folder))
+
+    assert cli._dry_run(project, pol, args, True, abs_folder) == 1
+
+    cap = capsys.readouterr()
+    assert f"stories mode: cannot canonicalize the spec folder {abs_folder!r}" in cap.err
+    assert "Run `bmad-loop validate` for what this host is doing." in cap.err
+    assert "linear schedule" not in cap.out  # no preview of a folder we cannot place
 
 
 # --------------- `bmad-loop mux`: backend listing + persisted choice (issue #87) ----
@@ -8324,3 +8950,261 @@ def test_dry_run_uses_policy_namespace(project, capsys):
 
     assert cli._dry_run(project, pol, args) == 0
     assert "L0-2-1-contracts" in capsys.readouterr().out
+
+
+# ------------------------------------------------- the git support floor (GIT_FLOOR)
+
+
+def _fake_git_version(monkeypatch, reported, *, rc=0):
+    """Fake `git version` at the PREDICATE seam — `verify.git_bytes` — so the whole
+    chain under test (`git_below_floor` -> `git_version_at_least` -> the caller's
+    branch) runs for real. Patching `verify.git_below_floor` instead would fake the
+    predicate away and leave only the wiring proven; the two are separate ablation
+    axes and each needs its own seam."""
+    real = verify.git_bytes
+
+    def fake(repo, *args, timeout_s=None):
+        if args == ("version",):
+            return subprocess.CompletedProcess(
+                args=["git", "version"], returncode=rc, stdout=reported.encode(), stderr=b""
+            )
+        return real(repo, *args, timeout_s=timeout_s)
+
+    monkeypatch.setattr(verify, "git_bytes", fake)
+
+
+UNDER_FLOOR_GIT = "git version 2.25.1\n"
+
+
+def test_run_refuses_an_under_floor_git(project, capsys, monkeypatch):
+    """A host below `verify.GIT_FLOOR` never reaches the engine.
+
+    2.25 is the load-bearing choice: it HAS every git feature bmad-loop uses, so a
+    capability check would wave it through. Only a support-floor gate refuses it.
+
+    Ablation: delete the `_reject_under_floor_git` call in `cmd_run` and this fails
+    — the run proceeds past the gate. (Wiring axis; the predicate axis is
+    `tests/test_verify.py::test_git_version_at_least_reads_only_a_git_version_line`.)"""
+    install_bmad_config(project)
+    _fake_git_version(monkeypatch, UNDER_FLOOR_GIT)
+
+    assert cli.main(["run", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert "2.25.1" in err
+    assert verify.git_floor_text() in err
+
+
+def test_run_refuses_when_git_cannot_be_run_at_all(project, capsys, monkeypatch):
+    """ "Absent/unspawnable" is a different fact from "too old", and it is refused
+    too. A run that cannot ask git its version has no business reaching `git
+    worktree add` — the gate must not degrade to "assume it's fine"."""
+    install_bmad_config(project)
+
+    def boom(repo, *args, timeout_s=None):
+        raise verify.GitSpawnError("git failed to spawn in /x: [Errno 2] No such file")
+
+    monkeypatch.setattr(verify, "git_bytes", boom)
+
+    assert cli.main(["run", "--project", str(project.project)]) == 1
+    assert "could not be run" in capsys.readouterr().err
+
+
+def test_run_gate_admits_a_git_exactly_at_the_floor(project, monkeypatch):
+    """The boundary is INCLUSIVE. Asserted on the helper rather than through a whole
+    run, so the pass leg cannot be green for some later gate's reason."""
+    _fake_git_version(monkeypatch, f"git version {verify.git_floor_text()}.0\n")
+    assert cli._reject_under_floor_git(project.project) is None
+
+
+def test_sweep_refuses_an_under_floor_git(project, capsys, monkeypatch):
+    """The refusal covers every Engine-construction entrypoint, not just `run`."""
+    install_bmad_config(project)
+    _fake_git_version(monkeypatch, UNDER_FLOOR_GIT)
+
+    assert cli.main(["sweep", "--project", str(project.project)]) == 1
+    assert verify.git_floor_text() in capsys.readouterr().err
+
+
+def test_validate_reports_an_under_floor_git_as_a_problem(project, capsys, monkeypatch):
+    """A `problem`, not a warning — `validate` exits 1 on the same host `run` aborts
+    on. The severity IS the contract here: a `report.warn` would still emit the
+    finding, so asserting only its presence would stay green through the regression
+    this guards.
+
+    Ablation: change the `report.fail` to `report.warn` and this fails on the rc."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    _fake_git_version(monkeypatch, UNDER_FLOOR_GIT)
+
+    findings = _validate_findings(project, capsys, rc=1)
+    assert findings["git.version"]["severity"] == "problem"
+    assert findings["git.version"]["detail"]["reported"] == "git version 2.25.1"
+
+
+def test_validate_and_run_agree_on_an_under_floor_git(project, capsys, monkeypatch):
+    """The point of making this a `problem`: one host state, one verdict. `validate`
+    reporting green while `run` aborts is the disagreement `cmd_validate` is built to
+    avoid, and it is invisible unless both are asserted together."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    _fake_git_version(monkeypatch, UNDER_FLOOR_GIT)
+
+    validate_rc = cli.main(["validate", "--project", str(project.project)])
+    capsys.readouterr()
+    run_rc = cli.main(["run", "--project", str(project.project)])
+    assert (validate_rc, run_rc) == (1, 1)
+
+
+def test_validate_passes_the_git_floor_on_a_current_host(project, capsys, monkeypatch):
+    """The ok leg, pinned rather than left to the machine: without the fake this row
+    would pass or fail by whatever git the box has."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    _fake_git_version(monkeypatch, "git version 2.55.0\n")
+
+    findings = _validate_findings(project, capsys)
+    assert findings["git.version"]["severity"] == "ok"
+
+
+def test_validate_pays_a_hung_git_once(project, capsys, monkeypatch):
+    """`cmd_validate` spawns three git children in a row and `_run_git` gives each
+    one the whole `GIT_TIMEOUT_S`, so against a binary that never returns the two
+    probes AFTER the first spend two more deadlines to learn what `git.probe`
+    already reported — six minutes, on the 120s default, for a command whose only
+    job is to answer quickly.
+
+    The findings are asserted alongside the counters because the skip must cost the
+    operator nothing: both skipped branches were already silent on a git fault, so
+    the report has to read exactly as it did before. A cheaper validate that also
+    dropped a finding would be a different change.
+
+    Ablation: remove the `git_answers` guard from either probe and that probe's
+    counter goes to 1."""
+    _make_validate_pass(project, monkeypatch, capsys)
+
+    def hung(*_args, **_kwargs):
+        raise verify.GitTimeoutError(f"git status timed out after 120s in {project.project}")
+
+    version_probes = []
+    render_probes = []
+
+    def counted_version(_repo, *args, timeout_s=None):
+        version_probes.append(args)
+        return subprocess.CompletedProcess(
+            args=["git", *args], returncode=0, stdout=b"git version 2.55.0\n", stderr=b""
+        )
+
+    def counted_tracked(_repo, rel):
+        render_probes.append(rel)
+        return False
+
+    monkeypatch.setattr(verify, "worktree_clean", hung)
+    monkeypatch.setattr(verify, "git_bytes", counted_version)
+    monkeypatch.setattr(verify, "path_tracked", counted_tracked)
+
+    findings = _validate_findings(project, capsys, rc=1)
+    assert version_probes == [], "the version probe re-paid the deadline git already spent"
+    assert render_probes == [], "the render-tracked probe re-paid it a third time"
+    assert findings["git.probe"]["severity"] == "problem"
+    assert "timed out" in findings["git.probe"]["message"]
+    assert "git.version" not in findings  # silent before the skip, silent after
+    assert "git.render-tracked" not in findings
+
+
+def test_validate_still_reports_the_git_version_when_git_ran_and_failed(
+    project, capsys, monkeypatch
+):
+    """The skip is narrow on purpose, and this is the leg that pins it. A non-zero
+    rc — dubious ownership, a corrupt index, a directory that is not a repo — is git
+    ANSWERING: the next probe returns just as promptly, and it is the only finding
+    that names the host fact `run` will abort on. Dropping it to save a deadline
+    that was never going to be paid would send an operator whose git is both broken
+    here AND below the floor back for a second round trip.
+
+    Ablation: widen the `git_answers` guard to any `GitError` and `git.version`
+    vanishes from the report."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    _fake_git_version(monkeypatch, UNDER_FLOOR_GIT)
+
+    def refused(*_args, **_kwargs):
+        raise verify.GitError(
+            f"git status failed in {project.project}: fatal: detected dubious ownership"
+        )
+
+    monkeypatch.setattr(verify, "worktree_clean", refused)
+
+    findings = _validate_findings(project, capsys, rc=1)
+    assert "dubious ownership" in findings["git.probe"]["message"]
+    assert findings["git.version"]["severity"] == "problem"
+    assert findings["git.version"]["detail"]["reported"] == "git version 2.25.1"
+
+
+def test_auto_sweep_factory_raises_on_an_under_floor_git(project, monkeypatch):
+    """The child sweep's arm of the same refusal, and the one that cannot report an
+    rc: `_sweep_factory` runs under the engine, so it RAISES — the disposition the
+    #414 isolation conflict already uses there.
+
+    `launched == []` is the load-bearing half. A refusal that still reached
+    `_start_sweep` would spawn the very session it exists to prevent, and the
+    exception alone cannot tell those apart: the factory's contract is that any
+    raise BEFORE `started` leaves the parent's trigger unspent, so the assertion
+    has to prove the launch did not happen, not merely that something was raised.
+
+    Ablation: delete the `git_below_floor` check in `_sweep_factory` and this fails
+    — the factory launches a child sweep on a 2.25 host."""
+    factory, launched = _pinned_sweep_factory(project, monkeypatch)
+    _fake_git_version(monkeypatch, UNDER_FLOOR_GIT)
+
+    with pytest.raises(RuntimeError, match="2\\.25\\.1"):
+        factory("epic-boundary", started=_never_started)
+    assert launched == []
+
+
+def test_resume_refuses_an_under_floor_git(project, capsys, monkeypatch):
+    """Resume re-reads config.yaml and policy.toml off disk, so it is a second
+    entrypoint into the same engine and takes the same refusal — a run started on a
+    supported git must not finish its remaining stories after a downgrade.
+
+    The gate sits ahead of the kill/journal work on purpose, so this asserts the rc
+    and the message rather than stubbing `runs.kill_session`: reaching that call at
+    all would already be the bug.
+
+    Ablation: delete the `_reject_under_floor_git` call in `_resume_paused_run` and
+    this fails — the resume proceeds past the gate."""
+    install_bmad_config(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    run_dir = _make_run_with_state(
+        project.project,
+        "20990101-000000-beef",
+        paused_reason="spec approval",
+        paused_stage="spec-approval",
+    )
+    _fake_git_version(monkeypatch, UNDER_FLOOR_GIT)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    err = capsys.readouterr().err
+    assert "2.25.1" in err
+    assert verify.git_floor_text() in err
+
+
+def test_dry_run_banner_names_an_under_floor_git(project, capsys, monkeypatch):
+    """`--dry-run` returns BEFORE `_reject_under_floor_git`, so without this the
+    preview renders a plausible schedule for a command guaranteed to exit 1.
+
+    The git floor belongs in this banner where the dirty-tree and queue gates
+    deliberately do not: those are transient tree state an operator can fix between
+    the preview and the run, while an under-floor git is a fact about the host that
+    the preview cannot honestly print around.
+
+    Ablation: drop the `git_below_floor` probe from `_warn_preflight_would_abort`
+    and this fails — the preview goes out with no banner at all."""
+    from conftest import install_base_skills
+
+    install_base_skills(project)
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+    _fake_git_version(monkeypatch, UNDER_FLOOR_GIT)
+
+    assert cli._dry_run(project, pol, args) == 0
+    err = capsys.readouterr().err
+    assert "NOT runnable" in err
+    assert "2.25.1" in err and verify.git_floor_text() in err

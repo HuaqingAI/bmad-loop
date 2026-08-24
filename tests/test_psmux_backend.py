@@ -78,7 +78,7 @@ def test_new_window_ships_env_and_command_as_encoded_pwsh(rec, tmp_path):
     )
 
     # the tmux-family scaffolding is the base's, spawned via the psmux binary,
-    # with no -e flags (psmux drops them)
+    # with no -e flags — the env rides the encoded source's prelude instead
     assert rec.argv[:12] == [
         "psmux",
         "new-window",
@@ -321,16 +321,17 @@ def test_new_session_failure_raises_multiplexer_error(monkeypatch, tmp_path):
 # --------------------------------------------------------------- kill_session
 
 
-def test_kill_session_uses_plain_target(rec, monkeypatch):
-    # strict which-stub: the guard must probe the psmux binary, not a
-    # copy-pasted "tmux"
+def test_kill_session_uses_the_inherited_exact_match_target(rec, monkeypatch):
+    # 3.3.8 honors the `=name` exact-match form (psmux/psmux#558), so the base's
+    # argv is correct here and the override is gone. strict which-stub: the
+    # base's guard must probe the psmux binary, not a copy-pasted "tmux".
     monkeypatch.setattr(
         psmux_backend.shutil,
         "which",
         lambda name: "C:\\bin\\psmux.exe" if name == "psmux" else None,
     )
     PsmuxMultiplexer().kill_session("s")
-    assert rec.argv == ["psmux", "kill-session", "-t", "s"]  # no `=` — psmux ignores it
+    assert rec.argv == ["psmux", "kill-session", "-t", "=s"]
 
 
 def test_kill_session_no_binary_no_spawn(rec, monkeypatch):
@@ -356,6 +357,7 @@ def _probe_fake(monkeypatch, answers: dict[str, tuple[int, str]]):
         return subprocess.CompletedProcess(argv, rc, stdout=out, stderr="")
 
     monkeypatch.setenv("TMUX", "/tmp/psmux-1000/default,123,0")  # inside psmux
+    monkeypatch.setenv("TMUX_PANE", "%9")  # the pane the probes pin to (gh-669)
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
 
 
@@ -439,22 +441,29 @@ def test_new_parked_window_composes_pwsh_source(rec, tmp_path):
 # ------------------------------------------------------------------ pipe_pane
 
 
-def test_pipe_pane_ships_positional_sidecar_sink(rec, tmp_path):
-    log = tmp_path / "win's.log"
+# The path shapes the sidecar could not carry: an apostrophe (doubled by
+# _pwsh_quote), a space and `$`/backtick interpolation syntax. All three ride
+# inside the base64 now, so they are one parametrization rather than a refusal.
+@pytest.mark.parametrize("name", ["win's.log", "my run.log", "$name`x.log"])
+def test_pipe_pane_ships_the_sink_as_an_encoded_flag_transport(rec, tmp_path, name):
+    log = tmp_path / name
     PsmuxMultiplexer().pipe_pane("@1", log)
 
+    assert len(rec.calls) == 1
     assert rec.argv[:5] == ["psmux", "pipe-pane", "-t", "@1", "-o"]
-    # psmux strips every dash-flag token from the piped command, so the sink
-    # must be a purely positional launch of a sidecar script
-    sidecar = tmp_path / "win's.log.sink.ps1"
-    assert rec.argv[5] == f'pwsh "{sidecar}"'
-    sink = sidecar.read_text(encoding="utf-8")
+    # One `-o` string, space-joined: base64 is [A-Za-z0-9+/=], so nothing in the
+    # composed command needs quoting against psmux's re-parse.
+    piped = rec.argv[5].split(" ")
+    assert piped[:3] == ["pwsh", "-NoProfile", "-EncodedCommand"]
+    sink = _decode(piped[3])
     # byte-exact raw stream copy (no console decode / re-encode / CRLF mangling),
     # flushed per chunk so the live tail sees bytes incrementally
     quoted = str(log).replace(chr(39), chr(39) * 2)
     assert f"[System.IO.File]::Open('{quoted}', 'Append', 'Write', 'Read')" in sink
     assert "$in.Read($buf, 0, $buf.Length)" in sink
     assert "$out.Flush()" in sink
+    # nothing is written beside the log any more
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_pipe_pane_swallows_failure_with_warning(monkeypatch, capsys, tmp_path):
@@ -463,21 +472,13 @@ def test_pipe_pane_swallows_failure_with_warning(monkeypatch, capsys, tmp_path):
     assert "pipe-pane log capture failed" in capsys.readouterr().err
 
 
-def test_pipe_pane_sidecar_write_failure_warns_without_spawning(rec, capsys, tmp_path):
-    # An unwritable sidecar path (missing log dir) must warn and skip the psmux
-    # call — never raise
-    assert PsmuxMultiplexer().pipe_pane("@1", tmp_path / "absent" / "log") is None
+def test_pipe_pane_warns_without_spawning_on_an_unencodable_log_path(rec, capsys, tmp_path):
+    # A lone surrogate (surrogateescape filesystem decoding) fails the UTF-16LE
+    # encode inside _shell_wrap BEFORE _tmux ever runs — warn-never-raise must
+    # hold there too, not only for the TmuxError arm.
+    assert PsmuxMultiplexer().pipe_pane("@1", tmp_path / "x\ud800.log") is None
     assert rec.calls == []
     assert "pipe-pane log capture failed" in capsys.readouterr().err
-
-
-@pytest.mark.parametrize("syntax", ["$name", "`name"])
-def test_pipe_pane_rejects_interpolating_sidecar_path(rec, capsys, tmp_path, syntax):
-    log = tmp_path / f"{syntax}.log"
-    assert PsmuxMultiplexer().pipe_pane("@1", log) is None
-    assert rec.calls == []
-    assert not log.with_name(log.name + ".sink.ps1").exists()
-    assert "PowerShell interpolation syntax" in capsys.readouterr().err
 
 
 # ------------------------------------------------------------------ selection
@@ -491,10 +492,14 @@ def test_available_requires_psmux_pwsh_and_supported_version(monkeypatch):
         "which",
         lambda name: f"C:\\bin\\{name}.exe" if name in ("psmux", "pwsh") else None,
     )
-    monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.3.7")
+    monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.3.8")
     assert PsmuxMultiplexer().available() is True
 
-    # 3.3.6 and older force-kill recycled PIDs on teardown — unusable
+    # 3.3.7 and older are refused: 3.3.6 force-kills recycled PIDs on teardown,
+    # and 3.3.7 lacks the fixes this backend's verbs now assume.
+    monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.3.7")
+    assert PsmuxMultiplexer().available() is False
+
     monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.3.6")
     assert PsmuxMultiplexer().available() is False
 
@@ -507,9 +512,13 @@ def test_available_requires_psmux_pwsh_and_supported_version(monkeypatch):
     monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 10.0")
     assert PsmuxMultiplexer().available() is True
 
-    # a suffixed newer release still clears the strictly-greater gate
-    monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.3.7-rc0")
+    # a suffixed newer release still clears the strictly-greater gate; a
+    # suffixed refused one still fails it (the suffix is not read at all)
+    monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.3.8-rc0")
     assert PsmuxMultiplexer().available() is True
+
+    monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.3.7-rc0")
+    assert PsmuxMultiplexer().available() is False
 
     # a two-part compat version (tmux's own format) reads as patch 0
     monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.4")
@@ -533,7 +542,7 @@ def test_available_composes_real_version_probe(monkeypatch):
         lambda name: f"C:\\bin\\{name}.exe" if name in ("psmux", "pwsh") else None,
     )
     monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"C:\\bin\\{name}.exe")
-    rec = _RecordRun(stdout="tmux 3.3.7\n")
+    rec = _RecordRun(stdout="tmux 3.3.8\n")
     monkeypatch.setattr(tmux_base.subprocess, "run", rec)
     assert PsmuxMultiplexer().available() is True
     assert rec.argv == ["psmux", "-V"]
@@ -554,13 +563,13 @@ def test_available_parses_the_gate_out_of_a_real_two_line_probe(monkeypatch):
         lambda name: f"C:\\bin\\{name}.exe" if name in ("psmux", "pwsh", "tmux") else None,
     )
 
-    for release, expected in (("3.3.7", True), ("3.3.6", False)):
-        rec = _RecordRun(stdout=f"tmux {release}\npsmux {release} (05cc5d4 2026-07-20)\n")
+    for release, expected in (("3.3.8", True), ("3.3.7", False)):
+        rec = _RecordRun(stdout=f"tmux {release}\npsmux {release} (66cf613 2026-08-18)\n")
         monkeypatch.setattr(tmux_base.subprocess, "run", rec)
         mux = PsmuxMultiplexer()
         assert mux.available() is expected
         # The fold reached the gate whole — both segments, one line.
-        assert mux.version() == f"tmux {release}; psmux {release} (05cc5d4 2026-07-20)"
+        assert mux.version() == f"tmux {release}; psmux {release} (66cf613 2026-08-18)"
 
 
 def test_available_caches_version_gate_per_instance(monkeypatch):
@@ -574,7 +583,7 @@ def test_available_caches_version_gate_per_instance(monkeypatch):
     def probe(self):
         nonlocal calls
         calls += 1
-        return "tmux 3.3.7"
+        return "tmux 3.3.8"
 
     monkeypatch.setattr(PsmuxMultiplexer, "version", probe)
     mux = PsmuxMultiplexer()
@@ -609,9 +618,8 @@ def test_registry_selects_psmux_when_forced(monkeypatch):
 # OUTSIDE any pane, where a bare `@N` resolves through the most-recent-session
 # fallback instead of the session that minted it. kill-window on such an id is
 # destructive against the wrong server, so new_parked_window, the `window_id`
-# columns of list_windows, and current_window_id all carry `session:@N` — and
-# select_window, whose CLI-side check matches only window index/name, resolves
-# that form back to an index before sending.
+# columns of list_windows, and current_window_id all carry `session:@N`, and
+# every `-t` consumer replays that form verbatim.
 
 
 def _rows_fake(monkeypatch, rows: str, *, new_window_id: str = "@2\n"):
@@ -696,10 +704,11 @@ def test_current_window_id_resolves_session_and_id_in_one_probe(monkeypatch):
     # own window and kill it. One expansion yields both parts or neither.
     recorder = _RecordRun(stdout="ctl:@2\n")
     monkeypatch.setenv("TMUX", "/tmp/psmux-1000/default,123,0")
+    monkeypatch.setenv("TMUX_PANE", "%9")
     monkeypatch.setattr(tmux_base.subprocess, "run", recorder)
     assert PsmuxMultiplexer().current_window_id() == "ctl:@2"
     assert len(recorder.calls) == 1
-    assert recorder.argv[1:] == ["display-message", "-p", _CURRENT_FMT]
+    assert recorder.argv[1:] == ["display-message", "-p", "-t", "%9", _CURRENT_FMT]
 
 
 def test_current_window_id_none_outside_mux(monkeypatch):
@@ -709,6 +718,55 @@ def test_current_window_id_none_outside_mux(monkeypatch):
     rec = _RecordRun()
     monkeypatch.setattr(tmux_base.subprocess, "run", rec)
     assert PsmuxMultiplexer().current_window_id() is None
+    assert rec.calls == []
+
+
+def test_display_message_pins_probe_to_the_calling_pane(monkeypatch):
+    # A target-less display-message resolves the server's *active* window on
+    # psmux, answering for a foreign window whenever the caller's window is not
+    # focused (gh-669) — every probe must carry `-t $TMUX_PANE`.
+    recorder = _RecordRun(stdout="%4\n")
+    monkeypatch.setenv("TMUX", "/tmp/psmux-1000/default,123,0")
+    monkeypatch.setenv("TMUX_PANE", "%4")
+    monkeypatch.setattr(tmux_base.subprocess, "run", recorder)
+    assert PsmuxMultiplexer().current_pane_id() == "%4"
+    assert len(recorder.calls) == 1  # the pinned probe, and nothing unpinned
+    assert recorder.argv[1:] == ["display-message", "-p", "-t", "%4", "#{pane_id}"]
+
+
+def test_display_message_unpinnable_probe_is_refused(monkeypatch):
+    # TMUX set but TMUX_PANE unset: the probe cannot be pinned, and an
+    # unpinnable probe would answer for whichever window is active — None
+    # without spawning, never a target-less display-message (gh-669).
+    monkeypatch.setenv("TMUX", "/tmp/psmux-1000/default,123,0")
+    monkeypatch.delenv("TMUX_PANE", raising=False)
+    rec = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", rec)
+    assert PsmuxMultiplexer().current_window_id() is None
+    assert rec.calls == []
+
+
+def test_display_message_non_pane_shaped_tmux_pane_is_refused(monkeypatch):
+    # Measured on 3.3.8: an `@N`-shaped (or live-session-name) target resolves
+    # rc=0 to the ACTIVE window — a foreign answer the rc cannot catch, unlike
+    # plain garbage, which fails closed at rc!=0 — so a TMUX_PANE that is not
+    # pane-shaped must never reach `-t` (gh-669).
+    monkeypatch.setenv("TMUX", "/tmp/psmux-1000/default,123,0")
+    monkeypatch.setenv("TMUX_PANE", "@3")
+    rec = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", rec)
+    assert PsmuxMultiplexer().current_window_id() is None
+    assert rec.calls == []
+
+
+def test_display_message_none_outside_mux_even_with_pane_var(monkeypatch):
+    # The base's TMUX guard survives the override: a stale TMUX_PANE in the
+    # environment of a plain shell must not conjure an "inside psmux" answer.
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.setenv("TMUX_PANE", "%4")
+    rec = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", rec)
+    assert PsmuxMultiplexer().current_pane_id() is None
     assert rec.calls == []
 
 
@@ -731,78 +789,14 @@ def test_current_window_id_none_on_unparseable_probe(monkeypatch):
         assert PsmuxMultiplexer().current_window_id() is None, answer
 
 
-def test_select_window_resolves_qualified_id_to_index(monkeypatch):
-    # psmux exits 1 with "can't find window: @3" for the id form, because the
-    # CLI-side existence check compares only against #{window_index}/#{window_name}.
-    recorder = _RecordRun(stdout="@1\t0\n@3\t2\n")
-    monkeypatch.setattr(tmux_base.subprocess, "run", recorder)
-    PsmuxMultiplexer().select_window("ctl:@3")
-    assert recorder.calls[0][0][1:] == [
-        "list-windows",
-        "-t",
-        "=ctl",
-        "-F",
-        "#{window_id}\t#{window_index}",
-    ]
-    assert recorder.argv[1:] == ["select-window", "-t", "ctl:2"]
-
-
-def test_select_window_resolve_scopes_the_lookup_to_the_session(monkeypatch):
-    # The lookup must carry -t =<session>: psmux routes by the explicit session,
-    # and an unscoped list-windows would read whichever server the fallback picks.
-    recorder = _RecordRun(stdout="@3\t2\n")
-    monkeypatch.setattr(tmux_base.subprocess, "run", recorder)
-    PsmuxMultiplexer().select_window("ctl:@3")
-    assert "-t" in recorder.calls[0][0] and "=ctl" in recorder.calls[0][0]
-
-
-def test_select_window_unresolved_id_sends_original_target(monkeypatch, capsys):
-    # No matching row: send the id anyway (guessing an index would focus an
-    # unrelated window) — but warn, because psmux's "can't find window" exit 1
-    # lands in a discarded pipe and the miss would otherwise be untraceable.
-    recorder = _RecordRun(stdout="@1\t0\n")
-    monkeypatch.setattr(tmux_base.subprocess, "run", recorder)
-    PsmuxMultiplexer().select_window("ctl:@9")
-    assert recorder.argv[1:] == ["select-window", "-t", "ctl:@9"]
-    assert "could not resolve ctl:@9" in capsys.readouterr().err
-
-
-def test_select_window_resolve_failure_sends_original_target(monkeypatch, capsys):
-    # A transport failure during the resolve must not escalate: select_window is
-    # best-effort, so it degrades to the unresolved target (with the same
-    # warning as a resolve miss), never raises — and it must still SEND, not
-    # swallow the verb along with the failure.
-    sent = []
-
-    def fake(argv, **kwargs):
-        if argv[1] == "list-windows":
-            raise subprocess.TimeoutExpired(argv, 1)
-        sent.append(argv)
-        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
-    PsmuxMultiplexer().select_window("ctl:@3")  # must not raise
-    assert sent and sent[-1][1:] == ["select-window", "-t", "ctl:@3"]
-    assert "could not resolve ctl:@3" in capsys.readouterr().err
-
-
-def test_select_window_resolves_equals_prefixed_qualified_id(monkeypatch):
-    # target(session, "@3") composes `=ctl:@3`, which the seam documents as a
-    # legal argument here. Matching without stripping the `=` would capture the
-    # session as "=ctl" and look up `-t ==ctl`; psmux strips only one `=`, so the
-    # resolve would miss and the select would quietly focus nothing.
-    recorder = _RecordRun(stdout="@3\t2\n")
-    monkeypatch.setattr(tmux_base.subprocess, "run", recorder)
-    PsmuxMultiplexer().select_window("=ctl:@3")
-    assert recorder.calls[0][0][3] == "=ctl"
-    assert recorder.argv[1:] == ["select-window", "-t", "ctl:2"]
-
-
-def test_select_window_name_token_passes_through(rec):
-    # A target() name token already resolves CLI-side; it must not be rewritten.
-    PsmuxMultiplexer().select_window("=ctl:run-abc")
-    assert rec.argv[1:] == ["select-window", "-t", "=ctl:run-abc"]
-    assert len(rec.calls) == 1  # no resolve lookup spawned
+@pytest.mark.parametrize("target", ["ctl:@3", "=ctl:@3", "=ctl:run-abc"])
+def test_select_window_sends_every_target_form_unrewritten(rec, target):
+    # psmux 3.3.8 resolves a scoped window-id target server-side (psmux/psmux#497),
+    # so the backend inherits the base verb: no index resolve, no extra listing
+    # round-trip, and the qualified id this backend mints is sent verbatim.
+    PsmuxMultiplexer().select_window(target)
+    assert rec.argv[1:] == ["select-window", "-t", target]
+    assert len(rec.calls) == 1
 
 
 def test_tmux_backend_keeps_bare_tui_ids(monkeypatch, tmp_path):
@@ -1087,6 +1081,44 @@ def test_kill_window_failed_kill_retains_the_keys(monkeypatch):
     assert not [c for c in recorder.calls if c[0][1] in ("set-option", "show-options")]
 
 
+def test_kill_window_failure_warning_reads_the_qualified_listing(monkeypatch, capsys):
+    # The base's survivor probe checks membership against list_window_ids,
+    # which this backend qualifies (`ctl:@3`, not the base's bare `@3`); the
+    # probe must recognize the surviving window through that shape or a failed
+    # psmux kill would never warn.
+    def fake(argv, **kwargs):
+        if argv[1] == "kill-window":
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="boom\n")
+        out = "@1\n@3\n" if argv[1] == "list-windows" else ""
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    PsmuxMultiplexer().kill_window("ctl:@3")
+    err = capsys.readouterr().err
+    assert "kill-window ctl:@3 exited 1" in err
+    assert "still alive" in err
+
+
+def test_kill_window_failure_warning_survives_an_exact_match_target(monkeypatch, capsys):
+    # Same probe, the other target shape this seam accepts: `_option_scope`
+    # normalizes a leading `=`, so the survivor probe has to as well — comparing
+    # the raw `=ctl:@3` against a listing of `ctl:@3` matches nothing and would
+    # silence the warning on exactly the leak it exists to report.
+    # Ablation: compare `target` instead of the rebuilt qualified id and this
+    # fails on a missing warning while the sibling test above still passes.
+    def fake(argv, **kwargs):
+        if argv[1] == "kill-window":
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="boom\n")
+        out = "@1\n@3\n" if argv[1] == "list-windows" else ""
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    PsmuxMultiplexer().kill_window("=ctl:@3")
+    err = capsys.readouterr().err
+    assert "kill-window =ctl:@3 exited 1" in err
+    assert "still alive" in err
+
+
 def test_kill_window_unverifiable_liveness_retains_the_keys(monkeypatch):
     # An empty liveness listing is a failed probe, not proof of death (the ctl
     # session always keeps its shell window) — retaining beats freeing a live
@@ -1243,44 +1275,48 @@ def test_kill_window_unroutable_target_skips_cleanup_but_kills(monkeypatch):
 @pytest.mark.parametrize(
     "value",
     [
-        "a;b",  # server splits top-level `;` — remainder would EXECUTE
-        "-flag",  # dropped as a flag server-side (or flips to unset via `u`)
-        "it's",  # bare `'` opens a quote in the server tokenizer
-        'x"y',  # bare `"` toggles quoting
-        "bad\nline",  # control line is `\n`-terminated — command injection
+        'x"y',  # `"`: _scoped_options strips ONE surrounding pair, so it corrupts the read
+        'x " y',  # same, spaced
+        "bad\nline",  # the listing is parsed line-by-line — a break splits the value
+        "bad\rline",  # splitlines() cuts on `\r` too, not just `\n`
         "",  # empty write is a silent server-side no-op; unset exists for this
-        "\\\\srv\\share My Proj",  # spaced → client double-quotes → `\\` collapses
-        "C:\\dir with space\\",  # spaced + trailing `\` → `\"` eats the close
-        'x " y',  # spaced + `"`: after a `\` the client's `\"` closes the wrapper
-        "a ; b",  # standalone `;` token splits even inside the client's quotes
-        "a \\; b",  # standalone `\;` token splits the same way
+        "-flag",  # dropped as a flag server-side, or flips to unset (psmux/psmux#583)
         " C:\\p x",  # leading space survives the wire but this backend's reads strip
         "C:\\p x ",  # trailing space, same round-trip loss
-        "C:\\Users\\O'Brien\\dev",  # SPACELESS `'` — unquoted, so the server tokenizer
-        # opens a quote on it. The spaced sibling below is accepted; the docs call
-        # out the inversion because an apostrophe in a Windows home is common.
     ],
 )
 def test_set_window_option_refuses_untransportable_values(monkeypatch, capsys, value):
-    # The CLI→server hop is lossy for these shapes (verified against psmux's
-    # client re-quoting, chain splitter and server tokenizer at v3.3.7; the
-    # `;`-token corruption reproduced on a live 3.3.7: `a ; b` stores as `a`).
-    # A corrupted stored tag never equals project_tag again — the window turns
-    # silently unprunable — so refuse loudly instead of storing garbage. The
-    # refusal also frees any prior value: a refused REwrite must read as unset,
-    # not replay the stale value (e.g. an old parked return target).
+    # What survives the wire on 3.3.8 is not the whole story: the READ half is
+    # ours, and a `"`, a line break or edge whitespace still cannot come back
+    # verbatim. A corrupted stored tag never equals project_tag again — the
+    # window turns silently unprunable — so refuse loudly instead of storing
+    # garbage. The refusal also frees any prior value: a refused REwrite must
+    # read as unset, not replay the stale value (e.g. an old parked return
+    # target).
     rec_ = _option_fake(monkeypatch)
     PsmuxMultiplexer().set_window_option("ctl:@3", "@bmad_project", value)
     assert [c[0][1:4] for c in rec_.calls] == [["set-option", "-u", "-t"]]
     assert "transport" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("value", ["a; b", "C:\\Users\\O'Brien Files\\proj"])
-def test_set_window_option_accepts_quote_safe_spaced_values(monkeypatch, value):
-    # Inside the client's double quotes `'` is literal and a mid-token `;`
-    # survives the whitespace-token chain splitter (live-verified: `a; b`
-    # round-trips on 3.3.7) — so these MUST pass. A blanket `;`/`'` ban would
-    # silently untag every project path with an apostrophe.
+@pytest.mark.parametrize(
+    "value",
+    [
+        "a; b",
+        "C:\\Users\\O'Brien Files\\proj",
+        "C:\\Users\\O'Brien\\dev",  # spaceless `'` — no longer a quote opener
+        "a;b",  # unspaced `;` (psmux/psmux#499)
+        "a ; b",  # standalone `;` token — the chain splitter is quote-aware now
+        "a \\; b",  # and its `\;` sibling
+        "\\\\srv\\share My Proj",  # spaced UNC — `\\` no longer collapses (#547)
+        "C:\\dir with space\\",  # trailing `\` no longer eats the closing quote
+        "x\u00a0y",  # non-ASCII whitespace no longer splits server-side (#536)
+    ],
+)
+def test_set_window_option_accepts_wire_safe_values(monkeypatch, value):
+    # Every ordinary Windows path shape 3.3.8 carries verbatim MUST pass: a
+    # gate still refusing them would silently untag apostrophed, UNC, spaced
+    # and trailing-separator project directories.
     rec_ = _option_fake(monkeypatch)
     PsmuxMultiplexer().set_window_option("ctl:@3", "@bmad_project", value)
     assert rec_.argv[-1] == value
@@ -1298,21 +1334,14 @@ def test_set_window_option_write_failure_warns(monkeypatch, capsys):
 @pytest.mark.parametrize(
     "value",
     [
-        "C:\\a ; b\\proj",  # live-probed: stores as `C:\a`, remainder EXECUTES
-        "C:\\projects\\my proj\\",  # live-probed: trailing `\` eats the closing quote
-        "\\\\srv\\share name\\proj",  # live-probed: spaced → `\\` collapses to `\`
-        "C:\\Users\\O'Brien\\proj",  # live-probed UNSPACED `'`: read back as `OBrien`
-        'C:\\a"b\\proj',  # live-probed unspaced `"`: read back as `ab`
-        "-flag",  # dropped as a flag server-side
-        "bad\nline",  # the control line is `\n`-terminated
+        'C:\\a"b\\proj',  # `"` cannot survive the listing's one-quote-pair strip
+        "bad\nline",  # the listing is parsed line-by-line
         "",  # an empty write is a silent server-side no-op
+        "-flag",  # dropped as a flag server-side (psmux/psmux#583)
     ],
 )
 def test_set_session_option_refuses_untransportable_values(monkeypatch, capsys, value):
-    # Same lossy CLI→server hop as the window channel, previously ungated on the
-    # session tag. The first three round-trips were measured on a live psmux
-    # 3.3.7 (sent → read back: `C:\a ; b\proj` → `C:\a`, `C:\projects\my proj\`
-    # → `C:\projects\my proj"`, `\\srv\share name\proj` → `\srv\share name\proj`).
+    # Same gate as the window channel, on a write that was ungated before #320.
     # Refusing leaves the option unset, which the prune's run-dir fallback
     # handles correctly — a corrupted tag would strand the session forever.
     # The refusal FREES the key instead of just returning: the server loads the
@@ -1328,15 +1357,19 @@ def test_set_session_option_refuses_untransportable_values(monkeypatch, capsys, 
 @pytest.mark.parametrize(
     "value",
     [
-        "C:\\my proj\\app",  # spaced but quote-safe
+        "C:\\my proj\\app",  # spaced
         "C:\\app",  # unspaced
-        "\\\\srv\\share\\app",  # unspaced UNC rides verbatim (no client quoting)
-        "C:\\Users\\O'Brien Files\\proj",  # spaced `'` is literal inside the quotes
+        "\\\\srv\\share\\app",  # unspaced UNC
+        "C:\\Users\\O'Brien Files\\proj",  # spaced `'`
+        "C:\\a ; b\\proj",  # `;` tokens no longer split the value (psmux/psmux#499)
+        "C:\\projects\\my proj\\",  # trailing `\` no longer eats the closing quote
+        "\\\\srv\\share name\\proj",  # spaced UNC — `\\` no longer collapses (#547)
+        "C:\\Users\\O'Brien\\proj",  # unspaced `'` no longer opens a quote
     ],
 )
 def test_set_session_option_accepts_transportable_values(monkeypatch, value):
-    # All four were confirmed to round-trip unchanged on live psmux 3.3.7; a
-    # gate that refused them would untag ordinary Windows project paths.
+    # All eight round-trip unchanged on psmux 3.3.8; a gate that refused them
+    # would untag ordinary Windows project paths.
     rec_ = _option_fake(monkeypatch)
     PsmuxMultiplexer().set_session_option("bmad-loop-x", "@bmad_project", value)
     assert rec_.argv[1:] == ["set-option", "-t", "bmad-loop-x", "@bmad_project", value]
@@ -1356,7 +1389,7 @@ def test_set_session_option_refusal_free_failure_warns_not_raises(monkeypatch, c
     # multiplexer must not abort session creation over a tag that is only an
     # optimization — but it must not pass silently either.
     _option_fake(monkeypatch, rc=1)
-    PsmuxMultiplexer().set_session_option("bmad-loop-x", "@bmad_project", "C:\\a ; b")
+    PsmuxMultiplexer().set_session_option("bmad-loop-x", "@bmad_project", 'C:\\a"b')
     err = capsys.readouterr().err
     assert "transport" in err and "failed" in err
 
@@ -1444,14 +1477,34 @@ def test_tmux_backend_forwards_option_columns_to_format(monkeypatch):
     assert rows == [("@1", "shell", "proj")]
 
 
-@pytest.mark.parametrize("value", ["nb\u00a0sp", "tab\there", "with space\u00a0nb"])
-def test_set_window_option_refuses_non_ascii_whitespace(monkeypatch, capsys, value):
-    # The client quotes only on ASCII space while the server tokenizer splits
-    # on Unicode whitespace — an NBSP/tab in an unquoted value splits the token.
+@pytest.mark.parametrize(
+    "value",
+    ["\u00a0lead", "trail\u00a0", "\tlead", "trail\t", " lead", "trail ", "   "],
+)
+def test_set_window_option_refuses_edge_whitespace_of_any_kind(monkeypatch, capsys, value):
+    # Not a wire property: this backend's own reads `.strip()`/`.Trim()`, and
+    # both strip Unicode whitespace, so an edge NBSP or tab reads back short
+    # exactly as an edge ASCII space does. Interior whitespace is fine. An
+    # all-whitespace value is the degenerate case \u2014 it strips to "", i.e. the
+    # empty write the gate refuses outright.
     rec_ = _option_fake(monkeypatch)
     PsmuxMultiplexer().set_window_option("ctl:@3", "@bmad_project", value)
     assert [c[0][1:4] for c in rec_.calls] == [["set-option", "-u", "-t"]]
     assert "transport" in capsys.readouterr().err
+
+
+# `splitlines()` is the refusal, not a `\n` check: it also cuts on \v, \f, the
+# file/group/record separators, NEL and the Unicode line/paragraph separators.
+# Every one of them splits _scoped_options' line-by-line parse, so every one has
+# to be refused \u2014 an `in "\r\n"` rewrite would look equivalent and quietly admit
+# eight corrupting shapes.
+@pytest.mark.parametrize(
+    "sep",
+    ["\n", "\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"],
+    ids=lambda s: f"U+{ord(s):04X}",
+)
+def test_transportable_refuses_every_splitlines_separator(sep):
+    assert not PsmuxMultiplexer._transportable(f"a{sep}b")
 
 
 def test_sweep_snapshots_keys_before_live_windows(monkeypatch, tmp_path):
@@ -1527,12 +1580,26 @@ def test_sweep_transport_exception_never_fails_the_mint(monkeypatch, tmp_path, c
 
 @pytest.mark.parametrize(
     "value",
-    ["a; b", "C:\\Users\\O'Brien Files\\proj", "two  spaces", "C:/p", "\\\\srv\\share"],
+    [
+        "a; b",
+        "a;b",
+        "C:\\Users\\O'Brien Files\\proj",
+        "two  spaces",
+        "C:/p",
+        "\\\\srv\\share",
+        "a ; b",
+        "a \\; b",
+        "C:\\dir with space\\",
+        "\\\\srv\\share My Proj",
+        "x\u00a0y",
+    ],
 )
 def test_accepted_values_round_trip_through_the_listing_parse(monkeypatch, value):
     # The write gate and the read parser are two halves of one invariant:
     # every accepted value must read back IDENTICAL from the `@key "value"`
     # listing shape psmux emits — else the prune's equality compare breaks.
+    # This is the bound on how far the gate may be narrowed: the wire getting
+    # cleaner buys nothing for a shape this parse cannot carry.
     assert PsmuxMultiplexer._transportable(value)
     _option_fake(monkeypatch, value=f'@bmad_project__blw@3 "{value}"\n')
     options = PsmuxMultiplexer()._scoped_options("ctl")
@@ -1576,15 +1643,23 @@ def test_ctl_prune_scan_discriminates_projects_end_to_end(monkeypatch, tmp_path)
 # ---------------------------------------- client verbs: observed effect (#317)
 
 
-def _client_fake(monkeypatch, *, attached, session="ctl", verb_rc=0):
+def _client_fake(monkeypatch, *, attached, session="ctl", verb_rc=0, drains_on_switch=False):
     """Script the two probes the client verbs measure with.
 
     ``attached`` is the successive answers to ``#{session_attached}``, consumed
-    in call order — so a detach that worked is ["1", "0"] and psmux's rc-0 no-op
-    is ["1", "1"]. Every verb exits ``verb_rc`` (0 by default: on psmux the exit
-    code says nothing, which is the whole point).
+    in call order. The delta verbs (``-l``, ``detach-client``) take two each — a
+    detach that worked is ["1", "0"] and psmux's rc-0 no-op is ["1", "1"] — while
+    ``switch-client -t`` takes ONE, the gate count read before it. Every verb
+    exits ``verb_rc`` (0 by default), which only the ``-t`` leg reads.
+
+    ``drains_on_switch`` makes the count answer ``"0"`` from the moment a
+    ``switch-client`` has been seen, i.e. the session empties BECAUSE the verb
+    ran — the one input that tells a gate read taken before the verb apart from
+    one taken after it. Without it that ordering is unobservable here, since
+    either position consumes the same single scripted answer.
     """
     monkeypatch.setenv("TMUX", "/tmp/psmux-1000/default,123,0")  # inside a pane
+    monkeypatch.setenv("TMUX_PANE", "%9")  # the pane the probes pin to (gh-669)
     counts = list(attached)
     calls: list[list] = []
 
@@ -1593,7 +1668,9 @@ def _client_fake(monkeypatch, *, attached, session="ctl", verb_rc=0):
         if argv[1] == "display-message" and argv[-1] == "#{session_name}":
             return subprocess.CompletedProcess(argv, 0, stdout=f"{session}\n", stderr="")
         if argv[1] == "display-message" and argv[-1] == "#{session_attached}":
-            return subprocess.CompletedProcess(argv, 0, stdout=f"{counts.pop(0)}\n", stderr="")
+            drained = drains_on_switch and any(c[1] == "switch-client" for c in calls[:-1])
+            answer = "0" if drained else counts.pop(0)
+            return subprocess.CompletedProcess(argv, 0, stdout=f"{answer}\n", stderr="")
         return subprocess.CompletedProcess(argv, verb_rc, stdout="", stderr="")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
@@ -1636,38 +1713,315 @@ def test_psmux_detach_outside_a_pane_is_false(monkeypatch):
     assert not any(c[1] == "detach-client" for c in calls)
 
 
-def test_psmux_switch_reports_the_drop(monkeypatch):
-    # `last_fallback=True` is what gives the last assertion teeth: with the
-    # default False the `-l` leg is unreachable by construction, so "no fallback
-    # when -t moved it" would hold even with the early return gone. Counts for
-    # two probes for the same reason — a second one must reach the assertion
-    # rather than run the fixture dry.
-    calls = _client_fake(monkeypatch, attached=["1", "0", "1", "0"])
+def test_psmux_switch_reports_a_same_session_move(monkeypatch):
+    """The regression the delta could not see (#659): the target pane lives in
+    THIS session, so the client moves between windows and the attached count
+    never changes. rc plus "there was a client here" is what answers True — and
+    the `-l` leg must stay unreached, since on a live client it drags that human
+    out to whatever session psmux last had, and reports THAT as the success.
+
+    `last_fallback=True` is what gives the last assertion teeth: with the
+    default False the `-l` leg is unreachable by construction. The counts are
+    scripted well past what either leg can consume for the same reason — put
+    the verdict back on the delta and this must fail on its own assertions, not
+    on a fixture running dry.
+    """
+    calls = _client_fake(monkeypatch, attached=["1"] * 6)
     assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is True
     assert ["psmux", "switch-client", "-t", "ctl:%9"] in calls
-    # no fallback when -t moved it
+    assert not any(c[1:3] == ["switch-client", "-l"] for c in calls)
+
+
+def test_psmux_switch_reports_a_cross_session_move(monkeypatch):
+    """The move empties this session, and the gate still admits it: the count is
+    read BEFORE the verb. `drains_on_switch` is what makes that ordering an
+    observable input — take the read after the switch and the emptied session
+    answers 0, refusing the very hand-back that just succeeded."""
+    calls = _client_fake(monkeypatch, attached=["1"] * 4, drains_on_switch=True)
+    assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is True
+    assert ["psmux", "switch-client", "-t", "ctl:%9"] in calls
+    assert not any(c[1:3] == ["switch-client", "-l"] for c in calls)
+    # One gate read, routed at this session — the #315-safe shape the detach
+    # tests pin for the delta legs, and the arity a re-added `after` read breaks.
+    assert calls.count(["psmux", "display-message", "-p", "-t", "ctl", "#{session_attached}"]) == 1
+
+
+def test_psmux_switch_with_nothing_attached_cannot_vouch(monkeypatch):
+    """psmux's switch-client exits 0 with no client to move, so rc alone would be
+    the vacuous True the seam forbids; the gate count refuses it. The verb is
+    still dispatched — the refusal is a verdict, not a skip — but the `-l`
+    fallback must NOT be: it has no target form, so with nobody attached here it
+    can only relocate a stranger's client.
+
+    None, not False: False is the joint claim that the client is still in this
+    window, and a session with nothing attached is the case that flatly refutes
+    its second half. Answering False routes the caller to ATTENDED and leaves a
+    --repeat sweep prompting a window nobody is viewing."""
+    calls = _client_fake(monkeypatch, attached=["0"] * 4)
+    assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is None
+    assert ["psmux", "switch-client", "-t", "ctl:%9"] in calls
+    assert not any(c[1:3] == ["switch-client", "-l"] for c in calls)
+
+
+def test_psmux_switch_does_not_fall_back_after_a_switch_that_succeeded(monkeypatch):
+    """The #659 drag, in the window the gate cannot vouch for: the count is
+    unreadable (any transient probe failure, not just an old build) while the
+    verb exits 0 and, on a supported build, really moved the client. Hanging the
+    fallback on the verdict rather than the rc fires `-l` here — undoing a
+    correct move and, worse, manufacturing the delta that reports it as success.
+
+    And the verdict itself is None: on a supported build the client really did
+    move, so the one thing this exit must not tell the caller is that a human is
+    still sitting in front of this window."""
+    calls = _client_fake(monkeypatch, attached=["#{session_attached}", "1", "0"])
+    assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is None
+    assert ["psmux", "switch-client", "-t", "ctl:%9"] in calls
     assert not any(c[1:3] == ["switch-client", "-l"] for c in calls)
 
 
 def test_psmux_switch_falls_back_then_reports_the_drop(monkeypatch):
-    calls = _client_fake(monkeypatch, attached=["1", "1", "1", "0"])
+    """A target that would not parse or no longer exists exits nonzero — the one
+    direction psmux's exit code was always honest in — so the `-l` leg runs and
+    answers on its own delta."""
+    calls = _client_fake(monkeypatch, attached=["1", "1", "0"], verb_rc=1)
     assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is True
     assert ["psmux", "switch-client", "-l"] in calls
 
 
-def test_psmux_switch_is_false_while_the_leg_is_inert(monkeypatch):
-    """psmux/psmux#483: the switch moves no client, and every arm still exits 0.
-    Both legs are attempted and both read as no effect, so the caller keeps
-    prompting instead of being told the human was handed their terminal back."""
-    calls = _client_fake(monkeypatch, attached=["1", "1", "1", "1"])
+def test_psmux_switch_is_false_when_both_legs_fail(monkeypatch):
+    calls = _client_fake(monkeypatch, attached=["1", "1", "1"], verb_rc=1)
     assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is False
     assert ["psmux", "switch-client", "-t", "ctl:%9"] in calls
     assert ["psmux", "switch-client", "-l"] in calls
 
 
+def test_psmux_switch_never_claims_an_unobservable_move(monkeypatch):
+    """A build with no #{session_attached} to read cannot establish that a client
+    was here, so rc 0 never becomes True — but the verb is dispatched anyway, so
+    the degraded read costs the caller nothing but the claim.
+
+    It costs it the opposite claim too, which is why this is None and not False.
+    An unreadable count does not say WHICH world this is: on a pre-floor build
+    `-t` is inert (psmux/psmux#483) and the client certainly stayed, while a
+    transient probe failure on a supported build means it certainly moved — the
+    case its sibling test pins. One branch, two physical stories, and nothing
+    here can tell them apart. None is the only answer that does not pick one."""
+    calls = _client_fake(monkeypatch, attached=["#{session_attached}"] * 3)
+    assert PsmuxMultiplexer().switch_client("ctl:%9") is None
+    assert ["psmux", "switch-client", "-t", "ctl:%9"] in calls
+
+
+def test_psmux_switch_survives_a_transport_fault(monkeypatch):
+    """A `-t` that cannot be spawned at all moved nobody — the documented False
+    sentinel, never an escalation out of a seam whose callers treat the answer as
+    advisory. The fault is scoped to `-t` on purpose: faulting both legs could
+    not tell "the fallback ran and also faulted" from "it was never reached",
+    and reaching it is the claim here — a fault is a failed switch, so the
+    fallback is exactly as available as it is after a nonzero rc."""
+    calls = _client_fake(monkeypatch, attached=["1", "1", "0"])
+    probing = tmux_base.subprocess.run  # the fixture's scripted probes
+
+    def boom(argv, **kwargs):
+        if argv[1:3] == ["switch-client", "-t"]:
+            raise OSError("psmux vanished mid-call")
+        return probing(argv, **kwargs)
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", boom)
+    assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is True
+    assert ["psmux", "switch-client", "-l"] in calls
+
+
+def test_psmux_switch_failed_rc_with_empty_session_still_dispatches_the_fallback(monkeypatch):
+    """The one released `-l` with nobody attached here: a failed `-t` frees the
+    fallback regardless of the gate, and `_client_left` then dispatches it and
+    answers on its own delta. Pinned as the fallback leg's pre-#659 shape —
+    skipping `-l` on an empty session would be a behavior change with its own
+    review, not a side effect of the verdict split.
+
+    0 -> 0 is no drop, but it is not the joint claim either: nobody was here to
+    stay, so the leg answers None and the sweep stops prompting."""
+    calls = _client_fake(monkeypatch, attached=["0", "0", "0"], verb_rc=1)
+    assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is None
+    assert ["psmux", "switch-client", "-l"] in calls
+
+
+def test_psmux_switch_timeout_does_not_fall_back(monkeypatch):
+    """A timeout is the absence of an answer, not a failed switch: the server may
+    have moved the client before the wait ran out. Treating it as proven failure
+    fires `-l` at a client that already went where it was asked — the #659 drag,
+    which then manufactures the delta that reports it as a success.
+
+    None is the same refusal one level up: a False would tell the return path
+    the client is still in this window, and the surviving return option is no
+    rescue when the caller answers that by blocking on input() here."""
+    calls = _client_fake(monkeypatch, attached=["1", "1", "0"])
+    probing = tmux_base.subprocess.run
+
+    def stall(argv, **kwargs):
+        if argv[1:3] == ["switch-client", "-t"]:
+            raise subprocess.TimeoutExpired(argv, 30)
+        return probing(argv, **kwargs)
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", stall)
+    assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is None
+    assert not any(c[1:3] == ["switch-client", "-l"] for c in calls)
+
+
+def test_psmux_switch_fallback_timeout_cannot_vouch(monkeypatch):
+    """The `-t` leg is not the only one that can relocate a client without
+    saying so. A `-l` whose answer never arrives may have moved the operator
+    anyway, so the delta legs owe the same None — otherwise the walked-away
+    client lands back in the ATTENDED bucket through the one path the #659 fix
+    left measuring.
+
+    The dispatch is recorded inside the stall, not read off `calls`: the raise
+    pre-empts the fixture, and without the record "the fallback timed out" and
+    "the fallback was never reached" would assert the same."""
+    _client_fake(monkeypatch, attached=["1", "1", "1"], verb_rc=1)
+    probing = tmux_base.subprocess.run
+    dispatched: list[list[str]] = []
+
+    def stall(argv, **kwargs):
+        if argv[1:3] == ["switch-client", "-l"]:
+            dispatched.append(list(argv))
+            raise subprocess.TimeoutExpired(argv, 30)
+        return probing(argv, **kwargs)
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", stall)
+    assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is None
+    assert dispatched == [["psmux", "switch-client", "-l"]]
+
+
+def test_psmux_switch_fallback_with_an_unreadable_count_cannot_vouch(monkeypatch):
+    """`-l` dispatched, its drop unmeasurable: the verb may have relocated the
+    client, so the leg answers None rather than claiming one stayed. Only the
+    fallback's own pair degrades — the `-t` gate read is scripted readable, so a
+    blanket-unreadable fixture could not tell this from the rc-0 gate's None."""
+    calls = _client_fake(
+        monkeypatch, attached=["1", "#{session_attached}", "#{session_attached}"], verb_rc=1
+    )
+    assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is None
+    assert ["psmux", "switch-client", "-l"] in calls
+
+
+def test_psmux_detach_timeout_still_answers_false(monkeypatch):
+    """`_client_left` widened to a tri-state for the switch leg; the detach leg
+    must not widen with it. Its caller already routes a failed detach to
+    UNREACHABLE, so a None here would be a seam state with no consumer — and
+    `detach_client` is typed bool."""
+    _client_fake(monkeypatch, attached=["1", "0"])
+    probing = tmux_base.subprocess.run
+
+    def stall(argv, **kwargs):
+        if argv[1] == "detach-client":
+            raise subprocess.TimeoutExpired(argv, 30)
+        return probing(argv, **kwargs)
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", stall)
+    assert PsmuxMultiplexer().detach_client() is False
+
+
+def test_psmux_switch_transport_fault_without_fallback_is_false(monkeypatch):
+    _client_fake(monkeypatch, attached=["1", "1", "1"])
+    probing = tmux_base.subprocess.run
+
+    def boom(argv, **kwargs):
+        if argv[1:3] == ["switch-client", "-t"]:
+            raise OSError("psmux vanished mid-call")
+        return probing(argv, **kwargs)
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", boom)
+    assert PsmuxMultiplexer().switch_client("ctl:%9") is False
+
+
+def test_psmux_switch_outside_a_pane_is_false(monkeypatch):
+    """No TMUX, so current_session answers None: no session to gate against and
+    no client of ours to move. Answer False without issuing the switch."""
+    calls = _client_fake(monkeypatch, attached=["1", "1"])
+    monkeypatch.delenv("TMUX", raising=False)
+    assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is False
+    assert not any(c[1] == "switch-client" for c in calls)
+
+
 def test_psmux_switch_without_fallback_does_not_attempt_it(monkeypatch):
-    # Scripted for two probes though one is expected: dropping the `last_fallback`
-    # conjunct must fail this on its assertion, not on the counts running dry.
-    calls = _client_fake(monkeypatch, attached=["1", "1", "1", "1"])
+    # Scripted past the gate though the fallback is not expected: dropping the
+    # `last_fallback` conjunct must fail this on its assertion, not on the
+    # counts running dry.
+    calls = _client_fake(monkeypatch, attached=["1", "1", "1"], verb_rc=1)
     assert PsmuxMultiplexer().switch_client("ctl:%9") is False
     assert not any(c[1:3] == ["switch-client", "-l"] for c in calls)
+
+
+def test_psmux_switch_failed_rc_on_an_empty_session_cannot_vouch(monkeypatch):
+    """The rc-nonzero twin of the gate above. Read what a nonzero rc means HERE
+    before reading across from tmux: the live gate bounds psmux's exit code from
+    both sides, and it does not divide the way tmux's does. A `-t` with nothing
+    to move exits ZERO on this backend (test_premise_client_verbs_exit_zero_...)
+    — psmux reports dispatch, not effect, which is the whole reason the count
+    gate exists — and rc goes nonzero for a target that cannot RESOLVE
+    (test_adopted_switch_client_rejects_an_unresolvable_target). So this state is
+    a stale target over an empty session, not tmux's "no current client", which
+    psmux never spends this code on.
+
+    That makes it an edge rather than the return path's common shape, and the
+    gate is still owed: the refusal proves no switch happened — the first half of
+    the seam's False — while a measured 0 refutes the second half rather than
+    supporting it, so the joint claim is not available and the answer is None.
+
+    Scripted past the gate though no fallback is expected, so dropping the gate
+    fails this on its assertion rather than on the counts running dry."""
+    calls = _client_fake(monkeypatch, attached=["0", "0", "0"], verb_rc=1)
+    assert PsmuxMultiplexer().switch_client("ctl:%9") is None
+    assert ["psmux", "switch-client", "-t", "ctl:%9"] in calls
+
+
+def test_psmux_switch_failed_rc_with_an_unreadable_count_cannot_vouch(monkeypatch):
+    """The gate's other half, pinned separately: a count that cannot be read at
+    all. `verb_rc=1` is what separates this from the rc-0 arm's None — the two
+    branches answer alike but are reached through opposite exit codes, so a
+    fixture that left the rc at 0 would grade the wrong gate."""
+    calls = _client_fake(monkeypatch, attached=["#{session_attached}"] * 3, verb_rc=1)
+    assert PsmuxMultiplexer().switch_client("ctl:%9") is None
+    assert ["psmux", "switch-client", "-t", "ctl:%9"] in calls
+
+
+def test_psmux_switch_transport_fault_on_an_empty_session_cannot_vouch(monkeypatch):
+    """A spawn-level fault proves the verb never ran, which is why its sibling
+    (a client measurably here) stays False. It says nothing about whether anyone
+    is at this terminal, and that half is already in hand: the gate count is read
+    BEFORE the verb, so this leaf can answer it on the fault exit too, where a
+    probe taken afterwards would only be measuring the broken transport."""
+    _client_fake(monkeypatch, attached=["0", "0", "0"])
+    probing = tmux_base.subprocess.run
+
+    def boom(argv, **kwargs):
+        if argv[1:3] == ["switch-client", "-t"]:
+            raise OSError("psmux vanished mid-call")
+        return probing(argv, **kwargs)
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", boom)
+    assert PsmuxMultiplexer().switch_client("ctl:%9") is None
+
+
+def test_psmux_switch_fallback_transport_fault_on_an_empty_session_cannot_vouch(monkeypatch):
+    """The same rule one level down. `_client_left`'s fault exit answered False
+    without consulting the count it had already taken, which its own docstring
+    forbids — None when the session had nobody on it to begin with — and the
+    fallback leg is the path that carried it back to the seam.
+
+    The dispatch is recorded inside the fault, not read off `calls`: the raise
+    pre-empts the fixture, so "the fallback faulted" and "the fallback was never
+    reached" would otherwise assert the same."""
+    _client_fake(monkeypatch, attached=["0", "0", "0"], verb_rc=1)
+    probing = tmux_base.subprocess.run
+    dispatched: list[list[str]] = []
+
+    def boom(argv, **kwargs):
+        if argv[1:3] == ["switch-client", "-l"]:
+            dispatched.append(list(argv))
+            raise OSError("psmux vanished mid-call")
+        return probing(argv, **kwargs)
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", boom)
+    assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is None
+    assert dispatched == [["psmux", "switch-client", "-l"]]
