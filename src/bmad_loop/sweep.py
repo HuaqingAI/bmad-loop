@@ -18,10 +18,16 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from . import deferredwork, gates, verify
-from .engine import Engine, RunPaused
+from .engine import Engine, RunPaused, _ArmedClose, _LedgerAnchor
 from .escalation import critical_escalations, env_fault_pause_reason, session_failure_reason
 from .model import PAUSE_STORY_GATE, Phase, StoryTask
-from .platform_util import atomic_write_text, neutralize_surrogates
+from .platform_util import (
+    atomic_write_text,
+    atomic_write_text_confined,
+    neutralize_surrogates,
+    safe_segment,
+)
+from .runs import _project_of_run_dir
 from .statemachine import advance
 from .workspace import discard_worktree
 
@@ -195,6 +201,17 @@ def validate_triage(
         name = str(item.get("name", ""))
         if not BUNDLE_NAME_RE.match(name):
             errors.append(f"bundle name {name!r} invalid (want {BUNDLE_NAME_RE.pattern})")
+        # The one rule BUNDLE_NAME_RE cannot express. A cycle-1 bundle's name IS its
+        # directory (`_write_intent`), and the reserved Windows device basenames --
+        # CON, NUL, AUX, PRN, COM<N>, LPT<N> -- are `[a-z0-9-]`-legal names that no
+        # Windows filesystem will accept as one (matched case-insensitively, so
+        # lowercase is no reprieve). Testing `safe_segment` identity rather than a
+        # hand-written device list keeps this gate in lockstep with the sanitizer
+        # that defines the set: the identical idiom, for the identical reason, as
+        # `runs.is_valid_run_id`. Guarded on the match above so one bad name yields
+        # one error and not two.
+        if BUNDLE_NAME_RE.match(name) and safe_segment(name) != name:
+            errors.append(f"bundle name {name!r} is not a legal path segment")
         if name in names:
             errors.append(f"duplicate bundle name {name!r}")
         names.add(name)
@@ -250,6 +267,18 @@ def validate_triage(
             bundle_name = str(raw.get("bundle_name", ""))
             if bundle_name and not BUNDLE_NAME_RE.match(bundle_name):
                 errors.append(f"decision {dw_id} option {key}: bad bundle_name {bundle_name!r}")
+            # The second site that mints a bundle directory, gated for the reason
+            # stated at the `bundles` loop above. A build-effect option's
+            # `bundle_name` becomes `Bundle.name` in `_materialize_bundles`, so it
+            # reaches `_write_intent`'s cycle-1 directory by the identical path --
+            # `BUNDLE_NAME_RE` is no more able to express the rule here than there.
+            # Guarded on the match above so one bad name yields one error, and on
+            # nothing else: an absent `bundle_name` fails that match already.
+            if BUNDLE_NAME_RE.match(bundle_name) and safe_segment(bundle_name) != bundle_name:
+                errors.append(
+                    f"decision {dw_id} option {key}: bundle_name {bundle_name!r} "
+                    "is not a legal path segment"
+                )
             if effect == "build" and bundle_name:
                 if bundle_name in names:
                     errors.append(f"duplicate bundle name {bundle_name!r}")
@@ -712,8 +741,15 @@ class SweepEngine(Engine):
 
         ledger = self.workspace.paths.deferred_work
         text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+        # The store lives under the project that owns `run_dir`, never
+        # `self.workspace.root`: under the `repo_root` override the two diverge
+        # and a workspace-rooted prune trimmed a store that does not exist,
+        # leaving consumed entries behind (the comment in `_decisions_phase`
+        # says why the run dir is the stable anchor). The ledger read above is
+        # unaffected — `deferred_work` hangs off `implementation_artifacts`,
+        # which stays project-rooted under the override.
         dropped = decisions_store.prune_pre_answers(
-            self.workspace.root, deferredwork.open_ids(text)
+            _project_of_run_dir(self.run_dir), deferredwork.open_ids(text)
         )
         if dropped:
             self.journal.append("decision-preanswers-pruned", dw_ids=dropped)
@@ -947,7 +983,15 @@ class SweepEngine(Engine):
             if crits:
                 details = "; ".join(str(e.get("detail", e.get("type", "?"))) for e in crits)
                 self._escalate(task, f"CRITICAL escalation from migration session: {details}")
-            new_text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+            # Split so ABSENCE survives: `new_text` stays `str` for
+            # `validate_migration`, while `rewrite` keeps the difference between
+            # "the session emptied the ledger" and "the session deleted it". On
+            # an untracked ledger the restore below has no blob to anchor on and
+            # this rejected rewrite — the exact text this attempt graded — is the
+            # anchor instead, so flattening `None` to `""` here would make the
+            # deleted-ledger case indistinguishable from a rival's empty write.
+            rewrite = ledger.read_text(encoding="utf-8") if ledger.is_file() else None
+            new_text = rewrite if rewrite is not None else ""
             if result.status != "completed":
                 errors = [session_failure_reason("migration", result)]
             else:
@@ -992,8 +1036,75 @@ class SweepEngine(Engine):
             # covers tracked files, the explicit write covers an untracked
             # ledger that `git reset` cannot restore
             self._safe_reset(task)
-            ledger.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write_text(ledger, text)
+            # The WRITE anchor derives from the committed blob, never from an
+            # observation of the tree taken after the very reset it would attest
+            # to: a rival writing a tracked ledger inside that window would BE
+            # the observation, and this restore would overwrite it (#735). Probed
+            # BEFORE the lock — it spawns git, and `ledger_lock` may cover file
+            # I/O only, which no reset window can (#286). A ledger git does not
+            # own has no blob to anchor on, and `reset --hard` cannot have
+            # touched it either, so there the anchor is the rejected rewrite this
+            # attempt actually graded — down to `None == None` when the session
+            # deleted the ledger outright. No anchor at all withholds the write.
+            anchor, committed = self._ledger_baseline_text(task)
+            expected = committed if committed is not None else rewrite
+            diverged = False
+            with deferredwork.ledger_lock(ledger):
+                # PURE TEXT ONLY under the hold — `ledger_lock` is not reentrant
+                # and every mutator takes it.
+                current = ledger.read_text(encoding="utf-8") if ledger.is_file() else None
+                if anchor is _LedgerAnchor.NO_RESET_CONTENT and current == text:
+                    # ALREADY the text this restore exists to write, so it is
+                    # done and there is nothing to escalate. Reachable without
+                    # any rival: a session that atomic-SAVES the ledger replaces
+                    # a tracked symlink with a regular file, `reset --hard` puts
+                    # the link back, and the external target it cannot reach was
+                    # never rewritten — so the ledger is correct while `rewrite`,
+                    # read off the regular file, is not what is on disk. Demanding
+                    # the anchor here would escalate a finished restore and spend
+                    # the attempt budget on it.
+                    #
+                    # Scoped to NO_RESET_CONTENT deliberately. On a BASELINE
+                    # anchor the reset republishes the committed text, so
+                    # `current == text` is the ORDINARY post-reset state and
+                    # accepting it there would retire the divergence check and
+                    # the probe-fault escalation along with it. Only where the
+                    # reset restored no text of its own is "already correct"
+                    # information the anchor cannot supply.
+                    pass
+                # Either anchor will do below, unlike the engine's two restores:
+                # this site supplies its own text for the no-reset-content case
+                # (`rewrite`, which it graded), so `expected` is never the bare
+                # `None` that would read a rival's deletion as the reset's work.
+                elif anchor is not _LedgerAnchor.NONE and current == expected:
+                    ledger.parent.mkdir(parents=True, exist_ok=True)
+                    atomic_write_text(ledger, text)
+                else:
+                    diverged = True
+            if diverged:
+                # No merge and no silent skip. The comment above is the reason:
+                # leaving the rejected rewrite standing IS re-prompting over a
+                # half-broken ledger, and the migration input a human must fix is
+                # no longer the one this attempt was graded against — the same
+                # call `migrate-duplicate-ids` makes about a corrupt ledger.
+                # A baseline probe that could not answer lands here too, and
+                # deliberately: without an anchor there is no proof the text on
+                # disk is the reset's own work rather than somebody's live write,
+                # and an unprovable restore is exactly the overwrite this arm
+                # exists to refuse. The escalation is the right recovery for both
+                # — the resume above resets the attempt budget and re-reads the
+                # ledger, which is what a rival-corrupted migration input needs.
+                # Journaled outside the hold; `_escalate` raises.
+                self.journal.append(
+                    "sweep-migration-restore-diverged",
+                    story_key=MIGRATE_KEY,
+                    ledger=str(ledger),
+                )
+                self._escalate(
+                    task,
+                    "the ledger changed underneath the failed migration attempt — "
+                    "re-run the sweep",
+                )
             if task.attempt >= self.policy.sweep.max_migration_attempts:
                 self._escalate(
                     task, "migration failed deterministic validation: " + "; ".join(errors)
@@ -1122,12 +1233,21 @@ class SweepEngine(Engine):
     def _close_resolved(self, plan: TriagePlan) -> int:
         self._emit("pre_close_resolved")
         ledger = self.workspace.paths.deferred_work
-        closed = []
-        for entry in plan.already_resolved:
-            if deferredwork.mark_done(
-                ledger, entry.id, self._today(), f"already resolved: {entry.evidence}"
-            ):
-                closed.append(entry.id)
+        # ONE locked read->edit->write for the whole batch (#286/#469). The
+        # per-entry `mark_done` loop this replaces took the cross-process ledger
+        # lock once per id, leaving a rival writer — a live run's harvest, the TUI
+        # decision modal, `sweep --archive` — a window between every pair of
+        # closures, so half this phase's closures could be lost while the other
+        # half landed and the journal claimed all of them. `notes=` carries the
+        # per-entry evidence the loop passed positionally, so the resulting ledger
+        # text and the returned ids (order preserved, skips dropped) are unchanged.
+        closed = deferredwork.mark_done_many(
+            ledger,
+            [entry.id for entry in plan.already_resolved],
+            self._today(),
+            "already resolved",
+            notes=[f"already resolved: {entry.evidence}" for entry in plan.already_resolved],
+        )
         if closed:
             self.journal.append("sweep-resolved-closed", dw_ids=closed)
         self._commit_ledger("chore(sweep): close resolved deferred-work entries")
@@ -1138,6 +1258,14 @@ class SweepEngine(Engine):
         from . import decisions as decisions_store  # lazy: decisions imports sweep
 
         decisions_path = self.run_dir / "decisions.json"
+        # The project that OWNS `run_dir`, not `self.workspace.root`: under the
+        # supported `repo_root` override (isolation = "none") the workspace root
+        # is the separate code repo while the run dir — and the project-level
+        # pre-answer store — stay under the PROJECT, so a workspace-rooted
+        # confinement refused every write here and a workspace-rooted read
+        # silently ignored the store. Derived from the run dir's own shape, which
+        # no workspace swap moves.
+        project_root = _project_of_run_dir(self.run_dir)
         answers: dict[str, dict[str, str]] = (
             _read_json(decisions_path) if decisions_path.is_file() else {}
         )
@@ -1146,7 +1274,7 @@ class SweepEngine(Engine):
         # unattended/abandoned sweep left). The ledger edits were already applied
         # when they answered, so here we only take the answer onboard — this run
         # won't re-prompt/re-skip and build answers materialize into bundles.
-        pre = decisions_store.load_pre_answers(self.workspace.root)
+        pre = decisions_store.load_pre_answers(project_root)
         seeded = False
         for decision in plan.decisions:
             if decision.id in answers or decision.id not in pre:
@@ -1166,9 +1294,19 @@ class SweepEngine(Engine):
             # project-level `.bmad-loop/decisions.json` is a different file with a
             # near-identical temp name — that is the exposed one. Taken anyway for
             # the fsync and the unique temp name, which two writers of one key
-            # would otherwise collide on. follow_symlinks=False replaces the NAME,
-            # which is what the bare replace did too.
-            atomic_write_text(decisions_path, json.dumps(answers, indent=2), follow_symlinks=False)
+            # would otherwise collide on. Confined to the project root (#593):
+            # replacing the NAME, as the bare replace did, left `.bmad-loop/` and
+            # `runs/` above it resolved by name, and a link planted at either
+            # aimed this write out of the project. The root has to be the PROJECT
+            # (`project_root` above; its comment says why not
+            # `self.workspace.root`) — and not `self.run_dir` either: a file
+            # confined against its own parent walks no components at all, which
+            # would refuse nothing.
+            atomic_write_text_confined(
+                decisions_path,
+                json.dumps(answers, indent=2),
+                confine_root=project_root,
+            )
         pending = [d for d in plan.decisions if d.id not in answers]
         answered_interactively = False
         if not self.prompting:
@@ -1204,8 +1342,10 @@ class SweepEngine(Engine):
                     "effect": option.effect,
                     "answered_at": self._today(),
                 }
-                atomic_write_text(  # same file, same reasoning as the seeded write above (#363)
-                    decisions_path, json.dumps(answers, indent=2), follow_symlinks=False
+                atomic_write_text_confined(  # same file, same reasoning as above (#363, #593)
+                    decisions_path,
+                    json.dumps(answers, indent=2),
+                    confine_root=project_root,
                 )
                 self.journal.append(
                     "decision-answered",
@@ -1265,12 +1405,20 @@ class SweepEngine(Engine):
     def _apply_decision_effect(self, decision: Decision, option: DecisionOption) -> None:
         ledger = self.workspace.paths.deferred_work
         detail = option.resolution or option.intent
-        deferredwork.append_decision(ledger, decision.id, self._today(), option.label, detail)
+        close_note = None
         if option.effect == "close":
-            note = "closed by human decision" + (
+            close_note = "closed by human decision" + (
                 f": {option.resolution}" if option.resolution else ""
             )
-            deferredwork.mark_done(ledger, decision.id, self._today(), note)
+        # ONE locked read->edit->write (#286/#469). As the `append_decision` +
+        # `mark_done` pair it was two acquisitions with a window between them, and
+        # a rival writer landing there saw an entry whose decision line says "close
+        # it" and whose status still says open — a human answer half-recorded. The
+        # bytes are identical to the pair's: `record_decision` inserts the decision
+        # line before it applies the close, which is the order the pair produced.
+        deferredwork.record_decision(
+            ledger, decision.id, self._today(), option.label, detail, close_note=close_note
+        )
 
     def _commit_ledger(self, message: str) -> None:
         """Commit pending orchestrator ledger edits; bundles need a clean
@@ -1303,6 +1451,24 @@ class SweepEngine(Engine):
             bundle_name = (option.bundle_name if option else "") or str(
                 answer.get("bundle_name", "")
             )
+            # A pre-answer's bundle_name never passed `validate_triage` — it was
+            # answered out of band against an earlier triage, and a fresh one can
+            # renumber or drop the option it named — so this fallback lane was the
+            # one route by which a name failing the two option-site gates (#637)
+            # still reached `_write_intent` as a directory. Gate it with the same
+            # two rules, but by DISCARD rather than by error: the human's build
+            # decision is the payload and `decision-<id>` below is the always-legal
+            # name it falls back to anyway, so the discard is journaled the way
+            # `_normalize_bundle_names`'s repairs are and the sweep proceeds.
+            if bundle_name and (
+                not BUNDLE_NAME_RE.match(bundle_name) or safe_segment(bundle_name) != bundle_name
+            ):
+                self.journal.append(
+                    "sweep-bundle-name-discarded",
+                    decision=decision.id,
+                    original=bundle_name,
+                )
+                bundle_name = ""
             key = (option.key if option else "") or str(answer.get("key", "")) or "?"
             name = bundle_name or "decision-" + decision.id.lower()
             bundles.append(
@@ -1518,7 +1684,7 @@ class SweepEngine(Engine):
         return f"resolved by sweep bundle {task.story_key}"
 
     def _close_declared_deferred(
-        self, task: StoryTask, snapshot: list[tuple[Path, str]] | None = None
+        self, task: StoryTask, snapshot: list[_ArmedClose] | None = None
     ) -> None:
         """No-op: a bundle's ledger closure is owned by
         ``_close_bundle_ledger_when_spec_status``, which runs after accepted dev
@@ -1571,7 +1737,12 @@ class SweepEngine(Engine):
         ledger = self.workspace.paths.deferred_work
         note = self._bundle_close_note(task)
         operation_id = self._bundle_close_operation_id(task)
-        reopened = [i for i in task.dw_ids if deferredwork.mark_open(ledger, i, note, operation_id)]
+        # ONE locked read->edit->write (#286/#469): the per-id `mark_open`
+        # comprehension this replaces took the lock once per id, and a rollback
+        # that leaves some closes undone and others standing is the one shape this
+        # method exists to prevent. Order and skip semantics are `mark_open_many`'s
+        # own, which are the comprehension's.
+        reopened = deferredwork.mark_open_many(ledger, list(task.dw_ids), note, operation_id)
         if reopened:
             self.journal.append("sweep-bundle-reopened", story_key=task.story_key, dw_ids=reopened)
 

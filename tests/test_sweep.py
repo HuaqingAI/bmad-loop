@@ -1,7 +1,9 @@
 """Sweep engine scenario tests against the mock adapter — no tmux, no LLM."""
 
+import contextlib
 import json
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -24,11 +26,12 @@ from conftest import (
     write_spec,
 )
 
-from bmad_loop import deferredwork, runs
+from bmad_loop import deferredwork, platform_util, runs
 from bmad_loop import sweep as sweep_mod
 from bmad_loop import verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
+from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.journal import Journal, load_state, save_state
 from bmad_loop.model import PAUSE_STORY_GATE, Phase, RunState, StoryTask, TokenUsage
 from bmad_loop.policy import (
@@ -284,6 +287,171 @@ def test_bundle_key_re_refuses_a_trailing_newline():
     assert BUNDLE_KEY_RE.match("dw-foo").groups() == ("", "foo")
     assert BUNDLE_KEY_RE.match("dw2-foo").groups() == ("2", "foo")
     assert BUNDLE_KEY_RE.match("dw-c2-foo").group(2) == "c2-foo"
+
+
+# ------------------------------ reserved Windows device basenames (#637)
+#
+# The third axis on the same "a bundle name IS a path segment" surface. A
+# reserved device basename is `[a-z0-9-]`-legal and at least 2 characters, so
+# BUNDLE_NAME_RE accepts every one of them, and a cycle-1 bundle turns the name
+# into run_dir/bundles/<name>/ verbatim -- a directory native Windows will not
+# create. The gate is `safe_segment` identity, so the accepted set stays in
+# lockstep with the sanitizer instead of a second hand-written device list.
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["con", "nul", "aux", "prn", "com1", "com9", "lpt1", "lpt9"],
+    ids=["con", "nul", "aux", "prn", "com1", "com9", "lpt1", "lpt9"],
+)
+def test_validate_triage_rejects_reserved_device_bundle_names(name):
+    """ABLATION: delete the safe_segment identity gate and every row here accepts."""
+    rj = triage_result(["DW-1"], bundles=[{"name": name, "dw_ids": ["DW-1"], "intent": "do x"}])
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    # Exactly one error, not merely one that matches: these names pass
+    # BUNDLE_NAME_RE, so a bare `plan is None` (or an `any(...)` over errors)
+    # would pass for reasons unrelated to the device name. The count is what
+    # says the two name gates report a given defect once between them.
+    assert len(errors) == 1
+    assert repr(name) in errors[0]
+    assert "not a legal path segment" in errors[0]
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["CON", "nul.", "aux.txt", "lpt9 "],
+    ids=["uppercase", "trailing-dot", "extension", "trailing-space"],
+)
+def test_validate_triage_reports_one_error_when_a_name_fails_both_gates(name):
+    """ABLATION: drop the `BUNDLE_NAME_RE.match(name) and` guard and each row
+    double-reports -- two errors for one name. Unlike the reserved-name rows
+    above, these fail BUNDLE_NAME_RE *and* safe_segment identity, so they are
+    the only inputs on which that guard can be observed at all."""
+    rj = triage_result(["DW-1"], bundles=[{"name": name, "dw_ids": ["DW-1"], "intent": "do x"}])
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    assert len(errors) == 1
+    assert repr(name) in errors[0]
+    assert "invalid" in errors[0]
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["com10", "console", "com", "lpt", "aux2", "nul-fix", "a" * 40],
+    ids=["com10", "console", "com", "lpt", "aux2", "nul-fix", "max-length"],
+)
+def test_validate_triage_accepts_ordinary_bundle_names(name):
+    """The over-refusal guard: `com10` and `console` merely start with a device
+    name, and a 40-character name is BUNDLE_NAME_RE's maximum -- well under
+    platform_util.MAX_SEGMENT (120), so length never reaches the new gate."""
+    rj = triage_result(["DW-1"], bundles=[{"name": name, "dw_ids": ["DW-1"], "intent": "do x"}])
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert errors == []
+    assert plan is not None
+    assert plan.bundles[0].name == name
+
+
+# ------------------------- the same rule at the decision-option site (#637)
+#
+# `validate_triage` gates bundle names TWICE. A build-effect option's
+# `bundle_name` becomes `Bundle.name` in `_materialize_bundles`, so it reaches
+# `_write_intent`'s cycle-1 directory by the same path the `bundles` loop above
+# does -- and it was validated against BUNDLE_NAME_RE alone.
+
+
+def _option_bundle_decision(bundle_name):
+    """One otherwise-clean build decision whose only possible defect is its
+    option's `bundle_name`. That cleanliness is what lets the tests below assert
+    an error COUNT: a decision also carries question / >=2 options /
+    recommendation rules, any of which would add errors of their own."""
+    return triage_result(
+        ["DW-1"],
+        decisions=[
+            {
+                "id": "DW-1",
+                "question": "build it?",
+                "options": [
+                    {
+                        "key": "1",
+                        "label": "build",
+                        "effect": "build",
+                        "intent": "fix it",
+                        "bundle_name": bundle_name,
+                    },
+                    {"key": "2", "label": "keep", "effect": "keep-open"},
+                ],
+                "recommendation": "1",
+            }
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    "bundle_name",
+    ["con", "nul", "aux", "prn", "com1", "com9", "lpt1", "lpt9"],
+    ids=["con", "nul", "aux", "prn", "com1", "com9", "lpt1", "lpt9"],
+)
+def test_validate_triage_rejects_reserved_device_option_bundle_names(bundle_name):
+    """ABLATION: delete the safe_segment identity gate at the decision-option
+    site and every row here accepts. The `bundles` loop's gate does not reach
+    this value -- it is a different loop over a different key."""
+    rj = _option_bundle_decision(bundle_name)
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    # Exactly one error, not merely one that matches: these names pass
+    # BUNDLE_NAME_RE, so a bare `plan is None` would pass for reasons unrelated
+    # to the device name.
+    assert len(errors) == 1
+    assert repr(bundle_name) in errors[0]
+    assert "not a legal path segment" in errors[0]
+    assert "option 1" in errors[0]
+
+
+@pytest.mark.parametrize(
+    "bundle_name",
+    ["CON", "nul.", "aux.txt", "lpt9 "],
+    ids=["uppercase", "trailing-dot", "extension", "trailing-space"],
+)
+def test_validate_triage_reports_one_option_error_when_a_name_fails_both_gates(bundle_name):
+    """ABLATION: drop the `BUNDLE_NAME_RE.match(bundle_name) and` guard and each
+    row double-reports -- two errors for one name. The rows above cannot show
+    this: a lowercase device name PASSES BUNDLE_NAME_RE, so it raises exactly one
+    error with or without the guard. Only an input failing both gates can
+    observe it at all."""
+    rj = _option_bundle_decision(bundle_name)
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    assert len(errors) == 1
+    assert repr(bundle_name) in errors[0]
+    assert "bad bundle_name" in errors[0]
+
+
+@pytest.mark.parametrize(
+    "bundle_name",
+    ["com10", "console", "nul-fix"],
+    ids=["com10", "console", "nul-fix"],
+)
+def test_validate_triage_accepts_ordinary_option_bundle_names(bundle_name):
+    """The over-refusal guard at this site: `com10` and `console` merely start
+    with a device name, and the gate must not reach them."""
+    rj = _option_bundle_decision(bundle_name)
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert errors == []
+    assert plan is not None
+    assert plan.decisions[0].option("1").bundle_name == bundle_name
 
 
 def test_validate_triage_truncates_overlong_bundle_name():
@@ -2640,6 +2808,63 @@ def test_preanswered_build_materializes_bundle_unattended(project):
     assert '"decision-preanswers-pruned"' in journal
 
 
+def test_preanswered_bundle_name_failing_the_segment_gate_is_discarded(project):
+    """Round-2 review: a pre-answer's `bundle_name` never passes `validate_triage`
+    — it was answered out of band against an earlier triage, and a fresh one can
+    renumber or drop the option it named — so it was the one route by which a name
+    failing the two option-site gates (#637) still reached `_write_intent` as a
+    directory (`nul` passes BUNDLE_NAME_RE and fails `safe_segment` identity).
+    `_materialize_bundles` now applies the same two rules to that lane, by
+    journaled DISCARD rather than by error: the build decision is the payload and
+    the always-legal `decision-<id>` fallback is what an unnamed answer gets
+    anyway. Ablation: drop that gate and this reddens — the bundle materializes
+    as `nul`, so the `decision-dw-1` effects below never match and the discard
+    event never appears."""
+    from bmad_loop import decisions
+    from bmad_loop.sweep import DecisionOption
+
+    write_ledger(project, {"DW-1": "open"})
+    # stored key "9" is NOT one of this triage's option keys, so every field —
+    # bundle_name included — comes from the stored answer, not a validated option
+    decisions.record_pre_answer(
+        project.project,
+        "DW-1",
+        DecisionOption(
+            key="9", label="Widen", effect="build", intent="widen the field", bundle_name="nul"
+        ),
+        date="2026-06-12",
+    )
+    plan = triage_result(
+        ["DW-1"],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {"key": "1", "label": "Widen", "effect": "build", "intent": "fresh intent"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "decision-dw-1", ["DW-1"]),
+            bundle_review_effect(project, "decision-dw-1"),
+        ],
+        prompting=False,
+    )
+    summary = engine.run()
+    assert not summary.paused
+
+    journal = journal_text(engine)
+    assert '"sweep-bundle-name-discarded"' in journal
+    assert '"nul"' in journal  # the discard names the spelling it dropped
+    assert engine.state.tasks["dw-decision-dw-1"].phase == Phase.DONE
+    assert "dw-nul" not in engine.state.tasks  # the raw name minted nothing
+
+
 def test_preanswered_keep_open_suppresses_prompt_and_persists(project):
     """A keep-open pre-answer is adopted (no skip, no re-prompt) and, since the
     entry stays open, the store keeps it for the next sweep too."""
@@ -2679,17 +2904,19 @@ def test_preanswered_keep_open_suppresses_prompt_and_persists(project):
 
 # ------------------------------- the two per-run `decisions.json` writes (cf. #363)
 #
-# `sweep.atomic_write_text` is ONE module binding shared by FOUR call sites: the
-# `_ensure_migration` ledger restore, the two `_decisions_phase` writes below, and
-# `_write_bundle_intent`. A bare module-wide boom would make the "revert this site"
-# ablation pass for the WRONG REASON — the run still crashes on "disk full", just
-# raised from somewhere else — so both stubs below filter on the FILENAME and
-# delegate otherwise, and both plans carry ZERO bundles so the bundle-intent write
-# is unreachable too.
+# `sweep.atomic_write_text_confined` (#593) is the binding the two `_decisions_phase`
+# writes below share. The module's OTHER two writers — the `_ensure_migration` ledger
+# restore and `_write_bundle_intent` — kept the plain `sweep.atomic_write_text`, so
+# splitting the adoption narrowed what these patches can reach. The FILENAME filter
+# and the delegate-otherwise arm stay anyway: a bare module-wide boom would make the
+# "revert this site" ablation pass for the WRONG REASON — the run still crashes on
+# "disk full", just raised from somewhere else — and the filter is what keeps that
+# true if a third site in this module ever adopts the confined helper. Both plans
+# carry ZERO bundles so the bundle-intent write is unreachable too.
 #
 # The filter is safe against the project-level pre-answer store, which is also named
-# `decisions.json`: that goes through `decisions.atomic_write_text`, a different
-# module's binding, which these patches do not touch.
+# `decisions.json`: that goes through `decisions.atomic_write_text_confined`, a
+# different module's binding, which these patches do not touch.
 
 
 def test_seeded_decisions_write_failure_strands_nothing(project, monkeypatch):
@@ -2740,14 +2967,14 @@ def test_seeded_decisions_write_failure_strands_nothing(project, monkeypatch):
     )
     engine, _ = make_sweep(project, [triage_effect(plan)], prompting=False)
 
-    real = sweep_mod.atomic_write_text
+    real = sweep_mod.atomic_write_text_confined
 
-    def boom(path, text, *, follow_symlinks=True):
+    def boom(path, text, *, confine_root, require_writable_target=False):
         if Path(path).name == "decisions.json":
             raise OSError("disk full")
-        real(path, text, follow_symlinks=follow_symlinks)
+        real(path, text, confine_root=confine_root, require_writable_target=require_writable_target)
 
-    monkeypatch.setattr(sweep_mod, "atomic_write_text", boom)
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", boom)
     summary = engine.run()
 
     assert summary.crashed and "disk full" in str(summary.crash_error)
@@ -2786,14 +3013,14 @@ def test_interactive_decision_write_failure_strands_nothing(project, monkeypatch
     )
     engine, _ = make_sweep(project, [triage_effect(plan)], answers=["1"], prompting=True)
 
-    real = sweep_mod.atomic_write_text
+    real = sweep_mod.atomic_write_text_confined
 
-    def boom(path, text, *, follow_symlinks=True):
+    def boom(path, text, *, confine_root, require_writable_target=False):
         if Path(path).name == "decisions.json":
             raise OSError("disk full")
-        real(path, text, follow_symlinks=follow_symlinks)
+        real(path, text, confine_root=confine_root, require_writable_target=require_writable_target)
 
-    monkeypatch.setattr(sweep_mod, "atomic_write_text", boom)
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", boom)
     summary = engine.run()
 
     journal = journal_text(engine)
@@ -2802,6 +3029,107 @@ def test_interactive_decision_write_failure_strands_nothing(project, monkeypatch
     assert '"decision-answered"' not in journal  # the raise landed AT the write
     assert not (engine.run_dir / "decisions.json").exists()
     assert list(engine.run_dir.glob("decisions*.tmp")) == []  # no stranded temp
+
+
+def test_decisions_phase_keys_on_the_run_dir_project_not_workspace_root(project, tmp_path):
+    """The supported `repo_root` override (`_bmad/bmm/config.yaml`, honoured only
+    with `isolation = "none"` — worktree isolation refuses the divergence) puts
+    `workspace.root` at the separate CODE repo while the per-run `decisions.json`
+    and the project-level pre-answer store stay under the PROJECT. Keying this
+    phase on `workspace.root` therefore made every pre-answer seed — and the
+    first interactive answer — raise `UnconfinedWriteError`, and aimed the
+    pre-answer READ at a store that does not exist. All three now key on the
+    project that owns `run_dir` (`runs._project_of_run_dir`), which no workspace
+    swap moves.
+
+    The divergence is installed at the exact seam the override reaches:
+    `workspace` is a plain attribute the bundle pipeline itself swaps, and
+    `_decisions_phase` runs outside that pipeline by contract. The divergent
+    root is a real empty git repo so the phase's ledger-commit tail stays a
+    no-op rather than a spawn error.
+
+    Ablations, each reddening its own assertion: point the pre-answer read back
+    at `self.workspace.root` → the seeded answer is missing; point the seeded
+    write's `confine_root` back → `UnconfinedWriteError` before any assertion;
+    point the interactive write's back → the same raise at the DW-2 answer."""
+    from bmad_loop import decisions
+    from bmad_loop.workspace import Workspace
+
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    decisions.record_pre_answer(
+        project.project,
+        "DW-1",
+        DecisionOption(key="2", label="Keep", effect="keep-open"),
+        date="2026-06-12",
+    )
+    options = [
+        {"key": "1", "label": "Build", "effect": "build", "intent": "x"},
+        {"key": "2", "label": "Keep", "effect": "keep-open"},
+    ]
+    rj = triage_result(
+        ["DW-1", "DW-2"],
+        decisions=[
+            _decision("DW-1", options, recommendation="2"),
+            _decision("DW-2", options, recommendation="2"),
+        ],
+    )
+    plan, errors = validate_triage(rj, {"DW-1", "DW-2"})
+    assert errors == []
+    engine, _ = make_sweep(project, [], answers=["2"], prompting=True)
+    elsewhere = tmp_path / "code-repo"
+    elsewhere.mkdir()
+    git(elsewhere, "init")
+    engine.workspace = Workspace(root=elsewhere, paths=engine.workspace.paths)
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+
+    answers, closed = engine._decisions_phase(plan)
+
+    assert answers["DW-1"]["effect"] == "keep-open"  # the READ found the project store
+    assert answers["DW-2"]["key"] == "2"  # the interactive write landed too
+    stored = json.loads((engine.run_dir / "decisions.json").read_text(encoding="utf-8"))
+    assert set(stored) == {"DW-1", "DW-2"}
+    assert closed == 0
+    assert list(elsewhere.rglob("decisions*")) == []  # nothing leaked into the code repo
+
+
+def test_prune_pre_answers_keys_on_the_run_dir_project_not_workspace_root(project, tmp_path):
+    """`_prune_pre_answers` is the fourth workspace-rooted call in the family
+    the test above pins (read, seeded write, interactive write): under the
+    `repo_root` override it pruned against `workspace.root` — the separate CODE
+    repo, whose store does not exist — so the prune silently dropped nothing
+    and a consumed pre-answer survived in the PROJECT store, suppressing
+    `pending_missed_decisions` for its id and standing ready to re-apply if the
+    id ever returns to the open set. It now keys on `runs._project_of_run_dir`,
+    the same root the load reads. The ledger read is deliberately untouched:
+    `deferred_work` hangs off `implementation_artifacts`, which stays
+    project-rooted under the override.
+
+    Ablation: point the prune back at `self.workspace.root` → DW-1 survives in
+    the project store and the pruned journal line never lands."""
+    from bmad_loop import decisions
+    from bmad_loop.workspace import Workspace
+
+    write_ledger(project, {"DW-2": "open"})  # DW-1 consumed: absent from the open set
+    for dw in ("DW-1", "DW-2"):
+        decisions.record_pre_answer(
+            project.project,
+            dw,
+            DecisionOption(key="2", label="Keep", effect="keep-open"),
+            date="2026-06-12",
+        )
+    engine, _ = make_sweep(project, [])
+    elsewhere = tmp_path / "code-repo"
+    elsewhere.mkdir()
+    git(elsewhere, "init")
+    engine.workspace = Workspace(root=elsewhere, paths=engine.workspace.paths)
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+
+    engine._prune_pre_answers()
+
+    # DW-1 dropped from the PROJECT store; the still-open keep-open answer kept
+    assert set(decisions.load_pre_answers(project.project)) == {"DW-2"}
+    assert '"decision-preanswers-pruned"' in journal_text(engine)
+    assert list(elsewhere.rglob("decisions*")) == []  # the code repo was never the store
 
 
 def test_max_bundles_truncation(project):
@@ -3555,6 +3883,230 @@ def test_migration_restore_write_failure_propagates_and_keeps_the_ledger(project
     # so a byte assertion would read CRLF on Windows and redden there only
     assert project.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
     assert project.deferred_work.read_bytes()  # and emphatically not zero bytes
+
+
+@contextlib.contextmanager
+def _rival_appending_ledger_lock(monkeypatch, ledger, addition):
+    """A `ledger_lock` spy that lands one foreign append BEFORE acquiring, and
+    still really locks.
+
+    Ahead of the acquisition on purpose: that is the window the migration
+    restore's compare-and-set covers — between the post-reset observation and the
+    hold. Still really locking for `_counting_ledger_lock`'s reason: a spy that
+    only staged the rival would let a nested acquisition through. One-shot, so a
+    later acquisition cannot file the rival twice.
+    """
+    real_lock = deferredwork.ledger_lock
+    landed: list[bool] = []
+
+    @contextlib.contextmanager
+    def spy_lock(path):
+        if path == ledger and not landed:
+            landed.append(True)
+            with ledger.open("a", encoding="utf-8") as f:
+                f.write(addition)
+        with real_lock(path):
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", spy_lock)
+    yield landed
+
+
+def _half_migrated_effect(project):
+    """A migration rewrite that converts only the done item, so the open one
+    stays legacy and `validate_migration` rejects it — the restore's trigger."""
+    manifest = legacy_manifest()
+    half = (
+        "# Deferred Work\n\n"
+        "### DW-1: Old fixed thing\n\norigin: migrated, 2026-06-12\nlocation: n/a\n"
+        "reason: repaired.\nstatus: done 2026-04-06\n\n"
+        "## Deferred from: epic 1 review (2026-04-06)\n\n"
+        "- **Open legacy thing here** — `src.txt` mishandles em-dashes\n"
+    )
+    return migrate_effect(project, half, [{"key": manifest[0]["key"], "dw_id": "DW-1"}])
+
+
+def test_migration_restore_escalates_on_divergence(project, monkeypatch):
+    """#286. The failed migration's restore is compare-and-set: when the ledger
+    moved between the reset and the lock, the pre-migration text is NOT written
+    back over it and a human is asked to re-run the sweep.
+
+    No merge and no silent skip, and the site's own rule is why. Leaving the
+    rejected rewrite standing would be re-prompting over a half-broken ledger,
+    and a migration input that changed underneath the attempt it was graded
+    against is a human problem — the same call `migrate-duplicate-ids` makes.
+
+    Ablation: drop the `anchored and current == expected` arm so the restore
+    always writes, and the rival's line is clobbered while no escalation is
+    raised.
+    """
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, adapter = make_sweep(project, [_half_migrated_effect(project)] * 2)
+    rival = "- **Filed by another process** — `other.txt` needs a look\n"
+    with _rival_appending_ledger_lock(monkeypatch, project.deferred_work, rival) as landed:
+        summary = engine.run()
+
+    assert summary.paused and landed == [True]
+    assert engine.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
+    assert "changed underneath the failed migration attempt" in engine.state.paused_reason
+    assert "sweep-migration-restore-diverged" in journal_kinds(engine)
+    # the rival's line stands, and the refusal did not paper the rewrite over
+    text = project.deferred_work.read_text(encoding="utf-8")
+    assert "Filed by another process" in text and text != LEGACY_LEDGER
+    # the refusal is terminal for this run: the second attempt never dispatches
+    assert len(adapter.sessions) == 1
+
+
+@contextlib.contextmanager
+def _rival_appending_safe_reset(monkeypatch, engine, ledger, addition):
+    """A `_safe_reset` spy that lands one foreign append the instant the real
+    reset returns, and still really resets.
+
+    That instant is where the migration restore's window opens: `_safe_reset`
+    returning is the last event before the restore decides what the ledger is
+    supposed to contain. A rival there is precisely what #735 describes, and it
+    is the half the old `current == observed` anchor could not see — the rival
+    became the observation. One-shot, because this wrapper is re-entered on every
+    migration attempt and the retry must not file it twice.
+    """
+    real_reset = engine._safe_reset
+    landed: list[bool] = []
+
+    def reset_then_rival(task, **kwargs):
+        real_reset(task, **kwargs)
+        if not landed:
+            landed.append(True)
+            with ledger.open("a", encoding="utf-8") as f:
+                f.write(addition)
+
+    monkeypatch.setattr(engine, "_safe_reset", reset_then_rival)
+    yield landed
+
+
+def test_migration_restore_escalates_when_a_rival_writes_inside_the_reset_window(
+    project, monkeypatch
+):
+    """#735, tracked. The twin above lands its rival at the lock, where the old
+    anchor already refused. This one lands it in the window the old anchor was
+    blind to: between `_safe_reset` returning and the read that graded it.
+
+    A rival writing a TRACKED ledger there BECOMES `observed`, so the compare
+    holds under the lock and the pre-migration text is written straight over it —
+    and the run then RETRIES over a ledger no human has looked at. The anchor is
+    the committed blob at `task.baseline_commit` instead, which is what the reset
+    republished and which no rival can author.
+
+    Ablation: restore the `observed` read after `_safe_reset` and compare
+    `current == observed` — the rival's line is clobbered, the escalation never
+    raises, and the second attempt dispatches. Every row below reds.
+    """
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, adapter = make_sweep(project, [_half_migrated_effect(project)] * 2)
+    rival = "- **Filed by another process** — `other.txt` needs a look\n"
+    with _rival_appending_safe_reset(monkeypatch, engine, project.deferred_work, rival) as landed:
+        summary = engine.run()
+
+    assert summary.paused and landed == [True]
+    assert engine.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
+    assert "changed underneath the failed migration attempt" in engine.state.paused_reason
+    assert "sweep-migration-restore-diverged" in journal_kinds(engine)
+    # the rival's line stands, and the refusal did not paper the rewrite over
+    text = project.deferred_work.read_text(encoding="utf-8")
+    assert "Filed by another process" in text and text != LEGACY_LEDGER
+    # the refusal is terminal for this run: the second attempt never dispatches
+    assert len(adapter.sessions) == 1
+
+
+def test_migration_restore_escalates_for_an_untracked_rival_inside_the_reset_window(
+    project, monkeypatch
+):
+    """#735, untracked. An untracked ledger has no blob to anchor on, and
+    `reset --hard` cannot have put anything back into it either — so the anchor
+    is the rejected rewrite this attempt actually graded, which is the one text
+    here that predates the window.
+
+    Same rival, same window, same refusal: the point is that losing the blob does
+    NOT send this site back to trusting the observation. `_ledger_baseline_text`
+    answers determinate absence (`(True, None)`) rather than "no anchor", and the
+    rewrite fills the slot.
+
+    Ablation: restore the `observed` read after `_safe_reset` and compare
+    `current == observed` — the rival is clobbered and the run retries.
+    """
+    write_legacy_ledger(project, LEGACY_LEDGER, commit=False)
+    engine, adapter = make_sweep(project, [_half_migrated_effect(project)] * 2)
+    rival = "- **Filed by another process** — `other.txt` needs a look\n"
+    with _rival_appending_safe_reset(monkeypatch, engine, project.deferred_work, rival) as landed:
+        summary = engine.run()
+
+    assert summary.paused and landed == [True]
+    assert engine.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
+    assert "changed underneath the failed migration attempt" in engine.state.paused_reason
+    assert "sweep-migration-restore-diverged" in journal_kinds(engine)
+    text = project.deferred_work.read_text(encoding="utf-8")
+    assert "Filed by another process" in text and text != LEGACY_LEDGER
+    assert len(adapter.sessions) == 1
+
+
+def test_migration_restore_escalates_when_the_baseline_probe_fails(project, monkeypatch):
+    """DIRECTION PIN, #735: an unprovable baseline escalates, it never falls back
+    to the observation.
+
+    No rival anywhere — the quiet fixture of the positive control below, with
+    only the probe faulted. Two failed probes' worth of uncertainty is the most
+    this site can have, and the answer to it is the same one a rival gets: refuse
+    the write and put it in front of a human. Unlike the defer restore there is
+    no append-only merge to degrade into — republishing the pre-migration text is
+    an overwrite or it is nothing — so the escalation IS the degrade, and the
+    resume it routes to resets the attempt budget and re-reads the ledger.
+
+    Ablation: invert the fault direction — have `_ledger_baseline_text`'s except
+    arm return `(True, self._ledger_text())` — and the restore writes, the run
+    retries, and every row below reds.
+    """
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, adapter = make_sweep(project, [_half_migrated_effect(project)] * 2)
+
+    def fail_probe(*args, **kwargs):
+        raise verify.GitError("injected baseline probe failure")
+
+    monkeypatch.setattr(verify, "worktree_file_bytes_at_revision", fail_probe)
+
+    summary = engine.run()
+
+    assert summary.paused
+    assert engine.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
+    assert "changed underneath the failed migration attempt" in engine.state.paused_reason
+    kinds = journal_kinds(engine)
+    assert "ledger-baseline-probe-failed" in kinds
+    assert "sweep-migration-restore-diverged" in kinds
+    # escalated on the FIRST failed attempt: an unprovable restore does not get
+    # to spend the retry budget over a ledger nobody has graded
+    assert len(adapter.sessions) == 1
+
+
+def test_migration_restore_quiet_path_unchanged(project):
+    """#286. With no interleaving writer the restore still puts the
+    pre-migration text back byte for byte, and journals no divergence — the CAS
+    is invisible on the path every migration failure actually takes.
+
+    The ledger is deliberately left UNTRACKED. `git reset --hard` puts a tracked
+    one back on its own, so the explicit write is the only thing standing between
+    a rejected rewrite and disk here — over a committed ledger this assertion
+    passes with the write deleted, which is what the site's own comment predicts
+    ("the baseline reset covers tracked files, the explicit write covers an
+    untracked ledger that `git reset` cannot restore").
+
+    Ablation: delete the restore write and the rejected rewrite stays on disk;
+    force the diverged arm and the journal row appears.
+    """
+    write_legacy_ledger(project, LEGACY_LEDGER, commit=False)
+    engine, _ = make_sweep(project, [_half_migrated_effect(project)] * 2)
+    summary = engine.run()
+
+    assert summary.paused
+    assert project.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
+    assert "sweep-migration-restore-diverged" not in journal_kinds(engine)
 
 
 def test_migration_escalation_resume_retries(project):
@@ -4594,3 +5146,376 @@ def test_bundle_harvest_alone_is_not_proof_of_work(project):
     assert engine.state.tasks["dw-fix-things"].phase == Phase.DEFERRED
     harvested = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
     assert len(harvested) == 1 and harvested[0]["dw_ids"] == ["DW-2"]
+
+
+# ------------------------- the per-run decisions writes, confined to the project (#593)
+
+
+def _redirect_the_run_dir(project, tmp_path):
+    """Plant a link at the run directory `make_sweep` will use, pointing OUT of the
+    project, and hand back where it points.
+
+    The link goes at the run dir rather than at `.bmad-loop/` deliberately: the
+    engine writes its journal, state and triage records into this same directory
+    through the ordinary (unconfined) writers, and those must keep working so the
+    run reaches the decisions phase at all. Only the two confined writes walk the
+    components from the project root, so only they refuse — which makes the
+    refusal attributable to the site under test rather than to a broken run."""
+    run_dir = project.project / ".bmad-loop" / "runs" / "sweep-run"
+    run_dir.parent.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    run_dir.symlink_to(outside, target_is_directory=True)
+    return outside
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_the_seeded_decisions_write_refuses_a_redirected_run_dir(project, tmp_path):
+    """The escape #593 names, on the pre-answer-seeded write. `follow_symlinks=False`
+    refused a link planted at `decisions.json`; it never refused one planted at any
+    directory ABOVE it, and this file sits three deep under the project root
+    (`.bmad-loop/runs/<id>/`), so a link at any of those three redirected both the
+    temp and the published file out of the project.
+
+    The `decision-preanswered` journal line is the PRECONDITION, exactly as in the
+    disk-full twin above: it is appended before the write, so without it the
+    "nothing escaped" assertion would pass for the entirely different reason that
+    the phase was never entered.
+
+    Ablation: revert this site to `atomic_write_text(..., follow_symlinks=False)`
+    and this fails — the run stops crashing and `decisions.json` appears in
+    `outside/`."""
+    from bmad_loop import decisions
+    from bmad_loop.sweep import DecisionOption
+
+    outside = _redirect_the_run_dir(project, tmp_path)
+    write_ledger(project, {"DW-1": "open"})
+    decisions.record_pre_answer(
+        project.project,
+        "DW-1",
+        DecisionOption(key="2", label="Keep", effect="keep-open"),
+        date="2026-06-12",
+    )
+    plan = triage_result(  # keep-open only: no bundle, so no bundle-intent write
+        ["DW-1"],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {"key": "1", "label": "Build", "effect": "build", "intent": "x"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+                recommendation="2",
+            )
+        ],
+    )
+    engine, _ = make_sweep(project, [triage_effect(plan)], prompting=False)
+
+    summary = engine.run()
+
+    assert summary.crashed
+    assert platform_util.UnconfinedWriteError.__name__ in str(summary.crash_error)
+    assert '"decision-preanswered"' in journal_text(engine)  # PRECONDITION: site reached
+    assert not (outside / "decisions.json").exists()  # nothing escaped the project
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_the_interactive_decisions_write_refuses_a_redirected_run_dir(project, tmp_path):
+    """The interactive write's own refusal — the same file, a few lines further
+    down, and a separate row for the reason its disk-full twin is separate: the two
+    writes are reached by different paths, and one adopted without the other would
+    leave half the file's writers unconfined.
+
+    Two preconditions, as in that twin. `decision-pending` is appended before
+    `prompter.ask`, proving the phase was entered; `decision-answered` is appended
+    AFTER the write, so its ABSENCE places the refusal at the site under test
+    rather than upstream of it.
+
+    Ablation: revert this site and this fails — the run completes and
+    `decisions.json` appears in `outside/`."""
+    outside = _redirect_the_run_dir(project, tmp_path)
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(  # close-only: no bundle, so no bundle-intent write
+        ["DW-1"],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {"key": "1", "label": "Close it", "effect": "close", "resolution": "moot"},
+                    {"key": "2", "label": "Keep open", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    engine, _ = make_sweep(project, [triage_effect(plan)], answers=["1"], prompting=True)
+
+    summary = engine.run()
+
+    journal = journal_text(engine)
+    assert summary.crashed
+    assert platform_util.UnconfinedWriteError.__name__ in str(summary.crash_error)
+    assert '"decision-pending"' in journal  # PRECONDITION: the prompt was reached
+    assert '"decision-answered"' not in journal  # the refusal landed AT the write
+    assert not (outside / "decisions.json").exists()  # nothing escaped the project
+
+
+def test_the_decisions_writes_land_on_a_clean_tree(project):
+    """The positive control for both refusals above. Without it they pass for a
+    `_decisions_phase` wired to crash on anything, which is every reason
+    `decisions.json` could be absent from `outside/` — and the run dir under test
+    there is a symlink, so this row also pins that an ORDINARY run dir still gets
+    its file."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {"key": "1", "label": "Close it", "effect": "close", "resolution": "moot"},
+                    {"key": "2", "label": "Keep open", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    engine, _ = make_sweep(project, [triage_effect(plan)], answers=["1"], prompting=True)
+
+    summary = engine.run()
+
+    assert not summary.crashed
+    landed = json.loads((engine.run_dir / "decisions.json").read_text(encoding="utf-8"))
+    assert landed["DW-1"]["effect"] == "close"
+
+
+# ------------------------------------------ batched locked ledger adoption (#286/#469)
+
+
+@contextlib.contextmanager
+def _counting_ledger_lock(monkeypatch, acquisitions):
+    """A `ledger_lock` spy that records every acquisition and still really locks.
+
+    Still locking matters: a spy that only counted would let a nesting bug
+    through, and `ledger_lock` raising on nested entry is the guard that keeps
+    these callers honest.
+    """
+    real_lock = deferredwork.ledger_lock
+
+    @contextlib.contextmanager
+    def spy_lock(p):
+        acquisitions.append(p)
+        with real_lock(p):
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", spy_lock)
+    yield
+
+
+def test_close_resolved_batches_with_per_entry_evidence(project, monkeypatch):
+    """The whole already-resolved set closes in ONE locked read->edit->write, and
+    each entry keeps its own evidence (#286/#469).
+
+    Two claims, and both are needed. The per-entry evidence says the collapse to
+    `mark_done_many` did not flatten three distinct notes into one shared string
+    — `notes=` pairs positionally with the ids, and a batch that dropped it would
+    still close all three entries and still journal all three ids. The
+    acquisition count is what says this is one transaction: as a per-entry
+    `mark_done` loop it took the cross-process ledger lock once per id, leaving a
+    rival writer — a live run's harvest, the TUI decision modal, `sweep
+    --archive` — a window between every pair of closures, so the sweep could
+    journal three closures with only some of them on disk.
+
+    Ablation: restore the per-entry `mark_done` loop. The evidence asserts still
+    pass, which is exactly why the count is asserted too; `acquisitions` goes to
+    3 and this reddens.
+    """
+    write_ledger(project, {"DW-1": "open", "DW-2": "open", "DW-3": "open"})
+    engine, _adapter = make_sweep(project, [])
+    plan = TriagePlan(
+        open_ids=frozenset({"DW-1", "DW-2", "DW-3"}),
+        already_resolved=(
+            ResolvedEntry("DW-1", "fixed by a1b2c3d"),
+            ResolvedEntry("DW-2", "superseded by DW-9"),
+            ResolvedEntry("DW-3", "never reproduced"),
+        ),
+    )
+
+    acquisitions = []
+    with _counting_ledger_lock(monkeypatch, acquisitions):
+        assert engine._close_resolved(plan) == 3
+
+    assert acquisitions == [project.deferred_work]  # ONE, and on this ledger
+    text = project.deferred_work.read_text(encoding="utf-8")
+    assert "already resolved: fixed by a1b2c3d" in text
+    assert "already resolved: superseded by DW-9" in text
+    assert "already resolved: never reproduced" in text
+    entries = ledger_entries(project)
+    assert all(entries[i].status.startswith("done ") for i in ("DW-1", "DW-2", "DW-3"))
+    closed = [e for e in engine.journal.entries() if e["kind"] == "sweep-resolved-closed"]
+    assert len(closed) == 1 and closed[0]["dw_ids"] == ["DW-1", "DW-2", "DW-3"]
+
+
+def test_reopen_after_defer_uses_one_lock(project, monkeypatch):
+    """A deferred bundle's closes are all undone in ONE locked read->edit->write
+    (#286/#469), and the journal reports the same ids in the same order.
+
+    A rollback that leaves some of this run's closes undone and others standing
+    is the one outcome this method exists to prevent, and the per-id `mark_open`
+    comprehension it replaces took the lock once per id — three separate windows
+    for a rival writer, in a step that has to be atomic to mean anything. The
+    journal assert is what says the collapse preserved the contract the caller
+    reads: `mark_open_many` returns the ids actually reopened, in the order
+    given, exactly as the comprehension did.
+
+    Ablation: restore the per-id comprehension — `acquisitions` goes to 3.
+    """
+    write_ledger(project, {"DW-1": "open", "DW-2": "open", "DW-3": "open"})
+    engine, _adapter = make_sweep(project, [])
+    task = StoryTask(story_key="dw-fix", epic=0, dw_ids=["DW-1", "DW-2", "DW-3"])
+    # Seed the reopenable closes BEFORE the spy: this write is the setup, not
+    # the behavior under test, and counting it would hide the real number.
+    deferredwork.mark_done_many_reopenable(
+        project.deferred_work,
+        task.dw_ids,
+        engine._today(),
+        engine._bundle_close_note(task),
+        engine._bundle_close_operation_id(task),
+    )
+
+    acquisitions = []
+    with _counting_ledger_lock(monkeypatch, acquisitions):
+        engine._reopen_ledger_after_defer(task)
+
+    assert acquisitions == [project.deferred_work]  # ONE, and on this ledger
+    entries = ledger_entries(project)
+    assert all(entries[i].open for i in ("DW-1", "DW-2", "DW-3"))
+    reopened = [e for e in engine.journal.entries() if e["kind"] == "sweep-bundle-reopened"]
+    assert len(reopened) == 1
+    assert reopened[0]["dw_ids"] == ["DW-1", "DW-2", "DW-3"]
+    assert reopened[0]["story_key"] == "dw-fix"
+
+
+def test_migration_restore_writes_back_an_external_ledger(project, tmp_path):
+    """#735 follow-up. An `implementation_artifacts` dir configured OUTSIDE the
+    repo tree is a supported shape — `ProjectPaths.rebased` deliberately leaves
+    such dirs put, because they are shared rather than per-checkout — so the
+    ledger can resolve outside `workspace.root`.
+
+    `git reset --hard` provably cannot have touched a path no revision of this
+    repo can even name, which is the same proof the untracked-inside-the-tree
+    case relies on. So the anchor is the rejected rewrite this attempt graded,
+    the restore puts the pre-migration text back, and no divergence is journaled.
+    Escalating here would strand the half-migrated rewrite on disk for a
+    configuration that is not ambiguous at all.
+    """
+    external = ProjectPaths(
+        project=project.project,
+        implementation_artifacts=tmp_path / "shared-artifacts" / "implementation-artifacts",
+        planning_artifacts=project.planning_artifacts,
+    )
+    external.implementation_artifacts.mkdir(parents=True)
+    write_legacy_ledger(external, LEGACY_LEDGER, commit=False)
+    engine, _ = make_sweep(external, [_half_migrated_effect(external)] * 2)
+    summary = engine.run()
+
+    assert summary.paused
+    assert external.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
+    assert "sweep-migration-restore-diverged" not in journal_kinds(engine)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_migration_restore_writes_back_a_symlinked_ledger(project, tmp_path):
+    """#735 follow-up. A ledger symlinked into the repo is a supported shape —
+    `atomic_write_text` follows symlinks BY DEFAULT precisely so such a ledger
+    "keeps being a symlink and the real file is what gets rewritten".
+
+    Git stores that tracked symlink as a blob holding the TARGET PATHNAME, so a
+    baseline anchor taken from the blob would compare a pathname against ledger
+    text and never be true — escalating every failed migration over a shape that
+    is not ambiguous at all. `reset --hard` restores the link, never what it
+    points at, so the reset republished no ledger text and the anchor is the
+    rejected rewrite this attempt graded, as for an untracked or external ledger.
+
+    Ablation: drop the `path_is_non_regular_at_revision` arm from
+    `_ledger_baseline_text` and this reddens on the restored-text assertion, with
+    `sweep-migration-restore-diverged` journaled and the half-migrated rewrite
+    left standing.
+    """
+    target = tmp_path / "shared" / "deferred-work.md"
+    target.parent.mkdir(parents=True)
+    target.write_text(LEGACY_LEDGER, encoding="utf-8")
+    if project.deferred_work.is_symlink() or project.deferred_work.exists():
+        project.deferred_work.unlink()
+    project.deferred_work.symlink_to(target)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "symlinked ledger")
+    engine, _ = make_sweep(project, [_half_migrated_effect(project)] * 2)
+    summary = engine.run()
+
+    assert summary.paused
+    # the link survived the round trip, and the real file holds the restored text
+    assert project.deferred_work.is_symlink()
+    assert target.read_text(encoding="utf-8") == LEGACY_LEDGER
+    assert "sweep-migration-restore-diverged" not in journal_kinds(engine)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_migration_restore_accepts_an_already_restored_symlink_ledger(project, tmp_path):
+    """#735/#736. A restore that finds the ledger already holding the text it
+    would write is DONE, not divergent.
+
+    Reachable with no rival at all. A migration session that atomic-saves —
+    write-temp-then-rename, which is how most editors and many CLIs write —
+    replaces the tracked symlink with a regular file. `reset --hard` puts the
+    link back, and the external target it can never reach was therefore never
+    rewritten, so the ledger is already correct. But `rewrite`, read off that
+    regular file, is the rejected migration text, so demanding the anchor here
+    reports a divergence that did not happen, escalates, and spends the attempt
+    budget: the second attempt never dispatches.
+
+    This is the #736 principle at the restore: an operation with nothing to write
+    must not fail.
+
+    Ablation: drop the `current == text` arm and this reddens on all three —
+    `sweep-migration-restore-diverged` is journaled, the paused reason becomes
+    the "changed underneath" accusation, and only one session runs.
+    """
+    target = tmp_path / "shared" / "deferred-work.md"
+    target.parent.mkdir(parents=True)
+    target.write_text(LEGACY_LEDGER, encoding="utf-8")
+    if project.deferred_work.is_symlink() or project.deferred_work.exists():
+        project.deferred_work.unlink()
+    project.deferred_work.symlink_to(target)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "symlinked ledger")
+
+    manifest = legacy_manifest()
+    half = (
+        "# Deferred Work\n\n"
+        "### DW-1: Old fixed thing\n\norigin: migrated, 2026-06-12\nlocation: n/a\n"
+        "reason: repaired.\nstatus: done 2026-04-06\n\n"
+        "## Deferred from: epic 1 review (2026-04-06)\n\n"
+        "- **Open legacy thing here** — `src.txt` mishandles em-dashes\n"
+    )
+
+    def atomic_save_effect(spec):
+        # the rename an atomic save performs: the symlink is REPLACED, so the
+        # external target keeps the pre-migration text throughout.
+        project.deferred_work.unlink()
+        project.deferred_work.write_text(half, encoding="utf-8")
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "deferred-sweep-migrate",
+                "mapping": [{"key": manifest[0]["key"], "dw_id": "DW-1"}],
+                "escalations": [],
+            },
+        )
+
+    engine, adapter = make_sweep(project, [atomic_save_effect] * 2)
+    summary = engine.run()
+
+    assert summary.paused  # on the attempt cap, having actually retried
+    assert "sweep-migration-restore-diverged" not in journal_kinds(engine)
+    assert "changed underneath the failed migration attempt" not in engine.state.paused_reason
+    assert target.read_text(encoding="utf-8") == LEGACY_LEDGER
+    assert len(adapter.sessions) == 2

@@ -3407,22 +3407,31 @@ async def test_plan_checkpoint_replan_resets_and_resumes(project, monkeypatch):
 
     calls: list[str] = []
     resets: list[tuple] = []
-    strips: list[Path] = []
+    strips: list[tuple[Path, Path]] = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
     monkeypatch.setattr(
-        devcontract, "reset_spec_status", lambda p, s: resets.append((p, s)) or True
+        devcontract,
+        "reset_spec_status",
+        lambda p, s, **kw: resets.append((p, s, kw["confine_root"])) or True,
     )
-    monkeypatch.setattr(devcontract, "strip_auto_run_result", lambda p: strips.append(p) or True)
+    monkeypatch.setattr(
+        devcontract,
+        "strip_auto_run_result",
+        lambda p, **kw: strips.append((p, kw["confine_root"])) or True,
+    )
     _run_dir, spec = _stories_paused_run(project.project, stage="plan-checkpoint")
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, SpecReviewModal)
         await pilot.click(await ready(pilot, "#act-replan"))
         await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
-        assert resets == [(spec, "draft")]
-        assert strips == [spec]
+        # the root is captured, not just the path: `_do_replan` has to pass the
+        # project it built `run_dir` from, and a `confine_root` naming the spec's
+        # own parent would be lexically confined and behaviourally inert (#593).
+        assert resets == [(spec, "draft", project.project)]
+        assert strips == [(spec, project.project)]
 
 
 async def test_story_checkpoint_continue_resumes(project, monkeypatch):
@@ -3668,6 +3677,33 @@ async def test_graceful_stop_token_messages(project, monkeypatch, token, needle)
         await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
         await pilot.click(await ready(pilot, "#ok"))
         await until(pilot, lambda: any(needle in m for m in notifications(app)))
+
+
+async def test_graceful_stop_write_failure_notifies_instead_of_crashing(project, monkeypatch):
+    """The worker catches `OSError` the way the CLI's `stop --graceful` does. The
+    confined lodge (#593) raises `UnconfinedWriteError` — an `OSError` — on a
+    planted parent, and Textual workers default to `exit_on_error=True`, so
+    without the catch pressing `S` in that scenario tore the whole dashboard
+    down instead of reporting the refusal.
+
+    Ablation: drop the worker's `except OSError` arm and this reddens — the
+    worker error kills the app under run_test and the toast never arrives."""
+    from bmad_loop import runs
+
+    def boom(rd):
+        raise runs.UnconfinedWriteError("cannot reach .bmad-loop/runs without a redirect")
+
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "alive")
+    monkeypatch.setattr(runs, "request_graceful_stop", boom)
+    make_run(project.project, "20260611-100000-aaaa", alive=True)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: dashboard(app).selected_run_id == "20260611-100000-aaaa")
+        await pilot.press("S")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: any("could not be written" in m for m in notifications(app)))
+        assert app.is_running  # the dashboard survived the refusal
 
 
 async def test_graceful_stop_not_live_warns_without_calling(project, monkeypatch):
@@ -4687,3 +4723,116 @@ def test_run_tui_survives_junk_forced_backend(monkeypatch, tmp_path):
     finally:
         mux_mod.get_multiplexer.cache_clear()
     assert ran == [True]
+
+
+def _write_two_triage_decisions(run_dir: Path) -> None:
+    """A sweep triage carrying TWO decisions, so a walk has somewhere to continue to."""
+    import json
+
+    (run_dir / "triage.json").write_text(
+        json.dumps(
+            {
+                "workflow": "deferred-sweep-triage",
+                "open_ids": ["DW-1", "DW-2"],
+                "already_resolved": [],
+                "bundles": [],
+                "blocked": [],
+                "skip": [],
+                "decisions": [
+                    {
+                        "id": dw_id,
+                        "question": f"what about {dw_id}?",
+                        "context": "ctx",
+                        "options": [
+                            {"key": "1", "label": "Widen", "effect": "build", "intent": "widen it"},
+                            {"key": "2", "label": "Keep", "effect": "keep-open"},
+                        ],
+                        "recommendation": "1",
+                    }
+                    for dw_id in ("DW-1", "DW-2")
+                ],
+                "escalations": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+async def test_decision_modal_survives_lock_and_state_root_failures(project, monkeypatch):
+    """Both ledger-lock failures degrade to a per-decision toast, and the walk
+    carries on to the next decision (#286/#469).
+
+    `apply_pre_answer` now takes a cross-process lock whose sidecar path is
+    derived from the state root, which gives it two new ways to fail: `OSError`
+    from the acquisition itself, and `runs.StateRootError` from deriving the
+    path. The second is NOT an `OSError`, and here that distinction is not
+    cosmetic — an uncaught exception in this callback does not print a traceback
+    and exit, it escapes into the Textual event loop and takes the dashboard
+    down mid-walk, with the human's remaining answers unrecorded and no window
+    left to type them into.
+
+    Both are raised, in that order, across two pending decisions: the first
+    grades the arm that already existed, the second grades the widened tuple.
+    The second modal appearing at all is what says the walk continued rather
+    than stopping at the first failure, and it is keyed on the modal's own
+    decision id so a first modal that simply never dismissed cannot satisfy it.
+
+    Ablation: drop `runs.StateRootError` from `_record_decision`'s catch tuple.
+    The DW-1 toast still lands; the DW-2 assertions red, with the exception
+    coming out of `run_test` instead of arriving as a notification.
+    """
+    from bmad_loop import decisions as decisions_mod
+    from bmad_loop import runs
+
+    install_bmad_config(project)
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: first thing\n\norigin: t\nlocation: a.py:1\nreason: t.\nstatus: open\n\n"
+        "### DW-2: second thing\n\norigin: t\nlocation: b.py:1\nreason: t.\nstatus: open\n",
+        encoding="utf-8",
+    )
+    _write_two_triage_decisions(make_run(project.project, "20260101-000000-aaaa", run_type="sweep"))
+
+    failures = iter(
+        [
+            OSError(11, "Resource deadlock avoided"),
+            runs.StateRootError("no usable state root"),
+        ]
+    )
+
+    def boom(*_args, **_kwargs):
+        raise next(failures)
+
+    # `bmad_loop.tui.app` holds the module, not the function, so patching the
+    # attribute here is what the TUI call site resolves.
+    monkeypatch.setattr(decisions_mod, "apply_pre_answer", boom)
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("d")
+        await until(pilot, lambda: isinstance(app.screen, DecisionModal))
+        await pilot.click(await ready(pilot, "#opt-1"))
+
+        # OSError: toast, no crash.
+        await until(pilot, lambda: any("failed to record DW-1" in m for m in notifications(app)))
+        # ...and the walk moved on, rather than ending on the first failure.
+        await until(
+            pilot,
+            lambda: isinstance(app.screen, DecisionModal) and app.screen._decision.id == "DW-2",
+        )
+        await pilot.click(await ready(pilot, "#opt-1"))
+
+        # StateRootError: same degradation, and it is not an OSError.
+        await until(pilot, lambda: any("failed to record DW-2" in m for m in notifications(app)))
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+        toasts = [n for n in app._notifications if "failed to record" in n.message]
+        assert len(toasts) == 2
+        assert {n.severity for n in toasts} == {"error"}
+        assert "Resource deadlock avoided" in toasts[0].message
+        assert "no usable state root" in toasts[1].message
+        # Survived both: still running, still on the dashboard, with the whole
+        # walk behind it. The `run_test` context exiting without raising is the
+        # other half — an escape into the event loop surfaces there, not here.
+        assert app.is_running

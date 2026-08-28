@@ -34,7 +34,7 @@ from .frontmatter import (
     status_of,
 )
 from .model import StoryTask, VerifyOutcome
-from .platform_util import atomic_write_bytes
+from .platform_util import atomic_write_bytes, atomic_write_bytes_confined
 from .policy import POLICY_FILE, Policy
 from .sprintstatus import STATUS_ORDER, story_status
 
@@ -2000,14 +2000,26 @@ def safe_rollback(
             # their orchestration config on top of it — and a truncated policy.toml
             # is not a smaller config but a parse error the next `bmad-loop run`
             # refuses on, which is the failure the whole restore exists to avoid.
-            # `follow_symlinks=False` is a real change here (a bare `write_bytes`
-            # opens the name and so writes THROUGH a link), and it is the right
-            # one twice over: `policy.write_mux_backend` already replaces this same
-            # file by name, so no link at this path survives the orchestrator
-            # anyway; and `runsetup` states a driven session can write
+            # Refusing to follow a link was a real change here (a bare
+            # `write_bytes` opens the name and so writes THROUGH one), and it is
+            # the right one twice over: `policy.write_mux_backend` already replaces
+            # this same file by name, so no link at this path survives the
+            # orchestrator anyway; and `runsetup` states a driven session can write
             # `.bmad-loop/policy.toml`, so honouring a link planted there would aim
-            # a host-side write at a path of that session's choosing.
-            atomic_write_bytes(policy_path, policy_content, follow_symlinks=False)
+            # a host-side write at a path of that session's choosing. Confined to
+            # `repo` (#593) because that refusal stopped at the final component:
+            # `policy_path` is built lexically from `repo` at the capture above, so
+            # the walk re-derives exactly the components that join was spelled
+            # from, and a link planted at `.bmad-loop/` no longer redirects the
+            # restore out of the repo. require_writable_target (#597) gives back
+            # the PermissionError a bare `write_bytes` raised on an operator's
+            # read-only policy.toml — this is their config, not machine state.
+            atomic_write_bytes_confined(
+                policy_path,
+                policy_content,
+                confine_root=repo,
+                require_writable_target=True,
+            )
     for target in cleanup.targets:
         try:
             target.path.unlink(missing_ok=True)
@@ -3035,7 +3047,7 @@ def capture_diff(repo: Path, baseline: str, *, max_file_bytes: int | None = None
     return "".join(parts)
 
 
-def set_frontmatter_field(path: Path, key: str, value: str) -> bool:
+def set_frontmatter_field(path: Path, key: str, value: str, *, confine_root: Path) -> bool:
     """Rewrite (or insert) a scalar ``<key>:`` line in a spec's `---`…`---`
     frontmatter block.
 
@@ -3063,9 +3075,16 @@ def set_frontmatter_field(path: Path, key: str, value: str) -> bool:
     Windows) by a write contracted to move one field. The INSERTED line takes the
     block's own ending, not a bare ``\\n``.
 
-    Atomic on the same terms too (#379) — `platform_util.atomic_write_bytes`,
-    ``follow_symlinks=False``, matching what `devcontract._atomic_write_spec`
-    already does to the same files. Use the BYTES helper and not the text one:
+    Atomic on the same terms too (#379), and CONFINED on the same terms (#593):
+    the spec-writer chokepoint rule — confined write in-tree, plain no-follow
+    write for an artifacts folder configured outside the checkout — is stated
+    once, in `frontmatter.set_frontmatter_status`, and this site implements it
+    identically. ``confine_root`` is required for the reason it is required
+    there. So is ``require_writable_target=True`` (#597): this rewrites an
+    operator-editable spec, and a read-only one is answered rather than routed
+    around by a replace that only needs the directory writable.
+
+    Use the BYTES helper and not the text one:
     `atomic_write_text` keeps ``Path.write_text``'s translating newline default,
     which would relay ``\\n``→``\\r\\n`` on Windows and undo the paragraph above.
     """
@@ -3079,7 +3098,13 @@ def set_frontmatter_field(path: Path, key: str, value: str) -> bool:
     edited = _edit_frontmatter_block(block, key, value, insert=True)
     if edited is None:
         return False
-    atomic_write_bytes(path, (before + edited + after).encode("utf-8"), follow_symlinks=False)
+    payload = (before + edited + after).encode("utf-8")
+    if path.is_relative_to(confine_root):
+        atomic_write_bytes_confined(
+            path, payload, confine_root=confine_root, require_writable_target=True
+        )
+    else:
+        atomic_write_bytes(path, payload, follow_symlinks=False, require_writable_target=True)
     return True
 
 
@@ -3177,6 +3202,32 @@ def spec_within_roots(spec_path: Path, paths: ProjectPaths) -> bool:
 
 
 def resolve_spec_path(spec_file: str, paths: ProjectPaths) -> Path:
+    """A session-reported ``spec_file`` as a concrete path: an absolute value passes
+    through untouched, a relative one is probed against ``paths.project`` and falls
+    back to ``paths.implementation_artifacts``.
+
+    Neither branch promises the result exists — the fallback is returned unprobed
+    when the project candidate is not a file — so every caller re-tests
+    ``.is_file()`` itself. Deliberately does NOT ``.resolve()``: callers needing
+    symlink and ``..`` normalization get it from :func:`spec_within_roots`, which
+    resolves both sides itself.
+
+    The rule its call sites follow: a caller that goes on to REWRITE the spec must
+    pair this with :func:`spec_within_roots` first. The value is session-reported
+    and this function hands back whatever it spells, so the containment check is
+    what stands between an untrusted string and a write to it. The frontmatter
+    reconcile, the marker repair and the repair/review spec resets all pair it; so
+    do the two attempt-binding observations, which write nothing themselves but
+    establish the binding ``recovery_flow`` later restores bytes through — the
+    check belongs at the site conferring the authority, not only at the write.
+
+    The rule is about writes to the SPEC, not writes in general, and two callers sit
+    outside it deliberately: the post-dev board sync and the sweep bundle's ledger
+    close each read a ``status:`` from an unchecked path and then write to a
+    deterministic orchestrator-owned target of their own (the sprint board, the
+    deferred-work ledger). An out-of-tree spec can influence what those write, never
+    where. A caller that only reads — the ``--json`` read-model, the dev-verify
+    gates — pairs it with nothing."""
     p = Path(spec_file)
     if p.is_absolute():
         return p
@@ -3231,12 +3282,18 @@ def _verify_shared_gates(
 
     The proof-of-work exclude is derived here from the `task` this gate already
     receives (`verify_dev_exclude_relpaths`, which needs the latched restore patch);
-    ``extra_exclude`` carries only what a mode adds on top — ``()`` for sprint and
-    bundle, the story record + manifest for stories. Threading the restore patch in
+    ``extra_exclude`` carries only what a mode adds on top — the engine-written
+    paths for sprint and bundle, those plus the story record + manifest for
+    stories, and ``None`` on the two legs that skip the gate outright (sprint's
+    park, stories' plan halt). Threading the restore patch in
     from three call sites instead left a default-None foot-gun for a future fourth
     mode, which would silently let a restore re-drive pass proof-of-work on the
-    patch file's mere presence. ``extra_exclude=None`` still skips the gate outright
-    (a plan-halt leg produced only its own spec)."""
+    patch file's mere presence. ``extra_exclude=None`` still skips the gate
+    outright, and two callers now spell it for two different reasons: a plan-halt
+    leg produced only its own spec (structurally spec-only), and a park may
+    legitimately have produced no code at all because its remaining work is a
+    human's (#676). Both mean "there is no diff to demand here"; neither
+    generalizes to the other's leg, so keep them named separately."""
     workflow = rj.get("workflow")
     if workflow != DEV_WORKFLOW:
         return VerifyOutcome.retry(
@@ -3371,9 +3428,10 @@ def verify_dev(
     Checks the claimed spec exists, carries the fixed ``auto-dev`` workflow tag,
     sits at the expected status (``in-review`` when a separate review session
     follows, ``done`` when review is disabled), records a baseline matching the
-    orchestrator's, has produced changes since that baseline, and that the
-    story's sprint-status was advanced to the matching stage. Returns a retryable
-    VerifyOutcome on any mismatch, escalates on git failure, passes otherwise.
+    orchestrator's, has produced changes since that baseline (every leg but the
+    park — see ``operator_park`` below), and that the story's sprint-status was
+    advanced to the matching stage. Returns a retryable VerifyOutcome on any
+    mismatch, escalates on git failure, passes otherwise.
 
     ``operator_park`` (``[operator] enabled``, engine-supplied) adds one more
     accepted spec/sprint pair: ``(awaiting-operator, awaiting-operator)``, the
@@ -3384,10 +3442,47 @@ def verify_dev(
     a terminal the gate knows, so it fails the ordinary status check and the
     session is retried with that mismatch as feedback.
 
+    On the park leg the proof-of-work gate is skipped, the same way the plan-halt
+    leg of :func:`verify_dev_stories` skips it and by the same ``extra_exclude=None``
+    spelling: a park's whole output can legitimately be its own spec's park
+    declaration plus the board sync, both of which proof-of-work already excludes,
+    so demanding a diff read a correct park as "no changes since baseline commit"
+    and refused it (#676) — costing the attempt, and with it the park declaration:
+    reverted outright under ``isolation = "worktree"`` or
+    ``scm.rollback_on_failure = true``, and a paused run with manual-recovery steps
+    on the default in-place config. What is still pending here is the
+    ORCHESTRATOR's commit — the squash plus the park record land only after this
+    gate passes — not the session's own work: ``bmad-build-auto`` commits each
+    iteration, so a skill commit chain usually already sits above baseline
+    (``Engine._finalize_commit_phase``), and a reset discards that too, onto an
+    ``attempt-preserve/*`` ref. Nothing else relaxes — the
+    ``operator_actions`` gate above still refuses a park that enumerates nothing,
+    and the workflow-tag, status, baseline-match and sprint-pair gates all still
+    run. Two of those four are not independent evidence on this leg, and saying so
+    is the point: the status check is tautological here (the same ``fm`` that
+    selected ``parked`` is threaded in as ``fm=fm``, so the shared gate compares it
+    against an ``expected_status`` derived from itself), and the sprint pair was
+    written from that same frontmatter by ``Engine._post_dev_state_sync`` a dozen
+    lines before this gate runs, so it confirms the orchestrator's own write landed
+    rather than anything the session did. What still binds a park to the attempt
+    the orchestrator actually launched is the workflow tag, the baseline match, and
+    a non-empty actions list — and the middle one is weaker on this leg than its
+    name suggests. Baseline-match also accepts a claim NEWER than the recorded
+    baseline whenever it is a HEAD-reachable descendant, and the comment guarding
+    that branch names the compensating control: such a commit "may have arrived in
+    the shared checkout from outside the session", so the check re-anchors
+    proof-of-work onto the claimed commit rather than trusting the match alone.
+    Proof-of-work is precisely what this leg skips, so on a park that re-anchoring
+    is inert and the newer-claim branch tightens nothing. The trade is recorded rather than hidden: the skip
+    covers EVERY park, including one that wrote nothing and listed plausible
+    actions, because the actions gate tests list non-emptiness and never content.
+
     ``engine_written`` names project-relative paths the orchestrator itself
     wrote above this gate during the attempt. They compose with the mode's normal
     proof-of-work exclusions so engine bookkeeping cannot masquerade as session
-    work; see :meth:`Engine._harvest_gate_exclude`.
+    work; see :meth:`Engine._harvest_gate_exclude`. On the parked leg they are not
+    passed at all — proof-of-work is skipped there, so there is no exclusion set
+    left for them to compose with.
     """
     rj = result_json or {}
     spec_file = rj.get("spec_file")
@@ -3417,7 +3512,12 @@ def verify_dev(
         expected_status=(
             AWAITING_OPERATOR if parked else ("in-review" if review_enabled else "done")
         ),
-        extra_exclude=engine_written,
+        # Proof-of-work is the one gate the parked leg skips (``extra_exclude=None``,
+        # the callee-blessed spelling): a park's whole residue can legitimately be
+        # the spec and the board, both already excluded (#676). The park paragraph
+        # in this function's docstring carries the reasoning and, more importantly,
+        # what the skip does NOT relax.
+        extra_exclude=None if parked else engine_written,
         fm=fm,
     )
     if gate is not None:
@@ -3928,6 +4028,42 @@ def verify_commands_outcome(policy: Policy, cwd: Path) -> VerifyOutcome:
     return verify_command_results_outcome(run_verify_commands(policy, cwd), cwd)
 
 
+def _verify_review_commands(policy: Policy, paths: ProjectPaths) -> VerifyOutcome:
+    """Run a review gate's ``[verify] commands`` in ``paths.repo_root``.
+
+    The two roots split by what is being addressed, and the split is deliberate:
+    the artifacts these gates read — the claimed spec, ``paths.sprint_status``,
+    ``paths.deferred_work`` — are BMAD output and stay project-rooted, while
+    ``[verify] commands`` are the operator's build/test verbs and belong in the
+    git root the code lives in. Every other caller of these commands already
+    resolves them that way: the dev side runs them in ``Workspace.root``
+    (``Engine._verify_commands_with_results``), which ``Workspace.default`` sets
+    from ``paths.repo_root``, and ``cli._reverify`` is handed ``paths.repo_root``
+    at both of its call sites. The three review gates were the sole outlier
+    (#695).
+
+    The two roots are the same path in the default layout and under worktree
+    isolation (``ProjectPaths.rebased`` sets both); they diverge only under an
+    explicit ``repo_root:`` with ``isolation = "none"``. One helper rather than
+    three edited lines so the three gates cannot drift apart on the split.
+
+    On win32 the cwd carries one more thing with it, so the split is not purely a
+    subprocess concern: ``verify_commands_outcome`` forwards ``cwd`` a second time
+    into ``env_fault_reason`` -> ``_win32_env_fault_reason``, which resolves a
+    command's leading token as ``cwd / token`` to tell "tool missing" from "command
+    failed" — and an env fault escalates where a plain failure retries. So a
+    RELATIVE verify command is now classified against ``repo_root`` on these legs
+    too. That is the correct direction (classification should follow execution, and
+    the dev side already classifies against the same root), but it is a second
+    consequence of the move rather than a restatement of the first.
+
+    ``paths.repo_root`` is the ONLY member of ``paths`` this reads — it takes the
+    whole dataclass to keep the three call sites uniform, not because it consults
+    anything else. A future caller must not infer that artifact paths reach here.
+    """
+    return verify_commands_outcome(policy, paths.repo_root)
+
+
 def verify_review(
     task: StoryTask,
     paths: ProjectPaths,
@@ -3954,7 +4090,10 @@ def verify_review(
     the same observed-spec-status selection ``verify_dev`` uses: this is the gate
     the park path runs before committing (``Engine._park_awaiting_operator``), so
     parked work clears exactly the deterministic checks every other commit path
-    clears — the pair, a non-empty action list, and the verify commands. The
+    clears *at this gate* — the pair, a non-empty action list, and the verify
+    commands. The scope is load-bearing: a ``done`` story additionally clears
+    proof-of-work at the dev gate, which a park no longer does (#676), so this
+    gate is not evidence that a park faced every check a ``done`` story faced. The
     sign-off-regression arm stays scoped to the ``done`` pair: a board short of
     ``awaiting-operator`` is a stage never reached, not a revoked sign-off.
 
@@ -4000,7 +4139,7 @@ def verify_review(
             f"sprint-status for {task.story_key} is {sprint!r}, expected {expected!r}"
         )
 
-    return verify_commands_outcome(policy, paths.project)
+    return _verify_review_commands(policy, paths)
 
 
 def _is_signoff_regression(sprint: str | None, sprint_reached_done: bool, policy: Policy) -> bool:
@@ -4032,7 +4171,7 @@ def verify_review_stories(task: StoryTask, paths: ProjectPaths, policy: Policy) 
     status = status_of(fm)
     if status != "done":
         return VerifyOutcome.retry(f"spec status is {status!r}, expected 'done'")
-    return verify_commands_outcome(policy, paths.project)
+    return _verify_review_commands(policy, paths)
 
 
 def verify_review_bundle(task: StoryTask, paths: ProjectPaths, policy: Policy) -> VerifyOutcome:
@@ -4072,7 +4211,7 @@ def verify_review_bundle(task: StoryTask, paths: ProjectPaths, policy: Policy) -
             fixable=True,
         )
 
-    return verify_commands_outcome(policy, paths.project)
+    return _verify_review_commands(policy, paths)
 
 
 def commit_story(repo: Path, message: str) -> str:

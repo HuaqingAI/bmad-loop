@@ -1,29 +1,40 @@
 """Ledger parsing and editing: deferredwork.py."""
 
+import contextlib
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
 
-from bmad_loop import deferredwork, fences
+from bmad_loop import deferredwork, fences, platform_util, runs
 from bmad_loop.deferredwork import (
     _ISO_DATE_RE,
+    ARCHIVE_REL,
     LINE_BREAK_RE,
     SEVERITY_ALIASES,
+    EntrySpec,
     append_decision,
+    append_entries,
     append_entry,
+    archive_closed,
     classify,
     field_line_present,
     field_severity,
+    gates,
     has_legacy,
     mark_done,
     mark_done_many,
     mark_done_many_reopenable,
     mark_open,
+    mark_open_many,
     next_seq,
     open_ids,
     parse_declaration,
     parse_ledger,
     parse_legacy,
+    record_decision,
 )
 
 OPERATION_ID = "run-20260803T120000/dw-fix"
@@ -2353,3 +2364,1937 @@ def test_an_unclosed_fence_swallows_no_prose_gate():
     """Parity with `gates()`: `unclosed_hides_rest=False`, so one stray ``` cannot
     silence every declaration below it."""
     assert _prose_gated("```", "an example nobody closed", "HARD GATE: for real") is True
+
+
+# ------------------------------------------------------- archive_closed (#706)
+#
+# Closed entries are moved verbatim to a sibling archive file; a minimal
+# stub (heading + status + archived line) replaces each in the live ledger
+# so parse_ledger reads it as done, open_ids drops it, and a subsequent run
+# skips it by the `archived:` line rather than re-archiving the stub.
+
+
+def test_archive_all_done(tmp_path):
+    """Done entries are moved verbatim to the archive file and replaced with
+    minimal stubs that parse as done; open entries are untouched."""
+    path = write_ledger(tmp_path)
+    archived = archive_closed(path, archive_date="2026-08-24")
+    assert archived == ["DW-2"]
+
+    text = path.read_text(encoding="utf-8")
+    entries = {e.id: e for e in parse_ledger(text)}
+    # The stub still parses as done, with the original close date
+    assert entries["DW-2"].done
+    assert entries["DW-2"].status == "done 2026-05-25"
+    assert "reason: pre-existing." not in entries["DW-2"].body  # body was moved
+    assert "location: src/foo.py:10" not in entries["DW-2"].body
+    # Load-bearing field lines survive in the stub (engine replay dedupe)
+    assert "origin: code review of spec-1-1.md" in entries["DW-2"].body
+    assert entries["DW-2"].title == "Old closed item"  # heading preserved
+    assert "archived: 2026-08-24" in entries["DW-2"].body  # stub marker
+    # Open entries untouched
+    assert entries["DW-1"].open
+    assert "origin: quick-dev" in entries["DW-1"].body
+    assert entries["DW-3"].open
+    assert "seen-again" in entries["DW-3"].body
+
+    # The archive file has the full body with an `archived:` line
+    archive_path = path.parent / ARCHIVE_REL
+    assert archive_path.is_file()
+    archive_text = archive_path.read_text(encoding="utf-8")
+    assert "### DW-2: Old closed item" in archive_text
+    assert "origin: code review of spec-1-1.md" in archive_text
+    assert "status: done 2026-05-25" in archive_text
+    assert "archived: 2026-08-24" in archive_text
+
+
+def test_archive_before_cutoff(tmp_path):
+    """--before archives only entries closed strictly before that date."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: May item\n\norigin: a\nstatus: done 2026-05-15\n\n"
+        "### DW-2: july item\n\norigin: b\nstatus: done 2026-07-01\n\n"
+        "### DW-3: still open\n\norigin: c\nstatus: open\n"
+    )
+    path = write_ledger(tmp_path, text)
+    archived = archive_closed(path, before="2026-06-01", archive_date="2026-08-24")
+    assert archived == ["DW-1"]
+
+    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    assert entries["DW-1"].done  # stub
+    assert "archived: 2026-08-24" in entries["DW-1"].body
+    assert "origin: a" in entries["DW-1"].body  # preserved field line
+    # July entry untouched — not before the cutoff
+    assert entries["DW-2"].status == "done 2026-07-01"
+    assert "origin: b" in entries["DW-2"].body
+    assert entries["DW-3"].open
+
+
+def test_archive_dry_run(tmp_path):
+    """Dry run returns the ids that would be archived but writes nothing."""
+    path = write_ledger(tmp_path)
+    before = path.read_text(encoding="utf-8")
+    archived = archive_closed(path, dry_run=True)
+    assert archived == ["DW-2"]
+    assert path.read_text(encoding="utf-8") == before
+    assert not (path.parent / ARCHIVE_REL).exists()
+
+
+def test_archive_no_done_entries(tmp_path):
+    """A ledger with only open entries returns an empty list and writes nothing."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: open one\n\norigin: a\nstatus: open\n\n"
+        "### DW-2: open two\n\norigin: b\nstatus: open\n"
+    )
+    path = write_ledger(tmp_path, text)
+    before = path.read_text(encoding="utf-8")
+    assert archive_closed(path) == []
+    assert path.read_text(encoding="utf-8") == before
+    assert not (path.parent / ARCHIVE_REL).exists()
+
+
+def test_archive_no_ledger(tmp_path):
+    """A missing ledger file returns an empty list."""
+    path = tmp_path / "deferred-work.md"
+    assert archive_closed(path) == []
+    assert not (path.parent / ARCHIVE_REL).exists()
+
+
+def test_archive_done_without_date_skipped(tmp_path):
+    """An entry with `status: done` (no date) is skipped — there is no close
+    date to compare against a cutoff or to stamp the stub with."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: closed without date\n\norigin: a\nstatus: done\n\n"
+        "### DW-2: closed with date\n\norigin: b\nstatus: done 2026-05-25\n"
+    )
+    path = write_ledger(tmp_path, text)
+    archived = archive_closed(path, archive_date="2026-08-24")
+    assert archived == ["DW-2"]
+
+    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    assert entries["DW-1"].status == "done"  # untouched
+    assert "origin: a" in entries["DW-1"].body  # body still there
+    assert entries["DW-2"].done  # stub
+
+
+def test_archive_rerun_appends_to_existing(tmp_path):
+    """A second run appends new entries to the existing archive without
+    overwriting, and skips stubs left by the first run."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: first done\n\norigin: a\nstatus: done 2026-05-15\n\n"
+        "### DW-2: second done\n\norigin: b\nstatus: done 2026-06-01\n\n"
+        "### DW-3: open\n\norigin: c\nstatus: open\n"
+    )
+    path = write_ledger(tmp_path, text)
+    # First run: archive only the May entry
+    archive_closed(path, before="2026-06-01", archive_date="2026-08-24")
+    archive_path = path.parent / ARCHIVE_REL
+    first = archive_path.read_text(encoding="utf-8")
+    assert "DW-1" in first
+    assert "DW-2" not in first
+
+    # Close DW-3 and archive the rest — DW-1's stub is skipped
+    mark_done(path, "DW-3", "2026-07-01", "resolved")
+    archived = archive_closed(path, archive_date="2026-08-25")
+    assert set(archived) == {"DW-2", "DW-3"}
+
+    second = archive_path.read_text(encoding="utf-8")
+    # Both old and new entries are in the archive
+    assert "DW-1" in second and "DW-2" in second and "DW-3" in second
+    # The first run's stamp is preserved (not overwritten)
+    assert "archived: 2026-08-24" in second
+    assert "archived: 2026-08-25" in second
+
+
+def test_archive_stub_preserves_id_and_parses_as_done(tmp_path):
+    """The stub's heading and status line let parse_ledger read it as done
+    and open_ids exclude it, while the DW- id stays findable for grep."""
+    path = write_ledger(tmp_path)
+    archive_closed(path, archive_date="2026-08-24")
+
+    text = path.read_text(encoding="utf-8")
+    entries = {e.id: e for e in parse_ledger(text)}
+    assert entries["DW-2"].id == "DW-2"
+    assert entries["DW-2"].done
+    assert not entries["DW-2"].open
+    assert "DW-2" not in open_ids(text)
+
+
+def test_archive_open_entries_untouched(tmp_path):
+    """Open entries are never modified — their bodies stay byte-identical."""
+    path = write_ledger(tmp_path)
+    before_open = {e.id: e.body for e in parse_ledger(path.read_text(encoding="utf-8")) if e.open}
+    archive_closed(path, archive_date="2026-08-24")
+    after = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    for dw_id, body in before_open.items():
+        assert after[dw_id].body == body
+
+
+def test_archive_validates_before_date(tmp_path):
+    """An invalid --before date raises ValueError without writing anything."""
+    path = write_ledger(tmp_path)
+    before = path.read_text(encoding="utf-8")
+    with pytest.raises(ValueError, match="date must be YYYY-MM-DD"):
+        archive_closed(path, before="not-a-date")
+    assert path.read_text(encoding="utf-8") == before
+    assert not (path.parent / ARCHIVE_REL).exists()
+
+
+def test_archive_validates_archive_date(tmp_path):
+    """An invalid archive_date raises ValueError without writing anything."""
+    path = write_ledger(tmp_path)
+    before = path.read_text(encoding="utf-8")
+    with pytest.raises(ValueError, match="date must be YYYY-MM-DD"):
+        archive_closed(path, archive_date="2026-13-01")
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_archive_bad_date_raises_even_with_no_ledger(tmp_path):
+    """Validated at function entry, ahead of the is_file short-circuit."""
+    path = tmp_path / "nope.md"
+    with pytest.raises(ValueError, match="date must be YYYY-MM-DD"):
+        archive_closed(path, before="nope")
+    with pytest.raises(ValueError, match="date must be YYYY-MM-DD"):
+        archive_closed(path, archive_date="nope")
+
+
+def test_archive_skips_already_archived_stubs(tmp_path):
+    """A second run with no new closures finds only stubs (which carry an
+    `archived:` line) and archives nothing."""
+    path = write_ledger(tmp_path)
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-2"]
+    assert archive_closed(path, archive_date="2026-08-25") == []
+    archive_path = path.parent / ARCHIVE_REL
+    assert "archived: 2026-08-25" not in archive_path.read_text(encoding="utf-8")
+
+
+def test_archive_default_archive_date_is_today(tmp_path):
+    """When archive_date is not supplied, the stub and archive carry today's date."""
+    from datetime import date as calendar_date
+
+    path = write_ledger(tmp_path)
+    archive_closed(path)
+    today = calendar_date.today().isoformat()
+
+    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    assert f"archived: {today}" in entries["DW-2"].body
+    archive_path = path.parent / ARCHIVE_REL
+    assert f"archived: {today}" in archive_path.read_text(encoding="utf-8")
+
+
+def test_archive_multi_entry_reparse(tmp_path):
+    """Archiving 2+ done entries in one call leaves stubs that re-parse with
+    correct id, title, status, and archived line; open entries are byte-identical."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: first done\n\norigin: a\nstatus: done 2026-05-15\n\n"
+        "### DW-2: open one\n\norigin: b\nstatus: open\n\n"
+        "### DW-3: second done\n\norigin: c\nstatus: done 2026-06-01\n\n"
+        "### DW-4: open two\n\norigin: d\nstatus: open\n"
+    )
+    path = write_ledger(tmp_path, text)
+    before_open = {e.id: e.body for e in parse_ledger(path.read_text(encoding="utf-8")) if e.open}
+    archived = archive_closed(path, archive_date="2026-08-24")
+    assert set(archived) == {"DW-1", "DW-3"}
+
+    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    for dw_id, title, close_date in [
+        ("DW-1", "first done", "2026-05-15"),
+        ("DW-3", "second done", "2026-06-01"),
+    ]:
+        assert entries[dw_id].id == dw_id
+        assert entries[dw_id].title == title
+        assert entries[dw_id].done
+        assert entries[dw_id].status == f"done {close_date}"
+        assert "archived: 2026-08-24" in entries[dw_id].body
+    for dw_id, body in before_open.items():
+        assert entries[dw_id].body == body
+
+
+def test_archive_before_boundary_excludes_cutoff_date(tmp_path):
+    """An entry closed exactly on the cutoff date is NOT archived (strict <)."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: on the boundary\n\norigin: a\nstatus: done 2026-06-01\n\n"
+        "### DW-2: before the boundary\n\norigin: b\nstatus: done 2026-05-31\n"
+    )
+    path = write_ledger(tmp_path, text)
+    archived = archive_closed(path, before="2026-06-01", archive_date="2026-08-24")
+    assert archived == ["DW-2"]  # DW-1 is ON the cutoff, excluded by strict <
+
+
+def test_archive_rejects_status_with_extra_tokens(tmp_path):
+    """A status like `done 2026-05-25 junk` is not a close date — exactly two
+    tokens are required, so the entry is skipped rather than archived on a
+    garbage date (#706 review)."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: extra tokens\n\norigin: a\nstatus: done 2026-05-25 junk\n\n"
+        "### DW-2: clean close\n\norigin: b\nstatus: done 2026-05-25\n"
+    )
+    path = write_ledger(tmp_path, text)
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-2"]
+    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    assert "origin: a" in entries["DW-1"].body  # untouched
+
+
+def test_archive_rejects_impossible_calendar_date(tmp_path):
+    """A well-shaped impossible day (2026-02-30) passes the ISO regex but no
+    calendar carries it — skipped, not archived (#706 review)."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: feb 30\n\norigin: a\nstatus: done 2026-02-30\n\n"
+        "### DW-2: real date\n\norigin: b\nstatus: done 2026-05-25\n"
+    )
+    path = write_ledger(tmp_path, text)
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-2"]
+    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    assert "origin: a" in entries["DW-1"].body  # untouched
+
+
+def test_archive_crash_recovery_no_duplicate_bodies(tmp_path):
+    """Crash between the archive write and the ledger write leaves full entries
+    in the ledger with bodies already archived. A retry must stub the ledger
+    entries (completing the operation) without appending duplicate bodies
+    (#706 review)."""
+    path = write_ledger(tmp_path)
+    # Simulate the crashed first run: the body landed in the archive, but the
+    # ledger was never trimmed (still holds the full DW-2 entry).
+    archive_path = path.parent / ARCHIVE_REL
+    archive_path.write_text(
+        "### DW-2: Old closed item\n\n"
+        "origin: code review of spec-1-1.md, 2026-05-20\n"
+        "location: src/foo.py:10\n"
+        "reason: pre-existing.\n"
+        "status: done 2026-05-25\n"
+        "archived: 2026-08-24\n",
+        encoding="utf-8",
+    )
+    archived = archive_closed(path, archive_date="2026-08-25")
+    assert archived == ["DW-2"]  # the operation completes: stub written
+
+    # The ledger now holds the stub...
+    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    assert entries["DW-2"].done
+    assert "reason: pre-existing." not in entries["DW-2"].body  # body was moved, stub left
+
+    # ...and the archive carries the body exactly once, with the FIRST run's
+    # stamp preserved — no duplicate append, no re-stamp.
+    archive_text = archive_path.read_text(encoding="utf-8")
+    assert archive_text.count("### DW-2:") == 1
+    assert "archived: 2026-08-24" in archive_text
+    assert "archived: 2026-08-25" not in archive_text
+
+
+def test_archive_crash_recovery_stub_keeps_the_archived_body_stamp(tmp_path):
+    """A stub recovered from a crashed run is stamped with the date already on
+    its archived body, not with the retry's date. The stamp is what picks one
+    of an id's several archive blocks — including once `mark_open` demotes it
+    into the `archived-body:` pointer — so a stub naming a date no block
+    carries resolves to nothing (#711 review)."""
+    path = write_ledger(tmp_path)
+    archive_path = path.parent / ARCHIVE_REL
+    archive_path.write_text(
+        "### DW-2: Old closed item\n\n"
+        "origin: code review of spec-1-1.md, 2026-05-20\n"
+        "location: src/foo.py:10\n"
+        "reason: pre-existing.\n"
+        "status: done 2026-05-25\n"
+        "archived: 2026-08-24\n",
+        encoding="utf-8",
+    )
+    assert archive_closed(path, archive_date="2026-08-25") == ["DW-2"]
+
+    stub = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}["DW-2"]
+    assert "archived: 2026-08-24" in stub.body  # the body's own stamp
+    assert "archived: 2026-08-25" not in stub.body  # not the retry's
+
+    # Resolve the stub the way a reader must: its stamp names exactly one block.
+    stamp = deferredwork._archived_stamp(stub)
+    archive_text = archive_path.read_text(encoding="utf-8")
+    blocks = [
+        e for e in parse_ledger(archive_text) if e.id == "DW-2" and f"archived: {stamp}" in e.body
+    ]
+    assert len(blocks) == 1
+    assert "reason: pre-existing." in blocks[0].body
+
+
+def test_archive_fresh_stub_keeps_this_runs_stamp(tmp_path):
+    """The recovered-stamp carry-over is scoped to entries the crash-recovery
+    skip fired for: an entry archived normally is stamped with this run's date
+    on both sides (#711 review)."""
+    path = write_ledger(tmp_path)
+    assert archive_closed(path, archive_date="2026-08-25") == ["DW-2"]
+    stub = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}["DW-2"]
+    assert "archived: 2026-08-25" in stub.body
+    assert "archived: 2026-08-25" in (path.parent / ARCHIVE_REL).read_text(encoding="utf-8")
+
+
+def test_archive_crash_recovery_fenced_example_does_not_suppress(tmp_path):
+    """A fenced worked example in the archive quoting `### DW-2:` is not a
+    real archived body — the crash-recovery skip must be fence-aware, so the
+    live DW-2 is still archived rather than silently kept (#706 review)."""
+    path = write_ledger(tmp_path)
+    # An archive whose only DW-2 mention is inside a fenced example entry:
+    # the example carries no live `archived:` field, so it must not count.
+    archive_path = path.parent / ARCHIVE_REL
+    archive_path.write_text(
+        "# Archived Deferred Work\n\n"
+        "```markdown\n"
+        "### DW-2: Old closed item\n\n"
+        "origin: quoted example, not a real body\n"
+        "status: done 2026-05-25\n"
+        "```\n",
+        encoding="utf-8",
+    )
+    archived = archive_closed(path, archive_date="2026-08-24")
+    assert archived == ["DW-2"]  # not suppressed by the fenced heading
+
+    # The real body was appended; the fenced example survives verbatim above it
+    archive_text = archive_path.read_text(encoding="utf-8")
+    assert archive_text.count("### DW-2:") == 2  # quoted + real
+    assert "origin: code review of spec-1-1.md" in archive_text
+    assert "quoted example" in archive_text
+
+
+# ------------------------------------------- archive follow-up review (#706, pass 2)
+
+
+def test_archive_stub_preserves_gate_origin_source_spec(tmp_path):
+    """The stub keeps gate:/origin:/source_spec: lines — validate's closed-gate
+    report and the engine's status-agnostic replay dedupe both key on them
+    regardless of status."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: gated close\n\n"
+        "origin: spec-harvest fingerprint-abc\n"
+        "source_spec: specs/spec-1-1.md\n"
+        "gate: 1-2\n"
+        "location: src/foo.py\n"
+        "status: done 2026-05-25\n"
+    )
+    path = write_ledger(tmp_path, text)
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+    stub = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}["DW-1"]
+    assert "gate: 1-2" in stub.body
+    assert "origin: spec-harvest fingerprint-abc" in stub.body
+    assert "source_spec: specs/spec-1-1.md" in stub.body
+    assert "location: src/foo.py" not in stub.body  # the rest moved
+    assert gates(stub).tokens == ("1-2",)  # still speaks for validate
+
+
+def test_archive_stub_preserves_reopenable_undo_tail(tmp_path):
+    """A reopenable close's resolution/resolution-undo tail survives into the
+    stub, so a later sweep-bundle rollback can still undo the close."""
+    text = "# Deferred Work\n\n### DW-1: bundle close\n\norigin: a\nlocation: b\nstatus: open\n"
+    path = write_ledger(tmp_path, text)
+    mark_done_many_reopenable(path, ["DW-1"], "2026-05-25", "sweep bundle", "op-1")
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+    # The stub still reads done...
+    stub_ledger = path.read_text(encoding="utf-8")
+    assert "DW-1" not in open_ids(stub_ledger)
+    # ...and mark_open can still undo it (the tail is intact and adjacent)
+    assert mark_open(path, "DW-1", "sweep bundle", "op-1") is True
+    assert "DW-1" in open_ids(path.read_text(encoding="utf-8"))
+
+
+def test_archive_hand_written_archived_line_still_archives(tmp_path):
+    """A done entry carrying a stray unfenced `archived:` line but a real body
+    is NOT mistaken for a stub — shape, not one line, decides (#706 pass 2)."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: real entry, stray field\n\n"
+        "origin: a\nlocation: src/x.py\nreason: still real work\n"
+        "status: done 2026-05-25\narchived: 2026-01-01\n"
+    )
+    path = write_ledger(tmp_path, text)
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+    assert "reason: still real work" in (path.parent / ARCHIVE_REL).read_text(encoding="utf-8")
+
+
+def test_archive_is_archived_fence_filter_pinned(tmp_path):
+    """A done entry documenting `archived:` only inside a fenced example is
+    not treated as already-archived — the `_quoted` filter is load-bearing."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: documents the field\n\n"
+        "origin: a\nlocation: b\n"
+        "```\n"
+        "archived: 2026-01-01\n"
+        "```\n"
+        "status: done 2026-05-25\n"
+    )
+    path = write_ledger(tmp_path, text)
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+    stub = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}["DW-1"]
+    assert "archived: 2026-08-24" in stub.body  # real stamp, not the quoted one
+
+
+def test_archive_legacy_entries_untouched(tmp_path):
+    """Legacy (flat/pre-DW-format) content is never modified by archiving."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: done canonical\n\norigin: a\nstatus: done 2026-05-25\n\n"
+        "- source_spec: specs/spec-2-1.md — legacy flat finding, RESOLVED 2026-04-01\n\n"
+        "## Deferred from: review of spec-2-1.md\n\n"
+        "Some legacy freeform prose that predates the DW format.\n"
+    )
+    path = write_ledger(tmp_path, text)
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+    after = path.read_text(encoding="utf-8")
+    assert "- source_spec: specs/spec-2-1.md — legacy flat finding, RESOLVED 2026-04-01" in after
+    assert "## Deferred from: review of spec-2-1.md" in after
+    assert "legacy freeform prose" in after
+
+
+def test_archive_stub_is_grep_resolvable_and_classifies_clean(tmp_path):
+    """The stub keeps the heading so `grep DW-2` finds it, and a post-archive
+    ledger classifies with no malformed entries."""
+    path = write_ledger(tmp_path)
+    archive_closed(path, archive_date="2026-08-24")
+    text = path.read_text(encoding="utf-8")
+    assert "DW-2" in text  # grep-resolvable
+    declared = classify(text, ids=["DW-2"])
+    assert declared.malformed == ()  # stub reads done, not malformed
+    assert "DW-2" in declared.already_done
+
+
+def test_archive_reclose_after_archive_appends_new_body(tmp_path):
+    """An entry reopened and re-closed after its first body was archived gets
+    its second body appended — id equivalence alone must not suppress it."""
+    text = "# Deferred Work\n\n### DW-1: closes twice\n\norigin: a\nstatus: done 2026-05-25\n"
+    path = write_ledger(tmp_path, text)
+    archive_closed(path, archive_date="2026-06-01")
+    # Reopen (undo the stub) and re-close with a different date and body
+    reopened = text.replace("status: done 2026-05-25", "status: open\nreason: reopened")
+    reopened = reopened.replace("archived: 2026-06-01\n", "")
+    path.write_text(reopened, encoding="utf-8")
+    mark_done(path, "DW-1", "2026-07-01", "second close")
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+    archive_text = (path.parent / ARCHIVE_REL).read_text(encoding="utf-8")
+    assert archive_text.count("### DW-1:") == 2  # both closures preserved
+    assert "status: done 2026-07-01" in archive_text
+
+
+def test_archive_crash_recovery_edited_entry_keeps_both_bodies(tmp_path):
+    """Crash-recovery skip keys on id AND close date: an entry edited between
+    the crash and the retry is re-archived, not silently dropped."""
+    path = write_ledger(tmp_path)
+    # First (crashed) run archived the original body
+    archive_path = path.parent / ARCHIVE_REL
+    archive_path.write_text(
+        "### DW-2: Old closed item\n\n"
+        "origin: code review of spec-1-1.md, 2026-05-20\n"
+        "location: src/foo.py:10\n"
+        "reason: pre-existing.\n"
+        "status: done 2026-05-25\n"
+        "archived: 2026-08-24\n",
+        encoding="utf-8",
+    )
+    # The ledger entry was then re-closed later (different close date)
+    edited = LEDGER.replace("status: done 2026-05-25", "status: done 2026-06-10")
+    path.write_text(edited, encoding="utf-8")
+    assert archive_closed(path, archive_date="2026-08-25") == ["DW-2"]
+    archive_text = archive_path.read_text(encoding="utf-8")
+    assert archive_text.count("### DW-2:") == 2
+    assert "status: done 2026-06-10" in archive_text
+
+
+def test_archive_default_date_flake_fixed(tmp_path, monkeypatch):
+    """`calendar_date` is patched to a fixed clock (both `today()` and
+    `fromisoformat()`), so a midnight rollover mid-call cannot fail the
+    assertion (docs/testing.md flake policy)."""
+    from datetime import date as real_date
+
+    class FixedDate(real_date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 8, 24)
+
+    monkeypatch.setattr(deferredwork, "calendar_date", FixedDate)
+    path = write_ledger(tmp_path)
+    archive_closed(path)
+    assert f"archived: {FixedDate.today().isoformat()}" in (path.parent / ARCHIVE_REL).read_text(
+        encoding="utf-8"
+    )
+
+
+def test_archive_fenced_heading_in_archive_does_not_suppress_reclose(tmp_path):
+    """A `### DW-2:` mention inside an archived body's fenced example must not
+    read as that id's archived twin — the false-positive direction of the
+    crash-recovery membership check."""
+    path = write_ledger(tmp_path)
+    # An archive holding a fenced worked example that quotes DW-2's heading
+    archive_path = path.parent / ARCHIVE_REL
+    archive_path.write_text(
+        "### DW-9: documents the format\n\n"
+        "```\n"
+        "### DW-2: quoted example\n"
+        "status: done 2026-05-25\n"
+        "archived: 2026-01-01\n"
+        "```\n"
+        "status: done 2026-01-02\n"
+        "archived: 2026-01-03\n",
+        encoding="utf-8",
+    )
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-2"]
+    archive_text = archive_path.read_text(encoding="utf-8")
+    assert "origin: code review of spec-1-1.md" in archive_text  # real body landed
+
+
+# --------------------------------------------- archive reopen cycle (#711 review)
+#
+# A DW id outlives any one closure: `mark_open` reopens, a re-close follows, and
+# `append_decision` writes to a closed entry without reading its status. The
+# crash-recovery skip therefore cannot key on id + close date alone, the stub
+# shape must survive the spacing `_MARK_DONE_TAIL_RE` tolerates, and a reopen
+# must demote the `archived:` stamp that no longer describes the entry without
+# severing the reopened entry from the body that stamp was pointing at.
+
+
+def test_archive_same_date_reclose_preserves_new_body(tmp_path):
+    """Reopened and re-closed on the SAME date with a new resolution, the entry
+    is archived again rather than stubbed over its own content — id + close date
+    names a closure slot, not the body that filled it (#711 review)."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: closes twice on one day\n\n"
+        "origin: a\nlocation: src/x.py:1\nreason: first pass\nstatus: open\n"
+    )
+    path = write_ledger(tmp_path, text)
+    close_reopenable(path, "DW-1", "first close")
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+    assert mark_open(path, "DW-1", "first close", OPERATION_ID) is True
+    assert mark_done(path, "DW-1", "2026-06-11", "second close, a different note") is True
+
+    assert archive_closed(path, archive_date="2026-08-25") == ["DW-1"]
+    archive_text = (path.parent / ARCHIVE_REL).read_text(encoding="utf-8")
+    # The returned id is truthful: the second body really reached the archive.
+    assert "second close, a different note" in archive_text
+    assert archive_text.count("### DW-1:") == 2
+    # ...and it is not hiding in the ledger either — the stub carries no note.
+    stub = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}["DW-1"]
+    assert "second close, a different note" not in stub.body
+
+
+def test_archive_decision_on_stub_preserved(tmp_path):
+    """`append_decision` writes to a closed entry without reading its status, so
+    a decision can land on a stub; the next archive run must carry it across
+    instead of overwriting the stub with a fresh one (#711 review)."""
+    path = write_ledger(tmp_path)  # DW-2 is done 2026-05-25
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-2"]
+    assert append_decision(path, "DW-2", "2026-08-25", "keep", "still relevant") is True
+
+    assert archive_closed(path, archive_date="2026-08-26") == ["DW-2"]
+    archive_text = (path.parent / ARCHIVE_REL).read_text(encoding="utf-8")
+    assert "decision: 2026-08-25 keep — still relevant" in archive_text
+    assert archive_text.count("### DW-2:") == 2
+
+
+def test_mark_open_strips_archived_line(tmp_path):
+    """Reopening drops the entry's live `archived:` stamp — the body is back in
+    the ledger, so the line is a lie — demoting it to `archived-body:`, while a
+    fenced example of the field is left alone (#711 review)."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: documents the field it also carries\n\n"
+        "origin: a\n"
+        "```\n"
+        "archived: 2026-01-01\n"
+        "```\n"
+        "status: open\n"
+    )
+    path = write_ledger(tmp_path, text)
+    close_reopenable(path, "DW-1", "bundle close")
+    # Stamp it the way a stub is stamped: after the close's undo tail.
+    closed = path.read_text(encoding="utf-8")
+    path.write_text(closed.rstrip("\n") + "\narchived: 2026-08-24\n", encoding="utf-8")
+
+    assert mark_open(path, "DW-1", "bundle close", OPERATION_ID) is True
+    entry = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}["DW-1"]
+    assert entry.open
+    assert "archived: 2026-08-24" not in entry.body  # the live stamp is gone
+    assert "archived-body: 2026-08-24" in entry.body  # demoted, not deleted
+    assert "archived: 2026-01-01" in entry.body  # the fenced example is not a stamp
+    assert "archived-body: 2026-01-01" not in entry.body  # ...so it was not demoted
+    assert "origin: a" in entry.body  # nothing else was cut
+
+
+def test_mark_open_leaves_a_pointer_to_the_archived_body(tmp_path):
+    """A reopened stub stays triage-resolvable. Its `location:`/`reason:` are in
+    the archive file — the stub preserves neither — so the demoted
+    `archived-body:` line has to name the block holding them. Deleting the
+    stamp outright left triage a heading and nothing to triage (#711 review)."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: reopened after archiving\n\n"
+        "origin: a\n"
+        "location: src/x.py:1\n"
+        "reason: waiting on the codec seam\n"
+        "status: open\n"
+    )
+    path = write_ledger(tmp_path, text)
+    close_reopenable(path, "DW-1", "bundle close")
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+    assert mark_open(path, "DW-1", "bundle close", OPERATION_ID) is True
+
+    entry = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}["DW-1"]
+    assert entry.open
+    assert "reason: waiting on the codec seam" not in entry.body  # the body did move out
+    pointers = [ln for ln in entry.body.splitlines() if ln.startswith("archived-body:")]
+    assert pointers == ["archived-body: 2026-08-24"]  # and this is what says where to
+
+    # Walk the pointer the way a triage session must: its date picks the block,
+    # since one id owns several once a divergent re-closure is archived too.
+    stamp = pointers[0].split(":", 1)[1].strip()
+    archive_text = (path.parent / ARCHIVE_REL).read_text(encoding="utf-8")
+    blocks = [
+        e for e in parse_ledger(archive_text) if e.id == "DW-1" and f"archived: {stamp}" in e.body
+    ]
+    assert len(blocks) == 1
+    assert "location: src/x.py:1" in blocks[0].body
+    assert "reason: waiting on the codec seam" in blocks[0].body
+
+
+def test_archive_reopened_stub_recloses_and_archives(tmp_path):
+    """Full cycle: archive, reopen, re-close reopenably at a later date. Without
+    the reopen-side strip the re-close rebuilds the exact stub shape and
+    `_is_stub` traps the entry outside every future archive (#711 review)."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: full reopen cycle\n\n"
+        "origin: a\nlocation: src/x.py:1\nreason: first pass\nstatus: open\n"
+    )
+    path = write_ledger(tmp_path, text)
+    close_reopenable(path, "DW-1", "first close")
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+    assert mark_open(path, "DW-1", "first close", OPERATION_ID) is True
+    close_reopenable(path, "DW-1", "second close", date="2026-07-01")
+
+    entry = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}["DW-1"]
+    assert not deferredwork._is_stub(entry)  # the reopen cycle broke the stub shape
+    assert archive_closed(path, archive_date="2026-08-25") == ["DW-1"]
+    archive_text = (path.parent / ARCHIVE_REL).read_text(encoding="utf-8")
+    assert archive_text.count("### DW-1:") == 2  # both closures preserved
+    assert "status: done 2026-07-01" in archive_text
+    assert "resolution: second close" in archive_text
+
+
+def test_archive_same_day_reclosures_resolve_by_append_order(tmp_path):
+    """Two closures of one id archived on the SAME day share a stamp, so the
+    stamp narrows rather than identifies. The tie-break the format documents is
+    the archive's append order — later block, later closure — and that is a
+    property of how `archive_closed` writes, not a convention a reader can only
+    hope for (#711 review)."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: closed twice in one day\n\n"
+        "origin: a\nlocation: src/x.py:1\nreason: first pass\nstatus: open\n"
+    )
+    path = write_ledger(tmp_path, text)
+    close_reopenable(path, "DW-1", "first close", date="2026-06-11")
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+    assert mark_open(path, "DW-1", "first close", OPERATION_ID) is True
+    close_reopenable(path, "DW-1", "second close", date="2026-06-12")
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+
+    stub = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}["DW-1"]
+    stamp = deferredwork._archived_stamp(stub)
+    archive_text = (path.parent / ARCHIVE_REL).read_text(encoding="utf-8")
+    blocks = [
+        e for e in parse_ledger(archive_text) if e.id == "DW-1" and f"archived: {stamp}" in e.body
+    ]
+    # Both closures carry the same stamp — the ambiguity the tie-break exists for
+    assert len(blocks) == 2
+    # ...and file order is closure order, so the LAST one is what the stub points at
+    assert "resolution: first close" in blocks[0].body
+    assert "resolution: second close" in blocks[-1].body
+    assert "status: done 2026-06-11" in blocks[0].body
+    assert "status: done 2026-06-12" in blocks[-1].body
+
+
+def test_archive_tab_resolution_stub_converges(tmp_path):
+    """A tab-separated undo tail is copied into the stub verbatim, so the stub
+    shape must tolerate the spacing `_MARK_DONE_TAIL_RE` accepts. Otherwise the
+    stub reads as a live entry and every run re-archives it (#711 review)."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: tab-separated tail\n\n"
+        "origin: a\n"
+        "location: src/x.py:1\n"
+        "reason: prose that does not survive into the stub\n"
+        "status: done 2026-05-25\n"
+        "resolution:\ttabbed note\n"
+        "resolution-undo:\t" + "a" * 64 + "\t2026-05-25\t7374617475733a206f70656e\n"
+    )
+    path = write_ledger(tmp_path, text)
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+    # The stub kept the tail verbatim, tabs and all...
+    stub = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}["DW-1"]
+    assert "resolution:\ttabbed note" in stub.body
+    # ...and a second run recognizes it as a stub and settles.
+    assert archive_closed(path, archive_date="2026-08-25") == []
+    archive_text = (path.parent / ARCHIVE_REL).read_text(encoding="utf-8")
+    assert archive_text.count("### DW-1:") == 1
+    assert "archived: 2026-08-25" not in archive_text
+
+
+def test_archive_fenced_archived_line_in_twin_does_not_suppress(tmp_path):
+    """An archive entry whose ONLY `archived:` line sits inside a fenced example
+    is not an archived twin — the crash-recovery skip reads the field through the
+    fence filter, so the live entry is archived rather than stubbed over its own
+    body (#711 review, finding 5).
+
+    The twin's body is byte-identical to the ledger entry's, which is what makes
+    this test decide the fence filter and nothing else. Body equivalence is the
+    other half of the skip, and it is satisfied here in BOTH directions: with the
+    filter ablated the same fenced line is stripped from both sides, so the
+    bodies still compare equal and only `_is_archived` changes its answer.
+
+    Ablation: drop the `_quoted` guard from `_archived_line_spans` and the count
+    below reads 1 — the fenced example reads as a real stamp and the body never
+    reaches the archive."""
+    entry = (
+        "### DW-2: documents the archive field\n\n"
+        "origin: code review of spec-1-1.md, 2026-05-20\n"
+        "location: src/foo.py:10\n"
+        "reason: pre-existing.\n"
+        "```markdown\n"
+        "archived: 2026-01-01\n"
+        "```\n"
+        "status: done 2026-05-25\n"
+    )
+    path = write_ledger(tmp_path, "# Deferred Work\n\n" + entry)
+    archive_path = path.parent / ARCHIVE_REL
+    archive_path.write_text("# Archived Deferred Work\n\n" + entry, encoding="utf-8")
+
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-2"]
+    archive_text = archive_path.read_text(encoding="utf-8")
+    assert archive_text.count("### DW-2:") == 2  # the quoted stamp suppressed nothing
+    assert archive_text.count("archived: 2026-08-24") == 1  # the real stamp, once
+    # ...and the body left the ledger for the archive rather than being dropped.
+    stub = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}["DW-2"]
+    assert "reason: pre-existing." not in stub.body
+
+
+# ----------------------------------- batched locked mutation primitives (#286)
+#
+# Each batch primitive collapses what used to be N read->edit->write cycles into
+# ONE, so the section grades two separable claims per primitive: that the batch
+# really is one acquisition and one write, and that what it writes is what the
+# serial loop it replaces would have written. The second is not a formality —
+# batching is where the interesting bugs live. Every applier re-parses the text
+# it is handed, so a batch that fed each step the text the CALL read rather than
+# the text the previous step produced would mint the same `DW-<n>` for every
+# spec, miss an in-call duplicate, and apply the second reopen's cuts at offsets
+# the first reopen had already shifted.
+
+
+BATCH_SEED = """\
+# Deferred Work
+
+### DW-1: Already closed twin
+origin: code review of spec-batch.md
+location: n/a
+source_spec: `spec-batch.md`
+reason: fixed already.
+status: done 2026-06-01
+"""
+
+# One new entry, its exact in-call duplicate, and a spec whose marker matches the
+# CLOSED DW-1 above. Expected result: [DW-2, None, DW-3] — the duplicate dedupes
+# against the entry the first spec just appended, and the closed twin does not
+# suppress anything because the idempotence scan is open-only (the work is back).
+BATCH_SPECS = (
+    dict(title="first", origin="code review of spec-x.md", source_spec="spec-x.md", reason="r1"),
+    dict(
+        title="twin of first",
+        origin="code review of spec-x.md",
+        source_spec="spec-x.md",
+        reason="r1 again",
+    ),
+    dict(
+        title="closed twin returns",
+        origin="code review of spec-batch.md",
+        source_spec="spec-batch.md",
+        reason="came back",
+    ),
+)
+
+
+def _twin_ledger(tmp_path: Path, text: str) -> Path:
+    """A second ledger, in its own directory so it contends on its own lock."""
+    twin = tmp_path / "twin" / "deferred-work.md"
+    twin.parent.mkdir(parents=True, exist_ok=True)
+    twin.write_text(text, encoding="utf-8")
+    return twin
+
+
+@contextlib.contextmanager
+def _counting_lock(monkeypatch, acquisitions):
+    """Install a `ledger_lock` spy that records every acquisition and still locks."""
+    real_lock = deferredwork.ledger_lock
+
+    @contextlib.contextmanager
+    def spy_lock(p):
+        acquisitions.append(p)
+        with real_lock(p):
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", spy_lock)
+    yield
+
+
+def _counting_write(monkeypatch, writes):
+    """Install an `atomic_write_text` spy that records every write and still writes."""
+    real_write = deferredwork.atomic_write_text
+
+    def spy_write(p, text):
+        writes.append(p)
+        return real_write(p, text)
+
+    monkeypatch.setattr(deferredwork, "atomic_write_text", spy_write)
+
+
+def test_append_entries_is_one_lock_one_write(tmp_path, monkeypatch):
+    """Three specs cost one acquisition and one write, and mint sequential ids.
+
+    The three claims are one mechanism. Ids are sequential only because each
+    spec's `next_seq` runs against the text the previous spec produced, and that
+    text can only exist inside one hold — which is the same reason there is one
+    write. A loop of `append_entry` gets all three wrong at once.
+
+    Ablation: reimplement the body as `[append_entry(path, **spec) for spec in
+    specs]` — three acquisitions and three writes, and the row reds on the first
+    assertion it reaches."""
+    path = write_ledger(tmp_path)
+    specs = [
+        EntrySpec(
+            title=f"batched {n}", origin=f"probe-{n}", source_spec=f"spec-{n}.md", reason="raced"
+        )
+        for n in (1, 2, 3)
+    ]
+    acquisitions, writes = [], []
+    _counting_write(monkeypatch, writes)
+
+    with _counting_lock(monkeypatch, acquisitions):
+        assert append_entries(path, specs) == ["DW-4", "DW-5", "DW-6"]
+
+    assert acquisitions == [path]
+    assert writes == [path]
+
+
+def test_append_entries_matches_serial_append_entry_bytes(tmp_path):
+    """One batched call writes exactly what the serial loop it replaces writes.
+
+    Graded twice, against two different kinds of oracle, because they fail to
+    different bugs. The serial-loop twin catches every way batching can diverge
+    from looping — a shared `next_seq` read, an idempotence scan against stale
+    text, a separator computed from the text the call read. The literal catches
+    what the twin cannot: both sides now route through `_apply_append`, so a
+    drift in the extracted applier itself would move both files together and
+    leave them equal.
+
+    Compared as TEXT rather than bytes: the fixtures write via `write_text`, so a
+    byte comparison would red on Windows for the newline translation alone.
+
+    Ablation: mint every id from the text the call read (hoist `next_seq` out of
+    `_apply_append`) — the batch writes DW-2 twice, and both assertions red."""
+    path = write_ledger(tmp_path, BATCH_SEED)
+    twin = _twin_ledger(tmp_path, BATCH_SEED)
+
+    minted = append_entries(path, [EntrySpec(**spec) for spec in BATCH_SPECS])
+    serial = [append_entry(twin, **spec) for spec in BATCH_SPECS]
+
+    assert minted == ["DW-2", None, "DW-3"]
+    assert serial == minted
+    assert path.read_text(encoding="utf-8") == twin.read_text(encoding="utf-8")
+
+    assert path.read_text(encoding="utf-8") == BATCH_SEED + (
+        "\n### DW-2: first\n"
+        "origin: code review of spec-x.md\n"
+        "location: n/a\n"
+        "source_spec: `spec-x.md`\n"
+        "reason: r1\n"
+        "status: open\n"
+        "\n### DW-3: closed twin returns\n"
+        "origin: code review of spec-batch.md\n"
+        "location: n/a\n"
+        "source_spec: `spec-batch.md`\n"
+        "reason: came back\n"
+        "status: open\n"
+    )
+
+
+def test_append_entries_validates_all_specs_before_writing(tmp_path, monkeypatch):
+    """A bad spec anywhere in the sequence writes nothing — and is caught before
+    the lock is even taken.
+
+    All-or-nothing is the point: validating per spec inside the loop would commit
+    whatever prefix happened to precede the bad one, and the caller that raised
+    has no record of which entries landed. Asserting the lock was never acquired
+    grades the placement rather than merely the outcome — validation moved inside
+    the hold would still leave the ledger untouched here (there is one write, at
+    the end), so an untouched-bytes assertion alone passes for the wrong reason,
+    and a programmer bug would queue behind another process before reporting.
+
+    Ablation: move the two enum checks inside `with ledger_lock(path):` — the
+    acquisition assertion reds while the bytes assertion still passes, which is
+    exactly the pair's division of labor."""
+    path = write_ledger(tmp_path)
+    before = path.read_text(encoding="utf-8")
+    specs = [
+        EntrySpec(title="fine", origin="probe-1", source_spec="spec-1.md", reason="ok"),
+        EntrySpec(
+            title="bad",
+            origin="probe-2",
+            source_spec="spec-2.md",
+            reason="ok",
+            severity="catastrophic",
+        ),
+    ]
+    acquisitions = []
+
+    with _counting_lock(monkeypatch, acquisitions):
+        with pytest.raises(ValueError, match="severity must be one of"):
+            append_entries(path, specs)
+
+    assert acquisitions == []
+    assert path.read_text(encoding="utf-8") == before
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(lambda p: append_entries(p, []), id="append_entries"),
+        pytest.param(lambda p: mark_done_many(p, [], "2026-06-11", "fixed"), id="mark_done_many"),
+        pytest.param(lambda p: mark_open_many(p, [], "by dw-a", OPERATION_ID), id="mark_open_many"),
+    ],
+)
+def test_an_empty_batch_takes_no_lock(tmp_path, monkeypatch, call):
+    """Handed nothing to do, a batch primitive acquires nothing.
+
+    The per-id loops these replaced took no lock when the set was empty, because
+    there was no call to make; a batch that acquires anyway turns a no-op into
+    something that can fail on a lock it never needed — an `OSError` from the
+    acquisition, or a `runs.StateRootError` from deriving the sidecar path in an
+    environment that names no state root. The sweep reaches all three of these
+    with an empty set routinely: a triage plan with nothing already-resolved, a
+    discarded bundle with no closes to undo.
+
+    Validation still runs above the early return, which is why the date and the
+    operation id are real here rather than junk — an empty batch must still
+    report a caller's bad argument.
+
+    Ablation: delete the `if not dw_ids:` / `if not specs:` early return from the
+    primitive under test and its row reds, the spy having counted one."""
+    path = write_ledger(tmp_path)
+    before = path.read_text(encoding="utf-8")
+    acquisitions = []
+
+    with _counting_lock(monkeypatch, acquisitions):
+        assert call(path) == []
+
+    assert acquisitions == []
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_archive_closed_takes_no_lock_for_a_missing_ledger(tmp_path, monkeypatch):
+    """No ledger means no write, and so no lock — `advance`'s rule, one module over.
+
+    `bmad-loop sweep --archive` reports a project that has no ledger as SUCCESS
+    ("no deferred-work ledger at ..."). With the acquisition first, that answer
+    became a FAILURE wherever the state root cannot be derived: a released
+    behavior changed by a lock taken for a file that is not there. The guard under
+    the hold stays, deletion being able to race this one.
+
+    Ablation: move the `is_file` guard back below `with ledger_lock(path):` — the
+    spy fires and this reds."""
+    path = tmp_path / "deferred-work.md"  # deliberately never created
+    acquisitions = []
+
+    with _counting_lock(monkeypatch, acquisitions):
+        assert archive_closed(path, archive_date="2026-08-24") == []
+
+    assert acquisitions == []
+    assert not path.exists()  # and nothing was created on the way past
+
+
+def test_mark_open_many_matches_serial_mark_open_bytes(tmp_path, monkeypatch):
+    """A batched reopen writes what a serial `mark_open` loop writes, in one
+    acquisition and one write, skipping the ids it cannot reopen.
+
+    The skipped ids are load-bearing, not padding. `DW-2` was closed by the
+    ordinary `mark_done_many`, which writes no undo marker, and `DW-99` does not
+    exist — a batch that treated either as reopened would return an id its caller
+    would then journal as rolled back.
+
+    The equality is not vacuous now that `mark_open` delegates to this function:
+    `_apply_open` cuts a span computed from the entry's parsed offsets, and the
+    first reopen shifts every offset after it. Feeding the second id the text the
+    call READ rather than the text the first reopen produced corrupts the file.
+
+    Ablation: apply every id's cuts against the text read at the top of the hold
+    — the second entry's cut lands at a stale offset and the equality reds."""
+    seed = write_ledger(tmp_path)
+    mark_done_many_reopenable(seed, ["DW-1", "DW-3"], "2026-06-11", "by dw-a", OPERATION_ID)
+    assert mark_done(seed, "DW-2", "2026-06-11", "plain close") is False  # already done
+    closed = seed.read_text(encoding="utf-8")
+    twin = _twin_ledger(tmp_path, closed)
+
+    ids = ["DW-1", "DW-2", "DW-99", "DW-3"]
+    acquisitions, writes = [], []
+    _counting_write(monkeypatch, writes)
+
+    with _counting_lock(monkeypatch, acquisitions):
+        reopened = mark_open_many(seed, ids, "by dw-a", OPERATION_ID)
+
+    assert reopened == ["DW-1", "DW-3"]
+    assert acquisitions == [seed]
+    assert writes == [seed]
+
+    serial = [dw_id for dw_id in ids if mark_open(twin, dw_id, "by dw-a", OPERATION_ID)]
+    assert serial == reopened
+    assert seed.read_text(encoding="utf-8") == twin.read_text(encoding="utf-8")
+
+
+def test_mark_open_many_writes_nothing_when_no_id_is_eligible(tmp_path, monkeypatch):
+    """A replayed rollback over already-open entries leaves the file untouched —
+    and, since #736, takes no lock to establish that.
+
+    Ablation: delete `mark_open_many`'s pre-lock probe block — the acquisition
+    assertion reds. NOT the `if not reopened: return []` guard, whose documented
+    ablation used to live here and now goes GREEN: the probe answers these exact
+    inputs above the lock, so the write spy never reaches that guard. Its
+    ablation moved to `test_a_failing_probe_read_falls_through_to_the_locked_path`,
+    which faults the probe read so the same inputs reach the hold."""
+    path = write_ledger(tmp_path)
+    writes, acquisitions = [], []
+    _counting_write(monkeypatch, writes)
+
+    with _counting_lock(monkeypatch, acquisitions):
+        assert mark_open_many(path, ["DW-1", "DW-99"], "by dw-a", OPERATION_ID) == []
+
+    assert writes == []
+    assert acquisitions == []
+
+
+def test_record_decision_close_matches_the_serial_pair_bytes(tmp_path, monkeypatch):
+    """One `record_decision(close_note=...)` writes exactly what the
+    `append_decision` + `mark_done` pair writes, in one write rather than two.
+
+    The byte equality is where the ordering trap is graded. `_apply_done` inserts
+    its `resolution:` line immediately after the status line, and
+    `_MARK_DONE_TAIL_RE` — the pattern a reopenable close's undo marker is
+    matched with — anchors on exactly that adjacency. Applying the close first
+    and the decision second produces the same two lines in the other order, which
+    parses, reads correctly to a human, and quietly makes the close unreopenable.
+
+    Ablation: swap the two applier calls so `_apply_done` runs first — the
+    decision line lands between `status:` and `resolution:`, and both the
+    equality and the adjacency assertion red."""
+    path = write_ledger(tmp_path)
+    twin = _twin_ledger(tmp_path, path.read_text(encoding="utf-8"))
+    writes = []
+    _counting_write(monkeypatch, writes)
+
+    assert (
+        record_decision(
+            path,
+            "DW-1",
+            "2026-06-11",
+            "fix now",
+            "worth the churn",
+            close_note="closed by decision",
+        )
+        is True
+    )
+    assert writes == [path]
+
+    writes.clear()
+    assert append_decision(twin, "DW-1", "2026-06-11", "fix now", "worth the churn") is True
+    assert mark_done(twin, "DW-1", "2026-06-11", "closed by decision") is True
+    assert writes == [twin, twin]  # the pair this primitive replaces: two writes
+
+    assert path.read_text(encoding="utf-8") == twin.read_text(encoding="utf-8")
+
+    entry = deferredwork._find_entry(path.read_text(encoding="utf-8"), "DW-1")
+    assert entry is not None
+    body = entry.body.splitlines()
+    assert body[body.index("status: done 2026-06-11") + 1] == "resolution: closed by decision"
+    assert body[body.index("status: done 2026-06-11") + 2] == (
+        "decision: 2026-06-11 fix now — worth the churn"
+    )
+
+
+def test_record_decision_without_close_note_only_records_the_decision(tmp_path):
+    """The no-close case leaves the status alone and writes one decision line.
+
+    Asserted against a literal rather than against `append_decision`, which now
+    delegates here — a comparison between them could not fail.
+
+    Ablation: apply `_apply_done` unconditionally — `status: open` becomes
+    `status: done` and the literal reds."""
+    path = write_ledger(tmp_path)
+
+    assert record_decision(path, "DW-1", "2026-06-11", "defer", "next sprint") is True
+
+    assert path.read_text(encoding="utf-8") == LEDGER.replace(
+        "reason: out of scope for the digest story.\nstatus: open\n",
+        "reason: out of scope for the digest story.\n"
+        "status: open\n"
+        "decision: 2026-06-11 defer — next sprint\n",
+    )
+
+
+def test_record_decision_records_a_decision_on_an_already_done_entry(tmp_path):
+    """A done entry still gets its decision line; only the close half is skipped.
+
+    `append_decision`'s long-standing behavior, preserved through the merge: a
+    decision is a record of what a human chose, and an entry someone else already
+    closed is still an entry they chose something about. Returning False here
+    would tell the caller nothing was recorded while a line had been written.
+
+    Ablation: return False when `_apply_done` returns None — the return
+    assertion reds."""
+    path = write_ledger(tmp_path)
+
+    assert (
+        record_decision(path, "DW-2", "2026-06-11", "keep", "already fixed", close_note="n/a")
+        is True
+    )
+
+    entry = deferredwork._find_entry(path.read_text(encoding="utf-8"), "DW-2")
+    assert entry is not None
+    assert entry.status == "done 2026-05-25"  # untouched: the close half no-ops
+    assert "decision: 2026-06-11 keep — already fixed" in entry.body
+    assert "resolution:" not in entry.body
+
+
+def test_record_decision_returns_false_for_a_missing_entry(tmp_path, monkeypatch):
+    """A missing id records nothing, writes nothing, and takes no lock (#736).
+
+    Ablation: delete `record_decision`'s pre-lock probe block — the acquisition
+    assertion reds. The ablation this docstring used to carry ("write
+    unconditionally after the appliers") now goes GREEN: the probe answers a
+    missing id above the lock, so the write spy never reaches the under-lock
+    `if updated is None` guard. That guard's ablation moved to
+    `test_a_failing_probe_read_falls_through_to_the_locked_path`, which faults
+    the probe read so this same call reaches the hold."""
+    path = write_ledger(tmp_path)
+    before = path.read_text(encoding="utf-8")
+    writes, acquisitions = [], []
+    _counting_write(monkeypatch, writes)
+
+    with _counting_lock(monkeypatch, acquisitions):
+        assert record_decision(path, "DW-99", "2026-06-11", "keep", "x", close_note="y") is False
+
+    assert writes == []
+    assert acquisitions == []
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_mark_done_many_per_id_notes(tmp_path, monkeypatch):
+    """`notes[i]` supplies `dw_ids[i]`'s resolution note, still in one write.
+
+    The shape sweep's per-entry evidence needs: without it, closing N entries
+    under N different notes costs N read-modify-write cycles, which is the very
+    window this program is closing.
+
+    Ablation: ignore `notes` and pass `note` for every id — the fallback string
+    appears and the per-id notes do not."""
+    path = write_ledger(tmp_path)
+    writes = []
+    _counting_write(monkeypatch, writes)
+
+    assert mark_done_many(
+        path,
+        ["DW-1", "DW-3"],
+        "2026-06-11",
+        "fallback note",
+        notes=["evidence for one", "evidence for three"],
+    ) == ["DW-1", "DW-3"]
+
+    text = path.read_text(encoding="utf-8")
+    assert writes == [path]
+    assert "resolution: evidence for one" in text
+    assert "resolution: evidence for three" in text
+    assert "fallback note" not in text
+
+
+def test_mark_done_many_notes_length_mismatch_raises_before_any_io(tmp_path, monkeypatch):
+    """A short `notes` list raises before the lock, not partway through the ids.
+
+    The pairing is positional, so a mismatch is a caller bug that would otherwise
+    attribute the wrong evidence to a real closure — silently, since every note
+    is free text nothing validates. Raising above the lock keeps it from queueing
+    behind another process first.
+
+    Ablation: check the lengths inside the `with ledger_lock(path):` block — the
+    acquisition assertion reds."""
+    path = write_ledger(tmp_path)
+    before = path.read_text(encoding="utf-8")
+    acquisitions = []
+
+    with _counting_lock(monkeypatch, acquisitions):
+        with pytest.raises(ValueError, match="notes must be one per dw_id"):
+            mark_done_many(path, ["DW-1", "DW-3"], "2026-06-11", "n", notes=["only one"])
+
+    assert acquisitions == []
+    assert path.read_text(encoding="utf-8") == before
+
+
+# ----------------------------------- cross-process ledger lock (#286, #469)
+#
+# Every mutator here is a read->edit->write of the whole ledger, so two
+# orchestrator processes — a second run, a sweep, the TUI decision modal,
+# `sweep --archive` — would otherwise both read, both edit, and let the last
+# atomic write win. The section grades four separable claims: that each leaf
+# mutator holds `ledger_lock` across its whole critical section, that the hold
+# really excludes, that a nested acquisition raises rather than self-deadlocking,
+# and that a failed acquisition raises without writing.
+#
+# Exclusion is probed with `blocking=False` only. That is not an optimization:
+# `file_lock` is per open fd, so a blocking probe from this process would wait
+# forever on POSIX `flock` against a lock this very thread holds, and ~10s on
+# Windows before raising. The suite runs under xdist, so neither is acceptable.
+
+
+def _lock_is_held(path: Path) -> bool:
+    """True when the ledger's sidecar lock cannot be taken right now."""
+    try:
+        with platform_util.file_lock(runs.lock_path_for(path), blocking=False):
+            return False
+    except OSError:
+        return True
+
+
+@contextlib.contextmanager
+def _unavailable_lock(path, **kwargs):
+    """A `file_lock` that cannot be acquired.
+
+    `OSError(11, "Resource deadlock avoided")` is the shape `msvcrt.locking`
+    raises when its ~10 s blocking retry runs out — a routine outcome on the
+    Windows legs rather than a contrived one. The dead `yield` after the raise
+    keeps this a generator function, which `contextlib.contextmanager` requires.
+    """
+    raise OSError(11, "Resource deadlock avoided")
+    yield  # pragma: no cover — unreachable
+
+
+# Every row here must be seeded to WRITE. A no-op row would grade nothing: the
+# advisory pre-lock probe (#736) answers a read-dependent no-op before the
+# acquisition these tests spy on, so the hold, the nesting and the
+# raise-on-failure claims would all pass vacuously. `NOOP_MUTATORS` below is the
+# deliberate inverse, and grades the absence of that same acquisition.
+LOCKED_MUTATORS = {
+    "append_decision": lambda p: append_decision(p, "DW-1", "2026-06-11", "keep", "later"),
+    "append_entries": lambda p: append_entries(
+        p,
+        [
+            EntrySpec(
+                title="new", origin="probe-batch", source_spec="spec-probe-batch.md", reason="raced"
+            )
+        ],
+    ),
+    "append_entry": lambda p: append_entry(
+        p, title="new", origin="probe", source_spec="spec-probe.md", reason="raced"
+    ),
+    "archive_closed": lambda p: archive_closed(p, archive_date="2026-08-24"),
+    "mark_done": lambda p: mark_done(p, "DW-1", "2026-06-11", "fixed"),
+    "mark_done_many": lambda p: mark_done_many(p, ["DW-1"], "2026-06-11", "fixed"),
+    "mark_done_many_reopenable": lambda p: mark_done_many_reopenable(
+        p, ["DW-1"], "2026-06-11", "fixed", OPERATION_ID
+    ),
+    "mark_open": lambda p: mark_open(p, "DW-1", "by dw-a", OPERATION_ID),
+    "mark_open_many": lambda p: mark_open_many(p, ["DW-1"], "by dw-a", OPERATION_ID),
+    "record_decision": lambda p: record_decision(
+        p, "DW-1", "2026-06-11", "keep", "later", close_note="closed by decision"
+    ),
+}
+
+# The primitives that reopen a close need one on disk to undo; every other row
+# runs against the plain fixture.
+_NEEDS_A_REOPENABLE_CLOSE = {"mark_open", "mark_open_many"}
+
+
+def _seed_for(tmp_path: Path, name: str) -> Path:
+    """The ledger `name`'s call needs, written before any lock spy is installed."""
+    path = write_ledger(tmp_path)
+    if name in _NEEDS_A_REOPENABLE_CLOSE:
+        close_reopenable(path, "DW-1", "by dw-a")
+    return path
+
+
+@pytest.mark.parametrize("name", sorted(LOCKED_MUTATORS))
+def test_every_mutator_holds_the_ledger_lock(tmp_path, monkeypatch, name):
+    """Each leaf mutator takes the lock exactly once, and the hold really excludes.
+
+    Two claims in one assertion, and both are needed. That the spy fired says the
+    mutator routes through `ledger_lock` at all; that it fired ONCE says the whole
+    read->edit->write sits inside a single acquisition rather than a per-step
+    hold that another writer can slip between. The probe inside the critical
+    section says the acquisition is a real OS lock and not a no-op — a
+    `ledger_lock` that yielded without taking anything would satisfy the call
+    count and exclude nobody.
+
+    Ablation: delete this mutator's `with ledger_lock(path):` and dedent its
+    body — the spy never fires, `probed` stays empty, and the row reds."""
+    path = _seed_for(tmp_path, name)
+    real_lock = deferredwork.ledger_lock
+    probed = []
+
+    @contextlib.contextmanager
+    def spy_lock(p):
+        with real_lock(p):
+            probed.append(_lock_is_held(p))
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", spy_lock)
+
+    LOCKED_MUTATORS[name](path)
+
+    assert probed == [True]
+
+
+@pytest.mark.parametrize("name", sorted(LOCKED_MUTATORS))
+def test_mutators_acquire_exactly_once_and_never_nest(tmp_path, monkeypatch, name):
+    """One public call is one acquisition, at depth zero, for every entry point
+    including the thin wrappers.
+
+    What this adds over the row above is the *shape* of the failure it can name.
+    That test grades the leaf's hold from inside; this one grades the whole call
+    graph a public name reaches, and distinguishes the two ways the count can
+    exceed one. A wrapper that re-pairs two locked primitives instead of
+    delegating to a single leaf acquires twice in sequence — count 2, depth 0. A
+    wrapper that takes the lock and then calls a mutator under it acquires while
+    already held — `ledger_lock`'s own guard turns that into a `RuntimeError`
+    rather than the POSIX self-deadlock it would otherwise be, but the spy names
+    the offending mutator before the guard is even reached.
+
+    Ablation: re-pair `record_decision` as `append_decision(...)` +
+    `mark_done(...)` at the wrapper — that row's count becomes 2 and it reds."""
+    path = _seed_for(tmp_path, name)
+    real_lock = deferredwork.ledger_lock
+    depth = 0
+    acquisitions = 0
+
+    @contextlib.contextmanager
+    def spy_lock(p):
+        nonlocal depth, acquisitions
+        assert depth == 0, f"{name} nested a ledger_lock acquisition"
+        acquisitions += 1
+        depth += 1
+        try:
+            with real_lock(p):
+                yield
+        finally:
+            depth -= 1
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", spy_lock)
+
+    LOCKED_MUTATORS[name](path)
+
+    assert acquisitions == 1
+
+
+def test_ledger_lock_is_not_reentrant(tmp_path, monkeypatch):
+    """A nested acquisition raises rather than deadlocking, and raises BEFORE it
+    reaches the OS lock.
+
+    `file_lock` is per open fd: on POSIX a second `flock(LOCK_EX)` from this same
+    thread blocks against the lock the thread already holds, with no timeout and
+    no traceback — the run simply stops. The guard converts that silent wedge
+    into a loud error at the call site that introduced the nesting.
+
+    The `file_lock` counter is what makes the test deterministic. Asserting only
+    the `RuntimeError` would leave a version of the guard that raises *after*
+    attempting the acquire indistinguishable from one that raises before it, and
+    the former hangs. Counting proves the nested entry never reached the kernel,
+    so this test never risks the deadlock it is about.
+
+    Ablation is deliberately NOT run here: dropping the depth guard makes the
+    nested entry block forever rather than fail, which hangs the suite instead
+    of reddening one row. The guard's absence is graded by inspection.
+
+    The tail grades the release: the guard is per-thread state, so a hold that
+    is not cleared on exit would refuse every later mutation in this thread."""
+    path = write_ledger(tmp_path)
+    real_file_lock = deferredwork.file_lock
+    acquired = []
+
+    @contextlib.contextmanager
+    def counting(lock_path, **kwargs):
+        acquired.append(lock_path)
+        with real_file_lock(lock_path, **kwargs):
+            yield
+
+    monkeypatch.setattr(deferredwork, "file_lock", counting)
+
+    with deferredwork.ledger_lock(path):
+        with pytest.raises(RuntimeError, match="not reentrant"):
+            with deferredwork.ledger_lock(path):
+                pass  # pragma: no cover — the guard raises on entry
+    assert len(acquired) == 1  # the nested entry never reached the OS lock
+
+    with deferredwork.ledger_lock(path):  # released cleanly, so this is fine
+        pass
+    assert len(acquired) == 2
+
+
+def test_a_failed_acquisition_does_not_leak_the_reentrancy_guard(tmp_path, monkeypatch):
+    """An acquisition that raises must still leave this thread unmarked.
+
+    The guard is set before the acquire (it has to be — the acquire is what would
+    deadlock), so clearing it anywhere but a `finally` strands the thread: every
+    later mutation in this process raises `RuntimeError` and the run dies of a
+    transient lock failure it should merely have reported.
+
+    Ablation: move `_LOCK_STATE.held = False` out of `ledger_lock`'s `finally`
+    onto the success path — the second `mark_done` raises `RuntimeError` instead
+    of closing DW-1."""
+    path = write_ledger(tmp_path)
+    with monkeypatch.context() as m:
+        m.setattr(deferredwork, "file_lock", _unavailable_lock)
+        with pytest.raises(OSError, match="Resource deadlock avoided"):
+            mark_done(path, "DW-1", "2026-06-11", "fixed")
+
+    assert mark_done(path, "DW-1", "2026-06-11", "fixed")
+
+
+def test_scripted_interleave_loses_no_update(tmp_path, monkeypatch):
+    """The #286 lost-update scenario, made deterministic: a rival writer commits
+    in full between writer A's call and A's acquisition, and A must still see it.
+
+    Writer A closes DW-1; writer B appends a new entry. B is run to completion —
+    acquire, read, write, release — immediately BEFORE A delegates to the real
+    lock, which is the worst legal interleaving the lock permits. A therefore has
+    to read the ledger B just wrote, not one it snapshotted earlier, or A's write
+    reverts B's append.
+
+    Ablation: hoist `_mark_done_many`'s `path.read_text` above its
+    `with ledger_lock(path):` AND WRITE FROM IT — A's read then happens before
+    the spy fires, A writes its stale snapshot, and DW-4 is gone from the final
+    ledger. The hoist alone is no longer the ablation: the advisory probe (#736)
+    already reads above the lock. It decides nothing here — DW-1 is open, so the
+    probe declines to answer and the under-lock read stays authoritative — which
+    is exactly the property this row keeps grading."""
+    path = write_ledger(tmp_path)
+    real_lock = deferredwork.ledger_lock
+    rival_ran = []
+
+    @contextlib.contextmanager
+    def rival_first(p):
+        if not rival_ran:
+            rival_ran.append(True)  # once: B's own append re-enters this spy
+            assert (
+                append_entry(
+                    p,
+                    title="rival append",
+                    origin="rival-origin",
+                    source_spec="spec-rival.md",
+                    reason="raced with a close",
+                )
+                == "DW-4"
+            )
+        with real_lock(p):
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", rival_first)
+
+    assert mark_done(path, "DW-1", "2026-06-11", "closed by A")
+
+    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    assert entries["DW-4"].open  # B's append survived A's write
+    assert "origin: rival-origin" in entries["DW-4"].body
+    assert entries["DW-1"].status == "done 2026-06-11"  # ...and A's close landed
+    assert "resolution: closed by A" in entries["DW-1"].body
+    assert len(entries) == 4  # DW-1..DW-3 plus B's, every id distinct
+
+
+def test_archive_closed_writes_both_files_inside_one_acquisition(tmp_path, monkeypatch):
+    """The archive and the trimmed ledger are written under ONE hold.
+
+    The pair is a transaction: the archive is written first so a crash between
+    the writes leaves bodies duplicated (harmless, the archive is append-only)
+    rather than lost. Release the lock between them and a rival mutator lands in
+    the gap and writes the untrimmed ledger back, resurrecting entries whose
+    bodies have already moved to the archive — a duplicate no later run cleans
+    up. It is also why the archive sibling has no lock of its own: it is only
+    ever written under its ledger's.
+
+    Ablation: hoist either `atomic_write_text` out of the `with` — the event
+    order changes and the assertion reds."""
+    path = write_ledger(tmp_path)
+    archive = path.parent / ARCHIVE_REL
+    real_lock, real_write = deferredwork.ledger_lock, deferredwork.atomic_write_text
+    events = []
+
+    @contextlib.contextmanager
+    def spy_lock(p):
+        events.append("lock-enter")
+        with real_lock(p):
+            yield
+        events.append("lock-exit")
+
+    def spy_write(p, text):
+        events.append("write-archive" if p == archive else "write-ledger")
+        return real_write(p, text)
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", spy_lock)
+    monkeypatch.setattr(deferredwork, "atomic_write_text", spy_write)
+
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-2"]
+
+    assert events == ["lock-enter", "write-archive", "write-ledger", "lock-exit"]
+
+
+@pytest.mark.parametrize("name", sorted(LOCKED_MUTATORS))
+def test_lock_acquisition_failure_raises_and_writes_nothing(tmp_path, monkeypatch, name):
+    """A lock that cannot be taken fails the write; it never proceeds unlocked.
+
+    This pins the repo's "repair writes must raise" doctrine at the new seam.
+    Degrading to an unlocked write would be the worst of both worlds: the caller
+    is told the mutation succeeded while the exact interleaving the lock exists
+    to prevent is back, and only under contention — the case no test would catch.
+
+    Ablation: swallow the acquisition `OSError` inside `ledger_lock` and let the
+    body run anyway — `pytest.raises` fails on every row."""
+    path = _seed_for(tmp_path, name)
+    archive = path.parent / ARCHIVE_REL
+    before = path.read_text(encoding="utf-8")
+    archive_before = archive.read_text(encoding="utf-8") if archive.is_file() else None
+
+    monkeypatch.setattr(deferredwork, "file_lock", _unavailable_lock)
+
+    with pytest.raises(OSError, match="Resource deadlock avoided"):
+        LOCKED_MUTATORS[name](path)
+
+    assert path.read_text(encoding="utf-8") == before
+    assert (archive.read_text(encoding="utf-8") if archive.is_file() else None) == archive_before
+
+
+# --------------------------- read-dependent no-ops take no lock (#736)
+#
+# A lock taken for an operation that will not write turns a previously
+# successful no-op into a failure: the acquisition itself can raise `OSError`,
+# and deriving the sidecar path raises `runs.StateRootError` wherever no state
+# root is nameable. #726 closed two instances of that class here — the missing
+# ledger and the empty batch, both answerable without reading. This section
+# grades the third, where only a READ can tell that the call would write
+# nothing: every id already done, an id no entry carries, every spec deduping,
+# nothing eligible to archive. Each is answered from ONE advisory pre-lock read
+# that runs the same pure decision helper the locked pass runs; every other
+# answer, and any fault during the probe, falls through to the hold.
+
+_DEDUPE_SPEC = {
+    "title": "already appended by the seeder",
+    "origin": "probe-noop",
+    "source_spec": "spec-probe-noop.md",
+    "reason": "so the row dedupes and writes nothing",
+}
+
+# The deliberate inverse of `LOCKED_MUTATORS`: every row is seeded to write
+# NOTHING. Pairs are (call, expected result). The return value is graded
+# alongside the acquisition count because the count alone is satisfiable by a
+# probe that skipped the lock while answering the WRONG no-op value — and each
+# mutator's no-op answer is part of its frozen contract.
+NOOP_MUTATORS = {
+    # No entry carries DW-99, so the decision line has nowhere to go.
+    "append_decision": (
+        lambda p: append_decision(p, "DW-99", "2026-06-11", "keep", "later"),
+        False,
+    ),
+    # The seeder already appended this spec's open twin, so it dedupes.
+    "append_entries": (lambda p: append_entries(p, [EntrySpec(**_DEDUPE_SPEC)]), [None]),
+    "append_entry": (lambda p: append_entry(p, **_DEDUPE_SPEC), None),
+    # DW-2 closed 2026-05-25, on or after the cutoff; DW-1 and DW-3 are open.
+    "archive_closed": (lambda p: archive_closed(p, before="2026-05-01"), []),
+    "mark_done": (lambda p: mark_done(p, "DW-99", "2026-06-11", "fixed"), False),
+    # DW-2 is already done, and DW-99 does not exist.
+    "mark_done_many": (
+        lambda p: mark_done_many(p, ["DW-2", "DW-99"], "2026-06-11", "fixed"),
+        [],
+    ),
+    "mark_done_many_reopenable": (
+        lambda p: mark_done_many_reopenable(p, ["DW-2"], "2026-06-11", "fixed", OPERATION_ID),
+        [],
+    ),
+    "mark_open": (lambda p: mark_open(p, "DW-99", "by dw-a", OPERATION_ID), False),
+    # DW-1 is open and carries no undo marker; DW-99 does not exist.
+    "mark_open_many": (
+        lambda p: mark_open_many(p, ["DW-1", "DW-99"], "by dw-a", OPERATION_ID),
+        [],
+    ),
+    "record_decision": (
+        lambda p: record_decision(p, "DW-99", "2026-06-11", "keep", "x", close_note="y"),
+        False,
+    ),
+}
+
+# The append rows dedupe against an entry that has to be on disk first; every
+# other row is already a no-op against the plain fixture.
+_NEEDS_A_DEDUPE_TWIN = {"append_entries", "append_entry"}
+
+# One row per PROBED LEAF, keyed into `NOOP_MUTATORS` above. The wrapper rows
+# there reach these same five bodies, so faulting the probe once per leaf covers
+# every probe in the module without re-grading a delegation.
+PROBED_LEAVES = [
+    "append_entries",
+    "archive_closed",
+    "mark_done_many",
+    "mark_open_many",
+    "record_decision",
+]
+
+
+def _noop_seed_for(tmp_path: Path, name: str) -> Path:
+    """The ledger `name`'s no-op call needs, written before any spy is installed."""
+    path = write_ledger(tmp_path)
+    if name in _NEEDS_A_DEDUPE_TWIN:
+        assert append_entry(path, **_DEDUPE_SPEC) == "DW-4"
+    return path
+
+
+@pytest.mark.parametrize("name", sorted(NOOP_MUTATORS))
+def test_a_read_dependent_noop_takes_no_lock(tmp_path, monkeypatch, name):
+    """A call a read proves would write nothing acquires nothing.
+
+    The exact inverse of `test_every_mutator_holds_the_ledger_lock`, over the
+    same public surface: there the input is seeded to write and the acquisition
+    is mandatory; here it is seeded to no-op and the acquisition is a defect.
+    Both readings of "the lock is load-bearing" have to hold, or the fix has
+    traded one failure for another.
+
+    Nothing landing on disk is asserted as well as nothing acquiring, and it is
+    not redundant: the probe reaches its answer through the same pure helper the
+    locked pass folds, so a helper that reported "no write" while the authority
+    would have written would show up here as changed bytes rather than as a
+    count.
+
+    Ablation: delete this mutator's pre-lock `try:` probe block — the spy counts
+    one and the row reds on `acquisitions == []`."""
+    path = _noop_seed_for(tmp_path, name)
+    before = path.read_text(encoding="utf-8")
+    call, expected = NOOP_MUTATORS[name]
+    acquisitions = []
+
+    with _counting_lock(monkeypatch, acquisitions):
+        assert call(path) == expected
+
+    assert acquisitions == []
+    assert path.read_text(encoding="utf-8") == before
+    assert not (path.parent / ARCHIVE_REL).exists()
+
+
+@pytest.mark.parametrize("name", PROBED_LEAVES)
+def test_a_failing_probe_read_falls_through_to_the_locked_path(tmp_path, monkeypatch, name):
+    """A probe that cannot read decides nothing: the call takes the lock and the
+    under-lock guards refuse the write, exactly as before the probe existed.
+
+    This is what keeps those under-lock guards ablation-provable. Their own
+    tests used to reach them with these very inputs; the probe now answers first,
+    so the write-spy oracle fires above the lock and those ablations go green.
+    Faulting the probe read — and only the probe read, the under-lock one
+    succeeds — routes the same call back through the hold, where the guard is
+    the only thing standing between it and a pointless rewrite.
+
+    The acquisition count is the load-bearing assertion, not the return value.
+    A probe whose fault escaped instead of falling through would raise; a probe
+    that answered anyway would leave the count at zero. Only `== [path]` says
+    "fell through to the hold" rather than "never needed it" (S1 found the
+    matching trap one module over, where `pytest.raises` stayed green with the
+    `except` deleted).
+
+    Ablations, singly: (A) delete this leaf's `except Exception:` — the injected
+    `PermissionError` escapes and the row reds; (B) delete this leaf's
+    under-lock no-write guard (`if not marked:` / `if not reopened:` /
+    `if updated is None:` / `if all(dw_id is None ...)` / `if not to_archive:`)
+    — the write spy fires and the row reds."""
+    path = _noop_seed_for(tmp_path, name)
+    before = path.read_text(encoding="utf-8")
+    call, expected = NOOP_MUTATORS[name]
+    real, fired = Path.read_text, []
+
+    def raise_once_then_delegate(self, *a, **kw):
+        # Keyed on the ledger: the probe read is the FIRST read of this path, so
+        # the fault lands there and the under-lock read gets the real file.
+        if self == path and not fired:
+            fired.append(self)
+            raise PermissionError(13, "Permission denied")
+        return real(self, *a, **kw)
+
+    acquisitions, writes = [], []
+    _counting_write(monkeypatch, writes)
+    monkeypatch.setattr(Path, "read_text", raise_once_then_delegate)
+
+    with _counting_lock(monkeypatch, acquisitions):
+        assert call(path) == expected
+
+    assert fired  # the fault really fired (a green row proves nothing otherwise)
+    assert acquisitions == [path]
+    assert writes == []
+    assert path.read_text(encoding="utf-8") == before
+
+
+@pytest.mark.parametrize(
+    ("call", "expected"),
+    [
+        pytest.param(
+            lambda p: mark_done_many(p, ["DW-1"], "2026-06-11", "fixed"), [], id="mark_done_many"
+        ),
+        pytest.param(
+            lambda p: mark_open_many(p, ["DW-1"], "by dw-a", OPERATION_ID), [], id="mark_open_many"
+        ),
+        pytest.param(
+            lambda p: record_decision(p, "DW-1", "2026-06-11", "keep", "x"),
+            False,
+            id="record_decision",
+        ),
+    ],
+)
+def test_mutators_take_no_lock_for_a_missing_ledger(tmp_path, monkeypatch, call, expected):
+    """No ledger means no write, and so no lock — `archive_closed`'s rule, now
+    kept by its three siblings too.
+
+    These ids are real and these arguments are valid, so nothing but the absent
+    file can be answering: it is the `is_file` guard under test, not the probe
+    beneath it (which would fault on the same missing file and fall through).
+    The recheck under the hold stays in each body, creation being able to race
+    this answer.
+
+    Ablation: move that mutator's `is_file` guard back below its
+    `with ledger_lock(path):` — the spy fires and the row reds."""
+    path = tmp_path / "deferred-work.md"  # deliberately never created
+    acquisitions = []
+
+    with _counting_lock(monkeypatch, acquisitions):
+        assert call(path) == expected
+
+    assert acquisitions == []
+    assert not path.exists()  # and nothing was created on the way past
+
+
+@pytest.mark.parametrize("name", sorted(NOOP_MUTATORS))
+def test_a_noop_mutation_succeeds_when_no_state_root_is_derivable(tmp_path, monkeypatch, name):
+    """With nowhere to put a lock file, a no-op still succeeds; a write still fails.
+
+    `runs.StateRootError` is raised while DERIVING the sidecar path, before any
+    OS lock is attempted, so it reaches every caller of `ledger_lock` in an
+    environment that names no state root — and it is not an `OSError`, so no
+    caller's net catches it. Answering the no-op above the acquisition is what
+    stops that environment from failing calls that were never going to write.
+
+    The write-shaped control is not decoration: it is what says the patch is
+    live. Without it a `lock_path_for` stub that silently never fired would make
+    every row above vacuously green.
+
+    Ablation: delete any probe — that row raises `StateRootError` instead of
+    returning, and reds."""
+    path = _noop_seed_for(tmp_path, name)
+    call, expected = NOOP_MUTATORS[name]
+
+    def no_state_root(_path):
+        raise runs.StateRootError("no state root in this environment")
+
+    monkeypatch.setattr(runs, "lock_path_for", no_state_root)
+
+    assert call(path) == expected
+
+    with pytest.raises(runs.StateRootError):
+        mark_done(path, "DW-1", "2026-06-11", "a call that would really write")
+
+
+# The child of the two-process acceptance test. Appends 8 entries with distinct
+# origins (so the idempotence scan never dedupes one away) through the real
+# `append_entry`, after a file rendezvous with the parent. It reports the ids it
+# minted so the parent can grade the mint, not merely the entry count.
+CONCURRENT_APPENDER = (
+    "import pathlib, sys, time\n"
+    "from bmad_loop.deferredwork import append_entry\n"
+    "ledger, ready, go, done = (pathlib.Path(a) for a in sys.argv[1:5])\n"
+    "tag = sys.argv[5]\n"
+    "ready.write_text('ready')\n"
+    "deadline = time.monotonic() + 60\n"
+    "while time.monotonic() < deadline and not go.exists():\n"
+    "    time.sleep(0.01)\n"
+    "if not go.exists():\n"
+    "    sys.exit(3)\n"  # never released — what a broken rendezvous looks like
+    "ids = []\n"
+    "for n in range(8):\n"
+    "    ids.append(append_entry(ledger, title=tag + '-' + str(n),\n"
+    "                            origin=tag + '-origin-' + str(n),\n"
+    "                            source_spec='spec-' + tag + '-' + str(n) + '.md',\n"
+    "                            reason='raced'))\n"
+    "done.write_text('\\n'.join(str(i) for i in ids))\n"
+)
+
+
+def test_two_processes_append_concurrently_produce_distinct_ids(tmp_path):
+    """#286's first acceptance criterion, end to end: two PROCESSES appending at
+    once produce every entry, each with its own id, and lose none.
+
+    This is the integration proof that the lock crosses a process boundary — the
+    one thing no in-process spy can show, and the only test here that exercises
+    the `msvcrt` branch on the Windows CI legs rather than `flock`. The children
+    inherit the environment, so the autouse `_isolate_state_root` fixture's
+    `BMAD_LOOP_STATE_DIR` reaches them and all three processes resolve the same
+    sidecar.
+
+    Deliberately NOT this test's job to grade the lock's absence: without it the
+    outcome is stochastic — a lost update or a duplicated `next_seq` mint needs
+    the two read->write windows to actually overlap — so an ablation here reds
+    only sometimes. The deterministic coverage is
+    `test_every_mutator_holds_the_ledger_lock` and
+    `test_scripted_interleave_loses_no_update` above.
+
+    No parent-held lock: the parent must not be a third contender, or the
+    children's blocking acquires would sit on the Windows ~10 s ceiling. Waits
+    are bounded polls on a monotonic deadline, never a bare sleep."""
+    path = write_ledger(tmp_path, "# Deferred Work\n")
+    go = tmp_path / "go"
+    procs, readies, dones = [], [], []
+    for n in (1, 2):
+        ready, done = tmp_path / f"ready-{n}", tmp_path / f"done-{n}"
+        procs.append(
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    CONCURRENT_APPENDER,
+                    str(path),
+                    str(ready),
+                    str(go),
+                    str(done),
+                    f"w{n}",
+                ]
+            )
+        )
+        readies.append(ready)
+        dones.append(done)
+    try:
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not all(r.exists() for r in readies):
+            time.sleep(0.02)
+        assert all(r.exists() for r in readies), "a child never reached the rendezvous"
+
+        go.write_text("go")  # release both at once
+        for proc in procs:
+            proc.communicate(timeout=120)
+            assert proc.returncode == 0
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+
+    entries = parse_ledger(path.read_text(encoding="utf-8"))
+    assert len(entries) == 16  # nothing lost to a last-write-wins overwrite
+    assert len({e.id for e in entries}) == 16  # ...and no id minted twice
+
+    reported = [line for d in dones for line in d.read_text(encoding="utf-8").splitlines()]
+    assert "None" not in reported  # no append was silently deduped away
+    assert sorted(reported) == sorted(e.id for e in entries)

@@ -1,5 +1,6 @@
 """Engine scenario tests against the mock adapter — no tmux, no LLM."""
 
+import contextlib
 import dataclasses
 import hashlib
 import json
@@ -24,6 +25,7 @@ from conftest import (
     fault_read_text,
     generic_dev_effect,
     git,
+    refuse_to_resolve,
     review_effect,
     set_sprint,
     spec_path,
@@ -36,7 +38,14 @@ from conftest import (
 from bmad_loop import deferredwork, platform_util, runs, verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
-from bmad_loop.engine import Engine, RunPaused, RunStopped, _digest_of, _run_depth
+from bmad_loop.engine import (
+    Engine,
+    RunPaused,
+    RunStopped,
+    _digest_of,
+    _LedgerAnchor,
+    _run_depth,
+)
 from bmad_loop.journal import LOGS_DIR, VERIFY_DIR, Journal, load_state
 from bmad_loop.model import (
     PAUSE_EPIC_BOUNDARY,
@@ -2652,13 +2661,17 @@ def test_a_failed_park_record_rollback_is_journaled_not_raised(project, monkeypa
     left over for a park in no commit.
 
     `OSError` is the injected type deliberately. Unlike `_restore_deferred_closes`
-    this site passes `follow_symlinks=False`, so no `Path.resolve` runs and the
-    pre-3.13 `RuntimeError`-on-symlink-loop cannot arise — widening the guard here
-    would be copying a fix for a call this one does not make.
+    this site never resolves — the confined writer walks the components below the
+    project root with `O_NOFOLLOW` and calls no `Path.resolve` — so the pre-3.13
+    `RuntimeError`-on-symlink-loop cannot arise, and widening the guard here would
+    be copying a fix for a call this one does not make. `UnconfinedWriteError` is
+    an `OSError` subclass, so a confinement refusal lands in this same arm.
 
-    Patched as bound in `engine` and FILTERED BY FILENAME: the module has four
-    `atomic_write_text` sites on one binding, so a module-wide boom survives a
-    revert of this site and would go green by crashing from a different one.
+    Patched at the CONFINED binding as bound in `engine` (#593), and still
+    FILTERED BY FILENAME. The filter mattered when four sites shared one binding;
+    the confined name now has only this one, but `engine.atomic_write_text` still
+    exists for the other three — so a patch aimed at the old name would not raise,
+    it would simply never fire, which is why the journal row below is the oracle.
 
     Ablation: delete the `self.journal.append` and this fails on the journal row
     alone; delete the whole `except OSError` arm and it fails on `not
@@ -2666,14 +2679,16 @@ def test_a_failed_park_record_rollback_is_journaled_not_raised(project, monkeypa
     from bmad_loop import operatoractions
 
     engine, record = _park_over_an_earlier_record(project, ["the earlier park's action"])
-    real = platform_util.atomic_write_text
+    real = platform_util.atomic_write_text_confined
 
-    def boom(path, text, *, follow_symlinks=True):
+    def boom(path, text, *, confine_root, require_writable_target=False):
         if Path(path).name == record.name:
             raise OSError(30, "Read-only file system")
-        return real(path, text, follow_symlinks=follow_symlinks)
+        return real(
+            path, text, confine_root=confine_root, require_writable_target=require_writable_target
+        )
 
-    monkeypatch.setattr("bmad_loop.engine.atomic_write_text", boom)
+    monkeypatch.setattr("bmad_loop.engine.atomic_write_text_confined", boom)
 
     summary = engine.run()
 
@@ -4336,14 +4351,17 @@ def test_closes_deferred_rolls_back_when_a_signal_stops_the_close_itself(project
     monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
     engine = _closes_deferred_run(project, ["DW-1"])
     before = project.deferred_work.read_bytes()
-    real_mark = deferredwork.mark_done_many
+    # the forward close is `mark_done_many_reopenable` since #286 made the story
+    # close entry-scoped; patching the plain `mark_done_many` it used to call would
+    # inject nothing and this test would fail on its assertions instead of its fault
+    real_mark = deferredwork.mark_done_many_reopenable
 
     def sigterm_after_publication(*a, **kw):
         marked = real_mark(*a, **kw)  # the flip is on disk now
         signal.raise_signal(signal.SIGTERM)
         return marked  # unreachable: the handler raises first
 
-    monkeypatch.setattr(deferredwork, "mark_done_many", sigterm_after_publication)
+    monkeypatch.setattr(deferredwork, "mark_done_many_reopenable", sigterm_after_publication)
 
     summary = engine.run()
 
@@ -4364,10 +4382,12 @@ def test_failed_rollback_does_not_displace_the_commit_failure(project, monkeypat
     and the `BaseException` arm would skip its bare `raise` and swap a graceful
     `RunStopped` for a write complaint.
 
-    `OSError` was too narrow to hold that. `atomic_write_text` resolves the path
-    before its own try, and below 3.13 `Path.resolve` reports a symlink loop as
-    `RuntimeError` — for a ledger the helper explicitly supports being a symlink,
-    and whose OTHER resolve (`_ledger_in_repo`) already catches that type.
+    `OSError` was too narrow to hold that. The `atomic_write_text` under the undo
+    resolves the path before its own try, and below 3.13 `Path.resolve` reports a
+    symlink loop as `RuntimeError` — for a ledger the helper explicitly supports
+    being a symlink, and whose OTHER resolve (`_ledger_in_repo`) already catches
+    that type. Deriving the ledger lock's sidecar path can raise
+    `runs.StateRootError`, which is no `OSError` either.
 
     The fault is injected rather than built from a real symlink loop on purpose:
     3.13+ resolves loops without raising, so a loop-based version would pass on
@@ -4379,10 +4399,14 @@ def test_failed_rollback_does_not_displace_the_commit_failure(project, monkeypat
     def unresolvable(*a, **kw):
         raise RuntimeError("Symlink loop from '/w/deferred-work.md'")
 
-    # patched as bound in `engine` (its sole call site is the restore), NOT in
-    # `deferredwork` — the forward close must still publish, or there would be
-    # nothing for the rollback to fail at.
-    monkeypatch.setattr("bmad_loop.engine.atomic_write_text", unresolvable)
+    # patched on the restore's own primitive, not on the forward close's: since
+    # #286 the rollback goes through `mark_open_many` and the close through
+    # `mark_done_many_reopenable`, so breaking the first leaves the second free to
+    # publish — and there has to be a published close for the rollback to fail at.
+    # (This read `bmad_loop.engine.atomic_write_text` while the restore rewrote the
+    # whole document itself; the restore no longer calls it, so that patch would
+    # inject nothing.)
+    monkeypatch.setattr(deferredwork, "mark_open_many", unresolvable)
 
     summary = engine.run()
 
@@ -4399,6 +4423,126 @@ def test_failed_rollback_does_not_displace_the_commit_failure(project, monkeypat
     # still reads `done` for a commit that does not exist. Advisory, journaled,
     # human-attended — not silently papered over.
     assert not _ledger_entries(project)["DW-1"].open
+
+
+def test_deferred_close_rollback_preserves_a_concurrent_append(project, monkeypatch):
+    """The rollback undoes THIS story's closes and nothing else (#286).
+
+    The close-to-commit window spans `finalize_commit`'s git spawns and, on this
+    very leg, an operator-blocking pause, so it is long enough for a second
+    orchestrator process — another run, a sweep, the TUI decision modal — to file
+    an entry into the same ledger. The old restore rewrote the whole document from
+    the pre-close text and called that an accepted advisory trade-off; the rival's
+    entry disappeared, and `next_seq` would hand its id out again.
+
+    Ablation: restore `atomic_write_text(ledger, before)` over the pre-close text in
+    `_restore_deferred_closes` and the foreign entry vanishes — this reds."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+    ledger = project.deferred_work
+
+    def rival_appends_then_the_commit_fails(*a, **kw):
+        # a second writer, mid-window, through the ordinary public appender
+        deferredwork.append_entry(
+            ledger,
+            title="filed by another process",
+            origin="sweep, 2026-06-11",
+            source_spec="other.md",
+            reason="a rival writer got here first.",
+        )
+        raise verify.GitError("commit refused")
+
+    monkeypatch.setattr(verify, "finalize_commit", rival_appends_then_the_commit_fails)
+
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1
+    entries = _ledger_entries(project)
+    assert entries["DW-1"].open  # ours is undone
+    # ...and theirs is untouched, body and all — not merely present under a
+    # re-minted id, which a whole-document restore followed by a replay would give
+    assert "DW-2" in entries and "a rival writer got here first." in entries["DW-2"].body
+    rolled = [e for e in engine.journal.entries() if e["kind"] == "deferred-close-rolled-back"]
+    assert len(rolled) == 1 and rolled[0]["dw_ids"] == ["DW-1"]
+
+
+def test_deferred_close_rollback_preserves_a_concurrent_close(project, monkeypatch):
+    """The other half of entry scoping: a rival's CLOSE inside the window survives
+    the rollback (#286).
+
+    Harder than the append and the reason the undo is marker-owned rather than
+    id-owned: reopening "the ids we are rolling back" would already leave DW-2
+    alone, but restoring the pre-close document reverts it — silently undoing work
+    somebody else verified as resolved, which is the lost-closure half of #286.
+
+    Ablation: restore the whole-document write and DW-2 reads `open` again — reds."""
+    engine = _closes_deferred_run(project, ["DW-1"], ledger={"DW-1": "open", "DW-2": "open"})
+    ledger = project.deferred_work
+
+    def rival_closes_then_the_commit_fails(*a, **kw):
+        deferredwork.mark_done(ledger, "DW-2", "2026-06-11", "resolved by a human")
+        raise verify.GitError("commit refused")
+
+    monkeypatch.setattr(verify, "finalize_commit", rival_closes_then_the_commit_fails)
+
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1
+    entries = _ledger_entries(project)
+    assert entries["DW-1"].open  # ours is undone
+    assert not entries["DW-2"].open  # theirs still stands
+    assert "resolution: resolved by a human" in entries["DW-2"].body
+    rolled = [e for e in engine.journal.entries() if e["kind"] == "deferred-close-rolled-back"]
+    assert len(rolled) == 1 and rolled[0]["dw_ids"] == ["DW-1"]
+
+
+def test_deferred_close_reopen_degrade_is_journaled(project, monkeypatch):
+    """An armed close whose undo marker no longer matches is REPORTED, never worked
+    around (#286).
+
+    The undo matches on the `resolution:`/`resolution-undo:` pair sitting
+    immediately after the status line, so a foreign writer that inserts anything
+    between them — a `decision:` line is exactly the shape `record_decision` is
+    careful to write BEFORE the close for this reason — leaves the entry
+    permanently un-reopenable. The arm here is `exact`: the marker was on disk
+    moments ago, so its absence is somebody else's edit and not our own miss. The
+    entry stays `done`, the foreign line is preserved, and the ids are journaled;
+    overwriting around it would destroy the human decision that broke the tail.
+
+    The failure must also stay invisible to the exception in flight: the commit's
+    own escalation is the disposition, not the rollback's.
+
+    Ablation: drop the `failed` derivation (hardcode `failed = []`) — reds."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+    ledger = project.deferred_work
+
+    def rival_breaks_the_tail_then_the_commit_fails(*a, **kw):
+        text = ledger.read_text(encoding="utf-8")
+        # inserted between `status:` and `resolution:`, which is what breaks the
+        # adjacency `_MARK_DONE_TAIL_RE` matches on
+        broken = text.replace("\nresolution:", "\ndecision: 2026-06-11 keep-open\nresolution:", 1)
+        assert broken != text  # the close really published a tail to break
+        ledger.write_text(broken, encoding="utf-8")
+        raise verify.GitError("commit refused")
+
+    monkeypatch.setattr(verify, "finalize_commit", rival_breaks_the_tail_then_the_commit_fails)
+
+    summary = engine.run()
+
+    # the commit's disposition survives the degraded rollback intact
+    assert summary.paused and summary.escalated == 1 and not summary.crashed
+    reasons = [e["reason"] for e in engine.journal.entries() if e["kind"] == "story-escalated"]
+    assert len(reasons) == 1 and reasons[0].startswith("commit failed:")
+    entry = _ledger_entries(project)["DW-1"]
+    assert not entry.open  # left done, honestly, rather than rewritten around
+    assert "decision: 2026-06-11 keep-open" in entry.body  # the foreign line stands
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    unmatched = [
+        e for e in engine.journal.entries() if e["kind"] == "deferred-close-reopen-unmatched"
+    ]
+    assert len(unmatched) == 1 and unmatched[0]["dw_ids"] == ["DW-1"]
+    # nothing reopened, so there is no rollback to claim
+    assert "deferred-close-rolled-back" not in kinds
+    assert "deferred-close-rollback-failed" not in kinds  # a degrade, not a raise
 
 
 def test_transient_spec_read_fault_does_not_crash_run(project, monkeypatch):
@@ -6292,7 +6436,18 @@ def test_review_leg_reconciles_finalize_tail_death_followup_true(project):
 
 def test_defer_preserves_deferred_work_additions(project):
     """Review sessions append real knowledge to deferred-work.md; a plateau
-    defer's git reset must not erase it."""
+    defer's git reset must not erase it.
+
+    Doubles as the POSITIVE CONTROL for the blob anchor (#735): with no rival
+    anywhere, the reset-owned write arm still has to fire. The last row is what
+    earns it that job — the merge this site degrades to ALSO republishes DW-1, so
+    a normalization slip or a mis-derived rel that made `expected` never equal
+    `current` would leave the entry assertion green over an anchor that is dead,
+    and every negative test around it green with it.
+
+    Ablation: hardcode `anchored = False` in `_restore_defer_ledger` and the
+    diverged row appears.
+    """
     from conftest import git
     from conftest import review_effect as make_review
 
@@ -6301,9 +6456,16 @@ def test_defer_preserves_deferred_work_additions(project):
     git(project.project, "commit", "-q", "-m", "seed deferred-work")
     write_sprint(project, {"1-1-a": "ready-for-dev"})
 
+    filed: list[bool] = []
+
     def reviewing_with_defer(spec):
-        with project.deferred_work.open("a") as f:
-            f.write("\n### DW-1: pre-existing flaky retry\n\nstatus: open\n")
+        # latched: the review budget spends three sessions, but the finding is
+        # filed once — three copies of one heading are a duplicate-id ledger, and
+        # the merge the ablation above forces reports the ids it moved.
+        if not filed:
+            filed.append(True)
+            with project.deferred_work.open("a") as f:
+                f.write("\n### DW-1: pre-existing flaky retry\n\nstatus: open\n")
         return make_review(project, "1-1-a", clean=False, patched=1, finalized=False)(spec)
 
     engine, _ = make_engine(
@@ -6313,6 +6475,344 @@ def test_defer_preserves_deferred_work_additions(project):
     summary = engine.run()
     assert summary.deferred == 1
     assert "DW-1: pre-existing flaky retry" in project.deferred_work.read_text()
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "defer-ledger-restore-diverged" not in kinds
+
+
+@contextlib.contextmanager
+def _rival_appending_ledger_lock(monkeypatch, ledger, addition):
+    """A `ledger_lock` spy that lands one foreign append BEFORE acquiring, and
+    still really locks.
+
+    Ahead of the acquisition on purpose: that is the window the restore's
+    compare-and-set covers — between the post-reset observation and the hold —
+    and a deterministic write there is what a rival process would have done.
+    Still really locking, because a spy that only staged the rival would let a
+    nested acquisition through, and `ledger_lock` raising on nesting is the guard
+    keeping the restore's under-the-lock work pure. Latched one-shot so a second
+    acquisition cannot file the rival twice.
+    """
+    real_lock = deferredwork.ledger_lock
+    landed: list[bool] = []
+
+    @contextlib.contextmanager
+    def spy_lock(path):
+        if path == ledger and not landed:
+            landed.append(True)
+            with ledger.open("a", encoding="utf-8") as f:
+                f.write(addition)
+        with real_lock(path):
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", spy_lock)
+    yield landed
+
+
+def test_defer_restore_merges_a_concurrent_append(project, monkeypatch):
+    """#286. Another process files an entry while the defer's rollback is in
+    flight; the restore must republish its own review-found knowledge WITHOUT
+    taking the rival's entry back out.
+
+    The rival lands inside the compare-and-set window — after the post-reset
+    observation, before the lock — which is exactly the interleaving the old
+    `current != snapshot` guard overwrote wholesale.
+
+    Ablation: delete the `anchored and current == expected` arm so the restore
+    always writes the snapshot, and the rival entry vanishes.
+    """
+    from conftest import git
+    from conftest import review_effect as make_review
+
+    project.deferred_work.write_text("# Deferred Work\n")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "seed deferred-work")
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+
+    filed: list[bool] = []
+
+    def reviewing_with_defer(spec):
+        # latched: the review budget spends three sessions, but a finding is
+        # filed once — three copies of one heading would make a duplicate-id
+        # ledger, and the merge below reports the ids it moved.
+        if not filed:
+            filed.append(True)
+            with project.deferred_work.open("a") as f:
+                f.write("\n### DW-1: review-found flaky retry\n\nstatus: open\n")
+        return make_review(project, "1-1-a", clean=False, patched=1, finalized=False)(spec)
+
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a")] + [reviewing_with_defer for _ in range(3)],
+    )
+    rival = "\n### DW-2: filed by another process\n\nstatus: open\n"
+    with _rival_appending_ledger_lock(monkeypatch, project.deferred_work, rival) as landed:
+        summary = engine.run()
+
+    assert summary.deferred == 1 and landed == [True]
+    entries = _ledger_entries(project)
+    assert entries["DW-1"].title == "review-found flaky retry"
+    assert entries["DW-2"].title == "filed by another process"
+    (event,) = [e for e in engine.journal.entries() if e["kind"] == "defer-ledger-restore-diverged"]
+    assert event["story_key"] == "1-1-a"
+    assert event["dw_ids"] == ["DW-1"] and event["flat_remainder"] is False
+
+
+def test_defer_restore_merges_a_rival_that_wrote_inside_the_reset_window(project, monkeypatch):
+    """#735. The rival lands one window EARLIER than the twin above: between
+    `reset --hard` returning and the restore's observation read.
+
+    That window is the one the old anchor was blind to. A rival writing a TRACKED
+    ledger there BECOMES `observed`, so `current == observed` holds under the
+    lock, labels the rival's bytes "what the reset put back", and overwrites them
+    with the snapshot. The anchor is the ledger's committed blob at
+    `task.baseline_commit` instead — the text the reset actually republished, and
+    the one thing in this comparison no rival can author.
+
+    The oracle is the rival's SURVIVAL and the journal row, never the restored
+    bytes: this ledger is tracked, so `reset --hard` puts its committed text back
+    whether or not this code runs at all, and a byte assertion would pass for the
+    wrong reason (proven by control in #726 session 6).
+
+    Ablation: revert the write arm to `current == observed` and DW-2 vanishes
+    under the snapshot — the entry row reds, and the merge's `dw_ids` row with it.
+    """
+    from conftest import git
+    from conftest import review_effect as make_review
+
+    project.deferred_work.write_text("# Deferred Work\n")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "seed deferred-work")
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+
+    filed: list[bool] = []
+
+    def reviewing_with_defer(spec):
+        if not filed:  # one finding, three review sessions — see the twin above
+            filed.append(True)
+            with project.deferred_work.open("a") as f:
+                f.write("\n### DW-1: review-found flaky retry\n\nstatus: open\n")
+        return make_review(project, "1-1-a", clean=False, patched=1, finalized=False)(spec)
+
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a")] + [reviewing_with_defer for _ in range(3)],
+    )
+
+    real_rollback = engine._rollback_or_pause
+    landed: list[bool] = []
+
+    def rollback_then_rival(task, **kwargs):
+        real_rollback(task, **kwargs)
+        # After the reset returned, before `_restore_defer_ledger` reads
+        # `observed`: exactly the window #735 describes. One-shot, so a rollback
+        # on any other path cannot file it twice.
+        if not landed:
+            landed.append(True)
+            with project.deferred_work.open("a", encoding="utf-8") as f:
+                f.write("\n### DW-2: filed by another process\n\nstatus: open\n")
+
+    monkeypatch.setattr(engine, "_rollback_or_pause", rollback_then_rival)
+
+    summary = engine.run()
+
+    assert summary.deferred == 1 and landed == [True]
+    entries = _ledger_entries(project)
+    assert entries["DW-1"].title == "review-found flaky retry"
+    assert entries["DW-2"].title == "filed by another process"
+    (event,) = [e for e in engine.journal.entries() if e["kind"] == "defer-ledger-restore-diverged"]
+    assert event["story_key"] == "1-1-a" and event["dw_ids"] == ["DW-1"]
+
+
+def test_defer_restore_probe_failure_degrades_to_the_merge(project, monkeypatch):
+    """DIRECTION PIN, #735: an unprovable baseline merges, it never falls back to
+    the observation.
+
+    No rival at all here — the only difference from the positive control is a
+    faulted probe. The tempting degrade (trust `current == observed` when the
+    blob could not be read) is the defect itself, reintroduced through the error
+    path. This site can afford the strict direction where `_restore_ledger`
+    cannot afford anything softer: the merge is append-only, so refusing to
+    overwrite still republishes every entry the reset erased.
+
+    Ablation: have `_ledger_baseline_text`'s except arm return `(True,
+    self._ledger_text())` and the write arm fires — both journal rows red.
+    """
+    from conftest import git
+    from conftest import review_effect as make_review
+
+    project.deferred_work.write_text("# Deferred Work\n")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "seed deferred-work")
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+
+    filed: list[bool] = []
+
+    def reviewing_with_defer(spec):
+        if not filed:  # one finding, three review sessions — see the twin above
+            filed.append(True)
+            with project.deferred_work.open("a") as f:
+                f.write("\n### DW-1: review-found flaky retry\n\nstatus: open\n")
+        return make_review(project, "1-1-a", clean=False, patched=1, finalized=False)(spec)
+
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a")] + [reviewing_with_defer for _ in range(3)],
+    )
+
+    def fail_probe(*args, **kwargs):
+        raise GitError("injected baseline probe failure")
+
+    monkeypatch.setattr(verify, "worktree_file_bytes_at_revision", fail_probe)
+
+    summary = engine.run()
+
+    # the knowledge still comes back — via the merge, not via a write it could
+    # not prove it was entitled to make
+    assert summary.deferred == 1
+    assert _ledger_entries(project)["DW-1"].title == "review-found flaky retry"
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "ledger-baseline-probe-failed" in kinds
+    assert "defer-ledger-restore-diverged" in kinds
+
+
+def test_merge_reports_an_id_collision_instead_of_dropping_the_entry(project):
+    """A rival that mints OUR id is reported, never silently accepted (#286).
+
+    `git reset --hard` can remove an uncommitted `DW-5` and leave the ledger
+    ending at `DW-4`, so a rival appending into the restore's window mints `DW-5`
+    for an entry of its own — `next_seq` reads the shortened text. Keyed by id
+    alone, the merge then reads OUR lost entry as already present, drops it, and
+    reports nothing moved: a silent loss of exactly what this repair exists to
+    preserve, with a journal line saying it did nothing wrong.
+
+    Re-appending is not the answer either — that publishes a duplicate id, which
+    the writer's own `next_seq` and the sweep's duplicate-id refusal both treat as
+    corruption. So the pair is reported and left alone, the same call the flat
+    remainder makes: tell a human rather than guess.
+
+    Ablation: key `present` on the id alone (drop the body comparison) — `collided`
+    empties and the entry vanishes from both outputs, reddening the first two rows."""
+    engine, _ = make_engine(project, [])
+    ours = "### DW-5: ours\n\norigin: engine\nreason: ours.\nstatus: open\n"
+    theirs = "### DW-5: theirs\n\norigin: sweep\nreason: theirs.\nstatus: open\n"
+    snapshot = "# Deferred Work\n\n" + ours
+    current = "# Deferred Work\n\n" + theirs
+
+    restored, merged, flat_remainder, collided = engine._merge_snapshot_entries(current, snapshot)
+
+    assert collided == ["DW-5"]  # named, so the operator can reconcile the two
+    assert merged == []  # nothing was moved...
+    assert restored is None  # ...so the rival's entry is not written over
+    assert not flat_remainder  # the snapshot is fully canonical; no guessing needed
+
+
+def test_merge_still_carries_an_entry_whose_id_is_simply_absent(project):
+    """The collision check does not cost the ordinary merge (#286).
+
+    Same-id-different-body is reported; a snapshot entry the current text lacks
+    entirely is still appended verbatim, which is the case the merge exists for.
+    Without this beside the row above, keying `present` on `(id, body)` pairs
+    could report every re-append as a collision and still pass."""
+    engine, _ = make_engine(project, [])
+    kept = "### DW-4: theirs\n\norigin: sweep\nreason: theirs.\nstatus: open\n"
+    lost = "### DW-5: ours\n\norigin: engine\nreason: ours.\nstatus: open\n"
+
+    restored, merged, flat_remainder, collided = engine._merge_snapshot_entries(
+        "# Deferred Work\n\n" + kept, "# Deferred Work\n\n" + lost
+    )
+
+    assert merged == ["DW-5"]
+    assert collided == []
+    assert restored is not None and lost in restored
+    assert kept in restored  # the rival's entry survives the restore
+
+
+def test_defer_skips_restore_for_a_ledger_the_reset_never_touched(project, monkeypatch):
+    """#286. An untracked ledger sits outside `reset --hard`'s reach, so a delta
+    observed after the rollback can only be a live foreign write — and the right
+    restore is no write at all.
+
+    The guard this replaces compared disk against the snapshot and overwrote on
+    exactly that difference: it ARMED the lost update it reads like it prevents.
+
+    Ablation: delete the `_ledger_is_gits_to_restore` gate and `probed` stops
+    being empty — an untracked ledger reaches the baseline probe, spawning git
+    and then taking the ledger lock for a restore with nothing to restore.
+
+    That probe count is the oracle, and deliberately, because the DATA oracles
+    below no longer grade this gate at all. Since #735 the write arm is
+    `anchored and current == expected`, and an untracked ledger has no blob at
+    the baseline, so `expected` is None and the arm cannot fire whether the gate
+    runs or not: control falls through to the append-only merge, which finds
+    nothing the snapshot has and disk has lost, and writes nothing. Deleting the
+    gate used to clobber DW-2 — the consequence this docstring claimed — and now
+    costs only a spawn and an acquisition. The rival's survival is still asserted
+    because it is the behavior that matters; it is simply no longer this
+    ablation's discriminator.
+    """
+    from conftest import review_effect as make_review
+
+    # Untracked, and present before the attempt's baseline is stamped, so the
+    # reset's cleanup (created-since-baseline files only) leaves it alone. Git
+    # never owned this file, so git never put anything back into it either.
+    project.deferred_work.write_text("# Deferred Work\n")
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+
+    filed: list[bool] = []
+
+    def reviewing_with_defer(spec):
+        if not filed:  # one finding, three review sessions — see the twin above
+            filed.append(True)
+            with project.deferred_work.open("a") as f:
+                f.write("\n### DW-1: review-found flaky retry\n\nstatus: open\n")
+        return make_review(project, "1-1-a", clean=False, patched=1, finalized=False)(spec)
+
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a")] + [reviewing_with_defer for _ in range(3)],
+    )
+
+    real_rollback = engine._rollback_or_pause
+
+    def rollback_then_rival(task, **kwargs):
+        real_rollback(task, **kwargs)
+        # after the reset returned, before the restore reads its observation
+        with project.deferred_work.open("a") as f:
+            f.write("\n### DW-2: filed by another process\n\nstatus: open\n")
+
+    monkeypatch.setattr(engine, "_rollback_or_pause", rollback_then_rival)
+
+    probed: list[str] = []
+    real_baseline = engine._ledger_baseline_text
+
+    def recording_baseline(task):
+        # The gate's first observable: reaching this at all means the restore is
+        # about to spawn git and take the ledger lock for a file `reset --hard`
+        # never touched.
+        probed.append(task.story_key)
+        return real_baseline(task)
+
+    monkeypatch.setattr(engine, "_ledger_baseline_text", recording_baseline)
+
+    writes: list[Path] = []
+    real_write = platform_util.atomic_write_text
+
+    def recording_write(path, text, **kwargs):
+        writes.append(Path(path))
+        real_write(path, text, **kwargs)
+
+    monkeypatch.setattr("bmad_loop.engine.atomic_write_text", recording_write)
+
+    summary = engine.run()
+
+    assert summary.deferred == 1
+    # short-circuited above the probe, so above the lock too
+    assert probed == []
+    # the restore returned before writing: nothing of ours was owed here
+    assert project.deferred_work not in writes
+    entries = _ledger_entries(project)
+    assert entries["DW-1"].title == "review-found flaky retry"
+    assert entries["DW-2"].title == "filed by another process"
 
 
 def test_rollback_off_pauses_with_manual_notice(project):
@@ -11788,6 +12288,50 @@ def test_review_prompt_does_not_ask_the_session_to_double_file_deferrals(project
     assert "the orchestrator owns their status and resolution" in prompt
 
 
+def test_harvest_files_findings_in_one_write(project, monkeypatch):
+    """One harvest is ONE locked write, however many findings it carries.
+
+    A per-finding `append_entry` loop takes and drops the ledger lock once per
+    row, leaving a window between two of THIS spec's own findings for any other
+    mutator — a second run, a sweep, `sweep --archive`, the TUI decision modal —
+    to interleave (#286/#469). The count IS the claim: a batch that quietly fell
+    back to the loop would file both rows just the same, so the ledger contents
+    cannot tell the two apart and only the acquisition tally can.
+
+    The journal payload is asserted unchanged alongside it, because batching must
+    not be visible to anything downstream — `dw_ids` stays the filed ids in
+    frontmatter order, `deduped` still counts what the pre-scan and the writer's
+    own idempotence scan each suppressed.
+
+    Ablation: restore the per-finding `append_entry` loop and this reddens on the
+    acquisition list while every content assertion below stays green."""
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    sp = spec_path(project, task.story_key)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(sp, "done", "abc123", deferred=[HARVEST_A, HARVEST_B])
+    acquisitions: list[Path] = []
+    real_lock = deferredwork.ledger_lock
+
+    @contextlib.contextmanager
+    def spy_lock(p):
+        acquisitions.append(p)
+        with real_lock(p):
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", spy_lock)
+
+    engine._harvest_spec_deferrals(task, {"spec_file": str(sp)})
+
+    assert acquisitions == [project.deferred_work]  # two findings, ONE hold on the ledger
+    entries = _harvest_entries(project)
+    assert [entry.title for entry in entries] == [HARVEST_A["summary"], HARVEST_B["summary"]]
+    (event,) = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert event["dw_ids"] == [entry.id for entry in entries]
+    assert event["deduped"] == 0 and event["malformed"] == 0
+    assert task.harvest_wrote_ledger is True
+
+
 def test_spec_frontmatter_deferrals_harvested_into_ledger(project):
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     engine, _ = make_engine(
@@ -11951,7 +12495,12 @@ def test_spec_deferral_provenance_is_durable_before_append_for_crash_replay(proj
     sp.parent.mkdir(parents=True, exist_ok=True)
     write_spec(sp, "done", "abc123", deferred=[HARVEST_A])
     result_json = {"spec_file": str(sp)}
-    real_append = deferredwork.append_entry
+    # The harvest files its whole batch in ONE `append_entries_published` call
+    # (#286/#469), so that is where a host loss lands. Neither `append_entry` nor
+    # the `append_entries` wrapper is on this path any more, and patching either
+    # would inject nothing — the test would then fail on its assertions rather
+    # than on the crash it meant to stage.
+    real_append = deferredwork.append_entries_published
 
     class PowerLoss(BaseException):
         pass
@@ -11960,7 +12509,7 @@ def test_spec_deferral_provenance_is_durable_before_append_for_crash_replay(proj
         real_append(*args, **kwargs)
         raise PowerLoss
 
-    monkeypatch.setattr(deferredwork, "append_entry", append_then_die)
+    monkeypatch.setattr(deferredwork, "append_entries_published", append_then_die)
     with pytest.raises(PowerLoss):
         engine._harvest_spec_deferrals(task, result_json)
 
@@ -11969,7 +12518,7 @@ def test_spec_deferral_provenance_is_durable_before_append_for_crash_replay(proj
     saved_task = saved.tasks[task.story_key]
     assert saved_task.harvest_wrote_ledger is True
 
-    monkeypatch.setattr(deferredwork, "append_entry", real_append)
+    monkeypatch.setattr(deferredwork, "append_entries_published", real_append)
     resumed = Engine(
         paths=project,
         policy=engine.policy,
@@ -11998,7 +12547,12 @@ def test_expanded_harvest_records_are_durable_before_a_later_append(project, mon
     assert task.harvest_wrote_ledger is True
 
     write_spec(sp, "done", "abc123", deferred=[HARVEST_A, HARVEST_B])
-    real_append = deferredwork.append_entry
+    # The harvest files its whole batch in ONE `append_entries_published` call
+    # (#286/#469), so that is where a host loss lands. Neither `append_entry` nor
+    # the `append_entries` wrapper is on this path any more, and patching either
+    # would inject nothing — the test would then fail on its assertions rather
+    # than on the crash it meant to stage.
+    real_append = deferredwork.append_entries_published
 
     class PowerLoss(BaseException):
         pass
@@ -12007,7 +12561,7 @@ def test_expanded_harvest_records_are_durable_before_a_later_append(project, mon
         real_append(*args, **kwargs)
         raise PowerLoss
 
-    monkeypatch.setattr(deferredwork, "append_entry", append_then_die)
+    monkeypatch.setattr(deferredwork, "append_entries_published", append_then_die)
     with pytest.raises(PowerLoss):
         engine._harvest_spec_deferrals(task, result_json)
 
@@ -12020,6 +12574,63 @@ def test_expanded_harvest_records_are_durable_before_a_later_append(project, mon
         HARVEST_A["summary"],
         HARVEST_B["summary"],
     ]
+
+
+def test_harvest_anchor_names_what_was_published_not_a_later_rival(project, monkeypatch):
+    """`post_engine_ledger_digest` records what the engine wrote, not what the
+    file holds once somebody else has added to it (#286).
+
+    `append_entries_published` releases the ledger lock when it returns, so a
+    read-back taken after that can already carry a concurrent mutator's bytes.
+    Folding them into this anchor would make `_restore_ledger` classify them as
+    engine-owned and retract them on a rejected attempt — reintroducing, through
+    the anchor itself, the concurrent-writer loss this change exists to prevent.
+    Taking the text from inside the hold removes the window rather than narrowing
+    it.
+
+    Ablation: set the anchor from `self._ledger_digest()` (a read-back) instead of
+    the text the writer returned, and the rival's entry is inside the digest —
+    the `!=` row reds."""
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_VERIFY)
+    engine.state.tasks[task.story_key] = task
+    sp = spec_path(project, task.story_key)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(sp, "done", "abc123", deferred=[HARVEST_A])
+    result_json = {"spec_file": str(sp)}
+
+    ledger = project.deferred_work
+    real_append = deferredwork.append_entries_published
+    published: list[str] = []
+    rival_filed: list[bool] = []
+
+    def append_then_a_rival_writes(*args, **kwargs):
+        minted, text = real_append(*args, **kwargs)
+        if not rival_filed:
+            # Latched BEFORE the nested call, not after: the rival goes through
+            # the ordinary public appender, which delegates down to this very
+            # symbol, so an unlatched spy would re-enter itself forever.
+            rival_filed.append(True)
+            published.append(text or "")
+            # Lands the instant the writer's lock is released — the worst legal
+            # interleaving, and the one an unlocked read-back would absorb.
+            deferredwork.append_entry(
+                ledger,
+                title="filed by another process",
+                origin="sweep, 2026-06-11",
+                source_spec="other.md",
+                reason="a rival writer got here first.",
+            )
+        return minted, text
+
+    monkeypatch.setattr(deferredwork, "append_entries_published", append_then_a_rival_writes)
+
+    engine._harvest_spec_deferrals(task, result_json)
+
+    on_disk = ledger.read_text(encoding="utf-8")
+    assert "filed by another process" in on_disk  # the rival really did land
+    assert published and task.post_engine_ledger_digest == _digest_of(published[0])
+    assert task.post_engine_ledger_digest != _digest_of(on_disk)
 
 
 def test_spec_deferrals_dedup_sees_already_done_entries(project):
@@ -12145,22 +12756,58 @@ def test_ledger_digest_collapses_absent_and_empty_only():
 
 
 def test_persisted_ledger_restore_is_gated_by_capture_flag(project):
-    """None text is active only with the independent captured flag."""
+    """None text is active only with the independent captured flag.
+
+    Both halves are armed to unlink — the digest vouches for exactly the bytes on
+    disk — so the flag is the only thing left that can decide the first call, and
+    the assertion cannot pass because some other guard happened to refuse.
+
+    The armed half retracts a ledger the engine itself wrote, which is all the
+    unlink was ever for. That it must NOT retract one the engine did not write is
+    a separate claim, in
+    ``test_persisted_ledger_restore_skips_the_unlink_over_operator_content`` —
+    this test asserted the opposite of it until #286, deleting operator bytes the
+    engine never authored.
+    """
     engine, _ = make_engine(project, [], policy=_harvest_policy())
     task = StoryTask(story_key="1-1-a", epic=1)
     project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
-    project.deferred_work.write_text("operator-owned\n", encoding="utf-8")
+    harvested = "# Deferred Work\n\n## DW-1 our harvest row\n"
+    project.deferred_work.write_text(harvested, encoding="utf-8")
+    task.post_engine_ledger_digest = _digest_of(harvested)
 
     task.pre_harvest_ledger = None
     task.pre_harvest_ledger_captured = False
     engine._restore_persisted_ledger(task, replayed=False)
-    assert project.deferred_work.read_text(encoding="utf-8") == "operator-owned\n"
+    assert project.deferred_work.read_text(encoding="utf-8") == harvested
 
     task.pre_harvest_ledger_captured = True
     engine._restore_persisted_ledger(task, replayed=False)
     assert not project.deferred_work.exists()
     # Restore never prunes the harmless orchestrator-owned parent.
     assert project.deferred_work.parent.is_dir()
+
+
+def test_persisted_ledger_restore_skips_the_unlink_over_operator_content(project):
+    """An armed None snapshot never deletes a ledger the engine did not write."""
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    ledger = project.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text("operator-owned\n", encoding="utf-8")
+
+    # Armed exactly as the harvest-created case is, but no engine write ever
+    # happened, so there is no digest to vouch for what is on disk.
+    task.pre_harvest_ledger = None
+    task.pre_harvest_ledger_captured = True
+    engine._restore_persisted_ledger(task, replayed=False)
+
+    assert ledger.read_text(encoding="utf-8") == "operator-owned\n"
+    (event,) = [
+        e for e in engine.journal.entries() if e["kind"] == "ledger-restore-skipped-diverged"
+    ]
+    assert event["story_key"] == "1-1-a"
+    assert event["ledger"] == str(ledger)
 
 
 def test_unarmed_replay_journals_missing_snapshot_without_touching_ledger(project):
@@ -12261,6 +12908,357 @@ def test_ledger_scope_probe_failure_keeps_file_and_journals(project, monkeypatch
     assert event["story_key"] == task.story_key
 
 
+def test_ledger_rel_derives_lexically_before_resolving(project, monkeypatch):
+    """DIRECTION PIN (#552). `_ledger_rel` tries the LEXICAL `relative_to` first and
+    only falls back to `resolve()`. That ordering is load-bearing, not stylistic.
+
+    A registered-but-not-serving WSL UNC provider makes `resolve()` raise WinError
+    64 on a path that is perfectly nameable lexically. Resolving FIRST would turn
+    that into `(None, fault)` — and the fault degrades cost real behavior: the
+    baseline anchor drops to `NONE`, so the retraction skips, the defer restore
+    falls to its merge, and the sweep escalates, all for a ledger sitting in an
+    ordinary place inside the repo.
+
+    Ablation: reorder `_ledger_rel` to `return ledger.resolve().relative_to(
+    root.resolve()).as_posix(), None` first (the shape a reviewer proposed on PR
+    #737 to make symlinked artifact dirs classify as external). Both assertions
+    red — and NOTHING else in the suite does, which is why this row exists.
+    """
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    committed = "# Deferred Work\n\n## DW-1 committed at baseline\n"
+    project.deferred_work.write_text(committed, encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track deferred-work")
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = rev_parse_head(project.project)
+    task.baseline_untracked = []
+    refuse_to_resolve(monkeypatch, project.deferred_work, project.project)
+
+    # named lexically, with no fault raised
+    assert engine._ledger_rel() == ("_bmad-output/implementation-artifacts/deferred-work.md", None)
+    # and the anchor stays authoritative rather than degrading to no-anchor
+    assert engine._ledger_baseline_text(task) == (_LedgerAnchor.BASELINE, committed)
+
+
+def test_ledger_baseline_text_reads_the_committed_blob(project, monkeypatch):
+    """The reset-owned write anchor is the committed blob, read before the lock.
+
+    ``reset --hard <baseline>`` republishes exactly this blob, so the blob — and
+    not an observation of the working tree taken after that reset — is what a
+    reset-owned restore is entitled to overwrite (#735).
+
+    The probe spawns git and `ledger_lock` is contracted to cover file I/O only
+    (#286), so the spy grades WHERE the call happens as well as what it answers.
+
+    Ablation: move the `_ledger_baseline_text(task)` call in `_restore_ledger`
+    inside the `with deferredwork.ledger_lock(ledger):` block and the `held` row
+    reds.
+    """
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    committed = "# Deferred Work\n\n## DW-1 committed at baseline\n"
+    project.deferred_work.write_text(committed, encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track deferred-work")
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = rev_parse_head(project.project)
+    task.baseline_untracked = []
+
+    assert engine._ledger_baseline_text(task) == (_LedgerAnchor.BASELINE, committed)
+
+    held: list[bool] = []
+    real_blob = verify.worktree_file_bytes_at_revision
+
+    def spying_blob(*args, **kwargs):
+        held.append(bool(getattr(deferredwork._LOCK_STATE, "held", False)))
+        return real_blob(*args, **kwargs)
+
+    monkeypatch.setattr(verify, "worktree_file_bytes_at_revision", spying_blob)
+    engine._restore_ledger(task, committed + "\n## DW-2 this session's edit\n")
+
+    assert held == [False]
+
+
+def test_ledger_baseline_text_normalizes_committed_crlf(project):
+    """A CRLF blob is normalized to LF, because `_ledger_text` reads universal.
+
+    `worktree_file_bytes_at_revision` applies the path's working-tree filters, so
+    under `core.autocrlf=true` the baseline blob comes back CRLF while
+    `_ledger_text`'s `read_text` has already turned the same file on disk into
+    LF. Comparing them raw makes `reset_owned` silently NEVER-true on Windows:
+    every tracked restore would degrade to a skip, and no Linux run would ever
+    say so. This row is that Windows guard, made Linux-visible by committing the
+    CRLF bytes directly.
+
+    Ablation: drop the `.replace("\\r\\n", "\\n").replace("\\r", "\\n")` tail and
+    both rows red here, on Linux.
+    """
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_bytes(b"# Deferred Work\r\n\r\n## DW-1 crlf at baseline\r\n")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track a crlf deferred-work")
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = rev_parse_head(project.project)
+    task.baseline_untracked = []
+
+    anchored, expected = engine._ledger_baseline_text(task)
+    assert (anchored, expected) == (
+        _LedgerAnchor.BASELINE,
+        "# Deferred Work\n\n## DW-1 crlf at baseline\n",
+    )
+    # The point of the normalization: the anchor must equal what the ONLY thing
+    # it is ever compared against reads back off those same bytes.
+    assert expected == engine._ledger_text()
+
+
+def test_ledger_baseline_text_reports_absence_at_baseline(project):
+    """A baseline that does not carry the ledger is determinate, not a fault.
+
+    `reset --hard` leaves no tracked file there, so `None` IS the expected
+    post-reset state and the anchor still holds — which is what lets a restore
+    put the session's ledger back over an absence rather than calling it
+    divergence.
+    """
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = rev_parse_head(project.project)
+    task.baseline_untracked = []
+    # Committed AFTER the baseline was stamped: tracked now, absent at baseline.
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track deferred-work after the baseline")
+
+    assert engine._ledger_baseline_text(task) == (_LedgerAnchor.BASELINE, None)
+    assert [
+        e for e in engine.journal.entries() if e["kind"] == "ledger-baseline-probe-failed"
+    ] == []
+
+
+def test_ledger_baseline_text_degrades_without_a_baseline(project):
+    """No baseline commit is a determinate no-anchor, and NOT a probe fault.
+
+    Nothing failed — there is simply no revision to derive an expected state
+    from — so the write arm stands down silently rather than filing a fault row
+    an operator would have to triage.
+    """
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+
+    assert task.baseline_commit is None
+    assert engine._ledger_baseline_text(task) == (_LedgerAnchor.NONE, None)
+    assert [
+        e for e in engine.journal.entries() if e["kind"] == "ledger-baseline-probe-failed"
+    ] == []
+
+
+def test_ledger_baseline_probe_failure_degrades_and_journals(project, monkeypatch):
+    """A probe that cannot answer withholds the anchor — the INVERSE degrade.
+
+    `_ledger_is_gits_to_restore` degrades to True because its consumer is an
+    unlink and uncertainty must never delete. This probe's only consumer is a
+    write arm, so uncertainty must never write; copying the other direction here
+    would reopen #735 through the error path itself.
+
+    The catch also has to live INSIDE the helper: `verify.GitError` is a plain
+    `Exception` and the attempt's net is `(OSError, StateRootError)`, so an
+    escape would replace an in-flight `RunPaused` in that `finally`.
+
+    Ablation: delete the `except (verify.GitError, OSError, RuntimeError,
+    UnicodeDecodeError)` arm and the GitError escapes — this row reds on the
+    raise rather than on the tuple.
+    """
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track deferred-work")
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = rev_parse_head(project.project)
+    task.baseline_untracked = []
+
+    def fail_probe(*args, **kwargs):
+        raise GitError("injected baseline probe failure")
+
+    monkeypatch.setattr(verify, "worktree_file_bytes_at_revision", fail_probe)
+
+    assert engine._ledger_baseline_text(task) == (_LedgerAnchor.NONE, None)
+    (event,) = [e for e in engine.journal.entries() if e["kind"] == "ledger-baseline-probe-failed"]
+    assert event["story_key"] == "1-1-a"
+    assert "injected baseline probe failure" in event["error"]
+
+
+def test_restore_ledger_reset_owned_write_uses_the_blob_anchor(project):
+    """POSITIVE CONTROL: the reset-owned write arm still fires on the new anchor.
+
+    Without this row a normalization slip or a mis-derived rel would make
+    `expected` never equal `current`, every tracked restore would quietly degrade
+    to a skip, and every negative test around it would stay green — the anchor
+    would be dead and nothing would say so.
+
+    The digest anchor is deliberately NOT ours here, so the write is attributable
+    to `reset_owned` alone.
+
+    Ablation: hardcode `reset_owned = False` in `_restore_ledger` and both the
+    written bytes and the empty-journal row red.
+    """
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    committed = "# Deferred Work\n\n## DW-1 committed at baseline\n"
+    project.deferred_work.write_text(committed, encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track deferred-work")
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = rev_parse_head(project.project)
+    task.baseline_untracked = []
+    # What `reset --hard` erased: this session's own ledger edits, which the
+    # snapshot exists to put back over the republished committed bytes.
+    snapshot = committed + "\n## DW-2 this session's own edit\n"
+    task.post_engine_ledger_digest = _digest_of("bytes this engine never published")
+
+    engine._restore_ledger(task, snapshot)
+
+    assert project.deferred_work.read_text(encoding="utf-8") == snapshot
+    assert [
+        e for e in engine.journal.entries() if e["kind"] == "ledger-restore-skipped-diverged"
+    ] == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_defer_restore_never_resurrects_a_deleted_symlink_target(project, tmp_path):
+    """DIRECTION PIN (#735), the merge arm's twin of
+    `test_restore_ledger_never_reads_a_symlink_deletion_as_reset_owned`.
+
+    Gating the DIRECT overwrite on a `BASELINE` anchor is not enough here,
+    because this site degrades to an append-only merge rather than to a skip.
+    That merge is immune to a rival's WRITE — it only ever adds — but it read
+    `current or ""`, so a ledger that is GONE looked like a ledger where every
+    snapshot entry is merely missing, and it wrote them all back. Recreating a
+    file a rival deleted is the same overwrite wearing different clothes.
+
+    A tracked symlink is the shape that reaches it: it is git-owned, so the
+    `_ledger_is_gits_to_restore` gate above lets it through, while `reset --hard`
+    restores only the link and can never reach the target a rival unlinked.
+
+    Ablation: restore `current or ""` as the merge input and drop the
+    `current is not None` guard — the target comes back and this reddens.
+    """
+    target = tmp_path / "shared" / "deferred-work.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("# Deferred Work\n", encoding="utf-8")
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    if project.deferred_work.is_symlink() or project.deferred_work.exists():
+        project.deferred_work.unlink()
+    project.deferred_work.symlink_to(target)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track a symlinked deferred-work")
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = rev_parse_head(project.project)
+    task.baseline_untracked = []
+    snapshot = (
+        "# Deferred Work\n\n### DW-1: review found this\n\n"
+        "origin: review, 2026-08-26\nlocation: src.txt\nreason: needs a look.\nstatus: open\n"
+    )
+    # The rival's deletion, landing inside the window the reset opened.
+    target.unlink()
+
+    engine._restore_defer_ledger(task, snapshot)
+
+    assert not target.exists()
+    assert project.deferred_work.is_symlink()
+    (event,) = [e for e in engine.journal.entries() if e["kind"] == "defer-ledger-restore-diverged"]
+    assert event["dw_ids"] == []
+
+
+def test_restore_ledger_never_reads_a_symlink_deletion_as_reset_owned(project, tmp_path):
+    """DIRECTION PIN (#735). A tracked ledger symlink whose TARGET a rival deleted
+    inside the reset window must not be written back over.
+
+    `reset --hard` restores the link and cannot reach through it, so it never
+    republished any ledger text here — the anchor is `NO_RESET_CONTENT`, whose
+    `None` means "no text to offer", not "the reset removed it". Pairing that
+    `None` with the `None` a dangling link reads back would make the two compare
+    equal and undo the deletion. Only a `BASELINE` anchor may spend a missing
+    file as proof, because only there did the reset actually delete it — which is
+    exactly what `test_ledger_baseline_text_answers_determinate_absence` pins.
+
+    The digest anchor is deliberately NOT ours, so any write would be
+    attributable to `reset_owned` alone.
+
+    Ablation: widen the arm to `anchor is not _LedgerAnchor.NONE` and this reddens
+    on the restored-file assertion — the rival's deletion is undone.
+    """
+    target = tmp_path / "shared" / "deferred-work.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("# Deferred Work\n\n## DW-1 at baseline\n", encoding="utf-8")
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    if project.deferred_work.is_symlink() or project.deferred_work.exists():
+        project.deferred_work.unlink()
+    project.deferred_work.symlink_to(target)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track a symlinked deferred-work")
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = rev_parse_head(project.project)
+    task.baseline_untracked = []
+    task.post_engine_ledger_digest = _digest_of("bytes this engine never published")
+    # The rival's deletion, landing inside the window the reset opened.
+    target.unlink()
+
+    engine._restore_ledger(task, "# Deferred Work\n\n## DW-2 this session's edit\n")
+
+    # the deletion stands; the link was not spent as a channel to undo it
+    assert not target.exists()
+    assert project.deferred_work.is_symlink()
+    assert [
+        e for e in engine.journal.entries() if e["kind"] == "ledger-restore-skipped-diverged"
+    ] != []
+
+
+def test_restore_ledger_probe_failure_never_writes(project, monkeypatch):
+    """DIRECTION PIN: an unprovable baseline skips, it never falls back to the
+    observation.
+
+    The same inputs as the positive control above, with only the probe faulted.
+    The tempting degrade — trust `current == observed` when the blob could not be
+    read — is exactly the #735 defect, reintroduced through the error path. The
+    restore also has to come back normally: a fault that raised here would
+    replace an in-flight `RunPaused`.
+
+    Ablation: make `_ledger_baseline_text`'s except arm return
+    `(True, self._ledger_text())` and the write fires — the bytes row reds.
+    """
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    committed = "# Deferred Work\n\n## DW-1 committed at baseline\n"
+    project.deferred_work.write_text(committed, encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track deferred-work")
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = rev_parse_head(project.project)
+    task.baseline_untracked = []
+    snapshot = committed + "\n## DW-2 this session's own edit\n"
+    task.post_engine_ledger_digest = _digest_of("bytes this engine never published")
+
+    def fail_probe(*args, **kwargs):
+        raise GitError("injected baseline probe failure")
+
+    monkeypatch.setattr(verify, "worktree_file_bytes_at_revision", fail_probe)
+
+    engine._restore_ledger(task, snapshot)
+
+    assert project.deferred_work.read_text(encoding="utf-8") == committed
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "ledger-baseline-probe-failed" in kinds
+    assert "ledger-restore-skipped-diverged" in kinds
+
+
 def test_pre_harvest_ledger_restore_is_atomic_on_publication_failure(project, monkeypatch):
     """A failed rollback publish leaves the current ledger byte-intact."""
     engine, _ = make_engine(project, [], policy=_harvest_policy())
@@ -12273,12 +13271,149 @@ def test_pre_harvest_ledger_restore_is_atomic_on_publication_failure(project, mo
         raise OSError("atomic replace blocked")
 
     monkeypatch.setattr(platform_util, "atomic_replace", publication_fails)
+    # Reaching the write at all now needs the compare-and-set to hold: the bytes
+    # being retracted have to be the ones this engine published (#286).
+    task.post_engine_ledger_digest = _digest_of(current)
 
     with pytest.raises(OSError, match="atomic replace blocked"):
         engine._restore_ledger(task, "# Deferred Work\n\npre-harvest snapshot\n")
 
     assert project.deferred_work.read_text(encoding="utf-8") == current
     assert list(project.deferred_work.parent.glob("deferred-work.md.*.tmp")) == []
+
+
+def test_rejected_attempt_restore_skips_over_a_concurrent_append(project, monkeypatch):
+    """A writer that lands inside the restore window keeps its entry.
+
+    The rival is staged between the post-rollback observation and the lock —
+    the only window compare-and-set can still be surprised in — so the restore
+    finds text it can attribute to nobody and must refuse rather than retract.
+    """
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    ledger = project.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    snapshot = "# Deferred Work\n\n## DW-1 pre-existing\n"
+    harvested = snapshot + "\n## DW-2 our harvest row\n"
+    ledger.write_text(harvested, encoding="utf-8")
+    task.post_engine_ledger_digest = _digest_of(harvested)
+
+    rival = harvested + "\n## DW-3 a concurrent run's row\n"
+    real_lock = deferredwork.ledger_lock
+    staged = False
+
+    @contextlib.contextmanager
+    def staging_lock(path):
+        nonlocal staged
+        # Latch BEFORE writing: the real lock is re-entered by nothing here, but
+        # a spy that latches after its nested call recurses forever.
+        if not staged:
+            staged = True
+            path.write_text(rival, encoding="utf-8")
+        with real_lock(path):
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", staging_lock)
+    engine._restore_ledger(task, snapshot)
+
+    assert staged
+    assert ledger.read_text(encoding="utf-8") == rival
+    (event,) = [
+        e for e in engine.journal.entries() if e["kind"] == "ledger-restore-skipped-diverged"
+    ]
+    assert event["story_key"] == "1-1-a"
+    assert event["ledger"] == str(ledger)
+
+
+def test_harvest_created_ledger_is_never_unlinked_over_foreign_content(project):
+    """A rival's entry in a harvest-created ledger survives the retraction.
+
+    The engine created the file, so the snapshot is None and today's code
+    deleted it outright. The digest names only the harvest, and the file now
+    holds more than that, so the whole file is somebody else's problem too.
+    """
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    ledger = project.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    harvested = "# Deferred Work\n\n## DW-1 our harvest row\n"
+    task.post_engine_ledger_digest = _digest_of(harvested)
+    both = harvested + "\n## DW-2 a concurrent run's row\n"
+    ledger.write_text(both, encoding="utf-8")
+
+    engine._restore_ledger(task, None)
+
+    assert ledger.read_text(encoding="utf-8") == both
+    (event,) = [
+        e for e in engine.journal.entries() if e["kind"] == "ledger-restore-skipped-diverged"
+    ]
+    assert event["story_key"] == "1-1-a"
+    assert event["ledger"] == str(ledger)
+
+
+def test_restore_still_retracts_the_engines_own_harvest(project):
+    """The uncontended path is unchanged: our own append is put back and removed.
+
+    Both directions on an UNTRACKED ledger deliberately: a tracked one is put
+    back by ``reset --hard`` on its own, so it would grade the write vacuously.
+    """
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    ledger = project.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+
+    # The harvest appended to a ledger that already existed: the snapshot text
+    # is republished over our row.
+    snapshot = "# Deferred Work\n\n## DW-1 pre-existing\n"
+    harvested = snapshot + "\n## DW-2 our harvest row\n"
+    ledger.write_text(harvested, encoding="utf-8")
+    task.post_engine_ledger_digest = _digest_of(harvested)
+    engine._restore_ledger(task, snapshot)
+    assert ledger.read_text(encoding="utf-8") == snapshot
+
+    # The harvest created the ledger: the file goes away again.
+    created = "# Deferred Work\n\n## DW-1 our harvest row\n"
+    ledger.write_text(created, encoding="utf-8")
+    task.post_engine_ledger_digest = _digest_of(created)
+    engine._restore_ledger(task, None)
+    assert not ledger.exists()
+
+    assert [
+        e for e in engine.journal.entries() if e["kind"] == "ledger-restore-skipped-diverged"
+    ] == []
+
+
+def test_harvest_digest_is_on_disk_before_the_attempt_decision(project, monkeypatch):
+    """Probe the refresh's own save before any later ambient save can mask it.
+
+    The anchor is only useful to a process that did not take it: a host loss
+    between the append and the dev decision leaves the harvest on disk, and the
+    replay that finds it there must be able to recognize it as this engine's.
+    Sampled at the harvest journal line, which is the first statement after the
+    refresh, so a later save cannot supply the durability being asserted.
+    """
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A])],
+        policy=_harvest_policy(),
+    )
+    seen: list[tuple[str | None, str | None]] = []
+    real_append = engine.journal.append
+
+    def probing_append(kind, **fields):
+        if kind == "spec-deferrals-harvested" and not seen:
+            saved = load_state(engine.run_dir).tasks["1-1-a"]
+            seen.append((saved.post_engine_ledger_digest, engine._ledger_text()))
+        real_append(kind, **fields)
+
+    monkeypatch.setattr(engine.journal, "append", probing_append)
+
+    assert engine.run().done == 1
+
+    ((persisted, on_disk),) = seen
+    assert on_disk is not None and HARVEST_A["summary"] in on_disk
+    assert persisted == _digest_of(on_disk)
 
 
 def test_nonfixable_retry_leaves_tracked_ledger_at_its_baseline_bytes(project):
@@ -12304,6 +13439,67 @@ def test_nonfixable_retry_leaves_tracked_ledger_at_its_baseline_bytes(project):
     persisted = load_state(engine.run_dir).tasks["1-1-a"]
     assert persisted.pre_harvest_ledger_captured is False
     assert persisted.pre_harvest_ledger is None
+
+
+def test_rejected_attempt_restore_leaves_a_rival_that_wrote_inside_the_reset_window(
+    project, monkeypatch
+):
+    """THE #735 DEFECT PROOF. A rival that writes a TRACKED ledger between
+    `reset --hard` returning and the restore's observation read is not
+    reset-owned, and the snapshot must not be republished over it.
+
+    The anchor this replaces was `current == observed and gits`, with `observed`
+    read once the rollback returned. A rival landing inside that window BECOMES
+    `observed`, so the comparison holds later and labels the rival's bytes "what
+    reset put back". The blob anchor is taken from `task.baseline_commit`
+    instead, which no rival can author.
+
+    The oracle is the rival's SURVIVAL and the journal kind, never the restored
+    bytes: this ledger is tracked, so `reset --hard` republishes its committed
+    text whether or not this code runs at all, and a byte assertion would pass
+    for the wrong reason (proven by control in #726 session 6).
+
+    Ablation: restore `reset_owned = current == observed and gits` and the
+    snapshot overwrites the rival — the survival row AND the diverged row red.
+    """
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    before = "# Deferred Work\n\ntracked baseline\n"
+    project.deferred_work.write_text(before, encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track deferred-work")
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            _baseline_liar_effect(project, deferred=[HARVEST_A]),
+            dev_effect(project, "1-1-a", followup_review=False),
+        ],
+        policy=_harvest_policy(attempts=2),
+    )
+
+    real_rollback = engine._rollback_or_pause
+    landed: list[bool] = []
+
+    def rollback_then_rival(task, **kwargs):
+        real_rollback(task, **kwargs)
+        # After the reset returned, before `_restore_ledger` reads `observed`:
+        # exactly the window #735 describes. One-shot, so a later attempt's
+        # rollback cannot file it twice.
+        if not landed:
+            landed.append(True)
+            with project.deferred_work.open("a", encoding="utf-8") as f:
+                f.write("\n### DW-9: filed by another process\n\nstatus: open\n")
+
+    monkeypatch.setattr(engine, "_rollback_or_pause", rollback_then_rival)
+
+    assert engine.run().done == 1
+
+    assert landed == [True]
+    assert "DW-9: filed by another process" in project.deferred_work.read_text(encoding="utf-8")
+    (event,) = [
+        e for e in engine.journal.entries() if e["kind"] == "ledger-restore-skipped-diverged"
+    ]
+    assert event["story_key"] == "1-1-a"
 
 
 @pytest.mark.parametrize(
@@ -14020,3 +15216,62 @@ def test_dev_prompt_resolves_in_the_reopened_worktree_not_the_main_checkout(proj
         (worktree.resolve(), ".claude/skills"): "bmad-dev-auto",
         (project.project, ".claude/skills"): "bmad-build-auto",
     }
+
+
+# --------------------- the park-record put-back, confined to the project (#593)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_a_park_record_rollback_refused_as_unconfined_is_journaled(project):
+    """The escape #593 names, at the site whose failure arm must never raise.
+
+    `follow_symlinks=False` refused a link planted at the record itself and
+    nothing above it, so a link at `.bmad-loop/operator/` sent the put-back — the
+    PRIOR park's text, read out of the repo — to a path of the planter's choosing.
+    A driven session writes under this root all run long, which is what makes the
+    directory swap a real move rather than a hypothetical one.
+
+    The redirect is planted BY THE PRE-COMMIT HOOK, which is the only honest place
+    for it: `_write_park_record` has already captured the prior and rewritten the
+    record by then, so planting earlier would refuse that write instead and this
+    row would grade a different site. The hook fires in exactly the window between
+    the record write and the rollback, and it moves the real directory out rather
+    than deleting it, so the unconfined write would have had somewhere to land.
+
+    The oracle is the DEGRADE, not a raise. This runs inside the commit window's
+    except arms, so anything escaping displaces the escalation those arms carry —
+    `UnconfinedWriteError` is an `OSError` precisely so the refusal lands in the
+    existing guard and is journaled. The last assertion is the one that pins the
+    fix: the escaped record still holds THIS run's actions, so the prior text
+    never followed the link out.
+
+    Ablation: revert `_restore_park_record` to
+    `atomic_write_text(path, prior, follow_symlinks=False)` and this fails — the
+    journal row disappears and the redirected record is rewritten with the prior
+    park's actions."""
+    import json as _json
+
+    from bmad_loop import operatoractions
+
+    prior_actions = ["the earlier park's action"]
+    engine, record = _park_over_an_earlier_record(project, prior_actions)
+    operator_dir = operatoractions.records_dir(project.project)
+    outside = project.project.parent / "outside-operator"
+    hook = project.project / ".git" / "hooks" / "pre-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        f'mv "{operator_dir}" "{outside}"\n'
+        f'ln -s "{outside}" "{operator_dir}"\n'
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+
+    summary = engine.run()
+
+    assert not summary.crashed  # the refusal did not displace the escalation
+    journal = (engine.run_dir / "journal.jsonl").read_text(encoding="utf-8")
+    assert '"park-record-rollback-failed"' in journal
+    assert "UnconfinedWriteError" in journal  # journaled by NAME, not a bare errno
+    escaped = _json.loads((outside / record.name).read_text(encoding="utf-8"))
+    assert escaped["actions"] == ACTIONS  # this run's record, NOT the prior put back

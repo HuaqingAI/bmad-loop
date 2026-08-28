@@ -7,16 +7,303 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Added
+
+- **Atomic writers gain an opt-in `require_writable_target` refusal** (#597). Callers over
+  operator-curated files can ask for the `PermissionError` a plain `Path.write_text` used to
+  raise on a read-only target. Off by default — what the other callers do today is a
+  compatibility contract. The probe opens non-blocking, so a planted reader-less FIFO cannot
+  park the orchestrator.
+
+- **`bmad-loop sweep --archive`** moves closed (`status: done <ISO date>`) deferred-work entries to
+  a sibling `deferred-work-archive.md`, replacing each with a stub that preserves the DW- id for
+  grep and `closes_deferred` cross-references plus the load-bearing field lines (`gate:`,
+  `origin:`/`source_spec:`, reopenable-close undo markers). The live ledger then carries open
+  entries in full and archived ones as compact stubs, rather than every closed body forever.
+  Supports `--before DATE` to archive only entries closed before a cutoff, and `--dry-run` to
+  preview. Reopening an archived stub leaves an `archived-body:` line pointing at the archive
+  block that holds its body. Refuses while any engine run is live. Pure deterministic Python —
+  no LLM involvement.
+
+- **Batched deferred-work ledger primitives** (#286, #469). `append_entries`,
+  `mark_open_many`, `record_decision` and `mark_done_many`'s per-id `notes=` each collapse a
+  sequence that used to be one write per row — or one write per half of an append-then-close
+  pair — into a single read-modify-write. Each is byte-identical to the serial sequence it
+  replaces, validating the whole batch before it takes the lock, minting sequential ids and
+  deduplicating in-call twins exactly as the loop it stands in for did, so a caller adopting one
+  changes how many windows it leaves open and nothing else. `append_entries_published`
+  additionally hands back the text it wrote, so a caller that has to record what it published —
+  rather than what the file happens to hold afterwards — takes its anchor from inside the hold
+  instead of reading the ledger back once the lock is gone. An empty batch takes no lock at
+  all, matching the per-id loop it replaces, so a caller that batches nothing cannot begin
+  failing on a lock it never needed.
+
 ### Changed
 
 - Register this fork as the collision-free `huaqing-bmad-loop` custom BMAD module so URL-backed custom-source installs and Quick Updates retain the fork, and make `/bmad-loop-setup` reinstall the orchestrator from the exact manifest URL or local path instead of falling back to the official repository.
+- **A published run archive now lands at mode `0600`** instead of a umask-derived mode (#591).
+  It is staged through a file the orchestrator creates itself rather than one `tarfile` opens
+  by name, so it inherits the private mode the rest of the `.bmad-loop` write path uses.
+- **A read-only operator file is refused again instead of being rewritten** (#597).
+  `os.replace` needs write permission on the parent _directory_, never on the entry it
+  replaces, so marking `sprint-status.yaml`, `policy.toml`, a hook `settings.json`, a story
+  spec, a park record or the decisions store read-only stopped meaning anything once those
+  writes became atomic. Their writers now refuse with the `PermissionError` a plain
+  `write_text` used to raise. Machine-minted state (run archives, stop requests, the
+  config-digest stamp) is unaffected.
+- **Document the qualified-id obligation once for adapter authors (#311).** The authoring guide
+  states the rule a native-id backend must follow rather than leaving it to be inferred from
+  psmux's per-seam specifics, and `TerminalMultiplexer.new_parked_window` now says its id is
+  opaque and MAY be qualified, matching `new_window`. Documentation only; no behavior change.
+- **A config path component that names a Windows device, or ends in a period or space, is
+  refused at load** (#480). Values that were accepted before — `skill_tree = "NUL"`, a
+  `seed_files` entry of `aux.json`, a `worktree_seed` of `.claude/skills.` — now raise at all
+  seven validation sites: `scm.worktree_seed`, an adapter's `hooks.config_path` / `skill_tree` /
+  `seed_files`, a plugin's `seed_files` / `seed_globs` and `[python] module`, and the Unity
+  seeder's guard dir. Such a component names a _different_ path on Windows than the one it
+  spells — a device rather than a file, or a sibling once Win32 strips the trailing run — so the
+  file that gets seeded and the exclude pattern rendered from the authored spelling disagree
+  about which path they mean. The refusal is cross-platform on purpose, matching how the family
+  already rejects `C:\secrets` on POSIX: a config value must not mean one thing per host. A
+  component of only periods and spaces embedded beside a real one (`sub/...`) is refused by the
+  same rule — Win32 empties it and the value addresses `sub` — and the Unity seeder and a
+  plugin's `[python] module` validate the authored value rather than a `.strip()`-normalized
+  copy, so an authored trailing space is refused like at every other site instead of silently
+  trimmed. No shipped profile,
+  bundled `plugin.toml` or default trips it, but this is a compatibility break on
+  previously-loading config.
+
+### Fixed
+
+- **The three review gates run `[verify] commands` in the git root, not the BMAD project
+  root** (#695). Under an explicit `repo_root:` with `isolation = "none"` they shelled out in
+  the wrong tree — an operator's build/test verbs ran in the BMAD project dir rather than in
+  the git root their code lives in.
+  Artifact reads — the spec, the sprint board, the deferred-work ledger — stay project-rooted;
+  only the command `cwd` moves. Every other caller already used the repo root.
+- **A park that produced no code passes the dev gate** (#676). A session parking at
+  `awaiting-operator` may legitimately leave nothing but the spec's own park declaration and
+  the board sync, both of which proof-of-work excludes — so the gate read a correct park as
+  "no changes since baseline commit" and refused it, costing the attempt and the park
+  declaration with it. What was still pending at that point was the ORCHESTRATOR's commit —
+  the squash and the park record land only once this gate passes; the session's own work is
+  usually already committed above baseline, and a reset discards that too (onto an
+  `attempt-preserve/*` ref). What the loss looked like depended on configuration — a reverted tree
+  under `isolation = "worktree"` or `scm.rollback_on_failure = true`, a paused run with manual
+  recovery steps on the default in-place config. Proof-of-work is now skipped on the parked
+  leg only; the gate that refuses a park enumerating no `operator_actions` still runs. That skip
+  covers every park, including one that produced nothing and listed plausible actions — the
+  action gate tests that the list is non-empty, never what is in it.
+- **The git-add shield refuses to enable `extensions.worktreeConfig` over an operator's
+  explicit disable** (#396), instead of enabling it and deleting the line on rollback. The
+  probe read the flag `--type=bool`, so a `false`/`off`/`no`/`0` in the shared config read
+  as "needs enabling": the success path rewrote that declaration to `true` permanently, and
+  a failed activation's `--unset-all` removed the operator's line and reported a clean
+  rollback. Such a repo now gets no shield there, with a reason naming the spelling found.
+- **The git-add shield seeds `%APPDATA%/Git/ignore` on Git for Windows >= 2.46** (#403), the
+  file that fork prefers over `$HOME/.config/git/ignore` whenever it exists. Seeding the
+  `$HOME` one there was wrong in both directions — an empty seed that let global ignores leak
+  into `git add -A`, or patterns git is not applying that made session files go missing. Gated
+  on the reported version's own `.windows.` fork string, not on the platform.
+- **TUI: a graceful-stop request that cannot be written is reported, not fatal.** The `S`
+  worker caught only the helper's own refusals; an `OSError` from the write itself escaped,
+  and Textual's default `exit_on_error` took the dashboard down with it. It now surfaces
+  the same "may still be pending" guidance as `stop --graceful`.
+- **A denied publish no longer leaks its staging temp on Windows** (#597). The temp had
+  already taken a read-only target's READONLY bit when the replace was denied, and Windows
+  refuses to delete a READONLY file, so the cleanup was denied too and the temp survived.
+  It now clears the bit and retries.
+- Refuse a psmux attached-client count whose answer names a different session, so a duplicated
+  registry entry can no longer vouch for a `switch-client` that moved nobody — which
+  `return_attached_client` reported as `RETURNED`, clearing the return option for a human still
+  sitting there. Also refuse an empty or `:`-bearing session name before the probe spawns. A
+  same-named session on a foreign server, and one differing only by whitespace the seam
+  normalizes away, stay #531's subject (#671)
+- The git-add shield's rollback report no longer raises through its own stderr decode on
+  Windows (#394). `_shield_undo_extension` is contracted never to raise, but the `fsdecode` of a
+  failing `--unset-all`'s stderr was guarded for `GitError` alone.
+- **A run ref that names the runs directory itself is refused, and the two destructive run-dir
+  writes are contained** (#480). `runs._is_path_escape` was the only member of the seven-site
+  guard family omitting `names_tree_root`, so `""` and `"."` joined to the runs root exactly,
+  and `delete_run` removed whatever it was handed with a bare `rmtree`. That reach needed a
+  `state.json` lying at the runs root — without one those refs fall through to partial matching
+  and can only name a child — and the ref is the operator's own argv, so this was a footgun
+  rather than an escalation. `delete_run` and `archive_run` now also refuse a `run_dir` that is
+  not a direct child of the runs directory, raising `UnconfinedWriteError` ahead of the
+  live-session guard and not waived by `--force`. That refusal also covers a `run_dir` spelled
+  `runs/..` — the one shape the direct-child rebuild reproduces verbatim while `rmtree` would
+  resolve it to `.bmad-loop` itself — and a run-dir level redirected through a symlink or, on
+  Windows, an unelevated directory junction, which kept the lexical spelling while sending the
+  removal outside the project. An empty run ref is refused outright as well: it is a prefix and
+  a suffix of every id, so partial matching read it as a wildcard and resolved the sole run of
+  a one-run project.
+- **A sweep bundle name that is not a legal path segment is refused at triage** (#637), at both
+  of `validate_triage`'s bundle-name sites — the `bundles` list and a decision option's
+  `bundle_name`, which becomes `Bundle.name` by way of `_materialize_bundles`. A cycle-1
+  bundle's name becomes its directory verbatim, and the reserved device basenames are all
+  `[a-z0-9-]`-legal, so `BUNDLE_NAME_RE` accepted `con`, `nul` and `com1` while no Windows
+  filesystem would create the directory — matched case-insensitively, so lowercase was no
+  reprieve. The test is `safe_segment` identity rather than a second hand-written device list,
+  which keeps the accepted set in lockstep with the sanitizer that defines it: the same idiom,
+  for the same reason, as `runs.is_valid_run_id`. The persisted pre-answer lane takes the same
+  two rules at `_materialize_bundles` — a `bundle_name` answered out of band against an earlier
+  triage never passes `validate_triage`, and a fresh triage can renumber the option it named —
+  applied by journaled discard rather than by error: the build decision is honored under the
+  always-legal `decision-<id>` fallback name.
+- **Deferred-work ledger mutators serialize on a cross-process lock** (#286, #469). Every
+  mutator was an unlocked read-modify-write of the whole file, so two orchestrator processes —
+  a second `bmad-loop run`, a run plus a sweep, a run plus the TUI decision modal, a run plus
+  `sweep --archive` — both read, both edited, and the last atomic write won: entries lost,
+  closures silently reverted, and two appenders minting the same `DW-<n>` because each read
+  `next_seq` from the text it had just read. Every mutator now holds an advisory lock across its
+  whole read-modify-write, and the orchestrator's remaining multi-write sequences adopt the
+  batched primitives above, so each is one locked pass rather than one open window per row. The
+  lock lives at `<state root>/locks/<digest>-<basename>.lock`, out of the repository rather than
+  beside the ledger, because the ledger is tracked by design and the engine stages with
+  `git add -A`; it is keyed on the resolved path, so every spelling of one file contends on one
+  lock. Readers stay lock-free — every writer already replaced the file atomically, so a reader
+  sees one whole version or another. Nested acquisition raises instead of self-deadlocking, and a
+  lock that cannot be taken fails the write rather than proceeding unlocked. The dev/review
+  session's own ledger writes are unchanged and still take no lock. `bmad-loop sweep --archive`
+  names the ledger lock in its failure message rather than printing a bare `errno` — as a
+  possibility rather than a verdict, since the same arm also catches the archive's own read
+  and write failures and a full disk must not send an operator hunting a rival process. And
+  `bmad-loop
+decisions` and the TUI decision modal now also catch the state-root failure that deriving a
+  lock path can raise — in the TUI an uncaught one escaped into the Textual event loop and took
+  the dashboard down mid-walk. A project with no ledger at all is still answered without taking a
+  lock, so `--archive` keeps reporting it as the success it always was rather than failing
+  wherever no state root can be derived. `--archive`'s refusal while a run is live is
+  unchanged and deliberately kept: it is coarser than the lock, refusing the archive rewrite outright rather
+  than merely serializing it.
+- **`sprint-status.yaml` advances serialize on a cross-process lock** (#286, #469). Being the
+  board's sole writer was never mutual exclusion — a second orchestrator process runs that same
+  sole writer — and an advance is a read-modify-write of the whole board, so two of them both
+  read, both edited, and the last atomic write won: a story flipped by one run silently reverted
+  to its earlier status, and the run simply walked past it. `advance` now holds the board's own
+  sidecar lock across all three of its reads and its write, which also closes the gap inside a
+  single call between the never-regress decision and the bytes that decision was applied to. A
+  board that does not exist is still reported missing without creating a lock file at all, and a
+  lock that cannot be taken fails the advance on the channel that already carries its errors
+  rather than rewriting the board unserialized. Recomputing an advance for the isolated-run
+  ownership check runs the locked body directly against its private throwaway copy: it needs no
+  exclusion, nobody else being able to name that copy, and taking a lock anyway would strand one
+  more sidecar keyed on a path that exists only for that call, since lock files are never
+  reaped. The atomic, symlink-following,
+  read-only-refusing write itself is unchanged.
+- **A failed commit now rolls back only the ledger entries the story itself closed** (#286).
+  The window between a story's declared `closes_deferred:` closure and its commit spans git
+  spawns and, on the escalation leg, a pause for a human, so it is long enough for another
+  writer to reach the same ledger — and the rollback used to rewrite the whole document from
+  the pre-close text, taking whatever had arrived with it: an entry another process filed
+  vanished (and its `DW-<n>` was handed out again), and a closure someone else had verified
+  silently reverted to `open`. A story close is therefore written the way a sweep bundle's
+  has been since #284, with a durable undo marker owned by that close, and the rollback
+  reopens exactly those entries in one locked read-modify-write. Concurrent appends, closes
+  and recorded decisions are left standing. An armed entry whose marker has since been
+  displaced — a foreign line inserted between the status and its marker breaks the pairing —
+  is left `done` with the foreign content intact and journaled as
+  `deferred-close-reopen-unmatched`, rather than overwritten around; `deferred-close-rolled-back`
+  now names the ids it reopened. The rollback stays advisory: it still never raises out of
+  the failure arm it runs inside, so the commit's own escalation remains the disposition.
+  **Ledger format:** a story close now leaves a permanent
+  `resolution-undo: <digest> <date> <hex>` line beside its `resolution:` line, in the same
+  committed ledger — the format `sweep` bundle closes already publish, now used by one more
+  writer. Readers that ignore unknown fields are unaffected; `bmad-loop sweep --archive`
+  already preserves the line.
+- **A rolled-back defer no longer restores its ledger over a writer that arrived during
+  the rollback** (#286). The three ledger-restore windows that remain all span `git reset --hard`
+  and its preflight spawns, so a lock must not cover them; each is instead compare-and-set
+  against the ledger as observed the instant the rollback returned. The defer restore is also
+  gated on git owning the file, which inverts the old guard's worst case: on an untracked or
+  external ledger — the one kind `reset --hard` cannot have touched — every difference from the
+  snapshot was by definition somebody else's write, and rewriting the file on exactly that
+  difference is what destroyed it. Such a ledger is now left alone. When the text does move
+  between the observation and the lock, the snapshot is republished by APPENDING the entries disk
+  has since lost, keyed by DW- id and carrying their bodies verbatim, so a concurrent append
+  survives the restore instead of being rolled back with it; `defer-ledger-restore-diverged`
+  names the ids moved. Flat appender blocks, which belong to no canonical entry, are reported
+  rather than guessed at (`flat_remainder`) — the merge never invents a boundary the parser does
+  not model. Entries are matched by id AND body, so an id the reset removed and a rival then
+  re-minted for an entry of its own is reported as an `id_collisions` conflict rather than
+  silently accepted as already-there: matching on the id alone dropped the very entry the
+  merge exists to carry, and re-appending it would publish a duplicate `DW-<n>` instead. A
+  write or lock fault still propagates, as the unguarded write always did.
+- **A failed legacy-ledger migration refuses to restore over a ledger that changed
+  underneath it** (#286). The sweep's post-reset rewrite of the pre-migration text had the
+  same unguarded window; on a difference it now journals `sweep-migration-restore-diverged` and
+  escalates for a human to re-run the sweep rather than writing. Deliberately no merge and
+  no silent skip: leaving the rejected rewrite standing is the "never re-prompt over a
+  half-broken rewrite" failure the restore exists to prevent, and a migration input that
+  moved after the attempt was graded against it is a human problem — the same call the
+  duplicate-id refusal already makes.
+- **A rejected attempt's ledger retraction no longer overwrites, or deletes, a concurrent
+  writer's work** (#286). This restore compares against two anchors — a persisted digest of the
+  bytes the engine itself last published, and the ledger as observed the instant the rollback
+  returned when git owns the file and its `reset --hard` republished it. Matching neither means
+  the text is somebody else's, and the restore degrades to a journaled
+  `ledger-restore-skipped-diverged` skip rather than a write. Deliberately no merge: a
+  retraction cannot be expressed as an append. The skip is the safe direction — the
+  harvest entries left standing are real findings, `append_entry`'s idempotence stops the
+  next attempt filing them twice, and a non-restored ledger already reads as "changed" to
+  the attribution rebase, which stands the harvest exclusion down and exposes more of the
+  tree to the proof-of-work gate. The `snapshot is None` arm, which retracts a ledger the
+  harvest itself created, is gated on the same digest, closing a latent data loss: it
+  previously deleted whatever it found at that path, so a ledger a concurrent writer had
+  created inside the window went with it. A tracked ledger absent at snapshot time is
+  still never deleted, and is now answered before any lock is taken. A write or lock fault
+  is journaled as `ledger-restore-failed` and preserves an in-flight pause, as before.
+- **A read-dependent no-op is answered before its lock is taken** (#736). Taking a lock for
+  work that turns out to write nothing could fail a call that used to succeed — a replayed
+  `bmad-loop confirm` against a story the board already records as `done`, a replayed
+  rollback, `sweep --archive` over a ledger holding nothing closed — either on contention or
+  on deriving a sidecar path where no state root exists. `sprintstatus.advance` and the five
+  read-dependent `deferred-work.md` mutators now take one advisory read first, running the
+  same pure decision helper the locked pass runs; only a writes-nothing answer skips the lock,
+  and every other answer, plus any probe fault, falls through to the hold and decides there.
+  `sweep --archive` with nothing eligible now exits 0 rather than 1; an eligible archive under
+  a dead lock still fails as before. `append_entries_published` deliberately still locks on a
+  missing ledger, where absence means create.
+- **A ledger restore that spans `git reset --hard` anchors on the committed baseline blob**
+  (#735). The three restores no lock may cover — the rejected attempt's retraction, a rolled
+  back defer's, and the sweep's failed-migration rewrite — compared the ledger against an
+  observation read after the reset returned. A rival writing a tracked ledger inside that
+  window became the observation, so the compare held and the restore overwrote its entries.
+  Each write arm now takes its expected text from the ledger's blob at the baseline commit,
+  probed before the lock, since a lock may never span a subprocess. Where the reset
+  republishes no text at all — an untracked ledger, one configured outside the repo tree, or
+  one symlinked into it, whose blob is a target pathname rather than ledger text — the anchor
+  is the rewrite the attempt actually graded. Where no anchor can be derived, the retraction
+  skips, the defer restore merges what disk has lost, and the sweep escalates; those
+  doubly-uncertain cases previously still wrote. A rival whose text is byte-equal to the
+  anchor stays indistinguishable from the reset's own work.
+
+### Security
+
+- **The run-archive staging temp is minted by `mkstemp` beside the destination — exclusive,
+  `0600`, freshly named per attempt** (#591). The fixed temp name was created and unlinked by
+  name, so a symlink planted there was followed and the cleanup could remove a concurrent
+  archiver's in-flight temp; the exclusive create closes both, and the unpredictable
+  per-attempt name keeps a temp stranded by a kill — or a file planted at a guessable name —
+  from denying every later archive. The staged tarball is also `fsync`ed before publish,
+  since the run dir it came from is removed immediately after.
+- **Confined atomic writers anchor a file's parent with a directory descriptor instead of
+  resolving it by name** (#593). `follow_symlinks=False` refuses a link planted at the file
+  itself, but every directory above it was still looked up by name, so a link planted at
+  `.bmad-loop/` redirected the staging and the publish both. `atomic_write_text_confined` and
+  `atomic_write_bytes_confined` walk the components `O_NOFOLLOW` and write through the
+  resulting descriptor; a refusal raises `UnconfinedWriteError`, an `OSError`. Windows has no
+  `*at()` family and degrades to the documented check-then-write.
+- **The orchestrator's own writers under session-writable roots adopted those confined
+  helpers** (#593): the decisions store, park records, the stop-request channel (the graceful
+  lodge keeps its exclusive-create arbitration, now anchored at the walked parent), sweep
+  decisions, `policy.toml`, the story-spec writers, and the run's config-digest stamp. A
+  story spec in an artifacts folder configured _outside_ the checkout keeps the plain
+  no-follow write — supported configuration a confined write cannot vouch for.
 
 ## [0.11.1] — 2026-08-23
 
 ### Added
-
-- Support namespaced sprint boards such as `L0-epic-1` / `L0-1-1-story`, including namespace-pinned resume, TUI filtering, hard gates, and namespaced spec discovery.
-- Add `bmad-loop init --local-hooks` for checkout-local hook configs and lightweight per-clone initialization.
 
 - **git 2.34 or newer is now a declared prerequisite**, and the first one the orchestrator
   enforces. Set to keep Ubuntu 22.04 LTS (stock git 2.34) supported; Ubuntu 20.04 (2.25) and

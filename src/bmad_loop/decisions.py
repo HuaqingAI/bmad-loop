@@ -27,7 +27,7 @@ import re
 from pathlib import Path
 
 from . import bmadconfig, deferredwork, runs, verify
-from .platform_util import atomic_write_text
+from .platform_util import atomic_write_text_confined
 from .sweep import Decision, DecisionOption, validate_triage
 
 STORE_REL = Path(".bmad-loop") / "decisions.json"
@@ -60,13 +60,31 @@ def _write_store(project: Path, data: dict) -> None:
     `.bmad-loop/decisions.tmp` as an untracked file and hold `worktree_clean`
     False until a human deleted it; the helper removes its temp on any raise.
 
-    ``follow_symlinks=False`` is the behaviour-preserving choice — `os.replace`
+    Confined to ``project`` (#593). Refusing to follow a link planted at
+    `decisions.json` itself was the behaviour-preserving choice — `os.replace`
     never dereferenced this destination either — and the security one: a driven
     session can write under `.bmad-loop/`, so honouring a link planted here would
-    hand it a host-side write to any operator-writable path."""
+    hand it a host-side write to any operator-writable path. But that refusal
+    stopped at the final component, and the `mkdir` on the line below accepts a
+    symlink-to-a-directory, so a link planted at `.bmad-loop/` survived the setup
+    and redirected both the temp and the publish. The confined writer walks the
+    components below `project` `O_NOFOLLOW` and writes through the descriptor
+    that walk produced, so the same escalation now costs a refusal instead of a
+    host-side write. Permission-neutral: no-follow never inherited a mode either,
+    so the store still lands at `0600`.
+
+    ``require_writable_target=True`` (#597) restores the `PermissionError` a bare
+    `Path.write_text` raised here before #363 made the write atomic. The store is
+    operator-curated — an operator who marks it read-only is answered rather than
+    quietly overwritten and left with the `0444` still showing."""
     path = store_path(project)
     path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(path, json.dumps(data, indent=2, sort_keys=True), follow_symlinks=False)
+    atomic_write_text_confined(
+        path,
+        json.dumps(data, indent=2, sort_keys=True),
+        confine_root=project,
+        require_writable_target=True,
+    )
 
 
 def record_pre_answer(project: Path, dw_id: str, option: DecisionOption, *, date: str) -> None:
@@ -157,11 +175,21 @@ def apply_pre_answer(
     paths = bmadconfig.load_paths(project)
     ledger = paths.deferred_work
     detail = option.resolution or option.intent
-    deferredwork.append_decision(ledger, decision.id, date, option.label, detail)
+    close_note = None
     if option.effect == "close":
-        note = "closed by human decision" + (f": {option.resolution}" if option.resolution else "")
-        deferredwork.mark_done(ledger, decision.id, date, note)
-    else:
+        close_note = "closed by human decision" + (
+            f": {option.resolution}" if option.resolution else ""
+        )
+    # ONE locked read->edit->write (#286/#469). As the `append_decision` +
+    # `mark_done` pair it was two acquisitions with a window between them, and a
+    # rival writer landing there left the entry carrying a decision that says
+    # "close it" over a status that still says open. The bytes are identical to
+    # the pair's. The commit below stays OUTSIDE any lock — locks are held only
+    # around file I/O, never across a subprocess (#286).
+    deferredwork.record_decision(
+        ledger, decision.id, date, option.label, detail, close_note=close_note
+    )
+    if option.effect != "close":
         record_pre_answer(project, decision.id, option, date=date)
     if commit:
         try:

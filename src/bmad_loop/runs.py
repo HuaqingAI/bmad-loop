@@ -24,11 +24,15 @@ from .journal import STATE_FILE, VERIFY_DIR, Journal, load_state, save_state
 from .model import PAUSE_ESCALATION, Phase, RunState, StoryTask
 from .platform_util import (
     MAX_SEGMENT,
+    UnconfinedWriteError,
+    _mkstemp_beside,
     atomic_replace,
-    atomic_write_text,
+    atomic_write_text_confined,
+    create_exclusive_confined,
     has_parent_ref,
     is_absolute_path,
     is_link_like,
+    names_tree_root,
     retrying_unlink,
     safe_segment,
 )
@@ -138,6 +142,28 @@ def list_run_dirs(project: Path) -> list[Path]:
     if not runs.is_dir():
         return []
     return sorted(d for d in runs.iterdir() if (d / "state.json").is_file())
+
+
+def all_run_dirs(project: Path) -> list[Path] | None:
+    """Every run dir under the runs root — ``state.json`` or not — oldest first,
+    or ``None`` when the listing could not be taken.
+
+    The ungated counterpart to :func:`list_run_dirs`, and the one to ask when the
+    question is "does a run still own its control plane" rather than "which runs
+    can I read". A run whose state.json was removed or corrupted still holds a
+    live ``engine.pid``, so the gated view walks straight past exactly the run an
+    operator is mid-recovery on — the hazard :func:`_run_dir_names` documents,
+    whose set this wraps rather than re-listing.
+
+    ``None`` is an unreadable runs root and means *nothing was learned*, which is
+    not the same answer as the empty list a missing root gives. Callers that act
+    on "no live runs" have to tell those apart; see :func:`_run_dir_names`.
+    """
+    names = _run_dir_names(project)
+    if names is None:
+        return None
+    root = project / RUNS_DIR
+    return sorted(root / name for name in names)
 
 
 def latest_run_dir(project: Path) -> Path | None:
@@ -497,11 +523,19 @@ def write_trusted_config_digest(project: Path, run_id: str, digest: str) -> None
     look like an orphan to a ``clean`` racing the launch."""
     path = config_digest_path_for(project, run_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # follow_symlinks=False: a machine-minted record under a root whose path the
-    # driven session is handed (BMAD_LOOP_EVENTS_DIR names its sibling), so a
-    # planted link here must be replaced, never written through to whatever it
-    # aims at. The trailing newline is for the operator who cats the file.
-    atomic_write_text(path, digest + "\n", follow_symlinks=False)
+    # Confined to the state root (#593): a machine-minted record under a root
+    # whose path the driven session is handed (BMAD_LOOP_EVENTS_DIR names its
+    # sibling), so a planted link here must be replaced, never written through to
+    # whatever it aims at. Refusing a link at the FINAL component was not enough —
+    # `mkstemp(dir=...)` and `os.replace`'s destination still resolved every
+    # directory above by name, and the `mkdir` on the line above ACCEPTS a
+    # symlinked directory, so a link planted at either session-reachable component
+    # (`<project tag>/`, `<run id>/`) survived the setup step and redirected both
+    # the temp and the published stamp. `state_root()` is the one component the
+    # anchored walk starts from rather than checks, and it is a host fact this
+    # process derives — not a path any session names. The trailing newline is for
+    # the operator who cats the file.
+    atomic_write_text_confined(path, digest + "\n", confine_root=state_root())
 
 
 # ---------------------------------------------------- run resolution / liveness
@@ -527,11 +561,40 @@ def short_ref(run_id: str) -> str:
 
 def _is_path_escape(ref: str) -> bool:
     """True when ``ref`` would steer ``run_dir_for``'s recomposition outside the
-    runs dir — it is absolute/drive-qualified, climbs with ``..``, or carries a
-    path separator of either flavour. Sub-check of the run-id charset rather than
-    `is_valid_run_id` itself: a run dir created by an older version (or by hand)
-    may bear a name we would no longer mint, and must stay addressable."""
-    return is_absolute_path(ref) or has_parent_ref(ref) or "/" in ref or "\\" in ref
+    runs dir — it is absolute/drive-qualified, climbs with ``..``, names the runs
+    dir itself rather than anything inside it, or carries a path separator of
+    either flavour. Sub-check of the run-id charset rather than `is_valid_run_id`
+    itself: a run dir created by an older version (or by hand) may bear a name we
+    would no longer mint, and must stay addressable.
+
+    `names_tree_root` restores this site to the three-guard pairing every sibling
+    already spells (`policy.py`, `adapters/profile.py`, `plugins/manifest.py`); it
+    was the only member of the family omitting it (#480). It closes the spellings
+    that recompose to the runs *root* instead of a run in it. ``""`` and ``"."``
+    join to it exactly — measured here, both `runs / ""` and `runs / "."` *are*
+    the runs dir — so a `state.json` lying at that root made the exact branch
+    below hand `delete_run` the whole runs tree to `rmtree`. ``"..."``, ``".. "``
+    and ``"   "`` are the Win32 half of the same rule (cited, not measurable on
+    POSIX): the trim of trailing periods and spaces leaves ``..`` or nothing, so
+    they name `.bmad-loop/` or the runs dir there while both pure pathlib flavours
+    keep them as ordinary one-segment names.
+
+    Addressability is unharmed: skipping the exact branch only defers to partial
+    matching, and a legacy dir named ``"..."`` is still enumerated by
+    `list_run_dirs` and still matched by its own spelling.
+
+    `names_win32_alias`, the family's fourth member, is deliberately NOT applied
+    here — it would make a legacy run dir named ``NUL`` or ``run. `` permanently
+    unaddressable, which is the one thing this guard exists to prevent. Refusing
+    to *mint* such a name is `is_valid_run_id`'s job, and it already does it with
+    a `safe_segment` identity check."""
+    return (
+        is_absolute_path(ref)
+        or has_parent_ref(ref)
+        or names_tree_root(ref)
+        or "/" in ref
+        or "\\" in ref
+    )
 
 
 def resolve_run_dir(project: Path, ref: str) -> Path:
@@ -544,7 +607,17 @@ def resolve_run_dir(project: Path, ref: str) -> Path:
     ref that could escape the runs dir (`bmad-loop delete ../../x` would otherwise
     rmtree an outside directory that happens to hold a state.json). Such a ref
     falls through to partial matching, which can only ever yield a name
-    `list_run_dirs` enumerated — and so cannot escape."""
+    `list_run_dirs` enumerated — and so cannot escape.
+
+    An EMPTY ref is refused outright rather than deferred: `""` is a prefix and a
+    suffix of every name, so partial matching reads it as a wildcard — harmlessly
+    ambiguous with two runs, but silently resolving the sole run of a one-run
+    project, which handed `bmad-loop delete ""` that run. No addressability is
+    lost (no directory can be named `""`); every other escape spelling keeps the
+    partial fallback so a legacy dir named `"..."` stays matchable by its own
+    spelling."""
+    if not ref:
+        raise RunRefError("empty run ref: it would match every run, never name one")
     if not _is_path_escape(ref):
         exact = run_dir_for(project, ref)
         if is_run(exact):
@@ -853,6 +926,40 @@ def accepted_tags(project: Path) -> frozenset[str]:
     return frozenset({project_tag(project), str(project.resolve())})
 
 
+def lock_path_for(data_path: Path) -> Path:
+    """The advisory-lock sidecar for a mutable data file:
+    ``<state root>/locks/<sha256(resolved path)[:16]>-<basename>.lock``.
+
+    Out of the repository, deliberately, and NOT the ``<file>.lock`` sibling the
+    obvious reading of #286 asks for. The deferred-work ledger is a *tracked*
+    file by design, and both :func:`verify.commit_story` and
+    :func:`verify.finalize_commit` stage with ``git add -A``: a lock beside it
+    would be swept into the engine's own commits, and the git-add shield that
+    would otherwise hide it covers linked worktrees only. Under the state root
+    the sidecar is never git-visible at all, so no exclusion machinery has to be
+    kept correct for it.
+
+    Keyed on the **resolved** path so the identity of the lock is the identity of
+    the file rather than of the spelling used to reach it: a symlinked and a
+    direct path to one ledger rendezvous on one lock (without which the two
+    spellings would exclude nobody), two worktrees' in-tree ledgers are different
+    files and correctly get independent locks, and several projects pointed at a
+    shared external artifact dir land on one lock, which is where the real
+    contention is. The basename is appended for debuggability only — a human
+    reading ``ls`` of the locks dir should see which file a sidecar guards — and
+    carries no meaning for exclusion, which rides the digest.
+
+    Pure: no directory is created here, because
+    :func:`~bmad_loop.platform_util.file_lock` mkdirs the parent when it opens
+    the lock. May raise :class:`StateRootError` when the environment names no
+    usable state root (see :func:`state_root`); the caller fails rather than
+    silently locking somewhere else.
+    """
+    resolved = data_path.resolve()
+    digest = hashlib.sha256(os.fsencode(str(resolved))).hexdigest()[:16]
+    return state_root() / "locks" / f"{digest}-{resolved.name}.lock"
+
+
 def mux_sessions() -> list[str]:
     """All live session names, or [] when the multiplexer is missing, no server
     is running, or the query fails."""
@@ -1011,6 +1118,29 @@ def _stop_request_mode_of(path: Path) -> str | None:
     return "graceful"
 
 
+def _project_of_run_dir(run_dir: Path) -> Path:
+    """The project root a run directory hangs under, for confining writes into it.
+
+    Derived rather than passed because the stop-request channel is addressed by
+    run directory alone: `stop_run` resolves a run reference and never holds the
+    project separately. :func:`run_dir_for` is the only builder of these paths
+    and spells them ``project / RUNS_DIR / run_id``, so the root sits exactly
+    ``len(RUNS_DIR.parts)`` levels above the run's own directory — the arithmetic
+    tracks `RUNS_DIR` rather than hard-coding 2, so moving the runs tree moves
+    this with it.
+
+    A path too shallow to have that ancestor is not one this module built.
+    Refusing with :class:`UnconfinedWriteError` rather than letting `parents`
+    raise `IndexError` is the load-bearing part: `stop_run` degrades on `OSError`
+    so that a failed lodge still signals the run, and an `IndexError` there would
+    abort the stop before it ever signalled."""
+    depth = len(RUNS_DIR.parts)
+    parents = run_dir.parents
+    if len(parents) <= depth:
+        raise UnconfinedWriteError(f"{run_dir} is not shaped like a run directory")
+    return parents[depth]
+
+
 def _write_stop_request(run_dir: Path, mode: str) -> None:
     """Lodge a stop request of ``mode`` on the control-file channel, written
     atomically so a concurrent engine read never sees a partial body.
@@ -1038,13 +1168,24 @@ def _write_stop_request(run_dir: Path, mode: str) -> None:
     would abort ``stop_run`` *before* it ever signals. A ``mkstemp`` temp per writer
     removes the collision: the last replace wins and neither writer errors.
 
-    ``follow_symlinks=False`` preserves what the bare ``os.replace`` did — it never
-    dereferenced this destination — and matches what the file is: machine-minted
-    control state under a run dir a driven session can reach. It now lands at
-    ``mkstemp``'s ``0600`` instead of ``0644 & ~umask``; nothing reads it
-    cross-user."""
+    Refusing a link at the control file preserved what the bare ``os.replace``
+    did — it never dereferenced this destination — and matches what the file is:
+    machine-minted control state under a run dir a driven session can reach. The
+    write is now confined to the project root (#593), because that refusal
+    covered only the final component: every directory above it was still looked
+    up by name, so a link planted at ``.bmad-loop/`` — or at ``runs/``, or at the
+    run's own directory — aimed both the temp and the publish wherever it
+    pointed. The file still lands at ``mkstemp``'s ``0600`` instead of
+    ``0644 & ~umask``, since no-follow never inherited a mode either; nothing
+    reads it cross-user.
+
+    No ``require_writable_target``: this is not an operator-curated file but a
+    channel two ``stop`` invocations race on, and its whole contract above is
+    that the stronger request always lands."""
     body = json.dumps({"requested_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "mode": mode})
-    atomic_write_text(run_dir / STOP_REQUEST_FILE, body, follow_symlinks=False)
+    atomic_write_text_confined(
+        run_dir / STOP_REQUEST_FILE, body, confine_root=_project_of_run_dir(run_dir)
+    )
 
 
 def _create_stop_request(run_dir: Path) -> bool:
@@ -1067,7 +1208,13 @@ def _create_stop_request(run_dir: Path) -> bool:
 
     Refuses a planted symlink rather than following it — ``O_EXCL`` never
     dereferences — which is stricter than the ``follow_symlinks=False`` replace it
-    replaces.
+    replaces. That refusal covers only the FINAL component, though, so the create
+    goes through :func:`platform_util.create_exclusive_confined` (#593): a link
+    planted at ``.bmad-loop/``, ``runs/`` or the run's own directory was still
+    resolved by name and aimed the request outside the project, exactly the hole
+    the confined :func:`_write_stop_request` next door already closed. The
+    anchored create keeps the exclusive arbitration this function is built on;
+    an unreachable parent raises ``UnconfinedWriteError``.
 
     A failed write is deliberately NOT rolled back, and that is load-bearing rather
     than sloppy. ``unlink`` resolves a *name*, not the inode this call created, so a
@@ -1092,7 +1239,7 @@ def _create_stop_request(run_dir: Path) -> bool:
     body = json.dumps({"requested_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "mode": "graceful"})
     path = run_dir / STOP_REQUEST_FILE
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        fd = create_exclusive_confined(path, confine_root=_project_of_run_dir(run_dir))
     except FileExistsError:
         return False  # a request is already pending — a planted link included
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -1535,6 +1682,66 @@ def _discard_state_dir(project: Path, run_id: str) -> None:
     shutil.rmtree(target, ignore_errors=True)
 
 
+def _refuse_uncontained_run_dir(project: Path, run_dir: Path, action: str) -> None:
+    """Refuse to remove anything but a direct child of ``project``'s runs dir.
+
+    The containment half of #480, and deliberately independent of how the ref was
+    spelled: :func:`_is_path_escape` gates the *string* an operator typed, this
+    gates the *path* the two destructive writes are about to hand `shutil.rmtree`.
+    Both are wanted. `delete_run` and `archive_run` are module-public and take a
+    `run_dir` outright, so a caller that composed one by some route other than
+    :func:`resolve_run_dir` — the TUI's selection, a record read back from disk, a
+    call site not yet written — never passes the ref guard at all.
+
+    ``run_dir_for`` is the sole builder of these paths, so recomposing one from
+    the basename and comparing is exactly the "is a direct child" question: the
+    runs root itself, a nested grandchild, and anything outside the project all
+    differ from what it returns. Comparing against the rebuild rather than
+    walking `parents` keeps this tracking `RUNS_DIR` the way
+    :func:`_project_of_run_dir` does. The rebuild has one blind spot the name
+    check closes: ``.name`` of ``runs / ".."`` is ``".."`` and the rebuild
+    reproduces it verbatim, so the lexical equality holds while `rmtree` would
+    resolve it to ``.bmad-loop`` itself. pathlib drops ``"."`` at parse so only
+    the ``".."`` spelling survives to here; ``"."`` is refused anyway rather than
+    reasoned about.
+
+    The link walk below the equality check refuses a REDIRECTED spelling of a
+    contained path: with ``.bmad-loop``, ``runs`` or the run dir itself replaced
+    by a symlink (or, on Windows, an unelevated ``mklink /J`` junction — why this
+    is :func:`is_link_like` and not ``is_symlink``), the rebuild is lexically
+    identical while `rmtree` follows the redirect and removes a tree outside the
+    project. A planted redirect is this module's live threat class (see the #591
+    notes in :func:`archive_run`). The walk stops short of ``project`` — the
+    operator's own argument, and a project addressed through a symlinked home is
+    legitimate — and covers only the orchestrator-owned levels under it. It is
+    check-then-act, not fd-anchored like `journal.py`'s writes: `resolve()` is
+    banned here (it can raise on a WSL-UNC host — `tests/conftest.py`'s
+    ``refuse_to_resolve``), `tarfile` cannot take a dir fd at all, and the racer
+    that could re-plant between check and rmtree is a live session, which the
+    guard below this one refuses anyway.
+
+    Raises rather than degrading — observation may degrade, a repair write must
+    not: there is no partial `rmtree` to fall back to, and declining quietly would
+    report a removal that never happened. :class:`UnconfinedWriteError` is the
+    shape-refusal this module already raises for the same class of mistake (see
+    :func:`_project_of_run_dir`), and being an ``OSError`` it lands in the
+    handling callers already have for a removal that failed."""
+    if run_dir.name in (".", "..") or run_dir_for(project, run_dir.name) != run_dir:
+        raise UnconfinedWriteError(
+            f"refusing to {action} {run_dir}: not a run directory under {project / RUNS_DIR}"
+        )
+    node = run_dir
+    while node != project:
+        if is_link_like(node):
+            raise UnconfinedWriteError(
+                f"refusing to {action} {run_dir}: {node} is a symlink or junction"
+            )
+        parent = node.parent
+        if parent == node:  # anchored: never walk past the filesystem root
+            break
+        node = parent
+
+
 def delete_run(project: Path, run_dir: Path, *, force: bool = False) -> None:
     """Permanently remove a run directory. Callers enforce the engine-liveness
     guard; the session guard is enforced here (see :func:`_refuse_live_session`),
@@ -1544,7 +1751,12 @@ def delete_run(project: Path, run_dir: Path, *, force: bool = False) -> None:
     the leak on their own say-so. It deliberately does not kill the session
     instead — that would be unscoped, and this project cannot prove the session is
     its own (which is the whole defect). Trading a possible leak of our own session
-    for a possible kill of someone else's is the wrong direction for an override."""
+    for a possible kill of someone else's is the wrong direction for an override.
+
+    The containment guard runs first and is NOT under ``force``: an override is
+    the operator accepting a leaked session, never a licence to rmtree a path
+    outside the runs dir."""
+    _refuse_uncontained_run_dir(project, run_dir, "delete")
     if not force:
         _refuse_live_session(project, run_dir.name, "delete")
     shutil.rmtree(run_dir)
@@ -1565,16 +1777,17 @@ def archive_run(project: Path, run_dir: Path, *, force: bool = False) -> Path:
     the run's ``events/``: the channel moved out of the tree, and its files are
     transient completion signals the watcher has already consumed — the recorded
     decision accepts losing them from the archive. Everything an archive is read
-    for later (state, journal, tasks, logs) is in the run dir and unaffected."""
+    for later (state, journal, tasks, logs) is in the run dir and unaffected.
+
+    Containment (see :func:`_refuse_uncontained_run_dir`) is checked ahead of both,
+    for the reason the session guard runs early: a refusal must leave no archive
+    directory and no tarball behind."""
+    _refuse_uncontained_run_dir(project, run_dir, "archive")
     if not force:
         _refuse_live_session(project, run_dir.name, "archive")
     archive_dir = project / ARCHIVE_DIR
     archive_dir.mkdir(parents=True, exist_ok=True)
     dest = archive_dir / f"{run_dir.name}.tar.gz"
-    # `with_name`, not `with_suffix`: the latter replaces only the LAST suffix, so
-    # on `<id>.tar.gz` (stem `<id>.tar`) it produced `<id>.tar.tar.gz.tmp` — not the
-    # name this docstring implies, and not one any cleanup could be written against.
-    tmp = dest.with_name(dest.name + ".tmp")
     # #363: the guard, not a helper — the path is handed to `tarfile.open`, so there
     # is no payload for `atomic_write_*` to take. `init` now gitignores archive/, but
     # the guard remains load-bearing for repos initialized by older versions and for
@@ -1583,13 +1796,33 @@ def archive_run(project: Path, run_dir: Path, *, force: bool = False) -> Path:
     # `decisions._write_store`, `policy.write_mux_backend` and
     # `tui.settings.PolicyDoc.save` had. (Not the sweep's two `decisions.json`
     # writes, which look like the same fix but write under the ignored run dir.)
+    #
+    # #591: staged through `_mkstemp_beside` — the atomic writers' own exclusive
+    # `0600` create (binary-mode on win32), under a fresh unpredictable name per
+    # attempt. A fixed name made a temp stranded by a kill, or planted at the
+    # guessable spelling, deny every later attempt as `FileExistsError`; the
+    # truncate-and-reuse it replaced followed a planted symlink instead. mkstemp's
+    # exclusivity still never opens a name something else holds, and the name being
+    # this process's own mint is what licenses the cleanup unlink below. It sits
+    # outside the `try` on purpose: a create that fails has staged nothing to
+    # clean up.
+    fd, tmp_name = _mkstemp_beside(dest)
+    tmp = Path(tmp_name)
     try:
-        with tarfile.open(tmp, "w:gz") as tar:
-            tar.add(run_dir, arcname=run_dir.name)
+        with os.fdopen(fd, "wb") as raw:
+            with tarfile.open(fileobj=raw, mode="w:gz") as tar:
+                tar.add(run_dir, arcname=run_dir.name)
+            # Flushed and fsynced before the publish, and unlike the rest of this
+            # family that is not about staleness but about data loss: `shutil.rmtree`
+            # below removes the only other copy of the run, so a crash with the
+            # tarball still in page cache destroys it outright. Ordered inside the
+            # fdopen context so the gzip trailer `tar.close()` just wrote is included.
+            raw.flush()
+            os.fsync(raw.fileno())
         atomic_replace(tmp, dest)
     except BaseException:
         with contextlib.suppress(OSError):
-            tmp.unlink(missing_ok=True)
+            tmp.unlink(missing_ok=True)  # provably ours: mkstemp minted the name
         raise
     shutil.rmtree(run_dir)
     _discard_state_dir(project, run_dir.name)  # same tail as delete_run
@@ -2052,12 +2285,14 @@ def rearm_escalation(
                 # the restored diff); from-scratch -> ready-for-dev -> step-03
                 # (re-implement). Independent of the resolve agent having set it.
                 target_status = "in-review" if restore_patch else "ready-for-dev"
-                verify.set_frontmatter_status(spec_path, target_status)
+                verify.set_frontmatter_status(
+                    spec_path, target_status, confine_root=Path(state.project)
+                )
                 # drop the stale `## Auto Run Result` section along with the status flip
                 # (mirrors engine._reset_spec_for_repair): find_result_artifact keys on
                 # that heading, so leaving it would let the re-driven session's first
                 # save of the spec parse as the prior attempt's terminal outcome.
-                devcontract.strip_auto_run_result(spec_path)
+                devcontract.strip_auto_run_result(spec_path, confine_root=Path(state.project))
             except verify.FrontmatterWriteError as e:
                 # The spec reads fine but carries `status:` in a shape no line
                 # edit can move (a block scalar, a flow mapping, a value continued
@@ -2134,7 +2369,10 @@ def rearm_escalation(
     if restore_patch and task.spec_file and task.baseline_commit:
         try:
             verify.set_frontmatter_field(
-                Path(task.spec_file), "baseline_revision", task.baseline_commit
+                Path(task.spec_file),
+                "baseline_revision",
+                task.baseline_commit,
+                confine_root=Path(state.project),
             )
         except (OSError, UnicodeDecodeError, verify.FrontmatterWriteError) as e:
             # FrontmatterWriteError joins the tuple rather than getting its own

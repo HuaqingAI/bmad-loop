@@ -1,11 +1,12 @@
 """Pre-answer store, discovery of missed decisions, and out-of-band apply."""
 
 import json
+import sys
 
 import pytest
 from conftest import install_bmad_config, write_ledger
 
-from bmad_loop import decisions, deferredwork
+from bmad_loop import decisions, deferredwork, platform_util
 from bmad_loop.sweep import DecisionOption
 
 
@@ -91,10 +92,10 @@ def test_record_pre_answer_write_failure_raises_and_keeps_the_store(project, mon
     )
     before = path.read_bytes()
 
-    def boom(path, text, *, follow_symlinks=True):
+    def boom(path, text, *, confine_root, require_writable_target=False):
         raise OSError("disk full")
 
-    monkeypatch.setattr(decisions, "atomic_write_text", boom)
+    monkeypatch.setattr(decisions, "atomic_write_text_confined", boom)
     with pytest.raises(OSError, match="disk full"):
         decisions.record_pre_answer(
             project.project,
@@ -276,3 +277,147 @@ def _git_status(project):
         text=True,
         check=True,
     ).stdout
+
+
+# ------------------------------------------ the store's confined write (#593, #597)
+
+
+def _answer(project, dw_id="DW-7", date="2026-06-13"):
+    decisions.record_pre_answer(
+        project.project,
+        dw_id,
+        DecisionOption(key="1", label="Build it", effect="build", intent="do it"),
+        date=date,
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_the_store_write_refuses_a_symlinked_bmad_loop(project, tmp_path):
+    """The escape #593 names, at this site. `follow_symlinks=False` refused a link
+    planted at `decisions.json`; it never refused one at `.bmad-loop/`, and
+    `_write_store`'s own `mkdir(parents=True, exist_ok=True)` ACCEPTS a
+    symlink-to-a-directory, so the planted parent survives the setup step and both
+    the temp and the published store land wherever the link points.
+
+    A driven session can write under `.bmad-loop/`, which is what makes this a
+    real writer rather than a hypothetical one: the escalation the no-follow was
+    added to close costs a directory swap instead of a file swap.
+
+    The second assertion is the one that pins the fix — refusing loudly is worth
+    nothing if the write already landed outside the project.
+
+    Ablation: revert `_write_store` to
+    `atomic_write_text(path, ..., follow_symlinks=False)` and this fails
+    `DID NOT RAISE`, with `decisions.json` sitting in `outside/`."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (project.project / ".bmad-loop").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        _answer(project)
+
+    assert list(outside.iterdir()) == []  # nothing escaped the project
+
+
+def test_the_store_write_lands_on_a_clean_tree(project):
+    """The positive control for the refusal above. Without it that test passes for
+    a `_write_store` wired to refuse everything, which is every reason a file
+    could be absent from `outside/`."""
+    _answer(project)
+
+    assert decisions.load_pre_answers(project.project)["DW-7"]["effect"] == "build"
+    assert decisions.store_path(project.project).is_file()
+
+
+def test_the_store_write_refuses_a_readonly_store(project):
+    """#597 at this site: the store is operator-curated — a human answers these
+    decisions out of band — so a read-only one is answered with the
+    `PermissionError` a bare `Path.write_text` raised, not routed around by a
+    replace that only needs the DIRECTORY writable.
+
+    chmod is on the per-test copytree copy the `project` fixture makes, never the
+    session template (a read-only template would be inherited by every later
+    copy), and it is restored in a `finally` because Windows rmtree refuses a
+    READONLY file at cleanup.
+
+    Ablation: drop `require_writable_target=True` from `_write_store` and this
+    fails `DID NOT RAISE`, with the store rewritten and still reading 0444."""
+    _answer(project, "DW-7")
+    store = decisions.store_path(project.project)
+    before = store.read_bytes()
+    store.chmod(0o444)
+    try:
+        with pytest.raises(PermissionError):
+            _answer(project, "DW-9", date="2026-06-14")
+    finally:
+        store.chmod(0o644)
+
+    assert store.read_bytes() == before  # the second answer never landed
+
+
+@pytest.mark.parametrize(
+    ("effect", "label", "extra", "close_note"),
+    [
+        ("build", "Build", {"intent": "widen field"}, None),
+        ("close", "Close", {"resolution": "superseded"}, "closed by human decision: superseded"),
+    ],
+)
+def test_apply_pre_answer_is_one_ledger_transaction(
+    project, tmp_path, monkeypatch, effect, label, extra, close_note
+):
+    """The decision record and the closure it asks for land in ONE locked
+    read->edit->write, byte-identical to the released `append_decision` +
+    `mark_done` pair (#286/#469).
+
+    Two claims, and both are needed. The golden text says the collapse moved no
+    bytes — these ledgers are committed and read by humans, so `record_decision`
+    inserting the decision line before it applies the close is a contract, not a
+    detail (`_MARK_DONE_TAIL_RE` anchors an undo marker on the status/resolution
+    adjacency the other order would break). The acquisition count is what says
+    the pair actually collapsed: as two calls it was two acquisitions with a
+    window between them, and a rival writer landing there left the entry
+    carrying a decision that says "close it" over a status that still says open.
+    Byte equality alone passes just as well for the released pair.
+
+    Ablation: restore the pair in `decisions.apply_pre_answer`. The golden assert
+    still passes — that is the point — and `acquisitions` goes to 2 on the CLOSE
+    variant, which is the one that grades the collapse. The build variant stays
+    green under that ablation and is known to: with `close_note=None` there is no
+    second call to make, and `append_decision` is itself a one-acquisition
+    delegate to `record_decision`, so the two spellings are the same transaction.
+    It is kept for the claim it does decide — that the no-close path still writes
+    the pair's bytes and leaves the entry open — not as a second count oracle.
+    """
+    import contextlib
+
+    from bmad_loop.sweep import Decision
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    pristine = project.deferred_work.read_text(encoding="utf-8")
+    opt = DecisionOption(key="1", label=label, effect=effect, **extra)
+    d = Decision(id="DW-1", question="?", context="", options=(opt,), recommendation="1")
+
+    # The released serial pair, run against a twin of the same pristine ledger in
+    # its own directory so it contends on its own lock and is never counted.
+    golden = tmp_path / f"golden-{effect}" / "deferred-work.md"
+    golden.parent.mkdir(parents=True)
+    golden.write_text(pristine, encoding="utf-8")
+    deferredwork.append_decision(golden, "DW-1", "2026-06-13", label, opt.resolution or opt.intent)
+    if close_note is not None:
+        deferredwork.mark_done(golden, "DW-1", "2026-06-13", close_note)
+
+    acquisitions = []
+    real_lock = deferredwork.ledger_lock
+
+    @contextlib.contextmanager
+    def spy_lock(p):
+        acquisitions.append(p)
+        with real_lock(p):
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", spy_lock)
+    decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13", commit=False)
+
+    assert project.deferred_work.read_text(encoding="utf-8") == golden.read_text(encoding="utf-8")
+    assert acquisitions == [project.deferred_work]  # ONE, and on the project's ledger
