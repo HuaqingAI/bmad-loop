@@ -7,9 +7,14 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Changed
+
+- Register this fork as the collision-free `huaqing-bmad-loop` custom BMAD module so URL-backed custom-source installs and Quick Updates retain the fork, and make `/bmad-loop-setup` reinstall the orchestrator from the exact manifest URL or local path instead of falling back to the official repository.
+
 ## [0.11.1] — 2026-08-23
 
 ### Added
+
 - Support namespaced sprint boards such as `L0-epic-1` / `L0-1-1-story`, including namespace-pinned resume, TUI filtering, hard gates, and namespaced spec discovery.
 - Add `bmad-loop init --local-hooks` for checkout-local hook configs and lightweight per-clone initialization.
 

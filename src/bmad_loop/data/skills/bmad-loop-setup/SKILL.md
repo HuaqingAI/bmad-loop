@@ -7,11 +7,11 @@ description: Sets up BMAD Loop Skills module in a project. Use when the user req
 
 ## Overview
 
-Installs, configures, **and upgrades** the bmad-loop module in a project.
+Installs, configures, **and upgrades** the fork-distributed BMAD Loop module in a project. Its BMAD module code is read from `./assets/module.yaml`; the Python package, CLI, and skill names remain `bmad-loop` / `bmad-loop-*`.
 
-This module is unusual: alongside its automation skills it relies on the **bmad-loop orchestrator tool** — the Python program that actually drives the loop — installed as the `bmad-loop` package from its public Git repository. The skills do nothing on their own.
+This module is unusual: alongside its automation skills it relies on the **bmad-loop orchestrator tool** — the Python program that actually drives the loop — installed as the `bmad-loop` package from the same custom repository that supplied the BMAD module. The skills do nothing on their own.
 
-**The BMAD installer owns `_bmad/` registration; this skill does not.** When bmad-loop is installed through the BMAD installer (`npx bmad-method install`), the installer stages the skills under `_bmad/bmad-loop/`, writes that module's own config and help files, records it in `_bmad/_config/` (manifest, skill manifest, files manifest), and rebuilds the `/bmad-help` catalog. It regenerates the central `_bmad/config.toml` on every run, so nothing outside the installer should write there.
+**The BMAD installer owns `_bmad/` registration; this skill does not.** When the module is installed through the BMAD installer (`npx bmad-method install --custom-source ...`), the installer stages the skills under `_bmad/<module-code>/`, writes that module's own config and help files, records its custom source in `_bmad/_config/manifest.yaml`, and rebuilds the `/bmad-help` catalog. It regenerates the central `_bmad/config.toml` on every run, so nothing outside the installer should write there.
 
 So this skill's job is the part the installer structurally **cannot** do:
 
@@ -19,34 +19,45 @@ So this skill's job is the part the installer structurally **cannot** do:
 2. Run `bmad-loop init` to register the per-CLI hooks, lay down the bundled skills, and write `.bmad-loop/policy.toml` + gitignore entries.
 3. Preflight with `bmad-loop validate` and point the user at per-role adapter config.
 
-It also refreshes one file — `_bmad/bmad-loop/module-help.csv` — so the module's help entries are present even on a project that installed the tool directly rather than through the BMAD installer. Nothing else under `_bmad/` is written or deleted.
+It also refreshes one file — `_bmad/<module-code>/module-help.csv` — so the module's help entries are present even on a project that installed the tool directly rather than through the BMAD installer. Nothing else under `_bmad/` is written or deleted.
 
-Module identity (name, code, version) comes from `./assets/module.yaml`.
+Module identity (name, code, version) and the manual-install fallback repository come from `./assets/module.yaml`.
 
 `{project-root}` is a **literal token** in BMAD config _values_ — never substitute it there. **This does not apply to the filesystem path _arguments_ in the commands below**: those are real paths, so resolve `{project-root}` to the actual project root before running.
 
 ## On Activation
 
-1. Read `./assets/module.yaml` for module metadata (the `code` field is the module identifier).
-2. Check whether `{project-root}/_bmad/` exists. If it does not, this project has no BMAD install — say so, and note that the automation skills expect one. Setup can still install the orchestrator tool.
-3. Check whether `{project-root}/_bmad/bmad-loop/` exists. If it does, the module was installed by the BMAD installer and is already registered. If it does not, tell the user the module is not registered with BMAD, and that installing it via `npx bmad-method install` (selecting **bmad-loop**) adds it to `/bmad-help`. Do **not** gate setup on this — continue either way.
+1. Read `./assets/module.yaml`. Store its `code` as `{module-code}`, its `tool_repository` as `{fallback-tool-repository}`, and define `{module-dir}` as `{project-root}/_bmad/{module-code}`. Never hard-code the module directory name.
+2. Check whether `{project-root}/_bmad/` exists. If it does not, this project has no BMAD install — say so, and note that the automation skills expect one. Setup can still install the orchestrator tool from `{fallback-tool-repository}` or an explicit source argument.
+3. Check whether `{module-dir}` exists. If it does, the custom module was installed by the BMAD installer and is already registered. If it does not, tell the user the module is not registered with BMAD, and that installing this repository through `npx bmad-method install --custom-source <repository>` adds `{module-code}` to `/bmad-help`. Do **not** gate setup on this — continue either way.
+4. **Resolve the orchestrator source before touching uv.** The source used for the Python tool must be the source that supplied this custom BMAD module, not the official module that happens to share the `bmad-loop` product name. Resolve one `{tool-source}` in this order:
+   1. An explicit setup argument such as `source: <URL-or-path>` or `--source <URL-or-path>`.
+   2. The entry whose `name` exactly equals `{module-code}` in `{project-root}/_bmad/_config/manifest.yaml`:
+      - use a non-empty `localPath` first, but only if that path still exists;
+      - otherwise use a non-empty `rawSource`;
+      - otherwise use `repoUrl`, but only when the entry's `source` is `custom`.
+   3. `{fallback-tool-repository}` from `./assets/module.yaml`.
 
-**Decide fresh-install vs upgrade.** This drives whether the tool is upgraded and whether the per-project skills are refreshed. Treat it as an **upgrade** when either holds:
+   Never read source metadata from a manifest entry named plain `bmad-loop`; that is the official module and is a different installation identity. If a recorded `localPath` no longer exists, warn before falling through. State the selected source to the user. If no source can be resolved, stop before changing the uv tool instead of silently substituting another repository.
+
+   Normalize `{tool-source}` into one PEP 508 `{tool-reference}` while preserving any branch, tag, or commit suffix: local filesystem paths stay paths; values already beginning with `git+` stay unchanged; HTTP(S) Git repository URLs gain the `git+` prefix. The final package specification is `bmad-loop[tui] @ {tool-reference}`.
+
+**Decide fresh-install vs upgrade.** This drives reporting and whether the per-project skills are refreshed. Treat it as an **upgrade** when either holds:
 
 - The user asked for one in their arguments — `upgrade`, `update`, `upgrade tool and skills`, or similar.
-- The orchestrator tool is already installed under uv: run `uv tool list` and look for a `bmad-loop` entry. (A bare `bmad-loop --version` is **not** sufficient on its own — it can be satisfied by a source checkout or unrelated virtualenv; see step 1 below.)
+- The orchestrator tool is already installed under uv: run `uv tool list` and look for a `bmad-loop` entry. (A bare `bmad-loop --version` is **not** sufficient on its own — it can be satisfied by a source checkout or unrelated virtualenv.)
 
-Otherwise it is a **fresh install**. State the decision to the user before proceeding — e.g. "Detected an existing bmad-loop install — running an upgrade: tool + skills" or "No existing install detected — running a fresh setup".
+Otherwise it is a **fresh install**. State the decision and the resolved source before proceeding — e.g. "Detected an existing bmad-loop install — reinstalling from <fork source> and refreshing skills" or "No existing install detected — installing from <fork source>".
 
-If the user provides arguments (e.g. `accept all defaults`, `--headless`, `upgrade`), use them and skip interactive prompting. Still display the full confirmation summary at the end.
+If the user provides arguments (e.g. `accept all defaults`, `--headless`, `upgrade`, or `source: ...`), use them and skip interactive prompting. Still display the full confirmation summary at the end.
 
 ## Register Help Entries
 
 Refresh the module's help entries. This is the only file this skill writes under `_bmad/`, and it is exactly what the BMAD installer itself places there — so it is a no-op on an installer-installed project and idempotent on every re-run.
 
 ```bash
-mkdir -p "{project-root}/_bmad/bmad-loop"
-cp ./assets/module-help.csv "{project-root}/_bmad/bmad-loop/module-help.csv"
+mkdir -p "{module-dir}"
+cp ./assets/module-help.csv "{module-dir}/module-help.csv"
 ```
 
 `/bmad-help` reads the assembled catalog at `_bmad/_config/bmad-help.csv`, which the BMAD installer rebuilds from every `_bmad/<module>/module-help.csv`. So on a project that never ran the BMAD installer, these entries become visible the next time it runs — not immediately. Say that plainly in the Confirm step rather than claiming the help system was updated.
@@ -57,40 +68,23 @@ Skip this step entirely if `{project-root}/_bmad/` does not exist.
 
 The orchestrator is what spawns fresh coding CLI sessions through the selected adapter(s) to invoke `bmad-build-auto` (the upstream dev primitive; `bmad-dev-auto` on pre-rename releases) for the dev pass — then re-invokes it on the `done` spec for the follow-up review pass — and `bmad-loop-sweep`, watches their hook signals, and verifies their artifacts. Installing it is therefore part of setup, not an optional extra.
 
-> **Why from Git?** The BMAD installer copies only skill directories into a project — it does not carry sibling files, so the tool can't ride along in the skill folder. The canonical source is <https://github.com/bmad-code-org/bmad-loop>. (The reverse holds, though: the tool's wheel **bundles** the skills, so `bmad-loop init` lays them down into a project's skill trees on its own — see step 3.)
+> **Why reinstall from the resolved source?** The BMAD installer copies only skill directories into a project — it does not carry the Python package. A machine may also already have the official `bmad-loop` tool installed. Reinstalling from the exact custom source both installs the missing tool and deliberately switches an existing official install to this fork. The tool's package **bundles** the skills, so the following `bmad-loop init` keeps every CLI tree on the same source.
 
-Unless the user explicitly asked to skip it (e.g. `skills only` / `--no-tool`), install **or upgrade** and bootstrap now. Resolve `{project-root}` to the real project path before running.
+Unless the user explicitly asked to skip it (e.g. `skills only` / `--no-tool`), install **or upgrade** and bootstrap now. Resolve `{project-root}` and any local `{tool-reference}` to real absolute paths before running.
 
-1. **Check what's already on PATH:** run `bmad-loop --version`. A version printing here does **not** mean this project is set up — it only means _some_ `bmad-loop` is importable in the current environment. Before trusting it, run `uv tool list` and look for `bmad-loop`: if it's absent (the on-PATH copy comes from a source checkout or an unrelated virtualenv), warn the user that the active environment is shadowing a clean install and that the project would be relying on that checkout. Unless the user explicitly declines, install/upgrade from the canonical source below so the project doesn't depend on an incidental dev environment.
+1. **Check what's already on PATH:** run `bmad-loop --version`. A version printing here does **not** mean this project is set up — it only means _some_ `bmad-loop` is importable in the current environment. Run `uv tool list` and look for a `bmad-loop` entry so the final report can distinguish a fresh install from a source-switching reinstall. An incidental checkout or unrelated virtualenv is never accepted as a substitute for the uv-managed tool.
 
-2. **Install or upgrade from the Git repository** (the `[tui]` extra pulls in the Textual dashboard so `bmad-loop tui` works). `uv tool install` puts `bmad-loop` in uv's own managed environment, so there's no PEP 668 externally-managed conflict and no need for `--user`, an activated virtualenv, or `--break-system-packages`.
+2. **Install or reinstall from the resolved custom source** (the `[tui]` extra pulls in the Textual dashboard so `bmad-loop tui` works):
 
-   - **Fresh install** (no uv-managed `bmad-loop`):
+   ```bash
+   uv tool install --force --reinstall "bmad-loop[tui] @ {tool-reference}"
+   ```
 
-     ```bash
-     uv tool install "bmad-loop[tui] @ git+https://github.com/bmad-code-org/bmad-loop.git"
-     ```
+   Use this command for both fresh installs and upgrades. `--force` permits replacing an existing uv-managed tool whose source was the official repository; `--reinstall` refreshes Git/cache data and recreates the environment from the selected fork. Do **not** replace it with `uv tool upgrade bmad-loop`: that command intentionally preserves the previously installed source and would keep following an official install if one was already present.
 
-     Pin a release tag for reproducibility by appending `@v<X.Y.Z>` to the Git URL.
+   On an upgrade, record `bmad-loop --version` before the command. After the command, run it again and report the before → after delta. If the user explicitly requests a Git tag, branch, or commit, apply that ref to the resolved fork URL rather than substituting a different repository.
 
-   - **Upgrade** (uv already manages `bmad-loop`):
-
-     1. Record the current version first so you can report the delta: `bmad-loop --version`.
-     2. Default — follow `main` (or the currently pinned tag):
-
-        ```bash
-        uv tool upgrade bmad-loop --reinstall
-        ```
-
-        The `--reinstall` is **required** for a Git source: a plain `uv tool upgrade` reuses the cached commit and won't pull new code. Then **offer to pin a release tag** for reproducibility — if the user wants a specific version, move to it with:
-
-        ```bash
-        uv tool install --force "bmad-loop[tui] @ git+https://github.com/bmad-code-org/bmad-loop.git@v<X.Y.Z>"
-        ```
-
-     3. Re-run `bmad-loop --version` and note the before → after for the confirmation step.
-
-3. **Bootstrap the project** — install the coding-CLI hooks, the bundled `bmad-loop-*` skills, the `.bmad-loop/policy.toml` template, and the gitignore entry (idempotent).
+3. **Bootstrap the project** — install the coding-CLI hooks, the bundled `bmad-loop-*` skills from the just-installed fork, the `.bmad-loop/policy.toml` template, and the gitignore entry (idempotent).
 
    First decide **which coding CLI(s)** the orchestrator should drive. The supported adapters are `claude` (default), `codex`, `gemini`, `copilot`, and `antigravity` (Google's `agy`). Hooks are registered per CLI, so the choice matters — register every CLI you intend to use for dev/review/triage. Ask the user (unless they already specified it in their setup args, e.g. `cli: claude, codex`, or accepted defaults — then default to `claude` only):
 
@@ -152,7 +146,7 @@ Report:
 Also report:
 
 - The `bmad-loop validate` preflight result (pass, or the readiness checklist of what's still missing).
-- That `_bmad/bmad-loop/module-help.csv` was refreshed. If `_bmad/bmad-loop/` did not exist before this run (i.e. the BMAD installer never installed the module), say that the help entries will appear in `/bmad-help` after the BMAD installer next runs, and that installing the module via `npx bmad-method install` registers it properly.
+- The exact custom source used for the uv tool, and that `{module-dir}/module-help.csv` was refreshed. If `{module-dir}` did not exist before this run (i.e. the BMAD installer never installed the module), say that the help entries will appear in `/bmad-help` after the BMAD installer next runs, and that installing this repository via `npx bmad-method install --custom-source <repository>` registers `{module-code}` properly.
 - That this skill wrote nothing else under `_bmad/` — module registration, `config.toml`, and the help catalog are owned by the BMAD installer.
 
 Then display the `module_greeting` from `./assets/module.yaml` to the user.

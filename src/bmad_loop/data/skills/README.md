@@ -15,7 +15,7 @@ the table below).
 | `bmad-loop`         | — (this repo, Git)   | the orchestrator: ralph-loop, hooks, tmux adapters, TUI. CLI `bmad-loop`. Installed by `bmad-loop-setup` from Git.                                |
 | `bmad-loop-resolve` | — (bmad-loop-native) | interactive CRITICAL-escalation resolution: a human disambiguates a frozen spec so a paused story can be re-driven (`/bmad-loop-resolve <story>`) |
 | `bmad-loop-sweep`   | — (bmad-loop-native) | read-only deferred-work ledger triage; owns the canonical `deferred-work-format.md`                                                               |
-| `bmad-loop-setup`   | — (scaffolded)       | **installs the orchestrator tool from Git**, runs `bmad-loop init` + `validate`, refreshes `_bmad/bmad-loop/module-help.csv`                      |
+| `bmad-loop-setup`   | — (scaffolded)       | **installs the orchestrator tool from Git**, runs `bmad-loop init` + `validate`, refreshes `_bmad/huaqing-bmad-loop/module-help.csv`              |
 
 The **inner dev primitive is the upstream `bmad-build-auto` skill** (BMAD-METHOD's
 generic unattended dev session; `bmad-dev-auto` on pre-rename releases, resolved
@@ -34,7 +34,7 @@ The orchestrator tool now bundles these skills, so `bmad-loop init` lays them
 down for you:
 
 ```bash
-uv tool install "bmad-loop[tui] @ git+https://github.com/bmad-code-org/bmad-loop.git"
+uv tool install "bmad-loop[tui] @ git+https://github.com/HuaqingAI/bmad-loop.git"
 bmad-loop init --project /path/to/project --cli claude   # add --cli codex/gemini as needed
 claude "/bmad-loop-setup accept all defaults"            # installs the tool + wires the project
 ```
@@ -45,10 +45,10 @@ claude "/bmad-loop-setup accept all defaults"            # installs the tool + w
 left untouched (`--force-skills` to overwrite, `--no-skills` to skip).
 `bmad-loop-setup` is one-shot for the bootstrap the BMAD installer cannot do: it
 ensures the orchestrator tool is installed, then runs `bmad-loop init` and
-`bmad-loop validate` (preflight). Module registration — `_bmad/bmad-loop/`, the
+`bmad-loop validate` (preflight). Module registration — `_bmad/huaqing-bmad-loop/`, the
 central `config.toml`, the `/bmad-help` catalog — belongs to the BMAD installer,
 which regenerates it on every run; the only file the skill writes there is
-`_bmad/bmad-loop/module-help.csv`.
+`_bmad/huaqing-bmad-loop/module-help.csv`.
 
 The skills must be installed **together**: `bmad-loop-sweep` owns the canonical
 `deferred-work-format.md` that the ledger normalizes to, and the upstream dev
@@ -71,7 +71,7 @@ directory name.
 - The orchestrator tool is **not** bundled in the skill dirs — the BMAD installer
   copies only the skill directories, so a sibling `tool/` would never reach an
   installed project. `bmad-loop-setup` installs the `bmad-loop` package from
-  <https://github.com/bmad-code-org/bmad-loop> (`src/bmad_loop`, `pyproject.toml`
+  <https://github.com/HuaqingAI/bmad-loop> (`src/bmad_loop`, `pyproject.toml`
   are canonical at the repo root). (The skills, by contrast, ride along inside
   the package wheel.)
 - The inner dev primitive (`bmad-build-auto`, or `bmad-dev-auto` pre-rename) is

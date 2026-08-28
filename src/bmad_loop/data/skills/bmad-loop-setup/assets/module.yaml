@@ -1,8 +1,9 @@
-code: bmad-loop
+code: huaqing-bmad-loop
 name: BMAD Loop Skills
 description: "Automation-mode skills driven by the bmad-loop orchestrator: interactive escalation resolution (bmad-loop-resolve) and deferred-work sweep triage (bmad-loop-sweep) — the inner dev primitive (which self-reviews and commits) is the upstream bmad-build-auto skill (bmad-dev-auto on pre-rename releases)"
 module_version: 0.11.1
 default_selected: false
+tool_repository: https://github.com/HuaqingAI/bmad-loop.git
 module_greeting: >
   BMAD Loop installed — both the automation skills and the
   bmad-loop orchestrator tool (the Python program that drives the loop). Setup

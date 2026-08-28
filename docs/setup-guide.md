@@ -65,12 +65,25 @@ of the README.
 ## Installed via the BMAD-method installer? (recommended)
 
 The BMAD-method installer copies the three `bmad-loop-*` skill directories
-(`bmad-loop-setup`, `bmad-loop-sweep`, `bmad-loop-resolve`) into your project. It does **not** carry the orchestrator tool — the installer copies only skill
-directories, not their sibling files, so the tool can't ride along in the skill folder.
-It is installed separately from Git by the setup skill. The canonical source is
-<https://github.com/bmad-code-org/bmad-loop>. (Going the other way, the tool's wheel
-bundles the skills, so `bmad-loop init` can install them without the BMAD installer —
-when the installer already placed them, `init` simply skips the existing copies.)
+(`bmad-loop-setup`, `bmad-loop-sweep`, `bmad-loop-resolve`) into your project. This
+fork registers under the collision-free BMAD module code `huaqing-bmad-loop`; the
+Python package, CLI and skill names remain `bmad-loop`. Install it through the
+installer's custom-source flow rather than selecting the official `bmad-loop` module.
+The installer does **not** carry the orchestrator tool — it copies only skill
+directories, not their sibling files. `/bmad-loop-setup` reads the
+`huaqing-bmad-loop` entry in `_bmad/_config/manifest.yaml` and installs the tool from
+that exact custom URL or local path, falling back to this repository only when no
+manifest source exists. The tool's wheel bundles the skills, so `bmad-loop init` can
+install them without the BMAD installer; when the installer already placed them,
+`init` simply skips the existing copies.
+
+For a non-interactive fresh install using Codex, the equivalent command is:
+
+```bash
+npx bmad-method install --directory . --modules huaqing-bmad-loop --custom-source https://github.com/HuaqingAI/bmad-loop --tools codex --yes
+```
+
+In the interactive installer, choose the custom-source option and paste the repository URL. If an existing project already has the official `bmad-loop` module, use Modify, deselect that official module, and keep `huaqing-bmad-loop`; installing both produces duplicate `bmad-loop-*` skill names.
 
 After the installer runs, complete setup with one command:
 
@@ -80,16 +93,17 @@ claude "/bmad-loop-setup accept all defaults"
 
 `/bmad-loop-setup` handles both first-time setup and later upgrades — re-run it any time. It:
 
-1. Installs **or upgrades** the `bmad-loop` tool from Git (see
-   [Installing the tool and TUI](#installing-the-tool-and-tui)). On an upgrade it runs
-   `uv tool upgrade bmad-loop --reinstall`.
+1. Installs **or source-switches/upgrades** the `bmad-loop` tool from the exact
+   custom source recorded for `huaqing-bmad-loop` (see
+   [Installing the tool and TUI](#installing-the-tool-and-tui)). It uses
+   `uv tool install --force --reinstall` so a pre-existing official tool cannot win.
 2. Asks **which coding CLI(s)** the orchestrator should drive, then runs `bmad-loop init`
    to install the `bmad-loop-*` skills + register hooks + write the `.bmad-loop/policy.toml`
    template + add gitignore entries (including policy.toml itself — policy is per-machine; repos initialized before this run `git rm --cached .bmad-loop/policy.toml` once if theirs is already committed) (see [Choosing which CLIs to drive](#choosing-which-clis-to-drive)
    and [Initializing CLIs other than claude](#initializing-clis-other-than-claude)). On an
    upgrade it passes `--force-skills` so the per-project skill copies are refreshed.
 3. Runs `bmad-loop validate` as a preflight (see [Verify](#verify)).
-4. Refreshes `_bmad/bmad-loop/module-help.csv`, the module's help entries. That is the
+4. Refreshes `_bmad/huaqing-bmad-loop/module-help.csv`, the module's help entries. That is the
    only file it writes under `_bmad/` — module registration, the central `config.toml`,
    and the `/bmad-help` catalog are owned by the BMAD installer, which regenerates them
    on every run.
@@ -228,7 +242,7 @@ The `[tui]` extra pulls in the Textual dashboard (`textual` + `tomlkit` + `pyte`
 **Together (recommended):**
 
 ```bash
-uv tool install "bmad-loop[tui] @ git+https://github.com/bmad-code-org/bmad-loop.git"
+uv tool install "bmad-loop[tui] @ git+https://github.com/HuaqingAI/bmad-loop.git"
 ```
 
 **Tool first, TUI later (separately):** install the core without the extra, then add the
@@ -236,10 +250,10 @@ dashboard whenever you want it by re-running the same command **with** `[tui]`:
 
 ```bash
 # core tool only
-uv tool install "bmad-loop @ git+https://github.com/bmad-code-org/bmad-loop.git"
+uv tool install "bmad-loop @ git+https://github.com/HuaqingAI/bmad-loop.git"
 
 # add the TUI later — re-run with the extra (uv upgrades the install in place)
-uv tool install --upgrade "bmad-loop[tui] @ git+https://github.com/bmad-code-org/bmad-loop.git"
+uv tool install --force --reinstall "bmad-loop[tui] @ git+https://github.com/HuaqingAI/bmad-loop.git"
 ```
 
 Until the extra is present, `bmad-loop tui` prints a clear error
@@ -249,12 +263,13 @@ failing obscurely.
 `uv tool install` drops `bmad-loop` into uv's own managed tool environment, so there's no
 PEP 668 externally-managed conflict and no need for a virtualenv, `--user`, or `--break-system-packages`.
 
-To upgrade later, the simplest path is to re-run `/bmad-loop-setup` (or `/bmad-loop-setup
-upgrade`) — it detects the existing install, upgrades the tool with `uv tool upgrade
-bmad-loop --reinstall` (the `--reinstall` is **required** for a git source — a plain
-`uv tool upgrade` reuses the cached commit and won't pull new code), and re-lays the
-per-project skills with `bmad-loop init --force-skills`. To do it by hand, run those two
-commands yourself (see the [Upgrading](../README.md#upgrading) section of the README).
+To upgrade later, the simplest path is to re-run `/bmad-loop-setup` (or
+`/bmad-loop-setup upgrade`) — it resolves the custom source again, reinstalls the tool
+with `uv tool install --force --reinstall`, and re-lays the per-project skills with
+`bmad-loop init --force-skills`. The explicit source reinstall is intentional: a plain
+`uv tool upgrade` preserves whichever source was installed previously, including an
+official install. To do it by hand, run the two commands yourself (see the
+[Upgrading](../README.md#upgrading) section of the README).
 
 Confirm with `bmad-loop --version`.
 
@@ -435,12 +450,12 @@ deliberately want that generated or personal configuration back in version contr
 ### 6. Remove the BMAD module (BMAD-installer projects only)
 
 There is nothing to hand-unregister: bmad-loop writes no BMAD config. If you installed the
-module through the BMAD installer, remove it there — the installer owns `_bmad/bmad-loop/`,
+module through the BMAD installer, remove it there — the installer owns `_bmad/huaqing-bmad-loop/`,
 the central `config.toml`, and the `/bmad-help` catalog, and regenerates all three on its
 next run.
 
-If you only ever ran `/bmad-loop-setup`, delete `_bmad/bmad-loop/module-help.csv` (the one
-file it refreshes) — or the whole `_bmad/bmad-loop/` directory if the installer never
+If you only ever ran `/bmad-loop-setup`, delete `_bmad/huaqing-bmad-loop/module-help.csv` (the one
+file it refreshes) — or the whole `_bmad/huaqing-bmad-loop/` directory if the installer never
 created it. uv + `init`-only projects that have no `_bmad/` can skip this step.
 
 ### 7. Uninstall the tool

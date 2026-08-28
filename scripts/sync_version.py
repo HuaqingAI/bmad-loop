@@ -17,7 +17,7 @@ Every other field is derived from it:
   only discovers a descriptor at shallow paths (``skills/``, ``src/``, a
   ``*-setup/assets/`` directly under those, or the repo root) — the canonical
   copy under ``src/bmad_loop/data/skills/...`` is too deep, so this root mirror
-  is what lets the installer locate the ``bmad-loop`` module.
+  is what lets the installer locate the ``huaqing-bmad-loop`` custom module.
 
 Stamping also runs ``uv lock`` to refresh ``uv.lock`` (which pins the project
 version); CI's ``uv sync --locked`` fails the install step on a stale lock, so

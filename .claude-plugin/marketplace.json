@@ -1,15 +1,15 @@
 {
-  "name": "bmad-loop",
+  "name": "huaqing-bmad-loop",
   "owner": {
-    "name": "bmad-code-org"
+    "name": "HuaqingAI"
   },
   "license": "MIT",
   "homepage": "",
-  "repository": "https://github.com/bmad-code-org/bmad-loop",
+  "repository": "https://github.com/HuaqingAI/bmad-loop",
   "keywords": ["bmad", "bmad-loop", "automation"],
   "plugins": [
     {
-      "name": "bmad-loop",
+      "name": "huaqing-bmad-loop",
       "source": "./src/bmad_loop/data/skills",
       "description": "Automation-mode skills driven by the bmad-loop orchestrator: project bootstrap (bmad-loop-setup), interactive escalation resolution (bmad-loop-resolve) and deferred-work sweep triage (bmad-loop-sweep) — the inner dev primitive (which self-reviews and commits) is the upstream bmad-dev-auto skill",
       "version": "0.11.1",
