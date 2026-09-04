@@ -14545,6 +14545,42 @@ def test_harvest_files_the_finding_when_the_seen_again_match_goes_stale(project,
     ]
 
 
+def test_harvest_dedupes_a_cross_spec_twin_that_lands_after_the_snapshot(project, monkeypatch):
+    """The writer suppresses a rival cross-spec twin missed by the snapshot.
+
+    The real append primitive runs after the wrapper creates the rival row, so
+    only its opted-in origin scan can prevent a second open row.
+
+    Ablation: remove the harvest producer's flag (or the writer's origin-only
+    arm) and the harvest files DW-2 and reports ``deduped == 0``."""
+    from bmad_loop import devcontract
+
+    fp = devcontract.harvest_fingerprint(HARVEST_A["summary"], HARVEST_A["location"])
+    origin = f"spec-deferred {fp}"
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A])],
+        policy=_harvest_policy(),
+    )
+    assert not project.deferred_work.is_file()
+    real_append = deferredwork.append_entries_published
+
+    def file_the_rival_first(path, specs):
+        _seeded_ledger(project, origin=origin, source_spec="spec-9-9-z.md")
+        return real_append(path, specs)
+
+    monkeypatch.setattr(deferredwork, "append_entries_published", file_the_rival_first)
+
+    assert engine.run().done == 1
+
+    entries = _harvest_entries(project)
+    assert [entry.id for entry in entries] == ["DW-1"]
+    assert deferredwork.field_line_present(entries[0].body, "source_spec", "spec-9-9-z.md")
+    (event,) = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert event["dw_ids"] == [] and event["deduped"] == 1
+
+
 def test_ledger_digest_collapses_absent_and_empty_only():
     assert _digest_of(None) == _digest_of("")
     assert _digest_of("# Deferred Work\n") != _digest_of(None)

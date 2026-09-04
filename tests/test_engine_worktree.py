@@ -1265,6 +1265,80 @@ def test_carry_harvest_dedupe_stays_status_agnostic(project):
     assert task.harvest_carry_commit_pending is False  # nothing novel, so no latch
 
 
+def test_carry_harvest_dedupes_a_cross_spec_open_twin_in_the_writer(project):
+    """An open cross-spec twin is suppressed by the carry's writer.
+
+    The caller's frozen exact-pair pre-scan cannot match the deliberately
+    different source spec, so this reaches the opted-in writer arm.
+
+    Ablation: remove the carry producer's flag and a second open row is filed
+    and reported in ``harvest-carried.dw_ids``."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    record = _harvest_record()
+    rival = deferredwork.append_entry(
+        project.deferred_work,
+        title=record["title"],
+        origin=record["origin"],
+        location=record["location"],
+        source_spec="spec-9-9-z.md",
+        reason=record["reason"],
+        severity=record["severity"],
+    )
+    assert rival == "DW-1"
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, harvested_deferrals=[record])
+    engine.state.tasks[task.story_key] = task
+
+    engine._carry_harvested_deferrals(task)
+
+    entries = _main_harvest_entries(project)
+    assert [entry.id for entry in entries] == ["DW-1"]
+    assert entries[0].open
+    (carried,) = _harvest_carry_events(engine)
+    assert carried["dw_ids"] == []
+
+
+def test_carry_harvest_files_fresh_against_a_cross_spec_closed_twin(project):
+    """A closed cross-spec twin does not suppress the isolation carry.
+
+    The different source spec bypasses the caller's status-agnostic exact-pair
+    guard, while the writer's widened arm remains open-only.
+
+    Ablation: widen the caller pre-scan regardless of status, or remove the
+    writer's open guard, and DW-2 is not filed or reported."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    record = _harvest_record()
+    rival = deferredwork.append_entry(
+        project.deferred_work,
+        title=record["title"],
+        origin=record["origin"],
+        location=record["location"],
+        source_spec="spec-9-9-z.md",
+        reason=record["reason"],
+        severity=record["severity"],
+    )
+    assert rival == "DW-1"
+    assert deferredwork.mark_done(
+        project.deferred_work, rival, "2026-06-01", "fixed in another spec"
+    )
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, harvested_deferrals=[record])
+    engine.state.tasks[task.story_key] = task
+
+    engine._carry_harvested_deferrals(task)
+
+    entries = _main_harvest_entries(project)
+    assert [entry.id for entry in entries] == ["DW-1", "DW-2"]
+    assert not entries[0].open and entries[1].open
+    assert deferredwork.field_line_present(entries[1].body, "source_spec", record["source_spec"])
+    (carried,) = _harvest_carry_events(engine)
+    assert carried["dw_ids"] == ["DW-2"]
+
+
 def _in_place_policy(*, limits: LimitsPolicy | None = None):
     """`wt_policy`'s mirror: the live mode a mid-pause `isolation = "none"` edit
     leaves behind, with everything else identical so the two rows differ in one

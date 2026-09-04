@@ -1431,7 +1431,13 @@ class EntrySpec:
     The defaults are that function's defaults, so a spec built from the same
     values produces the same entry. Frozen because :func:`append_entries`
     validates the whole sequence before it takes the lock and then trusts what it
-    validated — a spec mutated in between would be written unchecked."""
+    validated — a spec mutated in between would be written unchecked.
+
+    ``cross_spec_dedupe`` widens the open-entry idempotence scan to match
+    ``origin`` alone. It is opt-in because only producers whose origin is already
+    a complete, spec-independent work identity may safely collapse rows from
+    different source specs. The scan remains open-only so resolved work can be
+    filed again when it recurs."""
 
     title: str
     origin: str
@@ -1440,12 +1446,14 @@ class EntrySpec:
     location: str = "n/a"
     status: str = "open"
     severity: str | None = None
+    cross_spec_dedupe: bool = False
 
 
 def _apply_append(text: str, spec: EntrySpec) -> tuple[str, str | None]:
     """Append one canonical `### DW-<seq>` entry *within* `text`, returning the
     new text and the id minted — or `text` unchanged and None when an open entry
-    already carries the same `origin:` marker and `source_spec:`.
+    already carries the same `origin:` marker and either the same `source_spec:`
+    or an opted-in cross-spec match.
 
     Pure — text in, text out, no `Path` and no I/O — which is what lets
     :func:`append_entries` run it once per spec against the text as it evolves,
@@ -1461,8 +1469,10 @@ def _apply_append(text: str, spec: EntrySpec) -> tuple[str, str | None]:
     against a sanitized line, so every replay of the same multiline defer would
     miss its own entry and append another.
 
-    The scan is deliberately open-only: a closed entry with the same marker does
-    not suppress the append, because the work has come back."""
+    The scan is deliberately open-only for both match arms: a closed entry with
+    the same marker does not suppress the append, because the work has come
+    back. The origin-only arm is opt-in so non-harvest producers keep the
+    released exact-pair semantics."""
     given_title = bool(spec.title)
     title = _one_line(spec.title)
     origin = _one_line(spec.origin)
@@ -1470,11 +1480,9 @@ def _apply_append(text: str, spec: EntrySpec) -> tuple[str, str | None]:
     reason = _one_line(spec.reason)
     location = _one_line(spec.location)
     for entry in parse_ledger(text):
-        if (
-            entry.open
-            and field_line_present(entry.body, "origin", origin)
-            and field_line_present(entry.body, "source_spec", source_spec)
-        ):
+        if not entry.open or not field_line_present(entry.body, "origin", origin):
+            continue
+        if spec.cross_spec_dedupe or field_line_present(entry.body, "source_spec", source_spec):
             return text, None
     dw_id = f"DW-{next_seq(text)}"
     if given_title and not title.strip():
@@ -1546,8 +1554,10 @@ def append_entries_published(
 ) -> tuple[list[str | None], str | None, str | None]:
     """:func:`append_entries`, additionally handing back the text it published —
     or None when it wrote nothing, because every spec deduped or `specs` was
-    empty — and the PREIMAGE it read under the lock, or None when no locked read
-    happened (nothing to write, or the ledger did not exist).
+    empty — and the PREIMAGE it read under the lock. For an existing ledger, a
+    None preimage means no locked read happened; an opted-in all-deduped batch
+    can write nothing yet return the locked preimage. An absent ledger has no
+    textual preimage, so it is also represented by None after a locked read.
 
     For a caller that has to record WHAT IT WROTE rather than what the file holds
     afterwards. Reading the ledger back after this returns is a different
@@ -1580,10 +1590,12 @@ def append_entries_published(
     idempotence scan, which is what stops two concurrent appenders reading the
     same highest id and both minting it (#469).
 
-    Byte-identical to a serial :func:`append_entry` loop over the same specs,
-    because each spec is applied to the text the previous one produced rather
-    than to the text this call read. That is what a naive batch gets wrong: minted
-    against the original text, every spec in one call would claim the same id.
+    With every spec using the default narrow semantics, byte-identical to a
+    serial :func:`append_entry` loop over the same specs, because each spec is
+    applied to the text the previous one produced rather than to the text this
+    call read. Opted-in specs have no serial ``append_entry`` equivalent; their
+    evolving batch text additionally lets a later source spec dedupe against an
+    earlier same-origin row. A naive batch gets both properties wrong.
 
     ALL specs are validated — the `status` and `severity` enumerations, which are
     orchestrator-owned and so raise rather than sanitize — before the lock is
@@ -1592,12 +1604,15 @@ def append_entries_published(
     prefix that happened to precede it. Validating above the lock also means a
     programmer bug reports itself without first waiting on another process.
 
-    Nothing is written when every spec dedupes, and no lock is taken either
-    (#736): a replayed defer is answered from one advisory read that runs
-    :func:`_apply_appends`, the same helper the locked pass runs, so it leaves
-    the file untouched rather than rewriting it byte-for-byte. Deliberately NO
-    missing-ledger guard, unlike its sibling mutators: an absent ledger here
-    means CREATE, which is a write, and a write must take the lock.
+    Nothing is written when every spec dedupes. For default narrow semantics no
+    lock is taken either (#736): a replayed defer is answered from one advisory
+    read that runs :func:`_apply_appends`, the same helper the locked pass runs.
+    An opted-in cross-spec batch always reaches the lock, even when the advisory
+    fold suppresses every spec, because an observed open twin may close before
+    the authoritative decision; the locked re-read must then file the recurrence
+    fresh. Deliberately NO missing-ledger guard, unlike its sibling mutators: an
+    absent ledger here means CREATE, which is a write, and a write must take the
+    lock.
 
     The write goes through :func:`~bmad_loop.platform_util.atomic_write_text` for
     the reasons documented on :func:`mark_done_many`, plus one this sibling shares
@@ -1626,7 +1641,9 @@ def append_entries_published(
         # any fault here, falls through to the hold, which re-reads and decides.
         probe = path.read_text(encoding="utf-8") if path.is_file() else ""
         minted = _apply_appends(probe, specs)[1]
-        if all(dw_id is None for dw_id in minted):
+        if all(dw_id is None for dw_id in minted) and not any(
+            spec.cross_spec_dedupe for spec in specs
+        ):
             # No lock was taken, so there is no locked read to report a preimage
             # from — and nothing was written for an anchor to claim either.
             return minted, None, None

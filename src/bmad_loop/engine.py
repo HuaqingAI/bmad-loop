@@ -4359,6 +4359,10 @@ class Engine:
                     source_spec=spec_name,
                     reason=reason,
                     severity=severity,
+                    # Backstop the lock-free harvest snapshot above: a rival may
+                    # file this spec-independent fingerprint under another spec
+                    # before the writer's locked re-read (DW-98).
+                    cross_spec_dedupe=True,
                 )
             )
         # One locked read->edit->write for the whole harvest (#286/#469) rather
@@ -7222,6 +7226,10 @@ class Engine:
                     source_spec=source_spec,
                     reason=str(item["reason"]),
                     severity=str(severity) if severity else None,
+                    # Backstop the lock-free isolation-carry snapshot: its
+                    # fingerprint may land under another spec before the
+                    # writer's locked re-read (DW-98).
+                    cross_spec_dedupe=True,
                 )
             )
         carried = [dw_id for dw_id in deferredwork.append_entries(ledger, specs) if dw_id]
