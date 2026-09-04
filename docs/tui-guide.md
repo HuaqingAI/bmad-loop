@@ -323,13 +323,14 @@ per-run tmux session, which can prove `alive` but never `dead`.
 
 Journal kinds are styled by substring, first match wins:
 
-| Substring                                       | Color  | Examples                                        |
-| ----------------------------------------------- | ------ | ----------------------------------------------- |
-| `escalat`, `failed`                             | red    | `preference-escalation`, `review-verify-failed` |
-| `done`, `complete`, `finished`                  | green  | `story-done`, `run-complete`                    |
-| `decision`, `deferred`, `boundary`, `truncated` | yellow | `decision-pending`, `epic-boundary`             |
-| `start`, `resume`                               | cyan   | `session-start`, `run-resume`                   |
-| anything else                                   | dim    |                                                 |
+| Substring                                            | Color  | Examples                                                                            |
+| ---------------------------------------------------- | ------ | ----------------------------------------------------------------------------------- |
+| `journal-line-unreadable` (full kind, matched first) | red    | a journal line that could not be parsed; reader-minted, never written by the engine |
+| `escalat`, `failed`                                  | red    | `preference-escalation`, `review-verify-failed`                                     |
+| `done`, `complete`, `finished`                       | green  | `story-done`, `run-complete`                                                        |
+| `decision`, `deferred`, `boundary`, `truncated`      | yellow | `decision-pending`, `epic-boundary`                                                 |
+| `start`, `resume`                                    | cyan   | `session-start`, `run-resume`                                                       |
+| anything else                                        | dim    |                                                                                     |
 
 ## Key bindings
 

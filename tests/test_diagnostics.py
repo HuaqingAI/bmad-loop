@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from bmad_loop import diagnostics, sanitize
-from bmad_loop.journal import Journal, load_state, save_state
+from bmad_loop.journal import UNREADABLE_LINE_KIND, Journal, load_state, save_state
 from bmad_loop.model import Phase, RunState, SessionRecord, StoryTask, TokenUsage
 from bmad_loop.policy import Policy
 
@@ -1507,6 +1507,42 @@ def test_decision_pending_question_is_dropped_not_scrubbed():
     rendered = json.dumps([one_token, empty])
     for canary in CANARIES:
         assert canary not in rendered, f"LEAK: {canary!r}"
+
+
+def test_unreadable_line_is_counted_but_does_not_move_the_clock(tmp_path):
+    """A journal with one unreadable line reports the reader-minted marker in
+    `kind_histogram` — the loss is COUNTED on the dump an operator ships — while
+    `first_ts`/`last_ts`/`duration_s` stay exactly what the real records say.
+
+    That separation is the whole reason `unreadable_line_entry` carries no `ts`: the
+    true write time of a torn line is unknowable, and a fabricated one would silently
+    stretch or shift the run's measured duration. `summarize_journal` skips a
+    `ts`-less entry for timestamps, so the omission is what keeps the clock honest.
+
+    The marker is also an UNDECLARED kind here, which exercises `_scrub_entry`'s
+    generic arm: it survives scrubbing intact rather than needing a routing row.
+
+    Ablation: give `unreadable_line_entry` a `ts` of `time.time()` and the
+    duration/last_ts assertions redden — verified."""
+    (tmp_path / "journal.jsonl").write_text(
+        '{"ts": 100.0, "kind": "run-start"}\n'
+        "not json at all\n"
+        '{"ts": 130.0, "kind": "run-complete"}\n',
+        encoding="utf-8",
+    )
+    entries = Journal(tmp_path).entries()
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    summary = diagnostics.summarize_journal(entries, pseudo, {}, cap=10)
+
+    assert summary.total_entries == 3
+    assert summary.kind_histogram[UNREADABLE_LINE_KIND] == 1
+    assert summary.first_ts == 100.0
+    assert summary.last_ts == 130.0
+    assert summary.duration_s == 30.0
+
+    scrubbed = next(e for e in summary.entries if e["kind"] == UNREADABLE_LINE_KIND)
+    assert "ts_offset" not in scrubbed  # no timestamp to offset from
+    assert scrubbed["bytes"] == len("not json at all")
 
 
 def test_structure_is_preserved(project):

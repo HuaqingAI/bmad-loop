@@ -55,6 +55,7 @@ from bmad_loop.journal import (
     JOURNAL_FILE,
     SELF_MINTED_FIELDS,
     TASK_CYCLE_ARTIFACTS,
+    UNREADABLE_LINE_KIND,
     Journal,
 )
 
@@ -3106,6 +3107,30 @@ def test_journal_kind_inventory_is_complete():
         + ("\n" if undeclared and stale else "")
         + "\n".join(f"  stale row: {kind!r}" for kind in sorted(stale))
     )
+
+
+def test_reader_minted_kind_is_deliberately_absent_from_the_inventory():
+    """`journal.UNREADABLE_LINE_KIND` must NOT be a `JOURNAL_KINDS` row.
+
+    This pins a hole a future reader will want to "fix". Every other kind in the
+    codebase is declared above, so an undeclared one looks like an oversight — but
+    this inventory is PRODUCER-side: `_journal_kind_inventory_drift` scans the literal
+    kinds passed to `journal.append`, and no producer ever writes this one. Both
+    readers (`Journal.entries`, `tui.data.JournalTail.read_new`) MINT it in place of a
+    line they could not decode. Adding the row would therefore make it a row nothing
+    writes, which is exactly what `test_journal_kind_inventory_is_complete`'s staleness
+    arm reddens on — the row would break CI, not complete it.
+
+    Ablation: add the kind to `JOURNAL_KINDS` and BOTH this test and
+    `test_journal_kind_inventory_is_complete` (staleness arm) redden — verified."""
+    assert UNREADABLE_LINE_KIND not in JOURNAL_KINDS, (
+        f"{UNREADABLE_LINE_KIND!r} is reader-minted, never written by a producer, so a "
+        "JOURNAL_KINDS row for it is a stale row by construction and reddens "
+        "test_journal_kind_inventory_is_complete. Remove the row."
+    )
+    # Anti-vacuity: the scan this test reasons about must actually be running, or the
+    # absence above would be true for the uninteresting reason that nothing is scanned.
+    assert JOURNAL_KINDS and {kind for _, _, _, _, kind in _of("journalkindliteral")}
 
 
 def _journal_kind_inventory_drift(

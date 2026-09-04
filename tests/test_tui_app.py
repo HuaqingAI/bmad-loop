@@ -45,7 +45,7 @@ from bmad_loop import policy as policy_mod
 from bmad_loop import runs as runs_mod
 from bmad_loop import verify
 from bmad_loop.adapters.multiplexer import MultiplexerError
-from bmad_loop.journal import Journal, save_state
+from bmad_loop.journal import UNREADABLE_LINE_KIND, Journal, save_state
 from bmad_loop.model import Phase, RunState, SessionRecord, StoryTask, TokenUsage
 from bmad_loop.runs import RUNS_DIR
 from bmad_loop.tui import data, launch, widgets
@@ -456,6 +456,39 @@ async def test_journal_pane_updates_after_poll(project):
 
         await until(pilot, has_entry)
         assert any("1-2-search" in row for row in journal_rows(journal))
+
+
+def test_journal_line_renders_the_unreadable_marker_red_without_restyling_producers():
+    """The reader-minted marker must not fall through to `dim`: a lost record is the
+    one journal line an operator must not read as background noise.
+
+    The second half is the trap the rule had to dodge. `_JOURNAL_STYLES` matches by
+    SUBSTRING, first match wins, and four PRODUCER kinds already end in
+    `-unreadable` — so a bare `("unreadable", "red")` rule would have silently
+    restyled all of them (and, sitting first, overridden
+    `deferred-close-declaration-unreadable`'s yellow). The rule spells the full kind
+    via `UNREADABLE_LINE_KIND` instead; this pins that those four are untouched.
+
+    Ablation: change the rule to the bare substring `"unreadable"` and the
+    producer-kind assertions redden — verified."""
+
+    def kind_style(kind: str):
+        console = Console(width=80)
+        entry = {"ts": 1_750_000_000, "kind": kind}
+        segments = [s for s in console.render(journal_line(entry)) if kind[:12] in s.text]
+        assert segments, f"no rendered segment carried {kind!r}"
+        return segments[0].style
+
+    assert kind_style(UNREADABLE_LINE_KIND).color is not None
+    assert kind_style(UNREADABLE_LINE_KIND).color.name == "red"
+
+    # producer kinds that also end in "-unreadable" keep exactly the styling they
+    # had before the marker rule existed
+    assert kind_style("story-gate-unreadable").dim is True
+    assert kind_style("stories-manifest-unreadable").dim is True
+    assert kind_style("rollback-owned-spec-unreadable").dim is True
+    declaration = kind_style("deferred-close-declaration-unreadable")
+    assert declaration.color is not None and declaration.color.name == "yellow"
 
 
 def test_journal_line_wraps_fields_with_hanging_indent():

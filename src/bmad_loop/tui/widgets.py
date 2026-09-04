@@ -26,6 +26,7 @@ from textual.widgets.tree import TreeNode
 
 from .. import policy
 from ..escalation import display_pause_reason
+from ..journal import UNREADABLE_LINE_KIND
 from ..model import (
     PAUSE_EPIC_BOUNDARY,
     PAUSE_ESCALATION,
@@ -260,6 +261,13 @@ class RunHeader(Static):
 
 # kind substrings -> style, first match wins; anything else renders dim
 _JOURNAL_STYLES = (
+    # Reader-minted, not a producer kind: `Journal.entries`/`JournalTail.read_new`
+    # substitute it for a line they could not decode, and a lost record must not read
+    # as background noise. The FULL kind, via the constant rather than a bare
+    # "unreadable" substring: four producer kinds end in "-unreadable"
+    # (`story-gate-unreadable`, `stories-manifest-unreadable`, …) and a substring rule
+    # would silently restyle them too.
+    (UNREADABLE_LINE_KIND, "red"),
     ("escalation-resolved", "green"),  # positive — must precede the "escalat" -> red rule
     ("escalat", "red"),
     ("failed", "red"),
