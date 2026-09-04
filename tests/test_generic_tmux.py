@@ -5417,6 +5417,174 @@ def test_unreadable_launch_spec_fails_closed_after_becoming_readable(tmp_path, m
     assert rj is not None and rj["park_asserted"] is False
 
 
+# --------------------------------- launch-snapshot retention bound (DW-96)
+#
+# `_launch_auto_run_results` holds one dict per launch, sized by the artifacts
+# directory, so retaining an entry per session grew O(sessions x files) for the
+# adapter's lifetime. The mixin's `run()` override evicts the task's entry in a
+# `finally` — the first point after every in-lifecycle reader (`wait_for_completion`'s
+# read-back AND `_post_kill_reconcile`'s post-teardown rescue) that is still reached
+# when `wait_for_completion` raises. Ablations: deleting the `finally` fails all four
+# rows, but only on the entry's ABSENCE — every row stubs `adapter.kill`, so moving the
+# pop into `kill()` removes it outright and proves nothing about ordering. The ablation
+# that discriminates ordering is evicting at the TOP of `_post_kill_reconcile`: that
+# fails only `test_launch_snapshot_outlives_the_post_kill_reconcile_readback`, on
+# `verdicts[-1] is True`.
+
+_PARK_MARKER_SPEC = (
+    "---\nstatus: awaiting-operator\nbaseline_revision: abc123\n"
+    "operator_actions:\n  - publish the TXT record\n---\n\n# Story\n\n"
+    "## Auto Run Result\n\nStatus: awaiting-operator\nParked.\n"
+)
+
+
+def _markerless_launch(path: Path) -> int:
+    """Write a marker-less in-progress spec and return the launch mtime floor, so a
+    marker the session appends later is unambiguously session-authored. The floor is
+    one nanosecond PAST the file's own mtime because the read-back's freshness gates
+    are `>= launched_ns`: a floor equal to the pre-launch mtime would accept the spec
+    as already written by this session, before it wrote anything."""
+    path.write_text("---\nstatus: in-progress\nbaseline_revision: abc123\n---\n\n# Story\n")
+    return path.stat().st_mtime_ns + 1
+
+
+def test_run_evicts_the_launch_snapshot_it_captured(tmp_path, monkeypatch):
+    """The bound itself: the snapshot lives for the whole session — the wait loop's
+    own read-back still resolves ownership from it, so the verdict a normal session
+    returns is unchanged — and is gone once run() returns. Asserting presence DURING
+    the wait keeps the row non-vacuous: a capture that never happened would satisfy
+    the post-run absence assertion too."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    launch_floor = _markerless_launch(ours)
+    monkeypatch.setattr(
+        generic.GenericAdapter,
+        "start_session",
+        lambda _adapter, _spec: _dev_handle(launched_ns=launch_floor),
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), expected_spec=str(ours))
+    seen = {}
+
+    def wait(handle, running_spec):
+        seen["present"] = running_spec.task_id in adapter._launch_auto_run_results
+        ours.write_text(_PARK_MARKER_SPEC)  # this session appended the park marker
+        os.utime(ours, ns=(launch_floor + _MTIME_TICK_NS, launch_floor + _MTIME_TICK_NS))
+        # stands in for the real wait loop's Stop handling, which read-backs here
+        return SessionResult(
+            status="completed",
+            result_json=adapter._result_json(handle, running_spec, wait=False),
+            session_id="sess",
+            transcript_path="/t.jsonl",
+        )
+
+    adapter.wait_for_completion = wait
+    adapter.kill = lambda handle: None
+
+    result = adapter.run(spec)
+
+    assert seen["present"] is True
+    # the in-lifecycle read-back answered from the snapshot, not from a missing key
+    assert result.result_json["park_asserted"] is True
+    assert spec.task_id not in adapter._launch_auto_run_results
+
+
+def test_launch_snapshot_outlives_the_post_kill_reconcile_readback(tmp_path, monkeypatch):
+    """Eviction must land after the LAST in-lifecycle reader, not at the kill: the
+    rescue re-runs the read-back once the window is dead, and a snapshot dropped
+    earlier would silently answer `False` — indistinguishable from a legitimate
+    fails-closed verdict. Records the verdict the real reconcile computed."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    launch_floor = _markerless_launch(ours)
+    monkeypatch.setattr(
+        generic.GenericAdapter,
+        "start_session",
+        lambda _adapter, _spec: _dev_handle(launched_ns=launch_floor),
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), expected_spec=str(ours))
+
+    def wait(_handle, _spec):
+        ours.write_text(_DONE_SPEC)  # this session appended the terminal marker
+        os.utime(ours, ns=(launch_floor + _MTIME_TICK_NS, launch_floor + _MTIME_TICK_NS))
+        return _unvouched("stalled")  # ... and lost its Stop
+
+    adapter.wait_for_completion = wait
+    adapter.kill = lambda handle: None
+    adapter._window_alive = lambda handle: False  # dead → the rescue runs
+
+    verdicts = []
+    real_authored = adapter._park_marker_session_authored
+
+    def recording(spec_path, running_spec):
+        verdict = real_authored(spec_path, running_spec)
+        verdicts.append(verdict)
+        return verdict
+
+    adapter._park_marker_session_authored = recording
+
+    result = adapter.run(spec)
+
+    # the reconcile's read-back still had attempt-relative evidence to answer from
+    assert verdicts and verdicts[-1] is True
+    assert result.status == "completed"
+    assert result.result_json["post_kill_reconciled"] is True
+    assert result.result_json["park_asserted"] is False  # a `done` marker never parks
+    assert spec.task_id not in adapter._launch_auto_run_results
+
+
+def test_run_evicts_the_launch_snapshot_when_wait_raises(tmp_path, monkeypatch):
+    """A raising wait_for_completion never reaches _post_kill_reconcile, so a
+    post-return eviction would leak exactly the sessions an operator stop or a
+    transport fault produces. The exception must reach the caller unchanged."""
+    adapter, _impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(
+        generic.GenericAdapter, "start_session", lambda _adapter, _spec: _dev_handle()
+    )
+    spec = _dev_spec(tmp_path)
+
+    def raising(_handle, _spec):
+        raise RuntimeError("stop requested")
+
+    adapter.wait_for_completion = raising
+    adapter.kill = lambda handle: None
+
+    with pytest.raises(RuntimeError, match="stop requested"):
+        adapter.run(spec)
+
+    assert spec.task_id not in adapter._launch_auto_run_results
+
+
+def test_run_evicts_only_the_returning_task_id(tmp_path, monkeypatch):
+    """Scoped to `spec.task_id`: one adapter can have another launch in flight, and
+    its snapshot must still answer the ownership question afterwards."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    theirs = impl / "spec-3-2-bar.md"
+    launch_floor = _markerless_launch(theirs)
+    monkeypatch.setattr(
+        generic.GenericAdapter,
+        "start_session",
+        lambda _adapter, _spec: _dev_handle(launched_ns=launch_floor),
+    )
+    other = dataclasses.replace(_dev_spec(tmp_path), task_id="3-2-dev-1", expected_spec=str(theirs))
+    adapter.start_session(other)  # still in flight when the first session returns
+
+    mine = _dev_spec(tmp_path)
+    adapter.wait_for_completion = lambda handle, spec: _unvouched("crashed")
+    adapter.kill = lambda handle: None
+    adapter.run(mine)
+
+    assert mine.task_id not in adapter._launch_auto_run_results
+    assert other.task_id in adapter._launch_auto_run_results
+    # and the surviving snapshot is still usable, not merely present
+    theirs.write_text(_PARK_MARKER_SPEC)
+    os.utime(theirs, ns=(launch_floor + _MTIME_TICK_NS, launch_floor + _MTIME_TICK_NS))
+    assert adapter._park_marker_session_authored(theirs, other) is True
+
+
 def test_expected_spec_ignores_foreign_markerless_spec(tmp_path, monkeypatch):
     """Same regression through the #224 missing-marker fallback, which #261 predates
     but which added a second identical mtime-only scan of the shared dir. A foreign

@@ -1312,10 +1312,18 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             time.sleep(RESULT_POLL_S)
 
 
-class _SessionStarter(Protocol):
-    """Next concrete adapter in the dev mixin's cooperative MRO."""
+class _SessionHost(Protocol):
+    """Next concrete adapter in the dev mixin's cooperative MRO.
+
+    The mixin dispatches two lifecycle methods through it: ``start_session``
+    (to take the launch snapshot before the transport starts) and ``run`` (to
+    bound that snapshot's retention to the session's lifetime). Both hosts —
+    GenericDevAdapter and OpencodeDevAdapter — inherit ``run`` from
+    ``CodingCLIAdapter``, so this is the base implementation in both MROs."""
 
     def start_session(self, spec: SessionSpec) -> SessionHandle: ...
+
+    def run(self, spec: SessionSpec) -> SessionResult: ...
 
 
 class _DevSynthesisMixin(_ResultFileMixin):
@@ -1324,7 +1332,9 @@ class _DevSynthesisMixin(_ResultFileMixin):
     skill contract). Locates the terminal spec the skill leaves on disk and
     synthesizes the legacy result dict via :mod:`devcontract`. Hosts provide
     ``self.paths`` (a :class:`ProjectPaths`), the ``self.policy`` knobs read
-    by ``_configure_dev_knobs``, and the ``_probe_alive`` liveness seam."""
+    by ``_configure_dev_knobs``, and the ``_probe_alive`` liveness seam. It also
+    owns the launch snapshot's session-scoped lifetime: its ``run()`` override
+    evicts the task's ``_launch_auto_run_results`` entry once the lifecycle ends."""
 
     # Set by the concrete adapter's __init__ (see docstring); bare annotations
     # (no runtime effect) tell the type checker the host attributes this reads.
@@ -1383,6 +1393,19 @@ class _DevSynthesisMixin(_ResultFileMixin):
         # incomplete; a path-level None means that one launch file was unreadable.
         # Both fail closed at the affected scope without letting an unrelated bad
         # Markdown file suppress a newly created, readable story spec.
+        #
+        # UNLIKE the three stores above, this one IS cleared: an unpinned launch
+        # captures one entry per `*.md` in the artifacts dir, so retaining a
+        # snapshot per session would grow O(sessions x files) for the adapter's
+        # lifetime (DW-96). The bound is in-flight scope, not a cap or an LRU —
+        # `run()` pops the task's entry in a `finally`, so only launches still
+        # inside their session lifecycle are held. Eviction sits at the END of the
+        # lifecycle because `_post_kill_reconcile` genuinely calls the reader after
+        # `run()`'s kill; it does NOT rest on today's rescue gates happening to make
+        # that verdict unobservable in the result (they do — a rescue requires a
+        # consistent `done`, `park_asserted` requires an `awaiting-operator` marker,
+        # and `synthesize_result` makes those mutually exclusive — but that is a
+        # coincidence of the current gates, not a reason to evict earlier).
         self._launch_auto_run_results: dict[str, dict[str, tuple[int, str] | None] | None] = {}
 
     @staticmethod
@@ -1432,13 +1455,31 @@ class _DevSynthesisMixin(_ResultFileMixin):
         # cooperative MRO dispatch rather than naming either host explicitly;
         # the protocol gives Pyright the host contract without adding a runtime
         # base that could alter method resolution.
-        return cast(_SessionStarter, super()).start_session(spec)
+        return cast(_SessionHost, super()).start_session(spec)
+
+    def run(self, spec: SessionSpec) -> SessionResult:
+        try:
+            return cast(_SessionHost, super()).run(spec)
+        finally:
+            # Retention bound for the launch snapshot (DW-96). Every in-lifecycle
+            # reader lives inside `run()` — `wait_for_completion`'s read-back and
+            # `_post_kill_reconcile`'s post-teardown rescue, which really does call
+            # `_park_marker_session_authored` after the kill — so this is the first
+            # point where the entry is provably dead evidence. A later direct read
+            # has no attempt-relative evidence and already fails closed on the
+            # missing key. `finally` (not a post-return line) so a raising
+            # `wait_for_completion` evicts too; `pop(..., None)` (not `del`) so a
+            # `start_session` that raised before the capture landed cannot replace
+            # the real exception with a KeyError.
+            self._launch_auto_run_results.pop(spec.task_id, None)
 
     def _park_marker_session_authored(self, spec_path: Path, spec: SessionSpec) -> bool:
         """Whether the live marker differs from this session's launch marker."""
         if spec.task_id not in self._launch_auto_run_results:
-            # Production always enters through start_session. A direct diagnostic
-            # read-back has no attempt-relative evidence and therefore fails closed.
+            # Two ways to land here, both answered the same: a direct diagnostic
+            # read-back that never entered through start_session, and a read after
+            # `run()` evicted the entry (DW-96). Neither has attempt-relative
+            # evidence to answer from, so both fail closed.
             return False
         captured = self._launch_auto_run_results[spec.task_id]
         if captured is None:
