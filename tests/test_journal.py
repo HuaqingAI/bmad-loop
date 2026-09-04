@@ -518,6 +518,41 @@ def test_append_heals_only_once_per_fragment(tmp_path):
     ]
 
 
+def test_append_preserves_a_complete_record_left_without_a_final_newline(tmp_path):
+    """An unterminated tail is not always a TORN record: a whole record whose final
+    newline never landed is complete JSON, and the heal must give it its own line so
+    it still parses. Without the prepend the next record concatenates onto it and BOTH
+    are lost — the same two-record fault, with the first record intact on disk.
+
+    Ablation: drop the `if not self._tail_is_terminated()` prepend and this reddens —
+    only the marker comes back (verified)."""
+    _journal_path(tmp_path).write_text('{"ts": 1, "kind": "unit-merged"}', encoding="utf-8")
+    journal = Journal(tmp_path)
+    journal.append("run-complete")
+
+    assert [e["kind"] for e in journal.entries()] == ["unit-merged", "run-complete"]
+
+
+def test_append_leaves_an_existing_crlf_tail_alone(tmp_path):
+    r"""A journal written through Windows text mode ends `\r\n`, whose LAST byte is
+    still `\n` — so the probe reads it as terminated and no blank line is added, and
+    the CRLF record still parses (`entries()` strips the `\r`).
+
+    This is the CRLF half of a two-file pin; `test_append_leaves_a_terminated_tail_alone`
+    is the LF half. The mutation only THIS half catches is a probe that reads a `\r\n`
+    tail as a foreign writer's torn record and heals it —
+    `tail.endswith(b"\n") and not tail.endswith(b"\r\n")` — which leaves the LF sibling
+    green and reddens the blank-line assertion here (verified)."""
+    _journal_path(tmp_path).write_bytes(b'{"ts": 1, "kind": "run-start"}\r\n')
+    journal = Journal(tmp_path)
+    journal.append("session-start", task_id="t0")
+
+    # read_text normalizes `\r\n` to `\n`, so this catches a wrongly-healed blank line
+    # in either spelling — including the `\r\n` one Windows text mode would write it as.
+    assert _journal_path(tmp_path).read_text(encoding="utf-8").count("\n\n") == 0
+    assert [e["kind"] for e in journal.entries()] == ["run-start", "session-start"]
+
+
 def test_rearm_journal_subclass_inherits_the_heal(tmp_path):
     """`runs._RearmJournal.append` forwards to `super().append`, so the heal is not
     something a subclass has to remember."""

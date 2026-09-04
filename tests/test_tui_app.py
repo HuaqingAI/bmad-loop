@@ -462,15 +462,19 @@ def test_journal_line_renders_the_unreadable_marker_red_without_restyling_produc
     """The reader-minted marker must not fall through to `dim`: a lost record is the
     one journal line an operator must not read as background noise.
 
-    The second half is the trap the rule had to dodge. `_JOURNAL_STYLES` matches by
+    The rest is the trap the rule had to dodge. `_JOURNAL_STYLES` matches by
     SUBSTRING, first match wins, and four PRODUCER kinds already end in
     `-unreadable` — so a bare `("unreadable", "red")` rule would have silently
     restyled all of them (and, sitting first, overridden
-    `deferred-close-declaration-unreadable`'s yellow). The rule spells the full kind
-    via `UNREADABLE_LINE_KIND` instead; this pins that those four are untouched.
+    `deferred-close-declaration-unreadable`'s yellow). Spelling the full kind as a
+    `_JOURNAL_STYLES` row would still match by containment, reddening any kind that
+    merely CONTAINS it; `journal_line` therefore matches `UNREADABLE_LINE_KIND` by
+    EQUALITY, ahead of the table. This pins both halves: the four producer kinds are
+    untouched, and a longer lookalike stays dim.
 
-    Ablation: change the rule to the bare substring `"unreadable"` and the
-    producer-kind assertions redden — verified."""
+    Ablation: change the equality check to a `_JOURNAL_STYLES` row spelling the full
+    kind and the lookalike assertion reddens; change it to the bare substring
+    `"unreadable"` and the producer-kind assertions redden — verified."""
 
     def kind_style(kind: str):
         console = Console(width=80)
@@ -489,6 +493,10 @@ def test_journal_line_renders_the_unreadable_marker_red_without_restyling_produc
     assert kind_style("rollback-owned-spec-unreadable").dim is True
     declaration = kind_style("deferred-close-declaration-unreadable")
     assert declaration.color is not None and declaration.color.name == "yellow"
+
+    # a kind that CONTAINS the marker kind is not the marker: equality, not
+    # containment, is what keeps red meaning "this line was lost"
+    assert kind_style(f"{UNREADABLE_LINE_KIND}-followup").dim is True
 
 
 def test_journal_line_wraps_fields_with_hanging_indent():

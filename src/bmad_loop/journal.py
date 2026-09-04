@@ -87,8 +87,9 @@ SELF_MINTED_FIELDS: frozenset[str] = frozenset({"log_task", "log_pos"})
 #
 # Spelled here, next to ``SELF_MINTED_FIELDS`` and for the same reason: two readers
 # (``Journal.entries`` and ``tui.data.JournalTail.read_new``) need exactly one shape,
-# and a second copy is how they drift. ``tui.widgets._JOURNAL_STYLES`` imports the
-# constant too, so the styling rule cannot outlive a rename.
+# and a second copy is how they drift. ``tui.widgets.journal_line`` imports the constant
+# too and matches it by EQUALITY, so the styling rule cannot outlive a rename and cannot
+# leak red onto a producer kind that merely contains this spelling.
 #
 # NOT a ``tests/test_portability_guard.py`` ``JOURNAL_KINDS`` row, deliberately: that
 # inventory is scanned from the literal kinds passed to ``Journal.append``, so a
@@ -98,7 +99,14 @@ UNREADABLE_LINE_KIND = "journal-line-unreadable"
 
 
 def unreadable_line_entry(byte_len: int) -> dict[str, Any]:
-    """One lost record, reported in the stream position it occupied.
+    """One unreadable journal line, reported in the stream position it occupied.
+
+    Deliberately one line, not one record: a marker stands for a LINE the reader could
+    not decode, and how many records that line cost is unknowable from the line alone.
+    A torn record that its own next append healed costs one; a line written before this
+    heal existed — or one a rival appender tore inside :meth:`Journal.append`'s
+    probe-to-write window — can be two records concatenated into a single unparseable
+    line. The ``bytes`` count is what is actually known.
 
     Deliberately minimal. No ``ts``: ``diagnostics.summarize_journal`` derives
     ``first_ts``/``last_ts``/``duration_s`` from entry timestamps, so a fabricated one
