@@ -180,7 +180,13 @@ _JOURNAL_ALIAS_FIELDS = {
     # `rearm-baseline-restamp-skipped`, `rearm-baseline-restamped`); the fifth,
     # `rearm-aborted`, is written by `runs._rollback_rearm` from the transaction guard's
     # error path — a DIFFERENT function, which is why "the only producer" is no longer
-    # the right shape for this note. Routing is by field NAME, not by kind, so the list
+    # the right shape for this note. A SIXTH kind, `accepted-spec-write-unreachable`,
+    # is NOT a re-arm record at all: it is written mid-run, from another module
+    # entirely, by `worktree_flow._warn_accepted_spec_superseded` when a fresh mount
+    # supersedes an accepted-but-uncommitted spec (DW-101). It carries the same two
+    # hazardous fields as `rearm-spec-write-unreachable` — `spec_file` here and
+    # `target_branch` above — plus `compared`, a bare boolean declared benign in the
+    # routing guard. Routing is by field NAME, not by kind, so the list
     # is documentation rather than a gate — but an enumeration that undercounts is how
     # the next reader concludes a kind is unrouted, so it is corrected rather than
     # left to age. `rearm-aborted` also carries `error` (dropped as free text) and
@@ -228,7 +234,9 @@ _JOURNAL_ALIAS_FIELDS = {
 # already landed. The scrub is what is wrong, so the scrub is where the fix belongs.
 #
 # Any new branch producer should pick a name the by-name table already routes
-# (`branch`, or `target_branch` — see `runs.rearm_escalation`) rather than add a target
+# (`branch`, or `target_branch` — see `runs.rearm_escalation`, and from OUTSIDE
+# that family `worktree_flow._warn_accepted_spec_superseded`) rather than add a
+# target
 # row here. `sentinel` is scoped for a different reason: its sole producer carries a
 # spec basename, so that known shape is aliased without making the same claim about a
 # future kind that reuses the generic name.

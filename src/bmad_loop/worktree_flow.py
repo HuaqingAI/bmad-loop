@@ -1500,9 +1500,41 @@ class WorktreeFlow:
         prior-attempt binding fields remain authoritative until fresh binding
         replaces them after the mount is provisioned.
         """
+        pair = self._accepted_spec_pair(task, worktree, project_relative_only=project_relative_only)
+        if pair is None:
+            return ()
+        relative, source, destination = pair
+        if not source.is_file() or destination.is_file():
+            return ()
+        return (relative,)
+
+    def _accepted_spec_pair(
+        self,
+        task: StoryTask,
+        worktree: Path,
+        *,
+        project_relative_only: bool = False,
+    ) -> tuple[str, Path, Path] | None:
+        """Locate the accepted project-local spec's (rel, main-checkout, mount) triple.
+
+        The ONE locator :meth:`_accepted_spec_seed` and
+        :meth:`_warn_accepted_spec_superseded` both decide on. Extracted rather than
+        restated so the warning can never report a loss against a pair the seed was
+        not looking at: two copies of this derivation drift the moment one of them
+        learns something about spec spellings the other does not, and the record
+        would then name a file whose delivery its own gate never measured.
+
+        ``None`` for everything that is not a canonical project-local accepted
+        artifact: an empty or absolute ``spec_file`` (an external spelling passes
+        through untouched), a source that does not resolve, one resolving outside
+        the project, and a destination that would escape the mount. Deliberately
+        asserts the existence of NEITHER end — that is the caller's arm, and the two
+        callers want opposite answers to it (the seed copies only into an ABSENT
+        destination; the warning compares only against a PRESENT one).
+        """
         raw = task.spec_file
         if not raw or Path(raw).is_absolute():
-            return ()
+            return None
         try:
             project = self.paths.project.resolve(strict=True)
             source = (
@@ -1515,10 +1547,81 @@ class WorktreeFlow:
             mounted_root = worktree.resolve(strict=True)
             destination.relative_to(mounted_root)
         except (OSError, RuntimeError, ValueError):
-            return ()
-        if not source.is_file() or destination.is_file():
-            return ()
-        return (relative.as_posix(),)
+            return None
+        return (relative.as_posix(), source, destination)
+
+    def _warn_accepted_spec_superseded(
+        self,
+        task: StoryTask,
+        worktree: Path,
+        *,
+        project_relative_only: bool = False,
+    ) -> None:
+        """Journal when a fresh mount's copy of the accepted spec is not the
+        operator's (DW-101).
+
+        The ``pause_after_spec`` approval gate hands the operator a spec that is
+        UNCOMMITTED by construction. For a TRACKED artifacts dir a re-drive's
+        ``git worktree add`` then delivers the COMMITTED bytes into the mount,
+        :meth:`_accepted_spec_seed` skips (its destination already exists) and the
+        ``accepted_delivered`` probe in :meth:`run_isolated` passes on existence and
+        containment alone — so the corrections the operator just made are silently
+        superseded by the pre-approval text. The escalation path already answers this
+        exact loss with ``rearm-spec-write-unreachable``; this is the approval path's
+        equivalent.
+
+        ADVISORY ONLY, and deliberately so on both counts: this method refuses,
+        pauses and rewrites NOTHING. It does not overwrite the mount's copy — a dirty
+        TRACKED file inside the mount is not covered by the worktree-local
+        ``info/exclude`` fold, so ``finalize_commit``'s ``git add -A`` would merge the
+        operator's in-progress edits into the story commit. And it does not refuse the
+        mount, which would hard-fail every isolated unit in a project that tracks its
+        artifacts dir. What happens to the unit afterwards is not this method's claim
+        to make (the ready gate may still veto the dispatch); the remedy is the
+        operator's, and it is the record's whole payload: commit the corrected spec on
+        the named branch.
+
+        Field shapes are routing decisions, not taste. ``spec_file`` carries the
+        MAIN-CHECKOUT absolute path — the file the operator has to commit, not the
+        mount's copy of it — and rides ``diagnostics._JOURNAL_ALIAS_FIELDS``' ``spec``
+        namespace. The branch is spelled ``target_branch`` rather than a fresh name
+        because that scrub routes by field NAME and ``target_branch`` is already
+        aliased to the ``branch`` namespace, while any new spelling falls through to
+        ``scrub_json``, which waves an identifier-shaped branch name through verbatim.
+        The discriminator is a bare boolean ``compared`` rather than a ``reason``/
+        ``error`` string for the mirror-image reason: both of those names are in
+        ``_JOURNAL_DROP_FIELDS`` and would ship as a presence marker instead of the
+        distinction the record exists to draw.
+
+        Silent for the two legs that are not this loss: a destination the mount never
+        delivered is the seed's own case (and a hard delivery fault has already
+        escalated above this call), and identical bytes are no loss at all. A read
+        that raises answers ``compared: false`` — the probe cannot PROVE the mount
+        reads the operator's bytes, and an unprovable delivery is exactly what this
+        record is for. Nothing here may raise out: the locator swallows its own
+        faults, ``_is_file`` is total over them, and the comparison is wrapped.
+        """
+        pair = self._accepted_spec_pair(task, worktree, project_relative_only=project_relative_only)
+        if pair is None:
+            return
+        _relative, source, destination = pair
+        if not _is_file(source) or not _is_file(destination):
+            return
+        try:
+            identical = source.read_bytes() == destination.read_bytes()
+        except (OSError, RuntimeError, ValueError):
+            compared = False
+        else:
+            if identical:
+                return
+            compared = True
+        self.journal.append(
+            "accepted-spec-write-unreachable",
+            story_key=task.story_key,
+            spec_file=str(source),
+            target_branch=self.state.target_branch,
+            compared=compared,
+        )
 
     def run_isolated(self, task: StoryTask, drive: Callable[[StoryTask], None]) -> None:
         """Run one unit's `drive` body in a fresh per-unit worktree, then merge
@@ -1782,6 +1885,20 @@ class WorktreeFlow:
             )
             self.escalate_unit(task, reason)  # always raises RunPaused
 
+        # The residue the delivery probe above cannot see, stated as a warning rather
+        # than a write: a spec the mount DID deliver, whose bytes are the committed
+        # ones rather than the operator's uncommitted corrections (DW-101). Ungated by
+        # `accepted_spec_relocated` on purpose — a hard delivery fault has already
+        # escalated above, and a spec the task already spelled project-relative
+        # reaches exactly the same loss without ever passing through the normalizer.
+        #
+        # LAST, below every gate that escalates: each of the three above always raises,
+        # so a call placed among them would record "the mount superseded your spec" for
+        # a unit that then never got near a session. Here the only things left are the
+        # ready gate's veto and drive() itself.
+        self._warn_accepted_spec_superseded(
+            task, unit.path, project_relative_only=accepted_spec_relocated
+        )
         self._save()
         prev = self._workspace_get()
         self._workspace_set(unit.workspace)

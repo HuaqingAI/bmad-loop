@@ -387,6 +387,11 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "checkpoint",
         "code_root_changed",
         "command_index",
+        # `accepted-spec-write-unreachable`'s discriminator: whether the byte
+        # comparison COMPLETED, not what it found. A bare boolean deliberately —
+        # `reason` and `error`, the natural spellings for "the read failed", are in
+        # `diagnostics._JOURNAL_DROP_FIELDS` and would ship as a presence marker.
+        "compared",
         "condition",
         "contradiction",
         "converted",
@@ -903,6 +908,7 @@ JOURNAL_KINDS = frozenset(
         "sweep-triage-result",
         "triage-decision",
         # worktree_flow.py
+        "accepted-spec-write-unreachable",
         "isolation-flip-orphan-preserved",
         "merge-preflight-refused",
         "merge-target-cleaned",

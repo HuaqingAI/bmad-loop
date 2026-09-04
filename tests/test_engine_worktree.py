@@ -462,6 +462,278 @@ def test_relocated_accepted_spec_escaping_the_mount_does_not_bind_an_outside_fil
     assert (outside / "escape.md").read_bytes() == b"unrelated external bytes\n"
 
 
+def _fault_read_bytes(monkeypatch, faults) -> None:
+    """Make ``read_bytes`` raise for the paths ``faults`` selects; others read on.
+
+    A selective monkeypatch rather than `chmod`, for `conftest.fault_read_text`'s
+    reason: chmod is a no-op for root and carries no read bit on Windows, so the
+    fault would silently not fire on half the CI matrix — and a probe that never
+    faults grades nothing. Takes a PREDICATE because one of the two copies this
+    grades — the mount's — lives under a worktree path the test cannot name until
+    the run has already provisioned it.
+    """
+    real = Path.read_bytes
+
+    def fake(self, *a, **kw):
+        if faults(self):
+            raise PermissionError(13, "Permission denied")
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_bytes", fake)
+
+
+def _superseded_records(engine):
+    return [
+        entry
+        for entry in engine.journal.entries()
+        if entry["kind"] == "accepted-spec-write-unreachable"
+    ]
+
+
+def _defer_reading_mount(engine, rel: str, seen: list[bytes]):
+    def drive(current):
+        seen.append((engine.workspace.root / rel).read_bytes())
+        current.phase = Phase.DEFERRED
+        current.defer_reason = "test complete"
+
+    return drive
+
+
+def test_mount_superseding_an_uncommitted_accepted_spec_warns_and_still_dispatches(project):
+    """The approval gate's residue, warned about rather than written (DW-101).
+
+    `pause_after_spec` hands the operator a spec that is uncommitted BY
+    CONSTRUCTION. A re-drive's fresh mount is a checkout of a commit, so for a
+    TRACKED artifacts dir it delivers the pre-approval bytes, `_accepted_spec_seed`
+    skips (its destination exists) and the `accepted_delivered` probe passes on
+    existence + containment alone — the corrections are silently superseded.
+
+    Ablation: delete the byte comparison in `_warn_accepted_spec_superseded`
+    (return before it) and this test FAILS — an existence-only probe is green for
+    every reason the mounted file could be there, which is the whole defect.
+    """
+    rel = "_bmad-output/implementation-artifacts/accepted-tracked.md"
+    accepted = project.project / rel
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    accepted.write_bytes(b"pre-approval bytes\n")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    # what the operator corrected at the gate, still uncommitted
+    accepted.write_bytes(b"operator corrections\n")
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    task = StoryTask("1-1-a", 1, spec_file=str(accepted))
+    engine.state.tasks[task.story_key] = task
+    seen: list[bytes] = []
+
+    engine._run_isolated(task, _defer_reading_mount(engine, rel, seen))
+
+    (record,) = _superseded_records(engine)
+    assert record["story_key"] == "1-1-a"
+    # the MAIN-CHECKOUT path — the file the operator has to commit — and the branch
+    # to commit it on, not the mount's copy and not the base
+    assert record["spec_file"] == str(accepted.resolve())
+    assert record["target_branch"] == "main"
+    assert record["compared"] is True
+    # advisory only: the unit still dispatched — and what it read is the MOUNT's
+    # copy, still the committed pre-approval bytes, so the warning did not repair
+    # what it reported. That is deliberate: a dirty TRACKED file inside the mount is
+    # not covered by the worktree-scoped exclude fold, so `finalize_commit`'s
+    # `git add -A` would fold the operator's in-progress edits into the story commit.
+    assert seen == [b"pre-approval bytes\n"]
+    # and the main checkout still holds the operator's corrections, untouched
+    assert accepted.read_bytes() == b"operator corrections\n"
+
+
+def test_byte_identical_accepted_spec_delivery_journals_no_warning(project):
+    """A committed spec the mount reproduces exactly is no loss, so no record."""
+    rel = "_bmad-output/implementation-artifacts/accepted-committed.md"
+    accepted = project.project / rel
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    accepted.write_bytes(b"accepted and committed\n")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    task = StoryTask("1-1-a", 1, spec_file=str(accepted))
+    engine.state.tasks[task.story_key] = task
+    seen: list[bytes] = []
+
+    engine._run_isolated(task, _defer_reading_mount(engine, rel, seen))
+
+    assert seen == [b"accepted and committed\n"]
+    assert _superseded_records(engine) == []
+
+
+def test_seeded_accepted_spec_journals_no_supersede_warning(project):
+    """The seed's own case: a gitignored spec the checkout cannot carry.
+
+    `_accepted_spec_seed` lays the operator's bytes into the mount before this
+    probe runs, so the comparison it then makes is against the file the seed just
+    wrote. Nothing was superseded and nothing is journalled — the warning must not
+    fire on the leg the seed already fixes.
+    """
+    rel = "_bmad-output/implementation-artifacts/accepted-seeded.md"
+    ignore_before_commit(project, rel)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    accepted = project.project / rel
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    accepted.write_bytes(b"accepted operator bytes\n")
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    task = StoryTask("1-1-a", 1, spec_file=str(accepted))
+    engine.state.tasks[task.story_key] = task
+    seen: list[bytes] = []
+
+    engine._run_isolated(task, _defer_reading_mount(engine, rel, seen))
+
+    assert seen == [b"accepted operator bytes\n"]
+    assert _superseded_records(engine) == []
+
+
+def test_unreadable_main_accepted_spec_warns_with_compared_false(project, monkeypatch):
+    """A probe that cannot READ cannot prove the mount carries the operator's bytes.
+
+    The MAIN-checkout half of the matrix's "either copy" row. The bytes are
+    identical here, so an unfaulted run journals nothing — the record exists purely
+    because the comparison could not be made, which is what `compared: false` says.
+    No exception escapes `run_isolated`: the unit still dispatches.
+    """
+    rel = "_bmad-output/implementation-artifacts/accepted-unreadable.md"
+    accepted = project.project / rel
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    accepted.write_bytes(b"accepted and committed\n")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    task = StoryTask("1-1-a", 1, spec_file=str(accepted))
+    engine.state.tasks[task.story_key] = task
+    drove: list[bool] = []
+    _fault_read_bytes(monkeypatch, lambda path: path == accepted.resolve())
+
+    def drive(current):
+        drove.append(True)
+        current.phase = Phase.DEFERRED
+        current.defer_reason = "test complete"
+
+    engine._run_isolated(task, drive)
+
+    (record,) = _superseded_records(engine)
+    assert record["spec_file"] == str(accepted.resolve())
+    assert record["target_branch"] == "main"
+    assert record["compared"] is False
+    assert drove == [True]
+
+
+def test_accepted_spec_outside_the_project_journals_no_supersede_warning(project, tmp_path):
+    """Nothing to supersede: the locator answers only for a project-local spec.
+
+    Two shapes in one run, because both reach `_accepted_spec_pair`'s first arm and
+    both must stay silent. An EXTERNAL absolute spec keeps its spelling through
+    `relativize_project_local_accepted_spec` (it is outside the project, so the
+    mount already reads that very file), and a spec-less task has no path to
+    compare at all — the shape most of this suite dispatches in.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    external = tmp_path / "outside-spec.md"
+    external.write_bytes(b"external accepted bytes\n")
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+
+    def defer(current):
+        current.phase = Phase.DEFERRED
+        current.defer_reason = "test complete"
+
+    for key, spec in (("1-1-a", str(external)), ("1-1-b", "")):
+        task = StoryTask(key, 1, spec_file=spec)
+        engine.state.tasks[task.story_key] = task
+        engine._run_isolated(task, defer)
+
+    assert _superseded_records(engine) == []
+    assert external.read_bytes() == b"external accepted bytes\n"
+
+
+def test_unreadable_mounted_accepted_spec_warns_with_compared_false(project, monkeypatch):
+    """The MOUNT half of the matrix's "either copy" row.
+
+    `source.read_bytes() == destination.read_bytes()` short-circuits nothing on the
+    left, but the two reads are separate syscalls and only the second one touches
+    the mount — so a fault on the main-checkout copy (the sibling test) never
+    reaches the destination read at all, and the mount-side leg needs its own row.
+
+    Ablation: narrow the comparison's `except` to the source read alone and this
+    reddens with a PermissionError out of `run_isolated`, which is the "no
+    filesystem fault may raise out of this path" clause failing.
+    """
+    rel = "_bmad-output/implementation-artifacts/accepted-mount-unreadable.md"
+    accepted = project.project / rel
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    accepted.write_bytes(b"accepted and committed\n")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    task = StoryTask("1-1-a", 1, spec_file=str(accepted))
+    engine.state.tasks[task.story_key] = task
+    drove: list[bool] = []
+    # every copy of this rel EXCEPT the main checkout's — i.e. the one the mount
+    # carries, whose path the test cannot name until provisioning has run
+    main_copy = accepted.resolve()
+    _fault_read_bytes(monkeypatch, lambda path: path.name == accepted.name and path != main_copy)
+
+    def drive(current):
+        drove.append(True)
+        current.phase = Phase.DEFERRED
+        current.defer_reason = "test complete"
+
+    engine._run_isolated(task, drive)
+
+    (record,) = _superseded_records(engine)
+    assert record["spec_file"] == str(main_copy)
+    assert record["compared"] is False
+    assert drove == [True]
+
+
+def test_project_relative_accepted_spec_superseded_by_the_mount_warns(project):
+    """The leg the call site is UNGATED for: a spec already spelled relative.
+
+    `relativize_project_local_accepted_spec` has nothing to do here, so
+    `accepted_spec_relocated` is False, the `accepted_delivered` escalation above is
+    skipped — and the loss is identical, because the mount still delivers the
+    committed bytes over the operator's uncommitted corrections. This is also the
+    spelling a resume PERSISTS, so it is the shape a re-drive actually arrives in.
+
+    Ablation: re-gate the `_warn_accepted_spec_superseded` call under
+    `if accepted_spec_relocated:` and this test FAILS while every other row in this
+    group stays green — they all pass an absolute `spec_file`.
+    """
+    rel = "_bmad-output/implementation-artifacts/accepted-relative.md"
+    accepted = project.project / rel
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    accepted.write_bytes(b"pre-approval bytes\n")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    accepted.write_bytes(b"operator corrections\n")
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    task = StoryTask("1-1-a", 1, spec_file=rel)
+    engine.state.tasks[task.story_key] = task
+    seen: list[bytes] = []
+
+    engine._run_isolated(task, _defer_reading_mount(engine, rel, seen))
+
+    (record,) = _superseded_records(engine)
+    # resolved to the main-checkout ABSOLUTE path even though the task spelled it
+    # relative — the record has to name the file the operator must commit
+    assert record["spec_file"] == str(accepted.resolve())
+    assert record["target_branch"] == "main"
+    assert record["compared"] is True
+    assert seen == [b"pre-approval bytes\n"]
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_missing_upstream_skill_seed_escalates_before_dispatch_and_records_mount(project, tmp_path):
     """A shared install outside the repo passes main's through-link resolution but

@@ -609,16 +609,17 @@ def test_rearm_records_leak_neither_the_code_root_nor_a_spec_name():
     assert restamped["overwritten"] != restamped["baseline"]
     assert restamped["restore"] is False  # a plain flag still ships
 
-    # The OTHER four kinds the re-arm family journals `spec_file` on. Routing is
+    # The OTHER four kinds the re-arm family journals `spec_file` on, plus the one
+    # producer of the same pair of fields from OUTSIDE that family. Routing is
     # by field NAME, so these ride the same `_JOURNAL_ALIAS_FIELDS` entry as
     # `rearm-baseline-restamped` and are correct today for free — which is exactly why
     # they belong in the sweep: the canary is what catches a field added to one of
-    # these kinds later, and a sweep that covers two of five grades the routing of a
+    # these kinds later, and a sweep that covers two of six grades the routing of a
     # record shape nobody re-checks.
     #
-    # `rearm-aborted` is the fifth and the one written by a DIFFERENT function
-    # (`runs._rollback_rearm`, from the transaction guard's error path) rather than by
-    # `rearm_escalation` itself — the divergence that made the routing entry's own
+    # `rearm-aborted` is the fifth of the re-arm kinds and the one written by a
+    # DIFFERENT function (`runs._rollback_rearm`, from the transaction guard's error
+    # path) rather than by `rearm_escalation` itself — the divergence that made the routing entry's own
     # producer note undercount. It carries two fields the others do not: `error`, which
     # the free-text drop set reaches, and `rollback`, a literal enum string that is
     # declared benign rather than routed and must therefore still ship VERBATIM.
@@ -637,11 +638,22 @@ def test_rearm_records_leak_neither_the_code_root_nor_a_spec_name():
                 "rearm-aborted",
                 {"error": f"OSError: cannot write {HOME_PATH}/spec.md", "rollback": "restored"},
             ),
+            # Not a re-arm record at all, and in the sweep for exactly that reason:
+            # `worktree_flow._warn_accepted_spec_superseded` writes the same two
+            # hazardous fields from a DIFFERENT module, mid-run, on the approval path
+            # rather than the escalation one. Routing is by field NAME, so it is
+            # correct today for free — and a sweep that grades only the family it was
+            # written for is how the next producer of these names gets missed.
+            (
+                "accepted-spec-write-unreachable",
+                {"target_branch": REARM_BRANCH, "compared": True},
+            ),
         )
     ]
     # every one of them aliases to the SAME alias as the restamped record above: one
-    # spec, one alias, however many kinds carry it
-    assert [s["spec_file"] for s in siblings] == [alias, alias, alias, alias]
+    # spec, one alias, however many kinds carry it — five graded here plus
+    # `rearm-baseline-restamped` above, the six producers of this field today
+    assert [s["spec_file"] for s in siblings] == [alias] * 5
     # the abort record's own two fields: the free-text one is dropped (it quotes a host
     # path back), the enum one is deliberately NOT aliased — both surfaces read the
     # record for `rollback`, so pseudonymizing it would destroy the field's whole point
@@ -664,6 +676,16 @@ def test_rearm_records_leak_neither_the_code_root_nor_a_spec_name():
         a for ns, orig, a in pseudo.entries() if ns == "branch" and orig == REARM_BRANCH
     )
     assert siblings[0]["target_branch"] == branch_alias != REARM_BRANCH
+    # The approval-path record says the same thing to the same operator — commit the
+    # corrected spec on THIS branch — so it is graded on the same routing, and its
+    # own `compared` discriminator must survive VERBATIM: a bare boolean declared
+    # benign, not aliased and not dropped, or the record stops telling a maintainer
+    # whether the comparison ran at all. Selected by KIND rather than by index: a row
+    # inserted above it would otherwise re-point the assertion at another record and
+    # grade nothing, silently.
+    superseded = next(s for s in siblings if s["kind"] == "accepted-spec-write-unreachable")
+    assert superseded["target_branch"] == branch_alias != REARM_BRANCH
+    assert superseded["compared"] is True
 
     rendered = json.dumps([advance_failed, restamped, *siblings])
     for canary in (SHA, other_sha, SPEC_NAME, PROPRIETARY, HOME_PATH, REARM_BRANCH, *CANARIES):
