@@ -311,6 +311,34 @@ JOURNAL_ROUTED_FIELDS = (
     | diagnostics._JOURNAL_KEYLIST_FIELDS
 )
 
+# Every journal KIND that carries a ``patch`` field. Declared because
+# ``_JOURNAL_DROP_FIELDS`` routes BY NAME, so the drop reaches every kind spelling the
+# name — while that entry's comment described one pair of records and nothing pinned
+# the true reach. A by-name rule whose comment names a subset is how a reader concludes
+# an unlisted kind is unrouted and starts journalling a path there expecting the
+# fallback to redact it.
+#
+# Inventory, not derivation: read off the producers by hand and asserted equal to the
+# scan, so a FURTHER kind picking up the field is a decision someone makes here rather
+# than a silent widening of a routing rule that already covers it.
+#
+# Two other surfaces enumerate these same kinds and neither reddens on its own when
+# this one changes: ``diagnostics._JOURNAL_DROP_FIELDS``' ``patch`` comment, and
+# ``tests/test_diagnostics.py::_PATCH_PATH_ROUTING_ROWS``, which asserts the drop per
+# kind at the routing seam. Adding or removing a kind here means updating both.
+JOURNAL_PATCH_KINDS = frozenset(
+    {
+        # recovery_flow.py — the intent-gap restore pair.
+        "attempt-restore-failed",
+        "attempt-restored",
+        # runs.py — the operator-selected stale-restore pair.
+        "stale-restore-unparseable",
+        "stale-restore-excluded",
+        # worktree_flow.py — the retained forensic patch of a closed unit.
+        "unit-closed",
+    }
+)
+
 # ``kind -> the field names routed on THAT kind only``, read off the same module so
 # the guard still cannot drift from it. Alias, identifier-list, and count-list rules
 # share this inventory because all three claim the same `(kind, field)` boundary.
@@ -671,11 +699,11 @@ JOURNAL_DYNAMIC_KIND_ALLOW = {
 }
 
 # Every literal journal KIND written today: a declared inventory, not a per-kind
-# audit — `JOURNAL_BENIGN_FIELDS`' claim, made for the kind axis. Kind #205 cannot
-# appear without someone deciding, in the same PR, what covers the record it
-# introduces: a routing row in `diagnostics` if any field carries an identifier, a
-# path or free text, and a test row asserting the record at the layer that reads it
-# — the decision review iteration 6 kept discovering had been skipped.
+# audit — `JOURNAL_BENIGN_FIELDS`' claim, made for the kind axis. A kind this set
+# does not already hold cannot appear without someone deciding, in the same PR, what
+# covers the record it introduces: a routing row in `diagnostics` if any field carries
+# an identifier, a path or free text, and a test row asserting the record at the layer
+# that reads it — the decision review iteration 6 kept discovering had been skipped.
 #
 # Generated from the scan, hand-reviewed, grouped by producer module; a kind two
 # modules write sits under a shared heading. A deleted or renamed kind reddens the
@@ -1571,6 +1599,47 @@ def _splat_kind_literal(value: ast.expr) -> str | None:
     return found
 
 
+def _journal_keyword_kinds(node: ast.Call) -> list[str]:
+    """Every kind a call delivers through the KEYWORD channel, in source order: an
+    explicit ``kind=`` (its literal, or :data:`UNRESOLVED_DYNAMIC_KIND` when the value
+    is not a string literal) and each ``**`` splat read through
+    :func:`_splat_kind_literal`, whose ``None`` — a readable splat spelling no ``kind``
+    key — is skipped rather than inventoried.
+
+    Written so the journal-write emit in ``_scan_source`` grades
+    ``journal.append(**{"kind": "x"})`` the way the caller-side dynamic-kind arm grades
+    ``self._skip_review_and_commit(task, **{"kind": "x"})``: through the same
+    ``_splat_kind_literal``, with the same three-way answer and the same
+    last-``kind``-key-wins rule. The two also diverge deliberately in WHEN they consult
+    the channel — the caller-side arm reads it per expression, unconditionally, while
+    the journal-write emit reads it only when nothing occupies the positional slot,
+    because a filled slot already owns the kind (see the call site).
+
+    Stated bound: this is NOT the single implementation of the keyword channel. The
+    caller-side arm still carries its own inline copy of these two branches; only
+    ``_splat_kind_literal`` is genuinely shared, and nothing asserts that the two
+    readings agree. Folding that arm onto this helper was ruled out of scope, so a
+    change to one branch here has to be mirrored there by hand.
+
+    Every keyword is yielded, not just the first: a call cannot legally deliver two
+    kinds, but a call the scan cannot fully read can deliver an unreadable one BESIDE a
+    readable one, and collapsing those to a single answer is how a kind no row declares
+    reaches the journal with nothing red."""
+    kinds: list[str] = []
+    for kw in node.keywords:
+        if kw.arg is None:
+            splat = _splat_kind_literal(kw.value)
+            if splat is not None:
+                kinds.append(splat)
+        elif kw.arg == "kind":
+            kinds.append(
+                kw.value.value
+                if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str)
+                else UNRESOLVED_DYNAMIC_KIND
+            )
+    return kinds
+
+
 def _is_journal_write(node: ast.AST, rel: str) -> bool:
     """Whether this node writes a journal entry — a ``<journal>.append(...)`` call in
     each of the four receiver spellings the scan reads: the three named handles (see
@@ -2095,6 +2164,13 @@ def _scan_source(src: str, rel: str):
         # None otherwise. None is not "no kind": it is "this scan cannot tell", and
         # it emits its own `journalkind` finding so the site fails loud rather than
         # being graded against a kind that had to be guessed.
+        #
+        # Read keywords only when `_positional_kind_literal` reports an EMPTY slot.
+        # An unreadable or starred positional argument keeps owning that slot. The
+        # AST literal extraction below stays independent of the resolver's sentinel:
+        # a literal spelling the sentinel is still a literal, including for fields.
+        # Without this keyword inventory, the doubly-declared plugins/bus.py::_log
+        # site can write append(**{"kind": "x"}) with both waivers hiding the kind.
         if _is_journal_write(node, rel):
             fn_name = enclosing_names.get(id(node))
             first = node.args[0] if node.args else None
@@ -2105,6 +2181,22 @@ def _scan_source(src: str, rel: str):
             )
             if kind is None:
                 findings.append(("journalkind", rel, node.lineno, line_at(node.lineno), fn_name))
+                if _positional_kind_literal(node, 0) is None:
+                    # Nothing occupies the slot: the kind, if any, arrives by keyword.
+                    # Unchanged on the `journalkind` axis — whether a POSITION may be
+                    # dynamic stays the literalness arm's question, and a keyword-spelled
+                    # kind is unusual enough that exempting it should be a deliberate
+                    # decision, not a side effect of this one.
+                    for keyword_kind in _journal_keyword_kinds(node):
+                        findings.append(
+                            (
+                                "journalkindliteral",
+                                rel,
+                                node.lineno,
+                                line_at(node.lineno),
+                                keyword_kind,
+                            )
+                        )
             else:
                 # The literal-kind twin, and the KIND inventory's only feed. NOT
                 # derivable from the `journalfield` rows below, although each of
@@ -3142,9 +3234,9 @@ def test_journal_kinds_are_literal_or_the_position_is_declared():
 
 def test_journal_kind_inventory_is_complete():
     """Every literal journal kind a producer writes is a declared `JOURNAL_KINDS`
-    row, in both directions — the enumerate-vs-declare gate for the kind axis. The
-    ~196 literal kinds had no inventory at all: a new record kind could land, with
-    or without a test row, and only a later review pass would ask what covers it.
+    row, in both directions — the enumerate-vs-declare gate for the kind axis. Before
+    this test the literal kinds had no inventory at all: a new record kind could land,
+    with or without a test row, and only a later review pass would ask what covers it.
     Now the question is asked by CI, at PR time, on the diff that introduces the
     kind.
 
@@ -3169,31 +3261,19 @@ def test_journal_kind_inventory_is_complete():
     Both arms are graded from ONE scan in ONE assertion
     (`_journal_kind_inventory_drift`): as two sequential asserts a rename reported
     only the undeclared spelling, and the stale row surfaced a run later, after the
-    new row had landed (review pass 2).
+    new row had landed (review pass 2). The failure TEXT is split back out per arm by
+    `_journal_kind_inventory_message`, which also carries the sentinel branch — one
+    assertion, three separately-worded remedies.
 
-    Ablation: delete the `journalkindliteral` emit and this reddens with all 204
-    rows stale; duplicate engine.py's epic-boundary write under the kind
+    Ablation: delete the `journalkindliteral` emit and this reddens with EVERY
+    declared row stale; duplicate engine.py's epic-boundary write under the kind
     `"guard-ablation-probe"` and ONLY this test reddens, naming the kind and site;
     add `self._skip_review_and_commit(task, kind="guard-ablation-probe")` to
     engine.py and ONLY this test reddens, naming the call; rename engine.py's
     `epic-boundary` write and the ONE failure names both the new spelling and the
     stale row."""
     undeclared, stale = _journal_kind_inventory_drift(_of("journalkindliteral"))
-    assert (undeclared, stale) == ([], set()), (
-        "the literal journal kinds and JOURNAL_KINDS disagree. A kind a producer "
-        "writes but no row declares — add its row IN THE SAME PR as what covers its "
-        "record: a diagnostics routing row if any field carries an identifier, a "
-        "path or free text, and the test asserting the record at the layer that "
-        "reads it; or drop the write. A row no producer writes any more — delete it "
-        "and retire its routing/test rows deliberately, because a stale row "
-        "pre-approves the next record that reuses the name:\n"
-        + "\n".join(
-            f"  undeclared {rel}:{ln}: {kind!r} — {txt.strip()}"
-            for rel, ln, txt, kind in undeclared
-        )
-        + ("\n" if undeclared and stale else "")
-        + "\n".join(f"  stale row: {kind!r}" for kind in sorted(stale))
-    )
+    assert (undeclared, stale) == ([], set()), _journal_kind_inventory_message(undeclared, stale)
 
 
 def test_reader_minted_kind_is_deliberately_absent_from_the_inventory():
@@ -3220,6 +3300,40 @@ def test_reader_minted_kind_is_deliberately_absent_from_the_inventory():
     assert JOURNAL_KINDS and {kind for _, _, _, _, kind in _of("journalkindliteral")}
 
 
+def test_unresolved_kind_sentinel_is_deliberately_absent_from_the_inventory():
+    """`UNRESOLVED_DYNAMIC_KIND` must NOT be a `JOURNAL_KINDS` row either — the
+    dedicated prohibition for the scan's unresolved-kind marker.
+
+    It is the more tempting of the two, because unlike the reader-minted kind this one
+    arrives in `_journal_kind_inventory_drift`'s UNDECLARED list looking exactly like a
+    real kind, which is what makes an unreadable site fail loud. A reader who takes
+    that failure at face value declares the row, the undeclared arm goes quiet, and the
+    guard has been taught to accept every site whose kind it cannot read. An emitted
+    sentinel is part of the scanned inventory, so declaring it does not necessarily
+    make it stale. This dedicated prohibition catches that declaration directly.
+
+    Ablation: add `UNRESOLVED_DYNAMIC_KIND` to `JOURNAL_KINDS` and this test reddens,
+    even when an unreadable call site emits it into the inventory."""
+    assert UNRESOLVED_DYNAMIC_KIND not in JOURNAL_KINDS, (
+        f"{UNRESOLVED_DYNAMIC_KIND!r} is a SENTINEL this scan mints for a kind it "
+        "could not read. Declaring it would hide unreadable sites from the inventory; "
+        "this dedicated prohibition forbids that declaration. Remove the row and fix "
+        "the unreadable CALL SITE instead."
+    )
+    # Anti-vacuity: the sentinel has to be a value this scan can actually emit, and the
+    # inventory has to be non-empty, or the absence above holds for reasons that have
+    # nothing to do with the decision it records.
+    assert (
+        JOURNAL_KINDS
+        and UNRESOLVED_DYNAMIC_KIND
+        == [
+            f[4]
+            for f in _scan_source("def f(self):\n    self._journal.append(**fields)\n", "engine.py")
+            if f[0] == "journalkindliteral"
+        ][0]
+    )
+
+
 def _journal_kind_inventory_drift(
     findings,
 ) -> tuple[list[tuple[str, int, str, str]], set[str]]:
@@ -3232,6 +3346,59 @@ def _journal_kind_inventory_drift(
         (rel, ln, txt, kind) for _, rel, ln, txt, kind in findings if kind not in JOURNAL_KINDS
     ]
     return undeclared, JOURNAL_KINDS - scanned
+
+
+def _journal_kind_inventory_message(
+    undeclared: list[tuple[str, int, str, str]], stale: set[str]
+) -> str:
+    """`test_journal_kind_inventory_is_complete`'s failure text, one paragraph per arm
+    and each emitted ONLY when its arm is non-empty.
+
+    Split because the single paragraph it replaced gave every failure the same advice,
+    and on one arm that advice was actively harmful. `UNRESOLVED_DYNAMIC_KIND` arrives
+    in the undeclared list like any other kind — deliberately, so an unreadable site
+    fails loud — but it is a SENTINEL: "add its row IN THE SAME PR" would hide the
+    unreadable site from the undeclared arm. The dedicated sentinel-prohibition test
+    prevents that declaration; staleness is not guaranteed for an emitted sentinel.
+    The fix is upstream, at the call site.
+
+    Per-arm emission is the other half: a message that recites the stale-row remedy
+    while nothing is stale reads as three unrelated defects, and the reader has to
+    work out which paragraph their failure is."""
+    unreadable = [row for row in undeclared if row[3] == UNRESOLVED_DYNAMIC_KIND]
+    unknown = [row for row in undeclared if row[3] != UNRESOLVED_DYNAMIC_KIND]
+    paragraphs = ["the literal journal kinds and JOURNAL_KINDS disagree."]
+    if unknown:
+        paragraphs.append(
+            "A kind a producer writes but no row declares — add its row IN THE SAME "
+            "PR as what covers its record: a diagnostics routing row if any field "
+            "carries an identifier, a path or free text, and the test asserting the "
+            "record at the layer that reads it; or drop the write:\n"
+            + "\n".join(
+                f"  undeclared {rel}:{ln}: {kind!r} — {txt.strip()}"
+                for rel, ln, txt, kind in unknown
+            )
+        )
+    if unreadable:
+        paragraphs.append(
+            f"A site emitting the unresolved-kind marker ({UNRESOLVED_DYNAMIC_KIND!r}) "
+            "— fix it at the CALL SITE: this spelling is reserved; if already written "
+            "literally, replace it with a different kind. Otherwise spell the kind as a "
+            "string literal, or hand the declared position one, instead of a variable, "
+            "an f-string or a `**` splat the scan cannot read into. Do NOT add a "
+            "JOURNAL_KINDS row for the sentinel: the dedicated "
+            "test_unresolved_kind_sentinel_is_deliberately_absent_from_the_inventory "
+            "forbids declaring it, which would hide unreadable sites:\n"
+            + "\n".join(f"  unreadable {rel}:{ln}: {txt.strip()}" for rel, ln, txt, _ in unreadable)
+        )
+    if stale:
+        paragraphs.append(
+            "A row no producer writes any more — delete it and retire its "
+            "routing/test rows deliberately, because a stale row pre-approves the "
+            "next record that reuses the name:\n"
+            + "\n".join(f"  stale row: {kind!r}" for kind in sorted(stale))
+        )
+    return "\n".join(paragraphs)
 
 
 def test_journal_kind_inventory_drift_reports_a_rename_on_both_arms():
@@ -3257,6 +3424,48 @@ def test_journal_kind_inventory_drift_reports_a_rename_on_both_arms():
         ("engine.py", 7728, "epic-boundary-renamed")
     ]
     assert stale == {"epic-boundary"}
+
+
+def test_journal_kind_inventory_message_gives_each_arm_its_own_remedy():
+    """The failure text names ONLY the arms that actually failed, and the sentinel arm
+    gets the opposite advice from the undeclared arm.
+
+    `UNRESOLVED_DYNAMIC_KIND` reaches `_journal_kind_inventory_drift`'s undeclared list
+    like a real kind — that is what makes an unreadable site fail loud — so the single
+    paragraph this replaced handed the reader "add its row IN THE SAME PR" for a
+    sentinel. Following it hides the unreadable site from the undeclared arm; the
+    dedicated sentinel-prohibition test catches that declaration even when the
+    sentinel is emitted and therefore is not stale.
+
+    Ablation: drop the `row[3] == UNRESOLVED_DYNAMIC_KIND` partition so both kinds
+    share one paragraph and the sentinel row's `not in` assertions redden; emit every
+    paragraph unconditionally and the stale/undeclared exclusions redden."""
+    site = ("plugins/bus.py", 42, "self._journal.append(**fields)", UNRESOLVED_DYNAMIC_KIND)
+    real = ("engine.py", 7, 'journal.append("brand-new-kind")', "brand-new-kind")
+
+    sentinel_only = _journal_kind_inventory_message([site], set())
+    assert "CALL SITE" in sentinel_only and "Do NOT add a JOURNAL_KINDS row" in sentinel_only
+    assert "plugins/bus.py:42" in sentinel_only
+    assert "this spelling is reserved" in sentinel_only
+    assert "if already written literally, replace it with a different kind" in sentinel_only
+    # The harmful advice, absent: neither the add-a-row remedy nor the stale-row one.
+    assert "IN THE SAME PR" not in sentinel_only
+    assert "stale row" not in sentinel_only
+
+    undeclared_only = _journal_kind_inventory_message([real], set())
+    assert "IN THE SAME PR" in undeclared_only and "'brand-new-kind'" in undeclared_only
+    assert "CALL SITE" not in undeclared_only
+    assert "stale row" not in undeclared_only
+
+    stale_only = _journal_kind_inventory_message([], {"epic-boundary"})
+    assert "  stale row: 'epic-boundary'" in stale_only
+    assert "IN THE SAME PR" not in stale_only and "CALL SITE" not in stale_only
+
+    # All three at once still reads as three remedies, not one blurred paragraph.
+    everything = _journal_kind_inventory_message([site, real], {"epic-boundary"})
+    assert all(
+        clue in everything for clue in ("CALL SITE", "IN THE SAME PR", "  stale row: ")
+    ), everything
 
 
 def test_journal_field_guard_actually_saw_the_producers():
@@ -3294,6 +3503,73 @@ def test_journal_field_guard_actually_saw_the_producers():
         "entry outlives its producer as a standing pre-approval for the next field "
         "that reuses the name. Delete them, or record where they now come from in "
         f"JOURNAL_SPLAT_ALLOW / JOURNAL_SELF_MINTED_FIELDS: {sorted(stale)}"
+    )
+
+
+def test_journal_patch_field_covers_every_kind_that_carries_it():
+    """`patch` is dropped BY NAME, so the rule reaches every kind that spells it — and
+    this pins which kinds those are, in both directions.
+
+    `_JOURNAL_DROP_FIELDS`' comment described one pair of records while by-name routing
+    reaches every kind spelling the name, and nothing held that reach: a further
+    producer could start journalling a `patch` and inherit the drop with no one
+    deciding it should. The drop happens to be the right answer for each kind declared
+    today (a bare feature- or spec-named patch has no separators for `scrub_json`'s
+    fallback to redact, so only removal covers it), but "happens to be right" is what
+    an inventory exists to convert into a decision. This is `JOURNAL_BENIGN_FIELDS`'
+    argument on a routed name.
+
+    The unattributable-kind assertion is what keeps the equality honest. Filtering
+    `kind is None` out of the scan — a write whose kind the guard cannot read — would
+    drop exactly the site this test is most needed at: a `patch` added inside any
+    `JOURNAL_DYNAMIC_KIND_ALLOW` function has no readable kind, so it would inherit the
+    by-name drop with the equality still green. Such a write fails loud instead.
+
+    Stated bound: a `patch` arriving through an UNRESOLVABLE `**` splat has no field
+    name at all (`field=None`), so it never reaches either assertion here. That hole is
+    held by the `JOURNAL_SPLAT_ALLOW` declaration and its sibling above, which pins the
+    declared holes against the tree — not by this test.
+
+    The membership assertion is the last half, and it does not stand alone: were
+    `patch` to leave `_JOURNAL_DROP_FIELDS`, `test_journal_fields_are_routed_or_declared_benign`
+    and `test_journal_field_offenders_split_routed_benign_and_holes[routed-name]` would
+    redden too, as would several `tests/test_diagnostics.py` rows. It is asserted here
+    anyway because those name the FIELD while this names the consequence for the kinds
+    below, and because a future benign declaration of `patch` would quiet them while
+    leaving these records shipping the path verbatim.
+
+    Ablation: drop one kind from `JOURNAL_PATCH_KINDS` and the equality reddens naming
+    it; give one of those producers an unreadable kind and the unattributable assertion
+    reddens; remove `"patch"` from `diagnostics._JOURNAL_DROP_FIELDS` and the membership
+    assertion reddens (with the siblings named above)."""
+    rows = [
+        (rel, ln, kind)
+        for _, rel, ln, _, (field, _, kind) in _of("journalfield")
+        if field == "patch"
+    ]
+    unattributable = [(rel, ln) for rel, ln, kind in rows if kind is None]
+    assert not unattributable, (
+        "a `patch` field is journalled at a site whose KIND this scan cannot read, so "
+        "JOURNAL_PATCH_KINDS below cannot account for it and the by-name drop would be "
+        "inherited with nothing deciding it. Spell the kind as a literal at the write, "
+        f"or move the field: {unattributable}"
+    )
+    scanned = {kind for _, _, kind in rows}
+    assert scanned == JOURNAL_PATCH_KINDS, (
+        "the journal kinds carrying a `patch` field and JOURNAL_PATCH_KINDS disagree. "
+        "`patch` is routed by NAME, so a new kind inherits the drop silently. Decide "
+        "here that the drop is right for it (or that the field belongs elsewhere), then "
+        "carry the decision to every surface that enumerates these kinds: this test, "
+        "`JOURNAL_PATCH_KINDS`' own comment, `diagnostics._JOURNAL_DROP_FIELDS`' "
+        "comment, and `tests/test_diagnostics.py::_PATCH_PATH_ROUTING_ROWS`, which "
+        "asserts the drop per kind at the routing seam and stays green on its own; "
+        f"undeclared: {sorted(scanned - JOURNAL_PATCH_KINDS)}, "
+        f"stale: {sorted(JOURNAL_PATCH_KINDS - scanned)}"
+    )
+    assert "patch" in diagnostics._JOURNAL_DROP_FIELDS, (
+        "`patch` left `_JOURNAL_DROP_FIELDS`: every kind in JOURNAL_PATCH_KINDS now "
+        "ships an operator-selected patch path, and `scrub_json`'s fallback is the "
+        "IDENTITY on a bare feature- or spec-named one."
     )
 
 
@@ -5307,9 +5583,10 @@ def test_journal_kind_literal_reads_a_splat_dynamic_kind():
     the journal with no `JOURNAL_KINDS` row while the completeness assertion stayed
     green.
 
-    The three unresolvable rows are the fail-loud half — a splat over a Name, a
-    non-literal `kind` value, and a non-static key — each yielding a kind no row can
-    declare, so the inventory reddens naming the site rather than under-reporting.
+    The rows expecting `UNRESOLVED_DYNAMIC_KIND` are the fail-loud half — a splat over
+    a Name, a non-literal `kind` value, a non-static or `{**other}` key wherever it sits
+    — each yielding a kind no row can declare, so the inventory reddens naming the site
+    rather than under-reporting.
 
     Ablation: delete the `kw.arg is None` branch from the `node.keywords` loop and
     every row here reddens."""
@@ -5577,6 +5854,139 @@ def test_journal_kind_literal_positional_arm_stays_silent_on_lookalikes():
         f[4] for f in _scan_source(forwarder, "plugins/bus.py") if f[0] == "journalkindliteral"
     ]
     assert found == ["plugin-hook"], found
+
+
+# The doubly-declared site DW-109 names: `plugins/bus.py::_log` is in
+# `JOURNAL_SPLAT_ALLOW` (its `**fields` is an accepted hole) AND in
+# `JOURNAL_DYNAMIC_KIND_ALLOW` (its kind is a parameter), so both arms that would
+# otherwise grade a splat-carried kind are waived there at once.
+_DOUBLY_DECLARED_FORWARDER = "def _log(self, kind, **fields):\n"
+
+
+def test_journal_write_reads_a_keyword_or_splat_kind():
+    """Read keyword kinds only over an EMPTY positional slot, preserving literalness.
+
+    At plugins/bus.py::_log both dynamic-kind and splat waivers apply, so the recovered
+    kind must independently reach the inventory. Filled, unreadable, and starred
+    positional slots retain their existing behavior and never consult keywords.
+
+    Ablation: delete the empty-slot keyword branch and keyword rows fail; remove the
+    empty-slot gate and unreadable/starred rows fail, as does the real _log write."""
+    for source, rel, kinds in (
+        # DW-109's shape, at the doubly-declared position.
+        (
+            _DOUBLY_DECLARED_FORWARDER + '    self._journal.append(**{"kind": "brand-new-kind"})\n',
+            "plugins/bus.py",
+            ["brand-new-kind"],
+        ),
+        # An unreadable splat over an empty slot is the sentinel, never silence: no row
+        # can declare it, so the inventory reddens naming the site.
+        (
+            "def f(self):\n    self._journal.append(**fields)\n",
+            "engine.py",
+            [UNRESOLVED_DYNAMIC_KIND],
+        ),
+        ('def f(self):\n    self._journal.append(kind="lit")\n', "engine.py", ["lit"]),
+        (
+            "def f(self):\n    self._journal.append(kind=chosen)\n",
+            "engine.py",
+            [UNRESOLVED_DYNAMIC_KIND],
+        ),
+        # A READABLE splat carrying no `kind` key is a statement that no kind is
+        # spelled — the third answer `_splat_kind_literal` exists to give — so nothing
+        # is inventoried and nothing is invented.
+        (
+            'def f(self):\n    self._journal.append(**{"story_key": s})\n',
+            "engine.py",
+            [],
+        ),
+        # A starred slot is occupied-but-unreadable, never EMPTY. Both keyword
+        # spellings remain unconsulted at the doubly-declared position.
+        (
+            _DOUBLY_DECLARED_FORWARDER + '    self._journal.append(*args, **{"kind": "x"})\n',
+            "plugins/bus.py",
+            [],
+        ),
+        (
+            _DOUBLY_DECLARED_FORWARDER + '    self._journal.append(*args, kind="x")\n',
+            "plugins/bus.py",
+            [],
+        ),
+        # TWO kinds through the one channel — the shape `_journal_keyword_kinds` returns
+        # a list for. The call cannot legally ship both, but the scan cannot see which
+        # `**fields` carries, so collapsing to the readable half would let an undeclared
+        # kind through; both are inventoried and the sentinel fails loud.
+        (
+            'def f(self):\n    self._journal.append(kind="lit", **fields)\n',
+            "engine.py",
+            ["lit", UNRESOLVED_DYNAMIC_KIND],
+        ),
+        # A readable literal slot. This row pins the pre-existing OUTER branch — a
+        # readable kind is reported as itself and nothing else is consulted — not the
+        # new gate, which the outer `if kind is None` never reaches here.
+        (
+            'def f(self):\n    self._journal.append("epic-boundary", **fields)\n',
+            "engine.py",
+            ["epic-boundary"],
+        ),
+        # The gate's discriminating row: a slot genuinely FILLED with an unreadable
+        # expression still owns the kind, so the `journalkind` arm reports the site and
+        # `**fields` mints no sentinel. This is the real tree's shape.
+        (
+            _DOUBLY_DECLARED_FORWARDER + "    self._journal.append(kind, **fields)\n",
+            "plugins/bus.py",
+            [],
+        ),
+    ):
+        found = [f[4] for f in _scan_source(source, rel) if f[0] == "journalkindliteral"]
+        assert found == kinds, f"extracted {found} from:\n{source}"
+
+    # The `journalkind` finding is still emitted BESIDE a keyword-spelled kind, and
+    # that is deliberate: whether a POSITION may be dynamic stays the literalness arm's
+    # question, so a keyword-spelled kind is refused outside a declared position exactly
+    # as before. Pinned here because the rows above read `journalkindliteral` only, and
+    # dropping the co-emission would silently widen the literalness waiver.
+    both = [
+        (f[0], f[4])
+        for f in _scan_source('def f(self):\n    self._journal.append(kind="lit")\n', "engine.py")
+        if f[0].startswith("journalkind")
+    ]
+    assert both == [("journalkind", "f"), ("journalkindliteral", "lit")], both
+
+    # The reason this matters, asserted end to end rather than left to the emit: the
+    # recovered kind has to reach the inventory's UNDECLARED arm, which is the only
+    # thing that reddens CI. Graded at the doubly-declared position, so the assertion
+    # is exactly the one both waivers used to swallow.
+    undeclared, _ = _journal_kind_inventory_drift(
+        [
+            f
+            for f in _scan_source(
+                _DOUBLY_DECLARED_FORWARDER
+                + '    self._journal.append(**{"kind": "brand-new-kind"})\n',
+                "plugins/bus.py",
+            )
+            if f[0] == "journalkindliteral"
+        ]
+    )
+    assert [(rel, kind) for rel, _, _, kind in undeclared] == [
+        ("plugins/bus.py", "brand-new-kind")
+    ], undeclared
+    # Anti-vacuity: the assertion above is only interesting because the kind is not a
+    # declared row AND the position is doubly waived. Both are pinned here so a future
+    # edit to either declaration cannot quietly make this test pass for free.
+    assert "brand-new-kind" not in JOURNAL_KINDS
+    assert ("plugins/bus.py", "_log") in JOURNAL_SPLAT_ALLOW
+    assert ("plugins/bus.py", "_log") in JOURNAL_DYNAMIC_KIND_ALLOW
+
+
+def test_journal_write_preserves_sentinel_spelled_literal():
+    """Resolver sentinel equality must not reclassify a positional AST literal."""
+    line = f"    self._journal.append({UNRESOLVED_DYNAMIC_KIND!r}, patch=path)"
+    findings = _scan_source(f"def f(self):\n{line}\n", "engine.py")
+    assert findings == [
+        ("journalkindliteral", "engine.py", 2, line, UNRESOLVED_DYNAMIC_KIND),
+        ("journalfield", "engine.py", 2, line, ("patch", "f", UNRESOLVED_DYNAMIC_KIND)),
+    ]
 
 
 def test_journal_routing_tables_are_read_from_diagnostics():

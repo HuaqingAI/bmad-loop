@@ -345,6 +345,19 @@ _JOURNAL_DROP_FIELDS = frozenset(
         # `story_key` already correlates these records, so aliasing adds no value;
         # drop it because the fallback redacts separator-bearing paths but lets a
         # bare feature- or spec-named patch through verbatim.
+        #
+        # This set routes by field NAME, so the drop reaches EVERY kind spelling
+        # `patch`, not only the operator-selected restore pair the sentence above
+        # describes: `stale-restore-unparseable` and `stale-restore-excluded`
+        # (`runs.py`), `attempt-restore-failed` and `attempt-restored`
+        # (`recovery_flow.py`), and `unit-closed` (`worktree_flow.py`). The drop is
+        # the right answer on each of them for the same reason — each carries a path
+        # the fallback cannot be relied on to redact — but the reach is a property of
+        # the rule, not of that reasoning, so a FURTHER kind would inherit it silently.
+        # `tests/test_portability_guard.py::JOURNAL_PATCH_KINDS` pins the list and
+        # reddens when a producer joins or leaves it; when it does, this comment and
+        # `tests/test_diagnostics.py::_PATCH_PATH_ROUTING_ROWS` — which asserts the
+        # drop per kind at the routing seam — both need updating by hand.
         "patch",
         # The absolute deferred-stash target embeds the run directory, story key,
         # and spec filename. Drop rather than create a second spec correlation;
