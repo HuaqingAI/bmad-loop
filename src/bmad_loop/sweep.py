@@ -1692,29 +1692,89 @@ class SweepEngine(Engine):
             answer = answers.get(decision.id)
             if not answer or answer.get("effect") != "build":
                 continue
-            # An in-run answer maps cleanly to a current option; a pre-answer
-            # (answered out of band against an earlier triage) may not — a fresh
-            # triage can renumber options — so fall back to the stored option
-            # semantics carried in the answer itself.
-            option = decision.option(str(answer.get("key")))
-            intent = (option.intent if option else "") or str(answer.get("intent", ""))
+            # `Decision.option` matches on KEY ALONE, and a key is a position in a
+            # list a later triage re-authors freely: `_ensure_triage` mints a fresh
+            # `triage-<n>.json` per repeat cycle while `answers` persists for the
+            # whole run in `<run>/decisions.json`, and a pre-answer is resolved
+            # against a triage minted after it was recorded. Either lane can hand
+            # this loop ONE question's answer beside a DIFFERENT question's option
+            # (DW-118: a stored `build` answer keyed "1" met a fresh option "1"
+            # spelled "Close as decayed", and the bundle shipped the stale intent
+            # under the close label). `label` + `effect` is the whole agreement
+            # test — the only two fields BOTH provenances always carry — and a
+            # disagreeing option is discarded outright: it contributes no field and
+            # the mismatch is journaled the way `sweep-bundle-name-discarded` is.
+            # ONE spelling of the key for the whole loop body: the lookup, the
+            # mismatch record and the note below must name the same string, and
+            # `str(answer.get("key"))` stringified a missing key to the literal
+            # "None" while the record spelled it "".
+            answer_key = str(answer.get("key", ""))
+            option = decision.option(answer_key)
+            matched = option is not None
+            if option is not None and (
+                option.label != str(answer.get("label", ""))
+                or option.effect != str(answer.get("effect", ""))
+            ):
+                # No triage prose in the record (labels, questions): the fields are
+                # a closed effect enum and a bare boolean. The answer's own
+                # `effect` is NOT journaled — the loop `continue`s above unless it
+                # is "build", so it is invariant here and discriminates nothing.
+                self.journal.append(
+                    "sweep-decision-option-mismatch",
+                    decision=decision.id,
+                    key=answer_key,
+                    option_effect=option.effect,
+                    label_matched=option.label == str(answer.get("label", "")),
+                )
+                option = None
+                matched = False
+            # The stored answer is the PAYLOAD; an agreeing option fills only what
+            # the answer omits (`answer or option`, not the reverse). That single
+            # expression routes both provenances without a provenance flag:
+            # `record_pre_answer` stores the chosen option's full semantics and
+            # `validate_triage` requires `intent` on every build option, so a build
+            # PRE-answer always carries its own intent and never picks up prose
+            # freshly re-authored by a triage the human never read; an IN-RUN
+            # answer is written with only key/label/effect/answered_at, so it draws
+            # intent and bundle_name from the option — but only an agreeing one.
+            intent = str(answer.get("intent", "")) or (option.intent if option else "")
             if not intent:
+                # A stale in-run answer: nothing to build from. Dropping it is the
+                # only safe action here — `_apply_decision_effect` already wrote
+                # this decision's ledger line in the cycle that answered it, so
+                # re-asking or re-applying would double-apply — but a recorded
+                # human `build` decision must not vanish on a journal line alone.
+                # The ledger entry is untouched, so the next sweep re-triages and
+                # re-asks it through `_decisions_phase`.
+                self.journal.append("sweep-decision-answer-dropped", decision=decision.id)
+                gates.notify(
+                    self.policy,
+                    self.run_dir,
+                    f"decision {decision.id}: recorded build decision discarded",
+                    "its triage option changed and the stored answer carries no "
+                    "intent of its own — the entry stays open for the next sweep",
+                )
                 continue
-            label = (option.label if option else "") or str(answer.get("label", "")) or "build"
-            bundle_name = (option.bundle_name if option else "") or str(
-                answer.get("bundle_name", "")
+            label = str(answer.get("label", "")) or (option.label if option else "") or "build"
+            bundle_name = str(answer.get("bundle_name", "")) or (
+                option.bundle_name if option else ""
             )
-            # A pre-answer's bundle_name never passed `validate_triage` — it was
+            # A stored answer's bundle_name never passed `validate_triage` — it was
             # answered out of band against an earlier triage, and a fresh one can
-            # renumber or drop the option it named — so this fallback lane was the
-            # one route by which a name failing the two option-site gates (#637)
-            # still reached `_write_intent` as a directory. Gate it with the same
-            # two rules, but by DISCARD rather than by error: the human's build
-            # decision is the payload and `decision-<id>` below is the always-legal
-            # name it falls back to anyway, so the discard is journaled the way
-            # `_normalize_bundle_names`'s repairs are and the sweep proceeds.
+            # renumber or drop the option it named — so this lane was the one route
+            # by which a name failing the two option-site gates (#637) still reached
+            # `_write_intent` as a directory. Gate it with the same two rules, plus
+            # the THIRD rule that site enforces as `duplicate bundle name`: a stored
+            # name equal to one already on this list makes both bundles hash to one
+            # `_bundle_key` and share one intent directory, so one of them is
+            # silently lost. All three by DISCARD rather than by error: the human's
+            # build decision is the payload and `decision-<id>` below is the
+            # always-legal name it falls back to anyway, so the discard is journaled
+            # the way `_normalize_bundle_names`'s repairs are and the sweep proceeds.
             if bundle_name and (
-                not BUNDLE_NAME_RE.match(bundle_name) or safe_segment(bundle_name) != bundle_name
+                not BUNDLE_NAME_RE.match(bundle_name)
+                or safe_segment(bundle_name) != bundle_name
+                or any(b.name == bundle_name for b in bundles)
             ):
                 self.journal.append(
                     "sweep-bundle-name-discarded",
@@ -1722,7 +1782,7 @@ class SweepEngine(Engine):
                     original=bundle_name,
                 )
                 bundle_name = ""
-            key = (option.key if option else "") or str(answer.get("key", "")) or "?"
+            key = (option.key if option else "") or answer_key or "?"
             name = bundle_name or "decision-" + decision.id.lower()
             bundles.append(
                 Bundle(
@@ -1732,6 +1792,15 @@ class SweepEngine(Engine):
                     decision_note=(
                         f"The human chose option {key} ({label}) for the "
                         f"question: {decision.question}"
+                        if matched
+                        # Never quote `decision.question` here: the option this
+                        # answer names has since been re-authored, so the question
+                        # now on file is not the one the human answered.
+                        else f"The human chose option {key} ({label}) against an "
+                        f"earlier triage of {decision.id}, whose options have "
+                        "since changed. The stored answer's own intent above is "
+                        "the contract; the question now on file is not the one "
+                        "it answered."
                     ),
                 )
             )

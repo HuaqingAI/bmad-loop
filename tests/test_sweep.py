@@ -140,6 +140,12 @@ def ledger_entries(project) -> dict:
     }
 
 
+def _mismatches(engine) -> list[dict]:
+    """Every `sweep-decision-option-mismatch` record the run wrote, in order."""
+    records = [json.loads(line) for line in journal_text(engine).splitlines() if line.strip()]
+    return [r for r in records if r.get("kind") == "sweep-decision-option-mismatch"]
+
+
 # ------------------------------------------------------- validate_triage
 
 _OVERLONG_BUNDLE_NAME = "integration-double-checkout-shared-client"
@@ -3188,6 +3194,17 @@ def test_interactive_decisions_build_and_close(project):
     assert "chore(sweep): record deferred-work decisions" in git(
         project.project, "log", "--oneline"
     )
+    # DW-118 row 1 — the IN-RUN lane against the very triage it answered. An
+    # in-run answer is written with only key/label/effect/answered_at, so the
+    # agreeing option is what supplies `intent` at all; the note quotes the
+    # question the human actually saw, and nothing is journaled as mismatched.
+    assert _mismatches(engine) == []
+    intent_md = (engine.run_dir / "bundles" / "decision-dw-1" / "intent.md").read_text(
+        encoding="utf-8"
+    )
+    assert "widen the field" in intent_md  # only the option carries it
+    assert "build the widening?" in intent_md  # the current question, quoted
+    assert "against an earlier triage" not in intent_md
 
 
 def _close_decision_plan():
@@ -3459,6 +3476,18 @@ def test_preanswered_build_materializes_bundle_unattended(project):
     # consumed: the entry left the open set, so its pre-answer is pruned
     assert decisions.load_pre_answers(project.project) == {}
     assert '"decision-preanswers-pruned"' in journal
+    # DW-118 row 8 — the key resolved to NO option, so there is no option to
+    # describe and nothing is journaled as mismatched; the note still takes the
+    # earlier-triage wording, since this answer was made against a triage whose
+    # options are gone. Ablation: journal the record unconditionally and the
+    # first assert reddens; keep the single matched-note wording and the last.
+    assert _mismatches(engine) == []
+    intent_md = (engine.run_dir / "bundles" / "decision-dw-1" / "intent.md").read_text(
+        encoding="utf-8"
+    )
+    assert "widen the field" in intent_md
+    assert "fresh intent" not in intent_md
+    assert "against an earlier triage of DW-1" in intent_md
 
 
 def test_preanswered_bundle_name_failing_the_segment_gate_is_discarded(project):
@@ -3516,6 +3545,750 @@ def test_preanswered_bundle_name_failing_the_segment_gate_is_discarded(project):
     assert '"nul"' in journal  # the discard names the spelling it dropped
     assert engine.state.tasks["dw-decision-dw-1"].phase == Phase.DONE
     assert "dw-nul" not in engine.state.tasks  # the raw name minted nothing
+
+
+def test_stale_preanswer_meeting_a_close_option_keeps_its_own_semantics(project):
+    """DW-118: `Decision.option` matches on KEY ALONE, and a key is a position in
+    a list a later triage re-authors freely, so a renumbering re-triage hands this
+    loop one question's stored answer beside another question's option. On the
+    real DW-55 a stored `build` answer keyed "1" met a fresh option "1" spelled
+    "Close as decayed": the bundle shipped the stale review intent under the close
+    label and quoted a question the human never answered. The label/effect
+    agreement check now discards the option outright — it contributes no field —
+    and the note says the choice was made against an earlier triage. Ablation:
+    delete the agreement check and this reddens twice over — `label` takes the
+    fresh option's "Close as decayed" and the note interpolates `decision.question`
+    back into `intent.md`."""
+    from bmad_loop import decisions
+    from bmad_loop.sweep import DecisionOption
+
+    write_ledger(project, {"DW-1": "open"})
+    decisions.record_pre_answer(
+        project.project,
+        "DW-1",
+        DecisionOption(
+            key="1",
+            label="Run the follow-up review",
+            effect="build",
+            intent="re-run the follow-up review over the seam",
+        ),
+        date="2026-06-12",
+    )
+    plan = triage_result(
+        ["DW-1"],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {"key": "1", "label": "Close as decayed", "effect": "close"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+                question="has this entry decayed past usefulness?",
+            )
+        ],
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "decision-dw-1", ["DW-1"]),
+            bundle_review_effect(project, "decision-dw-1"),
+        ],
+        prompting=False,
+    )
+    summary = engine.run()
+    assert not summary.paused
+
+    intent_md = (engine.run_dir / "bundles" / "decision-dw-1" / "intent.md").read_text(
+        encoding="utf-8"
+    )
+    assert "re-run the follow-up review over the seam" in intent_md  # the STORED intent
+    assert "Run the follow-up review" in intent_md  # the STORED label
+    assert "Close as decayed" not in intent_md  # never the non-matching option's
+    assert "decayed past usefulness" not in intent_md  # nor the question it never answered
+    assert "against an earlier triage of DW-1" in intent_md
+    [record] = _mismatches(engine)
+    assert record["decision"] == "DW-1"
+    assert record["key"] == "1"
+    assert record["option_effect"] == "close"
+    assert record["label_matched"] is False
+
+
+def test_stale_preanswer_meeting_a_different_build_option_keeps_its_own_intent(project):
+    """The harm class is not "a build answer met a close option" — it is a
+    DIFFERENT option's fields reaching the bundle. Two build options renumbered
+    against each other is the case a `effect`-only check would miss entirely: both
+    sides say `build`, so only the label clause separates them, and the dev
+    session would otherwise be dispatched to narrow a field the human asked to
+    widen. Ablation: delete the agreement check and `intent` takes the fresh
+    option's "narrow the field" (the old precedence preferred a non-empty option
+    field), so both intent asserts flip."""
+    from bmad_loop import decisions
+    from bmad_loop.sweep import DecisionOption
+
+    write_ledger(project, {"DW-1": "open"})
+    decisions.record_pre_answer(
+        project.project,
+        "DW-1",
+        DecisionOption(key="1", label="Widen", effect="build", intent="widen the field"),
+        date="2026-06-12",
+    )
+    plan = triage_result(
+        ["DW-1"],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {
+                        "key": "1",
+                        "label": "Narrow",
+                        "effect": "build",
+                        "intent": "narrow the field",
+                    },
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "decision-dw-1", ["DW-1"]),
+            bundle_review_effect(project, "decision-dw-1"),
+        ],
+        prompting=False,
+    )
+    summary = engine.run()
+    assert not summary.paused
+
+    intent_md = (engine.run_dir / "bundles" / "decision-dw-1" / "intent.md").read_text(
+        encoding="utf-8"
+    )
+    assert "widen the field" in intent_md
+    assert "narrow the field" not in intent_md
+    assert "Narrow" not in intent_md
+    [record] = _mismatches(engine)
+    assert record["option_effect"] == "build"
+    assert record["label_matched"] is False
+
+
+def test_stale_preanswer_mismatching_on_effect_alone_is_still_non_matching(project):
+    """`validate_triage` normalizes an absent option label to its KEY, so when
+    both triages omit the label the label clause degenerates to key equality and
+    the `effect` clause is the only discriminator left. This row drives that
+    clause on its own: identical labels, `build` re-authored to `close`. Ablation:
+    delete `or option.effect != str(answer.get("effect", ""))` and this reddens
+    while every other mismatch row here stays green — they all differ on `label`
+    too. (The stored intent still reaches the bundle either way; what the ablation
+    loses is the record and the earlier-triage note wording.)"""
+    from bmad_loop import decisions
+    from bmad_loop.sweep import DecisionOption
+
+    write_ledger(project, {"DW-1": "open"})
+    decisions.record_pre_answer(
+        project.project,
+        "DW-1",
+        DecisionOption(key="1", label="Handle it", effect="build", intent="handle the seam"),
+        date="2026-06-12",
+    )
+    plan = triage_result(
+        ["DW-1"],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    # SAME label, re-authored effect: only the effect clause can see it
+                    {"key": "1", "label": "Handle it", "effect": "close"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+                question="is this seam still worth handling?",
+            )
+        ],
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "decision-dw-1", ["DW-1"]),
+            bundle_review_effect(project, "decision-dw-1"),
+        ],
+        prompting=False,
+    )
+    summary = engine.run()
+    assert not summary.paused
+
+    [record] = _mismatches(engine)
+    assert record["label_matched"] is True  # the label agreed; the effect did not
+    assert record["option_effect"] == "close"
+    intent_md = (engine.run_dir / "bundles" / "decision-dw-1" / "intent.md").read_text(
+        encoding="utf-8"
+    )
+    assert "handle the seam" in intent_md  # a mismatch never suppresses a buildable bundle
+    assert "against an earlier triage of DW-1" in intent_md
+    assert "still worth handling" not in intent_md
+
+
+def test_preanswer_agreeing_with_a_reworded_option_keeps_the_prose_the_human_chose(project):
+    """Field-presence precedence: the stored answer is the payload, so an AGREEING
+    option fills only the fields the answer omits. Every triage session authors
+    fresh prose, so an option that still agrees on label and effect routinely
+    carries a rewritten `intent`/`bundle_name` the human never read — and under
+    the old `option_field or answer_field` order that rewrite is what the dev
+    session was dispatched on. Agreement means no mismatch record; it does not
+    mean the fresh prose wins. Ablation: restore `(option.intent if option else
+    "") or str(answer.get("intent", ""))` and this reddens — `intent.md` takes
+    "REWRITTEN" and the bundle is minted as `rewritten-x`, so the `widen-x`
+    session effects below never match."""
+    from bmad_loop import decisions
+    from bmad_loop.sweep import DecisionOption
+
+    write_ledger(project, {"DW-1": "open"})
+    decisions.record_pre_answer(
+        project.project,
+        "DW-1",
+        DecisionOption(
+            key="1",
+            label="Widen",
+            effect="build",
+            intent="widen the field",
+            bundle_name="widen-x",
+        ),
+        date="2026-06-12",
+    )
+    plan = triage_result(
+        ["DW-1"],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {
+                        "key": "1",
+                        "label": "Widen",  # agrees
+                        "effect": "build",  # agrees
+                        "intent": "REWRITTEN by a later triage",
+                        "bundle_name": "rewritten-x",
+                    },
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+                question="how wide should the field be?",
+            )
+        ],
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "widen-x", ["DW-1"]),
+            bundle_review_effect(project, "widen-x"),
+        ],
+        prompting=False,
+    )
+    summary = engine.run()
+    assert not summary.paused
+
+    assert _mismatches(engine) == []  # the option agreed; nothing to journal
+    assert not (engine.run_dir / "bundles" / "rewritten-x").exists()
+    intent_md = (engine.run_dir / "bundles" / "widen-x" / "intent.md").read_text(encoding="utf-8")
+    assert "widen the field" in intent_md
+    assert "REWRITTEN" not in intent_md
+    # an agreeing option keeps the current-question note wording
+    assert "how wide should the field be?" in intent_md
+    assert "against an earlier triage" not in intent_md
+
+
+def test_preanswer_omitting_a_bundle_name_takes_it_from_the_agreeing_option(project):
+    """The accepted seam of field-presence precedence: an agreeing option fills
+    only what the stored answer OMITS, so a pre-answer carrying no `bundle_name`
+    is minted under the option's. That is deliberate — the option agrees on both
+    label and effect, so it is the same option under a re-authored name, and the
+    alternative is the generic `decision-<id>` fallback. It is not the DW-118
+    harm class, which is a DIFFERENT option's fields reaching the bundle.
+    Ablation: make an agreeing option contribute nothing either and the bundle
+    mints as `decision-dw-1`, so the `widen-x` session effects below never match
+    and the run fails verification."""
+    from bmad_loop import decisions
+    from bmad_loop.sweep import DecisionOption
+
+    write_ledger(project, {"DW-1": "open"})
+    decisions.record_pre_answer(
+        project.project,
+        "DW-1",
+        # no bundle_name of its own: the gap the agreeing option fills
+        DecisionOption(key="1", label="Widen", effect="build", intent="widen the field"),
+        date="2026-06-12",
+    )
+    plan = triage_result(
+        ["DW-1"],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {
+                        "key": "1",
+                        "label": "Widen",  # agrees
+                        "effect": "build",  # agrees
+                        "intent": "fresh intent",
+                        "bundle_name": "widen-x",
+                    },
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "widen-x", ["DW-1"]),
+            bundle_review_effect(project, "widen-x"),
+        ],
+        prompting=False,
+    )
+    summary = engine.run()
+    assert not summary.paused
+
+    assert _mismatches(engine) == []  # the option agreed
+    assert engine.state.tasks["dw-widen-x"].phase == Phase.DONE  # the OPTION's name
+    assert not (engine.run_dir / "bundles" / "decision-dw-1").exists()
+    intent_md = (engine.run_dir / "bundles" / "widen-x" / "intent.md").read_text(encoding="utf-8")
+    assert "widen the field" in intent_md  # the intent the answer DID carry still wins
+    assert "fresh intent" not in intent_md
+
+
+def test_stale_in_run_answer_across_repeat_cycles_is_dropped_and_notified(project):
+    """The cross-cycle IN-RUN lane, which no pre-answer test reaches: `_cycle`
+    calls `_ensure_triage` per repeat cycle (a fresh, renumberable `triage-2.json`)
+    while `answers` persists for the whole run in `<run>/decisions.json`, so a
+    cycle-1 in-run answer is replayed against cycle-2's options. An in-run answer
+    is written with only key/label/effect/answered_at, so once the disagreeing
+    option is discarded there is nothing left to build from. Re-asking here would
+    double-apply `_apply_decision_effect` (cycle 1 already wrote the ledger's
+    decision line), so the answer is dropped — but a recorded human `build`
+    decision must not vanish on a journal line alone, hence the dedicated record
+    plus `gates.notify`, and the entry stays open for the next sweep to re-ask.
+    `max_bundles=1` is what keeps DW-1 open into cycle 2: cycle 1's decision
+    bundle is truncated behind the plan bundle. Ablation: delete the
+    `sweep-decision-answer-dropped` + notify block and both the record and the
+    ATTENTION assert redden."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    plan1 = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[{"name": "safe-fix", "dw_ids": ["DW-2"], "intent": "a"}],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {"key": "1", "label": "Widen", "effect": "build", "intent": "widen the field"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    plan2 = triage_result(
+        ["DW-1"],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    # cycle 2 renumbered: key "1" is now a different question's answer
+                    {"key": "1", "label": "Close as decayed", "effect": "close"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan1),
+            bundle_dev_effect(project, "safe-fix", ["DW-2"]),
+            bundle_review_effect(project, "safe-fix"),
+            triage_effect(plan2),
+        ],
+        policy=repeat_policy(max_bundles=1),
+        answers=["1"],
+        prompting=True,
+    )
+    summary = engine.run()
+    assert not summary.paused
+
+    journal = journal_text(engine)
+    # PRECONDITION: the in-run answer was recorded, and cycle 1 truncated its bundle
+    assert '"decision-answered"' in journal
+    assert '"sweep-bundles-truncated"' in journal
+    [record] = _mismatches(engine)
+    assert record["decision"] == "DW-1" and record["option_effect"] == "close"
+    assert record["label_matched"] is False
+    assert '"sweep-decision-answer-dropped"' in journal
+    assert not any(k.startswith("dw2-") for k in engine.state.tasks)  # cycle 2 built nothing
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert "recorded build decision discarded" in attention
+    assert ledger_entries(project)["DW-1"].open  # re-asked by the next sweep
+
+
+def test_non_matching_answers_bundle_name_still_faces_the_segment_gate(project):
+    """The `bundle_name` discard gate (#637) runs over whatever name survives the
+    agreement check, not only over the pre-existing key-not-found lane. This row
+    drives it through the label/effect mismatch lane: the key DOES resolve, the
+    option disagrees, so the stored `nul` is the surviving name and must still be
+    discarded down to `decision-<id>`. Ablation: drop the two-rule gate and the
+    bundle materializes as `nul`, so the `decision-dw-1` effects below never match
+    and the run fails verification."""
+    from bmad_loop import decisions
+    from bmad_loop.sweep import DecisionOption
+
+    write_ledger(project, {"DW-1": "open"})
+    decisions.record_pre_answer(
+        project.project,
+        "DW-1",
+        DecisionOption(
+            key="1", label="Widen", effect="build", intent="widen the field", bundle_name="nul"
+        ),
+        date="2026-06-12",
+    )
+    plan = triage_result(
+        ["DW-1"],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    # same key, different label: resolves, then disagrees
+                    {"key": "1", "label": "Narrow", "effect": "build", "intent": "narrow it"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "decision-dw-1", ["DW-1"]),
+            bundle_review_effect(project, "decision-dw-1"),
+        ],
+        prompting=False,
+    )
+    summary = engine.run()
+    assert not summary.paused
+
+    journal = journal_text(engine)
+    assert len(_mismatches(engine)) == 1  # PRECONDITION: the mismatch lane, not key-not-found
+    assert '"sweep-bundle-name-discarded"' in journal
+    assert '"nul"' in journal
+    assert engine.state.tasks["dw-decision-dw-1"].phase == Phase.DONE
+    assert "dw-nul" not in engine.state.tasks
+
+
+def test_non_matching_answer_that_builds_closes_its_entry_and_is_pruned(project):
+    """A mismatch changes which fields the bundle is built from — nothing else. A
+    non-matching answer that still carries its own intent runs the full pipeline,
+    so the ledger entry closes and the consumed pre-answer is pruned exactly as a
+    matching one's is; the human's `build` decision stands and only the current
+    triage's option is discarded. Driven through the label/effect mismatch lane
+    (the key resolves), not the pre-existing key-not-found lane. Ablation: make
+    the mismatch `continue` instead of discarding the option and DW-1 stays open
+    with its pre-answer still in the store."""
+    from bmad_loop import decisions
+    from bmad_loop.sweep import DecisionOption
+
+    write_ledger(project, {"DW-1": "open"})
+    decisions.record_pre_answer(
+        project.project,
+        "DW-1",
+        DecisionOption(key="1", label="Widen", effect="build", intent="widen the field"),
+        date="2026-06-12",
+    )
+    plan = triage_result(
+        ["DW-1"],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {"key": "1", "label": "Close as decayed", "effect": "close"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "decision-dw-1", ["DW-1"]),
+            bundle_review_effect(project, "decision-dw-1"),
+        ],
+        prompting=False,
+    )
+    summary = engine.run()
+    assert not summary.paused
+
+    assert len(_mismatches(engine)) == 1  # PRECONDITION: the mismatch lane
+    assert engine.state.tasks["dw-decision-dw-1"].phase == Phase.DONE
+    assert ledger_entries(project)["DW-1"].status.startswith("done")
+    assert decisions.load_pre_answers(project.project) == {}
+    assert '"decision-preanswers-pruned"' in journal_text(engine)
+
+
+def test_stale_in_run_answer_whose_option_vanished_is_dropped_without_a_mismatch(project):
+    """The other cross-cycle shape: cycle 2 DROPS the option instead of renumbering
+    it, so the key resolves to nothing. There is no option to describe, so no
+    `sweep-decision-option-mismatch` is written — but the in-run answer still
+    carries no `intent`, so the drop lane fires and the operator is told. This is
+    a behavior change on a lane that used to `continue` in silence, and it is the
+    one drop shape the renumbering row above cannot reach. Ablation: delete the
+    `sweep-decision-answer-dropped` + notify block and both the record and the
+    ATTENTION assert redden, while the empty-mismatch assert stays green."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    plan1 = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[{"name": "safe-fix", "dw_ids": ["DW-2"], "intent": "a"}],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {"key": "1", "label": "Widen", "effect": "build", "intent": "widen the field"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    plan2 = triage_result(
+        ["DW-1"],
+        decisions=[
+            # the answered option is GONE from cycle 2, not renumbered onto
+            _decision(
+                "DW-1",
+                # a decision needs two options; the answered key "1" is not one
+                [
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                    {"key": "3", "label": "Close as decayed", "effect": "close"},
+                ],
+                recommendation="2",  # key "1" is gone, so it cannot be recommended either
+            ),
+        ],
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan1),
+            bundle_dev_effect(project, "safe-fix", ["DW-2"]),
+            bundle_review_effect(project, "safe-fix"),
+            triage_effect(plan2),
+        ],
+        policy=repeat_policy(max_bundles=1),
+        answers=["1"],
+        prompting=True,
+    )
+    summary = engine.run()
+    assert not summary.paused
+
+    journal = journal_text(engine)
+    assert '"sweep-bundles-truncated"' in journal  # PRECONDITION: DW-1 survived cycle 1
+    assert _mismatches(engine) == []  # no option resolved, so nothing to describe
+    assert '"sweep-decision-answer-dropped"' in journal
+    assert not any(k.startswith("dw2-") for k in engine.state.tasks)
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert "recorded build decision discarded" in attention
+    assert ledger_entries(project)["DW-1"].open
+
+
+def test_stale_in_run_answer_never_inherits_a_disagreeing_options_intent(project):
+    """The `option = None` discard is what makes "a non-matching option
+    contributes NO field" true — `matched = False` alone only changes the note
+    wording. Every other mismatch row here stores an answer that already carries
+    the field the disagreeing option could leak, so none of them can see the
+    discard. This one can: the cycle-1 IN-RUN answer carries no `intent` at all,
+    and cycle 2 renumbers key "1" onto a *build* option that does. Ablation:
+    delete `option = None` alone (leaving `matched = False`) and this reddens —
+    `intent` falls through to "narrow the field", a cycle-2 bundle is minted from
+    prose the human never chose, and the dropped record is never written."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    plan1 = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[{"name": "safe-fix", "dw_ids": ["DW-2"], "intent": "a"}],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {"key": "1", "label": "Widen", "effect": "build", "intent": "widen the field"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    plan2 = triage_result(
+        ["DW-1"],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    # renumbered onto a DIFFERENT build option — one that carries the
+                    # very field the in-run answer lacks
+                    {
+                        "key": "1",
+                        "label": "Narrow",
+                        "effect": "build",
+                        "intent": "narrow the field",
+                    },
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan1),
+            bundle_dev_effect(project, "safe-fix", ["DW-2"]),
+            bundle_review_effect(project, "safe-fix"),
+            triage_effect(plan2),
+        ],
+        policy=repeat_policy(max_bundles=1),
+        answers=["1"],
+        prompting=True,
+    )
+    summary = engine.run()
+    assert not summary.paused
+
+    journal = journal_text(engine)
+    assert '"sweep-bundles-truncated"' in journal  # PRECONDITION: DW-1 survived cycle 1
+    [record] = _mismatches(engine)
+    assert record["option_effect"] == "build" and record["label_matched"] is False
+    assert '"sweep-decision-answer-dropped"' in journal
+    assert not any(k.startswith("dw2-") for k in engine.state.tasks)
+    # the discarded option's intent reached no bundle anywhere in the run
+    assert not any(
+        "narrow the field" in f.read_text(encoding="utf-8")
+        for f in engine.run_dir.glob("bundles/*/intent.md")
+    )
+    assert ledger_entries(project)["DW-1"].open
+
+
+def test_disagreeing_options_bundle_name_never_names_the_bundle(project):
+    """The other half of the `option = None` discard: a stored answer that omits
+    `bundle_name` beside a DISAGREEING option that carries one. The omission is
+    legitimate (the fallback is `decision-<id>`), so nothing but the discard stops
+    a different option's directory name from being minted. Ablation: delete
+    `option = None` alone and this reddens — the bundle mints as `narrow-x`, so
+    `dw-decision-dw-1` is never created and the session effects below never
+    match."""
+    from bmad_loop import decisions
+    from bmad_loop.sweep import DecisionOption
+
+    write_ledger(project, {"DW-1": "open"})
+    decisions.record_pre_answer(
+        project.project,
+        "DW-1",
+        # no bundle_name of its own
+        DecisionOption(key="1", label="Widen", effect="build", intent="widen the field"),
+        date="2026-06-12",
+    )
+    plan = triage_result(
+        ["DW-1"],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {
+                        "key": "1",
+                        "label": "Narrow",  # disagrees
+                        "effect": "build",
+                        "intent": "narrow it",
+                        "bundle_name": "narrow-x",
+                    },
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "decision-dw-1", ["DW-1"]),
+            bundle_review_effect(project, "decision-dw-1"),
+        ],
+        prompting=False,
+    )
+    summary = engine.run()
+    assert not summary.paused
+
+    assert len(_mismatches(engine)) == 1  # PRECONDITION: the mismatch lane
+    assert engine.state.tasks["dw-decision-dw-1"].phase == Phase.DONE
+    assert "dw-narrow-x" not in engine.state.tasks
+    assert not (engine.run_dir / "bundles" / "narrow-x").exists()
+    intent_md = (engine.run_dir / "bundles" / "decision-dw-1" / "intent.md").read_text(
+        encoding="utf-8"
+    )
+    assert "widen the field" in intent_md and "narrow it" not in intent_md
+
+
+def test_stored_bundle_name_colliding_with_a_plan_bundle_is_discarded(project):
+    """A stored answer's `bundle_name` never faced `validate_triage`'s `duplicate
+    bundle name` rule (sweep.py:280) that a validated option's name did — and once
+    the stored name wins the blend it can equal a plan bundle's, at which point
+    both `Bundle`s hash to one `_bundle_key` and share one intent directory, so
+    one of them is silently lost. The existing discard gate now carries that third
+    rule, falling back to the always-legal `decision-<id>`. Driven on the AGREEING
+    lane, which is where the precedence flip introduced the hazard. Ablation: drop
+    the collision clause and this reddens — `dw-decision-dw-1` is never minted and
+    `widen-x`'s intent.md carries the decision bundle's intent instead of the plan
+    bundle's."""
+    from bmad_loop import decisions
+    from bmad_loop.sweep import DecisionOption
+
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    decisions.record_pre_answer(
+        project.project,
+        "DW-1",
+        DecisionOption(
+            key="1",
+            label="Widen",
+            effect="build",
+            intent="widen the field",
+            bundle_name="widen-x",  # collides with the plan bundle below
+        ),
+        date="2026-06-12",
+    )
+    plan = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[{"name": "widen-x", "dw_ids": ["DW-2"], "intent": "the plan bundle's intent"}],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    # agrees on label and effect, and carries no name of its own,
+                    # so the stored `widen-x` is what survives the blend
+                    {"key": "1", "label": "Widen", "effect": "build", "intent": "fresh intent"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "widen-x", ["DW-2"]),
+            bundle_review_effect(project, "widen-x"),
+            bundle_dev_effect(project, "decision-dw-1", ["DW-1"]),
+            bundle_review_effect(project, "decision-dw-1"),
+        ],
+        prompting=False,
+    )
+    summary = engine.run()
+    assert not summary.paused
+
+    journal = journal_text(engine)
+    assert _mismatches(engine) == []  # PRECONDITION: the AGREEING lane
+    assert '"sweep-bundle-name-discarded"' in journal
+    assert engine.state.tasks["dw-widen-x"].phase == Phase.DONE
+    assert engine.state.tasks["dw-decision-dw-1"].phase == Phase.DONE  # both bundles survived
+    plan_intent = (engine.run_dir / "bundles" / "widen-x" / "intent.md").read_text(encoding="utf-8")
+    assert "the plan bundle's intent" in plan_intent
+    assert "widen the field" not in plan_intent  # never overwritten by the decision bundle
+    assert ledger_entries(project)["DW-2"].status.startswith("done")
 
 
 def test_preanswered_keep_open_suppresses_prompt_and_persists(project):

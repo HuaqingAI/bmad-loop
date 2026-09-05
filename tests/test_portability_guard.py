@@ -456,6 +456,14 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "items",
         "kept",
         "key",
+        # `sweep-decision-option-mismatch`'s label clause, as a BARE BOOLEAN. The
+        # record exists to say a stored decision answer no longer describes the
+        # option its key resolves to, and the natural spellings of that — the two
+        # labels, the decision's question — are triage prose an LLM authored about
+        # the customer's own backlog, so shipping them here would push that prose
+        # into every diagnostics dump. The boolean says which clause fired
+        # (`False` label, `True` effect-only) and names nothing.
+        "label_matched",
         "ledger",
         # `accepted-spec-delivery-unreachable`'s discriminator: whether the locator
         # RESOLVED a project-local rel, or only reported a swallowed filesystem
@@ -489,6 +497,12 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # — a benign declaration that turned out to be wrong.
         "open",
         "open_now",
+        # `sweep-decision-option-mismatch`'s other discriminator: the CURRENT
+        # option's effect, a closed enum (`DECISION_EFFECTS`: build/close/
+        # keep-open), so it carries no authored text. The answer's own effect is
+        # deliberately not journaled at all — the loop only reaches that site for
+        # "build", so it would discriminate nothing.
+        "option_effect",
         "original",
         "owed_after_implement",
         "phase",
@@ -927,6 +941,8 @@ JOURNAL_KINDS = frozenset(
         "sweep-bundle-skipped",
         "sweep-bundles-truncated",
         "sweep-cycle",
+        "sweep-decision-answer-dropped",
+        "sweep-decision-option-mismatch",
         "sweep-decisions-only",
         "sweep-inflight-redrive",
         "sweep-inflight-stranded",
