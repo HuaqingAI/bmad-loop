@@ -4151,12 +4151,13 @@ def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
         # marker is cleared only once the append has returned: an append that
         # fails leaves it set, so the retry re-enters here and writes the record
         # the move still owes — or, when the operator runs plain `resume` instead,
-        # `cli._prepare_resume_locked` reads the marker as a move, journals it on
-        # its own `run-resume` line and clears it on the same write that persists
-        # the resume. The one residual is a clearing save that fails after
-        # a successful append, which costs a duplicate — true — record on the
-        # retry; a duplicate is recoverable from the journal, a missing record and a
-        # false one are not.
+        # `cli._prepare_resume_locked` discharges it the same way this call does:
+        # its own `rearm-code-root-restamped` append naming the root the marker
+        # still describes, ahead of the re-stamp that overwrites it, cleared on the
+        # same write that persists the resume. The one residual is a clearing save
+        # that fails after a successful append, which costs a duplicate — true —
+        # record on the retry; a duplicate is recoverable from the journal, a
+        # missing record and a false one are not.
         Journal(run_dir).append(
             "rearm-code-root-restamped",
             repo=new,

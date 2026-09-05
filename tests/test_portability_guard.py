@@ -705,6 +705,8 @@ JOURNAL_KINDS = frozenset(
     {
         # cli.py
         "run-resume",
+        # cli.py + runs.py
+        "rearm-code-root-restamped",
         # engine.py
         "board-advance-carried",
         "board-advance-carry-failed",
@@ -843,7 +845,6 @@ JOURNAL_KINDS = frozenset(
         "rearm-baseline-advance-failed",
         "rearm-baseline-restamp-skipped",
         "rearm-baseline-restamped",
-        "rearm-code-root-restamped",
         "rearm-commits-probe-failed",
         "rearm-spec-flip-skipped",
         "rearm-spec-write-unreachable",

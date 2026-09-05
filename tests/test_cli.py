@@ -6094,6 +6094,14 @@ def _resume_entry(run_dir):
     return entry
 
 
+def _restamp_records(run_dir):
+    """Every `rearm-code-root-restamped` row, in journal order — a discharged code-root
+    record debt, never this resume's own re-stamp."""
+    from bmad_loop.journal import Journal
+
+    return [e for e in Journal(run_dir).entries() if e["kind"] == "rearm-code-root-restamped"]
+
+
 def test_resume_restamps_policy_snapshot_before_the_engine_runs(project, monkeypatch):
     """#189: resume reloads policy.toml and enforces it (the per-story budget,
     every SessionSpec) but used to leave the launch-time snapshot in place, so
@@ -6194,6 +6202,9 @@ def test_resume_restamps_the_code_root_when_the_config_moved(project, monkeypatc
     (at_start,) = seen
     assert at_start.code_root == moved.resolve()
     assert _resume_entry(run_dir)["code_root_changed"] is True
+    # A move with no debt behind it discharges nothing: the record below is for an
+    # unlanded `restamp_code_root` row, never for this resume's own re-stamp.
+    assert _restamp_records(run_dir) == []
     err = capsys.readouterr().err
     assert "the code root in _bmad/bmm/config.yaml has changed" in err
     # the warning names neither tree: a journalled scalar, an operator-facing sentence
@@ -6218,39 +6229,159 @@ def test_resume_reports_no_code_root_change_when_the_config_did_not_move(
     assert cli._resume_paused_run(project.project, run_dir) == 0
 
     assert _resume_entry(run_dir)["code_root_changed"] is False
+    assert _restamp_records(run_dir) == []  # no debt, no discharge
     assert "code root" not in capsys.readouterr().err
 
 
-def test_resume_consumes_an_outstanding_code_root_restamp(project, monkeypatch, capsys):
+def test_resume_discharges_an_outstanding_code_root_restamp(project, monkeypatch, capsys):
     """A move `runs.restamp_code_root` persisted whose record never landed reaches
-    resume with the mirror ALREADY agreeing with config — the compare alone reads "no
-    move" on the one gesture that still owes the operator its record and its warning.
+    resume with the mirror ALREADY agreeing with config. The marker is a RECORD DEBT,
+    not a move: resume discharges it with its own `rearm-code-root-restamped` append
+    naming the root the marker still describes, and the compare — which sees mirror and
+    config agreeing, because they do — records `false` and stays quiet. Folding the debt
+    into the `run-resume` boolean instead warned that the code root "has changed since
+    this run started" on a resume whose tree IS the tree the run started in, and
+    answered an A->B debt with a row that names no root at all.
 
-    The intent marker exists so a retry writes that record; the retry may arrive
-    through plain `resume` rather than `resolve`, and a run that finished from here
-    would leave the move unrecorded for good — the audit gap the marker closes. So the
-    marker counts as a move for the `run-resume` line and the stderr warning, and is
-    consumed on the same state write that persists the resume.
-
-    Ablation: drop the `or state.code_root_restamp_pending` half of the compare and this
-    reddens on the journal field (`assert False is True`); drop the clearing line
-    instead and it reddens on the persisted marker.
+    Ablation: delete the `if state.code_root_restamp_pending:` discharge append above
+    `state.repo_root = ...` and this reddens on the empty record list; drop the clearing
+    line instead and it reddens on the persisted marker; restore the retired
+    `or state.code_root_restamp_pending` clause and it reddens on both the `run-resume`
+    field and the absent-warning assertion.
     """
     from bmad_loop.journal import load_state
 
+    root = str(Path(project.project).resolve())
     run_dir = _paused_run_for_resume(
         project,
         monkeypatch,
-        repo_root=str(Path(project.project).resolve()),
+        repo_root=root,
         code_root_restamp_pending=True,
     )
     monkeypatch.setattr(cli, "Engine", _StubEngine)
 
     assert cli._resume_paused_run(project.project, run_dir) == 0
 
-    assert _resume_entry(run_dir)["code_root_changed"] is True
+    records = _restamp_records(run_dir)
+    assert [r["repo"] for r in records] == [root]
+    assert [r["code_root_changed"] for r in records] == [True]
+    # The debt is discharged on its own line; the compare reports the truth beside it.
+    assert _resume_entry(run_dir)["code_root_changed"] is False
     assert load_state(run_dir).code_root_restamp_pending is False
+    assert "code root" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("retry_root", ["was", "third"])
+def test_resume_discharges_the_owed_record_under_the_root_the_marker_names(
+    project, monkeypatch, capsys, retry_root
+):
+    """The owed record names the root the MARKER still describes, never the root config
+    now names. `code_root_restamp_pending` is a bare bool, so `state.repo_root` at entry
+    is the only surviving description of the root an unlanded record was owed for — an
+    operator who re-points `repo_root:` between the failed append and the resume
+    (restoring the original, or moving to a third tree) would otherwise have the owed
+    A->B row answered by a row describing a different move, unreconstructable after the
+    fact. The twin of `runs.restamp_code_root`'s own discharge, and the same reason.
+
+    Ablation: move the discharge append BELOW `state.repo_root = str(paths.repo_root)`
+    and this reddens on the recorded `repo` — it names the config's root, not the
+    marker's; delete the append and it reddens on the empty record list.
+    """
+    from bmad_loop.journal import load_state
+
+    owed = project.project / "owed-code"
+    owed.mkdir()
+    run_dir = _paused_run_for_resume(
+        project,
+        monkeypatch,
+        repo_root=str(owed),
+        code_root_restamp_pending=True,
+    )
+    # After the harness wrote config.yaml: "was" leaves the launch root in place, the
+    # operator having restored it; "third" re-points it at a tree neither side names.
+    again = Path(project.project).resolve() if retry_root == "was" else project.project / "third"
+    if retry_root != "was":
+        again.mkdir()
+        _configure_repo_root(project, again)
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    assert [r["repo"] for r in _restamp_records(run_dir)] == [str(owed)]
+    # The config really did move away from the mirror, so THIS resume is a move too.
+    assert _resume_entry(run_dir)["code_root_changed"] is True
     assert "the code root in _bmad/bmm/config.yaml has changed" in capsys.readouterr().err
+    persisted = load_state(run_dir)
+    assert persisted.repo_root == str(again.resolve())
+    assert persisted.code_root_restamp_pending is False
+
+
+def test_resume_leaves_the_owed_root_and_marker_intact_when_the_discharge_fails(
+    project, monkeypatch, capsys
+):
+    """The at-least-once bargain, driven through the RETRY leg — asserting a retry is
+    possible would pass for every reason the values could still be there.
+
+    The discharge is the FIRST fallible write of the resume: ahead of the `run-resume`
+    row, the pin re-baseline and every state mutation. So an append that raises has
+    left the journal, integrity pin and run state unchanged — no orphan `run-resume`
+    row for the retry to duplicate, and a root and marker still describing the tree
+    the record is owed for — and the retry
+    writes that record, once, under the owed root.
+
+    Ablation: move the discharge append below `journal.append("run-resume", **fields)`
+    and this reddens on the orphan row — the failed attempt leaves a `run-resume` entry
+    behind and the retry makes two. Move it below `save_state` instead and it reddens
+    on the persisted root and marker, the resume being durable while its record is not.
+    Move the integrity-pin write before the discharge and the OLDPIN assertion fails.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import Journal, load_state
+
+    owed = project.project / "owed-code"
+    owed.mkdir()
+    run_dir = _paused_run_for_resume(
+        project,
+        monkeypatch,
+        repo_root=str(owed),
+        code_root_restamp_pending=True,
+    )
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    runs.write_trusted_config_digest(project.project, run_dir.name, "OLDPIN")
+    real_append = Journal.append
+
+    def append_failing_the_discharge(self, kind, **fields):
+        if kind == "rearm-code-root-restamped":
+            raise OSError(30, "Read-only file system")
+        real_append(self, kind, **fields)
+
+    monkeypatch.setattr(Journal, "append", append_failing_the_discharge)
+
+    with pytest.raises(OSError):
+        cli._resume_paused_run(project.project, run_dir)
+
+    assert runs.read_trusted_config_digest(project.project, run_dir.name) == "OLDPIN"
+    persisted = load_state(run_dir)
+    assert persisted.repo_root == str(owed)
+    assert persisted.code_root_restamp_pending is True
+    assert persisted.paused is True
+    # No journal row landed before the failed discharge.
+    assert _restamp_records(run_dir) == []
+    assert _resume_entries(run_dir) == []
+
+    monkeypatch.setattr(Journal, "append", real_append)  # the write surface recovers
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    # The retry writes the owed record, ONCE, under the root the marker still named.
+    assert [r["repo"] for r in _restamp_records(run_dir)] == [str(owed)]
+    # Exactly one `run-resume` row across BOTH attempts — the failed one left none to
+    # duplicate. `True` because the owed root and the config root really do differ
+    # here; the discharge above still names the owed one, not the config's.
+    assert _resume_entry(run_dir)["code_root_changed"] is True
+    assert _resume_entry(run_dir)["security_config_changed"] is True
+    assert "host-exec config pinned at launch has changed" in capsys.readouterr().err
+    assert load_state(run_dir).code_root_restamp_pending is False
 
 
 def test_resume_migrates_a_legacy_state_without_calling_it_a_move(project, monkeypatch, capsys):
@@ -6271,6 +6402,7 @@ def test_resume_migrates_a_legacy_state_without_calling_it_a_move(project, monke
 
     assert load_state(run_dir).repo_root == str(Path(project.project).resolve())
     assert _resume_entry(run_dir)["code_root_changed"] is False
+    assert _restamp_records(run_dir) == []  # a migration owes no record either
     assert "code root" not in capsys.readouterr().err
 
 

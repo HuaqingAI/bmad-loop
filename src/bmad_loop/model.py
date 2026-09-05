@@ -703,9 +703,12 @@ class RunState:
     # in one step; this flag rides the state write itself, which is what lets a
     # retry tell "moved and recorded" from "moved, record still owed" — the one
     # distinction that keeps the record retryable without ever asserting a move
-    # that was not persisted. Consumed by whichever surface retries first: a second
-    # `restamp_code_root` writes its own record, and a plain `resume` folds the
-    # move into its `run-resume` line. Deliberately absent from `documents.py`'s `--json`
+    # that was not persisted. Consumed by whichever surface retries first, and by
+    # both the same way: a second `restamp_code_root` and a plain `resume` each
+    # discharge the debt with their own `rearm-code-root-restamped` append naming
+    # the root THIS field's `repo_root` still describes, before overwriting it —
+    # never by folding it into another line, which would answer an A→B debt with a
+    # row that names no root. Deliberately absent from `documents.py`'s `--json`
     # projection (schema 1), like `rearmed` / `resolved_redrive`.
     code_root_restamp_pending: bool = False
     policy_snapshot: dict[str, Any] = field(default_factory=dict)
