@@ -9981,7 +9981,13 @@ def test_confirm_reverify_reports_an_unusable_cwd_instead_of_crashing(
 
     The park record and the board must be untouched, for the same reason the
     red-command row beside this one asserts it: a refused `--reverify` has to
-    leave every record exactly where it found it."""
+    leave every record exactly where it found it.
+
+    The COUNT is what holds the no-stutter coupling on the operator-visible
+    surface (DW-119): `_reverify` prefixes its own "could not run" and
+    `run_verify_commands`' spawn-fault arm omits the phrase for exactly that
+    reason, so a membership assertion alone stays green if the phrase comes back
+    twice in the stderr the operator actually reads."""
     from bmad_loop import operatoractions, sprintstatus
 
     install_bmad_config(project)
@@ -9997,9 +10003,35 @@ def test_confirm_reverify_reports_an_unusable_cwd_instead_of_crashing(
     err = capsys.readouterr().err
     assert "--reverify failed" in err and "NOT confirmed" in err
     assert "could not run" in err and str(missing) in err
+    assert err.count("could not run") == 1
     assert sp.read_text() == before
     assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
     assert "1-1-a" in operatoractions.load(project.project)
+
+
+def test_reverify_does_not_stutter_the_could_not_run_prefix(project, tmp_path):
+    """The phrase appears ONCE across the two halves of the coupling (DW-119).
+
+    `verify.run_verify_commands`' spawn-fault arm omits "could not run" from its
+    `spawn_error` precisely BECAUSE `cli._reverify`'s env-fault branch prefixes
+    its own; the comment on each side records that the two once stuttered.
+
+    Graded at the `_reverify` seam rather than on captured stderr: `reason` is the
+    exact string both comments describe, so the count cannot be diluted by
+    surrounding CLI text. The end-to-end row above counts the same phrase on the
+    stderr an operator reads; this row pins the seam that produces it.
+
+    Ablation: put "could not run" phrasing back into the `spawn_error=` string in
+    `verify.run_verify_commands` and the count assertion reddens.
+    """
+    _write_policy(project.project, '[verify]\ncommands = ["python -c \\"pass\\""]\n')
+    missing = tmp_path / "no-such-cwd"
+
+    reason = cli._reverify(project.project, missing)
+
+    assert reason is not None
+    assert "could not run" in reason and str(missing) in reason
+    assert reason.count("could not run") == 1
 
 
 def _diverge_repo_root(paths, code_root: Path) -> None:

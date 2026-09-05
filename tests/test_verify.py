@@ -2297,7 +2297,11 @@ def test_a_spawn_fault_unrelated_to_the_cwd_translates_too(tmp_path, monkeypatch
     own refusals for real.
 
     Ablation: restore a message hardcoding the cwd as the cause (`could not run
-    in {cwd}: ...`) and the "does not blame the directory" assertion fails."""
+    in {cwd}: ...`) and the "does not blame the directory" assertion fails. That
+    assertion excludes the whole phrase, not just the `" in"` spelling, because
+    the whole phrase is what the production comment promises to omit — it is
+    `cli._reverify` that prefixes "could not run", and any reintroduction here
+    stutters it, however the rest of the sentence is worded."""
     real_run = subprocess.run
 
     def out_of_memory(*args, **kwargs):
@@ -2314,7 +2318,7 @@ def test_a_spawn_fault_unrelated_to_the_cwd_translates_too(tmp_path, monkeypatch
     assert "Cannot allocate memory" in result.spawn_error  # the real cause survives
     # the cwd is context, not a verdict: it appears, but not as the diagnosis
     assert str(tmp_path) in result.spawn_error
-    assert "could not run in" not in result.spawn_error
+    assert "could not run" not in result.spawn_error
 
     out = verify.verify_command_results_outcome([result], tmp_path)
     assert not out.ok and out.env_fault and not out.retryable

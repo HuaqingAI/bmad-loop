@@ -2572,6 +2572,67 @@ def test_harvest_gate_exclude_degrade_arm_is_rooted_on_the_code_tree(
     assert engine._harvest_gate_exclude(task) == ()
 
 
+def test_harvest_gate_exclude_names_the_prefixed_path_under_the_monorepo_shape(project):
+    """The VALUE claim the two sibling rows above cannot make (DW-64).
+
+    Both of those rows build the SIBLING shape for their divergent halves, where
+    the ledger sits outside the code tree entirely — so the only answer those
+    halves can assert is `()`, and a `paths.project` spelling is separable there
+    only because it is non-empty. (The first row does assert a non-empty value,
+    but under the COLLAPSED default shape, where the two roots are the same object
+    and no prefix distinguishes them.) No existing row makes a prefix-equality
+    claim under divergence. Nested, a project-rooted
+    spelling is not empty: git, running in the code tree, resolves
+    `_bmad-output/implementation-artifacts/deferred-work.md` onto the OUTER
+    project's real ledger and silently drops it from proof of work. That is the
+    layout where the #716 rule earns its keep, and only a prefix EQUALITY grades it.
+
+    The outer ledger is created deliberately rather than inherited from the sandbox
+    template, so the "wrong spelling names a real file" claim is graded by value
+    rather than by setup accident.
+
+    Ablation: set `root = paths.project` inside `_harvest_gate_exclude` and this
+    reddens on the `app/` prefix equality.
+    """
+    paths = nested_repo_root_paths(project)
+    # the premise the prefix assertion rests on: divergent AND nested (the sibling
+    # shape satisfies the first and not the second)
+    assert paths.project != paths.repo_root
+    assert paths.project.parent == paths.repo_root
+
+    # the OUTER project's ledger — the file a `project`-rooted pathspec silently
+    # names when git resolves it in the code tree
+    decoy = paths.repo_root / "_bmad-output" / "implementation-artifacts" / "deferred-work.md"
+    decoy.parent.mkdir(parents=True, exist_ok=True)
+    assert not decoy.exists(), (
+        "this row creates the outer ledger deliberately so the 'silently wrong' "
+        "claim is graded by value; inheriting one from the sandbox template would "
+        "make that premise a setup accident"
+    )
+    decoy.write_text("# outer ledger\n", encoding="utf-8")
+
+    engine, _ = make_engine(paths, [])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.harvest_wrote_ledger = True
+
+    exclude = engine._harvest_gate_exclude(task)
+    assert exclude == ("app/_bmad-output/implementation-artifacts/deferred-work.md",)
+    # the literal is only a proxy for the rule: what #716 promises is that the
+    # pathspec lands on THIS attempt's ledger when git resolves it in the code tree
+    assert (paths.repo_root / exclude[0]).resolve() == paths.deferred_work.resolve()
+    # silently wrong, not empty: the un-prefixed spelling resolves under the code
+    # tree onto a real file that is NOT the ledger it meant to exclude
+    assert decoy.is_file()
+    assert decoy.resolve() != paths.deferred_work.resolve()
+
+    # both disjuncts of the stand-down guard still hold under this shape
+    task.harvest_wrote_ledger = False
+    assert engine._harvest_gate_exclude(task) == ()
+    task.harvest_wrote_ledger = True
+    task.ledger_changed_before_harvest = True
+    assert engine._harvest_gate_exclude(task) == ()
+
+
 # ------------------- `[verify] commands` run where the SESSION ran (#695, DW-3)
 #
 # `Engine._verify_commands_with_results` runs the commands in `self.workspace.root`
