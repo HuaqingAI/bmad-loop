@@ -482,6 +482,37 @@ def _fault_read_bytes(monkeypatch, faults) -> None:
     monkeypatch.setattr(Path, "read_bytes", fake)
 
 
+def _fault_is_file(monkeypatch, faults) -> list[Path]:
+    """Make ``Path.is_file`` raise EACCES for the paths ``faults`` selects.
+
+    The existence-probe twin of :func:`_fault_read_bytes`, and a selective
+    monkeypatch for the same stated reason: `chmod` is a no-op for root and carries
+    no read bit on Windows, so the fault would silently not fire on half the CI
+    matrix. EACCES is the errno that separates a RAW probe from ``install._is_file``
+    on the interpreters where the raw probe raises at all: on Python <=3.13
+    ``Path.is_file`` raises it while folding ENOENT/ENOTDIR/EBADF/ELOOP to false. On
+    3.14 the raw probe folds EACCES too (``install._is_file``'s docstring records
+    the split), which is exactly why the fault is injected rather than staged on a
+    real filesystem — a `chmod` fixture would grade nothing on half the matrix.
+
+    Returns the list of paths actually faulted, in call order. Every caller asserts
+    on it: these predicates are path-identity based, so a change in how the locator
+    spells either end (different resolve strictness, a normalized mount root) would
+    quietly stop matching, and the row would go green while grading nothing.
+    """
+    real = Path.is_file
+    faulted: list[Path] = []
+
+    def fake(self, *a, **kw):
+        if faults(self):
+            faulted.append(Path(self))
+            raise PermissionError(13, "Permission denied")
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "is_file", fake)
+    return faulted
+
+
 def _superseded_records(engine):
     return [
         entry
@@ -732,6 +763,140 @@ def test_project_relative_accepted_spec_superseded_by_the_mount_warns(project):
     assert record["target_branch"] == "main"
     assert record["compared"] is True
     assert seen == [b"pre-approval bytes\n"]
+
+
+def test_unprobeable_main_accepted_spec_seeds_nothing_instead_of_raising(project, monkeypatch):
+    """The MAIN-checkout conjunct of the seed's existence arm, `not _is_file(source)`.
+
+    `_accepted_spec_seed`'s call site sits outside every `except` in
+    `run_isolated`, so a probe that RAISES kills the whole run rather than
+    allowing dispatch to continue. On Python <=3.13 a raw `Path.is_file` raises EACCES where
+    `install._is_file` folds it to the answer a copier already understands: there
+    are no bytes to promise, so seed nothing.
+
+    The fault is INJECTED at this one arm, and that is not a convenience — it is
+    the only way to reach it. A merely unsearchable parent never gets here on any
+    interpreter: `_accepted_spec_pair` resolves the source `strict=True`, which
+    raises first and folds the pair to None (measured on 3.13 and 3.14). What this
+    row grades is therefore the arm's totality against the faults that CAN reach
+    it — a TOCTOU between the locator's resolve and this stat, or a non-EACCES
+    OSError — not the unsearchable-parent story, which lands on the mount arm
+    below.
+
+    Ablation: restore `source.is_file()` on the left conjunct and this row reddens
+    with a `PermissionError` escaping `run_isolated`, while the mount-side row
+    below stays green.
+
+    The BARE BASENAME spelling is load-bearing, not incidental. `_accepted_spec_pair`
+    resolves a relative spec through `verify.resolve_spec_path`, whose own
+    `candidate.is_file()` is raw and sits inside the locator's `except OSError` — so
+    spelling the full project-relative rel points that probe at this very path, the
+    locator folds to None first, and the seed returns `()` no matter which probe its
+    existence arm uses. A basename makes `resolve_spec_path` probe
+    `project/<basename>` (absent, unfaulted) and fall back to the
+    implementation-artifacts copy UNPROBED, so the seed's own arm is the first
+    thing to touch the faulted path. Re-spell this as the full rel and the row
+    goes green against the bug it is here to pin.
+    """
+    name = "accepted-source-unprobeable.md"
+    rel = f"_bmad-output/implementation-artifacts/{name}"
+    ignore_before_commit(project, rel)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    accepted = project.project / rel
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    accepted.write_bytes(b"accepted operator bytes\n")
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    # RELATIVE on purpose: `accepted_spec_relocated` stays False, so the
+    # `accepted_delivered` escalation cannot mask an unseeded mount with a pause.
+    task = StoryTask("1-1-a", 1, spec_file=name)
+    engine.state.tasks[task.story_key] = task
+    main_copy = accepted.resolve()
+    faulted = _fault_is_file(monkeypatch, lambda path: path == main_copy)
+    mounted: list[bool] = []
+
+    def drive(current):
+        mounted.append((engine.workspace.root / rel).exists())
+        current.phase = Phase.DEFERRED
+        current.defer_reason = "test complete"
+
+    engine._run_isolated(task, drive)
+
+    # the fault really fired, and only on the arm this row means to grade
+    assert set(faulted) == {main_copy}
+    # the unit dispatched, ran to its own terminal phase and was neither escalated
+    # nor paused — `run_isolated` returning at all is what says no fault escaped it
+    assert mounted == [False]
+    assert task.phase == Phase.DEFERRED
+    assert "story-escalated" not in journal_kinds(engine)
+    # grades only that the DW-101 warning neither fired nor raised; it cannot
+    # distinguish a seed outcome, since the same faulted probe returns it early
+    assert _superseded_records(engine) == []
+
+
+def test_unprobeable_mounted_accepted_spec_folds_to_absent_instead_of_raising(project, monkeypatch):
+    """The MOUNT conjunct of the same arm, `_is_file(destination)`.
+
+    The two probes are separate syscalls and the left one answers true here, so
+    the source-side fault above never reaches this one — the conjunct needs its own
+    row. This is also the arm an unsearchable parent genuinely lands on: the
+    locator resolves the destination `strict=False`, which can leave an inaccessible
+    suffix unresolved. Other resolution failures can still fold the pair to None.
+
+    What is graded is the FOLD, not delivery: an unprobeable destination answers
+    ABSENT, so the rel is named and no exception escapes `run_isolated`. Whether
+    the operator's bytes then arrive is decided downstream by the seed loop's
+    `install._occupied`, which probes `exists()` — and under a REAL unsearchable
+    parent that raises too on <=3.13, folding to "occupied", so the loop would skip
+    the copy and journal `worktree-seed-skipped`. Delivery is asserted here only
+    because the injected fault is scoped to `Path.is_file`, leaving `exists()`
+    honest; it pins the arm's fold, not a promise about a real EACCES mount.
+
+    Ablation: restore `destination.is_file()` on the right conjunct and this row
+    reddens with a `PermissionError` escaping `run_isolated`, while the
+    source-side row above stays green.
+    """
+    rel = "_bmad-output/implementation-artifacts/accepted-mount-unprobeable.md"
+    ignore_before_commit(project, rel)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    accepted = project.project / rel
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    accepted.write_bytes(b"accepted operator bytes\n")
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    task = StoryTask("1-1-a", 1, spec_file=rel)
+    engine.state.tasks[task.story_key] = task
+    # every copy of this rel EXCEPT the main checkout's — i.e. the one the mount
+    # carries, whose path the test cannot name until provisioning has run. The
+    # predicate is deliberately broader than that one path; the assertion below is
+    # what pins the fault to exactly the mount's copy.
+    main_copy = accepted.resolve()
+    faulted = _fault_is_file(
+        monkeypatch,
+        lambda path: path.name == accepted.name and path not in (main_copy, accepted),
+    )
+    seen: list[bytes] = []
+    mounts: list[Path] = []
+
+    def drive(current):
+        mounts.append(engine.workspace.root)
+        seen.append((engine.workspace.root / rel).read_bytes())
+        current.phase = Phase.DEFERRED
+        current.defer_reason = "test complete"
+
+    engine._run_isolated(task, drive)
+
+    # the fault fired on exactly the mount's copy of the rel, and nowhere else
+    (mount,) = mounts
+    assert set(faulted) == {(mount / rel).resolve()}
+    assert seen == [b"accepted operator bytes\n"]
+    assert task.phase == Phase.DEFERRED
+    assert "story-escalated" not in journal_kinds(engine)
+    # grades only that the DW-101 warning neither fired nor raised; it cannot
+    # distinguish a seed outcome, since the same faulted probe returns it early
+    assert _superseded_records(engine) == []
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")

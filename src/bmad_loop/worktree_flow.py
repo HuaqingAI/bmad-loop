@@ -1499,12 +1499,32 @@ class WorktreeFlow:
         lacks its corresponding path. Absolute/external spellings pass through;
         prior-attempt binding fields remain authoritative until fresh binding
         replaces them after the mount is provisioned.
+
+        Both existence arms probe through ``_is_file``, total over ``OSError``,
+        rather than ``Path.is_file``: on Python <=3.13 the raw probe RAISES on an
+        entry below an unsearchable parent (3.14 answers false, as
+        :func:`install._is_file` records), and this call site sits outside every
+        ``except`` in ``run_isolated``, so such a fault killed the run instead of
+        allowing dispatch to continue.
+
+        Which arm a given fault can actually reach differs, because the locator
+        resolves the two ends differently. A parent that is merely unsearchable
+        does NOT reach the source arm on any interpreter: ``_accepted_spec_pair``
+        resolves the source ``strict=True``, which raises first and folds the pair
+        to ``None``. The source arm is reachable only by TOCTOU between that
+        resolve and this stat, or by a non-EACCES ``OSError``. The DESTINATION is
+        resolved ``strict=False``, which can leave an inaccessible suffix unresolved;
+        other resolution failures are still caught by the locator. A source probe
+        fault omits the seed; a destination probe fault treats that end as absent
+        and leaves delivery to the seed loop. This uses the same total probe as
+        :meth:`_ledger_seed`, :meth:`_board_seed` and
+        :meth:`_warn_accepted_spec_superseded` (DW-103).
         """
         pair = self._accepted_spec_pair(task, worktree, project_relative_only=project_relative_only)
         if pair is None:
             return ()
         relative, source, destination = pair
-        if not source.is_file() or destination.is_file():
+        if not _is_file(source) or _is_file(destination):
             return ()
         return (relative,)
 
