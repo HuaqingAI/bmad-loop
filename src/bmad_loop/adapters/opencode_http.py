@@ -1672,13 +1672,23 @@ class OpencodeDevAdapter(_DevSynthesisMixin, OpencodeHttpAdapter):
         self._configure_dev_knobs()
         # task_id -> server process, kept past kill(): kill() pops the
         # _ServerSession registry, but _post_kill_reconcile still needs to
-        # settle liveness after the teardown.
+        # settle liveness after the teardown. Retention is session-scoped, not
+        # the adapter's lifetime (DW-106): a live Popen per completed session
+        # would accumulate forever, so `_evict_task_state` drops the entry from
+        # `run()`'s `finally` — still provably past `_post_kill_reconcile`,
+        # which base `run()` calls INSIDE the call the mixin's `try` wraps.
         self._server_procs: dict[str, subprocess.Popen] = {}
 
     def start_session(self, spec: SessionSpec) -> SessionHandle:
         handle = super().start_session(spec)
         self._server_procs[spec.task_id] = self._sessions[spec.task_id].process
         return handle
+
+    def _evict_task_state(self, task_id: str) -> None:
+        # The mixin cannot reach this transport-owned store, so the eviction seam
+        # is extended here rather than moving `_server_procs` onto the mixin.
+        self._server_procs.pop(task_id, None)
+        super()._evict_task_state(task_id)
 
     def _probe_alive(self, handle: SessionHandle) -> bool | None:
         proc = self._server_procs.get(handle.task_id)

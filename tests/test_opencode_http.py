@@ -3043,6 +3043,121 @@ def test_e2e_dev_post_kill_rescue(tmp_path, fake_opencode):
     assert_server_gone(rec)
 
 
+# ------------------------------------- _server_procs retention bound (DW-106)
+#
+# `_server_procs` retains a live `subprocess.Popen` per task past kill(), so an
+# entry per completed session pinned one for the adapter's lifetime. It is the
+# one per-task store `_DevSynthesisMixin` cannot reach, so OpencodeDevAdapter
+# overrides the mixin's `_evict_task_state` seam and delegates up; `run()`'s
+# `finally` is still provably past `_post_kill_reconcile`, which base `run()`
+# calls INSIDE the call the mixin's `try` wraps. Ablation note: absence alone is
+# a weak assertion here — `_probe_alive` reads a missing key as "never spawned"
+# and answers False, exactly what a dead process answers — so the ordering row
+# asserts the entry is PRESENT at probe time, not just the verdict.
+
+
+def test_e2e_dev_run_evicts_the_retained_server_proc(tmp_path, fake_opencode):
+    """The bound itself: a normal completed session leaves no process handle behind.
+
+    Also pins the override's `super()._evict_task_state(task_id)` delegation. The
+    override is the ONLY `_evict_task_state` on this transport's MRO, so dropping
+    that call bounds `_server_procs` while every mixin-owned store leaks here —
+    a regression no generic-adapter row can see."""
+    launcher, rec = fake_opencode
+    adapter, impl = make_dev_adapter(tmp_path, binary=str(launcher))
+    spec = make_dev_spec(tmp_path, rec, "completed", impl / "spec-3-1-foo.md")
+
+    result = adapter.run(spec)
+
+    assert result.status == "completed"
+    assert adapter._server_procs == {}
+    # the delegation up the MRO really happened: all four mixin stores evicted too
+    assert spec.task_id not in adapter._launch_auto_run_results
+    assert spec.task_id not in adapter._fm_fallback_obs
+    assert spec.task_id not in adapter._fm_transition_obs
+    assert spec.task_id not in adapter._contract_nudge_sent
+    assert_server_gone(rec)
+
+
+def test_e2e_dev_server_proc_outlives_the_post_kill_probe(tmp_path, fake_opencode):
+    """Eviction must land after the LAST in-lifecycle reader: `_post_kill_reconcile`
+    settles liveness through `_probe_alive`, which answers from this very store.
+    Records that the entry was still present when the rescue probed, and the
+    verdict it computed from it."""
+    launcher, rec = fake_opencode
+    adapter, impl = make_dev_adapter(tmp_path, binary=str(launcher))
+    spec = make_dev_spec(tmp_path, rec, "busy-forever", impl / "spec-3-1-foo.md", timeout_s=1.5)
+
+    probes: list[tuple[bool, bool | None]] = []
+    real_probe = adapter._probe_alive
+
+    def recording(handle):
+        verdict = real_probe(handle)
+        probes.append((handle.task_id in adapter._server_procs, verdict))
+        return verdict
+
+    adapter._probe_alive = recording
+
+    result = adapter.run(spec)
+
+    # present at probe time, and provably dead -> the rescue was allowed to run
+    assert probes == [(True, False)]
+    assert result.status == "completed"
+    assert result.result_json["post_kill_reconciled"] is True
+    assert adapter._server_procs == {}
+    assert_server_gone(rec)
+
+
+def test_e2e_dev_run_evicts_the_server_proc_when_wait_raises(tmp_path, fake_opencode):
+    """The store DW-106 is actually about is a live `Popen`, and an operator stop is
+    exactly when it leaks: a raising `wait_for_completion` never reaches
+    `_post_kill_reconcile`, so only the `finally` covers it. base `run()`'s inner
+    `finally` still tears the server down; the mixin's outer `finally` drops the
+    handle to it, and the original exception reaches the caller unchanged."""
+    launcher, rec = fake_opencode
+    adapter, impl = make_dev_adapter(tmp_path, binary=str(launcher))
+    spec = make_dev_spec(tmp_path, rec, "completed", impl / "spec-3-1-foo.md")
+
+    started: list[bool] = []
+
+    def raising(handle, running_spec):
+        # the launch really happened: there is a live process handle to leak
+        started.append(running_spec.task_id in adapter._server_procs)
+        raise RuntimeError("stop requested")
+
+    adapter.wait_for_completion = raising
+
+    with pytest.raises(RuntimeError, match="stop requested"):
+        adapter.run(spec)
+
+    assert started == [True]
+    assert "3-1-dev-1" not in adapter._server_procs
+    assert_server_gone(rec)
+
+
+def test_e2e_dev_run_evicts_only_the_returning_task_ids_server_proc(tmp_path, fake_opencode):
+    """Scoped to `spec.task_id`: another dev session in flight on the same adapter
+    keeps its handle, so its own post-kill reconcile can still settle liveness."""
+    launcher, rec = fake_opencode
+    adapter, impl = make_dev_adapter(tmp_path, binary=str(launcher))
+
+    class _Proc:
+        def poll(self):
+            return None  # still running
+
+    adapter._server_procs["3-2-dev-1"] = _Proc()
+    spec = make_dev_spec(tmp_path, rec, "completed", impl / "spec-3-1-foo.md")
+
+    result = adapter.run(spec)
+
+    assert result.status == "completed"
+    assert "3-1-dev-1" not in adapter._server_procs
+    # the survivor is still usable, not merely present
+    other = SessionHandle(task_id="3-2-dev-1", native_id="ses_y")
+    assert adapter._probe_alive(other) is True
+    assert_server_gone(rec)
+
+
 def test_e2e_dev_wait_loop_drives_observe_tick(tmp_path, fake_opencode, monkeypatch):
     """Cross-adapter parity (#276 M2): the OpenCode wait loop invokes _observe_tick
     from its heartbeat-throttled block, exactly as the generic adapter does. The

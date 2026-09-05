@@ -1333,8 +1333,10 @@ class _DevSynthesisMixin(_ResultFileMixin):
     synthesizes the legacy result dict via :mod:`devcontract`. Hosts provide
     ``self.paths`` (a :class:`ProjectPaths`), the ``self.policy`` knobs read
     by ``_configure_dev_knobs``, and the ``_probe_alive`` liveness seam. It also
-    owns the launch snapshot's session-scoped lifetime: its ``run()`` override
-    evicts the task's ``_launch_auto_run_results`` entry once the lifecycle ends."""
+    owns the session-scoped lifetime of every per-task store it creates: its
+    ``run()`` override calls ``_evict_task_state`` once the lifecycle ends, which
+    drops the task's entries from all of them (DW-96, DW-107). Hosts that own a
+    per-task store the mixin cannot reach override that seam and delegate up."""
 
     # Set by the concrete adapter's __init__ (see docstring); bare annotations
     # (no runtime effect) tell the type checker the host attributes this reads.
@@ -1370,17 +1372,22 @@ class _DevSynthesisMixin(_ResultFileMixin):
         # Missing-marker fingerprint observations (#224):
         # task_id -> (path, mtime_ns, frontmatter status, observation count).
         # Task ids are unique per session, so entries never need resetting
-        # between sessions; the dict lives for the adapter's lifetime.
+        # between sessions; the entry is never cleared *within* the session
+        # (except the in-flight stale-fingerprint clear in `_frontmatter_fallback`,
+        # which deliberately restarts the count) and is evicted at the end of the
+        # session by `run()`'s `finally` (see `_evict_task_state`).
         self._fm_fallback_obs: dict[str, tuple[str, int, str, int]] = {}
         # First mid-session spec-status transition observed per session (#276 M2):
         # task_id -> normalized status. Recorded by `_observe_tick` when the spec's
         # frontmatter first moves off its launch status to a non-terminal state (in
         # practice `in-review`), which makes a later terminal frontmatter proof THIS
         # session wrote it. Same lifetime doctrine as `_fm_fallback_obs` — task_ids
-        # are unique per session, so entries are recorded once and never cleared.
+        # are unique per session, so an entry is recorded once and never cleared
+        # *within* the session, then evicted by `run()`'s `finally`.
         self._fm_transition_obs: dict[str, str] = {}
         # Targeted contract-nudge budget (#276 M4): task_ids that have already been
-        # sent the one CONTRACT_NUDGE_TEXT nudge. A set, never cleared, so the nudge
+        # sent the one CONTRACT_NUDGE_TEXT nudge. A set, never cleared *within* the
+        # session (eviction is `run()`'s `finally`, past every reader), so the nudge
         # fires at most once per session even though an mtime bump resets the
         # `_fm_fallback_obs` observation counter to 1 (#149's refill hazard cannot
         # apply — this budget is not a counter and touches no stall counters).
@@ -1394,18 +1401,12 @@ class _DevSynthesisMixin(_ResultFileMixin):
         # Both fail closed at the affected scope without letting an unrelated bad
         # Markdown file suppress a newly created, readable story spec.
         #
-        # UNLIKE the three stores above, this one IS cleared: an unpinned launch
-        # captures one entry per `*.md` in the artifacts dir, so retaining a
-        # snapshot per session would grow O(sessions x files) for the adapter's
-        # lifetime (DW-96). The bound is in-flight scope, not a cap or an LRU —
-        # `run()` pops the task's entry in a `finally`, so only launches still
-        # inside their session lifecycle are held. Eviction sits at the END of the
-        # lifecycle because `_post_kill_reconcile` genuinely calls the reader after
-        # `run()`'s kill; it does NOT rest on today's rescue gates happening to make
-        # that verdict unobservable in the result (they do — a rescue requires a
-        # consistent `done`, `park_asserted` requires an `awaiting-operator` marker,
-        # and `synthesize_result` makes those mutually exclusive — but that is a
-        # coincidence of the current gates, not a reason to evict earlier).
+        # The heaviest of the four stores, and the reason the eviction seam exists:
+        # an unpinned launch captures one entry per `*.md` in the artifacts dir, so
+        # retaining a snapshot per session would grow O(sessions x files) for the
+        # adapter's lifetime (DW-96) where the three stores above grow O(sessions).
+        # All four are evicted the same way, by `_evict_task_state` from `run()`'s
+        # `finally`; the bound is in-flight scope, not a cap or an LRU.
         self._launch_auto_run_results: dict[str, dict[str, tuple[int, str] | None] | None] = {}
 
     @staticmethod
@@ -1461,17 +1462,44 @@ class _DevSynthesisMixin(_ResultFileMixin):
         try:
             return cast(_SessionHost, super()).run(spec)
         finally:
-            # Retention bound for the launch snapshot (DW-96). Every in-lifecycle
-            # reader lives inside `run()` — `wait_for_completion`'s read-back and
-            # `_post_kill_reconcile`'s post-teardown rescue, which really does call
-            # `_park_marker_session_authored` after the kill — so this is the first
-            # point where the entry is provably dead evidence. A later direct read
-            # has no attempt-relative evidence and already fails closed on the
-            # missing key. `finally` (not a post-return line) so a raising
-            # `wait_for_completion` evicts too; `pop(..., None)` (not `del`) so a
-            # `start_session` that raised before the capture landed cannot replace
-            # the real exception with a KeyError.
-            self._launch_auto_run_results.pop(spec.task_id, None)
+            self._evict_task_state(spec.task_id)
+
+    def _evict_task_state(self, task_id: str) -> None:
+        """Retention bound for the four per-task stores named below (DW-96,
+        DW-106, DW-107). One documented eviction site rather than a pop scattered
+        per store; hosts owning a store this mixin cannot reach (OpencodeDev-
+        Adapter's `_server_procs`) override this and delegate up.
+
+        NOT every per-session store on every host: `OpencodeHttpAdapter._usage`
+        is also unbounded, and deliberately stays out. It is keyed by
+        `session_id` rather than `task_id`, and `read_usage(result)` is called by
+        the engine AFTER `run()` returns — so evicting it here would not just be
+        out of scope, it would zero token accounting for every session. Bounding
+        it needs a different lifecycle hook; do not add it to this seam.
+
+        Every in-lifecycle reader lives inside `run()` — `wait_for_completion`'s
+        read-back, `_observe_tick`'s sampling and the nudge budget, and
+        `_post_kill_reconcile`'s post-teardown rescue, which really does call
+        `_park_marker_session_authored` (and `_probe_alive`) after the kill — so
+        `run()`'s `finally` is the first point where these entries are provably
+        dead evidence. A later direct read has no attempt-relative evidence and
+        already fails closed on the missing key. Eviction sits at the END of the
+        lifecycle because that rescue genuinely reads after the kill; it does NOT
+        rest on today's rescue gates happening to make that verdict unobservable
+        in the result (they do — a rescue requires a consistent `done`,
+        `park_asserted` requires an `awaiting-operator` marker, and
+        `synthesize_result` makes those mutually exclusive — but that is a
+        coincidence of the current gates, not a reason to evict earlier).
+
+        Called from a `finally` (not a post-return line) so a raising
+        `wait_for_completion` evicts too, and scoped to the one task id so a
+        concurrent in-flight session keeps its entries. `pop(..., None)` /
+        `discard` (never `del`) so a `start_session` that raised before anything
+        was recorded cannot replace the real exception with a KeyError."""
+        self._launch_auto_run_results.pop(task_id, None)
+        self._fm_fallback_obs.pop(task_id, None)
+        self._fm_transition_obs.pop(task_id, None)
+        self._contract_nudge_sent.discard(task_id)
 
     def _park_marker_session_authored(self, spec_path: Path, spec: SessionSpec) -> bool:
         """Whether the live marker differs from this session's launch marker."""
@@ -1647,7 +1675,8 @@ class _DevSynthesisMixin(_ResultFileMixin):
 
         A pure sampling path, never a verdict path: it needs a launch snapshot to
         observe against, fires at most once per session (task_ids are unique;
-        entries are never cleared), and any unreadable/torn read is a skipped
+        the entry is never cleared within the session — ``run()``'s ``finally``
+        evicts it afterwards), and any unreadable/torn read is a skipped
         sample (silent OSError return), never evidence. Blank/torn parses (``s ==
         ""``) and terminal states (``done``/``blocked``) are NOT recorded — a
         terminal frontmatter is the Stop harvest's business, and the launch status
@@ -1778,8 +1807,9 @@ class _DevSynthesisMixin(_ResultFileMixin):
         fires the #276 M4 contract nudge when ``limits.dev_contract_nudge`` is on:
         one ``CONTRACT_NUDGE_TEXT`` send asking the skill to append the marker it
         owed, then repair at the source rather than only synthesizing here. It is
-        bounded by the never-cleared ``_contract_nudge_sent`` set (marked before
-        the send, ``MultiplexerError`` swallowed) — exactly once per session,
+        bounded by ``_contract_nudge_sent``, a set never cleared within the session
+        and evicted afterwards by ``run()``'s ``finally`` (marked before the send,
+        ``MultiplexerError`` swallowed) — exactly once per session,
         touching no stall counters, so an mtime bump that resets ``observations``
         to 1 never re-nudges. A compliant append is harvested by the ordinary
         marker scan on a later Stop, leaving synthesis as the backstop.
@@ -1913,9 +1943,9 @@ class _DevSynthesisMixin(_ResultFileMixin):
             # harvested by the normal marker scan on a later Stop; synthesis stays
             # the backstop). Exactly once per session: the task_id is marked BEFORE
             # the send so a raising transport still satisfies exactly-once, and the
-            # never-cleared set — not the mtime-resettable observation counter — is
-            # the budget, so the #149 refill hazard cannot apply. Touches no stall
-            # counters.
+            # set — never cleared within the session, and not the mtime-resettable
+            # observation counter — is the budget, so the #149 refill hazard cannot
+            # apply. Touches no stall counters.
             if (
                 self._contract_nudge_enabled
                 and observations == 1
