@@ -15,6 +15,8 @@ from pathlib import Path
 import pytest
 import yaml
 from conftest import (
+    _OK,
+    MISSING_TOOL_CMD,
     PROJECT_MARKER_CMD,
     REPO_ROOT_MARKER_CMD,
     UNRESOLVABLE,
@@ -10121,6 +10123,153 @@ def test_confirm_reverify_says_so_when_nothing_is_configured(project, capsys, mo
     out = capsys.readouterr().out
     assert "no [verify] commands are configured" in out
     assert "verify commands passed" not in out
+
+
+def _sentinel_writer_cmd(tmp_path: Path, sentinel: Path, *, rc: int, stem: str) -> str:
+    """A host-shell verify command that creates `sentinel`, then exits `rc`.
+
+    A `sys.executable` script rather than `touch` / `type nul >` + `exit`, because
+    verify commands run through the host shell and the rows below have to ask the
+    same question on `sh -c` and on `cmd /c`. `stem` only names the script and its
+    sentinel after the row using them — each row gets its own `tmp_path`, so the
+    paths are already distinct — which is what makes a failure message point at the
+    row it came from.
+    """
+    writer = tmp_path / f"{stem}.py"
+    writer.write_text(
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"Path({str(sentinel)!r}).write_text('ran', encoding='utf-8')\n"
+        f"sys.exit({rc})\n",
+        encoding="utf-8",
+    )
+    return f'"{sys.executable}" "{writer}"'
+
+
+def _noisy_failure_cmd(tmp_path: Path, marker: str) -> str:
+    """A host-shell verify command that prints `marker`, then exits 1.
+
+    A `sys.executable` script rather than a shell `echo`, for the same cross-shell
+    reason as the writer above — and because what an ordinary failing check emits
+    is the diagnostic `_reverify` appends to its reason, so a silent `exit 1` would
+    leave that half of the message unexercised.
+    """
+    script = tmp_path / "failing_check.py"
+    script.write_text(f"import sys\nprint({marker!r})\nsys.exit(1)\n", encoding="utf-8")
+    return f'"{sys.executable}" "{script}"'
+
+
+def _reverify_pair(tmp_path: Path, first: str, *, rc: int, stem: str) -> tuple[Path, str]:
+    """Write a two-command `[verify]` policy under `tmp_path` — `first`, then a
+    command that witnesses its own execution — and return `(sentinel, second)`.
+
+    A sentinel FILE rather than a spy on `run_verify_commands`: what the second
+    command did is a fact about the child process, and a spy is precisely what
+    would replace the child. `_reverify` needs nothing but a policy file, so the
+    `cmd_confirm` scaffolding the rows above carry (park record, board, `_confirm`
+    monkeypatch) is noise for what these pin.
+    """
+    sentinel = tmp_path / f"{stem}-ran"
+    second = _sentinel_writer_cmd(tmp_path, sentinel, rc=rc, stem=stem)
+    _write_policy(tmp_path, f"[verify]\ncommands = {json.dumps([first, second])}\n")
+    return sentinel, second
+
+
+def test_reverify_answers_with_the_first_environment_fault_not_a_later_failure(tmp_path, capsys):
+    """`_reverify` reads `env_fault_reason` BEFORE the return code and RETURNS on
+    the first command that answers either — so a second offender is never what the
+    operator is shown.
+
+    What this row and its counterpart uniquely pin is WHICH offender is reported.
+    The eleven pre-existing `--reverify` rows configure exactly one command apiece,
+    so none of them has a second offender the first could be confused with; they
+    already catch a `return` weakened to `continue`, because with one command that
+    exhausts the loop and reports a pass over a red command. The choice between the
+    FIRST offender and a later one is invisible to all of them.
+
+    `MISSING_TOOL_CMD` is an environment fault on both shells (sh 127, cmd exits 1
+    with "is not recognized") and ALSO carries a non-zero rc, which is what makes
+    the ordering observable: swap the two checks and the same command comes back as
+    `failed (rc ...)` — the operator's own environment misread as their story
+    having regressed.
+
+    Note what the short-circuit is and is not: `run_verify_commands` has already
+    run every command by the time this loop starts, so the sentinel EXISTS. The
+    `return` short-circuits the CLASSIFICATION, not the execution, and asserting
+    the sentinel here is what keeps a reader from inferring the stronger claim.
+
+    Ablation: record every offence and return the LAST one instead of the first —
+    only this row and its counterpart redden, while all eleven pre-existing
+    `--reverify` rows stay green, which is what makes it the discriminating one.
+    Also: replace the `fault` `return` with `continue` and the reason names the
+    writer instead; read `result.returncode` before `env_fault_reason` and the
+    reason flips to `failed (rc ...)` — rc 127 under sh, rc 1 under cmd.
+    """
+    sentinel, second = _reverify_pair(tmp_path, MISSING_TOOL_CMD, rc=1, stem="envfault")
+
+    reason = cli._reverify(tmp_path, tmp_path)
+
+    assert reason is not None
+    assert "could not run" in reason and "failed (rc" not in reason
+    assert MISSING_TOOL_CMD in reason  # names the command the operator has to fix
+    assert second not in reason  # and stops there rather than reporting the next one
+    assert sentinel.is_file()  # every command ran; only the reporting short-circuits
+    assert "verify commands passed" not in capsys.readouterr().out
+
+
+def test_reverify_answers_with_the_first_ordinary_failure_not_a_later_one(tmp_path, capsys):
+    """The other `return` in the same loop: a command that RAN and merely failed
+    also ends the walk, and is reported as a failure rather than as a broken
+    environment.
+
+    The counterpart to the row above — together they pin that neither exit falls
+    through to the next result, and that the two are told apart rather than
+    collapsed. The second command exits 3 so the two rc readings cannot be
+    confused for one another.
+
+    The first command also EMITS a line, which is the other half of this branch's
+    message: `_reverify` appends `result.output_tail` after the rc, and that tail is
+    the diagnostic the operator acts on. `_FAIL` (`exit 1`) is silent, and so is the
+    `raise SystemExit(3)` the pre-existing failure row uses, so nothing covered it.
+
+    Ablation: record every offence and return the LAST one instead of the first and
+    this row reddens on `failed (rc 1)` (it comes back naming the writer at rc 3),
+    while all eleven pre-existing `--reverify` rows stay green. Drop the
+    `output_tail` from the message and the marker assertion fails; drop the
+    command identity and the `repr(first)` assertion fails. Replacing the rc
+    `return` with `continue` reddens this row too, but for a blunter reason: with
+    the fault `return` intact neither command answers, so `_reverify` falls out of
+    the loop and returns None and the row fails on `reason is not None`.
+    """
+    marker = "check-42-did-not-hold"
+    first = _noisy_failure_cmd(tmp_path, marker)
+    sentinel, second = _reverify_pair(tmp_path, first, rc=3, stem="plainfail")
+
+    reason = cli._reverify(tmp_path, tmp_path)
+
+    assert reason is not None
+    assert "failed (rc 1)" in reason and "could not run" not in reason
+    assert marker in reason  # the tail is what tells the operator WHAT failed
+    assert repr(first) in reason  # preserve the identity as rendered by the CLI
+    assert "failed (rc 3)" not in reason and second not in reason
+    assert sentinel.is_file()
+    assert "verify commands passed" not in capsys.readouterr().out
+
+
+def test_reverify_walks_every_command_when_they_all_pass(tmp_path, capsys):
+    """The control for the two rows above: with nothing to return on, the walk
+    reaches the end and reports the pass.
+
+    The failure rows independently witness the second command with their sentinel
+    assertions. This control additionally pins the successful return and printed
+    pass message for a policy containing multiple commands.
+    """
+    sentinel, _second = _reverify_pair(tmp_path, _OK, rc=0, stem="allgreen")
+
+    assert cli._reverify(tmp_path, tmp_path) is None
+
+    assert sentinel.is_file()
+    assert "verify commands passed" in capsys.readouterr().out
 
 
 def test_confirm_survives_a_non_git_project(project, capsys, monkeypatch):

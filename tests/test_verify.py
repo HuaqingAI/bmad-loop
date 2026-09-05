@@ -2444,6 +2444,57 @@ def test_timeout_stays_an_ordinary_fixable_retry_with_no_spawn_error(tmp_path, m
     assert not out.ok and out.retryable and out.fixable and not out.env_fault
 
 
+def test_completed_timed_out_and_never_spawned_legs_survive_one_another(tmp_path, monkeypatch):
+    """All three exits of the loop body in ONE call, each followed by a further
+    command, so every arm's ``continue`` is load-bearing and the three stay
+    distinguishable when they occur together.
+
+    The existing timeout row configures only the timed-out command, leaving the
+    timeout arm's ``continue`` unpinned: with one command the result is identical
+    whether the loop continues or breaks, so `break` there keeps that row green.
+    Only a command AFTER a timeout can tell the two apart — and the documented "one
+    CommandResult apiece" is a claim about a mixed list, not about three separate
+    single-command runs.
+
+    The discriminators are asserted against each other, not just against
+    themselves: the timed-out leg carries ``-1``/``"timed out"`` with NO
+    ``spawn_error``, the never-spawned leg carries `SPAWN_FAULT_RC` (deliberately
+    not ``-1``) WITH one, so neither leg can be read as the other.
+
+    Ablation: `break` instead of `continue` in the timeout arm and the list comes
+    back two long; remove ``ValueError`` from the spawn handler and the raw
+    exception escapes before the fifth command runs; set `SPAWN_FAULT_RC = -1` and
+    the two no-exit-status legs stop being distinguishable by rc.
+    """
+    monkeypatch.setattr(verify, "COMMAND_TIMEOUT_S", 0.5)
+    sleeper = tmp_path / "sleeper.py"
+    sleeper.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+    hangs = f'"{sys.executable}" "{sleeper}"'
+    never_spawns = f"{_OK}\x00ignored"  # rejected pre-spawn: embedded NUL
+    commands = (_OK, hangs, _OK, never_spawns, _OK)
+    policy = Policy(verify=VerifyPolicy(commands=commands))
+
+    results = verify.run_verify_commands(policy, tmp_path)
+
+    # one apiece, in the configured order — a short list is the failure
+    assert [result.command for result in results] == list(commands)
+    completed, timed_out, after_timeout, never_started, after_spawn_fault = results
+
+    assert completed.returncode == 0 and completed.spawn_error is None
+
+    assert timed_out.returncode == -1
+    assert timed_out.output_tail == "timed out"
+    assert timed_out.spawn_error is None  # it RAN; only a child that never started faults
+
+    assert never_started.returncode == verify.SPAWN_FAULT_RC
+    assert never_started.returncode != timed_out.returncode  # the two sentinels stay apart
+    assert never_started.spawn_error is not None and "ValueError" in never_started.spawn_error
+
+    # the commands each fault was followed by still ran, which is what `continue` buys
+    assert after_timeout.returncode == 0 and after_timeout.spawn_error is None
+    assert after_spawn_fault.returncode == 0 and after_spawn_fault.spawn_error is None
+
+
 def test_verify_commands_bound_a_stream_instead_of_holding_it_whole(tmp_path, monkeypatch):
     """A chatty command's stream is cut to `MAX_STREAM_MEMORY_BYTES` as it is
     collected, and what it emitted is recorded rather than lost.
