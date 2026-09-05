@@ -1482,11 +1482,12 @@ def _kind_param_index(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> int | None:
 
 
 # A `kind` argument at a declared dynamic-kind position that the scan could not
-# resolve: a `*args` splat covering the parameter's slot, or a non-literal expression
-# in that slot or in a `kind=` keyword. Emitted AS a kind so the inventory arm reddens
-# naming the site: no row can declare it, and an unreadable argument must not share
-# its silence with "this call passed no literal".
-UNRESOLVED_DYNAMIC_KIND = "<unresolved-positional-kind>"
+# resolve: a `*args` splat covering the parameter's slot, a `**` splat the scan cannot
+# read into (a Name, a computed key, a nested `{**other}`, or a non-literal `kind`
+# value), or a non-literal expression in that slot or in a `kind=` keyword. Emitted AS
+# a kind so the inventory arm reddens naming the site: no row can declare it, and an
+# unreadable argument must not share its silence with "this call passed no literal".
+UNRESOLVED_DYNAMIC_KIND = "<unresolved-dynamic-kind>"
 
 
 def _positional_kind_literal(node: ast.Call, index: int) -> str | None:
@@ -1520,6 +1521,50 @@ def _positional_kind_literal(node: ast.Call, index: int) -> str | None:
     if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
         return arg.value
     return UNRESOLVED_DYNAMIC_KIND
+
+
+def _splat_kind_literal(value: ast.expr) -> str | None:
+    """The string literal a ``**`` splat hands a declared dynamic-kind position;
+    :data:`UNRESOLVED_DYNAMIC_KIND` when the splat is something the scan cannot read;
+    None only when it IS readable and carries no ``kind`` key.
+
+    Three-way for `_positional_kind_literal`'s reason: ABSENT and
+    OCCUPIED-BUT-UNREADABLE must not share one return value. A dict literal with no
+    ``kind`` key is a readable statement that the slot is empty — the position's own
+    parameter default applies and the definition arm reports it — while ``**fields``
+    is a statement the scan cannot read at all, and folding the two together would let
+    a splat-carried kind reach the journal with no ``JOURNAL_KINDS`` row while the
+    completeness assertion stayed green.
+
+    EVERY key/value pair is scanned, and the LAST ``kind`` key wins, because that is
+    what Python delivers: reading the first and returning made ``**{"kind": "a",
+    "kind": "b"}`` inventory ``a`` while the call shipped ``b``, and let a trailing
+    ``**other`` or computed key — either of which can override the entry just read —
+    pass as the literal it displaced. The inventoried row has to be the kind that
+    ships, or the arm grades a call that does not exist.
+
+    Deliberately unresolved, each landing on the sentinel rather than a guess: an
+    ``ast.IfExp`` between two dict literals (``_dict_literal_keys`` may union its KEYS,
+    but two branches can carry two different kind VALUES), a Name bound to a dict in
+    the same function (``_journal_splat_keys`` resolves those, but keys only), and a
+    dict built by a CALL (``**dict(kind="z")``), which the ``ast.Dict`` gate refuses
+    because the callee is not necessarily ``dict``."""
+    if not isinstance(value, ast.Dict):
+        return UNRESOLVED_DYNAMIC_KIND
+    found: str | None = None
+    for key, item in zip(value.keys, value.values):
+        # A `None` key node is `{**other}`; anything else non-static is computed.
+        # Either can carry — or overwrite — a `kind` wherever it sits, so position in
+        # the dict buys nothing and the whole splat is unreadable.
+        if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+            return UNRESOLVED_DYNAMIC_KIND
+        if key.value == "kind":
+            found = (
+                item.value
+                if isinstance(item, ast.Constant) and isinstance(item.value, str)
+                else UNRESOLVED_DYNAMIC_KIND
+            )
+    return found
 
 
 def _is_journal_write(node: ast.AST, rel: str) -> bool:
@@ -2340,7 +2385,34 @@ def _scan_source(src: str, rel: str):
             isinstance(node, ast.Call)
             and (rel, _called_name(node.func)) in JOURNAL_DYNAMIC_KIND_ALLOW
         ):
+            index = kind_positions.get(_called_name(node.func))
+            # A `**` splat cannot carry `kind` when the call already delivers it —
+            # Python raises TypeError on the duplicate — so a call whose kind is
+            # readable by another route must not also be reported as unreadable:
+            # `self._skip_review_and_commit(task, kind="lit", **fields)` and the
+            # forwarder's `self._log("plugin-hook", **fields)` both reddened the
+            # inventory on a kind the scan could read perfectly well. A slot filled
+            # with a non-literal counts as delivered too: the positional arm below
+            # already emits the sentinel for it, and two sentinels from one site are
+            # noise, not evidence.
+            kind_delivered = any(kw.arg == "kind" for kw in node.keywords) or (
+                index is not None and _positional_kind_literal(node, index) is not None
+            )
             for kw in node.keywords:
+                if kw.arg is None:
+                    # A `**` splat: `self._skip_review_and_commit(task, **{"kind":
+                    # "new-kind"})` is legal Python that reaches the journal, and this
+                    # loop skipped it entirely — `kw.arg` is None, so the `!= "kind"`
+                    # test below dropped it and the inventory reported itself complete.
+                    # None means the splat is readable and carries no `kind` (the
+                    # parameter default applies, which the definition arm reports);
+                    # anything unreadable is the sentinel, never silence.
+                    splat = None if kind_delivered else _splat_kind_literal(kw.value)
+                    if splat is not None:
+                        findings.append(
+                            ("journalkindliteral", rel, node.lineno, line_at(node.lineno), splat)
+                        )
+                    continue
                 if kw.arg != "kind":
                     continue
                 # A spelled-but-unreadable `kind=` is unresolvable, not absent, for
@@ -2365,8 +2437,7 @@ def _scan_source(src: str, rel: str):
             # A declared FORWARDER (`plugins/bus.py::_log`) is itself a journal
             # write, so the main emit above already read its positional kind; this
             # arm exists for the declared positions that are not forwarders, where
-            # nothing else reads the slot.
-            index = kind_positions.get(_called_name(node.func))
+            # nothing else reads the slot. `index` is the one read above.
             if (
                 index is not None
                 and not any(kw.arg == "kind" for kw in node.keywords)
@@ -5158,7 +5229,11 @@ def test_journal_kind_literal_probes_stay_silent_on_lookalikes():
     strings that never reach `Journal.append`.
 
     Ablation: drop `_is_journal_write`'s receiver anchor (accept any `.append`) and
-    the list-append row reddens."""
+    the list-append row reddens; make `_splat_kind_literal` return the sentinel instead
+    of None for a readable splat with no `kind` key and the `**{"story_key": s}` row
+    reddens; drop the `JOURNAL_DYNAMIC_KIND_ALLOW` membership test on the call arm and
+    the undeclared-callee splat row reddens with `['new-kind']`; key that arm by name
+    alone and the wrong-file splat row reddens with `['x']`."""
     for source, rel in (
         ("def f(self):\n    self.journal.append(kind, story_key=s)\n", "sweep.py"),
         (
@@ -5181,6 +5256,17 @@ def test_journal_kind_literal_probes_stay_silent_on_lookalikes():
         ),
         ('def f(self):\n    self.emit(kind="review-skipped")\n', "engine.py"),
         ("def _skip_review_and_commit(self, task, *, kind=None):\n    return None\n", "engine.py"),
+        # The `**` splat arm's silence, in the three directions it must not invent a
+        # kind: a READABLE splat that carries no `kind` (the position's parameter
+        # default applies, and the definition arm reports that instead — folding it
+        # into the sentinel would fail loud on a call that says nothing), a splat at an
+        # UNDECLARED callee, and the same splat call in a file declaring no position.
+        ('def f(self):\n    self._skip_review_and_commit(task, **{"story_key": s})\n', "engine.py"),
+        ('def f(self):\n    self.emit(**{"kind": "new-kind"})\n', "engine.py"),
+        (
+            'def f(self):\n    self._skip_review_and_commit(task, **{"kind": "x"})\n',
+            "stories_engine.py",
+        ),
     ):
         assert not [f for f in _scan_source(source, rel) if f[0] == "journalkindliteral"], source
 
@@ -5199,6 +5285,140 @@ def test_journal_kind_literal_probes_stay_silent_on_lookalikes():
         if f[0] == "journalkindliteral"
     ]
     assert unresolvable == [UNRESOLVED_DYNAMIC_KIND], unresolvable
+
+
+def test_journal_kind_literal_reads_a_splat_dynamic_kind():
+    """A `kind` handed a declared dynamic-kind position through a `**` SPLAT is
+    inventoried, not just a `kind=` keyword or a positional slot.
+
+    `self._skip_review_and_commit(task, **{"kind": "new-kind"})` is legal Python that
+    reaches the journal, and the `for kw in node.keywords` loop skipped it outright: a
+    splat's `kw.arg` is None, so the `!= "kind"` test dropped it and the kind landed in
+    the journal with no `JOURNAL_KINDS` row while the completeness assertion stayed
+    green.
+
+    The three unresolvable rows are the fail-loud half — a splat over a Name, a
+    non-literal `kind` value, and a non-static key — each yielding a kind no row can
+    declare, so the inventory reddens naming the site rather than under-reporting.
+
+    Ablation: delete the `kw.arg is None` branch from the `node.keywords` loop and
+    every row here reddens."""
+    for source, rel, kinds in (
+        (
+            'def f(self):\n    self._skip_review_and_commit(task, **{"kind": "new-kind"})\n',
+            "engine.py",
+            ["new-kind"],
+        ),
+        (
+            "def f(self):\n    self._skip_review_and_commit(task, **fields)\n",
+            "engine.py",
+            [UNRESOLVED_DYNAMIC_KIND],
+        ),
+        (
+            'def f(self):\n    self._skip_review_and_commit(task, **{"kind": chosen})\n',
+            "engine.py",
+            [UNRESOLVED_DYNAMIC_KIND],
+        ),
+        (
+            'def f(self):\n    self._skip_review_and_commit(task, **{key: "x"})\n',
+            "engine.py",
+            [UNRESOLVED_DYNAMIC_KIND],
+        ),
+        # `{**other}` spells a None key node: unresolvable by definition, exactly as
+        # `_dict_literal_keys` reads it — and it is unresolvable wherever it sits,
+        # because a trailing one OVERRIDES the `kind` just read. Same for a computed
+        # key. Reading the first `kind` and returning inventoried the entry Python
+        # then threw away.
+        (
+            'def f(self):\n    self._skip_review_and_commit(task, **{**other, "kind": "x"})\n',
+            "engine.py",
+            [UNRESOLVED_DYNAMIC_KIND],
+        ),
+        (
+            'def f(self):\n    self._skip_review_and_commit(task, **{"kind": "x", **other})\n',
+            "engine.py",
+            [UNRESOLVED_DYNAMIC_KIND],
+        ),
+        (
+            'def f(self):\n    self._skip_review_and_commit(task, **{"kind": "x", key: "y"})\n',
+            "engine.py",
+            [UNRESOLVED_DYNAMIC_KIND],
+        ),
+        # A duplicated literal key is legal, and Python's last-wins is the kind that
+        # ships: `b` is journalled, so `b` is what the inventory must grade.
+        (
+            'def f(self):\n    self._skip_review_and_commit(task, **{"kind": "a", "kind": "b"})\n',
+            "engine.py",
+            ["b"],
+        ),
+    ):
+        found = [f[4] for f in _scan_source(source, rel) if f[0] == "journalkindliteral"]
+        assert found == kinds, f"extracted {found} from:\n{source}"
+
+
+def test_journal_kind_literal_splat_defers_to_a_readably_delivered_kind():
+    """A splat alongside a kind the scan CAN read is not a second, unreadable kind.
+    Python raises TypeError on a duplicate keyword, so `**fields` in these two calls
+    provably cannot carry `kind` — yet the arm emitted the sentinel beside the literal
+    and reddened the inventory on a site whose kind is fully readable.
+
+    The forwarder row is the second route to the same mistake: `_log`'s kind arrives
+    POSITIONALLY, so no `kind=` keyword exists to notice, and only the filled slot says
+    the splat is spoken for.
+
+    Ablation: drop the `kind_delivered` guard on the splat emit and both rows redden
+    with a trailing `UNRESOLVED_DYNAMIC_KIND`."""
+    for source, rel, kinds in (
+        (
+            'def f(self):\n    self._skip_review_and_commit(task, kind="lit", **fields)\n',
+            "engine.py",
+            ["lit"],
+        ),
+        (
+            "def _log(self, kind, **fields):\n"
+            "    self._journal.append(kind, **fields)\n"
+            "\n"
+            'def caller(self):\n    self._log("plugin-hook", **fields)\n',
+            "plugins/bus.py",
+            ["plugin-hook"],
+        ),
+    ):
+        found = [f[4] for f in _scan_source(source, rel) if f[0] == "journalkindliteral"]
+        assert found == kinds, f"extracted {found} from:\n{source}"
+
+
+def test_journal_kind_literal_splat_and_positional_arms_do_not_double_report():
+    """The one call shape both new-ish arms can fire on: a POSITIONAL-OR-KEYWORD
+    declared position, where a `**` splat may fill the `kind` slot the positional arm
+    also reads. Each site must yield exactly one kind — the readable one.
+
+    Neither arm may hand off blindly, and each row grades the opposite handoff: with
+    the slot EMPTY only the splat can see the kind, and with the slot FILLED only the
+    positional arm can. A dedupe condition widened to "the other arm will get it"
+    silences one row or the other, which no probe outside this one catches.
+
+    Ablation: delete the `kw.arg is None` branch, or widen `kind_delivered` to `index
+    is not None` (deferring on any declared position rather than a FILLED one), and the
+    first row goes empty; widen the positional arm's `not any(kw.arg == "kind" ...)`
+    guard to bail on ANY keyword — the shape of a "let the splat arm own it" edit — and
+    the second row goes empty. `kind_delivered` is NOT what grades the second row: its
+    splat carries no `kind`, so `_splat_kind_literal` returns None either way."""
+    for source, rel, kinds in (
+        (
+            _POSITIONAL_KIND_DEF + "def caller(self):\n"
+            '    self._close_bundle_ledger_when_spec_status(task, spec, status, **{"kind": "k1"})\n',
+            "sweep.py",
+            ["k1"],
+        ),
+        (
+            _POSITIONAL_KIND_DEF + "def caller(self):\n"
+            '    self._close_bundle_ledger_when_spec_status(task, spec, status, "k2", **{"other": 1})\n',
+            "sweep.py",
+            ["k2"],
+        ),
+    ):
+        found = [f[4] for f in _scan_source(source, rel) if f[0] == "journalkindliteral"]
+        assert found == kinds, f"extracted {found} from:\n{source}"
 
 
 # The declared position whose `kind` is positional-or-keyword, with NO default, so the
