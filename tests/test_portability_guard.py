@@ -429,6 +429,14 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "decision",
         "decisions",
         "deduped",
+        # `sweep-decision-answer-dropped`'s discriminator: WHICH of the two drop
+        # lanes fired, as a closed two-value enum (`no-intent` | `name-collision`).
+        # A closed enum deliberately — `reason` and `error`, the natural spellings
+        # for "why was it dropped", are in `diagnostics._JOURNAL_DROP_FIELDS` and
+        # would ship as a presence marker instead of the distinction the record
+        # exists to draw, and a free-text spelling would be the one place triage
+        # prose could enter this record.
+        "drop_cause",
         "dropped",
         "dw_id",
         "effect",
@@ -934,6 +942,7 @@ JOURNAL_KINDS = frozenset(
         "sweep-bundle-close-carried",
         "sweep-bundle-close-carry-uncommitted",
         "sweep-bundle-closed",
+        "sweep-bundle-name-deduped",
         "sweep-bundle-name-discarded",
         "sweep-bundle-name-normalized",
         "sweep-bundle-reclosed",

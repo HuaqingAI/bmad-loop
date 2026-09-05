@@ -746,6 +746,17 @@ class SweepEngine(Engine):
         # decisions already journaled as skipped this process; without it a
         # persistent decision item would notify once per repeat cycle
         self._skipped_decisions: set[str] = set()
+        # decisions whose recorded answer this process already journaled as
+        # DROPPED (and notified) — same shape and same reason as
+        # `_skipped_decisions` above. `_materialize_bundles` leaves the run-level
+        # `answers` entry alone (it is the human's recorded answer and stays
+        # auditable on disk), so `_decisions_phase` re-reads it every repeat
+        # cycle: without this set a dropped decision re-notifies once per cycle,
+        # and a cycle whose re-triage happens to mint an AGREEING option would
+        # revive a decision the operator was already told had been dropped.
+        # Process-local run state, deliberately: the disposition is the run's,
+        # the answer is the human's.
+        self._dropped_decisions: set[str] = set()
         self.state.run_type = "sweep"
 
     def _remaining_estimate(self) -> int | None:
@@ -1692,6 +1703,8 @@ class SweepEngine(Engine):
             answer = answers.get(decision.id)
             if not answer or answer.get("effect") != "build":
                 continue
+            if decision.id in self._dropped_decisions:
+                continue  # announced dropped earlier this run (see __init__)
             # `Decision.option` matches on KEY ALONE, and a key is a position in a
             # list a later triage re-authors freely: `_ensure_triage` mints a fresh
             # `triage-<n>.json` per repeat cycle while `answers` persists for the
@@ -1746,7 +1759,15 @@ class SweepEngine(Engine):
                 # human `build` decision must not vanish on a journal line alone.
                 # The ledger entry is untouched, so the next sweep re-triages and
                 # re-asks it through `_decisions_phase`.
-                self.journal.append("sweep-decision-answer-dropped", decision=decision.id)
+                # `drop_cause` is a closed two-value enum so the two drop lanes
+                # are discriminated by an enum rather than by free text or by a
+                # second journal kind (`reason` is deliberately not a benign
+                # journal field).
+                self.journal.append(
+                    "sweep-decision-answer-dropped",
+                    decision=decision.id,
+                    drop_cause="no-intent",
+                )
                 gates.notify(
                     self.policy,
                     self.run_dir,
@@ -1754,6 +1775,7 @@ class SweepEngine(Engine):
                     "its triage option changed and the stored answer carries no "
                     "intent of its own — the entry stays open for the next sweep",
                 )
+                self._dropped_decisions.add(decision.id)
                 continue
             label = str(answer.get("label", "")) or (option.label if option else "") or "build"
             bundle_name = str(answer.get("bundle_name", "")) or (
@@ -1771,6 +1793,12 @@ class SweepEngine(Engine):
             # build decision is the payload and `decision-<id>` below is the
             # always-legal name it falls back to anyway, so the discard is journaled
             # the way `_normalize_bundle_names`'s repairs are and the sweep proceeds.
+            # Why a colliding STORED name is discarded here while the fallback below
+            # is SUFFIXED, two remedies for one collision condition: a stored name
+            # has somewhere to fall back TO, and falling back is the better repair —
+            # it is unvalidated prose carried by an answer whose option may be gone,
+            # so a `widen-x-2` variant of it claims a name nothing authored. The
+            # fallback has nothing below it, so suffixing is the only repair left.
             if bundle_name and (
                 not BUNDLE_NAME_RE.match(bundle_name)
                 or safe_segment(bundle_name) != bundle_name
@@ -1784,6 +1812,66 @@ class SweepEngine(Engine):
                 bundle_name = ""
             key = (option.key if option else "") or answer_key or "?"
             name = bundle_name or "decision-" + decision.id.lower()
+            # `decision-<id>` READS like a reserved namespace and is not one:
+            # `validate_triage` builds its duplicate-name set from plan bundle
+            # names and build-option `bundle_name`s only, so a triage plan may
+            # legally author a bundle literally named `decision-dw-118` and
+            # nothing ever compares this fallback against it. Downstream,
+            # `_bundle_key` is a pure function of the name, so two same-named
+            # `Bundle`s become ONE task: `_run_bundle` returns early on a
+            # terminal task, or writes the second's `intent.md` over the first's
+            # under the same dirname, and the human's decision bundle disappears
+            # without a record. Reserving the prefix upstream was rejected (it
+            # changes the triage-plan contract, escalates one unlucky
+            # LLM-authored name into a whole-plan rejection, and still misses a
+            # STORED name shaped `decision-<other-id>`, which never passes
+            # `validate_triage` at all), so uniqueness is re-established here —
+            # the one site where validated plan names, validated option names,
+            # unvalidated stored-answer names and the fallback all meet. The
+            # taken set is recomputed per decision, never snapshotted before the
+            # loop: it must cover the decision bundles appended by earlier
+            # iterations, which collide with each other the same way.
+            taken = {b.name for b in bundles}
+            if name in taken:
+                for attempt in range(2, 10):
+                    candidate = f"{name}-{attempt}"
+                    if candidate not in taken:
+                        # `name=` so the record stands on its own, the way its
+                        # sibling `sweep-bundle-name-discarded` carries `original=`:
+                        # without it the resulting name has to be re-derived by hand
+                        # from the id and the suffix.
+                        self.journal.append(
+                            "sweep-bundle-name-deduped",
+                            decision=decision.id,
+                            attempt=attempt,
+                            name=candidate,
+                        )
+                        name = candidate
+                        break
+                else:
+                    # The one point in NAME ASSIGNMENT at which a buildable stored
+                    # answer yields no bundle — a naming impossibility, not a
+                    # mismatch disposition, and bounded so the loop is provably
+                    # finite. (Scoped to this step deliberately: an already-named
+                    # decision bundle can still be removed further down by the
+                    # failed/keep-open skip or by the max_bundles truncation.) Loud
+                    # on both surfaces, like the no-intent drop it shares a kind
+                    # with.
+                    self.journal.append(
+                        "sweep-decision-answer-dropped",
+                        decision=decision.id,
+                        drop_cause="name-collision",
+                    )
+                    gates.notify(
+                        self.policy,
+                        self.run_dir,
+                        f"decision {decision.id}: recorded build decision discarded",
+                        f"its bundle could not be given a name unique among this "
+                        f"cycle's bundles ({name} and every -2..-9 suffix are "
+                        "taken) — the entry stays open for the next sweep",
+                    )
+                    self._dropped_decisions.add(decision.id)
+                    continue
             bundles.append(
                 Bundle(
                     name=name,

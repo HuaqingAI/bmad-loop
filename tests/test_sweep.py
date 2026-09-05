@@ -140,10 +140,15 @@ def ledger_entries(project) -> dict:
     }
 
 
+def _records(engine, kind: str) -> list[dict]:
+    """Every journal record of `kind` the run wrote, in order."""
+    records = [json.loads(line) for line in journal_text(engine).splitlines() if line.strip()]
+    return [r for r in records if r.get("kind") == kind]
+
+
 def _mismatches(engine) -> list[dict]:
     """Every `sweep-decision-option-mismatch` record the run wrote, in order."""
-    records = [json.loads(line) for line in journal_text(engine).splitlines() if line.strip()]
-    return [r for r in records if r.get("kind") == "sweep-decision-option-mismatch"]
+    return _records(engine, "sweep-decision-option-mismatch")
 
 
 # ------------------------------------------------------- validate_triage
@@ -4289,6 +4294,394 @@ def test_stored_bundle_name_colliding_with_a_plan_bundle_is_discarded(project):
     assert "the plan bundle's intent" in plan_intent
     assert "widen the field" not in plan_intent  # never overwritten by the decision bundle
     assert ledger_entries(project)["DW-2"].status.startswith("done")
+
+
+def test_fallback_name_colliding_with_a_plan_bundle_is_suffixed(project):
+    """DW-118 follow-up: `decision-<id>` READS like a reserved namespace and is
+    not one. `validate_triage` builds its duplicate-name set from plan bundle
+    names and build-option `bundle_name`s only, so a plan may legally author a
+    bundle called `decision-dw-1` and nothing compares the fallback against it —
+    at which point `_bundle_key` (a pure function of the name) aliases both
+    `Bundle`s onto ONE task and one intent directory, and the human's decision
+    bundle is silently skipped or overwritten. The final name is now made unique
+    with a bounded numeric suffix. Ablation: delete the uniqueness loop and this
+    reddens — no `sweep-bundle-name-deduped` record, `dw-decision-dw-1-2` is
+    never minted, and the single surviving `decision-dw-1` directory holds one
+    intent instead of two."""
+    from bmad_loop import decisions
+    from bmad_loop.sweep import DecisionOption
+
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    # no stored `bundle_name`, and the agreeing option carries none either, so
+    # the name falls back to `decision-dw-1` — the plan bundle's exact name
+    decisions.record_pre_answer(
+        project.project,
+        "DW-1",
+        DecisionOption(key="1", label="Widen", effect="build", intent="widen the field"),
+        date="2026-06-12",
+    )
+    plan = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[
+            {"name": "decision-dw-1", "dw_ids": ["DW-2"], "intent": "the plan bundle's intent"}
+        ],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {"key": "1", "label": "Widen", "effect": "build", "intent": "fresh intent"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "decision-dw-1", ["DW-2"]),
+            bundle_review_effect(project, "decision-dw-1"),
+            bundle_dev_effect(project, "decision-dw-1-2", ["DW-1"]),
+            bundle_review_effect(project, "decision-dw-1-2"),
+        ],
+        prompting=False,
+    )
+    summary = engine.run()
+    assert not summary.paused
+
+    assert _mismatches(engine) == []  # PRECONDITION: the AGREEING lane
+    [deduped] = _records(engine, "sweep-bundle-name-deduped")
+    assert deduped["decision"] == "DW-1" and deduped["attempt"] == 2
+    # the alias is what the rule closes: distinct task keys AND distinct dirs
+    assert engine.state.tasks["dw-decision-dw-1"].phase == Phase.DONE
+    assert engine.state.tasks["dw-decision-dw-1-2"].phase == Phase.DONE
+    assert engine.state.tasks["dw-decision-dw-1"].dw_ids == ["DW-2"]
+    assert engine.state.tasks["dw-decision-dw-1-2"].dw_ids == ["DW-1"]
+    bundles_dir = engine.run_dir / "bundles"
+    plan_intent = (bundles_dir / "decision-dw-1" / "intent.md").read_text(encoding="utf-8")
+    decision_intent = (bundles_dir / "decision-dw-1-2" / "intent.md").read_text(encoding="utf-8")
+    assert "the plan bundle's intent" in plan_intent
+    assert "widen the field" not in plan_intent  # never overwritten by the decision bundle
+    assert "widen the field" in decision_intent
+    entries = ledger_entries(project)
+    assert entries["DW-1"].status.startswith("done")
+    assert entries["DW-2"].status.startswith("done")
+
+
+def test_fallback_name_colliding_with_an_earlier_decision_bundle_is_suffixed(project):
+    """Two rules in one row. (a) The taken set is recomputed per decision, never
+    snapshotted before the loop: decision bundles collide with EACH OTHER exactly
+    as they collide with plan bundles — DW-1's stored `bundle_name` is literally
+    `decision-dw-2`, the name DW-2's own answer then falls back to. (b) FIRST FREE
+    wins, not a fixed `-2` retry: `-2` is occupied by a plan bundle here, so the
+    scan has to walk past it to `-3`. Ablations: hoist
+    `taken = {b.name for b in bundles}` above the decision loop and this reddens
+    (the second bundle takes `decision-dw-2` and aliases onto the first); replace
+    the `range(2, 10)` scan with a single fixed `-2` candidate and it reddens too
+    (nothing is free, so the answer is dropped instead of deduped)."""
+    from bmad_loop import decisions
+    from bmad_loop.sweep import DecisionOption
+
+    write_ledger(project, {"DW-1": "open", "DW-2": "open", "DW-3": "open"})
+    decisions.record_pre_answer(
+        project.project,
+        "DW-1",
+        DecisionOption(
+            key="1",
+            label="Widen",
+            effect="build",
+            intent="widen the field",
+            bundle_name="decision-dw-2",  # the name DW-2's fallback will want
+        ),
+        date="2026-06-12",
+    )
+    decisions.record_pre_answer(
+        project.project,
+        "DW-2",
+        DecisionOption(key="1", label="Narrow", effect="build", intent="narrow the field"),
+        date="2026-06-12",
+    )
+    plan = triage_result(
+        ["DW-1", "DW-2", "DW-3"],
+        # occupies the FIRST suffix, so `-2` is not free when DW-2 is deduped
+        bundles=[
+            {"name": "decision-dw-2-2", "dw_ids": ["DW-3"], "intent": "the plan bundle's intent"}
+        ],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {"key": "1", "label": "Widen", "effect": "build", "intent": "fresh 1"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            ),
+            _decision(
+                "DW-2",
+                [
+                    {"key": "1", "label": "Narrow", "effect": "build", "intent": "fresh 2"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            ),
+        ],
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "decision-dw-2-2", ["DW-3"]),
+            bundle_review_effect(project, "decision-dw-2-2"),
+            bundle_dev_effect(project, "decision-dw-2", ["DW-1"]),
+            bundle_review_effect(project, "decision-dw-2"),
+            bundle_dev_effect(project, "decision-dw-2-3", ["DW-2"]),
+            bundle_review_effect(project, "decision-dw-2-3"),
+        ],
+        prompting=False,
+        max_bundles=3,
+    )
+    summary = engine.run()
+    assert not summary.paused
+
+    assert _mismatches(engine) == []  # PRECONDITION: both options agree
+    [deduped] = _records(engine, "sweep-bundle-name-deduped")
+    assert deduped["decision"] == "DW-2"
+    assert deduped["attempt"] == 3  # `-2` was taken; the scan walked past it
+    assert deduped["name"] == "decision-dw-2-3"
+    assert engine.state.tasks["dw-decision-dw-2"].dw_ids == ["DW-1"]
+    assert engine.state.tasks["dw-decision-dw-2-3"].dw_ids == ["DW-2"]
+    assert engine.state.tasks["dw-decision-dw-2-2"].dw_ids == ["DW-3"]  # the plan bundle
+    bundles_dir = engine.run_dir / "bundles"
+    first = (bundles_dir / "decision-dw-2" / "intent.md").read_text(encoding="utf-8")
+    second = (bundles_dir / "decision-dw-2-3" / "intent.md").read_text(encoding="utf-8")
+    assert "widen the field" in first and "narrow the field" not in first
+    assert "narrow the field" in second
+
+
+def test_exhausting_the_name_suffix_bound_drops_and_notifies_the_decision(project):
+    """The SOLE case in which a buildable stored answer produces no bundle: the
+    fallback and every candidate in the bound are already taken, so there is no
+    name left that would not alias the human's bundle onto another one. A naming
+    impossibility, not a mismatch disposition, so it is loud on both surfaces —
+    `drop_cause` (a closed two-value enum) is what tells it apart from the
+    no-intent drop, and the entry stays open for the next sweep. `max_bundles=1`
+    keeps the nine occupying plan bundles from having to run. Ablation: delete
+    the exhausted-bound `else` and this reddens — no drop record, no ATTENTION
+    line, and the decision bundle silently re-takes `decision-dw-1`."""
+    from bmad_loop import decisions
+    from bmad_loop.sweep import DecisionOption
+
+    ids = [f"DW-{n}" for n in range(1, 11)]
+    write_ledger(project, {i: "open" for i in ids})
+    decisions.record_pre_answer(
+        project.project,
+        "DW-1",
+        DecisionOption(key="1", label="Widen", effect="build", intent="widen the field"),
+        date="2026-06-12",
+    )
+    # `decision-dw-1` plus every one of `-2` ... `-9`: the whole bound, taken
+    occupied = ["decision-dw-1"] + [f"decision-dw-1-{n}" for n in range(2, 10)]
+    plan = triage_result(
+        ids,
+        bundles=[
+            {"name": name, "dw_ids": [dw_id], "intent": f"plan intent {dw_id}"}
+            for name, dw_id in zip(occupied, ids[1:], strict=True)
+        ],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {"key": "1", "label": "Widen", "effect": "build", "intent": "fresh intent"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "decision-dw-1", ["DW-2"]),
+            bundle_review_effect(project, "decision-dw-1"),
+        ],
+        prompting=False,
+        max_bundles=1,
+    )
+    summary = engine.run()
+    assert not summary.paused
+
+    assert _mismatches(engine) == []  # PRECONDITION: the AGREEING lane
+    assert _records(engine, "sweep-bundle-name-deduped") == []  # the bound was exhausted
+    [drop] = _records(engine, "sweep-decision-answer-dropped")
+    assert drop["decision"] == "DW-1" and drop["drop_cause"] == "name-collision"
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert "recorded build decision discarded" in attention
+    assert "could not be given a name unique" in attention
+    # the one bundle that ran is the PLAN bundle; nothing aliased onto its task
+    assert engine.state.tasks["dw-decision-dw-1"].dw_ids == ["DW-2"]
+    assert ledger_entries(project)["DW-1"].open  # re-asked by the next sweep
+    assert "DW-1" in decisions.load_pre_answers(project.project)  # not consumed
+
+
+def test_a_name_collision_drop_is_not_revived_by_a_later_free_cycle(project):
+    """The quarantine's OTHER drop lane. `test_a_dropped_decision_is_not_revived...`
+    reaches it through `no-intent`; this row reaches it through `name-collision`,
+    where the answer is perfectly buildable and only the names were taken. Cycle 2
+    re-triages with a plan that authors NONE of the contested names, so the
+    fallback is free again — the revival the quarantine has to refuse, since the
+    operator has already been told this decision was discarded. `max_bundles=1`
+    keeps the nine occupying plan bundles from having to run. Ablation: delete the
+    `self._dropped_decisions.add(decision.id)` on the name-collision lane alone
+    and this reddens — cycle 2 mints a `dw2-decision-dw-1` task for an answer the
+    run already gave up on."""
+    from bmad_loop import decisions
+    from bmad_loop.sweep import DecisionOption
+
+    ids = [f"DW-{n}" for n in range(1, 11)]
+    write_ledger(project, {i: "open" for i in ids})
+    decisions.record_pre_answer(
+        project.project,
+        "DW-1",
+        DecisionOption(key="1", label="Widen", effect="build", intent="widen the field"),
+        date="2026-06-12",
+    )
+    decision = _decision(
+        "DW-1",
+        [
+            {"key": "1", "label": "Widen", "effect": "build", "intent": "fresh intent"},
+            {"key": "2", "label": "Keep", "effect": "keep-open"},
+        ],
+    )
+    occupied = ["decision-dw-1"] + [f"decision-dw-1-{n}" for n in range(2, 10)]
+    plan1 = triage_result(
+        ids,
+        bundles=[
+            {"name": name, "dw_ids": [dw_id], "intent": f"plan intent {dw_id}"}
+            for name, dw_id in zip(occupied, ids[1:], strict=True)
+        ],
+        decisions=[decision],
+    )
+    # cycle 2 authors no bundle at all, so every contested name is free again
+    plan2 = triage_result(
+        ["DW-1"] + ids[2:],
+        skip=[{"id": i, "reason": "not this cycle"} for i in ids[2:]],
+        decisions=[decision],
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan1),
+            bundle_dev_effect(project, "decision-dw-1", ["DW-2"]),
+            bundle_review_effect(project, "decision-dw-1"),
+            triage_effect(plan2),
+        ],
+        policy=repeat_policy(max_bundles=1),
+        prompting=False,
+    )
+    summary = engine.run()
+    assert not summary.paused
+
+    # PRECONDITION: cycle 2 ran, and against an option that AGREES with the answer
+    assert [r["cycle"] for r in _records(engine, "sweep-cycle")] == [2]
+    assert _mismatches(engine) == []
+    [drop] = _records(engine, "sweep-decision-answer-dropped")
+    assert drop["decision"] == "DW-1" and drop["drop_cause"] == "name-collision"
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert attention.count("recorded build decision discarded") == 1
+    assert "decision-dw-1 and every -2..-9 suffix are taken" in attention
+    # cycle 2's free fallback revived nothing
+    assert not any(k.startswith("dw2-") for k in engine.state.tasks)
+    assert ledger_entries(project)["DW-1"].open
+
+
+def test_a_dropped_decision_is_not_revived_by_a_later_agreeing_cycle(project):
+    """Dropping an answer is an announcement to the operator, and
+    `_materialize_bundles` deliberately leaves the run-level `answers` entry on
+    disk (it is the human's recorded answer and stays auditable), so every later
+    repeat cycle re-reads it. Cycle 3 here re-triages DW-1 back to an option that
+    AGREES with the cycle-1 in-run answer cycle 2 dropped: without the
+    process-local quarantine that answer revives and builds a bundle for a
+    decision the operator was told had been dropped — and each cycle re-notifies.
+    Ablation: delete the `_dropped_decisions` guard and this reddens — a
+    `dw3-decision-dw-1` task appears and a second drop record plus a second
+    ATTENTION line are written."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open", "DW-3": "open"})
+    plan1 = triage_result(
+        ["DW-1", "DW-2", "DW-3"],
+        bundles=[{"name": "safe-fix", "dw_ids": ["DW-2"], "intent": "a"}],
+        # DW-3 is held back for cycle 2 to bundle: that bundle is what makes
+        # cycle 2 progress, so the repeat loop reaches cycle 3 at all
+        skip=[{"id": "DW-3", "reason": "not this cycle"}],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {"key": "1", "label": "Widen", "effect": "build", "intent": "widen the field"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    plan2 = triage_result(
+        ["DW-1", "DW-3"],
+        bundles=[{"name": "later-fix", "dw_ids": ["DW-3"], "intent": "b"}],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    # renumbered: key "1" now answers a different question
+                    {"key": "1", "label": "Close as decayed", "effect": "close"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    plan3 = triage_result(
+        ["DW-1"],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    # cycle 3 re-authors key "1" back into agreement with the
+                    # cycle-1 answer — the revival the quarantine has to refuse
+                    {"key": "1", "label": "Widen", "effect": "build", "intent": "widen the field"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan1),
+            bundle_dev_effect(project, "safe-fix", ["DW-2"]),
+            bundle_review_effect(project, "safe-fix"),
+            triage_effect(plan2),
+            bundle_dev_effect(project, "later-fix", ["DW-3"]),
+            bundle_review_effect(project, "later-fix"),
+            triage_effect(plan3),
+        ],
+        policy=repeat_policy(max_bundles=1),
+        answers=["1"],
+        prompting=True,
+    )
+    summary = engine.run()
+    assert not summary.paused
+
+    journal = journal_text(engine)
+    # PRECONDITIONS: the in-run answer was recorded, cycle 1 truncated its bundle,
+    # and all three cycles ran
+    assert '"decision-answered"' in journal
+    assert '"sweep-bundles-truncated"' in journal
+    assert engine.state.tasks["dw2-later-fix"].phase == Phase.DONE
+    assert [r["cycle"] for r in _records(engine, "sweep-cycle")] == [2, 3]
+    # exactly one drop, one mismatch and one notification for the whole run
+    assert len(_mismatches(engine)) == 1
+    [drop] = _records(engine, "sweep-decision-answer-dropped")
+    assert drop["decision"] == "DW-1" and drop["drop_cause"] == "no-intent"
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert attention.count("recorded build decision discarded") == 1
+    # and cycle 3's agreeing option revived nothing
+    assert not any(k.startswith("dw3-") for k in engine.state.tasks)
+    assert ledger_entries(project)["DW-1"].open
 
 
 def test_preanswered_keep_open_suppresses_prompt_and_persists(project):
