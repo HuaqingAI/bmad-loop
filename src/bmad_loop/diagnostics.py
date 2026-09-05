@@ -180,13 +180,17 @@ _JOURNAL_ALIAS_FIELDS = {
     # `rearm-baseline-restamp-skipped`, `rearm-baseline-restamped`); the fifth,
     # `rearm-aborted`, is written by `runs._rollback_rearm` from the transaction guard's
     # error path — a DIFFERENT function, which is why "the only producer" is no longer
-    # the right shape for this note. A SIXTH kind, `accepted-spec-write-unreachable`,
-    # is NOT a re-arm record at all: it is written mid-run, from another module
-    # entirely, by `worktree_flow._warn_accepted_spec_superseded` when a fresh mount
-    # supersedes an accepted-but-uncommitted spec (DW-101). It carries the same two
+    # the right shape for this note. A SIXTH and a SEVENTH kind,
+    # `accepted-spec-write-unreachable` and `accepted-spec-delivery-unreachable`, are
+    # NOT re-arm records at all: both are written mid-run, from another module
+    # entirely, by `worktree_flow` — the first by `_warn_accepted_spec_superseded`
+    # when a fresh mount supersedes an accepted-but-uncommitted spec (DW-101), the
+    # second by `_warn_accepted_spec_undelivered` when the mount cannot be shown to
+    # carry that spec at all (DW-104, DW-115). Both carry the same two
     # hazardous fields as `rearm-spec-write-unreachable` — `spec_file` here and
-    # `target_branch` above — plus `compared`, a bare boolean declared benign in the
-    # routing guard. Routing is by field NAME, not by kind, so the list
+    # `target_branch` above — plus one bare boolean discriminator apiece, `compared`
+    # and `located`, declared benign in the routing guard. Routing is by field NAME,
+    # not by kind, so the list
     # is documentation rather than a gate — but an enumeration that undercounts is how
     # the next reader concludes a kind is unrouted, so it is corrected rather than
     # left to age. `rearm-aborted` also carries `error` (dropped as free text) and

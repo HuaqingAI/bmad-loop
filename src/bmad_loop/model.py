@@ -582,6 +582,13 @@ class StoryTask:
         symlink-external absolute values keep their original spelling. Resolving
         both sides before containment prevents a lexical in-project path through an
         outward symlink from being redirected into a replacement checkout.
+
+        Every probe sits INSIDE the ``try``, the regular-file one included (DW-116).
+        ``run_isolated`` calls this before its first ``except``, so an ``OSError`` out
+        of ``target.is_file()`` — a TOCTOU against the ``strict=True`` resolve just
+        above it, or a non-EACCES fault — killed the run rather than leaving the
+        spelling alone. Non-raising behavior is byte-identical: a false probe still
+        returns without relativizing, and so now does a raising one.
         """
         raw = self.spec_file
         if not raw or not Path(raw).is_absolute():
@@ -590,9 +597,9 @@ class StoryTask:
             project_root = project.resolve(strict=True)
             target = Path(raw).resolve(strict=True)
             relative = target.relative_to(project_root)
+            if not target.is_file():
+                return
         except (OSError, RuntimeError, ValueError):
-            return
-        if not target.is_file():
             return
         self.spec_file = relative.as_posix()
 

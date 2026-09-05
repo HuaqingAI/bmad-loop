@@ -457,6 +457,15 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "kept",
         "key",
         "ledger",
+        # `accepted-spec-delivery-unreachable`'s discriminator: whether the locator
+        # RESOLVED a project-local rel, or only reported a swallowed filesystem
+        # fault. A bare boolean deliberately, exactly like `compared` above —
+        # `reason` and `error`, the natural spellings for "which refusal was it",
+        # are in `diagnostics._JOURNAL_DROP_FIELDS` and would ship as a presence
+        # marker instead of the distinction the record exists to draw. Benign
+        # rather than routed: a boolean names no customer artifact, and the paths
+        # it discriminates ride `spec_file`, which IS routed.
+        "located",
         "log_pos",
         "malformed",
         "mode",
@@ -937,6 +946,7 @@ JOURNAL_KINDS = frozenset(
         "sweep-triage-result",
         "triage-decision",
         # worktree_flow.py
+        "accepted-spec-delivery-unreachable",
         "accepted-spec-write-unreachable",
         "isolation-flip-orphan-preserved",
         "merge-preflight-refused",

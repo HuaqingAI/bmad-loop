@@ -421,14 +421,29 @@ def test_relocated_accepted_spec_escaping_the_mount_does_not_bind_an_outside_fil
 
     The accepted spec's parent is a real directory in the main checkout but a
     committed OUTWARD symlink in the commit the fresh worktree is cut from, so
-    `_accepted_spec_seed` refuses on its own containment arm and — uniquely among
-    the seed refusals — journals nothing: the rel reaches neither `seed_files` nor
-    `worktree-seed-skipped` nor `worktree-seed-dropped`. The mounted probe is the
-    only remaining guard, and file-ness alone follows the link to an unrelated
-    external artifact and reads as delivered.
+    `_accepted_spec_seed` refuses on its own containment arm. Since DW-104 the rel
+    is nominated into `seed_files` anyway and therefore NAMED in
+    `worktree-seed-dropped` — `provision_worktree` re-derives `dst`, sees it escape
+    and copies nothing, and `worktree_seed_undelivered` reports the same rel from
+    its own containment arm. (Before that widening this refusal journalled nothing
+    at all, which is what DW-104 was.) The escalation is unchanged: the mounted
+    probe is still the guard that stops the bind, and file-ness alone follows the
+    link to an unrelated external artifact and reads as delivered.
 
     Ablation: drop the containment clause at that probe (or the whole condition)
     and the unit dispatches, bound to the outside file instead of escalating.
+
+    No `accepted-spec-delivery-unreachable` here: this is the RELOCATED leg, and it
+    escalates. Stated as an OBSERVATION, not as a graded claim — the ablation does
+    not exist for it. Deleting the `if not accepted_spec_relocated:` gate at the
+    call site leaves this row green, because the escalation above raises
+    `RunPaused` before control ever reaches that call. The gate is belt-and-braces
+    over a probe that would answer the same way anyway, and the only shape that
+    could tell the two apart is a main checkout whose own symlinks make the
+    locator's rel differ from `task.spec_file`. What this row does grade is the
+    absence a reader would otherwise have to take on trust: a relocated unit that
+    escalates leaves exactly one advisory RECORD — none — alongside the
+    `worktree-seed-dropped` entry the seed refusal still emits.
     """
     from bmad_loop.engine import RunPaused
 
@@ -460,6 +475,10 @@ def test_relocated_accepted_spec_escaping_the_mount_does_not_bind_an_outside_fil
     assert drove == []
     assert task.phase == Phase.ESCALATED
     assert (outside / "escape.md").read_bytes() == b"unrelated external bytes\n"
+    # the refused rel is now NAMED rather than silently dropped, and nothing was
+    # written outside the mount to make that naming possible
+    assert rel in _dropped_seed_entries(engine)
+    assert _undelivered_records(engine) == []
 
 
 def _fault_read_bytes(monkeypatch, faults) -> None:
@@ -518,6 +537,23 @@ def _superseded_records(engine):
         entry
         for entry in engine.journal.entries()
         if entry["kind"] == "accepted-spec-write-unreachable"
+    ]
+
+
+def _undelivered_records(engine):
+    return [
+        entry
+        for entry in engine.journal.entries()
+        if entry["kind"] == "accepted-spec-delivery-unreachable"
+    ]
+
+
+def _dropped_seed_entries(engine) -> list[str]:
+    return [
+        rel
+        for entry in engine.journal.entries()
+        if entry["kind"] == "worktree-seed-dropped"
+        for rel in entry["entries"]
     ]
 
 
@@ -750,6 +786,56 @@ def test_accepted_spec_outside_the_project_journals_no_supersede_warning(project
 
     assert _superseded_records(engine) == []
     assert external.read_bytes() == b"external accepted bytes\n"
+    # and neither shape is the delivery record's business either: an absolute
+    # spelling and an empty one both leave the locator all-None WITHOUT `faulted`,
+    # which is the state that separates "no claim here" from "a fault was
+    # swallowed". Ablation: fire the record whenever the mount cannot prove
+    # delivery (drop the `ends.relative is None and not ends.faulted` return) and
+    # this row reddens with two records for two specs this path never owned.
+    assert _undelivered_records(engine) == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_relative_accepted_spec_resolving_outside_the_project_journals_nothing(project, tmp_path):
+    """The third out-of-project shape, and the one only the locator can tell apart.
+
+    A RELATIVE spelling is not automatically this path's business: resolved through
+    a symlinked directory it can land under a shared artifacts tree outside the
+    project, which the mount reads directly and which no seed may copy. The locator
+    answers `source` set / `relative` None for it — deliberately NOT `faulted`, so
+    the delivery record stays silent even though the mount plainly does not carry
+    the file.
+
+    Ablation: fold the source-outside-the-project arm of `_accepted_spec_pair` into
+    its fault arm (return `faulted=True` there) and this row reddens with an
+    `accepted-spec-delivery-unreachable` naming a spec the project never owned.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    outside = tmp_path / "shared-artifacts"
+    outside.mkdir()
+    (outside / "shared-spec.md").write_bytes(b"external accepted bytes\n")
+    link = project.project / "linked-artifacts"
+    link.symlink_to(outside, target_is_directory=True)
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    # relative on purpose: `accepted_spec_relocated` stays False, so the advisory
+    # probe actually runs rather than being skipped by the relocated gate
+    task = StoryTask("1-1-a", 1, spec_file="linked-artifacts/shared-spec.md")
+    engine.state.tasks[task.story_key] = task
+    drove: list[bool] = []
+
+    def drive(current):
+        drove.append(True)
+        current.phase = Phase.DEFERRED
+        current.defer_reason = "test complete"
+
+    engine._run_isolated(task, drive)
+
+    assert drove == [True]
+    assert _undelivered_records(engine) == []
+    assert _superseded_records(engine) == []
+    assert (outside / "shared-spec.md").read_bytes() == b"external accepted bytes\n"
 
 
 def test_unreadable_mounted_accepted_spec_warns_with_compared_false(project, monkeypatch):
@@ -831,6 +917,13 @@ def test_project_relative_accepted_spec_superseded_by_the_mount_warns(project):
     assert record["target_branch"] == "main"
     assert record["compared"] is True
     assert seen == [b"pre-approval bytes"]
+    # The DELIVERY control for the same call site: this is the one leg where both
+    # advisory probes run (relative spelling, so `accepted_spec_relocated` is False),
+    # and the mount PROVES delivery — wrong bytes, but present and contained. The
+    # delivery record must not fire on a loss that is not its own.
+    # Ablation: drop the `if delivered: return` arm in
+    # `_warn_accepted_spec_undelivered` and this row reddens.
+    assert _undelivered_records(engine) == []
 
 
 def test_unprobeable_main_accepted_spec_seeds_nothing_instead_of_raising(project, monkeypatch):
@@ -901,6 +994,24 @@ def test_unprobeable_main_accepted_spec_seeds_nothing_instead_of_raising(project
     # grades only that the DW-101 warning neither fired nor raised; it cannot
     # distinguish a seed outcome, since the same faulted probe returns it early
     assert _superseded_records(engine) == []
+    # DW-115: `mounted == [False]` above IS the defect — the unit dispatched against
+    # a mount lacking the operator's spec, un-escalated, and until this record
+    # nothing in the journal named why. No gate on this leg can see it: the
+    # `accepted_delivered` escalation is skipped for a relative spelling, and the rel
+    # never reaches `worktree-seed-dropped` because the seed's source arm folded its
+    # fault to "no bytes to promise" and nominated nothing. `located` is TRUE — the
+    # LOCATOR resolved the rel; it was the seed's existence arm that faulted.
+    #
+    # Ablation: delete the `self.journal.append` in
+    # `_warn_accepted_spec_undelivered` and this row reddens while every silent
+    # control stays green.
+    (unreachable,) = _undelivered_records(engine)
+    assert unreachable["story_key"] == "1-1-a"
+    # the MAIN-CHECKOUT path, matching the DW-101 record's spelling: both name the
+    # file the operator has to look at, never the mount's missing copy
+    assert unreachable["spec_file"] == str(main_copy)
+    assert unreachable["target_branch"] == "main"
+    assert unreachable["located"] is True
 
 
 def test_unprobeable_mounted_accepted_spec_folds_to_absent_instead_of_raising(project, monkeypatch):
@@ -965,6 +1076,243 @@ def test_unprobeable_mounted_accepted_spec_folds_to_absent_instead_of_raising(pr
     # grades only that the DW-101 warning neither fired nor raised; it cannot
     # distinguish a seed outcome, since the same faulted probe returns it early
     assert _superseded_records(engine) == []
+    # The advisory delivery record DOES fire here, and correctly so: the injected
+    # fault is scoped to `Path.is_file`, which is the very probe that would prove
+    # delivery, so the record's own arm cannot prove it either. "Cannot prove" is
+    # what the record says — an unprovable delivery is exactly what it is for — and
+    # it stays advisory: the unit read the operator's bytes and ran to DEFERRED.
+    (unreachable,) = _undelivered_records(engine)
+    assert unreachable["located"] is True
+
+
+def test_unresolvable_accepted_spec_records_the_swallowed_locator_fault(project, monkeypatch):
+    """The locator's OWN `except`, which is the second mouth of DW-115's silence.
+
+    `_accepted_spec_pair` resolves the source `strict=True` inside a
+    `except (OSError, RuntimeError, ValueError)`. A real filesystem fault there —
+    the #529/#536 WSL UNC shape this stub reproduces — is swallowed, and the seed
+    returns `()` byte-identically to "this spelling is not ours". The mount then
+    lacks the operator's spec, the relative spelling skips the `accepted_delivered`
+    escalation, and the unit dispatches against the bare story key.
+
+    `located` is FALSE here, and that is the whole reason the discriminator exists:
+    it separates a fault the locator swallowed (no rel was ever derived) from the
+    unprobeable-source row above, where the rel WAS derived and only the seed's
+    existence arm folded. Same record, two different remedies.
+
+    Ablation: return `_AcceptedSpecEnds()` instead of `_AcceptedSpecEnds(faulted=True)`
+    from that `except` and this row reddens — the record's entry condition is
+    `faulted`, since a rel-less all-None locator result is otherwise exactly the
+    spelling this path has no claim on.
+    """
+    rel = "_bmad-output/implementation-artifacts/accepted-unresolvable.md"
+    ignore_before_commit(project, rel)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    accepted = project.project / rel
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    accepted.write_bytes(b"accepted operator bytes\n")
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    # RELATIVE on purpose: `accepted_spec_relocated` stays False, so no escalating
+    # gate can mask the silent dispatch this row is here to name.
+    task = StoryTask("1-1-a", 1, spec_file=rel)
+    engine.state.tasks[task.story_key] = task
+    # after every expectation is computed: the stub raises for this exact spelling
+    refuse_to_resolve(monkeypatch, project.project / rel)
+    mounted: list[bool] = []
+
+    def drive(current):
+        mounted.append((engine.workspace.root / rel).exists())
+        current.phase = Phase.DEFERRED
+        current.defer_reason = "test complete"
+
+    engine._run_isolated(task, drive)
+
+    # the fault did not escape `run_isolated`, and nothing escalated
+    assert mounted == [False]
+    assert task.phase == Phase.DEFERRED
+    assert "story-escalated" not in journal_kinds(engine)
+    assert _superseded_records(engine) == []
+    (unreachable,) = _undelivered_records(engine)
+    assert unreachable["story_key"] == "1-1-a"
+    # no `source` to name, so the record falls back to the project-anchored spelling
+    assert unreachable["spec_file"] == str(project.project / rel)
+    assert unreachable["target_branch"] == "main"
+    assert unreachable["located"] is False
+
+
+def test_missing_accepted_spec_records_the_unresolvable_locator_arm(project):
+    """The ordinary shape of `located: false` — no injected fault at all.
+
+    `_accepted_spec_pair` resolves the source `strict=True` inside one
+    `except (OSError, RuntimeError, ValueError)`, so a spelling that simply is not
+    there lands on the same arm a swallowed filesystem fault does. That is why the
+    record's `located: false` is documented as "the locator could not resolve the
+    spec at all" rather than as a fault: from inside that `except` the two causes
+    are indistinguishable, and the record claims only what it can tell.
+
+    A missing accepted spec is not a hypothetical: a re-drive whose artifacts dir
+    was cleaned, or a task carrying a spelling from a tree that has moved, arrives
+    exactly here — the unit dispatches against the bare story key with nothing in
+    the journal naming the spec it was supposed to read.
+
+    Ablation: return `_AcceptedSpecEnds()` rather than `faulted=True` from the
+    locator's source-resolve `except`, and this row
+    reddens with no record for a spec the mount plainly lacks. The
+    `resolving_outside_the_project` row above is the control that keeps the widened
+    `faulted` arm from swallowing spellings this path has no claim on.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    rel = "_bmad-output/implementation-artifacts/accepted-never-written.md"
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    # relative on purpose: `accepted_spec_relocated` stays False, so no escalating
+    # gate can mask the silent dispatch
+    task = StoryTask("1-1-a", 1, spec_file=rel)
+    engine.state.tasks[task.story_key] = task
+    mounted: list[bool] = []
+
+    def drive(current):
+        mounted.append((engine.workspace.root / rel).exists())
+        current.phase = Phase.DEFERRED
+        current.defer_reason = "test complete"
+
+    engine._run_isolated(task, drive)
+
+    assert mounted == [False]
+    assert task.phase == Phase.DEFERRED
+    assert "story-escalated" not in journal_kinds(engine)
+    (unreachable,) = _undelivered_records(engine)
+    assert unreachable["spec_file"] == str(project.project / rel)
+    assert unreachable["target_branch"] == "main"
+    assert unreachable["located"] is False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("outside_present", [True, False])
+def test_project_relative_accepted_spec_escaping_the_mount_is_dropped_and_recorded(
+    project, tmp_path, outside_present
+):
+    """DW-104's own leg: the containment refusal with NO escalating gate above it.
+
+    Same shape as the relocated row further up — the accepted spec's parent is a
+    real directory in the main checkout and a committed OUTWARD symlink in the
+    commit the worktree is cut from — but the task already spells `spec_file`
+    relative, which is the spelling a resume PERSISTS. `accepted_spec_relocated` is
+    therefore False, the `accepted_delivered` escalation is skipped, and until
+    DW-104 the whole loss was silent: `_accepted_spec_seed` refused on the
+    locator's containment arm and the rel reached no journal at all.
+
+    Both halves of the fix are graded here. The rel is now nominated into
+    `seed_files`, which is safe only because `provision_worktree` re-derives `dst`
+    and `continue`s on its own containment check — so `worktree_seed_undelivered`
+    names it in `worktree-seed-dropped` while NOTHING is written outside the mount.
+    And the advisory record fires, because file-ness at the mounted probe follows
+    the outward link to an unrelated external artifact and so cannot prove
+    delivery.
+
+    Ablation for the seed half: return `()` from `_accepted_spec_seed` on
+    `destination is None` and the `worktree-seed-dropped` assertion reddens while
+    the record still fires. Ablation for the containment clause: drop it from the
+    new probe and the record assertion reddens while the drop stays green.
+    """
+    rel_dir = "_bmad-output/relative-accepted-elsewhere"
+    rel = f"{rel_dir}/escape.md"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if outside_present:
+        (outside / "escape.md").write_bytes(b"unrelated external bytes\n")
+    link = project.project / rel_dir
+    link.symlink_to(outside, target_is_directory=True)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    # the commit keeps the outward symlink, so the fresh worktree materializes the
+    # escape; only the main checkout gets the real directory holding the artifact
+    link.unlink()
+    link.mkdir()
+    accepted = project.project / rel
+    accepted.write_bytes(b"accepted operator bytes\n")
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    task = StoryTask("1-1-a", 1, spec_file=rel)
+    engine.state.tasks[task.story_key] = task
+    drove: list[bool] = []
+
+    def drive(current):
+        drove.append(True)
+        current.phase = Phase.DEFERRED
+        current.defer_reason = "test complete"
+
+    engine._run_isolated(task, drive)
+
+    # advisory throughout: the unit dispatched and reached its own terminal phase
+    assert drove == [True]
+    assert task.phase == Phase.DEFERRED
+    assert "story-escalated" not in journal_kinds(engine)
+    assert rel in _dropped_seed_entries(engine)
+    (unreachable,) = _undelivered_records(engine)
+    assert unreachable["spec_file"] == str(accepted.resolve())
+    assert unreachable["target_branch"] == "main"
+    # the locator DID derive the rel — the refusal was containment, not a fault
+    assert unreachable["located"] is True
+    # nothing was copied out of the mount to make any of that reporting possible
+    if outside_present:
+        assert (outside / "escape.md").read_bytes() == b"unrelated external bytes\n"
+    else:
+        # Ablation: remove provisioning's destination-containment and raw/resolved
+        # mismatch guards plus _copy_traversable's target-containment check.
+        # The absent-file assertion fails; the occupied-file control stays green.
+        assert not (outside / "escape.md").exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_accepted_spec_seed_nominates_a_file_but_never_a_directory(project, tmp_path):
+    """The seed's existence arm is shared by BOTH branches, nomination included.
+
+    Graded directly on `_accepted_spec_seed` rather than through `_run_isolated`:
+    this is the lowest layer that can catch the regression, and the two rows differ
+    in exactly one bit — whether the source is a regular file — against one
+    identical escaping mount, which an end-to-end row cannot hold that still.
+
+    The mount's artifacts dir is an OUTWARD symlink, so both destinations resolve
+    out of the worktree and the locator refuses on containment with its rel known.
+    That is the NOMINATION branch, and the file row is the control proving it is
+    reached: without the shared `_is_file(source)` arm the directory would be
+    nominated the same way, and `provision_worktree` recurses whatever it is handed
+    — a refusal that came from an unresolvable mount root rather than a real escape
+    would leave it a contained `dst` and copy the whole tree into the mount.
+
+    Ablation: move `if not _is_file(source): return ()` below the
+    `if ends.destination is None:` branch and the directory row reddens with the rel
+    nominated, while the file control stays green.
+    """
+    artifacts = project.implementation_artifacts
+    artifacts.mkdir(parents=True, exist_ok=True)
+    (artifacts / "escaping-file.md").write_bytes(b"accepted operator bytes\n")
+    (artifacts / "escaping-dir").mkdir()
+    (artifacts / "escaping-dir" / "part.md").write_bytes(b"accepted operator bytes\n")
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    mount = tmp_path / "mount"
+    (mount / "_bmad-output").mkdir(parents=True)
+    (mount / "_bmad-output" / "implementation-artifacts").symlink_to(
+        outside, target_is_directory=True
+    )
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    flow = engine._worktree_flow
+
+    # control: the containment refusal DOES reach the nomination branch — a regular
+    # file with an escaping destination is handed to the copier, which refuses it on
+    # its own re-derived containment check (the row above grades that end to end)
+    assert flow._accepted_spec_seed(StoryTask("1-1-a", 1, spec_file="escaping-file.md"), mount) == (
+        "_bmad-output/implementation-artifacts/escaping-file.md",
+    )
+    # the guard: same mount, same refusal, directory source — nominated by neither
+    assert flow._accepted_spec_seed(StoryTask("1-1-b", 1, spec_file="escaping-dir"), mount) == ()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")

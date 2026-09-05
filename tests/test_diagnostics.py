@@ -535,7 +535,8 @@ def test_verify_command_free_text_drops_to_presence_booleans():
         assert canary not in rendered, f"LEAK: {canary!r}"
 
 
-def test_rearm_records_leak_neither_the_code_root_nor_a_spec_name():
+@pytest.mark.parametrize("located", [True, False])
+def test_rearm_records_leak_neither_the_code_root_nor_a_spec_name(located):
     """The two records `runs.rearm_escalation` added must be routed by FIELD NAME,
     not left to the `scrub_json` fallback (#640, #716).
 
@@ -609,8 +610,8 @@ def test_rearm_records_leak_neither_the_code_root_nor_a_spec_name():
     assert restamped["overwritten"] != restamped["baseline"]
     assert restamped["restore"] is False  # a plain flag still ships
 
-    # The OTHER four kinds the re-arm family journals `spec_file` on, plus the one
-    # producer of the same pair of fields from OUTSIDE that family. Routing is
+    # The OTHER four kinds the re-arm family journals `spec_file` on, plus the TWO
+    # producers of the same pair of fields from OUTSIDE that family. Routing is
     # by field NAME, so these ride the same `_JOURNAL_ALIAS_FIELDS` entry as
     # `rearm-baseline-restamped` and are correct today for free — which is exactly why
     # they belong in the sweep: the canary is what catches a field added to one of
@@ -648,12 +649,23 @@ def test_rearm_records_leak_neither_the_code_root_nor_a_spec_name():
                 "accepted-spec-write-unreachable",
                 {"target_branch": REARM_BRANCH, "compared": True},
             ),
+            # The second non-re-arm producer of the same two hazardous fields, from
+            # the same module and for the mirror-image loss: DW-101 says the mount
+            # delivered the WRONG bytes, DW-104/DW-115 say delivery cannot be proven
+            # at all. Its own discriminator is `located`, a bare boolean for
+            # `compared`'s reason, and it is here because the layer that READS this
+            # record is the scrubber — a kind whose routing nobody grades is how the
+            # next leak ships.
+            (
+                "accepted-spec-delivery-unreachable",
+                {"target_branch": REARM_BRANCH, "located": located},
+            ),
         )
     ]
     # every one of them aliases to the SAME alias as the restamped record above: one
-    # spec, one alias, however many kinds carry it — five graded here plus
-    # `rearm-baseline-restamped` above, the six producers of this field today
-    assert [s["spec_file"] for s in siblings] == [alias] * 5
+    # spec, one alias, however many kinds carry it — six graded here plus
+    # `rearm-baseline-restamped` above, the seven producers of this field today
+    assert [s["spec_file"] for s in siblings] == [alias] * 6
     # the abort record's own two fields: the free-text one is dropped (it quotes a host
     # path back), the enum one is deliberately NOT aliased — both surfaces read the
     # record for `rollback`, so pseudonymizing it would destroy the field's whole point
@@ -686,6 +698,15 @@ def test_rearm_records_leak_neither_the_code_root_nor_a_spec_name():
     superseded = next(s for s in siblings if s["kind"] == "accepted-spec-write-unreachable")
     assert superseded["target_branch"] == branch_alias != REARM_BRANCH
     assert superseded["compared"] is True
+    # The delivery record says the same thing to the same operator about the same two
+    # fields, so it is graded on the same routing — and its own `located`
+    # discriminator must survive VERBATIM for `compared`'s reason: aliased or dropped,
+    # the record stops saying WHICH silence it is ending (a containment refusal whose
+    # rel is known, or a swallowed filesystem fault where it is not). Selected by KIND
+    # rather than by index for the reason stated above.
+    unreachable = next(s for s in siblings if s["kind"] == "accepted-spec-delivery-unreachable")
+    assert unreachable["target_branch"] == branch_alias != REARM_BRANCH
+    assert unreachable["located"] is located
 
     rendered = json.dumps([advance_failed, restamped, *siblings])
     for canary in (SHA, other_sha, SPEC_NAME, PROPRIETARY, HOME_PATH, REARM_BRANCH, *CANARIES):

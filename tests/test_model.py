@@ -1,6 +1,7 @@
 """RunState serialization + lifecycle-flag tests."""
 
 import binascii
+import errno
 import json
 from pathlib import Path
 
@@ -480,6 +481,48 @@ def test_resolution_fault_accepted_spec_is_unchanged(tmp_path, monkeypatch):
 
     task.relativize_project_local_accepted_spec(project)
 
+    assert task.spec_file == raw
+
+
+def test_probe_fault_accepted_spec_is_unchanged_and_does_not_raise(tmp_path, monkeypatch):
+    """The regular-file probe may not raise out of the relativizer (DW-116).
+
+    `worktree_flow.run_isolated` calls this method BEFORE its first `try`, so an
+    `OSError` here kills the whole run rather than leaving the spelling alone.
+
+    The injected errno is deliberately NOT EACCES. An unsearchable parent cannot
+    reach this probe at all: the `strict=True` resolve two lines above raises EACCES
+    first, and the `except` already covers that. What CAN reach the probe is a TOCTOU
+    between those two syscalls, or a non-EACCES `OSError` from the stat itself — so
+    EIO is what this row injects. An EACCES injection would grade a shape that never
+    occurs here.
+
+    Ablation: move the probe back BELOW the `except` block and this row reddens with
+    the `OSError` escaping the call.
+    """
+    project = tmp_path / "project"
+    spec = project / "artifacts" / "spec.md"
+    spec.parent.mkdir(parents=True)
+    spec.write_text("spec\n", encoding="utf-8")
+    raw = str(spec)
+    resolved = spec.resolve()
+    real_is_file = Path.is_file
+    faulted: list[Path] = []
+
+    def fake(self, *a, **kw):
+        if Path(self) == resolved:
+            faulted.append(Path(self))
+            raise OSError(errno.EIO, "Input/output error")
+        return real_is_file(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "is_file", fake)
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=raw)
+
+    task.relativize_project_local_accepted_spec(project)
+
+    # the fault really fired on the arm this row grades — a path-identity predicate
+    # would otherwise go green while probing nothing
+    assert faulted == [resolved]
     assert task.spec_file == raw
 
 
