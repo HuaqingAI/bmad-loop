@@ -69,6 +69,46 @@ needs_strict_codec = pytest.mark.skipif(
 )
 
 
+# The single xdist scheduling group every real-multiplexer E2E joins. Spelled once
+# here so the two E2E modules and the guard in tests/test_conftest.py read the same
+# constant; a second spelling is a group that silently does not collide with this one.
+REAL_MUX_XDIST_GROUP = "real_mux_e2e"
+
+# Pin every test that spawns a REAL tmux server onto one xdist worker (DW-95). These
+# E2Es are the suite's only wall-clock-sensitive tests: each waits on a live session
+# reaching a hook event, so when several land on different workers at once they
+# contend for the same box and starve each other past their waits — the 2026-09-02
+# py3.13 CI leg failed exactly that way. `loadgroup` schedules every test sharing a
+# group name onto a single worker, so they serialize against each other while the
+# rest of the suite still fans out.
+#
+# INERT WITHOUT `--dist loadgroup`: under the default `load` scheduler xdist ignores
+# the mark entirely and no error is raised, which is why pyproject.toml declares the
+# flag in `addopts` (so local runs and CI schedule identically) and why the guard in
+# tests/test_conftest.py asserts that declaration alongside the marks.
+real_mux_e2e = pytest.mark.xdist_group(REAL_MUX_XDIST_GROUP)
+
+# Hang ceiling for a real-tmux session wait — both the hook-completion waits and the
+# window-death wait in `test_tmux_crash_detected`, which reaches its verdict through a
+# dead window rather than a hook event and rides this same constant.
+#
+# This is a HANG DETECTOR, not a performance budget: it answers "is this session
+# wedged?" and nothing else. It is deliberately NOT tuned to observed runtimes — never
+# lower it to make a slow test loud, and never read a passing run as evidence about
+# how fast the work is.
+#
+# Sized from both ends. Floor: the waits measure ~1.0s locally and 3.4-4.2s on the CI
+# runner, and the worst starvation ever observed was 30.14s, so 90s is ~21x the CI
+# work and ~3x that starvation — far outside anything the scheduler can do to it.
+# Ceiling: `--dist loadgroup` now serializes every one of these onto ONE worker, so a
+# SYSTEMIC regression pays the wait once per test rather than in parallel, and the
+# Linux test job is capped at `timeout-minutes: 15` (.github/workflows/ci.yml). Six
+# collected uses (five hook-completion cases and one crash case) can consume up to
+# 540s for these waits alone. Stories subprocess budgets and other overhead are
+# additional, so this ceiling does not guarantee the whole job fits within its cap.
+REAL_MUX_HANG_CEILING_S = 90.0
+
+
 def assert_run_state_lock_held(run_dir: Path) -> None:
     """Fail unless this process already owns the canonical logical state lock."""
     sidecar = runs.lock_path_for(run_dir / STATE_FILE, follow_final_symlink=False)

@@ -60,6 +60,7 @@ from conftest import (
     RENDERER_SCRIPT_IMPORTING_SIBLING,
     install_build_auto_skill,
     install_dev_base_skills,
+    real_mux_e2e,
 )
 
 from bmad_loop import runs
@@ -76,7 +77,13 @@ from bmad_loop.install import (
 # (`date +%s%N`; the detached-writer fake also needs setsid(1)) — BSD/macOS date
 # has no %N and macOS ships no setsid utility, so skipping honestly beats failing.
 HAVE_TMUX = sys.platform.startswith("linux") and shutil.which("tmux") is not None
-pytestmark = pytest.mark.skipif(not HAVE_TMUX, reason="stories E2E needs real tmux on Linux")
+# A LIST, not a single mark: every test here drives a real tmux server, so on top of
+# the host gate they all join the serialized real-mux xdist group (DW-95). These 15
+# are the bulk of that group.
+pytestmark = [
+    pytest.mark.skipif(not HAVE_TMUX, reason="stories E2E needs real tmux on Linux"),
+    real_mux_e2e,
+]
 
 # The fake CLI: reads the story id + spec folder from the session env (as the real
 # folder+id adapter does), writes the id-keyed story spec BEFORE the Stop event so

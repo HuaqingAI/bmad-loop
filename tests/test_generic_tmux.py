@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 import regex
-from conftest import json_recursion_payload
+from conftest import REAL_MUX_HANG_CEILING_S, json_recursion_payload, real_mux_e2e
 
 from bmad_loop import devcontract, runs
 from bmad_loop.adapters import base as adapter_base
@@ -3852,6 +3852,7 @@ def _write_fake_cli(tmp_path, script: str = FAKE_CLI):
 
 
 @pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
+@real_mux_e2e
 @pytest.mark.parametrize("profile_name", ["claude", "codex", "gemini"])
 def test_tmux_end_to_end_with_fake_cli(tmp_path, profile_name):
     """Spawn a real tmux window running a fake CLI that behaves like a
@@ -3872,7 +3873,7 @@ def test_tmux_end_to_end_with_fake_cli(tmp_path, profile_name):
         prompt="/bmad-dev-auto 1-1-a",
         cwd=tmp_path,
         env=spec_env,
-        timeout_s=30.0,
+        timeout_s=REAL_MUX_HANG_CEILING_S,
     )
     try:
         result = adapter.run(spec)
@@ -3889,6 +3890,7 @@ def test_tmux_end_to_end_with_fake_cli(tmp_path, profile_name):
 
 
 @pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
+@real_mux_e2e
 def test_tmux_reused_task_id_ignores_stale_artifacts(tmp_path):
     """A re-armed run reuses the task_id. A prior cycle's Stop event + result.json
     must NOT replay: start_session clears the stale result, and the launch-time
@@ -3916,7 +3918,7 @@ def test_tmux_reused_task_id_ignores_stale_artifacts(tmp_path):
             "BMAD_LOOP_EVENTS_DIR": str(adapter.watcher.events_dir),
             "BMAD_LOOP_TASK_ID": task_id,
         },
-        timeout_s=30.0,
+        timeout_s=REAL_MUX_HANG_CEILING_S,
     )
     try:
         result = adapter.run(spec)
@@ -3929,6 +3931,7 @@ def test_tmux_reused_task_id_ignores_stale_artifacts(tmp_path):
 
 
 @pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
+@real_mux_e2e
 def test_tmux_end_to_end_with_a_relay_that_only_knows_the_legacy_dir(tmp_path):
     """The version-skew guard, end to end through real tmux: a CURRENT
     orchestrator (it exports BMAD_LOOP_EVENTS_DIR and waits on the out-of-tree
@@ -3939,8 +3942,8 @@ def test_tmux_end_to_end_with_a_relay_that_only_knows_the_legacy_dir(tmp_path):
     `session_timeout_min` instead of completing.
 
     Ablation guard: drop `legacy_dir` from `SignalWatcher._dirs()` and this fails
-    (as a 30s timeout, not an assertion — which is precisely the production
-    symptom)."""
+    (as a wait that idles all the way to the hang ceiling, not an assertion — which
+    is precisely the production symptom)."""
     assert "$BMAD_LOOP_EVENTS_DIR" not in LEGACY_EVENTS_FAKE_CLI, "the twin still reads the new var"
     assert LEGACY_EVENTS_FAKE_CLI != FAKE_CLI, "the swap did not take"
 
@@ -3956,7 +3959,7 @@ def test_tmux_end_to_end_with_a_relay_that_only_knows_the_legacy_dir(tmp_path):
             "BMAD_LOOP_EVENTS_DIR": str(adapter.watcher.events_dir),
             "BMAD_LOOP_TASK_ID": "t-legacy-1",
         },
-        timeout_s=30.0,
+        timeout_s=REAL_MUX_HANG_CEILING_S,
     )
     try:
         result = adapter.run(spec)
@@ -3972,6 +3975,7 @@ def test_tmux_end_to_end_with_a_relay_that_only_knows_the_legacy_dir(tmp_path):
 
 
 @pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
+@real_mux_e2e
 def test_tmux_crash_detected(tmp_path):
     """A session that dies without writing result.json -> crashed. Also the
     SessionEnd-less path (codex profile) relies on this window-death check."""
@@ -3988,7 +3992,7 @@ def test_tmux_crash_detected(tmp_path):
         prompt="x",
         cwd=tmp_path,
         env={"BMAD_LOOP_RUN_DIR": str(adapter.run_dir), "BMAD_LOOP_TASK_ID": "t-crash"},
-        timeout_s=20.0,
+        timeout_s=REAL_MUX_HANG_CEILING_S,
     )
     try:
         result = adapter.run(spec)
@@ -3999,6 +4003,7 @@ def test_tmux_crash_detected(tmp_path):
 
 
 @pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
+@real_mux_e2e
 def test_tmux_timeout_with_flushed_spec_rescued_post_kill(tmp_path):
     """End-to-end #61 (total hook loss): the session writes its terminal spec but
     never emits any hook event, so the wait loop idles to `timeout` — a path that
@@ -4065,6 +4070,7 @@ def test_tmux_timeout_with_flushed_spec_rescued_post_kill(tmp_path):
 
 
 @pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
+@real_mux_e2e
 def test_tmux_timeout_silent_session_not_rescued(tmp_path):
     """The #261 counterpart of the rescue above, same call path, one delta: the CLI
     wedges instantly and renders NOTHING. A qualifying spec still appears in the
