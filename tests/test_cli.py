@@ -9967,6 +9967,36 @@ def test_confirm_reverify_success_lets_the_flip_through(project, capsys, monkeyp
     assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
 
 
+def _spawn_fault(cwd: Path) -> tuple[str, str]:
+    """What a real spawn into `cwd` raises: `(class name, "Class: message")`, both
+    derived rather than written.
+
+    POSIX raises `FileNotFoundError` for a missing cwd; Windows raises a different
+    `OSError` subclass, and the errno/strerror text differs again. Both halves of
+    `verify.run_verify_commands`' `spawn_error` — `type(exc).__name__` and `exc` —
+    are therefore platform-shaped, so a literal would pin one platform and quietly
+    stop grading anything on the other. Asking the platform is the same move
+    `tests/test_verify.py::test_unusable_cwd_escalates_as_an_environment_fault`
+    makes, one layer down; the second element extends it to the message, which is
+    the half that says WHY the child never started.
+
+    Catches what the arm it mirrors catches — `(OSError, ValueError)`, the latter
+    for the embedded-NUL cwd that arm documents — rather than `OSError` alone, so
+    a future caller passing such a cwd gets the derived name or the `pytest.fail`
+    below, not a raw error from the helper.
+
+    Fails loudly rather than degrading if the spawn succeeds: a `cwd` that turned
+    out to be usable means the caller's fixture no longer sets up the fault its
+    row is about, and a silently skipped assertion would hide that.
+    """
+    try:
+        subprocess.run([sys.executable, "-c", ""], cwd=cwd, check=False)
+    except (OSError, ValueError) as exc:
+        return type(exc).__name__, f"{type(exc).__name__}: {exc}"
+    else:  # pragma: no cover - a missing cwd is not spawnable
+        pytest.fail(f"spawn into {cwd} unexpectedly succeeded; the fixture no longer faults")
+
+
 def test_confirm_reverify_reports_an_unusable_cwd_instead_of_crashing(
     project, tmp_path, capsys, monkeypatch
 ):
@@ -9987,7 +10017,22 @@ def test_confirm_reverify_reports_an_unusable_cwd_instead_of_crashing(
     surface (DW-119): `_reverify` prefixes its own "could not run" and
     `run_verify_commands`' spawn-fault arm omits the phrase for exactly that
     reason, so a membership assertion alone stays green if the phrase comes back
-    twice in the stderr the operator actually reads."""
+    twice in the stderr the operator actually reads.
+
+    The DIAGNOSIS is asserted too (DW-122). The phrase count and the cwd are both
+    satisfied by a reason that says only where the spawn was attempted, so
+    together they let `_reverify`'s `f"... could not run: {fault}"` be reduced to
+    the cwd alone while an operator loses the one line telling them WHY the child
+    never started. Both halves of the producer's payload are pinned, not just the
+    class name: `run_verify_commands` mints `"{type(exc).__name__}: {exc}"` and
+    `env_fault_reason` returns it unchanged, so dropping the message half would
+    still leave a class-name-only assertion green while the errno/strerror text an
+    operator diagnoses from is gone. Both are derived from a real spawn into the
+    same cwd rather than written down, because the platforms disagree on each.
+
+    Ablation: replace that interpolation with a cwd-only string, or drop the
+    `: {exc}` half of `spawn_error`, and this reddens while every assertion above
+    it stays green."""
     from bmad_loop import operatoractions, sprintstatus
 
     install_bmad_config(project)
@@ -10004,6 +10049,9 @@ def test_confirm_reverify_reports_an_unusable_cwd_instead_of_crashing(
     assert "--reverify failed" in err and "NOT confirmed" in err
     assert "could not run" in err and str(missing) in err
     assert err.count("could not run") == 1
+    exc_name, diagnosis = _spawn_fault(missing)
+    assert err.count(exc_name) == 1
+    assert diagnosis in err
     assert sp.read_text() == before
     assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
     assert "1-1-a" in operatoractions.load(project.project)
@@ -10021,8 +10069,21 @@ def test_reverify_does_not_stutter_the_could_not_run_prefix(project, tmp_path):
     surrounding CLI text. The end-to-end row above counts the same phrase on the
     stderr an operator reads; this row pins the seam that produces it.
 
+    The same row also pins the DIAGNOSIS the prefix introduces (DW-122): the count
+    and the cwd are jointly satisfied by a reason that names only the directory, so
+    on their own they permit `f"{result.command!r} could not run: {fault}"` to
+    collapse to the cwd and drop the cause the operator needs. The whole payload
+    `env_fault_reason` hands back is pinned — `"{type(exc).__name__}: {exc}"`, not
+    the class name alone — because trimming the message half leaves a name-only
+    assertion green while the errno/strerror text disappears. `_spawn_fault`
+    derives both halves from a real spawn into this same missing cwd, since POSIX
+    and Windows agree on neither the `OSError` subclass nor its message.
+
     Ablation: put "could not run" phrasing back into the `spawn_error=` string in
-    `verify.run_verify_commands` and the count assertion reddens.
+    `verify.run_verify_commands` and the count assertion reddens. Replace
+    `cli._reverify`'s `f"{result.command!r} could not run: {fault}"` with a
+    cwd-only interpolation, or trim `spawn_error` to drop its `: {exc}` half, and
+    the diagnosis assertions redden instead.
     """
     _write_policy(project.project, '[verify]\ncommands = ["python -c \\"pass\\""]\n')
     missing = tmp_path / "no-such-cwd"
@@ -10032,6 +10093,9 @@ def test_reverify_does_not_stutter_the_could_not_run_prefix(project, tmp_path):
     assert reason is not None
     assert "could not run" in reason and str(missing) in reason
     assert reason.count("could not run") == 1
+    exc_name, diagnosis = _spawn_fault(missing)
+    assert reason.count(exc_name) == 1
+    assert diagnosis in reason
 
 
 def _diverge_repo_root(paths, code_root: Path) -> None:

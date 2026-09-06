@@ -2633,6 +2633,126 @@ def test_harvest_gate_exclude_names_the_prefixed_path_under_the_monorepo_shape(p
     assert engine._harvest_gate_exclude(task) == ()
 
 
+def test_harvest_gate_exclude_gates_the_nested_ledger_under_the_monorepo_shape(project):
+    """The OUTCOME claim the three value rows above cannot make (DW-121).
+
+    Each of those rows stops at the tuple's spelling. What none of them grades is
+    the JOIN `_verify_dev_artifacts` makes: it feeds that tuple to
+    `verify.verify_dev` as `engine_written`, and only running git with it proves
+    the pathspec resolves onto THIS attempt's nested ledger rather than onto the
+    outer project's. The verify-side monorepo cluster pairs every value row with an
+    outcome row and says so in prose; the engine-side producer had no such pair.
+
+    Built from the ENGINE side on purpose: the tuple driven through the gate is the
+    one `_harvest_gate_exclude` really returns, so an edit to the producer's root or
+    to the consumer's handling of `engine_written` reddens this row. It does NOT
+    grade the production WIRING — it calls `verify.verify_dev` directly rather than
+    through `_verify_dev_artifacts`, so deleting
+    `engine_written=self._harvest_gate_exclude(task)` from that caller leaves this
+    row and its three siblings green. That wiring is covered separately, by
+    `test_nonfixable_retry_reverts_harvest_before_the_next_attempt`. Its mirror,
+    `tests/test_verify.py::test_verify_dev_refuses_a_bare_spec_flip_under_the_monorepo_shape`,
+    grades the consumer's own exclusions; this one grades the tuple the engine hands it.
+
+    Every seeded file is COMMITTED because `verify._changes_since` counts untracked
+    files as residue: an untracked decoy, ledger or board would register as the work
+    this attempt never did, and the refusal would then hold for a reason that has
+    nothing to do with the pathspec's root. Committing also forces git's
+    exclude-pathspec branch, which is the branch this row exists to grade.
+
+    The decoy is created and then left ALONE. It exists to make "the wrong spelling
+    names a REAL file" true by value; had the attempt also touched it, the correct
+    spelling would count it as work and the gate could not refuse at all.
+
+    The gate outcome is asserted BEFORE the prefix equality deliberately. The
+    sibling value row above already grades the spelling, so under the ablation this
+    row has to redden on the OUTCOME to be worth its place — an equality assertion
+    reached first would make it a second copy of that row.
+
+    Ablation: set `root = paths.project` inside `_harvest_gate_exclude` and this
+    reddens with `ok=True` — the un-prefixed spelling excludes the untouched outer
+    decoy instead, this attempt's nested ledger append then counts as the work it
+    never did, and the proof-of-work gate passes.
+
+    Asserts the SPECIFIC reason, for the reason its verify-side mirror gives:
+    `not out.ok` alone is reachable from every other gate `verify_dev` runs
+    (workflow tag, status, baseline match, sprint pair), none of which is the
+    claim here.
+    """
+    paths = nested_repo_root_paths(project)
+    # the premise the whole row rests on: divergent AND nested. The sibling shape
+    # satisfies the first only, and there both spellings agree on the outcome.
+    assert paths.project != paths.repo_root
+    assert paths.project.parent == paths.repo_root
+
+    # the OUTER project's ledger: the real file a `project`-rooted pathspec names
+    # once git resolves it in the code tree
+    decoy = paths.repo_root / "_bmad-output" / "implementation-artifacts" / "deferred-work.md"
+    decoy.parent.mkdir(parents=True, exist_ok=True)
+    assert not decoy.exists(), (
+        "this row creates the outer ledger deliberately so the 'silently wrong' "
+        "claim is graded by value; inheriting one from the sandbox template would "
+        "make that premise a setup accident"
+    )
+    decoy_text = "# outer ledger\n"
+    decoy.write_text(decoy_text, encoding="utf-8")
+
+    # every file the attempt below touches is seeded as TRACKED content first
+    initial_baseline = verify.rev_parse_head(paths.repo_root)
+    write_sprint(paths, {"1-1-a": "ready-for-dev"})
+    sp = spec_path(paths, "1-1-a")
+    write_spec(sp, "ready-for-dev", initial_baseline)
+    write_ledger(paths, {"DW-1": "open"}, commit=False)
+    git(
+        paths.repo_root,
+        "add",
+        decoy.relative_to(paths.repo_root).as_posix(),
+        paths.sprint_status.relative_to(paths.repo_root).as_posix(),
+        sp.relative_to(paths.repo_root).as_posix(),
+        paths.deferred_work.relative_to(paths.repo_root).as_posix(),
+    )
+    git(paths.repo_root, "commit", "-q", "-m", "seed tracked bookkeeping and both ledgers")
+
+    engine, _ = make_engine(paths, [])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    # the baseline is stamped where the session's cwd is: the CODE tree
+    task.baseline_commit = verify.rev_parse_head(paths.repo_root)
+    task.harvest_wrote_ledger = True
+
+    # the attempt's ENTIRE residue: the spec flip, the board advance, and the
+    # orchestrator's own append to the NESTED ledger. No source edit at all.
+    write_sprint(paths, {"1-1-a": "review"})
+    write_spec(sp, "in-review", task.baseline_commit)
+    with paths.deferred_work.open("a", encoding="utf-8") as fh:
+        fh.write("\n### DW-2: harvested from the spec\n\nstatus: open\n")
+
+    exclude = engine._harvest_gate_exclude(task)
+    result_json = {"workflow": "auto-dev", "spec_file": str(sp)}
+    out = verify.verify_dev(task, paths, result_json, engine_written=exclude)
+
+    assert not out.ok
+    assert out.reason == "no changes in worktree since baseline commit"
+    # The in-row control that makes the refusal ATTRIBUTABLE: the SAME attempt with
+    # NO exclusion at all passes. That shows the nested ledger append IS countable
+    # residue which only the pathspec removes, so the refusal above is produced by
+    # the exclusion landing on it. Without this, `not out.ok` rests entirely on an
+    # out-of-band ablation, and a fixture change that made the append uncountable
+    # (left untracked, or newly covered by `app/.gitignore`) would keep the row
+    # green for a reason that has nothing to do with the pathspec's root.
+    assert verify.verify_dev(task, paths, result_json, engine_written=()).ok
+    # the spelling that produced the refusal, pinned once the outcome has spoken
+    assert exclude == ("app/_bmad-output/implementation-artifacts/deferred-work.md",)
+    # the wrong spelling would have named a REAL file, and the decoy contributed no
+    # residue of its own — so the refusal above is about the nested ledger being
+    # excluded, not about the outer one being absent
+    assert decoy.is_file() and decoy.read_text(encoding="utf-8") == decoy_text
+
+    # the same attempt with one real source edit passes, so the refusal is about the
+    # missing work and not about the fixture being unusable
+    (paths.project / "src.txt").write_text("real work\n", encoding="utf-8")
+    assert verify.verify_dev(task, paths, result_json, engine_written=exclude).ok
+
+
 # ------------------- `[verify] commands` run where the SESSION ran (#695, DW-3)
 #
 # `Engine._verify_commands_with_results` runs the commands in `self.workspace.root`
