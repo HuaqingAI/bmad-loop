@@ -743,21 +743,34 @@ class SweepEngine(Engine):
             for key in self.state.tasks
         )
         self.prompter = prompter or DecisionPrompter()
-        # decisions already journaled as skipped this process; without it a
-        # persistent decision item would notify once per repeat cycle
-        self._skipped_decisions: set[str] = set()
-        # decisions whose recorded answer this process already journaled as
-        # DROPPED (and notified) — same shape and same reason as
-        # `_skipped_decisions` above. `_materialize_bundles` leaves the run-level
-        # `answers` entry alone (it is the human's recorded answer and stays
-        # auditable on disk), so `_decisions_phase` re-reads it every repeat
-        # cycle: without this set a dropped decision re-notifies once per cycle,
-        # and a cycle whose re-triage happens to mint an AGREEING option would
-        # revive a decision the operator was already told had been dropped.
-        # Process-local run state, deliberately: the disposition is the run's,
+        # The two decision quarantines — ids already journaled as skipped, and
+        # ids whose recorded answer was already journaled as DROPPED (and
+        # notified) — live on `state` (`sweep_skipped_decisions` /
+        # `sweep_dropped_decisions`), not here. Without them a persistent
+        # decision item notifies once per repeat cycle, and a cycle whose
+        # re-triage happens to mint an AGREEING option revives a decision the
+        # operator was already told had been dropped: `_materialize_bundles`
+        # leaves the run-level `answers` entry alone (it is the human's recorded
+        # answer and stays auditable on disk), so `_decisions_phase` re-reads it
+        # every cycle. They are persisted run state (DW-124), deliberately:
+        # the disposition is the RUN's — so a pause/resume of the same run must
+        # not re-announce it, while a NEW run re-evaluates from scratch — and
         # the answer is the human's.
-        self._dropped_decisions: set[str] = set()
         self.state.run_type = "sweep"
+
+    def _quarantine(self, ids: list[str], dw_id: str) -> None:
+        """Add `dw_id` to one of `state`'s decision quarantines if absent, and
+        persist immediately — mirroring `Engine._run_auto_sweep`'s
+        mutate-then-`_save()` latch, since the whole point of the list is that a
+        resume of this run sees it.
+
+        Every call site runs this AFTER its journal row and its notify, so the
+        residual crash window (announced, not yet persisted) resumes into a
+        re-announcement rather than into a silent quarantine — the safe
+        direction for a record an operator reads."""
+        if dw_id not in ids:
+            ids.append(dw_id)
+        self._save()
 
     def _remaining_estimate(self) -> int | None:
         """Sweep override of the graceful-stop hint: how many deferred-work
@@ -929,11 +942,15 @@ class SweepEngine(Engine):
         from the keep-open lane to all three drop lanes by DW-135): the drop
         releases its id from a stored answer nothing can act on, so a later
         cycle's fresh triage can address it. It cannot spin the loop —
-        `_materialize_bundles` bounds each id to one drop per process, so the
-        signal fires at most once per id. Caveat: on crash-resume of a cycle whose
-        only progress was already-resolved closes, the replayed (idempotent)
-        closes report 0 and the run stops with no-progress; errs toward stopping,
-        never loops."""
+        `_materialize_bundles` bounds each id to one drop per run, and since
+        DW-124 that bound is persisted on `state`, so it holds across a
+        pause/resume too and the signal fires at most once per id. Caveat: on
+        crash-resume of a cycle whose only progress was already-resolved closes,
+        the replayed (idempotent) closes report 0 and the run stops with
+        no-progress; the same now goes for a cycle whose only would-be event is a
+        drop the pre-crash run already announced and persisted, which the
+        quarantine skips rather than re-signalling. Errs toward stopping, never
+        loops."""
         self._emit("pre_sweep_cycle", phase=str(cycle))
         self._warn_stranded_bundles()
         plan = self._ensure_triage(open_now, cycle)
@@ -1644,10 +1661,9 @@ class SweepEngine(Engine):
         pending = [d for d in plan.decisions if d.id not in answers]
         answered_interactively = False
         if not self.prompting:
-            pending = [d for d in pending if d.id not in self._skipped_decisions]
+            pending = [d for d in pending if d.id not in self.state.sweep_skipped_decisions]
             for decision in pending:
                 self.journal.append("decision-skipped-unattended", dw_id=decision.id)
-                self._skipped_decisions.add(decision.id)
             if pending:
                 gates.notify(
                     self.policy,
@@ -1655,6 +1671,14 @@ class SweepEngine(Engine):
                     f"{len(pending)} deferred-work decisions pending",
                     "run `bmad-loop sweep` interactively to answer them",
                 )
+            # Quarantine LAST — after the journal rows AND the notify above, the
+            # order `_quarantine`'s docstring promises. Persisting inside the loop
+            # instead would leave a crash window between the last `_save()` and
+            # the notify in which a resume finds every id already quarantined,
+            # filters `pending` empty and never writes the ATTENTION line at all:
+            # silently swallowing the announcement rather than repeating it.
+            for decision in pending:
+                self._quarantine(self.state.sweep_skipped_decisions, decision.id)
         else:
             for decision in pending:
                 # announce before blocking on input so observers (TUI, ATTENTION
@@ -1820,11 +1844,12 @@ class SweepEngine(Engine):
         of the three drop lanes below — `_cycle`'s progress signal.
 
         Every drop is progress for the same reason (DW-123, widened to the build
-        lanes by DW-135): it quarantines the id in `_dropped_decisions`, so the id
-        stops being bound to a stored answer nothing can act on and a later cycle's
-        fresh triage is free to address it. The signal stays finite because that
-        same set bounds each id to ONE drop per process, so a given id can raise it
-        at most once however many repeat cycles run.
+        lanes by DW-135): it quarantines the id in `state.sweep_dropped_decisions`,
+        so the id stops being bound to a stored answer nothing can act on and a
+        later cycle's fresh triage is free to address it. The signal stays finite
+        because that same list bounds each id to ONE drop per run — persisted, so
+        the bound holds across a pause/resume too (DW-124) — and a given id can
+        raise it at most once however many repeat cycles run.
         """
         self._emit("pre_materialize_bundles")
         bundles = list(plan.bundles)
@@ -1842,7 +1867,7 @@ class SweepEngine(Engine):
             # once per lane that declines to use it.
             if not isinstance(answer, dict) or answer.get("effect") != "build":
                 continue
-            if decision.id in self._dropped_decisions:
+            if decision.id in self.state.sweep_dropped_decisions:
                 continue  # announced dropped earlier this run (see __init__)
             # ONE spelling of the key for the whole loop body: the lookup, the
             # mismatch record and the note below must name the same string, and
@@ -1892,7 +1917,7 @@ class SweepEngine(Engine):
                     "its triage option changed and the stored answer carries no "
                     "intent of its own — the entry stays open for the next sweep",
                 )
-                self._dropped_decisions.add(decision.id)
+                self._quarantine(self.state.sweep_dropped_decisions, decision.id)
                 answer_dropped = True  # progress: see this method's docstring
                 continue
             label = str(answer.get("label", "")) or (option.label if option else "") or "build"
@@ -1988,7 +2013,7 @@ class SweepEngine(Engine):
                         f"cycle's bundles ({name} and every -2..-9 suffix are "
                         "taken) — the entry stays open for the next sweep",
                     )
-                    self._dropped_decisions.add(decision.id)
+                    self._quarantine(self.state.sweep_dropped_decisions, decision.id)
                     answer_dropped = True  # progress: see this method's docstring
                     continue
             bundles.append(
@@ -2028,13 +2053,42 @@ class SweepEngine(Engine):
         # answer suppress an overlapping bundle — journaled only as a
         # `human-chose-keep-open` skip, which reads as the human's decision on a
         # question this cycle never asked.
+        #
+        # DW-133 proposed gating the stale-option drop below on overlap with THIS
+        # cycle's bundles. REFUTED (2026-09-06, human-resolved) — do not
+        # re-propose. Two placements are possible and both are wrong:
+        #
+        # At the drop itself the gate is UNREACHABLE, so it buys nothing.
+        # `validate_triage`'s `claim()` (see :178) records every id in one `seen`
+        # map and errors on "appears in both", so `plan.bundles` and
+        # `plan.decisions` are disjoint by validation; the drop is reached only
+        # when `by_id.get(dw_id)` is not None — the id IS in `decisions`, hence in
+        # no plan bundle — and a keep-open answer mints no decision bundle of its
+        # own (that needs `effect == "build"`, which this lane's own guard
+        # excludes). Measured: with the condition replaced by a `raise`, the whole
+        # of tests/test_sweep.py passes — it never once fires.
+        #
+        # Hoisted ABOVE the `decision is None` arm it stops being a no-op and
+        # starts doing harm, since that arm is exactly where a kept answer DOES
+        # overlap a bundle: it suppresses that bundle, which is what keep-open
+        # means. Measured: three tests red, `test_repeat_keep_open_answer_blocks_rebundle`
+        # among them — the gate breaks legitimate suppression rather than the drop.
+        #
+        # Underneath both: the drop's forward-looking timing is load-bearing BY
+        # DESIGN. It must fire in the cycle that PROVES the answer stale — where
+        # the id is in `decisions` and so in no bundle — so that a LATER cycle's
+        # bundle is not silently suppressed. `tests/test_sweep.py`'s
+        # `test_keep_open_answer_whose_option_was_re_authored_stops_suppressing_bundles`
+        # is the shape to keep in view: its cycle 2 holds DW-1 in `decisions` with
+        # no bundles (where the drop must fire) and only cycle 3 bundles DW-1, so
+        # any rule keyed on this cycle's bundles can never see them together.
         by_id = {d.id: d for d in plan.decisions}
         keep_open_ids: set[str] = set()
         for dw_id, answer in answers.items():
             # Shape-guarded for the same reason the build lane above is.
             if not isinstance(answer, dict) or answer.get("effect") != "keep-open":
                 continue
-            if dw_id in self._dropped_decisions:
+            if dw_id in self.state.sweep_dropped_decisions:
                 continue  # announced dropped earlier this run (see __init__)
             decision = by_id.get(dw_id)
             if decision is None:
@@ -2088,7 +2142,7 @@ class SweepEngine(Engine):
                 f"the option it answered ({answer_key}) {fate}, so the keep-open "
                 f"protection is discarded and {dw_id} is eligible for bundling again",
             )
-            self._dropped_decisions.add(dw_id)
+            self._quarantine(self.state.sweep_dropped_decisions, dw_id)
             answer_dropped = True
         kept = []
         for b in bundles:

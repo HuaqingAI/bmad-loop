@@ -789,6 +789,16 @@ class RunState:
     # sweep runs only: the triage->bundles cycle in progress; 1 maps to the
     # legacy (unsuffixed) artifact names so old paused runs resume unchanged
     sweep_cycle: int = 1
+    # sweep runs only: the run's own dispositions of deferred-work decisions —
+    # ids already journaled as skipped-unattended, and ids whose recorded answer
+    # this run already journaled as DROPPED (and notified). Persisted so a
+    # pause/resume of the SAME run does not re-announce a disposition it already
+    # made; deliberately run-scoped, so a NEW run re-evaluates every decision
+    # from scratch. Deliberately NOT the human's answer either: that stays in
+    # `<run>/decisions.json`, auditable and untouched — only the disposition the
+    # run reached about it lives here.
+    sweep_skipped_decisions: list[str] = field(default_factory=list)
+    sweep_dropped_decisions: list[str] = field(default_factory=list)
     # auto-sweep triggers already fired this run (e.g. "epic-1", "run-end");
     # guards re-fire on resume
     sweeps_triggered: list[str] = field(default_factory=list)
@@ -880,6 +890,8 @@ class RunState:
             "source": self.source,
             "spec_folder": self.spec_folder,
             "sweep_cycle": self.sweep_cycle,
+            "sweep_skipped_decisions": self.sweep_skipped_decisions,
+            "sweep_dropped_decisions": self.sweep_dropped_decisions,
             "sweeps_triggered": self.sweeps_triggered,
             "sweeps_refused": self.sweeps_refused,
             "target_branch": self.target_branch,
@@ -914,6 +926,8 @@ class RunState:
             source=str(d.get("source", "sprint-status")),
             spec_folder=str(d.get("spec_folder", "")),
             sweep_cycle=int(d.get("sweep_cycle", 1)),
+            sweep_skipped_decisions=[str(s) for s in d.get("sweep_skipped_decisions", [])],
+            sweep_dropped_decisions=[str(s) for s in d.get("sweep_dropped_decisions", [])],
             sweeps_triggered=[str(s) for s in d.get("sweeps_triggered", [])],
             sweeps_refused={str(k): str(v) for k, v in d.get("sweeps_refused", {}).items()},
             target_branch=str(d.get("target_branch", "")),

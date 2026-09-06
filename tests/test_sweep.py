@@ -84,10 +84,15 @@ def triage_result(open_ids, **sections):
     }
 
 
-def make_sweep(project, script, policy=None, answers=(), prompting=False, **kwargs):
-    run_dir = project.project / ".bmad-loop" / "runs" / "sweep-run"
+def make_sweep(
+    project, script, policy=None, answers=(), prompting=False, run_id="sweep-run", **kwargs
+):
+    # `run_id` names a DISTINCT run: its own run_dir, state.json and journal.
+    # Overridden only where a test needs a second run rather than a resume of the
+    # first (run-scoped state, e.g. the DW-124 quarantine).
+    run_dir = project.project / ".bmad-loop" / "runs" / run_id
     adapter = MockAdapter(script, usage_per_session=TokenUsage(input_tokens=10, output_tokens=5))
-    state = RunState(run_id="sweep-run", project=str(project.project), started_at="now")
+    state = RunState(run_id=run_id, project=str(project.project), started_at="now")
     inputs = iter(answers)
     prompter = DecisionPrompter(input_fn=lambda _: next(inputs), print_fn=lambda _line: None)
     engine = SweepEngine(
@@ -4533,7 +4538,8 @@ def test_a_name_collision_drop_is_not_revived_by_a_later_free_cycle(project):
     fallback is free again — the revival the quarantine has to refuse, since the
     operator has already been told this decision was discarded. `max_bundles=1`
     keeps the nine occupying plan bundles from having to run. Ablation: delete the
-    `self._dropped_decisions.add(decision.id)` on the name-collision lane alone
+    `self._quarantine(self.state.sweep_dropped_decisions, decision.id)` on the
+    name-collision lane alone
     and this reddens — cycle 2 mints a `dw2-decision-dw-1` task for an answer the
     run already gave up on."""
     from bmad_loop import decisions
@@ -4602,9 +4608,10 @@ def test_a_dropped_decision_is_not_revived_by_a_later_agreeing_cycle(project):
     disk (it is the human's recorded answer and stays auditable), so every later
     repeat cycle re-reads it. Cycle 3 here re-triages DW-1 back to an option that
     AGREES with the cycle-1 in-run answer cycle 2 dropped: without the
-    process-local quarantine that answer revives and builds a bundle for a
+    run-scoped quarantine that answer revives and builds a bundle for a
     decision the operator was told had been dropped — and each cycle re-notifies.
-    Ablation: delete the `_dropped_decisions` guard and this reddens — a
+    Ablation: delete the build lane's `state.sweep_dropped_decisions` guard and
+    this reddens — a
     `dw3-decision-dw-1` task appears and a second drop record plus a second
     ATTENTION line are written."""
     write_ledger(project, {"DW-1": "open", "DW-2": "open", "DW-3": "open"})
@@ -5770,8 +5777,9 @@ def test_a_dropped_keep_open_answer_is_not_revived_by_a_later_agreeing_cycle(pro
     into agreement — the shape that would otherwise hand a decision the operator
     was told had been dropped its authority back, silently. It stays dropped and
     silent: one mismatch, one drop record and one ATTENTION line for the whole
-    process, and cycle 4's bundle over DW-1 runs rather than being skipped.
-    Ablation: delete the keep-open pass's `if dw_id in self._dropped_decisions`
+    run, and cycle 4's bundle over DW-1 runs rather than being skipped.
+    Ablation: delete the keep-open pass's `if dw_id in
+    self.state.sweep_dropped_decisions`
     guard and this reddens — cycle 3's agreeing option puts DW-1 back into
     `keep_open_ids` and `dw4-sneaky-fix` is skipped `human-chose-keep-open`."""
     write_ledger(project, {"DW-1": "open", "DW-2": "open", "DW-3": "open", "DW-4": "open"})
@@ -5850,46 +5858,246 @@ def test_a_dropped_keep_open_answer_is_not_revived_by_a_later_agreeing_cycle(pro
     assert engine.state.tasks["dw4-sneaky-fix"].phase == Phase.DONE
 
 
-def test_resumed_sweep_re_evaluates_a_dropped_keep_open_answer(project):
-    """The quarantine belongs to one engine process, not the recorded answer.
-    Reconstructing through the resume helper starts with an empty quarantine, reads
-    the unchanged run-local answer, and evaluates the stale option again — loudly,
-    including a second mismatch, drop and notification. Ablation: copy
-    `engine._dropped_decisions` onto `resumed` before materialization and the second
-    set of records disappears."""
+_STALE_KEEP_OPEN_ANSWER = {"key": "2", "label": "Keep", "effect": "keep-open"}
+
+
+def _stale_keep_open_plan():
+    """A cycle that re-asks DW-1 with key "2" renumbered off `Keep`/`keep-open`
+    and onto `Close as decayed`/`close` — the disagreement that drops a stored
+    keep-open answer."""
+    return TriagePlan(
+        open_ids=frozenset({"DW-1"}),
+        decisions=(
+            Decision(
+                id="DW-1",
+                question="q",
+                context="",
+                options=(
+                    DecisionOption(key="1", label="Build", effect="build", intent="x"),
+                    DecisionOption(key="2", label="Close as decayed", effect="close"),
+                ),
+                recommendation="1",
+            ),
+        ),
+    )
+
+
+def _drop_keep_open_answer_and_persist(project):
+    """Engine 1: drop DW-1's stale keep-open answer, leaving the disposition on
+    the persisted `state.json` for a resume to read back."""
     write_ledger(project, {"DW-1": "open"})
-    answer = {"key": "2", "label": "Keep", "effect": "keep-open"}
-    stale_decision = Decision(
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    (engine.run_dir / "decisions.json").write_text(
+        json.dumps({"DW-1": _STALE_KEEP_OPEN_ANSWER}, indent=2), encoding="utf-8"
+    )
+    _, dropped = engine._materialize_bundles(
+        _stale_keep_open_plan(), {"DW-1": _STALE_KEEP_OPEN_ANSWER}
+    )
+    # PRECONDITION: the drop happened, and `_quarantine` persisted it ITSELF —
+    # no `save_state` call here, because durability at the mutation is the point
+    assert dropped and engine.state.sweep_dropped_decisions == ["DW-1"]
+    assert load_state(engine.run_dir).sweep_dropped_decisions == ["DW-1"]
+    return engine
+
+
+def test_a_dropped_decision_stays_quarantined_across_a_resume(project):
+    """DW-124. The quarantine is the RUN's disposition, not one engine process's:
+    it rides `state.json`, so rebuilding through the resume helper reads it back
+    and the stale option is not re-evaluated. Before this it was `__init__` set
+    state, so a resume started empty, re-read the unchanged run-local answer and
+    re-announced a drop the operator had already been told about — a second
+    mismatch, a second drop row and a second ATTENTION line for one decision.
+    One of each across BOTH engines is the whole claim.
+
+    Ablation: drop `sweep_dropped_decisions` from `RunState.to_dict` (or make
+    `_quarantine` skip its `_save()`) and this reddens with two of each."""
+    engine = _drop_keep_open_answer_and_persist(project)
+
+    resumed, _ = resume_sweep(project, engine, [])
+    assert resumed.state.sweep_dropped_decisions == ["DW-1"]
+    resumed_answers, _ = resumed._decisions_phase(_stale_keep_open_plan())
+    _, dropped_again = resumed._materialize_bundles(_stale_keep_open_plan(), resumed_answers)
+
+    assert not dropped_again  # already announced; not progress a second time
+    assert len(_mismatches(resumed)) == 1
+    assert len(_records(resumed, "sweep-decision-answer-dropped")) == 1
+    attention = (resumed.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert attention.count("recorded keep-open decision discarded") == 1
+    # the human's answer is untouched by any of it — only the disposition persisted
+    stored = json.loads((resumed.run_dir / "decisions.json").read_text(encoding="utf-8"))
+    assert stored == {"DW-1": _STALE_KEEP_OPEN_ANSWER}
+
+
+@pytest.mark.parametrize("drop_cause", ["no-intent", "name-collision"])
+def test_a_build_answer_drop_stays_quarantined_across_a_resume(project, drop_cause):
+    """Both build-answer drop sites publish the same durable disposition as the
+    keep-open site: resume neither announces the drop again nor lets an answer
+    regain authority when a later plan makes it usable.
+
+    Ablation: replace either build lane's `_quarantine(...)` with an in-memory
+    append and that parameter reddens after `resume_sweep` reloads `state.json`.
+    """
+    write_ledger(project, {"DW-1": "open"})
+    agreeing = Decision(
         id="DW-1",
         question="q",
         context="",
-        options=(
-            DecisionOption(key="1", label="Build", effect="build", intent="x"),
-            DecisionOption(key="2", label="Close as decayed", effect="close"),
-        ),
+        options=(DecisionOption(key="1", label="Widen", effect="build", intent="x"),),
         recommendation="1",
     )
-    stale_plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(stale_decision,))
+    answer = {"key": "1", "label": "Widen", "effect": "build"}
+    if drop_cause == "no-intent":
+        dropping = Decision(
+            id="DW-1",
+            question="q",
+            context="",
+            options=(DecisionOption(key="1", label="Close", effect="close"),),
+            recommendation="1",
+        )
+        dropping_plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(dropping,))
+    else:
+        answer["intent"] = "x"
+        occupied = ["decision-dw-1"] + [f"decision-dw-1-{n}" for n in range(2, 10)]
+        dropping_plan = TriagePlan(
+            open_ids=frozenset({"DW-1"}),
+            bundles=tuple(
+                Bundle(name, (f"DW-{n + 2}",), "occupied") for n, name in enumerate(occupied)
+            ),
+            decisions=(agreeing,),
+        )
+
     engine, _ = make_sweep(project, [])
     engine.run_dir.mkdir(parents=True, exist_ok=True)
     (engine.run_dir / "decisions.json").write_text(
         json.dumps({"DW-1": answer}, indent=2), encoding="utf-8"
     )
-
-    _, dropped = engine._materialize_bundles(stale_plan, {"DW-1": answer})
-    assert dropped and engine._dropped_decisions == {"DW-1"}
-    save_state(engine.run_dir, engine.state)
+    _, dropped = engine._materialize_bundles(dropping_plan, {"DW-1": answer})
+    assert dropped and engine.state.sweep_dropped_decisions == ["DW-1"]
+    assert load_state(engine.run_dir).sweep_dropped_decisions == ["DW-1"]
 
     resumed, _ = resume_sweep(project, engine, [])
-    assert resumed._dropped_decisions == set()
-    resumed_answers, _ = resumed._decisions_phase(stale_plan)
-    _, dropped_again = resumed._materialize_bundles(stale_plan, resumed_answers)
+    _, dropped_again = resumed._materialize_bundles(dropping_plan, {"DW-1": answer})
+    revival, dropped_on_revival = resumed._materialize_bundles(
+        TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(agreeing,)),
+        {"DW-1": answer},
+    )
 
-    assert dropped_again
-    assert len(_mismatches(resumed)) == 2
-    assert len(_records(resumed, "sweep-decision-answer-dropped")) == 2
+    assert not dropped_again and not dropped_on_revival
+    assert revival == []
+    [drop] = _records(resumed, "sweep-decision-answer-dropped")
+    assert drop["decision"] == "DW-1" and drop["drop_cause"] == drop_cause
     attention = (resumed.run_dir / "ATTENTION").read_text(encoding="utf-8")
-    assert attention.count("recorded keep-open decision discarded") == 2
+    assert attention.count("recorded build decision discarded") == 1
+    stored = json.loads((resumed.run_dir / "decisions.json").read_text(encoding="utf-8"))
+    assert stored == {"DW-1": answer}
+
+
+def test_a_resumed_cycles_agreeing_option_does_not_revive_a_quarantined_answer(project):
+    """The revival the persisted quarantine has to refuse. The resumed cycle
+    re-authors key "2" back into agreement with the stored answer, which without
+    the quarantine hands a decision the operator was told had been dropped its
+    suppressing authority back — silently, since an agreeing option writes no
+    record at all. `keep_open_ids` has no observable of its own, so the bundle
+    over DW-1 is the probe: it must still run.
+
+    The plan is hand-built rather than validated, since `validate_triage` refuses
+    one id in both `bundles` and `decisions`; this is a unit probe of the lane.
+
+    Ablation: delete the keep-open lane's `if dw_id in
+    self.state.sweep_dropped_decisions` guard and this reddens — DW-1 re-enters
+    `keep_open_ids` and `sneaky-fix` is skipped `human-chose-keep-open`."""
+    engine = _drop_keep_open_answer_and_persist(project)
+
+    agreeing_plan = TriagePlan(
+        open_ids=frozenset({"DW-1"}),
+        bundles=(Bundle(name="sneaky-fix", dw_ids=("DW-1",), intent="y"),),
+        decisions=(
+            Decision(
+                id="DW-1",
+                question="q",
+                context="",
+                options=(
+                    DecisionOption(key="1", label="Build", effect="build", intent="x"),
+                    DecisionOption(key="2", label="Keep", effect="keep-open"),
+                ),
+                recommendation="1",
+            ),
+        ),
+    )
+    resumed, _ = resume_sweep(project, engine, [])
+    bundles, dropped_again = resumed._materialize_bundles(
+        agreeing_plan, {"DW-1": _STALE_KEEP_OPEN_ANSWER}
+    )
+
+    assert not dropped_again
+    assert [b.name for b in bundles] == ["sneaky-fix"]
+    assert "human-chose-keep-open" not in journal_text(resumed)
+    # and nothing was re-announced or re-recorded on the way there
+    assert len(_records(resumed, "sweep-decision-answer-dropped")) == 1
+    assert len(_mismatches(resumed)) == 1
+
+
+def test_the_unattended_skip_quarantine_survives_a_resume(project):
+    """DW-124's other half. `_decisions_phase`'s unattended arm journals
+    `decision-skipped-unattended` once per id and notifies once per non-empty
+    `pending` — a latch that was `__init__` state too, so a resumed run re-skipped
+    and re-notified every decision it had already reported as pending.
+
+    Ablation: drop `sweep_skipped_decisions` from `RunState.from_dict` and this
+    reddens with two skip rows and two ATTENTION lines."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_decision_for("DW-1"),))
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+
+    engine._decisions_phase(plan)
+    assert engine.state.sweep_skipped_decisions == ["DW-1"]
+    assert load_state(engine.run_dir).sweep_skipped_decisions == ["DW-1"]
+
+    resumed, _ = resume_sweep(project, engine, [])
+    resumed._decisions_phase(plan)
+
+    assert [r["dw_id"] for r in _records(resumed, "decision-skipped-unattended")] == ["DW-1"]
+    attention = (resumed.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert attention.count("deferred-work decisions pending") == 1
+
+
+def test_a_new_run_re_evaluates_a_dropped_keep_open_answer(project):
+    """DW-124's quarantine is run-scoped BY DESIGN: persisted so the SAME run does
+    not re-announce a disposition it already made, but never project-scoped, so a
+    NEW run re-evaluates every decision from scratch. That second half is the claim
+    the CHANGELOG, docs/FEATURES.md and both the `RunState` and `__init__` comments
+    all make, and the resume rows above cannot catch it — they share one run_dir,
+    so a quarantine that leaked across runs would leave them green.
+
+    Run 2 is a genuinely separate run (its own run_dir, state.json and journal),
+    handed the same stored answer a project-level pre-answer would give it, and it
+    must announce the drop again: this is the loud direction on purpose, since the
+    stale answer is still suppressing bundles for DW-1 in that run.
+
+    Ablation: make the quarantine project-scoped — read it from a module-level set,
+    or key it off the project rather than `state` — and this reddens, run 2 writing
+    no drop row, no mismatch and no ATTENTION line."""
+    engine = _drop_keep_open_answer_and_persist(project)
+
+    fresh, _ = make_sweep(project, [], run_id="sweep-run-2")
+    # PRECONDITION: a different run, and its quarantine starts empty
+    assert fresh.run_dir != engine.run_dir
+    assert fresh.state.sweep_dropped_decisions == []
+
+    _, dropped = fresh._materialize_bundles(
+        _stale_keep_open_plan(), {"DW-1": _STALE_KEEP_OPEN_ANSWER}
+    )
+
+    assert dropped  # progress again in the new run, not swallowed
+    assert fresh.state.sweep_dropped_decisions == ["DW-1"]
+    assert len(_records(fresh, "sweep-decision-answer-dropped")) == 1
+    assert len(_mismatches(fresh)) == 1
+    attention = (fresh.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert attention.count("recorded keep-open decision discarded") == 1
+    # run 1's own records are untouched — one drop each, not two in either
+    assert len(_records(engine, "sweep-decision-answer-dropped")) == 1
 
 
 # --------------------------------------- DW-134: a malformed stored-answer store
@@ -6127,7 +6335,7 @@ def test_materialize_bundles_skips_a_non_dict_answer(project):
     assert not dropped
     # built nothing of its own, and did not suppress the plan bundle over its id
     assert [b.name for b in bundles] == ["safe-fix"]
-    assert engine._dropped_decisions == set()
+    assert engine.state.sweep_dropped_decisions == []
     # the two records a lane that ACTED on the answer would have written
     assert _records(engine, "sweep-decision-answer-dropped") == []
     assert _records(engine, "sweep-bundle-skipped") == []
