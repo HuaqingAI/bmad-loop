@@ -1471,11 +1471,12 @@ class _DevSynthesisMixin(_ResultFileMixin):
         Adapter's `_server_procs`) override this and delegate up.
 
         NOT every per-session store on every host: `OpencodeHttpAdapter._usage`
-        is also unbounded, and deliberately stays out. It is keyed by
-        `session_id` rather than `task_id`, and `read_usage(result)` is called by
-        the engine AFTER `run()` returns — so evicting it here would not just be
-        out of scope, it would zero token accounting for every session. Bounding
-        it needs a different lifecycle hook; do not add it to this seam.
+        deliberately stays out. It is keyed by `session_id` rather than
+        `task_id`, and `read_usage(result)` is called by the engine AFTER `run()`
+        returns — so evicting it here would not just be out of scope, it would
+        zero token accounting for every session. It is instead bounded by a
+        capacity cap at its own write site (`USAGE_STASH_CAP`, DW-117), which
+        needs no lifecycle hook at all; do not add it to this seam.
 
         Every in-lifecycle reader lives inside `run()` — `wait_for_completion`'s
         read-back, `_observe_tick`'s sampling and the nudge budget, and

@@ -37,6 +37,7 @@ from bmad_loop.adapters.generic import BUDGET_NUDGE_TEXT, NUDGE_TEXT, STALL_NUDG
 from bmad_loop.adapters.opencode_http import (
     _RESET,
     _TOOL_COLOR,
+    USAGE_STASH_CAP,
     OpencodeDevAdapter,
     OpencodeHttpAdapter,
     OpencodeServerError,
@@ -1774,6 +1775,76 @@ def test_read_usage_returns_stash_by_session_id(tmp_path):
     assert adapter.read_usage(SessionResult(status="completed", session_id="ses_1")).total == 1
     assert adapter.read_usage(SessionResult(status="completed", session_id="ses_2")) is None
     assert adapter.read_usage(SessionResult(status="completed")) is None
+
+
+def test_stash_usage_bounded_by_cap_evicting_oldest_first(tmp_path):
+    """DW-117: `_usage` is session-keyed and read AFTER `run()` returns, so it
+    cannot ride `_evict_task_state`; the bound lives at the write site."""
+    adapter = make_adapter(tmp_path)
+    overflow = 5
+    for i in range(USAGE_STASH_CAP + overflow):
+        adapter._stash_usage(f"ses_{i}", TokenUsage(input_tokens=i))
+
+    assert len(adapter._usage) == USAGE_STASH_CAP
+    # the `overflow` oldest ids are gone, oldest-first
+    for i in range(overflow):
+        assert adapter.read_usage(SessionResult(status="completed", session_id=f"ses_{i}")) is None
+    # the boundary survivor and the newest id both still read back
+    for i in (overflow, USAGE_STASH_CAP + overflow - 1):
+        got = adapter.read_usage(SessionResult(status="completed", session_id=f"ses_{i}"))
+        assert got == TokenUsage(input_tokens=i)
+
+
+def test_stash_usage_rewrite_replaces_without_evicting(tmp_path):
+    """Re-stashing a live session must not evict a peer: only a NEW key evicts."""
+    adapter = make_adapter(tmp_path)
+    for i in range(USAGE_STASH_CAP):  # exactly full, so any eviction is observable
+        adapter._stash_usage(f"ses_{i}", TokenUsage(input_tokens=i))
+
+    adapter._stash_usage("ses_10", TokenUsage(input_tokens=999))  # a mid-order live id
+
+    assert len(adapter._usage) == USAGE_STASH_CAP  # count unchanged, nothing dropped
+    assert adapter.read_usage(SessionResult(status="completed", session_id="ses_10")) == TokenUsage(
+        input_tokens=999
+    )  # replaced in place
+    assert adapter.read_usage(  # the oldest peer was NOT evicted by the re-write
+        SessionResult(status="completed", session_id="ses_0")
+    ) == TokenUsage(input_tokens=0)
+
+
+def test_capture_usage_stashes_through_the_cap(tmp_path):
+    """The cap must bind the PRODUCTION write site, not just `_stash_usage`:
+    `_capture_usage` is the only caller, so an assignment that bypassed the
+    helper would restore the unbounded growth."""
+    adapter = make_adapter(tmp_path)
+    messages = [{"info": {"role": "assistant", "tokens": {"input": 3, "output": 1}}}]
+
+    class _Client200:
+        def get(self, path):
+            class _Resp:
+                status_code = 200
+
+                def json(self):
+                    return messages
+
+            return _Resp()
+
+    for i in range(USAGE_STASH_CAP + 2):
+        task_id = f"t{i}"
+        # a missing parent raises into `_capture_usage`'s except and skips the stash
+        (adapter.tasks_dir / task_id).mkdir(parents=True)
+        sess = _ServerSession(process=None, port=0, base_url="", password="", log_fh=None)
+        sess.session_id = f"ses_{i}"
+        sess.client = _Client200()
+        handle = SessionHandle(task_id=task_id, native_id=sess.session_id)
+        assert adapter._capture_usage(handle, sess) is not None  # the stash really ran
+
+    assert len(adapter._usage) == USAGE_STASH_CAP
+    assert adapter.read_usage(SessionResult(status="completed", session_id="ses_0")) is None
+    newest = USAGE_STASH_CAP + 1
+    assert adapter.read_usage(
+        SessionResult(status="completed", session_id=f"ses_{newest}")
+    ) == TokenUsage(input_tokens=3, output_tokens=1)
 
 
 def test_sample_weighted_usage_inert_on_http_failure(tmp_path):

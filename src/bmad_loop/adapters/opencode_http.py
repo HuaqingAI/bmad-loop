@@ -195,6 +195,24 @@ POLL_TICK_S = 5.0  # max event-queue wait per loop tick (generic's cadence)
 # settings file has to carry. Off means the sink is never opened.
 SSE_TRACE = True
 
+# Capacity bound for the `_usage` stash (DW-117). `_usage` is written once per
+# session in `_capture_usage` and never popped, so without a ceiling it grows
+# O(sessions) for the adapter's lifetime. It cannot ride the `_evict_task_state`
+# seam that bounds the per-task stores: it is keyed by `session_id`, not
+# `task_id`, and the engine calls `read_usage(result)` AFTER `run()` returns, so
+# evicting in `run()`'s `finally` would zero token accounting. Draining the entry
+# in `read_usage` itself would be a tighter bound but is ruled out too: DW-117
+# requires `read_usage` stay idempotent. So the bound is enforced at the write
+# site instead, oldest-first.
+#
+# What keeps a pending read safe is the SIZING MARGIN, not the eviction order: at
+# most a handful of sessions can stash between one session's `_capture_usage` and
+# the engine's `read_usage(result)` — bmad-loop drives sessions essentially
+# serially per run — so the pending entry is hundreds of writes away from being
+# the oldest. Pick a cap far above that gap, and the store is fixed-size without
+# a live read ever losing its entry.
+USAGE_STASH_CAP = 256
+
 # ``/event`` frame types that carry NO ``properties.sessionID`` but are still
 # attributed to this session, exempting them from the sessionID filter in
 # `_dispatch_sse`. Sound ONLY because bmad-loop spawns one `opencode serve` per
@@ -445,6 +463,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self._sessions: dict[str, _ServerSession] = {}
+        # Bounded at its write site by `_stash_usage`; see USAGE_STASH_CAP.
         self._usage: dict[str, TokenUsage] = {}
         # opencode serve survives parent death: sweep whatever is
         # still registered when the interpreter exits cooperatively. A hard
@@ -1504,10 +1523,26 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             messages = resp.json()
             path = self.tasks_dir / handle.task_id / "messages.json"
             path.write_text(json.dumps(messages, ensure_ascii=False, indent=2), encoding="utf-8")
-            self._usage[sess.session_id] = _sum_usage(messages)
+            self._stash_usage(sess.session_id, _sum_usage(messages))
             return str(path)
         except Exception:  # usage is metadata, never a gate
             return None
+
+    def _stash_usage(self, session_id: str, usage: TokenUsage) -> None:
+        """Write into the capacity-bounded `_usage` stash (see USAGE_STASH_CAP).
+
+        A plain dict is insertion-ordered on the 3.11 floor, so the oldest key is
+        `next(iter(...))`. Only a NEW key can evict, so re-stashing a live
+        session never drops a peer. Eviction is oldest-first, which makes an
+        entry's survival a function of how many NEW sessions stashed after it;
+        that a pending `read_usage(result)` still finds its entry rests on the
+        cap's sizing margin (see USAGE_STASH_CAP), not on the order itself — a
+        pending entry that HAD become the oldest is exactly what would be
+        dropped."""
+        if session_id not in self._usage:
+            while len(self._usage) >= USAGE_STASH_CAP:
+                del self._usage[next(iter(self._usage))]
+        self._usage[session_id] = usage
 
     def read_usage(self, result: SessionResult) -> TokenUsage | None:
         if not result.session_id:
