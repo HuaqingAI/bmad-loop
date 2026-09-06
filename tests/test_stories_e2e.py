@@ -41,12 +41,18 @@ zero-token real-tmux success path.
 (11) runs that complete renderer project under worktree isolation after removing
 the renderer script unit and central config from the index. The real tmux session
 can start only if runtime provisioning reconstructs the ignored `_bmad` surface.
+
+Alongside those scenarios the file also holds local-process `/proc`+pidfd harness
+rows covering the reap-identity helpers the two teardown E2Es depend on. Those rows
+spawn and reap their own short-lived children, but run no tmux or orchestrator session.
 """
 
 from __future__ import annotations
 
+import errno
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -78,9 +84,8 @@ from bmad_loop.install import (
 # (`date +%s%N`; the detached-writer fake also needs setsid(1)) — BSD/macOS date
 # has no %N and macOS ships no setsid utility, so skipping honestly beats failing.
 HAVE_TMUX = sys.platform.startswith("linux") and shutil.which("tmux") is not None
-# A LIST, not a single mark: every test here drives a real tmux server, so on top of
-# the host gate they all join the serialized real-mux xdist group (DW-95). These 15
-# are the bulk of that group.
+# A LIST, not a single mark: every real-tmux test here joins the serialized real-mux
+# xdist group (DW-95). The local-process identity rows below inherit the same marks.
 pytestmark = [
     pytest.mark.skipif(not HAVE_TMUX, reason="stories E2E needs real tmux on Linux"),
     real_mux_e2e,
@@ -232,12 +237,21 @@ events = {{ SessionStart = "SessionStart", Stop = "Stop" }}
 SPEC_FOLDER = "_bmad-output/epic-1"
 CLI = [sys.executable, "-m", "bmad_loop.cli"]
 
+# Shared verbatim by both fake CLIs and exercised directly below. Pure bash reads
+# field 22 from /proc/<pid>/stat by stripping through the last ") " and taking index
+# 19 of the remaining fields, then records the identity captured at spawn.
+RECORD_CHILD_IDENTITY_SH = r"""cstat=$(<"/proc/$child/stat")
+read -r -a cfields <<< "${cstat##*) }"
+printf '%s %s\n' "$child" "${cfields[19]}" > "$idfile"
+"""
+
 # A fake CLI that writes SessionStart and then sleeps forever — it NEVER fires a
 # Stop hook, so the dev session can only end via the orchestrator's own timeout
 # fire + bounded teardown (#157). Because the session never ends a turn, the
 # result-less-Stop stall machinery never engages either, exactly the wedged-in-a-
 # tool-call shape the issue reported.
-TIMEOUT_FAKE_CLI = r"""#!/usr/bin/env bash
+TIMEOUT_FAKE_CLI = (
+    r"""#!/usr/bin/env bash
 set -e
 rd="$BMAD_LOOP_RUN_DIR"; tid="$BMAD_LOOP_TASK_ID"
 ts=$(date +%s%N)
@@ -246,13 +260,16 @@ mkdir -p "$ed"
 printf '{"ts": %s, "event": "SessionStart", "task_id": "%s", "session_id": "fake-1"}' \
     "$ts" "$tid" > "$ed/$ts-$tid-SessionStart.json"
 # Background + wait keeps the same process group as a foreground sleep, but
-# records the child's pid so the test can prove teardown reaped descendants,
-# not just this shell (whose cmdline is all the pgrep check can see).
+# records the child's pid plus /proc start time so the test can prove teardown reaped
+# this exact descendant, not just this shell (whose cmdline is all pgrep can see).
 sleep 100000 &
 child=$!
-printf '%s\n' "$child" > "$rd/tasks/$tid/fake-child.pid"
-wait "$child"
+idfile="$rd/tasks/$tid/fake-child.pid"
 """
+    + RECORD_CHILD_IDENTITY_SH
+    + r"""wait "$child"
+"""
+)
 
 # A fake CLI that ends CLEANLY (writes a `done` spec + Stop, then idles like a real
 # interactive session) but first `setsid`-detaches a straggler into its OWN session.
@@ -260,7 +277,8 @@ wait "$child"
 # escapes the pane pgid entirely — the #183/#139 repro the pre-harvest descendant
 # reap must cover before the worktree is merged and removed. Sprint mode: writes the
 # id-keyed done spec + a real code change so the run merges and tears the worktree down.
-DETACHED_WRITER_FAKE_CLI = r"""#!/usr/bin/env bash
+DETACHED_WRITER_FAKE_CLI = (
+    r"""#!/usr/bin/env bash
 set -e
 rd="$BMAD_LOOP_RUN_DIR"; tid="$BMAD_LOOP_TASK_ID"; story="$BMAD_LOOP_STORY_KEY"
 ts=$(date +%s%N)
@@ -275,8 +293,10 @@ baseline=$(git rev-parse HEAD)
 # fork) — it now leads its own session and survives the pane pgid's SIGHUP.
 setsid sleep 100000 &
 child=$!
-printf '%s\n' "$child" > "$rd/tasks/$tid/fake-child.pid"
-
+idfile="$rd/tasks/$tid/fake-child.pid"
+"""
+    + RECORD_CHILD_IDENTITY_SH
+    + r"""
 # Sprint-mode result: a real code change + the id-keyed done spec the dev synthesis
 # reads back (written under the worktree cwd in isolation mode).
 impl="_bmad-output/implementation-artifacts"
@@ -295,6 +315,7 @@ printf '{"ts": %s, "event": "Stop", "task_id": "%s", "session_id": "fake-1"}' \
 # nothing) — else the shell could exit first, reparenting the child to init.
 sleep 600
 """
+)
 
 
 def _git(root: Path, *args: str) -> None:
@@ -834,11 +855,419 @@ def test_e2e_sprint_intent_gap_patch_restore(tmp_path):
     assert any(str(spec) in p for p in prompts)
 
 
+def _positive_ascii_decimal(token: str) -> bool:
+    return bool(token) and token.isascii() and token.isdecimal() and any(ch != "0" for ch in token)
+
+
+def _proc_starttime(pid: int) -> str | None:
+    """Return /proc stat field 22, or ``None`` only when the process is gone."""
+    try:
+        stat = Path("/proc", str(pid), "stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+
+    # The comm field is parenthesized and may itself contain spaces and parens, so
+    # split after the last close-paren exactly as process_host does. Malformed records
+    # are observation failures, not evidence that the child disappeared.
+    starttime = stat[stat.rindex(")") + 1 :].split()[19]
+    if not _positive_ascii_decimal(starttime):
+        raise ValueError(f"malformed start time in /proc/{pid}/stat: {starttime!r}")
+    return starttime
+
+
+def _recorded_child(pid_file: Path) -> tuple[int, str]:
+    """Parse the fake CLI's exact positive-ASCII ``<pid> <starttime>`` identity."""
+    raw = pid_file.read_text(encoding="utf-8")
+    fields = raw[:-1].split(" ") if raw.endswith("\n") else []
+    diagnostic = (
+        f"{pid_file} must hold exactly two positive ASCII-decimal tokens "
+        f"('<pid> <starttime>'), got {raw!r}"
+    )
+    valid = (
+        raw.count("\n") == 1
+        and len(fields) == 2
+        and all(_positive_ascii_decimal(field) for field in fields)
+    )
+    assert valid, diagnostic
+    try:
+        pid = int(fields[0])
+    except ValueError:
+        raise AssertionError(diagnostic) from None
+    return pid, fields[1]
+
+
+def _preflight_pidfd_support() -> None:
+    """Fail before a fake child is spawned if pidfd open or signalling is unavailable."""
+    fd = os.pidfd_open(os.getpid())
+    try:
+        signal.pidfd_send_signal(fd, 0)
+    finally:
+        os.close(fd)
+
+
+def _bind_recorded_child(pid: int, starttime: str) -> int | None:
+    """Bind a pidfd to the authenticated child, or return ``None`` once it is gone."""
+    if _proc_starttime(pid) != starttime:
+        return None
+    try:
+        fd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return None
+
+    # Authenticate -> bind -> re-authenticate. Once this second check agrees, the
+    # pidfd names the recorded process even if its numeric pid is later recycled.
+    try:
+        still_matches = _proc_starttime(pid) == starttime
+    except BaseException:
+        os.close(fd)
+        raise
+    if not still_matches:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _kill_recorded_child(fd: int | None) -> None:
+    """SIGKILL through a bound pidfd and close it; ignore only proven disappearance."""
+    if fd is None:
+        return
+    try:
+        try:
+            signal.pidfd_send_signal(fd, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    finally:
+        os.close(fd)
+
+
+# These harness rows spawn only local `sleep` processes. They inherit the module's
+# Linux+tmux gate and xdist group so the helpers and their E2E consumers cannot drift
+# onto different host conditions; no row below launches tmux or the orchestrator.
+
+
+def _reap(proc: subprocess.Popen) -> None:
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait(timeout=10)
+
+
+def _live_child() -> tuple[subprocess.Popen, str]:
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        starttime = _proc_starttime(proc.pid)
+        assert starttime is not None, f"spawned child {proc.pid} has no /proc identity"
+        return proc, starttime
+    except BaseException:
+        _reap(proc)
+        raise
+
+
+def test_recorded_identity_bash_and_python_agree(tmp_path):
+    proc, starttime = _live_child()
+    try:
+        pid_file = tmp_path / "fake-child.pid"
+        subprocess.run(
+            [
+                "bash",
+                "-c",
+                f"set -e\nchild={proc.pid}\nidfile={shlex.quote(str(pid_file))}\n"
+                + RECORD_CHILD_IDENTITY_SH,
+            ],
+            check=True,
+            timeout=30,
+        )
+        assert _recorded_child(pid_file) == (proc.pid, starttime)
+    finally:
+        _reap(proc)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "123\n",
+        "123 456 789\n",
+        "0 456\n",
+        "123 0\n",
+        "-123 456\n",
+        "１２３ 456\n",
+        "123 ٤٥٦\n",
+        "123 456",
+        "123\n456\n",
+        "123\t456\n",
+        "123\N{NO-BREAK SPACE}456\n",
+        f'{"9" * 5000} 456\n',
+    ],
+)
+def test_recorded_child_rejects_malformed_zero_and_non_ascii_identities(tmp_path, raw):
+    pid_file = tmp_path / "fake-child.pid"
+    pid_file.write_text(raw, encoding="utf-8")
+    with pytest.raises(AssertionError, match="positive ASCII-decimal"):
+        _recorded_child(pid_file)
+
+
+def test_reap_identity_binds_a_live_child(tmp_path):
+    proc, starttime = _live_child()
+    try:
+        pid_file = tmp_path / "fake-child.pid"
+        pid_file.write_text(f"{proc.pid} {starttime}\n", encoding="utf-8")
+        assert _recorded_child(pid_file) == (proc.pid, starttime)
+        fd = _bind_recorded_child(proc.pid, starttime)
+        assert fd is not None
+        try:
+            signal.pidfd_send_signal(fd, 0)
+        finally:
+            _kill_recorded_child(fd)
+    finally:
+        _reap(proc)
+
+
+def test_reap_identity_returns_none_for_a_reaped_child():
+    proc, starttime = _live_child()
+    _reap(proc)
+    assert _proc_starttime(proc.pid) != starttime
+    assert _bind_recorded_child(proc.pid, starttime) is None
+
+
+def test_reap_identity_refuses_a_start_time_mismatch(monkeypatch):
+    proc, starttime = _live_child()
+    try:
+        opened: list[int] = []
+        real_open = os.pidfd_open
+
+        def spy_open(pid: int) -> int:
+            opened.append(pid)
+            return real_open(pid)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "pidfd_open", spy_open)
+            assert _bind_recorded_child(proc.pid, str(int(starttime) + 1)) is None
+        assert opened == [], "a mismatched process must not be bound"
+        assert proc.poll() is None, "a mismatched process must not be signalled"
+    finally:
+        _reap(proc)
+
+
+def test_reap_identity_closes_the_fd_when_the_pid_is_recycled_around_the_bind(monkeypatch):
+    proc, starttime = _live_child()
+    try:
+        answers = iter([starttime, str(int(starttime) + 1)])
+        closed: list[int] = []
+        real_close = os.close
+
+        def spy_close(fd: int) -> None:
+            closed.append(fd)
+            real_close(fd)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(sys.modules[__name__], "_proc_starttime", lambda pid: next(answers))
+            patch.setattr(os, "close", spy_close)
+            assert _bind_recorded_child(proc.pid, starttime) is None
+        assert len(closed) == 1, "the pidfd must close after re-authentication fails"
+    finally:
+        _reap(proc)
+
+
+def test_reap_identity_closes_the_fd_when_reauthentication_raises(monkeypatch):
+    proc, starttime = _live_child()
+    try:
+        reads = 0
+        closed: list[int] = []
+        real_close = os.close
+
+        def read_starttime(_pid: int) -> str:
+            nonlocal reads
+            reads += 1
+            if reads == 1:
+                return starttime
+            raise PermissionError(errno.EACCES, "denied")
+
+        def spy_close(fd: int) -> None:
+            closed.append(fd)
+            real_close(fd)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(sys.modules[__name__], "_proc_starttime", read_starttime)
+            patch.setattr(os, "close", spy_close)
+            with pytest.raises(PermissionError):
+                _bind_recorded_child(proc.pid, starttime)
+        assert reads == 2
+        assert len(closed) == 1, "the pidfd must close when re-authentication raises"
+        assert proc.poll() is None
+    finally:
+        _reap(proc)
+
+
+def test_reap_identity_returns_none_when_pidfd_open_loses_the_process(monkeypatch):
+    proc, starttime = _live_child()
+    try:
+
+        def disappeared(_pid: int) -> int:
+            raise ProcessLookupError
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "pidfd_open", disappeared)
+            assert _bind_recorded_child(proc.pid, starttime) is None
+        assert proc.poll() is None, "the simulated open race must not signal the child"
+    finally:
+        _reap(proc)
+
+
+@pytest.mark.parametrize("case", ["permission", "short", "delimiter", "nondigit"])
+def test_proc_starttime_propagates_non_disappearance_and_malformed_failures(monkeypatch, case):
+    def read_stat(_self, **_kwargs):
+        if case == "permission":
+            raise PermissionError(errno.EACCES, "denied")
+        if case == "short":
+            return "1 (sleep) S 0"
+        if case == "delimiter":
+            return "not a proc stat record"
+        return "1 (sleep) " + " ".join(["S", *(["1"] * 18), "not-decimal"])
+
+    expected = (
+        PermissionError if case == "permission" else (IndexError if case == "short" else ValueError)
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "read_text", read_stat)
+        with pytest.raises(expected):
+            _proc_starttime(123)
+
+
+def test_kill_recorded_child_actually_kills_through_the_fd():
+    proc, starttime = _live_child()
+    try:
+        fd = _bind_recorded_child(proc.pid, starttime)
+        assert fd is not None
+        _kill_recorded_child(fd)
+        assert proc.wait(timeout=10) == -signal.SIGKILL
+    finally:
+        _reap(proc)
+
+
+def test_kill_recorded_child_propagates_signal_failure_and_closes_fd(monkeypatch):
+    proc, starttime = _live_child()
+    try:
+        fd = _bind_recorded_child(proc.pid, starttime)
+        assert fd is not None
+
+        def denied(_fd: int, _sig: int) -> None:
+            raise PermissionError(errno.EPERM, "denied")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(signal, "pidfd_send_signal", denied)
+            with pytest.raises(PermissionError):
+                _kill_recorded_child(fd)
+        with pytest.raises(OSError) as excinfo:
+            os.fstat(fd)
+        assert excinfo.value.errno == errno.EBADF
+        assert proc.poll() is None, "failed cleanup signalling must not imply disappearance"
+    finally:
+        _reap(proc)
+
+
+def test_kill_recorded_child_ignores_disappearance_and_closes_fd(monkeypatch):
+    fd = os.pidfd_open(os.getpid())
+
+    def disappeared(_fd: int, _sig: int) -> None:
+        raise ProcessLookupError
+
+    with monkeypatch.context() as patch:
+        patch.setattr(signal, "pidfd_send_signal", disappeared)
+        _kill_recorded_child(fd)
+    with pytest.raises(OSError) as excinfo:
+        os.fstat(fd)
+    assert excinfo.value.errno == errno.EBADF
+
+
+def test_live_child_reaps_its_process_when_identity_observation_fails(monkeypatch):
+    spawned: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    def spy_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    def denied(_pid: int) -> str:
+        raise PermissionError(errno.EACCES, "denied")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(subprocess, "Popen", spy_popen)
+        patch.setattr(sys.modules[__name__], "_proc_starttime", denied)
+        with pytest.raises(PermissionError):
+            _live_child()
+    assert len(spawned) == 1
+    assert spawned[0].poll() == -signal.SIGKILL
+
+
+def test_reap_identity_fails_loudly_when_pidfd_is_unsupported(monkeypatch):
+    proc, starttime = _live_child()
+    try:
+
+        def unsupported(_pid: int) -> int:
+            raise OSError(errno.ENOSYS, "pidfd_open not supported")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "pidfd_open", unsupported)
+            with pytest.raises(OSError) as bind_error:
+                _bind_recorded_child(proc.pid, starttime)
+            with pytest.raises(OSError) as preflight_error:
+                _preflight_pidfd_support()
+        assert bind_error.value.errno == errno.ENOSYS
+        assert preflight_error.value.errno == errno.ENOSYS
+
+        preflight_fds: list[int] = []
+
+        def blocked_signal(fd: int, _sig: int) -> None:
+            preflight_fds.append(fd)
+            raise PermissionError(errno.EPERM, "pidfd signalling blocked")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(signal, "pidfd_send_signal", blocked_signal)
+            with pytest.raises(PermissionError):
+                _preflight_pidfd_support()
+        assert len(preflight_fds) == 1
+        with pytest.raises(OSError) as excinfo:
+            os.fstat(preflight_fds[0])
+        assert excinfo.value.errno == errno.EBADF
+    finally:
+        _reap(proc)
+
+
+@pytest.mark.parametrize(
+    "surface_name",
+    [
+        "test_e2e_session_timeout_teardown",
+        "test_e2e_detached_writer_reaped_before_worktree_teardown",
+    ],
+)
+def test_reap_e2e_preflight_failure_prevents_run(tmp_path, monkeypatch, surface_name):
+    run_called = False
+
+    def unsupported() -> None:
+        raise OSError(errno.ENOSYS, "pidfd unavailable")
+
+    def unexpected_run(*_args, **_kwargs):
+        nonlocal run_called
+        run_called = True
+        raise AssertionError("_run must not be reached after preflight failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sys.modules[__name__], "_scaffold_sprint", lambda *_args, **_kwargs: None)
+        patch.setattr(sys.modules[__name__], "_preflight_pidfd_support", unsupported)
+        patch.setattr(sys.modules[__name__], "_run", unexpected_run)
+        with pytest.raises(OSError, match="pidfd unavailable"):
+            globals()[surface_name](tmp_path, monkeypatch, False)
+    assert not run_called
+
+
 def _tmux_has_session(name: str) -> bool:
     return subprocess.run(["tmux", "has-session", "-t", name], capture_output=True).returncode == 0
 
 
-def test_e2e_session_timeout_teardown(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "force_live_reap_assertion", [False, True], ids=["reaped", "live-assertion"]
+)
+def test_e2e_session_timeout_teardown(tmp_path, monkeypatch, force_live_reap_assertion):
     """#157 end to end through the real binary + real tmux: a dev session wedged
     forever (SessionStart, then sleep — never a Stop) is bounded only by the
     session timeout, and the fix makes that firing timely and observable. The
@@ -855,6 +1284,7 @@ def test_e2e_session_timeout_teardown(tmp_path, monkeypatch):
     # inherited by the `bmad-loop run` subprocess (_run passes no env=)
     monkeypatch.setenv("BMAD_LOOP_SESSION_TIMEOUT_S", "3")
 
+    _preflight_pidfd_support()
     proc = _run(root, "run", timeout=90)
     assert proc.returncode == 0, proc.stderr or proc.stdout
 
@@ -875,46 +1305,100 @@ def test_e2e_session_timeout_teardown(tmp_path, monkeypatch):
     assert end.get("expired_clock") in ("monotonic", "wall", "both"), end
     task_id = end["task_id"]
 
-    # (2) the fire moment left a timeout-fired breadcrumb, distinct from teardown
     tdir = run_dir / "tasks" / task_id
-    life = [
-        json.loads(ln)
-        for ln in (tdir / "session-lifecycle.jsonl").read_text(encoding="utf-8").splitlines()
-        if ln.strip()
-    ]
-    assert any(ln.get("event") == "timeout-fired" for ln in life), life
-
-    # (3) the wait loop's proof-of-life exists and is recent (not the frozen gap)
-    hb = json.loads((tdir / "heartbeat.json").read_text(encoding="utf-8"))
-    assert time.time() - hb["ts"] < 120, hb
-
-    # (4) teardown actually reaped the session — no orphan tmux session/process
-    assert not _tmux_has_session(f"bmad-loop-{run_id}")
-    if shutil.which("pgrep"):
-        pg = subprocess.run(["pgrep", "-af", "fake-cli.sh"], capture_output=True, text=True)
-        assert not [ln for ln in pg.stdout.splitlines() if str(root) in ln], pg.stdout
-    # The pgrep filter can only see the shell's cmdline; probe the recorded sleep
-    # descendant directly — the escalation force-kills pane-root pids, so a
-    # regression there would leak exactly this child while pgrep stays clean.
-    # Poll against the shared REAL_MUX_HANG_CEILING_S hang ceiling rather than a tight
-    # wall-clock budget: a just-killed child can linger as a zombie (kill 0 succeeds)
-    # until init reaps it after the shell died, and a starved scheduler can stretch that
-    # wait arbitrarily (DW-95/DW-108). Accepted trade-off: a merely SLOW reaper is caught
-    # by the 90s ceiling instead of a 10s budget; a broken one still fails either way.
     pid_file = tdir / "fake-child.pid"
     assert pid_file.is_file(), "fake CLI never recorded its sleep child"
-    fake_pid = int(pid_file.read_text(encoding="utf-8"))
-    deadline = time.monotonic() + REAL_MUX_HANG_CEILING_S
-    while True:
+    recorded_pid, recorded_start = _recorded_child(pid_file)
+    recorded_fd: int | None = None
+    poll_fd: int | None = None
+    injected_child: subprocess.Popen | None = None
+    poll_failure: AssertionError | None = None
+    injected_exit: int | None = None
+    try:
+        recorded_fd = _bind_recorded_child(recorded_pid, recorded_start)
+        if recorded_fd is None:
+            assert _proc_starttime(recorded_pid) != recorded_start, (
+                f"bind returned None while pid {recorded_pid} still carries the recorded start "
+                f"time {recorded_start}: the reap poll would be skipped without evidence"
+            )
+
+        poll_pid = recorded_pid
+        if force_live_reap_assertion:
+            # Verify the real fake-CLI child first. If it is still signalable, safely
+            # clean that exact process before substituting the fault-injection child.
+            real_fd, recorded_fd = recorded_fd, None
+            _kill_recorded_child(real_fd)
+            injected_child, injected_start = _live_child()
+            poll_pid = injected_child.pid
+            poll_fd = _bind_recorded_child(poll_pid, injected_start)
+            assert poll_fd is not None, "the forced-live child must bind before the reap poll"
+        else:
+            poll_fd, recorded_fd = recorded_fd, None
+
+        # (2) the fire moment left a timeout-fired breadcrumb, distinct from teardown
+        life = [
+            json.loads(ln)
+            for ln in (tdir / "session-lifecycle.jsonl").read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        assert any(ln.get("event") == "timeout-fired" for ln in life), life
+
+        # (3) the wait loop's proof-of-life exists and is recent (not the frozen gap)
+        hb = json.loads((tdir / "heartbeat.json").read_text(encoding="utf-8"))
+        assert time.time() - hb["ts"] < 120, hb
+
+        # (4) teardown actually reaped the session — no orphan tmux session/process
+        assert not _tmux_has_session(f"bmad-loop-{run_id}")
+        if shutil.which("pgrep"):
+            pg = subprocess.run(["pgrep", "-af", "fake-cli.sh"], capture_output=True, text=True)
+            assert not [ln for ln in pg.stdout.splitlines() if str(root) in ln], pg.stdout
+
+        # The identity is a pidfd authenticated against the start time captured at
+        # spawn, so a recycled pid can neither fake a survivor nor receive cleanup.
+        # Signal 0 remains zombie-tolerant: it succeeds until the exact child is reaped.
+        # A just-killed zombie can linger until init runs, and scheduler starvation can
+        # stretch that wait, so use the shared hang ceiling rather than a tight budget;
+        # a merely slow reaper gets more time, while a broken one still fails.
+        with monkeypatch.context() as clock_patch:
+            if force_live_reap_assertion:
+                moments = iter([0.0, REAL_MUX_HANG_CEILING_S])
+                clock_patch.setattr(time, "monotonic", lambda: next(moments))
+            try:
+                deadline = time.monotonic() + REAL_MUX_HANG_CEILING_S
+                while poll_fd is not None:
+                    try:
+                        signal.pidfd_send_signal(poll_fd, 0)
+                    except ProcessLookupError:
+                        break  # dead and reaped — teardown covered the descendant
+                    assert time.monotonic() < deadline, f"sleep child {poll_pid} survived teardown"
+                    time.sleep(0.1)
+            except AssertionError as exc:
+                poll_failure = exc
+                if not force_live_reap_assertion:
+                    raise
+    finally:
         try:
-            os.kill(fake_pid, 0)
-        except ProcessLookupError:
-            break  # dead and reaped — teardown covered the descendant
-        assert time.monotonic() < deadline, f"sleep child {fake_pid} survived teardown"
-        time.sleep(0.1)
+            try:
+                _kill_recorded_child(poll_fd)
+                if injected_child is not None:
+                    injected_exit = injected_child.wait(timeout=10)
+            finally:
+                _kill_recorded_child(recorded_fd)
+        finally:
+            if injected_child is not None and injected_child.poll() is None:
+                _reap(injected_child)
+
+    if force_live_reap_assertion:
+        assert str(poll_failure).splitlines()[0] == f"sleep child {poll_pid} survived teardown"
+        assert injected_exit == -signal.SIGKILL
 
 
-def test_e2e_detached_writer_reaped_before_worktree_teardown(tmp_path):
+@pytest.mark.parametrize(
+    "force_live_reap_assertion", [False, True], ids=["reaped", "live-assertion"]
+)
+def test_e2e_detached_writer_reaped_before_worktree_teardown(
+    tmp_path, monkeypatch, force_live_reap_assertion
+):
     """#183/#139 end to end: a dev session `setsid`-detaches a straggler into its own
     session (escaping the pane pgid tmux's SIGHUP reaps), then ends CLEANLY via a
     Stop + done spec. The verified-kill reap must chase the harvested descendant tree
@@ -932,13 +1416,40 @@ def test_e2e_detached_writer_reaped_before_worktree_teardown(tmp_path):
             "[limits]\nmax_dev_attempts = 1\nteardown_grace_s = 10\n"
         ),
     )
-    detached_pid: int | None = None
-    try:
-        proc = _run(root, "run", timeout=120)
-        assert proc.returncode == 0, proc.stderr or proc.stdout
+    _preflight_pidfd_support()
+    proc = _run(root, "run", timeout=120)
+    assert proc.returncode == 0, proc.stderr or proc.stdout
 
-        run_id = _run_id(root)
-        run_dir = root / ".bmad-loop" / "runs" / run_id
+    run_id = _run_id(root)
+    run_dir = root / ".bmad-loop" / "runs" / run_id
+    pid_files = list((run_dir / "tasks").glob("*/fake-child.pid"))
+    assert pid_files, "fake CLI never recorded its setsid child"
+    recorded_pid, recorded_start = _recorded_child(pid_files[0])
+    recorded_fd: int | None = None
+    poll_fd: int | None = None
+    injected_child: subprocess.Popen | None = None
+    poll_failure: AssertionError | None = None
+    injected_exit: int | None = None
+    try:
+        recorded_fd = _bind_recorded_child(recorded_pid, recorded_start)
+        if recorded_fd is None:
+            assert _proc_starttime(recorded_pid) != recorded_start, (
+                f"bind returned None while pid {recorded_pid} still carries the recorded "
+                f"start time {recorded_start}: the reap poll would be skipped blind"
+            )
+
+        poll_pid = recorded_pid
+        if force_live_reap_assertion:
+            # Verify or safely clean the real straggler before the injected child takes
+            # over the protected poll; keep the two identities distinct throughout.
+            real_fd, recorded_fd = recorded_fd, None
+            _kill_recorded_child(real_fd)
+            injected_child, injected_start = _live_child()
+            poll_pid = injected_child.pid
+            poll_fd = _bind_recorded_child(poll_pid, injected_start)
+            assert poll_fd is not None, "the forced-live child must bind before the reap poll"
+        else:
+            poll_fd, recorded_fd = recorded_fd, None
 
         # (1) clean end: the story landed done and merged, not a timeout/stall
         assert _sprint_status(root, story) == "done"
@@ -961,30 +1472,45 @@ def test_e2e_detached_writer_reaped_before_worktree_teardown(tmp_path):
         mounts = [ln for ln in wt.stdout.splitlines() if ln.startswith("worktree ")]
         assert len(mounts) == 1, wt.stdout  # only the primary checkout remains
 
-        # (4) the detached straggler is reaped BEFORE teardown: kill-0 -> gone. Polled
-        # against the shared REAL_MUX_HANG_CEILING_S hang ceiling — NOT the 10s
-        # `teardown_grace_s` above, and not a tight wall-clock budget, either of which a
-        # starved scheduler can blow through (DW-95/DW-108). Accepted trade-off: what is
-        # asserted is that the sweep reaps the straggler at all, not how fast; a reap
-        # that never happens still fails, at the 90s ceiling rather than at 10s.
-        pid_files = list((run_dir / "tasks").glob("*/fake-child.pid"))
-        assert pid_files, "fake CLI never recorded its setsid child"
-        detached_pid = int(pid_files[0].read_text(encoding="utf-8").strip())
-        deadline = time.monotonic() + REAL_MUX_HANG_CEILING_S
-        while True:
+        # (4) poll the start-time-authenticated pidfd. Signal 0 preserves the old
+        # alive-or-zombie semantics, while the bound identity cannot follow pid reuse.
+        # A zombie can linger until init runs and a starved scheduler can stretch that
+        # wait, so the shared hang ceiling remains deliberately distinct from the 10s
+        # teardown_grace_s; a reap that never happens still fails at the ceiling.
+        with monkeypatch.context() as clock_patch:
+            if force_live_reap_assertion:
+                moments = iter([0.0, REAL_MUX_HANG_CEILING_S])
+                clock_patch.setattr(time, "monotonic", lambda: next(moments))
             try:
-                os.kill(detached_pid, 0)
-            except ProcessLookupError:
-                break  # reaped by the descendant sweep before teardown
-            assert time.monotonic() < deadline, f"detached child {detached_pid} survived teardown"
-            time.sleep(0.1)
+                deadline = time.monotonic() + REAL_MUX_HANG_CEILING_S
+                while poll_fd is not None:
+                    try:
+                        signal.pidfd_send_signal(poll_fd, 0)
+                    except ProcessLookupError:
+                        break  # reaped by the descendant sweep before teardown
+                    assert (
+                        time.monotonic() < deadline
+                    ), f"detached child {poll_pid} survived teardown"
+                    time.sleep(0.1)
+            except AssertionError as exc:
+                poll_failure = exc
+                if not force_live_reap_assertion:
+                    raise
     finally:
-        # never leak the detached sleep if the test fails before the reap check
-        if detached_pid is not None:
+        try:
             try:
-                os.kill(detached_pid, signal.SIGKILL)
-            except OSError:
-                pass
+                _kill_recorded_child(poll_fd)
+                if injected_child is not None:
+                    injected_exit = injected_child.wait(timeout=10)
+            finally:
+                _kill_recorded_child(recorded_fd)
+        finally:
+            if injected_child is not None and injected_child.poll() is None:
+                _reap(injected_child)
+
+    if force_live_reap_assertion:
+        assert str(poll_failure).splitlines()[0] == (f"detached child {poll_pid} survived teardown")
+        assert injected_exit == -signal.SIGKILL
 
 
 def test_e2e_sweep_intent_gap_patch_restore(tmp_path):

@@ -1010,10 +1010,13 @@ def _declares_loadgroup(addopts: object) -> bool:
     return chosen == "loadgroup"
 
 
-# Per-module floors. Not one suite-wide number: at an actual 6 + 15 a `>= 20` floor
-# leaves a single test of slack, so deleting two E2Es would trip the floor and blame
+# Per-module floors. Not one suite-wide number: at an actual 6 + 30 a `>= 35` floor
+# leaves a single test of slack, so deleting two gated tests would trip the floor and blame
 # the detector for a change the author made on purpose.
-_EXPECTED_E2E_FLOORS = {"test_generic_tmux.py": 6, "test_stories_e2e.py": 15}
+# The stories count is 15 real-tmux test defs plus 15 local-process identity harness
+# defs. They share the module gate, so leaving the old floor would let helpers mask the
+# deletion of E2Es. Raise this floor with any new test def added to that module.
+_EXPECTED_E2E_FLOORS = {"test_generic_tmux.py": 6, "test_stories_e2e.py": 30}
 
 
 def test_every_real_tmux_e2e_joins_the_serialized_xdist_group():
