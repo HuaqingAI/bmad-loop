@@ -78,6 +78,81 @@ def increment_decimal_digits(value: str) -> str:
     return "".join(digits)
 
 
+# The scalars a stored answer's consumers read as strings, split by WHO reads them.
+# `_agreeing_option` runs on both `_materialize_bundles` lanes, so `key`/`label` are
+# consumed whatever the effect; `intent`/`bundle_name` are read by the BUILD lane
+# alone. Order within each tuple is the order a defect is reported in.
+_ANSWER_STR_FIELDS = ("key", "label")
+_BUILD_ANSWER_STR_FIELDS = ("intent", "bundle_name")
+
+
+def unusable_answer_reason(value: Any) -> str | None:
+    """Why `value` is not a usable persisted decision answer, or None when it is.
+
+    ONE schema for the two readers of a stored answer — `SweepEngine._decisions_phase`'s
+    read loops and `decisions.pending_missed_decisions` — because they have to agree
+    (DW-142): a value one accepted and the other rejected was an id that either got
+    silently ignored by every sweep while this command counted it answered, or the
+    reverse. The returned string is the `malformed` row's reason, so it names ids,
+    fields and TYPE names only, never a stored answer's prose.
+
+    The checks are exactly what the consumers assume, no more — because rejecting is
+    not free: an answer refused here stops being seeded, and for `keep-open` that
+    means it stops SUPPRESSING bundles, so a later cycle can bundle and build work
+    the human explicitly asked to leave alone. A field is therefore screened only
+    where a reader of THIS effect actually consumes it.
+
+    `effect` must be a recognized `DECISION_EFFECTS` member because
+    `_materialize_bundles` routes on it and an unrecognized one matches no lane — the
+    answer counts as given while nothing acts on it. `key` and `label`, when present,
+    must be strings for every effect: `_agreeing_option` reads both and runs on both
+    lanes. `intent` and `bundle_name` are screened for `build` ONLY, the sole lane
+    that reads them — a list `intent` used to reach `Bundle.intent` as its truthy
+    Python repr and ship into a dev session (DW-141), while the same corrupt field on
+    a keep-open answer is inert prose no reader touches. Fields no reader consumes
+    (`resolution`, `answered_at`) are not validated for any effect.
+
+    `close` is usable even though `record_pre_answer` never stores it: the
+    interactive writer in `_decisions_phase` records `effect: "close"` for a
+    decision answered `close` this run, so rejecting it would re-ask a decision the
+    human already answered inside the same run.
+
+    Rejecting is never a repair — the caller keeps the value and re-publishes it
+    unchanged; see `_decisions_phase`'s `unusable` map and `load_pre_answers`."""
+    if not isinstance(value, dict):
+        return f"not a JSON object: {type(value).__name__}"
+    if "effect" not in value:
+        return "effect missing"
+    effect = value["effect"]
+    if not isinstance(effect, str) or effect not in DECISION_EFFECTS:
+        return "effect not recognized"
+    fields = _ANSWER_STR_FIELDS
+    if effect == "build":
+        fields += _BUILD_ANSWER_STR_FIELDS
+    for field in fields:
+        if field in value and not isinstance(value[field], str):
+            return f"{field} not a string: {type(value[field]).__name__}"
+    return None
+
+
+def _answer_str(answer: dict[str, Any], field: str) -> str:
+    """A stored answer's scalar read as a string, or "" when it is anything else.
+
+    `str(answer.get(field, ""))` was the old spelling and it never failed: a list
+    became "['a', 'b']" and a dict "{...}" — truthy prose no human authored, which
+    the build lane then shipped as a `Bundle.intent` (DW-141). "" instead, so each
+    site's EXISTING fallback chain handles it: an agreeing option's value, then the
+    site's own default or its drop cause. No new branch, no new drop cause.
+
+    Defense-in-depth, not the production path: `_decisions_phase` already rejects
+    at the read site (`unusable_answer_reason`) every field a reader of that effect
+    consumes, so in production each site here only ever sees strings. It stays
+    because the test suite hands `_materialize_bundles` a map directly, past that
+    read site — the same reason each lane holds its own `isinstance` guard."""
+    value = answer.get(field)
+    return value if isinstance(value, str) else ""
+
+
 @dataclass(frozen=True)
 class _BundleNameRepair:
     field: str
@@ -1643,7 +1718,12 @@ class SweepEngine(Engine):
         self._emit("post_close_resolved")
         return len(closed)
 
-    def _decisions_phase(self, plan: TriagePlan) -> tuple[dict[str, dict[str, str]], int]:
+    # `dict[str, Any]` per answer, not `dict[str, str]`: `unusable_answer_reason`
+    # deliberately screens only the fields a reader consumes, so `resolution` and
+    # `answered_at` can legitimately hold non-strings and a keep-open answer may
+    # carry a corrupt `intent`. The narrower annotation read as a guarantee that
+    # would justify deleting `_answer_str`; it never was one.
+    def _decisions_phase(self, plan: TriagePlan) -> tuple[dict[str, dict[str, Any]], int]:
         from . import decisions as decisions_store  # lazy: decisions imports sweep
 
         decisions_path = self.run_dir / "decisions.json"
@@ -1672,7 +1752,7 @@ class SweepEngine(Engine):
         # top level leave nothing per-value to carry — so `unusable` stays empty
         # there and the next write this phase makes for its own reasons (a seeded
         # pre-answer, an in-run answer) replaces the corrupt file wholesale.
-        answers: dict[str, dict[str, str]] = {}
+        answers: dict[str, dict[str, Any]] = {}
         unusable: dict[str, Any] = {}
         malformed: list[str] = []
         if decisions_path.is_file():
@@ -1684,14 +1764,16 @@ class SweepEngine(Engine):
                 if isinstance(stored, dict):
                     for stored_id, value in stored.items():
                         key = str(stored_id)
-                        if isinstance(value, dict):
+                        # `unusable_answer_reason`, not a local `isinstance`: the
+                        # SAME schema `decisions.pending_missed_decisions` screens
+                        # by (DW-142), so an id this loop refuses to answer is one
+                        # that command re-offers instead of counting answered.
+                        reason = unusable_answer_reason(value)
+                        if reason is None:
                             answers[key] = value
                         else:
                             unusable[key] = value
-                            malformed.append(
-                                f"{key}: not a JSON object: {type(value).__name__} "
-                                "(<run>/decisions.json)"
-                            )
+                            malformed.append(f"{key}: {reason} (<run>/decisions.json)")
                 else:
                     self.journal.append(
                         "sweep-decisions-reload-failed",
@@ -1708,16 +1790,17 @@ class SweepEngine(Engine):
             if decision.id in answers or decision.id not in pre:
                 continue
             pre_answer = pre[decision.id]
-            if not isinstance(pre_answer, dict):
+            pre_reason = unusable_answer_reason(pre_answer)
+            if pre_reason is not None:
                 # `load_pre_answers` validates only the TOP level (decisions.py),
                 # so a value here can be any JSON at all. Same degrade as the
-                # run-local store above, and journaled in the same record — which
-                # is why each entry names the store it came from: the two files
-                # are different, and only one of them is the one to hand-fix.
-                malformed.append(
-                    f"{decision.id}: not a JSON object: {type(pre_answer).__name__} "
-                    "(project .bmad-loop/decisions.json)"
-                )
+                # run-local store above — same predicate, too — and journaled in
+                # the same record, which is why each entry names the store it came
+                # from: the two files are different, and only one of them is the
+                # one to hand-fix. Nothing is written back to the project store:
+                # this phase never repairs either file, and re-answering the
+                # decision out of band is what overwrites the unusable value.
+                malformed.append(f"{decision.id}: {pre_reason} (project .bmad-loop/decisions.json)")
                 continue
             answers[decision.id] = pre_answer
             self.journal.append(
@@ -1891,7 +1974,7 @@ class SweepEngine(Engine):
     # ---------------------------------------------------------- bundles
 
     def _agreeing_option(
-        self, decision: Decision, answer: dict[str, str], answer_key: str
+        self, decision: Decision, answer: dict[str, Any], answer_key: str
     ) -> DecisionOption | None:
         """The stored answer's key resolved against THIS cycle's decision, but only
         when the option it lands on is still the one the human answered.
@@ -1920,8 +2003,8 @@ class SweepEngine(Engine):
         option = decision.option(answer_key)
         if option is None:
             return None  # nothing resolved, so there is nothing to describe
-        label_matched = option.label == str(answer.get("label", ""))
-        if label_matched and option.effect == str(answer.get("effect", "")):
+        label_matched = option.label == _answer_str(answer, "label")
+        if label_matched and option.effect == _answer_str(answer, "effect"):
             return option
         # No triage prose in the record (labels, questions): the fields are closed
         # effect enums and a bare boolean. `answer_effect` says which LANE wrote the
@@ -1935,12 +2018,12 @@ class SweepEngine(Engine):
             key=answer_key,
             option_effect=option.effect,
             label_matched=label_matched,
-            answer_effect=str(answer.get("effect", "")),
+            answer_effect=_answer_str(answer, "effect"),
         )
         return None
 
     def _materialize_bundles(
-        self, plan: TriagePlan, answers: dict[str, dict[str, str]]
+        self, plan: TriagePlan, answers: dict[str, dict[str, Any]]
     ) -> tuple[list[Bundle], bool]:
         """This cycle's bundles, and whether ANY recorded answer was dropped by one
         of the three drop lanes below — `_cycle`'s progress signal.
@@ -1974,8 +2057,9 @@ class SweepEngine(Engine):
             # ONE spelling of the key for the whole loop body: the lookup, the
             # mismatch record and the note below must name the same string, and
             # `str(answer.get("key"))` stringified a missing key to the literal
-            # "None" while the record spelled it "".
-            answer_key = str(answer.get("key", ""))
+            # "None" while the record spelled it "" — and a non-string key to its
+            # repr, which `_answer_str` reads as "" instead (DW-141).
+            answer_key = _answer_str(answer, "key")
             # `matched` is exactly "an agreeing option was resolved": the helper
             # collapses the two ways that can fail (no such key / a re-authored one)
             # because this lane treats them alike. It tolerates BOTH — a build answer
@@ -1993,7 +2077,7 @@ class SweepEngine(Engine):
             # freshly re-authored by a triage the human never read; an IN-RUN
             # answer is written with only key/label/effect/answered_at, so it draws
             # intent and bundle_name from the option — but only an agreeing one.
-            intent = str(answer.get("intent", "")) or (option.intent if option else "")
+            intent = _answer_str(answer, "intent") or (option.intent if option else "")
             if not intent:
                 # A stale in-run answer: nothing to build from. Dropping it is the
                 # only safe action here — `_apply_decision_effect` already wrote
@@ -2022,8 +2106,8 @@ class SweepEngine(Engine):
                 self._quarantine(self.state.sweep_dropped_decisions, decision.id)
                 answer_dropped = True  # progress: see this method's docstring
                 continue
-            label = str(answer.get("label", "")) or (option.label if option else "") or "build"
-            bundle_name = str(answer.get("bundle_name", "")) or (
+            label = _answer_str(answer, "label") or (option.label if option else "") or "build"
+            bundle_name = _answer_str(answer, "bundle_name") or (
                 option.bundle_name if option else ""
             )
             # A stored answer's bundle_name never passed `validate_triage` — it was
@@ -2201,7 +2285,7 @@ class SweepEngine(Engine):
                 # keep-open means.
                 keep_open_ids.add(dw_id)
                 continue
-            answer_key = str(answer.get("key", ""))
+            answer_key = _answer_str(answer, "key")
             if self._agreeing_option(decision, answer, answer_key) is not None:
                 keep_open_ids.add(dw_id)
                 continue

@@ -28,7 +28,7 @@ from pathlib import Path
 
 from . import bmadconfig, deferredwork, runs, verify
 from .platform_util import atomic_write_text_confined
-from .sweep import Decision, DecisionOption, validate_triage
+from .sweep import Decision, DecisionOption, unusable_answer_reason, validate_triage
 
 STORE_REL = Path(".bmad-loop") / "decisions.json"
 _TRIAGE_RE = re.compile(r"^triage(?:-(\d+))?\.json$")
@@ -43,13 +43,24 @@ def store_path(project: Path) -> Path:
 
 def load_pre_answers(project: Path) -> dict[str, dict]:
     """The project-level pre-answer store, {DW-id: {effect,label,intent,...}}.
-    Tolerant of a missing or malformed file (returns {})."""
+    Tolerant of a missing or malformed file (returns {}): an absent file, an
+    unreadable one, JSON that will not parse, bytes that are not UTF-8 at all
+    (DW-140) and a non-object top level all degrade to an empty store rather than
+    aborting the caller — every caller here is either a sweep or the `decisions`
+    command, and neither has anything to gain from dying on one bad byte.
+
+    Only the TOP level is validated. Values stay exactly as stored, however
+    shaped: `record_pre_answer` and `prune_pre_answers` both read-modify-write the
+    whole store through this function, so filtering here would make an unrelated
+    write silently DELETE a human's corrupt entries — the file repair this
+    codebase refuses. Readers that consume a value screen it themselves with
+    `sweep.unusable_answer_reason`."""
     path = store_path(project)
     if not path.is_file():
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -122,8 +133,10 @@ def prune_pre_answers(project: Path, open_ids: set[str]) -> list[str]:
 def pending_missed_decisions(project: Path) -> list[Decision]:
     """Decisions earlier sweeps surfaced but no one answered: reconstructed from
     every run's persisted triage*.json, kept only when the DW id is still open
-    and not already in the pre-answer store. The most recent triage's wording of
-    each id wins. Sorted by DW number."""
+    and not already usably answered in the store — the value has to be one a sweep
+    would actually consume, not merely a key that is present (see `answered`
+    below). The most recent triage's wording of each id wins. Sorted by DW
+    number."""
     paths = bmadconfig.load_paths(project)
     ledger = paths.deferred_work
     text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
@@ -136,7 +149,16 @@ def pending_missed_decisions(project: Path) -> list[Decision]:
     # answered hid exactly those ids from this command, so the id was skipped by
     # every sweep and re-offered by nothing — unanswerable until a human found the
     # file. Re-answering overwrites the unusable value, which is the repair.
-    answered = {k for k, v in load_pre_answers(project).items() if isinstance(v, dict)}
+    #
+    # Usable is `sweep.unusable_answer_reason` — the SAME predicate the sweep read
+    # site applies (DW-142), not a local restatement of it. A value the sweep will
+    # not consume must be re-offered here, so a shape either reader alone screened
+    # out was an id no reader ever surfaced: a missing or unrecognized `effect` and
+    # a non-string `key`/`label`/`intent`/`bundle_name` are unusable here for
+    # exactly the reason they are unusable there.
+    answered = {
+        k for k, v in load_pre_answers(project).items() if unusable_answer_reason(v) is None
+    }
 
     # (run-id, cycle) descending == most recent first; run ids sort chronologically
     triage_files: list[tuple[str, int, Path]] = []

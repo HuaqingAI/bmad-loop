@@ -6367,6 +6367,322 @@ def test_interactive_answer_write_back_keeps_an_unusable_stored_value(project):
     assert reload_failed["errors"] == ["DW-9: not a JSON object: int (<run>/decisions.json)"]
 
 
+# ------- DW-141/DW-142: the stored-answer SHAPE, not just its container's type
+
+
+# (value, the reason `unusable_answer_reason` gives for it). The reason string is
+# half the contract: it is what the `malformed` row names, and it must stay ids /
+# field names / type names only — never the answer's prose.
+_UNUSABLE_SHAPES = [
+    pytest.param({}, "effect missing", id="empty-object"),
+    pytest.param({"key": "1", "label": "Widen"}, "effect missing", id="scalars-but-no-effect"),
+    pytest.param({"effect": "frobnicate"}, "effect not recognized", id="unknown-effect"),
+    pytest.param({"effect": ["build"]}, "effect not recognized", id="non-string-effect"),
+    pytest.param(
+        {"key": "1", "label": "Widen", "effect": "build", "intent": ["a", "b"]},
+        "intent not a string: list",
+        id="non-string-intent",
+    ),
+    pytest.param({"key": 1, "effect": "keep-open"}, "key not a string: int", id="non-string-key"),
+    pytest.param(
+        {"label": None, "effect": "build", "intent": "x"},
+        "label not a string: NoneType",
+        id="null-label",
+    ),
+    pytest.param(
+        {"effect": "build", "intent": "x", "bundle_name": 7},
+        "bundle_name not a string: int",
+        id="non-string-bundle-name",
+    ),
+]
+
+# The other half of the contract: shapes that must stay USABLE. Rejecting is not a
+# free "be strict" — an answer refused at the read site stops being seeded, and a
+# refused KEEP-OPEN answer stops suppressing its bundle, so a later cycle builds
+# work the human said to leave alone. Each row is a field this predicate must not
+# reach for.
+_USABLE_SHAPES = [
+    pytest.param({"effect": "build", "intent": "x"}, id="minimal-build"),
+    pytest.param({"key": "1", "label": "Keep", "effect": "keep-open"}, id="minimal-keep-open"),
+    pytest.param({"key": "1", "label": "W", "effect": "close"}, id="close-from-the-in-run-writer"),
+    pytest.param(
+        {"key": "1", "effect": "keep-open", "intent": ["a", "b"], "bundle_name": 7},
+        id="keep-open-with-build-only-fields-corrupt",
+    ),
+    pytest.param(
+        {"effect": "build", "intent": "x", "resolution": ["a"], "answered_at": 20260906},
+        id="non-string-fields-no-reader-consumes",
+    ),
+]
+
+
+@pytest.mark.parametrize("value,reason", _UNUSABLE_SHAPES)
+def test_unusable_answer_reason_names_the_defect(value, reason):
+    """The predicate itself, at the lowest layer that can catch a regression — its
+    reason strings are the `malformed` rows' wording AND the boundary both readers
+    agree on, so pinning them only through journal assertions left the pure
+    function untested. Ids, field names and type names only: never the answer's
+    prose (`journal.append` neither truncates nor sanitizes what it is handed)."""
+    assert sweep_mod.unusable_answer_reason(value) == reason
+
+
+@pytest.mark.parametrize("value", _USABLE_SHAPES)
+def test_unusable_answer_reason_accepts_what_readers_can_consume(value):
+    """The non-validation boundary, pinned so a later "tighten everything" pass
+    reddens here instead of silently rejecting answers in the field. `resolution`
+    and `answered_at` are unvalidated because no reader consumes them; `intent` and
+    `bundle_name` are unvalidated for keep-open because only the BUILD lane reads
+    them, and refusing a keep-open answer un-suppresses its bundle.
+    Ablation: validate `intent`/`bundle_name` for every effect (or add `resolution`
+    to the screened fields) and the matching row reddens."""
+    assert sweep_mod.unusable_answer_reason(value) is None
+
+
+@pytest.mark.parametrize("value,reason", _UNUSABLE_SHAPES)
+def test_unusable_stored_answer_shape_is_dropped_from_the_run_store(project, value, reason):
+    """DW-142. DW-134 stopped at "is it a dict"; a dict with no usable `effect` —
+    or with a scalar the bundle lanes read as a string that is not one — still
+    counted as an answer. `_materialize_bundles` routes on `effect`, so such a
+    value matched NO lane: the id was answered as far as every reader was
+    concerned and acted on by none. Rejected at the read site instead, it goes
+    back down the pending path, and the file is neither repaired nor trimmed.
+    Ablation: restore `if isinstance(value, dict)` in `_decisions_phase`'s
+    run-local loop and every row here reddens — the value lands in `answers`."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_decision_for("DW-1"),))
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    store = engine.run_dir / "decisions.json"
+    store.write_text(json.dumps({"DW-1": value}), encoding="utf-8")
+
+    answers, closed = engine._decisions_phase(plan)
+
+    assert answers == {} and closed == 0
+    [reload_failed] = _records(engine, "sweep-decisions-reload-failed")
+    assert reload_failed["errors"] == [f"DW-1: {reason} (<run>/decisions.json)"]
+    assert [r["dw_id"] for r in _records(engine, "decision-skipped-unattended")] == ["DW-1"]
+    # in-memory degrade: no write this phase makes touches the human's file
+    assert json.loads(store.read_text(encoding="utf-8")) == {"DW-1": value}
+
+
+def test_close_effect_stays_a_usable_stored_answer(project):
+    """The interactive writer records `effect: "close"` for a decision answered
+    `close` this run, so the shared predicate has to accept it: rejecting it would
+    re-ask, inside one run, a decision the human already answered. DW-1 keeps its
+    answer and is NOT re-offered down the unattended pending path.
+    Ablation: drop "close" from `DECISION_EFFECTS` and this reddens."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_decision_for("DW-1"),))
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    stored = {"key": "1", "label": "Widen", "effect": "close", "answered_at": "2026-09-06"}
+    (engine.run_dir / "decisions.json").write_text(json.dumps({"DW-1": stored}), encoding="utf-8")
+    # this phase journals nothing at all on the happy path, so `_records` needs the file
+    (engine.run_dir / "journal.jsonl").write_text("", encoding="utf-8")
+
+    answers, _closed = engine._decisions_phase(plan)
+
+    assert answers == {"DW-1": stored}
+    assert _records(engine, "sweep-decisions-reload-failed") == []
+    assert _records(engine, "decision-skipped-unattended") == []
+
+
+def test_keep_open_answer_with_a_corrupt_build_only_field_still_suppresses_its_bundle(project):
+    """The cost of over-rejecting, pinned end to end. `intent` and `bundle_name` are
+    read by the BUILD lane alone, so screening them for every effect would refuse
+    this keep-open answer at the read site — and a refused keep-open answer is not
+    a safe no-op: it stops being seeded, so it stops SUPPRESSING its bundle, and
+    this cycle builds work the human explicitly said to leave open. The corrupt
+    fields are inert prose no reader touches, so the answer stays usable and
+    `safe-fix` is skipped as `human-chose-keep-open`.
+    Ablation: screen `intent`/`bundle_name` for every effect (drop the
+    `effect == "build"` guard in `unusable_answer_reason`) and this reddens — the
+    answer lands in `unusable`, `answers` is empty and the bundle survives."""
+    write_ledger(project, {"DW-1": "open"})
+    decision = Decision(
+        id="DW-1",
+        question="q",
+        context="",
+        options=(DecisionOption(key="1", label="Keep", effect="keep-open"),),
+        recommendation="1",
+    )
+    plan = TriagePlan(
+        open_ids=frozenset({"DW-1"}),
+        bundles=(Bundle(name="safe-fix", dw_ids=("DW-1",), intent="a"),),
+        decisions=(decision,),
+    )
+    stored = {
+        "key": "1",
+        "label": "Keep",
+        "effect": "keep-open",
+        "intent": ["a", "b"],  # build-only fields, corrupt...
+        "bundle_name": 7,
+    }
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    (engine.run_dir / "decisions.json").write_text(json.dumps({"DW-1": stored}), encoding="utf-8")
+    (engine.run_dir / "journal.jsonl").write_text("", encoding="utf-8")
+
+    answers, _closed = engine._decisions_phase(plan)
+
+    assert answers == {"DW-1": stored}  # ...and the answer is still usable
+    assert _records(engine, "sweep-decisions-reload-failed") == []
+
+    bundles, dropped = engine._materialize_bundles(plan, answers)
+
+    assert bundles == []  # the protection the human bought is still in force
+    assert not dropped
+    [skipped] = _records(engine, "sweep-bundle-skipped")
+    assert skipped["name"] == "safe-fix" and skipped["reason"] == "human-chose-keep-open"
+
+
+def test_unusable_pre_answer_shape_is_dropped_and_the_write_back_republishes_it(project):
+    """DW-142, the project store's half plus the write-back promise. A pre-answer
+    whose `intent` is a list is rejected by the SAME predicate the run-local loop
+    uses, named in the same single record with its own store spelled out (the two
+    files are different and only one is the one to hand-fix), and the write-back
+    the well-shaped seeding triggers re-publishes the run-local value it could not
+    use rather than deleting it. Ablation: restore `isinstance(pre_answer, dict)`
+    in the seeding loop and DW-2 is seeded as an answer, reddening `answers`."""
+    from bmad_loop import decisions as decisions_store
+
+    write_ledger(project, {"DW-1": "open", "DW-2": "open", "DW-3": "open"})
+    good = {"key": "1", "label": "Widen", "effect": "build", "intent": "widen the field"}
+    bad_pre = {"key": "1", "label": "Widen", "effect": "build", "intent": ["a", "b"]}
+    pre_store = decisions_store.store_path(project.project)
+    pre_store.parent.mkdir(parents=True, exist_ok=True)
+    pre_store.write_text(json.dumps({"DW-2": bad_pre, "DW-3": good}), encoding="utf-8")
+
+    plan = TriagePlan(
+        open_ids=frozenset({"DW-1", "DW-2", "DW-3"}),
+        decisions=(_decision_for("DW-1"), _decision_for("DW-2"), _decision_for("DW-3")),
+    )
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    run_store = engine.run_dir / "decisions.json"
+    run_store.write_text(json.dumps({"DW-1": {"effect": "frobnicate"}}), encoding="utf-8")
+
+    answers, _closed = engine._decisions_phase(plan)
+
+    assert answers == {"DW-3": good}
+    [reload_failed] = _records(engine, "sweep-decisions-reload-failed")
+    assert reload_failed["errors"] == [
+        "DW-1: effect not recognized (<run>/decisions.json)",
+        "DW-2: intent not a string: list (project .bmad-loop/decisions.json)",
+    ]
+    # the seeded write-back re-published DW-1 verbatim beside the answer it took on
+    assert json.loads(run_store.read_text(encoding="utf-8")) == {
+        "DW-1": {"effect": "frobnicate"},
+        "DW-3": good,
+    }
+    # and the PROJECT store is untouched — this phase repairs neither file
+    assert json.loads(pre_store.read_text(encoding="utf-8")) == {"DW-2": bad_pre, "DW-3": good}
+    assert sorted(r["dw_id"] for r in _records(engine, "decision-skipped-unattended")) == [
+        "DW-1",
+        "DW-2",
+    ]
+
+
+def test_materialize_bundles_never_derives_an_intent_from_a_non_string(project):
+    """DW-141. `str(answer.get("intent", ""))` never failed on a list — it produced
+    the truthy repr `"['a', 'b']"`, which passed the `if not intent` gate and
+    shipped into `Bundle.intent`, `intent.md` and a dev session as prose no human
+    wrote. Read as `""` instead, it falls through the existing chain: no agreeing
+    option here (stored key "9" is not offered), so the existing `no-intent` drop
+    fires — no new branch and no new drop cause. The lane guard stays because the
+    suite hands `_materialize_bundles` a map directly, past the read site above.
+    Ablation: restore `str(answer.get("intent", ""))` and this reddens with a
+    bundle whose intent is the repr."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_decision_for("DW-1"),))
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    (engine.run_dir / "journal.jsonl").write_text("", encoding="utf-8")
+
+    bundles, dropped = engine._materialize_bundles(
+        plan, {"DW-1": {"key": "9", "effect": "build", "intent": ["a", "b"]}}
+    )
+
+    assert bundles == []
+    assert dropped  # the drop is repeat progress (DW-135)
+    assert [r["drop_cause"] for r in _records(engine, "sweep-decision-answer-dropped")] == [
+        "no-intent"
+    ]
+
+
+def test_materialize_bundles_falls_back_to_the_agreeing_option_for_non_string_scalars(project):
+    """DW-141's other half: a non-string scalar must not defeat the fallback the
+    site already has. The answer agrees with option "1" on label+effect, so the
+    list `intent` and the int `bundle_name` both read `""` and the OPTION supplies
+    each — the bundle carries the option's authored intent and its validated name,
+    with no `sweep-bundle-name-discarded` record (the repr "7" fails
+    `BUNDLE_NAME_RE`, so the old spelling discarded the name and fell back to
+    `decision-dw-1`). Ablation: restore either `str(answer.get(...))` and this
+    reddens on `intent` or on `name`."""
+    write_ledger(project, {"DW-1": "open"})
+    option = DecisionOption(
+        key="1", label="Widen", effect="build", intent="widen the field", bundle_name="widen-x"
+    )
+    decision = Decision(id="DW-1", question="q", context="", options=(option,), recommendation="1")
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(decision,))
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    (engine.run_dir / "journal.jsonl").write_text("", encoding="utf-8")
+
+    answer = {
+        "key": "1",
+        "label": "Widen",
+        "effect": "build",
+        "intent": ["a", "b"],
+        "bundle_name": 7,
+    }
+    bundles, dropped = engine._materialize_bundles(plan, {"DW-1": answer})
+
+    assert not dropped
+    assert [(b.name, b.intent) for b in bundles] == [("widen-x", "widen the field")]
+    assert _records(engine, "sweep-bundle-name-discarded") == []
+    assert _records(engine, "sweep-decision-answer-dropped") == []
+
+
+def test_keep_open_lane_does_not_resolve_an_option_from_a_non_string_key(project):
+    """DW-141, the keep-open lane. `str(answer.get("key", ""))` turned the JSON
+    number 1 into "1" and resolved option "1" by coincidence of repr, letting a
+    malformed answer suppress a bundle under a `human-chose-keep-open` skip that
+    reads as the human's decision. Read as `""` it resolves nothing, so the lane's
+    existing `stale-option` drop fires and the bundle survives.
+    Ablation: restore `str(answer.get("key", ""))` and this reddens — the bundle
+    is suppressed and nothing is dropped. The decision's sole option is written to
+    AGREE with the answer on label and effect, so the key read is the only thing
+    deciding the outcome; `_decision_for`'s build option would have failed the
+    effect comparison instead and hidden the ablation."""
+    write_ledger(project, {"DW-1": "open"})
+    decision = Decision(
+        id="DW-1",
+        question="q",
+        context="",
+        options=(DecisionOption(key="1", label="Keep", effect="keep-open"),),
+        recommendation="1",
+    )
+    plan = TriagePlan(
+        open_ids=frozenset({"DW-1"}),
+        bundles=(Bundle(name="safe-fix", dw_ids=("DW-1",), intent="a"),),
+        decisions=(decision,),
+    )
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    (engine.run_dir / "journal.jsonl").write_text("", encoding="utf-8")
+
+    bundles, dropped = engine._materialize_bundles(
+        plan, {"DW-1": {"key": 1, "label": "Keep", "effect": "keep-open"}}
+    )
+
+    assert [b.name for b in bundles] == ["safe-fix"]  # not suppressed
+    assert dropped
+    assert [r["drop_cause"] for r in _records(engine, "sweep-decision-answer-dropped")] == [
+        "stale-option"
+    ]
+
+
 # ------------------------------- DW-135: every drop lane is repeat progress
 
 
