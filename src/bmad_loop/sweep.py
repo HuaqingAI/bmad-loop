@@ -308,6 +308,34 @@ def select_entries(
     return SweepSelection(selected=open_entries, excluded=())
 
 
+def _plan_str(container: dict[str, Any], field: str, where: str, errors: list[str]) -> str | None:
+    """One LLM-authored free-text scalar off a triage plan, or None when it is
+    not a string — the plan-input twin of `unusable_answer_reason` (DW-148).
+
+    `str(value)` was the old spelling and it never failed: a list `intent`
+    became the truthy repr "['do', 'x']", which satisfied the
+    `effect == "build" and not intent` gate, landed in `DecisionOption.intent`
+    and rode into `Bundle.intent`, `intent.md` and a dev session — the DW-141
+    harm, on the plan surface instead of the persisted-answer store. A malformed
+    plan is REFUSED and re-driven instead, through the `errors` channel that
+    already exists; there is no repair path and no new drop cause.
+
+    The message names the decision id or the bundle's POSITION, the field and
+    the type name only, never the offending value's prose — the same rule, and
+    the same wording, as `unusable_answer_reason`.
+
+    Callers thread the `None` through rather than falling back to "": "" would
+    re-enter the field's own empty/invalid-value branch and double-report, and
+    one error per fault is the convention here (see
+    `test_validate_triage_reports_one_error_when_a_name_fails_both_gates`). The
+    dataclasses are constructed with `value or ""` at the end."""
+    value = container.get(field, "")
+    if isinstance(value, str):
+        return value
+    errors.append(f"{where}: {field} not a string: {type(value).__name__}")
+    return None
+
+
 def validate_triage(
     rj: dict[str, Any] | None, expected_open_ids: set[str] | None
 ) -> tuple[TriagePlan | None, list[str]]:
@@ -352,33 +380,48 @@ def validate_triage(
 
     bundles = []
     names: set[str] = set()
-    for item in rj.get("bundles", []):
-        name = str(item.get("name", ""))
-        if not BUNDLE_NAME_RE.match(name):
-            errors.append(f"bundle name {name!r} invalid (want {BUNDLE_NAME_RE.pattern})")
-        # The one rule BUNDLE_NAME_RE cannot express. A cycle-1 bundle's name IS its
-        # directory (`_write_intent`), and the reserved Windows device basenames --
-        # CON, NUL, AUX, PRN, COM<N>, LPT<N> -- are `[a-z0-9-]`-legal names that no
-        # Windows filesystem will accept as one (matched case-insensitively, so
-        # lowercase is no reprieve). Testing `safe_segment` identity rather than a
-        # hand-written device list keeps this gate in lockstep with the sanitizer
-        # that defines the set: the identical idiom, for the identical reason, as
-        # `runs.is_valid_run_id`. Guarded on the match above so one bad name yields
-        # one error and not two.
-        if BUNDLE_NAME_RE.match(name) and safe_segment(name) != name:
-            errors.append(f"bundle name {name!r} is not a legal path segment")
-        if name in names:
-            errors.append(f"duplicate bundle name {name!r}")
-        names.add(name)
+    for bundle_index, item in enumerate(rj.get("bundles", [])):
+        # Positional, not by name: the name itself may be the non-string field,
+        # so it cannot be the thing that identifies the bundle in an error. Same
+        # label shape as `_normalize_bundle_names`, which ran above.
+        where = f"bundles[{bundle_index}]"
+        name = _plan_str(item, "name", where, errors)
+        # `repr(name)` for every message that already named the bundle by name;
+        # the position stands in when there is no name to print.
+        label = repr(name) if name is not None else where
+        if name is not None:
+            if not BUNDLE_NAME_RE.match(name):
+                errors.append(f"bundle name {name!r} invalid (want {BUNDLE_NAME_RE.pattern})")
+            # The one rule BUNDLE_NAME_RE cannot express. A cycle-1 bundle's name IS its
+            # directory (`_write_intent`), and the reserved Windows device basenames --
+            # CON, NUL, AUX, PRN, COM<N>, LPT<N> -- are `[a-z0-9-]`-legal names that no
+            # Windows filesystem will accept as one (matched case-insensitively, so
+            # lowercase is no reprieve). Testing `safe_segment` identity rather than a
+            # hand-written device list keeps this gate in lockstep with the sanitizer
+            # that defines the set: the identical idiom, for the identical reason, as
+            # `runs.is_valid_run_id`. Guarded on the match above so one bad name yields
+            # one error and not two.
+            if BUNDLE_NAME_RE.match(name) and safe_segment(name) != name:
+                errors.append(f"bundle name {name!r} is not a legal path segment")
+            if name in names:
+                errors.append(f"duplicate bundle name {name!r}")
+            # Only a string name is registered, so a type-failed bundle is invisible
+            # to the option loop's `bundle_name in names` duplicate check. That gap
+            # is covered by the refusal: its type error is already in `errors`, and a
+            # non-empty `errors` returns `(None, errors)` before any duplicate could
+            # matter.
+            names.add(name)
         dw_ids = [str(i) for i in item.get("dw_ids", [])]
         if not dw_ids:
-            errors.append(f"bundle {name!r} has no dw_ids")
+            errors.append(f"bundle {label} has no dw_ids")
         for dw_id in dw_ids:
-            claim(dw_id, f"bundle {name!r}")
-        intent = str(item.get("intent", "")).strip()
-        if not intent:
-            errors.append(f"bundle {name!r} has no intent")
-        bundles.append(Bundle(name, tuple(dw_ids), intent))
+            claim(dw_id, f"bundle {label}")
+        intent = _plan_str(item, "intent", where, errors)
+        if intent is not None:
+            intent = intent.strip()
+            if not intent:
+                errors.append(f"bundle {label} has no intent")
+        bundles.append(Bundle(name or "", tuple(dw_ids), intent or ""))
 
     blocked = []
     for item in rj.get("blocked", []):
@@ -408,59 +451,85 @@ def validate_triage(
         options = []
         keys: set[str] = set()
         decision_bundle_names: set[str] = set()
-        for raw in item.get("options", []):
-            key = str(raw.get("key", ""))
-            effect = str(raw.get("effect", ""))
-            intent = str(raw.get("intent", "")).strip()
+        for option_index, raw in enumerate(item.get("options", [])):
+            raw_key = raw.get("key", "")
+            key = str(raw_key)
+            # Positional until the key is known to be a string, for the reason the
+            # `bundles` loop is positional: `key` is NOT type-checked here (it stays
+            # `str(...)`, see the note above), so an object key would otherwise print
+            # its own prose into a message this file promises carries type names only
+            # -- and these reach a journal. A string key keeps today's wording byte
+            # for byte, empty ones included.
+            where = (
+                f"decision {dw_id} option {key}"
+                if isinstance(raw_key, str)
+                else f"decision {dw_id} options[{option_index}]"
+            )
+            # Every free-text scalar this option contributes downstream, screened
+            # before any of them is read. A field that failed the type check is
+            # None from here on, and each value check below is guarded on that --
+            # one error per fault, never a type error plus the empty-value error
+            # a "" fallback would also have tripped.
+            effect = _plan_str(raw, "effect", where, errors)
+            intent = _plan_str(raw, "intent", where, errors)
+            if intent is not None:
+                intent = intent.strip()
+            option_label = _plan_str(raw, "label", where, errors)
+            if option_label is not None:
+                option_label = option_label.strip()
+            resolution = _plan_str(raw, "resolution", where, errors)
+            if resolution is not None:
+                resolution = resolution.strip()
+            bundle_name = _plan_str(raw, "bundle_name", where, errors)
             if not key or key in keys:
                 errors.append(f"decision {dw_id}: missing/duplicate option key {key!r}")
             keys.add(key)
-            if effect not in DECISION_EFFECTS:
-                errors.append(f"decision {dw_id} option {key}: bad effect {effect!r}")
-            if effect == "build" and not intent:
-                errors.append(f"decision {dw_id} option {key}: effect 'build' needs intent")
-            bundle_name = str(raw.get("bundle_name", ""))
-            if bundle_name and not BUNDLE_NAME_RE.match(bundle_name):
-                errors.append(f"decision {dw_id} option {key}: bad bundle_name {bundle_name!r}")
-            # The second site that mints a bundle directory, gated for the reason
-            # stated at the `bundles` loop above. A build-effect option's
-            # `bundle_name` becomes `Bundle.name` in `_materialize_bundles`, so it
-            # reaches `_write_intent`'s cycle-1 directory by the identical path --
-            # `BUNDLE_NAME_RE` is no more able to express the rule here than there.
-            # Guarded on the match above so one bad name yields one error, and on
-            # nothing else: an absent `bundle_name` fails that match already.
-            if BUNDLE_NAME_RE.match(bundle_name) and safe_segment(bundle_name) != bundle_name:
-                errors.append(
-                    f"decision {dw_id} option {key}: bundle_name {bundle_name!r} "
-                    "is not a legal path segment"
-                )
-            if effect == "build" and bundle_name:
-                if bundle_name in names:
-                    errors.append(f"duplicate bundle name {bundle_name!r}")
-                decision_bundle_names.add(bundle_name)
+            if effect is not None and effect not in DECISION_EFFECTS:
+                errors.append(f"{where}: bad effect {effect!r}")
+            if effect == "build" and intent is not None and not intent:
+                errors.append(f"{where}: effect 'build' needs intent")
+            if bundle_name is not None:
+                if bundle_name and not BUNDLE_NAME_RE.match(bundle_name):
+                    errors.append(f"{where}: bad bundle_name {bundle_name!r}")
+                # The second site that mints a bundle directory, gated for the reason
+                # stated at the `bundles` loop above. A build-effect option's
+                # `bundle_name` becomes `Bundle.name` in `_materialize_bundles`, so it
+                # reaches `_write_intent`'s cycle-1 directory by the identical path --
+                # `BUNDLE_NAME_RE` is no more able to express the rule here than there.
+                # Guarded on the match above so one bad name yields one error, and on
+                # nothing else: an absent `bundle_name` fails that match already.
+                if BUNDLE_NAME_RE.match(bundle_name) and safe_segment(bundle_name) != bundle_name:
+                    errors.append(
+                        f"{where}: bundle_name {bundle_name!r} is not a legal path segment"
+                    )
+                if effect == "build" and bundle_name:
+                    if bundle_name in names:
+                        errors.append(f"duplicate bundle name {bundle_name!r}")
+                    decision_bundle_names.add(bundle_name)
             options.append(
                 DecisionOption(
                     key=key,
-                    label=str(raw.get("label", "")).strip() or key,
-                    effect=effect,
-                    intent=intent,
-                    resolution=str(raw.get("resolution", "")).strip(),
-                    bundle_name=bundle_name,
+                    label=option_label or key,
+                    effect=effect or "",
+                    intent=intent or "",
+                    resolution=resolution or "",
+                    bundle_name=bundle_name or "",
                 )
             )
         names.update(decision_bundle_names)
         if len(options) < 2:
             errors.append(f"decision {dw_id} needs at least 2 options")
-        recommendation = str(item.get("recommendation", ""))
-        if recommendation not in keys:
+        recommendation = _plan_str(item, "recommendation", f"decision {dw_id}", errors)
+        if recommendation is not None and recommendation not in keys:
             errors.append(f"decision {dw_id}: recommendation {recommendation!r} not an option")
+        context = _plan_str(item, "context", f"decision {dw_id}", errors)
         decisions.append(
             Decision(
                 dw_id,
                 question,
-                str(item.get("context", "")).strip(),
+                (context or "").strip(),
                 tuple(options),
-                recommendation,
+                recommendation or "",
             )
         )
 

@@ -108,6 +108,26 @@ def test_pending_missed_decisions_uses_loaded_project_root(project, monkeypatch)
     assert original_spelling not in data._missed_cache
 
 
+def test_pending_missed_decisions_survives_an_undecodable_triage(project):
+    """DW-145 at the one surface where the fault escaped UNCAUGHT. This reader
+    catches `(BmadConfigError, OSError)`, and `UnicodeDecodeError` is a
+    `ValueError`: one run's cached triage holding non-UTF-8 bytes raised straight
+    out of `decisions.pending_missed_decisions`, past this handler, into the
+    dashboard's render. The good run's DW-1 still lists, so the widened except
+    tuple degrades per FILE rather than blanking the panel.
+    Ablation: revert that tuple to `(json.JSONDecodeError, OSError)` and this
+    reddens with `UnicodeDecodeError` rather than returning ["DW-1"]."""
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _write_triage_decision(make_run(project.project, "20260101-000000-aaaa"))
+    bad = make_run(project.project, "20260102-000000-bbbb")
+    (bad / "triage.json").write_bytes(b'{"workflow": "deferred-sweep-triage", "x": "\xff"}')
+
+    assert [d.id for d in data.pending_missed_decisions(project.project)] == ["DW-1"]
+
+
 def test_pending_missed_decisions_empty_for_uninitialized(tmp_path):
     assert data.pending_missed_decisions(tmp_path) == []
 

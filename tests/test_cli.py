@@ -695,6 +695,40 @@ def test_decisions_json_config_error_leaves_stdout_empty(project, capsys):
     assert "error:" in err
 
 
+def test_decisions_json_survives_an_undecodable_triage_cache(project, capsys):
+    """DW-145 end to end, at the surface a caller actually sees. `cmd_decisions`
+    catches `BmadConfigError` alone, so a `UnicodeDecodeError` out of
+    `pending_missed_decisions` — a `ValueError`, not an `OSError` — fell through
+    to `main`'s broad backstop: exit 1 with `error: 'utf-8' codec can't decode…`
+    on stderr and NO document on stdout, so one unreadable byte in one run's
+    cached triage took the whole listing down. The good run's DW-1 still lists,
+    so the widening degrades per file rather than emptying the document.
+    Ablation: revert the except tuple in `pending_missed_decisions` to
+    `(json.JSONDecodeError, OSError)` and this reddens — exit 1, empty stdout."""
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _make_run_with_decision(project, run_id="20260101-000000-aaaa")
+    bad = project.project / ".bmad-loop" / "runs" / "20260102-000000-bbbb"
+    bad.mkdir(parents=True, exist_ok=True)
+    (bad / "state.json").write_text(
+        json.dumps(
+            {
+                "run_id": "20260102-000000-bbbb",
+                "project": str(project.project),
+                "started_at": "now",
+                "run_type": "sweep",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (bad / "triage.json").write_bytes(b'{"workflow": "deferred-sweep-triage", "x": "\xff"}')
+
+    doc = _decisions_json(project, capsys, "--list")
+    assert [d["id"] for d in doc["decisions"]] == ["DW-1"]
+
+
 def test_decisions_answer_records_and_carries_forward(project, capsys, monkeypatch):
     from conftest import write_ledger
 

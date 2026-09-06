@@ -173,7 +173,16 @@ def pending_missed_decisions(project: Path) -> list[Decision]:
     for _run, _cycle, tp in triage_files:
         try:
             rj = json.loads(tp.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+        # `UnicodeDecodeError` is a `ValueError`, NOT an `OSError`, so bytes that
+        # are not UTF-8 at all escaped this arm (DW-145). Every caller here is a
+        # read-only surface with nothing to gain from dying on one bad byte in one
+        # run's cache: `cmd_decisions` and `cmd_status` catch `BmadConfigError`
+        # alone, so `main`'s broad backstop turned the whole command into exit 1
+        # (and `decisions --json` into no document at all), while the TUI's
+        # `(BmadConfigError, OSError)` catch let it escape outright. Same widening,
+        # same reason, as `load_pre_answers` and the two sweep siblings
+        # (`_ensure_triage`, `_decisions_phase`).
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             continue
         plan, _errors = validate_triage(rj, None)
         if plan is None:

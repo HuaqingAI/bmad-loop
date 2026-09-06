@@ -473,6 +473,236 @@ def test_validate_triage_accepts_ordinary_option_bundle_names(bundle_name):
     assert plan.decisions[0].option("1").bundle_name == bundle_name
 
 
+# ---------------------- non-string LLM-authored plan scalars (DW-148)
+#
+# The DW-141 harm on the plan-INPUT surface. `validate_triage` used to
+# `str(...)` every free-text scalar, so a list `intent` became the truthy repr
+# "['do', 'x']", satisfied `effect == "build" and not intent`, landed in
+# `DecisionOption.intent` and rode into `Bundle.intent`, `intent.md` and a dev
+# session. The plan is refused instead, through the existing `errors` channel;
+# the message names the id or the bundle position, the field and the TYPE name
+# only -- never the offending value's prose -- mirroring
+# `unusable_answer_reason`.
+
+
+def _clean_option_decision(**option_overrides):
+    """One otherwise-clean build decision, so the tests below can assert an error
+    COUNT: the decision satisfies question / >=2 options / recommendation, and the
+    build option carries a valid intent, so the only possible defect is the
+    override under test."""
+    option = {"key": "1", "label": "build", "effect": "build", "intent": "fix it"}
+    option.update(option_overrides)
+    return triage_result(
+        ["DW-1"],
+        decisions=[
+            {
+                "id": "DW-1",
+                "question": "build it?",
+                "context": "ctx",
+                "options": [option, {"key": "2", "label": "keep", "effect": "keep-open"}],
+                "recommendation": "1",
+            }
+        ],
+    )
+
+
+def test_validate_triage_refuses_a_non_string_option_intent():
+    """The headline DW-148 case. ABLATION: restore
+    `intent = str(raw.get("intent", "")).strip()` and this reddens -- the plan is
+    ACCEPTED with `option("1").intent == "['do', 'x']"`, a Python repr no human
+    authored, bound for `Bundle.intent` and an `intent.md`."""
+    rj = _clean_option_decision(intent=["do", "x"])
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    assert len(errors) == 1
+    assert "DW-1" in errors[0]
+    assert "intent not a string: list" in errors[0]
+    # The value's prose never appears -- the reason `unusable_answer_reason`
+    # reports type names, restated here because this text reaches a journal.
+    assert not any("['do', 'x']" in e for e in errors)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "type_name"),
+    [
+        pytest.param("effect", ["build"], "list", id="effect"),
+        # JSON `null` -- the likeliest non-string an LLM emits, and the one shape
+        # `str(...)` turned into the literal "None" rather than an obvious repr.
+        pytest.param("intent", None, "NoneType", id="intent-null"),
+        pytest.param("intent", {"a": 1}, "dict", id="intent"),
+        pytest.param("label", 5, "int", id="label"),
+        pytest.param("resolution", 5.5, "float", id="resolution"),
+        pytest.param("bundle_name", 7, "int", id="bundle_name"),
+    ],
+)
+def test_validate_triage_reports_one_error_per_non_string_option_scalar(field, value, type_name):
+    """Every option scalar the intent enumerates, each reporting its own field and
+    type name -- and EXACTLY one error apiece. The count is the one-error-per-fault
+    convention: threading `None` (not "") is what keeps a non-string `effect` out of
+    the "bad effect" branch and a non-string `intent` out of "effect 'build' needs
+    intent".
+    ABLATION: return "" instead of None from `_plan_str` and the effect and intent
+    rows double-report. The label / resolution / bundle_name rows cannot show it --
+    "" is a legal value for all three (an absent `bundle_name` already fails
+    BUNDLE_NAME_RE without an error) -- they pin the message text and the fact that
+    each field is screened at all."""
+    rj = _clean_option_decision(**{field: value})
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    assert len(errors) == 1
+    assert errors[0] == f"decision DW-1 option 1: {field} not a string: {type_name}"
+
+
+def test_validate_triage_names_an_option_positionally_when_its_key_is_not_a_string():
+    """`key` is deliberately NOT type-checked (it keeps `str(...)`), so it cannot
+    be trusted to name the option in an error -- the same reason the `bundles` loop
+    is positional. Interpolating it would print the offending value's own prose
+    into a message that carries type names only, and these reach a journal.
+    ABLATION: build `where` as `f"decision {dw_id} option {key}"` unconditionally
+    and this reddens with the dict's contents in the message."""
+    rj = _clean_option_decision(key={"leaky": "secret prose"}, intent=["do", "x"])
+    rj["decisions"][0]["recommendation"] = "{'leaky': 'secret prose'}"
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    assert errors == ["decision DW-1 options[0]: intent not a string: list"]
+    assert not any("secret prose" in e for e in errors)
+
+
+def test_validate_triage_keeps_todays_wording_for_an_empty_option_key():
+    """The other side of that switch: an empty key is still a STRING key, so the
+    existing wording stays byte-identical (`option ` with nothing after it) rather
+    than silently moving to the positional form. Pins that the positional fallback
+    is keyed on the TYPE, not on truthiness."""
+    rj = _clean_option_decision(key="", effect="frobnicate")
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    assert "decision DW-1 option : bad effect 'frobnicate'" in errors
+
+
+def test_validate_triage_reports_one_error_for_a_non_string_recommendation():
+    """ABLATION: drop the `recommendation is not None` guard and this double-reports
+    -- the type error plus `recommendation '' not an option`."""
+    rj = _clean_option_decision()
+    rj["decisions"][0]["recommendation"] = 1
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    assert errors == ["decision DW-1: recommendation not a string: int"]
+
+
+def test_validate_triage_reports_one_error_for_a_non_string_decision_context():
+    """`Decision.context` is free text a human reads when answering; a repr there
+    is the same defect, one field further out."""
+    rj = _clean_option_decision()
+    rj["decisions"][0]["context"] = ["ctx"]
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    assert errors == ["decision DW-1: context not a string: list"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "type_name"),
+    [
+        pytest.param("name", 5, "int", id="name"),
+        pytest.param("intent", ["harden"], "list", id="intent"),
+    ],
+)
+def test_validate_triage_reports_one_error_per_non_string_bundle_scalar(field, value, type_name):
+    """The bundle is identified POSITIONALLY, not by name: the name itself may be
+    the non-string field, so it cannot be what names the bundle in an error. Same
+    `bundles[{i}]` label shape `_normalize_bundle_names` already uses.
+    ABLATION: fall back to "" and the `name` row double-reports (the type error
+    plus `bundle name '' invalid (want ...)`) and the `intent` row double-reports
+    (plus `has no intent`)."""
+    bundle = {"name": "fix-it", "dw_ids": ["DW-1"], "intent": "harden it"}
+    bundle[field] = value
+    rj = triage_result(["DW-1"], bundles=[bundle])
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    assert len(errors) == 1
+    assert errors[0] == f"bundles[0]: {field} not a string: {type_name}"
+
+
+def test_validate_triage_names_the_right_bundle_position():
+    """Two bundles, the SECOND one malformed: the index has to be the offender's,
+    not a constant. ABLATION: hard-code `bundles[0]` and this reddens."""
+    rj = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[
+            {"name": "fix-it", "dw_ids": ["DW-1"], "intent": "harden it"},
+            {"name": "widen-it", "dw_ids": ["DW-2"], "intent": 7},
+        ],
+    )
+
+    plan, errors = validate_triage(rj, {"DW-1", "DW-2"})
+
+    assert plan is None
+    assert errors == ["bundles[1]: intent not a string: int"]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(
+            lambda rj: rj["decisions"][0]["options"][0].__setitem__("key", 1), id="option-key"
+        ),
+        pytest.param(lambda rj: rj["decisions"][0].__setitem__("question", 5), id="question"),
+    ],
+)
+def test_validate_triage_leaves_out_of_scope_decision_scalars_stringified(mutate):
+    """The scope boundary, asserted rather than assumed -- and it is a SCOPE
+    boundary, not a safety argument. `key` and `question` do reach an intent file:
+    `_materialize_bundles` interpolates both into `Bundle.decision_note`, which
+    `_write_intent` writes under `## Human decision` in
+    `run_dir/bundles/<name>/intent.md`, so a list `question` is accepted today and
+    lands there as `['a', 'b']`. They keep `str(...)` only because the bundle
+    intent enumerates the fields to type-check and these are not among them.
+    Widening the check to them would start refusing plans this release accepts, so
+    that is a separate decision with its own evidence -- this row exists to make
+    the current boundary explicit and to fail loudly if it moves by accident."""
+    rj = _clean_option_decision()
+    mutate(rj)
+    rj["decisions"][0]["recommendation"] = "1"
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert errors == []
+    assert plan is not None
+
+
+@pytest.mark.parametrize(
+    ("section", "item"),
+    [
+        pytest.param("already_resolved", {"id": "DW-1", "evidence": 5}, id="evidence"),
+        pytest.param("blocked", {"id": "DW-1", "blocker": 5}, id="blocker"),
+        pytest.param("skip", {"id": "DW-1", "reason": 5}, id="reason"),
+    ],
+)
+def test_validate_triage_leaves_out_of_scope_section_scalars_stringified(section, item):
+    """The other half of the scope boundary. `evidence`, `blocker` and `reason`
+    are ledger-bound notes, not `Bundle.intent` input, so they were deliberately
+    left on `str(...)`; a non-string one is still accepted."""
+    rj = triage_result(["DW-1"], **{section: [item]})
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert errors == []
+    assert plan is not None
+
+
 def test_validate_triage_truncates_overlong_bundle_name():
     """ABLATION A1: delete direct-bundle normalization and this fails on validation."""
     rj = triage_result(
