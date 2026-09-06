@@ -816,6 +816,172 @@ def test_session_wall_detector_leaves_scripted_clock_waits_alone():
     assert offenders == []
 
 
+# DW-108: the stories E2E polls two reap deadlines off `time.monotonic()`. They were
+# bare 10-second budgets — the same load-sensitivity class DW-95 removed from the
+# generic-tmux SessionSpec walls — and this file was the one real-tmux module the
+# wall guard above deliberately excluded, so nothing stopped a reintroduction.
+_EXPECTED_REAP_DEADLINE_SITES = {
+    "test_e2e_session_timeout_teardown": 1,
+    "test_e2e_detached_writer_reaped_before_worktree_teardown": 1,
+}
+
+
+_REAP_PROBE_GATE = (
+    '@pytest.mark.skipif(not HAVE_TMUX, reason="stories E2E needs real tmux on Linux")\n'
+)
+
+
+def _scan_reap_deadlines(src: str, rel: str) -> tuple[dict[str, int], list[str]]:
+    """Inspect ``time.monotonic() + <budget>`` poll deadlines in a real-tmux module.
+
+    A SECOND scanner rather than a widening of `_scan_session_walls`: that one grades
+    `SessionSpec(timeout_s=...)` constructor keywords and carries the deliberate-6.0
+    trigger exception list, neither of which has an analogue here — and the stories
+    file has no `SessionSpec` calls at all, so folding the shapes together would mean
+    threading an expression-kind switch through both.
+
+    Only ``time.monotonic() + <expr>`` additions inside a tmux-gated `test_*`
+    def count, so the `assert time.monotonic() < deadline` poll lines — comparisons,
+    not additions — fall outside without special-casing. The budget must resolve, via
+    `_conftest_aliases`, to the conftest-imported `REAL_MUX_HANG_CEILING_S` under
+    either import form; a same-spelled local that was never imported is not it.
+
+    Unlike the SessionSpec scan this does NOT flag a gated test holding zero sites:
+    most stories E2Es have no poll deadline at all. `_reap_inventory_offenders` is
+    what keeps a scan that found nothing from passing vacuously. Subprocess `timeout=`
+    budgets in that file are a separate scope and are not inspected here.
+
+    KNOWN BLIND SPOTS, deliberately not closed — the shape above is matched literally,
+    so every one of these scans CLEAN and would carry a bare budget past the guard:
+    commuted operands (`10 + time.monotonic()`), an `AugAssign` top-up (`d =
+    time.monotonic()` then `d += 10`), a different clock (`time.time() + 10`,
+    `time.perf_counter() + 10`), outer re-scaling around a clean inner Add
+    (`time.monotonic() + REAL_MUX_HANG_CEILING_S - 80`, an effective 10s budget), and a
+    local rebinding that shadows the imported ceiling. Closing them means grading
+    arbitrary arithmetic and local dataflow, which this focused scan will not do; the
+    narrow shape is the point. Probe rows below pin the commuted and outer-arithmetic
+    cases so the limit is executable rather than prose — the same doctrine
+    `_is_inline_tmux_skipif` uses for its non-literal-reason gap. Write these deadlines
+    in the plain shape and the guard sees them.
+    """
+    tree = ast.parse(src, filename=rel)
+    gated = {name for _rel, name, _grouped in _scan_source(src, rel)}
+    ceilings = _conftest_aliases(tree, frozenset({"REAL_MUX_HANG_CEILING_S"}))
+    sites: dict[str, int] = {}
+    offenders: list[str] = []
+    for stmt, _marks in _iter_test_defs(tree.body, []):
+        if stmt.name not in gated:
+            continue
+        for node in ast.walk(stmt):
+            if not isinstance(node, ast.BinOp) or not isinstance(node.op, ast.Add):
+                continue
+            head = _dotted(node.left.func) if isinstance(node.left, ast.Call) else None
+            if head != "time.monotonic":
+                continue
+            sites[stmt.name] = sites.get(stmt.name, 0) + 1
+            if _dotted(node.right) not in ceilings:
+                offenders.append(
+                    f"{rel}::{stmt.name}:{node.lineno}: expected imported "
+                    f"REAL_MUX_HANG_CEILING_S, got {ast.unparse(node.right)}"
+                )
+    return sites, offenders
+
+
+def _reap_inventory_offenders(sites: dict[str, int], rel: str) -> list[str]:
+    """Mismatches between a reap-deadline scan and the named expected-site inventory."""
+    return [
+        f"{rel}::{name}: expected {expected} reap deadline site, inspected "
+        f"{sites.get(name, 0)}; update the inventory for intentional changes"
+        for name, expected in _EXPECTED_REAP_DEADLINE_SITES.items()
+        if sites.get(name) != expected
+    ]
+
+
+def test_stories_e2e_reap_deadlines_use_the_shared_ceiling():
+    path = _TESTS_DIR / "test_stories_e2e.py"
+    sites, offenders = _scan_reap_deadlines(path.read_text(encoding="utf-8"), path.name)
+    assert not offenders, "\n".join(offenders)
+    inventory = _reap_inventory_offenders(sites, path.name)
+    assert not inventory, "\n".join(inventory)
+
+
+@pytest.mark.parametrize(
+    ("budget", "imports", "reported"),
+    [
+        ("REAL_MUX_HANG_CEILING_S", "from", None),
+        ("10", "from", "got 10"),
+        ("REAL_MUX_HANG_CEILING_S", "none", "got REAL_MUX_HANG_CEILING_S"),
+        ("conftest.REAL_MUX_HANG_CEILING_S", "dotted", None),
+    ],
+)
+def test_reap_deadline_detector_grades_poll_budgets(budget, imports, reported):
+    header = {
+        "from": "from conftest import REAL_MUX_HANG_CEILING_S\n",
+        "dotted": "import conftest\n",
+        "none": "",
+    }[imports]
+    source = (
+        header
+        + _REAP_PROBE_GATE
+        + "def test_reap():\n"
+        + f"    deadline = time.monotonic() + {budget}\n"
+        + "    assert time.monotonic() < deadline\n"
+    )
+    sites, offenders = _scan_reap_deadlines(source, "test_probe.py")
+    assert sites == {"test_reap": 1}  # the `<` poll comparison is not a second site
+    if reported is None:
+        assert offenders == []
+    else:
+        assert len(offenders) == 1
+        assert "test_probe.py::test_reap:" in offenders[0]
+        assert reported in offenders[0]
+
+
+@pytest.mark.parametrize(
+    ("gate", "body", "sites"),
+    [
+        # Gating is the only thing keeping this scanner off unrelated tests.
+        ("", "deadline = time.monotonic() + 10", {}),
+        # Documented blind spots: matched literally, so these carry a bare 10s budget
+        # past the guard. Pinned as must-stay-silent so the limit cannot rot into a
+        # believed-covered shape — see the detector docstring.
+        (_REAP_PROBE_GATE, "deadline = 10 + time.monotonic()", {}),
+        (
+            _REAP_PROBE_GATE,
+            "deadline = clock.monotonic() + REAL_MUX_HANG_CEILING_S",
+            {},
+        ),
+        (
+            _REAP_PROBE_GATE,
+            "deadline = time.monotonic() + REAL_MUX_HANG_CEILING_S - 80",
+            {"test_reap": 1},
+        ),
+    ],
+)
+def test_reap_deadline_detector_leaves_lookalikes_alone(gate, body, sites):
+    source = (
+        "from conftest import REAL_MUX_HANG_CEILING_S\n" f"{gate}def test_reap():\n    {body}\n"
+    )
+    scanned, offenders = _scan_reap_deadlines(source, "test_probe.py")
+    assert scanned == sites
+    assert offenders == []
+
+
+def test_reap_deadline_detector_cannot_pass_by_scanning_nothing():
+    source = (
+        "from conftest import REAL_MUX_HANG_CEILING_S\n"
+        + _REAP_PROBE_GATE
+        + "def test_e2e_session_timeout_teardown():\n    pass\n"
+    )
+    sites, offenders = _scan_reap_deadlines(source, "test_probe.py")
+    assert sites == {}
+    assert offenders == []  # the scan alone is silent — the inventory is what bites
+    inventory = _reap_inventory_offenders(sites, "test_probe.py")
+    assert len(inventory) == len(_EXPECTED_REAP_DEADLINE_SITES)
+    assert "test_probe.py::test_e2e_session_timeout_teardown" in inventory[0]
+    assert "inspected 0" in inventory[0]
+
+
 def _scan_tests() -> list[tuple[str, str, bool]]:
     found: list[tuple[str, str, bool]] = []
     for path in sorted(_TESTS_DIR.glob("test_*.py")):

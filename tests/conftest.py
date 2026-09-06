@@ -88,9 +88,11 @@ REAL_MUX_XDIST_GROUP = "real_mux_e2e"
 # tests/test_conftest.py asserts that declaration alongside the marks.
 real_mux_e2e = pytest.mark.xdist_group(REAL_MUX_XDIST_GROUP)
 
-# Hang ceiling for a real-tmux session wait — both the hook-completion waits and the
-# window-death wait in `test_tmux_crash_detected`, which reaches its verdict through a
-# dead window rather than a hook event and rides this same constant.
+# Hang ceiling for a real-tmux wait. Three consumer classes ride it: the hook-completion
+# waits; the window-death wait in `test_tmux_crash_detected`, which reaches its verdict
+# through a dead window rather than a hook event; and the descendant-reap poll deadlines
+# in `tests/test_stories_e2e.py` (DW-108), which wait on a killed child disappearing
+# rather than on any session event.
 #
 # This is a HANG DETECTOR, not a performance budget: it answers "is this session
 # wedged?" and nothing else. It is deliberately NOT tuned to observed runtimes — never
@@ -102,10 +104,11 @@ real_mux_e2e = pytest.mark.xdist_group(REAL_MUX_XDIST_GROUP)
 # work and ~3x that starvation — far outside anything the scheduler can do to it.
 # Ceiling: `--dist loadgroup` now serializes every one of these onto ONE worker, so a
 # SYSTEMIC regression pays the wait once per test rather than in parallel, and the
-# Linux test job is capped at `timeout-minutes: 15` (.github/workflows/ci.yml). Six
-# collected uses (five hook-completion cases and one crash case) can consume up to
-# 540s for these waits alone. Stories subprocess budgets and other overhead are
-# additional, so this ceiling does not guarantee the whole job fits within its cap.
+# Linux test job is capped at `timeout-minutes: 15` — 900s (.github/workflows/ci.yml).
+# Eight collected uses (five hook-completion cases, one crash case, and the two stories
+# reap polls) can consume up to 720s for these waits alone. The stories subprocess
+# budgets (`_run(..., timeout=90/120)`) and other overhead sit OUTSIDE this constant and
+# are additional, so this ceiling does not guarantee the whole job fits within its cap.
 REAL_MUX_HANG_CEILING_S = 90.0
 
 

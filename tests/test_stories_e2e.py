@@ -57,6 +57,7 @@ from pathlib import Path
 import pytest
 import yaml
 from conftest import (
+    REAL_MUX_HANG_CEILING_S,
     RENDERER_SCRIPT_IMPORTING_SIBLING,
     install_build_auto_skill,
     install_dev_base_skills,
@@ -895,12 +896,15 @@ def test_e2e_session_timeout_teardown(tmp_path, monkeypatch):
     # The pgrep filter can only see the shell's cmdline; probe the recorded sleep
     # descendant directly — the escalation force-kills pane-root pids, so a
     # regression there would leak exactly this child while pgrep stays clean.
-    # Poll briefly: a just-killed child can linger as a zombie (kill 0 succeeds)
-    # until init reaps it after the shell died.
+    # Poll against the shared REAL_MUX_HANG_CEILING_S hang ceiling rather than a tight
+    # wall-clock budget: a just-killed child can linger as a zombie (kill 0 succeeds)
+    # until init reaps it after the shell died, and a starved scheduler can stretch that
+    # wait arbitrarily (DW-95/DW-108). Accepted trade-off: a merely SLOW reaper is caught
+    # by the 90s ceiling instead of a 10s budget; a broken one still fails either way.
     pid_file = tdir / "fake-child.pid"
     assert pid_file.is_file(), "fake CLI never recorded its sleep child"
     fake_pid = int(pid_file.read_text(encoding="utf-8"))
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + REAL_MUX_HANG_CEILING_S
     while True:
         try:
             os.kill(fake_pid, 0)
@@ -957,11 +961,16 @@ def test_e2e_detached_writer_reaped_before_worktree_teardown(tmp_path):
         mounts = [ln for ln in wt.stdout.splitlines() if ln.startswith("worktree ")]
         assert len(mounts) == 1, wt.stdout  # only the primary checkout remains
 
-        # (4) the detached straggler was reaped within the grace: kill-0 -> gone.
+        # (4) the detached straggler is reaped BEFORE teardown: kill-0 -> gone. Polled
+        # against the shared REAL_MUX_HANG_CEILING_S hang ceiling — NOT the 10s
+        # `teardown_grace_s` above, and not a tight wall-clock budget, either of which a
+        # starved scheduler can blow through (DW-95/DW-108). Accepted trade-off: what is
+        # asserted is that the sweep reaps the straggler at all, not how fast; a reap
+        # that never happens still fails, at the 90s ceiling rather than at 10s.
         pid_files = list((run_dir / "tasks").glob("*/fake-child.pid"))
         assert pid_files, "fake CLI never recorded its setsid child"
         detached_pid = int(pid_files[0].read_text(encoding="utf-8").strip())
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + REAL_MUX_HANG_CEILING_S
         while True:
             try:
                 os.kill(detached_pid, 0)
