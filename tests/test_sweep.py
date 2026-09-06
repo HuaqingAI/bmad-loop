@@ -5614,7 +5614,7 @@ def test_keep_open_answer_whose_option_was_re_authored_stops_suppressing_bundles
     progress by itself so cycle 3 can bundle DW-1 instead of stopping at
     `no-progress`. The recorded answer is left alone on disk: it is the human's,
     and it stays auditable.
-    Ablation: remove `stale_keep_open_dropped` from `_cycle`'s progress predicate
+    Ablation: remove `answer_dropped` from `_cycle`'s progress predicate
     and this reddens because cycle 3 never runs and `dw3-sneaky-fix` is absent.
     Restoring the one-line keep-open comprehension also reddens the mismatch,
     drop and ATTENTION assertions."""
@@ -5890,6 +5890,456 @@ def test_resumed_sweep_re_evaluates_a_dropped_keep_open_answer(project):
     assert len(_records(resumed, "sweep-decision-answer-dropped")) == 2
     attention = (resumed.run_dir / "ATTENTION").read_text(encoding="utf-8")
     assert attention.count("recorded keep-open decision discarded") == 2
+
+
+# --------------------------------------- DW-134: a malformed stored-answer store
+
+
+_widen_or_keep = [
+    {"key": "1", "label": "Widen", "effect": "build", "intent": "x"},
+    {"key": "2", "label": "Keep", "effect": "keep-open"},
+]
+
+
+def _decision_for(dw_id):
+    """One-option `Decision` for the DW-134 rows, which care about the STORE's
+    shape rather than about option agreement."""
+    return Decision(
+        id=dw_id,
+        question="q",
+        context="",
+        options=(DecisionOption(key="1", label="Widen", effect="build", intent="widen the field"),),
+        recommendation="1",
+    )
+
+
+def test_non_dict_stored_answer_is_dropped_while_the_rest_still_answer(project):
+    """DW-134. `<run>/decisions.json` is the orchestrator's own file, but a crash
+    mid-write or a hand edit can leave a value that is not an object — and every
+    consumer calls `.get(...)` on it. The bad entry loses its answer and is
+    journaled; the well-shaped one beside it builds its bundle exactly as before.
+    Ablation: restore the bare `_read_json` assignment in `_decisions_phase` and
+    this reddens with an AttributeError out of `_materialize_bundles`."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    plan = triage_result(
+        ["DW-1", "DW-2"],
+        decisions=[
+            _decision("DW-1", _widen_or_keep),
+            _decision("DW-2", _widen_or_keep),
+        ],
+    )
+    good = {"key": "1", "label": "Widen", "effect": "build", "answered_at": "2026-09-05"}
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "decision-dw-2", ["DW-2"]),
+            bundle_review_effect(project, "decision-dw-2"),
+        ],
+    )
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    store = engine.run_dir / "decisions.json"
+    store.write_text(json.dumps({"DW-1": "keep-open", "DW-2": good}, indent=2), encoding="utf-8")
+
+    summary = engine.run()
+    assert not summary.paused
+
+    [reload_failed] = _records(engine, "sweep-decisions-reload-failed")
+    assert reload_failed["errors"] == [
+        "DW-1: not a JSON object: str (<run>/decisions.json)"  # names the file to hand-fix
+    ]
+    # DW-2's answer was honoured: its decision bundle ran and closed the entry
+    assert engine.state.tasks["dw-decision-dw-2"].phase == Phase.DONE
+    assert not ledger_entries(project)["DW-2"].open
+    # DW-1 kept no answer, so it went back down the unattended pending path
+    assert [r["dw_id"] for r in _records(engine, "decision-skipped-unattended")] == ["DW-1"]
+    assert ledger_entries(project)["DW-1"].open
+    # the degrade is IN-MEMORY: the human's file is neither repaired nor trimmed
+    assert json.loads(store.read_text(encoding="utf-8")) == {"DW-1": "keep-open", "DW-2": good}
+
+
+def test_stored_answers_with_a_non_dict_top_level_degrade_to_none(project):
+    """DW-134. A store that is a JSON array answers nothing; the cycle proceeds
+    through its normal pending path instead of raising."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_decision_for("DW-1"),))
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    (engine.run_dir / "decisions.json").write_text('["DW-1"]', encoding="utf-8")
+
+    answers, closed = engine._decisions_phase(plan)
+
+    assert answers == {} and closed == 0
+    [reload_failed] = _records(engine, "sweep-decisions-reload-failed")
+    assert reload_failed["errors"] == ["not a JSON object: list"]
+    assert [r["dw_id"] for r in _records(engine, "decision-skipped-unattended")] == ["DW-1"]
+
+
+def test_unreadable_stored_answers_degrade_to_none(project):
+    """DW-134. Truncated JSON (a crash mid-write) — caught, journaled with the
+    exception text, and the sweep carries on."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_decision_for("DW-1"),))
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    (engine.run_dir / "decisions.json").write_text('{"DW-1": {"key": "1"', encoding="utf-8")
+
+    answers, closed = engine._decisions_phase(plan)
+
+    assert answers == {} and closed == 0
+    [reload_failed] = _records(engine, "sweep-decisions-reload-failed")
+    assert reload_failed["errors"][0].startswith("unreadable: ")
+    assert [r["dw_id"] for r in _records(engine, "decision-skipped-unattended")] == ["DW-1"]
+
+
+def test_undecodable_stored_answers_degrade_to_none(project):
+    """DW-134. The third caught fault: bytes that are not UTF-8 at all."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_decision_for("DW-1"),))
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    (engine.run_dir / "decisions.json").write_bytes(b'{"DW-1": {"key": "\xff"}}')
+
+    answers, closed = engine._decisions_phase(plan)
+
+    assert answers == {}
+    [reload_failed] = _records(engine, "sweep-decisions-reload-failed")
+    assert reload_failed["errors"][0].startswith("unreadable: ")
+
+
+def test_oserror_reading_stored_answers_degrades_to_none(project, monkeypatch):
+    """DW-134. The read-side I/O arm is distinct from JSON and UTF-8 decoding:
+    a filesystem refusal must journal and take the same pending path. Ablation:
+    remove `OSError` from `_decisions_phase`'s catch tuple and this raises."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_decision_for("DW-1"),))
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    store = engine.run_dir / "decisions.json"
+    store.write_text(json.dumps({"DW-1": {"key": "1"}}), encoding="utf-8")
+    fault_read_text(monkeypatch, store)
+
+    answers, closed = engine._decisions_phase(plan)
+
+    assert answers == {} and closed == 0
+    [reload_failed] = _records(engine, "sweep-decisions-reload-failed")
+    assert reload_failed["errors"][0].startswith("unreadable: ")
+    assert [r["dw_id"] for r in _records(engine, "decision-skipped-unattended")] == ["DW-1"]
+
+
+def test_whole_file_fault_is_replaced_by_seeded_decision_write_back(project):
+    """A project pre-answer is a legitimate phase write, so it replaces a
+    non-object run store that has no per-value content the phase can preserve."""
+    from bmad_loop import decisions as decisions_store
+
+    write_ledger(project, {"DW-1": "open"})
+    good = {"key": "1", "label": "Widen", "effect": "build", "intent": "widen the field"}
+    pre_store = decisions_store.store_path(project.project)
+    pre_store.parent.mkdir(parents=True, exist_ok=True)
+    pre_store.write_text(json.dumps({"DW-1": good}), encoding="utf-8")
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_decision_for("DW-1"),))
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    run_store = engine.run_dir / "decisions.json"
+    run_store.write_text('["DW-1"]', encoding="utf-8")
+
+    answers, _closed = engine._decisions_phase(plan)
+
+    assert answers == {"DW-1": good}
+    assert json.loads(run_store.read_text(encoding="utf-8")) == {"DW-1": good}
+
+
+def test_whole_file_fault_is_replaced_by_interactive_decision_write_back(project):
+    """The interactive writer also replaces an unreadable whole-file fault so
+    the answer it just accepted survives a resume."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_decision_for("DW-1"),))
+    engine, _ = make_sweep(project, [], answers=["1"], prompting=True)
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    run_store = engine.run_dir / "decisions.json"
+    run_store.write_text('{"DW-1": {"key": "1"', encoding="utf-8")
+
+    answers, _closed = engine._decisions_phase(plan)
+
+    rewritten = json.loads(run_store.read_text(encoding="utf-8"))
+    assert answers["DW-1"]["effect"] == "build"
+    assert rewritten["DW-1"]["effect"] == "build"
+
+
+def test_malformed_pre_answer_is_dropped_and_the_write_back_keeps_the_unusable_value(project):
+    """DW-134, both halves in one row. `decisions.load_pre_answers` validates only
+    the TOP level, so a project-store VALUE can be any JSON and used to reach
+    `.get("effect")` in the seeding loop; it is dropped and named in the same
+    single record as the run-local store's bad value. And the write-back the
+    seeding triggers re-publishes the run-local value it could not use, rather
+    than deleting it — the degrade is in-memory, not a repair of the file."""
+    from bmad_loop import decisions as decisions_store
+
+    write_ledger(project, {"DW-1": "open", "DW-2": "open", "DW-3": "open"})
+    good = {"key": "1", "label": "Widen", "effect": "build", "intent": "widen the field"}
+    store = decisions_store.store_path(project.project)
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text(json.dumps({"DW-2": ["nope"], "DW-3": good}), encoding="utf-8")
+
+    plan = TriagePlan(
+        open_ids=frozenset({"DW-1", "DW-2", "DW-3"}),
+        decisions=(_decision_for("DW-1"), _decision_for("DW-2"), _decision_for("DW-3")),
+    )
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    run_store = engine.run_dir / "decisions.json"
+    run_store.write_text(json.dumps({"DW-1": 7}), encoding="utf-8")
+
+    answers, _closed = engine._decisions_phase(plan)
+
+    assert answers == {"DW-3": good}
+    [reload_failed] = _records(engine, "sweep-decisions-reload-failed")
+    assert reload_failed["errors"] == [
+        "DW-1: not a JSON object: int (<run>/decisions.json)",
+        "DW-2: not a JSON object: list (project .bmad-loop/decisions.json)",
+    ]
+    assert json.loads(run_store.read_text(encoding="utf-8")) == {"DW-1": 7, "DW-3": good}
+    assert sorted(r["dw_id"] for r in _records(engine, "decision-skipped-unattended")) == [
+        "DW-1",
+        "DW-2",
+    ]
+
+
+def test_materialize_bundles_skips_a_non_dict_answer(project):
+    """DW-134's other site. The test suite hands `_materialize_bundles` a map
+    directly, past `_decisions_phase`'s read-site guard, so each lane has to hold
+    the shape itself. A non-dict answer is a silent skip on BOTH lanes: no bundle
+    is built from it and it suppresses nothing.
+    Ablation: restore either lane's `answer.get(...)` without the isinstance and
+    this reddens with `AttributeError: 'int' object has no attribute 'get'`."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = TriagePlan(
+        open_ids=frozenset({"DW-1"}),
+        bundles=(Bundle(name="safe-fix", dw_ids=("DW-1",), intent="a"),),
+        decisions=(_decision_for("DW-1"),),
+    )
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    (engine.run_dir / "journal.jsonl").write_text("", encoding="utf-8")
+
+    bundles, dropped = engine._materialize_bundles(plan, {"DW-1": 7})
+
+    assert not dropped
+    # built nothing of its own, and did not suppress the plan bundle over its id
+    assert [b.name for b in bundles] == ["safe-fix"]
+    assert engine._dropped_decisions == set()
+    # the two records a lane that ACTED on the answer would have written
+    assert _records(engine, "sweep-decision-answer-dropped") == []
+    assert _records(engine, "sweep-bundle-skipped") == []
+
+
+def test_interactive_answer_write_back_keeps_an_unusable_stored_value(project):
+    """DW-134. The per-answer write-back inside the prompting loop republishes the
+    whole map, so without the `unusable` merge the first answer a human gives
+    deletes every value the read could not use — a silent repair of the human's
+    file on a write made for an unrelated reason. DW-9 is not a decision this
+    cycle, so nothing re-answers it; it must still be in the file afterwards.
+    Ablation: revert that call to `json.dumps(answers, indent=2)` and this reddens
+    — DW-9 is gone from the rewritten store."""
+    write_ledger(project, {"DW-1": "open", "DW-9": "open"})
+    plan = TriagePlan(open_ids=frozenset({"DW-1", "DW-9"}), decisions=(_decision_for("DW-1"),))
+    engine, _ = make_sweep(project, [], answers=["1"], prompting=True)
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    store = engine.run_dir / "decisions.json"
+    store.write_text(json.dumps({"DW-9": 7}), encoding="utf-8")
+
+    answers, _closed = engine._decisions_phase(plan)
+
+    assert answers["DW-1"]["effect"] == "build"  # PRECONDITION: the prompt ran
+    assert "DW-9" not in answers  # unusable in memory...
+    rewritten = json.loads(store.read_text(encoding="utf-8"))
+    assert rewritten["DW-9"] == 7  # ...but still on disk, unchanged
+    assert rewritten["DW-1"]["effect"] == "build"
+    [reload_failed] = _records(engine, "sweep-decisions-reload-failed")
+    assert reload_failed["errors"] == ["DW-9: not a JSON object: int (<run>/decisions.json)"]
+
+
+# ------------------------------- DW-135: every drop lane is repeat progress
+
+
+def test_dropped_build_answer_is_repeat_progress_exactly_once(project):
+    """DW-135. Cycle 2 renumbers key "1" off `Widen`/`build` and onto
+    `Close as decayed`/`close`, so the in-run build answer no longer resolves to an
+    agreeing option and carries no intent of its own — the `no-intent` drop. That
+    drop is cycle 2's ONLY event: it must count as progress by itself, or the run
+    stops at `no-progress` before cycle 3's fresh triage ever gets to look at DW-1.
+    Cycle 3 then proves the bound: DW-1 is already quarantined, so its re-agreeing
+    option produces no second drop, no second notification and no second progress
+    signal, and the repeat loop terminates.
+    Ablation: drop the `answer_dropped = True` from the `no-intent` lane and this
+    reddens — only one `sweep-cycle` record is written and `sweep-repeat-done`
+    reports 1 cycle."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    plan1 = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[{"name": "safe-fix", "dw_ids": ["DW-2"], "intent": "a"}],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {"key": "1", "label": "Widen", "effect": "build", "intent": "widen the field"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    # cycle 2: no bundles, no closes, no new decisions to answer — the drop is
+    # the whole of its addressable work
+    plan2 = triage_result(
+        ["DW-1"],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {"key": "1", "label": "Close as decayed", "effect": "close"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    # cycle 3 re-authors key "1" back into agreement: the quarantine must refuse
+    # it, leaving the cycle with nothing addressable
+    plan3 = triage_result(
+        ["DW-1"],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {"key": "1", "label": "Widen", "effect": "build", "intent": "widen the field"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan1),
+            bundle_dev_effect(project, "safe-fix", ["DW-2"]),
+            bundle_review_effect(project, "safe-fix"),
+            triage_effect(plan2),
+            triage_effect(plan3),
+        ],
+        # max_bundles=1 holds cycle 1's `decision-dw-1` bundle back (truncated), so
+        # the answer is still unspent when cycle 2 renumbers its option
+        policy=repeat_policy(max_bundles=1),
+        answers=["1"],
+        prompting=True,
+    )
+    summary = engine.run()
+    assert not summary.paused
+
+    journal = journal_text(engine)
+    # PRECONDITIONS: the in-run answer was recorded and cycle 1 truncated its bundle
+    assert '"decision-answered"' in journal
+    assert '"sweep-bundles-truncated"' in journal
+    assert engine.state.tasks["dw-safe-fix"].phase == Phase.DONE
+    # THE BUG: cycle 2's only event was the drop, and cycle 3 still ran
+    assert [r["cycle"] for r in _records(engine, "sweep-cycle")] == [2, 3]
+    [drop] = _records(engine, "sweep-decision-answer-dropped")
+    assert drop["decision"] == "DW-1" and drop["drop_cause"] == "no-intent"
+    # THE BOUND: one drop, one mismatch, one notification, and cycle 3 found
+    # nothing addressable, so the loop stopped instead of spinning
+    assert len(_mismatches(engine)) == 1
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert attention.count("recorded build decision discarded") == 1
+    [done] = _records(engine, "sweep-repeat-done")
+    assert done["reason"] == "no-progress" and done["cycles"] == 3
+    assert not any(k.startswith("dw3-") for k in engine.state.tasks)
+    assert ledger_entries(project)["DW-1"].open
+
+
+def test_dropped_name_collision_answer_is_repeat_progress(project):
+    """DW-135's OTHER build lane. `test_dropped_build_answer_is_repeat_progress...`
+    reaches the flag through `no-intent`; this row reaches it through
+    `name-collision`, where the answer is perfectly buildable and only the names
+    are taken. Cycle 2 authors `decision-dw-1` and every `-2`..`-9` suffix, so the
+    bound is exhausted and the answer is dropped — and those nine plan bundles are
+    all suppressed by keep-open answers (the taken-name set is built during the
+    decision loop, the keep-open skip runs after it), so the drop is the ONLY
+    addressable thing cycle 2 does. Cycle 3 then finds DW-1 quarantined and stops.
+    Ablation: delete `answer_dropped = True` from the name-collision lane and this
+    reddens — cycle 3 never runs and `sweep-repeat-done` reports 2 cycles."""
+    ids = [f"DW-{n}" for n in range(1, 12)]  # DW-1 decides; DW-2..10 occupy; DW-11 runs
+    write_ledger(project, {i: "open" for i in ids})
+    decision = _decision(
+        "DW-1",
+        [
+            {"key": "1", "label": "Widen", "effect": "build", "intent": "fresh intent"},
+            {"key": "2", "label": "Keep", "effect": "keep-open"},
+        ],
+    )
+    # `decision-dw-1` plus every one of `-2` ... `-9`: the whole bound, taken
+    occupied = ["decision-dw-1"] + [f"decision-dw-1-{n}" for n in range(2, 10)]
+    plan1 = triage_result(
+        ids,
+        bundles=[{"name": "safe-fix", "dw_ids": ["DW-11"], "intent": "a"}],
+        skip=[{"id": i, "reason": "not this cycle"} for i in ids[1:10]],
+        decisions=[decision],
+    )
+    plan2 = triage_result(
+        ids[:10],
+        bundles=[
+            {"name": name, "dw_ids": [dw_id], "intent": f"plan intent {dw_id}"}
+            for name, dw_id in zip(occupied, ids[1:10], strict=True)
+        ],
+        decisions=[decision],
+    )
+    plan3 = triage_result(
+        ids[:10],
+        skip=[{"id": i, "reason": "not this cycle"} for i in ids[1:10]],
+        decisions=[decision],
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan1),
+            bundle_dev_effect(project, "safe-fix", ["DW-11"]),
+            bundle_review_effect(project, "safe-fix"),
+            triage_effect(plan2),
+            triage_effect(plan3),
+        ],
+        # max_bundles=1 holds cycle 1's free `decision-dw-1` bundle back (truncated),
+        # so the answer is still unspent when cycle 2 takes every name it could use
+        policy=repeat_policy(max_bundles=1),
+    )
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    (engine.run_dir / "decisions.json").write_text(
+        json.dumps(
+            {
+                "DW-1": {"key": "1", "label": "Widen", "effect": "build"},
+                # no decision re-asks these, so they suppress their bundles outright
+                **{i: {"key": "2", "label": "Keep", "effect": "keep-open"} for i in ids[1:10]},
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    summary = engine.run()
+    assert not summary.paused
+
+    # PRECONDITIONS: the AGREEING lane, the bound exhausted rather than suffixed,
+    # and cycle 2 ran no bundle of any kind
+    assert _mismatches(engine) == []
+    assert _records(engine, "sweep-bundle-name-deduped") == []
+    assert engine.state.tasks["dw-safe-fix"].phase == Phase.DONE
+    assert not any(k.startswith("dw2-") for k in engine.state.tasks)
+    # THE BUG: cycle 2's only addressable event was the name-collision drop
+    [drop] = _records(engine, "sweep-decision-answer-dropped")
+    assert drop["decision"] == "DW-1" and drop["drop_cause"] == "name-collision"
+    assert [r["cycle"] for r in _records(engine, "sweep-cycle")] == [2, 3]
+    # THE BOUND: cycle 3 found DW-1 quarantined, so the loop stopped
+    [done] = _records(engine, "sweep-repeat-done")
+    assert done["reason"] == "no-progress" and done["cycles"] == 3
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert attention.count("recorded build decision discarded") == 1
+    assert ledger_entries(project)["DW-1"].open
 
 
 def test_repeat_resume_mid_cycle_two(project):

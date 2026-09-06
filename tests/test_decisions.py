@@ -145,6 +145,36 @@ def test_pending_missed_decisions_most_recent_wins_and_filters(project):
     assert pending[0].question == "new"  # newest run's wording
 
 
+def test_pending_missed_decisions_re_offers_an_id_whose_stored_value_is_unusable(project):
+    """DW-134's loose end. `load_pre_answers` validates only the top level, so a
+    store VALUE can be any JSON; a sweep drops such a value and re-files the id as
+    unanswered. Keying `answered` off presence alone therefore hid the id from
+    this command while every sweep skipped it — unanswerable until a human opened
+    the file. DW-2 (well-shaped) still counts as answered, so the exclusion is not
+    simply gone. Ablation: restore `answered = set(load_pre_answers(project))` and
+    this reddens — DW-1 drops out of the list."""
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    _make_run(
+        project,
+        "20260101-000000-aaaa",
+        _triage(["DW-1", "DW-2"], [_decision("DW-1"), _decision("DW-2")]),
+    )
+    store = decisions.store_path(project.project)
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text(
+        json.dumps(
+            {
+                "DW-1": "keep-open",  # a bare effect string, not the answer object
+                "DW-2": {"key": "2", "label": "Keep as is", "effect": "keep-open"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert [d.id for d in decisions.pending_missed_decisions(project.project)] == ["DW-1"]
+
+
 def test_pending_missed_decisions_empty_when_nothing_open(project):
     install_bmad_config(project)
     write_ledger(project, {"DW-1": "done 2026-06-01"})

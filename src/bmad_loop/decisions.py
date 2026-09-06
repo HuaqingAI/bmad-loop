@@ -130,7 +130,13 @@ def pending_missed_decisions(project: Path) -> list[Decision]:
     open_now = deferredwork.open_ids(text)
     if not open_now:
         return []
-    answered = set(load_pre_answers(project))
+    # By usable VALUE, not by key presence: `load_pre_answers` validates only the
+    # top level, and a sweep drops a non-dict value and re-files the decision as
+    # unanswered (`sweep-decisions-reload-failed`). Counting the bare key as
+    # answered hid exactly those ids from this command, so the id was skipped by
+    # every sweep and re-offered by nothing — unanswerable until a human found the
+    # file. Re-answering overwrites the unusable value, which is the repair.
+    answered = {k for k, v in load_pre_answers(project).items() if isinstance(v, dict)}
 
     # (run-id, cycle) descending == most recent first; run ids sort chronologically
     triage_files: list[tuple[str, int, Path]] = []

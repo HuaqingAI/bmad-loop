@@ -925,15 +925,21 @@ class SweepEngine(Engine):
     def _cycle(self, cycle: int, open_now: set[str]) -> bool:
         """One triage -> close -> decide -> bundle pass. Returns whether the
         cycle completed any addressable work — the repeat loop's progress
-        predicate. Caveat: on crash-resume of a cycle whose only progress was
-        already-resolved closes, the replayed (idempotent) closes report 0 and
-        the run stops with no-progress; errs toward stopping, never loops."""
+        predicate. Dropping a recorded decision answer counts (DW-123, widened
+        from the keep-open lane to all three drop lanes by DW-135): the drop
+        releases its id from a stored answer nothing can act on, so a later
+        cycle's fresh triage can address it. It cannot spin the loop —
+        `_materialize_bundles` bounds each id to one drop per process, so the
+        signal fires at most once per id. Caveat: on crash-resume of a cycle whose
+        only progress was already-resolved closes, the replayed (idempotent)
+        closes report 0 and the run stops with no-progress; errs toward stopping,
+        never loops."""
         self._emit("pre_sweep_cycle", phase=str(cycle))
         self._warn_stranded_bundles()
         plan = self._ensure_triage(open_now, cycle)
         closed = self._close_resolved(plan)
         answers, decisions_closed = self._decisions_phase(plan)
-        bundles, stale_keep_open_dropped = self._materialize_bundles(plan, answers)
+        bundles, answer_dropped = self._materialize_bundles(plan, answers)
         if self.decisions_only:
             self.journal.append("sweep-decisions-only", bundles_not_run=len(bundles))
             self._prune_pre_answers()
@@ -955,7 +961,7 @@ class SweepEngine(Engine):
         )
         self._prune_pre_answers()
         self._emit("post_sweep_cycle", phase=str(cycle))
-        return closed > 0 or decisions_closed > 0 or bundles_done > 0 or stale_keep_open_dropped
+        return closed > 0 or decisions_closed > 0 or bundles_done > 0 or answer_dropped
 
     def _prune_pre_answers(self) -> None:
         """Drop consumed pre-answers — entries built or closed this cycle have
@@ -1530,9 +1536,48 @@ class SweepEngine(Engine):
         # silently ignored the store. Derived from the run dir's own shape, which
         # no workspace swap moves.
         project_root = _project_of_run_dir(self.run_dir)
-        answers: dict[str, dict[str, str]] = (
-            _read_json(decisions_path) if decisions_path.is_file() else {}
-        )
+        # The orchestrator writes this store itself, but a crash mid-write, a hand
+        # edit or an out-of-band writer can still leave it unreadable or wrongly
+        # shaped — and every consumer below calls `.get(...)` on its values, so the
+        # bare read let one malformed byte abort the whole sweep. Degrade exactly
+        # the way `_ensure_triage`'s cache reload does (journal it, carry on with
+        # what is usable): a decision left with no usable answer simply goes back
+        # down the pending/skip path, which is where it was before anyone answered
+        # it. Per-VALUE, not all-or-nothing, so one bad entry does not cost the
+        # well-shaped rest their answers.
+        #
+        # `unusable` keeps the PER-VALUE drops so the two write-backs below
+        # re-publish their parsed values unchanged: on that arm the degrade really is
+        # in-memory and this method neither repairs nor trims the file. The two
+        # WHOLE-FILE arms cannot offer that — an unreadable file and a non-object
+        # top level leave nothing per-value to carry — so `unusable` stays empty
+        # there and the next write this phase makes for its own reasons (a seeded
+        # pre-answer, an in-run answer) replaces the corrupt file wholesale.
+        answers: dict[str, dict[str, str]] = {}
+        unusable: dict[str, Any] = {}
+        malformed: list[str] = []
+        if decisions_path.is_file():
+            try:
+                stored = _read_json(decisions_path)
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+                self.journal.append("sweep-decisions-reload-failed", errors=[f"unreadable: {exc}"])
+            else:
+                if isinstance(stored, dict):
+                    for stored_id, value in stored.items():
+                        key = str(stored_id)
+                        if isinstance(value, dict):
+                            answers[key] = value
+                        else:
+                            unusable[key] = value
+                            malformed.append(
+                                f"{key}: not a JSON object: {type(value).__name__} "
+                                "(<run>/decisions.json)"
+                            )
+                else:
+                    self.journal.append(
+                        "sweep-decisions-reload-failed",
+                        errors=[f"not a JSON object: {type(stored).__name__}"],
+                    )
         closed = 0
         # Adopt out-of-band pre-answers (a human answered decisions an earlier
         # unattended/abandoned sweep left). The ledger edits were already applied
@@ -1543,13 +1588,34 @@ class SweepEngine(Engine):
         for decision in plan.decisions:
             if decision.id in answers or decision.id not in pre:
                 continue
-            answers[decision.id] = pre[decision.id]
+            pre_answer = pre[decision.id]
+            if not isinstance(pre_answer, dict):
+                # `load_pre_answers` validates only the TOP level (decisions.py),
+                # so a value here can be any JSON at all. Same degrade as the
+                # run-local store above, and journaled in the same record — which
+                # is why each entry names the store it came from: the two files
+                # are different, and only one of them is the one to hand-fix.
+                malformed.append(
+                    f"{decision.id}: not a JSON object: {type(pre_answer).__name__} "
+                    "(project .bmad-loop/decisions.json)"
+                )
+                continue
+            answers[decision.id] = pre_answer
             self.journal.append(
                 "decision-preanswered",
                 dw_id=decision.id,
-                effect=pre[decision.id].get("effect"),
+                effect=pre_answer.get("effect"),
             )
             seeded = True
+        if malformed:
+            # The PER-VALUE record: one, however many values it covers, naming the
+            # ids that lost their answer and the store each came from. It is not
+            # the only one a read can write — a whole-file fault above journals its
+            # own, so a run-local store that will not parse AND a malformed
+            # pre-answer behind it produce two records, one per fault class. Ids,
+            # store names and type names only: an answer's prose stays out of the
+            # journal, the way `sweep-decision-option-mismatch` keeps it out.
+            self.journal.append("sweep-decisions-reload-failed", errors=malformed)
         if seeded:
             # Same helper as `decisions._write_store` (#363), but NOT for #363's
             # reason: `decisions_path` here is the PER-RUN file under
@@ -1568,7 +1634,11 @@ class SweepEngine(Engine):
             # would refuse nothing.
             atomic_write_text_confined(
                 decisions_path,
-                json.dumps(answers, indent=2),
+                # `unusable` first so a well-shaped answer always wins the key:
+                # the entries it holds are the ones the read above could not use,
+                # re-published unchanged rather than dropped by a write this
+                # method makes for an unrelated reason.
+                json.dumps({**unusable, **answers}, indent=2),
                 confine_root=project_root,
             )
         pending = [d for d in plan.decisions if d.id not in answers]
@@ -1608,7 +1678,7 @@ class SweepEngine(Engine):
                 }
                 atomic_write_text_confined(  # same file, same reasoning as above (#363, #593)
                     decisions_path,
-                    json.dumps(answers, indent=2),
+                    json.dumps({**unusable, **answers}, indent=2),  # as above
                     confine_root=project_root,
                 )
                 self.journal.append(
@@ -1746,12 +1816,31 @@ class SweepEngine(Engine):
     def _materialize_bundles(
         self, plan: TriagePlan, answers: dict[str, dict[str, str]]
     ) -> tuple[list[Bundle], bool]:
+        """This cycle's bundles, and whether ANY recorded answer was dropped by one
+        of the three drop lanes below — `_cycle`'s progress signal.
+
+        Every drop is progress for the same reason (DW-123, widened to the build
+        lanes by DW-135): it quarantines the id in `_dropped_decisions`, so the id
+        stops being bound to a stored answer nothing can act on and a later cycle's
+        fresh triage is free to address it. The signal stays finite because that
+        same set bounds each id to ONE drop per process, so a given id can raise it
+        at most once however many repeat cycles run.
+        """
         self._emit("pre_materialize_bundles")
         bundles = list(plan.bundles)
-        stale_keep_open_dropped = False
+        answer_dropped = False
         for decision in plan.decisions:
             answer = answers.get(decision.id)
-            if not answer or answer.get("effect") != "build":
+            # `isinstance` rather than truthiness: `answers`' annotation is a
+            # contract this method cannot enforce, and the test suite is the caller
+            # that hands it a map directly rather than through `_cycle`. Inside
+            # `src/` the only caller IS `_cycle` (a resume re-enters there too), so
+            # `_decisions_phase`'s read-site guard covers the production path — but
+            # a lane that trusts the annotation aborts materialization on a
+            # `.get(...)` the moment anything else supplies the map. A silent skip
+            # either way: an unusable answer is journaled where it is read, not
+            # once per lane that declines to use it.
+            if not isinstance(answer, dict) or answer.get("effect") != "build":
                 continue
             if decision.id in self._dropped_decisions:
                 continue  # announced dropped earlier this run (see __init__)
@@ -1804,6 +1893,7 @@ class SweepEngine(Engine):
                     "intent of its own — the entry stays open for the next sweep",
                 )
                 self._dropped_decisions.add(decision.id)
+                answer_dropped = True  # progress: see this method's docstring
                 continue
             label = str(answer.get("label", "")) or (option.label if option else "") or "build"
             bundle_name = str(answer.get("bundle_name", "")) or (
@@ -1899,6 +1989,7 @@ class SweepEngine(Engine):
                         "taken) — the entry stays open for the next sweep",
                     )
                     self._dropped_decisions.add(decision.id)
+                    answer_dropped = True  # progress: see this method's docstring
                     continue
             bundles.append(
                 Bundle(
@@ -1940,7 +2031,8 @@ class SweepEngine(Engine):
         by_id = {d.id: d for d in plan.decisions}
         keep_open_ids: set[str] = set()
         for dw_id, answer in answers.items():
-            if answer.get("effect") != "keep-open":
+            # Shape-guarded for the same reason the build lane above is.
+            if not isinstance(answer, dict) or answer.get("effect") != "keep-open":
                 continue
             if dw_id in self._dropped_decisions:
                 continue  # announced dropped earlier this run (see __init__)
@@ -1965,9 +2057,12 @@ class SweepEngine(Engine):
             # rather than one named for the mismatch alone. Dropping is deliberately
             # the loud direction: honouring a stale keep-open answer silently skips
             # work the human never protected, while dropping it is journaled and
-            # notified. It is NOT the build lane's "the entry stays open for the
-            # next sweep": dropping here UNBLOCKS the id, and counts as progress so
-            # a later valid triage cycle can bundle it and close the entry. The
+            # notified. What this drop does that the build lanes' do not is UNBLOCK
+            # the id: a keep-open answer actively suppresses bundles, so removing it
+            # makes the id eligible for a bundle a later valid triage cycle can run
+            # and close the entry with, where a dropped build answer simply leaves
+            # the entry open to be re-asked. Both count as repeat progress (DW-135;
+            # this method's docstring says why). The
             # RUN-LOCAL record is what survives — the answer stays auditable in
             # `<run>/decisions.json` and the ledger line `_apply_decision_effect`
             # wrote is unchanged — while an out-of-band pre-answer in the PROJECT
@@ -1994,7 +2089,7 @@ class SweepEngine(Engine):
                 f"protection is discarded and {dw_id} is eligible for bundling again",
             )
             self._dropped_decisions.add(dw_id)
-            stale_keep_open_dropped = True
+            answer_dropped = True
         kept = []
         for b in bundles:
             overlap = sorted(set(b.dw_ids) & (failed_ids | keep_open_ids))
@@ -2017,7 +2112,7 @@ class SweepEngine(Engine):
             self.journal.append("sweep-bundles-truncated", dropped=dropped)
             bundles = bundles[: self.max_bundles]
         self._emit("post_materialize_bundles")
-        return bundles, stale_keep_open_dropped
+        return bundles, answer_dropped
 
     def _write_intent(self, bundle: Bundle, dirname: str) -> Path:
         ledger = self.workspace.paths.deferred_work

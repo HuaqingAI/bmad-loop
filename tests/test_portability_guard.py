@@ -965,6 +965,13 @@ JOURNAL_KINDS = frozenset(
         "sweep-decision-answer-dropped",
         "sweep-decision-option-mismatch",
         "sweep-decisions-only",
+        # `<run>/decisions.json` (or a project pre-answer inside it) would not
+        # read or is not shaped `{id: {...}}`: the answer map degrades instead of
+        # aborting the sweep. `errors` carries exception text, type names and the
+        # DW ids whose answers were dropped — already a benign field
+        # (`JOURNAL_BENIGN_FIELDS`), and no answer prose goes near it, so the
+        # record needs no `diagnostics` routing row.
+        "sweep-decisions-reload-failed",
         "sweep-inflight-redrive",
         "sweep-inflight-stranded",
         "sweep-intent-regenerated",
