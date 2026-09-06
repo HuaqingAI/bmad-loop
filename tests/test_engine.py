@@ -2753,6 +2753,142 @@ def test_harvest_gate_exclude_gates_the_nested_ledger_under_the_monorepo_shape(p
     assert verify.verify_dev(task, paths, result_json, engine_written=exclude).ok
 
 
+def test_accepted_park_observation_excludes_the_nested_ledger_under_the_monorepo_shape(project):
+    """The PARK arm's copy of the row above — the arm whose producer join nothing
+    graded (DW-139).
+
+    `_harvest_gate_exclude` feeds BOTH arms of `verify.verify_dev`: the gate arm via
+    `extra_exclude`, and — once the park waiver fires — the observation arm via
+    `observe_skipped_proof`. Only the gate arm had a row grading that join. The park
+    arm's row,
+    `tests/test_verify.py::test_verify_dev_park_zero_diff_excludes_the_orchestrators_own_writes`
+    (DW-132), hand-spells `engine_written=("ledger.md",)`, so the producer is never
+    invoked there and re-rooting it leaves that row green.
+
+    Driven through `Engine._verify_dev_artifacts` rather than `verify.verify_dev`
+    directly — unlike its gate-arm sibling above — because for this arm that method
+    IS the join: it is where `engine_written=self._harvest_gate_exclude(task)` meets
+    `operator_park=self._operator_park_enabled()`, and the tuple graded here has to
+    be the one the producer really returns rather than one the row spelled itself.
+
+    The nested shape is what makes the producer's root separable, for the reason the
+    sibling states: a `project`-rooted spelling names the OUTER project's REAL ledger
+    once git resolves it in the code tree, instead of collapsing to a pathspec that
+    matches nothing and agreeing with the correct spelling by accident.
+
+    Every seeded file is COMMITTED, for two reasons that land on different files.
+    `verify._changes_since` filters untracked paths through the same exclusions the
+    probe applies, so the board, the spec and the nested ledger are unaffected by
+    their tracked state — the outer DECOY is the only file untracked residue could
+    come from, and `park_zero_diff` would then be `False` for a reason with nothing to
+    do with the pathspec's root. Committing the ledger and the board is what makes the
+    harvested append a TRACKED diff, which forces git's exclude-pathspec branch — the
+    branch this row exists to grade, and the sibling's stated reason for committing.
+
+    The decoy is created and then left ALONE. It exists to make "the wrong spelling
+    names a REAL file" true by value; had the attempt also touched it, the CORRECT
+    spelling would count it as residue and the observation could never be `True`.
+
+    The outcome is asserted BEFORE the prefix pin, deliberately and for the sibling's
+    reason: under the ablation this row must redden on the OBSERVATION rather than on
+    a spelling equality the value rows above already grade.
+
+    Ablation, measured: set `root = paths.project` inside `_harvest_gate_exclude` and
+    this reddens on `park_zero_diff is False` — the un-prefixed spelling excludes the
+    untouched outer decoy instead, so the orchestrator's own append to the NESTED
+    ledger is counted and an accepted park is recorded as having left residue it never
+    left. The DW-121 gate-arm row above reddens with it.
+    """
+    paths = nested_repo_root_paths(project)
+    # the premise: divergent AND nested. The sibling shape satisfies the first only,
+    # and there both spellings agree on the observation.
+    assert paths.project != paths.repo_root
+    assert paths.project.parent == paths.repo_root
+
+    # the OUTER project's ledger: the real file a `project`-rooted pathspec names
+    # once git resolves it in the code tree
+    decoy = paths.repo_root / "_bmad-output" / "implementation-artifacts" / "deferred-work.md"
+    decoy.parent.mkdir(parents=True, exist_ok=True)
+    assert not decoy.exists(), (
+        "this row creates the outer ledger deliberately so the 'silently wrong' "
+        "claim is graded by value; inheriting one from the sandbox template would "
+        "make that premise a setup accident"
+    )
+    decoy_text = "# outer ledger\n"
+    decoy.write_text(decoy_text, encoding="utf-8")
+
+    # every file the attempt below touches is seeded as TRACKED content first, at
+    # PRE-park values: the flip INTO `awaiting-operator` with `operator_actions` has to
+    # be the attempt's own doing. Seeded already parked, the park status would be a
+    # setup artifact and the board write below would be byte-identical to what is
+    # committed, so neither would be residue this attempt produced.
+    initial_baseline = verify.rev_parse_head(paths.repo_root)
+    write_sprint(paths, {"1-1-a": "in-progress"})
+    sp = spec_path(paths, "1-1-a")
+    write_spec(sp, "ready-for-dev", initial_baseline)
+    write_ledger(paths, {"DW-1": "open"}, commit=False)
+    git(
+        paths.repo_root,
+        "add",
+        decoy.relative_to(paths.repo_root).as_posix(),
+        paths.sprint_status.relative_to(paths.repo_root).as_posix(),
+        sp.relative_to(paths.repo_root).as_posix(),
+        paths.deferred_work.relative_to(paths.repo_root).as_posix(),
+    )
+    git(paths.repo_root, "commit", "-q", "-m", "seed tracked bookkeeping and both ledgers")
+
+    engine, _ = make_engine(paths, [], policy=_park_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    # the baseline is stamped where the session's cwd is: the CODE tree
+    task.baseline_commit = verify.rev_parse_head(paths.repo_root)
+    task.harvest_wrote_ledger = True
+
+    # the attempt's ENTIRE residue: the spec flipped to the park status with its
+    # declared actions, the board advanced to the park token, and the orchestrator's
+    # own append to the NESTED ledger. No source edit at all — which is exactly what a
+    # legitimate park looks like.
+    write_spec(sp, "awaiting-operator", task.baseline_commit, operator_actions=ACTIONS)
+    write_sprint(paths, {"1-1-a": "awaiting-operator"})
+    with paths.deferred_work.open("a", encoding="utf-8") as fh:
+        fh.write("\n### DW-2: harvested from the spec\n\nstatus: open\n")
+
+    result_json = {"workflow": "auto-dev", "spec_file": str(sp), "park_asserted": True}
+    outcome = engine._verify_dev_artifacts(task, result_json)
+
+    assert outcome.ok
+    # the waiver fired, so the tuple reached `observe_skipped_proof` and not the gate
+    assert outcome.park_proof_skipped is True
+    # the claim: the pathspec the PRODUCER returned removed the nested append from
+    # the observation, so the accepted park is recorded as the zero-diff it is
+    assert outcome.park_zero_diff is True
+
+    # The in-row control that makes the observation ATTRIBUTABLE, driven through the
+    # SAME join rather than a hand-spelled `verify.verify_dev` call — spelling the
+    # call site's own arguments here would bypass the join this row exists to grade.
+    # Tripping the producer's stand-down disjunct makes it return `()` for this
+    # attempt, and the observation flips: the nested ledger append IS countable
+    # residue that only the pathspec removes, so the `True` above is produced by the
+    # exclusion landing on it. Without this, a fixture change that made the append
+    # uncountable (left untracked, or newly covered by `app/.gitignore`) would keep
+    # the row green for a reason unrelated to the pathspec's root. It also grades the
+    # stand-down disjunct on the PARK arm, which nothing did — the value rows above
+    # grade it on the returned tuple alone, never on what the observation then says.
+    task.ledger_changed_before_harvest = True
+    control = engine._verify_dev_artifacts(task, result_json)
+    assert control.park_proof_skipped is True
+    assert control.park_zero_diff is False
+    task.ledger_changed_before_harvest = False
+
+    # the spelling that produced the observation, pinned once the outcome has spoken
+    assert engine._harvest_gate_exclude(task) == (
+        "app/_bmad-output/implementation-artifacts/deferred-work.md",
+    )
+    # the wrong spelling would have named a REAL file, and the decoy contributed no
+    # residue of its own — so the `True` above is about the nested ledger being
+    # excluded, not about the outer one being absent
+    assert decoy.is_file() and decoy.read_text(encoding="utf-8") == decoy_text
+
+
 # ------------------- `[verify] commands` run where the SESSION ran (#695, DW-3)
 #
 # `Engine._verify_commands_with_results` runs the commands in `self.workspace.root`
