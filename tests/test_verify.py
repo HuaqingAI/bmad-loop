@@ -6408,6 +6408,80 @@ def test_stories_relpaths_separates_the_two_roots_in_a_monorepo(project):
     )
 
 
+def test_verify_dev_park_zero_diff_excludes_engine_writes_under_the_monorepo_shape(
+    project,
+):
+    """The collapsed sibling park row cannot distinguish exclusion roots because
+    its project and repo root are the same directory. Nested, the correct spelling
+    gains ``app/`` while the plausible wrong spelling names a real outer ledger,
+    so the two spellings produce opposite ``park_zero_diff`` observations.
+
+    Ablation performed: drop ``+ mode_exclude`` from ``proof_of_work_probe``'s
+    exclusion composition and this row reddens on the correct spelling's
+    ``park_zero_diff is True`` assertion; restoring the composition makes it green.
+    """
+    paths = nested_repo_root_paths(project)
+    assert paths.project != paths.repo_root
+    assert paths.project.parent == paths.repo_root
+
+    outer_ledger = project.implementation_artifacts / "deferred-work.md"
+    outer_ledger.write_text("- DW-132 outer decoy\n", encoding="utf-8")
+    git(
+        paths.repo_root,
+        "add",
+        outer_ledger.relative_to(paths.repo_root).as_posix(),
+    )
+    git(paths.repo_root, "commit", "-q", "-m", "seed outer deferred-work decoy")
+
+    task, sp = _residue_free(
+        paths, status=verify.AWAITING_OPERATOR, sprint=verify.AWAITING_OPERATOR
+    )
+    paths.deferred_work.write_text("- DW-132 harvested by the orchestrator\n", encoding="utf-8")
+
+    from_code_root = paths.deferred_work.relative_to(paths.repo_root).as_posix()
+    from_project = paths.deferred_work.relative_to(paths.project).as_posix()
+    assert (
+        from_code_root
+        in git(
+            paths.repo_root,
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "--",
+            from_code_root,
+        ).splitlines()
+    )
+    assert from_code_root == f"app/{from_project}"
+    assert (paths.repo_root / from_project).is_file()
+    assert (paths.repo_root / from_project) != paths.deferred_work
+
+    out = verify.verify_dev(
+        task,
+        paths,
+        dev_result(sp, park_asserted=True),
+        review_enabled=False,
+        operator_park=True,
+        engine_written=(from_code_root,),
+    )
+
+    assert out.ok
+    assert out.park_proof_skipped is True
+    assert out.park_zero_diff is True
+
+    misrooted = verify.verify_dev(
+        task,
+        paths,
+        dev_result(sp, park_asserted=True),
+        review_enabled=False,
+        operator_park=True,
+        engine_written=(from_project,),
+    )
+
+    assert misrooted.ok
+    assert misrooted.park_proof_skipped is True
+    assert misrooted.park_zero_diff is False
+
+
 def test_verify_dev_refuses_a_bare_spec_flip_under_the_monorepo_shape(project):
     """The OUTCOME assertion the sibling shape cannot make (DW-9).
 
