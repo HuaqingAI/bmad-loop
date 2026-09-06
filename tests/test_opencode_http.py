@@ -10,6 +10,7 @@ Everything binds 127.0.0.1; no real opencode binary or network access anywhere.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -1810,6 +1811,69 @@ def test_stash_usage_rewrite_replaces_without_evicting(tmp_path):
     assert adapter.read_usage(  # the oldest peer was NOT evicted by the re-write
         SessionResult(status="completed", session_id="ses_0")
     ) == TokenUsage(input_tokens=0)
+
+
+def test_usage_stash_survives_session_teardown(tmp_path):
+    """DW-129: `read_usage(result)` runs AFTER `run()`/`kill()` return, so the
+    `_usage` stash must outlive teardown — which is precisely why DW-117 put the
+    capacity bound at the write site (`_stash_usage`) rather than on a lifecycle
+    hook. Until this row the invariant was only observed INCIDENTALLY, by three
+    fake-binary E2E cases that happen to read usage after `run()` has already
+    torn the session down: `test_e2e_completed`,
+    `test_e2e_budget_enforce_trips_nudges_and_aborts_over_budget` and
+    `test_e2e_dev_synthesizes_terminal_spec`. This row pins it directly at the
+    kill seam instead, so the guarantee no longer depends on an E2E keeping that
+    incidental ordering.
+
+    The kill path is real (no stub of `kill`, `_teardown` or `_kill_process`),
+    but with `client`, `sse_thread`, `server_fh` and `event_fh` all None the legs
+    that actually execute are `sse_stop.set()`, `_kill_process` and
+    `log_fh.close()` — `_abort` short-circuits on `client is None` and the four
+    optional-sink branches are skipped. That is enough: closing `log_fh` is
+    teardown's LAST leg, so asserting it proves teardown ran to completion rather
+    than stopping at `_kill_process`.
+
+    Ablation (run manually, DW-129): inserting `self._usage.clear()` at the top of
+    `kill()` reddens this row — `read_usage` returns None — along with the three
+    E2E cases above, so the assertion is load-bearing rather than passing for an
+    unrelated reason.
+    """
+    adapter = make_adapter(tmp_path)
+    # Bounds _kill_process's terminate -> wait -> force-kill ladder, so a slow
+    # SIGTERM cannot stall this row.
+    adapter.kill_wait_s = 3.0
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+    # A real handle: _teardown closes it, guarded only by `except OSError`. Bound
+    # here so the `finally` can reclaim it if an assertion below fires first.
+    log_fh = (tmp_path / "t-1.log").open("w", encoding="utf-8")
+    try:
+        sess = _ServerSession(
+            process=process,
+            port=0,
+            base_url="",
+            password="",
+            log_fh=log_fh,
+        )
+        sess.session_id = "ses_1"
+        adapter._stash_usage("ses_1", TokenUsage(input_tokens=7))
+        adapter._sessions["t-1"] = sess
+
+        adapter.kill(SessionHandle(task_id="t-1", native_id="ses_1"))
+
+        assert "t-1" not in adapter._sessions  # kill() popped it
+        assert process.poll() is not None  # _kill_process reaped the child
+        assert sess.log_fh.closed  # ...and teardown ran through to its last leg
+        assert adapter.read_usage(
+            SessionResult(status="completed", session_id="ses_1")
+        ) == TokenUsage(input_tokens=7)
+    finally:
+        with contextlib.suppress(OSError):
+            log_fh.close()
+        process.kill()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def test_capture_usage_stashes_through_the_cap(tmp_path):
