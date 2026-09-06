@@ -11,7 +11,7 @@ Everything binds 127.0.0.1; no real opencode binary or network access anywhere.
 from __future__ import annotations
 
 import contextlib
-import importlib.util
+import inspect
 import json
 import os
 import queue
@@ -23,7 +23,16 @@ import time
 from pathlib import Path
 
 import pytest
-from conftest import write_script_launcher
+from conftest import (
+    RECORDED_CHILD_GLOB,
+    bind_recorded_child,
+    kill_recorded_child,
+    preflight_pidfd_support,
+    proc_starttime,
+    recorded_child,
+    recorded_children_swept,
+    write_script_launcher,
+)
 
 from bmad_loop import runs
 from bmad_loop.adapters import base as adapter_base
@@ -1621,10 +1630,10 @@ def test_kill_unknown_handle_is_a_noop(tmp_path):
     adapter.kill(SessionHandle(task_id="never-started", native_id="ses_x"))
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="os.kill(0) reap probe is POSIX")
 @pytest.mark.skipif(
-    not sys.platform.startswith("linux") and importlib.util.find_spec("psutil") is None,
-    reason="descendant discovery off Linux needs psutil (the non-linux extra)",
+    not sys.platform.startswith("linux"),
+    reason="the detached child is identified by its /proc start time and signalled "
+    "through os.pidfd_open — both Linux-only facilities",
 )
 def test_kill_process_reaps_detached_descendant(tmp_path):
     """#183 mirror on the HTTP transport, deterministic without a real opencode
@@ -1635,30 +1644,79 @@ def test_kill_process_reaps_detached_descendant(tmp_path):
     is reaped, proving the pre-signal descendant harvest + reap covers a straggler
     the pane/pgid kill would leak (a live opencode binary is not required, and the
     live-server harness cannot easily be made to detach a child — noted in the
-    report)."""
+    report).
+
+    DW-136: this test never holds a bare pid. The server records the same
+    ``<pid> <starttime>`` identity the stories fakes write, and every signal —
+    the liveness poll and the cleanup kill alike — goes out through a pidfd bound
+    while that pair still matched, so a recycled pid can neither fake a survivor
+    nor absorb the cleanup SIGKILL.
+    """
     adapter = make_adapter(tmp_path)
     adapter.kill_wait_s = 3.0
-    child_pid_file = tmp_path / "detached.pid"
-    # The "server" detaches a session-leader child (records its pid), then idles so
-    # it is provably alive at harvest — the server (process.pid) is the parent of
-    # the detached child, so host.descendants(server) finds it before the SIGTERM.
+    # RECORDED_CHILD_GLOB-shaped, so `recorded_children_swept` can rediscover this
+    # child from disk if the pre-bind region below raises before any fd names it.
+    child_pid_file = tmp_path / ".bmad-loop" / "runs" / "r0" / "tasks" / "t0" / "fake-child.pid"
+    child_pid_file.parent.mkdir(parents=True, exist_ok=True)
+    assert child_pid_file.relative_to(tmp_path).match(
+        RECORDED_CHILD_GLOB
+    ), f"{child_pid_file} is outside RECORDED_CHILD_GLOB ({RECORDED_CHILD_GLOB})"
+    publication_target = tmp_path / "direct-write-target"
+    child_pid_file.symlink_to(publication_target)
+    # Fail before anything is spawned if this host cannot open or signal a pidfd.
+    preflight_pidfd_support()
+    # The "server" detaches a session-leader child, records its identity (start time
+    # read from /proc by splitting after the last ")" — field index 19, exactly as
+    # `recorded_child`'s parser and the stories fakes do), then idles so the child is
+    # provably alive at harvest: the server (process.pid) is the parent of the
+    # detached child, so host.descendants(server) finds it before the SIGTERM. The
+    # record lands via a sibling temp file plus os.replace, because the strict parser
+    # makes a torn read fatal rather than merely lucky. If the read or parse fails
+    # instead, the child is killed through the server's own Popen handle (reuse-safe,
+    # and the only cleanup path left: with no identity file, nothing downstream can
+    # ever authenticate that process).
     server_body = (
-        "import subprocess, sys, time\n"
+        "import os, subprocess, sys, time\n"
         "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'],"
         " start_new_session=True)\n"
-        f"open({str(child_pid_file)!r}, 'w', encoding='utf-8').write(str(p.pid))\n"
+        "try:\n"
+        "    stat = open(f'/proc/{p.pid}/stat', encoding='utf-8').read()\n"
+        "    starttime = stat[stat.rindex(')') + 1:].split()[19]\n"
+        f"    idfile = {str(child_pid_file)!r}\n"
+        "    tmp = idfile + '.tmp'\n"
+        "    with open(tmp, 'w', encoding='utf-8') as fh:\n"
+        "        fh.write(f'{p.pid} {starttime}\\n')\n"
+        "    os.replace(tmp, idfile)\n"
+        "except BaseException:\n"
+        "    p.kill()\n"
+        "    p.wait()\n"
+        "    raise\n"
         "time.sleep(300)\n"
     )
-    process = subprocess.Popen([sys.executable, "-c", server_body])
-    detached_pid = None
+    process: subprocess.Popen | None = None
+    detached_fd: int | None = None
     try:
-        deadline = time.monotonic() + 10
-        while not child_pid_file.is_file() and time.monotonic() < deadline:
-            time.sleep(0.05)
-        assert child_pid_file.is_file(), "server never recorded its detached child"
-        detached_pid = int(child_pid_file.read_text(encoding="utf-8").strip())
-        # sanity: the recorded pid is the setsid'd process and is currently alive
-        os.kill(detached_pid, 0)
+        # The pre-bind window: the grandchild is running under its own session but no
+        # fd names it until the bind below. The 10s wait and the two asserts inside are
+        # all raise points, and a `start_new_session=True` sleep(300) that escapes them
+        # is unreapable by any authenticated path — so the sweeper covers the stretch.
+        with recorded_children_swept(tmp_path):
+            process = subprocess.Popen([sys.executable, "-c", server_body])
+            deadline = time.monotonic() + 10
+            while not child_pid_file.is_file() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert child_pid_file.is_file(), "server never recorded its detached child"
+            assert (
+                not child_pid_file.is_symlink()
+            ), "the recorder must replace, not write through, the published identity name"
+            detached_pid, detached_start = recorded_child(child_pid_file)
+            # sanity: the recorded pid is the setsid'd process and is currently alive —
+            # binding succeeds only while /proc still reports the recorded start time.
+            detached_fd = bind_recorded_child(detached_pid, detached_start)
+            assert detached_fd is not None, (
+                f"the recorded detached child {detached_pid} was already gone (or its start "
+                f"time no longer matches {detached_start}) before the kill under test ran"
+            )
 
         sess = _ServerSession(process=process, port=0, base_url="", password="", log_fh=None)
         adapter._kill_process(sess)
@@ -1667,23 +1725,100 @@ def test_kill_process_reaps_detached_descendant(tmp_path):
         reap_deadline = time.monotonic() + 10
         while True:
             try:
-                os.kill(detached_pid, 0)
+                # Signal 0 through the bound fd keeps the old alive-or-zombie
+                # semantics without ever naming the raw number again.
+                signal.pidfd_send_signal(detached_fd, 0)
             except ProcessLookupError:
                 break  # detached child reaped by the descendant sweep
             assert time.monotonic() < reap_deadline, f"detached child {detached_pid} survived"
             time.sleep(0.05)
     finally:
-        for pid in (detached_pid, process.pid):
-            if pid is None:
-                continue
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
+        # The child goes through its authenticated fd; the server goes through the
+        # Popen handle this test owns — `kill()` no-ops once `returncode` is set, and
+        # an unreaped pid cannot be recycled, so neither path can hit a stranger.
         try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            pass
+            kill_recorded_child(detached_fd)
+        finally:
+            if process is not None:
+                process.kill()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    pass
+
+
+def test_detached_descendant_row_is_gated_to_linux_only():
+    """DW-136: the row above authenticates its child by /proc start time and signals
+    it through a pidfd, both Linux-only. Its gate must say exactly that.
+
+    The old gate admitted macOS whenever psutil was importable — a host where neither
+    facility exists, so the only way to clean up was the bare-pid SIGKILL this change
+    removed. Widen the gate back and there is no authenticated signal to widen it to,
+    which is why the condition is pinned at the source level rather than by its value:
+    on Linux every candidate condition evaluates to False alike.
+    """
+    marks = [
+        m for m in test_kill_process_reaps_detached_descendant.pytestmark if m.name == "skipif"
+    ]
+    assert len(marks) == 1, f"expected exactly one skipif gate, got {marks}"
+    # Assert the gate's VALUE on this host, not a re-spelling of its own condition:
+    # `args[0] == (not sys.platform.startswith("linux"))` compares two expressions that
+    # agree everywhere for any platform-shaped condition, so it can never fail. This
+    # form does: a gate hardcoded True, or one keyed to the wrong platform, is caught
+    # on whichever leg it wrongly skips (CI runs ubuntu and windows).
+    skips_here = bool(marks[0].args[0])
+    if sys.platform.startswith("linux"):
+        assert not skips_here, "the gate skips the row on Linux, the one host it must run on"
+    else:
+        assert skips_here, "the gate admits a host with no /proc start times and no pidfd"
+    reason = marks[0].kwargs["reason"]
+    assert "/proc" in reason and "pidfd" in reason, reason
+
+    # ALL whitespace stripped, so `trunk fmt` re-wrapping the decorator across lines
+    # cannot silently break these substring checks.
+    source = "".join(inspect.getsource(test_kill_process_reaps_detached_descendant).split())
+    gate = source.split("deftest_kill_process_reaps_detached_descendant")[0]
+    assert 'sys.platform.startswith("linux")' in gate, gate
+    assert "psutil" not in gate, gate
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="plants a /proc-authenticated identity and reaps it through os.pidfd_open — "
+    "both Linux-only facilities",
+)
+def test_detached_descendant_row_sweeps_a_recorded_child_when_setup_fails(tmp_path, monkeypatch):
+    """DW-136 mirror of the stories DW-137 row: the row above spawns a session-leader
+    grandchild inside its pre-bind window, where a 10-second wait and two asserts can
+    all raise before any fd names it. Nothing else can clean that process up — it is
+    outside the server's process group and its number must never be signalled blind —
+    so the `recorded_children_swept` wrap is the only cleanup path. Delete the wrap and
+    the planted child below survives this test by ~5 minutes.
+
+    The row's own `recorded_child` binding is patched to raise, which is the shape a
+    torn or malformed record would take; the sweeper's copy lives in `conftest` and is
+    a different binding, so it still parses the planted file normally.
+    """
+    planted = tmp_path / ".bmad-loop" / "runs" / "r0" / "tasks" / "t9" / "fake-child.pid"
+    planted.parent.mkdir(parents=True)
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        starttime = proc_starttime(proc.pid)
+        assert starttime is not None, f"planted child {proc.pid} has no /proc identity"
+        planted.write_text(f"{proc.pid} {starttime}\n", encoding="utf-8")
+
+        def malformed(_pid_file):
+            raise AssertionError("must hold exactly two positive ASCII-decimal tokens")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(sys.modules[__name__], "recorded_child", malformed)
+            with pytest.raises(AssertionError, match="positive ASCII-decimal"):
+                test_kill_process_reaps_detached_descendant(tmp_path)
+        assert proc.wait(timeout=10) == -signal.SIGKILL
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=10)
 
 
 def test_kill_process_strikes_root_before_reraising_bad_host_override(tmp_path, monkeypatch):

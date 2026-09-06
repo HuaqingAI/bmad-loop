@@ -58,16 +58,25 @@ import signal
 import subprocess
 import sys
 import time
+import warnings
 from pathlib import Path
 
+import conftest
 import pytest
 import yaml
 from conftest import (
     REAL_MUX_HANG_CEILING_S,
+    RECORDED_CHILD_GLOB,
     RENDERER_SCRIPT_IMPORTING_SIBLING,
+    bind_recorded_child,
     install_build_auto_skill,
     install_dev_base_skills,
+    kill_recorded_child,
+    preflight_pidfd_support,
+    proc_starttime,
     real_mux_e2e,
+    recorded_child,
+    recorded_children_swept,
 )
 
 from bmad_loop import runs
@@ -242,7 +251,8 @@ CLI = [sys.executable, "-m", "bmad_loop.cli"]
 # 19 of the remaining fields, then records the identity captured at spawn.
 RECORD_CHILD_IDENTITY_SH = r"""cstat=$(<"/proc/$child/stat")
 read -r -a cfields <<< "${cstat##*) }"
-printf '%s %s\n' "$child" "${cfields[19]}" > "$idfile"
+printf '%s %s\n' "$child" "${cfields[19]}" > "$idfile.tmp"
+mv -f "$idfile.tmp" "$idfile"
 """
 
 # A fake CLI that writes SessionStart and then sleeps forever — it NEVER fires a
@@ -855,94 +865,12 @@ def test_e2e_sprint_intent_gap_patch_restore(tmp_path):
     assert any(str(spec) in p for p in prompts)
 
 
-def _positive_ascii_decimal(token: str) -> bool:
-    return bool(token) and token.isascii() and token.isdecimal() and any(ch != "0" for ch in token)
-
-
-def _proc_starttime(pid: int) -> str | None:
-    """Return /proc stat field 22, or ``None`` only when the process is gone."""
-    try:
-        stat = Path("/proc", str(pid), "stat").read_text(encoding="utf-8")
-    except (FileNotFoundError, ProcessLookupError):
-        return None
-
-    # The comm field is parenthesized and may itself contain spaces and parens, so
-    # split after the last close-paren exactly as process_host does. Malformed records
-    # are observation failures, not evidence that the child disappeared.
-    starttime = stat[stat.rindex(")") + 1 :].split()[19]
-    if not _positive_ascii_decimal(starttime):
-        raise ValueError(f"malformed start time in /proc/{pid}/stat: {starttime!r}")
-    return starttime
-
-
-def _recorded_child(pid_file: Path) -> tuple[int, str]:
-    """Parse the fake CLI's exact positive-ASCII ``<pid> <starttime>`` identity."""
-    raw = pid_file.read_text(encoding="utf-8")
-    fields = raw[:-1].split(" ") if raw.endswith("\n") else []
-    diagnostic = (
-        f"{pid_file} must hold exactly two positive ASCII-decimal tokens "
-        f"('<pid> <starttime>'), got {raw!r}"
-    )
-    valid = (
-        raw.count("\n") == 1
-        and len(fields) == 2
-        and all(_positive_ascii_decimal(field) for field in fields)
-    )
-    assert valid, diagnostic
-    try:
-        pid = int(fields[0])
-    except ValueError:
-        raise AssertionError(diagnostic) from None
-    return pid, fields[1]
-
-
-def _preflight_pidfd_support() -> None:
-    """Fail before a fake child is spawned if pidfd open or signalling is unavailable."""
-    fd = os.pidfd_open(os.getpid())
-    try:
-        signal.pidfd_send_signal(fd, 0)
-    finally:
-        os.close(fd)
-
-
-def _bind_recorded_child(pid: int, starttime: str) -> int | None:
-    """Bind a pidfd to the authenticated child, or return ``None`` once it is gone."""
-    if _proc_starttime(pid) != starttime:
-        return None
-    try:
-        fd = os.pidfd_open(pid)
-    except ProcessLookupError:
-        return None
-
-    # Authenticate -> bind -> re-authenticate. Once this second check agrees, the
-    # pidfd names the recorded process even if its numeric pid is later recycled.
-    try:
-        still_matches = _proc_starttime(pid) == starttime
-    except BaseException:
-        os.close(fd)
-        raise
-    if not still_matches:
-        os.close(fd)
-        return None
-    return fd
-
-
-def _kill_recorded_child(fd: int | None) -> None:
-    """SIGKILL through a bound pidfd and close it; ignore only proven disappearance."""
-    if fd is None:
-        return
-    try:
-        try:
-            signal.pidfd_send_signal(fd, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    finally:
-        os.close(fd)
-
-
-# These harness rows spawn only local `sleep` processes. They inherit the module's
-# Linux+tmux gate and xdist group so the helpers and their E2E consumers cannot drift
-# onto different host conditions; no row below launches tmux or the orchestrator.
+# These harness rows spawn only local `sleep` processes and are the contract tests for
+# the reap-identity helpers, which now live in tests/conftest.py because a second
+# consumer on a different host gate needs them (tests/test_opencode_http.py's detached
+# -descendant row, Linux-gated but tmux-free). They keep the module's Linux+tmux gate
+# and xdist group: tmux is stricter than the helpers require, so the rows still run
+# wherever the E2E consumers here do. No row below launches tmux or the orchestrator.
 
 
 def _reap(proc: subprocess.Popen) -> None:
@@ -954,7 +882,7 @@ def _reap(proc: subprocess.Popen) -> None:
 def _live_child() -> tuple[subprocess.Popen, str]:
     proc = subprocess.Popen(["sleep", "30"])
     try:
-        starttime = _proc_starttime(proc.pid)
+        starttime = proc_starttime(proc.pid)
         assert starttime is not None, f"spawned child {proc.pid} has no /proc identity"
         return proc, starttime
     except BaseException:
@@ -966,6 +894,8 @@ def test_recorded_identity_bash_and_python_agree(tmp_path):
     proc, starttime = _live_child()
     try:
         pid_file = tmp_path / "fake-child.pid"
+        publication_target = tmp_path / "direct-write-target"
+        pid_file.symlink_to(publication_target)
         subprocess.run(
             [
                 "bash",
@@ -976,7 +906,8 @@ def test_recorded_identity_bash_and_python_agree(tmp_path):
             check=True,
             timeout=30,
         )
-        assert _recorded_child(pid_file) == (proc.pid, starttime)
+        assert not pid_file.is_symlink(), "the recorder must replace, not write through, the name"
+        assert recorded_child(pid_file) == (proc.pid, starttime)
     finally:
         _reap(proc)
 
@@ -1002,7 +933,7 @@ def test_recorded_child_rejects_malformed_zero_and_non_ascii_identities(tmp_path
     pid_file = tmp_path / "fake-child.pid"
     pid_file.write_text(raw, encoding="utf-8")
     with pytest.raises(AssertionError, match="positive ASCII-decimal"):
-        _recorded_child(pid_file)
+        recorded_child(pid_file)
 
 
 def test_reap_identity_binds_a_live_child(tmp_path):
@@ -1010,13 +941,13 @@ def test_reap_identity_binds_a_live_child(tmp_path):
     try:
         pid_file = tmp_path / "fake-child.pid"
         pid_file.write_text(f"{proc.pid} {starttime}\n", encoding="utf-8")
-        assert _recorded_child(pid_file) == (proc.pid, starttime)
-        fd = _bind_recorded_child(proc.pid, starttime)
+        assert recorded_child(pid_file) == (proc.pid, starttime)
+        fd = bind_recorded_child(proc.pid, starttime)
         assert fd is not None
         try:
             signal.pidfd_send_signal(fd, 0)
         finally:
-            _kill_recorded_child(fd)
+            kill_recorded_child(fd)
     finally:
         _reap(proc)
 
@@ -1024,8 +955,8 @@ def test_reap_identity_binds_a_live_child(tmp_path):
 def test_reap_identity_returns_none_for_a_reaped_child():
     proc, starttime = _live_child()
     _reap(proc)
-    assert _proc_starttime(proc.pid) != starttime
-    assert _bind_recorded_child(proc.pid, starttime) is None
+    assert proc_starttime(proc.pid) != starttime
+    assert bind_recorded_child(proc.pid, starttime) is None
 
 
 def test_reap_identity_refuses_a_start_time_mismatch(monkeypatch):
@@ -1040,7 +971,7 @@ def test_reap_identity_refuses_a_start_time_mismatch(monkeypatch):
 
         with monkeypatch.context() as patch:
             patch.setattr(os, "pidfd_open", spy_open)
-            assert _bind_recorded_child(proc.pid, str(int(starttime) + 1)) is None
+            assert bind_recorded_child(proc.pid, str(int(starttime) + 1)) is None
         assert opened == [], "a mismatched process must not be bound"
         assert proc.poll() is None, "a mismatched process must not be signalled"
     finally:
@@ -1059,9 +990,12 @@ def test_reap_identity_closes_the_fd_when_the_pid_is_recycled_around_the_bind(mo
             real_close(fd)
 
         with monkeypatch.context() as patch:
-            patch.setattr(sys.modules[__name__], "_proc_starttime", lambda pid: next(answers))
+            # conftest, not this module: bind_recorded_child resolves proc_starttime in
+            # conftest's globals now, so a patch aimed here would silently no-op and the
+            # row would pass without ever steering the re-authentication it is about.
+            patch.setattr(conftest, "proc_starttime", lambda pid: next(answers))
             patch.setattr(os, "close", spy_close)
-            assert _bind_recorded_child(proc.pid, starttime) is None
+            assert bind_recorded_child(proc.pid, starttime) is None
         assert len(closed) == 1, "the pidfd must close after re-authentication fails"
     finally:
         _reap(proc)
@@ -1086,10 +1020,11 @@ def test_reap_identity_closes_the_fd_when_reauthentication_raises(monkeypatch):
             real_close(fd)
 
         with monkeypatch.context() as patch:
-            patch.setattr(sys.modules[__name__], "_proc_starttime", read_starttime)
+            # conftest, not this module — see the recycled-pid row above.
+            patch.setattr(conftest, "proc_starttime", read_starttime)
             patch.setattr(os, "close", spy_close)
             with pytest.raises(PermissionError):
-                _bind_recorded_child(proc.pid, starttime)
+                bind_recorded_child(proc.pid, starttime)
         assert reads == 2
         assert len(closed) == 1, "the pidfd must close when re-authentication raises"
         assert proc.poll() is None
@@ -1106,7 +1041,7 @@ def test_reap_identity_returns_none_when_pidfd_open_loses_the_process(monkeypatc
 
         with monkeypatch.context() as patch:
             patch.setattr(os, "pidfd_open", disappeared)
-            assert _bind_recorded_child(proc.pid, starttime) is None
+            assert bind_recorded_child(proc.pid, starttime) is None
         assert proc.poll() is None, "the simulated open race must not signal the child"
     finally:
         _reap(proc)
@@ -1129,15 +1064,15 @@ def test_proc_starttime_propagates_non_disappearance_and_malformed_failures(monk
     with monkeypatch.context() as patch:
         patch.setattr(Path, "read_text", read_stat)
         with pytest.raises(expected):
-            _proc_starttime(123)
+            proc_starttime(123)
 
 
 def test_kill_recorded_child_actually_kills_through_the_fd():
     proc, starttime = _live_child()
     try:
-        fd = _bind_recorded_child(proc.pid, starttime)
+        fd = bind_recorded_child(proc.pid, starttime)
         assert fd is not None
-        _kill_recorded_child(fd)
+        kill_recorded_child(fd)
         assert proc.wait(timeout=10) == -signal.SIGKILL
     finally:
         _reap(proc)
@@ -1146,7 +1081,7 @@ def test_kill_recorded_child_actually_kills_through_the_fd():
 def test_kill_recorded_child_propagates_signal_failure_and_closes_fd(monkeypatch):
     proc, starttime = _live_child()
     try:
-        fd = _bind_recorded_child(proc.pid, starttime)
+        fd = bind_recorded_child(proc.pid, starttime)
         assert fd is not None
 
         def denied(_fd: int, _sig: int) -> None:
@@ -1155,7 +1090,7 @@ def test_kill_recorded_child_propagates_signal_failure_and_closes_fd(monkeypatch
         with monkeypatch.context() as patch:
             patch.setattr(signal, "pidfd_send_signal", denied)
             with pytest.raises(PermissionError):
-                _kill_recorded_child(fd)
+                kill_recorded_child(fd)
         with pytest.raises(OSError) as excinfo:
             os.fstat(fd)
         assert excinfo.value.errno == errno.EBADF
@@ -1172,7 +1107,7 @@ def test_kill_recorded_child_ignores_disappearance_and_closes_fd(monkeypatch):
 
     with monkeypatch.context() as patch:
         patch.setattr(signal, "pidfd_send_signal", disappeared)
-        _kill_recorded_child(fd)
+        kill_recorded_child(fd)
     with pytest.raises(OSError) as excinfo:
         os.fstat(fd)
     assert excinfo.value.errno == errno.EBADF
@@ -1192,7 +1127,7 @@ def test_live_child_reaps_its_process_when_identity_observation_fails(monkeypatc
 
     with monkeypatch.context() as patch:
         patch.setattr(subprocess, "Popen", spy_popen)
-        patch.setattr(sys.modules[__name__], "_proc_starttime", denied)
+        patch.setattr(sys.modules[__name__], "proc_starttime", denied)
         with pytest.raises(PermissionError):
             _live_child()
     assert len(spawned) == 1
@@ -1209,9 +1144,9 @@ def test_reap_identity_fails_loudly_when_pidfd_is_unsupported(monkeypatch):
         with monkeypatch.context() as patch:
             patch.setattr(os, "pidfd_open", unsupported)
             with pytest.raises(OSError) as bind_error:
-                _bind_recorded_child(proc.pid, starttime)
+                bind_recorded_child(proc.pid, starttime)
             with pytest.raises(OSError) as preflight_error:
-                _preflight_pidfd_support()
+                preflight_pidfd_support()
         assert bind_error.value.errno == errno.ENOSYS
         assert preflight_error.value.errno == errno.ENOSYS
 
@@ -1224,13 +1159,221 @@ def test_reap_identity_fails_loudly_when_pidfd_is_unsupported(monkeypatch):
         with monkeypatch.context() as patch:
             patch.setattr(signal, "pidfd_send_signal", blocked_signal)
             with pytest.raises(PermissionError):
-                _preflight_pidfd_support()
+                preflight_pidfd_support()
         assert len(preflight_fds) == 1
         with pytest.raises(OSError) as excinfo:
             os.fstat(preflight_fds[0])
         assert excinfo.value.errno == errno.EBADF
     finally:
         _reap(proc)
+
+
+def _plant_recorded_identity(root: Path, raw: str, task: str = "t0") -> Path:
+    """Write ``raw`` where a fake CLI would record ``task``'s child identity.
+
+    ``task`` is a parameter because the sweeper's central promise is that ONE bad
+    file does not end the sweep; proving that needs two identities under one root,
+    and `sorted()` over the glob makes the task-dir name the sweep order.
+    """
+    pid_file = root / ".bmad-loop" / "runs" / "r0" / "tasks" / task / "fake-child.pid"
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    pid_file.write_text(raw, encoding="utf-8")
+    return pid_file
+
+
+def _warned_paths(record) -> str:
+    return "\n".join(str(w.message) for w in record)
+
+
+def test_recorded_children_swept_leaves_a_clean_block_alone(tmp_path):
+    proc, starttime = _live_child()
+    try:
+        _plant_recorded_identity(tmp_path, f"{proc.pid} {starttime}\n")
+        with recorded_children_swept(tmp_path):
+            pass
+        assert proc.poll() is None, "a clean exit must leave the fd owner's child alone"
+    finally:
+        _reap(proc)
+
+
+def test_recorded_children_swept_reaps_a_recorded_child_and_reraises(tmp_path):
+    proc, starttime = _live_child()
+    try:
+        _plant_recorded_identity(tmp_path, f"{proc.pid} {starttime}\n")
+        with pytest.raises(RuntimeError, match="pre-bind boom"):
+            with recorded_children_swept(tmp_path):
+                raise RuntimeError("pre-bind boom")
+        assert proc.wait(timeout=10) == -signal.SIGKILL
+    finally:
+        _reap(proc)
+
+
+def test_recorded_children_swept_warns_past_a_malformed_identity_and_keeps_sweeping(tmp_path):
+    """One unparseable file must not end the sweep, nor get its number signalled.
+
+    Two identities under one root, ordered by task dir so the malformed one is swept
+    FIRST: `t0` holds bytes no parser accepts while a live process sits at that very
+    number, and `t1` holds a valid live identity. The `t1` reap is what proves the
+    loop reached past the failure — asserting only that `t0`'s process survived would
+    pass just as well if the glob had matched nothing at all.
+    """
+    doomed, doomed_start = _live_child()
+    survivor, _survivor_start = _live_child()
+    try:
+        bad = _plant_recorded_identity(tmp_path, f"{survivor.pid} garbage\n", task="t0")
+        _plant_recorded_identity(tmp_path, f"{doomed.pid} {doomed_start}\n", task="t1")
+        with pytest.warns(UserWarning, match="unauthenticated survivor") as record:
+            with pytest.raises(RuntimeError, match="pre-bind boom"):
+                with recorded_children_swept(tmp_path):
+                    raise RuntimeError("pre-bind boom")
+        assert doomed.wait(timeout=10) == -signal.SIGKILL, "the sweep stopped at the bad file"
+        assert survivor.poll() is None, "an unparseable identity must not be signalled"
+        assert str(bad) in _warned_paths(record), _warned_paths(record)
+    finally:
+        _reap(doomed)
+        _reap(survivor)
+
+
+def test_recorded_children_swept_never_signals_a_stale_start_time(tmp_path):
+    """A start-time mismatch refuses the bind — silently, since nothing failed to parse.
+
+    The second, valid identity is the control: it is reaped, so the sweep demonstrably
+    ran and reached these files, which a bare "the stale process is still alive" check
+    could not distinguish from a glob that matched nothing.
+    """
+    stale, stale_start = _live_child()
+    doomed, doomed_start = _live_child()
+    try:
+        _plant_recorded_identity(tmp_path, f"{stale.pid} {int(stale_start) + 1}\n", task="t0")
+        _plant_recorded_identity(tmp_path, f"{doomed.pid} {doomed_start}\n", task="t1")
+        with pytest.raises(RuntimeError, match="pre-bind boom"):
+            with recorded_children_swept(tmp_path):
+                raise RuntimeError("pre-bind boom")
+        assert doomed.wait(timeout=10) == -signal.SIGKILL, "the sweep never reached the files"
+        assert stale.poll() is None, "a start-time mismatch must refuse the bind, not kill"
+    finally:
+        _reap(stale)
+        _reap(doomed)
+
+
+def test_recorded_children_swept_warns_when_the_bind_itself_fails(tmp_path, monkeypatch):
+    """The OSError arm: a parseable identity whose bind raises something that is NOT
+    proven disappearance. Without this row the handler could narrow to AssertionError
+    alone and every other sweeper row would stay green."""
+    proc, starttime = _live_child()
+    try:
+        pid_file = _plant_recorded_identity(tmp_path, f"{proc.pid} {starttime}\n")
+
+        def unsupported(_pid: int) -> int:
+            raise OSError(errno.ENOSYS, "pidfd_open not supported")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "pidfd_open", unsupported)
+            with pytest.warns(UserWarning, match="unauthenticated survivor") as record:
+                with pytest.raises(RuntimeError, match="pre-bind boom"):
+                    with recorded_children_swept(tmp_path):
+                        raise RuntimeError("pre-bind boom")
+        assert str(pid_file) in _warned_paths(record), _warned_paths(record)
+        assert proc.poll() is None, "a failed bind must not fall back to signalling the pid"
+    finally:
+        _reap(proc)
+
+
+def test_recorded_children_swept_warns_past_undecodable_bytes_and_keeps_sweeping(tmp_path):
+    """A non-UTF-8 record raises UnicodeDecodeError out of `read_text`, not
+    AssertionError — a handler listing only parse-shaped types would let it REPLACE
+    the in-flight exception and abandon every later file."""
+    doomed, doomed_start = _live_child()
+    try:
+        bad = tmp_path / ".bmad-loop" / "runs" / "r0" / "tasks" / "t0" / "fake-child.pid"
+        bad.parent.mkdir(parents=True, exist_ok=True)
+        bad.write_bytes(b"\xff\xfe 123\n")
+        _plant_recorded_identity(tmp_path, f"{doomed.pid} {doomed_start}\n", task="t1")
+        with pytest.warns(UserWarning, match="unauthenticated survivor") as record:
+            with pytest.raises(RuntimeError, match="pre-bind boom"):
+                with recorded_children_swept(tmp_path):
+                    raise RuntimeError("pre-bind boom")
+        assert doomed.wait(timeout=10) == -signal.SIGKILL, "the sweep stopped at the bad file"
+        assert str(bad) in _warned_paths(record), _warned_paths(record)
+    finally:
+        _reap(doomed)
+
+
+def test_recorded_children_swept_keeps_the_original_error_when_warnings_are_errors(tmp_path):
+    doomed, doomed_start = _live_child()
+    try:
+        _plant_recorded_identity(tmp_path, "garbage\n", task="t0")
+        _plant_recorded_identity(tmp_path, f"{doomed.pid} {doomed_start}\n", task="t1")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(RuntimeError, match="pre-bind boom"):
+                with recorded_children_swept(tmp_path):
+                    raise RuntimeError("pre-bind boom")
+        assert doomed.wait(timeout=10) == -signal.SIGKILL, "warning failure stopped the sweep"
+    finally:
+        _reap(doomed)
+
+
+def test_recorded_children_swept_warns_past_signal_failure_and_keeps_sweeping(
+    tmp_path, monkeypatch
+):
+    survivor, survivor_start = _live_child()
+    doomed, doomed_start = _live_child()
+    try:
+        first = _plant_recorded_identity(tmp_path, f"{survivor.pid} {survivor_start}\n", task="t0")
+        _plant_recorded_identity(tmp_path, f"{doomed.pid} {doomed_start}\n", task="t1")
+        real_send_signal = signal.pidfd_send_signal
+        calls = 0
+
+        def fail_first_signal(fd: int, sig: int) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise PermissionError(errno.EPERM, "denied")
+            real_send_signal(fd, sig)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(signal, "pidfd_send_signal", fail_first_signal)
+            with pytest.warns(UserWarning, match="unauthenticated survivor") as record:
+                with pytest.raises(RuntimeError, match="pre-bind boom"):
+                    with recorded_children_swept(tmp_path):
+                        raise RuntimeError("pre-bind boom")
+        assert calls == 2
+        assert str(first) in _warned_paths(record), _warned_paths(record)
+        assert survivor.poll() is None, "failed signalling must not imply disappearance"
+        assert doomed.wait(timeout=10) == -signal.SIGKILL, "signal failure stopped the sweep"
+    finally:
+        _reap(survivor)
+        _reap(doomed)
+
+
+def test_recorded_children_swept_preserves_partial_glob_results(tmp_path, monkeypatch):
+    doomed, doomed_start = _live_child()
+    try:
+        pid_file = _plant_recorded_identity(tmp_path, f"{doomed.pid} {doomed_start}\n")
+        real_glob = Path.glob
+
+        def interrupted_glob(path: Path, pattern: str):
+            if path == tmp_path and pattern == RECORDED_CHILD_GLOB:
+                yield pid_file
+                raise OSError(errno.EIO, "traversal interrupted")
+            yield from real_glob(path, pattern)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "glob", interrupted_glob)
+            with pytest.warns(UserWarning, match="traversal interrupted"):
+                with pytest.raises(RuntimeError, match="pre-bind boom"):
+                    with recorded_children_swept(tmp_path):
+                        raise RuntimeError("pre-bind boom")
+        assert doomed.wait(timeout=10) == -signal.SIGKILL
+    finally:
+        _reap(doomed)
+
+
+def test_recorded_children_swept_is_a_noop_without_identity_files(tmp_path):
+    with pytest.raises(RuntimeError, match="pre-bind boom"):
+        with recorded_children_swept(tmp_path):
+            raise RuntimeError("pre-bind boom")
 
 
 @pytest.mark.parametrize(
@@ -1253,11 +1396,43 @@ def test_reap_e2e_preflight_failure_prevents_run(tmp_path, monkeypatch, surface_
 
     with monkeypatch.context() as patch:
         patch.setattr(sys.modules[__name__], "_scaffold_sprint", lambda *_args, **_kwargs: None)
-        patch.setattr(sys.modules[__name__], "_preflight_pidfd_support", unsupported)
+        patch.setattr(sys.modules[__name__], "preflight_pidfd_support", unsupported)
         patch.setattr(sys.modules[__name__], "_run", unexpected_run)
         with pytest.raises(OSError, match="pidfd unavailable"):
             globals()[surface_name](tmp_path, monkeypatch, False)
     assert not run_called
+
+
+@pytest.mark.parametrize(
+    "surface_name",
+    [
+        "test_e2e_session_timeout_teardown",
+        "test_e2e_detached_writer_reaped_before_worktree_teardown",
+    ],
+)
+def test_reap_e2e_sweeps_a_recorded_child_when_the_run_fails(tmp_path, monkeypatch, surface_name):
+    """DW-137: a failure anywhere in the pre-bind window must not leak the child.
+
+    Both surfaces spawn their fake child inside `_run` but can only bind a pidfd after
+    the run directory and its `fake-child.pid` are discovered. Driving `_run` straight
+    into a raise reproduces that window exactly; delete either `recorded_children_swept`
+    wrap and the planted child survives this row.
+    """
+    proc, starttime = _live_child()
+    try:
+        _plant_recorded_identity(tmp_path / "sbx", f"{proc.pid} {starttime}\n")
+
+        def failing_run(*_args, **_kwargs):
+            raise RuntimeError("run refused")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(sys.modules[__name__], "_scaffold_sprint", lambda *_a, **_kw: None)
+            patch.setattr(sys.modules[__name__], "_run", failing_run)
+            with pytest.raises(RuntimeError, match="run refused"):
+                globals()[surface_name](tmp_path, monkeypatch, False)
+        assert proc.wait(timeout=10) == -signal.SIGKILL
+    finally:
+        _reap(proc)
 
 
 def _tmux_has_session(name: str) -> bool:
@@ -1284,53 +1459,72 @@ def test_e2e_session_timeout_teardown(tmp_path, monkeypatch, force_live_reap_ass
     # inherited by the `bmad-loop run` subprocess (_run passes no env=)
     monkeypatch.setenv("BMAD_LOOP_SESSION_TIMEOUT_S", "3")
 
-    _preflight_pidfd_support()
-    proc = _run(root, "run", timeout=90)
-    assert proc.returncode == 0, proc.stderr or proc.stdout
-
-    run_id = _run_id(root)
-    run_dir = root / ".bmad-loop" / "runs" / run_id
-
-    # (1) session-end status=timeout, journaled promptly, with the fire forensics
-    journal = [
-        json.loads(ln)
-        for ln in (run_dir / "journal.jsonl").read_text(encoding="utf-8").splitlines()
-        if ln.strip()
-    ]
-    ends = [j for j in journal if j["kind"] == "session-end" and j.get("status") == "timeout"]
-    assert ends, f"no session-end status=timeout: {[j['kind'] for j in journal]}"
-    end = ends[0]
-    assert end.get("fired_at"), end
-    assert end["teardown_s"] < 15.0, f"teardown gap not small (kill hung?): {end['teardown_s']}"
-    assert end.get("expired_clock") in ("monotonic", "wall", "both"), end
-    task_id = end["task_id"]
-
-    tdir = run_dir / "tasks" / task_id
-    pid_file = tdir / "fake-child.pid"
-    assert pid_file.is_file(), "fake CLI never recorded its sleep child"
-    recorded_pid, recorded_start = _recorded_child(pid_file)
+    preflight_pidfd_support()
+    # Initialized BEFORE the try so the finally below stays correct no matter how
+    # early the setup region raises.
     recorded_fd: int | None = None
     poll_fd: int | None = None
     injected_child: subprocess.Popen | None = None
     poll_failure: AssertionError | None = None
     injected_exit: int | None = None
     try:
-        recorded_fd = _bind_recorded_child(recorded_pid, recorded_start)
-        if recorded_fd is None:
-            assert _proc_starttime(recorded_pid) != recorded_start, (
-                f"bind returned None while pid {recorded_pid} still carries the recorded start "
-                f"time {recorded_start}: the reap poll would be skipped without evidence"
+        # Everything up to the bind is the pre-bind window: the fake CLI's child is
+        # already running but no fd names it yet, so a `_run` timeout or any assertion
+        # in here would leave it alive and uncleanable. The sweeper rediscovers and
+        # authenticates the recorded identities from disk on the way out.
+        with recorded_children_swept(root):
+            proc = _run(root, "run", timeout=90)
+            assert proc.returncode == 0, proc.stderr or proc.stdout
+
+            run_id = _run_id(root)
+            run_dir = root / ".bmad-loop" / "runs" / run_id
+
+            # (1) session-end status=timeout, journaled promptly, with the fire forensics
+            journal = [
+                json.loads(ln)
+                for ln in (run_dir / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+                if ln.strip()
+            ]
+            ends = [
+                j for j in journal if j["kind"] == "session-end" and j.get("status") == "timeout"
+            ]
+            assert ends, f"no session-end status=timeout: {[j['kind'] for j in journal]}"
+            end = ends[0]
+            assert end.get("fired_at"), end
+            assert (
+                end["teardown_s"] < 15.0
+            ), f"teardown gap not small (kill hung?): {end['teardown_s']}"
+            assert end.get("expired_clock") in ("monotonic", "wall", "both"), end
+            task_id = end["task_id"]
+
+            tdir = run_dir / "tasks" / task_id
+            pid_file = tdir / "fake-child.pid"
+            assert pid_file.is_file(), "fake CLI never recorded its sleep child"
+            # The fake builds this path from $BMAD_LOOP_RUN_DIR/$BMAD_LOOP_TASK_ID
+            # while the sweeper rediscovers it through RECORDED_CHILD_GLOB. Pin the
+            # two together: a producer-side layout change would otherwise make the
+            # sweeper a silent no-op with every row still green.
+            assert pid_file in set(root.glob(RECORDED_CHILD_GLOB)), (
+                f"{pid_file} is outside RECORDED_CHILD_GLOB ({RECORDED_CHILD_GLOB}), so the "
+                f"pre-bind sweeper could never find it"
             )
+            recorded_pid, recorded_start = recorded_child(pid_file)
+            recorded_fd = bind_recorded_child(recorded_pid, recorded_start)
+            if recorded_fd is None:
+                assert proc_starttime(recorded_pid) != recorded_start, (
+                    f"bind returned None while pid {recorded_pid} still carries the recorded "
+                    f"start time {recorded_start}: the reap poll would be skipped without evidence"
+                )
 
         poll_pid = recorded_pid
         if force_live_reap_assertion:
             # Verify the real fake-CLI child first. If it is still signalable, safely
             # clean that exact process before substituting the fault-injection child.
             real_fd, recorded_fd = recorded_fd, None
-            _kill_recorded_child(real_fd)
+            kill_recorded_child(real_fd)
             injected_child, injected_start = _live_child()
             poll_pid = injected_child.pid
-            poll_fd = _bind_recorded_child(poll_pid, injected_start)
+            poll_fd = bind_recorded_child(poll_pid, injected_start)
             assert poll_fd is not None, "the forced-live child must bind before the reap poll"
         else:
             poll_fd, recorded_fd = recorded_fd, None
@@ -1379,11 +1573,11 @@ def test_e2e_session_timeout_teardown(tmp_path, monkeypatch, force_live_reap_ass
     finally:
         try:
             try:
-                _kill_recorded_child(poll_fd)
+                kill_recorded_child(poll_fd)
                 if injected_child is not None:
                     injected_exit = injected_child.wait(timeout=10)
             finally:
-                _kill_recorded_child(recorded_fd)
+                kill_recorded_child(recorded_fd)
         finally:
             if injected_child is not None and injected_child.poll() is None:
                 _reap(injected_child)
@@ -1416,37 +1610,48 @@ def test_e2e_detached_writer_reaped_before_worktree_teardown(
             "[limits]\nmax_dev_attempts = 1\nteardown_grace_s = 10\n"
         ),
     )
-    _preflight_pidfd_support()
-    proc = _run(root, "run", timeout=120)
-    assert proc.returncode == 0, proc.stderr or proc.stdout
-
-    run_id = _run_id(root)
-    run_dir = root / ".bmad-loop" / "runs" / run_id
-    pid_files = list((run_dir / "tasks").glob("*/fake-child.pid"))
-    assert pid_files, "fake CLI never recorded its setsid child"
-    recorded_pid, recorded_start = _recorded_child(pid_files[0])
+    preflight_pidfd_support()
+    # Initialized BEFORE the try so the finally below stays correct no matter how
+    # early the setup region raises.
     recorded_fd: int | None = None
     poll_fd: int | None = None
     injected_child: subprocess.Popen | None = None
     poll_failure: AssertionError | None = None
     injected_exit: int | None = None
     try:
-        recorded_fd = _bind_recorded_child(recorded_pid, recorded_start)
-        if recorded_fd is None:
-            assert _proc_starttime(recorded_pid) != recorded_start, (
-                f"bind returned None while pid {recorded_pid} still carries the recorded "
-                f"start time {recorded_start}: the reap poll would be skipped blind"
+        # The pre-bind window: the setsid'd straggler exists but no fd names it until
+        # the glob below finds its identity file, so a `_run` timeout or a missing
+        # record used to leak it. The sweeper covers exactly that stretch.
+        with recorded_children_swept(root):
+            proc = _run(root, "run", timeout=120)
+            assert proc.returncode == 0, proc.stderr or proc.stdout
+
+            run_id = _run_id(root)
+            run_dir = root / ".bmad-loop" / "runs" / run_id
+            pid_files = list((run_dir / "tasks").glob("*/fake-child.pid"))
+            assert pid_files, "fake CLI never recorded its setsid child"
+            # Same producer/consumer pin as the timeout E2E above.
+            assert pid_files[0] in set(root.glob(RECORDED_CHILD_GLOB)), (
+                f"{pid_files[0]} is outside RECORDED_CHILD_GLOB ({RECORDED_CHILD_GLOB}), so the "
+                f"pre-bind sweeper could never find it"
             )
+            recorded_pid, recorded_start = recorded_child(pid_files[0])
+            recorded_fd = bind_recorded_child(recorded_pid, recorded_start)
+            if recorded_fd is None:
+                assert proc_starttime(recorded_pid) != recorded_start, (
+                    f"bind returned None while pid {recorded_pid} still carries the recorded "
+                    f"start time {recorded_start}: the reap poll would be skipped blind"
+                )
 
         poll_pid = recorded_pid
         if force_live_reap_assertion:
             # Verify or safely clean the real straggler before the injected child takes
             # over the protected poll; keep the two identities distinct throughout.
             real_fd, recorded_fd = recorded_fd, None
-            _kill_recorded_child(real_fd)
+            kill_recorded_child(real_fd)
             injected_child, injected_start = _live_child()
             poll_pid = injected_child.pid
-            poll_fd = _bind_recorded_child(poll_pid, injected_start)
+            poll_fd = bind_recorded_child(poll_pid, injected_start)
             assert poll_fd is not None, "the forced-live child must bind before the reap poll"
         else:
             poll_fd, recorded_fd = recorded_fd, None
@@ -1499,11 +1704,11 @@ def test_e2e_detached_writer_reaped_before_worktree_teardown(
     finally:
         try:
             try:
-                _kill_recorded_child(poll_fd)
+                kill_recorded_child(poll_fd)
                 if injected_child is not None:
                     injected_exit = injected_child.wait(timeout=10)
             finally:
-                _kill_recorded_child(recorded_fd)
+                kill_recorded_child(recorded_fd)
         finally:
             if injected_child is not None and injected_child.poll() is None:
                 _reap(injected_child)
