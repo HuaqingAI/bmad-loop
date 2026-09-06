@@ -4078,8 +4078,9 @@ def _redrive_spec_status(state: RunState, task: StoryTask, *, isolated_redrive: 
 def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
     """Re-point a paused run's persisted code-root mirror at `repo_root` — the tree
     the caller is about to act in — and return the warning an operator must see when
-    that MOVED a root the run had recorded (`None` when it already agreed, or when the
-    run predates the field).
+    that MOVED a root the run had recorded (`None` when it already agreed, when the run
+    predates the field, or when this call only discharged a record an earlier call's
+    move still owed).
 
     Exists because `rearm_escalation` reads that mirror OUT OF PROCESS
     (`RunState.code_root`) and has no `ProjectPaths` to consult, while `repo_root:` is
@@ -4097,13 +4098,22 @@ def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
 
     The message names neither tree, like resume's: what an operator needs is that the
     run has changed repositories, and the paths are the half that would put an
-    attacker-controlled string on their terminal.
+    attacker-controlled string on their terminal. It names a move THIS call made, never
+    a record merely owed by an earlier one — `cli._prepare_resume_locked` draws the same
+    line on the same seam, so the re-arm surfaces and plain `resume` agree about when an
+    operator is warned.
     """
     with state_lock(run_dir):
         state = load_state(run_dir)
         new = str(repo_root)
         if state.repo_root == new and not state.code_root_restamp_pending:
             return None
+        # Whether THIS call re-pointed a root the run had RECORDED — deliberately not
+        # "re-pointed the field", which the empty→`new` legacy migration below also
+        # does: `bool(state.repo_root)` excludes that migration by design, because a
+        # missing value is not a divergent one. Distinct from the marker below, which
+        # only says a record is OWED — for this call's move or an earlier one's.
+        moved = False
         if state.repo_root != new:
             # Discharge an OWED record before the root it names is overwritten.
             # The marker is a bare bool, so the only surviving description of the
@@ -4146,6 +4156,12 @@ def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
         # diagnose registry (`diagnostics._JOURNAL_DROP_FIELDS`), so the path never
         # reaches a dump.
         #
+        # This line is ALSO reached with nothing moved, discharging a record owed by an
+        # EARLIER call's move whose own append failed; the boolean reports THIS call, so
+        # that path writes `false`. The marker is a record debt, not a move, and the row
+        # that settles it may not assert one — resume's `run-resume` boolean already
+        # reads `false` in the same state.
+        #
         # AFTER the persisted move, never before it: a record written first would
         # assert a completed move that a failed save then never made. And the
         # marker is cleared only once the append has returned: an append that
@@ -4161,10 +4177,17 @@ def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
         Journal(run_dir).append(
             "rearm-code-root-restamped",
             repo=new,
-            code_root_changed=True,
+            code_root_changed=moved,
         )
         state.code_root_restamp_pending = False
         save_state(run_dir, state)
+    # Sits with the existing return below so the two exits read as one decision about
+    # what the caller is told. Reached only via the discharge above: the record was
+    # owed by an EARLIER call's move and has now landed, but nothing moved here, so
+    # there is nothing to warn an operator about — the same answer
+    # `cli._prepare_resume_locked` gives.
+    if not moved:
+        return None
     return (
         f"run {run_dir.name}: the code root in _bmad/bmm/config.yaml has changed since "
         "this run started — the re-drive works in the tree configured now, while the "
