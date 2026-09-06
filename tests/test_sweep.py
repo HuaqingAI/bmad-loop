@@ -8689,3 +8689,247 @@ def test_bundle_restart_arm_anchors_spec_ownership_before_it_discards_the_mount(
 
     assert seen["spec_file"] == str(unit.path / "_bmad-output/accepted.md")
     assert seen["dispatched_spec_file"] == str(unit.path / "_bmad-output/dispatched.md")
+
+
+# ------------- terminal-key / dw_ids agreement on a resume (DW-125)
+#
+# `_run_bundle`'s terminal-task early return used to compare the KEY alone, and
+# the key is a pure function of `(name, cycle)`. Lose `<run>/triage.json` on a
+# resume and `_ensure_triage` regenerates a plan whose bundle names are
+# re-authored freely — so a fresh bundle that happened to reuse a finished
+# bundle's name was silently swallowed with its ids never run.
+# `_materialize_bundles`' uniqueness pass cannot see this: it compares names
+# against THIS cycle's list, never against persisted state. The guard now tests
+# the persisted task's `dw_ids` and suffixes the NAME on divergence.
+
+
+def _bundle_task(engine, key: str, dw_ids, phase=Phase.DONE) -> StoryTask:
+    task = StoryTask(story_key=key, epic=0, dw_ids=list(dw_ids), phase=phase)
+    engine.state.tasks[key] = task
+    return task
+
+
+def _stub_run_story(engine, monkeypatch) -> list[StoryTask]:
+    """Record dispatches without spending a session — these rows are about
+    naming, not about what the dev leg then does."""
+    dispatched: list[StoryTask] = []
+    monkeypatch.setattr(engine, "_run_story", dispatched.append)
+    return dispatched
+
+
+@pytest.mark.parametrize(
+    "persisted",
+    [["DW-1", "DW-2"], ["DW-2", "DW-1"], []],
+    ids=["same-ids", "reordered-ids", "legacy-empty"],
+)
+def test_run_bundle_skips_terminal_task_whose_dw_ids_agree(project, monkeypatch, persisted):
+    """Agreement is SET equality, so a regenerated plan that reorders the same
+    ids is still the same bundle and is still skipped — treating it as new would
+    re-run finished work on every cache-loss resume. An EMPTY persisted list is
+    the pre-`dw_ids` `state.json` shape (`model.py` loads a missing key as `[]`)
+    and agrees with anything, so no paused legacy run needs migrating."""
+    write_ledger(project, {"DW-1": "done 2026-06-11", "DW-2": "done 2026-06-11"})
+    engine, adapter = make_sweep(project, [])
+    _bundle_task(engine, "dw-fix", persisted)
+    dispatched = _stub_run_story(engine, monkeypatch)
+
+    key = engine._run_bundle(Bundle(name="fix", dw_ids=("DW-1", "DW-2"), intent="i"), 1)
+
+    assert key == "dw-fix"
+    assert list(engine.state.tasks) == ["dw-fix"]  # no second task minted
+    assert not dispatched and not adapter.sessions
+    kinds = {e["kind"] for e in engine.journal.entries()}
+    assert "bundle-start" not in kinds and "sweep-bundle-key-deduped" not in kinds
+
+
+def test_run_bundle_dedupes_when_a_terminal_task_holds_the_key_for_other_ids(project, monkeypatch):
+    """Ablation: restore the key-only early return and this fails at `key` —
+    the bundle is skipped, `dw-fix-2` never exists and DW-2 never runs."""
+    write_ledger(project, {"DW-1": "done 2026-06-11", "DW-2": "open"})
+    engine, _ = make_sweep(project, [])
+    _bundle_task(engine, "dw-fix", ["DW-1"])
+    dispatched = _stub_run_story(engine, monkeypatch)
+
+    key = engine._run_bundle(Bundle(name="fix", dw_ids=("DW-2",), intent="second"), 1)
+
+    assert key == "dw-fix-2"
+    assert dispatched == [engine.state.tasks["dw-fix-2"]]
+    assert engine.state.tasks["dw-fix-2"].dw_ids == ["DW-2"]
+    assert engine.state.tasks["dw-fix"].dw_ids == ["DW-1"]  # the finished one untouched
+    # the intent DOCUMENT has to agree with the directory and with the name
+    # `_ensure_bundle_intent` recovers back out of the story key
+    intent = engine.run_dir / "bundles" / "fix-2" / "intent.md"
+    text = intent.read_text(encoding="utf-8")
+    assert "# Deferred-work bundle: fix-2" in text and "bundle_name: fix-2" in text
+    assert engine.state.tasks["dw-fix-2"].bundle_file == str(intent)
+    (rec,) = _records(engine, "sweep-bundle-key-deduped")
+    assert rec["original"] == "fix" and rec["name"] == "fix-2"
+    assert rec["attempt"] == 2 and rec["dw_ids"] == ["DW-2"]
+    (start,) = _records(engine, "bundle-start")
+    assert start["story_key"] == "dw-fix-2"
+
+
+def test_run_bundle_skips_a_deduped_key_without_re_announcing_the_rename(project, monkeypatch):
+    """The ordinary SECOND resume: `dw-fix` is terminal with divergent ids and
+    the deduped `dw-fix-2` is terminal with agreeing ids, so the bundle is
+    skipped as already-finished. The rename record belongs to the run that
+    actually took the name — journaling it in the resolver re-announced it once
+    per resume for a bundle nothing renamed.
+
+    Ablation: move the `sweep-bundle-key-deduped` append back above
+    `_run_bundle`'s terminal early return and the no-record assertion fails."""
+    write_ledger(project, {"DW-1": "done 2026-06-11", "DW-2": "done 2026-06-11"})
+    engine, adapter = make_sweep(project, [])
+    _bundle_task(engine, "dw-fix", ["DW-1"])
+    _bundle_task(engine, "dw-fix-2", ["DW-2"])
+    dispatched = _stub_run_story(engine, monkeypatch)
+
+    key = engine._run_bundle(Bundle(name="fix", dw_ids=("DW-2",), intent="second"), 1)
+
+    assert key == "dw-fix-2"
+    assert not dispatched and not adapter.sessions
+    # `entries()` rather than `_records`: a skip this total journals NOTHING, so
+    # journal.jsonl does not exist and the raw-file helper would fault on the read
+    kinds = {e["kind"] for e in engine.journal.entries()}
+    assert "sweep-bundle-key-deduped" not in kinds and "bundle-start" not in kinds
+
+
+def test_run_bundle_dedupe_keeps_the_cycle_n_key_and_dirname_shape(project, monkeypatch):
+    write_ledger(project, {"DW-1": "done 2026-06-11", "DW-2": "open"})
+    engine, _ = make_sweep(project, [])
+    _bundle_task(engine, "dw3-fix", ["DW-1"])
+    _stub_run_story(engine, monkeypatch)
+
+    key = engine._run_bundle(Bundle(name="fix", dw_ids=("DW-2",), intent="second"), 3)
+
+    assert key == "dw3-fix-2"
+    intent = engine.run_dir / "bundles" / "c3-fix-2" / "intent.md"
+    assert "bundle_name: fix-2" in intent.read_text(encoding="utf-8")
+    # deduping the NAME (not the key alone) is what keeps this round-trip correct
+    match = BUNDLE_KEY_RE.match(key)
+    assert match is not None and match.group(1) == "3" and match.group(2) == "fix-2"
+
+
+def test_run_bundle_leaves_a_non_terminal_task_to_the_inflight_recovery(project, monkeypatch):
+    """The guard is deliberately scoped to TERMINAL tasks: an in-flight task at
+    the key still goes down `_recover_inflight_bundle` exactly as before, ids
+    agreeing or not."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    engine, _ = make_sweep(project, [])
+    _bundle_task(engine, "dw-fix", ["DW-1"], phase=Phase.DEV_RUNNING)
+    dispatched = _stub_run_story(engine, monkeypatch)
+
+    key = engine._run_bundle(Bundle(name="fix", dw_ids=("DW-2",), intent="second"), 1)
+
+    assert key == "dw-fix" and "dw-fix-2" not in engine.state.tasks
+    assert dispatched == [engine.state.tasks["dw-fix"]]
+    assert engine.state.tasks["dw-fix"].phase == Phase.PENDING  # reset by the recovery
+    assert not _records(engine, "sweep-bundle-key-deduped")
+    assert (engine.run_dir / "bundles" / "fix" / "intent.md").is_file()
+
+
+def test_run_bundle_refuses_when_every_candidate_key_is_taken(project, monkeypatch):
+    """The suffix search is bounded at 2-9 so it is provably finite. Exhausting
+    it is loud on both surfaces and mints nothing — the ids stay open for the
+    next sweep rather than being swallowed by a key that is not theirs.
+
+    Ablation: drop the `sweep-bundle-key-collision` append and the record
+    assertion fails at zero entries; drop the `gates.notify` and ATTENTION is
+    never written."""
+    write_ledger(project, {"DW-9": "open"})
+    engine, _ = make_sweep(project, [])
+    for name in ["fix"] + [f"fix-{n}" for n in range(2, 10)]:
+        _bundle_task(engine, f"dw-{name}", ["DW-1"])
+    dispatched = _stub_run_story(engine, monkeypatch)
+    before = set(engine.state.tasks)
+
+    key = engine._run_bundle(Bundle(name="fix", dw_ids=("DW-9",), intent="ninth"), 1)
+
+    assert key is None and not dispatched
+    assert set(engine.state.tasks) == before  # no task minted
+    (rec,) = _records(engine, "sweep-bundle-key-collision")
+    assert rec["name"] == "fix" and rec["dw_ids"] == ["DW-9"]
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    # the KEYS, not the bare name: from cycle 2 they carry a `dw<N>-` prefix, so
+    # a name-only message names nothing the operator can find in state.json
+    assert "'fix'" in attention and "DW-9" in attention
+    assert "dw-fix through dw-fix-9" in attention and "cycle 1" in attention
+    assert not _records(engine, "sweep-bundle-key-deduped")
+
+
+def test_cycle_survives_a_bundle_that_could_not_be_named(project):
+    """`bundles_done` grades the keys `_run_bundle` actually reports, so a bundle
+    that yielded no key is neither counted nor looked up — the old re-derivation
+    from `bundle.name` would have read the finished `dw-fix` task instead."""
+    write_ledger(project, {"DW-9": "open"})
+    plan = triage_result(["DW-9"], bundles=[{"name": "fix", "dw_ids": ["DW-9"], "intent": "i"}])
+    engine, adapter = make_sweep(project, [triage_effect(plan)])
+    for name in ["fix"] + [f"fix-{n}" for n in range(2, 10)]:
+        _bundle_task(engine, f"dw-{name}", ["DW-1"])
+
+    assert engine._cycle(1, {"DW-9"}) is False  # no addressable work
+
+    assert len(adapter.sessions) == 1  # triage only; nothing dispatched for the bundle
+    assert _records(engine, "sweep-bundle-key-collision")
+    assert ledger_entries(project)["DW-9"].open
+
+
+def test_resume_with_a_lost_triage_cache_runs_a_regenerated_same_named_bundle(project):
+    """The end-to-end shape the guard exists for: a cycle-1 bundle `fix` (DW-1)
+    finishes, the run is stopped mid-cycle, and the resume loses `triage.json`.
+    The fresh triage re-authors the remaining id under the SAME name — which used
+    to hit the finished task's key and vanish. It now runs as `dw-fix-2`.
+
+    Ablation: restore the key-only early return and `dw-fix-2` is never created,
+    DW-2 stays open, and the run finishes having done nothing."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    run_dir = project.project / ".bmad-loop" / "runs" / "sweep-run"
+    plan = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[
+            {"name": "fix", "dw_ids": ["DW-1"], "intent": "first"},
+            {"name": "later", "dw_ids": ["DW-2"], "intent": "second"},
+        ],
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "fix", ["DW-1"]),
+            _lodge_after(bundle_review_effect(project, "fix"), run_dir),
+        ],
+    )
+    engine.run()
+
+    assert engine.state.tasks["dw-fix"].phase == Phase.DONE
+    assert "dw-later" not in engine.state.tasks  # the stop landed between bundles
+    assert ledger_entries(project)["DW-1"].status.startswith("done")
+
+    (run_dir / "triage.json").unlink()  # the cache the resume would have reloaded
+    regenerated = triage_result(
+        ["DW-2"], bundles=[{"name": "fix", "dw_ids": ["DW-2"], "intent": "second"}]
+    )
+    resumed, _ = resume_sweep(
+        project,
+        engine,
+        [
+            triage_effect(regenerated),
+            bundle_dev_effect(project, "fix-2", ["DW-2"]),
+            bundle_review_effect(project, "fix-2"),
+        ],
+    )
+    summary = resumed.run()
+
+    assert not summary.paused
+    assert resumed.state.tasks["dw-fix-2"].phase == Phase.DONE
+    assert resumed.state.tasks["dw-fix-2"].dw_ids == ["DW-2"]
+    assert ledger_entries(project)["DW-2"].status.startswith("done")
+    # the already-finished bundle keeps its key, its ids and its phase
+    assert resumed.state.tasks["dw-fix"].phase == Phase.DONE
+    assert resumed.state.tasks["dw-fix"].dw_ids == ["DW-1"]
+    (rec,) = _records(resumed, "sweep-bundle-key-deduped")
+    assert rec["original"] == "fix" and rec["name"] == "fix-2"
+    assert "bundle_name: fix-2" in (run_dir / "bundles" / "fix-2" / "intent.md").read_text(
+        encoding="utf-8"
+    )
+    assert worktree_clean(project.project)

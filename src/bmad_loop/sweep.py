@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -962,6 +962,7 @@ class SweepEngine(Engine):
             self._prune_pre_answers()
             self._emit("post_sweep_cycle", phase=str(cycle))
             return False
+        graded_keys: list[str] = []
         for bundle in bundles:
             # Item boundary: a request during bundle N lets N finish through
             # commit; bundle N+1 never starts. A request landing during triage
@@ -970,12 +971,21 @@ class SweepEngine(Engine):
             # persisted, triage.json is cached, closes are idempotent, and
             # terminal tasks are skipped on re-drive.
             self._check_stop_request()
-            self._run_bundle(bundle, cycle)
-        bundles_done = sum(
-            1
-            for b in bundles
-            if self.state.tasks[self._bundle_key(b.name, cycle)].phase == Phase.DONE
-        )
+            key = self._run_bundle(bundle, cycle)
+            if key is not None:
+                graded_keys.append(key)
+        # Grade the key each bundle was actually resolved to — the one it ran
+        # under, or the terminal one it was skipped as already-finished at,
+        # which counts here exactly as it always has. What is never used is a
+        # key re-derived from `bundle.name`: since DW-125 a bundle whose own key
+        # is held by a terminal task carrying different dw_ids runs under a
+        # DEDUPED name, so the re-derived key named the wrong task — the
+        # finished one, whose DONE phase counted a bundle this cycle never ran,
+        # in both the deduped case and the name-collision drop that runs nothing
+        # at all. Reading the reported keys also keeps the lookup total: every
+        # key returned here has a task by construction, where a re-derived one
+        # need not.
+        bundles_done = sum(1 for key in graded_keys if self.state.tasks[key].phase == Phase.DONE)
         self._prune_pre_answers()
         self._emit("post_sweep_cycle", phase=str(cycle))
         return closed > 0 or decisions_closed > 0 or bundles_done > 0 or answer_dropped
@@ -1015,23 +1025,115 @@ class SweepEngine(Engine):
     def _bundle_key(self, name: str, cycle: int) -> str:
         return f"dw-{name}" if cycle == 1 else f"dw{cycle}-{name}"
 
-    def _run_bundle(self, bundle: Bundle, cycle: int) -> None:
-        key = self._bundle_key(bundle.name, cycle)
+    def _bundle_name_for(self, bundle: Bundle, cycle: int) -> tuple[str, int] | None:
+        """The name this bundle runs under and the attempt that found it, or
+        None when no key is available. Pure apart from the exhaustion record:
+        the dedupe record belongs to `_run_bundle`, which is the only caller
+        that knows whether the bundle went on to USE the deduped name.
+
+        The terminal-task early return below is what makes a resume cheap: a
+        bundle already finished this run is skipped rather than re-driven. It
+        used to compare the KEY alone (DW-125), and the key is a pure function of
+        `(name, cycle)` — so when a resume loses `<run>/triage.json`,
+        `_ensure_triage` regenerates a plan whose names are re-authored freely,
+        and a fresh bundle that happens to reuse a finished bundle's name was
+        silently swallowed with its ids never run. `_materialize_bundles`'
+        uniqueness pass cannot see this: it compares names against THIS cycle's
+        list, never against persisted state.
+
+        The bundle's identity is its `dw_ids`, so agreement is tested on those,
+        as SET equality — a regenerated triage may emit the same ids in a
+        different order, and treating that as a new bundle would re-run finished
+        work on every cache-loss resume, a worse regression than the bug. A
+        persisted EMPTY list agrees with anything: it is the pre-`dw_ids`
+        `state.json` shape (`model.py` loads a missing key as `[]`), and reading
+        it as divergence would re-run every bundle of every legacy paused run.
+
+        On divergence the name gains the same bounded `-2` … `-9` suffix
+        `_materialize_bundles` applies to a colliding stored name — deduping the
+        NAME rather than the key alone is what keeps `_bundle_key`, the intent
+        dirname and `_ensure_bundle_intent`'s key→name round-trip consistent.
+        This is the third collision remedy in this file and must not be confused
+        with the other two: `_materialize_bundles` DISCARDS a colliding stored
+        `bundle_name` (it has `decision-<id>` beneath it) and SUFFIXES that
+        fallback (which has nothing beneath it). Here a validated plan name
+        collides with PERSISTED state, and suffixing is the only repair — there
+        is no fallback name to reach for.
+
+        Scoped to TERMINAL tasks deliberately: an in-flight task at the key still
+        goes through `_recover_inflight_bundle` exactly as before
+        (`_finish_inflight_bundles` drives persisted bundles terminal before a
+        cycle picks new work, and `_warn_stranded_bundles` says so loudly when
+        one survives)."""
+        wanted = set(bundle.dw_ids)
+        for attempt in range(1, 10):
+            name = bundle.name if attempt == 1 else f"{bundle.name}-{attempt}"
+            task = self.state.tasks.get(self._bundle_key(name, cycle))
+            if task is not None and task.terminal and task.dw_ids and set(task.dw_ids) != wanted:
+                continue
+            return name, attempt
+        # Bounded, so the search is provably finite — and loud on both surfaces,
+        # because the alternative is the swallowed bundle this guard exists to
+        # prevent. The ids stay open for the next sweep.
+        self.journal.append(
+            "sweep-bundle-key-collision", name=bundle.name, dw_ids=list(bundle.dw_ids)
+        )
+        # Spell the KEYS, not the bare name: from cycle 2 they are `dw<N>-...`,
+        # so a name-only message names nothing the operator can grep state.json
+        # for.
+        first = self._bundle_key(bundle.name, cycle)
+        gates.notify(
+            self.policy,
+            self.run_dir,
+            f"sweep bundle {bundle.name!r} could not be named",
+            f"every key from {first} through {first}-9 (cycle {cycle}) is held by a "
+            "finished bundle carrying different deferred-work ids; not run: "
+            + ", ".join(bundle.dw_ids),
+        )
+        return None
+
+    def _run_bundle(self, bundle: Bundle, cycle: int) -> str | None:
+        """Run one bundle; returns the task key it ran under, or None when no key
+        was available (see `_bundle_name_for`). `_cycle` grades progress on the
+        returned keys, so it must never be re-derived from `bundle.name`."""
+        resolved = self._bundle_name_for(bundle, cycle)
+        if resolved is None:
+            return None
+        name, attempt = resolved
+        key = self._bundle_key(name, cycle)
         task = self.state.tasks.get(key)
         if task is not None and task.terminal:
-            return  # finished (or adjudicated) in a previous resume cycle
+            return key  # finished (or adjudicated) in a previous resume cycle
+        if attempt > 1:
+            # Below the skip deliberately: the ordinary second-resume shape has
+            # the deduped key ALREADY terminal and agreeing, and journaling the
+            # rename up in the resolver re-announced it once per resume for a
+            # bundle nothing then renamed. `original=` + `name=` so the record
+            # stands on its own, the way its sibling `sweep-bundle-name-deduped`
+            # does; `dw_ids` say which work the new key carries.
+            self.journal.append(
+                "sweep-bundle-key-deduped",
+                original=bundle.name,
+                name=name,
+                attempt=attempt,
+                dw_ids=list(bundle.dw_ids),
+            )
         if task is None:
             task = StoryTask(story_key=key, epic=0, dw_ids=list(bundle.dw_ids))
             self.state.tasks[key] = task
             self.journal.append("bundle-start", story_key=key, dw_ids=list(bundle.dw_ids))
         elif self._recover_inflight_bundle(task):
-            return
-        dirname = bundle.name if cycle == 1 else f"c{cycle}-{bundle.name}"
-        task.bundle_file = str(self._write_intent(bundle, dirname))
+            return key
+        dirname = name if cycle == 1 else f"c{cycle}-{name}"
+        # The document has to agree with the directory it lands in and with the
+        # name `_ensure_bundle_intent` recovers back out of the story key.
+        written = bundle if name == bundle.name else replace(bundle, name=name)
+        task.bundle_file = str(self._write_intent(written, dirname))
         self._save()
         self._emit("pre_bundle", task)
         self._run_story(task)
         self._emit("post_bundle", task)
+        return key
 
     def _recover_inflight_bundle(self, task: StoryTask) -> bool:
         """Recover a bundle task interrupted mid-flight (or re-armed after a

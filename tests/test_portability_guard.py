@@ -954,6 +954,8 @@ JOURNAL_KINDS = frozenset(
         "sweep-bundle-close-carried",
         "sweep-bundle-close-carry-uncommitted",
         "sweep-bundle-closed",
+        "sweep-bundle-key-collision",
+        "sweep-bundle-key-deduped",
         "sweep-bundle-name-deduped",
         "sweep-bundle-name-discarded",
         "sweep-bundle-name-normalized",
