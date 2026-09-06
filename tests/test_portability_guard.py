@@ -436,6 +436,14 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "decision",
         "decisions",
         "deduped",
+        # Written by `runs.restamp_code_root`'s TRAILING append alone — one of the
+        # three producers of `rearm-code-root-restamped`, not a predicate over the
+        # kind (the two discharge rows omit it, asserting `code_root_changed=true`
+        # instead). There it says whether that row settles a record owed by an EARLIER
+        # call's move. A bare boolean about the ROW's own role — it names no root, no
+        # run and no path; the tree is `repo`, which
+        # `diagnostics._JOURNAL_DROP_FIELDS` already reduces to a presence flag.
+        "discharged_owed_move",
         # `sweep-decision-answer-dropped`'s discriminator: WHICH drop lane fired, as
         # a closed three-value enum (`no-intent` | `name-collision` |
         # `stale-option`). `stale-option` is the keep-open lane's (DW-123) and covers

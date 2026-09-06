@@ -4157,10 +4157,23 @@ def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
         # reaches a dump.
         #
         # This line is ALSO reached with nothing moved, discharging a record owed by an
-        # EARLIER call's move whose own append failed; the boolean reports THIS call, so
-        # that path writes `false`. The marker is a record debt, not a move, and the row
-        # that settles it may not assert one — resume's `run-resume` boolean already
-        # reads `false` in the same state.
+        # EARLIER call's move whose own append failed. Two booleans, because one cannot
+        # say both things: `code_root_changed` keeps its THIS-CALL meaning on THIS append
+        # (so it writes `false` here, agreeing with resume's `run-resume` boolean in the
+        # same state — the two sibling discharge appends are a different shape and
+        # hardcode `true`), while `discharged_owed_move` carries the EARLIER move the row
+        # is settling. That path's row is the only durable trace that move ever leaves —
+        # call one raised instead of returning the warning, this call returns `None`,
+        # and a later plain `resume` computes `code_root_changed=false` too because the
+        # mirror already agrees — so without the second boolean the record reads as
+        # "nothing moved" (DW-128). Together the two make it complete.
+        #
+        # Stamped on THIS append alone, never on the two sibling discharge rows
+        # (`runs.py`'s pre-move discharge above, `cli._prepare_resume_locked`'s): those
+        # assert `code_root_changed=true` outright, so the move they settle is already
+        # named and a second boolean would be redundant. A consumer must therefore read
+        # an ABSENT key as "not stated", never as `false` — the kind has three producers
+        # and only one of them speaks to this.
         #
         # AFTER the persisted move, never before it: a record written first would
         # assert a completed move that a failed save then never made. And the
@@ -4174,10 +4187,18 @@ def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
         # that fails after a successful append, which costs a duplicate — true —
         # record on the retry; a duplicate is recoverable from the journal, a
         # missing record and a false one are not.
+        #
+        # `code_root_restamp_pending` is written `True` in exactly one place
+        # (`= moved`, off `bool(state.repo_root)`), so it is only ever opened by a
+        # genuine move; this append is reached only with it set. Hence `not moved`
+        # here is precisely "a record owed by an EARLIER call's real move" — no new
+        # state and no new read.
+        discharged_owed_move = not moved
         Journal(run_dir).append(
             "rearm-code-root-restamped",
             repo=new,
             code_root_changed=moved,
+            discharged_owed_move=discharged_owed_move,
         )
         state.code_root_restamp_pending = False
         save_state(run_dir, state)

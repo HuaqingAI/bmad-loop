@@ -713,6 +713,71 @@ def test_rearm_records_leak_neither_the_code_root_nor_a_spec_name(located):
         assert canary not in rendered, f"LEAK: {canary!r}"
 
 
+def test_the_owed_code_root_discharge_row_keeps_both_of_its_booleans():
+    """`rearm-code-root-restamped` is the record whose ONLY surviving field is a
+    boolean: `repo` is in `_JOURNAL_DROP_FIELDS`, so a dump keeps a presence flag and
+    the tree the row names never reaches it. That made the discharge shape — call one
+    re-points the root and its append raises, the retry settles the record having moved
+    nothing — read as "nothing moved" in a dump, because `code_root_changed` is about
+    THIS call and correctly says `false` there (DW-128).
+
+    `discharged_owed_move` is the second boolean that closes it, and it must survive
+    VERBATIM for `compared`'s and `located`'s reason above: aliased or dropped, the row
+    stops saying the one thing it was added to say. Graded here rather than only at the
+    producer because the scrubber is the layer that can take it away — this kind has no
+    `_JOURNAL_KIND_SCHEMAS` entry, so both booleans reach `scrub_json` and ship as
+    themselves.
+
+    Ablation: give the kind a declared schema that names neither boolean and this
+    reddens while `tests/test_runs.py` stays green. Note WHICH way it reddens — the
+    fail-closed arm collapses every unnamed field, so BOTH booleans become `_present`
+    keys and the first tuple assertion dies on `KeyError: 'code_root_changed'`, not on
+    anything spelled `discharged_owed_move_present`. `repo_present` above survives that
+    ablation either way, since `_JOURNAL_DROP_FIELDS` reaches `repo` before the
+    declared-schema arm does.
+
+    Both shapes, because a field graded on one value grades nothing: the discharge row
+    inverts the pair, and the ordinary move row is the control that keeps the assertion
+    from passing on a hardcoded constant.
+    """
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    discharge = diagnostics._scrub_entry(
+        {
+            "ts": 2.0,
+            "kind": "rearm-code-root-restamped",
+            "repo": HOME_PATH,
+            "code_root_changed": False,
+            "discharged_owed_move": True,
+        },
+        pseudo,
+        {},
+        1.0,
+    )
+    own_move = diagnostics._scrub_entry(
+        {
+            "ts": 3.0,
+            "kind": "rearm-code-root-restamped",
+            "repo": HOME_PATH,
+            "code_root_changed": True,
+            "discharged_owed_move": False,
+        },
+        pseudo,
+        {},
+        1.0,
+    )
+
+    # the tree is still reduced to a presence flag — the new field buys no path
+    assert "repo" not in discharge and discharge["repo_present"] is True
+    assert "repo" not in own_move and own_move["repo_present"] is True
+    # ...while both booleans ship as themselves, inverted between the two shapes
+    assert (discharge["code_root_changed"], discharge["discharged_owed_move"]) == (False, True)
+    assert (own_move["code_root_changed"], own_move["discharged_owed_move"]) == (True, False)
+
+    rendered = json.dumps([discharge, own_move])
+    for canary in (HOME_PATH, PROPRIETARY, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+
+
 def test_the_two_commit_probe_records_alias_one_baseline_to_one_name():
     """`old_baseline` is a 40-hex sha on BOTH of `_stale_restore_residue`'s records,
     and routing is by field NAME, so one entry has to cover both kinds (DW-81).

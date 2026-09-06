@@ -3094,7 +3094,9 @@ def test_restamp_code_root_keeps_the_move_retryable_when_the_record_fails(tmp_pa
     append and it reddens the same way; never set it and the first assertion reddens;
     hardcode the trailing append's `code_root_changed=True` or drop the `if not
     moved: return None` arm and the retry reddens on the row's boolean or on the
-    silent return."""
+    silent return. Hardcode the trailing append's `discharged_owed_move=False`, or drop
+    the kwarg entirely, and the last assertion reddens — that boolean is the only thing
+    on this path that says a move happened at all."""
     from bmad_loop.journal import Journal
 
     run = escalated_run(tmp_path, "r1", story_key="s1")
@@ -3131,6 +3133,11 @@ def test_restamp_code_root_keeps_the_move_retryable_when_the_record_fails(tmp_pa
     ]
     assert [r["repo"] for r in records] == [str(now)]  # exactly once, on the retry
     assert records[0]["code_root_changed"] is False  # ...and about the retry's own move
+    # ...while THIS row is the only durable trace call one's real move ever leaves:
+    # call one raised instead of returning the warning, this call returned `None`, and
+    # a later plain `resume` computes `code_root_changed=false` too because the mirror
+    # already agrees. Without this field the record reads as "nothing moved" (DW-128).
+    assert records[0]["discharged_owed_move"] is True
 
 
 def test_restamp_code_root_warns_for_this_calls_move_not_an_owed_record(tmp_path):
@@ -3173,7 +3180,9 @@ def test_restamp_code_root_warns_for_this_calls_move_not_an_owed_record(tmp_path
 
     assert moved_message is not None
     assert "the code root in _bmad/bmm/config.yaml has changed" in moved_message
-    assert [(r["repo"], r["code_root_changed"]) for r in records()] == [(str(now), True)]
+    assert [(r["repo"], r["code_root_changed"], r["discharged_owed_move"]) for r in records()] == [
+        (str(now), True, False)
+    ]
     assert load_state(run.run_dir).code_root_restamp_pending is False
 
     # ...now the state a failed record-append leaves: root already aimed, debt owed
@@ -3187,9 +3196,13 @@ def test_restamp_code_root_warns_for_this_calls_move_not_an_owed_record(tmp_path
     persisted = load_state(run.run_dir)
     assert persisted.code_root == now
     assert persisted.code_root_restamp_pending is False  # the debt is discharged...
-    assert [(r["repo"], r["code_root_changed"]) for r in records()] == [
-        (str(now), True),
-        (str(now), False),  # ...exactly once, and truthfully about THIS call
+    assert [(r["repo"], r["code_root_changed"], r["discharged_owed_move"]) for r in records()] == [
+        (str(now), True, False),
+        # ...exactly once, and truthfully about THIS call — which moved nothing but
+        # DID settle the record an earlier move owed, so the two booleans invert
+        # (DW-128). A regression that stamped `discharged_owed_move` on the real
+        # move in phase one reddens on the first tuple.
+        (str(now), False, True),
     ]
 
 
@@ -3296,6 +3309,12 @@ def test_restamp_code_root_discharges_the_owed_record_before_moving_again(
     # gets its own row — one record per move, neither of them lost.
     assert [r["repo"] for r in records] == [str(owed), str(again)]
     assert all(r["code_root_changed"] is True for r in records)
+    # The pre-move discharge is the sibling `discharged_owed_move` deliberately does
+    # NOT reach: it already asserts `code_root_changed=True`, so the move it settles is
+    # named outright and a second boolean would be redundant. Only the trailing append
+    # carries the key, and here it carries it `False` — this call moved the root too.
+    assert "discharged_owed_move" not in records[0]
+    assert records[1]["discharged_owed_move"] is False
 
 
 def test_restamp_code_root_reloads_after_a_rival_writer(tmp_path, monkeypatch):
