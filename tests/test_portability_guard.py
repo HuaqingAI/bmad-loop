@@ -2235,8 +2235,9 @@ def _scan_source(src: str, rel: str):
             else:
                 # The literal-kind twin, and the KIND inventory's only feed. NOT
                 # derivable from the `journalfield` rows below, although each of
-                # those carries the kind: a kind-only write (`run-complete` and
-                # three siblings) has no keyword row to ride on.
+                # those carries the kind: a kind-only write like `run-complete`
+                # (no keyword arguments at all, not even a `**` splat) has no
+                # keyword row to ride on.
                 findings.append(
                     ("journalkindliteral", rel, node.lineno, line_at(node.lineno), kind)
                 )
@@ -2497,11 +2498,12 @@ def _scan_source(src: str, rel: str):
     # `JOURNAL_DYNAMIC_KIND_ALLOW` functions, and that function's own `kind`
     # parameter default. The write inside such a position spells a parameter, so
     # the journal-write arm above reports it as `journalkind` and nothing more —
-    # which is how `review-skipped-awaiting-operator` and its three siblings
-    # reached the journal with no inventory row anyone had to decide on (review
-    # pass 2). Same `journalkindliteral` finding, same inventory; keyed `(file,
-    # name)` exactly like the position it serves, so a same-named callee in a file
-    # that declares no such position stays silent.
+    # which is how a literal that reaches the journal ONLY through such a
+    # position (`review-skipped-awaiting-operator`, for one) got there with no
+    # inventory row anyone had to decide on (review pass 2). Same
+    # `journalkindliteral` finding, same inventory; keyed `(file, name)` exactly
+    # like the position it serves, so a same-named callee in a file that declares
+    # no such position stays silent.
     # Where each declared position keeps its `kind`, so a caller that spells the
     # kind POSITIONALLY is read too. Keyed by name within this file, exactly like
     # the allow set it is derived from.
@@ -5495,10 +5497,10 @@ def test_journal_kind_probes_flag_a_non_literal_kind():
 
 def test_journal_kind_literal_probes_extract_the_kind():
     """The kind inventory's detector half: a journal write whose kind IS a string
-    literal emits that kind — including a kind-only write (`run-complete` and three
-    siblings), which the FIELD detector never reports because there is no keyword
-    to carry it, and a declared forwarder's call site, whose kind would otherwise
-    stop at `plugins/bus.py::_log`'s wall.
+    literal emits that kind — including a kind-only write like `run-complete` (no
+    keyword arguments at all, not even a `**` splat), which the FIELD detector
+    never reports, and a declared forwarder's call site, whose kind would
+    otherwise stop at `plugins/bus.py::_log`'s wall.
 
     Ablation: delete the `journalkindliteral` emit and every row here reddens."""
     for source, rel, kind in (
