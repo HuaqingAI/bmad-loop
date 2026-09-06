@@ -933,7 +933,7 @@ class SweepEngine(Engine):
         plan = self._ensure_triage(open_now, cycle)
         closed = self._close_resolved(plan)
         answers, decisions_closed = self._decisions_phase(plan)
-        bundles = self._materialize_bundles(plan, answers)
+        bundles, stale_keep_open_dropped = self._materialize_bundles(plan, answers)
         if self.decisions_only:
             self.journal.append("sweep-decisions-only", bundles_not_run=len(bundles))
             self._prune_pre_answers()
@@ -955,7 +955,7 @@ class SweepEngine(Engine):
         )
         self._prune_pre_answers()
         self._emit("post_sweep_cycle", phase=str(cycle))
-        return closed > 0 or decisions_closed > 0 or bundles_done > 0
+        return closed > 0 or decisions_closed > 0 or bundles_done > 0 or stale_keep_open_dropped
 
     def _prune_pre_answers(self) -> None:
         """Drop consumed pre-answers — entries built or closed this cycle have
@@ -1694,53 +1694,80 @@ class SweepEngine(Engine):
 
     # ---------------------------------------------------------- bundles
 
+    def _agreeing_option(
+        self, decision: Decision, answer: dict[str, str], answer_key: str
+    ) -> DecisionOption | None:
+        """The stored answer's key resolved against THIS cycle's decision, but only
+        when the option it lands on is still the one the human answered.
+
+        `Decision.option` matches on KEY ALONE, and a key is a position in a list a
+        later triage re-authors freely: `_ensure_triage` mints a fresh
+        `triage-<n>.json` per repeat cycle while `answers` persists for the whole run
+        in `<run>/decisions.json`, and a pre-answer is resolved against a triage
+        minted after it was recorded. Either provenance can hand a caller ONE
+        question's answer beside a DIFFERENT question's option (DW-118: a stored
+        `build` answer keyed "1" met a fresh option "1" spelled "Close as decayed",
+        and the bundle shipped the stale intent under the close label). `label` +
+        `effect` is the whole agreement test — the only two fields BOTH provenances
+        always carry (`record_pre_answer` stores the chosen option's full semantics;
+        an in-run answer is written with key/label/effect/answered_at) — and a
+        disagreeing option is discarded outright, its mismatch journaled the way
+        `sweep-bundle-name-discarded` is.
+
+        ONE agreement discipline for both lanes of `_materialize_bundles` (DW-123):
+        the build lane had this test inline while the keep-open lane trusted the
+        stored `effect` with no resolution at all, so a renumbered option let a stale
+        keep-open answer suppress a bundle under a `human-chose-keep-open` skip that
+        reads as the human's decision. What the two lanes still differ on is the
+        DISPOSITION of a `None` — see each call site.
+        """
+        option = decision.option(answer_key)
+        if option is None:
+            return None  # nothing resolved, so there is nothing to describe
+        label_matched = option.label == str(answer.get("label", ""))
+        if label_matched and option.effect == str(answer.get("effect", "")):
+            return option
+        # No triage prose in the record (labels, questions): the fields are closed
+        # effect enums and a bare boolean. `answer_effect` says which LANE wrote the
+        # record — it is the stored answer's own effect, invariant per lane but no
+        # longer invariant across the two that reach here, and it is what separates a
+        # discarded build option from a discarded keep-open one in a journal both
+        # write with the same kind.
+        self.journal.append(
+            "sweep-decision-option-mismatch",
+            decision=decision.id,
+            key=answer_key,
+            option_effect=option.effect,
+            label_matched=label_matched,
+            answer_effect=str(answer.get("effect", "")),
+        )
+        return None
+
     def _materialize_bundles(
         self, plan: TriagePlan, answers: dict[str, dict[str, str]]
-    ) -> list[Bundle]:
+    ) -> tuple[list[Bundle], bool]:
         self._emit("pre_materialize_bundles")
         bundles = list(plan.bundles)
+        stale_keep_open_dropped = False
         for decision in plan.decisions:
             answer = answers.get(decision.id)
             if not answer or answer.get("effect") != "build":
                 continue
             if decision.id in self._dropped_decisions:
                 continue  # announced dropped earlier this run (see __init__)
-            # `Decision.option` matches on KEY ALONE, and a key is a position in a
-            # list a later triage re-authors freely: `_ensure_triage` mints a fresh
-            # `triage-<n>.json` per repeat cycle while `answers` persists for the
-            # whole run in `<run>/decisions.json`, and a pre-answer is resolved
-            # against a triage minted after it was recorded. Either lane can hand
-            # this loop ONE question's answer beside a DIFFERENT question's option
-            # (DW-118: a stored `build` answer keyed "1" met a fresh option "1"
-            # spelled "Close as decayed", and the bundle shipped the stale intent
-            # under the close label). `label` + `effect` is the whole agreement
-            # test — the only two fields BOTH provenances always carry — and a
-            # disagreeing option is discarded outright: it contributes no field and
-            # the mismatch is journaled the way `sweep-bundle-name-discarded` is.
             # ONE spelling of the key for the whole loop body: the lookup, the
             # mismatch record and the note below must name the same string, and
             # `str(answer.get("key"))` stringified a missing key to the literal
             # "None" while the record spelled it "".
             answer_key = str(answer.get("key", ""))
-            option = decision.option(answer_key)
+            # `matched` is exactly "an agreeing option was resolved": the helper
+            # collapses the two ways that can fail (no such key / a re-authored one)
+            # because this lane treats them alike. It tolerates BOTH — a build answer
+            # carries its own `intent` payload and can still build from it — and
+            # drops only when that payload is missing, a few lines below. The
+            # keep-open lane has no payload to fall back on, so it cannot.
+            option = self._agreeing_option(decision, answer, answer_key)
             matched = option is not None
-            if option is not None and (
-                option.label != str(answer.get("label", ""))
-                or option.effect != str(answer.get("effect", ""))
-            ):
-                # No triage prose in the record (labels, questions): the fields are
-                # a closed effect enum and a bare boolean. The answer's own
-                # `effect` is NOT journaled — the loop `continue`s above unless it
-                # is "build", so it is invariant here and discriminates nothing.
-                self.journal.append(
-                    "sweep-decision-option-mismatch",
-                    decision=decision.id,
-                    key=answer_key,
-                    option_effect=option.effect,
-                    label_matched=option.label == str(answer.get("label", "")),
-                )
-                option = None
-                matched = False
             # The stored answer is the PAYLOAD; an agreeing option fills only what
             # the answer omits (`answer or option`, not the reverse). That single
             # expression routes both provenances without a provenance flag:
@@ -1759,10 +1786,11 @@ class SweepEngine(Engine):
                 # human `build` decision must not vanish on a journal line alone.
                 # The ledger entry is untouched, so the next sweep re-triages and
                 # re-asks it through `_decisions_phase`.
-                # `drop_cause` is a closed two-value enum so the two drop lanes
-                # are discriminated by an enum rather than by free text or by a
-                # second journal kind (`reason` is deliberately not a benign
-                # journal field).
+                # `drop_cause` is a closed three-value enum (`no-intent` here,
+                # `name-collision` below, `stale-option` in the keep-open lane) so
+                # the drop lanes are discriminated by an enum rather than by free
+                # text or by a second journal kind (`reason` is deliberately not a
+                # benign journal field).
                 self.journal.append(
                     "sweep-decision-answer-dropped",
                     decision=decision.id,
@@ -1902,8 +1930,71 @@ class SweepEngine(Engine):
             for i in t.dw_ids
         }
         # ids a human explicitly chose to keep open: a later triage must not
-        # override that answer (bundle dev sessions mark their dw_ids done)
-        keep_open_ids = {dw_id for dw_id, a in answers.items() if a.get("effect") == "keep-open"}
+        # override that answer (bundle dev sessions mark their dw_ids done). Held to
+        # the SAME agreement test the build lane above runs (DW-123): this set is
+        # read straight off `answers`, whose entries outlive the triage they were
+        # answered against, so an unresolved `effect == "keep-open"` let a stale
+        # answer suppress an overlapping bundle — journaled only as a
+        # `human-chose-keep-open` skip, which reads as the human's decision on a
+        # question this cycle never asked.
+        by_id = {d.id: d for d in plan.decisions}
+        keep_open_ids: set[str] = set()
+        for dw_id, answer in answers.items():
+            if answer.get("effect") != "keep-open":
+                continue
+            if dw_id in self._dropped_decisions:
+                continue  # announced dropped earlier this run (see __init__)
+            decision = by_id.get(dw_id)
+            if decision is None:
+                # No decision for this id THIS cycle — the fresh triage bundled or
+                # closed it directly instead of re-asking. There is no option to
+                # disagree with, so the answer is the only record of the human's
+                # choice and it stands: suppressing the bundle is exactly what
+                # keep-open means.
+                keep_open_ids.add(dw_id)
+                continue
+            answer_key = str(answer.get("key", ""))
+            if self._agreeing_option(decision, answer, answer_key) is not None:
+                keep_open_ids.add(dw_id)
+                continue
+            # Unlike the build lane, a keep-open answer has no payload beyond
+            # "keep-open" itself, so without a currently-resolvable, agreeing option
+            # there is nothing left to trust and the answer is dropped. Hence a THIRD
+            # `drop_cause` covering both failures — a renumbered option (which wrote
+            # a mismatch record just now) and a vanished one (which could not) —
+            # rather than one named for the mismatch alone. Dropping is deliberately
+            # the loud direction: honouring a stale keep-open answer silently skips
+            # work the human never protected, while dropping it is journaled and
+            # notified. It is NOT the build lane's "the entry stays open for the
+            # next sweep": dropping here UNBLOCKS the id, and counts as progress so
+            # a later valid triage cycle can bundle it and close the entry. The
+            # RUN-LOCAL record is what survives — the answer stays auditable in
+            # `<run>/decisions.json` and the ledger line `_apply_decision_effect`
+            # wrote is unchanged — while an out-of-band pre-answer in the PROJECT
+            # store is pruned by `_prune_pre_answers` once that later bundle closes
+            # the entry, the same way a built or closed decision's is.
+            self.journal.append(
+                "sweep-decision-answer-dropped",
+                decision=dw_id,
+                drop_cause="stale-option",
+            )
+            # Which of the two failures fired, named rather than left to the
+            # journal: the notify is the surface an operator actually reads, and
+            # "changed" is wrong for a key this triage simply does not offer.
+            fate = (
+                "is gone from this cycle's triage"
+                if decision.option(answer_key) is None
+                else "has been re-authored since"
+            )
+            gates.notify(
+                self.policy,
+                self.run_dir,
+                f"decision {dw_id}: recorded keep-open decision discarded",
+                f"the option it answered ({answer_key}) {fate}, so the keep-open "
+                f"protection is discarded and {dw_id} is eligible for bundling again",
+            )
+            self._dropped_decisions.add(dw_id)
+            stale_keep_open_dropped = True
         kept = []
         for b in bundles:
             overlap = sorted(set(b.dw_ids) & (failed_ids | keep_open_ids))
@@ -1926,7 +2017,7 @@ class SweepEngine(Engine):
             self.journal.append("sweep-bundles-truncated", dropped=dropped)
             bundles = bundles[: self.max_bundles]
         self._emit("post_materialize_bundles")
-        return bundles
+        return bundles, stale_keep_open_dropped
 
     def _write_intent(self, bundle: Bundle, dirname: str) -> Path:
         ledger = self.workspace.paths.deferred_work

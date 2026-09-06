@@ -3617,6 +3617,9 @@ def test_stale_preanswer_meeting_a_close_option_keeps_its_own_semantics(project)
     assert record["key"] == "1"
     assert record["option_effect"] == "close"
     assert record["label_matched"] is False
+    # the lane discriminator, pinned from the BUILD side — the keep-open row that
+    # pins "keep-open" cannot tell a real read of the answer from a constant
+    assert record["answer_effect"] == "build"
 
 
 def test_stale_preanswer_meeting_a_different_build_option_keeps_its_own_intent(project):
@@ -4461,8 +4464,9 @@ def test_exhausting_the_name_suffix_bound_drops_and_notifies_the_decision(projec
     fallback and every candidate in the bound are already taken, so there is no
     name left that would not alias the human's bundle onto another one. A naming
     impossibility, not a mismatch disposition, so it is loud on both surfaces —
-    `drop_cause` (a closed two-value enum) is what tells it apart from the
-    no-intent drop, and the entry stays open for the next sweep. `max_bundles=1`
+    `drop_cause` (a closed three-value enum: this one, `no-intent`, and the
+    keep-open lane's `stale-option`) is what tells it apart from the other drops,
+    and the entry stays open for the next sweep. `max_bundles=1`
     keeps the nine occupying plan bundles from having to run. Ablation: delete
     the exhausted-bound `else` and this reddens — no drop record, no ATTENTION
     line, and the decision bundle silently re-takes `decision-dw-1`."""
@@ -4719,6 +4723,81 @@ def test_preanswered_keep_open_suppresses_prompt_and_persists(project):
     assert "decision-skipped-unattended" not in journal
     assert ledger_entries(project)["DW-1"].open
     assert decisions.load_pre_answers(project.project)["DW-1"]["effect"] == "keep-open"
+
+
+def test_preanswered_keep_open_whose_option_was_re_authored_stops_suppressing(project):
+    """The keep-open drop's OUT-OF-BAND provenance, and the one the agreement check
+    exists for: a pre-answer outlives the process that recorded it, so the triage it
+    meets is always a later one — the row above is the same store meeting a triage
+    that still agrees. `record_pre_answer` stores the chosen option's full semantics
+    under fixed keys, so a lane that exempted answers carrying their own payload
+    would wave exactly this provenance through unchecked. Cycle 1 re-authors the
+    answered key "2" onto `close`, so the pre-answer is journaled, dropped and
+    quarantined; cycle 2's bundle over DW-1 then runs instead of being skipped
+    `human-chose-keep-open`, and closing the entry prunes the store.
+
+    Ablation: exempt pre-answers from the agreement check — `if "intent" in answer:
+    keep_open_ids.add(dw_id); continue` ahead of it, which selects this provenance
+    exactly, since `record_pre_answer` is the only writer of that key — and this
+    reddens: no mismatch, no drop, and `dw2-sneaky-fix` never becomes a task."""
+    from bmad_loop import decisions
+    from bmad_loop.sweep import DecisionOption
+
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    decisions.record_pre_answer(
+        project.project,
+        "DW-1",
+        DecisionOption(key="2", label="Keep", effect="keep-open"),
+        date="2026-06-12",
+    )
+    plan1 = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[{"name": "safe-fix", "dw_ids": ["DW-2"], "intent": "a"}],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {"key": "1", "label": "Build", "effect": "build", "intent": "x"},
+                    # key "2" answers a different question than the store's answer did
+                    {"key": "2", "label": "Close as decayed", "effect": "close"},
+                ],
+            )
+        ],
+    )
+    plan2 = triage_result(
+        ["DW-1"], bundles=[{"name": "sneaky-fix", "dw_ids": ["DW-1"], "intent": "y"}]
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan1),
+            bundle_dev_effect(project, "safe-fix", ["DW-2"]),
+            bundle_review_effect(project, "safe-fix"),
+            triage_effect(plan2),
+            bundle_dev_effect(project, "sneaky-fix", ["DW-1"]),
+            bundle_review_effect(project, "sneaky-fix"),
+        ],
+        policy=repeat_policy(),
+        prompting=False,
+    )
+    summary = engine.run()
+    assert not summary.paused
+
+    journal = journal_text(engine)
+    # PRECONDITION: the answer came from the STORE, not from an in-run prompt
+    assert '"decision-preanswered"' in journal
+    assert '"decision-answered"' not in journal
+    [record] = _mismatches(engine)
+    assert record["option_effect"] == "close" and record["label_matched"] is False
+    assert record["answer_effect"] == "keep-open"
+    [drop] = _records(engine, "sweep-decision-answer-dropped")
+    assert drop["decision"] == "DW-1" and drop["drop_cause"] == "stale-option"
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert attention.count("recorded keep-open decision discarded") == 1
+    assert "human-chose-keep-open" not in journal
+    assert engine.state.tasks["dw2-sneaky-fix"].phase == Phase.DONE
+    # the unblocked bundle closed the entry, so the project store is pruned with it
+    assert decisions.load_pre_answers(project.project) == {}
 
 
 # ------------------------------- the two per-run `decisions.json` writes (cf. #363)
@@ -5455,6 +5534,362 @@ def test_repeat_keep_open_answer_blocks_rebundle(project):
     assert "sweep-bundle-skipped" in journal and "human-chose-keep-open" in journal
     assert not any("sneaky-fix" in k for k in engine.state.tasks)
     assert ledger_entries(project)["DW-1"].open
+
+
+# ------------------- keep-open answers meet a re-authored option (DW-123)
+#
+# The row above is the shape where the id has NO decision in the cycle that
+# bundles it — nothing to disagree with, so the stored answer is the only record
+# of the human's choice and it stands. The four rows below are the shapes where a
+# later cycle DOES re-ask the id, which is where a key resolving to a re-authored
+# option can turn a stale answer into a `human-chose-keep-open` skip of work the
+# human never protected. All four are cross-cycle by necessity: `validate_triage`
+# lets one id be claimed by exactly one category, so no single plan can put an id
+# in `decisions` and in a bundle at once — the disagreement is detected in the
+# cycle that re-asks and its consequence lands in a later one.
+
+
+def test_keep_open_answer_agreeing_with_a_re_authored_option_still_blocks_rebundle(project):
+    """The direction the fix must NOT change. Cycle 2 re-asks DW-1 with the same
+    option the cycle-1 answer chose, so the agreement test passes and the answer
+    keeps its authority: cycle 3's bundle over DW-1 is still skipped
+    `human-chose-keep-open`, with no mismatch and no drop anywhere in the run.
+    Ablation: replace the keep arm's `self._agreeing_option(...) is not None` with
+    `False` — "a decision exists, so distrust the answer" — and this reddens on
+    both negative asserts: the drop fires in cycle 2 and `dw3-sneaky-fix` runs."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open", "DW-3": "open"})
+    keep_open = [
+        {"key": "1", "label": "Build", "effect": "build", "intent": "x"},
+        {"key": "2", "label": "Keep", "effect": "keep-open"},
+    ]
+    plan1 = triage_result(
+        ["DW-1", "DW-2", "DW-3"],
+        bundles=[{"name": "safe-fix", "dw_ids": ["DW-2"], "intent": "a"}],
+        # held back so cycle 2 has work of its own and the repeat loop reaches 3
+        skip=[{"id": "DW-3", "reason": "not this cycle"}],
+        decisions=[_decision("DW-1", keep_open)],
+    )
+    plan2 = triage_result(
+        ["DW-1", "DW-3"],
+        bundles=[{"name": "later-fix", "dw_ids": ["DW-3"], "intent": "b"}],
+        # re-asked, and the answered key still spells the answered option
+        decisions=[_decision("DW-1", keep_open)],
+    )
+    plan3 = triage_result(
+        ["DW-1"], bundles=[{"name": "sneaky-fix", "dw_ids": ["DW-1"], "intent": "y"}]
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan1),
+            bundle_dev_effect(project, "safe-fix", ["DW-2"]),
+            bundle_review_effect(project, "safe-fix"),
+            triage_effect(plan2),
+            bundle_dev_effect(project, "later-fix", ["DW-3"]),
+            bundle_review_effect(project, "later-fix"),
+            triage_effect(plan3),
+        ],
+        policy=repeat_policy(),
+        answers=["2"],
+        prompting=True,
+    )
+    summary = engine.run()
+    assert not summary.paused
+
+    journal = journal_text(engine)
+    # PRECONDITIONS: the answer was recorded and all three cycles ran
+    assert '"decision-answered"' in journal
+    assert [r["cycle"] for r in _records(engine, "sweep-cycle")] == [2, 3]
+    assert _mismatches(engine) == []
+    assert _records(engine, "sweep-decision-answer-dropped") == []
+    assert "human-chose-keep-open" in journal
+    assert not any("sneaky-fix" in k for k in engine.state.tasks)
+    assert ledger_entries(project)["DW-1"].open
+
+
+def test_keep_open_answer_whose_option_was_re_authored_stops_suppressing_bundles(project):
+    """The bug itself. Cycle 2 renumbers key "2" off `Keep`/`keep-open` and onto
+    `Close as decayed`/`close`, so the stored keep-open answer now names a question
+    the human never answered. Cycle 2 contains only that drop: it must count as
+    progress by itself so cycle 3 can bundle DW-1 instead of stopping at
+    `no-progress`. The recorded answer is left alone on disk: it is the human's,
+    and it stays auditable.
+    Ablation: remove `stale_keep_open_dropped` from `_cycle`'s progress predicate
+    and this reddens because cycle 3 never runs and `dw3-sneaky-fix` is absent.
+    Restoring the one-line keep-open comprehension also reddens the mismatch,
+    drop and ATTENTION assertions."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    plan1 = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[{"name": "safe-fix", "dw_ids": ["DW-2"], "intent": "a"}],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {"key": "1", "label": "Build", "effect": "build", "intent": "x"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    plan2 = triage_result(
+        ["DW-1"],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {"key": "1", "label": "Build", "effect": "build", "intent": "x"},
+                    # key "2" now answers a different question
+                    {"key": "2", "label": "Close as decayed", "effect": "close"},
+                ],
+            )
+        ],
+    )
+    plan3 = triage_result(
+        ["DW-1"], bundles=[{"name": "sneaky-fix", "dw_ids": ["DW-1"], "intent": "y"}]
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan1),
+            bundle_dev_effect(project, "safe-fix", ["DW-2"]),
+            bundle_review_effect(project, "safe-fix"),
+            triage_effect(plan2),
+            triage_effect(plan3),
+            bundle_dev_effect(project, "sneaky-fix", ["DW-1"]),
+            bundle_review_effect(project, "sneaky-fix"),
+        ],
+        policy=repeat_policy(),
+        answers=["2"],
+        prompting=True,
+    )
+    summary = engine.run()
+    assert not summary.paused
+
+    journal = journal_text(engine)
+    assert '"decision-answered"' in journal  # PRECONDITION: the answer was recorded
+    assert [r["cycle"] for r in _records(engine, "sweep-cycle")] == [2, 3]
+    [record] = _mismatches(engine)
+    assert record["option_effect"] == "close" and record["label_matched"] is False
+    # the field that says WHICH lane wrote the record — the stored answer's effect
+    assert record["answer_effect"] == "keep-open"
+    [drop] = _records(engine, "sweep-decision-answer-dropped")
+    assert drop["decision"] == "DW-1" and drop["drop_cause"] == "stale-option"
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert attention.count("recorded keep-open decision discarded") == 1
+    assert "the option it answered (2) has been re-authored since" in attention
+    assert "is gone from this cycle's triage" not in attention
+    # the bundle the stale answer used to skip ran instead
+    assert "human-chose-keep-open" not in journal
+    assert engine.state.tasks["dw3-sneaky-fix"].phase == Phase.DONE
+    # nothing on disk was rewritten: the human's answer stays as recorded
+    stored = json.loads((engine.run_dir / "decisions.json").read_text(encoding="utf-8"))
+    assert stored["DW-1"]["key"] == "2" and stored["DW-1"]["effect"] == "keep-open"
+
+
+def test_keep_open_answer_whose_option_vanished_is_dropped_without_a_mismatch(project):
+    """The other stale shape, and why the third `drop_cause` is `stale-option`
+    rather than `option-mismatch`: cycle 2 DROPS key "2" instead of renumbering it,
+    so nothing resolves and there is no option to describe. No
+    `sweep-decision-option-mismatch` is written — but a keep-open answer carries
+    nothing beyond the option it named, so the drop lane still fires and the
+    operator is still told, and the drop alone advances repeat mode so a later
+    valid triage cycle can bundle the id.
+    Ablation A: move the mismatch append above the helper's `option is None` early
+    return and the empty-mismatch assert reddens. Ablation B: restore the one-line
+    `keep_open_ids` comprehension and both the drop record and the ATTENTION assert
+    redden while the empty-mismatch assert stays green. Ablation C: count the drop
+    as progress only when the answered key still resolves and cycle 3 never runs."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    plan1 = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[{"name": "safe-fix", "dw_ids": ["DW-2"], "intent": "a"}],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {"key": "1", "label": "Build", "effect": "build", "intent": "x"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    plan2 = triage_result(
+        ["DW-1"],
+        decisions=[
+            _decision(
+                "DW-1",
+                # a decision needs two options; the answered key "2" is not one
+                [
+                    {"key": "1", "label": "Build", "effect": "build", "intent": "x"},
+                    {"key": "3", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    plan3 = triage_result(
+        ["DW-1"], bundles=[{"name": "sneaky-fix", "dw_ids": ["DW-1"], "intent": "y"}]
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan1),
+            bundle_dev_effect(project, "safe-fix", ["DW-2"]),
+            bundle_review_effect(project, "safe-fix"),
+            triage_effect(plan2),
+            triage_effect(plan3),
+            bundle_dev_effect(project, "sneaky-fix", ["DW-1"]),
+            bundle_review_effect(project, "sneaky-fix"),
+        ],
+        policy=repeat_policy(),
+        answers=["2"],
+        prompting=True,
+    )
+    summary = engine.run()
+    assert not summary.paused
+
+    assert '"decision-answered"' in journal_text(engine)  # PRECONDITION
+    assert _mismatches(engine) == []  # no option resolved, so nothing to describe
+    [drop] = _records(engine, "sweep-decision-answer-dropped")
+    assert drop["decision"] == "DW-1" and drop["drop_cause"] == "stale-option"
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert attention.count("recorded keep-open decision discarded") == 1
+    assert "the option it answered (2) is gone from this cycle's triage" in attention
+    assert "has been re-authored since" not in attention
+    assert [r["cycle"] for r in _records(engine, "sweep-cycle")] == [2, 3]
+    assert engine.state.tasks["dw3-sneaky-fix"].phase == Phase.DONE
+    # the drop does not rewrite the recorded answer; the later bundle closes the id
+    stored = json.loads((engine.run_dir / "decisions.json").read_text(encoding="utf-8"))
+    assert stored["DW-1"]["key"] == "2" and stored["DW-1"]["effect"] == "keep-open"
+    assert ledger_entries(project)["DW-1"].status.startswith("done")
+
+
+def test_a_dropped_keep_open_answer_is_not_revived_by_a_later_agreeing_cycle(project):
+    """The keep-open lane's half of the quarantine the build drops already had.
+    Cycle 2 drops the answer (renumbered option); cycle 3 re-authors key "2" back
+    into agreement — the shape that would otherwise hand a decision the operator
+    was told had been dropped its authority back, silently. It stays dropped and
+    silent: one mismatch, one drop record and one ATTENTION line for the whole
+    process, and cycle 4's bundle over DW-1 runs rather than being skipped.
+    Ablation: delete the keep-open pass's `if dw_id in self._dropped_decisions`
+    guard and this reddens — cycle 3's agreeing option puts DW-1 back into
+    `keep_open_ids` and `dw4-sneaky-fix` is skipped `human-chose-keep-open`."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open", "DW-3": "open", "DW-4": "open"})
+    keep_open = [
+        {"key": "1", "label": "Build", "effect": "build", "intent": "x"},
+        {"key": "2", "label": "Keep", "effect": "keep-open"},
+    ]
+    plan1 = triage_result(
+        ["DW-1", "DW-2", "DW-3", "DW-4"],
+        bundles=[{"name": "safe-fix", "dw_ids": ["DW-2"], "intent": "a"}],
+        # DW-3 and DW-4 are held back so cycles 2 and 3 each make progress of
+        # their own and the repeat loop reaches cycle 4
+        skip=[
+            {"id": "DW-3", "reason": "not this cycle"},
+            {"id": "DW-4", "reason": "not this cycle"},
+        ],
+        decisions=[_decision("DW-1", keep_open)],
+    )
+    plan2 = triage_result(
+        ["DW-1", "DW-3", "DW-4"],
+        bundles=[{"name": "later-fix", "dw_ids": ["DW-3"], "intent": "b"}],
+        skip=[{"id": "DW-4", "reason": "not this cycle"}],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {"key": "1", "label": "Build", "effect": "build", "intent": "x"},
+                    {"key": "2", "label": "Close as decayed", "effect": "close"},
+                ],
+            )
+        ],
+    )
+    plan3 = triage_result(
+        ["DW-1", "DW-4"],
+        bundles=[{"name": "third-fix", "dw_ids": ["DW-4"], "intent": "c"}],
+        # back in agreement with the cycle-1 answer: the revival to refuse
+        decisions=[_decision("DW-1", keep_open)],
+    )
+    plan4 = triage_result(
+        ["DW-1"], bundles=[{"name": "sneaky-fix", "dw_ids": ["DW-1"], "intent": "y"}]
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan1),
+            bundle_dev_effect(project, "safe-fix", ["DW-2"]),
+            bundle_review_effect(project, "safe-fix"),
+            triage_effect(plan2),
+            bundle_dev_effect(project, "later-fix", ["DW-3"]),
+            bundle_review_effect(project, "later-fix"),
+            triage_effect(plan3),
+            bundle_dev_effect(project, "third-fix", ["DW-4"]),
+            bundle_review_effect(project, "third-fix"),
+            triage_effect(plan4),
+            bundle_dev_effect(project, "sneaky-fix", ["DW-1"]),
+            bundle_review_effect(project, "sneaky-fix"),
+        ],
+        policy=repeat_policy(),
+        answers=["2"],
+        prompting=True,
+    )
+    summary = engine.run()
+    assert not summary.paused
+
+    # PRECONDITIONS: the answer was recorded and all four cycles ran
+    assert '"decision-answered"' in journal_text(engine)
+    assert [r["cycle"] for r in _records(engine, "sweep-cycle")] == [2, 3, 4]
+    # exactly one mismatch, one drop and one notification for the whole process
+    assert len(_mismatches(engine)) == 1
+    [drop] = _records(engine, "sweep-decision-answer-dropped")
+    assert drop["decision"] == "DW-1" and drop["drop_cause"] == "stale-option"
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert attention.count("recorded keep-open decision discarded") == 1
+    # and cycle 3's agreeing option did not restore the answer's authority
+    assert "human-chose-keep-open" not in journal_text(engine)
+    assert engine.state.tasks["dw4-sneaky-fix"].phase == Phase.DONE
+
+
+def test_resumed_sweep_re_evaluates_a_dropped_keep_open_answer(project):
+    """The quarantine belongs to one engine process, not the recorded answer.
+    Reconstructing through the resume helper starts with an empty quarantine, reads
+    the unchanged run-local answer, and evaluates the stale option again — loudly,
+    including a second mismatch, drop and notification. Ablation: copy
+    `engine._dropped_decisions` onto `resumed` before materialization and the second
+    set of records disappears."""
+    write_ledger(project, {"DW-1": "open"})
+    answer = {"key": "2", "label": "Keep", "effect": "keep-open"}
+    stale_decision = Decision(
+        id="DW-1",
+        question="q",
+        context="",
+        options=(
+            DecisionOption(key="1", label="Build", effect="build", intent="x"),
+            DecisionOption(key="2", label="Close as decayed", effect="close"),
+        ),
+        recommendation="1",
+    )
+    stale_plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(stale_decision,))
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    (engine.run_dir / "decisions.json").write_text(
+        json.dumps({"DW-1": answer}, indent=2), encoding="utf-8"
+    )
+
+    _, dropped = engine._materialize_bundles(stale_plan, {"DW-1": answer})
+    assert dropped and engine._dropped_decisions == {"DW-1"}
+    save_state(engine.run_dir, engine.state)
+
+    resumed, _ = resume_sweep(project, engine, [])
+    assert resumed._dropped_decisions == set()
+    resumed_answers, _ = resumed._decisions_phase(stale_plan)
+    _, dropped_again = resumed._materialize_bundles(stale_plan, resumed_answers)
+
+    assert dropped_again
+    assert len(_mismatches(resumed)) == 2
+    assert len(_records(resumed, "sweep-decision-answer-dropped")) == 2
+    attention = (resumed.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert attention.count("recorded keep-open decision discarded") == 2
 
 
 def test_repeat_resume_mid_cycle_two(project):

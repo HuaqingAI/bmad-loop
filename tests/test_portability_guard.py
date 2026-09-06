@@ -400,6 +400,13 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "adapter_dev",
         "adapter_review",
         "already_resolved",
+        # `sweep-decision-option-mismatch`'s lane discriminator: the STORED
+        # answer's own effect, a closed `DECISION_EFFECTS` value (build/close/
+        # keep-open) taken from the answer, never authored text. Both lanes of
+        # `_materialize_bundles` now run one agreement helper and write this kind
+        # through it (DW-123), so this is what separates a discarded `build`
+        # option from a discarded `keep-open` one.
+        "answer_effect",
         "attempt",
         "blocked",
         "blocking",
@@ -429,8 +436,12 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "decision",
         "decisions",
         "deduped",
-        # `sweep-decision-answer-dropped`'s discriminator: WHICH of the two drop
-        # lanes fired, as a closed two-value enum (`no-intent` | `name-collision`).
+        # `sweep-decision-answer-dropped`'s discriminator: WHICH drop lane fired, as
+        # a closed three-value enum (`no-intent` | `name-collision` |
+        # `stale-option`). `stale-option` is the keep-open lane's (DW-123) and covers
+        # both of its failures — a renumbered option and a vanished one — because
+        # only the first can also write a `sweep-decision-option-mismatch`, so the
+        # cause cannot be named for the mismatch alone.
         # A closed enum deliberately — `reason` and `error`, the natural spellings
         # for "why was it dropped", are in `diagnostics._JOURNAL_DROP_FIELDS` and
         # would ship as a presence marker instead of the distinction the record
@@ -507,9 +518,10 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "open_now",
         # `sweep-decision-option-mismatch`'s other discriminator: the CURRENT
         # option's effect, a closed enum (`DECISION_EFFECTS`: build/close/
-        # keep-open), so it carries no authored text. The answer's own effect is
-        # deliberately not journaled at all — the loop only reaches that site for
-        # "build", so it would discriminate nothing.
+        # keep-open), so it carries no authored text. Read beside `answer_effect`
+        # above, which is the STORED answer's: the record used to be written from
+        # one lane, where the answer's own effect was invariably "build" and
+        # discriminated nothing, and since DW-123 two lanes share the site.
         "option_effect",
         "original",
         "owed_after_implement",
