@@ -3264,11 +3264,12 @@ def test_journal_kinds_are_literal_or_the_position_is_declared():
     — the same stance the guard takes on an unresolvable ``**splat``, and for the
     same reason: a site the scan cannot read must not read as clean.
 
-    Seven such writes exist, at four positions, and all four journal only by-name
-    routed fields today (``JOURNAL_DYNAMIC_KIND_ALLOW`` records which). Declaring one
-    waives the kind resolution and nothing else: a kind-scoped name at one of them is
-    still refused by the sibling assertion, because nothing can prove which kind it
-    lands on.
+    Such writes sit at four positions — one position can hold several, as the
+    ``family`` f-strings in ``recovery_flow.prune_preserve_refs`` do — and all four
+    journal only by-name routed fields today (``JOURNAL_DYNAMIC_KIND_ALLOW`` records
+    which). Declaring one waives the kind resolution and nothing else: a kind-scoped
+    name at one of them is still refused by the sibling assertion, because nothing can
+    prove which kind it lands on.
 
     Ablation: empty ``JOURNAL_DYNAMIC_KIND_ALLOW`` and this reddens naming all four
     positions."""
@@ -5514,7 +5515,13 @@ def test_journal_kind_literal_probes_extract_the_kind():
     never reports, and a declared forwarder's call site, whose kind would
     otherwise stop at `plugins/bus.py::_log`'s wall.
 
-    Ablation: delete the `journalkindliteral` emit and every row here reddens."""
+    Ablation, per arm: delete the journal-write emit and the `run-start`,
+    `run-complete`, `plugin-loaded` and `plugin-hook` rows redden; delete the caller's
+    `kind=` emit and the `review-skipped-awaiting-operator` row reddens; delete the
+    declared position's parameter-default emit and the `review-skipped` and
+    `sweep-bundle-closed` rows redden. The keyword kind over an empty positional slot,
+    the `**` splat literal, and the positional literal at a declared non-forwarder call
+    site feed no row here; deleting any of them leaves this test green."""
     for source, rel, kind in (
         (
             'def f(self):\n    self.journal.append("run-start", story_key=s)\n',
