@@ -725,28 +725,39 @@ JOURNAL_SPLAT_ALLOW = {
 # the CALLERS visible, that one declares the forwarder's own hole.
 JOURNAL_FORWARDERS = {("plugins/bus.py", "_log")}
 
-# ``(file, enclosing function)`` of every journal write whose KIND is not a string
-# literal. Kind-scoped routing (`JOURNAL_KIND_ROUTED_FIELDS` /
-# `JOURNAL_KIND_BENIGN_FIELDS`) cannot be evaluated at such a call, so — exactly like
-# an unresolvable splat — the site fails loud rather than being graded against a kind
-# the scan had to guess.
+# ``(file, enclosing function)`` of every journal write whose positional KIND is not
+# a string literal, mapped to HOW MANY such writes that position holds. This is the
+# scan's `journalkind` population, including an empty positional slot even when a
+# literal kind arrives by keyword. Kind-scoped routing
+# (`JOURNAL_KIND_ROUTED_FIELDS` / `JOURNAL_KIND_BENIGN_FIELDS`) cannot be evaluated
+# at such a call, so — exactly like an unresolvable splat — the site fails loud
+# rather than being graded against a kind the scan had to guess.
 #
 # Declaring a position waives the KIND resolution and NOTHING else: a kind-scoped
 # name at one of these sites is still refused, because nothing here can prove which
-# kind it lands on.
+# kind it lands on. The waiver is per-POSITION, so it covers writes the declarer
+# never read; the count is what makes a write added inside an already-declared
+# position visible — `test_journal_dynamic_kind_positions_write_what_they_declare`
+# holds each key's value against the tree.
+#
+# The value counts WRITE SITES inside the position — not kinds, and not call sites.
+# The `recovery_flow` row's writes happen to mint one kind spelling each, and the
+# single-write rows are reached from several callers, but neither is what the number
+# means: a further `journal.append` inside the position moves it even when the kind it
+# spells already exists.
 JOURNAL_DYNAMIC_KIND_ALLOW = {
     # `kind` is a keyword parameter defaulting to `review-skipped`, flipped to
     # `review-skipped-awaiting-operator` by the park path. Journals `story_key` only.
-    ("engine.py", "_skip_review_and_commit"),
+    ("engine.py", "_skip_review_and_commit"): 1,
     # `kind` is chosen by the two ledger-close call sites. Journals `story_key` and
     # `dw_ids` only.
-    ("sweep.py", "_close_bundle_ledger_when_spec_status"),
-    # Four writes, each an f-string over the `family` loop variable:
-    # `attempt-preserve` / `attempt-preserve-dirty` × `-pruned` / `-prune-failed`.
-    ("recovery_flow.py", "prune_preserve_refs"),
+    ("sweep.py", "_close_bundle_ledger_when_spec_status"): 1,
+    # F-string writes over the `family` loop variable: `attempt-preserve` /
+    # `attempt-preserve-dirty` × `-pruned` / `-prune-failed`.
+    ("recovery_flow.py", "prune_preserve_refs"): 4,
     # The forwarder passes its caller's `kind` straight through; every CALLER spells
     # a literal, and `JOURNAL_FORWARDERS` is what lets the scan read them there.
-    ("plugins/bus.py", "_log"),
+    ("plugins/bus.py", "_log"): 1,
 }
 
 # Every literal journal KIND written today: a declared inventory, not a per-kind
@@ -1602,7 +1613,7 @@ def _positional_kind_literal(node: ast.Call, index: int) -> str | None:
     variable there reddens
     ``test_journal_kinds_are_literal_or_the_position_is_declared`` anyway. At the two
     non-forwarder positions (``engine._skip_review_and_commit``,
-    ``sweep._close_bundle_ledger_when_spec_status``) the allow set waives exactly that
+    ``sweep._close_bundle_ledger_when_spec_status``) the declaration waives exactly that
     test for the write INSIDE the position, so nothing else grades the slot: a caller
     handing it a variable would reach the journal with a kind no row declares while
     every arm stayed green."""
@@ -2535,7 +2546,7 @@ def _scan_source(src: str, rel: str):
     # no such position stays silent.
     # Where each declared position keeps its `kind`, so a caller that spells the
     # kind POSITIONALLY is read too. Keyed by name within this file, exactly like
-    # the allow set it is derived from.
+    # the position mapping it is derived from.
     kind_positions = {
         node.name: _kind_param_index(node)
         for node in ast.walk(tree)
@@ -3218,6 +3229,21 @@ def _journal_kind_offenders(findings) -> list[tuple[str, int, str]]:
     ]
 
 
+def _journal_kind_count_drift(findings) -> dict[tuple[str, str], tuple[int, int]]:
+    """The same positions on the other axis: each DECLARED position mapped to
+    ``(declared, measured)`` wherever the two disagree, in both directions.
+
+    Undeclared positions are deliberately absent — that is
+    ``_journal_kind_offenders``' question, and answering it twice would report one
+    defect through two messages."""
+    measured = Counter((rel, fn) for _, rel, _, _, fn in findings)
+    return {
+        pos: (declared, measured[pos])
+        for pos, declared in JOURNAL_DYNAMIC_KIND_ALLOW.items()
+        if measured[pos] != declared
+    }
+
+
 def test_journal_fields_are_routed_or_declared_benign():
     """Every field name a journal producer SPELLS AT A CALL is either routed by
     ``diagnostics`` — by name, or by name-and-kind — or listed in the benign
@@ -3296,6 +3322,40 @@ def test_journal_kinds_are_literal_or_the_position_is_declared():
         "not declared itself one — pass a literal kind, or add the position to "
         "JOURNAL_DYNAMIC_KIND_ALLOW with what it journals:\n"
         + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders)
+    )
+
+
+def test_journal_dynamic_kind_positions_write_what_they_declare():
+    """Each ``JOURNAL_DYNAMIC_KIND_ALLOW`` position holds exactly the number of
+    `journalkind` findings it declares — writes without a positional string-literal
+    kind. The count lives in the declaration, where an edit has to move it, rather
+    than in prose no assertion reads.
+
+    Prose could not hold this. The waiver is granted per POSITION, so one more
+    f-string write dropped inside ``recovery_flow.prune_preserve_refs`` is waived on
+    arrival: the declaredness sibling above still passes (the position is declared),
+    the routing rows still pass (the fields are by-name routed), and the only thing
+    that was ever wrong is a comment. This row is what turns that into a red test,
+    on the diff that adds the write.
+
+    Bound: it grades DECLARED positions only, in both directions — an undeclared
+    position is the sibling's business and stays its message, and a declared row
+    whose writes all gained positional literal kinds reddens here at measured 0
+    rather than lingering as a waiver for nothing.
+
+    Ablation: add one ``self.journal.append(f"{family}-ablation", ...)`` inside
+    ``recovery_flow.prune_preserve_refs`` beyond what it declares and this reddens at
+    that position, measured one above declared, while the declaredness sibling stays
+    green."""
+    wrong = _journal_kind_count_drift(_of("journalkind"))
+    assert wrong == {}, (
+        "a declared dynamic-kind position no longer writes what it declares — the "
+        "count is part of the declaration, so move it in the SAME PR as the write "
+        "(a measured 0 means the row is stale: delete it):\n"
+        + "\n".join(
+            f"  {rel}::{fn}: declared {declared}, measured {found}"
+            for (rel, fn), (declared, found) in sorted(wrong.items())
+        )
     )
 
 
@@ -5505,6 +5565,111 @@ def test_journal_kind_declaration_is_scoped_by_position(label, rel, fn, is_offen
         f"a non-literal kind in {rel}::{fn} should "
         f"{'be refused' if is_offender else 'be allowed'}"
     )
+
+
+# The count axis of the same declaration, as rows. Each case is a MUTATION of the
+# declared population plus the drift it must report, written as deltas off
+# `JOURNAL_DYNAMIC_KIND_ALLOW` rather than as literal counts, so a deliberate change
+# to the declaration moves these rows with it instead of leaving a second hardcoded
+# count behind — the defect this whole row family retires.
+#
+# The positions are DERIVED from the declaration for the same reason: naming one
+# would be a hardcoded key, and subscripting it at import turns "delete the stale
+# row", which is the remedy the tree-wide failure message hands out, into a
+# collection error for every row in this file. `default` keeps import total under the
+# declaredness sibling's "empty the declaration" ablation too.
+_MULTI_WRITE_POSITION, _DECLARED_WRITES = max(
+    JOURNAL_DYNAMIC_KIND_ALLOW.items(), key=lambda kv: kv[1], default=(("", ""), 0)
+)
+_OTHER_POSITION, _OTHER_DECLARED = min(
+    ((pos, n) for pos, n in JOURNAL_DYNAMIC_KIND_ALLOW.items() if pos != _MULTI_WRITE_POSITION),
+    key=lambda kv: kv[1],
+    default=(("", ""), 0),
+)
+
+
+def test_journal_kind_count_cases_rest_on_a_multi_write_position():
+    """The rows below mutate the declared position holding the MOST writes, derived
+    from the declaration rather than named. This pins the premise that makes the
+    derivation worth anything: some declared position holds two or more writes."""
+    assert _DECLARED_WRITES >= 2, (
+        "no declared dynamic-kind position holds 2+ writes any more, so the "
+        "`write-removed` and `position-went-literal` cases below collapse into each "
+        "other — both become measured 0 — and stop covering separate directions. "
+        f"Declared: {dict(JOURNAL_DYNAMIC_KIND_ALLOW)}"
+    )
+
+
+JOURNAL_KIND_COUNT_CASES = [
+    # The tree as declared: silent.
+    ("as-declared", dict(JOURNAL_DYNAMIC_KIND_ALLOW), {}),
+    # A write ADDED inside an already-declared position — the shape prose could not
+    # hold, and the one the real-tree ablation exercises.
+    (
+        "write-added",
+        {**JOURNAL_DYNAMIC_KIND_ALLOW, _MULTI_WRITE_POSITION: _DECLARED_WRITES + 1},
+        {_MULTI_WRITE_POSITION: (_DECLARED_WRITES, _DECLARED_WRITES + 1)},
+    ),
+    # …and the other direction: a write REMOVED is drift too, not an improvement.
+    (
+        "write-removed",
+        {**JOURNAL_DYNAMIC_KIND_ALLOW, _MULTI_WRITE_POSITION: _DECLARED_WRITES - 1},
+        {_MULTI_WRITE_POSITION: (_DECLARED_WRITES, _DECLARED_WRITES - 1)},
+    ),
+    # Every write at the position gained a literal kind: the row is now a waiver for
+    # nothing, and measured 0 is what says so.
+    (
+        "position-went-literal",
+        {**JOURNAL_DYNAMIC_KIND_ALLOW, _MULTI_WRITE_POSITION: 0},
+        {_MULTI_WRITE_POSITION: (_DECLARED_WRITES, 0)},
+    ),
+    # Two positions drifting at once: the report is a mapping, not a first-offender,
+    # so both pairs come back and the tree-wide message has more than one line to
+    # sort.
+    (
+        "two-positions-drift",
+        {
+            **JOURNAL_DYNAMIC_KIND_ALLOW,
+            _MULTI_WRITE_POSITION: _DECLARED_WRITES + 1,
+            _OTHER_POSITION: _OTHER_DECLARED + 2,
+        },
+        {
+            _MULTI_WRITE_POSITION: (_DECLARED_WRITES, _DECLARED_WRITES + 1),
+            _OTHER_POSITION: (_OTHER_DECLARED, _OTHER_DECLARED + 2),
+        },
+    ),
+    # An UNDECLARED position is the declaredness sibling's business; this axis stays
+    # silent rather than reporting one defect through two messages.
+    (
+        "undeclared-position",
+        {**JOURNAL_DYNAMIC_KIND_ALLOW, ("sweep.py", "_triage"): 3},
+        {},
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "population", "expected"),
+    JOURNAL_KIND_COUNT_CASES,
+    ids=[c[0] for c in JOURNAL_KIND_COUNT_CASES],
+)
+def test_journal_kind_count_drift_reports_both_directions(label, population, expected):
+    """`_journal_kind_count_drift`'s decision, as rows — the mutations the real tree
+    cannot show without editing `src/`.
+
+    Anti-vacuity is NOT why these exist, and the absence idiom does not apply here:
+    the tree-wide row grades declared positions, so `_journal_kind_count_drift([])`
+    reports every one of them at `(declared, 0)` and a scan that stopped finding
+    dynamic-kind writes reddens there rather than passing green. Reach is why. None
+    of these mutations can arise on the real tree without editing `src/`, so each
+    feeds a synthetic population and pins the helper's decision on both directions
+    where the tree cannot show it."""
+    findings = [
+        ("journalkind", rel, 1, "journal.append(kind)", fn)
+        for (rel, fn), count in population.items()
+        for _ in range(count)
+    ]
+    assert _journal_kind_count_drift(findings) == expected, label
 
 
 def test_journal_kind_probes_flag_a_non_literal_kind():
