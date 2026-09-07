@@ -17,6 +17,7 @@ from conftest import (
     bundle_dev_effect,
     bundle_dev_escalates,
     bundle_review_effect,
+    bundle_spec_path,
     crash_at_merge_back,
     fault_read_text,
     git,
@@ -24,6 +25,7 @@ from conftest import (
     install_bmad_config,
     install_build_auto_skill,
     migrate_effect,
+    nested_repo_root_paths,
     passes_once,
     triage_effect,
     write_ledger,
@@ -10142,6 +10144,143 @@ def test_bundle_harvest_alone_is_not_proof_of_work(project):
     assert engine.state.tasks["dw-fix-things"].phase == Phase.DEFERRED
     harvested = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
     assert len(harvested) == 1 and harvested[0]["dw_ids"] == ["DW-2"]
+
+
+def test_bundle_gate_excludes_the_nested_ledger_under_the_monorepo_shape(project):
+    """Grade the sweep bundle gate arm of the harvest exclusion (DW-168).
+
+    THE JOIN: ``SweepEngine._verify_dev_artifacts`` hands
+    ``Engine._harvest_gate_exclude(task)`` to ``verify.verify_dev_bundle`` as
+    ``engine_written``, which becomes the proof-of-work gate's ``extra_exclude``.
+    That is the producer's FOURTH consumer, and until this row nothing graded it
+    under a divergent ``repo_root``: the collapsed-shape row above
+    (``test_bundle_harvest_alone_is_not_proof_of_work``) runs where ``repo_root``
+    and ``project`` are the same string, so re-rooting the producer on
+    ``paths.project`` left every sweep row green. Driven through the engine's own
+    ``_verify_dev_artifacts`` rather than calling ``verify`` directly, the way the
+    DW-153 stories row does, so the wiring is part of what reddens.
+
+    THE NESTED SHAPE IS REQUIRED. Disjoint roots make both spellings agree: the
+    project-rooted one is a non-empty pathspec that matches nothing in the code
+    tree, so the gate refuses either way and a wrong root passes unnoticed. Nested,
+    the un-prefixed spelling names a REAL outer file — the decoy ledger below — so
+    the two roots are separable by VALUE.
+
+    EVERY SEEDED FILE IS COMMITTED, for two different reasons. The DECOY has to be
+    tracked because ``verify._changes_since`` counts untracked files as residue and
+    no exclusion names the decoy under the correct root, so an untracked one would
+    register as the work this attempt never did and the refusal would hold for a
+    reason that has nothing to do with the pathspec's root. That reason does NOT
+    extend to the nested ledger or the bundle spec: `_changes_since` filters
+    untracked paths through the same composed exclude tuple
+    (``created = {p for p in created if not _path_under_any(p, exclude)}``), and
+    both of those ARE named in it, so either one would be dropped whether tracked
+    or not. They are committed for the second reason instead -- it forces git's
+    exclude-pathspec branch, which is the branch this row exists to grade. The
+    seeds are staged path by path rather than via ``write_ledger(commit=True)``,
+    whose repo-wide ``git add -A`` would sweep the outer decoy in implicitly — the
+    decoy being tracked is this row's premise, not a side effect of a helper.
+
+    THE DECOY IS LEFT ALONE after creation and asserted byte-unchanged at the end.
+    It exists to make "the wrong spelling names a REAL file" true by value; had the
+    attempt also touched it, the correct spelling would count it as work and the
+    gate could not refuse at all. Asserting it present and unmodified is what makes
+    the ablation's failure attributable to the ROOT rather than to an absent file.
+
+    THE OUTCOME IS ASSERTED BEFORE THE SPELLING PIN. The producer's tuple already
+    has value rows in ``tests/test_engine.py``; under the ablation this row has to
+    redden on the OUTCOME to be worth its place, and an equality assertion reached
+    first would make it a second copy of those. The reason is asserted VERBATIM
+    because ``not outcome.ok`` alone is reachable from all three gates
+    ``_verify_shared_gates`` runs ahead of the probe (workflow tag, spec status,
+    baseline match), none of which is the claim here — which is also why the seed
+    clears all three: ``workflow: auto-dev``, status ``done`` (``_dev_review_enabled``
+    is False on the generic dev path) and a ``baseline_revision`` equal to
+    ``task.baseline_commit``.
+
+    Ablation, MEASURED: set ``root = paths.project`` in ``_harvest_gate_exclude``
+    and this row fails on ``assert not outcome.ok`` -- observed
+    ``AssertionError: assert not True``, the outcome carrying ``ok=True`` and an
+    empty ``reason``. The un-prefixed spelling excludes the untouched OUTER decoy,
+    so the orchestrator's append to the nested ledger counts as work the attempt
+    never did and the gate passes.
+    """
+    paths = nested_repo_root_paths(project)
+    # the premise: divergent AND nested. The sibling disjoint shape satisfies the
+    # first only, and there both spellings agree on the outcome.
+    assert paths.project != paths.repo_root
+    assert paths.project.parent == paths.repo_root
+
+    # the OUTER project's ledger: the real file a `project`-rooted pathspec names
+    # once git resolves it in the code tree
+    decoy = paths.repo_root / "_bmad-output" / "implementation-artifacts" / "deferred-work.md"
+    decoy.parent.mkdir(parents=True, exist_ok=True)
+    assert not decoy.exists(), (
+        "this row creates the outer ledger deliberately so the 'silently wrong' "
+        "claim is graded by value; inheriting one from the sandbox template would "
+        "make that premise a setup accident"
+    )
+    decoy_bytes = b"# outer ledger\n"
+    decoy.write_bytes(decoy_bytes)
+
+    # every file the attempt below touches is seeded as TRACKED content first
+    initial_baseline = verify.rev_parse_head(paths.repo_root)
+    write_ledger(paths, {"DW-1": "open"}, commit=False)
+    sp = bundle_spec_path(paths, "fix-things")
+    write_spec(sp, "in-progress", initial_baseline)
+    git(
+        paths.repo_root,
+        "add",
+        decoy.relative_to(paths.repo_root).as_posix(),
+        paths.deferred_work.relative_to(paths.repo_root).as_posix(),
+        sp.relative_to(paths.repo_root).as_posix(),
+    )
+    git(paths.repo_root, "commit", "-q", "-m", "seed tracked bookkeeping and both ledgers")
+
+    engine, _ = make_sweep(paths, [], policy=_harvest_bundle_policy(attempts=1))
+    task = StoryTask(story_key="dw-fix-things", epic=0, dw_ids=["DW-1"])
+    # the baseline is stamped where the session's cwd is: the CODE tree
+    task.baseline_commit = verify.rev_parse_head(paths.repo_root)
+    task.harvest_wrote_ledger = True
+
+    # the attempt's ENTIRE residue: the bundle spec's status flip and the
+    # orchestrator's own append to the NESTED ledger. No source edit at all.
+    write_spec(sp, "done", task.baseline_commit)
+    with paths.deferred_work.open("a", encoding="utf-8") as fh:
+        fh.write("\n### DW-2: harvested from the spec\n\nstatus: open\n")
+
+    result_json = {"workflow": "auto-dev", "spec_file": str(sp)}
+    outcome = engine._verify_dev_artifacts(task, result_json)
+
+    assert not outcome.ok
+    assert outcome.reason == "no changes in worktree since baseline commit"
+
+    # The in-row control that makes the refusal ATTRIBUTABLE: the SAME attempt with
+    # the producer stood down passes. That shows the nested ledger append IS
+    # countable residue which only the pathspec removes, so the refusal above is
+    # produced by the exclusion landing on it. Without this, `not outcome.ok` rests
+    # entirely on an out-of-band ablation, and a fixture change that made the append
+    # uncountable (left untracked, or newly covered by `app/.gitignore`) would keep
+    # the row green for a reason unrelated to the pathspec's root.
+    task.ledger_changed_before_harvest = True
+    assert engine._harvest_gate_exclude(task) == ()
+    assert engine._verify_dev_artifacts(task, result_json).ok
+    # back to the real attempt so the spelling pin below measures the real answer
+    task.ledger_changed_before_harvest = False
+
+    # the spelling that produced the refusal, pinned once the outcome has spoken
+    assert engine._harvest_gate_exclude(task) == (
+        "app/_bmad-output/implementation-artifacts/deferred-work.md",
+    )
+    # the wrong spelling would have named a REAL file, and the decoy contributed no
+    # residue of its own — so the refusal above is about the nested ledger being
+    # excluded, not about the outer one being absent
+    assert decoy.is_file() and decoy.read_bytes() == decoy_bytes
+
+    # the same attempt with one real source edit passes, so the refusal is about the
+    # missing work and not about the fixture being unusable
+    (paths.project / "src.txt").write_text("real work\n", encoding="utf-8")
+    assert engine._verify_dev_artifacts(task, result_json).ok
 
 
 # ------------------------- the per-run decisions writes, confined to the project (#593)

@@ -5396,15 +5396,30 @@ class Engine:
 
         The relpath is derived against ``paths.repo_root``, the tree the gate
         invokes git in, NOT ``paths.project`` (#716). The two are the same object
-        in every configuration but the `repo_root` override, and under that
-        override the ledger sits outside the code tree — where it cannot satisfy
-        proof-of-work, so ``()`` is the right answer rather than a pathspec git
-        would silently match nothing against.
+        in every configuration but the `repo_root` override, and that override has
+        TWO shapes whose wrong-root symptoms differ (DW-169):
 
-        Graded by
+        - DISJOINT (any root that is NOT an ancestor of `project` — a sibling
+          checkout beside it is the example the fixtures build, but a descendant
+          of `project`, or a root unrelated to it, lands here too): the ledger
+          sits OUTSIDE the probed tree, where it cannot satisfy proof-of-work at
+          all, so the ``ValueError`` arm's ``()`` is the right answer rather than
+          a pathspec git would silently match nothing against.
+        - NESTED / ANCESTOR (`repo_root` an ancestor of `project`, the monorepo
+          shape): the ledger sits INSIDE the probed tree and the correct relpath
+          keeps the project prefix (``app/_bmad-output/...``). Here ``()`` would be
+          wrong and a ``paths.project`` spelling is not empty either — it drops the
+          prefix and names a DIFFERENT, REAL file, the outer project's own ledger.
+          That is the silently-wrong case: git matches something, just not this
+          attempt's append, so the engine's own ledger write is left counting as
+          session proof of work.
+
+        Graded by these consumer-JOIN rows, which drive the tuple through a gate;
+        the tuple's own value rows live alongside them in ``tests/test_engine.py``:
         ``tests/test_engine.py::test_harvest_gate_exclude_gates_the_nested_ledger_under_the_monorepo_shape``,
         ``tests/test_engine.py::test_accepted_park_observation_excludes_the_nested_ledger_under_the_monorepo_shape``,
-        and ``tests/test_stories_engine.py::test_accepted_plan_halt_observation_excludes_the_nested_ledger_under_the_monorepo_shape``.
+        ``tests/test_stories_engine.py::test_accepted_plan_halt_observation_excludes_the_nested_ledger_under_the_monorepo_shape``,
+        and ``tests/test_sweep.py::test_bundle_gate_excludes_the_nested_ledger_under_the_monorepo_shape``.
         """
         if not task.harvest_wrote_ledger or task.ledger_changed_before_harvest:
             return ()
