@@ -45,6 +45,7 @@ from __future__ import annotations
 import ast
 import json
 from collections import Counter
+from itertools import product
 from pathlib import Path
 
 import pytest
@@ -797,12 +798,47 @@ JOURNAL_DYNAMIC_KIND_ALLOW = {
     # `kind` is chosen by the two ledger-close call sites. Journals `story_key` and
     # `dw_ids` only.
     ("sweep.py", "_close_bundle_ledger_when_spec_status"): 1,
-    # F-string writes over the `family` loop variable: `attempt-preserve` /
-    # `attempt-preserve-dirty` × `-pruned` / `-prune-failed`.
+    # F-string writes over the `family` loop variable. WHICH kinds they spell is
+    # not claimed here — `JOURNAL_DYNAMIC_KIND_SPELLINGS` holds that axis, read off
+    # the same AST, so the spelling claim is made in exactly one place.
     ("recovery_flow.py", "prune_preserve_refs"): 4,
     # The forwarder passes its caller's `kind` straight through; every CALLER spells
     # a literal, and `JOURNAL_FORWARDERS` is what lets the scan read them there.
     ("plugins/bus.py", "_log"): 1,
+}
+
+# The kind SPELLINGS a dynamic-kind position mints itself, keyed by the same
+# ``(file, function)`` position as the count above. One row today: the f-string
+# family in `recovery_flow.prune_preserve_refs`, whose kinds exist nowhere as a
+# literal — the scan expands `f"{family}-pruned"` by resolving `family` through the
+# for-loop over literal tuples that binds it, and
+# `test_journal_dynamic_kind_positions_mint_what_they_declare` grades the two sets
+# against each other in both directions.
+#
+# SEPARATE from `JOURNAL_DYNAMIC_KIND_ALLOW` rather than a richer value on it: that
+# dict's int values are consumed by the derived count-drift probe rows (`max`/`min`
+# over `.items()` by value) and by a position-key shape those rows read, so the two
+# axes stay two tables. The count answers "how many writes live here", this answers
+# "what do they spell"; a write added inside the position moves the count, a rename
+# moves this, and a new f-string kind moves both.
+#
+# Same position-key bound as the count table: the key holds a BARE function name, so
+# two same-named journal-writing functions in one module aggregate their spellings
+# into one row and a spelling moving between them reddens nothing.
+#
+# ⚠️ This does NOT feed `JOURNAL_KINDS`. These kinds stay out of the literal-kind
+# inventory by that set's own stated bound — they are minted, not written, and the
+# routing tables the inventory serves cannot be evaluated at a site whose kind is not
+# a literal. This table is the identity pin for the minted spellings, nothing more.
+JOURNAL_DYNAMIC_KIND_SPELLINGS = {
+    ("recovery_flow.py", "prune_preserve_refs"): frozenset(
+        {
+            "attempt-preserve-pruned",
+            "attempt-preserve-prune-failed",
+            "attempt-preserve-dirty-pruned",
+            "attempt-preserve-dirty-prune-failed",
+        }
+    ),
 }
 
 # Every literal journal KIND written today: a declared inventory, not a per-kind
@@ -1893,6 +1929,221 @@ def _journal_splat_keys(fn: ast.AST | None, name: str) -> set[str] | None:
     return keys if stored else None
 
 
+def _bound_names(target: ast.expr) -> set[str]:
+    """Every ``Name`` appearing in an assignment/loop TARGET.
+
+    Deliberately over-approximate — a subscript target (``d[key] = v``) reports both
+    ``d`` and ``key``, neither of which it rebinds. Over-reporting a binding can only
+    make :func:`_loop_literal_bindings` fail closed; under-reporting one would let a
+    rebound name resolve to a stale literal."""
+    return {node.id for node in ast.walk(target) if isinstance(node, ast.Name)}
+
+
+def _arguments_bind(args: ast.arguments, name: str) -> bool:
+    """True when a ``def``/``lambda`` parameter list binds ``name`` — positional-only,
+    positional, keyword-only, ``*args`` and ``**kwargs`` alike.
+
+    Shared by :func:`_rebinds_name`'s two callable arms so a ``lambda`` parameter
+    shadowing a loop name cannot be read as the loop's value while the identical
+    ``def`` shape refuses."""
+    every = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+    if args.vararg is not None:
+        every.append(args.vararg)
+    if args.kwarg is not None:
+        every.append(args.kwarg)
+    return any(arg.arg == name for arg in every)
+
+
+def _rebinds_name(node: ast.AST, name: str) -> bool:
+    """True when ``node`` binds ``name`` by any route OTHER than a ``for``
+    statement — the one route :func:`_loop_literal_bindings` can read.
+
+    Every arm is a fail-closed direction, not a completeness claim: an assignment, a
+    walrus, a ``with … as``, an ``except … as``, an import alias, a comprehension
+    target (its own scope, but its literal is not the loop's), a ``global``/
+    ``nonlocal`` declaration, a nested def/class of that name, and a parameter of a
+    ``def`` or ``lambda`` — the enclosing function's own included. Any of them means
+    the name is not solely the loop's, so the resolver refuses rather than answering
+    from the ``for`` alone.
+
+    A shape no arm names still resolves from the ``for`` alone; a ``match`` capture
+    pattern (``case str() as family:``) is the known one. Each arm is pinned by a row
+    of ``test_journal_minted_kind_probes_fail_loud_on_an_unresolvable_interpolation``,
+    so a deleted arm reddens; an arm never added is a gap this docstring does not
+    claim to close."""
+    if isinstance(node, ast.Assign):
+        return any(name in _bound_names(t) for t in node.targets)
+    if isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+        return name in _bound_names(node.target)
+    if isinstance(node, ast.comprehension):
+        return name in _bound_names(node.target)
+    if isinstance(node, ast.withitem):
+        return node.optional_vars is not None and name in _bound_names(node.optional_vars)
+    if isinstance(node, ast.ExceptHandler):
+        return node.name == name
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return any((alias.asname or alias.name.split(".")[0]) == name for alias in node.names)
+    if isinstance(node, (ast.Global, ast.Nonlocal)):
+        return name in node.names
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return node.name == name or _arguments_bind(node.args, name)
+    if isinstance(node, ast.Lambda):
+        return _arguments_bind(node.args, name)
+    if isinstance(node, ast.ClassDef):
+        return node.name == name
+    return False
+
+
+def _sequence_literal_elements(node: ast.expr) -> list[ast.expr] | None:
+    """The elements of a literal tuple/list/set display, or None for anything else —
+    a name, a call, a comprehension, or a display carrying a ``*`` unpacking, whose
+    element count is not knowable statically."""
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)) and not any(
+        isinstance(el, ast.Starred) for el in node.elts
+    ):
+        return list(node.elts)
+    return None
+
+
+def _loop_column_literals(iterable: ast.expr, column: int | None) -> set[str] | None:
+    """The string literals a ``for`` target takes from ``iterable``: the elements
+    themselves when ``column`` is None (a bare ``Name`` target), else index
+    ``column`` of each element (a ``Tuple`` target unpacked from a literal sequence
+    of literal sequences). None whenever any step is not statically readable."""
+    elements = _sequence_literal_elements(iterable)
+    if elements is None:
+        return None
+    values: set[str] = set()
+    for element in elements:
+        item = element
+        if column is not None:
+            # Unpacking is positional; a set display's AST order is not its
+            # iteration order, so it cannot supply a statically known column.
+            inner = (
+                _sequence_literal_elements(element)
+                if isinstance(element, (ast.Tuple, ast.List))
+                else None
+            )
+            if inner is None or column >= len(inner):
+                return None
+            item = inner[column]
+        if not (isinstance(item, ast.Constant) and isinstance(item.value, str)):
+            return None
+        values.add(item.value)
+    return values
+
+
+def _scoped_walk(fn: ast.AST):
+    """``(node, nested)`` for every node under ``fn``, where ``nested`` is True once
+    the walk has entered a nested ``def``/``lambda``/class.
+
+    ``ast.walk`` cannot express this and answering without it is wrong, not merely
+    coarse: a ``for family in ("PHANTOM",)`` inside a nested helper binds a name the
+    f-string in the OUTER body never sees, and unioning it mints a spelling the code
+    cannot write. It also put the binder at odds with :func:`_rebinds_name`, which
+    already treats a nested ``def`` of that name as a reason to refuse."""
+    stack: list[tuple[ast.AST, bool]] = [(fn, False)]
+    scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+    while stack:
+        node, nested = stack.pop()
+        yield node, nested
+        inner = nested or (isinstance(node, scopes) and node is not fn)
+        stack.extend((child, inner) for child in ast.iter_child_nodes(node))
+
+
+def _loop_literal_bindings(fn: ast.AST | None, name: str) -> set[str] | None:
+    """The string-literal values ``name`` takes from ``for`` targets in the enclosing
+    function's OWN scope, or None when a binding the resolver models is not statically
+    readable.
+
+    The reader behind the minted-kind axis: ``f"{family}-pruned"`` in
+    ``recovery_flow.prune_preserve_refs`` is only legible because ``family`` is bound
+    by ``for family, prune in (("attempt-preserve", …), ("attempt-preserve-dirty",
+    …))`` in the same function, over a literal tuple of literal tuples. Values are
+    UNIONED across every such loop, so a name bound by two loops mints from both.
+
+    Fails closed like :func:`_journal_splat_keys`, and for the same reason — a
+    partially-resolved name would under-report and read as green. A name with NO
+    ``for`` binding in the function (a parameter, a module global, a value from a
+    call) is unresolvable, not vacuously empty; a ``for`` over anything but a literal
+    sequence, a starred or nested target, a ``for`` binding in a NESTED scope the
+    f-string cannot see, a name bound by a second route (:func:`_rebinds_name`), and a
+    column the element sequence is too short for each return None rather than the
+    values seen so far. The caller turns None into :data:`UNRESOLVED_DYNAMIC_KIND`,
+    which no declaration can match.
+
+    Bound, stated where :func:`_rebinds_name` states its own: the refusals are the
+    enumerated ones, not every binding Python has. A rebinding route no arm names
+    (a ``match`` capture pattern, say) still resolves from the ``for`` alone."""
+    if fn is None:
+        return None
+    values: set[str] = set()
+    bound = False
+    for node, nested in _scoped_walk(fn):
+        if isinstance(node, (ast.For, ast.AsyncFor)):
+            target = node.target
+            if name not in _bound_names(target):
+                continue
+            if nested:
+                # A loop inside a nested def/lambda binds a name the enclosing body's
+                # f-string cannot see: refuse rather than union in a phantom spelling.
+                return None
+            bound = True
+            column: int | None = None
+            if not isinstance(target, ast.Name):
+                if not isinstance(target, (ast.Tuple, ast.List)):
+                    return None
+                indices = [
+                    index
+                    for index, element in enumerate(target.elts)
+                    if isinstance(element, ast.Name) and element.id == name
+                ]
+                # A nested, duplicated or starred target holding the name is legal
+                # Python the resolver deliberately does not model.
+                if len(indices) != 1 or any(
+                    isinstance(element, (ast.Tuple, ast.List, ast.Starred))
+                    for element in target.elts
+                ):
+                    return None
+                column = indices[0]
+            resolved = _loop_column_literals(node.iter, column)
+            if resolved is None:
+                return None
+            values |= resolved
+        elif _rebinds_name(node, name):
+            return None
+    return values if bound else None
+
+
+def _fstring_kind_spellings(fn: ast.AST | None, joined: ast.JoinedStr) -> set[str]:
+    """Every kind spelling an f-string in the KIND slot can mint: literal parts
+    verbatim, each ``{name}`` expanded to that name's resolved loop bindings, crossed
+    over the parts.
+
+    Never empty and never skipped. A part the scan cannot reduce to string literals —
+    a call, an attribute, an expression, a conversion (``!r``) or a format spec, or a
+    name :func:`_loop_literal_bindings` refuses — contributes
+    :data:`UNRESOLVED_DYNAMIC_KIND` instead, so the spelling that comes out cannot
+    match any declaration and reddens the minting assertion naming the site. That is
+    the same stance :func:`_positional_kind_literal` takes: unreadable must not read
+    as clean."""
+    parts: list[set[str]] = []
+    for part in joined.values:
+        if isinstance(part, ast.Constant) and isinstance(part.value, str):
+            parts.append({part.value})
+            continue
+        resolved = None
+        if (
+            isinstance(part, ast.FormattedValue)
+            and part.conversion in (-1, None)
+            and part.format_spec is None
+            and isinstance(part.value, ast.Name)
+        ):
+            resolved = _loop_literal_bindings(fn, part.value.id)
+        parts.append(resolved or {UNRESOLVED_DYNAMIC_KIND})
+    return {"".join(combination) for combination in product(*parts)}
+
+
 def _enclosing_function_names(tree: ast.AST) -> dict[int, str | None]:
     """``id(node) -> the name of the INNERMOST function definition containing it``
     (None at module level).
@@ -2353,6 +2604,40 @@ def _scan_source(src: str, rel: str):
             )
             if kind is None:
                 findings.append(("journalkind", rel, node.lineno, line_at(node.lineno), fn_name))
+                if isinstance(first, ast.JoinedStr):
+                    # An f-string kind is MINTED rather than written: no literal for
+                    # it exists anywhere in the tree, so the count row above is all
+                    # that ever graded the site and a respelling stayed invisible.
+                    # Read the spelling instead — literal parts verbatim,
+                    # interpolations resolved through the loop bindings that supply
+                    # them — one finding per spelling, graded against
+                    # `JOURNAL_DYNAMIC_KIND_SPELLINGS`. Unreadable parts arrive as
+                    # `UNRESOLVED_DYNAMIC_KIND`, which no row can declare.
+                    #
+                    # Only a JoinedStr in the POSITIONAL slot, and both halves of
+                    # that are bounds. The other dynamic kinds here spell a parameter
+                    # (`engine._skip_review_and_commit`,
+                    # `sweep._close_bundle_ledger_when_spec_status`,
+                    # `plugins/bus.py::_log`), whose literals reach the inventory from
+                    # OUTSIDE the position through the `journalkindliteral` arms below.
+                    # And an f-string arriving by KEYWORD (`append(kind=f"…")`) mints
+                    # nothing here: `_journal_keyword_kinds` already reads that channel
+                    # and reports `UNRESOLVED_DYNAMIC_KIND`, which
+                    # `test_journal_kind_inventory_is_complete` refuses outright — a
+                    # louder answer than a minted spelling, and the reason this axis
+                    # does not duplicate it.
+                    for spelling in sorted(
+                        _fstring_kind_spellings(enclosing_nodes.get(id(node)), first)
+                    ):
+                        findings.append(
+                            (
+                                "journalkindminted",
+                                rel,
+                                node.lineno,
+                                line_at(node.lineno),
+                                (fn_name, spelling),
+                            )
+                        )
                 if _positional_kind_literal(node, 0) is None:
                     # Nothing occupies the slot: the kind, if any, arrives by keyword.
                     # Unchanged on the `journalkind` axis — whether a POSITION may be
@@ -3536,6 +3821,37 @@ def _journal_kind_count_drift(findings) -> dict[tuple[str, str], tuple[int, int]
     }
 
 
+def _journal_minted_kind_drift(
+    findings,
+) -> dict[tuple[str, str | None], tuple[frozenset[str], frozenset[str]]]:
+    """Each position in the UNION of `JOURNAL_DYNAMIC_KIND_SPELLINGS` and the measured
+    `journalkindminted` findings, mapped to ``(declared, measured)`` wherever the two
+    SETS disagree.
+
+    The union, not the declared keys, is what makes this grade in both directions at
+    once: a new or renamed spelling shows up as measured-not-declared, a vanished one
+    as declared-not-measured, an undeclared minting position as an empty declared
+    half, and a stale row as an empty measured half. A rename moves both halves in one
+    entry, so it cannot be reported as an addition now and a staleness a run later —
+    the same shape `_journal_kind_inventory_drift` settled on for the literal
+    inventory.
+
+    Unlike `_journal_kind_count_drift` this does NOT restrict itself to declared
+    positions: minting is not waived per position anywhere, so an f-string kind
+    appearing at a new position is this helper's business and there is no sibling
+    assertion to hand it to."""
+    measured: dict[tuple[str, str | None], set[str]] = {}
+    for _, rel, _, _, (fn, spelling) in findings:
+        measured.setdefault((rel, fn), set()).add(spelling)
+    drift: dict[tuple[str, str | None], tuple[frozenset[str], frozenset[str]]] = {}
+    for position in set(JOURNAL_DYNAMIC_KIND_SPELLINGS) | set(measured):
+        declared = JOURNAL_DYNAMIC_KIND_SPELLINGS.get(position, frozenset())
+        found = frozenset(measured.get(position, ()))
+        if declared != found:
+            drift[position] = (declared, found)
+    return drift
+
+
 def test_journal_fields_are_routed_or_declared_benign():
     """Every field name a journal producer SPELLS AT A CALL is either routed by
     ``diagnostics`` — by name, or by name-and-kind — or listed in the benign
@@ -3651,6 +3967,51 @@ def test_journal_dynamic_kind_positions_write_what_they_declare():
     )
 
 
+def test_journal_dynamic_kind_positions_mint_what_they_declare():
+    """The kind SPELLINGS an f-string dynamic-kind position mints are exactly the ones
+    `JOURNAL_DYNAMIC_KIND_SPELLINGS` declares, in both directions — the identity axis
+    the count sibling above cannot hold.
+
+    The count is blind to identity by construction. Respelling `f"{family}-pruned"` to
+    `f"{family}-purged"`, or respelling the `"attempt-preserve-dirty"` literal the loop
+    tuple carries, leaves the position at four writes: the count row stays green, the
+    literalness row stays green (the position is declared), and `JOURNAL_KINDS`' stated
+    bound keeps these kinds out of the literal inventory on purpose — so before this
+    row the only thing that named them was a comment, and a comment cannot fail.
+
+    The spellings are DERIVED, not restated: `_fstring_kind_spellings` expands the
+    JoinedStr in the kind slot and resolves each interpolation through the same-function
+    `for` bindings that supply it, so `src/` is the measurement and this table is the
+    only place a spelling is written by hand. An edit to either side has to move the
+    other.
+
+    Fails loud rather than skipping. An interpolation the resolver cannot reduce —
+    a call, a parameter, a name assigned from anything but a literal loop — mints a
+    spelling carrying `UNRESOLVED_DYNAMIC_KIND`, which no row can declare, so an
+    unreadable kind reddens here instead of quietly leaving the position under-measured.
+
+    Ablation: respell `f"{family}-pruned"` to `f"{family}-purged"` in
+    `recovery_flow.prune_preserve_refs` and this reddens naming the position on both
+    directions at once (two spellings undeclared, two measured-absent) while
+    `test_journal_dynamic_kind_positions_write_what_they_declare` and
+    `test_journal_kinds_are_literal_or_the_position_is_declared` stay green. Emptying
+    `JOURNAL_DYNAMIC_KIND_SPELLINGS` reddens it too, at declared-empty."""
+    wrong = _journal_minted_kind_drift(_of("journalkindminted"))
+    assert wrong == {}, (
+        "a dynamic-kind position no longer mints what it declares — the spellings are "
+        "read off the AST, so move JOURNAL_DYNAMIC_KIND_SPELLINGS in the SAME PR as "
+        "the kind (an empty measured half means the row is stale: delete it; an empty "
+        "declared half means the position is new: add it):\n"
+        + "\n".join(
+            f"  {rel}::{fn}: minted-but-undeclared {sorted(found - declared)}, "
+            f"declared-but-unminted {sorted(declared - found)}"
+            for (rel, fn), (declared, found) in sorted(
+                wrong.items(), key=lambda item: (item[0][0], item[0][1] or "")
+            )
+        )
+    )
+
+
 def test_journal_kind_inventory_is_complete():
     """Every literal journal kind a producer writes is a declared `JOURNAL_KINDS`
     row, in both directions — the enumerate-vs-declare gate for the kind axis. Before
@@ -3751,6 +4112,49 @@ def test_unresolved_kind_sentinel_is_deliberately_absent_from_the_inventory():
             if f[0] == "journalkindliteral"
         ][0]
     )
+
+
+def test_unresolved_kind_sentinel_is_deliberately_absent_from_the_minted_declaration():
+    """`UNRESOLVED_DYNAMIC_KIND` must not be a `JOURNAL_DYNAMIC_KIND_SPELLINGS` value
+    either — the same prohibition as the row above, for the minting axis.
+
+    Same trap, worse blast radius. An unreadable interpolation reaches
+    `_journal_minted_kind_drift` as a spelling carrying the sentinel, looking exactly
+    like a real kind in the minted-but-undeclared list; a reader who takes that failure
+    at face value declares it, and the position is then permanently blind — every
+    future f-string the resolver cannot read at that position matches the declared
+    sentinel and passes. Unlike a stale `JOURNAL_KINDS` row, the declaration does not
+    even go stale, because the site keeps emitting it.
+
+    It is also what makes `_fstring_kind_spellings`' and
+    `_loop_literal_bindings`' "no declaration can match this" claims true; without this
+    row they are aspiration.
+
+    Ablation: add `"<unresolved-dynamic-kind>-pruned"` to the `recovery_flow.py` row —
+    spelled as the literal, because the constant is defined further down the file than
+    the table — and this reddens. It is the shape a reader copies straight out of a
+    failure message. Siblings redden with it today only because nothing on the tree
+    mints the sentinel; the moment something did, `mint_what_they_declare` would go
+    QUIET at that position and this row would be the only one left objecting, which is
+    the case it exists for."""
+    offenders = {
+        position
+        for position, spellings in JOURNAL_DYNAMIC_KIND_SPELLINGS.items()
+        if any(UNRESOLVED_DYNAMIC_KIND in spelling for spelling in spellings)
+    }
+    assert offenders == set(), (
+        f"{UNRESOLVED_DYNAMIC_KIND!r} is a SENTINEL the scan mints for an interpolation "
+        "it could not read. Declaring a spelling that carries it blinds the minting "
+        "axis at that position for good. Remove it and make the f-string READABLE — a "
+        "loop over string literals in the same scope — or leave the site red:\n"
+        + "\n".join(f"  {rel}::{fn}" for rel, fn in sorted(offenders))
+    )
+    # Anti-vacuity: the declaration has to be non-empty, and the sentinel has to be a
+    # spelling this scan can actually mint, or the absence above holds for reasons that
+    # have nothing to do with the decision it records.
+    assert JOURNAL_DYNAMIC_KIND_SPELLINGS and _fstring_kind_spellings(
+        None, ast.parse('f"{family}-pruned"').body[0].value
+    ) == {f"{UNRESOLVED_DYNAMIC_KIND}-pruned"}
 
 
 def _journal_kind_inventory_drift(
@@ -5962,6 +6366,442 @@ def test_journal_kind_count_drift_reports_both_directions(label, population, exp
         for _ in range(count)
     ]
     assert _journal_kind_count_drift(findings) == expected, label
+
+
+# The `recovery_flow.prune_preserve_refs` shape, as a snippet: a `for` over a literal
+# tuple of literal tuples, and the SAME four writes the real function makes — two
+# spelling `-pruned` (the partial-prune and the clean paths) and two `-prune-failed`
+# (with and without the failed refs). Four rather than a convenient two so the
+# "reproduces today's tree" claim below is true against the declared COUNT as well as
+# the declared spellings, and so the pair of sites minting one spelling exercises the
+# drift helper's de-duplication.
+#
+# Everything the minted-kind probes need to mutate lives here rather than in `src/`,
+# which the guard must not edit — and scanning it as `recovery_flow.py` puts the
+# findings at the very position `JOURNAL_DYNAMIC_KIND_SPELLINGS` declares, so the
+# drift helper grades them against the real row.
+MINTED_KIND_PROBE_SOURCE = """\
+def prune_preserve_refs(self):
+    for family, prune in (
+        ("attempt-preserve", verify.prune_preserve_refs),
+        ("attempt-preserve-dirty", verify.prune_preserve_dirty_refs),
+    ):
+        try:
+            deleted = prune(root, keep)
+        except Exception as exc:
+            partial = getattr(exc, "deleted", [])
+            if partial:
+                self.journal.append(f"{family}-pruned", count=len(partial), refs=partial)
+            failed = getattr(exc, "failed", [])
+            if failed:
+                self.journal.append(f"{family}-prune-failed", error=str(exc), failed=failed)
+            else:
+                self.journal.append(f"{family}-prune-failed", error=str(exc))
+            continue
+        if deleted:
+            self.journal.append(f"{family}-pruned", count=len(deleted), refs=deleted)
+"""
+
+# The position the snippet lands on and the spellings declared for it. READ from the
+# declaration rather than restated, avoiding a second inventory of full spellings.
+# The source fixture still mirrors the production family literals and suffixes and
+# must be updated alongside them when their spelling changes.
+_MINTED_POSITION = ("recovery_flow.py", "prune_preserve_refs")
+_MINTED_SPELLINGS = JOURNAL_DYNAMIC_KIND_SPELLINGS[_MINTED_POSITION]
+
+
+def _minted(source: str, rel: str = "recovery_flow.py"):
+    """The `journalkindminted` findings a snippet yields, as `_of` would hand them to
+    the drift helper."""
+    return [f for f in _scan_source(source, rel) if f[0] == "journalkindminted"]
+
+
+def _minted_spellings(source: str, rel: str = "recovery_flow.py") -> set[str]:
+    """Just the spellings, de-duplicated across sites."""
+    return {spelling for *_, (_, spelling) in _minted(source, rel)}
+
+
+def _shadowed_loop_write(kind: str, *body: str) -> str:
+    """A function whose `for family` loop resolves to `attempt-preserve`, with ``body``
+    spliced in ahead of a journal write spelling ``kind``.
+
+    The shared shape behind the fail-loud rows: because the loop alone resolves to the
+    DECLARED spelling `attempt-preserve-pruned`, a guard deleted from `_rebinds_name`,
+    `_loop_literal_bindings` or `_fstring_kind_spellings` does not redden the tree-wide
+    assertion — it reads the wrong value and stays green. These rows are what turn each
+    guard into something ablation can reach."""
+    lines = [
+        "def prune_preserve_refs(self):",
+        '    for family in ("attempt-preserve",):',
+        *(f"        {line}" for line in body),
+        f"        self.journal.append({kind}, count=n)",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _shadowed_loop(*body: str) -> str:
+    """:func:`_shadowed_loop_write` over the plain `f"{family}-pruned"` kind — the
+    shape every `_rebinds_name` row uses, where the mutation is the spliced body."""
+    return _shadowed_loop_write('f"{family}-pruned"', *body)
+
+
+def test_journal_minted_kind_probes_expand_the_fstring():
+    """The detector half: an f-string kind is expanded through the loop bindings that
+    supply it, over the shapes the tree cannot show — a `Tuple` target unpacked from a
+    literal tuple of literal tuples (the tree's shape), a bare `Name` target over a
+    literal tuple, and a name bound by TWO loops, whose values are unioned.
+
+    The two-loop row pins `values |= resolved`: ablate it to `values = resolved` and
+    only the last loop's spellings survive, which on the real tree is invisible because
+    `family` is bound once.
+
+    Ablation: delete the `isinstance(first, ast.JoinedStr)` emit and every row here
+    reddens with an empty set."""
+    assert _minted_spellings(MINTED_KIND_PROBE_SOURCE) == set(_MINTED_SPELLINGS)
+    # The snippet reproduces today's tree on both axes, so it must drift against the
+    # real declaration by nothing — and land on the declared write count.
+    assert _journal_minted_kind_drift(_minted(MINTED_KIND_PROBE_SOURCE)) == {}
+    assert _MINTED_POSITION not in _journal_kind_count_drift(
+        [
+            f
+            for f in _scan_source(MINTED_KIND_PROBE_SOURCE, "recovery_flow.py")
+            if f[0] == "journalkind"
+        ]
+    )
+
+    bare_target = (
+        "def prune_preserve_refs(self):\n"
+        '    for family in ("attempt-preserve", "attempt-preserve-dirty"):\n'
+        '        self.journal.append(f"{family}-pruned", count=n)\n'
+    )
+    assert _minted_spellings(bare_target) == {s for s in _MINTED_SPELLINGS if s.endswith("-pruned")}
+
+    two_loops = (
+        "def prune_preserve_refs(self):\n"
+        '    for family in ("attempt-preserve",):\n'
+        "        pass\n"
+        '    for family in ("attempt-preserve-dirty",):\n'
+        '        self.journal.append(f"{family}-pruned", count=n)\n'
+    )
+    assert _minted_spellings(two_loops) == {s for s in _MINTED_SPELLINGS if s.endswith("-pruned")}
+
+
+# `(old, new)` fragments that respell one half of the f-string. Each is a substring
+# of the SOURCE (so the mutation is a plain replace) and of the SPELLINGS it produces
+# (so the expected drift halves are derived, not restated): `-pruned` is the literal
+# suffix, `attempt-preserve-dirty` the loop tuple's family literal.
+MINTED_KIND_RESPELLINGS = [
+    ("kind suffix respelled", "-pruned", "-purged"),
+    ("family literal respelled", "attempt-preserve-dirty", "attempt-preserve-grubby"),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "old", "new"),
+    MINTED_KIND_RESPELLINGS,
+    ids=["suffix", "family"],
+)
+def test_journal_minted_kind_probes_catch_a_respelling(label, old, new):
+    """DW-151's gap, as rows: a respelling on EITHER half of the f-string — the literal
+    suffix or the loop tuple's family literal — reddens the minting assertion in both
+    directions at once, while the write COUNT it also declares is untouched.
+
+    That second clause is the whole point. Both mutations leave the position at four
+    `journalkind` findings, so `_journal_kind_count_drift` reports nothing and the
+    literalness row still sees a declared position; before this axis existed the only
+    thing that named these kinds was a comment.
+
+    The expected halves are DERIVED from the declaration and the mutation — the
+    spellings the mutated substring appears in vanish, the rewritten ones arrive.
+    Production renames also require updating the matching source fixture fragments;
+    these expected sets do not need a separate inventory edit.
+
+    Ablation: delete the `isinstance(first, ast.JoinedStr)` emit, or make
+    `_fstring_kind_spellings` return the literal parts only, and both rows redden. The
+    filter's `!=` cannot be ablated from HERE — a respelling adds as well as removes,
+    so an additions-only reading (`found - declared` in place of `!=`) still reports
+    these rows; `test_journal_minted_kind_drift_reports_a_stale_declared_row` is the
+    row that holds the removal direction."""
+    source = MINTED_KIND_PROBE_SOURCE.replace(old, new)
+    assert source != MINTED_KIND_PROBE_SOURCE, label
+    gone = {spelling for spelling in _MINTED_SPELLINGS if old in spelling}
+    added = {spelling.replace(old, new) for spelling in gone}
+    assert gone and added.isdisjoint(_MINTED_SPELLINGS), label
+    declared, found = _journal_minted_kind_drift(_minted(source))[_MINTED_POSITION]
+    assert declared - found == gone, label
+    assert found - declared == added, label
+
+    # The count axis is blind to all of it: the mutation renames a kind, it does not
+    # add or remove a write, so the position still measures the four writes it declares
+    # and `_journal_kind_count_drift` has nothing to say about it.
+    assert _MINTED_POSITION not in _journal_kind_count_drift(
+        [f for f in _scan_source(source, "recovery_flow.py") if f[0] == "journalkind"]
+    ), label
+
+
+@pytest.mark.parametrize(
+    ("label", "source"),
+    [
+        (
+            "parameter, no loop binding",
+            "def prune_preserve_refs(self, family):\n"
+            '    self.journal.append(f"{family}-pruned", count=n)\n',
+        ),
+        (
+            "loop over a call",
+            "def prune_preserve_refs(self):\n"
+            "    for family in _families():\n"
+            '        self.journal.append(f"{family}-pruned", count=n)\n',
+        ),
+        (
+            "interpolated call",
+            "def prune_preserve_refs(self):\n"
+            '    self.journal.append(f"{_family_for(x)}-pruned", count=n)\n',
+        ),
+        # `_fstring_kind_spellings`' two per-part guards. Both change what the code
+        # actually writes while leaving the name resolvable: `{family!r}` ships
+        # `'attempt-preserve'` quotes and all, `{family:.4}` ships `atte`.
+        ("conversion applied", _shadowed_loop_write('f"{family!r}-pruned"')),
+        ("format spec applied", _shadowed_loop_write('f"{family:.4}-pruned"')),
+        # `_sequence_literal_elements`' starred guard, in the two places it sits. On
+        # the OUTER iterable the `Constant` check would refuse the `Starred` element
+        # anyway; on an INNER element it is the only thing that refuses, because
+        # column 0 is a perfectly good literal whose position depends on an unknown
+        # arity.
+        (
+            "starred loop iterable",
+            "def prune_preserve_refs(self):\n"
+            '    for family in ("attempt-preserve", *rest):\n'
+            '        self.journal.append(f"{family}-pruned", count=n)\n',
+        ),
+        (
+            "starred element of the loop tuple",
+            "def prune_preserve_refs(self):\n"
+            '    for family, prune in (("attempt-preserve", *rest),):\n'
+            '        self.journal.append(f"{family}-pruned", count=n)\n',
+        ),
+        # A `for` binding the enclosing body cannot SEE. `ast.walk` unioned it in and
+        # minted a spelling the code never writes.
+        (
+            "loop inside a nested def",
+            "def prune_preserve_refs(self):\n"
+            '    for family in ("attempt-preserve",):\n'
+            "        def inner():\n"
+            '            for family in ("PHANTOM",):\n'
+            "                pass\n"
+            '        self.journal.append(f"{family}-pruned", count=n)\n',
+        ),
+        # A `lambda` parameter shadowing the loop name, with the write INSIDE the
+        # lambda — `_enclosing_function_nodes` maps the call to the enclosing `def`,
+        # so without the `ast.Lambda` arm the resolver answers from the outer loop.
+        (
+            "lambda parameter shadows the loop",
+            "def prune_preserve_refs(self):\n"
+            '    for family in ("attempt-preserve",):\n'
+            '        f = lambda family: self.journal.append(f"{family}-pruned", count=n)\n',
+        ),
+        (
+            "variadic lambda parameter shadows the loop",
+            "def prune_preserve_refs(self):\n"
+            '    for family in ("attempt-preserve",):\n'
+            '        f = lambda *family: self.journal.append(f"{family}-pruned", count=n)\n',
+        ),
+        (
+            "keyword variadic lambda parameter shadows the loop",
+            "def prune_preserve_refs(self):\n"
+            '    for family in ("attempt-preserve",):\n'
+            '        f = lambda **family: self.journal.append(f"{family}-pruned", count=n)\n',
+        ),
+        (
+            "class-local loop cannot supply the outer write",
+            "def prune_preserve_refs(self):\n"
+            "    class Inner:\n"
+            '        for family in ("attempt-preserve",):\n'
+            "            pass\n"
+            '    self.journal.append(f"{family}-pruned", count=n)\n',
+        ),
+        (
+            "nested unpacking overwrites the selected column",
+            "def prune_preserve_refs(self):\n"
+            '    for family, (family, extra) in (("attempt-preserve", ("PHANTOM", 1)),):\n'
+            '        self.journal.append(f"{family}-pruned", count=n)\n',
+        ),
+        (
+            "unpacked set has no fixed column order",
+            "def prune_preserve_refs(self):\n"
+            '    for family, other in ({"attempt-preserve", "PHANTOM"},):\n'
+            '        self.journal.append(f"{family}-pruned", count=n)\n',
+        ),
+        # One row per `_rebinds_name` arm, each spliced into a loop that would
+        # otherwise resolve to the DECLARED spelling — so deleting the arm reddens here
+        # rather than passing green against the declaration.
+        ("assign", _shadowed_loop("family = family.upper()")),
+        ("annassign", _shadowed_loop('family: str = "PHANTOM"')),
+        ("augassign", _shadowed_loop('family += "-x"')),
+        ("walrus", _shadowed_loop('if (family := "PHANTOM"):', "    pass")),
+        ("comprehension", _shadowed_loop('rows = [family for family in ("PHANTOM",)]')),
+        ("with-as", _shadowed_loop("with lock() as family:", "    pass")),
+        (
+            "except-as",
+            _shadowed_loop("try:", "    pass", "except Exception as family:", "    pass"),
+        ),
+        ("import-as", _shadowed_loop("import collections as family")),
+        ("from-import-as", _shadowed_loop("from collections import Counter as family")),
+        ("global", _shadowed_loop("global family")),
+        ("nonlocal", _shadowed_loop("nonlocal family")),
+        ("nested-def-name", _shadowed_loop("def family():", "    return 1")),
+        ("nested-def-param", _shadowed_loop("def inner(family):", "    return family")),
+        ("class-name", _shadowed_loop("class family:", "    pass")),
+    ],
+    ids=[
+        "parameter",
+        "call-iterable",
+        "call-part",
+        "conversion",
+        "format-spec",
+        "starred-iterable",
+        "starred-element",
+        "nested-loop",
+        "lambda-param",
+        "lambda-vararg",
+        "lambda-kwarg",
+        "class-loop",
+        "nested-target",
+        "inner-set",
+        "assign",
+        "annassign",
+        "augassign",
+        "walrus",
+        "comprehension",
+        "with-as",
+        "except-as",
+        "import-as",
+        "from-import-as",
+        "global",
+        "nonlocal",
+        "nested-def-name",
+        "nested-def-param",
+        "class-name",
+    ],
+)
+def test_journal_minted_kind_probes_fail_loud_on_an_unresolvable_interpolation(label, source):
+    """Every direction `_loop_literal_bindings`, `_sequence_literal_elements` and
+    `_fstring_kind_spellings` refuse mints a spelling carrying
+    `UNRESOLVED_DYNAMIC_KIND` — never nothing, and never the loop's literal.
+
+    Skipping is one failure mode this forbids: an unreadable interpolation that emitted
+    no finding would leave the position measured short, which reads exactly like a
+    write that was deliberately removed. Answering ANYWAY is the worse one, and it is
+    why every `_rebinds_name` arm gets a row rather than a comment. Each row splices
+    its shadowing construct into a loop that resolves to `attempt-preserve-pruned` — a
+    DECLARED spelling — so an arm deleted from `_rebinds_name` does not redden the
+    tree-wide assertion or anything else in this file; it just reads the wrong value
+    and stays green. AGENTS.md's ablation rule, applied per arm.
+
+    Ablation: return an empty set (or drop the part) instead of the sentinel in
+    `_fstring_kind_spellings` and every row reddens; delete any single arm of
+    `_rebinds_name`, the `nested` refusal in `_loop_literal_bindings`, or the starred
+    guard in `_sequence_literal_elements` and exactly the rows named above redden."""
+    assert _minted_spellings(source) == {f"{UNRESOLVED_DYNAMIC_KIND}-pruned"}, label
+    # …and it cannot be declared away: the drift helper reports the position.
+    assert _journal_minted_kind_drift(_minted(source)), label
+
+
+def test_loop_literal_bindings_is_unresolvable_without_a_loop():
+    """`_loop_literal_bindings` answers None — not an empty set — for a name no `for`
+    in the function binds, which is the `values if bound else None` flag.
+
+    Unpinnable through the spelling probes: the caller's `resolved or {sentinel}` turns
+    an empty set into the same sentinel, so ablating the flag to `return values` leaves
+    every row above green while the helper's own contract (`_journal_splat_keys`' —
+    "a name with no store at all is unresolvable, not vacuously empty") is broken. A
+    later caller that distinguished the two would inherit the bug silently."""
+    fn = ast.parse("def prune_preserve_refs(self):\n    return 1\n").body[0]
+    assert _loop_literal_bindings(fn, "family") is None
+    assert _loop_literal_bindings(None, "family") is None
+    # …and the positive direction, so the None above is not the only answer it gives.
+    bound = ast.parse('def f():\n    for family in ("attempt-preserve",):\n        pass\n').body[0]
+    assert _loop_literal_bindings(bound, "family") == {"attempt-preserve"}
+
+
+def test_journal_minted_kind_drift_reports_an_undeclared_position():
+    """A position that starts minting f-string kinds without a declaration reddens with
+    an EMPTY declared half — the union arm of `_journal_minted_kind_drift`.
+
+    Nothing waives minting per position (unlike the kind-resolution waiver
+    `JOURNAL_DYNAMIC_KIND_ALLOW` grants), so there is no sibling assertion to hand this
+    to and the helper must answer it itself. The snippet is the same one, scanned as a
+    file that declares no spellings.
+
+    The declared `recovery_flow.py` row rides along at measured-empty, because a
+    snippet population holds no findings for it — that is the staleness arm below, and
+    the reason this row reads ONE key rather than comparing the whole dict.
+
+    Ablation: iterate `JOURNAL_DYNAMIC_KIND_SPELLINGS`' keys instead of the union and
+    this reddens with a KeyError."""
+    drift = _journal_minted_kind_drift(_minted(MINTED_KIND_PROBE_SOURCE, "sweep.py"))
+    assert drift[("sweep.py", "prune_preserve_refs")] == (
+        frozenset(),
+        frozenset(_MINTED_SPELLINGS),
+    )
+
+
+def test_journal_minted_kind_drift_reports_a_stale_declared_row():
+    """The other end of the union: a declared row whose position stopped minting
+    reddens at measured-empty, so the declaration cannot survive as a pre-approval for
+    whatever kind reuses those spellings next.
+
+    This is also the anti-vacuity floor for the tree-wide row — a scan that quietly
+    stopped emitting `journalkindminted` findings reddens there rather than passing
+    green, which the `[]` population demonstrates directly."""
+    assert _journal_minted_kind_drift([]) == {
+        position: (frozenset(declared), frozenset())
+        for position, declared in JOURNAL_DYNAMIC_KIND_SPELLINGS.items()
+    }
+    assert JOURNAL_DYNAMIC_KIND_SPELLINGS, "an empty declaration would make the row vacuous"
+
+
+def test_journal_minted_kind_probes_stay_silent_on_a_non_fstring_kind():
+    """Only a JoinedStr in the KIND slot mints. A Name kind, a call kind, a `**` splat
+    covering the slot and a plain literal each emit nothing on this axis — the other
+    dynamic-kind positions (`engine._skip_review_and_commit`,
+    `sweep._close_bundle_ledger_when_spec_status`, `plugins/bus.py::_log`) spell a
+    parameter, whose literals reach the inventory from outside through
+    `journalkindliteral`, and must not acquire a phantom minted spelling here.
+
+    Vacuous on its own — deleting the emit leaves it green — which is what the positive
+    rows above are for; this pins the emit's REACH, not its existence. An f-string
+    ANYWHERE else in the call is silent too — a field value, and the KEYWORD kind
+    channel — which are the arms most likely to be widened by accident.
+
+    `append(kind=f"…")` is silent here but not unguarded: `_journal_keyword_kinds`
+    reads that channel and reports `UNRESOLVED_DYNAMIC_KIND`, which
+    `test_journal_kind_inventory_is_complete` refuses. The last assertion holds that
+    second half, so this row cannot be read as "a keyword f-string kind is fine"."""
+    for source, rel in (
+        ("def f(self):\n    self.journal.append(kind, story_key=s)\n", "recovery_flow.py"),
+        ("def f(self):\n    self.journal.append(_kind_for(x), count=n)\n", "recovery_flow.py"),
+        ("def f(self):\n    self.journal.append(**everything)\n", "recovery_flow.py"),
+        ('def f(self):\n    self.journal.append("run-start", story_key=s)\n', "recovery_flow.py"),
+        (
+            'def f(self):\n    self.journal.append("run-start", ref=f"{family}-pruned")\n',
+            "recovery_flow.py",
+        ),
+        ('def f(self):\n    results.append(f"{family}-pruned")\n', "recovery_flow.py"),
+        (
+            'def f(self):\n    self.journal.append(kind=f"{family}-pruned", count=n)\n',
+            "recovery_flow.py",
+        ),
+    ):
+        assert not _minted(source, rel), source
+
+    # The keyword channel's own guard, so its silence above is a division of labour
+    # rather than a hole: the same call reaches the literal inventory as the sentinel.
+    keyword_kind = 'def f(self):\n    self.journal.append(kind=f"{family}-pruned", count=n)\n'
+    assert [
+        f[4] for f in _scan_source(keyword_kind, "recovery_flow.py") if f[0] == "journalkindliteral"
+    ] == [UNRESOLVED_DYNAMIC_KIND]
 
 
 def test_journal_kind_probes_flag_a_non_literal_kind():
