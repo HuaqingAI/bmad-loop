@@ -669,19 +669,72 @@ JOURNAL_BENIGN_FIELDS = frozenset(
 # the failure mode DW-82 exists to remove, applied to the guard itself.
 JOURNAL_SELF_MINTED_FIELDS = SELF_MINTED_FIELDS
 
-# ``(file, enclosing function) -> the field names that actually flow through it`` for
-# every ``journal.append(**name)`` whose keys are NOT statically resolvable. An
+# ``(file, enclosing function)`` of every ``journal.append(**name)`` whose keys are
+# NOT statically resolvable, mapped to HOW MANY such writes that position holds. An
 # unresolved splat is a HOLE in the inventory above — the guard cannot tell whether a
-# new field arrived through it — so it fails loud and each hole is declared here with
-# why it is one, rather than being silently skipped. A new splat site anywhere else
-# reddens the guard until someone either makes its keys resolvable or adds a line here.
+# new field arrived through it — so it fails loud and each hole is declared here,
+# with the field names it lets through and the reasoning for it on the sibling
+# ``JOURNAL_SPLAT_FIELDS`` below. A new splat site anywhere else reddens the guard
+# until someone either makes its keys resolvable or adds a line here.
 #
 # All four are unresolvable for the same structural reason: the dict is not built
-# from literals in the calling function. The VALUES are an inventory read off the
-# producer, not an assertion the scan can check — they are what keeps the staleness
-# check on ``JOURNAL_BENIGN_FIELDS`` from calling a splat-borne name dead, and they
-# are the honest answer to "which names does this hole let through".
+# from literals in the calling function.
+#
+# The value counts WRITE SITES inside the position — not the FIELDS that flow through
+# it (`JOURNAL_SPLAT_FIELDS`' axis), and not the call sites that reach it. The waiver
+# is granted per POSITION, so before the count existed a SECOND splat dropped inside
+# an already-declared position was waived on arrival and its field names escaped the
+# inventory with the suite green — the exact shape DW-138 retired on
+# `JOURNAL_DYNAMIC_KIND_ALLOW`, on a table that already held two writes at one
+# position. `_journal_field_offenders` grades the count at the offending LINES and
+# `test_journal_field_guard_actually_saw_the_producers` grades it as NUMBERS in both
+# staleness directions; that test's docstring says why the answer appears twice.
+#
+# SEPARATE from `JOURNAL_SPLAT_FIELDS` rather than a richer value, for the reason
+# `JOURNAL_DYNAMIC_KIND_SPELLINGS` is separate from the count it accompanies: the int
+# values feed derived count-drift probe rows, the consumers outside the field guard
+# read the FIELD sets by subscript, and the two axes answer different questions. A
+# write added inside the position moves the count, a new key inside the splatted dict
+# moves the fields.
+#
+# ⚠️ STATED BOUNDS. The key holds a BARE function name, not a qualified
+# `class.method`, so two same-named journal-writing functions in ONE module aggregate
+# into a single row: their writes sum into one count and their fields into one set,
+# and a splat moving between them reddens nothing. No such pair exists today, and the
+# assumption is enforced rather than trusted — the scan emits each journal write's
+# enclosing DEF identity, `_journal_bare_name_collisions` reads it, and
+# `test_journal_writers_do_not_share_a_bare_name` reddens on the day the pair
+# arrives. Qualifying the key is deliberately DEFERRED (DW-152), not overlooked: the
+# bound is stated so the next reader inherits the decision, not the surprise.
 JOURNAL_SPLAT_ALLOW = {
+    # One `**streams` write, closing the verify-command entry.
+    ("engine.py", "_journal_verify_command_results"): 1,
+    # One `**pref` write per escalation record.
+    ("engine.py", "_review_and_commit"): 1,
+    # TWO `**self._session_end_extras(result)` writes — the normal session-end path
+    # and the `finally` fallback that runs when the normal one did not reach. Both
+    # splat the SAME method's dict, which is why one field inventory covers the pair;
+    # the count is the only thing that can see a third arrive.
+    ("engine.py", "_run_session"): 2,
+    # One `**fields` forward: the forwarder's own hole.
+    ("plugins/bus.py", "_log"): 1,
+}
+
+# The FIELD names that actually flow through each declared hole above, keyed by the
+# same ``(file, enclosing function)`` position. The VALUES are an inventory read off
+# the producer, not an assertion the scan can check — they are what keeps the
+# staleness check on ``JOURNAL_BENIGN_FIELDS`` from calling a splat-borne name dead,
+# and they are the honest answer to "which names does this hole let through".
+#
+# Co-extensive with `JOURNAL_SPLAT_ALLOW` by ASSERTION, not by convention: every
+# declared hole has a field inventory (possibly empty) and every inventory has a
+# count. `test_journal_splat_tables_declare_the_same_positions` holds the two key
+# sets equal, because splitting one table into two introduces a way to drift that no
+# other row here would catch.
+#
+# Same position-key bound as the count table — a BARE function name — with the same
+# collision guard behind it; see `JOURNAL_SPLAT_ALLOW`'s ⚠️ STATED BOUNDS block.
+JOURNAL_SPLAT_FIELDS = {
     # `streams` keys are computed — `f"{kind}_path"` and its three siblings over a
     # fixed (stdout, stderr) loop — so the resolver cannot read them and the argument
     # for the hole is the POSITION. Said plainly because the previous comment argued
@@ -791,6 +844,17 @@ JOURNAL_FORWARDERS = {("plugins/bus.py", "_log")}
 # single-write rows are reached from several callers, but neither is what the number
 # means: a further `journal.append` inside the position moves it even when the kind it
 # spells already exists.
+#
+# ⚠️ STATED BOUNDS. The key holds a BARE function name, not a qualified
+# `class.method`, so two same-named journal-writing functions in ONE module aggregate
+# into a single row: their writes sum into one count and a dynamic kind moving
+# between them reddens nothing. Same bound on `JOURNAL_DYNAMIC_KIND_SPELLINGS` and on
+# `JOURNAL_SPLAT_ALLOW` / `JOURNAL_SPLAT_FIELDS` — one key shape, one hole. No such
+# pair exists today, and the assumption is enforced rather than trusted: the scan
+# emits each journal write's enclosing DEF identity,
+# `_journal_bare_name_collisions` reads it, and
+# `test_journal_writers_do_not_share_a_bare_name` reddens on the day the pair
+# arrives. Qualifying the key is deliberately DEFERRED (DW-152), not overlooked.
 JOURNAL_DYNAMIC_KIND_ALLOW = {
     # `kind` is a keyword parameter defaulting to `review-skipped`, flipped to
     # `review-skipped-awaiting-operator` by the park path. Journals `story_key` only.
@@ -2596,6 +2660,30 @@ def _scan_source(src: str, rel: str):
         # site can write append(**{"kind": "x"}) with both waivers hiding the kind.
         if _is_journal_write(node, rel):
             fn_name = enclosing_names.get(id(node))
+            # The DEF IDENTITY behind the bare-name position key, once per journal
+            # write. Every position table here is keyed by `(file, bare function
+            # name)`, an assumption nothing enforced: two same-named journal-writing
+            # functions in one module aggregate into one row. The name cannot express
+            # the difference, so the enclosing def's lineno is emitted alongside it —
+            # read off `enclosing_nodes`, the twin already built for the splat
+            # resolver, so no second AST walk is needed. `(None, None)` at module
+            # level, which `_journal_bare_name_collisions` skips.
+            #
+            # `None` is spelled, not defaulted: every node `_enclosing_function_nodes`
+            # can hand back is a `FunctionDef`/`AsyncFunctionDef` and carries a
+            # `lineno`, so a `getattr` default would never fire on today's tree and
+            # would silently degrade the emit to `(name, None)` — the collision
+            # helper's skip condition — if that ever stopped holding.
+            enclosing_def = enclosing_nodes.get(id(node))
+            findings.append(
+                (
+                    "journalfnscope",
+                    rel,
+                    node.lineno,
+                    line_at(node.lineno),
+                    (fn_name, None if enclosing_def is None else enclosing_def.lineno),
+                )
+            )
             first = node.args[0] if node.args else None
             kind = (
                 first.value
@@ -3763,6 +3851,19 @@ def test_isolation_conflict_refusal_sites_are_enumerated():
     )
 
 
+def _journal_measured_splats(findings) -> Counter[tuple[str, str | None]]:
+    """``(file, enclosing function) -> how many UNRESOLVABLE splat findings sit
+    there``, over a ``journalfield`` population.
+
+    One definition of "this finding is a hole", shared by the two graders that must
+    agree about it: ``_journal_field_offenders`` (which flags the lines of an
+    over-count) and ``_journal_splat_count_drift`` (which reports the numbers in every
+    direction). Built twice, a change to what MARKS a hole — a sentinel in place of
+    ``field is None``, a reshaped payload — would land in one and not the other, and
+    the filter would flag while the grader stayed silent or the reverse."""
+    return Counter((rel, fn) for _, rel, _, _, (field, fn, _) in findings if field is None)
+
+
 def _journal_field_offenders(findings) -> list[tuple[str, int, str, str]]:
     """The routing invariant as a filter, in the two directions a finding can fail:
     a field name that neither ``diagnostics`` nor the benign inventory accounts for,
@@ -3774,13 +3875,37 @@ def _journal_field_offenders(findings) -> list[tuple[str, int, str, str]]:
     only on its declared shapes and is an offender everywhere else unless that other
     shape is explicitly benign. That includes a call whose kind the scan could not
     resolve. `target` is the dangerous example: flattening it made
-    ``journal.append("unit-merge-failed", target=branch)`` read as routed."""
+    ``journal.append("unit-merge-failed", target=branch)`` read as routed.
+
+    The splat arm grades the declared COUNT, not mere membership. A position declares
+    how many unresolvable writes it holds, so a SECOND splat dropped inside an
+    already-declared position is an offender at every one of its lines — membership
+    alone waived it on arrival, and its field names escaped the inventory with this
+    guard green. Only over-count is reported here: a position measuring FEWER writes
+    than it declares has no finding to hang a message on, which is why
+    ``test_journal_field_guard_actually_saw_the_producers`` grades the same numbers in
+    both staleness directions. On the UNDECLARED direction the two overlap on purpose,
+    and they answer different questions — LINES to fix here, NUMBERS to move there —
+    which is the deliberate departure from ``_journal_kind_count_drift``'s
+    declared-only restriction."""
     offenders: list[tuple[str, int, str, str]] = []
+    measured_splats = _journal_measured_splats(findings)
     for _, rel, ln, txt, (field, fn, kind) in findings:
         where = f"{fn}()" if fn else "<module>"
         if field is None:
-            if (rel, fn) not in JOURNAL_SPLAT_ALLOW:
+            declared = JOURNAL_SPLAT_ALLOW.get((rel, fn))
+            if declared is None:
                 offenders.append((rel, ln, txt, f"unresolvable **splat in {where}"))
+            elif measured_splats[(rel, fn)] > declared:
+                offenders.append(
+                    (
+                        rel,
+                        ln,
+                        txt,
+                        f"unresolvable **splat in {where} beyond its declared hole "
+                        f"(measured {measured_splats[(rel, fn)]}, declared {declared})",
+                    )
+                )
             continue
         if field in JOURNAL_ROUTED_FIELDS or field in JOURNAL_BENIGN_FIELDS:
             continue
@@ -3850,6 +3975,61 @@ def _journal_minted_kind_drift(
         if declared != found:
             drift[position] = (declared, found)
     return drift
+
+
+def _journal_splat_count_drift(findings) -> dict[tuple[str, str | None], tuple[int, int]]:
+    """Each position in the UNION of ``JOURNAL_SPLAT_ALLOW`` and the measured
+    unresolvable-splat findings, mapped to ``(declared, measured)`` wherever the two
+    disagree.
+
+    The union, not the declared keys, is what makes this grade in every direction at
+    once: an undeclared position arrives with a declared half of 0, a stale row with a
+    measured half of 0, and a write added or removed inside an already-declared
+    position with two non-zero halves. That is broader than
+    ``_journal_kind_count_drift``, which restricts itself to declared positions to
+    avoid answering ``_journal_kind_offenders``' question twice — and the reason the
+    splat axis differs is that its sibling filter (``_journal_field_offenders``) can
+    only report over-count. A position that lost a write, or lost every write, has no
+    finding left for the filter to flag, so if this helper deferred to it the way the
+    kind axis does, a stale hole would sit there sanctioning nothing with the suite
+    green. Overlap on the undeclared direction is the accepted price, taken with eyes
+    open rather than as the only one in this file: the filter names the LINE to fix,
+    this names the NUMBER to move."""
+    measured = _journal_measured_splats(findings)
+    drift: dict[tuple[str, str | None], tuple[int, int]] = {}
+    for position in set(JOURNAL_SPLAT_ALLOW) | set(measured):
+        declared = JOURNAL_SPLAT_ALLOW.get(position, 0)
+        found = measured[position]
+        if declared != found:
+            drift[position] = (declared, found)
+    return drift
+
+
+def _journal_bare_name_collisions(findings) -> dict[tuple[str, str], list[int]]:
+    """Every ``(file, bare function name)`` a journal write's position key can name,
+    where TWO distinct function definitions in that file answer to the name — mapped
+    to both ``def`` linenos.
+
+    All five ``(file, bare function name)``-keyed journal tables rest on this —
+    ``JOURNAL_SPLAT_ALLOW`` / ``JOURNAL_SPLAT_FIELDS``,
+    ``JOURNAL_DYNAMIC_KIND_ALLOW`` / ``JOURNAL_DYNAMIC_KIND_SPELLINGS`` and
+    ``JOURNAL_FORWARDERS`` — and the bare name silently aggregates such a pair into
+    one row: their counts sum, their declared sets merge, and a write moving from one
+    to the other reddens nothing. ``JOURNAL_FORWARDERS`` is the sharpest of the five,
+    because it does not merely aggregate: it makes ``_is_journal_write`` treat a call
+    to that NAME in that FILE as a journal write, so a same-named function that never
+    touches the journal still hands its callers' keywords to the field inventory.
+    Qualifying the key is deferred (DW-152); this makes the assumption behind the
+    deferral enforceable instead of assumed.
+
+    Module-level writes (``fn is None``) are never a collision — a file has exactly one
+    module scope, so it cannot collide with itself."""
+    seen: dict[tuple[str, str], set[int]] = {}
+    for _, rel, _, _, (fn, def_lineno) in findings:
+        if fn is None or def_lineno is None:
+            continue
+        seen.setdefault((rel, fn), set()).add(def_lineno)
+    return {position: sorted(linenos) for position, linenos in seen.items() if len(linenos) > 1}
 
 
 def test_journal_fields_are_routed_or_declared_benign():
@@ -4299,11 +4479,20 @@ def test_journal_field_guard_actually_saw_the_producers():
 
     Also pins the three shapes the scan must not lose — the routed names really are
     produced (so ``JOURNAL_ROUTED_FIELDS`` is coupled to live producers rather than
-    to a copied list), every declared splat hole still exists (so a stale
-    ``JOURNAL_SPLAT_ALLOW`` entry cannot sit there sanctioning nothing), and every
+    to a copied list), every declared splat hole still holds exactly the number of
+    unresolvable writes it declares (so neither a stale ``JOURNAL_SPLAT_ALLOW`` entry
+    sanctioning nothing nor a write added inside a declared one can pass), and every
     declared BENIGN name still has a producer.
 
-    That last one is the direction nothing held before. The benign inventory is a
+    The splat half grades COUNTS, not membership. A set comparison is blind to a
+    second splat dropped inside an already-declared position — the position is still
+    in both sets — which is exactly how such a write's field names escaped the
+    inventory with this row green. ``_journal_field_offenders`` reports the same
+    over-count as offending LINES, and that overlap is deliberate: this row is the
+    only one that can see the two staleness directions, because a position that lost
+    a write leaves no finding for a filter over findings to flag.
+
+    That benign direction is the one nothing held before. The benign inventory is a
     pre-approval list, so a name whose producer was deleted does not just sit there
     inertly: it pre-approves a future, unrelated field that happens to reuse the
     spelling, with no one making the decision the inventory exists to force. The two
@@ -4313,19 +4502,132 @@ def test_journal_field_guard_actually_saw_the_producers():
     produced = {field for _, _, _, _, (field, _, _) in findings if field is not None}
     assert len(produced) > 100, f"the scan found only {len(produced)} journal fields"
     assert produced & JOURNAL_ROUTED_FIELDS, "no routed field has a static producer"
-    holes = {(rel, fn) for _, rel, _, _, (field, fn, _) in findings if field is None}
-    assert holes == set(JOURNAL_SPLAT_ALLOW), (
-        "JOURNAL_SPLAT_ALLOW no longer matches the unresolvable splats in the tree; "
-        f"undeclared: {sorted(holes - set(JOURNAL_SPLAT_ALLOW))}, "
-        f"stale: {sorted(set(JOURNAL_SPLAT_ALLOW) - holes)}"
+    drift = _journal_splat_count_drift(findings)
+    assert drift == {}, (
+        "JOURNAL_SPLAT_ALLOW no longer matches the unresolvable splats in the tree — "
+        "the count is part of the declaration, so move it in the SAME PR as the "
+        "write, and record what the hole lets through in JOURNAL_SPLAT_FIELDS "
+        "alongside it:\n"
+        + "\n".join(
+            f"  {rel}::{fn}: declared {declared}, measured {found}"
+            + (
+                " (undeclared position: declare the hole or resolve its keys)"
+                if declared == 0
+                else (
+                    " (stale row: no unresolvable splat here any more, delete it)"
+                    if found == 0
+                    else " (drift inside a declared position)"
+                )
+            )
+            for (rel, fn), (declared, found) in sorted(
+                drift.items(), key=lambda kv: (kv[0][0], kv[0][1] or "")
+            )
+        )
     )
-    unscannable = JOURNAL_SELF_MINTED_FIELDS.union(*JOURNAL_SPLAT_ALLOW.values())
+    unscannable = JOURNAL_SELF_MINTED_FIELDS.union(*JOURNAL_SPLAT_FIELDS.values())
     stale = JOURNAL_BENIGN_FIELDS - produced - unscannable
     assert stale == set(), (
         "JOURNAL_BENIGN_FIELDS names fields no producer writes any more — a benign "
         "entry outlives its producer as a standing pre-approval for the next field "
         "that reuses the name. Delete them, or record where they now come from in "
-        f"JOURNAL_SPLAT_ALLOW / JOURNAL_SELF_MINTED_FIELDS: {sorted(stale)}"
+        f"JOURNAL_SPLAT_FIELDS / JOURNAL_SELF_MINTED_FIELDS: {sorted(stale)}"
+    )
+
+
+def test_journal_splat_tables_declare_the_same_positions():
+    """``JOURNAL_SPLAT_ALLOW`` and ``JOURNAL_SPLAT_FIELDS`` are keyed identically and
+    co-extensively — every declared hole has a field inventory (possibly empty) and
+    every inventory has a write count.
+
+    Splitting one table into two is what makes this assertable and what makes it
+    necessary. A count row with no field row would sanction a hole whose names are
+    inventoried nowhere, so the benign staleness check above would start calling a
+    splat-borne name dead; a field row with no count row would be a set of names the
+    tree-wide count grader never visits. Neither shape reddens anywhere else — the
+    field consumers subscript the positions they name, and the count grader iterates
+    its own keys — so the coupling the single table used to get from its shape is
+    asserted here instead.
+
+    Also refuses a declared count of ZERO, a spelling the count shape newly makes
+    expressible and which is silent everywhere else: the drift grader compares
+    ``0 != 0`` and says nothing, no ``field is None`` finding exists for the offender
+    filter to flag, the key-set half above passes while the ``JOURNAL_SPLAT_FIELDS``
+    sibling survives — and that sibling's names keep suppressing the
+    ``JOURNAL_BENIGN_FIELDS`` staleness check through ``unscannable``. The old set
+    comparison reddened on exactly that row, so this is the coverage the count rewrite
+    would otherwise have dropped.
+
+    Ablation: delete either table's ``plugins/bus.py::_log`` row and this reddens; set
+    its count to ``0`` and the zero half reddens."""
+    assert set(JOURNAL_SPLAT_ALLOW) == set(JOURNAL_SPLAT_FIELDS), (
+        "the splat count and field declarations disagree about which positions are "
+        "holes — one of the two was edited alone; every declared hole needs both a "
+        "write count and a field inventory (an empty frozenset is a real answer):\n"
+        f"  count without fields: {sorted(set(JOURNAL_SPLAT_ALLOW) - set(JOURNAL_SPLAT_FIELDS))}\n"
+        f"  fields without count: {sorted(set(JOURNAL_SPLAT_FIELDS) - set(JOURNAL_SPLAT_ALLOW))}"
+    )
+    empty = sorted(pos for pos, count in JOURNAL_SPLAT_ALLOW.items() if count < 1)
+    assert empty == [], (
+        "a declared splat hole holds at least one unresolvable write — a count of 0 "
+        "sanctions nothing while its field inventory still suppresses the benign "
+        f"staleness check, so delete the row instead: {empty}"
+    )
+
+
+def test_journal_writers_do_not_share_a_bare_name():
+    """No scanned module holds TWO journal-writing functions answering to one bare
+    name — the assumption every position table in this file rests on.
+
+    Five tables are keyed by ``(file, bare function name)``:
+    ``JOURNAL_SPLAT_ALLOW`` / ``JOURNAL_SPLAT_FIELDS``,
+    ``JOURNAL_DYNAMIC_KIND_ALLOW`` / ``JOURNAL_DYNAMIC_KIND_SPELLINGS`` and
+    ``JOURNAL_FORWARDERS``. Such a pair aggregates into ONE row: their write counts
+    sum, their declared sets merge, and a splat or a dynamic kind moving from one to
+    the other reddens nothing while the row it lands in still reads as accurate.
+    ``JOURNAL_FORWARDERS`` is worse than aggregation — it makes ``_is_journal_write``
+    read a call to that NAME in that FILE as a journal write, so a same-named function
+    that never touches the journal still routes its callers' keywords into the field
+    inventory. DW-152 deliberately deferred qualifying the key to ``class.method``;
+    what it did not defer is knowing when the deferral stops being safe. That day is
+    this row going red.
+
+    The identity comes from the scan, not from a name: the journal-write emit carries
+    each write's enclosing ``def`` lineno alongside the bare name, so two definitions
+    are two linenos even when the name is one. Module-level writes are never a
+    collision — a file has one module scope.
+
+    Ablation (observed): appending a second journal-writing ``_log`` to
+    ``src/bmad_loop/plugins/bus.py`` reddens this naming
+    ``plugins/bus.py::_log defined at lines [257, 263]``. The probe rows in
+    ``test_journal_bare_name_collision_probes_read_def_identity`` carry the mutations
+    that ablation cannot reach — the lookalikes that must stay silent."""
+    scoped = _of("journalfnscope")
+    collisions = _journal_bare_name_collisions(scoped)
+    assert collisions == {}, (
+        "two journal-writing functions in one module share a bare function name, "
+        "which is the key every journal position table uses — their declarations "
+        "have silently merged. Rename one, or qualify the position keys (DW-152) "
+        "and move every table with them:\n"
+        + "\n".join(
+            f"  {rel}::{name} defined at lines {linenos}"
+            for (rel, name), linenos in sorted(collisions.items())
+        )
+    )
+    # Anti-vacuity, over the SAME population the absence assertion just ran on. The
+    # assertion above is an ABSENCE over an emit, so it is green both when no module
+    # holds a duplicate and when the emit stopped firing. Every position DECLARED on
+    # any of the five bare-name-keyed tables must show up in the measured population
+    # — `JOURNAL_FORWARDERS` included, which is otherwise covered only by happening
+    # to also be a splat row — the same coupling
+    # `test_journal_field_guard_actually_saw_the_producers` makes for the field emit,
+    # and the reason deleting the emit is not a way to pass this.
+    measured_positions = {(rel, fn) for _, rel, _, _, (fn, _) in scoped}
+    missing = (
+        set(JOURNAL_SPLAT_ALLOW) | set(JOURNAL_DYNAMIC_KIND_ALLOW) | JOURNAL_FORWARDERS
+    ) - measured_positions
+    assert missing == set(), (
+        "the def-identity emit did not reach every declared journal position, so the "
+        f"collision assertion above proves nothing about them: {sorted(missing)}"
     )
 
 
@@ -6368,6 +6670,264 @@ def test_journal_kind_count_drift_reports_both_directions(label, population, exp
     assert _journal_kind_count_drift(findings) == expected, label
 
 
+# The SPLAT axis of the same idiom: `(label, population, expected drift)` rows written
+# as deltas off `JOURNAL_SPLAT_ALLOW` rather than as literal counts, so a deliberate
+# change to the declaration moves these rows with it instead of leaving a second
+# hardcoded count behind.
+#
+# The positions are DERIVED for the same reason as the dynamic-kind rows above:
+# naming one would be a hardcoded key, and subscripting it at import turns "delete the
+# stale row" — the remedy the tree-wide failure message hands out — into a collection
+# error for every row in this file. `default` keeps import total even under an emptied
+# declaration.
+_SPLAT_MULTI_POSITION, _SPLAT_DECLARED = max(
+    JOURNAL_SPLAT_ALLOW.items(), key=lambda kv: kv[1], default=(("", ""), 0)
+)
+_SPLAT_SINGLE_POSITION, _SPLAT_SINGLE_DECLARED = min(
+    ((pos, n) for pos, n in JOURNAL_SPLAT_ALLOW.items() if pos != _SPLAT_MULTI_POSITION),
+    key=lambda kv: kv[1],
+    default=(("", ""), 0),
+)
+# A position no declaration names, for the undeclared direction.
+_SPLAT_UNDECLARED_POSITION = ("stories_engine.py", "_advance")
+
+
+def test_journal_splat_count_cases_rest_on_a_multi_write_position():
+    """The rows below mutate the declared hole holding the MOST unresolvable writes,
+    derived from the declaration rather than named. This pins the premise that makes
+    the derivation worth anything: some declared position holds two or more splats —
+    which is the shape DW-150 exists for, and without it `write-removed` and
+    `position-went-resolvable` collapse into each other at measured 0.
+
+    And that a SECOND declared position exists, which is the other half of the same
+    premise: with a one-row table `_SPLAT_SINGLE_POSITION` falls through `min`'s
+    `default` to `("", "")` at declared 0, and the `stale-row` case below would then
+    fail naming `_journal_splat_count_drift` — blaming the helper for a shrunken
+    declaration this test exists to name instead."""
+    assert _SPLAT_DECLARED >= 2, (
+        "no declared splat hole holds 2+ writes any more, so the `write-removed` and "
+        "`position-went-resolvable` cases below stop covering separate directions. "
+        f"Declared: {dict(JOURNAL_SPLAT_ALLOW)}"
+    )
+    assert _SPLAT_SINGLE_DECLARED >= 1, (
+        "the declaration no longer holds a second position, so `_SPLAT_SINGLE_POSITION` "
+        "fell through to `min`'s default and the `stale-row` case below grades a "
+        f"phantom. Declared: {dict(JOURNAL_SPLAT_ALLOW)}"
+    )
+    assert _SPLAT_UNDECLARED_POSITION not in JOURNAL_SPLAT_ALLOW
+
+
+JOURNAL_SPLAT_COUNT_CASES = [
+    # The tree as declared: silent.
+    ("as-declared", dict(JOURNAL_SPLAT_ALLOW), {}),
+    # A splat ADDED inside an already-declared position — DW-150's shape, the one
+    # membership was blind to and the one the real-tree ablation exercises.
+    (
+        "write-added",
+        {**JOURNAL_SPLAT_ALLOW, _SPLAT_MULTI_POSITION: _SPLAT_DECLARED + 1},
+        {_SPLAT_MULTI_POSITION: (_SPLAT_DECLARED, _SPLAT_DECLARED + 1)},
+    ),
+    # …and the other direction: a splat REMOVED from a multi-write hole is drift too,
+    # not an improvement — the declaration now over-states the hole.
+    (
+        "write-removed",
+        {**JOURNAL_SPLAT_ALLOW, _SPLAT_MULTI_POSITION: _SPLAT_DECLARED - 1},
+        {_SPLAT_MULTI_POSITION: (_SPLAT_DECLARED, _SPLAT_DECLARED - 1)},
+    ),
+    # Every splat at the multi-write position became resolvable: the row is a waiver
+    # for nothing, and measured 0 off a declared 2+ is what says so.
+    (
+        "position-went-resolvable",
+        {**JOURNAL_SPLAT_ALLOW, _SPLAT_MULTI_POSITION: 0},
+        {_SPLAT_MULTI_POSITION: (_SPLAT_DECLARED, 0)},
+    ),
+    # The same measured 0 off a SINGLE-write row, which is the stale-row shape the
+    # old set comparison caught and which must survive the move to counts: the
+    # position is gone from the tree and the declaration still names it.
+    (
+        "stale-row",
+        {**JOURNAL_SPLAT_ALLOW, _SPLAT_SINGLE_POSITION: 0},
+        {_SPLAT_SINGLE_POSITION: (_SPLAT_SINGLE_DECLARED, 0)},
+    ),
+    # An UNDECLARED position: declared half 0, so the union keying is what reports it.
+    # Unlike the kind axis this is NOT deferred to the offender filter — that filter
+    # names the line, this names the number, and the producer test's docstring says
+    # why both.
+    (
+        "undeclared-position",
+        {**JOURNAL_SPLAT_ALLOW, _SPLAT_UNDECLARED_POSITION: 1},
+        {_SPLAT_UNDECLARED_POSITION: (0, 1)},
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "population", "expected"),
+    JOURNAL_SPLAT_COUNT_CASES,
+    ids=[c[0] for c in JOURNAL_SPLAT_COUNT_CASES],
+)
+def test_journal_splat_count_drift_reports_every_direction(label, population, expected):
+    """`_journal_splat_count_drift`'s decision, as rows — the mutations the real tree
+    cannot show without editing `src/`, which this guard must not do.
+
+    Each population also carries a RESOLVABLE field at an undeclared position, which
+    must never reach the drift: the count reads the `field is None` rows only, and a
+    helper that counted every journal field would report a position for every module
+    in the tree."""
+    findings = [
+        ("journalfield", rel, 1, "journal.append(k, **extras)", (None, fn, None))
+        for (rel, fn), count in population.items()
+        for _ in range(count)
+    ]
+    findings.append(
+        ("journalfield", "sweep.py", 1, "journal.append(k, story_key=s)", ("story_key", "_t", None))
+    )
+    assert _journal_splat_count_drift(findings) == expected, label
+
+
+def test_journal_field_offenders_flag_every_line_of_an_over_declared_splat():
+    """A splat added inside an already-declared hole is an offender at EVERY one of
+    its lines, naming measured against declared — the half of DW-150 that lands in the
+    routing guard's remedy rather than in the producer test's numbers.
+
+    Membership alone waived all of them: the position was declared, so a second,
+    third or tenth `**splat` dropped in beside the first read as sanctioned and its
+    field names never entered the inventory. Both lines are reported rather than the
+    surplus one, because nothing in a count says WHICH write is the new one.
+
+    The under-count direction is deliberately absent here and lives in
+    `test_journal_splat_count_drift_reports_every_direction`: a position that lost a
+    write leaves no finding for a filter over findings to flag."""
+    rel, fn = _SPLAT_MULTI_POSITION
+    findings = [
+        ("journalfield", rel, 10 + i, "journal.append(k, **extras)", (None, fn, None))
+        for i in range(_SPLAT_DECLARED + 1)
+    ]
+    offenders = _journal_field_offenders(findings)
+    assert [ln for _, ln, _, _ in offenders] == [10 + i for i in range(_SPLAT_DECLARED + 1)]
+    assert all(
+        f"measured {_SPLAT_DECLARED + 1}, declared {_SPLAT_DECLARED}" in what
+        for *_, what in offenders
+    ), offenders
+    # …and the declared population itself stays silent, so the row above is not
+    # passing because the branch refuses every splat.
+    assert (
+        _journal_field_offenders(findings[:_SPLAT_DECLARED]) == []
+    ), "the declared count is refused, so the over-count assertion proves nothing"
+
+
+# Two same-named journal-writing defs in ONE module: the collision the position keys
+# cannot express. Both write the journal, so both reach the emit; the bare name is one
+# and the `def` linenos are two.
+_BARE_NAME_COLLISION_SOURCE = """\
+class A:
+    def _log(self, kind, **fields):
+        self.journal.append(kind, **fields)
+
+
+class B:
+    def _log(self, kind, **fields):
+        self.journal.append(kind, **fields)
+"""
+
+# The control: ONE journal-writing def of that name, beside a same-named def that
+# writes nothing. A collision helper keyed on definitions rather than on journal
+# WRITES would flag this, and the position tables would be right to ignore it for the
+# four POSITION tables — a non-writing function contributes no findings to aggregate
+# into their rows.
+#
+# ⚠️ Not `JOURNAL_FORWARDERS`, the fifth bare-name-keyed table. That row makes
+# `_is_journal_write` read a CALL to `_log` inside `plugins/bus.py` as a journal
+# write, so a same-named non-journaling `_log` there would still route its callers'
+# keywords into the field inventory. This row is the position tables' answer, not a
+# claim that a non-writing twin is harmless everywhere.
+_BARE_NAME_SINGLE_WRITER_SOURCE = """\
+class A:
+    def _log(self, kind, **fields):
+        self.journal.append(kind, **fields)
+
+
+class B:
+    def _log(self, kind, **fields):
+        return None
+"""
+
+
+def test_journal_bare_name_collision_probes_read_def_identity():
+    """`_journal_bare_name_collisions`' decision, as probes — the mutations the real
+    tree cannot show, since it holds no duplicate today and `src/` must not be edited
+    to invent one.
+
+    Five rows, one per way the helper or the emit could be wrong: two same-named
+    writing defs in one module ARE a collision (with both `def` linenos, which is the
+    identity the bare name cannot carry); one writing def beside a same-named
+    non-writing one is NOT (the position tables aggregate WRITES, not definitions);
+    the same name in two different FILES is not, because the key is `(file, name)`; a
+    module-level write is not, because a file has exactly one module scope; and a
+    non-journal `.append` inside a def emits nothing at all — the must-stay-silent
+    lookalike every new emit in this file owes, without which the emit could pass
+    every row above by firing on every `.append` in the tree.
+
+    Each silent row pins its POPULATION as well as the empty result, so none of them
+    passes for the wrong reason. `== {}` alone is green with the emit deleted.
+
+    Ablation (observed): dropping the `def` lineno from the emit — leaving the bare
+    name alone — reddens the collision row rather than silencing it, because
+    `_journal_bare_name_collisions` skips `def_lineno is None` and the result
+    collapses to `{}`. Emitting a CONSTANT lineno is the mutation that would make one
+    name one key, and it reddens the same row."""
+    collisions = _journal_bare_name_collisions(
+        [
+            f
+            for f in _scan_source(_BARE_NAME_COLLISION_SOURCE, "plugins/bus.py")
+            if f[0] == "journalfnscope"
+        ]
+    )
+    assert collisions == {("plugins/bus.py", "_log"): [2, 7]}, collisions
+
+    single_writer = [
+        f
+        for f in _scan_source(_BARE_NAME_SINGLE_WRITER_SOURCE, "plugins/bus.py")
+        if f[0] == "journalfnscope"
+    ]
+    assert [f[4] for f in single_writer] == [("_log", 2)], single_writer
+    assert _journal_bare_name_collisions(single_writer) == {}
+
+    # Same bare name, two FILES — the shape the real tree already holds
+    # (`plugins/bus.py::_log` and a `_log` elsewhere), and not a collision.
+    one_writer = "class A:\n    def _log(self, kind, **fields):\n        self.journal.append(kind, **fields)\n"
+    across_files = [
+        f
+        for rel in ("plugins/bus.py", "stories_engine.py")
+        for f in _scan_source(one_writer, rel)
+        if f[0] == "journalfnscope"
+    ]
+    assert len(across_files) == 2, across_files
+    assert _journal_bare_name_collisions(across_files) == {}
+
+    # Module-level writes: `fn is None`, so they are skipped rather than aggregated
+    # into a phantom `(rel, None)` row that two files could never disambiguate.
+    module_level = [
+        f
+        for f in _scan_source(
+            'journal.append("run-start", attempt=1)\njournal.append("run-stop", attempt=2)\n',
+            "cli.py",
+        )
+        if f[0] == "journalfnscope"
+    ]
+    assert [f[4] for f in module_level] == [(None, None), (None, None)], module_level
+    assert _journal_bare_name_collisions(module_level) == {}
+
+    # The must-stay-silent lookalike: an `.append` on something that is not a journal
+    # receiver, inside a def. No `journalfnscope` at all — not a `(name, lineno)` pair
+    # the collision helper then has to filter out. Scanned in a file with no
+    # `JOURNAL_FORWARDERS` row, so the name cannot be what makes it a write.
+    not_a_journal = _scan_source(
+        "def _triage(self):\n    self.items.append(story)\n    other.append(1)\n", "sweep.py"
+    )
+    assert [f for f in not_a_journal if f[0] == "journalfnscope"] == [], not_a_journal
+
+
 # The `recovery_flow.prune_preserve_refs` shape, as a snippet: a `for` over a literal
 # tuple of literal tuples, and the SAME four writes the real function makes — two
 # spelling `-pruned` (the partial-prune and the clean paths) and two `-prune-failed`
@@ -7354,6 +7914,7 @@ def test_journal_write_preserves_sentinel_spelled_literal():
     line = f"    self._journal.append({UNRESOLVED_DYNAMIC_KIND!r}, patch=path)"
     findings = _scan_source(f"def f(self):\n{line}\n", "engine.py")
     assert findings == [
+        ("journalfnscope", "engine.py", 2, line, ("f", 1)),
         ("journalkindliteral", "engine.py", 2, line, UNRESOLVED_DYNAMIC_KIND),
         ("journalfield", "engine.py", 2, line, ("patch", "f", UNRESOLVED_DYNAMIC_KIND)),
     ]
@@ -7400,13 +7961,14 @@ def test_journal_routing_tables_are_read_from_diagnostics():
         "unreachable and every off-schema key falls back to `scrub_json`"
     )
     # The kind whose keys are LLM-authored is the reason the table exists, and
-    # `JOURNAL_SPLAT_ALLOW`'s comment for `engine.py::_review_and_commit` names this
+    # `JOURNAL_SPLAT_FIELDS`' comment for `engine.py::_review_and_commit` names this
     # table as the mechanism that covers that hole. Pinned rather than trusted: a
     # comment naming a mechanism that is not there is the failure this file exists
     # to refuse.
     assert "preference-escalation" in schemas
     assert (
-        schemas["preference-escalation"] == JOURNAL_SPLAT_ALLOW[("engine.py", "_review_and_commit")]
+        schemas["preference-escalation"]
+        == JOURNAL_SPLAT_FIELDS[("engine.py", "_review_and_commit")]
     ), (
         "the declared schema and the splat inventory that cites it disagree — one "
         "of the two was edited alone"
@@ -7422,7 +7984,7 @@ def test_journal_routing_tables_are_read_from_diagnostics():
         # journal only through the allowlisted splat, so the inventory there is
         # where they are declared.
         unaccounted = names - JOURNAL_ROUTED_FIELDS - JOURNAL_BENIGN_FIELDS
-        unaccounted -= frozenset().union(*JOURNAL_SPLAT_ALLOW.values())
+        unaccounted -= frozenset().union(*JOURNAL_SPLAT_FIELDS.values())
         assert unaccounted == set(), (
             f"{kind}'s declared schema names fields the guard does not account for: "
             f"{sorted(unaccounted)}"
